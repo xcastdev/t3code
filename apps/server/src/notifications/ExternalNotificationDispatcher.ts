@@ -107,16 +107,19 @@ export const make = Effect.gen(function* () {
   const compileAdapter = (
     destination: ExternalNotificationDestination & { readonly webhookUrl: string },
   ) => {
-    if (destination._tag === "home-assistant-webhook") {
-      return (payload: ExternalNotificationPayload) =>
-        homeAssistant.send({
-          destinationId: destination.id,
-          webhookUrl: destination.webhookUrl,
-          payload,
-        });
+    switch (destination._tag) {
+      case "home-assistant-webhook":
+        return (payload: ExternalNotificationPayload) =>
+          homeAssistant.send({
+            destinationId: destination.id,
+            webhookUrl: destination.webhookUrl,
+            payload,
+          });
+      default: {
+        const exhaustiveDestination: never = destination._tag;
+        return exhaustiveDestination;
+      }
     }
-    return (_payload: ExternalNotificationPayload) =>
-      Effect.die(`Unsupported external notification adapter: ${destination._tag}`);
   };
 
   const getConfiguredDestinations = Effect.fn("ExternalNotificationDispatcher.getDestinations")(
