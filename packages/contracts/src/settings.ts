@@ -638,6 +638,41 @@ export const BackgroundActivitySettings = Schema.Struct({
 }).pipe(Schema.withDecodingDefault(Effect.succeed({})));
 export type BackgroundActivitySettings = typeof BackgroundActivitySettings.Type;
 
+/** Destinations are deliberately a closed union: adding an adapter is a contract change. */
+export const ExternalNotificationAppScheme = Schema.Literals([
+  "t3code-dev",
+  "t3code-preview",
+  "t3code",
+]);
+export type ExternalNotificationAppScheme = typeof ExternalNotificationAppScheme.Type;
+
+export const ExternalNotificationHomeAssistantDestination = Schema.TaggedStruct(
+  "home-assistant-webhook",
+  {
+    id: TrimmedNonEmptyString,
+    label: TrimmedNonEmptyString,
+    enabled: Schema.Boolean,
+    /** True iff a URL is held by ServerSecretStore. Never exposes that URL. */
+    configured: Schema.Boolean,
+    /** Write-only at the RPC boundary; redacted before settings leave the server. */
+    webhookUrl: Schema.optionalKey(TrimmedString),
+  },
+);
+export const ExternalNotificationDestination = Schema.Union([
+  ExternalNotificationHomeAssistantDestination,
+]);
+export type ExternalNotificationDestination = typeof ExternalNotificationDestination.Type;
+
+export const ExternalNotificationSettings = Schema.Struct({
+  appScheme: ExternalNotificationAppScheme.pipe(
+    Schema.withDecodingDefault(Effect.succeed("t3code-dev" as const)),
+  ),
+  destinations: Schema.Array(ExternalNotificationDestination).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
+}).pipe(Schema.withDecodingDefault(Effect.succeed({})));
+export type ExternalNotificationSettings = typeof ExternalNotificationSettings.Type;
+
 export const ServerSettings = Schema.Struct({
   // Legacy token-by-token assistant output. Deliberately a fresh key (was
   // `enableAssistantStreaming`): decoding drops the old key, so everyone,
@@ -658,6 +693,7 @@ export const ServerSettings = Schema.Struct({
    * between a desktop window and a phone attached to the same server.
    */
   enableAgentBrowserAccess: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  externalNotifications: ExternalNotificationSettings,
   backgroundActivity: BackgroundActivitySettings,
   // Legacy flat fields retained for old settings files and old clients. New
   // consumers should resolve `backgroundActivity` instead.
@@ -883,6 +919,12 @@ export const ServerSettingsPatch = Schema.Struct({
   enableLegacyTokenStreaming: Schema.optionalKey(Schema.Boolean),
   enableProviderUpdateChecks: Schema.optionalKey(Schema.Boolean),
   enableAgentBrowserAccess: Schema.optionalKey(Schema.Boolean),
+  externalNotifications: Schema.optionalKey(
+    Schema.Struct({
+      appScheme: Schema.optionalKey(ExternalNotificationAppScheme),
+      destinations: Schema.optionalKey(Schema.Array(ExternalNotificationDestination)),
+    }),
+  ),
   backgroundActivity: Schema.optionalKey(
     Schema.Struct({
       schemaVersion: Schema.optionalKey(Schema.Literal(1)),

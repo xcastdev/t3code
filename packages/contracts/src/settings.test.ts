@@ -12,6 +12,7 @@ import {
   ServerSettings,
   ServerSettingsPatch,
 } from "./settings.ts";
+import { buildExternalNotificationDeepLink } from "./externalNotifications.ts";
 
 const decodeClientSettings = Schema.decodeUnknownSync(ClientSettingsSchema);
 const decodeClientSettingsPatch = Schema.decodeUnknownSync(ClientSettingsPatch);
@@ -249,6 +250,78 @@ describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
         providerInstances: { "1bad": { driver: "codex" } },
       }),
     ).toThrow();
+  });
+});
+
+describe("ServerSettings.externalNotifications", () => {
+  it("defaults to the development app scheme with no destinations", () => {
+    expect(decodeServerSettings({}).externalNotifications).toEqual({
+      appScheme: "t3code-dev",
+      destinations: [],
+    });
+  });
+
+  it("accepts Home Assistant destinations and validates the closed union", () => {
+    const destination = {
+      _tag: "home-assistant-webhook",
+      id: "home",
+      label: "Home Assistant",
+      enabled: true,
+      configured: false,
+    } as const;
+    expect(
+      decodeServerSettingsPatch({
+        externalNotifications: {
+          appScheme: "t3code-preview",
+          destinations: [destination],
+        },
+      }),
+    ).toEqual({
+      externalNotifications: {
+        appScheme: "t3code-preview",
+        destinations: [destination],
+      },
+    });
+
+    expect(() =>
+      decodeServerSettingsPatch({
+        externalNotifications: {
+          destinations: [{ ...destination, _tag: "unknown" }],
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeServerSettingsPatch({
+        externalNotifications: { appScheme: "unknown" },
+      }),
+    ).toThrow();
+    expect(decodeServerSettingsPatch({ externalNotifications: { destinations: [] } })).toEqual({
+      externalNotifications: { destinations: [] },
+    });
+    expect(() =>
+      decodeServerSettingsPatch({
+        externalNotifications: {
+          destinations: [{ ...destination, id: "   " }],
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeServerSettingsPatch({
+        externalNotifications: {
+          destinations: [{ ...destination, label: "   " }],
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("encodes environment and thread path components independently", () => {
+    expect(
+      buildExternalNotificationDeepLink({
+        appScheme: "t3code-dev",
+        environmentId: "env/with space",
+        threadId: "thread/with space",
+      }),
+    ).toBe("t3code-dev://threads/env%2Fwith%20space/thread%2Fwith%20space");
   });
 });
 

@@ -188,6 +188,19 @@ export function applyServerSettingsPatch(
     ...(patch.providerInstances !== undefined
       ? { providerInstances: patch.providerInstances }
       : {}),
+    ...(patch.externalNotifications !== undefined
+      ? {
+          externalNotifications: {
+            ...next.externalNotifications,
+            ...(patch.externalNotifications.appScheme !== undefined
+              ? { appScheme: patch.externalNotifications.appScheme }
+              : {}),
+            ...(patch.externalNotifications.destinations !== undefined
+              ? { destinations: patch.externalNotifications.destinations }
+              : {}),
+          },
+        }
+      : {}),
     ...(patch.sourceControlWriterModelSelection !== undefined
       ? { sourceControlWriterModelSelection: patch.sourceControlWriterModelSelection }
       : {}),

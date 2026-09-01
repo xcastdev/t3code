@@ -1,10 +1,12 @@
 import {
   DEFAULT_SERVER_SETTINGS,
+  ExternalNotificationHomeAssistantDestination,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
 } from "@t3tools/contracts";
 import * as Duration from "effect/Duration";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 import { resolveServerBackgroundActivitySettings } from "./backgroundActivitySettings.ts";
 import { createModelSelection } from "./model.ts";
@@ -18,6 +20,45 @@ import {
 } from "./serverSettings.ts";
 
 describe("serverSettings helpers", () => {
+  it("replaces external notification destinations without materializing defaults", () => {
+    const decodeDestination = Schema.decodeUnknownSync(
+      ExternalNotificationHomeAssistantDestination,
+    );
+    const currentDestination = decodeDestination({
+      _tag: "home-assistant-webhook",
+      id: "current",
+      label: "Current",
+      enabled: true,
+      configured: true,
+    });
+    const nextDestination = decodeDestination({
+      _tag: "home-assistant-webhook",
+      id: "next",
+      label: "Next",
+      enabled: false,
+      configured: false,
+    });
+    const current = {
+      ...DEFAULT_SERVER_SETTINGS,
+      externalNotifications: {
+        appScheme: "t3code-preview" as const,
+        destinations: [currentDestination],
+      },
+    };
+
+    expect(
+      applyServerSettingsPatch(current, {
+        externalNotifications: { destinations: [nextDestination] },
+      }).externalNotifications,
+    ).toEqual({
+      appScheme: "t3code-preview",
+      destinations: [nextDestination],
+    });
+    expect(
+      applyServerSettingsPatch(current, { enableAgentBrowserAccess: false }).externalNotifications,
+    ).toEqual(current.externalNotifications);
+  });
+
   it("normalizes optional persisted strings", () => {
     expect(normalizePersistedServerSettingString(undefined)).toBeUndefined();
     expect(normalizePersistedServerSettingString("   ")).toBeUndefined();
