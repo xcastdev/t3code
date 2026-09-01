@@ -12,17 +12,17 @@ Implement server-authoritative external notifications with Home Assistant adapte
 - **lifecycle state:** in_progress
 - **current phase:** P9
 - **baseline revision:** `d94577e5c5cfaacc3225c1d06bf0506184514420`
-- **candidate revision:** `WORKTREE@c3e17e31ac6667057254d5ad5343a779f85dd5fa` (dirty overlay; evidence tests remain uncommitted)
+- **candidate revision:** `53d151085d94f0d7a7acb12cb2776b9ce159050b` (immutable implementation candidate)
 - **declared scope digest:** `sha256:48ed5a1ebc20dee5ca68935180121492e89702eccfec427c19ede998b1115f47` (sorted newline-delimited paths)
 - **current changed files digest:** `sha256:48ed5a1ebc20dee5ca68935180121492e89702eccfec427c19ede998b1115f47` (sorted newline-delimited paths)
 
 ## Execution status
 
-Implementation is complete through P8, and focused P5–P7 boundary evidence is now present. The Web UI now adds destinations through a generic integration selector, renders integration-specific fields, preserves custom destination names during type changes, and confirms destructive removal with a short-lived success toast. The work remains in `in_progress/` because this is a high-risk plan and independent validation/revalidation are not complete.
+Implementation is complete through P8, and focused P5–P7 boundary evidence is now present. The Web UI now adds destinations through a generic integration selector, renders integration-specific fields, preserves custom destination names during type changes, and confirms destructive removal with a short-lived success toast. The dispatcher now uses a compiler-checked exhaustive adapter switch. The work remains in `in_progress/` because this is a high-risk plan and independent validation/revalidation are not complete.
 
 The implementation corrected two findings from independent review: external webhook URLs no longer enter settings streams, and external webhook secrets are restored when a settings update fails. Disabled but configured destinations are eligible for an explicit test without entering normal fanout. Relay and external startup snapshots use separate readiness state so an external-first startup does not prevent later relay reconciliation.
 
-The previously reported boundary evidence gaps are repaired with adapter transport/timeout/2xx tests, dispatcher concurrency tests, relay no-credential/settings-replay coverage, client failure propagation, and Web UI operation coverage. The user has also manually validated the running external-notification flow and final settings controls. Independent validation and revalidation must be rerun against the current dirty candidate.
+The previously reported boundary evidence gaps are repaired with adapter transport/timeout/2xx tests, dispatcher concurrency tests, relay no-credential/settings-replay coverage, client failure propagation, and Web UI operation coverage. The user has also manually validated the running external-notification flow and final settings controls. Independent validation and revalidation must be rerun against the immutable candidate recorded above.
 
 ## AC Trace Table
 

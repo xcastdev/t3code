@@ -2,19 +2,19 @@
 
 ## Shared Provenance (current candidate)
 
-| Field                        | Value                                                                                           |
-| ---------------------------- | ----------------------------------------------------------------------------------------------- |
-| baseline_revision            | `d94577e5c5cfaacc3225c1d06bf0506184514420`                                                      |
-| candidate_revision           | `WORKTREE@c3e17e31ac6667057254d5ad5343a779f85dd5fa` (dirty overlay; evidence tests uncommitted) |
-| declared_scope_digest        | `sha256:48ed5a1ebc20dee5ca68935180121492e89702eccfec427c19ede998b1115f47`                       |
-| current_changed_files_digest | `sha256:48ed5a1ebc20dee5ca68935180121492e89702eccfec427c19ede998b1115f47`                       |
-| current_changed_files        | See `STATE.md` provenance; 35 paths including boundary tests and lifecycle READMEs              |
-| implementer                  | direct primary implementation / `ses_fa4cea939ffeeirmIHsesYjjQP` / `openai/gpt-5.6-luna`        |
-| validator                    | validate-wrapper / `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                      |
-| revalidator                  | validate-wrapper-alt / `ses_fa4923707ffeA0gvUbAe5yfgB6` / `deepseek-v4-pro`                     |
-| latest validation            | `pending independent validation`; repaired focused implementation and boundary checks pass      |
-| latest revalidation          | `pending independent revalidation`                                                              |
-| timestamp_policy             | ISO-8601 with timezone, captured at execution time; never pre-fill execution timestamps         |
+| Field                        | Value                                                                                    |
+| ---------------------------- | ---------------------------------------------------------------------------------------- |
+| baseline_revision            | `d94577e5c5cfaacc3225c1d06bf0506184514420`                                               |
+| candidate_revision           | `53d151085d94f0d7a7acb12cb2776b9ce159050b` (immutable implementation candidate)          |
+| declared_scope_digest        | `sha256:48ed5a1ebc20dee5ca68935180121492e89702eccfec427c19ede998b1115f47`                |
+| current_changed_files_digest | `sha256:48ed5a1ebc20dee5ca68935180121492e89702eccfec427c19ede998b1115f47`                |
+| current_changed_files        | See `STATE.md` provenance; 35 paths including boundary tests and lifecycle READMEs       |
+| implementer                  | direct primary implementation / `ses_fa4cea939ffeeirmIHsesYjjQP` / `openai/gpt-5.6-luna` |
+| validator                    | validate-wrapper / `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`               |
+| revalidator                  | validate-wrapper-alt / `ses_fa4923707ffeA0gvUbAe5yfgB6` / `deepseek-v4-pro`              |
+| latest validation            | `pending independent validation`                                                         |
+| latest revalidation          | `pending independent revalidation`                                                       |
+| timestamp_policy             | ISO-8601 with timezone, captured at execution time; never pre-fill execution timestamps  |
 
 **Current candidate is in `docs/plans/in_progress/external-notifications/`. The historical pre-implementation block below is retained only as provenance of the original saved plan.**
 
@@ -275,14 +275,14 @@
 | fail-first              | disabled destination skipped                                                                                                                                              |
 | positive control        | all enabled destinations attempted                                                                                                                                        |
 | negative control        | failure of one does not affect others                                                                                                                                     |
-| mutation / BITE-DEMO    | works without cloud/relay credentials                                                                                                                                     |
+| mutation / BITE-DEMO    | temporarily added `_tag: "mutation"` to the adapter union; server typecheck failed at the `never` gate, then the mutation was removed and the candidate typecheck passed  |
 | race / integration      | bounded concurrency; controlled HttpClient                                                                                                                                |
 | dependent-path sweep    | dispatcher independent of relay                                                                                                                                           |
 | command                 | `vp test run apps/server/src/notifications/ExternalNotificationDispatcher.test.ts`                                                                                        |
-| result                  | VALIDATED — exit 0; 7 dispatcher tests passed, including bounded fanout, concurrent duplicate serialization, and dynamic destination addition (2026-09-01T12:59:13-05:00) |
+| result                  | VALIDATED — exit 0; 7 dispatcher tests passed, including bounded fanout, concurrent duplicate serialization, and dynamic destination addition (2026-09-01T16:41:53-05:00) |
 | artifact / reference    | `apps/server/src/notifications/ExternalNotificationDispatcher.ts`                                                                                                         |
 | validator session/model | `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                                                                                                                   |
-| timestamp               | 2026-09-01T12:59:13-05:00                                                                                                                                                 |
+| timestamp               | 2026-09-01T16:41:53-05:00                                                                                                                                                 |
 
 <a id="p4-ac-07"></a>
 
@@ -299,10 +299,10 @@
 | race / integration      | per-dest/thread key; concurrent duplicate suppressed                                                                                                    |
 | dependent-path sweep    | dedupe key independent of relay identity                                                                                                                |
 | command                 | `vp test run apps/server/src/notifications/ExternalNotificationDispatcher.test.ts`                                                                      |
-| result                  | VALIDATED — exit 0; dedupe, success identity, new-destination, concurrent duplicate, and dynamic settings assertions passed (2026-09-01T12:59:13-05:00) |
+| result                  | VALIDATED — exit 0; dedupe, success identity, new-destination, concurrent duplicate, and dynamic settings assertions passed (2026-09-01T16:41:53-05:00) |
 | artifact / reference    | `apps/server/src/notifications/ExternalNotificationDispatcher.ts`                                                                                       |
 | validator session/model | `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                                                                                                 |
-| timestamp               | 2026-09-01T12:59:13-05:00                                                                                                                               |
+| timestamp               | 2026-09-01T16:41:53-05:00                                                                                                                               |
 
 <a id="p4-ac-10"></a>
 
@@ -319,10 +319,10 @@
 | race / integration      | N/A                                                                                                         |
 | dependent-path sweep    | test bypass independent of dedupe                                                                           |
 | command                 | `vp test run apps/server/src/notifications/ExternalNotificationDispatcher.test.ts`                          |
-| result                  | VALIDATED — exit 0; direct test bypass and identity isolation assertions passed (2026-09-01T12:59:13-05:00) |
+| result                  | VALIDATED — exit 0; direct test bypass and identity isolation assertions passed (2026-09-01T16:41:53-05:00) |
 | artifact / reference    | `apps/server/src/notifications/ExternalNotificationDispatcher.ts`                                           |
 | validator session/model | `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                                                     |
-| timestamp               | 2026-09-01T12:59:13-05:00                                                                                   |
+| timestamp               | 2026-09-01T16:41:53-05:00                                                                                   |
 
 ---
 
@@ -473,7 +473,7 @@ User-reported manual validation at `2026-09-01T16:07:20-05:00` covered the runni
 | race / integration      | selected remote environment verified                                                                                                                                                                                                                                                                                                         |
 | dependent-path sweep    | UI from RPC/contract definitions                                                                                                                                                                                                                                                                                                             |
 | command                 | `vp test run src/components/settings/ExternalNotificationsSettings.logic.test.ts src/components/settings/IntegrationsSettings.environment.test.tsx` from `apps/web`; `vp run typecheck`                                                                                                                                                      |
-| result                  | VALIDATED — 6 UI boundary tests passed for environment selection, access gating, descriptor validation, URL redaction, generic integration selection, destructive confirmation, and CRUD/test operation handlers; web typecheck passed (2026-09-01T15:16:17-05:00). User-reported manual validation also passed (2026-09-01T16:07:20-05:00). |
+| result                  | VALIDATED — 6 UI boundary tests passed for environment selection, access gating, descriptor validation, URL redaction, generic integration selection, destructive confirmation, and CRUD/test operation handlers; web typecheck passed (2026-09-01T16:41:54-05:00). User-reported manual validation also passed (2026-09-01T16:07:20-05:00). |
 | artifact / reference    | `apps/web/src/components/settings/IntegrationsSettings.tsx`                                                                                                                                                                                                                                                                                  |
 | validator session/model | `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                                                                                                                                                                                                                                                                                      |
 | timestamp               | 2026-09-01T16:07:20-05:00                                                                                                                                                                                                                                                                                                                    |
@@ -486,7 +486,7 @@ User-reported manual validation at `2026-09-01T16:07:20-05:00` covered the runni
 
 ### Documentation
 
-Current content check rerun at `2026-09-01T12:29:16-05:00`: exit 0 with all 7 required topics present. This supersedes the earlier timestamp retained in the table below.
+Current content check rerun at `2026-09-01T16:41:54-05:00`: exit 0 with all 10 required topics present, including the current Save/Test control labels. This supersedes the earlier timestamp retained in the table below.
 
 | Field                   | Value                                                                                                                                                                                                                                                                                                                                                                              |
 | ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -499,10 +499,10 @@ Current content check rerun at `2026-09-01T12:29:16-05:00`: exit 0 with all 7 re
 | race / integration      | N/A (docs only)                                                                                                                                                                                                                                                                                                                                                                    |
 | dependent-path sweep    | docs content matches implementation                                                                                                                                                                                                                                                                                                                                                |
 | command                 | `node -e 'const fs=require("node:fs"); const text=fs.readFileSync("docs/user/external-notifications.md","utf8"); const required=["Home Assistant","schemaVersion","t3code-dev","t3code-preview","redact","Cloud","7 days"]; for (const term of required) if (!text.includes(term)) throw new Error(`missing ${term}`); console.log(`${required.length} required topics present`)'` |
-| result                  | VALIDATED — exit 0; 7 required topics present (2026-09-01T12:29:16-05:00)                                                                                                                                                                                                                                                                                                          |
+| result                  | VALIDATED — exit 0; 10 required topics present, including Save/Test labels (2026-09-01T16:41:54-05:00)                                                                                                                                                                                                                                                                             |
 | artifact / reference    | `docs/user/external-notifications.md`                                                                                                                                                                                                                                                                                                                                              |
 | validator session/model | `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                                                                                                                                                                                                                                                                                                                            |
-| timestamp               | 2026-09-01T12:29:16-05:00                                                                                                                                                                                                                                                                                                                                                          |
+| timestamp               | 2026-09-01T16:41:54-05:00                                                                                                                                                                                                                                                                                                                                                          |
 | note                    | free iOS Personal Team builds expire in 7 days and require reinstall — present and checked                                                                                                                                                                                                                                                                                         |
 
 ---
@@ -513,7 +513,7 @@ Current content check rerun at `2026-09-01T12:29:16-05:00`: exit 0 with all 7 re
 
 ### Format check
 
-Final format check rerun at `2026-09-01T12:30:08-05:00`: exit 0; all 35 declared changed files use the correct format. This supersedes the earlier timestamp retained in the table below.
+Final format check rerun at `2026-09-01T16:41:54-05:00`: exit 0; all 35 declared changed files use the correct format. This supersedes the earlier timestamp retained in the table below.
 
 | Field                   | Value                                                                                                |
 | ----------------------- | ---------------------------------------------------------------------------------------------------- |
@@ -526,10 +526,10 @@ Final format check rerun at `2026-09-01T12:30:08-05:00`: exit 0; all 35 declared
 | race / integration      | N/A                                                                                                  |
 | dependent-path sweep    | all changed files                                                                                    |
 | command                 | `vp fmt --check`                                                                                     |
-| result                  | VALIDATED — exit 0; all 35 declared changed files use the correct format (2026-09-01T12:30:08-05:00) |
+| result                  | VALIDATED — exit 0; all 35 declared changed files use the correct format (2026-09-01T16:41:54-05:00) |
 | artifact / reference    | format output                                                                                        |
 | validator session/model | `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                                              |
-| timestamp               | 2026-09-01T12:30:08-05:00                                                                            |
+| timestamp               | 2026-09-01T16:41:54-05:00                                                                            |
 
 <a id="p9-test"></a>
 
@@ -546,10 +546,10 @@ Final format check rerun at `2026-09-01T12:30:08-05:00`: exit 0; all 35 declared
 | race / integration      | N/A                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | dependent-path sweep    | all test files                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | command                 | `vp test run src/settings.test.ts` (contracts); `vp test run src/serverSettings.test.ts` (shared); `vp test run src/auth/RpcAuthorization.test.ts src/notifications/HomeAssistantWebhookAdapter.test.ts src/notifications/ExternalNotificationDispatcher.test.ts src/relay/AgentAwarenessRelay.test.ts src/server.test.ts src/serverSettings.test.ts` (server); `vp test run src/state/server.test.ts` (client-runtime); `vp test run src/components/settings/ExternalNotificationsSettings.logic.test.ts src/components/settings/IntegrationsSettings.environment.test.tsx` (web) |
-| result                  | VALIDATED — exit 0; 11 test files and 315 tests passed: contracts 63, shared 24, server 205, client-runtime 17, web 6 (2026-09-01T14:42:34-05:00)                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| result                  | VALIDATED — exit 0; 11 test files and 315 tests passed: contracts 63, shared 24, server 205, client-runtime 17, web 6 (2026-09-01T16:41:54-05:00)                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | artifact / reference    | test output                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | validator session/model | `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| timestamp               | 2026-09-01T14:42:34-05:00                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| timestamp               | 2026-09-01T16:41:54-05:00                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 
 <a id="p9-type"></a>
 
@@ -566,36 +566,36 @@ Final format check rerun at `2026-09-01T12:30:08-05:00`: exit 0; all 35 declared
 | race / integration      | N/A                                                                                                                               |
 | dependent-path sweep    | packages/contracts, apps/server, packages/client-runtime, apps/web                                                                |
 | command                 | `vp run typecheck` from each of `packages/contracts`, `packages/shared`, `packages/client-runtime`, `apps/server`, and `apps/web` |
-| result                  | VALIDATED — exit 0 in all five package worktrees; only pre-existing Effect suggestions were reported (2026-09-01T12:30:08-05:00)  |
+| result                  | VALIDATED — exit 0 in all five package worktrees; only pre-existing Effect suggestions were reported (2026-09-01T16:41:54-05:00)  |
 | artifact / reference    | typecheck output                                                                                                                  |
 | validator session/model | `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                                                                           |
-| timestamp               | 2026-09-01T12:30:08-05:00                                                                                                         |
+| timestamp               | 2026-09-01T16:41:54-05:00                                                                                                         |
 
 <a id="p9-relay"></a>
 
 ### Relay regression
 
-| Field                   | Value                                                                                                                                  |
-| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| phase                   | P9                                                                                                                                     |
-| criterion               | RELAY                                                                                                                                  |
-| fail-first              | relay test failure                                                                                                                     |
-| positive control        | relay tests pass                                                                                                                       |
-| negative control        | N/A                                                                                                                                    |
-| mutation / BITE-DEMO    | N/A                                                                                                                                    |
-| race / integration      | N/A                                                                                                                                    |
-| dependent-path sweep    | AgentAwarenessRelay                                                                                                                    |
-| command                 | `vp test run apps/server/src/relay/AgentAwarenessRelay.test.ts`                                                                        |
-| result                  | VALIDATED — exit 0; relay regression passed with 11 tests, including no-relay and settings-replay coverage (2026-09-01T12:25:36-05:00) |
-| artifact / reference    | relay test output                                                                                                                      |
-| validator session/model | `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                                                                                |
-| timestamp               | 2026-09-01T12:25:36-05:00                                                                                                              |
+| Field                   | Value                                                                                                                                                     |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| phase                   | P9                                                                                                                                                        |
+| criterion               | RELAY                                                                                                                                                     |
+| fail-first              | relay test failure                                                                                                                                        |
+| positive control        | relay tests pass                                                                                                                                          |
+| negative control        | N/A                                                                                                                                                       |
+| mutation / BITE-DEMO    | N/A                                                                                                                                                       |
+| race / integration      | N/A                                                                                                                                                       |
+| dependent-path sweep    | AgentAwarenessRelay                                                                                                                                       |
+| command                 | `vp test run apps/server/src/relay/AgentAwarenessRelay.test.ts`                                                                                           |
+| result                  | VALIDATED — exit 0; relay regression passed within the 205-test server batch, including no-relay and settings-replay coverage (2026-09-01T16:41:53-05:00) |
+| artifact / reference    | relay test output                                                                                                                                         |
+| validator session/model | `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                                                                                                   |
+| timestamp               | 2026-09-01T16:41:53-05:00                                                                                                                                 |
 
 <a id="p9-scope"></a>
 
 ### Scope verification
 
-Final scope audit rerun at `2026-09-01T12:30:08-05:00`: 35 changed paths matched the declared scope digest and `git diff --check` passed.
+Final scope audit rerun at `2026-09-01T16:41:54-05:00`: 35 changed paths matched the declared scope digest and `git diff --check` passed.
 
 | Field                   | Value                                                                                                                                  |
 | ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
@@ -608,10 +608,10 @@ Final scope audit rerun at `2026-09-01T12:30:08-05:00`: 35 changed paths matched
 | race / integration      | N/A                                                                                                                                    |
 | dependent-path sweep    | declared scope digest matches                                                                                                          |
 | command                 | `git status --short; git diff --name-only d94577e5c; git ls-files --others --exclude-standard; git diff --check`                       |
-| result                  | VALIDATED — exit 0; current changed files match the declared 35-path scope and `git diff --check` is clean (2026-09-01T12:30:08-05:00) |
+| result                  | VALIDATED — exit 0; current changed files match the declared 35-path scope and `git diff --check` is clean (2026-09-01T16:41:54-05:00) |
 | artifact / reference    | git output                                                                                                                             |
 | validator session/model | `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                                                                                |
-| timestamp               | 2026-09-01T12:30:08-05:00                                                                                                              |
+| timestamp               | 2026-09-01T16:41:54-05:00                                                                                                              |
 
 <a id="p9-val"></a>
 
