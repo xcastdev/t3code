@@ -30,6 +30,8 @@ import * as Tracer from "effect/Tracer";
 
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import * as ExternalNotificationDispatcher from "../notifications/ExternalNotificationDispatcher.ts";
 import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
@@ -545,6 +547,8 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
             AgentAwarenessRelay.layer.pipe(
               Layer.provide(layer),
               Layer.provideMerge(NodeServices.layer),
+              Layer.provideMerge(ServerSettings.layerTest()),
+              Layer.provideMerge(ExternalNotificationDispatcher.layerTest),
             ),
           ),
         );
@@ -714,6 +718,8 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
             AgentAwarenessRelay.layer.pipe(
               Layer.provide(layer),
               Layer.provideMerge(NodeServices.layer),
+              Layer.provideMerge(ServerSettings.layerTest()),
+              Layer.provideMerge(ExternalNotificationDispatcher.layerTest),
             ),
           ),
           Effect.provideService(RelayClientTracer, Option.some(collectingTracer(productSpans))),

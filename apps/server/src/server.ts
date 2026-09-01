@@ -57,6 +57,8 @@ import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { OrchestrationReactorLive } from "./orchestration/Layers/OrchestrationReactor.ts";
+import * as ExternalNotificationDispatcher from "./notifications/ExternalNotificationDispatcher.ts";
+import * as HomeAssistantWebhookAdapter from "./notifications/HomeAssistantWebhookAdapter.ts";
 import { RuntimeReceiptBusLive } from "./orchestration/Layers/RuntimeReceiptBus.ts";
 import { ProviderRuntimeIngestionLive } from "./orchestration/Layers/ProviderRuntimeIngestion.ts";
 import { ProviderCommandReactorLive } from "./orchestration/Layers/ProviderCommandReactor.ts";
@@ -251,7 +253,17 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ProviderCommandReactorLive),
   Layer.provideMerge(CheckpointReactorLive),
   Layer.provideMerge(ThreadDeletionReactorLive),
-  Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
+  Layer.provideMerge(
+    AgentAwarenessRelay.layer.pipe(
+      Layer.provide(ServerSecretStore.layer),
+      Layer.provideMerge(
+        ExternalNotificationDispatcher.layer.pipe(
+          Layer.provide(HomeAssistantWebhookAdapter.layer),
+          Layer.provide(ServerEnvironment.layer),
+        ),
+      ),
+    ),
+  ),
   Layer.provideMerge(RuntimeReceiptBusLive),
 );
 

@@ -59,6 +59,7 @@ import {
   AssetWorkspaceContextResolutionError,
   RpcClientId,
   EnvironmentAuthorizationError,
+  ExternalNotificationError,
   ThreadId,
   type TerminalAttachStreamEvent,
   type TerminalError,
@@ -99,6 +100,7 @@ import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
+import * as ExternalNotificationDispatcher from "./notifications/ExternalNotificationDispatcher.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
@@ -510,6 +512,21 @@ const makeWsRpcLayer = (
       const config = yield* ServerConfig.ServerConfig;
       const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
       const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const externalNotificationDispatcher = Option.getOrElse(
+        yield* Effect.serviceOption(ExternalNotificationDispatcher.ExternalNotificationDispatcher),
+        () =>
+          ({
+            dispatch: () => Effect.void,
+            hasEnabledDestinations: Effect.succeed(false),
+            test: (destinationId: string) =>
+              Effect.fail(
+                new ExternalNotificationError({
+                  destinationId,
+                  reason: "not-configured",
+                }),
+              ),
+          }) satisfies ExternalNotificationDispatcher.ExternalNotificationDispatcher["Service"],
+      );
       const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
@@ -1721,6 +1738,14 @@ const makeWsRpcLayer = (
             serverSettings
               .updateSettings(patch)
               .pipe(Effect.map(ServerSettings.redactServerSettingsForClient)),
+            {
+              "rpc.aggregate": "server",
+            },
+          ),
+        [WS_METHODS.serverTestExternalNotification]: ({ destinationId }) =>
+          observeRpcEffect(
+            WS_METHODS.serverTestExternalNotification,
+            externalNotificationDispatcher.test(destinationId),
             {
               "rpc.aggregate": "server",
             },

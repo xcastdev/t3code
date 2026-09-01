@@ -1,6 +1,7 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
   DEFAULT_SERVER_SETTINGS,
+  ExternalNotificationHomeAssistantDestination,
   ProviderDriverKind,
   ProviderInstanceId,
   resolveProviderInstanceEnabled,
@@ -25,6 +26,16 @@ import * as ServerSettingsModule from "./serverSettings.ts";
 
 const decodeSettingsPatch = Schema.decodeUnknownEffect(ServerSettingsPatch);
 const decodeServerSettings = Schema.decodeUnknownEffect(ServerSettings);
+const externalNotificationDestination = Schema.decodeUnknownSync(
+  ExternalNotificationHomeAssistantDestination,
+)({
+  _tag: "home-assistant-webhook",
+  id: "home-assistant",
+  label: "Home Assistant",
+  enabled: true,
+  configured: false,
+  webhookUrl: "https://home.example.test/api/webhook/test-id",
+});
 
 const makeServerSettingsLayer = () =>
   ServerSettingsModule.layer.pipe(
@@ -1048,4 +1059,134 @@ it.layer(NodeServices.layer)("server settings", (it) => {
       );
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
+
+  it.effect("stores external notification webhook URLs as redacted server secrets", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const serverConfig = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const destination = externalNotificationDestination;
+      const changes = yield* serverSettings.subscribeChanges;
+
+      const next = yield* serverSettings.updateSettings({
+        externalNotifications: {
+          appScheme: "t3code-preview",
+          destinations: [destination],
+        },
+      });
+
+      assert.deepInclude(next.externalNotifications.destinations[0], {
+        id: "home-assistant",
+        configured: true,
+        webhookUrl: "https://home.example.test/api/webhook/test-id",
+      });
+      assert.notInclude(
+        yield* fileSystem.readFileString(serverConfig.settingsPath),
+        "https://home.example.test/api/webhook/test-id",
+      );
+      const streamed = yield* changes.pipe(Stream.runHead);
+      const streamedDestination =
+        Option.getOrUndefined(streamed)?.externalNotifications.destinations[0];
+      if (streamedDestination === undefined) {
+        throw new Error("Expected the streamed external notification destination");
+      }
+      assert.isFalse("webhookUrl" in streamedDestination);
+      const redactedDestination =
+        ServerSettingsModule.redactServerSettingsForClient(next).externalNotifications
+          .destinations[0];
+      if (redactedDestination === undefined) {
+        throw new Error("Expected the external notification destination");
+      }
+      assert.deepInclude(redactedDestination, { id: "home-assistant", configured: true });
+      assert.isFalse("webhookUrl" in redactedDestination);
+
+      const preserved = yield* serverSettings.updateSettings({
+        externalNotifications: {
+          destinations: [{ ...destination, configured: true }],
+        },
+      });
+      assert.equal(
+        preserved.externalNotifications.destinations[0]?.webhookUrl,
+        destination.webhookUrl,
+      );
+
+      yield* serverSettings.updateSettings({ externalNotifications: { destinations: [] } });
+      const { webhookUrl: _webhookUrl, ...destinationWithoutUrl } = destination;
+      const afterRemoval = yield* serverSettings.updateSettings({
+        externalNotifications: {
+          destinations: [{ ...destinationWithoutUrl, configured: true }],
+        },
+      });
+      assert.deepInclude(afterRemoval.externalNotifications.destinations[0], {
+        id: "home-assistant",
+        configured: false,
+      });
+      assert.isUndefined(afterRemoval.externalNotifications.destinations[0]?.webhookUrl);
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("restores the previous webhook secret when persistence fails", () => {
+    const destinationId = "rollback-destination";
+    const secretName = ServerSettingsModule.externalNotificationWebhookSecretName(destinationId);
+    const previousSecret = new TextEncoder().encode("https://old.example.test/webhook");
+    const values = new Map([[secretName, previousSecret]]);
+    let reads = 0;
+    const readFailure = new ServerSecretStore.SecretStoreReadError({
+      resource: `secret ${secretName}`,
+      cause: new Error("injected read failure"),
+    });
+    const secretStore = {
+      get: (name: string) => {
+        reads += 1;
+        return reads === 2
+          ? Effect.fail(readFailure)
+          : Effect.succeed(Option.fromNullishOr(values.get(name)));
+      },
+      set: (name: string, value: Uint8Array) =>
+        Effect.sync(() => {
+          values.set(name, Uint8Array.from(value));
+        }),
+      create: (name: string, value: Uint8Array) =>
+        Effect.sync(() => {
+          values.set(name, Uint8Array.from(value));
+        }),
+      getOrCreateRandom: () => Effect.succeed(new Uint8Array()),
+      remove: (name: string) =>
+        Effect.sync(() => {
+          values.delete(name);
+        }),
+    } satisfies ServerSecretStore.ServerSecretStore["Service"];
+    const settingsLayer = ServerSettingsModule.layer.pipe(
+      Layer.provide(Layer.succeed(ServerSecretStore.ServerSecretStore, secretStore)),
+      Layer.provideMerge(Layer.fresh(SqlitePersistenceMemory)),
+      Layer.provideMerge(
+        Layer.fresh(
+          ServerConfig.layerTest(process.cwd(), {
+            prefix: "t3code-server-settings-external-rollback-test-",
+          }),
+        ),
+      ),
+    );
+
+    return Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+      const error = yield* Effect.flip(
+        serverSettings.updateSettings({
+          externalNotifications: {
+            destinations: [
+              {
+                ...externalNotificationDestination,
+                id: destinationId,
+                webhookUrl: "https://new.example.test/webhook",
+              },
+            ],
+          },
+        }),
+      );
+
+      assert.equal(error.operation, "write-secret");
+      assert.deepEqual(values.get(secretName), previousSecret);
+      assert.equal(reads, 2);
+    }).pipe(Effect.provide(settingsLayer));
+  });
 });

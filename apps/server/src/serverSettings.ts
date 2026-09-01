@@ -133,6 +133,10 @@ function providerEnvironmentSecretName(input: {
   return `provider-env-${Buffer.from(input.instanceId, "utf8").toString("base64url")}-${Buffer.from(input.name, "utf8").toString("base64url")}`;
 }
 
+export function externalNotificationWebhookSecretName(destinationId: string): string {
+  return `external-notification-webhook-${Buffer.from(destinationId, "utf8").toString("base64url")}`;
+}
+
 function redactProviderEnvironmentVariable(
   variable: ProviderInstanceEnvironmentVariable,
 ): ProviderInstanceEnvironmentVariable {
@@ -159,7 +163,17 @@ export function redactServerSettingsForClient(settings: ServerSettings): ServerS
         : instance,
     ]),
   );
-  return { ...settings, providerInstances };
+  return {
+    ...settings,
+    providerInstances,
+    externalNotifications: {
+      ...settings.externalNotifications,
+      destinations: settings.externalNotifications.destinations.map((destination) => {
+        const { webhookUrl: _webhookUrl, ...redacted } = destination;
+        return redacted;
+      }),
+    },
+  };
 }
 
 export class ServerSettingsService extends Context.Service<
@@ -324,6 +338,7 @@ const ATOMIC_SETTINGS_KEYS: ReadonlySet<string> = new Set([
   "providerHealthRefreshInterval",
   "sourceControlWriterModelSelection",
   "textGenerationModelSelection",
+  "externalNotifications",
 ]);
 
 // Preserve both enabled states because provider history cannot recover a new opt-in.
@@ -518,6 +533,31 @@ const make = Effect.gen(function* () {
       };
     });
 
+  const materializeExternalNotificationSecrets = (settings: ServerSettings) =>
+    Effect.gen(function* () {
+      const destinations: Array<ServerSettings["externalNotifications"]["destinations"][number]> =
+        [];
+      for (const destination of settings.externalNotifications.destinations) {
+        const secret = yield* secretStore.get(
+          externalNotificationWebhookSecretName(destination.id),
+        );
+        const { webhookUrl: _webhookUrl, ...descriptor } = destination;
+        destinations.push({
+          ...descriptor,
+          configured: Option.isSome(secret),
+          ...(Option.isSome(secret) ? { webhookUrl: textDecoder.decode(secret.value) } : {}),
+        });
+      }
+      return {
+        ...settings,
+        externalNotifications: { ...settings.externalNotifications, destinations },
+      };
+    }).pipe(
+      Effect.mapError(
+        (cause) => new ServerSettingsError({ settingsPath, operation: "read-secret", cause }),
+      ),
+    );
+
   const materializeChanges = (changes: Stream.Stream<ServerSettings>) =>
     changes.pipe(
       Stream.mapEffect((settings) =>
@@ -636,6 +676,67 @@ const make = Effect.gen(function* () {
       };
     });
 
+  const persistExternalNotificationSecrets = (current: ServerSettings, next: ServerSettings) =>
+    Effect.gen(function* () {
+      const staleIds = new Set(current.externalNotifications.destinations.map(({ id }) => id));
+      const destinations: Array<ServerSettings["externalNotifications"]["destinations"][number]> =
+        [];
+      for (const destination of next.externalNotifications.destinations) {
+        const secretName = externalNotificationWebhookSecretName(destination.id);
+        if (destination.webhookUrl !== undefined) {
+          if (destination.webhookUrl) {
+            yield* secretStore.set(secretName, textEncoder.encode(destination.webhookUrl));
+          } else {
+            yield* secretStore.remove(secretName);
+          }
+        }
+        const secret = yield* secretStore.get(secretName);
+        const { webhookUrl: _webhookUrl, ...persisted } = destination;
+        destinations.push({ ...persisted, configured: Option.isSome(secret) });
+        staleIds.delete(destination.id);
+      }
+      for (const id of staleIds) {
+        yield* secretStore.remove(externalNotificationWebhookSecretName(id));
+      }
+      return { ...next, externalNotifications: { ...next.externalNotifications, destinations } };
+    }).pipe(
+      Effect.mapError(
+        (cause) => new ServerSettingsError({ settingsPath, operation: "write-secret", cause }),
+      ),
+    );
+
+  const snapshotExternalNotificationSecrets = (current: ServerSettings, next: ServerSettings) =>
+    Effect.gen(function* () {
+      const ids = new Set([
+        ...current.externalNotifications.destinations.map(({ id }) => id),
+        ...next.externalNotifications.destinations.map(({ id }) => id),
+      ]);
+      const snapshot: Array<readonly [string, Option.Option<Uint8Array>]> = [];
+      for (const id of ids) {
+        const name = externalNotificationWebhookSecretName(id);
+        const secret = yield* secretStore.get(name);
+        snapshot.push([
+          name,
+          Option.isSome(secret) ? Option.some(Uint8Array.from(secret.value)) : Option.none(),
+        ]);
+      }
+      return snapshot;
+    }).pipe(
+      Effect.mapError(
+        (cause) => new ServerSettingsError({ settingsPath, operation: "read-secret", cause }),
+      ),
+    );
+
+  const restoreExternalNotificationSecrets = (
+    snapshot: ReadonlyArray<readonly [string, Option.Option<Uint8Array>]>,
+  ) =>
+    Effect.forEach(
+      snapshot,
+      ([name, secret]) =>
+        Option.isSome(secret) ? secretStore.set(name, secret.value) : secretStore.remove(name),
+      { discard: true },
+    ).pipe(Effect.ignoreCause({ log: true }));
+
   const writeSettingsAtomically = Effect.fnUntraced(
     function* (settings: ServerSettings) {
       const sparseSettingsJson = yield* encodeServerSettingsJson(
@@ -733,21 +834,33 @@ const make = Effect.gen(function* () {
     ready: Deferred.await(startedDeferred),
     getSettings: getSettingsFromCache.pipe(
       Effect.flatMap(materializeProviderEnvironmentSecrets),
+      Effect.flatMap(materializeExternalNotificationSecrets),
       Effect.map(resolveTextGenerationProvider),
     ),
     updateSettings: (patch) =>
       writeSemaphore.withPermits(1)(
         Effect.gen(function* () {
           const current = yield* getSettingsFromCache;
-          const nextPersisted = yield* persistProviderEnvironmentSecrets(
+          const patched = applyServerSettingsPatch(current, patch);
+          const externalSecretSnapshot = yield* snapshotExternalNotificationSecrets(
             current,
-            applyServerSettingsPatch(current, patch),
+            patched,
           );
-          const next = yield* normalizeServerSettings(nextPersisted);
-          yield* writeSettingsAtomically(next);
+          const next = yield* Effect.gen(function* () {
+            const withProviderSecrets = yield* persistProviderEnvironmentSecrets(current, patched);
+            const nextPersisted = yield* persistExternalNotificationSecrets(
+              current,
+              withProviderSecrets,
+            );
+            const normalized = yield* normalizeServerSettings(nextPersisted);
+            yield* writeSettingsAtomically(normalized);
+            return normalized;
+          }).pipe(Effect.onError(() => restoreExternalNotificationSecrets(externalSecretSnapshot)));
           yield* Cache.set(settingsCache, cacheKey, next);
           yield* emitChange(next);
-          const materialized = yield* materializeProviderEnvironmentSecrets(next);
+          const materialized = yield* materializeProviderEnvironmentSecrets(next).pipe(
+            Effect.flatMap(materializeExternalNotificationSecrets),
+          );
           return resolveTextGenerationProvider(materialized);
         }),
       ),
