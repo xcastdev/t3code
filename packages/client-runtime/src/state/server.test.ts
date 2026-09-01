@@ -11,6 +11,7 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -19,18 +20,21 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as TestClock from "effect/testing/TestClock";
 import { RpcClientError } from "effect/unstable/rpc";
 import * as Socket from "effect/unstable/socket/Socket";
+import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import {
   AVAILABLE_CONNECTION_STATE,
   PrimaryConnectionTarget,
   type PreparedConnection,
 } from "../connection/model.ts";
+import * as EnvironmentRegistry from "../connection/registry.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as Persistence from "../platform/persistence.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import {
   applyServerConfigProjection,
+  createServerEnvironmentAtoms,
   makeEnvironmentServerConfigState,
   isLegacyUpdateHandoffLoss,
   matchesServerUpdateReadyEvent,
@@ -544,6 +548,120 @@ describe("server state projection", () => {
       );
 
       expect(yield* Queue.poll(savedConfigs)).toEqual(Option.none());
+    }),
+  );
+
+  it.effect("routes external notification tests to the selected environment", () =>
+    Effect.gen(function* () {
+      const calls: Array<{ readonly destinationId: string }> = [];
+      const client = {
+        [WS_METHODS.serverTestExternalNotification]: (input: { readonly destinationId: string }) =>
+          Effect.sync(() => {
+            calls.push(input);
+            return { destinationId: input.destinationId, delivered: true as const };
+          }),
+      } as unknown as WsRpcProtocolClient;
+      const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        target: TARGET,
+        state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
+        session: yield* SubscriptionRef.make(Option.some(session(client))),
+        prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+        connect: Effect.void,
+        disconnect: Effect.void,
+        retryNow: Effect.void,
+      } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+      const run: EnvironmentRegistry.EnvironmentRegistry["Service"]["run"] = (
+        _environmentId,
+        effect,
+      ) => Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+      const runStream: EnvironmentRegistry.EnvironmentRegistry["Service"]["runStream"] = (
+        _environmentId,
+        stream,
+      ) => Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+      const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
+        run,
+        runStream,
+      } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
+      const runtime = Atom.runtime(
+        Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
+      ) as unknown as Atom.AtomRuntime<
+        EnvironmentRegistry.EnvironmentRegistry | Persistence.EnvironmentCacheStore,
+        never
+      >;
+      const atoms = createServerEnvironmentAtoms(runtime, {
+        initialConfigValueAtom: () => Atom.make<ServerConfig | null>(null),
+      });
+      const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (value) =>
+        Effect.sync(() => value.dispose()),
+      );
+
+      const result = yield* Effect.promise(() =>
+        atoms.testExternalNotification.run(registry, {
+          environmentId: TARGET.environmentId,
+          input: { destinationId: "home-assistant-primary" },
+        }),
+      );
+
+      expect(AsyncResult.isSuccess(result)).toBe(true);
+      expect(calls).toEqual([{ destinationId: "home-assistant-primary" }]);
+    }),
+  );
+
+  it.effect("preserves external notification test failures from the selected environment", () =>
+    Effect.gen(function* () {
+      const client = {
+        [WS_METHODS.serverTestExternalNotification]: () =>
+          Effect.fail(
+            new RpcClientError.RpcClientError({
+              reason: new Socket.SocketCloseError({ code: 1006 }),
+            }),
+          ),
+      } as unknown as WsRpcProtocolClient;
+      const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+        target: TARGET,
+        state: yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE),
+        session: yield* SubscriptionRef.make(Option.some(session(client))),
+        prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+        connect: Effect.void,
+        disconnect: Effect.void,
+        retryNow: Effect.void,
+      } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+      const run: EnvironmentRegistry.EnvironmentRegistry["Service"]["run"] = (
+        _environmentId,
+        effect,
+      ) => Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+      const runStream: EnvironmentRegistry.EnvironmentRegistry["Service"]["runStream"] = (
+        _environmentId,
+        stream,
+      ) => Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor);
+      const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
+        run,
+        runStream,
+      } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
+      const runtime = Atom.runtime(
+        Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
+      ) as unknown as Atom.AtomRuntime<
+        EnvironmentRegistry.EnvironmentRegistry | Persistence.EnvironmentCacheStore,
+        never
+      >;
+      const atoms = createServerEnvironmentAtoms(runtime, {
+        initialConfigValueAtom: () => Atom.make<ServerConfig | null>(null),
+      });
+      const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (value) =>
+        Effect.sync(() => value.dispose()),
+      );
+
+      const result = yield* Effect.promise(() =>
+        atoms.testExternalNotification.run(registry, {
+          environmentId: TARGET.environmentId,
+          input: { destinationId: "home-assistant-primary" },
+        }),
+      );
+
+      expect(AsyncResult.isFailure(result)).toBe(true);
+      if (AsyncResult.isFailure(result)) {
+        expect(Cause.squash(result.cause)).toBeInstanceOf(RpcClientError.RpcClientError);
+      }
     }),
   );
 });

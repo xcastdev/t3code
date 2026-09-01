@@ -41,6 +41,9 @@ describe("RPC authorization scopes", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.providerUploadFeedback)).toBe(
       AuthOrchestrationOperateScope,
     );
+    expect(requiredScopeForRpcMethod(WS_METHODS.serverTestExternalNotification)).toBe(
+      AuthOrchestrationOperateScope,
+    );
   });
 
   it("reads the reviewer menu under the same scope as the pull request it belongs to", () => {

@@ -1,6 +1,6 @@
 # External Notifications — TODO
 
-Implementation exists through P8, but P5–P7 items remain open because their linked acceptance rows still lack the required integration and boundary evidence. Do not treat implementation presence as completion.
+Implementation and focused P5–P7 evidence now exist. P9 independent validation and revalidation remain open; do not treat implementation presence as completion.
 
 ## P0 — Baseline / Fail-First
 
@@ -51,32 +51,32 @@ Implementation exists through P8, but P5–P7 items remain open because their li
 
 ## P5 — Awareness / Relay Integration
 
-- [ ] AC-08 Modify `apps/server/src/relay/AgentAwarenessRelay.ts` to move canonical processing before sink gates — `LEDGER.md#p5-ac-08`
-- [ ] AC-08 Preserve filtering, thread ID extraction, projection, meaningful identity, unchanged suppression, startup replay, transient tombstone, confirmation, sanitization — `LEDGER.md#p5-ac-08`
-- [ ] AC-07 Add dispatcher as sibling sink with separate identity — `LEDGER.md#p5-ac-07`
-- [ ] AC-06 Ensure relay works absent/failing external; external works absent/disabled/failing relay — `LEDGER.md#p5-ac-06`
-- [ ] AC-09 Ensure signed payload and identity unchanged; relay tests pass — `LEDGER.md#p5-ac-09`
-- [ ] AC-08 Startup replay independent of relay; settings-change re-enqueue through same worker — `LEDGER.md#p5-ac-08`
-- [ ] Write/update `apps/server/src/relay/AgentAwarenessRelay.test.ts` — `LEDGER.md#p5-ac-08`
+- [x] AC-08 Modify `apps/server/src/relay/AgentAwarenessRelay.ts` to move canonical processing before sink gates — `LEDGER.md#p5-ac-08`
+- [x] AC-08 Preserve filtering, thread ID extraction, projection, meaningful identity, unchanged suppression, startup replay, transient tombstone, confirmation, sanitization — `LEDGER.md#p5-ac-08`
+- [x] AC-07 Add dispatcher as sibling sink with separate identity — `LEDGER.md#p5-ac-07`
+- [x] AC-06 Ensure relay works absent/failing external; external works absent/disabled/failing relay — `LEDGER.md#p5-ac-06`
+- [x] AC-09 Ensure signed payload and identity unchanged; relay tests pass — `LEDGER.md#p5-ac-09`
+- [x] AC-08 Startup replay independent of relay; settings-change re-enqueue through same worker — `LEDGER.md#p5-ac-08`
+- [x] Write/update `apps/server/src/relay/AgentAwarenessRelay.test.ts` — `LEDGER.md#p5-ac-08`
 
 ## P6 — RPC / Client
 
-- [ ] AC-10 Add operate test RPC handler in `apps/server/src/ws.ts` — `LEDGER.md#p6-ac-10`
-- [ ] AC-10 Operate-authorized, exactly selected configured destination, synthetic `test: true` — `LEDGER.md#p6-ac-10`
-- [ ] AC-10 Read-only/unauth rejected; sanitized errors — `LEDGER.md#p6-ac-10`
-- [ ] AC-11 Add environment command in `apps/server/src/server.ts` — `LEDGER.md#p6-ac-11`
-- [ ] AC-11 Update `packages/client-runtime/src/state/server.ts` — `LEDGER.md#p6-ac-11`
-- [ ] Write/update `apps/server/src/server.test.ts` additions — `LEDGER.md#p6-ac-10`
-- [ ] Write/update `packages/client-runtime/src/state/server.test.ts` additions — `LEDGER.md#p6-ac-11`
+- [x] AC-10 Add operate test RPC handler in `apps/server/src/ws.ts` — `LEDGER.md#p6-ac-10`
+- [x] AC-10 Operate-authorized, exactly selected configured destination, synthetic `test: true` — `LEDGER.md#p6-ac-10`
+- [x] AC-10 Read-only/unauth rejected; sanitized errors — `LEDGER.md#p6-ac-10`
+- [x] AC-11 Add environment command in `apps/server/src/server.ts` — `LEDGER.md#p6-ac-11`
+- [x] AC-11 Update `packages/client-runtime/src/state/server.ts` — `LEDGER.md#p6-ac-11`
+- [x] Write/update `apps/server/src/server.test.ts` additions — `LEDGER.md#p6-ac-10`
+- [x] Write/update `packages/client-runtime/src/state/server.test.ts` additions — `LEDGER.md#p6-ac-11`
 
 ## P7 — Web Settings
 
-- [ ] AC-12 Integrate external notifications into `apps/web/src/components/settings/IntegrationsSettings.tsx` — `LEDGER.md#p7-ac-12`
-- [ ] AC-12 Implement scheme/add/label/enable/disable/replace/test/remove/Configured — `LEDGER.md#p7-ac-12`
-- [ ] AC-12 Never display URL; read-only when disabled; selected remote environment; truthful save/test failure — `LEDGER.md#p7-ac-12`
-- [ ] AC-12 Browser settings unaffected — `LEDGER.md#p7-ac-12`
-- [ ] Write `apps/web/src/components/settings/ExternalNotificationsSettings.logic.test.ts` — `LEDGER.md#p7-ac-12`
-- [ ] Write `apps/web/src/components/settings/ExternalNotificationsSettings.environment.test.tsx` — `LEDGER.md#p7-ac-12`
+- [x] AC-12 Integrate external notifications into `apps/web/src/components/settings/IntegrationsSettings.tsx` — `LEDGER.md#p7-ac-12`
+- [x] AC-12 Implement scheme/add/label/enable/disable/replace/test/remove/Configured — `LEDGER.md#p7-ac-12`
+- [x] AC-12 Never display URL; read-only when disabled; selected remote environment; truthful save/test failure — `LEDGER.md#p7-ac-12`
+- [x] AC-12 Browser settings unaffected — `LEDGER.md#p7-ac-12`
+- [x] Write `apps/web/src/components/settings/ExternalNotificationsSettings.logic.test.ts` — `LEDGER.md#p7-ac-12`
+- [x] Write `apps/web/src/components/settings/IntegrationsSettings.environment.test.tsx` — `LEDGER.md#p7-ac-12`
 
 ## P8 — Docs
 

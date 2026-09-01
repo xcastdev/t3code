@@ -6,10 +6,13 @@ import {
 } from "@t3tools/contracts";
 import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as HttpClient from "effect/unstable/http/HttpClient";
+import * as HttpClientError from "effect/unstable/http/HttpClientError";
 import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 import * as HttpClientRequest from "effect/unstable/http/HttpClientRequest";
+import * as TestClock from "effect/testing/TestClock";
 
 import * as HomeAssistantWebhookAdapter from "./HomeAssistantWebhookAdapter.ts";
 
@@ -29,7 +32,7 @@ function makeAdapterLayer(input: {
   readonly response?: () => Response;
   readonly execute?: (
     request: HttpClientRequest.HttpClientRequest,
-  ) => Effect.Effect<HttpClientResponse.HttpClientResponse, never>;
+  ) => Effect.Effect<HttpClientResponse.HttpClientResponse, HttpClientError.HttpClientError>;
 }) {
   const requests: Array<HttpClientRequest.HttpClientRequest> = [];
   const client = HttpClient.make(
@@ -67,6 +70,10 @@ describe("HomeAssistantWebhookAdapter", () => {
       assert.strictEqual(request.method, "POST");
       assert.strictEqual(request.url, sendInput.webhookUrl);
       assert.strictEqual(request.headers["content-type"], "application/json");
+      const rawBody = (request.body as { readonly body?: Uint8Array }).body;
+      assert.isDefined(rawBody);
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      assert.deepStrictEqual(JSON.parse(new TextDecoder().decode(rawBody)), payload);
     }).pipe(Effect.provide(adapter.layer));
   });
 
@@ -83,6 +90,55 @@ describe("HomeAssistantWebhookAdapter", () => {
         reason: "http-status",
         status: 503,
       });
+    }).pipe(Effect.provide(adapter.layer));
+  });
+
+  it.effect("maps transport failures to a typed error", () => {
+    const adapter = makeAdapterLayer({
+      execute: (request) =>
+        Effect.fail(
+          new HttpClientError.HttpClientError({
+            reason: new HttpClientError.TransportError({
+              request,
+              cause: "connection refused",
+            }),
+          }),
+        ),
+    });
+
+    return Effect.gen(function* () {
+      const service = yield* HomeAssistantWebhookAdapter.HomeAssistantWebhookAdapter;
+      const error = yield* Effect.flip(service.send(sendInput));
+
+      assert.deepInclude(error, {
+        destinationId: "destination-1",
+        reason: "transport",
+      });
+    }).pipe(Effect.provide(adapter.layer));
+  });
+
+  it.effect("maps an HTTP client timeout to a typed error", () => {
+    const adapter = makeAdapterLayer({ execute: () => Effect.never });
+
+    return Effect.gen(function* () {
+      const service = yield* HomeAssistantWebhookAdapter.HomeAssistantWebhookAdapter;
+      const fiber = yield* Effect.flip(service.send(sendInput)).pipe(Effect.forkScoped);
+      yield* TestClock.adjust("10 seconds");
+      const error = yield* Fiber.join(fiber);
+
+      assert.deepInclude(error, {
+        destinationId: "destination-1",
+        reason: "timeout",
+      });
+    }).pipe(Effect.provide(Layer.mergeAll(adapter.layer, TestClock.layer())));
+  });
+
+  it.effect("accepts a successful 200 response", () => {
+    const adapter = makeAdapterLayer({ response: () => new Response(null, { status: 200 }) });
+
+    return Effect.gen(function* () {
+      const service = yield* HomeAssistantWebhookAdapter.HomeAssistantWebhookAdapter;
+      yield* service.send(sendInput);
     }).pipe(Effect.provide(adapter.layer));
   });
 

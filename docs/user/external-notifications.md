@@ -1,16 +1,17 @@
 # External notifications
 
-External notifications send agent awareness updates from a T3 Code environment to Home Assistant. Home Assistant delivers the push. T3 Connect Cloud does not.
+External notifications send agent awareness updates from a T3 Code environment to configured external destinations. Home Assistant is currently supported; T3 Connect Cloud does not deliver these notifications.
 
-## Add a Home Assistant destination
+## Add an external notification destination
 
 1. Open **Settings → Integrations**.
 2. Select the environment that owns the notification settings.
-3. Under **External notifications**, click **Add Home Assistant destination**.
-4. Give the destination a label.
-5. Paste the Home Assistant webhook URL and click **Replace URL**.
-6. Turn on the destination.
-7. Click **Send test**.
+3. Under **External notifications**, click **Add external notification**.
+4. Choose **Home Assistant** from the integration dropdown.
+5. Give the destination a label.
+6. Paste the Home Assistant webhook URL and click **Replace URL**.
+7. Turn on the destination.
+8. Click **Send test**.
 
 Home Assistant creates webhook URLs under **Settings → Automations & scenes → Webhooks**. A webhook automation can use a URL such as:
 
@@ -18,7 +19,7 @@ Home Assistant creates webhook URLs under **Settings → Automations & scenes �
 https://home.example.com/api/webhook/your-webhook-id
 ```
 
-T3 Code stores the URL as a server secret and redacts it from settings sent to connected clients. The URL is never shown after you save it. To replace it, paste the new URL and click **Replace URL**. To remove it, remove the destination.
+T3 Code stores the URL as a server secret and redacts it from settings sent to connected clients. The URL is never shown after you save it. To replace it, paste the new URL and click **Save**. To remove it, click the delete button and confirm; the stored secret is removed immediately.
 
 ## Notification payload
 

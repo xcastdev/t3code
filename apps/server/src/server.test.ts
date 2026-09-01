@@ -13,6 +13,7 @@ import {
   type DpopFailureReason,
   EnvironmentId,
   EventId,
+  ExternalNotificationError,
   GitCommandError,
   KeybindingRule,
   MessageId,
@@ -129,6 +130,7 @@ import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import * as ServerSettings from "./serverSettings.ts";
+import * as ExternalNotificationDispatcher from "./notifications/ExternalNotificationDispatcher.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
@@ -400,6 +402,7 @@ const buildAppUnderTest = (options?: {
     providerRegistry?: Partial<ProviderRegistry.ProviderRegistry["Service"]>;
     providerService?: Partial<ProviderService.ProviderService["Service"]>;
     serverSettings?: Partial<ServerSettings.ServerSettingsService["Service"]>;
+    externalNotificationDispatcher?: Partial<ExternalNotificationDispatcher.ExternalNotificationDispatcherShape>;
     externalLauncher?: Partial<ExternalLauncher.ExternalLauncher["Service"]>;
     vcsDriver?: Partial<VcsDriver.VcsDriver["Service"]>;
     vcsDriverRegistry?: Partial<VcsDriverRegistry.VcsDriverRegistry["Service"]>;
@@ -669,14 +672,21 @@ const buildAppUnderTest = (options?: {
         ),
       ),
       Layer.provide(
-        Layer.mock(ServerSettings.ServerSettingsService)({
-          start: Effect.void,
-          ready: Effect.void,
-          getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
-          updateSettings: () => Effect.succeed(DEFAULT_SERVER_SETTINGS),
-          streamChanges: Stream.empty,
-          ...options?.layers?.serverSettings,
-        }),
+        Layer.mergeAll(
+          Layer.mock(ServerSettings.ServerSettingsService)({
+            start: Effect.void,
+            ready: Effect.void,
+            getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+            updateSettings: () => Effect.succeed(DEFAULT_SERVER_SETTINGS),
+            streamChanges: Stream.empty,
+            ...options?.layers?.serverSettings,
+          }),
+          options?.layers?.externalNotificationDispatcher
+            ? Layer.mock(ExternalNotificationDispatcher.ExternalNotificationDispatcher)({
+                ...options.layers.externalNotificationDispatcher,
+              })
+            : ExternalNotificationDispatcher.layerTest,
+        ),
       ),
       Layer.provide(
         Layer.mergeAll(
@@ -3481,6 +3491,116 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       if (rpcError._tag === "EnvironmentAuthorizationError") {
         assert.equal(rpcError.requiredScope, "orchestration:read");
       }
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("delivers an external notification test through websocket rpc", () =>
+    Effect.gen(function* () {
+      const destinationId = "home-assistant-primary";
+      const test = vi.fn<
+        ExternalNotificationDispatcher.ExternalNotificationDispatcherShape["test"]
+      >(() => Effect.succeed({ destinationId, delivered: true }));
+      yield* buildAppUnderTest({
+        layers: {
+          externalNotificationDispatcher: { test },
+        },
+      });
+
+      const { response: exchangeResponse, body: tokenBody } = yield* exchangeAccessToken(
+        defaultDesktopBootstrapToken,
+        { scope: "orchestration:operate" },
+      );
+      assert.equal(exchangeResponse.status, 200);
+      assert.equal(tokenBody.scope, "orchestration:operate");
+      assert.isDefined(tokenBody.access_token);
+
+      const wsTicketResponse = yield* HttpClient.post("/api/auth/websocket-ticket", {
+        headers: {
+          authorization: `Bearer ${tokenBody.access_token ?? ""}`,
+        },
+      });
+      const wsTicketBody = (yield* wsTicketResponse.json) as { readonly ticket: string };
+      assert.equal(wsTicketResponse.status, 200);
+
+      const wsUrl = `${yield* getWsServerUrl("/ws", { authenticated: false })}?wsTicket=${encodeURIComponent(wsTicketBody.ticket)}`;
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.serverTestExternalNotification]({ destinationId }),
+        ),
+      );
+
+      assert.deepStrictEqual(result, { destinationId, delivered: true });
+      assert.deepStrictEqual(test.mock.calls, [[destinationId]]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects external notification tests without orchestration operate scope", () =>
+    Effect.gen(function* () {
+      const deliveries = vi.fn();
+      const test = vi.fn<
+        ExternalNotificationDispatcher.ExternalNotificationDispatcherShape["test"]
+      >(() =>
+        Effect.sync(() => {
+          deliveries();
+          return { destinationId: "unexpected", delivered: true };
+        }),
+      );
+      yield* buildAppUnderTest({
+        layers: {
+          externalNotificationDispatcher: { test },
+        },
+      });
+
+      const { response: exchangeResponse, body: tokenBody } = yield* exchangeAccessToken(
+        defaultDesktopBootstrapToken,
+        { scope: "orchestration:read" },
+      );
+      assert.equal(exchangeResponse.status, 200);
+      assert.equal(tokenBody.scope, "orchestration:read");
+      assert.isDefined(tokenBody.access_token);
+
+      const wsTicketResponse = yield* HttpClient.post("/api/auth/websocket-ticket", {
+        headers: {
+          authorization: `Bearer ${tokenBody.access_token ?? ""}`,
+        },
+      });
+      const wsTicketBody = (yield* wsTicketResponse.json) as { readonly ticket: string };
+      assert.equal(wsTicketResponse.status, 200);
+
+      const wsUrl = `${yield* getWsServerUrl("/ws", { authenticated: false })}?wsTicket=${encodeURIComponent(wsTicketBody.ticket)}`;
+      const rpcError = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.serverTestExternalNotification]({ destinationId: "home-assistant" }),
+          ),
+        ),
+      );
+
+      assert.equal(rpcError._tag, "EnvironmentAuthorizationError");
+      if (rpcError._tag === "EnvironmentAuthorizationError") {
+        assert.equal(rpcError.requiredScope, "orchestration:operate");
+      }
+      assert.equal(deliveries.mock.calls.length, 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("returns typed external notification errors through websocket rpc", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest();
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const rpcError = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.serverTestExternalNotification]({ destinationId: "missing" }),
+          ),
+        ),
+      );
+
+      assert.instanceOf(rpcError, ExternalNotificationError);
+      assert.deepInclude(rpcError, {
+        destinationId: "missing",
+        reason: "not-configured",
+      });
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

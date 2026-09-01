@@ -58,6 +58,15 @@ import {
 import { useAtomCommand } from "~/state/use-atom-command";
 
 import { Button } from "../ui/button";
+import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "../ui/alert-dialog";
 import { NumberField, NumberFieldGroup, NumberFieldInput } from "../ui/number-field";
 import {
   Select,
@@ -564,7 +573,57 @@ const decodeExternalNotificationDestination = Schema.decodeUnknownOption(
   ExternalNotificationDestination,
 );
 
-function externalNotificationDestinationWith(input: {
+type ExternalNotificationDestinationTag = ExternalNotificationDestination["_tag"];
+
+const EXTERNAL_NOTIFICATION_DESTINATION_OPTIONS = [
+  {
+    value: "home-assistant-webhook",
+    label: "Home Assistant",
+    description: "Send agent activity to a Home Assistant webhook.",
+  },
+] as const satisfies ReadonlyArray<{
+  readonly value: ExternalNotificationDestinationTag;
+  readonly label: string;
+  readonly description: string;
+}>;
+
+const LEGACY_GENERIC_DESTINATION_LABEL = "External notification";
+
+const externalNotificationDestinationTagLabel = (tag: ExternalNotificationDestinationTag): string =>
+  EXTERNAL_NOTIFICATION_DESTINATION_OPTIONS.find((option) => option.value === tag)?.label ?? tag;
+
+function isExternalNotificationDestinationTag(
+  value: string | null,
+): value is ExternalNotificationDestinationTag {
+  return (
+    value !== null &&
+    EXTERNAL_NOTIFICATION_DESTINATION_OPTIONS.some((option) => option.value === value)
+  );
+}
+
+export function createExternalNotificationDestination(input: {
+  readonly type: ExternalNotificationDestinationTag;
+  readonly id: string;
+  readonly label: string;
+  readonly enabled: boolean;
+}): ExternalNotificationDestination | null {
+  switch (input.type) {
+    case "home-assistant-webhook": {
+      const decoded = decodeExternalNotificationDestination({
+        _tag: input.type,
+        id: input.id,
+        label: input.label,
+        enabled: input.enabled,
+        configured: false,
+      });
+      return Option.isSome(decoded) ? decoded.value : null;
+    }
+  }
+  const _exhaustive: never = input.type;
+  return _exhaustive;
+}
+
+export function externalNotificationDestinationWith(input: {
   readonly destination: ExternalNotificationDestination;
   readonly label?: string;
   readonly enabled?: boolean;
@@ -607,22 +666,25 @@ function ExternalNotificationsUnavailableRow({
   );
 }
 
-function ExternalNotificationDestinationCard({
+export function ExternalNotificationDestinationCard({
   destination,
   readOnly,
   onChange,
+  onChangeType,
   onRemove,
   onTest,
 }: {
   readonly destination: ExternalNotificationDestination;
   readonly readOnly: boolean;
   readonly onChange: (destination: ExternalNotificationDestination) => void;
-  readonly onRemove: () => void;
+  readonly onChangeType: (type: ExternalNotificationDestinationTag, label: string) => void;
+  readonly onRemove: () => void | Promise<void>;
   readonly onTest: () => Promise<void>;
 }) {
   const [label, setLabel] = useState(destination.label);
   const [webhookUrl, setWebhookUrl] = useState("");
   const [testing, setTesting] = useState(false);
+  const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
 
   const commitLabel = () => {
     if (label.trim() === "" || label === destination.label) {
@@ -662,84 +724,203 @@ function ExternalNotificationDestinationCard({
     }
   };
 
+  const changeDestinationType = (value: string | null) => {
+    if (!isExternalNotificationDestinationTag(value) || value === destination._tag) return;
+    setWebhookUrl("");
+    onChangeType(value, label.trim());
+  };
+
+  const destinationEditor = renderExternalNotificationDestinationEditor({
+    destination,
+    readOnly,
+    webhookUrl,
+    onWebhookUrlChange: setWebhookUrl,
+    onSaveWebhookUrl: saveWebhookUrl,
+  });
+  const integrationId = `${destination.id}-integration`;
+  const nameId = `${destination.id}-name`;
+
   return (
-    <div className="rounded-xl border border-border/70 bg-muted/10 p-3 sm:p-4">
-      <div className="flex items-start gap-3">
-        <PlugIcon className="mt-1 size-4 shrink-0 text-muted-foreground" aria-hidden />
-        <div className="min-w-0 flex-1 space-y-2">
-          <div className="flex flex-wrap items-center gap-2">
-            <Input
-              aria-label={`${destination.label} destination name`}
-              className="max-w-64"
-              size="sm"
-              value={label}
-              disabled={readOnly}
-              onChange={(event) => setLabel(event.target.value)}
-              onBlur={commitLabel}
-            />
-            <Switch
-              checked={destination.enabled}
-              disabled={readOnly}
-              aria-label={`${destination.label} enabled`}
-              onCheckedChange={(checked) => {
-                const next = externalNotificationDestinationWith({
-                  destination,
-                  enabled: Boolean(checked),
-                });
-                if (next !== null) onChange(next);
-              }}
-            />
-          </div>
-          <p className="text-xs text-muted-foreground">
-            Home Assistant webhook ·{" "}
-            {destination.configured ? "Webhook URL saved securely." : "No webhook URL configured."}
-          </p>
-          <div className="flex flex-wrap items-center gap-2">
-            <Input
-              aria-label={`Replace ${destination.label} webhook URL`}
-              className="min-w-64 flex-1 sm:max-w-md"
-              size="sm"
-              type="url"
-              value={webhookUrl}
-              disabled={readOnly}
-              placeholder="Paste a new webhook URL to replace the saved one"
-              autoComplete="off"
-              onChange={(event) => setWebhookUrl(event.target.value)}
-            />
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={readOnly || webhookUrl.trim() === ""}
-              onClick={saveWebhookUrl}
-            >
-              Replace URL
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={readOnly || !destination.configured || testing}
-              onClick={() => void testDestination()}
-            >
-              <SendIcon className="size-3.5" aria-hidden />
-              {testing ? "Testing…" : "Send test"}
-            </Button>
-            <Button
-              size="icon-sm"
-              variant="destructive-outline"
-              disabled={readOnly}
-              onClick={onRemove}
-              aria-label={`Remove ${destination.label}`}
-            >
-              <Trash2Icon className="size-3.5" aria-hidden />
-            </Button>
+    <>
+      <div className="rounded-xl border border-border/70 bg-muted/10 p-3 sm:p-4">
+        <div className="flex items-start gap-3">
+          <PlugIcon className="mt-1 size-4 shrink-0 text-muted-foreground" aria-hidden />
+          <div className="min-w-0 flex-1 space-y-3">
+            <div className="space-y-1.5">
+              <label
+                className="block text-xs font-medium text-muted-foreground"
+                htmlFor={integrationId}
+              >
+                Integration
+              </label>
+              <Select
+                value={destination._tag}
+                disabled={readOnly}
+                onValueChange={changeDestinationType}
+              >
+                <SelectTrigger
+                  id={integrationId}
+                  size="sm"
+                  className="w-full sm:w-52"
+                  aria-label={`${destination.label} notification integration`}
+                >
+                  <SelectValue>
+                    {externalNotificationDestinationTagLabel(destination._tag)}
+                  </SelectValue>
+                </SelectTrigger>
+                <SelectPopup align="start" className="min-w-64">
+                  {EXTERNAL_NOTIFICATION_DESTINATION_OPTIONS.map((option) => (
+                    <SelectItem key={option.value} value={option.value}>
+                      <span className="flex min-w-0 flex-col gap-0.5">
+                        <span>{option.label}</span>
+                        <span className="text-xs text-muted-foreground">{option.description}</span>
+                      </span>
+                    </SelectItem>
+                  ))}
+                </SelectPopup>
+              </Select>
+            </div>
+            <div className="flex items-end gap-2">
+              <div className="min-w-0 flex-1 space-y-1.5">
+                <label className="block text-xs font-medium text-muted-foreground" htmlFor={nameId}>
+                  Name
+                </label>
+                <Input
+                  id={nameId}
+                  aria-label={`${destination.label} destination name`}
+                  className="w-full max-w-64"
+                  size="sm"
+                  value={label}
+                  disabled={readOnly}
+                  onChange={(event) => setLabel(event.target.value)}
+                  onBlur={commitLabel}
+                />
+              </div>
+              <Switch
+                checked={destination.enabled}
+                disabled={readOnly}
+                aria-label={`${destination.label} enabled`}
+                onCheckedChange={(checked) => {
+                  const next = externalNotificationDestinationWith({
+                    destination,
+                    enabled: Boolean(checked),
+                  });
+                  if (next !== null) onChange(next);
+                }}
+              />
+            </div>
+            {destinationEditor.fields}
+            <div className="space-y-1.5">
+              <span className="block text-xs font-medium text-muted-foreground">Actions</span>
+              <div className="flex flex-wrap items-center gap-2">
+                {destinationEditor.saveAction}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={readOnly || !destination.configured || testing}
+                  onClick={() => void testDestination()}
+                >
+                  <SendIcon className="size-3.5" aria-hidden />
+                  {testing ? "Testing…" : "Test"}
+                </Button>
+                <Button
+                  size="icon-sm"
+                  variant="destructive-outline"
+                  disabled={readOnly}
+                  onClick={() => setDeleteConfirmOpen(true)}
+                  aria-label={`Remove ${destination.label}`}
+                >
+                  <Trash2Icon className="size-3.5" aria-hidden />
+                </Button>
+              </div>
+            </div>
           </div>
         </div>
       </div>
-    </div>
+      <AlertDialog open={deleteConfirmOpen} onOpenChange={setDeleteConfirmOpen}>
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Delete “{destination.label}”?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This removes the destination and its stored secret. Future notifications will no
+              longer be sent to it.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" />}>Cancel</AlertDialogClose>
+            <Button
+              variant="destructive"
+              onClick={() => {
+                setDeleteConfirmOpen(false);
+                void onRemove();
+              }}
+            >
+              Delete destination
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
+    </>
   );
 }
 
-function EnvironmentExternalNotificationsSettings({
+function renderExternalNotificationDestinationEditor({
+  destination,
+  readOnly,
+  webhookUrl,
+  onWebhookUrlChange,
+  onSaveWebhookUrl,
+}: {
+  readonly destination: ExternalNotificationDestination;
+  readonly readOnly: boolean;
+  readonly webhookUrl: string;
+  readonly onWebhookUrlChange: (value: string) => void;
+  readonly onSaveWebhookUrl: () => void;
+}) {
+  const destinationTag = destination._tag;
+  switch (destinationTag) {
+    case "home-assistant-webhook":
+      return {
+        fields: (
+          <>
+            <p className="text-xs text-muted-foreground">
+              Home Assistant webhook ·{" "}
+              {destination.configured
+                ? "Webhook URL saved securely."
+                : "No webhook URL configured."}
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Input
+                aria-label={`Replace ${destination.label} webhook URL`}
+                className="min-w-64 flex-1 sm:max-w-md"
+                size="sm"
+                type="url"
+                value={webhookUrl}
+                disabled={readOnly}
+                placeholder="Paste a new webhook URL to replace the saved one"
+                autoComplete="off"
+                onChange={(event) => onWebhookUrlChange(event.target.value)}
+              />
+            </div>
+          </>
+        ),
+        saveAction: (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={readOnly || webhookUrl.trim() === ""}
+            onClick={onSaveWebhookUrl}
+          >
+            Save
+          </Button>
+        ),
+      };
+  }
+  const _exhaustive: never = destinationTag;
+  return _exhaustive;
+}
+
+export function EnvironmentExternalNotificationsSettings({
   environmentId,
   environmentLabel,
   readOnly,
@@ -759,7 +940,7 @@ function EnvironmentExternalNotificationsSettings({
   });
   const destinations = settings.externalNotifications.destinations;
 
-  const saveSettings = async (patch: ServerSettingsPatch) => {
+  const saveSettings = async (patch: ServerSettingsPatch): Promise<boolean> => {
     const result = await updateServerSettings({
       environmentId,
       input: { patch },
@@ -774,7 +955,9 @@ function EnvironmentExternalNotificationsSettings({
             error instanceof Error ? error.message : "The server rejected the settings update.",
         }),
       );
+      return false;
     }
+    return result._tag === "Success";
   };
 
   const updateDestination = (nextDestination: ExternalNotificationDestination) => {
@@ -787,27 +970,64 @@ function EnvironmentExternalNotificationsSettings({
     });
   };
 
-  const removeDestination = (destinationId: string) => {
+  const updateDestinationType = (
+    destinationId: string,
+    type: ExternalNotificationDestinationTag,
+    label: string,
+  ) => {
+    const current = destinations.find((destination) => destination.id === destinationId);
+    if (!current || current._tag === type) return;
+    const currentDefaultLabel = externalNotificationDestinationTagLabel(current._tag);
+    const nextLabel =
+      label === currentDefaultLabel || label === LEGACY_GENERIC_DESTINATION_LABEL
+        ? externalNotificationDestinationTagLabel(type)
+        : label || current.label;
+    const nextDestination = createExternalNotificationDestination({
+      type,
+      id: `external-notification-${Date.now()}`,
+      label: nextLabel,
+      enabled: current.enabled,
+    });
+    if (nextDestination === null) return;
     void saveSettings({
       externalNotifications: {
-        destinations: destinations.filter((destination) => destination.id !== destinationId),
+        destinations: destinations.map((destination) =>
+          destination.id === destinationId ? nextDestination : destination,
+        ),
       },
     });
   };
 
-  const addDestination = () => {
-    const id = `home-assistant-${Date.now()}`;
-    const destination = decodeExternalNotificationDestination({
-      _tag: "home-assistant-webhook",
-      id,
-      label: "Home Assistant",
-      enabled: true,
-      configured: false,
+  const removeDestination = async (destinationId: string) => {
+    const removedDestination = destinations.find((destination) => destination.id === destinationId);
+    if (removedDestination === undefined) return;
+    const saved = await saveSettings({
+      externalNotifications: {
+        destinations: destinations.filter((destination) => destination.id !== destinationId),
+      },
     });
-    if (Option.isNone(destination)) return;
+    if (!saved) return;
+    toastManager.add(
+      stackedThreadToast({
+        type: "success",
+        title: "External notification deleted",
+        description: "Its stored secret was removed.",
+        timeout: 5_000,
+      }),
+    );
+  };
+
+  const addDestination = () => {
+    const destination = createExternalNotificationDestination({
+      type: "home-assistant-webhook",
+      id: `external-notification-${Date.now()}`,
+      label: externalNotificationDestinationTagLabel("home-assistant-webhook"),
+      enabled: true,
+    });
+    if (destination === null) return;
     void saveSettings({
       externalNotifications: {
-        destinations: [...destinations, destination.value],
+        destinations: [...destinations, destination],
       },
     });
   };
@@ -877,19 +1097,20 @@ function EnvironmentExternalNotificationsSettings({
             destination={destination}
             readOnly={readOnly}
             onChange={updateDestination}
+            onChangeType={(type, label) => updateDestinationType(destination.id, type, label)}
             onRemove={() => removeDestination(destination.id)}
             onTest={() => testDestination(destination.id)}
           />
         ))}
         <Button size="sm" variant="outline" disabled={readOnly} onClick={addDestination}>
-          Add Home Assistant destination
+          Add external notification
         </Button>
       </div>
     </SettingsSection>
   );
 }
 
-function AccessGatedExternalNotificationsSettings({
+export function AccessGatedExternalNotificationsSettings({
   environment,
   operateAccess,
   deviceTabs,
@@ -995,7 +1216,7 @@ function SelectedExternalNotificationsSettings({
   );
 }
 
-function ExternalNotificationsSettings() {
+export function ExternalNotificationsSettings() {
   const { environments, isReady } = useEnvironments();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const options = useMemo(

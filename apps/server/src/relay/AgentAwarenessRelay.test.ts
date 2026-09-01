@@ -16,7 +16,8 @@ import type {
   RelayAgentActivityPublishProofPayload,
   RelayAgentActivityState,
 } from "@t3tools/contracts/relay";
-import { CommandId, ProviderInstanceId } from "@t3tools/contracts";
+import { CommandId, DEFAULT_SERVER_SETTINGS, ProviderInstanceId } from "@t3tools/contracts";
+import type { ServerSettings as ServerSettingsValue } from "@t3tools/contracts";
 import { RelayClientTracer } from "@t3tools/shared/relayTracing";
 import { RELAY_ACTIVITY_PUBLISH_TYP, verifyRelayJwt } from "@t3tools/shared/relayJwt";
 import { describe, expect, it } from "@effect/vitest";
@@ -413,148 +414,184 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
     ).rejects.toBeDefined();
   });
 
-  it.effect("keeps the orchestration listener armed until relay config is installed", () =>
-    Effect.scoped(
-      Effect.gen(function* () {
-        const events = yield* Queue.unbounded<OrchestrationEvent>();
-        const threadShellRequested = yield* Deferred.make<void>();
-        const secrets = makeMemorySecretStore();
-        const now = "2026-05-25T00:00:00.000Z";
-        const projectId = "project-1" as ProjectId;
-        const threadId = "thread-1" as ThreadId;
-        const environmentId = "env-1" as EnvironmentId;
+  describe.sequential("AgentAwarenessRelay integration", () => {
+    it.effect(
+      "delivers external notifications without relay credentials and replays on settings changes",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const events = yield* Queue.unbounded<OrchestrationEvent>();
+            const externalDispatches =
+              yield* Queue.unbounded<ExternalNotificationDispatcher.ExternalNotificationDispatchInput>();
+            const settingsChanges = yield* Queue.unbounded<ServerSettingsValue>();
+            const threadShellRequested = yield* Deferred.make<void>();
+            const secrets = makeMemorySecretStore();
+            const now = "2026-05-25T00:00:00.000Z";
+            const projectId = "project-1" as ProjectId;
+            const threadId = "thread-1" as ThreadId;
+            const environmentId = "env-1" as EnvironmentId;
 
-        const project = {
-          id: projectId,
-          title: "T3 Code",
-          workspaceRoot: "/workspace",
-          repositoryIdentity: null,
-          defaultModelSelection: null,
-          scripts: [],
-          createdAt: now,
-          updatedAt: now,
-        } satisfies OrchestrationProjectShell;
-
-        const thread = {
-          id: threadId,
-          projectId,
-          title: "Run remote agent",
-          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
-          runtimeMode: "full-access",
-          interactionMode: "default",
-          branch: null,
-          worktreePath: null,
-          latestTurn: {
-            turnId: "turn-1" as TurnId,
-            state: "running",
-            requestedAt: now,
-            startedAt: now,
-            completedAt: null,
-            assistantMessageId: null,
-          },
-          createdAt: now,
-          updatedAt: now,
-          archivedAt: null,
-          settledOverride: null,
-          settledAt: null,
-          session: {
-            threadId,
-            status: "running",
-            providerName: "Codex",
-            runtimeMode: "full-access",
-            activeTurnId: "turn-1" as TurnId,
-            lastError: null,
-            updatedAt: now,
-          },
-          latestUserMessageAt: now,
-          hasPendingApprovals: false,
-          hasPendingUserInput: false,
-          hasActionableProposedPlan: false,
-        } satisfies OrchestrationThreadShell;
-
-        const orchestrationEngine = {
-          readEvents: () => Stream.empty,
-          dispatch: () => Effect.succeed({ sequence: 1 }),
-          streamDomainEvents: Stream.fromQueue(events),
-          latestSequence: Effect.succeed(0),
-        } satisfies OrchestrationEngineShape;
-
-        const snapshotQuery = {
-          getShellSnapshot: () =>
-            Effect.succeed({
-              snapshotSequence: 1,
-              projects: [project],
-              threads: [thread],
+            const project = {
+              id: projectId,
+              title: "T3 Code",
+              workspaceRoot: "/workspace",
+              repositoryIdentity: null,
+              defaultModelSelection: null,
+              scripts: [],
+              createdAt: now,
               updatedAt: now,
-            } satisfies OrchestrationShellSnapshot),
-          getThreadShellById: () =>
-            Deferred.succeed(threadShellRequested, undefined).pipe(
-              Effect.ignore,
-              Effect.as(Option.some(thread)),
-            ),
-          getProjectShellById: () => Effect.succeed(Option.some(project)),
-        } as unknown as ProjectionSnapshotQueryShape;
+            } satisfies OrchestrationProjectShell;
 
-        const descriptor = {
-          environmentId,
-          label: "Test Desktop",
-          platform: {
-            os: "darwin",
-            arch: "arm64",
-          },
-          serverVersion: "0.0.0-test",
-          capabilities: {
-            repositoryIdentity: true,
-          },
-        } satisfies ExecutionEnvironmentDescriptor;
-
-        const layer = Layer.mergeAll(
-          Layer.succeed(ServerSecretStore.ServerSecretStore, secrets.store),
-          Layer.succeed(ServerEnvironment.ServerEnvironment, {
-            getEnvironmentId: Effect.succeed(environmentId),
-            getDescriptor: Effect.succeed(descriptor),
-          }),
-          Layer.succeed(OrchestrationEngineService, orchestrationEngine),
-          Layer.succeed(ProjectionSnapshotQuery, snapshotQuery),
-        );
-
-        yield* Effect.gen(function* () {
-          const relay = yield* AgentAwarenessRelay.AgentAwarenessRelay;
-          yield* relay.start();
-          yield* secrets.setString(RELAY_URL_SECRET, "http://127.0.0.1:1");
-          yield* secrets.setString(RELAY_ENVIRONMENT_CREDENTIAL_SECRET, "relay-credential");
-          yield* secrets.setString(PUBLISH_AGENT_ACTIVITY_SECRET, "true");
-          yield* Queue.offer(events, {
-            type: "thread.activity-appended",
-            sequence: 1,
-            eventId: "evt-1",
-            commandId: CommandId.make("cmd-1"),
-            aggregateKind: "thread",
-            aggregateId: threadId,
-            actor: { kind: "server" },
-            payload: {
-              threadId,
-              activity: {
-                kind: "approval.requested",
+            const thread = {
+              id: threadId,
+              projectId,
+              title: "Run remote agent",
+              modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5.4" },
+              runtimeMode: "full-access",
+              interactionMode: "default",
+              branch: null,
+              worktreePath: null,
+              latestTurn: {
+                turnId: "turn-1" as TurnId,
+                state: "running",
+                requestedAt: now,
+                startedAt: now,
+                completedAt: null,
+                assistantMessageId: null,
               },
-            },
-            occurredAt: now,
-          } as unknown as OrchestrationEvent);
+              createdAt: now,
+              updatedAt: now,
+              archivedAt: null,
+              settledOverride: null,
+              settledAt: null,
+              session: {
+                threadId,
+                status: "running",
+                providerName: "Codex",
+                runtimeMode: "full-access",
+                activeTurnId: "turn-1" as TurnId,
+                lastError: null,
+                updatedAt: now,
+              },
+              latestUserMessageAt: now,
+              hasPendingApprovals: false,
+              hasPendingUserInput: false,
+              hasActionableProposedPlan: false,
+            } satisfies OrchestrationThreadShell;
 
-          yield* Deferred.await(threadShellRequested).pipe(Effect.timeout("2 seconds"));
-        }).pipe(
-          Effect.provide(
-            AgentAwarenessRelay.layer.pipe(
-              Layer.provide(layer),
-              Layer.provideMerge(NodeServices.layer),
-              Layer.provideMerge(ServerSettings.layerTest()),
-              Layer.provideMerge(ExternalNotificationDispatcher.layerTest),
-            ),
-          ),
-        );
-      }),
-    ),
-  );
+            const orchestrationEngine = {
+              readEvents: () => Stream.empty,
+              dispatch: () => Effect.succeed({ sequence: 1 }),
+              streamDomainEvents: Stream.fromQueue(events),
+              latestSequence: Effect.succeed(0),
+            } satisfies OrchestrationEngineShape;
+
+            const snapshotQuery = {
+              getShellSnapshot: () =>
+                Effect.succeed({
+                  snapshotSequence: 1,
+                  projects: [project],
+                  threads: [thread],
+                  updatedAt: now,
+                } satisfies OrchestrationShellSnapshot),
+              getThreadShellById: () =>
+                Deferred.succeed(threadShellRequested, undefined).pipe(
+                  Effect.ignore,
+                  Effect.as(Option.some(thread)),
+                ),
+              getProjectShellById: () => Effect.succeed(Option.some(project)),
+            } as unknown as ProjectionSnapshotQueryShape;
+
+            const descriptor = {
+              environmentId,
+              label: "Test Desktop",
+              platform: {
+                os: "darwin",
+                arch: "arm64",
+              },
+              serverVersion: "0.0.0-test",
+              capabilities: {
+                repositoryIdentity: true,
+              },
+            } satisfies ExecutionEnvironmentDescriptor;
+
+            const layer = Layer.mergeAll(
+              Layer.succeed(ServerSecretStore.ServerSecretStore, secrets.store),
+              Layer.succeed(ServerEnvironment.ServerEnvironment, {
+                getEnvironmentId: Effect.succeed(environmentId),
+                getDescriptor: Effect.succeed(descriptor),
+              }),
+              Layer.succeed(OrchestrationEngineService, orchestrationEngine),
+              Layer.succeed(ProjectionSnapshotQuery, snapshotQuery),
+            );
+            const settingsLayer = Layer.succeed(
+              ServerSettings.ServerSettingsService,
+              ServerSettings.ServerSettingsService.of({
+                start: Effect.void,
+                ready: Effect.void,
+                getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+                updateSettings: () => Effect.succeed(DEFAULT_SERVER_SETTINGS),
+                streamChanges: Stream.fromQueue(settingsChanges),
+                subscribeChanges: Effect.succeed(Stream.fromQueue(settingsChanges)),
+              }),
+            );
+
+            yield* Effect.gen(function* () {
+              const relay = yield* AgentAwarenessRelay.AgentAwarenessRelay;
+              yield* relay.start();
+              yield* Queue.offer(events, {
+                type: "thread.activity-appended",
+                sequence: 1,
+                eventId: "evt-1",
+                commandId: CommandId.make("cmd-1"),
+                aggregateKind: "thread",
+                aggregateId: threadId,
+                actor: { kind: "server" },
+                payload: {
+                  threadId,
+                  activity: {
+                    kind: "approval.requested",
+                  },
+                },
+                occurredAt: now,
+              } as unknown as OrchestrationEvent);
+
+              yield* Deferred.await(threadShellRequested).pipe(Effect.timeout("2 seconds"));
+              const dispatch = yield* Queue.take(externalDispatches);
+              expect(dispatch).toMatchObject({
+                environmentId,
+                threadId,
+                reason: "snapshot",
+              });
+              yield* Queue.offer(settingsChanges, DEFAULT_SERVER_SETTINGS);
+              const replay = yield* Queue.take(externalDispatches).pipe(
+                Effect.timeout("2 seconds"),
+              );
+              expect(replay).toMatchObject({
+                environmentId,
+                threadId,
+                reason: "snapshot",
+              });
+            }).pipe(
+              Effect.provide(
+                AgentAwarenessRelay.layer.pipe(
+                  Layer.provide(layer),
+                  Layer.provideMerge(NodeServices.layer),
+                  Layer.provideMerge(settingsLayer),
+                  Layer.provideMerge(
+                    Layer.succeed(ExternalNotificationDispatcher.ExternalNotificationDispatcher, {
+                      dispatch: (input) => Queue.offer(externalDispatches, input),
+                      hasEnabledDestinations: Effect.succeed(true),
+                      test: () => Effect.die("external notification test is not used here"),
+                    }),
+                  ),
+                ),
+              ),
+            );
+          }),
+        ),
+    );
+  });
 
   it.effect("publishes agent activity to the relay transport URL, not the relay issuer", () =>
     Effect.scoped(
@@ -563,6 +600,7 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
         const context = yield* Effect.context<never>();
         const runFork = Effect.runForkWith(context);
         const events = yield* Queue.unbounded<OrchestrationEvent>();
+        const settingsChanges = yield* Queue.unbounded<ServerSettingsValue>();
         const fetchSeen = yield* Deferred.make<URL>();
         const userSpans: Array<string> = [];
         const productSpans: Array<string> = [];
@@ -684,13 +722,20 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
             getProjectShellById: () => Effect.succeed(Option.some(project)),
           } as unknown as ProjectionSnapshotQueryShape),
         );
+        const settingsLayer = Layer.succeed(
+          ServerSettings.ServerSettingsService,
+          ServerSettings.ServerSettingsService.of({
+            start: Effect.void,
+            ready: Effect.void,
+            getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+            updateSettings: () => Effect.succeed(DEFAULT_SERVER_SETTINGS),
+            streamChanges: Stream.fromQueue(settingsChanges),
+            subscribeChanges: Effect.succeed(Stream.fromQueue(settingsChanges)),
+          }),
+        );
 
         yield* Effect.gen(function* () {
           const relay = yield* AgentAwarenessRelay.AgentAwarenessRelay;
-          yield* secrets.setString(RELAY_URL_SECRET, "https://transport.example.test");
-          yield* secrets.setString(RELAY_ISSUER_SECRET, "https://issuer.example.test");
-          yield* secrets.setString(RELAY_ENVIRONMENT_CREDENTIAL_SECRET, "relay-credential");
-          yield* secrets.setString(PUBLISH_AGENT_ACTIVITY_SECRET, "true");
           yield* relay.start();
           yield* Queue.offer(events, {
             type: "thread.activity-appended",
@@ -709,6 +754,11 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
             occurredAt: now,
           } as unknown as OrchestrationEvent);
 
+          yield* secrets.setString(RELAY_URL_SECRET, "https://transport.example.test");
+          yield* secrets.setString(RELAY_ISSUER_SECRET, "https://issuer.example.test");
+          yield* secrets.setString(RELAY_ENVIRONMENT_CREDENTIAL_SECRET, "relay-credential");
+          yield* secrets.setString(PUBLISH_AGENT_ACTIVITY_SECRET, "true");
+          yield* Queue.offer(settingsChanges, DEFAULT_SERVER_SETTINGS);
           const url = yield* Deferred.await(fetchSeen).pipe(Effect.timeout("2 seconds"));
           expect(url.origin).toBe("https://transport.example.test");
           expect(productSpans).toContain("makePublishProof");
@@ -718,7 +768,7 @@ describe.sequential("signRelayAgentActivityPublishProof", () => {
             AgentAwarenessRelay.layer.pipe(
               Layer.provide(layer),
               Layer.provideMerge(NodeServices.layer),
-              Layer.provideMerge(ServerSettings.layerTest()),
+              Layer.provideMerge(settingsLayer),
               Layer.provideMerge(ExternalNotificationDispatcher.layerTest),
             ),
           ),

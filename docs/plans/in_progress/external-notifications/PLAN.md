@@ -12,17 +12,17 @@ Implement server-authoritative external notifications with Home Assistant adapte
 - **lifecycle state:** in_progress
 - **current phase:** P9
 - **baseline revision:** `d94577e5c5cfaacc3225c1d06bf0506184514420`
-- **candidate revision:** `WORKTREE@d94577e5c5cfaacc3225c1d06bf0506184514420` (dirty; implementation remains uncommitted)
-- **declared scope digest:** `sha256:2dec9ec164d739a2b421c74d67f57b4a2339ebb37082eb39faf9ef18c43ffa8f` (sorted newline-delimited paths)
-- **current changed files digest:** `sha256:2dec9ec164d739a2b421c74d67f57b4a2339ebb37082eb39faf9ef18c43ffa8f` (sorted newline-delimited paths)
+- **candidate revision:** `WORKTREE@c3e17e31ac6667057254d5ad5343a779f85dd5fa` (dirty overlay; evidence tests remain uncommitted)
+- **declared scope digest:** `sha256:48ed5a1ebc20dee5ca68935180121492e89702eccfec427c19ede998b1115f47` (sorted newline-delimited paths)
+- **current changed files digest:** `sha256:48ed5a1ebc20dee5ca68935180121492e89702eccfec427c19ede998b1115f47` (sorted newline-delimited paths)
 
 ## Execution status
 
-Implementation is complete through P8. Focused tests and package typechecks pass for the implemented paths. The work remains in `in_progress/` because this is a high-risk plan and the final evidence gate is not complete.
+Implementation is complete through P8, and focused P5–P7 boundary evidence is now present. The Web UI now adds destinations through a generic integration selector, renders integration-specific fields, preserves custom destination names during type changes, and confirms destructive removal with a short-lived success toast. The work remains in `in_progress/` because this is a high-risk plan and independent validation/revalidation are not complete.
 
 The implementation corrected two findings from independent review: external webhook URLs no longer enter settings streams, and external webhook secrets are restored when a settings update fails. Disabled but configured destinations are eligible for an explicit test without entering normal fanout. Relay and external startup snapshots use separate readiness state so an external-first startup does not prevent later relay reconciliation.
 
-Remaining evidence gaps are dedicated RPC-boundary, client-command, and Web UI tests, plus independent late-relay integration coverage. No browser verification has been run.
+The previously reported boundary evidence gaps are repaired with adapter transport/timeout/2xx tests, dispatcher concurrency tests, relay no-credential/settings-replay coverage, client failure propagation, and Web UI operation coverage. The user has also manually validated the running external-notification flow and final settings controls. Independent validation and revalidation must be rerun against the current dirty candidate.
 
 ## AC Trace Table
 
@@ -56,7 +56,7 @@ Remaining evidence gaps are dedicated RPC-boundary, client-command, and Web UI t
 
 ## Declared Source Scope
 
-`apps/server/src/auth/RpcAuthorization.ts` `apps/server/src/notifications/ExternalNotificationDispatcher.test.ts` `apps/server/src/notifications/ExternalNotificationDispatcher.ts` `apps/server/src/notifications/HomeAssistantWebhookAdapter.test.ts` `apps/server/src/notifications/HomeAssistantWebhookAdapter.ts` `apps/server/src/relay/AgentAwarenessRelay.test.ts` `apps/server/src/relay/AgentAwarenessRelay.ts` `apps/server/src/server.ts` `apps/server/src/serverSettings.test.ts` `apps/server/src/serverSettings.ts` `apps/server/src/ws.ts` `apps/web/src/components/settings/IntegrationsSettings.tsx` `docs/plans/README.md` `docs/plans/completed/README.md` `docs/plans/in_progress/README.md` `docs/plans/in_progress/external-notifications/LEDGER.md` `docs/plans/in_progress/external-notifications/PLAN.md` `docs/plans/in_progress/external-notifications/SPEC.md` `docs/plans/in_progress/external-notifications/STATE.md` `docs/plans/in_progress/external-notifications/TODO.md` `docs/plans/planned/README.md` `docs/user/external-notifications.md` `packages/client-runtime/src/state/server.ts` `packages/contracts/src/externalNotifications.ts` `packages/contracts/src/index.ts` `packages/contracts/src/rpc.ts` `packages/contracts/src/settings.test.ts` `packages/contracts/src/settings.ts` `packages/shared/src/serverSettings.test.ts` `packages/shared/src/serverSettings.ts`
+`apps/server/src/auth/RpcAuthorization.test.ts` `apps/server/src/auth/RpcAuthorization.ts` `apps/server/src/notifications/ExternalNotificationDispatcher.test.ts` `apps/server/src/notifications/ExternalNotificationDispatcher.ts` `apps/server/src/notifications/HomeAssistantWebhookAdapter.test.ts` `apps/server/src/notifications/HomeAssistantWebhookAdapter.ts` `apps/server/src/relay/AgentAwarenessRelay.test.ts` `apps/server/src/relay/AgentAwarenessRelay.ts` `apps/server/src/server.test.ts` `apps/server/src/server.ts` `apps/server/src/serverSettings.test.ts` `apps/server/src/serverSettings.ts` `apps/server/src/ws.ts` `apps/web/src/components/settings/ExternalNotificationsSettings.logic.test.ts` `apps/web/src/components/settings/IntegrationsSettings.environment.test.tsx` `apps/web/src/components/settings/IntegrationsSettings.tsx` `docs/plans/README.md` `docs/plans/completed/README.md` `docs/plans/in_progress/README.md` `docs/plans/in_progress/external-notifications/LEDGER.md` `docs/plans/in_progress/external-notifications/PLAN.md` `docs/plans/in_progress/external-notifications/SPEC.md` `docs/plans/in_progress/external-notifications/STATE.md` `docs/plans/in_progress/external-notifications/TODO.md` `docs/plans/planned/README.md` `docs/user/external-notifications.md` `packages/client-runtime/src/state/server.test.ts` `packages/client-runtime/src/state/server.ts` `packages/contracts/src/externalNotifications.ts` `packages/contracts/src/index.ts` `packages/contracts/src/rpc.ts` `packages/contracts/src/settings.test.ts` `packages/contracts/src/settings.ts` `packages/shared/src/serverSettings.test.ts` `packages/shared/src/serverSettings.ts`
 
 Generated artifacts: none expected. Route tree unchanged. Unexpected generated files require replan.
 
@@ -240,7 +240,7 @@ P8 → P9
 3. Never display URL. Read-only when disabled.
 4. Selected remote environment. Truthful save/test failure.
 5. Browser settings unaffected.
-6. Add dedicated logic and environment tests for the integrated section (remaining evidence work).
+6. Add dedicated logic and environment tests for the integrated section.
 
 ### P8 — Docs
 
