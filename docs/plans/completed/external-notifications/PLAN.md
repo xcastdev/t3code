@@ -9,7 +9,7 @@ Implement server-authoritative external notifications with Home Assistant adapte
 - **deliveryMode:** local
 - **evidenceTier:** high-risk
 - **tier rationale:** security, secret persistence, authorization, shared delivery identity, outbound HTTP, concurrent fanout, cross-service behavior
-- **lifecycle state:** in_progress
+- **lifecycle state:** completed
 - **current phase:** P9
 - **baseline revision:** `d94577e5c5cfaacc3225c1d06bf0506184514420`
 - **candidate revision:** `53d151085d94f0d7a7acb12cb2776b9ce159050b` (immutable implementation candidate)
@@ -18,11 +18,11 @@ Implement server-authoritative external notifications with Home Assistant adapte
 
 ## Execution status
 
-Implementation is complete through P8, and focused P5–P7 boundary evidence is now present. The Web UI now adds destinations through a generic integration selector, renders integration-specific fields, preserves custom destination names during type changes, and confirms destructive removal with a short-lived success toast. The dispatcher now uses a compiler-checked exhaustive adapter switch. The work remains in `in_progress/` because this is a high-risk plan and independent validation/revalidation are not complete.
+Implementation is complete through P8, and focused P5–P7 boundary evidence is now present. The Web UI now adds destinations through a generic integration selector, renders integration-specific fields, preserves custom destination names during type changes, and confirms destructive removal with a short-lived success toast. The dispatcher now uses a compiler-checked exhaustive adapter switch. The plan is marked complete by explicit user override on 2026-09-01T18:41:22-05:00; the unresolved high-risk validation exception remains recorded in STATE.md and LEDGER.md.
 
 The implementation corrected two findings from independent review: external webhook URLs no longer enter settings streams, and external webhook secrets are restored when a settings update fails. Disabled but configured destinations are eligible for an explicit test without entering normal fanout. Relay and external startup snapshots use separate readiness state so an external-first startup does not prevent later relay reconciliation.
 
-The previously reported boundary evidence gaps are repaired with adapter transport/timeout/2xx tests, dispatcher concurrency tests, relay no-credential/settings-replay coverage, client failure propagation, and Web UI operation coverage. The user has also manually validated the running external-notification flow and final settings controls. Independent validation and revalidation must be rerun against the immutable candidate recorded above.
+The previously reported boundary evidence gaps are repaired with adapter transport/timeout/2xx tests, dispatcher concurrency tests, relay no-credential/settings-replay coverage, client failure propagation, and Web UI operation coverage. The user has also manually validated the running external-notification flow and final settings controls. Independent validation was `UNVERIFIABLE` and revalidation was `FAIL`; both are retained as an explicit user-accepted completion exception.
 
 ## AC Trace Table
 
@@ -56,9 +56,11 @@ The previously reported boundary evidence gaps are repaired with adapter transpo
 
 ## Declared Source Scope
 
-`apps/server/src/auth/RpcAuthorization.test.ts` `apps/server/src/auth/RpcAuthorization.ts` `apps/server/src/notifications/ExternalNotificationDispatcher.test.ts` `apps/server/src/notifications/ExternalNotificationDispatcher.ts` `apps/server/src/notifications/HomeAssistantWebhookAdapter.test.ts` `apps/server/src/notifications/HomeAssistantWebhookAdapter.ts` `apps/server/src/relay/AgentAwarenessRelay.test.ts` `apps/server/src/relay/AgentAwarenessRelay.ts` `apps/server/src/server.test.ts` `apps/server/src/server.ts` `apps/server/src/serverSettings.test.ts` `apps/server/src/serverSettings.ts` `apps/server/src/ws.ts` `apps/web/src/components/settings/ExternalNotificationsSettings.logic.test.ts` `apps/web/src/components/settings/IntegrationsSettings.environment.test.tsx` `apps/web/src/components/settings/IntegrationsSettings.tsx` `docs/plans/README.md` `docs/plans/completed/README.md` `docs/plans/in_progress/README.md` `docs/plans/in_progress/external-notifications/LEDGER.md` `docs/plans/in_progress/external-notifications/PLAN.md` `docs/plans/in_progress/external-notifications/SPEC.md` `docs/plans/in_progress/external-notifications/STATE.md` `docs/plans/in_progress/external-notifications/TODO.md` `docs/plans/planned/README.md` `docs/user/external-notifications.md` `packages/client-runtime/src/state/server.test.ts` `packages/client-runtime/src/state/server.ts` `packages/contracts/src/externalNotifications.ts` `packages/contracts/src/index.ts` `packages/contracts/src/rpc.ts` `packages/contracts/src/settings.test.ts` `packages/contracts/src/settings.ts` `packages/shared/src/serverSettings.test.ts` `packages/shared/src/serverSettings.ts`
+`apps/server/src/auth/RpcAuthorization.test.ts` `apps/server/src/auth/RpcAuthorization.ts` `apps/server/src/notifications/ExternalNotificationDispatcher.test.ts` `apps/server/src/notifications/ExternalNotificationDispatcher.ts` `apps/server/src/notifications/HomeAssistantWebhookAdapter.test.ts` `apps/server/src/notifications/HomeAssistantWebhookAdapter.ts` `apps/server/src/relay/AgentAwarenessRelay.test.ts` `apps/server/src/relay/AgentAwarenessRelay.ts` `apps/server/src/server.test.ts` `apps/server/src/server.ts` `apps/server/src/serverSettings.test.ts` `apps/server/src/serverSettings.ts` `apps/server/src/ws.ts` `apps/web/src/components/settings/ExternalNotificationsSettings.logic.test.ts` `apps/web/src/components/settings/IntegrationsSettings.environment.test.tsx` `apps/web/src/components/settings/IntegrationsSettings.tsx` `docs/plans/README.md` `docs/plans/completed/README.md` `docs/plans/in_progress/README.md` `docs/plans/completed/external-notifications/LEDGER.md` `docs/plans/completed/external-notifications/PLAN.md` `docs/plans/completed/external-notifications/SPEC.md` `docs/plans/completed/external-notifications/STATE.md` `docs/plans/completed/external-notifications/TODO.md` `docs/plans/planned/README.md` `docs/user/external-notifications.md` `packages/client-runtime/src/state/server.test.ts` `packages/client-runtime/src/state/server.ts` `packages/contracts/src/externalNotifications.ts` `packages/contracts/src/index.ts` `packages/contracts/src/rpc.ts` `packages/contracts/src/settings.test.ts` `packages/contracts/src/settings.ts` `packages/shared/src/serverSettings.test.ts` `packages/shared/src/serverSettings.ts`
 
 Generated artifacts: none expected. Route tree unchanged. Unexpected generated files require replan.
+
+Archive note: the lifecycle package was moved from `docs/plans/in_progress/external-notifications/` to `docs/plans/completed/external-notifications/` after implementation. The original candidate scope entries retain their historical paths; the archived paths are the authoritative locations now.
 
 ## Decisions / Assumptions / Blockers
 

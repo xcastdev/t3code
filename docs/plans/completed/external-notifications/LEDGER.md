@@ -2,21 +2,25 @@
 
 ## Shared Provenance (current candidate)
 
-| Field                        | Value                                                                                    |
-| ---------------------------- | ---------------------------------------------------------------------------------------- |
-| baseline_revision            | `d94577e5c5cfaacc3225c1d06bf0506184514420`                                               |
-| candidate_revision           | `53d151085d94f0d7a7acb12cb2776b9ce159050b` (immutable implementation candidate)          |
-| declared_scope_digest        | `sha256:48ed5a1ebc20dee5ca68935180121492e89702eccfec427c19ede998b1115f47`                |
-| current_changed_files_digest | `sha256:48ed5a1ebc20dee5ca68935180121492e89702eccfec427c19ede998b1115f47`                |
-| current_changed_files        | See `STATE.md` provenance; 35 paths including boundary tests and lifecycle READMEs       |
-| implementer                  | direct primary implementation / `ses_fa4cea939ffeeirmIHsesYjjQP` / `openai/gpt-5.6-luna` |
-| validator                    | validate-wrapper / `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`               |
-| revalidator                  | validate-wrapper-alt / `ses_fa4923707ffeA0gvUbAe5yfgB6` / `deepseek-v4-pro`              |
-| latest validation            | `pending independent validation`                                                         |
-| latest revalidation          | `pending independent revalidation`                                                       |
-| timestamp_policy             | ISO-8601 with timezone, captured at execution time; never pre-fill execution timestamps  |
+| Field                        | Value                                                                                                       |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| baseline_revision            | `d94577e5c5cfaacc3225c1d06bf0506184514420`                                                                  |
+| candidate_revision           | `53d151085d94f0d7a7acb12cb2776b9ce159050b` (immutable implementation candidate)                             |
+| declared_scope_digest        | `sha256:48ed5a1ebc20dee5ca68935180121492e89702eccfec427c19ede998b1115f47`                                   |
+| current_changed_files_digest | `sha256:48ed5a1ebc20dee5ca68935180121492e89702eccfec427c19ede998b1115f47`                                   |
+| current_changed_files        | See `STATE.md` provenance; 35 paths including boundary tests and lifecycle READMEs                          |
+| implementer                  | direct primary implementation / `ses_fa4cea939ffeeirmIHsesYjjQP` / `openai/gpt-5.6-luna`                    |
+| validator                    | validate-wrapper / fresh task `ses_fa1106ae8ffeILzxg11DjeeWKP`; session unavailable / `openai/gpt-5.6-sol`  |
+| revalidator                  | validate-wrapper-alt / fresh task `ses_fa1106ad8ffeWbJt566p647Zj3`; session unavailable / `deepseek-v4-pro` |
+| latest validation            | `UNVERIFIABLE` — explicit user override recorded 2026-09-01T18:41:22-05:00                                  |
+| latest revalidation          | `FAIL` — explicit user override recorded 2026-09-01T18:41:22-05:00                                          |
+| timestamp_policy             | ISO-8601 with timezone, captured at execution time; never pre-fill execution timestamps                     |
 
-**Current candidate is in `docs/plans/in_progress/external-notifications/`. The historical pre-implementation block below is retained only as provenance of the original saved plan.**
+**Current candidate is in `docs/plans/completed/external-notifications/`. The historical pre-implementation block below is retained only as provenance of the original saved plan.**
+
+## Completion Override
+
+The user explicitly instructed completion and archival on `2026-09-01T18:41:22-05:00` despite the high-risk gate remaining unresolved. The fresh validator result is `UNVERIFIABLE` because session provenance was unavailable, and the fresh revalidator result is `FAIL` because that validator provenance was not accepted. This is an explicit exception, not a final evidence `PASS`.
 
 ---
 
@@ -617,38 +621,38 @@ Final scope audit rerun at `2026-09-01T16:41:54-05:00`: 35 changed paths matched
 
 ### Independent validation
 
-| Field                   | Value                                                                                                                                             |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| phase                   | P9                                                                                                                                                |
-| criterion               | VAL                                                                                                                                               |
-| fail-first              | validator finds defect                                                                                                                            |
-| positive control        | validator confirms all evidence                                                                                                                   |
-| negative control        | validator negative tests pass                                                                                                                     |
-| mutation / BITE-DEMO    | all BITE-DEMO evidence verified                                                                                                                   |
-| race / integration      | all race/integration evidence verified                                                                                                            |
-| dependent-path sweep    | all dependent paths verified                                                                                                                      |
-| command                 | independent validator run                                                                                                                         |
-| result                  | STALE — the prior validator run predates the latest adapter, dispatcher, relay, client, and UI evidence controls; rerun on an immutable candidate |
-| artifact / reference    | validator report                                                                                                                                  |
-| validator session/model | `ses_fa4a1c53fffe0A6R6N4gbMp5h7` / `openai/gpt-5.6-sol`                                                                                           |
-| timestamp               | 2026-09-01T00:45:33-05:00 (superseded by subsequent evidence changes)                                                                             |
+| Field                   | Value                                                                                                                                                                               |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| phase                   | P9                                                                                                                                                                                  |
+| criterion               | VAL                                                                                                                                                                                 |
+| fail-first              | validator finds defect                                                                                                                                                              |
+| positive control        | validator confirms all evidence                                                                                                                                                     |
+| negative control        | validator negative tests pass                                                                                                                                                       |
+| mutation / BITE-DEMO    | all BITE-DEMO evidence verified                                                                                                                                                     |
+| race / integration      | all race/integration evidence verified                                                                                                                                              |
+| dependent-path sweep    | all dependent paths verified                                                                                                                                                        |
+| command                 | independent validator run                                                                                                                                                           |
+| result                  | UNVERIFIABLE — fresh validation reviewed candidate `53d151085d94f0d7a7acb12cb2776b9ce159050b`; session provenance was unavailable. User override recorded 2026-09-01T18:41:22-05:00 |
+| artifact / reference    | validator report                                                                                                                                                                    |
+| validator session/model | unavailable (fresh task `ses_fa1106ae8ffeILzxg11DjeeWKP`) / `openai/gpt-5.6-sol`                                                                                                    |
+| timestamp               | 2026-09-01T18:41:22-05:00                                                                                                                                                           |
 
 <a id="p9-reval"></a>
 
 ### Independent revalidation (high-risk required)
 
-| Field                   | Value                                                                                                                                               |
-| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| phase                   | P9                                                                                                                                                  |
-| criterion               | REVAL                                                                                                                                               |
-| fail-first              | revalidator finds defect                                                                                                                            |
-| positive control        | revalidator confirms all evidence                                                                                                                   |
-| negative control        | revalidator negative tests pass                                                                                                                     |
-| mutation / BITE-DEMO    | all evidence re-verified                                                                                                                            |
-| race / integration      | all evidence re-verified                                                                                                                            |
-| dependent-path sweep    | all paths re-verified                                                                                                                               |
-| command                 | independent revalidator run                                                                                                                         |
-| result                  | STALE — the prior revalidator run predates the latest adapter, dispatcher, relay, client, and UI evidence controls; rerun on an immutable candidate |
-| artifact / reference    | revalidator report                                                                                                                                  |
-| validator session/model | `ses_fa4923707ffeA0gvUbAe5yfgB6` / `deepseek-v4-pro`                                                                                                |
-| timestamp               | 2026-09-01T00:45:33-05:00 (superseded by subsequent evidence changes)                                                                               |
+| Field                   | Value                                                                                                                                                           |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| phase                   | P9                                                                                                                                                              |
+| criterion               | REVAL                                                                                                                                                           |
+| fail-first              | revalidator finds defect                                                                                                                                        |
+| positive control        | revalidator confirms all evidence                                                                                                                               |
+| negative control        | revalidator negative tests pass                                                                                                                                 |
+| mutation / BITE-DEMO    | all evidence re-verified                                                                                                                                        |
+| race / integration      | all evidence re-verified                                                                                                                                        |
+| dependent-path sweep    | all paths re-verified                                                                                                                                           |
+| command                 | independent revalidator run                                                                                                                                     |
+| result                  | FAIL — fresh revalidation found no substantive implementation defect but could not close validator provenance; user override recorded 2026-09-01T18:41:22-05:00 |
+| artifact / reference    | revalidator report                                                                                                                                              |
+| validator session/model | unavailable (fresh task `ses_fa1106ad8ffeWbJt566p647Zj3`) / `deepseek-v4-pro`                                                                                   |
+| timestamp               | 2026-09-01T18:41:22-05:00                                                                                                                                       |

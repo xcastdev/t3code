@@ -1,6 +1,6 @@
 # External Notifications — TODO
 
-Implementation and focused P5–P7 evidence now exist. P9 independent validation and revalidation remain open; do not treat implementation presence as completion.
+Implementation and focused P5–P7 evidence exist. P9 independent validation/revalidation outcomes remain recorded in LEDGER.md; completion was explicitly overridden by the user on 2026-09-01T18:41:22-05:00.
 
 ## P0 — Baseline / Fail-First
 
@@ -92,5 +92,5 @@ Implementation and focused P5–P7 evidence now exist. P9 independent validation
 - [x] P9-TYPE Run `vp run typecheck` from each package workdir — `LEDGER.md#p9-type`
 - [x] P9-RELAY Run relay regression — `LEDGER.md#p9-relay`
 - [x] P9-SCOPE Run git status, diff, check against baseline — `LEDGER.md#p9-scope`
-- [ ] P9-VAL Independent validator on same candidate — `LEDGER.md#p9-val`
-- [ ] P9-REVAL Independent revalidator on same candidate (high-risk requirement) — `LEDGER.md#p9-reval`
+- [x] P9-VAL Independent validator on same candidate — `LEDGER.md#p9-val` (executed; result UNVERIFIABLE; completion override)
+- [x] P9-REVAL Independent revalidator on same candidate (high-risk requirement) — `LEDGER.md#p9-reval` (executed; result FAIL; completion override)
