@@ -816,6 +816,14 @@ export function createServerEnvironmentAtoms<R, E>(
       scheduler: configScheduler,
       concurrency: configConcurrency,
     }),
+    testExternalNotification: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:test-external-notification",
+      tag: WS_METHODS.serverTestExternalNotification,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId }) => environmentId,
+      },
+    }),
     signalProcess: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:signal-process",
       tag: WS_METHODS.serverSignalProcess,

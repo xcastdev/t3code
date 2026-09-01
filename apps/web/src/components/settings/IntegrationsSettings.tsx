@@ -21,13 +21,41 @@ import {
   PREVIEW_ZOOM_LEVELS,
   type PreviewAppearancePreference,
   type PreviewViewportSetting,
+  ExternalNotificationDestination,
+  type ServerSettingsPatch,
 } from "@t3tools/contracts";
+import {
+  isAtomCommandInterrupted,
+  squashAtomCommandFailure,
+} from "@t3tools/client-runtime/state/runtime";
+import { connectionStatusText } from "@t3tools/client-runtime/connection";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import { PREVIEW_VIEWPORT_PRESETS } from "@t3tools/shared/previewViewport";
-import { InfoIcon } from "lucide-react";
-import type { ReactNode } from "react";
+import { InfoIcon, MonitorIcon, PlugIcon, SendIcon, Trash2Icon } from "lucide-react";
+import { useMemo, useState, type ReactNode } from "react";
 
 import { ScreenRotationIcon } from "~/browser/ScreenRotationIcon";
 import { isElectron } from "../../env";
+import { usePrimarySessionState } from "../../environments/primary";
+import { useEnvironmentSessionState } from "../../state/session";
+import {
+  buildProviderEnvironmentOptions,
+  classifyProviderEnvironmentAccess,
+  resolvePrimaryOperateAccess,
+  resolveRemoteOperateAccess,
+  resolveSelectedProviderEnvironmentId,
+  type ProviderEnvironmentAccess,
+  type ProviderOperateAccess,
+} from "./ProviderSettingsPanel.logic";
+import { useEnvironmentSettings } from "~/hooks/useSettings";
+import { serverEnvironment } from "~/state/server";
+import {
+  useEnvironments,
+  usePrimaryEnvironmentId,
+  type EnvironmentPresentation,
+} from "~/state/environments";
+import { useAtomCommand } from "~/state/use-atom-command";
 
 import { Button } from "../ui/button";
 import { NumberField, NumberFieldGroup, NumberFieldInput } from "../ui/number-field";
@@ -41,6 +69,8 @@ import {
   SelectValue,
 } from "../ui/select";
 import { Switch } from "../ui/switch";
+import { Input } from "../ui/input";
+import { stackedThreadToast, toastManager } from "../ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import {
   useClientSettings,
@@ -525,6 +555,506 @@ export function IntegrationsSettingsPanel() {
           previewDefaults
         )}
       </SettingsSection>
+      <ExternalNotificationsSettings />
     </SettingsPageContainer>
+  );
+}
+
+const decodeExternalNotificationDestination = Schema.decodeUnknownOption(
+  ExternalNotificationDestination,
+);
+
+function externalNotificationDestinationWith(input: {
+  readonly destination: ExternalNotificationDestination;
+  readonly label?: string;
+  readonly enabled?: boolean;
+  readonly webhookUrl?: string;
+}): ExternalNotificationDestination | null {
+  const destination = input.destination;
+  const decoded = decodeExternalNotificationDestination({
+    ...destination,
+    ...(input.label === undefined ? {} : { label: input.label }),
+    ...(input.enabled === undefined ? {} : { enabled: input.enabled }),
+    ...(input.webhookUrl === undefined ? {} : { webhookUrl: input.webhookUrl }),
+  });
+  return Option.isSome(decoded) ? decoded.value : null;
+}
+
+function ExternalNotificationsUnavailableRow({
+  environment,
+  access,
+  deviceTabs,
+}: {
+  readonly environment: EnvironmentPresentation;
+  readonly access: Exclude<ProviderEnvironmentAccess, { kind: "editable" | "read-only" }>;
+  readonly deviceTabs: ReactNode;
+}) {
+  const title =
+    access.kind === "loading"
+      ? "Loading external notifications"
+      : access.kind === "error"
+        ? "Could not connect to this device"
+        : "External notifications are unavailable";
+  const description =
+    access.kind === "loading"
+      ? "Checking what this session is allowed to change."
+      : connectionStatusText(environment.connection);
+  return (
+    <SettingsSection title="External notifications">
+      {deviceTabs}
+      <SettingsRow title={title} description={description} />
+    </SettingsSection>
+  );
+}
+
+function ExternalNotificationDestinationCard({
+  destination,
+  readOnly,
+  onChange,
+  onRemove,
+  onTest,
+}: {
+  readonly destination: ExternalNotificationDestination;
+  readonly readOnly: boolean;
+  readonly onChange: (destination: ExternalNotificationDestination) => void;
+  readonly onRemove: () => void;
+  readonly onTest: () => Promise<void>;
+}) {
+  const [label, setLabel] = useState(destination.label);
+  const [webhookUrl, setWebhookUrl] = useState("");
+  const [testing, setTesting] = useState(false);
+
+  const commitLabel = () => {
+    if (label.trim() === "" || label === destination.label) {
+      setLabel(destination.label);
+      return;
+    }
+    const next = externalNotificationDestinationWith({ destination, label });
+    if (next === null) {
+      setLabel(destination.label);
+      return;
+    }
+    onChange(next);
+  };
+
+  const saveWebhookUrl = () => {
+    const next = externalNotificationDestinationWith({ destination, webhookUrl });
+    if (next === null || webhookUrl.trim() === "") {
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Webhook URL is required",
+          description: "Paste a valid Home Assistant webhook URL before saving.",
+        }),
+      );
+      return;
+    }
+    onChange(next);
+    setWebhookUrl("");
+  };
+
+  const testDestination = async () => {
+    setTesting(true);
+    try {
+      await onTest();
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-border/70 bg-muted/10 p-3 sm:p-4">
+      <div className="flex items-start gap-3">
+        <PlugIcon className="mt-1 size-4 shrink-0 text-muted-foreground" aria-hidden />
+        <div className="min-w-0 flex-1 space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              aria-label={`${destination.label} destination name`}
+              className="max-w-64"
+              size="sm"
+              value={label}
+              disabled={readOnly}
+              onChange={(event) => setLabel(event.target.value)}
+              onBlur={commitLabel}
+            />
+            <Switch
+              checked={destination.enabled}
+              disabled={readOnly}
+              aria-label={`${destination.label} enabled`}
+              onCheckedChange={(checked) => {
+                const next = externalNotificationDestinationWith({
+                  destination,
+                  enabled: Boolean(checked),
+                });
+                if (next !== null) onChange(next);
+              }}
+            />
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Home Assistant webhook ·{" "}
+            {destination.configured ? "Webhook URL saved securely." : "No webhook URL configured."}
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <Input
+              aria-label={`Replace ${destination.label} webhook URL`}
+              className="min-w-64 flex-1 sm:max-w-md"
+              size="sm"
+              type="url"
+              value={webhookUrl}
+              disabled={readOnly}
+              placeholder="Paste a new webhook URL to replace the saved one"
+              autoComplete="off"
+              onChange={(event) => setWebhookUrl(event.target.value)}
+            />
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={readOnly || webhookUrl.trim() === ""}
+              onClick={saveWebhookUrl}
+            >
+              Replace URL
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={readOnly || !destination.configured || testing}
+              onClick={() => void testDestination()}
+            >
+              <SendIcon className="size-3.5" aria-hidden />
+              {testing ? "Testing…" : "Send test"}
+            </Button>
+            <Button
+              size="icon-sm"
+              variant="destructive-outline"
+              disabled={readOnly}
+              onClick={onRemove}
+              aria-label={`Remove ${destination.label}`}
+            >
+              <Trash2Icon className="size-3.5" aria-hidden />
+            </Button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EnvironmentExternalNotificationsSettings({
+  environmentId,
+  environmentLabel,
+  readOnly,
+  deviceTabs,
+}: {
+  readonly environmentId: EnvironmentPresentation["environmentId"];
+  readonly environmentLabel: string;
+  readonly readOnly: boolean;
+  readonly deviceTabs: ReactNode;
+}) {
+  const settings = useEnvironmentSettings(environmentId);
+  const updateServerSettings = useAtomCommand(serverEnvironment.updateSettings, {
+    reportFailure: false,
+  });
+  const testExternalNotification = useAtomCommand(serverEnvironment.testExternalNotification, {
+    reportFailure: false,
+  });
+  const destinations = settings.externalNotifications.destinations;
+
+  const saveSettings = async (patch: ServerSettingsPatch) => {
+    const result = await updateServerSettings({
+      environmentId,
+      input: { patch },
+    });
+    if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+      const error = squashAtomCommandFailure(result);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Could not save external notification settings",
+          description:
+            error instanceof Error ? error.message : "The server rejected the settings update.",
+        }),
+      );
+    }
+  };
+
+  const updateDestination = (nextDestination: ExternalNotificationDestination) => {
+    void saveSettings({
+      externalNotifications: {
+        destinations: destinations.map((destination) =>
+          destination.id === nextDestination.id ? nextDestination : destination,
+        ),
+      },
+    });
+  };
+
+  const removeDestination = (destinationId: string) => {
+    void saveSettings({
+      externalNotifications: {
+        destinations: destinations.filter((destination) => destination.id !== destinationId),
+      },
+    });
+  };
+
+  const addDestination = () => {
+    const id = `home-assistant-${Date.now()}`;
+    const destination = decodeExternalNotificationDestination({
+      _tag: "home-assistant-webhook",
+      id,
+      label: "Home Assistant",
+      enabled: true,
+      configured: false,
+    });
+    if (Option.isNone(destination)) return;
+    void saveSettings({
+      externalNotifications: {
+        destinations: [...destinations, destination.value],
+      },
+    });
+  };
+
+  const testDestination = async (destinationId: string) => {
+    const result = await testExternalNotification({
+      environmentId,
+      input: { destinationId },
+    });
+    if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+      const error = squashAtomCommandFailure(result);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "External notification test failed",
+          description:
+            error instanceof Error ? error.message : "The destination could not be reached.",
+        }),
+      );
+      return;
+    }
+    if (result._tag === "Success") {
+      toastManager.add(
+        stackedThreadToast({
+          type: "success",
+          title: "Test notification sent",
+          description: `${environmentLabel} delivered a test event to Home Assistant.`,
+        }),
+      );
+    }
+  };
+
+  return (
+    <SettingsSection title="External notifications">
+      {deviceTabs}
+      <SettingsRow
+        title="App link scheme"
+        description="The app scheme used in notification links. Use the preview scheme when testing a preview build."
+        control={
+          <Select
+            value={settings.externalNotifications.appScheme}
+            disabled={readOnly}
+            onValueChange={(value) => {
+              if (value === "t3code-dev" || value === "t3code-preview" || value === "t3code") {
+                void saveSettings({ externalNotifications: { appScheme: value } });
+              }
+            }}
+          >
+            <SelectTrigger
+              className="w-full sm:w-44"
+              aria-label="External notification app link scheme"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectPopup align="end">
+              <SelectItem value="t3code-dev">Development</SelectItem>
+              <SelectItem value="t3code-preview">Preview</SelectItem>
+              <SelectItem value="t3code">Production</SelectItem>
+            </SelectPopup>
+          </Select>
+        }
+      />
+      <div className="space-y-3 px-3 pb-3 sm:px-4 sm:pb-4">
+        {destinations.map((destination) => (
+          <ExternalNotificationDestinationCard
+            key={destination.id}
+            destination={destination}
+            readOnly={readOnly}
+            onChange={updateDestination}
+            onRemove={() => removeDestination(destination.id)}
+            onTest={() => testDestination(destination.id)}
+          />
+        ))}
+        <Button size="sm" variant="outline" disabled={readOnly} onClick={addDestination}>
+          Add Home Assistant destination
+        </Button>
+      </div>
+    </SettingsSection>
+  );
+}
+
+function AccessGatedExternalNotificationsSettings({
+  environment,
+  operateAccess,
+  deviceTabs,
+}: {
+  readonly environment: EnvironmentPresentation;
+  readonly operateAccess: ProviderOperateAccess;
+  readonly deviceTabs: ReactNode;
+}) {
+  const access = classifyProviderEnvironmentAccess({
+    connectionPhase: environment.connection.phase,
+    hasServerConfig: environment.serverConfig !== null,
+    operateAccess,
+  });
+  if (access.kind !== "editable" && access.kind !== "read-only") {
+    return (
+      <ExternalNotificationsUnavailableRow
+        environment={environment}
+        access={access}
+        deviceTabs={deviceTabs}
+      />
+    );
+  }
+  return (
+    <EnvironmentExternalNotificationsSettings
+      key={environment.environmentId}
+      environmentId={environment.environmentId}
+      environmentLabel={environment.label}
+      readOnly={access.kind === "read-only"}
+      deviceTabs={deviceTabs}
+    />
+  );
+}
+
+function PrimarySessionExternalNotificationsSettings({
+  environment,
+  deviceTabs,
+}: {
+  readonly environment: EnvironmentPresentation;
+  readonly deviceTabs: ReactNode;
+}) {
+  const session = usePrimarySessionState();
+  const operateAccess = resolvePrimaryOperateAccess({
+    isPrimary: true,
+    hasDesktopBridge: false,
+    session: session.data,
+    isPending: session.isPending,
+    hasError: session.error !== null,
+  });
+  return (
+    <AccessGatedExternalNotificationsSettings
+      environment={environment}
+      operateAccess={operateAccess}
+      deviceTabs={deviceTabs}
+    />
+  );
+}
+
+function RemoteSessionExternalNotificationsSettings({
+  environment,
+  deviceTabs,
+}: {
+  readonly environment: EnvironmentPresentation;
+  readonly deviceTabs: ReactNode;
+}) {
+  const session = useEnvironmentSessionState(environment.environmentId);
+  const operateAccess = resolveRemoteOperateAccess({
+    session: session.data,
+    isPending: session.isPending,
+    hasError: session.hasError,
+  });
+  return (
+    <AccessGatedExternalNotificationsSettings
+      environment={environment}
+      operateAccess={operateAccess}
+      deviceTabs={deviceTabs}
+    />
+  );
+}
+
+function SelectedExternalNotificationsSettings({
+  environment,
+  deviceTabs,
+}: {
+  readonly environment: EnvironmentPresentation;
+  readonly deviceTabs: ReactNode;
+}) {
+  if (environment.entry.target._tag === "PrimaryConnectionTarget") {
+    return isElectron ? (
+      <AccessGatedExternalNotificationsSettings
+        environment={environment}
+        operateAccess="granted"
+        deviceTabs={deviceTabs}
+      />
+    ) : (
+      <PrimarySessionExternalNotificationsSettings
+        environment={environment}
+        deviceTabs={deviceTabs}
+      />
+    );
+  }
+  return (
+    <RemoteSessionExternalNotificationsSettings environment={environment} deviceTabs={deviceTabs} />
+  );
+}
+
+function ExternalNotificationsSettings() {
+  const { environments, isReady } = useEnvironments();
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const options = useMemo(
+    () => buildProviderEnvironmentOptions(environments, primaryEnvironmentId),
+    [environments, primaryEnvironmentId],
+  );
+  const [selectedEnvironmentId, setSelectedEnvironmentId] = useState<
+    EnvironmentPresentation["environmentId"] | null
+  >(primaryEnvironmentId);
+  const effectiveEnvironmentId = resolveSelectedProviderEnvironmentId(
+    options,
+    selectedEnvironmentId,
+    primaryEnvironmentId,
+  );
+  const selectedEnvironment =
+    options.find((environment) => environment.environmentId === effectiveEnvironmentId) ?? null;
+  const deviceTabs =
+    options.length > 1 ? (
+      <div
+        role="tablist"
+        aria-label="Notification settings devices"
+        className="flex gap-1 overflow-x-auto border-b border-border/70 px-3 py-2 sm:px-4"
+      >
+        {options.map((environment) => (
+          <button
+            key={environment.environmentId}
+            type="button"
+            role="tab"
+            aria-selected={environment.environmentId === effectiveEnvironmentId}
+            className="flex shrink-0 items-center gap-1.5 rounded-md px-2.5 py-1.5 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground aria-selected:bg-muted aria-selected:text-foreground"
+            onClick={() => setSelectedEnvironmentId(environment.environmentId)}
+          >
+            {environment.entry.target._tag === "PrimaryConnectionTarget" ? (
+              <MonitorIcon className="size-3.5" aria-hidden />
+            ) : null}
+            {environment.label}
+          </button>
+        ))}
+      </div>
+    ) : null;
+
+  if (selectedEnvironment === null) {
+    return (
+      <SettingsSection title="External notifications">
+        <SettingsRow
+          title={isReady ? "No connected devices" : "Loading devices"}
+          description={
+            isReady
+              ? "Connect an execution environment before configuring notifications."
+              : "Reading connected execution environments."
+          }
+        />
+      </SettingsSection>
+    );
+  }
+  return (
+    <SelectedExternalNotificationsSettings
+      environment={selectedEnvironment}
+      deviceTabs={deviceTabs}
+    />
   );
 }
