@@ -406,6 +406,7 @@ export function ProjectMcpCatalogSettings({
             {draft ? (
               <form
                 className="grid gap-5"
+                noValidate
                 onSubmit={(event) => {
                   event.preventDefault();
                   void save();

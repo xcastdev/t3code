@@ -1,3 +1,5 @@
+/* @vitest-environment happy-dom */
+
 import {
   EnvironmentId,
   McpServerId,
@@ -9,11 +11,9 @@ import {
   type ServerProvider,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
-import type { ReactElement } from "react";
-import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
-
-import { visitElements } from "../../test/reactElementTree";
-import { reactHookHarness as hooks } from "../../test/reactHookHarness";
+import { act } from "react";
+import { createRoot, type Root } from "react-dom/client";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const atoms = vi.hoisted(() => ({
   catalog: Symbol("catalog"),
@@ -35,23 +35,6 @@ const query = vi.hoisted(() => ({
   refresh: vi.fn(),
 }));
 
-vi.mock("react", async (importOriginal) => {
-  const actual = await importOriginal<typeof import("react")>();
-  const { reactHookHarness } = await import("../../test/reactHookHarness");
-  return {
-    ...actual,
-    useCallback: reactHookHarness.useCallback,
-    useMemo: reactHookHarness.useMemo,
-    useRef: reactHookHarness.useRef,
-    useState: reactHookHarness.useState,
-  };
-});
-
-vi.mock("react/compiler-runtime", async () => {
-  const { reactHookHarness } = await import("../../test/reactHookHarness");
-  return { c: reactHookHarness.useMemoCache };
-});
-
 vi.mock("../../state/projects", () => ({
   projectMcpEnvironment: {
     catalog: () => atoms.catalog,
@@ -71,6 +54,133 @@ vi.mock("../../state/use-atom-command", () => ({
     if (atom === atoms.update) return commands.update;
     return commands.remove;
   },
+}));
+
+vi.mock("../ui/alert-dialog", () => ({
+  AlertDialog: ({ open, children }: { open: boolean; children: React.ReactNode }) =>
+    open ? <div>{children}</div> : null,
+  AlertDialogClose: ({ render }: { render: React.ReactNode }) => render,
+  AlertDialogDescription: ({ children }: { children: React.ReactNode }) => <p>{children}</p>,
+  AlertDialogFooter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  AlertDialogHeader: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  AlertDialogPopup: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  AlertDialogTitle: ({ children }: { children: React.ReactNode }) => <h2>{children}</h2>,
+}));
+
+vi.mock("../ui/button", () => ({
+  Button: ({
+    size: _size,
+    variant: _variant,
+    render: _render,
+    ...props
+  }: React.ComponentProps<"button"> & { size?: unknown; variant?: unknown; render?: unknown }) => (
+    <button {...props} />
+  ),
+}));
+
+vi.mock("../ui/checkbox", () => ({
+  Checkbox: ({
+    checked,
+    onCheckedChange,
+    ...props
+  }: React.ComponentProps<"input"> & {
+    checked: boolean;
+    onCheckedChange: (checked: boolean) => void;
+  }) => (
+    <input
+      {...props}
+      checked={checked}
+      type="checkbox"
+      onChange={(event) => onCheckedChange(event.target.checked)}
+    />
+  ),
+}));
+
+vi.mock("../ui/dialog", () => ({
+  Dialog: ({ open, children }: { open: boolean; children: React.ReactNode }) =>
+    open ? <div>{children}</div> : null,
+  DialogClose: ({ render }: { render: React.ReactNode }) => render,
+  DialogDescription: ({ children }: { children: React.ReactNode }) => <p>{children}</p>,
+  DialogFooter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DialogHeader: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DialogPanel: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DialogPopup: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DialogTitle: ({ children }: { children: React.ReactNode }) => <h2>{children}</h2>,
+}));
+
+vi.mock("../ui/input", async () => {
+  const React = await import("react");
+  return {
+    Input: React.forwardRef<
+      HTMLInputElement,
+      React.ComponentProps<"input"> & { nativeInput?: boolean; size?: unknown; unstyled?: boolean }
+    >(({ nativeInput: _nativeInput, size: _size, unstyled: _unstyled, ...props }, ref) => (
+      <input ref={ref} {...props} />
+    )),
+  };
+});
+
+vi.mock("../ui/switch", () => ({
+  Switch: ({
+    checked,
+    onCheckedChange,
+    ...props
+  }: React.ComponentProps<"button"> & {
+    checked: boolean;
+    onCheckedChange: (checked: boolean) => void;
+  }) => (
+    <button
+      {...props}
+      aria-checked={checked}
+      role="switch"
+      type="button"
+      onClick={() => onCheckedChange(!checked)}
+    />
+  ),
+}));
+
+vi.mock("../ui/toast", () => ({
+  stackedThreadToast: vi.fn(),
+  toastManager: { add: vi.fn() },
+}));
+
+vi.mock("./settingsLayout", () => ({
+  SettingsRow: ({
+    title,
+    description,
+    status,
+    control,
+    children,
+  }: {
+    title: string;
+    description?: string;
+    status?: string;
+    control?: React.ReactNode;
+    children?: React.ReactNode;
+  }) => (
+    <section>
+      <h3>{title}</h3>
+      {description ? <p>{description}</p> : null}
+      {status ? <p>{status}</p> : null}
+      {control}
+      {children}
+    </section>
+  ),
+  SettingsSection: ({
+    title,
+    headerAction,
+    children,
+  }: {
+    title: string;
+    headerAction?: React.ReactNode;
+    children: React.ReactNode;
+  }) => (
+    <section>
+      <h2>{title}</h2>
+      {headerAction}
+      {children}
+    </section>
+  ),
 }));
 
 import { applicationLabel, canEdit, ProjectMcpCatalogSettings } from "./ProjectMcpSettings";
@@ -144,47 +254,62 @@ function catalog(providerInstanceIds: ReadonlyArray<ProviderInstanceId> = [codex
   });
 }
 
-function renderPanel(canMutate = true): ReactElement<Record<string, unknown>> {
-  hooks.beginRender();
-  return ProjectMcpCatalogSettings({
-    environmentId,
-    projectId,
-    providers: [provider()],
-    canMutate,
-  }) as ReactElement<Record<string, unknown>>;
-}
+const roots: Root[] = [];
 
-function action(tree: unknown, label: string): ReactElement<Record<string, unknown>> {
-  const found = visitElements(tree, (element) => element.props["aria-label"] === label);
-  expect(found).not.toBeNull();
-  return found!;
-}
-
-function button(tree: unknown, label: string): ReactElement<Record<string, unknown>> {
-  const found = visitElements(tree, (element) => {
-    const children = element.props.children;
-    return children === label || (Array.isArray(children) && children.includes(label));
-  });
-  expect(found).not.toBeNull();
-  return found!;
-}
-
-function submit(tree: unknown): void {
-  const form = visitElements(tree, (element) => element.type === "form");
-  expect(form).not.toBeNull();
-  (form?.props.onSubmit as ((event: { preventDefault: () => void }) => void) | undefined)?.({
-    preventDefault: vi.fn(),
+async function renderPanel(canMutate = true): Promise<void> {
+  const container = document.createElement("div");
+  document.body.append(container);
+  const root = createRoot(container);
+  roots.push(root);
+  await act(async () => {
+    root.render(
+      <ProjectMcpCatalogSettings
+        canMutate={canMutate}
+        environmentId={environmentId}
+        projectId={projectId}
+        providers={[provider()]}
+      />,
+    );
   });
 }
 
-async function flushPromises(): Promise<void> {
-  await Promise.resolve();
-  await Promise.resolve();
+function labelled<T extends Element>(label: string): T {
+  const element = document.querySelector(`[aria-label="${label}"]`);
+  expect(element).not.toBeNull();
+  return element as T;
+}
+
+function button(label: string, occurrence = 0): HTMLButtonElement {
+  const buttons = [...document.querySelectorAll("button")].filter(
+    (element) => element.textContent === label,
+  );
+  expect(buttons[occurrence]).toBeDefined();
+  return buttons[occurrence]!;
+}
+
+async function click(element: HTMLElement): Promise<void> {
+  await act(async () => {
+    element.click();
+  });
+}
+
+async function input(element: HTMLInputElement, value: string): Promise<void> {
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+  setter?.call(element, value);
+  await act(async () => {
+    element.dispatchEvent(new Event("input", { bubbles: true }));
+  });
+}
+
+async function settle(): Promise<void> {
+  await act(async () => {
+    await Promise.resolve();
+  });
 }
 
 describe("ProjectMcpSettings", () => {
   beforeEach(() => {
-    hooks.reset();
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     query.data = catalog();
     query.error = null;
     query.isPending = false;
@@ -194,43 +319,62 @@ describe("ProjectMcpSettings", () => {
     commands.remove.mockReset().mockResolvedValue({ _tag: "Success" });
   });
 
+  afterEach(async () => {
+    await act(async () => {
+      for (const root of roots.splice(0)) root.unmount();
+    });
+    document.body.replaceChildren();
+    vi.unstubAllGlobals();
+  });
+
   it("labels next-session support honestly", () => {
     expect(applicationLabel("next-session")).toBe("Applies to new sessions");
   });
 
-  it("does not expose mutation controls for a managed entry", () => {
-    const tree = renderPanel();
+  it("renders managed entries without mutation controls and disables mutations without operate access", async () => {
+    await renderPanel(false);
+
     expect(canEdit(managedEntry)).toBe(false);
-    expect(
-      visitElements(tree, (element) => element.props["aria-label"] === "Edit t3-code"),
-    ).toBeNull();
-    expect(
-      visitElements(tree, (element) => element.props["aria-label"] === "Remove t3-code"),
-    ).toBeNull();
+    expect(document.body.textContent).toContain("Managed by T3");
+    expect(document.querySelector('[aria-label="Edit t3-code"]')).toBeNull();
+    expect(document.querySelector('[aria-label="Remove t3-code"]')).toBeNull();
+    expect(button("Add server").disabled).toBe(true);
+    expect(labelled<HTMLButtonElement>("Enable External").disabled).toBe(true);
+    expect(labelled<HTMLButtonElement>("Edit External").disabled).toBe(true);
+    expect(labelled<HTMLButtonElement>("Remove External").disabled).toBe(true);
   });
 
-  it("keeps mutations disabled while operate access is unavailable", () => {
-    const tree = renderPanel(false);
-    expect(button(tree, "Add server").props.disabled).toBe(true);
-    expect(action(tree, "Enable External").props.disabled).toBe(true);
-    expect(action(tree, "Edit External").props.disabled).toBe(true);
-    expect(action(tree, "Remove External").props.disabled).toBe(true);
+  it("submits accessible blank-field validation instead of native constraint validation", async () => {
+    await renderPanel();
+    await click(button("Add server"));
+
+    expect(document.querySelector("form")).not.toBeNull();
+    expect(labelled<HTMLInputElement>("MCP server name").required).toBe(true);
+    expect(labelled<HTMLInputElement>("MCP server URL").required).toBe(true);
+
+    await click(button("Add server", 1));
+
+    const name = labelled<HTMLInputElement>("MCP server name");
+    const url = labelled<HTMLInputElement>("MCP server URL");
+    expect(name.getAttribute("aria-invalid")).toBe("true");
+    expect(url.getAttribute("aria-invalid")).toBe("true");
+    expect(name.getAttribute("aria-describedby")).toBe("project-mcp-name-error");
+    expect(url.getAttribute("aria-describedby")).toBe("project-mcp-url-error");
+    expect(document.querySelectorAll('[role="alert"]')).toHaveLength(2);
+    expect(document.activeElement).toBe(name);
+
+    await input(name, "External");
+    expect(name.getAttribute("aria-invalid")).toBe("false");
+    expect(url.getAttribute("aria-invalid")).toBe("true");
   });
 
-  it("saves a server without any selected providers", async () => {
-    let tree = renderPanel();
-    (button(tree, "Add server").props.onClick as (() => void) | undefined)?.();
-    tree = renderPanel();
-    (action(tree, "MCP server name").props.onChange as ((event: unknown) => void) | undefined)?.({
-      target: { value: "Detached" },
-    });
-    tree = renderPanel();
-    (action(tree, "MCP server URL").props.onChange as ((event: unknown) => void) | undefined)?.({
-      target: { value: "https://detached.example.com/mcp" },
-    });
-    tree = renderPanel();
-    submit(tree);
-    await flushPromises();
+  it("saves a server with an empty provider selection", async () => {
+    await renderPanel();
+    await click(button("Add server"));
+    await input(labelled<HTMLInputElement>("MCP server name"), "Detached");
+    await input(labelled<HTMLInputElement>("MCP server URL"), "https://detached.example.com/mcp");
+    await click(button("Add server", 1));
+    await settle();
 
     expect(commands.create).toHaveBeenCalledWith({
       environmentId,
@@ -244,17 +388,18 @@ describe("ProjectMcpSettings", () => {
     });
   });
 
-  it("keeps a stale provider visible until the user removes it", async () => {
+  it("shows and removes stale providers while editing", async () => {
     query.data = catalog([removedProviderId]);
-    let tree = renderPanel();
-    (action(tree, "Edit External").props.onClick as (() => void) | undefined)?.();
-    tree = renderPanel();
-    const staleProvider = action(tree, "Select unavailable provider removed-provider");
-    expect(staleProvider.props.checked).toBe(true);
-    (staleProvider.props.onCheckedChange as ((checked: boolean) => void) | undefined)?.(false);
-    tree = renderPanel();
-    submit(tree);
-    await flushPromises();
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+
+    const staleProvider = labelled<HTMLInputElement>(
+      "Select unavailable provider removed-provider",
+    );
+    expect(staleProvider.checked).toBe(true);
+    await click(staleProvider);
+    await click(button("Save changes"));
+    await settle();
 
     expect(commands.update).toHaveBeenCalledWith({
       environmentId,
@@ -269,44 +414,19 @@ describe("ProjectMcpSettings", () => {
     });
   });
 
-  it("waits for confirmation before removing a server", async () => {
-    let tree = renderPanel();
-    (action(tree, "Remove External").props.onClick as (() => void) | undefined)?.();
-    await flushPromises();
-    expect(commands.remove).not.toHaveBeenCalled();
+  it("requires confirmation before removing a server", async () => {
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Remove External"));
 
-    tree = renderPanel();
-    expect(button(tree, "Remove server")).not.toBeNull();
-    (button(tree, "Remove server").props.onClick as (() => void) | undefined)?.();
-    await flushPromises();
+    expect(commands.remove).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain('Remove "External"?');
+
+    await click(button("Remove server"));
+    await settle();
+
     expect(commands.remove).toHaveBeenCalledWith({
       environmentId,
       input: { projectId, id: externalServer().id },
     });
-  });
-
-  it("marks blank name and URL fields invalid and clears each error when corrected", () => {
-    let tree = renderPanel();
-    (button(tree, "Add server").props.onClick as (() => void) | undefined)?.();
-    tree = renderPanel();
-    submit(tree);
-    tree = renderPanel();
-
-    const name = action(tree, "MCP server name");
-    const url = action(tree, "MCP server URL");
-    expect(name.props.required).toBe(true);
-    expect(url.props.required).toBe(true);
-    expect(name.props["aria-invalid"]).toBe(true);
-    expect(url.props["aria-invalid"]).toBe(true);
-    expect(name.props["aria-describedby"]).toBe("project-mcp-name-error");
-    expect(url.props["aria-describedby"]).toBe("project-mcp-url-error");
-    expect(visitElements(tree, (element) => element.props.role === "alert")).not.toBeNull();
-
-    (name.props.onChange as ((event: unknown) => void) | undefined)?.({
-      target: { value: "External" },
-    });
-    tree = renderPanel();
-    expect(action(tree, "MCP server name").props["aria-invalid"]).toBe(false);
-    expect(action(tree, "MCP server URL").props["aria-invalid"]).toBe(true);
   });
 });
