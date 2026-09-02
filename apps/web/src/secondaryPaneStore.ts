@@ -110,7 +110,9 @@ export function migratePersistedSecondaryPaneState(persistedState: unknown): {
 } {
   if (!persistedState || typeof persistedState !== "object") return { byThreadKey: {} };
   const rawByThreadKey = (persistedState as { byThreadKey?: unknown }).byThreadKey;
-  if (!rawByThreadKey || typeof rawByThreadKey !== "object") return { byThreadKey: {} };
+  if (!rawByThreadKey || typeof rawByThreadKey !== "object" || Array.isArray(rawByThreadKey)) {
+    return { byThreadKey: {} };
+  }
 
   const byThreadKey: Record<string, ThreadSecondaryPaneState> = {};
   for (const [threadKey, rawState] of Object.entries(rawByThreadKey)) {
@@ -243,6 +245,10 @@ export const useSecondaryPaneStore = create<SecondaryPaneStoreState>()(
       ),
       partialize: (state) => ({ byThreadKey: state.byThreadKey }),
       migrate: migratePersistedSecondaryPaneState,
+      merge: (persistedState, currentState) => ({
+        ...currentState,
+        ...migratePersistedSecondaryPaneState(persistedState),
+      }),
     },
   ),
 );
