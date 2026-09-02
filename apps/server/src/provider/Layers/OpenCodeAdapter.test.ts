@@ -5143,6 +5143,21 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           properties: { sessionID: "ses_task_child", status: { type: "busy" } },
         },
         {
+          id: "evt-child-question",
+          type: "question.asked",
+          properties: {
+            id: "que-task-child",
+            sessionID: "ses_task_child",
+            questions: [
+              {
+                header: "Scope",
+                question: "Which files should I inspect?",
+                options: [{ label: "All", description: "Inspect every file." }],
+              },
+            ],
+          },
+        },
+        {
           id: "evt-child-idle",
           type: "session.idle",
           properties: { sessionID: "ses_task_child" },
@@ -5174,7 +5189,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       ];
       const eventsFiber = yield* adapter.streamEvents.pipe(
         Stream.filter((event) => event.threadId === threadId && event.type.startsWith("task.")),
-        Stream.take(4),
+        Stream.take(5),
         Stream.runCollect,
         Effect.forkChild,
       );
@@ -5186,7 +5201,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
       NodeAssert.deepEqual(
         events.map((event) => event.type),
-        ["task.started", "task.progress", "task.progress", "task.completed"],
+        ["task.started", "task.progress", "task.progress", "task.progress", "task.completed"],
       );
       const started = events[0];
       if (started?.type === "task.started") {
@@ -5201,9 +5216,13 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       }
       const idle = events[2];
       if (idle?.type === "task.progress") {
-        NodeAssert.equal(idle.payload.status, "idle");
+        NodeAssert.equal(idle.payload.status, "waiting");
       }
-      const completed = events[3];
+      const childIdle = events[3];
+      if (childIdle?.type === "task.progress") {
+        NodeAssert.equal(childIdle.payload.status, "idle");
+      }
+      const completed = events[4];
       if (completed?.type === "task.completed") {
         NodeAssert.equal(completed.payload.status, "completed");
         NodeAssert.equal(completed.payload.summary, "Done");

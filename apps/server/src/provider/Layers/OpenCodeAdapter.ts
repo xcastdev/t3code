@@ -2335,6 +2335,35 @@ export function makeOpenCodeAdapter(
         !isParentEvent &&
         isKnownChildTaskEvent &&
         childTask !== undefined &&
+        isChildRequestEvent
+      ) {
+        if (event.type === "permission.asked") {
+          yield* emitOpenCodeTaskProgress(
+            context,
+            childTask,
+            turnId,
+            event,
+            "waiting",
+            `Permission requested: ${event.properties.permission}`,
+          );
+        } else if (event.type === "question.asked") {
+          yield* emitOpenCodeTaskProgress(
+            context,
+            childTask,
+            turnId,
+            event,
+            "waiting",
+            trimText(event.properties.questions[0]?.question),
+          );
+        } else {
+          yield* emitOpenCodeTaskProgress(context, childTask, turnId, event, "running");
+        }
+      }
+
+      if (
+        !isParentEvent &&
+        isKnownChildTaskEvent &&
+        childTask !== undefined &&
         !isChildRequestEvent
       ) {
         yield* emitOpenCodeTaskChildEvent(context, childTask, event, turnId);
