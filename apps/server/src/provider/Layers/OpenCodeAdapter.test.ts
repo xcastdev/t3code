@@ -5359,6 +5359,87 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("keeps a native-command turn active while OpenCode waits for a question", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-command-idle-question");
+      const sessionID = "http://127.0.0.1:9999/session";
+      const commandStarted = promiseWithResolvers<void>();
+      const commandRelease = promiseWithResolvers<void>();
+      const questionEvent = promiseWithResolvers<unknown>();
+      const questionReply = promiseWithResolvers<unknown>();
+      runtimeMock.state.commandObserved = () => commandStarted.resolve(undefined);
+      runtimeMock.state.commandImplementation = async () => commandRelease.promise;
+      runtimeMock.state.subscribedEvents = [questionEvent.promise, questionReply.promise];
+
+      const questionFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) => event.threadId === threadId && event.type === "user-input.requested",
+        ),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "/init",
+          modelSelection: createModelSelection(ProviderInstanceId.make("opencode"), "openai/gpt-5"),
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => commandStarted.promise);
+
+      questionEvent.resolve({
+        id: "evt-command-idle-question",
+        type: "question.asked",
+        properties: questionRequest("question-command-idle", sessionID),
+      });
+      yield* Fiber.join(questionFiber).pipe(Effect.timeout("1 second"));
+      commandRelease.resolve(undefined);
+      yield* Fiber.join(turnFiber).pipe(Effect.timeout("1 second"));
+
+      // OpenCode reports idle while a question is open. That is waiting work,
+      // not completed work: keep the provider turn alive so Stop can still
+      // target it.
+      yield* advanceTestClock(250);
+      const session = (yield* adapter.listSessions()).find(
+        (candidate) => candidate.threadId === threadId,
+      );
+      NodeAssert.equal(session?.status, "running");
+      NodeAssert.notEqual(session?.activeTurnId, undefined);
+
+      const resolvedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) => event.threadId === threadId && event.type === "user-input.resolved",
+        ),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      questionReply.resolve({
+        id: "evt-command-idle-question-replied",
+        type: "question.replied",
+        properties: {
+          sessionID,
+          requestID: "question-command-idle",
+          answers: [["Workspace"]],
+        },
+      });
+      yield* Fiber.join(resolvedFiber).pipe(Effect.timeout("1 second"));
+      yield* advanceTestClock(250);
+      yield* advanceTestClock(500);
+      const completedSession = (yield* adapter.listSessions()).find(
+        (candidate) => candidate.threadId === threadId,
+      );
+      NodeAssert.equal(completedSession?.status, "ready");
+      NodeAssert.equal(completedSession?.activeTurnId, undefined);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("lets OpenCode own session title generation and emits title metadata updates", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

@@ -294,6 +294,7 @@ interface OpenCodePromptAdmission {
   readonly generation: number;
   readonly turnId: TurnId;
   readonly messageId: string;
+  readonly nativeCommand: boolean;
   readonly priorAwaitingBusy: boolean;
   readonly priorIdle: { readonly turnId: TurnId; readonly raw: unknown } | undefined;
   idleDuringAdmission: { readonly turnId: TurnId; readonly raw: unknown } | undefined;
@@ -1351,6 +1352,9 @@ export function makeOpenCodeAdapter(
       }
     });
 
+    const hasPendingOpenCodeRequest = (context: OpenCodeSessionContext) =>
+      context.pendingPermissions.size > 0 || context.pendingQuestions.size > 0;
+
     const completeOpenCodeTurn = Effect.fn("completeOpenCodeTurn")(function* (
       context: OpenCodeSessionContext,
       turnId: TurnId,
@@ -1429,7 +1433,8 @@ export function makeOpenCodeAdapter(
           if (
             context.activeTurnId !== turnId ||
             context.awaitingBusyAfterInterruption ||
-            context.promptGeneration !== pending.promptGeneration
+            context.promptGeneration !== pending.promptGeneration ||
+            hasPendingOpenCodeRequest(context)
           ) {
             context.pendingIdleReconciliation = undefined;
             return;
@@ -1584,7 +1589,10 @@ export function makeOpenCodeAdapter(
         promptAdmission.recoveryRaw = raw;
       }
       if (promptAdmission.recoveryFiber) {
-        return;
+        if (promptAdmission.recoveryFiber.pollUnsafe() === undefined) {
+          return;
+        }
+        delete promptAdmission.recoveryFiber;
       }
       const recover = Effect.gen(function* () {
         yield* Deferred.await(promptAdmission.acceptance);
@@ -1596,6 +1604,17 @@ export function makeOpenCodeAdapter(
             promptAdmission.cancelled ||
             (yield* Ref.get(context.stopped))
           ) {
+            return;
+          }
+
+          // OpenCode reports idle while a command is waiting for a question
+          // or approval. Keep the active turn until that request resolves so
+          // the client can still stop it.
+          if (hasPendingOpenCodeRequest(context)) {
+            // This recovery is deliberately paused, rather than terminal.
+            // Release its one-shot guard now so the terminal request event
+            // can start a fresh reconciliation after the answer arrives.
+            delete promptAdmission.recoveryFiber;
             return;
           }
 
@@ -1715,6 +1734,21 @@ export function makeOpenCodeAdapter(
       );
       promptAdmission.recoveryFiber = yield* recover.pipe(Effect.forkIn(context.sessionScope));
     });
+
+    const reconcileResolvedOpenCodeRequest = Effect.fn("reconcileResolvedOpenCodeRequest")(
+      function* (context: OpenCodeSessionContext, raw: unknown) {
+        const activeTurnId = context.activeTurnId;
+        if (!activeTurnId || hasPendingOpenCodeRequest(context)) {
+          return;
+        }
+        if (context.promptAdmission?.nativeCommand) {
+          context.promptAdmission = undefined;
+          yield* scheduleIdleReconciliation(context, activeTurnId, raw);
+          return;
+        }
+        yield* schedulePromptAdmissionRecovery(context, raw);
+      },
+    );
 
     const interruptOpenCodeTurn = Effect.fn("interruptOpenCodeTurn")(function* (
       context: OpenCodeSessionContext,
@@ -2693,12 +2727,19 @@ export function makeOpenCodeAdapter(
             if (promptAdmission.accepted) {
               const idle = promptAdmission.idleDuringAdmission;
               context.awaitingBusyAfterInterruption = false;
-              context.promptAdmission = undefined;
-              if (promptAdmission.recoveryFiber) {
-                yield* Fiber.interrupt(promptAdmission.recoveryFiber);
-              }
-              if (idle) {
-                yield* scheduleIdleReconciliation(context, idle.turnId, idle.raw);
+              if (promptAdmission.nativeCommand) {
+                // The command may be paused on a question after its user
+                // message arrives. Keep its admission so the answer's
+                // terminal event can reconcile the consumed idle status.
+                yield* schedulePromptAdmissionRecovery(context, event);
+              } else {
+                context.promptAdmission = undefined;
+                if (promptAdmission.recoveryFiber) {
+                  yield* Fiber.interrupt(promptAdmission.recoveryFiber);
+                }
+                if (idle) {
+                  yield* scheduleIdleReconciliation(context, idle.turnId, idle.raw);
+                }
               }
             }
           }
@@ -2973,6 +3014,7 @@ export function makeOpenCodeAdapter(
         case "permission.replied": {
           yield* emitTerminalOpenCodeRequest(context, event);
           context.pendingPermissions.delete(event.properties.requestID);
+          yield* reconcileResolvedOpenCodeRequest(context, event);
           break;
         }
 
@@ -2984,12 +3026,14 @@ export function makeOpenCodeAdapter(
         case "question.replied": {
           yield* emitTerminalOpenCodeRequest(context, event);
           context.pendingQuestions.delete(event.properties.requestID);
+          yield* reconcileResolvedOpenCodeRequest(context, event);
           break;
         }
 
         case "question.rejected": {
           context.pendingQuestions.delete(event.properties.requestID);
           yield* emitTerminalOpenCodeRequest(context, event);
+          yield* reconcileResolvedOpenCodeRequest(context, event);
           break;
         }
 
@@ -3027,6 +3071,9 @@ export function makeOpenCodeAdapter(
           }
 
           if (event.properties.status.type === "idle" && turnId) {
+            if (hasPendingOpenCodeRequest(context)) {
+              break;
+            }
             if (context.cancellation?.turnId === turnId) {
               context.cancellation.deferredIdleEvent = event;
               break;
@@ -3059,6 +3106,9 @@ export function makeOpenCodeAdapter(
           // guards as `session.status: idle`, otherwise a child/late idle can
           // complete the wrong turn.
           if (context.cancellation?.turnId === turnId) {
+            break;
+          }
+          if (hasPendingOpenCodeRequest(context)) {
             break;
           }
           if (context.promptAdmission?.turnId === turnId) {
@@ -3573,15 +3623,21 @@ export function makeOpenCodeAdapter(
             : undefined;
           context.pendingIdleReconciliation = undefined;
           const promptGeneration = context.promptGeneration + 1;
+          const nativeCommand = text ? parseOpenCodeCommandInput(text) : undefined;
           const promptAdmission: OpenCodePromptAdmission = {
             generation: promptGeneration,
             turnId,
             messageId,
+            nativeCommand: nativeCommand !== undefined,
             priorAwaitingBusy,
             priorIdle: priorIdleCandidate,
             idleDuringAdmission: undefined,
             idleObservedAfterMessage: false,
-            messageObserved: false,
+            // `session.command` has a synchronous lifecycle response instead
+            // of prompt_async's enqueue acknowledgement. Its return confirms
+            // the command reached OpenCode, even when it creates no user
+            // message to observe (for example, /init).
+            messageObserved: nativeCommand !== undefined,
             busyObserved: false,
             idleStatusConfirmations: 0,
             accepted: false,
@@ -3635,7 +3691,6 @@ export function makeOpenCodeAdapter(
           }
 
           let promptTimedOut = false;
-          const nativeCommand = text ? parseOpenCodeCommandInput(text) : undefined;
           const submitPrompt = runOpenCodeSdk(
             nativeCommand ? "session.command" : "session.promptAsync",
             async (signal) => {
@@ -3826,7 +3881,13 @@ export function makeOpenCodeAdapter(
           }
           promptAdmission.accepted = true;
           yield* Deferred.succeed(promptAdmission.acceptance, undefined).pipe(Effect.ignore);
-          if (
+          if (promptAdmission.nativeCommand) {
+            // Native commands do not use prompt_async's acknowledgement
+            // lifecycle. Retain the admission until a status reconciliation
+            // observes their actual completion; a question can otherwise
+            // consume the sole idle event and strand the turn forever.
+            yield* schedulePromptAdmissionRecovery(context, promptAdmission.recoveryRaw);
+          } else if (
             context.promptAdmission === promptAdmission &&
             context.activeTurnId === turnId &&
             context.promptGeneration === promptAdmission.generation &&
