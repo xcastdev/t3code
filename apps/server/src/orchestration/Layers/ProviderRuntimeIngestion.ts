@@ -887,6 +887,77 @@ export function runtimeEventToActivities(
   return [];
 }
 
+/**
+ * Providers do not necessarily send per-request resolution events when a user
+ * aborts a turn. Close requests opened by that turn so their UI cannot outlive
+ * the turn that owned them.
+ */
+function resolutionActivitiesForAbortedTurn(
+  event: Extract<ProviderRuntimeEvent, { readonly type: "turn.aborted" }>,
+  activities: ReadonlyArray<OrchestrationThreadActivity>,
+): ReadonlyArray<OrchestrationThreadActivity> {
+  const turnId = toTurnId(event.turnId);
+  if (!turnId) {
+    return [];
+  }
+
+  const openRequests = new Map<string, OrchestrationThreadActivity>();
+  const orderedActivities = [...activities].toSorted(
+    (left, right) =>
+      left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id),
+  );
+
+  for (const activity of orderedActivities) {
+    const payload =
+      typeof activity.payload === "object" && activity.payload !== null
+        ? (activity.payload as Record<string, unknown>)
+        : null;
+    const requestId = typeof payload?.requestId === "string" ? payload.requestId : null;
+    if (!requestId) {
+      continue;
+    }
+    if (activity.kind === "approval.resolved" || activity.kind === "user-input.resolved") {
+      openRequests.delete(requestId);
+      continue;
+    }
+    if (
+      activity.turnId === turnId &&
+      (activity.kind === "approval.requested" || activity.kind === "user-input.requested")
+    ) {
+      openRequests.set(requestId, activity);
+    }
+  }
+
+  return Array.from(openRequests, ([requestId, activity]) => {
+    const payload = activity.payload as Record<string, unknown>;
+    if (activity.kind === "approval.requested") {
+      return {
+        id: EventId.make(`${event.eventId}:cancel:${requestId}`),
+        createdAt: event.createdAt,
+        tone: "approval" as const,
+        kind: "approval.resolved",
+        summary: "Approval cancelled",
+        payload: {
+          requestId,
+          ...(typeof payload.requestKind === "string" ? { requestKind: payload.requestKind } : {}),
+          ...(typeof payload.requestType === "string" ? { requestType: payload.requestType } : {}),
+          decision: "cancel",
+        },
+        turnId,
+      };
+    }
+    return {
+      id: EventId.make(`${event.eventId}:cancel:${requestId}`),
+      createdAt: event.createdAt,
+      tone: "info" as const,
+      kind: "user-input.resolved",
+      summary: "User input cancelled",
+      payload: { requestId, answers: {}, resolution: "cancelled" },
+      turnId,
+    };
+  });
+}
+
 const make = Effect.gen(function* () {
   const threadBackgroundLiveness = yield* ThreadBackgroundLivenessService;
   const threadPlanProgress = yield* ThreadPlanProgressService;
@@ -2047,6 +2118,27 @@ const make = Effect.gen(function* () {
           ),
         ),
       ).pipe(Effect.asVoid);
+
+      if (event.type === "turn.aborted") {
+        const detail = yield* getLoadedThreadDetail();
+        const terminalActivities = resolutionActivitiesForAbortedTurn(
+          event,
+          detail?.activities ?? [],
+        );
+        yield* Effect.forEach(terminalActivities, (activity) =>
+          providerCommandId(event, `thread-activity-cancel:${activity.id}`).pipe(
+            Effect.flatMap((commandId) =>
+              orchestrationEngine.dispatch({
+                type: "thread.activity.append",
+                commandId,
+                threadId: thread.id,
+                activity,
+                createdAt: activity.createdAt,
+              }),
+            ),
+          ),
+        ).pipe(Effect.asVoid);
+      }
     });
 
   const processDomainEvent = (_event: TurnStartRequestedDomainEvent) => Effect.void;
