@@ -23,16 +23,16 @@ OAuth, local stdio MCP servers, or live reload for project MCP servers.
 ## Check provider support and application labels
 
 T3 Code sends a server only to selected providers that support it. OpenCode or another
-unsupported provider may remain selected, but it shows **Not supported** and does not receive the
-server.
+unsupported provider may remain selected, but it shows **Not supported by this provider** and does
+not receive the server.
 
 The application label for each selected provider shows support and timing:
 
-- **Available now** means the provider supports the server.
 - **Applies to new sessions** means the provider receives the server when a new session starts.
   Existing sessions do not change.
-- **Not supported** means the provider does not receive the server, even if selected.
-- **Unavailable** means the provider is not available to receive the server.
+- **Not supported by this provider** means the provider does not receive the server, even if
+  selected.
+- **Provider unavailable** means the provider is not available to receive the server.
 
 If you select no providers, T3 Code saves the server but attaches it nowhere. After you add, edit,
 enable, disable, or reassign a server, start a new session when the application label says
