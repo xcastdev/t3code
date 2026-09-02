@@ -12,6 +12,9 @@ import {
   OrchestrationThread,
   OrchestrationThreadDetailSnapshot,
   ProjectScript,
+  McpServerId,
+  ProjectMcpUrl,
+  ProviderInstanceId,
   TurnId,
   type OrchestrationCheckpointSummary,
   type OrchestrationLatestTurn,
@@ -172,6 +175,14 @@ const ThreadTurnRangeLookupInput = Schema.Struct({
   beforeTurnKey: Schema.String,
 });
 const ProjectionProjectLookupRowSchema = ProjectionProjectDbRowSchema;
+const ProjectionProjectMcpServerDbRowSchema = Schema.Struct({
+  projectId: ProjectId,
+  serverId: McpServerId,
+  name: Schema.String,
+  url: ProjectMcpUrl,
+  enabled: Schema.Number,
+  providerInstanceIds: Schema.fromJsonString(Schema.Array(ProviderInstanceId)),
+});
 const ProjectionThreadIdLookupRowSchema = Schema.Struct({
   threadId: ThreadId,
 });
@@ -609,6 +620,23 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           updated_at AS "updatedAt"
         FROM projection_thread_sessions
         ORDER BY thread_id ASC
+      `,
+  });
+
+  const listProjectMcpServerRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionProjectMcpServerDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          project_id AS "projectId",
+          server_id AS "serverId",
+          name,
+          url,
+          enabled,
+          provider_instance_ids_json AS "providerInstanceIds"
+        FROM projection_project_mcp_servers
+        ORDER BY project_id ASC, name COLLATE NOCASE ASC, server_id ASC
       `,
   });
 
@@ -1761,6 +1789,14 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
+          listProjectMcpServerRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getCommandReadModel:listProjectMcpServers:query",
+                "ProjectionSnapshotQuery.getCommandReadModel:listProjectMcpServers:decodeRows",
+              ),
+            ),
+          ),
           listThreadRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
@@ -1805,10 +1841,21 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       )
       .pipe(
         Effect.flatMap(
-          ([projectRows, threadRows, proposedPlanRows, sessionRows, latestTurnRows, stateRows]) =>
+          ([
+            projectRows,
+            projectMcpServerRows,
+            threadRows,
+            proposedPlanRows,
+            sessionRows,
+            latestTurnRows,
+            stateRows,
+          ]) =>
             Effect.sync(() => {
               let updatedAt: string | null = null;
               const projects: OrchestrationProject[] = [];
+              const projectMcpServers: Array<
+                NonNullable<OrchestrationReadModel["projectMcpServers"]>[number]
+              > = [];
               const threads: OrchestrationThread[] = [];
 
               for (let index = 0; index < projectRows.length; index += 1) {
@@ -1828,6 +1875,22 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   createdAt: row.createdAt,
                   updatedAt: row.updatedAt,
                   deletedAt: row.deletedAt,
+                });
+              }
+              for (let index = 0; index < projectMcpServerRows.length; index += 1) {
+                const row = projectMcpServerRows[index];
+                if (!row) {
+                  continue;
+                }
+                projectMcpServers.push({
+                  projectId: row.projectId,
+                  server: {
+                    id: row.serverId,
+                    name: row.name,
+                    url: row.url,
+                    enabled: row.enabled === 1,
+                    providerInstanceIds: row.providerInstanceIds,
+                  },
                 });
               }
               for (let index = 0; index < threadRows.length; index += 1) {
@@ -1942,6 +2005,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               return {
                 snapshotSequence: computeSnapshotSequence(stateRows),
                 projects,
+                projectMcpServers,
                 threads,
                 updatedAt: updatedAt ?? "1970-01-01T00:00:00.000Z",
               } satisfies OrchestrationReadModel;

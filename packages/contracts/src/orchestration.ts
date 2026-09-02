@@ -23,6 +23,7 @@ import {
   TurnId,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { McpServerId, ProjectMcpServer } from "./projectMcp.ts";
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
@@ -490,6 +491,12 @@ export type OrchestrationThread = typeof OrchestrationThread.Type;
 export const OrchestrationReadModel = Schema.Struct({
   snapshotSequence: NonNegativeInt,
   projects: Schema.Array(OrchestrationProject),
+  projectMcpServers: Schema.Array(
+    Schema.Struct({
+      projectId: ProjectId,
+      server: ProjectMcpServer,
+    }),
+  ).pipe(Schema.optional),
   threads: Schema.Array(OrchestrationThread),
   updatedAt: IsoDateTime,
 });
@@ -730,6 +737,30 @@ const ProjectDeleteCommand = Schema.Struct({
   commandId: CommandId,
   projectId: ProjectId,
   force: Schema.optional(Schema.Boolean),
+});
+
+const ProjectMcpServerCreateCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-server.create"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  server: ProjectMcpServer,
+  createdAt: IsoDateTime,
+});
+
+const ProjectMcpServerUpdateCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-server.update"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  server: ProjectMcpServer,
+  updatedAt: IsoDateTime,
+});
+
+const ProjectMcpServerRemoveCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-server.remove"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  id: McpServerId,
+  removedAt: IsoDateTime,
 });
 
 const ThreadCreateCommand = Schema.Struct({
@@ -984,6 +1015,9 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ProjectCreateCommand,
   ProjectMetaUpdateCommand,
   ProjectDeleteCommand,
+  ProjectMcpServerCreateCommand,
+  ProjectMcpServerUpdateCommand,
+  ProjectMcpServerRemoveCommand,
   ThreadCreateCommand,
   ThreadDeleteCommand,
   ThreadArchiveCommand,
@@ -1012,6 +1046,9 @@ export const ClientOrchestrationCommand = Schema.Union([
   ProjectCreateCommand,
   ProjectMetaUpdateCommand,
   ProjectDeleteCommand,
+  ProjectMcpServerCreateCommand,
+  ProjectMcpServerUpdateCommand,
+  ProjectMcpServerRemoveCommand,
   ThreadCreateCommand,
   ThreadDeleteCommand,
   ThreadArchiveCommand,
@@ -1130,6 +1167,9 @@ export const OrchestrationEventType = Schema.Literals([
   "project.created",
   "project.meta-updated",
   "project.deleted",
+  "project.mcp-server.created",
+  "project.mcp-server.updated",
+  "project.mcp-server.removed",
   "thread.created",
   "thread.deleted",
   "thread.archived",
@@ -1191,6 +1231,24 @@ export const ProjectMetaUpdatedPayload = Schema.Struct({
 export const ProjectDeletedPayload = Schema.Struct({
   projectId: ProjectId,
   deletedAt: IsoDateTime,
+});
+
+export const ProjectMcpServerCreatedPayload = Schema.Struct({
+  projectId: ProjectId,
+  server: ProjectMcpServer,
+  createdAt: IsoDateTime,
+});
+
+export const ProjectMcpServerUpdatedPayload = Schema.Struct({
+  projectId: ProjectId,
+  server: ProjectMcpServer,
+  updatedAt: IsoDateTime,
+});
+
+export const ProjectMcpServerRemovedPayload = Schema.Struct({
+  projectId: ProjectId,
+  id: McpServerId,
+  removedAt: IsoDateTime,
 });
 
 export const ThreadCreatedPayload = Schema.Struct({
@@ -1441,6 +1499,21 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("project.deleted"),
     payload: ProjectDeletedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-server.created"),
+    payload: ProjectMcpServerCreatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-server.updated"),
+    payload: ProjectMcpServerUpdatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-server.removed"),
+    payload: ProjectMcpServerRemovedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

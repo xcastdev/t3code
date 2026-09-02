@@ -1,5 +1,6 @@
 import {
   ApprovalRequestId,
+  ProviderInstanceId,
   type ChatAttachment,
   type OrchestrationEvent,
   type OrchestrationSessionStatus,
@@ -10,6 +11,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -57,6 +59,7 @@ import {
 
 export const ORCHESTRATION_PROJECTOR_NAMES = {
   projects: "projection.projects",
+  projectMcpServers: "projection.project-mcp-servers",
   threads: "projection.threads",
   threadMessages: "projection.thread-messages",
   threadProposedPlans: "projection.thread-proposed-plans",
@@ -66,6 +69,10 @@ export const ORCHESTRATION_PROJECTOR_NAMES = {
   checkpoints: "projection.checkpoints",
   pendingApprovals: "projection.pending-approvals",
 } as const;
+
+const encodeProviderInstanceIds = Schema.encodeSync(
+  Schema.fromJsonString(Schema.Array(ProviderInstanceId)),
+);
 
 type ProjectorName =
   (typeof ORCHESTRATION_PROJECTOR_NAMES)[keyof typeof ORCHESTRATION_PROJECTOR_NAMES];
@@ -574,6 +581,64 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           return;
       }
     });
+
+    const applyProjectMcpServersProjection: ProjectorDefinition["apply"] = (
+      event,
+      _attachmentSideEffects,
+    ) =>
+      Effect.gen(function* () {
+        switch (event.type) {
+          case "project.mcp-server.created":
+          case "project.mcp-server.updated":
+            const providerInstanceIdsJson = encodeProviderInstanceIds(
+              event.payload.server.providerInstanceIds,
+            );
+            yield* sql`
+            INSERT INTO projection_project_mcp_servers (
+              server_id,
+              project_id,
+              name,
+              url,
+              enabled,
+              provider_instance_ids_json
+            )
+            VALUES (
+              ${event.payload.server.id},
+              ${event.payload.projectId},
+              ${event.payload.server.name},
+              ${event.payload.server.url},
+              ${event.payload.server.enabled ? 1 : 0},
+              ${providerInstanceIdsJson}
+            )
+            ON CONFLICT (server_id)
+            DO UPDATE SET
+              project_id = excluded.project_id,
+              name = excluded.name,
+              url = excluded.url,
+              enabled = excluded.enabled,
+              provider_instance_ids_json = excluded.provider_instance_ids_json
+          `;
+            return;
+
+          case "project.mcp-server.removed":
+            yield* sql`
+            DELETE FROM projection_project_mcp_servers
+            WHERE project_id = ${event.payload.projectId}
+              AND server_id = ${event.payload.id}
+          `;
+            return;
+
+          case "project.deleted":
+            yield* sql`
+            DELETE FROM projection_project_mcp_servers
+            WHERE project_id = ${event.payload.projectId}
+          `;
+            return;
+
+          default:
+            return;
+        }
+      }).pipe(Effect.mapError(toPersistenceSqlError("ProjectionPipeline.projectMcpServers:query")));
 
     const refreshThreadShellSummary = Effect.fn("refreshThreadShellSummary")(function* (
       threadId: ThreadId,
@@ -1699,6 +1764,10 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
       {
         name: ORCHESTRATION_PROJECTOR_NAMES.projects,
         apply: applyProjectsProjection,
+      },
+      {
+        name: ORCHESTRATION_PROJECTOR_NAMES.projectMcpServers,
+        apply: applyProjectMcpServersProjection,
       },
       {
         name: ORCHESTRATION_PROJECTOR_NAMES.threadMessages,

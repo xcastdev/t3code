@@ -28,6 +28,9 @@ const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 // window is a failed/stale start, not pending work. Mirrors the client's
 // QUEUED_TURN_START_GRACE_MS in client-runtime threadSettled.ts.
 const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
+const PROJECT_MCP_SERVER_LIMIT = 50;
+
+const foldProjectMcpName = (name: string): string => name.toLocaleLowerCase();
 
 /**
  * Blocked-on-you work derived from the thread's retained activities: an
@@ -345,6 +348,133 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           projectId: command.projectId,
           deletedAt: occurredAt,
+        },
+      };
+    }
+
+    case "project.mcp-server.create": {
+      yield* requireProject({
+        readModel,
+        command,
+        projectId: command.projectId,
+      });
+      const existingEntries = (readModel.projectMcpServers ?? []).filter(
+        (entry) => entry.projectId === command.projectId,
+      );
+      if (existingEntries.length >= PROJECT_MCP_SERVER_LIMIT) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `Project '${command.projectId}' cannot contain more than ${PROJECT_MCP_SERVER_LIMIT} MCP servers.`,
+          }),
+        );
+      }
+      if (
+        existingEntries.some(
+          (entry) =>
+            foldProjectMcpName(entry.server.name) === foldProjectMcpName(command.server.name),
+        )
+      ) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `Project '${command.projectId}' already contains an MCP server named '${command.server.name}'.`,
+          }),
+        );
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "project",
+          aggregateId: command.projectId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "project.mcp-server.created",
+        payload: {
+          projectId: command.projectId,
+          server: command.server,
+          createdAt: command.createdAt,
+        },
+      };
+    }
+
+    case "project.mcp-server.update": {
+      yield* requireProject({
+        readModel,
+        command,
+        projectId: command.projectId,
+      });
+      const existingEntries = (readModel.projectMcpServers ?? []).filter(
+        (entry) => entry.projectId === command.projectId,
+      );
+      if (!existingEntries.some((entry) => entry.server.id === command.server.id)) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `Project '${command.projectId}' does not contain MCP server '${command.server.id}'.`,
+          }),
+        );
+      }
+      if (
+        existingEntries.some(
+          (entry) =>
+            entry.server.id !== command.server.id &&
+            foldProjectMcpName(entry.server.name) === foldProjectMcpName(command.server.name),
+        )
+      ) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `Project '${command.projectId}' already contains an MCP server named '${command.server.name}'.`,
+          }),
+        );
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "project",
+          aggregateId: command.projectId,
+          occurredAt: command.updatedAt,
+          commandId: command.commandId,
+        })),
+        type: "project.mcp-server.updated",
+        payload: {
+          projectId: command.projectId,
+          server: command.server,
+          updatedAt: command.updatedAt,
+        },
+      };
+    }
+
+    case "project.mcp-server.remove": {
+      yield* requireProject({
+        readModel,
+        command,
+        projectId: command.projectId,
+      });
+      if (
+        !(readModel.projectMcpServers ?? []).some(
+          (entry) => entry.projectId === command.projectId && entry.server.id === command.id,
+        )
+      ) {
+        return yield* Effect.fail(
+          new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `Project '${command.projectId}' does not contain MCP server '${command.id}'.`,
+          }),
+        );
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "project",
+          aggregateId: command.projectId,
+          occurredAt: command.removedAt,
+          commandId: command.commandId,
+        })),
+        type: "project.mcp-server.removed",
+        payload: {
+          projectId: command.projectId,
+          id: command.id,
+          removedAt: command.removedAt,
         },
       };
     }

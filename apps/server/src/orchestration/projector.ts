@@ -13,6 +13,9 @@ import {
   MessageSentPayloadSchema,
   ProjectCreatedPayload,
   ProjectDeletedPayload,
+  ProjectMcpServerCreatedPayload,
+  ProjectMcpServerRemovedPayload,
+  ProjectMcpServerUpdatedPayload,
   ProjectMetaUpdatedPayload,
   ThreadActivityAppendedPayload,
   ThreadArchivedPayload,
@@ -189,6 +192,7 @@ export function createEmptyReadModel(nowIso: string): OrchestrationReadModel {
   return {
     snapshotSequence: 0,
     projects: [],
+    projectMcpServers: [],
     threads: [],
     updatedAt: nowIso,
   };
@@ -274,6 +278,59 @@ export function projectEvent(
                   updatedAt: payload.deletedAt,
                 }
               : project,
+          ),
+          projectMcpServers: (nextBase.projectMcpServers ?? []).filter(
+            (entry) => entry.projectId !== payload.projectId,
+          ),
+        })),
+      );
+
+    case "project.mcp-server.created":
+      return decodeForEvent(
+        ProjectMcpServerCreatedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          projectMcpServers: [
+            ...(nextBase.projectMcpServers ?? []).filter(
+              (entry) => entry.server.id !== payload.server.id,
+            ),
+            { projectId: payload.projectId, server: payload.server },
+          ],
+        })),
+      );
+
+    case "project.mcp-server.updated":
+      return decodeForEvent(
+        ProjectMcpServerUpdatedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          projectMcpServers: (nextBase.projectMcpServers ?? []).map((entry) =>
+            entry.projectId === payload.projectId && entry.server.id === payload.server.id
+              ? { projectId: payload.projectId, server: payload.server }
+              : entry,
+          ),
+        })),
+      );
+
+    case "project.mcp-server.removed":
+      return decodeForEvent(
+        ProjectMcpServerRemovedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => ({
+          ...nextBase,
+          projectMcpServers: (nextBase.projectMcpServers ?? []).filter(
+            (entry) => !(entry.projectId === payload.projectId && entry.server.id === payload.id),
           ),
         })),
       );
