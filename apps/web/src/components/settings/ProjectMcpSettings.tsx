@@ -14,13 +14,26 @@ import type {
   ServerProvider,
 } from "@t3tools/contracts";
 import { PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 
+import { isElectron } from "../../env";
+import { usePrimarySessionState } from "../../environments/primary";
 import { deriveProviderInstanceEntries } from "../../providerInstances";
+import { usePrimaryEnvironmentId } from "../../state/environments";
 import { projectMcpEnvironment } from "../../state/projects";
 import { useEnvironmentQuery } from "../../state/query";
 import { serverEnvironment } from "../../state/server";
+import { useEnvironmentSessionState } from "../../state/session";
 import { useAtomCommand } from "../../state/use-atom-command";
+import {
+  AlertDialog,
+  AlertDialogClose,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogPopup,
+  AlertDialogTitle,
+} from "../ui/alert-dialog";
 import { Button } from "../ui/button";
 import { Checkbox } from "../ui/checkbox";
 import {
@@ -36,6 +49,10 @@ import {
 import { Input } from "../ui/input";
 import { Switch } from "../ui/switch";
 import { stackedThreadToast, toastManager } from "../ui/toast";
+import {
+  resolvePrimaryOperateAccess,
+  resolveRemoteOperateAccess,
+} from "./ProviderSettingsPanel.logic";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
 
 type CatalogEntry = ProjectMcpServer | ProjectMcpManagedServer;
@@ -46,6 +63,8 @@ interface ProjectMcpDraft {
   readonly enabled: boolean;
   readonly providerInstanceIds: ReadonlyArray<ProviderInstanceId>;
 }
+
+type ProjectMcpFieldErrors = Partial<Record<"name" | "url", string>>;
 
 const EMPTY_DRAFT: ProjectMcpDraft = {
   name: "",
@@ -105,14 +124,16 @@ function ProjectMcpEntryDetails({
   );
 }
 
-function ProjectMcpCatalogSettings({
+export function ProjectMcpCatalogSettings({
   environmentId,
   projectId,
   providers,
+  canMutate,
 }: {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
   readonly providers: ReadonlyArray<ServerProvider>;
+  readonly canMutate: boolean;
 }) {
   const catalog = useEnvironmentQuery(
     projectMcpEnvironment.catalog({ environmentId, input: { projectId } }),
@@ -135,13 +156,16 @@ function ProjectMcpCatalogSettings({
   );
   const [editing, setEditing] = useState<ProjectMcpServer | null>(null);
   const [draft, setDraft] = useState<ProjectMcpDraft | null>(null);
-  const [formError, setFormError] = useState<string | null>(null);
+  const [fieldErrors, setFieldErrors] = useState<ProjectMcpFieldErrors>({});
   const [isSaving, setIsSaving] = useState(false);
+  const [removalTarget, setRemovalTarget] = useState<ProjectMcpServer | null>(null);
+  const nameInputRef = useRef<HTMLInputElement>(null);
+  const urlInputRef = useRef<HTMLInputElement>(null);
 
   const openCreate = useCallback(() => {
     setEditing(null);
     setDraft(EMPTY_DRAFT);
-    setFormError(null);
+    setFieldErrors({});
   }, []);
   const openEdit = useCallback((entry: ProjectMcpServer) => {
     setEditing(entry);
@@ -151,12 +175,12 @@ function ProjectMcpCatalogSettings({
       enabled: entry.enabled,
       providerInstanceIds: entry.providerInstanceIds,
     });
-    setFormError(null);
+    setFieldErrors({});
   }, []);
   const closeForm = useCallback(() => {
     setDraft(null);
     setEditing(null);
-    setFormError(null);
+    setFieldErrors({});
   }, []);
   const reportFailure = useCallback(<A, E>(title: string, result: AtomCommandResult<A, E>) => {
     if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
@@ -170,11 +194,17 @@ function ProjectMcpCatalogSettings({
     );
   }, []);
   const save = useCallback(async () => {
-    if (!draft || isSaving) return;
+    if (!draft || isSaving || !canMutate) return;
     const name = draft.name.trim();
     const url = draft.url.trim();
-    if (!name || !url) {
-      setFormError("Name and URL are required.");
+    const errors: ProjectMcpFieldErrors = {
+      ...(!name ? { name: "Name is required." } : {}),
+      ...(!url ? { url: "URL is required." } : {}),
+    };
+    if (Object.keys(errors).length > 0) {
+      setFieldErrors(errors);
+      if (errors.name) nameInputRef.current?.focus();
+      else urlInputRef.current?.focus();
       return;
     }
 
@@ -201,6 +231,7 @@ function ProjectMcpCatalogSettings({
     }
   }, [
     catalog,
+    canMutate,
     closeForm,
     createEntry,
     draft,
@@ -213,7 +244,7 @@ function ProjectMcpCatalogSettings({
   ]);
   const updateExisting = useCallback(
     async (entry: ProjectMcpServer, changes: Partial<ProjectMcpDraft>) => {
-      if (isSaving) return;
+      if (isSaving || !canMutate) return;
       setIsSaving(true);
       try {
         const result = await updateEntry({
@@ -236,36 +267,53 @@ function ProjectMcpCatalogSettings({
         setIsSaving(false);
       }
     },
-    [catalog, environmentId, isSaving, projectId, reportFailure, updateEntry],
+    [canMutate, catalog, environmentId, isSaving, projectId, reportFailure, updateEntry],
   );
   const removeExisting = useCallback(
     async (entry: ProjectMcpServer) => {
-      if (isSaving) return;
+      if (isSaving || !canMutate) return false;
       setIsSaving(true);
       try {
         const result = await removeEntry({ environmentId, input: { projectId, id: entry.id } });
         if (result._tag === "Success") {
           catalog.refresh();
-          return;
+          return true;
         }
         reportFailure("Failed to remove MCP server", result);
+        return false;
       } finally {
         setIsSaving(false);
       }
     },
-    [catalog, environmentId, isSaving, projectId, removeEntry, reportFailure],
+    [canMutate, catalog, environmentId, isSaving, projectId, removeEntry, reportFailure],
   );
+  const confirmRemoval = useCallback(async () => {
+    if (removalTarget === null) return;
+    if (await removeExisting(removalTarget)) {
+      setRemovalTarget(null);
+    }
+  }, [removalTarget, removeExisting]);
 
   const entries: ReadonlyArray<CatalogEntry> = [
     ...(catalog.data?.external ?? []),
     ...(catalog.data?.managed ?? []),
   ];
+  const unavailableProviderIds =
+    draft?.providerInstanceIds.filter(
+      (providerInstanceId) => !providerNameById.has(providerInstanceId),
+    ) ?? [];
 
   return (
     <SettingsSection
       title="MCP servers"
       headerAction={
-        <Button size="xs" variant="outline" type="button" onClick={openCreate}>
+        <Button
+          size="xs"
+          variant="outline"
+          type="button"
+          disabled={!canMutate}
+          onClick={openCreate}
+        >
           <PlusIcon className="size-3.5" />
           Add server
         </Button>
@@ -309,7 +357,7 @@ function ProjectMcpCatalogSettings({
                 <>
                   <Switch
                     checked={entry.enabled}
-                    disabled={isSaving}
+                    disabled={isSaving || !canMutate}
                     aria-label={`Enable ${entry.name}`}
                     onCheckedChange={(enabled) => void updateExisting(entry, { enabled })}
                   />
@@ -317,7 +365,7 @@ function ProjectMcpCatalogSettings({
                     size="icon-xs"
                     variant="ghost"
                     type="button"
-                    disabled={isSaving}
+                    disabled={isSaving || !canMutate}
                     aria-label={`Edit ${entry.name}`}
                     onClick={() => openEdit(entry)}
                   >
@@ -327,9 +375,9 @@ function ProjectMcpCatalogSettings({
                     size="icon-xs"
                     variant="ghost"
                     type="button"
-                    disabled={isSaving}
+                    disabled={isSaving || !canMutate}
                     aria-label={`Remove ${entry.name}`}
-                    onClick={() => void removeExisting(entry)}
+                    onClick={() => setRemovalTarget(entry)}
                   >
                     <Trash2Icon className="size-3.5" />
                   </Button>
@@ -366,21 +414,57 @@ function ProjectMcpCatalogSettings({
                 <label className="grid gap-1.5 text-sm font-medium">
                   Name
                   <Input
+                    ref={nameInputRef}
                     autoFocus
                     aria-label="MCP server name"
+                    aria-invalid={Boolean(fieldErrors.name)}
+                    aria-describedby={fieldErrors.name ? "project-mcp-name-error" : undefined}
+                    required
                     value={draft.name}
-                    onChange={(event) => setDraft({ ...draft, name: event.target.value })}
+                    disabled={!canMutate || isSaving}
+                    onChange={(event) => {
+                      setDraft({ ...draft, name: event.target.value });
+                      if (fieldErrors.name) {
+                        const { name: _name, ...remainingErrors } = fieldErrors;
+                        setFieldErrors(remainingErrors);
+                      }
+                    }}
                   />
+                  {fieldErrors.name ? (
+                    <p
+                      id="project-mcp-name-error"
+                      role="alert"
+                      className="text-sm text-destructive"
+                    >
+                      {fieldErrors.name}
+                    </p>
+                  ) : null}
                 </label>
                 <label className="grid gap-1.5 text-sm font-medium">
                   URL
                   <Input
+                    ref={urlInputRef}
                     aria-label="MCP server URL"
+                    aria-invalid={Boolean(fieldErrors.url)}
+                    aria-describedby={fieldErrors.url ? "project-mcp-url-error" : undefined}
                     inputMode="url"
                     placeholder="https://mcp.example.com"
+                    required
                     value={draft.url}
-                    onChange={(event) => setDraft({ ...draft, url: event.target.value })}
+                    disabled={!canMutate || isSaving}
+                    onChange={(event) => {
+                      setDraft({ ...draft, url: event.target.value });
+                      if (fieldErrors.url) {
+                        const { url: _url, ...remainingErrors } = fieldErrors;
+                        setFieldErrors(remainingErrors);
+                      }
+                    }}
                   />
+                  {fieldErrors.url ? (
+                    <p id="project-mcp-url-error" role="alert" className="text-sm text-destructive">
+                      {fieldErrors.url}
+                    </p>
+                  ) : null}
                 </label>
                 <div className="flex items-center justify-between gap-3">
                   <div>
@@ -392,6 +476,7 @@ function ProjectMcpCatalogSettings({
                   <Switch
                     checked={draft.enabled}
                     aria-label="Enable MCP server"
+                    disabled={!canMutate || isSaving}
                     onCheckedChange={(enabled) => setDraft({ ...draft, enabled })}
                   />
                 </div>
@@ -406,6 +491,8 @@ function ProjectMcpCatalogSettings({
                       <label key={provider.instanceId} className="flex items-center gap-2 text-sm">
                         <Checkbox
                           checked={selected}
+                          aria-label={`Select provider ${provider.displayName}`}
+                          disabled={!canMutate || isSaving}
                           onCheckedChange={(checked) =>
                             setDraft({
                               ...draft,
@@ -421,15 +508,36 @@ function ProjectMcpCatalogSettings({
                       </label>
                     );
                   })}
+                  {unavailableProviderIds.map((providerInstanceId) => (
+                    <label
+                      key={providerInstanceId}
+                      className="flex items-center gap-2 text-sm text-muted-foreground"
+                    >
+                      <Checkbox
+                        checked
+                        aria-label={`Select unavailable provider ${providerInstanceId}`}
+                        disabled={!canMutate || isSaving}
+                        onCheckedChange={(checked) => {
+                          if (checked) return;
+                          setDraft({
+                            ...draft,
+                            providerInstanceIds: draft.providerInstanceIds.filter(
+                              (id) => id !== providerInstanceId,
+                            ),
+                          });
+                        }}
+                      />
+                      {providerInstanceId} (Unavailable)
+                    </label>
+                  ))}
                 </fieldset>
-                {formError ? <p className="text-sm text-destructive">{formError}</p> : null}
                 <DialogFooter>
                   <DialogClose
                     render={<Button variant="outline" type="button" disabled={isSaving} />}
                   >
                     Cancel
                   </DialogClose>
-                  <Button type="submit" disabled={isSaving}>
+                  <Button type="submit" disabled={isSaving || !canMutate}>
                     {editing ? "Save changes" : "Add server"}
                   </Button>
                 </DialogFooter>
@@ -438,7 +546,88 @@ function ProjectMcpCatalogSettings({
           </DialogPanel>
         </DialogPopup>
       </Dialog>
+
+      <AlertDialog
+        open={removalTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setRemovalTarget(null);
+        }}
+      >
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Remove "{removalTarget?.name}"?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This removes the server from this checkout. Existing provider sessions may keep their
+              current configuration.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" disabled={isSaving} />}>
+              Cancel
+            </AlertDialogClose>
+            <Button
+              variant="destructive"
+              disabled={isSaving || !canMutate}
+              onClick={() => void confirmRemoval()}
+            >
+              Remove server
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
     </SettingsSection>
+  );
+}
+
+function PrimarySessionProjectMcpSettings({
+  environmentId,
+  projectId,
+  providers,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId;
+  readonly providers: ReadonlyArray<ServerProvider>;
+}) {
+  const session = usePrimarySessionState();
+  const operateAccess = resolvePrimaryOperateAccess({
+    isPrimary: true,
+    hasDesktopBridge: isElectron,
+    session: session.data,
+    isPending: session.isPending,
+    hasError: session.error !== null,
+  });
+  return (
+    <ProjectMcpCatalogSettings
+      environmentId={environmentId}
+      projectId={projectId}
+      providers={providers}
+      canMutate={operateAccess === "granted"}
+    />
+  );
+}
+
+function RemoteSessionProjectMcpSettings({
+  environmentId,
+  projectId,
+  providers,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId;
+  readonly providers: ReadonlyArray<ServerProvider>;
+}) {
+  const session = useEnvironmentSessionState(environmentId);
+  const operateAccess = resolveRemoteOperateAccess({
+    session: session.data,
+    isPending: session.isPending,
+    hasError: session.hasError,
+  });
+  return (
+    <ProjectMcpCatalogSettings
+      environmentId={environmentId}
+      projectId={projectId}
+      providers={providers}
+      canMutate={operateAccess === "granted"}
+    />
   );
 }
 
@@ -451,9 +640,19 @@ export function ProjectMcpSettings({
   readonly projectId: ProjectId;
 }) {
   const config = useAtomValue(serverEnvironment.configValueAtom(environmentId));
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
   if (config?.environment.capabilities.projectMcpCatalog !== true) return null;
+  if (environmentId === primaryEnvironmentId) {
+    return (
+      <PrimarySessionProjectMcpSettings
+        environmentId={environmentId}
+        projectId={projectId}
+        providers={config.providers}
+      />
+    );
+  }
   return (
-    <ProjectMcpCatalogSettings
+    <RemoteSessionProjectMcpSettings
       environmentId={environmentId}
       projectId={projectId}
       providers={config.providers}
