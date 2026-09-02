@@ -304,7 +304,7 @@ interface OpenCodePromptAdmission {
   idleStatusConfirmations: number;
   accepted: boolean;
   cancelled: boolean;
-  readonly acceptance: Deferred.Deferred<void>;
+  readonly acceptance: Deferred.Deferred<void, ProviderAdapterRequestError>;
   readonly submissionSettled: Deferred.Deferred<void>;
   promptFiber?: Fiber.Fiber<void, ProviderAdapterRequestError>;
   recoveryFiber?: Fiber.Fiber<void, never>;
@@ -1354,6 +1354,26 @@ export function makeOpenCodeAdapter(
 
     const hasPendingOpenCodeRequest = (context: OpenCodeSessionContext) =>
       context.pendingPermissions.size > 0 || context.pendingQuestions.size > 0;
+
+    // `session.command` does not acknowledge submission until the command has
+    // finished. A command-originated busy status, message, or input request is
+    // stronger evidence that OpenCode accepted it, and lets T3 stop waiting on
+    // Node's HTTP headers timeout while retaining the command fiber for Stop.
+    const acceptNativeCommandAdmission = Effect.fn("acceptNativeCommandAdmission")(function* (
+      context: OpenCodeSessionContext,
+    ) {
+      const admission = context.promptAdmission;
+      if (
+        !admission?.nativeCommand ||
+        admission.accepted ||
+        admission.cancelled ||
+        context.activeTurnId !== admission.turnId
+      ) {
+        return;
+      }
+      admission.accepted = true;
+      yield* Deferred.succeed(admission.acceptance, undefined).pipe(Effect.ignore);
+    });
 
     const completeOpenCodeTurn = Effect.fn("completeOpenCodeTurn")(function* (
       context: OpenCodeSessionContext,
@@ -2724,6 +2744,7 @@ export function makeOpenCodeAdapter(
             promptAdmission?.messageId === event.properties.info.id
           ) {
             promptAdmission.messageObserved = true;
+            yield* acceptNativeCommandAdmission(context);
             if (promptAdmission.accepted) {
               const idle = promptAdmission.idleDuringAdmission;
               context.awaitingBusyAfterInterruption = false;
@@ -3008,6 +3029,7 @@ export function makeOpenCodeAdapter(
 
         case "permission.asked": {
           yield* emitPendingOpenCodeRequest(context, event, event);
+          yield* acceptNativeCommandAdmission(context);
           break;
         }
 
@@ -3020,6 +3042,7 @@ export function makeOpenCodeAdapter(
 
         case "question.asked": {
           yield* emitPendingOpenCodeRequest(context, event, event);
+          yield* acceptNativeCommandAdmission(context);
           break;
         }
 
@@ -3046,6 +3069,7 @@ export function makeOpenCodeAdapter(
             context.awaitingBusyAfterInterruption = false;
             if (context.promptAdmission?.turnId === turnId) {
               context.promptAdmission.busyObserved = true;
+              yield* acceptNativeCommandAdmission(context);
               yield* schedulePromptAdmissionRecovery(context, event);
             }
             yield* updateProviderSession(context, {
@@ -3642,7 +3666,7 @@ export function makeOpenCodeAdapter(
             idleStatusConfirmations: 0,
             accepted: false,
             cancelled: false,
-            acceptance: Deferred.makeUnsafe<void>(),
+            acceptance: Deferred.makeUnsafe<void, ProviderAdapterRequestError>(),
             submissionSettled: Deferred.makeUnsafe<void>(),
             recoveryRaw: undefined,
           };
@@ -3753,10 +3777,21 @@ export function makeOpenCodeAdapter(
                   }),
                 )
           ).pipe(
+            Effect.tap(() => (nativeCommand ? acceptNativeCommandAdmission(context) : Effect.void)),
             Effect.tapError((requestError) =>
               context.promptAdmission !== promptAdmission || context.activeTurnId !== turnId
                 ? Effect.void
                 : Effect.gen(function* () {
+                    // A native command can produce an OpenCode lifecycle event
+                    // while its synchronous HTTP request is still open. Once
+                    // that event admitted the turn, a later client-side fetch
+                    // timeout is not a command failure and must not abort it.
+                    if (nativeCommand && promptAdmission.accepted) {
+                      return;
+                    }
+                    yield* Deferred.fail(promptAdmission.acceptance, requestError).pipe(
+                      Effect.ignore,
+                    );
                     if (!promptTimedOut) {
                       if (steeringTurnId !== undefined) {
                         context.promptAdmission = undefined;
@@ -3839,6 +3874,10 @@ export function makeOpenCodeAdapter(
                     });
                   }),
             ),
+            Effect.catchIf(
+              () => nativeCommand !== undefined && promptAdmission.accepted,
+              () => Effect.void,
+            ),
             Effect.onExit((exit) =>
               Effect.gen(function* () {
                 yield* Deferred.succeed(promptAdmission.submissionSettled, undefined).pipe(
@@ -3855,8 +3894,12 @@ export function makeOpenCodeAdapter(
           );
           const promptFiber = yield* promptEffect.pipe(Effect.forkIn(context.sessionScope));
           promptAdmission.promptFiber = promptFiber;
-          const promptExit = yield* Effect.exit(Fiber.join(promptFiber));
-          delete promptAdmission.promptFiber;
+          const promptExit = nativeCommand
+            ? yield* Effect.exit(Deferred.await(promptAdmission.acceptance))
+            : yield* Effect.exit(Fiber.join(promptFiber));
+          if (!nativeCommand) {
+            delete promptAdmission.promptFiber;
+          }
 
           const intentionallyCancelled =
             promptAdmission.cancelled ||

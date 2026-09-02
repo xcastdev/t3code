@@ -5344,15 +5344,68 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
       yield* adapter.interruptTurn(threadId, session?.activeTurnId);
       const turnExit = yield* Fiber.await(turnFiber);
-      NodeAssert.equal(Exit.isFailure(turnExit), true);
-      if (Exit.isFailure(turnExit)) {
-        NodeAssert.equal(Cause.hasInterruptsOnly(turnExit.cause), true);
-      }
+      // The question admitted the native command before its synchronous HTTP
+      // request returned, so dispatch has completed. The provider session
+      // itself remains active and is still what Stop must cancel.
+      NodeAssert.equal(Exit.isSuccess(turnExit), true);
       NodeAssert.ok(runtimeMock.state.abortCalls.length >= 1);
 
       commandRelease.resolve(undefined);
       yield* adapter.stopSession(threadId);
     }),
+  );
+
+  it.effect(
+    "admits a slash command when OpenCode asks a question before the command request returns",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-opencode-command-question-admission");
+        const sessionID = "http://127.0.0.1:9999/session";
+        const commandStarted = promiseWithResolvers<void>();
+        const commandRelease = promiseWithResolvers<void>();
+        const questionEvent = promiseWithResolvers<unknown>();
+        runtimeMock.state.commandObserved = () => commandStarted.resolve(undefined);
+        runtimeMock.state.commandImplementation = async () => commandRelease.promise;
+        runtimeMock.state.subscribedEvents = [questionEvent.promise];
+
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const turnFiber = yield* adapter
+          .sendTurn({
+            threadId,
+            input: "/spec add a fetch timeout regression",
+            modelSelection: createModelSelection(
+              ProviderInstanceId.make("opencode"),
+              "openai/gpt-5",
+            ),
+          })
+          .pipe(Effect.forkChild);
+        yield* Effect.promise(() => commandStarted.promise);
+
+        questionEvent.resolve({
+          id: "evt-command-question-admission",
+          type: "question.asked",
+          properties: questionRequest("question-command-admission", sessionID),
+        });
+
+        // `session.command` remains synchronous until the command is done, but
+        // this question proves OpenCode accepted it. Do not hold the caller open
+        // until Node's five-minute fetch headers timeout.
+        yield* Fiber.join(turnFiber).pipe(Effect.timeout("1 second"));
+
+        const session = (yield* adapter.listSessions()).find(
+          (candidate) => candidate.threadId === threadId,
+        );
+        NodeAssert.equal(session?.status, "running");
+        NodeAssert.notEqual(session?.activeTurnId, undefined);
+
+        commandRelease.resolve(undefined);
+        yield* adapter.stopSession(threadId);
+      }),
   );
 
   it.effect("keeps a native-command turn active while OpenCode waits for a question", () =>
