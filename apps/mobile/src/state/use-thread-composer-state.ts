@@ -5,6 +5,7 @@ import * as Cause from "effect/Cause";
 
 import {
   CommandId,
+  expandOpenCodeCommandTemplate,
   MessageId,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   type EnvironmentId,
@@ -13,6 +14,7 @@ import {
   type RuntimeMode,
   type ThreadId,
 } from "@t3tools/contracts";
+import { mergeServerProviderCatalogs } from "@t3tools/client-runtime/providerCatalog";
 import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
 import {
   codexFeedbackMessage,
@@ -52,10 +54,12 @@ import {
 import { setPendingConnectionError } from "../state/use-remote-environment-registry";
 import { useSelectedThreadDetail } from "../state/use-thread-detail";
 import { useThreadSelection } from "../state/use-thread-selection";
+import { useEnvironmentQuery } from "./query";
 import { enqueueThreadOutboxMessage } from "./thread-outbox";
 import { useThreadOutboxMessages } from "./use-thread-outbox";
 import { threadEnvironment } from "./threads";
 import { useAtomCommand } from "./use-atom-command";
+import { serverEnvironment } from "./server";
 
 export function appendReviewCommentToDraft(input: {
   readonly environmentId: EnvironmentId;
@@ -142,6 +146,20 @@ export function useThreadComposerState() {
   const modelSelection = selectedDraft?.modelSelection ?? selectedThread?.modelSelection ?? null;
   const runtimeMode = selectedDraft?.runtimeMode ?? selectedThread?.runtimeMode ?? null;
   const interactionMode = selectedDraft?.interactionMode ?? selectedThread?.interactionMode ?? null;
+  const providerCatalogQuery = useEnvironmentQuery(
+    selectedThread === null || selectedThreadShell === null
+      ? null
+      : serverEnvironment.providerCatalog({
+          environmentId: selectedThreadShell.environmentId,
+          input: { threadId: selectedThread.id },
+        }),
+  );
+  const providersWithCatalog = useMemo(() => {
+    const providers = selectedEnvironmentRuntime?.serverConfig?.providers ?? [];
+    return providerCatalogQuery.data === null
+      ? providers
+      : mergeServerProviderCatalogs(providers, providerCatalogQuery.data);
+  }, [providerCatalogQuery.data, selectedEnvironmentRuntime?.serverConfig?.providers]);
 
   const selectedThreadSessionActivity = useMemo(() => {
     const selectedThread = selectedThreadDetail ?? selectedThreadShell;
@@ -193,7 +211,7 @@ export function useThreadComposerState() {
       return null;
     }
 
-    const provider = selectedEnvironmentRuntime?.serverConfig?.providers.find(
+    const provider = providersWithCatalog.find(
       (entry) => entry.instanceId === thread.modelSelection.instanceId,
     );
     const feedbackCommand =
@@ -259,6 +277,10 @@ export function useThreadComposerState() {
 
     const metadata = makeQueuedMessageMetadata();
     const messageId = MessageId.make(metadata.messageId);
+    const displayText =
+      provider?.driver === "opencode"
+        ? expandOpenCodeCommandTemplate(text, provider.slashCommands)
+        : text;
     // Enqueue publishes the queued atom synchronously (the durable write
     // happens behind it), so clearing the draft here gives send feedback on
     // the tap frame instead of after file I/O. If the write fails the message
@@ -270,6 +292,7 @@ export function useThreadComposerState() {
       messageId,
       commandId: CommandId.make(metadata.commandId),
       text,
+      ...(displayText !== text ? { displayText } : {}),
       attachments,
       modelSelection: draft.modelSelection ?? thread.modelSelection,
       runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
@@ -297,12 +320,7 @@ export function useThreadComposerState() {
       },
     );
     return messageId;
-  }, [
-    selectedEnvironmentRuntime?.serverConfig?.providers,
-    selectedThreadDetail,
-    selectedThreadShell,
-    uploadThreadFeedback,
-  ]);
+  }, [providersWithCatalog, selectedThreadDetail, selectedThreadShell, uploadThreadFeedback]);
 
   const onChangeDraftMessage = useCallback(
     (value: string) => {

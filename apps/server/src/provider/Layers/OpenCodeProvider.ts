@@ -2,7 +2,9 @@ import {
   type ModelCapabilities,
   type OpenCodeSettings,
   type ServerProviderModel,
+  type ServerProviderSlashCommand,
   type ServerProviderSkill,
+  type ServerProviderCatalog,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Data from "effect/Data";
@@ -260,7 +262,9 @@ function trimOptional(value: string | null | undefined): string | undefined {
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
 
-function flattenOpenCodeSkills(input: OpenCodeInventory): ReadonlyArray<ServerProviderSkill> {
+export function flattenOpenCodeSkills(
+  input: OpenCodeInventory,
+): ReadonlyArray<ServerProviderSkill> {
   const skills: ServerProviderSkill[] = [];
   for (const skill of input.skills ?? []) {
     const name = trimOptional(skill.name);
@@ -279,6 +283,53 @@ function flattenOpenCodeSkills(input: OpenCodeInventory): ReadonlyArray<ServerPr
   }
 
   return skills.toSorted((left, right) => left.name.localeCompare(right.name));
+}
+
+export function flattenOpenCodeCommands(
+  input: OpenCodeInventory,
+): ReadonlyArray<ServerProviderSlashCommand> {
+  const commands: ServerProviderSlashCommand[] = [];
+  for (const command of input.commands ?? []) {
+    const name = trimOptional(command.name);
+    // Skills are rendered by the dedicated skill menu entry. Keeping their
+    // command aliases here would produce duplicate slash-menu rows.
+    if (!name || command.source === "skill") {
+      continue;
+    }
+    const description = trimOptional(command.description);
+    const template = trimOptional(command.template);
+    const hint = command.hints
+      .map(trimOptional)
+      .find((value): value is string => value !== undefined);
+    commands.push({
+      name,
+      ...(description ? { description } : {}),
+      ...(hint ? { input: { hint } } : {}),
+      ...(template ? { template } : {}),
+    });
+  }
+  const seen = new Set<string>();
+  return commands
+    .filter((command) => {
+      const key = command.name.toLowerCase();
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .toSorted((left, right) => left.name.localeCompare(right.name));
+}
+
+export function flattenOpenCodeCatalog(input: {
+  readonly instanceId: ServerProviderCatalog["instanceId"];
+  readonly inventory: OpenCodeInventory;
+}): ServerProviderCatalog {
+  return {
+    instanceId: input.instanceId,
+    slashCommands: flattenOpenCodeCommands(input.inventory),
+    skills: flattenOpenCodeSkills(input.inventory),
+  };
 }
 
 export const makePendingOpenCodeProvider = (
@@ -443,6 +494,7 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
           directory: cwd,
           ...(server.serverPassword !== undefined ? { serverPassword: server.serverPassword } : {}),
         }),
+        { directory: cwd },
       )
       .pipe(Effect.map((inventory) => ({ inventory, version: server.version })));
   const inventoryEffect = isExternalServer
@@ -476,12 +528,14 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
     DEFAULT_OPENCODE_MODEL_CAPABILITIES,
   );
   const skills = flattenOpenCodeSkills(inventoryExit.value.inventory);
+  const slashCommands = flattenOpenCodeCommands(inventoryExit.value.inventory);
   const connectedCount = inventoryExit.value.inventory.providerList.connected.length;
   return buildServerProvider({
     presentation: OPENCODE_PRESENTATION,
     enabled: true,
     checkedAt,
     models,
+    slashCommands,
     skills,
     probe: {
       installed: true,

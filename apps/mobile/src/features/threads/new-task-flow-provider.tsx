@@ -13,6 +13,7 @@ import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
+  expandOpenCodeCommandTemplate,
   MessageId,
   T3_PROJECT_FILE_NAME,
   ThreadId,
@@ -26,6 +27,7 @@ import * as Arr from "effect/Array";
 import { pipe } from "effect/Function";
 
 import { useEnvironmentServerConfig, useProjects, useThreadShells } from "../../state/entities";
+import { serverEnvironment } from "../../state/server";
 import type { TurnCommandMetadata } from "../../lib/commandMetadata";
 import type { DraftComposerAttachment } from "../../lib/composerImages";
 import type { ModelOption, ProviderGroup } from "../../lib/modelOptions";
@@ -76,6 +78,7 @@ import {
   useSavedRemoteConnections,
 } from "../../state/use-remote-environment-registry";
 import { EnvironmentProject } from "@t3tools/client-runtime/state/shell";
+import { mergeServerProviderCatalogs } from "@t3tools/client-runtime/providerCatalog";
 import { type VcsRef } from "@t3tools/client-runtime/state/vcs";
 import {
   buildHomeProjectScopes,
@@ -467,12 +470,29 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
         option.selection.instanceId === selectedModel.instanceId &&
         option.selection.model === selectedModel.model,
     ) ?? null;
+  const providerCatalogQuery = useEnvironmentQuery(
+    selectedProject === null
+      ? null
+      : serverEnvironment.providerCatalog({
+          environmentId: selectedProject.environmentId,
+          input: { projectId: selectedProject.id },
+        }),
+  );
+  const providersWithCatalog = useMemo(
+    () =>
+      selectedEnvironmentServerConfig === null || providerCatalogQuery.data === null
+        ? (selectedEnvironmentServerConfig?.providers ?? [])
+        : mergeServerProviderCatalogs(
+            selectedEnvironmentServerConfig.providers,
+            providerCatalogQuery.data,
+          ),
+    [providerCatalogQuery.data, selectedEnvironmentServerConfig],
+  );
   const selectedProviderStatus = useMemo(
     () =>
-      selectedEnvironmentServerConfig?.providers.find(
-        (provider) => provider.instanceId === selectedModel?.instanceId,
-      ) ?? null,
-    [selectedEnvironmentServerConfig, selectedModel?.instanceId],
+      providersWithCatalog.find((provider) => provider.instanceId === selectedModel?.instanceId) ??
+      null,
+    [providersWithCatalog, selectedModel?.instanceId],
   );
   const setSelectedModelKey = useCallback(
     // Options ride along in the same write: a follow-up setSelectedModelOptions
@@ -890,6 +910,14 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
         messageId: MessageId.make(metadata.messageId),
         commandId: CommandId.make(metadata.commandId),
         text,
+        ...(selectedProviderStatus?.driver === "opencode"
+          ? {
+              displayText: expandOpenCodeCommandTemplate(
+                text,
+                selectedProviderStatus.slashCommands,
+              ),
+            }
+          : {}),
         attachments: draft.attachments,
         modelSelection: draftModelSelection,
         runtimeMode: draft.runtimeMode ?? DEFAULT_RUNTIME_MODE,
@@ -931,6 +959,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       planModePreferenceLoaded,
       startFromOrigin,
       workspaceMode,
+      selectedProviderStatus,
     ],
   );
 

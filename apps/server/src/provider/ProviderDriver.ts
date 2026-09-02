@@ -25,6 +25,7 @@ import type {
   ProviderDriverKind,
   ProviderInstanceEnvironment,
   ProviderInstanceId,
+  ServerProviderCatalog,
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 import type * as Schema from "effect/Schema";
@@ -71,6 +72,12 @@ export interface ProviderInstance {
   readonly snapshot: ServerProviderShape;
   readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
   readonly textGeneration: TextGeneration.TextGeneration["Service"];
+  /**
+   * Resolve capabilities that are scoped to a project/worktree. Most
+   * providers have no cwd-local catalog; OpenCode supplies this for its
+   * native commands and skills.
+   */
+  readonly getCatalog?: (cwd: string) => Effect.Effect<ServerProviderCatalog>;
 }
 
 export interface ProviderContinuationIdentity {

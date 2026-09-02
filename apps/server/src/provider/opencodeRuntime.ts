@@ -4,6 +4,7 @@ import type { ChatAttachment, ProviderApprovalDecision, RuntimeMode } from "@t3t
 import {
   createOpencodeClient,
   type Agent,
+  type Command,
   type FilePartInput,
   type Model,
   type OpencodeClient,
@@ -186,6 +187,8 @@ export interface OpenCodeInventory {
   readonly providerList: ProviderListResponse;
   readonly agents: ReadonlyArray<Agent>;
   readonly skills: ReadonlyArray<OpenCodeSkill>;
+  /** Native slash commands, scoped to the requested project directory. */
+  readonly commands: ReadonlyArray<Command>;
 }
 
 export interface ParsedOpenCodeModelSlug {
@@ -253,6 +256,7 @@ export interface OpenCodeRuntimeShape {
   }) => OpencodeClient;
   readonly loadOpenCodeInventory: (
     client: OpencodeClient,
+    options?: { readonly directory?: string },
   ) => Effect.Effect<OpenCodeInventory, OpenCodeRuntimeError>;
   readonly loadInventoryFromCli: (input: {
     readonly binaryPath: string;
@@ -833,8 +837,10 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
     );
   };
 
-  const loadProviders = (client: OpencodeClient) =>
-    runOpenCodeSdk("provider.list", () => client.provider.list()).pipe(
+  const loadProviders = (client: OpencodeClient, directory?: string) =>
+    runOpenCodeSdk("provider.list", () =>
+      client.provider.list(directory ? { directory } : undefined),
+    ).pipe(
       Effect.filterMapOrFail(
         (list) =>
           list.data
@@ -849,14 +855,18 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
       ),
     );
 
-  const loadAgents = (client: OpencodeClient) =>
-    runOpenCodeSdk("app.agents", () => client.app.agents()).pipe(
+  const loadAgents = (client: OpencodeClient, directory?: string) =>
+    runOpenCodeSdk("app.agents", () =>
+      client.app.agents(directory ? { directory } : undefined),
+    ).pipe(
       Effect.map((result) => result.data ?? []),
       Effect.orElseSucceed((): ReadonlyArray<Agent> => []),
     );
 
-  const loadSkills = (client: OpencodeClient) =>
-    runOpenCodeSdk("app.skills", () => client.app.skills()).pipe(
+  const loadSkills = (client: OpencodeClient, directory?: string) =>
+    runOpenCodeSdk("app.skills", () =>
+      client.app.skills(directory ? { directory } : undefined),
+    ).pipe(
       Effect.map((result) =>
         (result.data ?? []).map((skill) => ({
           name: skill.name,
@@ -867,10 +877,33 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
       Effect.orElseSucceed((): ReadonlyArray<OpenCodeSkill> => []),
     );
 
-  const loadOpenCodeInventory: OpenCodeRuntimeShape["loadOpenCodeInventory"] = (client) =>
-    Effect.all([loadProviders(client), loadAgents(client), loadSkills(client)], {
-      concurrency: "unbounded",
-    }).pipe(Effect.map(([providerList, agents, skills]) => ({ providerList, agents, skills })));
+  const loadCommands = (client: OpencodeClient, directory?: string) =>
+    runOpenCodeSdk("command.list", () =>
+      client.command.list(directory ? { directory } : undefined),
+    ).pipe(
+      Effect.map((result) => result.data ?? []),
+      Effect.orElseSucceed((): ReadonlyArray<Command> => []),
+    );
+
+  const loadOpenCodeInventory: OpenCodeRuntimeShape["loadOpenCodeInventory"] = (client, options) =>
+    Effect.all(
+      [
+        loadProviders(client, options?.directory),
+        loadAgents(client, options?.directory),
+        loadSkills(client, options?.directory),
+        loadCommands(client, options?.directory),
+      ],
+      {
+        concurrency: "unbounded",
+      },
+    ).pipe(
+      Effect.map(([providerList, agents, skills, commands]) => ({
+        providerList,
+        agents,
+        skills,
+        commands,
+      })),
+    );
 
   const loadInventoryFromCli: OpenCodeRuntimeShape["loadInventoryFromCli"] = (input) =>
     Effect.gen(function* () {
@@ -968,6 +1001,7 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
         providerList: { all: allProviders, default: {}, connected },
         agents,
         skills,
+        commands: [],
       };
     });
 

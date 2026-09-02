@@ -12,7 +12,13 @@
  *
  * @module provider/Drivers/OpenCodeDriver
  */
-import { OpenCodeSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
+import {
+  OpenCodeSettings,
+  ProviderDriverKind,
+  type ServerProvider,
+  type ServerProviderCatalog,
+  type ServerProviderSlashCommand,
+} from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -29,6 +35,7 @@ import { ProviderDriverError } from "../Errors.ts";
 import { makeOpenCodeAdapter } from "../Layers/OpenCodeAdapter.ts";
 import {
   checkOpenCodeProviderStatus,
+  flattenOpenCodeCatalog,
   makePendingOpenCodeProvider,
 } from "../Layers/OpenCodeProvider.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
@@ -131,6 +138,10 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         accentColor,
         continuationGroupKey: continuationIdentity.continuationKey,
       });
+      const commandCatalogByDirectory = new Map<
+        string,
+        ReadonlyArray<ServerProviderSlashCommand>
+      >();
       const effectiveConfig = { ...config, enabled } satisfies OpenCodeSettings;
       const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
         binaryPath: effectiveConfig.binaryPath,
@@ -140,6 +151,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
       const adapter = yield* makeOpenCodeAdapter(effectiveConfig, {
         instanceId,
         environment: processEnv,
+        commandCatalog: (directory) => commandCatalogByDirectory.get(directory) ?? [],
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
       });
       const serverOwner = yield* OpenCodeServerOwner.make({
@@ -159,6 +171,11 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         serverConfig.cwd,
         processEnv,
       ).pipe(
+        Effect.tap((provider) =>
+          Effect.sync(() => {
+            commandCatalogByDirectory.set(serverConfig.cwd, provider.slashCommands);
+          }),
+        ),
         Effect.map(stampIdentity),
         Effect.provideService(OpenCodeServerOwner.OpenCodeServerOwner, serverOwner),
         Effect.provideService(OpenCodeRuntime, openCodeRuntime),
@@ -196,6 +213,71 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         ),
       );
 
+      const getCatalog = (cwd: string): Effect.Effect<ServerProviderCatalog> => {
+        if (!effectiveConfig.enabled) {
+          commandCatalogByDirectory.set(cwd, []);
+          return Effect.succeed({
+            instanceId,
+            slashCommands: [],
+            skills: [],
+          });
+        }
+
+        const loadInventory = (server: {
+          readonly url: string;
+          readonly serverPassword?: string;
+        }) =>
+          openCodeRuntime
+            .loadOpenCodeInventory(
+              openCodeRuntime.createOpenCodeSdkClient({
+                baseUrl: server.url,
+                directory: cwd,
+                ...(server.serverPassword !== undefined
+                  ? { serverPassword: server.serverPassword }
+                  : {}),
+              }),
+              { directory: cwd },
+            )
+            .pipe(
+              Effect.map((inventory) => {
+                const catalog = flattenOpenCodeCatalog({
+                  instanceId,
+                  inventory,
+                });
+                commandCatalogByDirectory.set(cwd, catalog.slashCommands);
+                return catalog;
+              }),
+            );
+
+        const inventoryEffect = effectiveConfig.serverUrl
+          ? openCodeRuntime
+              .connectToOpenCodeServer({
+                binaryPath: effectiveConfig.binaryPath,
+                directory: cwd,
+                serverUrl: effectiveConfig.serverUrl,
+                ...(effectiveConfig.serverPassword
+                  ? { serverPassword: effectiveConfig.serverPassword }
+                  : {}),
+              })
+              .pipe(Effect.flatMap(loadInventory), Effect.scoped)
+          : serverOwner.withServer(loadInventory);
+
+        return inventoryEffect.pipe(
+          Effect.catch(() =>
+            snapshot.getSnapshot.pipe(
+              Effect.map((current) => {
+                commandCatalogByDirectory.set(cwd, current.slashCommands);
+                return {
+                  instanceId,
+                  slashCommands: current.slashCommands,
+                  skills: current.skills,
+                } satisfies ServerProviderCatalog;
+              }),
+            ),
+          ),
+        );
+      };
+
       return {
         instanceId,
         driverKind: DRIVER_KIND,
@@ -206,6 +288,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         snapshot,
         adapter,
         textGeneration,
+        getCatalog,
       } satisfies ProviderInstance;
     }),
 };

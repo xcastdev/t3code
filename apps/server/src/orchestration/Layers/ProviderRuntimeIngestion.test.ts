@@ -369,6 +369,42 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBe("turn failed");
   });
 
+  it("clears an active turn when the provider aborts it", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-for-abort"),
+      provider: ProviderDriverKind.make("opencode"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      turnId: asTurnId("turn-aborted"),
+    });
+
+    await waitForThread(
+      harness.readModel,
+      (thread) =>
+        thread.session?.status === "running" && thread.session?.activeTurnId === "turn-aborted",
+    );
+
+    harness.emit({
+      type: "turn.aborted",
+      eventId: asEventId("evt-turn-aborted"),
+      provider: ProviderDriverKind.make("opencode"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+      turnId: asTurnId("turn-aborted"),
+      payload: { reason: "Interrupted by user." },
+    });
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.status === "ready" && entry.session?.activeTurnId === null,
+    );
+    expect(thread.session?.lastError).toBeNull();
+  });
+
   it("applies provider session.state.changed transitions directly", async () => {
     const harness = await createHarness();
     const waitingAt = "2026-01-01T00:00:00.000Z";
@@ -3582,6 +3618,104 @@ describe("ProviderRuntimeIngestion", () => {
     expect(resolvedPayload?.answers).toEqual({
       sandbox_mode: "workspace-write",
     });
+  });
+
+  it("cancels pending user input and approvals when its turn is aborted", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const turnId = asTurnId("turn-aborts-pending-requests");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-pending-request-abort"),
+      provider: ProviderDriverKind.make("opencode"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId,
+    });
+
+    await waitForThread(harness.readModel, (thread) => thread.session?.activeTurnId === turnId);
+
+    harness.emit({
+      type: "user-input.requested",
+      eventId: asEventId("evt-user-input-requested-for-abort"),
+      provider: ProviderDriverKind.make("opencode"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId,
+      requestId: ApprovalRequestId.make("req-user-input-aborted"),
+      payload: {
+        questions: [
+          {
+            id: "scope",
+            header: "Scope",
+            question: "Which scope should be used?",
+            options: [{ label: "Small", description: "Use the smaller scope" }],
+          },
+        ],
+      },
+    });
+    harness.emit({
+      type: "request.opened",
+      eventId: asEventId("evt-approval-requested-for-abort"),
+      provider: ProviderDriverKind.make("opencode"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      turnId,
+      requestId: ApprovalRequestId.make("req-approval-aborted"),
+      payload: {
+        requestType: "command_execution_approval",
+      },
+    });
+
+    await harness.drain();
+
+    harness.emit({
+      type: "turn.aborted",
+      eventId: asEventId("evt-turn-aborted-with-pending-requests"),
+      provider: ProviderDriverKind.make("opencode"),
+      createdAt: "2026-01-01T00:00:01.000Z",
+      threadId: asThreadId("thread-1"),
+      turnId,
+      payload: { reason: "Interrupted by user." },
+    });
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) =>
+        entry.activities.some(
+          (activity) =>
+            activity.kind === "user-input.resolved" &&
+            typeof activity.payload === "object" &&
+            activity.payload !== null &&
+            (activity.payload as Record<string, unknown>).requestId === "req-user-input-aborted",
+        ) &&
+        entry.activities.some(
+          (activity) =>
+            activity.kind === "approval.resolved" &&
+            typeof activity.payload === "object" &&
+            activity.payload !== null &&
+            (activity.payload as Record<string, unknown>).requestId === "req-approval-aborted",
+        ),
+    );
+    expect(thread.session?.status).toBe("ready");
+    expect(thread.session?.activeTurnId).toBeNull();
+    const cancelledQuestion = thread.activities.find(
+      (activity) =>
+        activity.kind === "user-input.resolved" &&
+        typeof activity.payload === "object" &&
+        activity.payload !== null &&
+        (activity.payload as Record<string, unknown>).requestId === "req-user-input-aborted",
+    );
+    const cancelledApproval = thread.activities.find(
+      (activity) =>
+        activity.kind === "approval.resolved" &&
+        typeof activity.payload === "object" &&
+        activity.payload !== null &&
+        (activity.payload as Record<string, unknown>).requestId === "req-approval-aborted",
+    );
+    expect((cancelledQuestion?.payload as Record<string, unknown>).resolution).toBe("cancelled");
+    expect((cancelledApproval?.payload as Record<string, unknown>).decision).toBe("cancel");
   });
 
   it("continues processing runtime events after a single event handler failure", async () => {

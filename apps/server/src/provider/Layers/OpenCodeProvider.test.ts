@@ -396,6 +396,49 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
       );
     }),
   );
+
+  it.effect("includes native OpenCode commands without duplicating skill aliases", () =>
+    Effect.gen(function* () {
+      runtimeMock.state.inventory = {
+        providerList: { connected: [], all: [], default: {} },
+        agents: [],
+        skills: [],
+        commands: [
+          {
+            name: "review",
+            description: "Review code",
+            source: "command",
+            template: "  Review $ARGUMENTS  ",
+            hints: ["focus"],
+          },
+          {
+            name: "skill-review",
+            description: "Skill alias",
+            source: "skill",
+            template: "Use skill",
+            hints: [],
+          },
+          {
+            name: "review",
+            description: "Duplicate",
+            source: "mcp",
+            template: "Duplicate",
+            hints: [],
+          },
+        ],
+      };
+
+      const snapshot = yield* checkProvider(makeOpenCodeSettings());
+      NodeAssert.deepEqual(snapshot.slashCommands, [
+        {
+          name: "review",
+          description: "Review code",
+          input: { hint: "focus" },
+          template: "Review $ARGUMENTS",
+        },
+      ]);
+    }),
+  );
 });
 
 it.layer(testLayer)("checkOpenCodeProviderStatus with configured server URL", (it) => {

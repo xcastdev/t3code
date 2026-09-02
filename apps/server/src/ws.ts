@@ -73,6 +73,7 @@ import { HttpRouter, HttpServerRequest, HttpServerRespondable } from "effect/uns
 import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
+import { resolveThreadWorkspaceCwd } from "./checkpointing/Utils.ts";
 import * as ServerConfig from "./config.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
@@ -1228,6 +1229,56 @@ const makeWsRpcLayer = (
         };
       });
 
+      const loadServerProviderCatalog = (input: {
+        readonly threadId?: ThreadId | undefined;
+        readonly projectId?: ProjectId | undefined;
+      }) =>
+        Effect.gen(function* () {
+          if (input.threadId === undefined && input.projectId === undefined) {
+            return { providers: [] } as const;
+          }
+
+          const thread =
+            input.threadId === undefined
+              ? Option.none()
+              : yield* projectionSnapshotQuery.getThreadShellById(input.threadId);
+          if (
+            Option.isSome(thread) &&
+            input.projectId !== undefined &&
+            thread.value.projectId !== input.projectId
+          ) {
+            return { providers: [] } as const;
+          }
+          const projectId = Option.isSome(thread) ? thread.value.projectId : input.projectId;
+          if (projectId === undefined) {
+            return { providers: [] } as const;
+          }
+          const project = yield* projectionSnapshotQuery.getProjectShellById(projectId);
+          if (Option.isNone(project)) {
+            return { providers: [] } as const;
+          }
+          const cwd = Option.isSome(thread)
+            ? resolveThreadWorkspaceCwd({
+                thread: thread.value,
+                projects: [project.value],
+              })
+            : project.value.workspaceRoot;
+          if (cwd === undefined) {
+            return { providers: [] } as const;
+          }
+
+          if (providerRegistry.getProviderCatalogs === undefined) {
+            return { providers: [] } as const;
+          }
+          const providers = yield* providerRegistry.getProviderCatalogs(cwd);
+          return { providers };
+        }).pipe(
+          // A catalog is an enhancement to an already usable provider
+          // snapshot. A missing/deleted thread or a transient OpenCode probe
+          // must never make the composer unavailable.
+          Effect.orElseSucceed(() => ({ providers: [] }) as const),
+        );
+
       const refreshGitStatus = (cwd: string) =>
         vcsStatusBroadcaster
           .refreshStatus(cwd)
@@ -1640,6 +1691,10 @@ const makeWsRpcLayer = (
           }),
         [WS_METHODS.serverGetConfig]: (_input) =>
           observeRpcEffect(WS_METHODS.serverGetConfig, loadServerConfig, {
+            "rpc.aggregate": "server",
+          }),
+        [WS_METHODS.serverGetProviderCatalog]: (input) =>
+          observeRpcEffect(WS_METHODS.serverGetProviderCatalog, loadServerProviderCatalog(input), {
             "rpc.aggregate": "server",
           }),
         [WS_METHODS.serverRefreshProviders]: (input) =>

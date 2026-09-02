@@ -968,7 +968,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           threadId: command.threadId,
           messageId: command.message.messageId,
           role: "user",
-          text: command.message.text,
+          text: command.message.displayText ?? command.message.text,
           attachments: command.message.attachments,
           turnId: null,
           streaming: false,
@@ -988,6 +988,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           threadId: command.threadId,
           messageId: command.message.messageId,
+          providerText: command.message.text,
           ...(command.modelSelection !== undefined
             ? { modelSelection: command.modelSelection }
             : {}),
