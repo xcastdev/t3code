@@ -332,7 +332,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         },
       },
       event: {
-        subscribe: async () => {
+        subscribe: async (_parameters?: unknown, options?: { readonly signal?: AbortSignal }) => {
           runtimeMock.state.eventSubscribeObserved?.();
           return {
             stream: (async function* () {
@@ -340,7 +340,19 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
                 yield { id: "evt-auto-connected", type: "server.connected", properties: {} };
               }
               for (const event of runtimeMock.state.subscribedEvents) {
-                const resolved = await event;
+                const resolved =
+                  event instanceof Promise && options?.signal
+                    ? await Promise.race([
+                        event,
+                        new Promise<never>((_, reject) => {
+                          options.signal?.addEventListener(
+                            "abort",
+                            () => reject(new DOMException("Aborted", "AbortError")),
+                            { once: true },
+                          );
+                        }),
+                      ])
+                    : await event;
                 while (runtimeMock.state.promptEchoEvents.length > 0) {
                   yield runtimeMock.state.promptEchoEvents.shift();
                 }
@@ -2560,6 +2572,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const opened = openedEvents.find((event) => event.type === "request.opened");
       NodeAssert.ok(opened);
       NodeAssert.equal(opened.requestId, "per_child");
+      NodeAssert.equal(opened.payload.requestType, "dynamic_tool_call");
       NodeAssert.equal(
         opened.raw?.source === "opencode.sdk.event" &&
           typeof opened.raw.payload === "object" &&
@@ -2682,6 +2695,86 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.equal(Option.getOrUndefined(resolved)?.type, "user-input.resolved");
 
       yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("settles pending permissions and questions when a session stops", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-stop-pending-opencode-requests");
+      const streamHold = promiseWithResolvers<unknown>();
+      const requestObserved = promiseWithResolvers<void>();
+      runtimeMock.state.subscribedEvents = [
+        {
+          id: "evt-root-permission",
+          type: "permission.asked",
+          properties: {
+            id: "per_stop",
+            sessionID: "http://127.0.0.1:9999/session",
+            permission: "skill",
+            patterns: ["review"],
+            metadata: {},
+            always: [],
+          },
+        },
+        {
+          id: "evt-root-question",
+          type: "question.asked",
+          properties: {
+            id: "que_stop",
+            sessionID: "http://127.0.0.1:9999/session",
+            questions: [
+              {
+                header: "Scope",
+                question: "Which scope should OpenCode use?",
+                options: [{ label: "Workspace", description: "Use this workspace." }],
+              },
+            ],
+          },
+        },
+        streamHold.promise,
+      ];
+
+      let requestCount = 0;
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.threadId === threadId &&
+            (event.type === "request.opened" ||
+              event.type === "user-input.requested" ||
+              event.type === "request.resolved" ||
+              event.type === "user-input.resolved"),
+        ),
+        Stream.tap(() => {
+          requestCount += 1;
+          if (requestCount === 2) {
+            requestObserved.resolve(undefined);
+          }
+          return Effect.void;
+        }),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "approval-required",
+      });
+      yield* Effect.promise(() => requestObserved.promise);
+      streamHold.resolve({ id: "evt-hold", type: "server.connected", properties: {} });
+      yield* adapter.stopSession(threadId);
+
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      NodeAssert.deepEqual(
+        events.map((event) => event.type),
+        ["request.opened", "user-input.requested", "request.resolved", "user-input.resolved"],
+      );
+      const resolvedApproval = events.find((event) => event.type === "request.resolved");
+      NodeAssert.equal(resolvedApproval?.payload.decision, "cancel");
+      const resolvedQuestion = events.find((event) => event.type === "user-input.resolved");
+      NodeAssert.deepEqual(resolvedQuestion?.payload.answers, {});
     }),
   );
 

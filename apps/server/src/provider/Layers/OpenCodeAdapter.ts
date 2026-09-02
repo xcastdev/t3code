@@ -445,7 +445,12 @@ function toToolLifecycleItemType(toolName: string): ToolLifecycleItemType {
 
 function mapPermissionToRequestType(
   permission: string,
-): "command_execution_approval" | "file_read_approval" | "file_change_approval" | "unknown" {
+):
+  | "command_execution_approval"
+  | "file_read_approval"
+  | "file_change_approval"
+  | "dynamic_tool_call"
+  | "unknown" {
   switch (permission) {
     case "bash":
       return "command_execution_approval";
@@ -454,7 +459,12 @@ function mapPermissionToRequestType(
     case "edit":
       return "file_change_approval";
     default:
-      return "unknown";
+      // OpenCode has more permission names than the canonical approval
+      // vocabulary (for example `task`, `skill`, `grep`, and
+      // `external_directory`). Keep those requests actionable. The client
+      // renders `dynamic_tool_call` as a command-style approval, while the
+      // native permission name and patterns remain in the request detail.
+      return "dynamic_tool_call";
   }
 }
 
@@ -720,6 +730,9 @@ const cancelPendingOpenCodePrompt = Effect.fn("cancelPendingOpenCodePrompt")(fun
 const closeStartingOpenCodeContext = Effect.fn("closeStartingOpenCodeContext")(function* (
   context: OpenCodeSessionContext,
   abortRemote: boolean,
+  settlePendingRequests: (
+    context: OpenCodeSessionContext,
+  ) => Effect.Effect<void, ProviderAdapterRequestError>,
 ) {
   if (yield* Ref.getAndSet(context.stopped, true)) {
     return;
@@ -738,11 +751,15 @@ const closeStartingOpenCodeContext = Effect.fn("closeStartingOpenCodeContext")(f
   if (abortRemote) {
     yield* abortOpenCodeSessionForTeardown(context);
   }
+  yield* settlePendingRequests(context);
   yield* Scope.close(context.sessionScope, Exit.void).pipe(Effect.ignore);
 });
 
 const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
   context: OpenCodeSessionContext,
+  settlePendingRequests: (
+    context: OpenCodeSessionContext,
+  ) => Effect.Effect<void, ProviderAdapterRequestError>,
 ) {
   // Race-safe one-shot: first caller flips the flag, everyone else no-ops.
   if (yield* Ref.getAndSet(context.stopped, true)) {
@@ -768,6 +785,7 @@ const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
   // handles (event-pump fiber, server-exit fiber, event-subscribe fetch),
   // but we still want to tell OpenCode that this session is done.
   yield* abortOpenCodeSessionForTeardown(context);
+  yield* settlePendingRequests(context);
 
   // Closing the session scope interrupts every fiber forked into it and
   // runs each finalizer we registered — the `AbortController.abort()` call,
@@ -901,7 +919,8 @@ export function makeOpenCodeAdapter(
         // the remaining cleanups.
         yield* Effect.forEach(
           contexts,
-          (context) => Effect.ignoreCause(stopOpenCodeContext(context)),
+          (context) =>
+            Effect.ignoreCause(stopOpenCodeContext(context, settlePendingOpenCodeRequests)),
           { concurrency: "unbounded", discard: true },
         );
         // Close the logger AFTER session teardown so any final lifecycle
@@ -916,6 +935,66 @@ export function makeOpenCodeAdapter(
 
     const emit = (event: ProviderRuntimeEvent) =>
       Queue.offer(runtimeEvents, event).pipe(Effect.asVoid);
+
+    const settlePendingOpenCodeRequests = Effect.fn("settlePendingOpenCodeRequests")(function* (
+      context: OpenCodeSessionContext,
+    ) {
+      const turnId = context.activeTurnId;
+      const pendingPermissions = [...context.pendingPermissions.values()];
+      const pendingQuestions = [...context.pendingQuestions.values()];
+
+      // Stop relation retries before emitting terminal events. This prevents
+      // a request discovered by a late ancestry lookup from being reopened
+      // after the session has already been stopped.
+      for (const retry of context.requestRelationRetries.values()) {
+        if (retry.fiber) {
+          yield* Fiber.interrupt(retry.fiber);
+        }
+      }
+      context.requestRelationRetries.clear();
+
+      for (const request of pendingPermissions) {
+        if (context.emittedTerminalRequestIds.has(request.id)) {
+          continue;
+        }
+        context.resolvedRequestIds.add(request.id);
+        context.emittedTerminalRequestIds.add(request.id);
+        yield* emit({
+          ...(yield* buildEventBase({
+            threadId: context.session.threadId,
+            turnId,
+            requestId: request.id,
+            raw: request,
+          })),
+          type: "request.resolved",
+          payload: {
+            requestType: mapPermissionToRequestType(request.permission),
+            decision: "cancel",
+          },
+        });
+      }
+      context.pendingPermissions.clear();
+
+      for (const request of pendingQuestions) {
+        if (context.emittedTerminalRequestIds.has(request.id)) {
+          continue;
+        }
+        context.resolvedRequestIds.add(request.id);
+        context.emittedTerminalRequestIds.add(request.id);
+        yield* emit({
+          ...(yield* buildEventBase({
+            threadId: context.session.threadId,
+            turnId,
+            requestId: request.id,
+            raw: request,
+          })),
+          type: "user-input.resolved",
+          payload: { answers: {} },
+        });
+      }
+      context.pendingQuestions.clear();
+    });
+
     const writeNativeEvent = (
       threadId: ThreadId,
       event: {
@@ -1402,6 +1481,7 @@ export function makeOpenCodeAdapter(
           exitKind: "error",
         },
       }).pipe(Effect.ignore);
+      yield* settlePendingOpenCodeRequests(context).pipe(Effect.ignore);
       // Inline the teardown that `stopOpenCodeContext` would do; we can't
       // delegate to it because our `getAndSet` above already flipped the
       // one-shot guard, so the call would no-op.
@@ -2294,7 +2374,7 @@ export function makeOpenCodeAdapter(
           if (existing.session.status === "connecting" && !(yield* Ref.get(existing.stopped))) {
             return (yield* awaitOpenCodeContextReady(existing)).session;
           }
-          yield* stopOpenCodeContext(existing);
+          yield* stopOpenCodeContext(existing, settlePendingOpenCodeRequests);
           deleteContextIfCurrent(existing);
         }
 
@@ -2491,13 +2571,19 @@ export function makeOpenCodeAdapter(
         if (raceWinner) {
           // Another start published first. A newly created remote session
           // belongs to this loser; a resumed session is shared upstream state.
-          yield* closeStartingOpenCodeContext(context, started.created);
+          yield* closeStartingOpenCodeContext(
+            context,
+            started.created,
+            settlePendingOpenCodeRequests,
+          );
           return (yield* awaitOpenCodeContextReady(raceWinner)).session;
         }
         sessions.set(input.threadId, context);
-        const cleanupStartingContext = closeStartingOpenCodeContext(context, started.created).pipe(
-          Effect.ensuring(Effect.sync(() => deleteContextIfCurrent(context))),
-        );
+        const cleanupStartingContext = closeStartingOpenCodeContext(
+          context,
+          started.created,
+          settlePendingOpenCodeRequests,
+        ).pipe(Effect.ensuring(Effect.sync(() => deleteContextIfCurrent(context))));
         const connectionExit = yield* Effect.gen(function* () {
           yield* startEventPump(context);
           yield* Deferred.await(context.firstConnection).pipe(
@@ -3045,7 +3131,7 @@ export function makeOpenCodeAdapter(
             threadId,
           });
         }
-        const stopped = yield* stopOpenCodeContext(context);
+        const stopped = yield* stopOpenCodeContext(context, settlePendingOpenCodeRequests);
         deleteContextIfCurrent(context);
         if (!stopped) {
           return;
@@ -3129,7 +3215,8 @@ export function makeOpenCodeAdapter(
         // interrupt the sibling fibers. Same pattern as the layer finalizer.
         yield* Effect.forEach(
           contexts,
-          (context) => Effect.ignoreCause(stopOpenCodeContext(context)),
+          (context) =>
+            Effect.ignoreCause(stopOpenCodeContext(context, settlePendingOpenCodeRequests)),
           { concurrency: "unbounded", discard: true },
         );
       });
