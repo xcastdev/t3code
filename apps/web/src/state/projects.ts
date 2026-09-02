@@ -1,6 +1,9 @@
 import { createEnvironmentProjectAtoms } from "@t3tools/client-runtime/state/projects";
 import { createProjectEnvironmentAtoms } from "@t3tools/client-runtime/state/projects";
-import { createEnvironmentRpcQueryAtomFamily } from "@t3tools/client-runtime/state/runtime";
+import {
+  createEnvironmentRpcCommand,
+  createEnvironmentRpcQueryAtomFamily,
+} from "@t3tools/client-runtime/state/runtime";
 import { WS_METHODS } from "@t3tools/contracts";
 
 import { environmentCatalog } from "../connection/catalog";
@@ -19,6 +22,29 @@ export const projectContentSearch = createEnvironmentRpcQueryAtomFamily(connecti
   staleTimeMs: 5_000,
   idleTtlMs: 60_000,
 });
+
+/** Project-scoped MCP catalog reads and writes for one connected environment. */
+export const projectMcpEnvironment = {
+  catalog: createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
+    label: "environment-data:projects:mcp-catalog",
+    tag: WS_METHODS.projectMcpList,
+    staleTimeMs: 5_000,
+    idleTtlMs: 60_000,
+  }),
+  create: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:projects:mcp-create",
+    tag: WS_METHODS.projectMcpCreate,
+  }),
+  update: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:projects:mcp-update",
+    tag: WS_METHODS.projectMcpUpdate,
+  }),
+  remove: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:projects:mcp-remove",
+    tag: WS_METHODS.projectMcpRemove,
+  }),
+};
+
 export const environmentProjects = createEnvironmentProjectAtoms({
   catalogValueAtom: environmentCatalog.catalogValueAtom,
   snapshotAtom: environmentSnapshotAtom,
