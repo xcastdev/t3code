@@ -553,6 +553,7 @@ function PullRequestsView({
             }}
             context="page"
             composerDraftTarget={threadRef}
+            onActed={listQuery.refresh}
           />
         ) : (
           <div className="flex h-full flex-col items-center justify-center gap-2 px-6 text-center text-xs text-muted-foreground">
