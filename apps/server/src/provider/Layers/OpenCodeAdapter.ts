@@ -2012,6 +2012,7 @@ export function makeOpenCodeAdapter(
       }
       context.emittedTerminalRequestIds.add(requestId);
       if (event.type === "permission.replied") {
+        const request = context.pendingPermissions.get(requestId);
         yield* emit({
           ...(yield* buildEventBase({
             threadId: context.session.threadId,
@@ -2021,7 +2022,7 @@ export function makeOpenCodeAdapter(
           })),
           type: "request.resolved",
           payload: {
-            requestType: "unknown",
+            requestType: request ? mapPermissionToRequestType(request.permission) : "unknown",
             decision: mapPermissionDecision(event.properties.reply),
           },
         });
@@ -2661,8 +2662,8 @@ export function makeOpenCodeAdapter(
         }
 
         case "permission.replied": {
-          context.pendingPermissions.delete(event.properties.requestID);
           yield* emitTerminalOpenCodeRequest(context, event);
+          context.pendingPermissions.delete(event.properties.requestID);
           break;
         }
 

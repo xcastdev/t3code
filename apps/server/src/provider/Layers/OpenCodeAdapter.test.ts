@@ -2639,6 +2639,9 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       });
       const resolved = yield* Fiber.join(resolvedEventFiber).pipe(Effect.timeout("1 second"));
       NodeAssert.equal(Option.getOrUndefined(resolved)?.type, "request.resolved");
+      if (Option.isSome(resolved) && resolved.value.type === "request.resolved") {
+        NodeAssert.equal(resolved.value.payload.requestType, "dynamic_tool_call");
+      }
 
       yield* adapter.stopSession(threadId);
     }),
