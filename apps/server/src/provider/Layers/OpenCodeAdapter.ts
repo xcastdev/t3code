@@ -398,6 +398,7 @@ interface OpenCodeSessionContext {
   readonly subtaskPartById: Map<string, OpenCodeSubtaskPart>;
   readonly tasksBySessionId: Map<string, OpenCodeTaskState>;
   readonly taskSessionByToolCallId: Map<string, string>;
+  readonly pendingTextDeltasByPartId: Map<string, string>;
   readonly emittedTextByPartId: Map<string, string>;
   readonly toolStatusByCallId: Map<string, OpenCodeToolStatus>;
   readonly completedAssistantPartIds: Set<string>;
@@ -2444,9 +2445,22 @@ export function makeOpenCodeAdapter(
           break;
         }
 
+        case "message.part.removed": {
+          context.partById.delete(event.properties.partID);
+          context.subtaskPartById.delete(event.properties.partID);
+          context.pendingTextDeltasByPartId.delete(event.properties.partID);
+          context.emittedTextByPartId.delete(event.properties.partID);
+          context.completedAssistantPartIds.delete(event.properties.partID);
+          break;
+        }
+
         case "message.part.delta": {
           const existingPart = context.partById.get(event.properties.partID);
           if (!existingPart) {
+            context.pendingTextDeltasByPartId.set(
+              event.properties.partID,
+              `${context.pendingTextDeltasByPartId.get(event.properties.partID) ?? ""}${event.properties.delta}`,
+            );
             break;
           }
           const role = messageRoleForPart(context, existingPart);
@@ -2490,7 +2504,18 @@ export function makeOpenCodeAdapter(
         }
 
         case "message.part.updated": {
-          const part = event.properties.part;
+          const rawPart = event.properties.part;
+          const pendingDelta = context.pendingTextDeltasByPartId.get(rawPart.id);
+          context.pendingTextDeltasByPartId.delete(rawPart.id);
+          const part =
+            pendingDelta && (rawPart.type === "text" || rawPart.type === "reasoning")
+              ? {
+                  ...rawPart,
+                  text: rawPart.text.endsWith(pendingDelta)
+                    ? rawPart.text
+                    : `${rawPart.text}${pendingDelta}`,
+                }
+              : rawPart;
           context.partById.set(part.id, part);
           if (part.type === "subtask") {
             context.subtaskPartById.set(part.id, part);
@@ -3032,6 +3057,7 @@ export function makeOpenCodeAdapter(
           subtaskPartById: new Map(),
           tasksBySessionId: new Map(),
           taskSessionByToolCallId: new Map(),
+          pendingTextDeltasByPartId: new Map(),
           emittedTextByPartId: new Map(),
           toolStatusByCallId: new Map(),
           messageRoleById: new Map(),

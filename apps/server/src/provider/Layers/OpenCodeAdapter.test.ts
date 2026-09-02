@@ -4864,6 +4864,67 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("retains text deltas that arrive before their part snapshot", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-delta-before-part");
+      const sessionID = "http://127.0.0.1:9999/session";
+      runtimeMock.state.subscribedEvents = [
+        {
+          id: "evt-delta-message",
+          type: "message.updated",
+          properties: { sessionID, info: { id: "msg-delta-before", role: "assistant" } },
+        },
+        {
+          id: "evt-delta-before-part",
+          type: "message.part.delta",
+          properties: {
+            sessionID,
+            messageID: "msg-delta-before",
+            partID: "part-delta-before",
+            field: "text",
+            delta: "Hello before the snapshot",
+          },
+        },
+        {
+          id: "evt-part-after-delta",
+          type: "message.part.updated",
+          properties: {
+            sessionID,
+            part: {
+              id: "part-delta-before",
+              sessionID,
+              messageID: "msg-delta-before",
+              type: "text",
+              text: "",
+              time: { start: 1, end: 2 },
+            },
+            time: 2,
+          },
+        },
+      ];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "content.delta"),
+        Stream.take(1),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const event = Option.getOrUndefined(
+        yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.equal(event?.type, "content.delta");
+      if (event?.type === "content.delta") {
+        NodeAssert.equal(event.payload.delta, "Hello before the snapshot");
+      }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("normalizes assistant token usage without repeating identical snapshots", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
