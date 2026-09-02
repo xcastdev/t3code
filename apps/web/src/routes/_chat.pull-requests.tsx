@@ -1556,6 +1556,7 @@ function PullRequestsRouteView() {
         {rightPanelState.isOpen && activePullRequestSurface && panelEnvironmentId !== null ? (
           <RightPanelTabs
             mode="inline"
+            emptyState="tabs"
             widthStorageKey="t3code:pull-request-panel-width"
             // Default to roughly half the viewport: the PR list needs more
             // room than a chat, so the 540px chat-preview default squashes
@@ -1580,7 +1581,6 @@ function PullRequestsRouteView() {
               if (surface.kind === "pull-request") closeSurfacesToRight(surface);
             }}
             onCloseAllSurfaces={closeAllSurfaces}
-            onCopyFilePath={() => undefined}
             onAddBrowser={() => undefined}
             onAddTerminal={() => undefined}
             onAddDiff={() => undefined}

@@ -128,7 +128,7 @@ import { readLocalApi } from "../localApi";
 import { useAssetUrlState } from "../assets/assetUrls";
 import { cn } from "../lib/utils";
 import { useRemoteOpenResolution, type RemoteOpenMode } from "../remoteOpen";
-import { useRightPanelStore } from "../rightPanelStore";
+import { useSecondaryPaneStore } from "../secondaryPaneStore";
 import { readThreadShell, useProjects } from "../state/entities";
 import { serverEnvironment } from "../state/server";
 import { shellEnvironment } from "../state/shell";
@@ -2040,7 +2040,7 @@ function ChatMarkdown({
       // in flight.
       const isLatestLookup = claimWorkspaceBasenameLookup();
       const openAt = (path: string) =>
-        useRightPanelStore.getState().openFile(threadRef, path, line);
+        useSecondaryPaneStore.getState().openFile(threadRef, path, line);
       if (!cwd || !needsWorkspaceBasenameLookup(workspaceRelativePath)) {
         openAt(workspaceRelativePath);
         return;

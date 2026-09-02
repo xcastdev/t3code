@@ -12,7 +12,7 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { ChevronRight, Code2, Eye, FolderTree, Globe2, LoaderCircle } from "lucide-react";
+import { ChevronRight, Code2, Eye, Globe2, LoaderCircle } from "lucide-react";
 import * as Schema from "effect/Schema";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -22,7 +22,7 @@ import { OpenInPicker } from "~/components/chat/OpenInPicker";
 import { useRemoteOpenState } from "~/remoteOpen";
 import { useClientSettings } from "~/hooks/useSettings";
 import { useTheme } from "~/hooks/useTheme";
-import { getLocalStorageItem, setLocalStorageItem, useLocalStorage } from "~/hooks/useLocalStorage";
+import { useLocalStorage } from "~/hooks/useLocalStorage";
 import { useWorkspaceMutationRefresh } from "~/hooks/useWorkspaceMutationRefresh";
 import { DIFF_SURFACE_THEME_UNSAFE_CSS, resolveDiffThemeName } from "~/lib/diffRendering";
 import { cn } from "~/lib/utils";
@@ -41,7 +41,6 @@ import { projectEnvironment } from "~/state/projects";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 
-import FileBrowserPanel from "./FileBrowserPanel";
 import { FileMarkdownPreview } from "./FileMarkdownPreview";
 import {
   type FileCommentAnnotationEntry,
@@ -77,13 +76,11 @@ interface FilePreviewPanelProps {
   availableEditors: ReadonlyArray<EditorId>;
   revealLine: number | null;
   revealRequestId: number;
-  onOpenFile: (relativePath: string) => void;
   onPendingChange: (relativePath: string, pending: boolean) => void;
   selectedFilePending: boolean;
   workspaceMutationId: string | null;
 }
 
-const FILE_EXPLORER_STORAGE_KEY = "t3code.fileExplorerOpen";
 const RENDER_MARKDOWN_STORAGE_KEY = "t3code.renderMarkdown";
 const FILE_SAVE_DEBOUNCE_MS = 500;
 const FILE_LINK_REVEAL_ATTRIBUTE = "data-file-link-reveal";
@@ -755,15 +752,6 @@ function RenderedMarkdownSurface({
   );
 }
 
-function initialExplorerOpen(): boolean {
-  try {
-    return getLocalStorageItem(FILE_EXPLORER_STORAGE_KEY, Schema.Boolean) ?? true;
-  } catch (error) {
-    console.error(error);
-    return true;
-  }
-}
-
 export default function FilePreviewPanel({
   environmentId,
   cwd,
@@ -775,7 +763,6 @@ export default function FilePreviewPanel({
   availableEditors,
   revealLine,
   revealRequestId,
-  onOpenFile,
   onPendingChange,
   selectedFilePending,
   workspaceMutationId,
@@ -793,7 +780,6 @@ export default function FilePreviewPanel({
   });
   const isImage = relativePath !== null && isWorkspaceImagePreviewPath(relativePath);
   const file = useProjectFileQuery(environmentId, cwd, relativePath, !isImage);
-  const [explorerOpen, setExplorerOpen] = useState(initialExplorerOpen);
   // Reading markdown rendered is a preference, not a property of one file. Keeping
   // it on the panel meant a thread switch dropped it and forced source back.
   const [renderMarkdownPreferred, setRenderMarkdownPreferred] = useLocalStorage(
@@ -836,18 +822,6 @@ export default function FilePreviewPanel({
     );
     currentCrumb?.scrollIntoView({ block: "nearest", inline: "end" });
   }, [relativePath]);
-
-  const toggleExplorer = () => {
-    setExplorerOpen((current) => {
-      const next = !current;
-      try {
-        setLocalStorageItem(FILE_EXPLORER_STORAGE_KEY, next, Schema.Boolean);
-      } catch (error) {
-        console.error(error);
-      }
-      return next;
-    });
-  };
 
   const handleOpenInBrowser = useCallback(() => {
     if (!absolutePath || !environmentHttpBaseUrl) return;
@@ -978,25 +952,6 @@ export default function FilePreviewPanel({
               <TooltipPopup>Open file in preview browser</TooltipPopup>
             </Tooltip>
           ) : null}
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Toggle
-                  className="shrink-0"
-                  pressed={explorerOpen}
-                  onPressedChange={toggleExplorer}
-                  aria-label={explorerOpen ? "Hide file explorer" : "Show file explorer"}
-                  variant="ghost"
-                  size="sm"
-                >
-                  <FolderTree className="size-3.5" />
-                </Toggle>
-              }
-            />
-            <TooltipPopup>
-              {explorerOpen ? "Hide file explorer" : "Show file explorer"}
-            </TooltipPopup>
-          </Tooltip>
         </div>
       ) : null}
       {relativePath && file.data?.truncated ? (
@@ -1081,28 +1036,6 @@ export default function FilePreviewPanel({
             )
           ) : null}
         </div>
-        {explorerOpen || relativePath === null ? (
-          <aside
-            className={cn(
-              "flex min-h-0 shrink-0 bg-background",
-              relativePath
-                ? "w-[min(22rem,46%)] min-w-64 border-l border-border/60"
-                : "min-w-0 flex-1",
-            )}
-          >
-            <FileBrowserPanel
-              key={`${environmentId}:${cwd}`}
-              environmentId={environmentId}
-              cwd={cwd}
-              projectName={projectName}
-              selectedPath={relativePath}
-              selectedPathRevealId={revealRequestId}
-              onOpenFile={onOpenFile}
-              workspaceMutationId={workspaceMutationId}
-              {...(relativePath && !isImage ? { onRefreshSelectedFile: file.refresh } : {})}
-            />
-          </aside>
-        ) : null}
       </div>
     </div>
   );

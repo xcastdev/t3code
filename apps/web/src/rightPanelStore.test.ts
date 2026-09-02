@@ -1,4 +1,4 @@
-import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { scopeThreadRef, scopedThreadKey } from "@t3tools/client-runtime/environment";
 import { type EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
 
@@ -75,14 +75,17 @@ describe("rightPanelStore", () => {
     });
   });
 
-  it("upgrades saved file surfaces with neutral reveal state", () => {
+  it("drops saved file surfaces into an empty rail", () => {
     expect(
       migratePersistedRightPanelState({
         byThreadKey: {
           "env-1:thread-A": {
             isOpen: true,
             activeSurfaceId: "file:src/index.ts",
-            surfaces: [{ id: "file:src/index.ts", kind: "file", relativePath: "src/index.ts" }],
+            surfaces: [
+              null,
+              { id: "file:src/index.ts", kind: "file", relativePath: "src/index.ts" },
+            ],
           },
         },
       }),
@@ -90,16 +93,8 @@ describe("rightPanelStore", () => {
       byThreadKey: {
         "env-1:thread-A": {
           isOpen: true,
-          activeSurfaceId: "file:src/index.ts",
-          surfaces: [
-            {
-              id: "file:src/index.ts",
-              kind: "file",
-              relativePath: "src/index.ts",
-              revealLine: null,
-              revealRequestId: 0,
-            },
-          ],
+          activeSurfaceId: null,
+          surfaces: [],
         },
       },
     });
@@ -242,7 +237,7 @@ describe("rightPanelStore", () => {
     });
   });
 
-  it("keeps files as a singleton surface", () => {
+  it("keeps Project Explorer as a singleton surface", () => {
     useRightPanelStore.getState().open(refA, "files");
     useRightPanelStore.getState().open(refA, "files");
     expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
@@ -252,88 +247,25 @@ describe("rightPanelStore", () => {
     });
   });
 
-  it("replaces the standalone explorer with peer file surfaces", () => {
-    useRightPanelStore.getState().open(refA, "files");
-    useRightPanelStore.getState().openFile(refA, "src/index.ts");
-    useRightPanelStore.getState().openFile(refA, "src/index.ts");
-    useRightPanelStore.getState().openFile(refA, "README.md");
-
-    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
-      isOpen: true,
-      activeSurfaceId: "file:README.md",
-      surfaces: [
-        {
-          id: "file:src/index.ts",
-          kind: "file",
-          relativePath: "src/index.ts",
-          revealLine: null,
-          revealRequestId: 2,
+  it("migrates legacy file surfaces into the visible empty rail", () => {
+    expect(
+      migratePersistedRightPanelState({
+        byThreadKey: {
+          [scopedThreadKey(refA)]: {
+            isOpen: true,
+            activeSurfaceId: "file:src/index.ts",
+            surfaces: [{ id: "file:src/index.ts", kind: "file", relativePath: "src/index.ts" }],
+          },
         },
-        {
-          id: "file:README.md",
-          kind: "file",
-          relativePath: "README.md",
-          revealLine: null,
-          revealRequestId: 1,
+      }),
+    ).toEqual({
+      byThreadKey: {
+        [scopedThreadKey(refA)]: {
+          isOpen: true,
+          activeSurfaceId: null,
+          surfaces: [],
         },
-      ],
-    });
-  });
-
-  it("updates line reveal requests when reopening a file surface", () => {
-    useRightPanelStore.getState().openFile(refA, "src/index.ts", 42);
-    useRightPanelStore.getState().openFile(refA, "src/index.ts", 87);
-
-    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
-      isOpen: true,
-      activeSurfaceId: "file:src/index.ts",
-      surfaces: [
-        {
-          id: "file:src/index.ts",
-          kind: "file",
-          relativePath: "src/index.ts",
-          revealLine: 87,
-          revealRequestId: 2,
-        },
-      ],
-    });
-
-    useRightPanelStore.getState().openFile(refA, "src/index.ts");
-
-    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
-      isOpen: true,
-      activeSurfaceId: "file:src/index.ts",
-      surfaces: [
-        {
-          id: "file:src/index.ts",
-          kind: "file",
-          relativePath: "src/index.ts",
-          revealLine: null,
-          revealRequestId: 3,
-        },
-      ],
-    });
-  });
-
-  it("removes persisted file surfaces when their workspace no longer exists", () => {
-    useRightPanelStore.getState().openFile(refA, "src/index.ts");
-    useRightPanelStore.getState().open(refA, "agents");
-    useRightPanelStore.getState().openFile(refA, "README.md");
-
-    useRightPanelStore.getState().reconcileFileSurfaces(refA, false);
-
-    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
-      isOpen: true,
-      activeSurfaceId: "agents",
-      surfaces: [{ id: "agents", kind: "agents" }],
-    });
-
-    useRightPanelStore.getState().openFile(refB, "conductor.json");
-    useRightPanelStore.getState().reconcileFileSurfaces(refB, false);
-    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refB)).toEqual({
-      isOpen: false,
-      activeSurfaceId: null,
-      surfaces: [],
+      },
     });
   });
 
@@ -602,12 +534,12 @@ describe("rightPanelStore", () => {
     });
   });
 
-  it("closing the final terminal pane removes its surface and closes the panel", () => {
+  it("closing the final terminal pane removes its surface and leaves the rail visible", () => {
     useRightPanelStore.getState().openTerminal(refA, "term-1");
     useRightPanelStore.getState().closeTerminal(refA, "terminal:term-1", "term-1");
 
     expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
-      isOpen: false,
+      isOpen: true,
       activeSurfaceId: null,
       surfaces: [],
     });
@@ -623,12 +555,12 @@ describe("rightPanelStore", () => {
     );
   });
 
-  it("closing the final surface closes the panel", () => {
+  it("closing the final surface leaves the panel in rail mode", () => {
     useRightPanelStore.getState().openTerminal(refA, "term-1");
     useRightPanelStore.getState().closeSurface(refA, "terminal:term-1");
 
     expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
-      isOpen: false,
+      isOpen: true,
       activeSurfaceId: null,
       surfaces: [],
     });
@@ -636,29 +568,21 @@ describe("rightPanelStore", () => {
 
   it("closing other surfaces keeps the selected surface active", () => {
     useRightPanelStore.getState().openBrowser(refA, "tab-a");
-    useRightPanelStore.getState().openFile(refA, "src/index.ts");
+    useRightPanelStore.getState().open(refA, "diff");
     useRightPanelStore.getState().openTerminal(refA, "term-1");
 
-    useRightPanelStore.getState().closeOtherSurfaces(refA, "file:src/index.ts");
+    useRightPanelStore.getState().closeOtherSurfaces(refA, "diff");
 
     expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
       isOpen: true,
-      activeSurfaceId: "file:src/index.ts",
-      surfaces: [
-        {
-          id: "file:src/index.ts",
-          kind: "file",
-          relativePath: "src/index.ts",
-          revealLine: null,
-          revealRequestId: 1,
-        },
-      ],
+      activeSurfaceId: "diff",
+      surfaces: [{ id: "diff", kind: "diff" }],
     });
   });
 
   it("closing surfaces to the right activates the selected surface when active was removed", () => {
     useRightPanelStore.getState().openBrowser(refA, "tab-a");
-    useRightPanelStore.getState().openFile(refA, "src/index.ts");
+    useRightPanelStore.getState().open(refA, "diff");
     useRightPanelStore.getState().openTerminal(refA, "term-1");
 
     useRightPanelStore.getState().closeSurfacesToRight(refA, "browser:tab-a");
@@ -670,14 +594,14 @@ describe("rightPanelStore", () => {
     });
   });
 
-  it("closing all surfaces closes the panel", () => {
+  it("closing all surfaces leaves the rail visible", () => {
     useRightPanelStore.getState().openBrowser(refA, "tab-a");
-    useRightPanelStore.getState().openFile(refA, "src/index.ts");
+    useRightPanelStore.getState().open(refA, "agents");
 
     useRightPanelStore.getState().closeAllSurfaces(refA);
 
     expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
-      isOpen: false,
+      isOpen: true,
       activeSurfaceId: null,
       surfaces: [],
     });

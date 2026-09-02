@@ -1,7 +1,7 @@
 import type { ScopedThreadRef } from "@t3tools/contracts";
 import { isWindowsAbsolutePath, normalizeProjectPathForComparison } from "@t3tools/shared/path";
 
-import { useRightPanelStore } from "./rightPanelStore";
+import { useSecondaryPaneStore } from "./secondaryPaneStore";
 import { resolvePathLinkTarget } from "./terminal-links";
 
 interface OpenDiffFilePrimaryActionInput {
@@ -92,7 +92,7 @@ export function openDiffFilePrimaryAction({
   if (!workspaceFilePath) return;
 
   if (threadRef) {
-    useRightPanelStore.getState().openFile(threadRef, workspaceFilePath);
+    useSecondaryPaneStore.getState().openFile(threadRef, workspaceFilePath);
     return;
   }
 

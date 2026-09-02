@@ -29,21 +29,27 @@ import { cn } from "~/lib/utils";
 import { readLocalApi } from "~/localApi";
 import { Button } from "~/components/ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
-import { Kbd } from "~/components/ui/kbd";
 import { Menu, MenuItem, MenuPopup, MenuShortcut, MenuTrigger } from "~/components/ui/menu";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { PanelTabCloseButton } from "~/components/ui/panel-tab-close-button";
 import { faviconUrlForOrigin } from "~/lib/favicon";
-import { useTheme } from "~/hooks/useTheme";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 
 import { PreviewPanelShell, type PreviewPanelMode } from "./preview/PreviewPanelShell";
 import { FaviconImage } from "./preview/PreviewFaviconIcon";
 import { previewBridge } from "./preview/previewBridge";
-import { PierreEntryIcon } from "./chat/PierreEntryIcon";
+import { RightPanelRail } from "./right-panel/RightPanelRail";
+import { createRightPanelSurfaceActions } from "./right-panel/rightPanelSurfaceActions";
+import { surfaceShortcutActionForKey } from "./right-panel/rightPanelShortcuts";
+export {
+  surfaceShortcutActionForKey,
+  surfaceShortcutTargetsTypingContext,
+} from "./right-panel/rightPanelShortcuts";
 
 interface RightPanelTabsProps {
   mode: PreviewPanelMode;
+  /** Chat uses the rail when empty; route-specific panels can retain tabs. */
+  emptyState?: "rail" | "tabs";
   maximized?: boolean;
   /** Forwarded to PreviewPanelShell so this surface persists its own width. */
   widthStorageKey?: string;
@@ -67,7 +73,6 @@ interface RightPanelTabsProps {
   onCloseOtherSurfaces: (surface: RightPanelSurface) => void;
   onCloseSurfacesToRight: (surface: RightPanelSurface) => void;
   onCloseAllSurfaces: () => void;
-  onCopyFilePath: (relativePath: string) => void;
   onAddBrowser: () => void;
   onAddTerminal: () => void;
   onAddDiff: () => void;
@@ -94,39 +99,7 @@ export interface PullRequestTabStatus {
   isDraft: boolean;
 }
 
-const SURFACE_DISABLED_REASONS = {
-  browser: "Browser previews are only available in the T3 Code desktop app.",
-  terminal: "Terminal surfaces are only available from a project thread.",
-  files: "Files are only available when a project is open.",
-  diff: "Diff is only available for server threads in Git repositories.",
-  pullRequest: "This thread's branch has no pull request yet.",
-  agents: "Agents are only available from a thread.",
-} as const;
-
-/** Overlays that must win over the launcher's letter shortcuts. */
-const LAUNCHER_SHORTCUT_BLOCKING_LAYERS = [
-  '[data-slot="dialog-popup"]',
-  '[data-slot="alert-dialog-popup"]',
-  '[data-slot="command-dialog-popup"]',
-  '[data-slot="menu-popup"]',
-  '[data-slot="select-popup"]',
-  '[data-slot="popover-popup"]',
-  '[data-slot="combobox-popup"]',
-  '[data-slot="autocomplete-popup"]',
-].join(",");
-
-/** One-line unavailability hints for the empty-state cards. */
-const SURFACE_UNAVAILABLE_HINTS = {
-  browser: "Only available in the desktop app.",
-  terminal: "Available when a project is open.",
-  files: "Available when a project is open.",
-  diff: "Available for Git repositories.",
-  pullRequest: "No pull request on this branch yet.",
-  agents: "Available from a thread.",
-} as const;
-
 type TabContextMenuAction =
-  | "copy-path"
   | "toggle-mute"
   | "close"
   | "close-others"
@@ -173,40 +146,6 @@ function tabAudioState(overlay: DesktopPreviewOverlay | null): TabAudioState {
   return overlay.audioMuted ? "muted" : "audible";
 }
 
-type SurfaceShortcutEvent = Pick<
-  KeyboardEvent,
-  "altKey" | "ctrlKey" | "defaultPrevented" | "isComposing" | "key" | "metaKey"
->;
-
-export function surfaceShortcutActionForKey<
-  const Action extends { available: boolean; shortcut: string },
->(actions: readonly Action[], event: SurfaceShortcutEvent): Action | null {
-  if (event.defaultPrevented || event.isComposing) return null;
-  if (event.metaKey || event.ctrlKey || event.altKey) return null;
-  return (
-    actions.find(
-      (action) => action.available && action.shortcut.toLowerCase() === event.key.toLowerCase(),
-    ) ?? null
-  );
-}
-
-/**
- * A focused editable is a typing context whether or not it has text yet: an
- * empty chat composer at rest is still where the user's next keystrokes are
- * meant to land, and claiming launcher letters from it would redirect prompts
- * into whatever surface opens. The `:not` clause lets `closest` see past
- * non-editable islands (`contenteditable="false"`) to an editable host around
- * them, matching ComposerPendingUserInputPanel's typing guard.
- */
-export function surfaceShortcutTargetsTypingContext(
-  target: { closest(selectors: string): unknown } | null,
-): boolean {
-  return (
-    target?.closest('input, textarea, select, [contenteditable]:not([contenteditable="false"])') !=
-    null
-  );
-}
-
 function DisabledReasonTooltip(props: { reason: string; trigger: ReactElement }) {
   return (
     <Tooltip>
@@ -238,255 +177,6 @@ function SurfaceMenuItem(props: {
   return <DisabledReasonTooltip reason={props.disabledReason} trigger={item} />;
 }
 
-/**
- * Card launcher shown when the right panel has no surfaces. Keyboard-first
- * without palette chrome: a surface's letter opens it directly from anywhere
- * outside a typing context, and arrows plus Enter work while the launcher is
- * focused. The highlight only appears on hover or arrow use. Unavailable
- * surfaces stay visible with a one-line reason.
- */
-function RightPanelEmptyState(props: {
-  onAddBrowser: () => void;
-  onAddTerminal: () => void;
-  onAddDiff: () => void;
-  onAddFiles: () => void;
-  onAddPullRequest: () => void;
-  onAddAgents: () => void;
-  browserAvailable: boolean;
-  terminalAvailable: boolean;
-  diffAvailable: boolean;
-  filesAvailable: boolean;
-  pullRequestAvailable: boolean;
-  agentsAvailable: boolean;
-  liveAgentCount: number;
-}) {
-  // -1 means no highlight: it only appears on hover or arrow use.
-  const [highlight, setHighlight] = useState(-1);
-
-  const actions = [
-    {
-      label: "Browser",
-      description: "Open a local app or URL.",
-      icon: Globe2,
-      shortcut: "B",
-      available: props.browserAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.browser,
-      onClick: props.onAddBrowser,
-      badgeCount: 0,
-    },
-    {
-      label: "Terminal",
-      description: "Start a shell in this workspace.",
-      icon: TerminalSquare,
-      shortcut: "T",
-      available: props.terminalAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.terminal,
-      onClick: props.onAddTerminal,
-      badgeCount: 0,
-    },
-    {
-      label: "Files",
-      description: "Browse and read workspace files.",
-      icon: Files,
-      shortcut: "F",
-      available: props.filesAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.files,
-      onClick: props.onAddFiles,
-      badgeCount: 0,
-    },
-    {
-      label: "Diff",
-      description: "Review changes in this thread.",
-      icon: FileDiff,
-      shortcut: "D",
-      available: props.diffAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.diff,
-      onClick: props.onAddDiff,
-      badgeCount: 0,
-    },
-    {
-      label: "Pull request",
-      description: "Open this branch's pull request.",
-      icon: GitPullRequest,
-      shortcut: "P",
-      available: props.pullRequestAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.pullRequest,
-      onClick: props.onAddPullRequest,
-      badgeCount: 0,
-    },
-    {
-      label: "Agents",
-      description: "Follow subagents and workflows.",
-      icon: Bot,
-      shortcut: "A",
-      available: props.agentsAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.agents,
-      onClick: props.onAddAgents,
-      badgeCount: props.liveAgentCount,
-    },
-  ] as const;
-
-  type SurfaceAction = (typeof actions)[number];
-
-  const availableActions = actions.filter((action) => action.available);
-  const highlightIndex =
-    availableActions.length === 0 ? -1 : Math.min(highlight, availableActions.length - 1);
-
-  // Letter shortcuts work while the launcher is visible, not only while it
-  // is focused; focus moves around too easily (stray clicks) to carry them.
-  // Capture phase so app-level key handlers cannot swallow the event first;
-  // typing contexts and already-handled events are left alone.
-  const shortcutActionsRef = useRef(availableActions);
-  useEffect(() => {
-    shortcutActionsRef.current = availableActions;
-  });
-  useEffect(() => {
-    const handler = (event: KeyboardEvent) => {
-      const action = surfaceShortcutActionForKey(shortcutActionsRef.current, event);
-      if (!action) return;
-      if (document.querySelector(LAUNCHER_SHORTCUT_BLOCKING_LAYERS)) return;
-      const target = event.target;
-      if (target instanceof Element && surfaceShortcutTargetsTypingContext(target)) return;
-      event.preventDefault();
-      event.stopPropagation();
-      action.onClick();
-    };
-    window.addEventListener("keydown", handler, true);
-    return () => window.removeEventListener("keydown", handler, true);
-  }, []);
-
-  const handleKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (event.defaultPrevented || event.metaKey || event.ctrlKey || event.altKey) return;
-    if (availableActions.length === 0) return;
-    if (event.key === "ArrowDown" || event.key === "ArrowRight") {
-      event.preventDefault();
-      setHighlight((highlightIndex + 1) % availableActions.length);
-      return;
-    }
-    if (event.key === "ArrowUp" || event.key === "ArrowLeft") {
-      event.preventDefault();
-      setHighlight(
-        highlightIndex === -1
-          ? availableActions.length - 1
-          : (highlightIndex - 1 + availableActions.length) % availableActions.length,
-      );
-      return;
-    }
-    if (event.key === "Enter") {
-      // A focused card button owns its own activation; only open from the
-      // highlight when the container itself has focus.
-      if (event.target instanceof HTMLElement && event.target.closest("button")) return;
-      const action = availableActions[highlightIndex];
-      if (!action) return;
-      event.preventDefault();
-      action.onClick();
-    }
-  };
-
-  // Stable identity so React only runs this callback ref on mount/unmount;
-  // an inline arrow would re-attach and re-focus on every render.
-  const focusOnMount = useCallback((node: HTMLDivElement | null) => {
-    node?.focus();
-  }, []);
-
-  const isHighlighted = (action: SurfaceAction) =>
-    highlightIndex !== -1 && availableActions[highlightIndex] === action;
-
-  const actionIcon = (action: SurfaceAction, iconClassName = "size-4") => {
-    const Icon = action.icon;
-    return (
-      <span className="relative inline-flex shrink-0">
-        <Icon className={iconClassName} />
-        {action.badgeCount > 0 ? (
-          <span
-            aria-hidden
-            className="absolute -top-1.5 -right-2 flex h-3.5 min-w-3.5 items-center justify-center rounded-full bg-info px-1 text-[9px] font-semibold tabular-nums text-white"
-          >
-            {action.badgeCount}
-          </span>
-        ) : null}
-      </span>
-    );
-  };
-
-  const cardShellClass =
-    "rounded-lg border border-border/80 bg-card dark:border-transparent dark:shadow-none dark:inset-ring-1 dark:inset-ring-white/5";
-  const highlightedCardClass = "bg-accent/60 dark:inset-ring-white/20";
-
-  return (
-    <div
-      ref={focusOnMount}
-      tabIndex={0}
-      onKeyDown={handleKeyDown}
-      aria-label="Open a surface"
-      data-surface-launcher-keys={availableActions.map((action) => action.shortcut).join("")}
-      className={cn(
-        "flex min-h-0 flex-1 items-center justify-center overflow-y-auto px-6 pt-6 outline-none",
-        // The panel topbar sits above this container; matching bottom padding
-        // keeps the cards centered against the full panel, not the leftover.
-        "pb-[calc(var(--workspace-topbar-height)+--spacing(6))]",
-      )}
-    >
-      <div className="relative w-full max-w-lg">
-        <div className="absolute inset-x-0 bottom-full mb-5 text-center">
-          <h3 className="font-medium text-foreground text-sm">Open a surface</h3>
-          <p className="mt-1 text-muted-foreground text-xs">
-            Choose what to show in the right panel.
-          </p>
-        </div>
-        <div className="grid grid-cols-2 gap-2">
-          {actions.map((action) =>
-            action.available ? (
-              <button
-                key={action.label}
-                type="button"
-                onClick={action.onClick}
-                onMouseEnter={() => setHighlight(availableActions.indexOf(action))}
-                onMouseLeave={() =>
-                  setHighlight((current) =>
-                    current === availableActions.indexOf(action) ? -1 : current,
-                  )
-                }
-                className={cn(
-                  "relative flex w-full cursor-pointer flex-col items-start p-4 text-left transition hover:border-border hover:bg-accent/60",
-                  cardShellClass,
-                  isHighlighted(action) && highlightedCardClass,
-                )}
-              >
-                <Kbd className="absolute top-3 right-3">{action.shortcut}</Kbd>
-                <span className="flex items-center gap-2 pe-8">
-                  {actionIcon(action)}
-                  <span className="font-medium text-sm">{action.label}</span>
-                </span>
-                <span className="mt-1.5 text-muted-foreground text-xs leading-relaxed">
-                  {action.description}
-                </span>
-              </button>
-            ) : (
-              <div
-                key={action.label}
-                className={cn(
-                  "relative flex w-full flex-col items-start p-4 opacity-40",
-                  cardShellClass,
-                )}
-              >
-                <Kbd className="absolute top-3 right-3">{action.shortcut}</Kbd>
-                <span className="flex items-center gap-2 pe-8">
-                  {actionIcon(action)}
-                  <span className="font-medium text-sm">{action.label}</span>
-                </span>
-                <span className="mt-1.5 text-muted-foreground text-xs leading-relaxed">
-                  {action.disabledReason}
-                </span>
-              </div>
-            ),
-          )}
-        </div>
-      </div>
-    </div>
-  );
-}
-
 function surfaceTitle(
   surface: RightPanelSurface,
   sessions: Readonly<Record<string, PreviewSessionSnapshot>>,
@@ -496,9 +186,7 @@ function surfaceTitle(
     case "diff":
       return "Diff";
     case "files":
-      return "Files";
-    case "file":
-      return surface.relativePath.slice(surface.relativePath.lastIndexOf("/") + 1);
+      return "Project Explorer";
     case "terminal":
       return (
         terminalLabelsById.get(surface.activeTerminalId) ??
@@ -544,13 +232,11 @@ function SurfaceIcon({
   surface,
   sessions,
   desktopByTabId,
-  theme,
   pullRequestStatuses,
 }: {
   surface: RightPanelSurface;
   sessions: Readonly<Record<string, PreviewSessionSnapshot>>;
   desktopByTabId: Readonly<Record<string, DesktopPreviewOverlay>>;
-  theme: "light" | "dark";
   pullRequestStatuses: Readonly<Record<string, PullRequestTabStatus>> | undefined;
 }) {
   switch (surface.kind) {
@@ -566,15 +252,6 @@ function SurfaceIcon({
       return <FileDiff className="size-3 shrink-0" />;
     case "files":
       return <Files className="size-3 shrink-0" />;
-    case "file":
-      return (
-        <PierreEntryIcon
-          pathValue={surface.relativePath}
-          kind="file"
-          theme={theme}
-          className="size-3"
-        />
-      );
     case "terminal":
       return <TerminalSquare className="size-3 shrink-0" />;
     case "pull-request": {
@@ -598,60 +275,24 @@ function SurfaceIcon({
 
 export function RightPanelTabs(props: RightPanelTabsProps) {
   const ownsDesktopTitleBar = isElectron && props.mode === "inline";
-  const { resolvedTheme } = useTheme();
   const tabListRef = useRef<HTMLDivElement>(null);
   const [addSurfaceMenuOpen, setAddSurfaceMenuOpen] = useState(false);
 
-  const addSurfaceActions = [
-    {
-      label: "Browser",
-      icon: Globe2,
-      shortcut: "B",
-      available: props.browserAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.browser,
-      onClick: props.onAddBrowser,
-    },
-    {
-      label: "Terminal",
-      icon: TerminalSquare,
-      shortcut: "T",
-      available: props.terminalAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.terminal,
-      onClick: props.onAddTerminal,
-    },
-    {
-      label: "Files",
-      icon: Files,
-      shortcut: "F",
-      available: props.filesAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.files,
-      onClick: props.onAddFiles,
-    },
-    {
-      label: "Diff",
-      icon: FileDiff,
-      shortcut: "D",
-      available: props.diffAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.diff,
-      onClick: props.onAddDiff,
-    },
-    {
-      label: "Pull request",
-      icon: GitPullRequest,
-      shortcut: "P",
-      available: props.pullRequestAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.pullRequest,
-      onClick: props.onAddPullRequest,
-    },
-    {
-      label: "Agents",
-      icon: Bot,
-      shortcut: "A",
-      available: props.agentsAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.agents,
-      onClick: props.onAddAgents,
-    },
-  ] as const;
+  const addSurfaceActions = createRightPanelSurfaceActions({
+    browserAvailable: props.browserAvailable,
+    terminalAvailable: props.terminalAvailable,
+    diffAvailable: props.diffAvailable,
+    filesAvailable: props.filesAvailable,
+    pullRequestAvailable: props.pullRequestAvailable,
+    agentsAvailable: props.agentsAvailable,
+    liveAgentCount: props.liveAgentCount,
+    onAddBrowser: props.onAddBrowser,
+    onAddTerminal: props.onAddTerminal,
+    onAddDiff: props.onAddDiff,
+    onAddFiles: props.onAddFiles,
+    onAddPullRequest: props.onAddPullRequest,
+    onAddAgents: props.onAddAgents,
+  });
 
   const handleAddSurfaceMenuKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
     const action = surfaceShortcutActionForKey(addSurfaceActions, event.nativeEvent);
@@ -674,9 +315,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       if (surfaceIndex < 0) return;
 
       const items: ContextMenuItem<TabContextMenuAction>[] = [];
-      if (surface.kind === "file") {
-        items.push({ id: "copy-path", label: "Copy path" });
-      }
       const menuPreviewTabId = previewTabIdOf(surface, props.previewSessions);
       // Desktop overlay state only arrives once the preview manager has created
       // the tab. A server session id alone can still be ahead of that, and
@@ -717,9 +355,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
 
       const action = await api.contextMenu.show(items, { x: event.clientX, y: event.clientY });
       switch (action) {
-        case "copy-path":
-          if (surface.kind === "file") props.onCopyFilePath(surface.relativePath);
-          break;
         case "toggle-mute": {
           // menuOverlay repeats the disabled gate above: the desktop tab must
           // exist before it can be addressed, however the menu was dismissed.
@@ -768,6 +403,10 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
     const activeTab = tabListRef.current?.querySelector<HTMLElement>("[data-active-tab='true']");
     activeTab?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [props.activeSurfaceId]);
+
+  if (props.activeSurfaceId === null && props.emptyState !== "tabs") {
+    return <RightPanelRail actions={addSurfaceActions} />;
+  }
 
   return (
     <PreviewPanelShell
@@ -831,7 +470,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
                       surface={surface}
                       sessions={props.previewSessions}
                       desktopByTabId={props.desktopByTabId}
-                      theme={resolvedTheme}
                       pullRequestStatuses={props.pullRequestStatuses}
                     />
                     {pending ? (
@@ -930,25 +568,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
         {props.layoutControls}
       </div>
       <div className="flex min-h-0 flex-1 flex-col" data-right-panel-surface-content>
-        {props.activeSurfaceId === null ? (
-          <RightPanelEmptyState
-            onAddBrowser={props.onAddBrowser}
-            onAddTerminal={props.onAddTerminal}
-            onAddDiff={props.onAddDiff}
-            onAddFiles={props.onAddFiles}
-            onAddPullRequest={props.onAddPullRequest}
-            onAddAgents={props.onAddAgents}
-            browserAvailable={props.browserAvailable}
-            terminalAvailable={props.terminalAvailable}
-            diffAvailable={props.diffAvailable}
-            filesAvailable={props.filesAvailable}
-            pullRequestAvailable={props.pullRequestAvailable}
-            agentsAvailable={props.agentsAvailable}
-            liveAgentCount={props.liveAgentCount}
-          />
-        ) : (
-          props.children
-        )}
+        {props.children}
       </div>
     </PreviewPanelShell>
   );

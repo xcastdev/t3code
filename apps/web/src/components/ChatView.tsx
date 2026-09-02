@@ -145,6 +145,7 @@ import { isCommandPaletteOpen } from "../commandPaletteBus";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "../rightPanelLayout";
+import { SECONDARY_PANE_COMPACT_MEDIA_QUERY } from "../workspacePaneLayout";
 import {
   selectActiveRightPanel,
   selectActiveRightPanelSurface,
@@ -154,10 +155,17 @@ import {
   useRightPanelStore,
 } from "../rightPanelStore";
 import {
+  selectActiveSecondaryPaneSurface,
+  selectThreadSecondaryPaneState,
+  type SecondaryPaneSurface,
+  useSecondaryPaneStore,
+} from "../secondaryPaneStore";
+import {
   isPreviewSupportedInRuntime,
   setActivePreviewTab,
   useThreadPreviewState,
 } from "../previewStateStore";
+import { resolveWorkspaceTitlebarOwner } from "../workspacePaneLayout";
 import { previewRuntimeTabId } from "../browser/previewRuntimeTabId";
 import { addBrowserSurface } from "./preview/addBrowserSurface";
 import { closePreviewSession } from "./preview/closePreviewSession";
@@ -174,6 +182,7 @@ import { PullRequestDetailPanel } from "./pullRequest/PullRequestDetailPanel";
 import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { RightPanelTabs, type PullRequestTabStatus } from "./RightPanelTabs";
+import { SecondaryPaneShell } from "./workspace/SecondaryPaneShell";
 import { AgentsPanel } from "./AgentsPanel";
 import {
   deriveAgentPanelModel,
@@ -507,7 +516,8 @@ const PreviewPanel = lazy(() =>
   import("./preview/PreviewPanel").then((module) => ({ default: module.PreviewPanel })),
 );
 const DiffPanel = lazy(() => import("./DiffPanel"));
-const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
+const FileEditorPanel = lazy(() => import("./files/FileEditorPanel"));
+const ProjectExplorerPanel = lazy(() => import("./files/ProjectExplorerPanel"));
 const EMPTY_PENDING_FILE_SURFACE_IDS: ReadonlySet<string> = new Set();
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
@@ -1513,6 +1523,7 @@ function ChatViewContent(props: ChatViewProps) {
   const [pendingUserInputQuestionIndexByRequestId, setPendingUserInputQuestionIndexByRequestId] =
     useState<Record<string, number>>({});
   const shouldUseRightPanelSheet = useMediaQuery(RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY);
+  const secondaryPaneIsStacked = useMediaQuery(SECONDARY_PANE_COMPACT_MEDIA_QUERY);
   const [terminalFocusRequestId, setTerminalFocusRequestId] = useState(0);
   const [pullRequestDialogState, setPullRequestDialogState] =
     useState<PullRequestDialogState | null>(null);
@@ -1735,6 +1746,12 @@ function ChatViewContent(props: ChatViewProps) {
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
+  const secondaryPaneState = useSecondaryPaneStore((state) =>
+    selectThreadSecondaryPaneState(state.byThreadKey, activeThreadRef),
+  );
+  const activeSecondaryPaneSurface = useSecondaryPaneStore((state) =>
+    selectActiveSecondaryPaneSurface(state.byThreadKey, activeThreadRef),
+  );
   const [pullRequestTabStatuses, setPullRequestTabStatuses] = useState<
     Record<string, PullRequestTabStatus>
   >({});
@@ -1750,8 +1767,6 @@ function ChatViewContent(props: ChatViewProps) {
     },
     [activePullRequestSurfaceId],
   );
-  const activeFileSurface =
-    activeRightPanelSurface?.kind === "file" ? activeRightPanelSurface : null;
   const activePreviewState = useThreadPreviewState(activeThreadRef);
   const activePreviewServerEpoch = activePreviewState.serverEpoch;
   const resolvePreviewRuntimeTabId = useMemo(
@@ -1779,10 +1794,25 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const previewPanelOpen = activeRightPanelKind === "preview" && isPreviewSupportedInRuntime();
   const rightPanelOpen = rightPanelState.isOpen;
-  const canMaximizeRightPanel = rightPanelOpen && !shouldUseRightPanelSheet;
+  const rightPanelExpanded = rightPanelOpen && activeRightPanelSurface !== null;
+  const canMaximizeRightPanel = rightPanelExpanded && !shouldUseRightPanelSheet;
   const rightPanelMaximized =
     canMaximizeRightPanel && maximizedRightPanelThreadKey === routeThreadKey;
-  const inlineRightPanelOwnsTitleBar = rightPanelOpen && !shouldUseRightPanelSheet;
+  const workspaceTitlebarOwner = resolveWorkspaceTitlebarOwner({
+    secondaryPaneOpen: secondaryPaneState.isOpen && activeSecondaryPaneSurface !== null,
+    rightPanelOpen,
+    rightPanelHasActiveSurface: activeRightPanelSurface !== null,
+    rightPanelUsesSheet: shouldUseRightPanelSheet,
+  });
+  const inlineRightPanelOwnsTitleBar = workspaceTitlebarOwner === "right-panel";
+
+  useEffect(() => {
+    if (!activeThreadRef) return;
+    const { byThreadKey } = useRightPanelStore.getState();
+    if (byThreadKey[scopedThreadKey(activeThreadRef)] === undefined) {
+      useRightPanelStore.getState().show(activeThreadRef);
+    }
+  }, [activeThreadRef]);
 
   useEffect(() => {
     if (!activeThreadRef) return;
@@ -1900,7 +1930,10 @@ function ChatViewContent(props: ChatViewProps) {
 
   useEffect(() => {
     if (!activeThreadRef || !activeEnvironmentBootstrapComplete) return;
-    useRightPanelStore.getState().reconcileFileSurfaces(activeThreadRef, activeProject !== null);
+    useRightPanelStore
+      .getState()
+      .reconcileProjectExplorerSurface(activeThreadRef, activeProject !== null);
+    useSecondaryPaneStore.getState().reconcileWorkspace(activeThreadRef, activeProject !== null);
   }, [activeEnvironmentBootstrapComplete, activeProject, activeThreadRef]);
 
   // Compute the list of environments this logical project spans, used to
@@ -3623,10 +3656,42 @@ function ChatViewContent(props: ChatViewProps) {
   const openFileSurface = useCallback(
     (relativePath: string) => {
       if (!activeThreadRef || !activeProject) return;
-      useRightPanelStore.getState().openFile(activeThreadRef, relativePath);
+      useSecondaryPaneStore.getState().openFile(activeThreadRef, relativePath);
     },
     [activeProject, activeThreadRef],
   );
+  const activateSecondaryPaneSurface = useCallback(
+    (surface: SecondaryPaneSurface) => {
+      if (!activeThreadRef) return;
+      useSecondaryPaneStore.getState().activateSurface(activeThreadRef, surface.id);
+    },
+    [activeThreadRef],
+  );
+  const closeSecondaryPaneSurface = useCallback(
+    (surface: SecondaryPaneSurface) => {
+      if (!activeThreadRef) return;
+      useSecondaryPaneStore.getState().closeSurface(activeThreadRef, surface.id);
+    },
+    [activeThreadRef],
+  );
+  const closeOtherSecondaryPaneSurfaces = useCallback(
+    (surface: SecondaryPaneSurface) => {
+      if (!activeThreadRef) return;
+      useSecondaryPaneStore.getState().closeOtherSurfaces(activeThreadRef, surface.id);
+    },
+    [activeThreadRef],
+  );
+  const closeSecondaryPaneSurfacesToRight = useCallback(
+    (surface: SecondaryPaneSurface) => {
+      if (!activeThreadRef) return;
+      useSecondaryPaneStore.getState().closeSurfacesToRight(activeThreadRef, surface.id);
+    },
+    [activeThreadRef],
+  );
+  const closeAllSecondaryPaneSurfaces = useCallback(() => {
+    if (!activeThreadRef) return;
+    useSecondaryPaneStore.getState().closeAllSurfaces(activeThreadRef);
+  }, [activeThreadRef]);
   // The thread's own change request, placed against the project it belongs to. Without a
   // project there is nothing to resolve it against, so the caller falls back to the browser.
   const linkedThreadPullRequest = activeThread?.linkedPullRequest ?? null;
@@ -3946,7 +4011,7 @@ function ChatViewContent(props: ChatViewProps) {
     cleanupRightPanelSurfaces(rightPanelState.surfaces);
     useRightPanelStore.getState().closeAllSurfaces(activeThreadRef);
   }, [activeThreadRef, cleanupRightPanelSurfaces, rightPanelState.surfaces]);
-  const copyRightPanelFilePath = useCallback((relativePath: string) => {
+  const copyWorkspaceFilePath = useCallback((relativePath: string) => {
     if (typeof window === "undefined" || !navigator.clipboard?.writeText) {
       toastManager.add(
         stackedThreadToast({
@@ -6998,7 +7063,7 @@ function ChatViewContent(props: ChatViewProps) {
       )}
       data-workspace-titlebar-controls
     >
-      {rightPanelOpen && !shouldUseRightPanelSheet ? (
+      {rightPanelExpanded && !shouldUseRightPanelSheet ? (
         <RightPanelMaximizeControl
           maximized={rightPanelMaximized}
           onToggle={toggleRightPanelMaximized}
@@ -7095,34 +7160,46 @@ function ChatViewContent(props: ChatViewProps) {
         environmentId={activeThreadRef?.environmentId ?? null}
         threadId={activeThreadRef?.threadId ?? null}
       />
-    ) : (activeRightPanelSurface?.kind === "files" || activeRightPanelSurface?.kind === "file") &&
-      activeProject &&
-      activeWorkspaceRoot ? (
+    ) : activeRightPanelSurface?.kind === "files" && activeProject && activeWorkspaceRoot ? (
       <Suspense fallback={null}>
-        <FilePreviewPanel
+        <ProjectExplorerPanel
           key={`${activeProject.environmentId}:${activeWorkspaceRoot}`}
           environmentId={activeProject.environmentId}
           cwd={activeWorkspaceRoot}
           projectName={activeProject.title}
-          threadRef={activeThreadRef}
-          composerDraftTarget={composerDraftTarget}
-          keybindings={keybindings}
-          availableEditors={availableEditors}
-          relativePath={
-            activeRightPanelSurface.kind === "file" ? activeRightPanelSurface.relativePath : null
-          }
-          revealLine={activeFileSurface?.revealLine ?? null}
-          revealRequestId={activeFileSurface?.revealRequestId ?? 0}
+          selectedPath={activeSecondaryPaneSurface?.relativePath ?? null}
+          selectedPathRevealId={activeSecondaryPaneSurface?.revealRequestId ?? 0}
           onOpenFile={openFileSurface}
-          onPendingChange={handleFilePendingChange}
-          selectedFilePending={
-            activeFileSurface !== null && pendingFileSurfaceIds.has(activeFileSurface.id)
-          }
           workspaceMutationId={workspaceMutationId}
         />
       </Suspense>
     ) : null
   ) : null;
+
+  const secondaryPaneContent =
+    activeThreadRef &&
+    activeProject &&
+    activeWorkspaceRoot &&
+    activeSecondaryPaneSurface?.kind === "file" ? (
+      <Suspense fallback={null}>
+        <FileEditorPanel
+          key={`${activeProject.environmentId}:${activeWorkspaceRoot}:${activeSecondaryPaneSurface.relativePath}`}
+          environmentId={activeProject.environmentId}
+          cwd={activeWorkspaceRoot}
+          projectName={activeProject.title}
+          relativePath={activeSecondaryPaneSurface.relativePath}
+          threadRef={activeThreadRef}
+          composerDraftTarget={composerDraftTarget}
+          keybindings={keybindings}
+          availableEditors={availableEditors}
+          revealLine={activeSecondaryPaneSurface.revealLine}
+          revealRequestId={activeSecondaryPaneSurface.revealRequestId}
+          onPendingChange={handleFilePendingChange}
+          selectedFilePending={pendingFileSurfaceIds.has(activeSecondaryPaneSurface.id)}
+          workspaceMutationId={workspaceMutationId}
+        />
+      </Suspense>
+    ) : null;
 
   const workspaceFileDropHandlers = makeWorkspaceFileDropHandlers({
     setDragActive: setIsWorkspaceFileDragActive,
@@ -7131,7 +7208,7 @@ function ChatViewContent(props: ChatViewProps) {
 
   return (
     <div className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background">
-      {rightPanelOpen && !shouldUseRightPanelSheet ? panelLayoutControls : null}
+      {rightPanelExpanded && !shouldUseRightPanelSheet ? panelLayoutControls : null}
       <div
         className={cn(
           "flex min-h-0 min-w-0 flex-col overflow-x-hidden",
@@ -7146,7 +7223,7 @@ function ChatViewContent(props: ChatViewProps) {
           reserveNativeControls={reserveTitleBarControlInset && !inlineRightPanelOwnsTitleBar}
           className="relative bg-background"
         >
-          {!rightPanelOpen ? panelLayoutControls : null}
+          {!rightPanelExpanded ? panelLayoutControls : null}
           <ChatHeader
             {...(!supportsPullRequests || activeProjectRepository === null
               ? {}
@@ -7167,7 +7244,7 @@ function ChatViewContent(props: ChatViewProps) {
             }
             keybindings={keybindings}
             availableEditors={availableEditors}
-            rightPanelOpen={rightPanelOpen}
+            rightPanelOpen={rightPanelExpanded}
             gitCwd={gitCwd}
             onNewThreadInProject={handleNewThreadInActiveProject}
             onRunProjectScript={runProjectScript}
@@ -7186,7 +7263,14 @@ function ChatViewContent(props: ChatViewProps) {
           }}
         />
         {/* Main content area with optional plan sidebar */}
-        <div className="flex min-h-0 min-w-0 flex-1">
+        <div
+          className={cn(
+            "flex min-h-0 min-w-0 flex-1",
+            secondaryPaneState.isOpen &&
+              activeSecondaryPaneSurface !== null &&
+              "max-[760px]:flex-col",
+          )}
+        >
           {/* Chat column */}
           <div
             className="relative flex min-h-0 min-w-0 flex-1 flex-col"
@@ -7519,6 +7603,21 @@ function ChatViewContent(props: ChatViewProps) {
             ) : null}
           </div>
           {/* end chat column */}
+          {secondaryPaneState.isOpen && activeSecondaryPaneSurface ? (
+            <SecondaryPaneShell
+              surfaces={secondaryPaneState.surfaces}
+              activeSurfaceId={secondaryPaneState.activeSurfaceId}
+              onActivate={activateSecondaryPaneSurface}
+              onClose={closeSecondaryPaneSurface}
+              onCloseOtherSurfaces={closeOtherSecondaryPaneSurfaces}
+              onCloseSurfacesToRight={closeSecondaryPaneSurfacesToRight}
+              onCloseAllSurfaces={closeAllSecondaryPaneSurfaces}
+              onCopyPath={copyWorkspaceFilePath}
+              layout={secondaryPaneIsStacked ? "stack" : "inline"}
+            >
+              {secondaryPaneContent}
+            </SecondaryPaneShell>
+          ) : null}
         </div>
         {/* end horizontal flex container */}
 
@@ -7558,7 +7657,6 @@ function ChatViewContent(props: ChatViewProps) {
           onCloseOtherSurfaces={closeOtherRightPanelSurfaces}
           onCloseSurfacesToRight={closeRightPanelSurfacesToRight}
           onCloseAllSurfaces={closeAllRightPanelSurfaces}
-          onCopyFilePath={copyRightPanelFilePath}
           onAddBrowser={createBrowserSurface}
           onAddTerminal={addTerminalSurface}
           onAddDiff={addDiffSurface}
@@ -7578,7 +7676,7 @@ function ChatViewContent(props: ChatViewProps) {
         </RightPanelTabs>
       ) : null}
       {shouldUseRightPanelSheet && rightPanelOpen && activeThreadRef ? (
-        <RightPanelSheet open onClose={closePreviewPanel}>
+        <RightPanelSheet open onClose={closePreviewPanel} rail={activeRightPanelSurface === null}>
           <RightPanelTabs
             mode="sheet"
             // Same effective inset as the closed-state titlebar controls
@@ -7598,7 +7696,6 @@ function ChatViewContent(props: ChatViewProps) {
             onCloseOtherSurfaces={closeOtherRightPanelSurfaces}
             onCloseSurfacesToRight={closeRightPanelSurfacesToRight}
             onCloseAllSurfaces={closeAllRightPanelSurfaces}
-            onCopyFilePath={copyRightPanelFilePath}
             onAddBrowser={createBrowserSurface}
             onAddTerminal={addTerminalSurface}
             onAddDiff={addDiffSurface}

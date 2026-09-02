@@ -33,7 +33,11 @@ const PREVIEW_PANEL_DEFAULT_WIDTH = 540;
  */
 const SIBLING_COLUMN_MIN_WIDTH = 360;
 
-export function getPreviewPanelMaxWidth(viewportWidth: number, containerWidth?: number): number {
+export function getPreviewPanelMaxWidth(
+  viewportWidth: number,
+  containerWidth?: number,
+  minWidth = PREVIEW_PANEL_MIN_WIDTH,
+): number {
   const fractionCap = Math.floor(viewportWidth * PREVIEW_PANEL_MAX_WIDTH_FRACTION);
   const containerCap =
     containerWidth === undefined ? Infinity : Math.floor(containerWidth) - SIBLING_COLUMN_MIN_WIDTH;
@@ -41,7 +45,7 @@ export function getPreviewPanelMaxWidth(viewportWidth: number, containerWidth?: 
   // columns' minimums the sibling yields, and useResizableWidth's clamp
   // must not see max < min (it would resolve the inversion to min and,
   // via drag-end persistence, overwrite the user's stored width).
-  return Math.max(PREVIEW_PANEL_MIN_WIDTH, Math.min(fractionCap, containerCap));
+  return Math.max(minWidth, Math.min(fractionCap, containerCap));
 }
 
 /**
@@ -61,18 +65,22 @@ export function PreviewPanelShell(props: {
   widthStorageKey?: string;
   /** Overrides the initial width (px) before the user has resized the panel. */
   defaultWidth?: number;
+  /** Overrides the minimum width for inline panels with a larger sibling minimum. */
+  minWidth?: number;
+  className?: string;
   children: ReactNode;
 }) {
   const useDragRegion = isElectron && props.mode !== "sheet" && props.mode !== "embedded";
   const isInline = props.mode === "inline";
   const hostRef = useRef<HTMLDivElement | null>(null);
+  const minWidth = props.minWidth ?? PREVIEW_PANEL_MIN_WIDTH;
   // Only inline non-maximized mode applies `width`/`maxWidth`; skip the
   // container measurement (and its re-renders) everywhere else.
-  const maxWidth = useClampedMaxWidth(hostRef, isInline && !props.maximized);
+  const maxWidth = useClampedMaxWidth(hostRef, isInline && !props.maximized, minWidth);
   const { width, handlers } = useResizableWidth({
     storageKey: props.widthStorageKey ?? PREVIEW_PANEL_WIDTH_STORAGE_KEY,
     defaultWidth: props.defaultWidth ?? PREVIEW_PANEL_DEFAULT_WIDTH,
-    minWidth: PREVIEW_PANEL_MIN_WIDTH,
+    minWidth,
     maxWidth,
     edge: "left",
   });
@@ -87,6 +95,7 @@ export function PreviewPanelShell(props: {
             ? "flex-1 border-l border-border"
             : "shrink-0 border-l border-border"
           : "w-full",
+        props.className,
       )}
       style={isInline && !props.maximized ? { width: `${width}px` } : undefined}
       data-preview-panel-mode={props.mode}
@@ -108,7 +117,11 @@ export function PreviewPanelShell(props: {
  * Row measurement only runs when `enabled`; modes without a resize handle
  * never apply the resulting width, so they skip the observer entirely.
  */
-function useClampedMaxWidth(hostRef: RefObject<HTMLDivElement | null>, enabled: boolean): number {
+function useClampedMaxWidth(
+  hostRef: RefObject<HTMLDivElement | null>,
+  enabled: boolean,
+  minWidth: number,
+): number {
   const [vw, setVw] = useState(() => (typeof window === "undefined" ? 1280 : window.innerWidth));
   const [containerWidth, setContainerWidth] = useState<number | undefined>(undefined);
   useEffect(() => {
@@ -147,5 +160,5 @@ function useClampedMaxWidth(hostRef: RefObject<HTMLDivElement | null>, enabled: 
       observer.disconnect();
     };
   }, [hostRef, enabled]);
-  return getPreviewPanelMaxWidth(vw, containerWidth);
+  return getPreviewPanelMaxWidth(vw, containerWidth, minWidth);
 }

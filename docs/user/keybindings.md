@@ -49,8 +49,13 @@ Use **Inspect** to pick an element in the app and reveal its color token. Inspec
 successful pick; its hover glow and badge preview the element and color family that click will select.
 **Cancel** or `Escape` exits Inspect and clears its selection and spotlight.
 
-`rightPanel.toggleMaximized` maximizes or restores the open right panel. It has no default shortcut,
+`rightPanel.toggleMaximized` maximizes or restores the expanded right-sidebar panel. It has no default shortcut,
 so add one in **Settings** → **Keybindings** if you want to use it.
+
+The right sidebar opens as a narrow icon rail. Select an icon to expand that surface, then use the
+plus button in its tab bar to open another surface. Surface letter shortcuts such as `B` for
+Browser, `D` for Diff, `F` for Project Explorer, `P` for Pull request, `T` for Terminal, and `A`
+for Agents work when focus is outside a text field.
 
 `thread.settle` settles the active thread or restores it when it is already settled. Its default
 shortcut is `mod+shift+s`, and it does not run while the terminal has focus.

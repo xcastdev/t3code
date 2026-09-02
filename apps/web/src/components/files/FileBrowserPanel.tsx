@@ -27,7 +27,7 @@ interface FileBrowserPanelProps {
   environmentId: EnvironmentId;
   cwd: string;
   projectName: string;
-  /** File currently open in the preview pane; revealed and selected in the tree. */
+  /** File currently open in the secondary editor pane; revealed and selected in the tree. */
   selectedPath: string | null;
   /** Bumped when the same path should be revealed again (e.g. re-opened from search). */
   selectedPathRevealId: number;

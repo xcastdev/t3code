@@ -102,7 +102,6 @@ function renderTabs(
       onCloseOtherSurfaces={() => undefined}
       onCloseSurfacesToRight={() => undefined}
       onCloseAllSurfaces={() => undefined}
-      onCopyFilePath={() => undefined}
       onAddBrowser={() => undefined}
       onAddTerminal={() => undefined}
       onAddPullRequest={() => undefined}

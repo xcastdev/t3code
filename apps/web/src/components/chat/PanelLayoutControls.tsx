@@ -27,7 +27,7 @@ export const PanelLayoutControls = memo(function PanelLayoutControls({
   rightPanelAvailable,
   rightPanelOpen,
   rightPanelShortcutLabel,
-  rightPanelUnavailableLabel = "Right panel is unavailable",
+  rightPanelUnavailableLabel = "Right sidebar is unavailable",
   liveAgentCount,
   onToggleTerminal,
   onToggleRightPanel,
@@ -67,8 +67,8 @@ export const PanelLayoutControls = memo(function PanelLayoutControls({
             onPressedChange={onToggleRightPanel}
             aria-label={
               liveAgentCount > 0
-                ? `Toggle right panel, ${liveAgentCount} ${liveAgentCount === 1 ? "agent" : "agents"} working`
-                : "Toggle right panel"
+                ? `Toggle right sidebar, ${liveAgentCount} ${liveAgentCount === 1 ? "agent" : "agents"} working`
+                : "Toggle right sidebar"
             }
             variant="ghost"
             size="sm"
@@ -87,7 +87,7 @@ export const PanelLayoutControls = memo(function PanelLayoutControls({
         </TooltipTrigger>
         <TooltipPopup side="bottom">
           {rightPanelAvailable
-            ? `Toggle right panel${rightPanelShortcutLabel ? ` (${rightPanelShortcutLabel})` : ""}${
+            ? `Toggle right sidebar${rightPanelShortcutLabel ? ` (${rightPanelShortcutLabel})` : ""}${
                 liveAgentCount > 0
                   ? ` · ${liveAgentCount} ${liveAgentCount === 1 ? "agent" : "agents"} working`
                   : ""
