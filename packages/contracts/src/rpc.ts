@@ -60,6 +60,7 @@ import {
   ReviewDiffPreviewResult,
 } from "./review.ts";
 import { KeybindingsConfigError } from "./keybindings.ts";
+import { ProjectId, ThreadId } from "./baseSchemas.ts";
 import {
   ClientOrchestrationCommand,
   ORCHESTRATION_WS_METHODS,
@@ -167,6 +168,7 @@ import {
 import {
   ServerConfigStreamEvent,
   ServerConfig,
+  ServerProviderCatalogPayload,
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
   ServerLifecycleStreamEvent,
@@ -277,6 +279,7 @@ export const WS_METHODS = {
   // Server meta
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
+  serverGetProviderCatalog: "server.getProviderCatalog",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
   serverUpdateServer: "server.updateServer",
@@ -361,6 +364,17 @@ export const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
   payload: Schema.Struct({}),
   success: ServerConfig,
   error: Schema.Union([KeybindingsConfigError, ServerSettingsError, EnvironmentAuthorizationError]),
+});
+
+export const WsServerGetProviderCatalogRpc = Rpc.make(WS_METHODS.serverGetProviderCatalog, {
+  payload: Schema.Struct({
+    /** The server resolves this thread to its authoritative project/worktree cwd. */
+    threadId: Schema.optional(ThreadId),
+    /** Drafts have no thread yet, so resolve their project workspace directly. */
+    projectId: Schema.optional(ProjectId),
+  }),
+  success: ServerProviderCatalogPayload,
+  error: EnvironmentAuthorizationError,
 });
 
 export const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
@@ -1044,6 +1058,7 @@ export const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeReso
 export const WsRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
+  WsServerGetProviderCatalogRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsServerUpdateServerRpc,

@@ -97,6 +97,23 @@ export const ServerProviderSkill = Schema.Struct({
 export type ServerProviderSkill = typeof ServerProviderSkill.Type;
 
 /**
+ * Provider capabilities discovered for one project/worktree. The server
+ * keeps this separate from `ServerProvider` because models, auth, and install
+ * state are instance-global while OpenCode commands and skills are cwd-local.
+ */
+export const ServerProviderCatalog = Schema.Struct({
+  instanceId: ProviderInstanceId,
+  slashCommands: Schema.Array(ServerProviderSlashCommand),
+  skills: Schema.Array(ServerProviderSkill),
+});
+export type ServerProviderCatalog = typeof ServerProviderCatalog.Type;
+
+export const ServerProviderCatalogPayload = Schema.Struct({
+  providers: Schema.Array(ServerProviderCatalog),
+});
+export type ServerProviderCatalogPayload = typeof ServerProviderCatalogPayload.Type;
+
+/**
  * Availability of a configured provider instance from the runtime's POV.
  *
  *  - `available` — the build ships this driver and an instance is wired

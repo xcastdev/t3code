@@ -720,6 +720,19 @@ export const ProviderRegistryLive = Layer.effect(
 
     return {
       getProviders: Ref.get(providersRef),
+      getProviderCatalogs: (cwd) =>
+        Effect.gen(function* () {
+          const instances = yield* instanceRegistry.listInstances;
+          const catalogs = yield* Effect.forEach(
+            instances,
+            (instance) =>
+              instance.getCatalog === undefined ? Effect.succeed(null) : instance.getCatalog(cwd),
+            { concurrency: "unbounded" },
+          );
+          return catalogs.filter(
+            (catalog): catalog is NonNullable<typeof catalog> => catalog !== null,
+          );
+        }),
       refresh: (provider?: ProviderDriverKind) =>
         refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
       refreshInstance: (instanceId: ProviderInstanceId) =>

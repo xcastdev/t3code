@@ -277,6 +277,7 @@ import {
   requestOlderThreadTurns,
   threadHasOlderTurns,
 } from "@t3tools/client-runtime/state/threads";
+import { mergeServerProviderCatalogs } from "@t3tools/client-runtime/providerCatalog";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironments, usePrimaryEnvironment } from "../state/environments";
 import {
@@ -2349,7 +2350,27 @@ function ChatViewContent(props: ChatViewProps) {
     versionMismatchSelfUpdate,
     versionMismatchServerLabel,
   ]);
-  const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
+  const providerCatalogQuery = useEnvironmentQuery(
+    activeThreadId !== null && activeThreadEnvironmentId !== null
+      ? serverEnvironment.providerCatalog({
+          environmentId: activeThreadEnvironmentId,
+          input: { threadId: activeThreadId },
+        })
+      : activeProject !== null
+        ? serverEnvironment.providerCatalog({
+            environmentId,
+            input: { projectId: activeProject.id },
+          })
+        : null,
+  );
+  const providerStatuses = useMemo(
+    () =>
+      mergeServerProviderCatalogs(
+        serverConfig?.providers ?? EMPTY_PROVIDERS,
+        providerCatalogQuery.data ?? { providers: [] },
+      ),
+    [providerCatalogQuery.data, serverConfig?.providers],
+  );
   const unlockedSelectedProvider = resolveSelectableProvider(
     providerStatuses,
     selectedProviderByThreadId ?? threadProvider,

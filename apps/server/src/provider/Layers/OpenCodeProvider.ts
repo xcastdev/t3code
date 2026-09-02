@@ -4,6 +4,7 @@ import {
   type ServerProviderModel,
   type ServerProviderSlashCommand,
   type ServerProviderSkill,
+  type ServerProviderCatalog,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Data from "effect/Data";
@@ -261,7 +262,9 @@ function trimOptional(value: string | null | undefined): string | undefined {
   return trimmed && trimmed.length > 0 ? trimmed : undefined;
 }
 
-function flattenOpenCodeSkills(input: OpenCodeInventory): ReadonlyArray<ServerProviderSkill> {
+export function flattenOpenCodeSkills(
+  input: OpenCodeInventory,
+): ReadonlyArray<ServerProviderSkill> {
   const skills: ServerProviderSkill[] = [];
   for (const skill of input.skills ?? []) {
     const name = trimOptional(skill.name);
@@ -282,7 +285,7 @@ function flattenOpenCodeSkills(input: OpenCodeInventory): ReadonlyArray<ServerPr
   return skills.toSorted((left, right) => left.name.localeCompare(right.name));
 }
 
-function flattenOpenCodeCommands(
+export function flattenOpenCodeCommands(
   input: OpenCodeInventory,
 ): ReadonlyArray<ServerProviderSlashCommand> {
   const commands: ServerProviderSlashCommand[] = [];
@@ -314,6 +317,17 @@ function flattenOpenCodeCommands(
       return true;
     })
     .toSorted((left, right) => left.name.localeCompare(right.name));
+}
+
+export function flattenOpenCodeCatalog(input: {
+  readonly instanceId: ServerProviderCatalog["instanceId"];
+  readonly inventory: OpenCodeInventory;
+}): ServerProviderCatalog {
+  return {
+    instanceId: input.instanceId,
+    slashCommands: flattenOpenCodeCommands(input.inventory),
+    skills: flattenOpenCodeSkills(input.inventory),
+  };
 }
 
 export const makePendingOpenCodeProvider = (

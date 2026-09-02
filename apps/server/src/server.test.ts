@@ -5048,6 +5048,84 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("resolves provider catalogs from the thread worktree", () =>
+    Effect.gen(function* () {
+      const requestedCwds: Array<string> = [];
+      const projectId = ProjectId.make("project-catalog");
+      const threadId = ThreadId.make("thread-catalog");
+      const worktreePath = "/tmp/catalog-project/.t3/worktrees/feature";
+      const now = "2026-01-01T00:00:00.000Z";
+
+      yield* buildAppUnderTest({
+        layers: {
+          providerRegistry: {
+            getProviderCatalogs: (cwd) =>
+              Effect.sync(() => {
+                requestedCwds.push(cwd);
+                return [
+                  {
+                    instanceId: ProviderInstanceId.make("opencode"),
+                    slashCommands: [{ name: "project-command" }],
+                    skills: [
+                      {
+                        name: "project-skill",
+                        path: `${cwd}/.opencode/skills/project-skill/SKILL.md`,
+                        enabled: true,
+                      },
+                    ],
+                  },
+                ];
+              }),
+          },
+          projectionSnapshotQuery: {
+            getThreadShellById: () =>
+              Effect.succeed(
+                Option.some(
+                  makeDefaultOrchestrationThreadShell({
+                    id: threadId,
+                    projectId,
+                    worktreePath,
+                  }),
+                ),
+              ),
+            getProjectShellById: () =>
+              Effect.succeed(
+                Option.some({
+                  id: projectId,
+                  title: "Catalog project",
+                  workspaceRoot: "/tmp/catalog-project",
+                  defaultModelSelection: null,
+                  scripts: [],
+                  createdAt: now,
+                  updatedAt: now,
+                }),
+              ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.serverGetProviderCatalog]({ threadId }),
+        ),
+      );
+      const draftResult = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.serverGetProviderCatalog]({ projectId }),
+        ),
+      );
+
+      assert.deepEqual(requestedCwds, [worktreePath, "/tmp/catalog-project"]);
+      assert.equal(result.providers[0]?.slashCommands[0]?.name, "project-command");
+      assert.equal(result.providers[0]?.skills[0]?.name, "project-skill");
+      assert.equal(
+        draftResult.providers[0]?.skills[0]?.path,
+        "/tmp/catalog-project/.opencode/skills/project-skill/SKILL.md",
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("refreshes providers for each subscribeServerConfig connection", () =>
     Effect.gen(function* () {
       const refreshCalls = yield* Ref.make(0);

@@ -10,6 +10,7 @@ import type {
   ProviderInstanceId,
   ProviderDriverKind,
   ServerProvider,
+  ServerProviderCatalog,
   ServerProviderUpdateState,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -26,6 +27,11 @@ export interface ProviderRegistryShape {
    * instances of the same driver) and disambiguate via `instanceId`.
    */
   readonly getProviders: Effect.Effect<ReadonlyArray<ServerProvider>>;
+
+  /** Resolve cwd-local provider capabilities for a project/worktree. */
+  readonly getProviderCatalogs?: (
+    cwd: string,
+  ) => Effect.Effect<ReadonlyArray<ServerProviderCatalog>>;
 
   /**
    * Refresh all providers, or the default instance of the specified

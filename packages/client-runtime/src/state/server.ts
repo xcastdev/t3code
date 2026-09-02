@@ -745,6 +745,12 @@ export function createServerEnvironmentAtoms<R, E>(
     updateStateAtom,
     settingsValueAtom,
     providersValueAtom,
+    providerCatalog: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:provider-catalog",
+      tag: WS_METHODS.serverGetProviderCatalog,
+      staleTimeMs: 2_000,
+      idleTtlMs: 30_000,
+    }),
     traceDiagnostics: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:server:trace-diagnostics",
       tag: WS_METHODS.serverGetTraceDiagnostics,

@@ -12,7 +12,12 @@
  *
  * @module provider/Drivers/OpenCodeDriver
  */
-import { OpenCodeSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
+import {
+  OpenCodeSettings,
+  ProviderDriverKind,
+  type ServerProvider,
+  type ServerProviderCatalog,
+} from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -29,6 +34,7 @@ import { ProviderDriverError } from "../Errors.ts";
 import { makeOpenCodeAdapter } from "../Layers/OpenCodeAdapter.ts";
 import {
   checkOpenCodeProviderStatus,
+  flattenOpenCodeCatalog,
   makePendingOpenCodeProvider,
 } from "../Layers/OpenCodeProvider.ts";
 import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
@@ -196,6 +202,68 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         ),
       );
 
+      const getCatalog = (cwd: string): Effect.Effect<ServerProviderCatalog> => {
+        if (!effectiveConfig.enabled) {
+          return Effect.succeed({
+            instanceId,
+            slashCommands: [],
+            skills: [],
+          });
+        }
+
+        const loadInventory = (server: {
+          readonly url: string;
+          readonly serverPassword?: string;
+        }) =>
+          openCodeRuntime
+            .loadOpenCodeInventory(
+              openCodeRuntime.createOpenCodeSdkClient({
+                baseUrl: server.url,
+                directory: cwd,
+                ...(server.serverPassword !== undefined
+                  ? { serverPassword: server.serverPassword }
+                  : {}),
+              }),
+              { directory: cwd },
+            )
+            .pipe(
+              Effect.map((inventory) =>
+                flattenOpenCodeCatalog({
+                  instanceId,
+                  inventory,
+                }),
+              ),
+            );
+
+        const inventoryEffect = effectiveConfig.serverUrl
+          ? openCodeRuntime
+              .connectToOpenCodeServer({
+                binaryPath: effectiveConfig.binaryPath,
+                directory: cwd,
+                serverUrl: effectiveConfig.serverUrl,
+                ...(effectiveConfig.serverPassword
+                  ? { serverPassword: effectiveConfig.serverPassword }
+                  : {}),
+              })
+              .pipe(Effect.flatMap(loadInventory), Effect.scoped)
+          : serverOwner.withServer(loadInventory);
+
+        return inventoryEffect.pipe(
+          Effect.catch(() =>
+            snapshot.getSnapshot.pipe(
+              Effect.map(
+                (current) =>
+                  ({
+                    instanceId,
+                    slashCommands: current.slashCommands,
+                    skills: current.skills,
+                  }) satisfies ServerProviderCatalog,
+              ),
+            ),
+          ),
+        );
+      };
+
       return {
         instanceId,
         driverKind: DRIVER_KIND,
@@ -206,6 +274,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         snapshot,
         adapter,
         textGeneration,
+        getCatalog,
       } satisfies ProviderInstance;
     }),
 };

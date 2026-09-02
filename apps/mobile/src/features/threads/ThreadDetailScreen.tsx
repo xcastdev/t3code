@@ -20,6 +20,7 @@ import type {
   ThreadId,
   UserInputQuestion,
 } from "@t3tools/contracts";
+import { mergeServerProviderCatalogs } from "@t3tools/client-runtime/providerCatalog";
 import * as Haptics from "expo-haptics";
 import {
   memo,
@@ -89,6 +90,8 @@ import {
 import { ThreadFeed } from "./ThreadFeed";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { resolveThreadFeedSubmissionAnchor } from "./thread-feed-live-follow";
+import { useEnvironmentQuery } from "../../state/query";
+import { serverEnvironment } from "../../state/server";
 
 export interface ThreadDetailScreenProps {
   readonly selectedThread: OrchestrationThreadShell;
@@ -509,12 +512,31 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   const isSplitLayout = layoutVariant === "split";
   const contentMaxWidth = isSplitLayout ? CHAT_CONTENT_MAX_WIDTH : undefined;
   const selectedInstanceId = props.selectedThread.modelSelection.instanceId;
+  const providerCatalogQuery = useEnvironmentQuery(
+    serverEnvironment.providerCatalog({
+      environmentId: props.environmentId,
+      input: { threadId: props.selectedThread.id },
+    }),
+  );
+  const serverConfigWithCatalog = useMemo(() => {
+    if (props.serverConfig === null || providerCatalogQuery.data === null) {
+      return props.serverConfig;
+    }
+    return {
+      ...props.serverConfig,
+      providers: mergeServerProviderCatalogs(
+        props.serverConfig.providers,
+        providerCatalogQuery.data,
+      ),
+    };
+  }, [providerCatalogQuery.data, props.serverConfig]);
   useStreamingHaptics(props.selectedThread.id, props.selectedThreadFeed);
   const selectedProviderSkills = useMemo(
     () =>
-      props.serverConfig?.providers.find((provider) => provider.instanceId === selectedInstanceId)
-        ?.skills ?? [],
-    [props.serverConfig, selectedInstanceId],
+      serverConfigWithCatalog?.providers.find(
+        (provider) => provider.instanceId === selectedInstanceId,
+      )?.skills ?? [],
+    [selectedInstanceId, serverConfigWithCatalog],
   );
 
   useLayoutEffect(() => {
@@ -806,7 +828,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                   environmentLabel={props.environmentLabel}
                   threadSyncPhase={threadSyncPhase}
                   selectedThread={props.selectedThread}
-                  serverConfig={props.serverConfig}
+                  serverConfig={serverConfigWithCatalog}
                   queueCount={props.selectedThreadQueueCount}
                   environmentId={props.environmentId}
                   projectCwd={props.projectWorkspaceRoot}

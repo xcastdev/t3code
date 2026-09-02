@@ -55,6 +55,10 @@
       "types": "./src/providerSkills.ts",
       "default": "./src/providerSkills.ts"
     },
+    "./providerCatalog": {
+      "types": "./src/providerCatalog.ts",
+      "default": "./src/providerCatalog.ts"
+    },
     "./voice-input": {
       "types": "./src/voice-input/index.ts",
       "default": "./src/voice-input/index.ts"
