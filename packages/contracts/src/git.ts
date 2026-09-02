@@ -83,6 +83,23 @@ export const VcsRef = Schema.Struct({
 });
 export type VcsRef = typeof VcsRef.Type;
 
+export const VcsIndexStatus = Schema.Literals([
+  "staged",
+  "unstaged",
+  "both",
+  "untracked",
+  "conflicted",
+]);
+export type VcsIndexStatus = typeof VcsIndexStatus.Type;
+
+export const VcsWorkingTreeFile = Schema.Struct({
+  path: TrimmedNonEmptyStringSchema,
+  insertions: NonNegativeInt,
+  deletions: NonNegativeInt,
+  indexStatus: Schema.optional(VcsIndexStatus),
+});
+export type VcsWorkingTreeFile = typeof VcsWorkingTreeFile.Type;
+
 const VcsWorktree = Schema.Struct({
   path: TrimmedNonEmptyStringSchema,
   refName: TrimmedNonEmptyStringSchema,
@@ -103,6 +120,27 @@ export const VcsStatusInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
 });
 export type VcsStatusInput = typeof VcsStatusInput.Type;
+
+const NonEmptyPaths = Schema.Array(TrimmedNonEmptyStringSchema).check(Schema.isMinLength(1));
+
+export const VcsStageFilesInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  paths: NonEmptyPaths,
+});
+export type VcsStageFilesInput = typeof VcsStageFilesInput.Type;
+
+export const VcsWorkingTreeDiffInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  path: TrimmedNonEmptyStringSchema,
+  comparison: Schema.Literals(["index", "head"]),
+});
+export type VcsWorkingTreeDiffInput = typeof VcsWorkingTreeDiffInput.Type;
+
+export const GitCommitIndexInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  message: TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(10_000)),
+});
+export type GitCommitIndexInput = typeof GitCommitIndexInput.Type;
 
 export const VcsPullInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
@@ -215,13 +253,7 @@ const VcsStatusLocalShape = {
   refName: Schema.NullOr(TrimmedNonEmptyStringSchema),
   hasWorkingTreeChanges: Schema.Boolean,
   workingTree: Schema.Struct({
-    files: Schema.Array(
-      Schema.Struct({
-        path: TrimmedNonEmptyStringSchema,
-        insertions: NonNegativeInt,
-        deletions: NonNegativeInt,
-      }),
-    ),
+    files: Schema.Array(VcsWorkingTreeFile),
     insertions: NonNegativeInt,
     deletions: NonNegativeInt,
   }),
@@ -297,6 +329,17 @@ export const VcsSwitchRefResult = Schema.Struct({
   refName: Schema.NullOr(TrimmedNonEmptyStringSchema),
 });
 export type VcsSwitchRefResult = typeof VcsSwitchRefResult.Type;
+
+export const VcsWorkingTreeDiffResult = Schema.Struct({
+  diff: Schema.String,
+  truncated: Schema.Boolean,
+});
+export type VcsWorkingTreeDiffResult = typeof VcsWorkingTreeDiffResult.Type;
+
+export const GitCommitIndexResult = Schema.Struct({
+  commitSha: TrimmedNonEmptyStringSchema,
+});
+export type GitCommitIndexResult = typeof GitCommitIndexResult.Type;
 
 export const GitRunStackedActionResult = Schema.Struct({
   action: GitStackedAction,

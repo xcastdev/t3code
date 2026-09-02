@@ -29,6 +29,8 @@ import {
 } from "./assets.ts";
 import {
   GitActionProgressEvent,
+  GitCommitIndexInput,
+  GitCommitIndexResult,
   VcsSwitchRefInput,
   VcsSwitchRefResult,
   GitCommandError,
@@ -51,6 +53,9 @@ import {
   VcsStatusInput,
   VcsStatusResult,
   VcsStatusStreamEvent,
+  VcsStageFilesInput,
+  VcsWorkingTreeDiffInput,
+  VcsWorkingTreeDiffResult,
 } from "./git.ts";
 import {
   ReviewDiffFileContentsInput,
@@ -245,11 +250,15 @@ export const WS_METHODS = {
   vcsCreateRef: "vcs.createRef",
   vcsSwitchRef: "vcs.switchRef",
   vcsInit: "vcs.init",
+  vcsStageFiles: "vcs.stageFiles",
+  vcsUnstageFiles: "vcs.unstageFiles",
+  vcsGetWorkingTreeDiff: "vcs.getWorkingTreeDiff",
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
   gitResolvePullRequest: "git.resolvePullRequest",
   gitPreparePullRequestThread: "git.preparePullRequestThread",
+  gitCommitIndex: "git.commitIndex",
 
   // Review methods
   reviewGetDiffPreview: "review.getDiffPreview",
@@ -801,6 +810,28 @@ export const WsVcsInitRpc = Rpc.make(WS_METHODS.vcsInit, {
   error: Schema.Union([VcsError, EnvironmentAuthorizationError]),
 });
 
+export const WsVcsStageFilesRpc = Rpc.make(WS_METHODS.vcsStageFiles, {
+  payload: VcsStageFilesInput,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+export const WsVcsUnstageFilesRpc = Rpc.make(WS_METHODS.vcsUnstageFiles, {
+  payload: VcsStageFilesInput,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+export const WsVcsGetWorkingTreeDiffRpc = Rpc.make(WS_METHODS.vcsGetWorkingTreeDiff, {
+  payload: VcsWorkingTreeDiffInput,
+  success: VcsWorkingTreeDiffResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+export const WsGitCommitIndexRpc = Rpc.make(WS_METHODS.gitCommitIndex, {
+  payload: GitCommitIndexInput,
+  success: GitCommitIndexResult,
+  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+});
+
 /**
  * Ephemeral live diff preview for compact/mobile surfaces.
  * Not the persisted T3 Review model. Future review sessions should use
@@ -1118,12 +1149,16 @@ export const WsRpcGroup = RpcGroup.make(
   WsGitRunStackedActionRpc,
   WsGitResolvePullRequestRpc,
   WsGitPreparePullRequestThreadRpc,
+  WsGitCommitIndexRpc,
   WsVcsListRefsRpc,
   WsVcsCreateWorktreeRpc,
   WsVcsRemoveWorktreeRpc,
   WsVcsCreateRefRpc,
   WsVcsSwitchRefRpc,
   WsVcsInitRpc,
+  WsVcsStageFilesRpc,
+  WsVcsUnstageFilesRpc,
+  WsVcsGetWorkingTreeDiffRpc,
   WsReviewGetDiffPreviewRpc,
   WsReviewGetDiffFileContentsRpc,
   WsTerminalOpenRpc,
