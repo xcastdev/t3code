@@ -2,6 +2,38 @@
 
 T3 Code connects to your Git hosting provider so you can create pull requests, review code, and manage repositories without leaving the app.
 
+## Use Source Control in a thread
+
+Open **Source Control** from the right-panel rail or its plus menu. The panel follows the active
+thread's working directory and has two views.
+
+### Review changes
+
+The **Changes** view shows the current branch, ahead and behind counts, file changes, and a
+selected-file diff. The status updates when another client changes the working tree.
+
+Click **Stage** or **Unstage** to change a complete file in the Git index. Source Control does not
+support partial staging by hunk.
+
+Enter a commit message and click **Commit** to commit only the files already staged in the index.
+The commit action never stages unstaged files. T3 Code asks you to confirm commits on the default
+branch.
+
+Use the branch selector to switch branches or create a branch. T3 Code asks you to confirm the
+switch when the working tree has changes. Git must be available on the machine running T3 Code.
+
+### Review pull requests
+
+The **Pull requests** view lists open pull requests for the active project. Select a pull request
+to open its existing review panel beside the list.
+
+The Source Control panel replaces the separate **Diff** and **Pull Requests** rail buttons and the
+thread header's **Commit & Push** control. The bottom-left **Pull Requests** shortcut remains and
+opens this panel with the **Pull requests** view selected.
+
+Partial staging and conflict resolution are not available in Source Control. Use Git in a terminal
+when you need either operation.
+
 ## Supported Providers
 
 T3 Code works with the platforms your team already uses:
@@ -29,10 +61,9 @@ T3 Code works with the platforms your team already uses:
 
 ### Manage Code Reviews Without Context Switching
 
-**Create pull requests while you work**
+**Review pull requests while you work**
 
-- Push a branch and create a pull request from the Git actions controls in the toolbar
-- T3 Code can suggest titles and descriptions based on your commits
+- Open the **Pull requests** view in Source Control to review open pull requests for the active project
 - With **Repository conventions** selected, generated source control text follows the project's
   `AGENTS.md` along with recent commit subjects. Claude writers also follow `CLAUDE.md`
 - Supports GitHub Pull Requests, GitLab Merge Requests, Bitbucket Pull Requests, and Azure DevOps Pull Requests

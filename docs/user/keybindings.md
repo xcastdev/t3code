@@ -54,8 +54,9 @@ so add one in **Settings** → **Keybindings** if you want to use it.
 
 The right sidebar opens as a narrow icon rail. Select an icon to expand that surface, then use the
 plus button in its tab bar to open another surface. Surface letter shortcuts such as `B` for
-Browser, `D` for Diff, `F` for Project Explorer, `P` for Pull request, `T` for Terminal, and `A`
-for Agents work when focus is outside a text field.
+Browser, `F` for Project Explorer, `G` for Source Control, `T` for Terminal, and `A` for Agents
+work when focus is outside a text field. Source Control contains the Changes and Pull requests
+views.
 
 `thread.settle` settles the active thread or restores it when it is already settled. Its default
 shortcut is `mod+shift+s`, and it does not run while the terminal has focus.
