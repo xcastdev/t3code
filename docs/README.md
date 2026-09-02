@@ -9,6 +9,7 @@
 - [Organizing threads](./user/thread-sidebar.md)
 - [Review usage](./user/usage.md)
 - [Customize a project icon](./user/project-settings.md)
+- [Project MCP servers](./user/project-mcp-servers.md)
 - [Mobile appearance](./user/mobile-appearance.md)
 - [Environment themes](./user/environment-theme.md)
 - [Remote access](./user/remote-access.md)
