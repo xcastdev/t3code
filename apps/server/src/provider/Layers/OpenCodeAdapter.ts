@@ -193,6 +193,7 @@ type OpenCodeSubtaskPart = Extract<Part, { readonly type: "subtask" }>;
 interface OpenCodeTaskState {
   readonly sessionId: string;
   readonly parentSessionId: string;
+  readonly parentAgentId?: string;
   readonly toolUseId: string;
   description: string;
   role?: string;
@@ -607,6 +608,11 @@ function openCodeTaskStateFromToolPart(
   return {
     sessionId: childSessionId,
     parentSessionId: metadataParentSessionId ?? existing?.parentSessionId ?? parentSessionId,
+    ...(metadataParentSessionId && metadataParentSessionId !== parentSessionId
+      ? { parentAgentId: metadataParentSessionId }
+      : existing?.parentAgentId
+        ? { parentAgentId: existing.parentAgentId }
+        : {}),
     toolUseId: existing?.toolUseId ?? part.callID,
     description,
     ...(role ? { role } : {}),
@@ -624,7 +630,7 @@ function openCodeTaskLinkage(state: OpenCodeTaskState) {
     ...(state.role ? { role: state.role } : {}),
     ...(state.model ? { model: state.model } : {}),
     toolUseId: state.toolUseId,
-    parentAgentId: state.parentSessionId,
+    ...(state.parentAgentId ? { parentAgentId: state.parentAgentId } : {}),
     timelineBypass: true as const,
   };
 }

@@ -5209,6 +5209,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         NodeAssert.equal(started.payload.role, "explore");
         NodeAssert.equal(started.payload.model, "openai/gpt-5");
         NodeAssert.equal(started.payload.agentKind, "agent");
+        NodeAssert.equal(started.payload.parentAgentId, undefined);
       }
       const progress = events[1];
       if (progress?.type === "task.progress") {
