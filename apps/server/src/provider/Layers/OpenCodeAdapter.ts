@@ -3079,6 +3079,13 @@ export function makeOpenCodeAdapter(
           break;
         }
 
+        case "session.deleted":
+          // A deleted parent session cannot accept a follow-up prompt. Treat
+          // it as a terminal transport failure so the orchestration session
+          // and Agents rows are released instead of remaining active forever.
+          yield* emitUnexpectedExit(context, "OpenCode session was deleted.");
+          break;
+
         case "session.error": {
           const message = sessionErrorMessage(event.properties.error);
           const activeTurnId = context.activeTurnId;
