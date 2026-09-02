@@ -671,9 +671,9 @@ describe("Git workflow command atoms", () => {
           retryNow: Effect.void,
         } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
         const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
-          run: (_environmentId, effect) =>
+          run: <A, E, R>(_environmentId: EnvironmentId, effect: Effect.Effect<A, E, R>) =>
             Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
-          followStream: (_environmentId, stream) =>
+          followStream: <A, E, R>(_environmentId: EnvironmentId, stream: Stream.Stream<A, E, R>) =>
             Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
         } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
         const runtime = Atom.runtime(
@@ -741,7 +741,7 @@ describe("Git workflow command atoms", () => {
           retryNow: Effect.void,
         } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
         const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
-          run: (_environmentId, effect) =>
+          run: <A, E, R>(_environmentId: EnvironmentId, effect: Effect.Effect<A, E, R>) =>
             Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
         } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
         const runtime = Atom.runtime(
