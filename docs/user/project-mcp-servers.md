@@ -17,26 +17,26 @@ T3 Code accepts HTTPS URLs and HTTP URLs with loopback hosts. It rejects HTTP UR
 It also rejects URLs with an embedded username or password or a query string. Saving or viewing an
 entry does not check whether its URL is reachable.
 
-The initial release supports remote HTTP MCP URLs. T3 Code does not support custom headers,
-secrets, OAuth, local stdio MCP servers, or live reload for project MCP servers.
+Project MCP servers support remote HTTP MCP URLs. T3 Code does not support custom headers, secrets,
+OAuth, local stdio MCP servers, or live reload for project MCP servers.
 
 ## Check provider support and application labels
 
 T3 Code sends a server only to selected providers that support it. OpenCode or another
-unsupported provider may remain selected, but it shows **Not supported by this provider** and does
-not receive the server.
+unsupported provider may remain selected, but it shows **Not supported** and does not receive the
+server.
 
-The application label for each selected provider tells you when the server applies:
+The application label for each selected provider shows support and timing:
 
-- **Applies to this session** means the provider can use the server in the current session.
+- **Available now** means the provider supports the server.
 - **Applies to new sessions** means the provider receives the server when a new session starts.
   Existing sessions do not change.
-- **Not supported by this provider** means the provider does not receive the server.
-- **Provider unavailable** means the provider is not available to receive the server.
+- **Not supported** means the provider does not receive the server, even if selected.
+- **Unavailable** means the provider is not available to receive the server.
 
-If you select no providers, T3 Code saves the server but attaches it nowhere. Start a new session
-when the application label says **Applies to new sessions**. This applies after you add, edit,
-enable, disable, or reassign a server.
+If you select no providers, T3 Code saves the server but attaches it nowhere. After you add, edit,
+enable, disable, or reassign a server, start a new session when the application label says
+**Applies to new sessions**.
 
 ## T3-managed servers are read-only
 
