@@ -8,16 +8,14 @@ function makeActions(
   const onClick = vi.fn();
   const callbacks = {
     onAddBrowser: onClick,
-    onAddDiff: onClick,
     onAddFiles: onClick,
-    onAddPullRequest: onClick,
+    onAddSourceControl: onClick,
     onAddAgents: onClick,
   };
   return createRightPanelSurfaceActions({
     browserAvailable: true,
-    diffAvailable: true,
     filesAvailable: true,
-    pullRequestAvailable: true,
+    sourceControlAvailable: true,
     agentsAvailable: true,
     liveAgentCount: 0,
     ...callbacks,
@@ -30,11 +28,10 @@ describe("rightPanelSurfaceActions", () => {
     expect(makeActions().map((action) => action.label)).toEqual([
       "Browser",
       "Project Explorer",
-      "Diff",
-      "Pull request",
+      "Source Control",
       "Agents",
     ]);
-    expect(makeActions().map((action) => action.shortcut)).toEqual(["B", "F", "D", "P", "A"]);
+    expect(makeActions().map((action) => action.shortcut)).toEqual(["B", "F", "G", "A"]);
     expect(makeActions().some((action) => action.label === "Terminal")).toBe(false);
   });
 

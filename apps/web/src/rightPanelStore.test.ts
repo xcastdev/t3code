@@ -239,6 +239,42 @@ describe("rightPanelStore", () => {
     });
   });
 
+  it("opens Source Control on Changes and switches its view", () => {
+    useRightPanelStore.getState().openSourceControl(refA);
+    expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
+      isOpen: true,
+      activeSurfaceId: "source-control",
+      surfaces: [{ id: "source-control", kind: "source-control", view: "changes" }],
+    });
+
+    useRightPanelStore.getState().setSourceControlView(refA, "pull-requests");
+    expect(
+      selectSelectedRightPanelSurface(useRightPanelStore.getState().byThreadKey, refA),
+    ).toEqual({ id: "source-control", kind: "source-control", view: "pull-requests" });
+  });
+
+  it("normalizes a persisted Source Control view during migration", () => {
+    expect(
+      migratePersistedRightPanelState({
+        byThreadKey: {
+          [scopedThreadKey(refA)]: {
+            isOpen: true,
+            activeSurfaceId: "source-control",
+            surfaces: [{ id: "source-control", kind: "source-control", view: "pull-requests" }],
+          },
+        },
+      }),
+    ).toEqual({
+      byThreadKey: {
+        [scopedThreadKey(refA)]: {
+          isOpen: true,
+          activeSurfaceId: "source-control",
+          surfaces: [{ id: "source-control", kind: "source-control", view: "pull-requests" }],
+        },
+      },
+    });
+  });
+
   it("migrates legacy file surfaces into the visible empty rail", () => {
     expect(
       migratePersistedRightPanelState({

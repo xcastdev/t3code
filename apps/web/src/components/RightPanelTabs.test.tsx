@@ -102,15 +102,13 @@ function renderTabs(
       onCloseSurfacesToRight={() => undefined}
       onCloseAllSurfaces={() => undefined}
       onAddBrowser={() => undefined}
-      onAddPullRequest={() => undefined}
-      onAddDiff={() => undefined}
       onAddFiles={() => undefined}
+      onAddSourceControl={() => undefined}
       onAddAgents={() => undefined}
       liveAgentCount={0}
       browserAvailable
-      diffAvailable={false}
       filesAvailable={false}
-      pullRequestAvailable={false}
+      sourceControlAvailable={false}
       agentsAvailable={false}
     >
       <div>content</div>
@@ -144,7 +142,7 @@ describe("RightPanelTabs preview favicon", () => {
 describe("surface shortcuts", () => {
   const actions = [
     { shortcut: "B", available: true, label: "Browser" },
-    { shortcut: "D", available: false, label: "Diff" },
+    { shortcut: "G", available: false, label: "Source Control" },
   ] as const;
 
   it("matches available surface shortcuts case-insensitively", () => {

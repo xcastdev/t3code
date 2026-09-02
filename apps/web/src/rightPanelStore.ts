@@ -4,8 +4,9 @@
  * This is intentionally a shallow workspace model: it owns an ordered set of
  * surface descriptors and the active surface, while each feature continues to
  * own its durable resource state. Browser surfaces point at preview tab ids,
- * the files surface is the Project Explorer, and diff/files remain singleton
- * surfaces. Terminals are owned by the bottom dock, not this store.
+ * the files surface is the Project Explorer, and diff/files/source-control
+ * remain singleton surfaces. Terminals are owned by the bottom dock, not this
+ * store.
  */
 import { scopedThreadKey } from "@t3tools/client-runtime/environment";
 import type { ScopedThreadRef } from "@t3tools/contracts";
@@ -14,8 +15,16 @@ import { createJSONStorage, persist } from "zustand/middleware";
 
 import { resolveStorage } from "./lib/storage";
 
-export const RIGHT_PANEL_KINDS = ["diff", "files", "preview", "pull-request", "agents"] as const;
+export const RIGHT_PANEL_KINDS = [
+  "diff",
+  "files",
+  "preview",
+  "pull-request",
+  "source-control",
+  "agents",
+] as const;
 export type RightPanelKind = (typeof RIGHT_PANEL_KINDS)[number];
+export type SourceControlPanelView = "changes" | "pull-requests";
 
 export type RightPanelSurface =
   | { id: `browser:${string}`; kind: "preview"; resourceId: string }
@@ -39,6 +48,7 @@ export type RightPanelSurface =
       repository: string;
       number: number;
     }
+  | { id: "source-control"; kind: "source-control"; view: SourceControlPanelView }
   | { id: "agents"; kind: "agents" };
 
 const RIGHT_PANEL_STORAGE_KEY = "t3code:right-panel-state:v2";
@@ -48,7 +58,8 @@ const RIGHT_PANEL_STORAGE_KEY = "t3code:right-panel-state:v2";
 // v12 moves file editor tabs into the secondary workspace pane. Legacy file
 // surfaces are dropped while preserving an open empty rail. v13 moves terminal
 // sessions into the bottom dock and drops legacy right-sidebar terminal tabs.
-const RIGHT_PANEL_STORAGE_VERSION = 13;
+// v14 combines the diff and pull-request entry points into source control.
+const RIGHT_PANEL_STORAGE_VERSION = 14;
 
 /**
  * The pull-request list's shared panel (see PULL_REQUESTS_PANEL_ID in the route) is session
@@ -64,8 +75,13 @@ export interface ThreadRightPanelState {
 
 interface RightPanelStoreState {
   byThreadKey: Record<string, ThreadRightPanelState>;
-  open: (ref: ScopedThreadRef, kind: Exclude<RightPanelKind, "pull-request">) => void;
+  open: (
+    ref: ScopedThreadRef,
+    kind: Exclude<RightPanelKind, "pull-request" | "source-control">,
+  ) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
+  openSourceControl: (ref: ScopedThreadRef, view?: SourceControlPanelView) => void;
+  setSourceControlView: (ref: ScopedThreadRef, view: SourceControlPanelView) => void;
   openPullRequest: (
     ref: ScopedThreadRef,
     target: { environmentId?: string; projectId: string; repository: string; number: number },
@@ -80,7 +96,10 @@ interface RightPanelStoreState {
   show: (ref: ScopedThreadRef) => void;
   close: (ref: ScopedThreadRef) => void;
   toggleVisibility: (ref: ScopedThreadRef) => void;
-  toggle: (ref: ScopedThreadRef, kind: Exclude<RightPanelKind, "pull-request">) => void;
+  toggle: (
+    ref: ScopedThreadRef,
+    kind: Exclude<RightPanelKind, "pull-request" | "source-control">,
+  ) => void;
   removeThread: (ref: ScopedThreadRef) => void;
 }
 
@@ -91,7 +110,7 @@ const EMPTY_THREAD_STATE: ThreadRightPanelState = {
 };
 
 const singletonSurface = (
-  kind: Exclude<RightPanelKind, "preview" | "pull-request">,
+  kind: Exclude<RightPanelKind, "preview" | "pull-request" | "source-control">,
 ): RightPanelSurface => {
   switch (kind) {
     case "diff":
@@ -102,6 +121,12 @@ const singletonSurface = (
       return { id: "agents", kind };
   }
 };
+
+const sourceControlSurface = (view: SourceControlPanelView): RightPanelSurface => ({
+  id: "source-control",
+  kind: "source-control",
+  view,
+});
 
 const browserSurface = (tabId: string | null): RightPanelSurface =>
   tabId
@@ -245,6 +270,17 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
                         }),
                       ];
                     }
+                    if (surfaceKind === "source-control") {
+                      const sourceControl = surface as {
+                        kind?: string;
+                        view?: string;
+                      };
+                      return [
+                        sourceControlSurface(
+                          sourceControl.view === "pull-requests" ? "pull-requests" : "changes",
+                        ),
+                      ];
+                    }
                     return [surface];
                   })
                 : [];
@@ -307,6 +343,27 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               ? current.surfaces.filter((entry) => entry.id !== "browser:new")
               : current.surfaces;
             return upsertSurface({ ...current, surfaces: withoutPlaceholder }, surface);
+          }),
+        })),
+      openSourceControl: (ref, view = "changes") =>
+        set((state) => ({
+          byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
+            const surface = sourceControlSurface(view);
+            const surfaces = current.surfaces.some((entry) => entry.kind === "source-control")
+              ? current.surfaces.map((entry) => (entry.kind === "source-control" ? surface : entry))
+              : [...current.surfaces, surface];
+            return { ...current, isOpen: true, surfaces, activeSurfaceId: surface.id };
+          }),
+        })),
+      setSourceControlView: (ref, view) =>
+        set((state) => ({
+          byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
+            const index = current.surfaces.findIndex((entry) => entry.kind === "source-control");
+            if (index < 0) return current;
+            const surface = sourceControlSurface(view);
+            const surfaces = current.surfaces.slice();
+            surfaces[index] = surface;
+            return { ...current, isOpen: true, surfaces, activeSurfaceId: surface.id };
           }),
         })),
       openPullRequest: (ref, target) =>

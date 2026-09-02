@@ -1579,14 +1579,12 @@ function PullRequestsRouteView() {
             }}
             onCloseAllSurfaces={closeAllSurfaces}
             onAddBrowser={() => undefined}
-            onAddDiff={() => undefined}
             onAddFiles={() => undefined}
-            onAddPullRequest={() => undefined}
+            onAddSourceControl={() => undefined}
             onAddAgents={() => undefined}
             browserAvailable={false}
-            diffAvailable={false}
             filesAvailable={false}
-            pullRequestAvailable={false}
+            sourceControlAvailable={false}
             agentsAvailable={false}
             liveAgentCount={0}
             pullRequestStatuses={pullRequestTabStatuses}

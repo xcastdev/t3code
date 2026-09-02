@@ -15,7 +15,11 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { Atom, AtomRegistry } from "effect/unstable/reactivity";
 
-import { createEnvironmentRpcCommand, createEnvironmentSubscriptionAtomFamily } from "./runtime.ts";
+import {
+  createEnvironmentRpcCommand,
+  createEnvironmentRpcQueryAtomFamily,
+  createEnvironmentSubscriptionAtomFamily,
+} from "./runtime.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import { safeErrorLogAttributes } from "../errors/safeLog.ts";
@@ -317,6 +321,10 @@ export function createVcsEnvironmentAtoms<R, E>(
       tag: WS_METHODS.vcsGetWorkingTreeDiff,
       scheduler: vcsCommandScheduler,
       concurrency: vcsCommandConcurrency,
+    }),
+    getWorkingTreeDiffQuery: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:vcs:working-tree-diff-query",
+      tag: WS_METHODS.vcsGetWorkingTreeDiff,
     }),
     commitIndex: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:git:commit-index",

@@ -3,6 +3,7 @@ import {
   Bot,
   FileDiff,
   Files,
+  GitBranch,
   GitPullRequest,
   Globe2,
   Plus,
@@ -70,14 +71,12 @@ interface RightPanelTabsProps {
   onCloseSurfacesToRight: (surface: RightPanelSurface) => void;
   onCloseAllSurfaces: () => void;
   onAddBrowser: () => void;
-  onAddDiff: () => void;
   onAddFiles: () => void;
-  onAddPullRequest: () => void;
+  onAddSourceControl: () => void;
   onAddAgents: () => void;
   browserAvailable: boolean;
-  diffAvailable: boolean;
   filesAvailable: boolean;
-  pullRequestAvailable: boolean;
+  sourceControlAvailable: boolean;
   agentsAvailable: boolean;
   pullRequestStatuses?: Readonly<Record<string, PullRequestTabStatus>>;
   /** Running + waiting subagents; badges the Agents card in the empty state. */
@@ -182,6 +181,8 @@ function surfaceTitle(
       return "Project Explorer";
     case "pull-request":
       return `#${surface.number}`;
+    case "source-control":
+      return "Source Control";
     case "agents":
       return "Agents";
     case "preview": {
@@ -254,6 +255,8 @@ function SurfaceIcon({
                 : "text-muted-foreground";
       return <GitPullRequest className={cn("size-3 shrink-0", toneClassName)} />;
     }
+    case "source-control":
+      return <GitBranch className="size-3 shrink-0" />;
     case "agents":
       return <Bot className="size-3 shrink-0" />;
   }
@@ -266,15 +269,13 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
 
   const addSurfaceActions = createRightPanelSurfaceActions({
     browserAvailable: props.browserAvailable,
-    diffAvailable: props.diffAvailable,
     filesAvailable: props.filesAvailable,
-    pullRequestAvailable: props.pullRequestAvailable,
+    sourceControlAvailable: props.sourceControlAvailable,
     agentsAvailable: props.agentsAvailable,
     liveAgentCount: props.liveAgentCount,
     onAddBrowser: props.onAddBrowser,
-    onAddDiff: props.onAddDiff,
     onAddFiles: props.onAddFiles,
-    onAddPullRequest: props.onAddPullRequest,
+    onAddSourceControl: props.onAddSourceControl,
     onAddAgents: props.onAddAgents,
   });
 

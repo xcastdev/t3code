@@ -23,9 +23,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   type ReactNode,
 } from "react";
-import GitActionsControl from "../GitActionsControl";
 import { isTrailingDoubleClick } from "../Sidebar.logic";
-import { type DraftId } from "~/composerDraftStore";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { toastManager } from "../ui/toast";
 import ProjectScriptsControl, {
@@ -50,7 +48,6 @@ import { cn } from "~/lib/utils";
 interface ChatHeaderProps {
   activeThreadEnvironmentId: EnvironmentId;
   activeThreadId: ThreadId;
-  draftId?: DraftId;
   activeThreadTitle: string;
   /** Drafts have no server thread yet, so the title carries no action menu. */
   isServerThread: boolean;
@@ -66,8 +63,6 @@ interface ChatHeaderProps {
   availableEditors: ReadonlyArray<EditorId>;
   rightPanelOpen: boolean;
   trailingControls?: ReactNode;
-  gitCwd: string | null;
-  readonly onOpenPullRequest?: ((number: number) => void) | undefined;
   onNewThreadInProject: () => void;
   onRunProjectScript: (script: ProjectScript) => void;
   onAddProjectScript: (input: NewProjectScriptInput) => Promise<ProjectScriptActionResult>;
@@ -122,7 +117,6 @@ export function shouldShowOpenInPicker(input: {
 export const ChatHeader = memo(function ChatHeader({
   activeThreadEnvironmentId,
   activeThreadId,
-  draftId,
   activeThreadTitle,
   isServerThread,
   changeRequest,
@@ -136,8 +130,6 @@ export const ChatHeader = memo(function ChatHeader({
   availableEditors,
   rightPanelOpen,
   trailingControls,
-  gitCwd,
-  onOpenPullRequest,
   onNewThreadInProject,
   onRunProjectScript,
   onAddProjectScript,
@@ -428,14 +420,6 @@ export const ChatHeader = memo(function ChatHeader({
               />
             )}
           </>
-        )}
-        {activeProjectName && (
-          <GitActionsControl
-            gitCwd={gitCwd}
-            activeThreadRef={scopeThreadRef(activeThreadEnvironmentId, activeThreadId)}
-            onOpenPullRequest={onOpenPullRequest}
-            {...(draftId ? { draftId } : {})}
-          />
         )}
         {trailingControls}
       </div>

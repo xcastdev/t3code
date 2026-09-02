@@ -1,8 +1,8 @@
 import type { LucideIcon } from "lucide-react";
-import { Bot, FileDiff, Files, GitPullRequest, Globe2 } from "lucide-react";
+import { Bot, Files, GitBranch, Globe2 } from "lucide-react";
 
 export type RightPanelSurfaceAction = {
-  id: "browser" | "files" | "diff" | "pull-request" | "agents";
+  id: "browser" | "files" | "source-control" | "agents";
   label: string;
   description: string;
   shortcut: string;
@@ -16,22 +16,19 @@ export type RightPanelSurfaceAction = {
 const DISABLED_REASONS = {
   browser: "Browser previews are only available in the T3 Code desktop app.",
   files: "Project Explorer is only available when a project is open.",
-  diff: "Diff is only available for server threads in Git repositories.",
-  pullRequest: "This thread's branch has no pull request yet.",
+  sourceControl: "Source Control is only available when a project is open.",
   agents: "Agents are only available from a thread.",
 } as const;
 
 export function createRightPanelSurfaceActions(input: {
   browserAvailable: boolean;
-  diffAvailable: boolean;
   filesAvailable: boolean;
-  pullRequestAvailable: boolean;
+  sourceControlAvailable: boolean;
   agentsAvailable: boolean;
   liveAgentCount: number;
   onAddBrowser: () => void;
-  onAddDiff: () => void;
   onAddFiles: () => void;
-  onAddPullRequest: () => void;
+  onAddSourceControl: () => void;
   onAddAgents: () => void;
 }): RightPanelSurfaceAction[] {
   return [
@@ -58,26 +55,15 @@ export function createRightPanelSurfaceActions(input: {
       onClick: input.onAddFiles,
     },
     {
-      id: "diff",
-      label: "Diff",
-      description: "Review changes in this thread.",
-      shortcut: "D",
-      icon: FileDiff,
-      available: input.diffAvailable,
-      disabledReason: DISABLED_REASONS.diff,
+      id: "source-control",
+      label: "Source Control",
+      description: "Review changes, branches, and pull requests.",
+      shortcut: "G",
+      icon: GitBranch,
+      available: input.sourceControlAvailable,
+      disabledReason: DISABLED_REASONS.sourceControl,
       badgeCount: 0,
-      onClick: input.onAddDiff,
-    },
-    {
-      id: "pull-request",
-      label: "Pull request",
-      description: "Open this branch's pull request.",
-      shortcut: "P",
-      icon: GitPullRequest,
-      available: input.pullRequestAvailable,
-      disabledReason: DISABLED_REASONS.pullRequest,
-      badgeCount: 0,
-      onClick: input.onAddPullRequest,
+      onClick: input.onAddSourceControl,
     },
     {
       id: "agents",

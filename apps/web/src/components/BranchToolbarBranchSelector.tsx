@@ -34,6 +34,7 @@ import { vcsEnvironment } from "../state/vcs";
 import { cn } from "../lib/utils";
 import { parsePullRequestReference } from "../pullRequestReference";
 import { getSourceControlPresentation } from "../sourceControlPresentation";
+import { needsDirtyBranchConfirmation } from "./source-control/sourceControlPanel.logic";
 import {
   deriveLocalBranchNameFromRemoteRef,
   resolveBranchTriggerLabel,
@@ -389,7 +390,29 @@ export function BranchToolbarBranchSelector({
     });
   };
 
-  const selectBranch = (refName: VcsRef) => {
+  const confirmDirtyBranchSwitch = useCallback(
+    async (branchName: string): Promise<boolean> => {
+      if (!needsDirtyBranchConfirmation(branchStatusQuery.data?.hasWorkingTreeChanges === true)) {
+        return true;
+      }
+      const api = readLocalApi();
+      if (!api) {
+        toastManager.add({
+          type: "error",
+          title: "Confirmation is unavailable",
+          description:
+            "This branch switch was canceled because the confirmation dialog is unavailable.",
+        });
+        return false;
+      }
+      return api.dialogs.confirm(
+        `Switch to \"${branchName}\" with uncommitted changes?\nYour working tree will carry over if Git can apply it cleanly.`,
+      );
+    },
+    [branchStatusQuery.data?.hasWorkingTreeChanges],
+  );
+
+  const selectBranch = async (refName: VcsRef) => {
     if (!branchCwd || !activeProjectCwd || isBranchActionPending) return;
 
     if (isSelectingWorktreeBase) {
@@ -415,6 +438,8 @@ export function BranchToolbarBranchSelector({
     const selectedBranchName = refName.isRemote
       ? deriveLocalBranchNameFromRemoteRef(refName.name)
       : refName.name;
+
+    if (!(await confirmDirtyBranchSwitch(selectedBranchName))) return;
 
     setIsBranchMenuOpen(false);
     onComposerFocusRequest?.();
@@ -450,9 +475,11 @@ export function BranchToolbarBranchSelector({
     });
   };
 
-  const createRef = (rawName: string) => {
+  const createRef = async (rawName: string) => {
     const name = sanitizeNewRefName(rawName);
     if (!branchCwd || !name || isBranchActionPending) return;
+
+    if (!(await confirmDirtyBranchSwitch(name))) return;
 
     setIsBranchMenuOpen(false);
     onComposerFocusRequest?.();

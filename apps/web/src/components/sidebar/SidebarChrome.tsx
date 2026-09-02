@@ -6,11 +6,14 @@ import {
 } from "lucide-react";
 import type { ReactNode } from "react";
 import { memo, useCallback } from "react";
-import { Link, useCanGoBack, useLocation, useNavigate } from "@tanstack/react-router";
+import { Link, useCanGoBack, useLocation, useNavigate, useParams } from "@tanstack/react-router";
 
 import { useEnvironmentIdentificationMode } from "../../hooks/useSettings";
 import { cn } from "../../lib/utils";
 import { useEnvironments } from "../../state/environments";
+import { resolveThreadRouteRef } from "../../threadRoutes";
+import { useRightPanelStore } from "../../rightPanelStore";
+import { pullRequestShortcutTarget } from "../source-control/sourceControlPanel.logic";
 import {
   resolveEnvironmentIdentificationPillLabel,
   resolveSidebarStageBackdropVariant,
@@ -160,6 +163,10 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
               : null,
   });
   const { environments } = useEnvironments();
+  const routeThreadRef = useParams({
+    strict: false,
+    select: (params) => resolveThreadRouteRef(params),
+  });
   // The page reads every connected server, so one of them offering pull requests is enough for
   // the link to lead somewhere.
   const pullRequestsSupported = environments.some(
@@ -172,8 +179,14 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
   }, [isMobile, setOpenMobile]);
   const handlePullRequestsClick = useCallback(() => {
     closeMobileSidebar();
+    if (routeThreadRef) {
+      useRightPanelStore
+        .getState()
+        .openSourceControl(routeThreadRef, pullRequestShortcutTarget().view);
+      return;
+    }
     void navigate({ to: "/pull-requests", search: { involvement: "all", state: "open" } });
-  }, [closeMobileSidebar, navigate]);
+  }, [closeMobileSidebar, navigate, routeThreadRef]);
   const handleSettingsClick = useCallback(() => {
     closeMobileSidebar();
     void navigate({ to: "/settings" });

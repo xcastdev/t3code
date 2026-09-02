@@ -187,6 +187,7 @@ import { isThreadOwnPullRequest } from "./pullRequest/pullRequestDetail.logic";
 import { PullRequestDetailPanel } from "./pullRequest/PullRequestDetailPanel";
 import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
+import { SourceControlPanel } from "./source-control/SourceControlPanel";
 import { RightPanelTabs, type PullRequestTabStatus } from "./RightPanelTabs";
 import { SecondaryPaneShell } from "./workspace/SecondaryPaneShell";
 import { SecondaryPaneTabs } from "./workspace/SecondaryPaneTabs";
@@ -3479,11 +3480,10 @@ function ChatViewContent(props: ChatViewProps) {
     if (!activeThreadRef) return;
     void addBrowserSurface({ threadRef: activeThreadRef, openPreview });
   }, [activeThreadRef, openPreview]);
-  const addDiffSurface = useCallback(() => {
-    if (!activeThreadRef || !isServerThread || !isGitRepo) return;
-    useRightPanelStore.getState().open(activeThreadRef, "diff");
-    onDiffPanelOpen?.();
-  }, [activeThreadRef, isGitRepo, isServerThread, onDiffPanelOpen]);
+  const addSourceControlSurface = useCallback(() => {
+    if (!activeThreadRef || !activeProject) return;
+    useRightPanelStore.getState().openSourceControl(activeThreadRef, "changes");
+  }, [activeProject, activeThreadRef]);
   const addFilesSurface = useCallback(() => {
     if (!activeThreadRef || !activeProject) return;
     useRightPanelStore.getState().open(activeThreadRef, "files");
@@ -3540,46 +3540,6 @@ function ChatViewContent(props: ChatViewProps) {
   const linkedThreadPullRequest = activeThread?.linkedPullRequest ?? null;
   const activeProjectRepository = activeProject?.repositoryIdentity?.displayName ?? null;
   const threadRepository = linkedThreadPullRequest?.repository ?? activeProjectRepository;
-  const openThreadPullRequest = useCallback(
-    (number: number) => {
-      if (!supportsPullRequests || !activeThreadRef) {
-        return;
-      }
-      const projectId = linkedThreadPullRequest?.projectId ?? activeProject?.id;
-      const repository = linkedThreadPullRequest?.repository ?? activeProjectRepository;
-      if (projectId === undefined || repository === null) return;
-      useRightPanelStore.getState().openPullRequest(activeThreadRef, {
-        projectId,
-        repository,
-        number,
-      });
-    },
-    [
-      activeProject,
-      activeProjectRepository,
-      activeThreadRef,
-      linkedThreadPullRequest,
-      supportsPullRequests,
-    ],
-  );
-  const openProjectPullRequest = useCallback(
-    (number: number) => {
-      if (
-        !supportsPullRequests ||
-        !activeThreadRef ||
-        !activeProject ||
-        activeProjectRepository === null
-      ) {
-        return;
-      }
-      useRightPanelStore.getState().openPullRequest(activeThreadRef, {
-        projectId: activeProject.id,
-        repository: activeProjectRepository,
-        number,
-      });
-    },
-    [activeProject, activeProjectRepository, activeThreadRef, supportsPullRequests],
-  );
   const togglePreviewPanel = useCallback(() => {
     if (!activeThreadRef || !isPreviewSupportedInRuntime()) return;
     if (previewPanelOpen) {
@@ -4360,14 +4320,6 @@ function ChatViewContent(props: ChatViewProps) {
     linkedPullRequest: linkedThreadPullRequest,
     linkedPullRequestStatus,
   });
-  // The right panel offers the thread's own change request, so it can only offer it once the
-  // branch has one; until then the picker says so rather than opening an empty panel.
-  const addPullRequestSurface = useCallback(() => {
-    if (activeThreadPr === null) return;
-    openThreadPullRequest(activeThreadPr.number);
-  }, [activeThreadPr, openThreadPullRequest]);
-  const pullRequestSurfaceAvailable =
-    supportsPullRequests && activeThreadPr !== null && threadRepository !== null;
   // Primitive slice of the displayed PR for the settle-rule memos below:
   // resolveDisplayedThreadPr returns a fresh object every render, so memoize
   // on the fields the rules read instead of the object identity.
@@ -6809,6 +6761,22 @@ function ChatViewContent(props: ChatViewProps) {
           workspaceMutationId={workspaceMutationId}
         />
       </Suspense>
+    ) : activeRightPanelSurface?.kind === "source-control" ? (
+      <SourceControlPanel
+        key={`${activeThreadKey}:${activeRightPanelSurface.view}`}
+        environmentId={activeThread.environmentId}
+        threadId={activeThread.id}
+        threadRef={activeThreadRef}
+        cwd={gitStatusCwd ?? activeProject?.workspaceRoot ?? null}
+        projectId={activeProject?.id ?? null}
+        envLocked={envLocked}
+        view={activeRightPanelSurface.view}
+        onViewChange={(view) => {
+          useRightPanelStore.getState().setSourceControlView(activeThreadRef, view);
+        }}
+        supportsPullRequests={supportsPullRequests}
+        pullRequestsCapabilityKnown={pullRequestsCapabilityKnown}
+      />
     ) : activeRightPanelSurface?.kind === "pull-request" && !pullRequestsCapabilityKnown ? (
       <PullRequestDetailGhost />
     ) : activeRightPanelSurface?.kind === "pull-request" && !supportsPullRequests ? (
@@ -6925,12 +6893,8 @@ function ChatViewContent(props: ChatViewProps) {
             className="relative z-10 bg-background"
           >
             <ChatHeader
-              {...(!supportsPullRequests || activeProjectRepository === null
-                ? {}
-                : { onOpenPullRequest: openProjectPullRequest })}
               activeThreadEnvironmentId={activeThread.environmentId}
               activeThreadId={activeThread.id}
-              {...(routeKind === "draft" && draftId ? { draftId } : {})}
               activeThreadTitle={activeThread.title}
               isServerThread={isServerThread}
               changeRequest={activeThreadChangeRequest}
@@ -6948,7 +6912,6 @@ function ChatViewContent(props: ChatViewProps) {
               trailingControls={
                 panelControlsPlacement === "chat-header" ? panelToggleControls : undefined
               }
-              gitCwd={gitCwd}
               onNewThreadInProject={handleNewThreadInActiveProject}
               onRunProjectScript={runProjectScript}
               onAddProjectScript={saveProjectScript}
@@ -7394,14 +7357,12 @@ function ChatViewContent(props: ChatViewProps) {
           onCloseSurfacesToRight={closeRightPanelSurfacesToRight}
           onCloseAllSurfaces={closeAllRightPanelSurfaces}
           onAddBrowser={createBrowserSurface}
-          onAddDiff={addDiffSurface}
           onAddFiles={addFilesSurface}
-          onAddPullRequest={addPullRequestSurface}
+          onAddSourceControl={addSourceControlSurface}
           onAddAgents={addAgentsSurface}
           browserAvailable={isPreviewSupportedInRuntime()}
-          diffAvailable={isServerThread && isGitRepo}
           filesAvailable={activeProject !== null}
-          pullRequestAvailable={pullRequestSurfaceAvailable}
+          sourceControlAvailable={activeProject !== null}
           agentsAvailable
           pullRequestStatuses={pullRequestTabStatuses}
           liveAgentCount={agentPanelModel.liveCount}
@@ -7426,14 +7387,12 @@ function ChatViewContent(props: ChatViewProps) {
             onCloseSurfacesToRight={closeRightPanelSurfacesToRight}
             onCloseAllSurfaces={closeAllRightPanelSurfaces}
             onAddBrowser={createBrowserSurface}
-            onAddDiff={addDiffSurface}
             onAddFiles={addFilesSurface}
-            onAddPullRequest={addPullRequestSurface}
+            onAddSourceControl={addSourceControlSurface}
             onAddAgents={addAgentsSurface}
             browserAvailable={isPreviewSupportedInRuntime()}
-            diffAvailable={isServerThread && isGitRepo}
             filesAvailable={activeProject !== null}
-            pullRequestAvailable={pullRequestSurfaceAvailable}
+            sourceControlAvailable={activeProject !== null}
             agentsAvailable
             pullRequestStatuses={pullRequestTabStatuses}
             liveAgentCount={agentPanelModel.liveCount}
