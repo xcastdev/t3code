@@ -7,6 +7,7 @@ import {
   ProjectMcpCatalog,
   ProjectMcpCreateInput,
   ProjectMcpListInput,
+  ProjectMcpNameConflictError,
   ProjectMcpRemoveInput,
   ProjectMcpServer,
   ProjectMcpUpdateInput,
@@ -91,6 +92,7 @@ describe("Project MCP contract shapes", () => {
           },
         ],
         managed: [],
+        applications: [{ serverId: "mcp-1", providerInstanceId: "codex", mode: "next-session" }],
       }),
     ).toEqual({
       external: [
@@ -103,6 +105,7 @@ describe("Project MCP contract shapes", () => {
         },
       ],
       managed: [],
+      applications: [{ serverId: "mcp-1", providerInstanceId: "codex", mode: "next-session" }],
     });
   });
 
@@ -149,5 +152,17 @@ describe("Project MCP contract shapes", () => {
     expect(Schema.decodeUnknownSync(ProjectMcpUrl)("https://example.com/mcp")).toBe(
       "https://example.com/mcp",
     );
+  });
+
+  it("decodes an actionable case-folded name conflict error", () => {
+    const error = Schema.decodeUnknownSync(ProjectMcpNameConflictError)({
+      _tag: "ProjectMcpNameConflictError",
+      name: "Docs",
+      message: 'An MCP server named "Docs" already exists in this project.',
+    });
+
+    expect(error._tag).toBe("ProjectMcpNameConflictError");
+    expect(error.name).toBe("Docs");
+    expect(error.message).toContain("already exists");
   });
 });

@@ -43,6 +43,13 @@ export const ProjectMcpApplicationMode = Schema.Literals([
 ]);
 export type ProjectMcpApplicationMode = typeof ProjectMcpApplicationMode.Type;
 
+export const ProjectMcpApplication = Schema.Struct({
+  serverId: McpServerId,
+  providerInstanceId: ProviderInstanceId,
+  mode: ProjectMcpApplicationMode,
+});
+export type ProjectMcpApplication = typeof ProjectMcpApplication.Type;
+
 export const ProjectMcpServer = Schema.Struct({
   id: McpServerId,
   name: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_MCP_NAME_MAX_LENGTH)),
@@ -63,8 +70,17 @@ export type ProjectMcpManagedServer = typeof ProjectMcpManagedServer.Type;
 export const ProjectMcpCatalog = Schema.Struct({
   external: Schema.Array(ProjectMcpServer),
   managed: Schema.Array(ProjectMcpManagedServer),
+  applications: Schema.Array(ProjectMcpApplication),
 });
 export type ProjectMcpCatalog = typeof ProjectMcpCatalog.Type;
+
+export class ProjectMcpNameConflictError extends Schema.TaggedErrorClass<ProjectMcpNameConflictError>()(
+  "ProjectMcpNameConflictError",
+  {
+    name: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_MCP_NAME_MAX_LENGTH)),
+    message: TrimmedNonEmptyString,
+  },
+) {}
 
 export const ProjectMcpCreateInput = Schema.Struct({
   projectId: ProjectId,
