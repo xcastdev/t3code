@@ -49,6 +49,18 @@ describe("ProviderSessionStartInput", () => {
     expect(getOptionValue(parsed.modelSelection?.options, "fastMode")).toBe(true);
   });
 
+  it("accepts internal OpenCode recovery metadata", () => {
+    const parsed = decodeProviderSessionStartInput({
+      threadId: "thread-recovery",
+      provider: "opencode",
+      providerInstanceId: "opencode",
+      runtimeMode: "full-access",
+      recovery: { turnId: "turn-recovery", state: "waiting" },
+    });
+
+    expect(parsed.recovery).toEqual({ turnId: "turn-recovery", state: "waiting" });
+  });
+
   it("rejects payloads without runtime mode", () => {
     expect(() =>
       decodeProviderSessionStartInput({

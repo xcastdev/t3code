@@ -408,7 +408,7 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
             name: "review",
             description: "Review code",
             source: "command",
-            template: "Review $ARGUMENTS",
+            template: "  Review $ARGUMENTS  ",
             hints: ["focus"],
           },
           {
@@ -430,7 +430,12 @@ it.layer(testLayer)("checkOpenCodeProviderStatus", (it) => {
 
       const snapshot = yield* checkProvider(makeOpenCodeSettings());
       NodeAssert.deepEqual(snapshot.slashCommands, [
-        { name: "review", description: "Review code", input: { hint: "focus" } },
+        {
+          name: "review",
+          description: "Review code",
+          input: { hint: "focus" },
+          template: "Review $ARGUMENTS",
+        },
       ]);
     }),
   );

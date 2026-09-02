@@ -17,6 +17,7 @@ import {
   ProviderDriverKind,
   type ServerProvider,
   type ServerProviderCatalog,
+  type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -137,6 +138,10 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         accentColor,
         continuationGroupKey: continuationIdentity.continuationKey,
       });
+      const commandCatalogByDirectory = new Map<
+        string,
+        ReadonlyArray<ServerProviderSlashCommand>
+      >();
       const effectiveConfig = { ...config, enabled } satisfies OpenCodeSettings;
       const maintenanceCapabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(UPDATE, {
         binaryPath: effectiveConfig.binaryPath,
@@ -146,6 +151,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
       const adapter = yield* makeOpenCodeAdapter(effectiveConfig, {
         instanceId,
         environment: processEnv,
+        commandCatalog: (directory) => commandCatalogByDirectory.get(directory) ?? [],
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
       });
       const serverOwner = yield* OpenCodeServerOwner.make({
@@ -165,6 +171,11 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         serverConfig.cwd,
         processEnv,
       ).pipe(
+        Effect.tap((provider) =>
+          Effect.sync(() => {
+            commandCatalogByDirectory.set(serverConfig.cwd, provider.slashCommands);
+          }),
+        ),
         Effect.map(stampIdentity),
         Effect.provideService(OpenCodeServerOwner.OpenCodeServerOwner, serverOwner),
         Effect.provideService(OpenCodeRuntime, openCodeRuntime),
@@ -204,6 +215,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
 
       const getCatalog = (cwd: string): Effect.Effect<ServerProviderCatalog> => {
         if (!effectiveConfig.enabled) {
+          commandCatalogByDirectory.set(cwd, []);
           return Effect.succeed({
             instanceId,
             slashCommands: [],
@@ -227,12 +239,14 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
               { directory: cwd },
             )
             .pipe(
-              Effect.map((inventory) =>
-                flattenOpenCodeCatalog({
+              Effect.map((inventory) => {
+                const catalog = flattenOpenCodeCatalog({
                   instanceId,
                   inventory,
-                }),
-              ),
+                });
+                commandCatalogByDirectory.set(cwd, catalog.slashCommands);
+                return catalog;
+              }),
             );
 
         const inventoryEffect = effectiveConfig.serverUrl
@@ -251,14 +265,14 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         return inventoryEffect.pipe(
           Effect.catch(() =>
             snapshot.getSnapshot.pipe(
-              Effect.map(
-                (current) =>
-                  ({
-                    instanceId,
-                    slashCommands: current.slashCommands,
-                    skills: current.skills,
-                  }) satisfies ServerProviderCatalog,
-              ),
+              Effect.map((current) => {
+                commandCatalogByDirectory.set(cwd, current.slashCommands);
+                return {
+                  instanceId,
+                  slashCommands: current.slashCommands,
+                  skills: current.skills,
+                } satisfies ServerProviderCatalog;
+              }),
             ),
           ),
         );

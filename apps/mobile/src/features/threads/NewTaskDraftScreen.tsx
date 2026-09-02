@@ -21,7 +21,10 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
-import { PROVIDER_SEND_TURN_MAX_ATTACHMENTS } from "@t3tools/contracts";
+import {
+  expandOpenCodeCommandTemplate,
+  PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
+} from "@t3tools/contracts";
 
 import { ComposerEditor, type ComposerEditorHandle } from "../../components/ComposerEditor";
 import {
@@ -901,6 +904,13 @@ export function NewTaskDraftScreen(props: {
       runtimeMode,
       interactionMode,
       initialMessageText,
+      initialDisplayText:
+        flow.selectedProviderStatus?.driver === "opencode"
+          ? expandOpenCodeCommandTemplate(
+              initialMessageText,
+              flow.selectedProviderStatus.slashCommands,
+            )
+          : initialMessageText,
       initialAttachments: draft.attachments,
       onAttachmentsUploaded: async (attachments) => {
         flow.replaceAttachments(attachments);

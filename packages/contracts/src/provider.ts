@@ -4,6 +4,7 @@ import {
   ApprovalRequestId,
   EventId,
   IsoDateTime,
+  MessageId,
   ProviderItemId,
   ThreadId,
   TurnId,
@@ -50,6 +51,20 @@ export const ProviderSession = Schema.Struct({
 });
 export type ProviderSession = typeof ProviderSession.Type;
 
+const ProviderSessionRecoveryAssistantMessage = Schema.Struct({
+  messageId: MessageId,
+  text: Schema.String,
+  streaming: Schema.Boolean,
+});
+
+export const ProviderSessionRecovery = Schema.Struct({
+  turnId: TurnId,
+  state: Schema.Literals(["running", "waiting"]),
+  userMessageId: Schema.optional(MessageId),
+  assistantMessages: Schema.optional(Schema.Array(ProviderSessionRecoveryAssistantMessage)),
+});
+export type ProviderSessionRecovery = typeof ProviderSessionRecovery.Type;
+
 export const ProviderSessionStartInput = Schema.Struct({
   threadId: ThreadId,
   provider: Schema.optional(ProviderDriverKind),
@@ -62,6 +77,7 @@ export const ProviderSessionStartInput = Schema.Struct({
   approvalPolicy: Schema.optional(ProviderApprovalPolicy),
   sandboxMode: Schema.optional(ProviderSandboxMode),
   runtimeMode: RuntimeMode,
+  recovery: Schema.optional(ProviderSessionRecovery),
 });
 export type ProviderSessionStartInput = typeof ProviderSessionStartInput.Type;
 

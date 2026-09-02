@@ -297,6 +297,7 @@ export function flattenOpenCodeCommands(
       continue;
     }
     const description = trimOptional(command.description);
+    const template = trimOptional(command.template);
     const hint = command.hints
       .map(trimOptional)
       .find((value): value is string => value !== undefined);
@@ -304,6 +305,7 @@ export function flattenOpenCodeCommands(
       name,
       ...(description ? { description } : {}),
       ...(hint ? { input: { hint } } : {}),
+      ...(template ? { template } : {}),
     });
   }
   const seen = new Set<string>();

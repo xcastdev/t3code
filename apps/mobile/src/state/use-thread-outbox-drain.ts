@@ -708,6 +708,9 @@ export function useThreadOutboxDrain(): void {
             messageId: queuedMessage.messageId,
             role: "user",
             text: queuedMessage.text,
+            ...(queuedMessage.displayText !== undefined
+              ? { displayText: queuedMessage.displayText }
+              : {}),
             attachments: prepared.attachments,
           },
           modelSelection: settings.modelSelection,
@@ -798,6 +801,7 @@ export function useThreadOutboxDrain(): void {
           messageId: queuedMessage.messageId,
           createdAt: queuedMessage.createdAt,
           text: queuedMessage.text.trim(),
+          displayText: queuedMessage.displayText,
           attachments: queuedMessage.attachments,
           uploadedAttachments: prepared.attachments,
           modelSelection,

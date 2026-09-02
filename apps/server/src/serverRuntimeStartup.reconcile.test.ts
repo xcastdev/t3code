@@ -21,21 +21,36 @@ import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 
 const providerInstanceId = ProviderInstanceId.make("codex");
 const updatedAt = "2026-08-20T12:00:00.000Z";
+const openCodeInstanceId = ProviderInstanceId.make("opencode");
 
 const makeThread = (
   id: string,
   status: "starting" | "running" | "ready" | "stopped" | "error",
   activeTurnId: TurnId | null = null,
   archivedAt: string | null = null,
+  providerName: "codex" | "opencode" = "codex",
+  instanceId: ProviderInstanceId = providerInstanceId,
+  messages: ReadonlyArray<{
+    readonly id: string;
+    readonly role: "user" | "assistant";
+    readonly text: string;
+    readonly turnId: TurnId | null;
+    readonly streaming: boolean;
+  }> = [],
+  activities: ReadonlyArray<{ readonly kind: string; readonly payload: unknown }> = [],
 ) => ({
   id: ThreadId.make(id),
+  title: id,
+  modelSelection: { instanceId, model: "openai/gpt-5" },
+  messages,
+  activities,
   archivedAt,
   deletedAt: null,
   session: {
     threadId: ThreadId.make(id),
     status,
-    providerName: "codex" as const,
-    providerInstanceId,
+    providerName,
+    providerInstanceId: instanceId,
     runtimeMode: "full-access" as const,
     activeTurnId,
     lastError: null,
@@ -43,9 +58,13 @@ const makeThread = (
   },
 });
 
-const makeProviderService = (liveThreadIds: ReadonlyArray<ThreadId> = []) =>
+const makeProviderService = (
+  liveThreadIds: ReadonlyArray<ThreadId> = [],
+  startSession: ProviderService.ProviderService["Service"]["startSession"] = () =>
+    Effect.die("unused"),
+) =>
   ({
-    startSession: () => Effect.die("unused"),
+    startSession,
     sendTurn: () => Effect.die("unused"),
     interruptTurn: () => Effect.die("unused"),
     respondToRequest: () => Effect.die("unused"),
@@ -59,9 +78,18 @@ const makeProviderService = (liveThreadIds: ReadonlyArray<ThreadId> = []) =>
     streamEvents: Stream.empty,
   }) satisfies ProviderService.ProviderService["Service"];
 
-const queryWithThreads = (threads: ReadonlyArray<ReturnType<typeof makeThread>>) =>
+const queryWithThreads = (
+  threads: ReadonlyArray<ReturnType<typeof makeThread>>,
+  detailReads: ThreadId[] = [],
+) =>
   ({
     getCommandReadModel: () => Effect.succeed({ threads } as never),
+    getThreadDetailById: (threadId: ThreadId) =>
+      Effect.sync(() => {
+        detailReads.push(threadId);
+        const thread = threads.find((candidate) => candidate.id === threadId);
+        return thread === undefined ? Option.none() : Option.some(thread);
+      }),
   }) as unknown as ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"];
 
 const runReconciliation = (input: {
@@ -69,15 +97,17 @@ const runReconciliation = (input: {
   readonly liveThreadIds?: ReadonlyArray<ThreadId>;
   readonly directory: ProviderSessionDirectory.ProviderSessionDirectory["Service"];
   readonly dispatch: OrchestrationEngine.OrchestrationEngineService["Service"]["dispatch"];
+  readonly startSession?: ProviderService.ProviderService["Service"]["startSession"];
+  readonly detailReads?: ThreadId[];
 }) =>
   ServerRuntimeStartup.reconcileProviderSessions.pipe(
     Effect.provideService(
       ProjectionSnapshotQuery.ProjectionSnapshotQuery,
-      queryWithThreads(input.threads),
+      queryWithThreads(input.threads, input.detailReads),
     ),
     Effect.provideService(
       ProviderService.ProviderService,
-      makeProviderService(input.liveThreadIds),
+      makeProviderService(input.liveThreadIds, input.startSession),
     ),
     Effect.provideService(ProviderSessionDirectory.ProviderSessionDirectory, input.directory),
     Effect.provideService(OrchestrationEngine.OrchestrationEngineService, {
@@ -159,6 +189,105 @@ it.effect("reconciles multiple active and archived orphans but skips live sessio
           assert.deepStrictEqual(binding.runtimePayload, { activeTurnId: null });
           assert.deepStrictEqual(binding.resumeCursor, { cursor: binding.threadId });
         }
+      }),
+    ),
+  );
+});
+
+it.effect("reattaches a recoverable OpenCode turn instead of orphaning it", () => {
+  const turnId = TurnId.make("turn-opencode-recovered");
+  const thread = makeThread(
+    "thread-opencode-recovered",
+    "running",
+    turnId,
+    null,
+    "opencode",
+    openCodeInstanceId,
+    [
+      {
+        id: "user-opencode-recovered",
+        role: "user",
+        text: "Continue",
+        turnId: null,
+        streaming: false,
+      },
+      {
+        id: "assistant:part-opencode-recovered",
+        role: "assistant",
+        text: "Already shown",
+        turnId,
+        streaming: false,
+      },
+    ],
+    [{ kind: "user-input.requested", payload: { requestId: "request-opencode-recovered" } }],
+  );
+  const starts: Array<unknown> = [];
+  const bindingReads: ThreadId[] = [];
+  const detailReads: ThreadId[] = [];
+  const dispatched: OrchestrationCommand[] = [];
+  const upserts: ProviderSessionDirectory.ProviderRuntimeBinding[] = [];
+
+  return runReconciliation({
+    threads: [thread],
+    detailReads,
+    directory: {
+      getBinding: (candidate) =>
+        Effect.sync(() => {
+          bindingReads.push(candidate);
+          return Option.some({
+            threadId: candidate,
+            provider: ProviderDriverKind.make("opencode"),
+            providerInstanceId: openCodeInstanceId,
+            status: "running" as const,
+            resumeCursor: { schemaVersion: 1, sessionId: "ses_recovered" },
+            runtimePayload: { cwd: "/workspace/project" },
+            runtimeMode: "full-access" as const,
+          });
+        }),
+      upsert: (binding) => Effect.sync(() => upserts.push(binding)),
+      getProvider: () => Effect.die("unused"),
+      listThreadIds: () => Effect.die("unused"),
+      listBindings: () => Effect.die("unused"),
+    },
+    startSession: (_threadId, input) =>
+      Effect.sync(() => starts.push(input)).pipe(
+        Effect.as({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId: thread.id,
+        } as never),
+      ),
+    dispatch: (command) =>
+      Effect.sync(() => dispatched.push(command)).pipe(Effect.as({ sequence: dispatched.length })),
+  }).pipe(
+    Effect.tap(() =>
+      Effect.sync(() => {
+        assert.deepStrictEqual(bindingReads, [thread.id]);
+        assert.equal(upserts.length, 0);
+        assert.equal(dispatched.length, 0);
+        assert.deepStrictEqual(detailReads, [thread.id]);
+        assert.equal(starts.length, 1);
+        assert.deepStrictEqual(starts[0], {
+          threadId: thread.id,
+          provider: ProviderDriverKind.make("opencode"),
+          providerInstanceId: openCodeInstanceId,
+          cwd: "/workspace/project",
+          title: thread.title,
+          modelSelection: thread.modelSelection,
+          resumeCursor: { schemaVersion: 1, sessionId: "ses_recovered" },
+          runtimeMode: "full-access",
+          recovery: {
+            turnId,
+            state: "waiting",
+            userMessageId: "user-opencode-recovered",
+            assistantMessages: [
+              {
+                messageId: "assistant:part-opencode-recovered",
+                text: "Already shown",
+                streaming: false,
+              },
+            ],
+          },
+        });
       }),
     ),
   );

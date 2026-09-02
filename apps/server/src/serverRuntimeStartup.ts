@@ -296,6 +296,83 @@ const runStartupPhase = <A, E, R>(phase: string, effect: Effect.Effect<A, E, R>)
 const ORPHANED_PROVIDER_SESSION_ERROR =
   "Provider session did not survive a server restart. Send a new message to continue.";
 
+const OPENCODE_RESUME_VERSION = 1;
+
+function isOpenCodeRecoveryCursor(
+  raw: unknown,
+): raw is { readonly schemaVersion: 1; readonly sessionId: string } {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    return false;
+  }
+  const record = raw as Record<string, unknown>;
+  return (
+    record.schemaVersion === OPENCODE_RESUME_VERSION &&
+    typeof record.sessionId === "string" &&
+    record.sessionId.trim().length > 0
+  );
+}
+
+function readRuntimePayloadString(payload: unknown, key: string): string | undefined {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return undefined;
+  }
+  const value = (payload as Record<string, unknown>)[key];
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function isStaleRequestFailureDetail(payload: Record<string, unknown>): boolean {
+  const detail = typeof payload.detail === "string" ? payload.detail.toLowerCase() : "";
+  return (
+    detail.includes("stale pending approval request") ||
+    detail.includes("unknown pending approval request") ||
+    detail.includes("unknown pending permission request") ||
+    detail.includes("stale pending user-input request") ||
+    detail.includes("unknown pending user-input request") ||
+    detail.includes("unknown pending user input request") ||
+    detail.includes("unknown pending codex user input request")
+  );
+}
+
+function hasOpenBlockingRequestForRecovery(thread: {
+  readonly activities: ReadonlyArray<{ readonly kind: string; readonly payload: unknown }>;
+}): boolean {
+  const openRequestIds = new Set<string>();
+  for (const activity of thread.activities) {
+    if (typeof activity.payload !== "object" || activity.payload === null) {
+      continue;
+    }
+    const requestId = (activity.payload as Record<string, unknown>).requestId;
+    if (typeof requestId !== "string") {
+      continue;
+    }
+    if (activity.kind === "approval.requested" || activity.kind === "user-input.requested") {
+      openRequestIds.add(requestId);
+    } else if (activity.kind === "approval.resolved" || activity.kind === "user-input.resolved") {
+      openRequestIds.delete(requestId);
+    } else if (
+      (activity.kind === "provider.approval.respond.failed" ||
+        activity.kind === "provider.user-input.respond.failed") &&
+      isStaleRequestFailureDetail(activity.payload as Record<string, unknown>)
+    ) {
+      openRequestIds.delete(requestId);
+    }
+  }
+  return openRequestIds.size > 0;
+}
+
+function startupFailureDetail(cause: unknown): string {
+  if (typeof cause === "object" && cause !== null) {
+    const record = cause as Record<string, unknown>;
+    if (typeof record.detail === "string" && record.detail.trim().length > 0) {
+      return record.detail;
+    }
+    if (typeof record.message === "string" && record.message.trim().length > 0) {
+      return record.message;
+    }
+  }
+  return String(cause);
+}
+
 export const reconcileProviderSessions = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
@@ -321,8 +398,125 @@ export const reconcileProviderSessions = Effect.gen(function* () {
     if (session === null) {
       continue;
     }
+    const bindingRead = yield* Effect.exit(directory.getBinding(thread.id));
+    const binding = Exit.isSuccess(bindingRead) ? bindingRead.value : Option.none();
+    if (Exit.isFailure(bindingRead)) {
+      if (Cause.hasInterrupts(bindingRead.cause)) {
+        return yield* Effect.failCause(bindingRead.cause);
+      }
+      yield* Effect.logWarning("failed to read orphaned provider session directory binding", {
+        threadId: thread.id,
+        cause: bindingRead.cause,
+      });
+    }
+
+    const isRecoveryCandidate =
+      Option.isSome(binding) &&
+      String(binding.value.provider) === "opencode" &&
+      binding.value.providerInstanceId !== undefined &&
+      session.activeTurnId !== null &&
+      isOpenCodeRecoveryCursor(binding.value.resumeCursor);
+    if (isRecoveryCandidate) {
+      const recoveryThread = yield* query.getThreadDetailById(thread.id).pipe(
+        Effect.map(Option.getOrUndefined),
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.failCause(cause)
+            : Effect.logWarning("failed to hydrate OpenCode recovery thread detail", {
+                threadId: thread.id,
+                cause,
+              }).pipe(Effect.as(undefined)),
+        ),
+      );
+      const recoverySource = recoveryThread ?? thread;
+      const recoveryCwd = readRuntimePayloadString(binding.value.runtimePayload, "cwd");
+      const recoveryUserMessage = recoverySource.messages.findLast(
+        (message) => message.role === "user",
+      );
+      const recoveryAssistantMessages = recoverySource.messages
+        .filter(
+          (message) => message.role === "assistant" && message.turnId === session.activeTurnId,
+        )
+        .map(({ id, text, streaming }) => ({ messageId: id, text, streaming }));
+      const recoveryInput = {
+        threadId: thread.id,
+        provider: binding.value.provider,
+        providerInstanceId: binding.value.providerInstanceId,
+        ...(recoveryCwd ? { cwd: recoveryCwd } : {}),
+        title: thread.title,
+        ...(thread.modelSelection.instanceId === binding.value.providerInstanceId
+          ? { modelSelection: thread.modelSelection }
+          : {}),
+        resumeCursor: binding.value.resumeCursor,
+        runtimeMode: session.runtimeMode,
+        recovery: {
+          turnId: session.activeTurnId,
+          state: hasOpenBlockingRequestForRecovery(recoverySource) ? "waiting" : "running",
+          ...(recoveryUserMessage ? { userMessageId: recoveryUserMessage.id } : {}),
+          ...(recoveryAssistantMessages.length > 0
+            ? { assistantMessages: recoveryAssistantMessages }
+            : {}),
+        },
+      } as const;
+      const recoveryExit = yield* Effect.exit(
+        providerService.startSession(thread.id, recoveryInput),
+      );
+      if (Exit.isSuccess(recoveryExit)) {
+        continue;
+      }
+      if (Cause.hasInterrupts(recoveryExit.cause)) {
+        return yield* Effect.failCause(recoveryExit.cause);
+      }
+      const recoveryFailureDetail = startupFailureDetail(Cause.squash(recoveryExit.cause));
+      const detail = recoveryFailureDetail.toLowerCase().includes("no longer exists after restart")
+        ? recoveryFailureDetail
+        : ORPHANED_PROVIDER_SESSION_ERROR;
+      yield* directory
+        .upsert({
+          ...binding.value,
+          status: "error",
+          runtimePayload: { activeTurnId: null, lastError: detail },
+        })
+        .pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterrupts(cause)
+              ? Effect.failCause(cause)
+              : Effect.logWarning("failed to mark OpenCode recovery binding as failed", {
+                  threadId: thread.id,
+                  cause,
+                }),
+          ),
+        );
+      yield* Effect.gen(function* () {
+        const reconciledAt = DateTime.formatIso(yield* DateTime.now);
+        yield* orchestrationEngine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make(yield* crypto.randomUUIDv4),
+          threadId: thread.id,
+          session: {
+            ...session,
+            status: "error",
+            activeTurnId: null,
+            lastError: detail,
+            updatedAt: reconciledAt,
+          },
+          createdAt: reconciledAt,
+        });
+      }).pipe(
+        Effect.retry({ times: 1 }),
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause)
+            ? Effect.failCause(cause)
+            : Effect.logWarning("failed to settle failed OpenCode recovery projection", {
+                threadId: thread.id,
+                cause,
+              }),
+        ),
+      );
+      continue;
+    }
+
     yield* Effect.gen(function* () {
-      const binding = yield* directory.getBinding(thread.id);
       if (Option.isSome(binding)) {
         yield* directory.upsert({
           ...binding.value,

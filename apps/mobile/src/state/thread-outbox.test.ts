@@ -134,6 +134,19 @@ describe("thread outbox", () => {
     });
   });
 
+  it("persists the expanded display text separately from the provider input", () => {
+    const message = {
+      ...queuedMessage({
+        messageId: "message-command",
+        createdAt: "2026-06-08T10:00:01.000Z",
+      }),
+      text: '/review src/a.ts "two words"',
+      displayText: 'Review src/a.ts "two words"',
+    } satisfies QueuedThreadMessage;
+
+    expect(decodeQueuedThreadMessage(encodeQueuedThreadMessage(message))).toEqual(message);
+  });
+
   it("compares model options as part of the queued settings change", () => {
     const base = {
       instanceId: ProviderInstanceId.make("codex"),

@@ -30,6 +30,7 @@ export interface ProjectThreadStartTurnSpec {
   readonly messageId: string;
   readonly createdAt: string;
   readonly text: string;
+  readonly displayText?: string;
   readonly attachments: ReadonlyArray<DraftComposerAttachment>;
   readonly uploadedAttachments?: ReadonlyArray<UploadChatImageAttachment | ChatFileAttachment>;
   readonly modelSelection: ModelSelection;
@@ -58,6 +59,7 @@ export function buildProjectThreadStartTurnInput(spec: ProjectThreadStartTurnSpe
       messageId: MessageId.make(spec.messageId),
       role: "user" as const,
       text: spec.text,
+      ...(spec.displayText !== undefined ? { displayText: spec.displayText } : {}),
       attachments:
         spec.uploadedAttachments ??
         toUploadChatImageAttachments(

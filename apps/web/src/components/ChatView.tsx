@@ -23,6 +23,7 @@ import {
   ProviderDriverKind,
   RuntimeMode,
   TerminalOpenInput,
+  expandOpenCodeCommandTemplate,
 } from "@t3tools/contracts";
 import {
   connectionStatusTitle,
@@ -583,6 +584,16 @@ function formatOutgoingPrompt(params: {
   const caps = getProviderModelCapabilities(params.models, params.model, params.provider);
   const promptEffort = resolvePromptInjectedEffort(caps, params.effort);
   return applyClaudePromptEffortPrefix(params.text, promptEffort);
+}
+
+function formatDisplayedPrompt(params: {
+  provider: ProviderDriverKind;
+  text: string;
+  slashCommands: ReadonlyArray<ServerProvider["slashCommands"][number]>;
+}): string {
+  return params.provider === "opencode"
+    ? expandOpenCodeCommandTemplate(params.text, params.slashCommands)
+    : params.text;
 }
 const SCRIPT_TERMINAL_COLS = 120;
 const SCRIPT_TERMINAL_ROWS = 30;
@@ -5617,6 +5628,7 @@ function ChatViewContent(props: ChatViewProps) {
       selectedProvider: ctxSelectedProvider,
       selectedModel: ctxSelectedModel,
       selectedProviderModels: ctxSelectedProviderModels,
+      selectedProviderSlashCommands: ctxSelectedProviderSlashCommands,
       selectedPromptEffort: ctxSelectedPromptEffort,
       selectedModelSelection: ctxSelectedModelSelection,
     } = sendCtx;
@@ -5880,6 +5892,18 @@ function ChatViewContent(props: ChatViewProps) {
       effort: ctxSelectedPromptEffort,
       text: messageTextForSend || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
     });
+    const displayedMessageText = formatOutgoingPrompt({
+      provider: ctxSelectedProvider,
+      model: ctxSelectedModel,
+      models: ctxSelectedProviderModels,
+      effort: ctxSelectedPromptEffort,
+      text:
+        formatDisplayedPrompt({
+          provider: ctxSelectedProvider,
+          text: messageTextForSend,
+          slashCommands: ctxSelectedProviderSlashCommands,
+        }) || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
+    });
     if (composerRef.current?.validateProviderInput(outgoingMessageText) === false) {
       return;
     }
@@ -6038,7 +6062,7 @@ function ChatViewContent(props: ChatViewProps) {
       {
         id: messageIdForSend,
         role: "user",
-        text: outgoingMessageText,
+        text: displayedMessageText,
         ...(optimisticAttachments.length > 0 ? { attachments: optimisticAttachments } : {}),
         turnId: null,
         createdAt: messageCreatedAt,
@@ -6183,6 +6207,7 @@ function ChatViewContent(props: ChatViewProps) {
             messageId: messageIdForSend,
             role: "user",
             text: outgoingMessageText,
+            displayText: displayedMessageText,
             attachments: turnAttachmentsResult.value,
           },
           modelSelection: ctxSelectedModelSelection,
@@ -6532,6 +6557,7 @@ function ChatViewContent(props: ChatViewProps) {
         selectedProvider: ctxSelectedProvider,
         selectedModel: ctxSelectedModel,
         selectedProviderModels: ctxSelectedProviderModels,
+        selectedProviderSlashCommands: ctxSelectedProviderSlashCommands,
         selectedPromptEffort: ctxSelectedPromptEffort,
         selectedModelSelection: ctxSelectedModelSelection,
       } = sendCtx;
@@ -6546,6 +6572,17 @@ function ChatViewContent(props: ChatViewProps) {
         effort: ctxSelectedPromptEffort,
         text: trimmed,
       });
+      const displayedMessageText = formatOutgoingPrompt({
+        provider: ctxSelectedProvider,
+        model: ctxSelectedModel,
+        models: ctxSelectedProviderModels,
+        effort: ctxSelectedPromptEffort,
+        text: formatDisplayedPrompt({
+          provider: ctxSelectedProvider,
+          text: trimmed,
+          slashCommands: ctxSelectedProviderSlashCommands,
+        }),
+      });
 
       sendInFlightRef.current = true;
       beginLocalDispatch({ preparingWorktree: false });
@@ -6558,7 +6595,7 @@ function ChatViewContent(props: ChatViewProps) {
         {
           id: messageIdForSend,
           role: "user",
-          text: outgoingMessageText,
+          text: displayedMessageText,
           turnId: null,
           createdAt: messageCreatedAt,
           updatedAt: messageCreatedAt,
@@ -6595,6 +6632,7 @@ function ChatViewContent(props: ChatViewProps) {
               messageId: messageIdForSend,
               role: "user",
               text: outgoingMessageText,
+              displayText: displayedMessageText,
               attachments: [],
             },
             modelSelection: ctxSelectedModelSelection,

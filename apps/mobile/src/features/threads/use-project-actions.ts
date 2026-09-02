@@ -40,6 +40,7 @@ export function useCreateProjectThread() {
       readonly runtimeMode: RuntimeMode;
       readonly interactionMode: ProviderInteractionMode;
       readonly initialMessageText: string;
+      readonly initialDisplayText?: string;
       readonly initialAttachments: ReadonlyArray<DraftComposerAttachment>;
       readonly onAttachmentsUploaded: (
         attachments: ReadonlyArray<DraftComposerAttachment>,
@@ -117,6 +118,7 @@ export function useCreateProjectThread() {
           messageId: metadata.messageId,
           createdAt: metadata.createdAt,
           text: initialMessageText,
+          displayText: input.initialDisplayText,
           attachments: input.initialAttachments,
           uploadedAttachments: prepared.attachments,
           modelSelection: input.modelSelection,

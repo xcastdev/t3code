@@ -13,6 +13,7 @@ import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
+  expandOpenCodeCommandTemplate,
   MessageId,
   T3_PROJECT_FILE_NAME,
   ThreadId,
@@ -909,6 +910,14 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
         messageId: MessageId.make(metadata.messageId),
         commandId: CommandId.make(metadata.commandId),
         text,
+        ...(selectedProviderStatus?.driver === "opencode"
+          ? {
+              displayText: expandOpenCodeCommandTemplate(
+                text,
+                selectedProviderStatus.slashCommands,
+              ),
+            }
+          : {}),
         attachments: draft.attachments,
         modelSelection: draftModelSelection,
         runtimeMode: draft.runtimeMode ?? DEFAULT_RUNTIME_MODE,
@@ -950,6 +959,7 @@ export function NewTaskFlowProvider(props: React.PropsWithChildren) {
       planModePreferenceLoaded,
       startFromOrigin,
       workspaceMode,
+      selectedProviderStatus,
     ],
   );
 
