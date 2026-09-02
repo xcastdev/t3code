@@ -16,6 +16,7 @@ import {
   ExternalNotificationError,
   GitCommandError,
   KeybindingRule,
+  McpServerId,
   MessageId,
   ExternalLauncherCommandNotFoundError,
   OrchestrationThreadDetailSnapshot,
@@ -138,6 +139,7 @@ import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
+import * as ProjectMcpService from "./project/ProjectMcpService.ts";
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
@@ -416,6 +418,7 @@ const buildAppUnderTest = (options?: {
     projectSetupScriptRunner?: Partial<
       ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"]
     >;
+    projectMcpService?: Partial<ProjectMcpService.ProjectMcpService["Service"]>;
     terminalManager?: Partial<TerminalManager.TerminalManager["Service"]>;
     orchestrationEngine?: Partial<OrchestrationEngine.OrchestrationEngineService["Service"]>;
     threadDeletionReactor?: Partial<ThreadDeletionReactor["Service"]>;
@@ -777,6 +780,16 @@ const buildAppUnderTest = (options?: {
         Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
           runForThread: () => Effect.succeed({ status: "no-script" as const }),
           ...options?.layers?.projectSetupScriptRunner,
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(ProjectMcpService.ProjectMcpService)({
+          list: () => Effect.succeed({ external: [], managed: [], applications: [] }),
+          create: () => Effect.die("Project MCP create is not stubbed in this test"),
+          update: () => Effect.die("Project MCP update is not stubbed in this test"),
+          remove: () => Effect.die("Project MCP remove is not stubbed in this test"),
+          resolveForSession: () => Effect.succeed([]),
+          ...options?.layers?.projectMcpService,
         }),
       ),
       Layer.provide(
@@ -5123,6 +5136,130 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         draftResult.providers[0]?.skills[0]?.path,
         "/tmp/catalog-project/.opencode/skills/project-skill/SKILL.md",
       );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("routes project MCP catalog operations after validating project ownership", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-mcp-catalog");
+      const serverId = McpServerId.make("mcp-docs");
+      const providerInstanceId = ProviderInstanceId.make("codex-primary");
+      const server = {
+        id: serverId,
+        name: "t3-code",
+        url: "https://docs.example.test/mcp",
+        enabled: true,
+        providerInstanceIds: [providerInstanceId],
+      } as const;
+      const calls: Array<string> = [];
+      const project = {
+        id: projectId,
+        title: "MCP Catalog",
+        workspaceRoot: "/tmp/project-mcp-catalog",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: "2026-09-02T00:00:00.000Z",
+        updatedAt: "2026-09-02T00:00:00.000Z",
+      } as const;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getProjectShellById: (requestedProjectId) =>
+              Effect.succeed(
+                requestedProjectId === projectId ? Option.some(project) : Option.none(),
+              ),
+          },
+          projectMcpService: {
+            list: () =>
+              Effect.sync(() => {
+                calls.push("list");
+                return {
+                  external: [server],
+                  managed: [],
+                  applications: [{ serverId, providerInstanceId, mode: "next-session" as const }],
+                };
+              }),
+            create: () =>
+              Effect.sync(() => {
+                calls.push("create");
+                return server;
+              }),
+            update: () =>
+              Effect.sync(() => {
+                calls.push("update");
+                return server;
+              }),
+            remove: () =>
+              Effect.sync(() => {
+                calls.push("remove");
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const results = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.all([
+            client[WS_METHODS.projectMcpList]({ projectId }),
+            client[WS_METHODS.projectMcpCreate]({
+              projectId,
+              name: server.name,
+              url: server.url,
+              enabled: server.enabled,
+              providerInstanceIds: server.providerInstanceIds,
+            }),
+            client[WS_METHODS.projectMcpUpdate]({ projectId, ...server }),
+            client[WS_METHODS.projectMcpRemove]({ projectId, id: serverId }),
+          ]),
+        ),
+      );
+
+      assert.deepEqual(results[0].external, [server]);
+      assert.deepEqual(results[0].applications, [
+        { serverId, providerInstanceId, mode: "next-session" },
+      ]);
+      assert.deepEqual(results[1], server);
+      assert.deepEqual(results[2], server);
+      assert.deepEqual(calls, ["list", "create", "update", "remove"]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects project MCP catalog operations for projects outside the environment", () =>
+    Effect.gen(function* () {
+      const listCalls = yield* Ref.make(0);
+      const projectId = ProjectId.make("project-not-owned");
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getProjectShellById: () => Effect.succeed(Option.none()),
+          },
+          projectMcpService: {
+            list: () =>
+              Ref.update(listCalls, (count) => count + 1).pipe(
+                Effect.as({
+                  external: [],
+                  managed: [],
+                  applications: [],
+                }),
+              ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const rpcError = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) => client[WS_METHODS.projectMcpList]({ projectId })),
+        ),
+      );
+
+      assert.equal(rpcError._tag, "EnvironmentAuthorizationError");
+      if (rpcError._tag === "EnvironmentAuthorizationError") {
+        assert.equal(rpcError.requiredScope, "orchestration:read");
+      }
+      assert.equal(yield* Ref.get(listCalls), 0);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

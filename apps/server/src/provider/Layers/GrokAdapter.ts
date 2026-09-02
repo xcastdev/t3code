@@ -79,6 +79,7 @@ import {
   XAiExitPlanModeRequest,
 } from "../acp/XAiAcpExtension.ts";
 import { type GrokAdapterShape } from "../Services/GrokAdapter.ts";
+import { projectMcpNativeKey } from "../Services/ProviderAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
@@ -979,6 +980,12 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           });
 
           const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+          const projectMcpServers = (input.projectMcpServers ?? []).map((server) => ({
+            type: "http" as const,
+            name: projectMcpNativeKey(server),
+            url: server.url,
+            headers: [],
+          }));
           const acp = yield* makeGrokAcpRuntime({
             grokSettings,
             ...(options?.environment ? { environment: options.environment } : {}),
@@ -987,20 +994,25 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             runtimeMode: input.runtimeMode,
             ...(resumeSessionId ? { resumeSessionId } : {}),
             clientInfo: { name: "t3-code", version: "0.0.0" },
-            ...(mcpSession
+            ...(projectMcpServers.length > 0 || mcpSession
               ? {
                   mcpServers: [
-                    {
-                      type: "http" as const,
-                      name: "t3-code",
-                      url: mcpSession.endpoint,
-                      headers: [
-                        {
-                          name: "Authorization",
-                          value: mcpSession.authorizationHeader,
-                        },
-                      ],
-                    },
+                    ...projectMcpServers,
+                    ...(mcpSession
+                      ? [
+                          {
+                            type: "http" as const,
+                            name: "t3-code",
+                            url: mcpSession.endpoint,
+                            headers: [
+                              {
+                                name: "Authorization",
+                                value: mcpSession.authorizationHeader,
+                              },
+                            ],
+                          },
+                        ]
+                      : []),
                   ],
                 }
               : {}),
@@ -2028,7 +2040,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
 
     return {
       provider: PROVIDER,
-      capabilities: { sessionModelSwitch: "in-session" },
+      capabilities: { sessionModelSwitch: "in-session", remoteHttpMcp: "next-session" },
       startSession,
       sendTurn,
       interruptTurn,

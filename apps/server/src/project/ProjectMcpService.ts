@@ -8,6 +8,7 @@ import {
   type ProjectMcpCreateInput,
   type ProjectMcpRemoveInput,
   type ProjectMcpUpdateInput,
+  type ResolvedProjectMcpServer,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -66,7 +67,7 @@ export interface ProjectMcpServiceShape {
   readonly resolveForSession: (
     projectId: ProjectId,
     providerInstanceId: ProviderInstanceId,
-  ) => Effect.Effect<ReadonlyArray<ProjectMcpServer>, Error>;
+  ) => Effect.Effect<ReadonlyArray<ResolvedProjectMcpServer>, Error>;
 }
 
 export class ProjectMcpService extends Context.Service<ProjectMcpService, ProjectMcpServiceShape>()(
@@ -80,7 +81,18 @@ const makeProjectMcpService = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
 
   const list: ProjectMcpServiceShape["list"] = (projectId) =>
-    sql<Schema.Schema.Type<typeof ProjectMcpProjectionRow>>`
+    Effect.gen(function* () {
+      const instances = yield* providerInstances.listInstances;
+      const applicationModes = new Map(
+        instances.map(
+          (instance) =>
+            [
+              instance.instanceId,
+              instance.enabled ? instance.adapter.capabilities.remoteHttpMcp : "unavailable",
+            ] as const,
+        ),
+      );
+      const external = yield* sql<Schema.Schema.Type<typeof ProjectMcpProjectionRow>>`
       SELECT
         server_id AS "serverId",
         name,
@@ -91,38 +103,36 @@ const makeProjectMcpService = Effect.gen(function* () {
       WHERE project_id = ${projectId}
       ORDER BY name COLLATE NOCASE ASC, server_id ASC
     `.pipe(
-      Effect.flatMap((rows) =>
-        Effect.forEach(rows, (row) =>
-          decodeProviderInstanceIds(row.providerInstanceIds).pipe(
-            Effect.flatMap((providerInstanceIds) =>
-              decodeProjectMcpServer({
-                id: row.serverId,
-                name: row.name,
-                url: row.url,
-                enabled: row.enabled === 1,
-                providerInstanceIds,
-              }),
+        Effect.flatMap((rows) =>
+          Effect.forEach(rows, (row) =>
+            decodeProviderInstanceIds(row.providerInstanceIds).pipe(
+              Effect.flatMap((providerInstanceIds) =>
+                decodeProjectMcpServer({
+                  id: row.serverId,
+                  name: row.name,
+                  url: row.url,
+                  enabled: row.enabled === 1,
+                  providerInstanceIds,
+                }),
+              ),
             ),
           ),
         ),
-      ),
-      Effect.map((external) => ({
+      );
+      return {
         external,
-        // Adapter capabilities arrive in Task 3. Until then, mode ownership
-        // stays on the server and conservatively reports unsupported.
         applications: external.flatMap((entry) =>
           entry.providerInstanceIds.map((providerInstanceId) => ({
             serverId: entry.id,
             providerInstanceId,
-            mode: "unsupported" as const,
+            mode: applicationModes.get(providerInstanceId) ?? "unavailable",
           })),
         ),
-        // Preview MCP is session-scoped and remains outside catalog persistence.
-        // Task 3 supplies its concrete managed read-model entry with the
-        // session capability matrix.
+        // Preview MCP is attached from session-scoped credentials, never from
+        // these mutable project records.
         managed: [],
-      })),
-    );
+      };
+    });
 
   const validateUrl = (url: string, commandType: string) =>
     isAllowedUrl(url)
@@ -257,9 +267,11 @@ const makeProjectMcpService = Effect.gen(function* () {
   ) =>
     list(projectId).pipe(
       Effect.map((catalog) =>
-        catalog.external.filter(
-          (entry) => entry.enabled && entry.providerInstanceIds.includes(providerInstanceId),
-        ),
+        catalog.external
+          .filter(
+            (entry) => entry.enabled && entry.providerInstanceIds.includes(providerInstanceId),
+          )
+          .map(({ id, name, url }) => ({ id, name, url })),
       ),
     );
 

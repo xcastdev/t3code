@@ -52,6 +52,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
+import { projectMcpNativeKey } from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
@@ -1684,6 +1685,10 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const projectMcpArgs = (input.projectMcpServers ?? []).flatMap((server) => [
+          "-c",
+          `mcp_servers.${projectMcpNativeKey(server)}.url=${JSON.stringify(server.url)}`,
+        ]);
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
           providerInstanceId: boundInstanceId,
@@ -1700,17 +1705,29 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? { model: input.modelSelection.model }
             : {}),
           ...(serviceTier ? { serviceTier } : {}),
-          ...(mcpSession
+          ...(projectMcpArgs.length > 0 || mcpSession
             ? {
                 environment: {
                   ...(options?.environment ?? process.env),
-                  T3_MCP_BEARER_TOKEN: mcpSession.authorizationHeader.replace(/^Bearer\s+/, ""),
+                  ...(mcpSession
+                    ? {
+                        T3_MCP_BEARER_TOKEN: mcpSession.authorizationHeader.replace(
+                          /^Bearer\s+/,
+                          "",
+                        ),
+                      }
+                    : {}),
                 },
                 appServerArgs: [
-                  "-c",
-                  `mcp_servers.t3-code.url=${mcpSession.endpoint}`,
-                  "-c",
-                  'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
+                  ...projectMcpArgs,
+                  ...(mcpSession
+                    ? [
+                        "-c",
+                        `mcp_servers.t3-code.url=${mcpSession.endpoint}`,
+                        "-c",
+                        'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
+                      ]
+                    : []),
                 ],
               }
             : {}),
@@ -2010,6 +2027,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     provider: PROVIDER,
     capabilities: {
       sessionModelSwitch: "in-session",
+      remoteHttpMcp: "next-session",
     },
     startSession,
     sendTurn,

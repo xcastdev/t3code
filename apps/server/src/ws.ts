@@ -40,6 +40,7 @@ import {
   OrchestrationGetTurnDiffError,
   ORCHESTRATION_WS_METHODS,
   type ProjectId,
+  ProjectMcpNameConflictError,
   type ProjectEntriesFailure,
   type ProjectFileFailure,
   type ProjectFileOperation,
@@ -117,6 +118,7 @@ import * as VcsProvisioningService from "./vcs/VcsProvisioningService.ts";
 import * as GitWorkflowService from "./git/GitWorkflowService.ts";
 import * as ReviewService from "./review/ReviewService.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
+import * as ProjectMcpService from "./project/ProjectMcpService.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
@@ -532,6 +534,7 @@ const makeWsRpcLayer = (
       const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
       const projectSetupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
+      const projectMcpService = yield* ProjectMcpService.ProjectMcpService;
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
       const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
@@ -1279,6 +1282,35 @@ const makeWsRpcLayer = (
           Effect.orElseSucceed(() => ({ providers: [] }) as const),
         );
 
+      const requireOwnedProject = (method: string, projectId: ProjectId) =>
+        projectionSnapshotQuery.getProjectShellById(projectId).pipe(
+          Effect.orDie,
+          Effect.flatMap(
+            Option.match({
+              onNone: () =>
+                Effect.fail(
+                  new EnvironmentAuthorizationError({
+                    message: `Project '${projectId}' does not belong to this environment.`,
+                    requiredScope: requiredScopeForRpcMethod(method),
+                  }),
+                ),
+              onSome: Effect.succeed,
+            }),
+          ),
+        );
+
+      const runProjectMcpOperation = <A, E, R>(
+        method: string,
+        projectId: ProjectId,
+        operation: Effect.Effect<A, E, R>,
+      ) => requireOwnedProject(method, projectId).pipe(Effect.andThen(operation));
+      const preserveProjectMcpNameConflict = <A, R>(operation: Effect.Effect<A, Error, R>) =>
+        operation.pipe(
+          Effect.catch((error) =>
+            error instanceof ProjectMcpNameConflictError ? Effect.fail(error) : Effect.die(error),
+          ),
+        );
+
       const refreshGitStatus = (cwd: string) =>
         vcsStatusBroadcaster
           .refreshStatus(cwd)
@@ -1705,6 +1737,46 @@ const makeWsRpcLayer = (
               : providerRegistry.refresh()
             ).pipe(Effect.map((providers) => ({ providers }))),
             { "rpc.aggregate": "server" },
+          ),
+        [WS_METHODS.projectMcpList]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectMcpList,
+            runProjectMcpOperation(
+              WS_METHODS.projectMcpList,
+              input.projectId,
+              projectMcpService.list(input.projectId).pipe(Effect.orDie),
+            ),
+            { "rpc.aggregate": "project-mcp" },
+          ),
+        [WS_METHODS.projectMcpCreate]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectMcpCreate,
+            runProjectMcpOperation(
+              WS_METHODS.projectMcpCreate,
+              input.projectId,
+              preserveProjectMcpNameConflict(projectMcpService.create(input)),
+            ),
+            { "rpc.aggregate": "project-mcp" },
+          ),
+        [WS_METHODS.projectMcpUpdate]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectMcpUpdate,
+            runProjectMcpOperation(
+              WS_METHODS.projectMcpUpdate,
+              input.projectId,
+              preserveProjectMcpNameConflict(projectMcpService.update(input)),
+            ),
+            { "rpc.aggregate": "project-mcp" },
+          ),
+        [WS_METHODS.projectMcpRemove]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectMcpRemove,
+            runProjectMcpOperation(
+              WS_METHODS.projectMcpRemove,
+              input.projectId,
+              projectMcpService.remove(input).pipe(Effect.orDie),
+            ),
+            { "rpc.aggregate": "project-mcp" },
           ),
         [WS_METHODS.providerUploadFeedback]: (input) =>
           observeRpcEffect(

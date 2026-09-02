@@ -19,6 +19,8 @@ import { createModelSelection } from "@t3tools/shared/model";
 import {
   ApprovalRequestId,
   CursorSettings,
+  EnvironmentId,
+  McpServerId,
   ProviderDriverKind,
   type ProviderRuntimeEvent,
   ThreadId,
@@ -26,6 +28,7 @@ import {
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import type { CursorAdapterShape } from "../Services/CursorAdapter.ts";
 import { makeCursorAdapter } from "./CursorAdapter.ts";
@@ -168,6 +171,72 @@ const cursorAdapterTestLayer = it.layer(
 );
 
 cursorAdapterTestLayer("CursorAdapterLive", (it) => {
+  it.effect("passes project MCP servers to ACP with immutable ID-derived names", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-project-mcp");
+      yield* Effect.sync(() =>
+        McpProviderSession.setMcpProviderSession({
+          environmentId: EnvironmentId.make("environment-test"),
+          threadId,
+          providerSessionId: "preview-session",
+          providerInstanceId: ProviderInstanceId.make("cursor-primary"),
+          endpoint: "http://127.0.0.1:4310/mcp",
+          authorizationHeader: "Bearer preview-token",
+        }),
+      );
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "cursor-acp-mcp-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const argvLogPath = NodePath.join(tempDir, "argv.txt");
+      yield* Effect.promise(() => NodeFSP.writeFile(requestLogPath, "", "utf8"));
+      const wrapperPath = yield* Effect.promise(() =>
+        makeProbeWrapper(requestLogPath, argvLogPath),
+      );
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        projectMcpServers: [
+          {
+            id: McpServerId.make("mcp-docs"),
+            name: "t3-code",
+            url: "https://docs.example.test/mcp",
+          },
+        ],
+      });
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const sessionNew = requests.find((entry) => entry.method === "session/new");
+      assert.deepEqual((sessionNew?.params as { mcpServers?: unknown })?.mcpServers, [
+        {
+          type: "http",
+          name: "t3-project-mcp-docs",
+          url: "https://docs.example.test/mcp",
+          headers: [],
+        },
+        {
+          type: "http",
+          name: "t3-code",
+          url: "http://127.0.0.1:4310/mcp",
+          headers: [{ name: "Authorization", value: "Bearer preview-token" }],
+        },
+      ]);
+      yield* adapter.stopSession(threadId);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(ThreadId.make("cursor-project-mcp")),
+        ),
+      ),
+    ),
+  );
+
   it.effect("starts a session and maps mock ACP prompt flow to runtime events", () =>
     Effect.gen(function* () {
       const adapter = yield* CursorAdapter;

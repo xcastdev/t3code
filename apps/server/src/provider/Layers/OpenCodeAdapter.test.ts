@@ -19,6 +19,8 @@ import type { PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2";
 
 import {
   ApprovalRequestId,
+  EnvironmentId,
+  McpServerId,
   MessageId,
   OpenCodeSettings,
   ProviderDriverKind,
@@ -28,6 +30,7 @@ import {
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import type { OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
@@ -113,6 +116,7 @@ const runtimeMock = {
     questionListImplementation: null as (() => Promise<Array<QuestionRequest>>) | null,
     sessionUpdateCalls: [] as Array<{ sessionID: string; permission: unknown }>,
     forkCalls: [] as Array<{ sessionID: string; directory?: string }>,
+    mcpAddCalls: [] as Array<unknown>,
   },
   reset() {
     this.state.startCalls.length = 0;
@@ -161,6 +165,7 @@ const runtimeMock = {
     this.state.questionListImplementation = null;
     this.state.sessionUpdateCalls.length = 0;
     this.state.forkCalls.length = 0;
+    this.state.mcpAddCalls.length = 0;
   },
 };
 
@@ -209,6 +214,12 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
   runOpenCodeCommand: () => Effect.succeed({ stdout: "", stderr: "", code: 0 }),
   createOpenCodeSdkClient: ({ baseUrl, serverPassword }) =>
     ({
+      mcp: {
+        add: async (input: unknown) => {
+          runtimeMock.state.mcpAddCalls.push(input);
+          return { data: true };
+        },
+      },
       session: {
         create: async (input: Record<string, unknown>) => {
           runtimeMock.state.sessionCreateUrls.push(baseUrl);
@@ -472,6 +483,9 @@ const openCodeAdapterTestSettings = Schema.decodeSync(OpenCodeSettings)({
   serverUrl: "http://127.0.0.1:9999",
   serverPassword: "secret-password",
 });
+const localOpenCodeAdapterTestSettings = Schema.decodeSync(OpenCodeSettings)({
+  binaryPath: "fake-opencode",
+});
 
 const OpenCodeAdapterTestLayer = Layer.effect(
   OpenCodeAdapter,
@@ -535,6 +549,62 @@ const questionRequest = (id: string, sessionID: string): QuestionRequest => ({
 });
 
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
+  it.effect("reports remote HTTP project MCP as unsupported", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      NodeAssert.equal(adapter.capabilities.remoteHttpMcp, "unsupported");
+    }),
+  );
+
+  it.effect("preserves preview MCP while leaving project MCP unsupported", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-opencode-project-mcp");
+      const adapter = yield* makeOpenCodeAdapter(localOpenCodeAdapterTestSettings);
+      yield* Effect.sync(() =>
+        McpProviderSession.setMcpProviderSession({
+          environmentId: EnvironmentId.make("environment-test"),
+          threadId,
+          providerSessionId: "preview-session",
+          providerInstanceId: ProviderInstanceId.make("opencode-primary"),
+          endpoint: "http://127.0.0.1:4310/mcp",
+          authorizationHeader: "Bearer preview-token",
+        }),
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        projectMcpServers: [
+          {
+            id: McpServerId.make("mcp-docs"),
+            name: "t3-code",
+            url: "https://docs.example.test/mcp",
+          },
+        ],
+      });
+
+      NodeAssert.deepEqual(runtimeMock.state.mcpAddCalls, [
+        {
+          name: "t3-code",
+          config: {
+            type: "remote",
+            url: "http://127.0.0.1:4310/mcp",
+            headers: { Authorization: "Bearer preview-token" },
+            oauth: false,
+          },
+        },
+      ]);
+      yield* adapter.stopSession(threadId);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(asThreadId("thread-opencode-project-mcp")),
+        ),
+      ),
+    ),
+  );
+
   it.effect("reuses a configured OpenCode server URL instead of spawning a local server", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

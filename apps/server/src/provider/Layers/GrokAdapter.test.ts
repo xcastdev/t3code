@@ -17,7 +17,9 @@ import * as TestClock from "effect/testing/TestClock";
 
 import {
   ApprovalRequestId,
+  EnvironmentId,
   GrokSettings,
+  McpServerId,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
@@ -26,6 +28,7 @@ import {
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   grokPromptSettlementBelongsToContext,
   isGrokEnterPlanModeToolCall,
@@ -213,6 +216,68 @@ it("requires a settlement to match the live Grok turn", () => {
 });
 
 it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
+  it.effect("passes project MCP servers to ACP with immutable ID-derived names", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-project-mcp");
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-acp-mcp-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_REQUEST_LOG_PATH: requestLogPath }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      yield* Effect.sync(() =>
+        McpProviderSession.setMcpProviderSession({
+          environmentId: EnvironmentId.make("environment-test"),
+          threadId,
+          providerSessionId: "preview-session",
+          providerInstanceId: ProviderInstanceId.make("grok-primary"),
+          endpoint: "http://127.0.0.1:4310/mcp",
+          authorizationHeader: "Bearer preview-token",
+        }),
+      );
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("grok"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        projectMcpServers: [
+          {
+            id: McpServerId.make("mcp-docs"),
+            name: "t3-code",
+            url: "https://docs.example.test/mcp",
+          },
+        ],
+      });
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const sessionNew = requests.find((entry) => entry.method === "session/new");
+      assert.deepEqual((sessionNew?.params as { mcpServers?: unknown })?.mcpServers, [
+        {
+          type: "http",
+          name: "t3-project-mcp-docs",
+          url: "https://docs.example.test/mcp",
+          headers: [],
+        },
+        {
+          type: "http",
+          name: "t3-code",
+          url: "http://127.0.0.1:4310/mcp",
+          headers: [{ name: "Authorization", value: "Bearer preview-token" }],
+        },
+      ]);
+      yield* adapter.stopSession(threadId);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(ThreadId.make("grok-project-mcp")),
+        ),
+      ),
+    ),
+  );
+
   it.effect("starts a session and maps mock ACP prompt flow to runtime events", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-mock-thread");

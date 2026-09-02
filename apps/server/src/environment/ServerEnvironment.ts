@@ -153,6 +153,7 @@ export const make = Effect.gen(function* () {
       attachmentUploads: true,
       fileAttachments: { maxUploadBytes: PROVIDER_SEND_TURN_MAX_FILE_BYTES },
       pullRequests: true,
+      projectMcpCatalog: true,
       threadSettlement: true,
       threadSnooze: true,
       environmentThemes: true,

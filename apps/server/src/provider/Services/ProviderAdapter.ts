@@ -20,19 +20,29 @@ import type {
   ProviderUploadFeedbackResult,
   ThreadId,
   ProviderTurnStartResult,
+  ResolvedProjectMcpServer,
   TurnId,
 } from "@t3tools/contracts";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
+export type ProviderRemoteHttpMcpMode = "active-session" | "next-session" | "unsupported";
 
 export interface ProviderAdapterCapabilities {
   /**
    * Declares whether changing the model on an existing session is supported.
    */
   readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
+  readonly remoteHttpMcp: ProviderRemoteHttpMcpMode;
 }
+
+export type ProviderAdapterSessionStartInput = ProviderSessionStartInput & {
+  readonly projectMcpServers?: ReadonlyArray<ResolvedProjectMcpServer>;
+};
+
+export const projectMcpNativeKey = (server: ResolvedProjectMcpServer): string =>
+  `t3-project-${server.id}`;
 
 export interface ProviderThreadTurnSnapshot {
   readonly id: TurnId;
@@ -55,7 +65,7 @@ export interface ProviderAdapterShape<TError> {
    * Start a provider-backed session.
    */
   readonly startSession: (
-    input: ProviderSessionStartInput,
+    input: ProviderAdapterSessionStartInput,
   ) => Effect.Effect<ProviderSession, TError>;
 
   /**

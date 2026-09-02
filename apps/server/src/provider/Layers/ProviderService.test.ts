@@ -15,8 +15,10 @@ import type {
 import {
   ApprovalRequestId,
   EventId,
+  McpServerId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProjectId,
   ProviderSessionStartInput,
   ThreadId,
   TurnId,
@@ -62,12 +64,32 @@ import {
 import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
+import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ProjectMcpService from "../../project/ProjectMcpService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
 const serverConfigTestLayer = ServerConfig.layerTest(process.cwd(), process.cwd()).pipe(
   Layer.provide(NodeServices.layer),
 );
+const defaultProjectId = ProjectId.make("provider-service-project");
+const makeProviderProjectContextTestLayer = (
+  resolveForSession: ProjectMcpService.ProjectMcpServiceShape["resolveForSession"] = () =>
+    Effect.succeed([]),
+) =>
+  Layer.mergeAll(
+    Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+      getThreadShellById: () => Effect.succeed(Option.some({ projectId: defaultProjectId })),
+    } as never),
+    Layer.succeed(ProjectMcpService.ProjectMcpService, {
+      resolveForSession,
+    } as never),
+  );
+
+const makeTestProviderServiceLive = (
+  options?: Parameters<typeof makeProviderServiceLive>[0],
+  projectContextLayer = makeProviderProjectContextTestLayer(),
+) => makeProviderServiceLive(options).pipe(Layer.provide(projectContextLayer));
 
 const asRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
 const asEventId = (value: string): EventId => EventId.make(value);
@@ -218,6 +240,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     provider,
     capabilities: {
       sessionModelSwitch: "in-session",
+      remoteHttpMcp: "next-session",
     },
     startSession,
     sendTurn,
@@ -302,10 +325,21 @@ function makeProviderServiceLayer() {
     Layer.provide(SqlitePersistenceMemory),
   );
   const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+  const projectMcpServer = {
+    id: McpServerId.make("mcp-docs"),
+    name: "t3-code",
+    url: "https://docs.example.test/mcp",
+  } as const;
+  const resolveProjectMcp = vi.fn<ProjectMcpService.ProjectMcpServiceShape["resolveForSession"]>(
+    () => Effect.succeed([projectMcpServer]),
+  );
 
   const layer = it.layer(
     Layer.mergeAll(
-      makeProviderServiceLive().pipe(
+      makeTestProviderServiceLive(
+        undefined,
+        makeProviderProjectContextTestLayer(resolveProjectMcp),
+      ).pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(defaultServerSettingsLayer),
@@ -329,6 +363,8 @@ function makeProviderServiceLayer() {
     codex,
     claude,
     cursor,
+    projectMcpServer,
+    resolveProjectMcp,
     layer,
   };
 }
@@ -357,7 +393,7 @@ it.effect("ProviderServiceLive catches stopAll failures during shutdown", () =>
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
     const providerLayer = Layer.mergeAll(
-      makeProviderServiceLive().pipe(
+      makeTestProviderServiceLive().pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(defaultServerSettingsLayer),
@@ -417,7 +453,7 @@ it.effect("ProviderServiceLive rejects new sessions for disabled providers", () 
       Layer.provide(SqlitePersistenceMemory),
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
-    const providerLayer = makeProviderServiceLive().pipe(
+    const providerLayer = makeTestProviderServiceLive().pipe(
       Layer.provide(providerAdapterLayer),
       Layer.provide(directoryLayer),
       Layer.provide(defaultServerSettingsLayer),
@@ -502,7 +538,7 @@ it.effect(
       const directoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const providerLayer = makeProviderServiceLive().pipe(
+      const providerLayer = makeTestProviderServiceLive().pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(serverSettingsLayer),
@@ -573,7 +609,7 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
       Layer.provide(SqlitePersistenceMemory),
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
-    const providerLayer = makeProviderServiceLive().pipe(
+    const providerLayer = makeTestProviderServiceLive().pipe(
       Layer.provide(providerAdapterLayer),
       Layer.provide(directoryLayer),
       Layer.provide(defaultServerSettingsLayer),
@@ -632,7 +668,7 @@ it.effect(
       const directoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const providerLayer = makeProviderServiceLive().pipe(
+      const providerLayer = makeTestProviderServiceLive().pipe(
         Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
         Layer.provide(directoryLayer),
         Layer.provide(defaultServerSettingsLayer),
@@ -681,7 +717,7 @@ it.effect("ProviderServiceLive writes canonical events to the emitting thread se
       Layer.provide(SqlitePersistenceMemory),
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
-    const providerLayer = makeProviderServiceLive({
+    const providerLayer = makeTestProviderServiceLive({
       canonicalEventLogger: {
         filePath: "memory://provider-canonical-events",
         write: (event, threadId) => {
@@ -752,7 +788,7 @@ it.effect("ProviderServiceLive keeps persisted resumable sessions on startup", (
       });
     }).pipe(Effect.provide(directoryLayer));
 
-    const providerLayer = makeProviderServiceLive().pipe(
+    const providerLayer = makeTestProviderServiceLive().pipe(
       Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
       Layer.provide(directoryLayer),
       Layer.provide(defaultServerSettingsLayer),
@@ -817,7 +853,7 @@ it.effect(
       const firstDirectoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const firstProviderLayer = makeProviderServiceLive().pipe(
+      const firstProviderLayer = makeTestProviderServiceLive().pipe(
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
         ),
@@ -877,7 +913,7 @@ it.effect(
       const secondDirectoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const secondProviderLayer = makeProviderServiceLive().pipe(
+      const secondProviderLayer = makeTestProviderServiceLive().pipe(
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
         ),
@@ -929,6 +965,48 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
+  it.effect("resolves project MCP servers for normal starts and internal recovery", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-project-mcp");
+      routing.resolveProjectMcp.mockClear();
+      routing.codex.startSession.mockClear();
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project-mcp",
+        runtimeMode: "full-access",
+      });
+
+      assert.deepEqual(routing.resolveProjectMcp.mock.calls, [[defaultProjectId, codexInstanceId]]);
+      assert.deepEqual(
+        (routing.codex.startSession.mock.calls[0]?.[0] as { projectMcpServers?: unknown })
+          .projectMcpServers,
+        [routing.projectMcpServer],
+      );
+
+      yield* routing.codex.stopSession(threadId);
+      routing.codex.startSession.mockClear();
+      yield* provider.sendTurn({ threadId, input: "recover", attachments: [] });
+
+      assert.deepEqual(routing.resolveProjectMcp.mock.calls, [
+        [defaultProjectId, codexInstanceId],
+        [defaultProjectId, codexInstanceId],
+      ]);
+      assert.deepEqual(
+        (routing.codex.startSession.mock.calls[0]?.[0] as { projectMcpServers?: unknown })
+          .projectMcpServers,
+        [routing.projectMcpServer],
+      );
+      yield* provider.stopSession({ threadId });
+      routing.codex.startSession.mockClear();
+      routing.codex.sendTurn.mockClear();
+      routing.codex.stopSession.mockClear();
+    }),
+  );
+
   it.effect("routes provider operations and rollback conversation", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -1612,7 +1690,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       const firstDirectoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const firstProviderLayer = makeProviderServiceLive().pipe(
+      const firstProviderLayer = makeTestProviderServiceLive().pipe(
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
         ),
@@ -1651,7 +1729,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       const secondDirectoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const secondProviderLayer = makeProviderServiceLive().pipe(
+      const secondProviderLayer = makeTestProviderServiceLive().pipe(
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
         ),
@@ -1720,7 +1798,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         const firstDirectoryLayer = ProviderSessionDirectoryLive.pipe(
           Layer.provide(runtimeRepositoryLayer),
         );
-        const firstProviderLayer = makeProviderServiceLive().pipe(
+        const firstProviderLayer = makeTestProviderServiceLive().pipe(
           Layer.provide(
             Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
           ),
@@ -1754,7 +1832,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         const secondDirectoryLayer = ProviderSessionDirectoryLive.pipe(
           Layer.provide(runtimeRepositoryLayer),
         );
-        const secondProviderLayer = makeProviderServiceLive().pipe(
+        const secondProviderLayer = makeTestProviderServiceLive().pipe(
           Layer.provide(
             Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
           ),
@@ -2225,7 +2303,7 @@ describe("agent browser access", () => {
       const directoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const providerLayer = makeProviderServiceLive({
+      const providerLayer = makeTestProviderServiceLive({
         issueMcpCredential: (request) =>
           Effect.sync(() => {
             issued.push(request.threadId);

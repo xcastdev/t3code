@@ -38,6 +38,8 @@ import * as Stream from "effect/Stream";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import * as ServerConfig from "../../config.ts";
+import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ProjectMcpService from "../../project/ProjectMcpService.ts";
 import {
   increment,
   providerMetricAttributes,
@@ -226,6 +228,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
   const registry = yield* ProviderAdapterRegistry.ProviderAdapterRegistry;
   const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+  const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+  const projectMcpService = yield* ProjectMcpService.ProjectMcpService;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const issueMcpCredential =
     options?.issueMcpCredential ?? McpSessionRegistry.issueActiveMcpCredential;
@@ -282,6 +286,45 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     McpSessionRegistry.revokeActiveMcpThread(threadId).pipe(
       Effect.tap(() => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
     );
+
+  const startAdapterSession = Effect.fn("ProviderService.startAdapterSession")(function* (input: {
+    readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+    readonly providerInstanceId: ProviderInstanceId;
+    readonly operation: string;
+    readonly sessionInput: Omit<
+      Parameters<ProviderAdapterShape<ProviderAdapterError>["startSession"]>[0],
+      "projectMcpServers"
+    >;
+  }) {
+    const thread = yield* projectionSnapshotQuery
+      .getThreadShellById(input.sessionInput.threadId)
+      .pipe(
+        Effect.mapError((cause) =>
+          toValidationError(
+            input.operation,
+            `Could not resolve project for thread '${input.sessionInput.threadId}'.`,
+            cause,
+          ),
+        ),
+      );
+    if (Option.isNone(thread)) {
+      return yield* toValidationError(
+        input.operation,
+        `Cannot start thread '${input.sessionInput.threadId}' because it is not in the durable read model.`,
+      );
+    }
+    const projectMcpServers = yield* projectMcpService
+      .resolveForSession(thread.value.projectId, input.providerInstanceId)
+      .pipe(
+        Effect.mapError((cause) =>
+          toValidationError(input.operation, "Could not resolve project MCP servers.", cause),
+        ),
+      );
+    yield* prepareMcpSession(input.sessionInput.threadId, input.providerInstanceId);
+    return yield* input.adapter
+      .startSession({ ...input.sessionInput, projectMcpServers })
+      .pipe(Effect.onError(() => clearMcpSession(input.sessionInput.threadId)));
+  });
 
   const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
     Effect.succeed(event).pipe(
@@ -453,9 +496,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
-      yield* prepareMcpSession(input.binding.threadId, bindingInstanceId);
-      const resumed = yield* adapter
-        .startSession({
+      const resumed = yield* startAdapterSession({
+        adapter,
+        providerInstanceId: bindingInstanceId,
+        operation: input.operation,
+        sessionInput: {
           threadId: input.binding.threadId,
           provider: input.binding.provider,
           providerInstanceId: bindingInstanceId,
@@ -463,8 +508,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
           ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
           runtimeMode: input.binding.runtimeMode ?? "full-access",
-        })
-        .pipe(Effect.onError(() => clearMcpSession(input.binding.threadId)));
+        },
+      });
       if (resumed.provider !== adapter.provider) {
         yield* clearMcpSession(input.binding.threadId);
         return yield* toValidationError(
@@ -649,15 +694,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "provider.cwd.effective": effectiveCwd ?? "",
         });
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
-        yield* prepareMcpSession(threadId, resolvedInstanceId);
-        const session = yield* adapter
-          .startSession({
+        const session = yield* startAdapterSession({
+          adapter,
+          providerInstanceId: resolvedInstanceId,
+          operation: "ProviderService.startSession",
+          sessionInput: {
             ...input,
             providerInstanceId: resolvedInstanceId,
             ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
             ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
-          })
-          .pipe(Effect.onError(() => clearMcpSession(threadId)));
+          },
+        });
 
         if (session.provider !== adapter.provider) {
           yield* clearMcpSession(threadId);

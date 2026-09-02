@@ -24,6 +24,8 @@ import * as ProjectMcpService from "./ProjectMcpService.ts";
 const projectA = ProjectId.make("project-a");
 const projectB = ProjectId.make("project-b");
 const codexInstance = ProviderInstanceId.make("codex");
+const openCodeInstance = ProviderInstanceId.make("opencode");
+const disabledCursorInstance = ProviderInstanceId.make("cursor-disabled");
 
 const codexInput = {
   name: "Docs",
@@ -48,7 +50,23 @@ const disabledInput = {
 
 const providerInstanceRegistry = Layer.succeed(ProviderInstanceRegistry, {
   getInstance: () => Effect.die("Unused in ProjectMcpService tests"),
-  listInstances: Effect.succeed([{ instanceId: codexInstance }]),
+  listInstances: Effect.succeed([
+    {
+      instanceId: codexInstance,
+      enabled: true,
+      adapter: { capabilities: { remoteHttpMcp: "next-session" } },
+    },
+    {
+      instanceId: openCodeInstance,
+      enabled: true,
+      adapter: { capabilities: { remoteHttpMcp: "unsupported" } },
+    },
+    {
+      instanceId: disabledCursorInstance,
+      enabled: false,
+      adapter: { capabilities: { remoteHttpMcp: "next-session" } },
+    },
+  ]),
   listUnavailable: Effect.succeed([]),
   streamChanges: Effect.never,
   subscribeChanges: Effect.die("Unused in ProjectMcpService tests"),
@@ -83,6 +101,25 @@ const createProject = (projectId: ProjectId, commandId: string) =>
   });
 
 it.layer(testLayer)("ProjectMcpService", (it) => {
+  it.effect("derives application modes from live provider capabilities", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const projectId = ProjectId.make("application-modes-project");
+      yield* createProject(projectId, "application-modes-project");
+      const entry = yield* service.create({
+        projectId,
+        ...codexInput,
+        providerInstanceIds: [codexInstance, openCodeInstance, disabledCursorInstance],
+      });
+
+      expect((yield* service.list(projectId)).applications).toEqual([
+        { serverId: entry.id, providerInstanceId: codexInstance, mode: "next-session" },
+        { serverId: entry.id, providerInstanceId: openCodeInstance, mode: "unsupported" },
+        { serverId: entry.id, providerInstanceId: disabledCursorInstance, mode: "unavailable" },
+      ]);
+    }),
+  );
+
   it.effect("resolves only enabled entries for the selected project and provider", () =>
     Effect.gen(function* () {
       const service = yield* ProjectMcpService.ProjectMcpService;
@@ -92,7 +129,9 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
       yield* service.create({ projectId: projectA, ...disabledInput });
       yield* service.create({ projectId: projectB, ...projectBInput });
 
-      expect(yield* service.resolveForSession(projectA, codexInstance)).toEqual([codexEntry]);
+      expect(yield* service.resolveForSession(projectA, codexInstance)).toEqual([
+        { id: codexEntry.id, name: codexEntry.name, url: codexEntry.url },
+      ]);
     }),
   );
 
@@ -173,6 +212,11 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
       expect(
         persisted.find((entry) => entry.id === McpServerId.make("mcp-stale"))?.providerInstanceIds,
       ).toEqual([staleProviderId]);
+      expect(
+        (yield* service.list(staleProject)).applications.find(
+          (application) => application.serverId === McpServerId.make("mcp-stale"),
+        )?.mode,
+      ).toBe("unavailable");
       yield* service.update({
         projectId: staleProject,
         id: McpServerId.make("mcp-stale"),

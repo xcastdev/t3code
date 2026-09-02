@@ -75,6 +75,7 @@ import {
   extractTodosAsPlan,
 } from "../acp/CursorAcpExtension.ts";
 import { type CursorAdapterShape } from "../Services/CursorAdapter.ts";
+import { projectMcpNativeKey } from "../Services/ProviderAdapter.ts";
 import { resolveCursorAcpBaseModelId } from "./CursorProvider.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
@@ -532,6 +533,12 @@ export function makeCursorAdapter(
             : cursorSettings;
 
           const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+          const projectMcpServers = (input.projectMcpServers ?? []).map((server) => ({
+            type: "http" as const,
+            name: projectMcpNativeKey(server),
+            url: server.url,
+            headers: [],
+          }));
           const acp = yield* makeCursorAcpRuntime({
             cursorSettings: effectiveCursorSettings,
             ...(options?.environment ? { environment: options.environment } : {}),
@@ -539,20 +546,25 @@ export function makeCursorAdapter(
             cwd,
             ...(resumeSessionId ? { resumeSessionId } : {}),
             clientInfo: { name: "t3-code", version: "0.0.0" },
-            ...(mcpSession
+            ...(projectMcpServers.length > 0 || mcpSession
               ? {
                   mcpServers: [
-                    {
-                      type: "http" as const,
-                      name: "t3-code",
-                      url: mcpSession.endpoint,
-                      headers: [
-                        {
-                          name: "Authorization",
-                          value: mcpSession.authorizationHeader,
-                        },
-                      ],
-                    },
+                    ...projectMcpServers,
+                    ...(mcpSession
+                      ? [
+                          {
+                            type: "http" as const,
+                            name: "t3-code",
+                            url: mcpSession.endpoint,
+                            headers: [
+                              {
+                                name: "Authorization",
+                                value: mcpSession.authorizationHeader,
+                              },
+                            ],
+                          },
+                        ]
+                      : []),
                   ],
                 }
               : {}),
@@ -1175,7 +1187,7 @@ export function makeCursorAdapter(
 
     return {
       provider: PROVIDER,
-      capabilities: { sessionModelSwitch: "in-session" },
+      capabilities: { sessionModelSwitch: "in-session", remoteHttpMcp: "next-session" },
       startSession,
       sendTurn,
       interruptTurn,

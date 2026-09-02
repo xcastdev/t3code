@@ -48,6 +48,7 @@ import { ProviderService } from "../src/provider/Services/ProviderService.ts";
 import { AnalyticsService } from "../src/telemetry/Services/AnalyticsService.ts";
 import { CheckpointReactorLive } from "../src/orchestration/Layers/CheckpointReactor.ts";
 import * as RepositoryIdentityResolver from "../src/project/RepositoryIdentityResolver.ts";
+import * as ProjectMcpService from "../src/project/ProjectMcpService.ts";
 import { OrchestrationEngineLive } from "../src/orchestration/Layers/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "../src/orchestration/Layers/ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "../src/orchestration/Layers/ProjectionSnapshotQuery.ts";
@@ -287,23 +288,34 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(providerSessionDirectoryLayer),
     );
     const providerEventLoggersLayer = Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers);
+    const projectionSnapshotQueryLayer = OrchestrationProjectionSnapshotQueryLive;
+    const projectMcpServiceLayer = Layer.succeed(ProjectMcpService.ProjectMcpService, {
+      list: () => Effect.die("Project MCP catalog reads are not used by this harness"),
+      create: () => Effect.die("Project MCP catalog writes are not used by this harness"),
+      update: () => Effect.die("Project MCP catalog writes are not used by this harness"),
+      remove: () => Effect.die("Project MCP catalog writes are not used by this harness"),
+      resolveForSession: () => Effect.succeed([]),
+    });
     const providerLayer = useRealCodex
       ? makeProviderServiceLive().pipe(
           Layer.provide(providerSessionDirectoryLayer),
           Layer.provide(realCodexRegistry),
           Layer.provide(AnalyticsService.layerTest),
           Layer.provide(providerEventLoggersLayer),
+          Layer.provide(projectionSnapshotQueryLayer),
+          Layer.provide(projectMcpServiceLayer),
         )
       : makeProviderServiceLive().pipe(
           Layer.provide(providerSessionDirectoryLayer),
           Layer.provide(fakeRegistry!),
           Layer.provide(AnalyticsService.layerTest),
           Layer.provide(providerEventLoggersLayer),
+          Layer.provide(projectionSnapshotQueryLayer),
+          Layer.provide(projectMcpServiceLayer),
         );
     const providerRegistryLayer = makeProviderRegistryLayer();
 
     const checkpointStoreLayer = CheckpointStore.layer.pipe(Layer.provide(VcsDriverRegistry.layer));
-    const projectionSnapshotQueryLayer = OrchestrationProjectionSnapshotQueryLive;
     const runtimeServicesLayer = Layer.mergeAll(
       projectionSnapshotQueryLayer,
       orchestrationLayer.pipe(Layer.provide(projectionSnapshotQueryLayer)),

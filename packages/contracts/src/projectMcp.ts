@@ -40,6 +40,7 @@ export const ProjectMcpApplicationMode = Schema.Literals([
   "active-session",
   "next-session",
   "unsupported",
+  "unavailable",
 ]);
 export type ProjectMcpApplicationMode = typeof ProjectMcpApplicationMode.Type;
 
@@ -58,6 +59,8 @@ export const ProjectMcpServer = Schema.Struct({
   providerInstanceIds: Schema.Array(ProviderInstanceId),
 });
 export type ProjectMcpServer = typeof ProjectMcpServer.Type;
+
+export type ResolvedProjectMcpServer = Pick<ProjectMcpServer, "id" | "name" | "url">;
 
 export const ProjectMcpManagedServer = Schema.Struct({
   id: McpServerId,

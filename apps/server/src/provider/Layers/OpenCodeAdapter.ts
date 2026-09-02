@@ -4618,6 +4618,7 @@ export function makeOpenCodeAdapter(
       provider: PROVIDER,
       capabilities: {
         sessionModelSwitch: "in-session",
+        remoteHttpMcp: "unsupported",
       },
       startSession,
       sendTurn,

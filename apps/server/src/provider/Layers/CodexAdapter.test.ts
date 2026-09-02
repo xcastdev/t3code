@@ -6,7 +6,9 @@ import * as NodePath from "node:path";
 import {
   ApprovalRequestId,
   CodexSettings,
+  EnvironmentId,
   EventId,
+  McpServerId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderItemId,
@@ -36,6 +38,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as CodexErrors from "effect-codex-app-server/errors";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
@@ -434,6 +437,69 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
       NodeAssert.ok(runtime);
       NodeAssert.equal(runtime.options.launchArgs, "--strict-config --enable foo");
     }).pipe(Effect.provide(layer));
+  });
+
+  it.effect("attaches project MCP servers with immutable ID-derived keys", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    const layer = Layer.effect(
+      CodexAdapter,
+      Effect.gen(function* () {
+        return yield* makeCodexAdapter(decodeCodexSettings({}), {
+          makeRuntime: runtimeFactory.factory,
+        });
+      }),
+    ).pipe(
+      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(providerSessionDirectoryTestLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("sess-project-mcp");
+      yield* Effect.sync(() =>
+        McpProviderSession.setMcpProviderSession({
+          environmentId: EnvironmentId.make("environment-test"),
+          threadId,
+          providerSessionId: "preview-session",
+          providerInstanceId: ProviderInstanceId.make("codex-primary"),
+          endpoint: "http://127.0.0.1:4310/mcp",
+          authorizationHeader: "Bearer preview-token",
+        }),
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        runtimeMode: "full-access",
+        projectMcpServers: [
+          {
+            id: McpServerId.make("mcp-docs"),
+            name: "t3-code",
+            url: "https://docs.example.test/mcp",
+          },
+        ],
+      });
+
+      const runtime = runtimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      NodeAssert.deepEqual(runtime.options.appServerArgs, [
+        "-c",
+        'mcp_servers.t3-project-mcp-docs.url="https://docs.example.test/mcp"',
+        "-c",
+        "mcp_servers.t3-code.url=http://127.0.0.1:4310/mcp",
+        "-c",
+        'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
+      ]);
+      NodeAssert.equal(runtime.options.environment?.T3_MCP_BEARER_TOKEN, "preview-token");
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(asThreadId("sess-project-mcp")),
+        ),
+      ),
+      Effect.provide(layer),
+    );
   });
 
   it.effect("uses T3CODE_CODEX_LAUNCH_ARGS for the session runtime", () => {

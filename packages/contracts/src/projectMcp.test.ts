@@ -115,8 +115,9 @@ describe("Project MCP contract shapes", () => {
         "active-session",
         "next-session",
         "unsupported",
+        "unavailable",
       ]),
-    ).toEqual(["active-session", "next-session", "unsupported"]);
+    ).toEqual(["active-session", "next-session", "unsupported", "unavailable"]);
   });
 
   it("requires project scope on every mutation and list input", () => {

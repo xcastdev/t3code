@@ -96,6 +96,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
+import { projectMcpNativeKey } from "../Services/ProviderAdapter.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 const encodeUnknownJsonStringExit = Schema.encodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
 const decodeUnknownJsonStringExit = Schema.decodeUnknownExit(Schema.fromJsonString(Schema.Unknown));
@@ -4280,6 +4281,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           : {}),
       };
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+      const resolvedProjectMcpServers = input.projectMcpServers ?? [];
+      const projectMcpServers = Object.fromEntries(
+        resolvedProjectMcpServers.map((server) => [
+          projectMcpNativeKey(server),
+          { type: "http" as const, url: server.url },
+        ]),
+      );
       // The attachments dir grant lets the agent Read/copy pasted images at
       // the paths ProviderService injects into the turn text, without an
       // approval prompt. It is a leaf directory holding only attachment
@@ -4315,16 +4323,21 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         env: claudeEnvironment,
         additionalDirectories,
         ...(Object.keys(extraArgs).length > 0 ? { extraArgs } : {}),
-        ...(mcpSession
+        ...(resolvedProjectMcpServers.length > 0 || mcpSession
           ? {
               mcpServers: {
-                "t3-code": {
-                  type: "http",
-                  url: mcpSession.endpoint,
-                  headers: {
-                    Authorization: mcpSession.authorizationHeader,
-                  },
-                },
+                ...projectMcpServers,
+                ...(mcpSession
+                  ? {
+                      "t3-code": {
+                        type: "http" as const,
+                        url: mcpSession.endpoint,
+                        headers: {
+                          Authorization: mcpSession.authorizationHeader,
+                        },
+                      },
+                    }
+                  : {}),
               },
             }
           : {}),
@@ -4716,6 +4729,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     provider: PROVIDER,
     capabilities: {
       sessionModelSwitch: "in-session",
+      remoteHttpMcp: "next-session",
     },
     startSession,
     sendTurn,
