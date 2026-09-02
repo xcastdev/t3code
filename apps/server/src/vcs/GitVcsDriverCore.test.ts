@@ -160,9 +160,9 @@ it.effect("uses stable diagnostics for every parsed non-repository command", () 
     yield* driver.listRefs({ cwd });
 
     assert.deepStrictEqual(commands, [
+      { args: ["rev-parse", "--git-common-dir"], lcAll: "C" },
       { args: ["status", "--porcelain=2", "--branch"], lcAll: "C" },
       { args: ["rev-parse", "--abbrev-ref", "HEAD"], lcAll: "C" },
-      { args: ["rev-parse", "--git-common-dir"], lcAll: "C" },
     ]);
   }).pipe(Effect.provide(layer));
 });
@@ -1271,6 +1271,24 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("reports and stages nested-cwd changes with one root-relative path", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const pathService = yield* Path.Path;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, "src/a.txt", "changed\n");
+
+        const status = yield* driver.statusDetailsLocal(pathService.join(cwd, "src"));
+        assert.deepStrictEqual(
+          status.workingTree.files.map((file) => file.path),
+          ["src/a.txt"],
+        );
+        yield* driver.stageFiles({ cwd: pathService.join(cwd, "src"), paths: ["src/a.txt"] });
+        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), "src/a.txt");
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
     it.effect("keeps staged rename and delete records in the index state", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -1678,7 +1696,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         const pathService = yield* Path.Path;
 
         yield* writeTextFile(cwd, "src/a.txt", "changed\n");
-        yield* driver.stageFiles({ cwd: pathService.join(cwd, "src"), paths: ["a.txt"] });
+        yield* driver.stageFiles({ cwd: pathService.join(cwd, "src"), paths: ["src/a.txt"] });
         assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), "src/a.txt");
 
         yield* driver.unstageFiles({ cwd, paths: ["src/a.txt"] });
@@ -1714,6 +1732,42 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         const error = yield* driver.stageFiles({ cwd, paths: ["linked.txt"] }).pipe(Effect.flip);
         assert.include(error.detail, "outside");
       }),
+    );
+
+    it.effect("returns a patch for an untracked file", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, "new.txt", "new contents\n");
+
+        const result = yield* driver.getWorkingTreeDiff({
+          cwd,
+          path: "new.txt",
+          comparison: "head",
+        });
+        assert.include(result.diff, "+new contents");
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
+    it.effect("stages a deleted file after its parent directory is removed", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, "obsolete/file.txt", "tracked\n");
+        yield* git(cwd, ["add", "obsolete/file.txt"]);
+        yield* git(cwd, ["commit", "-m", "add obsolete file"]);
+        yield* fileSystem.remove(pathService.join(cwd, "obsolete"), { recursive: true });
+
+        yield* driver.stageFiles({ cwd, paths: ["obsolete/file.txt"] });
+        assert.include(
+          yield* git(cwd, ["diff", "--cached", "--name-status"]),
+          "D\tobsolete/file.txt",
+        );
+      }).pipe(Effect.provide(TestLayer)),
     );
 
     it.effect("returns bounded diffs and commits exactly the existing index", () =>

@@ -1579,9 +1579,13 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   });
 
   const readStatusDetailsLocal = Effect.fn("readStatusDetailsLocal")(function* (cwd: string) {
+    const repositoryPaths = yield* resolveRepositoryPaths(cwd).pipe(
+      Effect.catchTags({ GitCommandError: () => Effect.succeed(null) }),
+    );
+    const commandCwd = repositoryPaths?.worktreeRoot ?? cwd;
     const statusResult = yield* executeGitWithStableDiagnostics(
       "GitVcsDriver.statusDetails.status",
-      cwd,
+      commandCwd,
       ["status", "--porcelain=2", "--branch"],
       {
         allowNonZeroExit: true,
@@ -1614,9 +1618,6 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       });
     }
 
-    const repositoryPaths = yield* resolveRepositoryPaths(cwd).pipe(
-      Effect.catchTags({ GitCommandError: () => Effect.succeed(null) }),
-    );
     const statusCacheKey = repositoryPaths?.gitCommonDir;
     const [
       numstatStdout,
@@ -1630,7 +1631,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       [
         executeGitWithStableDiagnostics(
           "GitVcsDriver.statusDetails.numstat",
-          cwd,
+          commandCwd,
           ["diff", "HEAD", "--numstat", "--"],
           { allowNonZeroExit: true },
         ).pipe(
@@ -1639,11 +1640,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             if (isUnbornHeadStderr(result.stderr)) {
               return Effect.map(
                 Effect.all([
-                  runGitStdout("GitVcsDriver.statusDetails.numstat.unborn", cwd, [
+                  runGitStdout("GitVcsDriver.statusDetails.numstat.unborn", commandCwd, [
                     "diff",
                     "--numstat",
                   ]),
-                  runGitStdout("GitVcsDriver.statusDetails.numstat.unborn.staged", cwd, [
+                  runGitStdout("GitVcsDriver.statusDetails.numstat.unborn.staged", commandCwd, [
                     "diff",
                     "--cached",
                     "--numstat",
@@ -1691,25 +1692,25 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           : originRemoteExists(cwd).pipe(Effect.orElseSucceed(() => false)),
         executeGitWithStableDiagnostics(
           "GitVcsDriver.statusDetails.stagedPaths",
-          cwd,
+          commandCwd,
           ["diff", "--cached", "--name-only", "-z", "--"],
           { allowNonZeroExit: true },
         ),
         executeGitWithStableDiagnostics(
           "GitVcsDriver.statusDetails.unstagedPaths",
-          cwd,
+          commandCwd,
           ["diff", "--name-only", "-z", "--"],
           { allowNonZeroExit: true },
         ),
         executeGitWithStableDiagnostics(
           "GitVcsDriver.statusDetails.untrackedPaths",
-          cwd,
+          commandCwd,
           ["--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z"],
           { allowNonZeroExit: true },
         ),
         executeGitWithStableDiagnostics(
           "GitVcsDriver.statusDetails.conflictedPaths",
-          cwd,
+          commandCwd,
           ["diff", "--name-only", "--diff-filter=U", "-z", "--"],
           { allowNonZeroExit: true },
         ),
@@ -1747,7 +1748,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       if (line.trim().length > 0 && !line.startsWith("#")) {
         hasWorkingTreeChanges = true;
         const pathValue = parsePorcelainPath(line);
-        if (pathValue) changedFilesWithoutNumstat.add(pathValue);
+        if (pathValue && !line.startsWith("? ")) changedFilesWithoutNumstat.add(pathValue);
       }
     }
 
@@ -2440,6 +2441,25 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       detail,
     });
 
+  const resolveExistingIndexPathAncestor = Effect.fn(
+    "GitVcsDriver.resolveExistingIndexPathAncestor",
+  )(function* (requestedPath: string, repositoryRoot: string) {
+    let candidate = requestedPath;
+    while (true) {
+      const realPath = yield* fileSystem.realPath(candidate).pipe(
+        Effect.catchTags({
+          PlatformError: (cause) =>
+            cause.reason._tag === "NotFound" ? Effect.succeed(null) : Effect.fail(cause),
+        }),
+      );
+      if (realPath !== null) return realPath;
+      if (candidate === repositoryRoot) {
+        return yield* fileSystem.realPath(candidate);
+      }
+      candidate = path.dirname(candidate);
+    }
+  });
+
   const validateIndexPaths = Effect.fn("GitVcsDriver.validateIndexPaths")(function* (
     operation: string,
     cwd: string,
@@ -2479,7 +2499,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         );
       }
 
-      const requestedPath = path.resolve(cwd, pathValue);
+      const requestedPath = path.resolve(repositoryRoot, pathValue);
       const relativePath = path.relative(repositoryRoot, requestedPath);
       if (relativePath.length === 0 || !isPathWithinRoot(repositoryRoot, requestedPath)) {
         return yield* indexPathError(
@@ -2490,12 +2510,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         );
       }
 
-      const realTarget = yield* fileSystem.realPath(requestedPath).pipe(
-        Effect.catch(() =>
-          fileSystem
-            .realPath(path.dirname(requestedPath))
-            .pipe(Effect.map((realParent) => path.join(realParent, path.basename(requestedPath)))),
-        ),
+      const realTarget = yield* resolveExistingIndexPathAncestor(
+        requestedPath,
+        repositoryRoot,
+      ).pipe(
         Effect.mapError((cause) =>
           indexPathError(
             operation,
@@ -2611,7 +2629,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       executeGit(
         "GitVcsDriver.getWorkingTreeDiff.untracked",
         validated.repositoryRoot,
-        ["--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "--", relativePath],
+        [
+          "--literal-pathspecs",
+          "ls-files",
+          "--others",
+          "--exclude-standard",
+          "-z",
+          "--",
+          relativePath,
+        ],
         { allowNonZeroExit: true },
       ),
     ]);
