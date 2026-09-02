@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  canAttemptDirtyBranchSwitch,
   fileAction,
   isFileStaged,
   needsDirtyBranchConfirmation,
@@ -8,6 +9,12 @@ import {
 } from "./sourceControlPanel.logic";
 
 describe("source control panel logic", () => {
+  it("blocks branch switching until status is known", () => {
+    expect(canAttemptDirtyBranchSwitch(undefined)).toBe(false);
+    expect(canAttemptDirtyBranchSwitch(false)).toBe(true);
+    expect(canAttemptDirtyBranchSwitch(true)).toBe(true);
+  });
+
   it("shows stage and unstage actions from the index state", () => {
     expect(fileAction({ indexStatus: "unstaged" })).toMatchObject({ label: "Stage" });
     expect(fileAction({ indexStatus: "staged" })).toMatchObject({ label: "Unstage" });

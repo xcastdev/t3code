@@ -140,6 +140,44 @@ describe("GitRunStackedActionResult", () => {
 });
 
 describe("Git index and diff contracts", () => {
+  it("preserves whitespace in Git path values", () => {
+    const path = " report.txt ";
+    const status = decodeVcsStatus({
+      isRepo: true,
+      hasPrimaryRemote: false,
+      isDefaultRef: false,
+      refName: "main",
+      hasWorkingTreeChanges: true,
+      workingTree: {
+        files: [{ path, insertions: 1, deletions: 0, indexStatus: "unstaged" }],
+        insertions: 1,
+        deletions: 0,
+      },
+      hasUpstream: false,
+      aheadCount: 0,
+      behindCount: 0,
+      aheadOfDefaultCount: 0,
+      pr: null,
+    });
+
+    expect(status.workingTree.files[0]?.path).toBe(path);
+    expect(decodeVcsStageFilesInput({ cwd: "/repo", paths: [path] }).paths).toEqual([path]);
+    expect(decodeVcsWorkingTreeDiffInput({ cwd: "/repo", path, comparison: "head" }).path).toBe(
+      path,
+    );
+  });
+
+  it("rejects empty and NUL-containing Git path values", () => {
+    expect(() => decodeVcsStageFilesInput({ cwd: "/repo", paths: [""] })).toThrow();
+    expect(() =>
+      decodeVcsWorkingTreeDiffInput({
+        cwd: "/repo",
+        path: "bad\u0000path.txt",
+        comparison: "head",
+      }),
+    ).toThrow();
+  });
+
   it("decodes a file with staged and unstaged changes", () => {
     const parsed = decodeVcsStatus({
       isRepo: true,

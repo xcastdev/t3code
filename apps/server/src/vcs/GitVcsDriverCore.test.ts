@@ -1222,6 +1222,27 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("preserves whitespace in tracked status paths", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const path = " report.txt ";
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, path, "before\n");
+        yield* git(cwd, ["add", "--", path]);
+        yield* git(cwd, ["commit", "-m", "add whitespace path"]);
+        yield* writeTextFile(cwd, path, "after\n");
+
+        const status = yield* (yield* GitVcsDriver.GitVcsDriver).statusDetails(cwd);
+
+        assert.deepStrictEqual(
+          status.workingTree.files.map((file) => file.path),
+          [path],
+        );
+        assert.equal(status.workingTree.files[0]?.insertions, 1);
+        assert.equal(status.workingTree.files[0]?.deletions, 1);
+      }),
+    );
+
     it.effect("reports staged, unstaged, untracked, and conflicted index states", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -1731,6 +1752,77 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         yield* fileSystem.symlink(outsideFile, symlinkPath);
         const error = yield* driver.stageFiles({ cwd, paths: ["linked.txt"] }).pipe(Effect.flip);
         assert.include(error.detail, "outside");
+      }),
+    );
+
+    it.effect("treats pathspec magic literally when unstaging files", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* initRepoWithCommit(cwd);
+        const literalPath = ":(glob)*.txt";
+        const siblingPath = "sibling.txt";
+        yield* writeTextFile(cwd, literalPath, "literal\n");
+        yield* writeTextFile(cwd, siblingPath, "sibling\n");
+        yield* git(cwd, ["add", "--", literalPath, siblingPath]);
+        yield* git(cwd, ["commit", "-m", "add pathspec fixtures"]);
+        yield* writeTextFile(cwd, literalPath, "literal changed\n");
+        yield* writeTextFile(cwd, siblingPath, "sibling changed\n");
+        yield* driver.stageFiles({ cwd, paths: [literalPath, siblingPath] });
+
+        yield* driver.unstageFiles({ cwd, paths: [literalPath] });
+
+        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), siblingPath);
+      }),
+    );
+
+    it.effect("treats pathspec magic literally in tracked diffs", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* initRepoWithCommit(cwd);
+        const literalPath = ":(glob)*.txt";
+        const siblingPath = "sibling.txt";
+        yield* writeTextFile(cwd, literalPath, "literal\n");
+        yield* writeTextFile(cwd, siblingPath, "sibling\n");
+        yield* git(cwd, ["add", "--", literalPath, siblingPath]);
+        yield* git(cwd, ["commit", "-m", "add pathspec fixtures"]);
+        yield* writeTextFile(cwd, literalPath, "literal changed\n");
+        yield* writeTextFile(cwd, siblingPath, "sibling changed\n");
+
+        const result = yield* driver.getWorkingTreeDiff({
+          cwd,
+          path: literalPath,
+          comparison: "head",
+        });
+
+        assert.include(result.diff, literalPath);
+        assert.notInclude(result.diff, siblingPath);
+      }),
+    );
+
+    it.effect("does not execute textconv helpers for tracked diffs", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, ".gitattributes", "converted.txt diff=marker\n");
+        yield* writeTextFile(cwd, "converted.txt", "before\n");
+        yield* git(cwd, ["add", ".gitattributes", "converted.txt"]);
+        yield* git(cwd, ["commit", "-m", "add textconv fixture"]);
+        yield* git(cwd, ["config", "diff.marker.textconv", "touch .git/textconv-marker && cat"]);
+        yield* writeTextFile(cwd, "converted.txt", "after\n");
+
+        const result = yield* driver.getWorkingTreeDiff({
+          cwd,
+          path: "converted.txt",
+          comparison: "head",
+        });
+
+        assert.include(result.diff, "+after");
+        assert.isFalse(yield* fileSystem.exists(pathService.join(cwd, ".git/textconv-marker")));
       }),
     );
 

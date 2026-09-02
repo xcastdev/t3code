@@ -41,6 +41,10 @@ export function needsDirtyBranchConfirmation(hasWorkingTreeChanges: boolean): bo
   return hasWorkingTreeChanges;
 }
 
+export function canAttemptDirtyBranchSwitch(hasWorkingTreeChanges: boolean | undefined): boolean {
+  return hasWorkingTreeChanges !== undefined;
+}
+
 export function pullRequestShortcutTarget(): {
   readonly kind: "source-control";
   readonly view: "pull-requests";

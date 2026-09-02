@@ -170,14 +170,13 @@ function parseNumstatEntries(
   for (const line of stdout.split(/\r?\n/g)) {
     if (line.trim().length === 0) continue;
     const [addedRaw, deletedRaw, ...pathParts] = line.split("\t");
-    const rawPath =
-      pathParts.length > 1 ? (pathParts.at(-1) ?? "").trim() : pathParts.join("\t").trim();
+    const rawPath = pathParts.length > 1 ? (pathParts.at(-1) ?? "") : pathParts.join("\t");
     if (rawPath.length === 0) continue;
     const added = Number.parseInt(addedRaw ?? "0", 10);
     const deleted = Number.parseInt(deletedRaw ?? "0", 10);
     const renameArrowIndex = rawPath.indexOf(" => ");
     const normalizedPath =
-      renameArrowIndex >= 0 ? rawPath.slice(renameArrowIndex + " => ".length).trim() : rawPath;
+      renameArrowIndex >= 0 ? rawPath.slice(renameArrowIndex + " => ".length) : rawPath;
     entries.push({
       path: normalizedPath.length > 0 ? normalizedPath : rawPath,
       insertions: Number.isFinite(added) ? added : 0,
@@ -189,23 +188,27 @@ function parseNumstatEntries(
 
 function parsePorcelainPath(line: string): string | null {
   if (line.startsWith("? ") || line.startsWith("! ")) {
-    const simple = line.slice(2).trim();
+    const simple = line.slice(2);
     return simple.length > 0 ? simple : null;
-  }
-
-  if (!(line.startsWith("1 ") || line.startsWith("2 ") || line.startsWith("u "))) {
-    return null;
   }
 
   const tabIndex = line.indexOf("\t");
   if (tabIndex >= 0) {
     const fromTab = line.slice(tabIndex + 1);
     const [filePath] = fromTab.split("\t");
-    return filePath?.trim().length ? filePath.trim() : null;
+    return filePath?.length ? filePath : null;
   }
 
-  const parts = line.trim().split(/\s+/g);
-  const filePath = parts.at(-1) ?? "";
+  const metadataFieldCount = line.startsWith("1 ")
+    ? 7
+    : line.startsWith("2 ")
+      ? 8
+      : line.startsWith("u ")
+        ? 9
+        : null;
+  if (metadataFieldCount === null) return null;
+  const match = new RegExp(`^[12u] (?:\\S+ ){${metadataFieldCount}}(.*)$`).exec(line);
+  const filePath = match?.[1] ?? "";
   return filePath.length > 0 ? filePath : null;
 }
 
@@ -2596,8 +2599,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       "GitVcsDriver.unstageFiles",
       validated.repositoryRoot,
       headResult.exitCode === 0
-        ? ["restore", "--staged", "--", ...validated.paths]
-        : ["reset", "--", ...validated.paths],
+        ? ["--literal-pathspecs", "restore", "--staged", "--", ...validated.paths]
+        : ["--literal-pathspecs", "reset", "--", ...validated.paths],
     );
   });
 
@@ -2661,8 +2664,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           relativePath,
         ]
       : [
+          "--literal-pathspecs",
           "diff",
           "--no-ext-diff",
+          "--no-textconv",
           "--patch",
           "--minimal",
           ...(input.comparison === "index" ? ["--cached"] : ["HEAD"]),

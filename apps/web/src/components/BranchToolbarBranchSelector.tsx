@@ -34,7 +34,7 @@ import { vcsEnvironment } from "../state/vcs";
 import { cn } from "../lib/utils";
 import { parsePullRequestReference } from "../pullRequestReference";
 import { getSourceControlPresentation } from "../sourceControlPresentation";
-import { needsDirtyBranchConfirmation } from "./source-control/sourceControlPanel.logic";
+import { canAttemptDirtyBranchSwitch } from "./source-control/sourceControlPanel.logic";
 import {
   deriveLocalBranchNameFromRemoteRef,
   resolveBranchTriggerLabel,
@@ -392,7 +392,16 @@ export function BranchToolbarBranchSelector({
 
   const confirmDirtyBranchSwitch = useCallback(
     async (branchName: string): Promise<boolean> => {
-      if (!needsDirtyBranchConfirmation(branchStatusQuery.data?.hasWorkingTreeChanges === true)) {
+      const hasWorkingTreeChanges = branchStatusQuery.data?.hasWorkingTreeChanges;
+      if (!canAttemptDirtyBranchSwitch(hasWorkingTreeChanges)) {
+        toastManager.add({
+          type: "error",
+          title: "Branch status is unavailable",
+          description: "Branch status is unavailable. Refresh before switching branches.",
+        });
+        return false;
+      }
+      if (hasWorkingTreeChanges === false) {
         return true;
       }
       const api = readLocalApi();

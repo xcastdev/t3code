@@ -4,6 +4,9 @@ import { SourceControlProviderError, SourceControlProviderInfo } from "./sourceC
 import { VcsDriverKind } from "./vcs.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
+const GitPath = Schema.String.check(Schema.isNonEmpty()).check(
+  Schema.makeFilter((path) => !path.includes("\u0000") || "Git paths must not contain NUL."),
+);
 const GIT_LIST_BRANCHES_MAX_LIMIT = 200;
 
 // Domain Types
@@ -93,7 +96,7 @@ export const VcsIndexStatus = Schema.Literals([
 export type VcsIndexStatus = typeof VcsIndexStatus.Type;
 
 export const VcsWorkingTreeFile = Schema.Struct({
-  path: TrimmedNonEmptyStringSchema,
+  path: GitPath,
   insertions: NonNegativeInt,
   deletions: NonNegativeInt,
   indexStatus: Schema.optional(VcsIndexStatus),
@@ -121,7 +124,7 @@ export const VcsStatusInput = Schema.Struct({
 });
 export type VcsStatusInput = typeof VcsStatusInput.Type;
 
-const NonEmptyPaths = Schema.Array(TrimmedNonEmptyStringSchema).check(Schema.isMinLength(1));
+const NonEmptyPaths = Schema.Array(GitPath).check(Schema.isMinLength(1));
 
 export const VcsStageFilesInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
@@ -131,7 +134,7 @@ export type VcsStageFilesInput = typeof VcsStageFilesInput.Type;
 
 export const VcsWorkingTreeDiffInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
-  path: TrimmedNonEmptyStringSchema,
+  path: GitPath,
   comparison: Schema.Literals(["index", "head"]),
 });
 export type VcsWorkingTreeDiffInput = typeof VcsWorkingTreeDiffInput.Type;
