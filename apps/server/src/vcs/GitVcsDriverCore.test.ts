@@ -161,7 +161,7 @@ it.effect("uses stable diagnostics for every parsed non-repository command", () 
 
     assert.deepStrictEqual(commands, [
       { args: ["rev-parse", "--git-common-dir"], lcAll: "C" },
-      { args: ["status", "--porcelain=2", "--branch"], lcAll: "C" },
+      { args: ["status", "--porcelain=2", "--branch", "-z"], lcAll: "C" },
       { args: ["rev-parse", "--abbrev-ref", "HEAD"], lcAll: "C" },
     ]);
   }).pipe(Effect.provide(layer));
@@ -1243,6 +1243,59 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("preserves tab and newline tracked paths without quoted duplicates", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const tabPath = "tab\tfile.txt";
+        const newlinePath = "newline\nfile.txt";
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, tabPath, "before\n");
+        yield* writeTextFile(cwd, newlinePath, "before\n");
+        yield* git(cwd, ["add", "--", tabPath, newlinePath]);
+        yield* git(cwd, ["commit", "-m", "add unusual paths"]);
+        yield* writeTextFile(cwd, tabPath, "after\n");
+        yield* writeTextFile(cwd, newlinePath, "after\n");
+
+        const status = yield* (yield* GitVcsDriver.GitVcsDriver).statusDetails(cwd);
+
+        assert.equal(status.workingTree.files.length, 2);
+        for (const path of [tabPath, newlinePath]) {
+          assert.deepInclude(status.workingTree.files, {
+            path,
+            insertions: 1,
+            deletions: 1,
+            indexStatus: "unstaged",
+          });
+        }
+      }),
+    );
+
+    it.effect("reports a staged rename at its destination with destination stats", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const sourcePath = "source.txt";
+        const destinationPath = "renamed\tfile\n.txt";
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, sourcePath, "one\ntwo\nthree\nfour\nfive\n");
+        yield* git(cwd, ["add", "--", sourcePath]);
+        yield* git(cwd, ["commit", "-m", "add rename source"]);
+        yield* git(cwd, ["mv", "--", sourcePath, destinationPath]);
+        yield* writeTextFile(cwd, destinationPath, "one\ntwo\nthree\nfour\nfive\nsix\n");
+        yield* git(cwd, ["add", "--", destinationPath]);
+
+        const status = yield* (yield* GitVcsDriver.GitVcsDriver).statusDetails(cwd);
+
+        assert.deepStrictEqual(status.workingTree.files, [
+          {
+            path: destinationPath,
+            insertions: 1,
+            deletions: 0,
+            indexStatus: "staged",
+          },
+        ]);
+      }),
+    );
+
     it.effect("reports staged, unstaged, untracked, and conflicted index states", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -1752,6 +1805,45 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         yield* fileSystem.symlink(outsideFile, symlinkPath);
         const error = yield* driver.stageFiles({ cwd, paths: ["linked.txt"] }).pipe(Effect.flip);
         assert.include(error.detail, "outside");
+      }),
+    );
+
+    it.effect("unstages both sides of a staged rename selected by its destination", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const sourcePath = "source.txt";
+        const destinationPath = ":(glob)renamed.txt";
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, sourcePath, "rename me\n");
+        yield* git(cwd, ["add", "--", sourcePath]);
+        yield* git(cwd, ["commit", "-m", "add rename source"]);
+        yield* git(cwd, ["mv", "--", sourcePath, destinationPath]);
+
+        const status = yield* driver.statusDetails(cwd);
+        assert.deepStrictEqual(
+          status.workingTree.files.map((file) => file.path),
+          [destinationPath],
+        );
+
+        yield* driver.unstageFiles({ cwd, paths: [destinationPath] });
+
+        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-status"]), "");
+      }),
+    );
+
+    it.effect("treats staging a missing untracked path as an idempotent no-op", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, "staged.txt", "staged\n");
+        yield* driver.stageFiles({ cwd, paths: ["staged.txt"] });
+        const indexBefore = yield* git(cwd, ["diff", "--cached", "--name-status"]);
+
+        yield* driver.stageFiles({ cwd, paths: ["missing.txt"] });
+
+        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-status"]), indexBefore);
       }),
     );
 
