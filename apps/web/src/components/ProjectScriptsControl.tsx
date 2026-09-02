@@ -14,6 +14,7 @@ import {
   initialProjectActionSelection,
   projectActionMenuIntent,
   projectScriptForSelection,
+  resolveProjectActionSelection,
   type ProjectActionMenuIntent,
   type ProjectActionSelection,
 } from "~/projectActionSelection";
@@ -85,6 +86,7 @@ export default function ProjectScriptsControl({
     imports: false,
   });
   const [editorRequest, setEditorRequest] = useState<ProjectScriptEditorRequest | null>(null);
+  const [splitMenuOpen, setSplitMenuOpen] = useState(false);
   const [splitSelectionState, setSplitSelectionState] = useState<{
     readonly key: string | null;
     readonly selection: ProjectActionSelection;
@@ -101,13 +103,9 @@ export default function ProjectScriptsControl({
     return primaryProjectScript(scripts);
   }, [preferredScriptId, scripts]);
   const selectedAction = useMemo(() => {
-    if (splitSelectionState.key === selectionKey) {
-      const selectedScript = projectScriptForSelection(scripts, splitSelectionState.selection);
-      if (splitSelectionState.selection.kind === "add" || selectedScript !== null) {
-        return splitSelectionState.selection;
-      }
-    }
-    return initialProjectActionSelection(scripts, preferredScriptId);
+    const rememberedSelection =
+      splitSelectionState.key === selectionKey ? splitSelectionState.selection : null;
+    return resolveProjectActionSelection(scripts, preferredScriptId, rememberedSelection);
   }, [preferredScriptId, scripts, selectionKey, splitSelectionState]);
   const selectedScript = projectScriptForSelection(scripts, selectedAction);
   const importableScripts = useMemo(
@@ -126,6 +124,7 @@ export default function ProjectScriptsControl({
     "data-highlighted:bg-transparent data-highlighted:text-foreground hover:bg-accent hover:text-accent-foreground focus-visible:bg-accent focus-visible:text-accent-foreground data-highlighted:hover:bg-accent data-highlighted:hover:text-accent-foreground data-highlighted:focus-visible:bg-accent data-highlighted:focus-visible:text-accent-foreground";
 
   const openAddDialog = useCallback(() => {
+    setSplitMenuOpen(false);
     setEditorRequest({ scriptId: null, initial: EMPTY_PROJECT_SCRIPT_INPUT });
   }, []);
 
@@ -167,6 +166,7 @@ export default function ProjectScriptsControl({
 
   const openEditDialog = (script: ProjectScript) => {
     setActionsMenuOpen({ scripts: false, imports: false });
+    setSplitMenuOpen(false);
     setEditorRequest(editorRequestForScript(script, keybindings));
   };
 
@@ -275,7 +275,7 @@ export default function ProjectScriptsControl({
   );
 
   const splitControls = (
-    <Menu>
+    <Menu open={splitMenuOpen} onOpenChange={setSplitMenuOpen}>
       <Group aria-label="Project actions">
         <Button
           size="xs"

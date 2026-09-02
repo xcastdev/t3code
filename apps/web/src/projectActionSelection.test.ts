@@ -5,6 +5,7 @@ import {
   initialProjectActionSelection,
   projectActionMenuIntent,
   projectScriptForSelection,
+  resolveProjectActionSelection,
   type ProjectActionSelection,
 } from "./projectActionSelection";
 
@@ -52,5 +53,12 @@ describe("project action selection", () => {
 
   it("treats Add action as an editor command in the split menu", () => {
     expect(projectActionMenuIntent({ kind: "add" })).toEqual({ kind: "open-add-editor" });
+  });
+
+  it("falls back to the new primary action after an empty-project placeholder", () => {
+    expect(resolveProjectActionSelection(scripts, null, { kind: "add" })).toEqual({
+      kind: "script",
+      scriptId: "dev",
+    });
   });
 });

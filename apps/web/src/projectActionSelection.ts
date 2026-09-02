@@ -37,3 +37,14 @@ export function projectScriptForSelection(
   if (selection.kind === "add") return null;
   return scripts.find((script) => script.id === selection.scriptId) ?? null;
 }
+
+export function resolveProjectActionSelection(
+  scripts: ReadonlyArray<ProjectScript>,
+  preferredScriptId: string | null,
+  selection: ProjectActionSelection | null,
+): ProjectActionSelection {
+  if (selection?.kind === "script" && projectScriptForSelection(scripts, selection) !== null) {
+    return selection;
+  }
+  return initialProjectActionSelection(scripts, preferredScriptId);
+}
