@@ -2022,11 +2022,11 @@ export function makeOpenCodeAdapter(
               event.properties.status.message,
             );
           } else {
-            yield* emitOpenCodeTaskProgress(context, task, turnId, event, "idle");
+            yield* emitOpenCodeTaskCompleted(context, task, turnId, event, "completed");
           }
           break;
         case "session.idle":
-          yield* emitOpenCodeTaskProgress(context, task, turnId, event, "idle");
+          yield* emitOpenCodeTaskCompleted(context, task, turnId, event, "completed");
           break;
         case "session.error":
           yield* emitOpenCodeTaskCompleted(

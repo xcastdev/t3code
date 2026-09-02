@@ -5195,7 +5195,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       ];
       const eventsFiber = yield* adapter.streamEvents.pipe(
         Stream.filter((event) => event.threadId === threadId && event.type.startsWith("task.")),
-        Stream.take(5),
+        Stream.take(4),
         Stream.runCollect,
         Effect.forkChild,
       );
@@ -5207,7 +5207,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
       NodeAssert.deepEqual(
         events.map((event) => event.type),
-        ["task.started", "task.progress", "task.progress", "task.progress", "task.completed"],
+        ["task.started", "task.progress", "task.progress", "task.completed"],
       );
       const started = events[0];
       if (started?.type === "task.started") {
@@ -5225,14 +5225,10 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       if (idle?.type === "task.progress") {
         NodeAssert.equal(idle.payload.status, "waiting");
       }
-      const childIdle = events[3];
-      if (childIdle?.type === "task.progress") {
-        NodeAssert.equal(childIdle.payload.status, "idle");
-      }
-      const completed = events[4];
+      const completed = events[3];
       if (completed?.type === "task.completed") {
         NodeAssert.equal(completed.payload.status, "completed");
-        NodeAssert.equal(completed.payload.summary, "Done");
+        NodeAssert.equal(completed.payload.summary, undefined);
       }
       yield* adapter.stopSession(threadId);
     }),
