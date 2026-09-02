@@ -188,7 +188,7 @@ export interface OpenCodeInventory {
   readonly agents: ReadonlyArray<Agent>;
   readonly skills: ReadonlyArray<OpenCodeSkill>;
   /** Native slash commands, scoped to the requested project directory. */
-  readonly commands?: ReadonlyArray<Command>;
+  readonly commands: ReadonlyArray<Command>;
 }
 
 export interface ParsedOpenCodeModelSlug {
