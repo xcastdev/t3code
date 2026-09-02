@@ -2,6 +2,7 @@ import {
   type ModelCapabilities,
   type OpenCodeSettings,
   type ServerProviderModel,
+  type ServerProviderSlashCommand,
   type ServerProviderSkill,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -281,6 +282,40 @@ function flattenOpenCodeSkills(input: OpenCodeInventory): ReadonlyArray<ServerPr
   return skills.toSorted((left, right) => left.name.localeCompare(right.name));
 }
 
+function flattenOpenCodeCommands(
+  input: OpenCodeInventory,
+): ReadonlyArray<ServerProviderSlashCommand> {
+  const commands: ServerProviderSlashCommand[] = [];
+  for (const command of input.commands ?? []) {
+    const name = trimOptional(command.name);
+    // Skills are rendered by the dedicated skill menu entry. Keeping their
+    // command aliases here would produce duplicate slash-menu rows.
+    if (!name || command.source === "skill") {
+      continue;
+    }
+    const description = trimOptional(command.description);
+    const hint = command.hints
+      .map(trimOptional)
+      .find((value): value is string => value !== undefined);
+    commands.push({
+      name,
+      ...(description ? { description } : {}),
+      ...(hint ? { input: { hint } } : {}),
+    });
+  }
+  const seen = new Set<string>();
+  return commands
+    .filter((command) => {
+      const key = command.name.toLowerCase();
+      if (seen.has(key)) {
+        return false;
+      }
+      seen.add(key);
+      return true;
+    })
+    .toSorted((left, right) => left.name.localeCompare(right.name));
+}
+
 export const makePendingOpenCodeProvider = (
   openCodeSettings: OpenCodeSettings,
 ): Effect.Effect<ServerProviderDraft> =>
@@ -443,6 +478,7 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
           directory: cwd,
           ...(server.serverPassword !== undefined ? { serverPassword: server.serverPassword } : {}),
         }),
+        { directory: cwd },
       )
       .pipe(Effect.map((inventory) => ({ inventory, version: server.version })));
   const inventoryEffect = isExternalServer
@@ -476,12 +512,14 @@ export const checkOpenCodeProviderStatus = Effect.fn("checkOpenCodeProviderStatu
     DEFAULT_OPENCODE_MODEL_CAPABILITIES,
   );
   const skills = flattenOpenCodeSkills(inventoryExit.value.inventory);
+  const slashCommands = flattenOpenCodeCommands(inventoryExit.value.inventory);
   const connectedCount = inventoryExit.value.inventory.providerList.connected.length;
   return buildServerProvider({
     presentation: OPENCODE_PRESENTATION,
     enabled: true,
     checkedAt,
     models,
+    slashCommands,
     skills,
     probe: {
       installed: true,

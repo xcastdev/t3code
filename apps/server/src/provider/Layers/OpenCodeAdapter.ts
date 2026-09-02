@@ -628,6 +628,24 @@ function openCodeTaskLinkage(state: OpenCodeTaskState) {
   };
 }
 
+function parseOpenCodeCommandInput(
+  text: string,
+): { readonly command: string; readonly arguments?: string } | undefined {
+  const match = /^\/([A-Za-z0-9][A-Za-z0-9._-]*)(?:\s+([\s\S]*))?$/.exec(text.trim());
+  if (!match) {
+    return undefined;
+  }
+  const command = match[1];
+  if (!command) {
+    return undefined;
+  }
+  const argumentsText = match[2]?.trim();
+  return {
+    command,
+    ...(argumentsText ? { arguments: argumentsText } : {}),
+  };
+}
+
 function mapPermissionToRequestType(
   permission: string,
 ):
@@ -3239,18 +3257,38 @@ export function makeOpenCodeAdapter(
           }
 
           let promptTimedOut = false;
-          const promptEffect = runOpenCodeSdk("session.promptAsync", (signal) =>
-            context.client.session.promptAsync(
-              {
-                sessionID: context.openCodeSessionId,
-                messageID: messageId,
-                model: parsedModel,
-                ...(context.activeAgent ? { agent: context.activeAgent } : {}),
-                ...(context.activeVariant ? { variant: context.activeVariant } : {}),
-                parts: [...(text ? [{ type: "text" as const, text }] : []), ...fileParts],
-              },
-              { signal },
-            ),
+          const nativeCommand = text ? parseOpenCodeCommandInput(text) : undefined;
+          const promptEffect = runOpenCodeSdk(
+            nativeCommand ? "session.command" : "session.promptAsync",
+            async (signal) => {
+              if (nativeCommand) {
+                await context.client.session.command(
+                  {
+                    sessionID: context.openCodeSessionId,
+                    messageID: messageId,
+                    command: nativeCommand.command,
+                    ...(nativeCommand.arguments ? { arguments: nativeCommand.arguments } : {}),
+                    model: `${parsedModel.providerID}/${parsedModel.modelID}`,
+                    ...(context.activeAgent ? { agent: context.activeAgent } : {}),
+                    ...(context.activeVariant ? { variant: context.activeVariant } : {}),
+                    parts: fileParts,
+                  },
+                  { signal },
+                );
+                return;
+              }
+              await context.client.session.promptAsync(
+                {
+                  sessionID: context.openCodeSessionId,
+                  messageID: messageId,
+                  model: parsedModel,
+                  ...(context.activeAgent ? { agent: context.activeAgent } : {}),
+                  ...(context.activeVariant ? { variant: context.activeVariant } : {}),
+                  parts: [...(text ? [{ type: "text" as const, text }] : []), ...fileParts],
+                },
+                { signal },
+              );
+            },
           ).pipe(
             Effect.timeout("10 seconds"),
             Effect.catchTags({

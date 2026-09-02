@@ -116,6 +116,46 @@ it.layer(testLayer)("OpenCodeRuntime inventory", (it) => {
     }),
   );
 
+  it.effect("loads native slash commands with the project directory", () =>
+    Effect.gen(function* () {
+      const runtime = yield* OpenCodeRuntime;
+      let commandDirectory: string | undefined;
+      const client = {
+        provider: {
+          list: () => Promise.resolve({ data: { connected: [], all: [], default: {} } }),
+        },
+        app: {
+          agents: () => Promise.resolve({ data: [] }),
+          skills: () => Promise.resolve({ data: [] }),
+        },
+        command: {
+          list: (parameters?: { directory?: string }) => {
+            commandDirectory = parameters?.directory;
+            return Promise.resolve({
+              data: [
+                {
+                  name: "review",
+                  description: "Review this change",
+                  source: "command" as const,
+                  template: "Review $ARGUMENTS",
+                  hints: ["files or focus"],
+                },
+              ],
+            });
+          },
+        },
+      } as unknown as OpencodeClient;
+
+      const inventory = yield* runtime.loadOpenCodeInventory(client, { directory: "/repo" });
+
+      NodeAssert.equal(commandDirectory, "/repo");
+      NodeAssert.deepEqual(
+        inventory.commands?.map((command) => command.name),
+        ["review"],
+      );
+    }),
+  );
+
   it.effect("drops oversized CLI skill output without losing the model inventory", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;

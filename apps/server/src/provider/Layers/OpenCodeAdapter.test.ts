@@ -74,6 +74,8 @@ const runtimeMock = {
     messageCalls: [] as Array<{ sessionID: string; messageID: string }>,
     messageFailures: 0,
     promptCalls: [] as Array<unknown>,
+    commandCalls: [] as Array<unknown>,
+    commandObserved: null as (() => void) | null,
     promptAsyncError: null as Error | null,
     promptAsyncImplementation: null as (() => Promise<void>) | null,
     autoPromptEcho: true,
@@ -121,6 +123,8 @@ const runtimeMock = {
     this.state.messageCalls.length = 0;
     this.state.messageFailures = 0;
     this.state.promptCalls.length = 0;
+    this.state.commandCalls.length = 0;
+    this.state.commandObserved = null;
     this.state.promptAsyncError = null;
     this.state.promptAsyncImplementation = null;
     this.state.autoPromptEcho = true;
@@ -274,6 +278,32 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
           if (runtimeMock.state.promptAsyncError) {
             throw runtimeMock.state.promptAsyncError;
           }
+          if (
+            runtimeMock.state.autoPromptEcho &&
+            typeof input === "object" &&
+            input !== null &&
+            "sessionID" in input &&
+            "messageID" in input &&
+            typeof input.sessionID === "string" &&
+            typeof input.messageID === "string"
+          ) {
+            runtimeMock.state.messages.push({
+              info: { id: input.messageID, role: "user" },
+              parts: [],
+            });
+            runtimeMock.state.promptEchoEvents.push({
+              id: `evt-auto-user-${input.messageID}`,
+              type: "message.updated",
+              properties: {
+                sessionID: input.sessionID,
+                info: { id: input.messageID, role: "user" },
+              },
+            });
+          }
+        },
+        command: async (input: unknown) => {
+          runtimeMock.state.commandCalls.push(input);
+          runtimeMock.state.commandObserved?.();
           if (
             runtimeMock.state.autoPromptEcho &&
             typeof input === "object" &&
@@ -5116,6 +5146,58 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       if (completed?.type === "task.completed") {
         NodeAssert.equal(completed.payload.status, "completed");
         NodeAssert.equal(completed.payload.summary, "Done");
+      }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("invokes slash commands through OpenCode's native command endpoint", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-command");
+      const sessionID = "http://127.0.0.1:9999/session";
+      const commandEvent = promiseWithResolvers<unknown>();
+      const commandStarted = promiseWithResolvers<void>();
+      runtimeMock.state.subscribedEvents = [
+        commandEvent.promise,
+        {
+          id: "evt-command-idle",
+          type: "session.status",
+          properties: { sessionID, status: { type: "idle" } },
+        },
+      ];
+      runtimeMock.state.commandObserved = () => commandStarted.resolve(undefined);
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "/review changed files",
+          modelSelection: createModelSelection(ProviderInstanceId.make("opencode"), "openai/gpt-5"),
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => commandStarted.promise);
+      commandEvent.resolve({
+        id: "evt-command-busy",
+        type: "session.status",
+        properties: { sessionID, status: { type: "busy" } },
+      });
+      yield* Fiber.join(turnFiber).pipe(Effect.timeout("1 second"));
+
+      const [commandCall] = runtimeMock.state.commandCalls;
+      NodeAssert.equal(typeof commandCall, "object");
+      if (commandCall && typeof commandCall === "object") {
+        const commandPayload = commandCall as Record<string, unknown>;
+        NodeAssert.equal(commandPayload.sessionID, sessionID);
+        NodeAssert.equal(typeof commandPayload.messageID, "string");
+        NodeAssert.equal(commandPayload.command, "review");
+        NodeAssert.equal(commandPayload.arguments, "changed files");
+        NodeAssert.equal(commandPayload.model, "openai/gpt-5");
+        NodeAssert.deepEqual(commandPayload.parts, []);
       }
       yield* adapter.stopSession(threadId);
     }),
