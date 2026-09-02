@@ -3636,7 +3636,7 @@ export function makeOpenCodeAdapter(
 
           let promptTimedOut = false;
           const nativeCommand = text ? parseOpenCodeCommandInput(text) : undefined;
-          const promptEffect = runOpenCodeSdk(
+          const submitPrompt = runOpenCodeSdk(
             nativeCommand ? "session.command" : "session.promptAsync",
             async (signal) => {
               if (nativeCommand) {
@@ -3667,22 +3667,37 @@ export function makeOpenCodeAdapter(
                 { signal },
               );
             },
-          ).pipe(
-            Effect.timeout("10 seconds"),
-            Effect.catchTags({
-              OpenCodeRuntimeError: (cause) => Effect.fail(toRequestError(cause)),
-              TimeoutError: (cause) => {
-                promptTimedOut = true;
-                return Effect.fail(
-                  new ProviderAdapterRequestError({
-                    provider: PROVIDER,
-                    method: "session.promptAsync",
-                    detail: "OpenCode prompt submission did not complete within 10 seconds.",
-                    cause,
+          );
+          // `prompt_async` is an acknowledgement endpoint, while a native
+          // command can stay open while its command is waiting for user input.
+          // Timing out the latter locally detaches OpenCode's eventual
+          // question from its still-running turn and makes Stop target stale
+          // session state.
+          const promptEffect = (
+            nativeCommand
+              ? submitPrompt.pipe(
+                  Effect.catchTags({
+                    OpenCodeRuntimeError: (cause) => Effect.fail(toRequestError(cause)),
                   }),
-                );
-              },
-            }),
+                )
+              : submitPrompt.pipe(
+                  Effect.timeout("10 seconds"),
+                  Effect.catchTags({
+                    OpenCodeRuntimeError: (cause) => Effect.fail(toRequestError(cause)),
+                    TimeoutError: (cause) => {
+                      promptTimedOut = true;
+                      return Effect.fail(
+                        new ProviderAdapterRequestError({
+                          provider: PROVIDER,
+                          method: "session.promptAsync",
+                          detail: "OpenCode prompt submission did not complete within 10 seconds.",
+                          cause,
+                        }),
+                      );
+                    },
+                  }),
+                )
+          ).pipe(
             Effect.tapError((requestError) =>
               context.promptAdmission !== promptAdmission || context.activeTurnId !== turnId
                 ? Effect.void

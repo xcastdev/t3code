@@ -78,6 +78,7 @@ const runtimeMock = {
     commandObserved: null as (() => void) | null,
     promptAsyncError: null as Error | null,
     promptAsyncImplementation: null as (() => Promise<void>) | null,
+    commandImplementation: null as ((signal?: AbortSignal) => Promise<void>) | null,
     autoPromptEcho: true,
     autoConnect: true,
     promptEchoEvents: [] as Array<unknown>,
@@ -127,6 +128,7 @@ const runtimeMock = {
     this.state.commandObserved = null;
     this.state.promptAsyncError = null;
     this.state.promptAsyncImplementation = null;
+    this.state.commandImplementation = null;
     this.state.autoPromptEcho = true;
     this.state.autoConnect = true;
     this.state.promptEchoEvents.length = 0;
@@ -301,9 +303,10 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             });
           }
         },
-        command: async (input: unknown) => {
+        command: async (input: unknown, options?: { signal?: AbortSignal }) => {
           runtimeMock.state.commandCalls.push(input);
           runtimeMock.state.commandObserved?.();
+          await runtimeMock.state.commandImplementation?.(options?.signal);
           if (
             runtimeMock.state.autoPromptEcho &&
             typeof input === "object" &&
@@ -5283,6 +5286,75 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         NodeAssert.equal(commandPayload.model, "openai/gpt-5");
         NodeAssert.deepEqual(commandPayload.parts, []);
       }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("keeps a slash-command turn cancellable when it waits for a user question", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-command-question");
+      const sessionID = "http://127.0.0.1:9999/session";
+      const commandStarted = promiseWithResolvers<void>();
+      const commandRelease = promiseWithResolvers<void>();
+      const questionEvent = promiseWithResolvers<unknown>();
+      runtimeMock.state.commandObserved = () => commandStarted.resolve(undefined);
+      runtimeMock.state.commandImplementation = async () => commandRelease.promise;
+      runtimeMock.state.subscribedEvents = [questionEvent.promise];
+
+      const questionFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) => event.threadId === threadId && event.type === "user-input.requested",
+        ),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turnFiber = yield* adapter
+        .sendTurn({
+          threadId,
+          input: "/spec add a cancel test",
+          modelSelection: createModelSelection(ProviderInstanceId.make("opencode"), "openai/gpt-5"),
+        })
+        .pipe(Effect.forkChild);
+      yield* Effect.promise(() => commandStarted.promise);
+
+      // A native command can wait for a question. Its HTTP response is not a
+      // prompt-admission acknowledgement, so the ten-second prompt timeout
+      // must not detach the still-active turn.
+      yield* advanceTestClock(10_000);
+      NodeAssert.equal(turnFiber.pollUnsafe(), undefined);
+
+      questionEvent.resolve({
+        id: "evt-command-question",
+        type: "question.asked",
+        properties: questionRequest("question-command", sessionID),
+      });
+      const question = Option.getOrUndefined(
+        yield* Fiber.join(questionFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.equal(question?.type, "user-input.requested");
+      NodeAssert.notEqual(question?.turnId, undefined);
+
+      const sessions = yield* adapter.listSessions();
+      const session = sessions.find((candidate) => candidate.threadId === threadId);
+      NodeAssert.equal(session?.status, "running");
+      NodeAssert.notEqual(session?.activeTurnId, undefined);
+      NodeAssert.equal(question?.turnId, session?.activeTurnId);
+
+      yield* adapter.interruptTurn(threadId, session?.activeTurnId);
+      const turnExit = yield* Fiber.await(turnFiber);
+      NodeAssert.equal(Exit.isFailure(turnExit), true);
+      if (Exit.isFailure(turnExit)) {
+        NodeAssert.equal(Cause.hasInterruptsOnly(turnExit.cause), true);
+      }
+      NodeAssert.ok(runtimeMock.state.abortCalls.length >= 1);
+
+      commandRelease.resolve(undefined);
       yield* adapter.stopSession(threadId);
     }),
   );
