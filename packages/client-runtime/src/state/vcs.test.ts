@@ -642,3 +642,110 @@ describe("cached VCS refs", () => {
     ),
   );
 });
+
+describe("Git workflow command atoms", () => {
+  it.effect("exposes staging, diff, and index commit commands", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const requests: Array<{ method: string; input: unknown }> = [];
+        const client = {
+          [WS_METHODS.vcsStageFiles]: (input: unknown) =>
+            Effect.sync(() => requests.push({ method: WS_METHODS.vcsStageFiles, input })),
+          [WS_METHODS.vcsUnstageFiles]: (input: unknown) =>
+            Effect.sync(() => requests.push({ method: WS_METHODS.vcsUnstageFiles, input })),
+          [WS_METHODS.vcsGetWorkingTreeDiff]: (input: unknown) =>
+            Effect.sync(() =>
+              requests.push({ method: WS_METHODS.vcsGetWorkingTreeDiff, input }),
+            ).pipe(Effect.as({ diff: "diff", truncated: false })),
+          [WS_METHODS.gitCommitIndex]: (input: unknown) =>
+            Effect.sync(() => requests.push({ method: WS_METHODS.gitCommitIndex, input })).pipe(
+              Effect.as({ commitSha: "abc123" }),
+            ),
+        } as unknown as WsRpcProtocolClient;
+        const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+          target: TARGET,
+          state: yield* SubscriptionRef.make(CONNECTED_CONNECTION_STATE),
+          session: yield* SubscriptionRef.make(Option.some(session(client))),
+          prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+          connect: Effect.void,
+          disconnect: Effect.void,
+          retryNow: Effect.void,
+        } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+        const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
+          run: (_environmentId, effect) =>
+            Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
+        const runtime = Atom.runtime(
+          Layer.merge(
+            Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
+            Layer.succeed(Persistence.EnvironmentCacheStore, cacheWithRefs(Option.none())),
+          ),
+        );
+        const atoms = createVcsEnvironmentAtoms(runtime);
+        const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (value) =>
+          Effect.sync(() => value.dispose()),
+        );
+
+        const environmentId = TARGET.environmentId;
+        expect(
+          AsyncResult.isSuccess(
+            yield* Effect.promise(() =>
+              atoms.stageFiles.run(registry, {
+                environmentId,
+                input: { cwd: "/repo", paths: ["a.txt"] },
+              }),
+            ),
+          ),
+        ).toBe(true);
+        expect(
+          AsyncResult.isSuccess(
+            yield* Effect.promise(() =>
+              atoms.unstageFiles.run(registry, {
+                environmentId,
+                input: { cwd: "/repo", paths: ["a.txt"] },
+              }),
+            ),
+          ),
+        ).toBe(true);
+        expect(
+          AsyncResult.isSuccess(
+            yield* Effect.promise(() =>
+              atoms.getWorkingTreeDiff.run(registry, {
+                environmentId,
+                input: { cwd: "/repo", path: "a.txt", comparison: "head" },
+              }),
+            ),
+          ),
+        ).toBe(true);
+        expect(
+          AsyncResult.isSuccess(
+            yield* Effect.promise(() =>
+              atoms.commitIndex.run(registry, {
+                environmentId,
+                input: { cwd: "/repo", message: "commit a" },
+              }),
+            ),
+          ),
+        ).toBe(true);
+        expect(requests).toEqual([
+          {
+            method: WS_METHODS.vcsStageFiles,
+            input: { cwd: "/repo", paths: ["a.txt"] },
+          },
+          {
+            method: WS_METHODS.vcsUnstageFiles,
+            input: { cwd: "/repo", paths: ["a.txt"] },
+          },
+          {
+            method: WS_METHODS.vcsGetWorkingTreeDiff,
+            input: { cwd: "/repo", path: "a.txt", comparison: "head" },
+          },
+          {
+            method: WS_METHODS.gitCommitIndex,
+            input: { cwd: "/repo", message: "commit a" },
+          },
+        ]);
+      }),
+    ),
+  );
+});

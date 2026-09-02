@@ -6011,6 +6011,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
   it.effect("routes websocket rpc git methods", () =>
     Effect.gen(function* () {
+      const firstLocalRefresh = yield* Deferred.make<void>();
+      const secondLocalRefresh = yield* Deferred.make<void>();
+      let localRefreshCalls = 0;
       yield* buildAppUnderTest({
         config: {
           cwd: "/tmp/repo",
@@ -6127,6 +6130,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
               }),
           },
           gitVcsDriver: {
+            stageFiles: () => Effect.void,
+            unstageFiles: () => Effect.void,
+            getWorkingTreeDiff: () => Effect.succeed({ diff: "index-diff", truncated: false }),
+            commitIndex: () => Effect.succeed({ commitSha: "def456" }),
             pullCurrentBranch: () =>
               Effect.succeed({
                 status: "pulled",
@@ -6157,6 +6164,25 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             switchRef: (input) => Effect.succeed({ refName: input.refName }),
           },
           vcsStatusBroadcaster: {
+            refreshLocalStatus: () =>
+              Effect.sync(() => {
+                localRefreshCalls += 1;
+                return localRefreshCalls;
+              }).pipe(
+                Effect.tap((calls) =>
+                  calls === 1
+                    ? Deferred.succeed(firstLocalRefresh, undefined)
+                    : Deferred.succeed(secondLocalRefresh, undefined),
+                ),
+                Effect.as({
+                  isRepo: true,
+                  hasPrimaryRemote: true,
+                  isDefaultRef: true,
+                  refName: "main",
+                  hasWorkingTreeChanges: false,
+                  workingTree: { files: [], insertions: 0, deletions: 0 },
+                }),
+              ),
             refreshStatus: () =>
               Effect.succeed({
                 isRepo: true,
@@ -6209,6 +6235,39 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       });
 
       const wsUrl = yield* getWsServerUrl("/ws");
+
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.vcsStageFiles]({ cwd: "/tmp/repo", paths: ["a.ts"] }),
+        ),
+      );
+      yield* Deferred.await(firstLocalRefresh);
+
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.vcsUnstageFiles]({ cwd: "/tmp/repo", paths: ["a.ts"] }),
+        ),
+      );
+      yield* Deferred.await(secondLocalRefresh);
+
+      const workingTreeDiff = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.vcsGetWorkingTreeDiff]({
+            cwd: "/tmp/repo",
+            path: "a.ts",
+            comparison: "index",
+          }),
+        ),
+      );
+      assert.deepEqual(workingTreeDiff, { diff: "index-diff", truncated: false });
+
+      const indexCommit = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.gitCommitIndex]({ cwd: "/tmp/repo", message: "commit staged" }),
+        ),
+      );
+      assert.deepEqual(indexCommit, { commitSha: "def456" });
+      assert.equal(localRefreshCalls, 3);
 
       const pull = yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) => client[WS_METHODS.vcsPull]({ cwd: "/tmp/repo" })),

@@ -1283,6 +1283,10 @@ const makeWsRpcLayer = (
         vcsStatusBroadcaster
           .refreshStatus(cwd)
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
+      const refreshLocalGitStatus = (cwd: string) =>
+        vcsStatusBroadcaster
+          .refreshLocalStatus(cwd)
+          .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
 
       return WsRpcGroup.of({
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
@@ -2238,6 +2242,26 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "git" },
           ),
+        [WS_METHODS.vcsStageFiles]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.vcsStageFiles,
+            gitWorkflow.stageFiles(input).pipe(Effect.tap(() => refreshLocalGitStatus(input.cwd))),
+            { "rpc.aggregate": "vcs" },
+          ),
+        [WS_METHODS.vcsUnstageFiles]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.vcsUnstageFiles,
+            gitWorkflow
+              .unstageFiles(input)
+              .pipe(Effect.tap(() => refreshLocalGitStatus(input.cwd))),
+            { "rpc.aggregate": "vcs" },
+          ),
+        [WS_METHODS.vcsGetWorkingTreeDiff]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.vcsGetWorkingTreeDiff,
+            gitWorkflow.getWorkingTreeDiff(input),
+            { "rpc.aggregate": "vcs" },
+          ),
         [WS_METHODS.gitRunStackedAction]: (input) =>
           observeRpcStream(
             WS_METHODS.gitRunStackedAction,
@@ -2275,6 +2299,12 @@ const makeWsRpcLayer = (
             gitWorkflow
               .preparePullRequestThread(input)
               .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            { "rpc.aggregate": "git" },
+          ),
+        [WS_METHODS.gitCommitIndex]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.gitCommitIndex,
+            gitWorkflow.commitIndex(input).pipe(Effect.tap(() => refreshLocalGitStatus(input.cwd))),
             { "rpc.aggregate": "git" },
           ),
         [WS_METHODS.vcsListRefs]: (input) =>
