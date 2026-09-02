@@ -1015,9 +1015,6 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ProjectCreateCommand,
   ProjectMetaUpdateCommand,
   ProjectDeleteCommand,
-  ProjectMcpServerCreateCommand,
-  ProjectMcpServerUpdateCommand,
-  ProjectMcpServerRemoveCommand,
   ThreadCreateCommand,
   ThreadDeleteCommand,
   ThreadArchiveCommand,
@@ -1046,9 +1043,6 @@ export const ClientOrchestrationCommand = Schema.Union([
   ProjectCreateCommand,
   ProjectMetaUpdateCommand,
   ProjectDeleteCommand,
-  ProjectMcpServerCreateCommand,
-  ProjectMcpServerUpdateCommand,
-  ProjectMcpServerRemoveCommand,
   ThreadCreateCommand,
   ThreadDeleteCommand,
   ThreadArchiveCommand,
@@ -1146,6 +1140,9 @@ const ThreadTitleRegenerationCompleteCommand = Schema.Struct({
 });
 
 const InternalOrchestrationCommand = Schema.Union([
+  ProjectMcpServerCreateCommand,
+  ProjectMcpServerUpdateCommand,
+  ProjectMcpServerRemoveCommand,
   ThreadSessionSetCommand,
   ThreadMessageAssistantDeltaCommand,
   ThreadMessageAssistantCompleteCommand,

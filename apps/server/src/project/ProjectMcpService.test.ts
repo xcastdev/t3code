@@ -114,6 +114,30 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
     }),
   );
 
+  it.effect("rejects a create that reuses a server ID from another project", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const engine = yield* OrchestrationEngineService;
+      const firstProject = ProjectId.make("duplicate-id-project-a");
+      const secondProject = ProjectId.make("duplicate-id-project-b");
+      yield* createProject(firstProject, "duplicate-id-project-a");
+      yield* createProject(secondProject, "duplicate-id-project-b");
+      const server = yield* service.create({ projectId: firstProject, ...codexInput });
+
+      const exit = yield* Effect.exit(
+        engine.dispatch({
+          type: "project.mcp-server.create",
+          commandId: CommandId.make("duplicate-mcp-server-id"),
+          projectId: secondProject,
+          server: { ...server, name: "Other project docs" },
+          createdAt: "2026-09-02T20:00:00.000Z",
+        }),
+      );
+
+      expect(exit._tag).toBe("Failure");
+    }),
+  );
+
   it.effect("keeps empty selections and stale provider IDs while rejecting newly unknown IDs", () =>
     Effect.gen(function* () {
       const service = yield* ProjectMcpService.ProjectMcpService;
