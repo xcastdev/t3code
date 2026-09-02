@@ -130,6 +130,14 @@ import {
   ProjectWriteFileResult,
 } from "./project.ts";
 import {
+  ProjectMcpCreateInput,
+  ProjectMcpListInput,
+  ProjectMcpCatalog,
+  ProjectMcpRemoveInput,
+  ProjectMcpServer,
+  ProjectMcpUpdateInput,
+} from "./projectMcp.ts";
+import {
   TerminalAttachInput,
   TerminalAttachStreamEvent,
   TerminalClearInput,
@@ -223,6 +231,10 @@ export const WS_METHODS = {
   projectsSearchContents: "projects.searchContents",
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
+  projectMcpList: "projectMcp.list",
+  projectMcpCreate: "projectMcp.create",
+  projectMcpUpdate: "projectMcp.update",
+  projectMcpRemove: "projectMcp.remove",
 
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
@@ -695,6 +707,30 @@ export const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   error: Schema.Union([ProjectWriteFileError, EnvironmentAuthorizationError]),
 });
 
+export const WsProjectMcpListRpc = Rpc.make(WS_METHODS.projectMcpList, {
+  payload: ProjectMcpListInput,
+  success: ProjectMcpCatalog,
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsProjectMcpCreateRpc = Rpc.make(WS_METHODS.projectMcpCreate, {
+  payload: ProjectMcpCreateInput,
+  success: ProjectMcpServer,
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsProjectMcpUpdateRpc = Rpc.make(WS_METHODS.projectMcpUpdate, {
+  payload: ProjectMcpUpdateInput,
+  success: ProjectMcpServer,
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsProjectMcpRemoveRpc = Rpc.make(WS_METHODS.projectMcpRemove, {
+  payload: ProjectMcpRemoveInput,
+  success: Schema.Void,
+  error: EnvironmentAuthorizationError,
+});
+
 export const WsShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
   payload: LaunchEditorInput,
   error: Schema.Union([ExternalLauncherError, EnvironmentAuthorizationError]),
@@ -1106,6 +1142,10 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectsSearchContentsRpc,
   WsProjectsSearchEntriesRpc,
   WsProjectsWriteFileRpc,
+  WsProjectMcpListRpc,
+  WsProjectMcpCreateRpc,
+  WsProjectMcpUpdateRpc,
+  WsProjectMcpRemoveRpc,
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,
