@@ -380,10 +380,21 @@ export const ChatHeader = memo(function ChatHeader({
           rightPanelOpen ? "pr-0" : "pr-16",
         )}
       >
-        {activeProjectScripts && (
+        {activeProjectScripts && showOpenInPicker ? (
           <ProjectScriptsControl
             scripts={activeProjectScripts}
             fileScripts={fileScripts}
+            split
+            selectionKey={`${activeThreadEnvironmentId}:${activeProjectCwd ?? activeProjectName}`}
+            menuContents={
+              <OpenInPicker
+                environmentId={activeThreadEnvironmentId}
+                keybindings={keybindings}
+                availableEditors={availableEditors}
+                openInCwd={openInCwd}
+                menu
+              />
+            }
             keybindings={keybindings}
             preferredScriptId={preferredScriptId}
             onRunScript={onRunProjectScript}
@@ -391,14 +402,29 @@ export const ChatHeader = memo(function ChatHeader({
             onUpdateScript={onUpdateProjectScript}
             onDeleteScript={onDeleteProjectScript}
           />
-        )}
-        {showOpenInPicker && (
-          <OpenInPicker
-            environmentId={activeThreadEnvironmentId}
-            keybindings={keybindings}
-            availableEditors={availableEditors}
-            openInCwd={openInCwd}
-          />
+        ) : (
+          <>
+            {activeProjectScripts && (
+              <ProjectScriptsControl
+                scripts={activeProjectScripts}
+                fileScripts={fileScripts}
+                keybindings={keybindings}
+                preferredScriptId={preferredScriptId}
+                onRunScript={onRunProjectScript}
+                onAddScript={onAddProjectScript}
+                onUpdateScript={onUpdateProjectScript}
+                onDeleteScript={onDeleteProjectScript}
+              />
+            )}
+            {showOpenInPicker && (
+              <OpenInPicker
+                environmentId={activeThreadEnvironmentId}
+                keybindings={keybindings}
+                availableEditors={availableEditors}
+                openInCwd={openInCwd}
+              />
+            )}
+          </>
         )}
         {activeProjectName && (
           <GitActionsControl

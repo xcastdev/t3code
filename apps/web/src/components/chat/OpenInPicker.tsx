@@ -18,7 +18,16 @@ import { useEnvironment } from "../../state/environments";
 import { ChevronDownIcon, FolderClosedIcon } from "lucide-react";
 import { Button } from "../ui/button";
 import { Group, GroupSeparator } from "../ui/group";
-import { Menu, MenuItem, MenuPopup, MenuShortcut, MenuTrigger } from "../ui/menu";
+import {
+  Menu,
+  MenuItem,
+  MenuPopup,
+  MenuShortcut,
+  MenuSub,
+  MenuSubPopup,
+  MenuSubTrigger,
+  MenuTrigger,
+} from "../ui/menu";
 import {
   AntigravityIcon,
   CursorIcon,
@@ -179,6 +188,7 @@ export const OpenInPicker = memo(function OpenInPicker({
   availableEditors,
   openInCwd,
   compact = false,
+  menu = false,
   enableShortcut = true,
 }: {
   environmentId: EnvironmentId;
@@ -186,6 +196,7 @@ export const OpenInPicker = memo(function OpenInPicker({
   availableEditors: ReadonlyArray<EditorId>;
   openInCwd: string | null;
   compact?: boolean;
+  menu?: boolean;
   enableShortcut?: boolean;
 }) {
   const openInEditorMutation = useAtomCommand(shellEnvironment.openInEditor, "open in editor");
@@ -265,8 +276,42 @@ export const OpenInPicker = memo(function OpenInPicker({
     return () => window.removeEventListener("keydown", handler);
   }, [enableShortcut, keybindings, openInCwd, openInEditor, preferredEditor]);
 
-  return (
-    <Group aria-label="Open in editor">
+  const editorMenuItems = (
+    <>
+      {remote.mode === "remote-unavailable" ? (
+        <MenuItem disabled>No SSH route to {environmentLabel}</MenuItem>
+      ) : (
+        <>
+          {options.length === 0 && <MenuItem disabled>No installed editors found</MenuItem>}
+          {options.map(({ label, Icon, value, kind }) => (
+            <MenuItem key={value} onClick={() => openInEditor(value)}>
+              <Icon aria-hidden="true" className={getOpenInIconClass(kind)} />
+              {label}
+              {value === preferredEditor && openFavoriteEditorShortcutLabel && (
+                <MenuShortcut>{openFavoriteEditorShortcutLabel}</MenuShortcut>
+              )}
+            </MenuItem>
+          ))}
+          {remote.mode === "remote-links" && !remoteHintSeen && (
+            <MenuItem disabled>Opens over SSH. Needs your key on {environmentLabel}</MenuItem>
+          )}
+        </>
+      )}
+    </>
+  );
+
+  const menuControls = (
+    <MenuSub>
+      <MenuSubTrigger>
+        <FolderClosedIcon />
+        Open With
+      </MenuSubTrigger>
+      <MenuSubPopup align="start">{editorMenuItems}</MenuSubPopup>
+    </MenuSub>
+  );
+
+  const controls = (
+    <>
       <Button
         aria-label={compact ? "Open file in preferred editor" : undefined}
         className="ps-[8.5px]"
@@ -304,28 +349,10 @@ export const OpenInPicker = memo(function OpenInPicker({
         >
           <ChevronDownIcon aria-hidden="true" className="size-4" />
         </MenuTrigger>
-        <MenuPopup align="end">
-          {remote.mode === "remote-unavailable" ? (
-            <MenuItem disabled>No SSH route to {environmentLabel}</MenuItem>
-          ) : (
-            <>
-              {options.length === 0 && <MenuItem disabled>No installed editors found</MenuItem>}
-              {options.map(({ label, Icon, value, kind }) => (
-                <MenuItem key={value} onClick={() => openInEditor(value)}>
-                  <Icon aria-hidden="true" className={getOpenInIconClass(kind)} />
-                  {label}
-                  {value === preferredEditor && openFavoriteEditorShortcutLabel && (
-                    <MenuShortcut>{openFavoriteEditorShortcutLabel}</MenuShortcut>
-                  )}
-                </MenuItem>
-              ))}
-              {remote.mode === "remote-links" && !remoteHintSeen && (
-                <MenuItem disabled>Opens over SSH. Needs your key on {environmentLabel}</MenuItem>
-              )}
-            </>
-          )}
-        </MenuPopup>
+        <MenuPopup align="end">{editorMenuItems}</MenuPopup>
       </Menu>
-    </Group>
+    </>
   );
+
+  return menu ? menuControls : <Group aria-label="Open in editor">{controls}</Group>;
 });
