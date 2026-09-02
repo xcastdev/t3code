@@ -325,6 +325,7 @@ export function createVcsEnvironmentAtoms<R, E>(
     getWorkingTreeDiffQuery: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:vcs:working-tree-diff-query",
       tag: WS_METHODS.vcsGetWorkingTreeDiff,
+      idleTtlMs: 0,
     }),
     commitIndex: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:git:commit-index",

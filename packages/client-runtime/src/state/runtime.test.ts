@@ -1,6 +1,7 @@
 import { describe, expect, it } from "@effect/vitest";
 import { EnvironmentId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -10,6 +11,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import * as TestClock from "effect/testing/TestClock";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import {
@@ -79,6 +81,7 @@ function queryConnectionState(
 
 const makeEnvironmentQueryHarness = Effect.fn("TestEnvironmentQuery.makeHarness")(function* <A, E>(
   execute: Effect.Effect<A, E>,
+  options: { readonly idleTtlMs?: number } = {},
 ) {
   const supervisorState = yield* SubscriptionRef.make(queryConnectionState());
   const supervisorSession = yield* SubscriptionRef.make(Option.some(QUERY_RPC_SESSION));
@@ -108,6 +111,7 @@ const makeEnvironmentQueryHarness = Effect.fn("TestEnvironmentQuery.makeHarness"
   const family = createEnvironmentQueryAtomFamily(runtime, {
     label: "test.environment-query",
     staleTimeMs: 60_000,
+    ...(options.idleTtlMs === undefined ? {} : { idleTtlMs: options.idleTtlMs }),
     execute: () => execute,
   });
 
@@ -272,6 +276,32 @@ describe("environmentRpcKey", () => {
 });
 
 describe("environment query lifecycle", () => {
+  it.effect("cancels a zero-idle-TTL query when its last subscriber leaves", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const started = yield* Deferred.make<void>();
+        const cancelled = yield* Deferred.make<void>();
+        const request = Deferred.succeed(started, undefined).pipe(
+          Effect.andThen(Effect.never),
+          Effect.ensuring(Deferred.succeed(cancelled, undefined)),
+        );
+        const harness = yield* makeEnvironmentQueryHarness(request, { idleTtlMs: 0 });
+        const registry = AtomRegistry.make();
+        const unsubscribe = registry.subscribe(harness.atom, () => undefined, { immediate: true });
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            unsubscribe();
+            registry.dispose();
+          }),
+        );
+
+        yield* Deferred.await(started);
+        unsubscribe();
+        yield* Deferred.await(cancelled);
+      }).pipe(Effect.provide(TestClock.layer())),
+    ),
+  );
+
   it.effect(
     "retries an interrupted query without exposing a failure during session replacement",
     () =>

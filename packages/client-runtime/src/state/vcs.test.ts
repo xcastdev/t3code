@@ -5,6 +5,7 @@ import {
   type VcsListRefsResult,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -644,6 +645,74 @@ describe("cached VCS refs", () => {
 });
 
 describe("Git workflow command atoms", () => {
+  it.effect("cancels the previous selected-file diff before completing the next one", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const order = yield* Ref.make<ReadonlyArray<string>>([]);
+        const aStarted = yield* Deferred.make<void>();
+        const client = {
+          [WS_METHODS.vcsGetWorkingTreeDiff]: (input: { readonly path: string }) =>
+            input.path === "a.txt"
+              ? Deferred.succeed(aStarted, undefined).pipe(
+                  Effect.andThen(Effect.never),
+                  Effect.ensuring(Ref.update(order, (events) => [...events, "a-cancelled"])),
+                )
+              : Ref.update(order, (events) => [...events, "b-completed"]).pipe(
+                  Effect.as({ diff: "b", truncated: false }),
+                ),
+        } as unknown as WsRpcProtocolClient;
+        const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+          target: TARGET,
+          state: yield* SubscriptionRef.make(CONNECTED_CONNECTION_STATE),
+          session: yield* SubscriptionRef.make(Option.some(session(client))),
+          prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+          connect: Effect.void,
+          disconnect: Effect.void,
+          retryNow: Effect.void,
+        } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+        const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
+          run: (_environmentId, effect) =>
+            Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          followStream: (_environmentId, stream) =>
+            Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
+        const runtime = Atom.runtime(
+          Layer.merge(
+            Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
+            Layer.succeed(Persistence.EnvironmentCacheStore, cacheWithRefs(Option.none())),
+          ),
+        );
+        const atoms = createVcsEnvironmentAtoms(runtime);
+        const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (value) =>
+          Effect.sync(() => value.dispose()),
+        );
+        const a = atoms.getWorkingTreeDiffQuery({
+          environmentId: TARGET.environmentId,
+          input: { cwd: "/repo", path: "a.txt", comparison: "head" },
+        });
+        const b = atoms.getWorkingTreeDiffQuery({
+          environmentId: TARGET.environmentId,
+          input: { cwd: "/repo", path: "b.txt", comparison: "head" },
+        });
+        const unsubscribeA = registry.subscribe(a, () => undefined, { immediate: true });
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribeA));
+
+        yield* Deferred.await(aStarted);
+        unsubscribeA();
+        yield* TestClock.adjust(0);
+        const unsubscribeB = registry.subscribe(b, () => undefined, { immediate: true });
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribeB));
+
+        expect(
+          yield* AtomRegistry.getResult(registry, b, {
+            suspendOnWaiting: true,
+          }),
+        ).toEqual({ diff: "b", truncated: false });
+        expect(yield* Ref.get(order)).toEqual(["a-cancelled", "b-completed"]);
+      }),
+    ).pipe(Effect.provide(TestClock.layer())),
+  );
+
   it.effect("exposes staging, diff, and index commit commands", () =>
     Effect.scoped(
       Effect.gen(function* () {
