@@ -4,6 +4,17 @@ import { memo } from "react";
 import { Toggle } from "../ui/toggle";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 
+export type PanelControlsPlacement = "chat-header" | "secondary-pane" | "right-sidebar";
+
+export function resolvePanelControlsPlacement(input: {
+  rightPanelExpanded: boolean;
+  secondaryPaneOpen: boolean;
+}): PanelControlsPlacement {
+  if (input.rightPanelExpanded) return "right-sidebar";
+  if (input.secondaryPaneOpen) return "secondary-pane";
+  return "chat-header";
+}
+
 interface PanelLayoutControlsProps {
   showTerminalControl?: boolean;
   terminalAvailable: boolean;
@@ -62,7 +73,7 @@ export const PanelLayoutControls = memo(function PanelLayoutControls({
       <Tooltip>
         <TooltipTrigger render={<span className="flex shrink-0" />}>
           <Toggle
-            className="shrink-0 [-webkit-app-region:no-drag]"
+            className="size-9! min-w-9! rounded-md px-0! shrink-0 [-webkit-app-region:no-drag]"
             pressed={rightPanelOpen}
             onPressedChange={onToggleRightPanel}
             aria-label={
@@ -99,27 +110,31 @@ export const PanelLayoutControls = memo(function PanelLayoutControls({
   );
 });
 
-export const RightPanelMaximizeControl = memo(function RightPanelMaximizeControl({
-  maximized,
+export function secondaryPaneFullscreenLabel(fullscreen: boolean): string {
+  return fullscreen ? "Exit fullscreen" : "Enter fullscreen";
+}
+
+export const SecondaryPaneFullscreenControl = memo(function SecondaryPaneFullscreenControl({
+  fullscreen,
   onToggle,
 }: {
-  maximized: boolean;
+  fullscreen: boolean;
   onToggle: () => void;
 }) {
-  const label = maximized ? "Restore panel size" : "Maximize panel";
+  const label = secondaryPaneFullscreenLabel(fullscreen);
   return (
     <Tooltip>
       <TooltipTrigger
         render={
           <Toggle
             className="shrink-0 [-webkit-app-region:no-drag]"
-            pressed={maximized}
+            pressed={fullscreen}
             onPressedChange={onToggle}
             aria-label={label}
             variant="ghost"
             size="sm"
           >
-            {maximized ? (
+            {fullscreen ? (
               <Minimize2Icon className="size-4" />
             ) : (
               <Maximize2Icon className="size-4" />

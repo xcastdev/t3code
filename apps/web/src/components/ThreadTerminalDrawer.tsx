@@ -11,6 +11,7 @@ import {
   SquareSplitVertical,
   TerminalSquare,
   Trash2,
+  XIcon,
 } from "lucide-react";
 import {
   type ContextMenuItem,
@@ -79,6 +80,8 @@ import {
 const MIN_DRAWER_HEIGHT = 180;
 const MAX_DRAWER_HEIGHT_RATIO = 0.75;
 const MULTI_CLICK_SELECTION_ACTION_DELAY_MS = 260;
+
+export const terminalDrawerCloseActionLabel = "Close terminal drawer";
 
 function maxDrawerHeight(): number {
   if (typeof window === "undefined") return DEFAULT_THREAD_TERMINAL_HEIGHT;
@@ -1007,6 +1010,7 @@ interface ThreadTerminalDrawerProps {
   closeShortcutLabel?: string | undefined;
   onActiveTerminalChange: (terminalId: string) => void;
   onCloseTerminal: (terminalId: string) => void;
+  onCloseDrawer: () => void;
   onHeightChange: (height: number) => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
   keybindings: ResolvedKeybindingsConfig;
@@ -1068,6 +1072,7 @@ export default function ThreadTerminalDrawer({
   closeShortcutLabel,
   onActiveTerminalChange,
   onCloseTerminal,
+  onCloseDrawer,
   onHeightChange,
   onAddTerminalContext,
   keybindings,
@@ -1479,6 +1484,14 @@ export default function ThreadTerminalDrawer({
             >
               <Trash2 className="size-3.25" />
             </TerminalActionButton>
+            <div className="h-4 w-px bg-border/80" />
+            <TerminalActionButton
+              className="p-1 text-foreground/90 transition-colors hover:bg-accent"
+              onClick={onCloseDrawer}
+              label={terminalDrawerCloseActionLabel}
+            >
+              <XIcon className="size-3.25" />
+            </TerminalActionButton>
           </div>
         </div>
       )}
@@ -1618,6 +1631,13 @@ export default function ThreadTerminalDrawer({
                     label={closeTerminalActionLabel}
                   >
                     <Trash2 className="size-3.25" />
+                  </TerminalActionButton>
+                  <TerminalActionButton
+                    className="inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors hover:bg-accent/70"
+                    onClick={onCloseDrawer}
+                    label={terminalDrawerCloseActionLabel}
+                  >
+                    <XIcon className="size-3.25" />
                   </TerminalActionButton>
                 </div>
               </div>

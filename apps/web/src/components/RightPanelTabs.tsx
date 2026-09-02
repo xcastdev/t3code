@@ -1,5 +1,4 @@
 import type { ContextMenuItem, PreviewSessionSnapshot, PullRequestState } from "@t3tools/contracts";
-import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
 import {
   Bot,
   FileDiff,
@@ -7,7 +6,6 @@ import {
   GitPullRequest,
   Globe2,
   Plus,
-  TerminalSquare,
   Volume2,
   VolumeOff,
 } from "lucide-react";
@@ -33,7 +31,6 @@ import { Menu, MenuItem, MenuPopup, MenuShortcut, MenuTrigger } from "~/componen
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { PanelTabCloseButton } from "~/components/ui/panel-tab-close-button";
 import { faviconUrlForOrigin } from "~/lib/favicon";
-import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 
 import { PreviewPanelShell, type PreviewPanelMode } from "./preview/PreviewPanelShell";
 import { FaviconImage } from "./preview/PreviewFaviconIcon";
@@ -50,11 +47,11 @@ interface RightPanelTabsProps {
   mode: PreviewPanelMode;
   /** Chat uses the rail when empty; route-specific panels can retain tabs. */
   emptyState?: "rail" | "tabs";
-  maximized?: boolean;
   /** Forwarded to PreviewPanelShell so this surface persists its own width. */
   widthStorageKey?: string;
   /** Forwarded to PreviewPanelShell as the initial width before a user resize. */
   defaultWidth?: number;
+  /** Controls owned by the sidebar when its surface is expanded. */
   layoutControls?: ReactNode;
   surfaces: readonly RightPanelSurface[];
   activeSurfaceId: string | null;
@@ -67,20 +64,17 @@ interface RightPanelTabsProps {
    * process, so desktop operations must not be addressed with them.
    */
   previewRuntimeTabId?: ((tabId: string) => string) | undefined;
-  terminalLabelsById: ReadonlyMap<string, string>;
   onActivate: (surface: RightPanelSurface) => void;
   onCloseSurface: (surface: RightPanelSurface) => void;
   onCloseOtherSurfaces: (surface: RightPanelSurface) => void;
   onCloseSurfacesToRight: (surface: RightPanelSurface) => void;
   onCloseAllSurfaces: () => void;
   onAddBrowser: () => void;
-  onAddTerminal: () => void;
   onAddDiff: () => void;
   onAddFiles: () => void;
   onAddPullRequest: () => void;
   onAddAgents: () => void;
   browserAvailable: boolean;
-  terminalAvailable: boolean;
   diffAvailable: boolean;
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
@@ -180,18 +174,12 @@ function SurfaceMenuItem(props: {
 function surfaceTitle(
   surface: RightPanelSurface,
   sessions: Readonly<Record<string, PreviewSessionSnapshot>>,
-  terminalLabelsById: ReadonlyMap<string, string>,
 ): string {
   switch (surface.kind) {
     case "diff":
       return "Diff";
     case "files":
       return "Project Explorer";
-    case "terminal":
-      return (
-        terminalLabelsById.get(surface.activeTerminalId) ??
-        getTerminalLabel(surface.activeTerminalId)
-      );
     case "pull-request":
       return `#${surface.number}`;
     case "agents":
@@ -252,8 +240,6 @@ function SurfaceIcon({
       return <FileDiff className="size-3 shrink-0" />;
     case "files":
       return <Files className="size-3 shrink-0" />;
-    case "terminal":
-      return <TerminalSquare className="size-3 shrink-0" />;
     case "pull-request": {
       const status = pullRequestStatuses?.[surface.id] ?? null;
       const toneClassName =
@@ -280,14 +266,12 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
 
   const addSurfaceActions = createRightPanelSurfaceActions({
     browserAvailable: props.browserAvailable,
-    terminalAvailable: props.terminalAvailable,
     diffAvailable: props.diffAvailable,
     filesAvailable: props.filesAvailable,
     pullRequestAvailable: props.pullRequestAvailable,
     agentsAvailable: props.agentsAvailable,
     liveAgentCount: props.liveAgentCount,
     onAddBrowser: props.onAddBrowser,
-    onAddTerminal: props.onAddTerminal,
     onAddDiff: props.onAddDiff,
     onAddFiles: props.onAddFiles,
     onAddPullRequest: props.onAddPullRequest,
@@ -405,25 +389,31 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
   }, [props.activeSurfaceId]);
 
   if (props.activeSurfaceId === null && props.emptyState !== "tabs") {
-    return <RightPanelRail actions={addSurfaceActions} />;
+    if (props.mode !== "inline") {
+      return <RightPanelRail actions={addSurfaceActions} />;
+    }
+    return (
+      <div
+        className="flex h-full min-h-0 flex-col pt-[var(--workspace-topbar-height)]"
+        data-right-panel-rail-host
+      >
+        <RightPanelRail className="min-h-0 flex-1" actions={addSurfaceActions} />
+      </div>
+    );
   }
 
   return (
     <PreviewPanelShell
       mode={props.mode}
-      {...(props.maximized !== undefined ? { maximized: props.maximized } : {})}
       {...(props.widthStorageKey !== undefined ? { widthStorageKey: props.widthStorageKey } : {})}
       {...(props.defaultWidth !== undefined ? { defaultWidth: props.defaultWidth } : {})}
     >
       <div
         className={cn(
           "flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center gap-1 pl-2",
-          // The sheet overlays from the viewport top, so its tab bar keeps
-          // the titlebar's height: a compact row re-centers the layout
-          // controls a few pixels higher and the cluster jumps on open.
-          props.mode === "inline" && !props.layoutControls ? "pr-28" : "pr-3",
-          ownsDesktopTitleBar && "wco:pr-[calc(var(--workspace-native-controls-inset)+6rem)]",
-          props.mode === "inline" && props.maximized && COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
+          "pr-[calc(env(safe-area-inset-right)+var(--workspace-right-panel-rail-control-inset))]",
+          ownsDesktopTitleBar &&
+            "wco:pr-[calc(var(--workspace-native-controls-inset)+var(--workspace-right-panel-rail-control-inset))]",
         )}
         data-right-panel-tabbar
       >
@@ -438,7 +428,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             {props.surfaces.map((surface) => {
               const active = surface.id === props.activeSurfaceId;
               const pending = props.pendingSurfaceIds.has(surface.id);
-              const title = surfaceTitle(surface, props.previewSessions, props.terminalLabelsById);
+              const title = surfaceTitle(surface, props.previewSessions);
               const previewTabId = previewTabIdOf(surface, props.previewSessions);
               // Desktop state is keyed by the session id, but desktop actions
               // must be addressed with the runtime id.

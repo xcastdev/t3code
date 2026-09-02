@@ -4,9 +4,16 @@ import {
   resolveTerminalSelectionActionPosition,
   shouldHandleTerminalExit,
   shouldHandleTerminalSelectionMouseUp,
+  terminalDrawerCloseActionLabel,
   terminalSelectionActionDelayForClickCount,
   terminalSelectionLineRange,
 } from "./ThreadTerminalDrawer";
+
+describe("terminal drawer toolbar", () => {
+  it("labels the collapse action separately from closing a terminal session", () => {
+    expect(terminalDrawerCloseActionLabel).toBe("Close terminal drawer");
+  });
+});
 
 describe("resolveTerminalSelectionActionPosition", () => {
   it("prefers the selection rect over the last pointer position", () => {

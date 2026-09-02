@@ -9,7 +9,13 @@ import {
   surfaceShortcutTargetsTypingContext,
 } from "./rightPanelShortcuts";
 
-export function RightPanelRail({ actions }: { actions: readonly RightPanelSurfaceAction[] }) {
+export function RightPanelRail({
+  actions,
+  className,
+}: {
+  actions: readonly RightPanelSurfaceAction[];
+  className?: string;
+}) {
   const shortcutActionsRef = useRef(actions);
   useEffect(() => {
     shortcutActionsRef.current = actions;
@@ -30,7 +36,10 @@ export function RightPanelRail({ actions }: { actions: readonly RightPanelSurfac
 
   return (
     <aside
-      className="flex h-full w-12 shrink-0 flex-col items-center gap-1 border-l border-border bg-background py-2"
+      className={cn(
+        "flex w-[var(--workspace-right-panel-rail-width)] shrink-0 flex-col items-center gap-1 border-l border-border bg-background py-2",
+        className ?? "h-full",
+      )}
       aria-label="Right sidebar"
       data-right-panel-rail
       data-surface-launcher-keys={actions
@@ -70,7 +79,12 @@ export function RightPanelRail({ actions }: { actions: readonly RightPanelSurfac
           return (
             <Tooltip key={action.id}>
               <TooltipTrigger render={trigger} />
-              <TooltipPopup side="left">
+              <TooltipPopup
+                side="left"
+                sideOffset={8}
+                className="max-w-56 border-border/80 bg-popover/95 px-2.5 py-1.5 shadow-lg"
+                data-right-panel-rail-tooltip
+              >
                 <span className="flex flex-col gap-0.5">
                   <span>{action.label}</span>
                   <span className="text-[10px] text-muted-foreground">

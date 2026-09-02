@@ -1,4 +1,4 @@
-import { type ReactNode } from "react";
+import { type ReactNode, useRef } from "react";
 
 import {
   RIGHT_PANEL_RAIL_SHEET_CLASS_NAME,
@@ -13,6 +13,8 @@ export function RightPanelSheet(props: {
   onClose: () => void;
   rail?: boolean;
 }) {
+  const sheetRef = useRef<HTMLDivElement>(null);
+
   return (
     <Sheet
       open={props.open}
@@ -26,10 +28,12 @@ export function RightPanelSheet(props: {
         side="right"
         showCloseButton={false}
         keepMounted
+        ref={sheetRef}
+        initialFocus={sheetRef}
         className={cn(
           props.rail ? RIGHT_PANEL_RAIL_SHEET_CLASS_NAME : RIGHT_PANEL_SHEET_CLASS_NAME,
           props.rail &&
-            "wco:mt-[env(titlebar-area-height)] wco:h-[calc(100%-env(titlebar-area-height))]",
+            "mt-[var(--workspace-topbar-height)] h-[calc(100%-var(--workspace-topbar-height))] max-h-[calc(100%-var(--workspace-topbar-height))]",
         )}
       >
         {props.children}

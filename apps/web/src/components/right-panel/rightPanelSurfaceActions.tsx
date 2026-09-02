@@ -1,8 +1,8 @@
 import type { LucideIcon } from "lucide-react";
-import { Bot, FileDiff, Files, GitPullRequest, Globe2, TerminalSquare } from "lucide-react";
+import { Bot, FileDiff, Files, GitPullRequest, Globe2 } from "lucide-react";
 
 export type RightPanelSurfaceAction = {
-  id: "browser" | "terminal" | "files" | "diff" | "pull-request" | "agents";
+  id: "browser" | "files" | "diff" | "pull-request" | "agents";
   label: string;
   description: string;
   shortcut: string;
@@ -15,7 +15,6 @@ export type RightPanelSurfaceAction = {
 
 const DISABLED_REASONS = {
   browser: "Browser previews are only available in the T3 Code desktop app.",
-  terminal: "Terminal surfaces are only available from a project thread.",
   files: "Project Explorer is only available when a project is open.",
   diff: "Diff is only available for server threads in Git repositories.",
   pullRequest: "This thread's branch has no pull request yet.",
@@ -24,14 +23,12 @@ const DISABLED_REASONS = {
 
 export function createRightPanelSurfaceActions(input: {
   browserAvailable: boolean;
-  terminalAvailable: boolean;
   diffAvailable: boolean;
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
   agentsAvailable: boolean;
   liveAgentCount: number;
   onAddBrowser: () => void;
-  onAddTerminal: () => void;
   onAddDiff: () => void;
   onAddFiles: () => void;
   onAddPullRequest: () => void;
@@ -48,17 +45,6 @@ export function createRightPanelSurfaceActions(input: {
       disabledReason: DISABLED_REASONS.browser,
       badgeCount: 0,
       onClick: input.onAddBrowser,
-    },
-    {
-      id: "terminal",
-      label: "Terminal",
-      description: "Start a shell in this workspace.",
-      shortcut: "T",
-      icon: TerminalSquare,
-      available: input.terminalAvailable,
-      disabledReason: DISABLED_REASONS.terminal,
-      badgeCount: 0,
-      onClick: input.onAddTerminal,
     },
     {
       id: "files",

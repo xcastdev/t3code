@@ -8,7 +8,6 @@ function makeActions(
   const onClick = vi.fn();
   const callbacks = {
     onAddBrowser: onClick,
-    onAddTerminal: onClick,
     onAddDiff: onClick,
     onAddFiles: onClick,
     onAddPullRequest: onClick,
@@ -16,7 +15,6 @@ function makeActions(
   };
   return createRightPanelSurfaceActions({
     browserAvailable: true,
-    terminalAvailable: true,
     diffAvailable: true,
     filesAvailable: true,
     pullRequestAvailable: true,
@@ -31,13 +29,13 @@ describe("rightPanelSurfaceActions", () => {
   it("keeps rail and plus-menu labels in one ordered registry", () => {
     expect(makeActions().map((action) => action.label)).toEqual([
       "Browser",
-      "Terminal",
       "Project Explorer",
       "Diff",
       "Pull request",
       "Agents",
     ]);
-    expect(makeActions().map((action) => action.shortcut)).toEqual(["B", "T", "F", "D", "P", "A"]);
+    expect(makeActions().map((action) => action.shortcut)).toEqual(["B", "F", "D", "P", "A"]);
+    expect(makeActions().some((action) => action.label === "Terminal")).toBe(false);
   });
 
   it("preserves availability explanations and live-agent badges", () => {

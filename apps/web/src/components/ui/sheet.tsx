@@ -2,6 +2,7 @@
 
 import { Dialog as SheetPrimitive } from "@base-ui/react/dialog";
 import { XIcon } from "lucide-react";
+import { forwardRef } from "react";
 import { cn } from "~/lib/utils";
 import { Button } from "~/components/ui/button";
 import { ScrollArea } from "~/components/ui/scroll-area";
@@ -57,20 +58,26 @@ function SheetViewport({
   );
 }
 
-function SheetPopup({
-  className,
-  children,
-  showCloseButton = true,
-  keepMounted = false,
-  side = "right",
-  variant = "default",
-  ...props
-}: SheetPrimitive.Popup.Props & {
-  showCloseButton?: boolean;
-  keepMounted?: boolean;
-  side?: "right" | "left" | "top" | "bottom";
-  variant?: "default" | "inset";
-}) {
+const SheetPopup = forwardRef<
+  HTMLDivElement,
+  SheetPrimitive.Popup.Props & {
+    showCloseButton?: boolean;
+    keepMounted?: boolean;
+    side?: "right" | "left" | "top" | "bottom";
+    variant?: "default" | "inset";
+  }
+>(function SheetPopup(
+  {
+    className,
+    children,
+    showCloseButton = true,
+    keepMounted = false,
+    side = "right",
+    variant = "default",
+    ...props
+  },
+  ref,
+) {
   return (
     <SheetPortal keepMounted={keepMounted}>
       <SheetBackdrop />
@@ -91,6 +98,7 @@ function SheetPopup({
             className,
           )}
           data-slot="sheet-popup"
+          ref={ref}
           {...props}
         >
           {children}
@@ -107,7 +115,7 @@ function SheetPopup({
       </SheetViewport>
     </SheetPortal>
   );
-}
+});
 
 function SheetHeader({ className, ...props }: React.ComponentProps<"div">) {
   return (

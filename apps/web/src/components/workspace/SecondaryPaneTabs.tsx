@@ -21,6 +21,7 @@ type SecondaryPaneTabContextMenuAction =
   | "close-all";
 
 export function SecondaryPaneTabs(props: {
+  className?: string;
   surfaces: readonly SecondaryPaneSurface[];
   activeSurfaceId: string | null;
   onActivate: (surface: SecondaryPaneSurface) => void;
@@ -74,7 +75,10 @@ export function SecondaryPaneTabs(props: {
 
   return (
     <div
-      className="flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] shrink-0 items-center border-b border-border/60 px-2"
+      className={cn(
+        "flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] min-w-0 shrink-0 items-center border-b border-border/60 px-2",
+        props.className,
+      )}
       data-secondary-pane-tabbar
       role="tablist"
       aria-label="Open files"

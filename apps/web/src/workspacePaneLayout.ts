@@ -1,5 +1,7 @@
 export type WorkspaceTitlebarOwner = "chat" | "secondary" | "right-panel";
 export type SecondaryPaneLayoutMode = "inline" | "stack";
+export type WorkspaceHeaderRightInsetMode = "default" | "right-panel-control" | "native-controls";
+export type WorkspacePaneFlexDirection = "flex-row" | "flex-col";
 
 export const SECONDARY_PANE_DEFAULT_WIDTH = 560;
 export const SECONDARY_PANE_MIN_WIDTH = 420;
@@ -9,6 +11,12 @@ export const SECONDARY_PANE_COMPACT_MEDIA_QUERY = "(max-width: 760px)";
 
 export function getSecondaryPaneLayoutMode(workspaceWidth: number): SecondaryPaneLayoutMode {
   return workspaceWidth <= 760 ? "stack" : "inline";
+}
+
+export function getWorkspacePaneFlexDirection(
+  layout: SecondaryPaneLayoutMode,
+): WorkspacePaneFlexDirection {
+  return layout === "stack" ? "flex-col" : "flex-row";
 }
 
 export function getSecondaryPaneMaxWidth(workspaceWidth: number): number {
@@ -29,4 +37,23 @@ export function resolveWorkspaceTitlebarOwner(input: {
   }
   if (input.secondaryPaneOpen) return "secondary";
   return "chat";
+}
+
+export function shouldAlignHeaderControlsWithRightPanelRail(input: {
+  rightPanelOpen: boolean;
+  rightPanelHasActiveSurface: boolean;
+}): boolean {
+  return input.rightPanelOpen && !input.rightPanelHasActiveSurface;
+}
+
+export function resolveWorkspaceHeaderRightInsetMode(input: {
+  rightPanelRailAligned: boolean;
+  rightPanelControlInset: boolean;
+  reserveNativeControls: boolean;
+}): WorkspaceHeaderRightInsetMode {
+  if (input.rightPanelRailAligned || input.rightPanelControlInset) {
+    return "right-panel-control";
+  }
+  if (input.reserveNativeControls) return "native-controls";
+  return "default";
 }
