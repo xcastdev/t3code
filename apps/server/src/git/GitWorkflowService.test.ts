@@ -24,6 +24,52 @@ function makeLayer(input: {
 }
 
 describe("GitWorkflowService", () => {
+  it.effect("routes Git index operations through the Git driver", () => {
+    const stageFiles = vi.fn(() => Effect.succeed(undefined));
+    const unstageFiles = vi.fn(() => Effect.succeed(undefined));
+    const getWorkingTreeDiff = vi.fn(() => Effect.succeed({ diff: "diff", truncated: false }));
+    const commitIndex = vi.fn(() => Effect.succeed({ commitSha: "abc123" }));
+    const testLayer = GitWorkflowService.layer.pipe(
+      Layer.provide(
+        Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
+          resolve: () => Effect.succeed({ kind: "git" } as VcsDriverRegistry.VcsDriverHandle),
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(GitVcsDriver.GitVcsDriver)({
+          stageFiles,
+          unstageFiles,
+          getWorkingTreeDiff,
+          commitIndex,
+        }),
+      ),
+      Layer.provide(Layer.mock(GitManager.GitManager)({})),
+    );
+
+    return Effect.gen(function* () {
+      const workflow = yield* GitWorkflowService.GitWorkflowService;
+      yield* workflow.stageFiles({ cwd: "/repo", paths: ["a.txt"] });
+      yield* workflow.unstageFiles({ cwd: "/repo", paths: ["a.txt"] });
+      const diff = yield* workflow.getWorkingTreeDiff({
+        cwd: "/repo",
+        path: "a.txt",
+        comparison: "head",
+      });
+      const commit = yield* workflow.commitIndex({ cwd: "/repo", message: "commit a" });
+
+      expect(diff).toEqual({ diff: "diff", truncated: false });
+      expect(commit).toEqual({ commitSha: "abc123" });
+      expect(stageFiles).toHaveBeenCalledWith({ cwd: "/repo", paths: ["a.txt"] });
+      expect(unstageFiles).toHaveBeenCalledWith({ cwd: "/repo", paths: ["a.txt"] });
+      expect(getWorkingTreeDiff).toHaveBeenCalledWith({
+        cwd: "/repo",
+        path: "a.txt",
+        comparison: "head",
+      });
+      expect(commitIndex).toHaveBeenCalledWith({ cwd: "/repo", message: "commit a" });
+    }).pipe(Effect.provide(testLayer));
+  });
+
   it.effect("returns an empty local status when no VCS repository is detected", () =>
     Effect.gen(function* () {
       const workflow = yield* GitWorkflowService.GitWorkflowService;

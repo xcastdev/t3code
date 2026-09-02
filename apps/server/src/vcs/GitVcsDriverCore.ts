@@ -52,6 +52,7 @@ const RANGE_DIFF_PATCH_MAX_OUTPUT_BYTES = 59_000;
 const REVIEW_DIFF_PATCH_MAX_OUTPUT_BYTES = 120_000;
 const REVIEW_UNTRACKED_DIFF_MAX_OUTPUT_BYTES = 80_000;
 const REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES = 1024 * 1024;
+const WORKING_TREE_DIFF_MAX_OUTPUT_BYTES = 120_000;
 const WORKSPACE_FILES_MAX_OUTPUT_BYTES = 120_000;
 const STATUS_UPSTREAM_REFRESH_INTERVAL = Duration.seconds(15);
 const STATUS_UPSTREAM_REFRESH_TIMEOUT = Duration.seconds(5);
@@ -1617,7 +1618,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       Effect.catchTags({ GitCommandError: () => Effect.succeed(null) }),
     );
     const statusCacheKey = repositoryPaths?.gitCommonDir;
-    const [numstatStdout, defaultBranch, hasPrimaryRemote] = yield* Effect.all(
+    const [
+      numstatStdout,
+      defaultBranch,
+      hasPrimaryRemote,
+      stagedPathsResult,
+      unstagedPathsResult,
+      untrackedPathsResult,
+      conflictedPathsResult,
+    ] = yield* Effect.all(
       [
         executeGitWithStableDiagnostics(
           "GitVcsDriver.statusDetails.numstat",
@@ -1680,6 +1689,30 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         statusCacheKey
           ? Cache.get(originExistsCache, statusCacheKey).pipe(Effect.orElseSucceed(() => false))
           : originRemoteExists(cwd).pipe(Effect.orElseSucceed(() => false)),
+        executeGitWithStableDiagnostics(
+          "GitVcsDriver.statusDetails.stagedPaths",
+          cwd,
+          ["diff", "--cached", "--name-only", "-z", "--"],
+          { allowNonZeroExit: true },
+        ),
+        executeGitWithStableDiagnostics(
+          "GitVcsDriver.statusDetails.unstagedPaths",
+          cwd,
+          ["diff", "--name-only", "-z", "--"],
+          { allowNonZeroExit: true },
+        ),
+        executeGitWithStableDiagnostics(
+          "GitVcsDriver.statusDetails.untrackedPaths",
+          cwd,
+          ["--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z"],
+          { allowNonZeroExit: true },
+        ),
+        executeGitWithStableDiagnostics(
+          "GitVcsDriver.statusDetails.conflictedPaths",
+          cwd,
+          ["diff", "--name-only", "--diff-filter=U", "-z", "--"],
+          { allowNonZeroExit: true },
+        ),
       ],
       { concurrency: "unbounded" },
     );
@@ -1740,6 +1773,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     }
 
     const numstatEntries = parseNumstatEntries(numstatStdout);
+    const stagedPaths = new Set(splitNullSeparatedGitStdoutPaths(stagedPathsResult));
+    const unstagedPaths = new Set(splitNullSeparatedGitStdoutPaths(unstagedPathsResult));
+    const untrackedPaths = new Set(splitNullSeparatedGitStdoutPaths(untrackedPathsResult));
+    const conflictedPaths = new Set(splitNullSeparatedGitStdoutPaths(conflictedPathsResult));
     const fileStatMap = new Map<string, { insertions: number; deletions: number }>();
     for (const entry of numstatEntries) {
       fileStatMap.set(entry.path, { insertions: entry.insertions, deletions: entry.deletions });
@@ -1747,19 +1784,38 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
     let insertions = 0;
     let deletions = 0;
-    const files = Array.from(fileStatMap.entries())
-      .map(([filePath, stat]) => {
+    const filePaths = new Set([
+      ...fileStatMap.keys(),
+      ...changedFilesWithoutNumstat,
+      ...stagedPaths,
+      ...unstagedPaths,
+      ...untrackedPaths,
+      ...conflictedPaths,
+    ]);
+    const files = Array.from(filePaths)
+      .map((filePath) => {
+        const stat = fileStatMap.get(filePath) ?? { insertions: 0, deletions: 0 };
         insertions += stat.insertions;
         deletions += stat.deletions;
-        return { path: filePath, insertions: stat.insertions, deletions: stat.deletions };
+        const indexStatus = conflictedPaths.has(filePath)
+          ? ("conflicted" as const)
+          : untrackedPaths.has(filePath)
+            ? ("untracked" as const)
+            : stagedPaths.has(filePath) && unstagedPaths.has(filePath)
+              ? ("both" as const)
+              : stagedPaths.has(filePath)
+                ? ("staged" as const)
+                : unstagedPaths.has(filePath)
+                  ? ("unstaged" as const)
+                  : undefined;
+        return {
+          path: filePath,
+          insertions: stat.insertions,
+          deletions: stat.deletions,
+          ...(indexStatus === undefined ? {} : { indexStatus }),
+        };
       })
       .toSorted((a, b) => a.path.localeCompare(b.path));
-
-    for (const filePath of changedFilesWithoutNumstat) {
-      if (fileStatMap.has(filePath)) continue;
-      files.push({ path: filePath, insertions: 0, deletions: 0 });
-    }
-    files.sort((a, b) => a.path.localeCompare(b.path));
 
     return {
       isRepo: true,
@@ -2377,6 +2433,252 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))
     );
   };
+
+  const indexPathError = (operation: string, cwd: string, pathValue: string, detail: string) =>
+    new GitCommandError({
+      ...gitCommandContext({ operation, cwd, args: [pathValue] }),
+      detail,
+    });
+
+  const validateIndexPaths = Effect.fn("GitVcsDriver.validateIndexPaths")(function* (
+    operation: string,
+    cwd: string,
+    paths: readonly string[],
+  ) {
+    const repositoryPaths = yield* resolveRepositoryPaths(cwd);
+    const repositoryRoot = repositoryPaths?.worktreeRoot;
+    if (!repositoryRoot) {
+      return yield* indexPathError(
+        operation,
+        cwd,
+        cwd,
+        "Index operations require a non-bare Git worktree.",
+      );
+    }
+
+    const realRepositoryRoot = yield* fileSystem
+      .realPath(repositoryRoot)
+      .pipe(
+        Effect.mapError((cause) =>
+          indexPathError(
+            operation,
+            cwd,
+            repositoryRoot,
+            "Could not resolve the Git worktree root.",
+          ),
+        ),
+      );
+    const validatedPaths: string[] = [];
+    for (const pathValue of paths) {
+      if (pathValue.length === 0 || path.isAbsolute(pathValue)) {
+        return yield* indexPathError(
+          operation,
+          cwd,
+          pathValue,
+          "Git index paths must be non-empty root-relative paths.",
+        );
+      }
+
+      const requestedPath = path.resolve(cwd, pathValue);
+      const relativePath = path.relative(repositoryRoot, requestedPath);
+      if (relativePath.length === 0 || !isPathWithinRoot(repositoryRoot, requestedPath)) {
+        return yield* indexPathError(
+          operation,
+          cwd,
+          pathValue,
+          `Git index path '${pathValue}' resolves outside the repository root.`,
+        );
+      }
+
+      const realTarget = yield* fileSystem.realPath(requestedPath).pipe(
+        Effect.catch(() =>
+          fileSystem
+            .realPath(path.dirname(requestedPath))
+            .pipe(Effect.map((realParent) => path.join(realParent, path.basename(requestedPath)))),
+        ),
+        Effect.mapError((cause) =>
+          indexPathError(
+            operation,
+            cwd,
+            pathValue,
+            `Could not resolve Git index path '${pathValue}'.`,
+          ),
+        ),
+      );
+      if (!isPathWithinRoot(realRepositoryRoot, realTarget)) {
+        return yield* indexPathError(
+          operation,
+          cwd,
+          pathValue,
+          `Git index path '${pathValue}' resolves outside the repository root.`,
+        );
+      }
+
+      const fileInfo = yield* fileSystem.stat(requestedPath).pipe(
+        Effect.catchTags({
+          PlatformError: (cause) =>
+            cause.reason._tag === "NotFound" ? Effect.succeed(null) : Effect.fail(cause),
+        }),
+        Effect.mapError((cause) =>
+          indexPathError(
+            operation,
+            cwd,
+            pathValue,
+            `Could not inspect Git index path '${pathValue}'.`,
+          ),
+        ),
+      );
+      if (fileInfo?.type === "Directory") {
+        return yield* indexPathError(
+          operation,
+          cwd,
+          pathValue,
+          `Git index path '${pathValue}' must identify a file.`,
+        );
+      }
+
+      if (!validatedPaths.includes(relativePath)) {
+        validatedPaths.push(relativePath);
+      }
+    }
+    return { repositoryRoot, paths: validatedPaths };
+  });
+
+  const stageFiles: GitVcsDriver.GitVcsDriver["Service"]["stageFiles"] = Effect.fn("stageFiles")(
+    function* (input) {
+      const validated = yield* validateIndexPaths(
+        "GitVcsDriver.stageFiles.validatePaths",
+        input.cwd,
+        input.paths,
+      );
+      yield* runGit("GitVcsDriver.stageFiles", validated.repositoryRoot, [
+        "--literal-pathspecs",
+        "add",
+        "--",
+        ...validated.paths,
+      ]);
+    },
+  );
+
+  const unstageFiles: GitVcsDriver.GitVcsDriver["Service"]["unstageFiles"] = Effect.fn(
+    "unstageFiles",
+  )(function* (input) {
+    const validated = yield* validateIndexPaths(
+      "GitVcsDriver.unstageFiles.validatePaths",
+      input.cwd,
+      input.paths,
+    );
+    const headResult = yield* executeGit(
+      "GitVcsDriver.unstageFiles.head",
+      validated.repositoryRoot,
+      ["rev-parse", "--verify", "HEAD"],
+      { allowNonZeroExit: true },
+    );
+    yield* runGit(
+      "GitVcsDriver.unstageFiles",
+      validated.repositoryRoot,
+      headResult.exitCode === 0
+        ? ["restore", "--staged", "--", ...validated.paths]
+        : ["reset", "--", ...validated.paths],
+    );
+  });
+
+  const getWorkingTreeDiff: GitVcsDriver.GitVcsDriver["Service"]["getWorkingTreeDiff"] = Effect.fn(
+    "getWorkingTreeDiff",
+  )(function* (input) {
+    const validated = yield* validateIndexPaths(
+      "GitVcsDriver.getWorkingTreeDiff.validatePath",
+      input.cwd,
+      [input.path],
+    );
+    const relativePath = validated.paths[0];
+    if (!relativePath) {
+      return yield* indexPathError(
+        "GitVcsDriver.getWorkingTreeDiff",
+        input.cwd,
+        input.path,
+        "A single Git index path is required.",
+      );
+    }
+
+    const [headResult, untrackedResult] = yield* Effect.all([
+      executeGit(
+        "GitVcsDriver.getWorkingTreeDiff.head",
+        validated.repositoryRoot,
+        ["rev-parse", "--verify", "HEAD"],
+        { allowNonZeroExit: true },
+      ),
+      executeGit(
+        "GitVcsDriver.getWorkingTreeDiff.untracked",
+        validated.repositoryRoot,
+        ["--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "--", relativePath],
+        { allowNonZeroExit: true },
+      ),
+    ]);
+    const isUntracked = splitNullSeparatedGitStdoutPaths({
+      stdout: untrackedResult.stdout,
+      stdoutTruncated: untrackedResult.stdoutTruncated,
+    }).includes(relativePath);
+    const useUntrackedDiff =
+      input.comparison === "head" && (isUntracked || headResult.exitCode !== 0);
+    const diffArgs = useUntrackedDiff
+      ? [
+          "diff",
+          "--no-index",
+          "--patch",
+          "--no-color",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--minimal",
+          "--",
+          "/dev/null",
+          relativePath,
+        ]
+      : [
+          "diff",
+          "--no-ext-diff",
+          "--patch",
+          "--minimal",
+          ...(input.comparison === "index" ? ["--cached"] : ["HEAD"]),
+          "--",
+          relativePath,
+        ];
+    const result = yield* executeGit(
+      "GitVcsDriver.getWorkingTreeDiff",
+      validated.repositoryRoot,
+      diffArgs,
+      {
+        allowNonZeroExit: true,
+        maxOutputBytes: WORKING_TREE_DIFF_MAX_OUTPUT_BYTES,
+        appendTruncationMarker: true,
+      },
+    );
+    if (result.exitCode !== 0 && !(useUntrackedDiff && result.exitCode === 1)) {
+      return yield* new GitCommandError({
+        ...gitCommandContext({
+          operation: "GitVcsDriver.getWorkingTreeDiff",
+          cwd: input.cwd,
+          args: diffArgs,
+        }),
+        detail: "Git working-tree diff failed.",
+        exitCode: result.exitCode,
+        stdoutLength: result.stdout.length,
+        stderrLength: result.stderr.length,
+      });
+    }
+    return { diff: result.stdout, truncated: result.stdoutTruncated };
+  });
+
+  const commitIndex: GitVcsDriver.GitVcsDriver["Service"]["commitIndex"] = Effect.fn("commitIndex")(
+    function* (input) {
+      yield* runGit("GitVcsDriver.commitIndex", input.cwd, ["commit", "-m", input.message]);
+      const commitSha = yield* runGitStdout("GitVcsDriver.commitIndex.revParseHead", input.cwd, [
+        "rev-parse",
+        "HEAD",
+      ]);
+      return { commitSha: commitSha.trim() };
+    },
+  );
 
   const readReviewFileAtRevision = Effect.fn("readReviewFileAtRevision")(function* (
     input: ReviewDiffFileContentsInput,
@@ -3291,9 +3593,13 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     statusDetails,
     statusDetailsLocal,
     statusDetailsRemote,
+    stageFiles,
+    unstageFiles,
+    getWorkingTreeDiff,
     prepareCommitContext,
     commit: (cwd, subject, body, options) =>
       withListRefsInvalidation(cwd, commit(cwd, subject, body, options)),
+    commitIndex: (input) => withListRefsInvalidation(input.cwd, commitIndex(input)),
     pushCurrentBranch: (cwd, fallbackBranch, options) =>
       withListRefsInvalidation(cwd, pushCurrentBranch(cwd, fallbackBranch, options)),
     pullCurrentBranch: (cwd) => withListRefsInvalidation(cwd, pullCurrentBranch(cwd)),

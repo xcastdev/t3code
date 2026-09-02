@@ -5,6 +5,8 @@ import * as Layer from "effect/Layer";
 import {
   GitManagerError,
   GitCommandError,
+  type GitCommitIndexInput,
+  type GitCommitIndexResult,
   type VcsSwitchRefInput,
   type VcsSwitchRefResult,
   type VcsCreateRefInput,
@@ -26,6 +28,9 @@ import {
   type VcsStatusLocalResult,
   type VcsStatusRemoteResult,
   type VcsStatusResult,
+  type VcsStageFilesInput,
+  type VcsWorkingTreeDiffInput,
+  type VcsWorkingTreeDiffResult,
 } from "@t3tools/contracts";
 
 import * as GitManager from "./GitManager.ts";
@@ -48,6 +53,14 @@ export class GitWorkflowService extends Context.Service<
     readonly invalidateLocalStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateRemoteStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateStatus: (cwd: string) => Effect.Effect<void, never>;
+    readonly stageFiles: (input: VcsStageFilesInput) => Effect.Effect<void, GitCommandError>;
+    readonly unstageFiles: (input: VcsStageFilesInput) => Effect.Effect<void, GitCommandError>;
+    readonly getWorkingTreeDiff: (
+      input: VcsWorkingTreeDiffInput,
+    ) => Effect.Effect<VcsWorkingTreeDiffResult, GitCommandError>;
+    readonly commitIndex: (
+      input: GitCommitIndexInput,
+    ) => Effect.Effect<GitCommitIndexResult, GitCommandError>;
     readonly pullCurrentBranch: (cwd: string) => Effect.Effect<VcsPullResult, GitCommandError>;
     readonly runStackedAction: (
       input: GitRunStackedActionInput,
@@ -280,6 +293,22 @@ export const make = Effect.gen(function* () {
     invalidateLocalStatus: gitManager.invalidateLocalStatus,
     invalidateRemoteStatus: gitManager.invalidateRemoteStatus,
     invalidateStatus: gitManager.invalidateStatus,
+    stageFiles: (input) =>
+      ensureGitCommand("GitWorkflowService.stageFiles", input.cwd).pipe(
+        Effect.andThen(git.stageFiles(input)),
+      ),
+    unstageFiles: (input) =>
+      ensureGitCommand("GitWorkflowService.unstageFiles", input.cwd).pipe(
+        Effect.andThen(git.unstageFiles(input)),
+      ),
+    getWorkingTreeDiff: (input) =>
+      ensureGitCommand("GitWorkflowService.getWorkingTreeDiff", input.cwd).pipe(
+        Effect.andThen(git.getWorkingTreeDiff(input)),
+      ),
+    commitIndex: (input) =>
+      ensureGitCommand("GitWorkflowService.commitIndex", input.cwd).pipe(
+        Effect.andThen(git.commitIndex(input)),
+      ),
     pullCurrentBranch: (cwd) =>
       ensureGitCommand("GitWorkflowService.pullCurrentBranch", cwd).pipe(
         Effect.andThen(git.pullCurrentBranch(cwd)),

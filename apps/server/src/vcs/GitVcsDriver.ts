@@ -11,6 +11,8 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 
 import {
   GitCommandError,
+  type GitCommitIndexInput,
+  type GitCommitIndexResult,
   VcsProcessExitError,
   type VcsSwitchRefInput,
   type VcsSwitchRefResult,
@@ -29,6 +31,9 @@ import {
   type VcsRemoveWorktreeInput,
   type VcsStatusInput,
   type VcsStatusResult,
+  type VcsStageFilesInput,
+  type VcsWorkingTreeDiffInput,
+  type VcsWorkingTreeDiffResult,
 } from "@t3tools/contracts";
 import { makeGitVcsDriverCore } from "./GitVcsDriverCore.ts";
 import * as VcsDriver from "./VcsDriver.ts";
@@ -237,6 +242,14 @@ export class GitVcsDriver extends Context.Service<
       cwd: string,
       options?: GitRemoteStatusOptions,
     ) => Effect.Effect<GitRemoteStatusDetails, GitCommandError>;
+    readonly stageFiles: (input: VcsStageFilesInput) => Effect.Effect<void, GitCommandError>;
+    readonly unstageFiles: (input: VcsStageFilesInput) => Effect.Effect<void, GitCommandError>;
+    readonly getWorkingTreeDiff: (
+      input: VcsWorkingTreeDiffInput,
+    ) => Effect.Effect<VcsWorkingTreeDiffResult, GitCommandError>;
+    readonly commitIndex: (
+      input: GitCommitIndexInput,
+    ) => Effect.Effect<GitCommitIndexResult, GitCommandError>;
     readonly prepareCommitContext: (
       cwd: string,
       filePaths?: readonly string[],

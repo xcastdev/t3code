@@ -968,6 +968,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           path: "HEAD",
           insertions: 1,
           deletions: 0,
+          indexStatus: "unstaged",
         });
       }),
     );
@@ -1218,6 +1219,77 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         // Combined net from HEAD: +2 insertions.
         assert.equal(file.insertions, 2);
         assert.equal(file.deletions, 0);
+      }),
+    );
+
+    it.effect("reports staged, unstaged, untracked, and conflicted index states", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* writeTextFile(cwd, "staged.txt", "staged\n");
+        yield* driver.stageFiles({ cwd, paths: ["staged.txt"] });
+        yield* writeTextFile(cwd, "unstaged.txt", "unstaged\n");
+        yield* writeTextFile(cwd, "README.md", "working tree\n");
+
+        const status = yield* driver.statusDetails(cwd);
+        assert.equal(
+          status.workingTree.files.find((file) => file.path === "staged.txt")?.indexStatus,
+          "staged",
+        );
+        assert.equal(
+          status.workingTree.files.find((file) => file.path === "unstaged.txt")?.indexStatus,
+          "untracked",
+        );
+        assert.equal(
+          status.workingTree.files.find((file) => file.path === "README.md")?.indexStatus,
+          "unstaged",
+        );
+
+        yield* git(cwd, ["checkout", "-b", "conflict-side"]);
+        yield* writeTextFile(cwd, "README.md", "side\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "side change"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* writeTextFile(cwd, "README.md", "main\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "main change"]);
+        const merge = yield* driver.execute({
+          operation: "GitVcsDriverCore.test.merge-conflict",
+          cwd,
+          args: ["merge", "conflict-side"],
+          allowNonZeroExit: true,
+        });
+        assert.notEqual(merge.exitCode, 0);
+
+        const conflictedStatus = yield* driver.statusDetails(cwd);
+        assert.equal(
+          conflictedStatus.workingTree.files.find((file) => file.path === "README.md")?.indexStatus,
+          "conflicted",
+        );
+      }),
+    );
+
+    it.effect("keeps staged rename and delete records in the index state", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* git(cwd, ["mv", "README.md", "renamed.md"]);
+        let status = yield* driver.statusDetails(cwd);
+        assert.equal(
+          status.workingTree.files.find((file) => file.path === "renamed.md")?.indexStatus,
+          "staged",
+        );
+
+        yield* git(cwd, ["rm", "-f", "renamed.md"]);
+        status = yield* driver.statusDetails(cwd);
+        assert.equal(
+          status.workingTree.files.find((file) => file.path === "README.md")?.indexStatus,
+          "staged",
+        );
       }),
     );
 
@@ -1597,6 +1669,78 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
   });
 
   describe("commit context", () => {
+    it.effect("stages and unstages complete files without changing their contents", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+
+        yield* writeTextFile(cwd, "src/a.txt", "changed\n");
+        yield* driver.stageFiles({ cwd: pathService.join(cwd, "src"), paths: ["a.txt"] });
+        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), "src/a.txt");
+
+        yield* driver.unstageFiles({ cwd, paths: ["src/a.txt"] });
+        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), "");
+        assert.equal(
+          yield* fileSystem.readFileString(pathService.join(cwd, "src/a.txt")),
+          "changed\n",
+        );
+      }),
+    );
+
+    it.effect("handles initial repositories, literal paths, and symlink escapes", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const outside = yield* makeTmpDir("git-index-outside-");
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+
+        yield* driver.initRepo({ cwd });
+        yield* writeTextFile(cwd, "literal[1].txt", "literal\n");
+        yield* writeTextFile(cwd, "literal1.txt", "sibling\n");
+        yield* driver.stageFiles({ cwd, paths: ["literal[1].txt"] });
+        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), "literal[1].txt");
+
+        yield* driver.unstageFiles({ cwd, paths: ["literal[1].txt"] });
+        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), "");
+
+        const outsideFile = pathService.join(outside, "secret.txt");
+        yield* fileSystem.writeFileString(outsideFile, "secret\n");
+        const symlinkPath = pathService.join(cwd, "linked.txt");
+        yield* fileSystem.symlink(outsideFile, symlinkPath);
+        const error = yield* driver.stageFiles({ cwd, paths: ["linked.txt"] }).pipe(Effect.flip);
+        assert.include(error.detail, "outside");
+      }),
+    );
+
+    it.effect("returns bounded diffs and commits exactly the existing index", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* writeTextFile(cwd, "staged.txt", "staged\n");
+        yield* writeTextFile(cwd, "sibling.txt", "sibling\n");
+        yield* driver.stageFiles({ cwd, paths: ["staged.txt"] });
+        const stagedDiff = yield* driver.getWorkingTreeDiff({
+          cwd,
+          path: "staged.txt",
+          comparison: "index",
+        });
+        assert.include(stagedDiff.diff, "+staged");
+        assert.equal(stagedDiff.truncated, false);
+
+        const commit = yield* driver.commitIndex({ cwd, message: "commit staged file" });
+        assert.match(commit.commitSha, /^[a-f0-9]{40}$/);
+        assert.equal(yield* git(cwd, ["log", "-1", "--pretty=%s"]), "commit staged file");
+        assert.include(yield* git(cwd, ["status", "--porcelain"]), "?? sibling.txt");
+        assert.notInclude(yield* git(cwd, ["status", "--porcelain"]), "staged.txt");
+      }),
+    );
+
     it.effect("stages selected files and commits only those files", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
