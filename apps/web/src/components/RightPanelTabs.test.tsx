@@ -96,22 +96,18 @@ function renderTabs(
         ...(second ? { "tab-2": overlay(second) } : {}),
       }}
       {...(previewRuntimeTabId ? { previewRuntimeTabId } : {})}
-      terminalLabelsById={new Map()}
       onActivate={() => undefined}
       onCloseSurface={() => undefined}
       onCloseOtherSurfaces={() => undefined}
       onCloseSurfacesToRight={() => undefined}
       onCloseAllSurfaces={() => undefined}
-      onCopyFilePath={() => undefined}
       onAddBrowser={() => undefined}
-      onAddTerminal={() => undefined}
       onAddPullRequest={() => undefined}
       onAddDiff={() => undefined}
       onAddFiles={() => undefined}
       onAddAgents={() => undefined}
       liveAgentCount={0}
       browserAvailable
-      terminalAvailable={false}
       diffAvailable={false}
       filesAvailable={false}
       pullRequestAvailable={false}

@@ -46,4 +46,8 @@ describe("getPreviewPanelMaxWidth", () => {
   it("stays at the panel minimum even when the row is narrower than the reservation", () => {
     expect(getPreviewPanelMaxWidth(1_512, 300)).toBe(360);
   });
+
+  it("supports a larger minimum for workspace editor panes", () => {
+    expect(getPreviewPanelMaxWidth(1_000, 500, 420)).toBe(420);
+  });
 });

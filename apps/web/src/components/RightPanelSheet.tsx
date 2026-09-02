@@ -1,13 +1,20 @@
-import { type ReactNode } from "react";
+import { type ReactNode, useRef } from "react";
 
-import { RIGHT_PANEL_SHEET_CLASS_NAME } from "../rightPanelLayout";
+import {
+  RIGHT_PANEL_RAIL_SHEET_CLASS_NAME,
+  RIGHT_PANEL_SHEET_CLASS_NAME,
+} from "../rightPanelLayout";
+import { cn } from "~/lib/utils";
 import { Sheet, SheetPopup } from "./ui/sheet";
 
 export function RightPanelSheet(props: {
   children: ReactNode;
   open: boolean;
   onClose: () => void;
+  rail?: boolean;
 }) {
+  const sheetRef = useRef<HTMLDivElement>(null);
+
   return (
     <Sheet
       open={props.open}
@@ -21,7 +28,13 @@ export function RightPanelSheet(props: {
         side="right"
         showCloseButton={false}
         keepMounted
-        className={RIGHT_PANEL_SHEET_CLASS_NAME}
+        ref={sheetRef}
+        initialFocus={sheetRef}
+        className={cn(
+          props.rail ? RIGHT_PANEL_RAIL_SHEET_CLASS_NAME : RIGHT_PANEL_SHEET_CLASS_NAME,
+          props.rail &&
+            "mt-[var(--workspace-topbar-height)] h-[calc(100%-var(--workspace-topbar-height))] max-h-[calc(100%-var(--workspace-topbar-height))]",
+        )}
       >
         {props.children}
       </SheetPopup>
