@@ -4790,6 +4790,337 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("maps OpenCode todo updates into the shared turn plan", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-plan");
+      const todoEvent = promiseWithResolvers<unknown>();
+      runtimeMock.state.subscribedEvents = [todoEvent.promise];
+      const planFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "turn.plan.updated"),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      todoEvent.resolve({
+        id: "evt-opencode-todo",
+        type: "todo.updated",
+        properties: {
+          sessionID: "http://127.0.0.1:9999/session",
+          todos: [
+            { content: "Inspect the adapter", status: "completed", priority: "high" },
+            { content: "Render the plan", status: "in_progress", priority: "medium" },
+            { content: "", status: "pending", priority: "low" },
+          ],
+        },
+      });
+
+      const plan = Option.getOrUndefined(
+        yield* Fiber.join(planFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.equal(plan?.type, "turn.plan.updated");
+      if (plan?.type === "turn.plan.updated") {
+        NodeAssert.deepEqual(plan.payload.plan, [
+          { step: "Inspect the adapter", status: "completed" },
+          { step: "Render the plan", status: "inProgress" },
+        ]);
+      }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("normalizes assistant token usage without repeating identical snapshots", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-usage");
+      const sessionID = "http://127.0.0.1:9999/session";
+      const info = {
+        id: "msg-usage",
+        sessionID,
+        role: "assistant",
+        tokens: {
+          total: 42,
+          input: 30,
+          output: 8,
+          reasoning: 4,
+          cache: { read: 3, write: 0 },
+        },
+      };
+      runtimeMock.state.subscribedEvents = [
+        { id: "evt-usage-1", type: "message.updated", properties: { sessionID, info } },
+        { id: "evt-usage-2", type: "message.updated", properties: { sessionID, info } },
+      ];
+      const usageFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) => event.threadId === threadId && event.type === "thread.token-usage.updated",
+        ),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const events = Array.from(yield* Fiber.join(usageFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.equal(events.length, 1);
+      const usage = events[0];
+      if (usage?.type === "thread.token-usage.updated") {
+        NodeAssert.deepEqual(usage.payload.usage, {
+          usedTokens: 42,
+          totalProcessedTokens: 42,
+          inputTokens: 30,
+          cachedInputTokens: 3,
+          outputTokens: 8,
+          reasoningOutputTokens: 4,
+          lastUsedTokens: 42,
+          lastInputTokens: 30,
+          lastCachedInputTokens: 3,
+          lastOutputTokens: 8,
+          lastReasoningOutputTokens: 4,
+        });
+      }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect(
+    "starts a tool when running is the first observed state and ignores terminal regressions",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-opencode-tool-lifecycle");
+        const sessionID = "http://127.0.0.1:9999/session";
+        runtimeMock.state.subscribedEvents = [
+          {
+            id: "evt-tool-running",
+            type: "message.part.updated",
+            properties: {
+              sessionID,
+              part: {
+                id: "part-tool",
+                sessionID,
+                messageID: "msg-tool",
+                type: "tool",
+                callID: "call-tool",
+                tool: "bash",
+                state: { status: "running", input: { command: "pwd" }, time: { start: 1 } },
+              },
+              time: 1,
+            },
+          },
+          {
+            id: "evt-tool-running-duplicate",
+            type: "message.part.updated",
+            properties: {
+              sessionID,
+              part: {
+                id: "part-tool",
+                sessionID,
+                messageID: "msg-tool",
+                type: "tool",
+                callID: "call-tool",
+                tool: "bash",
+                state: { status: "running", input: { command: "pwd" }, time: { start: 1 } },
+              },
+              time: 2,
+            },
+          },
+          {
+            id: "evt-tool-completed",
+            type: "message.part.updated",
+            properties: {
+              sessionID,
+              part: {
+                id: "part-tool",
+                sessionID,
+                messageID: "msg-tool",
+                type: "tool",
+                callID: "call-tool",
+                tool: "bash",
+                state: {
+                  status: "completed",
+                  input: { command: "pwd" },
+                  output: "/workspace",
+                  title: "pwd",
+                  metadata: {},
+                  time: { start: 1, end: 2 },
+                },
+              },
+              time: 3,
+            },
+          },
+          {
+            id: "evt-tool-regressed",
+            type: "message.part.updated",
+            properties: {
+              sessionID,
+              part: {
+                id: "part-tool",
+                sessionID,
+                messageID: "msg-tool",
+                type: "tool",
+                callID: "call-tool",
+                tool: "bash",
+                state: { status: "running", input: { command: "pwd" }, time: { start: 1 } },
+              },
+              time: 4,
+            },
+          },
+        ];
+        const eventsFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId),
+          Stream.filter(
+            (event) => event.type === "item.started" || event.type === "item.completed",
+          ),
+          Stream.take(2),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+        NodeAssert.deepEqual(
+          events.map((event) => event.type),
+          ["item.started", "item.completed"],
+        );
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
+  it.effect("projects OpenCode Task parts and child lifecycle into task events", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-task");
+      const sessionID = "http://127.0.0.1:9999/session";
+      runtimeMock.state.subscribedEvents = [
+        {
+          id: "evt-subtask-part",
+          type: "message.part.updated",
+          properties: {
+            sessionID,
+            part: {
+              id: "part-subtask",
+              sessionID,
+              messageID: "msg-task",
+              type: "subtask",
+              prompt: "Inspect the repository",
+              description: "Inspect the repository",
+              agent: "explore",
+            },
+            time: 1,
+          },
+        },
+        {
+          id: "evt-task-running",
+          type: "message.part.updated",
+          properties: {
+            sessionID,
+            part: {
+              id: "part-task-tool",
+              sessionID,
+              messageID: "msg-task",
+              type: "tool",
+              callID: "call-task",
+              tool: "task",
+              state: {
+                status: "running",
+                input: { prompt: "Inspect the repository" },
+                metadata: {
+                  sessionId: "ses_task_child",
+                  parentSessionId: sessionID,
+                  model: { providerID: "openai", modelID: "gpt-5" },
+                },
+                time: { start: 1 },
+              },
+            },
+            time: 2,
+          },
+        },
+        {
+          id: "evt-child-busy",
+          type: "session.status",
+          properties: { sessionID: "ses_task_child", status: { type: "busy" } },
+        },
+        {
+          id: "evt-child-idle",
+          type: "session.idle",
+          properties: { sessionID: "ses_task_child" },
+        },
+        {
+          id: "evt-task-completed",
+          type: "message.part.updated",
+          properties: {
+            sessionID,
+            part: {
+              id: "part-task-tool",
+              sessionID,
+              messageID: "msg-task",
+              type: "tool",
+              callID: "call-task",
+              tool: "task",
+              state: {
+                status: "completed",
+                input: { prompt: "Inspect the repository" },
+                output: "Done",
+                title: "task",
+                metadata: { sessionId: "ses_task_child" },
+                time: { start: 1, end: 3 },
+              },
+            },
+            time: 4,
+          },
+        },
+      ];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type.startsWith("task.")),
+        Stream.take(4),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      NodeAssert.deepEqual(
+        events.map((event) => event.type),
+        ["task.started", "task.progress", "task.progress", "task.completed"],
+      );
+      const started = events[0];
+      if (started?.type === "task.started") {
+        NodeAssert.equal(started.payload.taskId, "ses_task_child");
+        NodeAssert.equal(started.payload.role, "explore");
+        NodeAssert.equal(started.payload.model, "openai/gpt-5");
+        NodeAssert.equal(started.payload.agentKind, "agent");
+      }
+      const progress = events[1];
+      if (progress?.type === "task.progress") {
+        NodeAssert.equal(progress.payload.status, "running");
+      }
+      const idle = events[2];
+      if (idle?.type === "task.progress") {
+        NodeAssert.equal(idle.payload.status, "idle");
+      }
+      const completed = events[3];
+      if (completed?.type === "task.completed") {
+        NodeAssert.equal(completed.payload.status, "completed");
+        NodeAssert.equal(completed.payload.summary, "Done");
+      }
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("lets OpenCode own session title generation and emits title metadata updates", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
