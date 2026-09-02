@@ -2483,7 +2483,13 @@ export function makeOpenCodeAdapter(
       }
 
       const payloadSessionId = openCodeEventSessionId(event);
-      const isParentEvent = payloadSessionId === context.openCodeSessionId;
+      // OpenCode's session.error payload makes sessionID optional. A
+      // session-scoped subscription can therefore deliver a parent failure
+      // without an id; treating that event as unrelated leaves the turn stuck
+      // in "running" forever.
+      const isParentEvent =
+        payloadSessionId === context.openCodeSessionId ||
+        (payloadSessionId === undefined && event.type === "session.error");
       let isKnownPendingTerminalEvent = false;
       if (
         payloadSessionId !== undefined &&
