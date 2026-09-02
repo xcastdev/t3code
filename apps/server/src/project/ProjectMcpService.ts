@@ -2,7 +2,10 @@ import {
   CommandId,
   McpServerId,
   ProjectMcpNameConflictError,
+  ProjectMcpProviderNotFoundError,
   ProjectMcpServer,
+  ProjectMcpServerLimitExceededError,
+  ProjectMcpServerNotFoundError,
   type ProjectId,
   type ProjectMcpCatalog,
   type ProjectMcpCreateInput,
@@ -86,8 +89,11 @@ const makeProjectMcpService = Effect.gen(function* () {
 
   const list: ProjectMcpServiceShape["list"] = (projectId) =>
     Effect.gen(function* () {
-      const instances = yield* providerInstances.listInstances;
-      const applicationModes = new Map(
+      const [instances, unavailableProviders] = yield* Effect.all([
+        providerInstances.listInstances,
+        providerInstances.listUnavailable,
+      ]);
+      const externalApplicationModes = new Map(
         instances.map(
           (instance) =>
             [
@@ -96,6 +102,19 @@ const makeProjectMcpService = Effect.gen(function* () {
             ] as const,
         ),
       );
+      const managedApplicationModes = new Map(
+        instances.map(
+          (instance) =>
+            [
+              instance.instanceId,
+              instance.enabled ? instance.adapter.capabilities.managedPreviewMcp : "unavailable",
+            ] as const,
+        ),
+      );
+      const knownProviderInstanceIds = [
+        ...instances.map((instance) => instance.instanceId),
+        ...unavailableProviders.map((provider) => provider.instanceId),
+      ];
       const external = yield* sql<Schema.Schema.Type<typeof ProjectMcpProjectionRow>>`
       SELECT
         server_id AS "serverId",
@@ -130,13 +149,13 @@ const makeProjectMcpService = Effect.gen(function* () {
             entry.providerInstanceIds.map((providerInstanceId) => ({
               serverId: entry.id,
               providerInstanceId,
-              mode: applicationModes.get(providerInstanceId) ?? "unavailable",
+              mode: externalApplicationModes.get(providerInstanceId) ?? "unavailable",
             })),
           ),
-          ...instances.map((instance) => ({
+          ...knownProviderInstanceIds.map((providerInstanceId) => ({
             serverId: MANAGED_PREVIEW_MCP_ID,
-            providerInstanceId: instance.instanceId,
-            mode: applicationModes.get(instance.instanceId) ?? "unavailable",
+            providerInstanceId,
+            mode: managedApplicationModes.get(providerInstanceId) ?? "unavailable",
           })),
         ],
         managed: [
@@ -144,7 +163,7 @@ const makeProjectMcpService = Effect.gen(function* () {
             id: MANAGED_PREVIEW_MCP_ID,
             name: "t3-code",
             url: getMcpEndpoint(httpServer),
-            providerInstanceIds: instances.map((instance) => instance.instanceId),
+            providerInstanceIds: knownProviderInstanceIds,
           },
         ],
       };
@@ -165,21 +184,19 @@ const makeProjectMcpService = Effect.gen(function* () {
     providerInstanceIds: ReadonlyArray<ProviderInstanceId>,
     previouslyPersistedIds: ReadonlyArray<ProviderInstanceId> = [],
   ) =>
-    providerInstances.listInstances.pipe(
-      Effect.flatMap((instances) => {
-        const knownIds = new Set(instances.map((instance) => instance.instanceId));
+    Effect.all([providerInstances.listInstances, providerInstances.listUnavailable]).pipe(
+      Effect.flatMap(([instances, unavailableProviders]) => {
+        const knownIds = new Set([
+          ...instances.map((instance) => instance.instanceId),
+          ...unavailableProviders.map((provider) => provider.instanceId),
+        ]);
         const retainedIds = new Set(previouslyPersistedIds);
         const unknownId = providerInstanceIds.find(
           (instanceId) => !knownIds.has(instanceId) && !retainedIds.has(instanceId),
         );
         return unknownId === undefined
           ? Effect.void
-          : Effect.fail(
-              new OrchestrationCommandInvariantError({
-                commandType: "project.mcp-server",
-                detail: `Provider instance '${unknownId}' is not configured in this environment.`,
-              }),
-            );
+          : Effect.fail(new ProjectMcpProviderNotFoundError({ providerInstanceId: unknownId }));
       }),
     );
 
@@ -205,9 +222,8 @@ const makeProjectMcpService = Effect.gen(function* () {
       yield* validateUrl(input.url, "project.mcp-server.create");
       const catalog = yield* list(input.projectId);
       if (catalog.external.length >= PROJECT_MCP_SERVER_LIMIT) {
-        return yield* new OrchestrationCommandInvariantError({
-          commandType: "project.mcp-server.create",
-          detail: `Project '${input.projectId}' cannot contain more than ${PROJECT_MCP_SERVER_LIMIT} MCP servers.`,
+        return yield* new ProjectMcpServerLimitExceededError({
+          limit: PROJECT_MCP_SERVER_LIMIT,
         });
       }
       yield* validateName(input.projectId, input.name, undefined);
@@ -238,10 +254,7 @@ const makeProjectMcpService = Effect.gen(function* () {
       const catalog = yield* list(input.projectId);
       const existing = catalog.external.find((entry) => entry.id === input.id);
       if (existing === undefined) {
-        return yield* new OrchestrationCommandInvariantError({
-          commandType: "project.mcp-server.update",
-          detail: `Project '${input.projectId}' does not contain MCP server '${input.id}'.`,
-        });
+        return yield* new ProjectMcpServerNotFoundError({ id: input.id });
       }
       yield* validateName(input.projectId, input.name, input.id);
       yield* validateProviderIds(input.providerInstanceIds, existing.providerInstanceIds);
@@ -266,6 +279,10 @@ const makeProjectMcpService = Effect.gen(function* () {
 
   const remove: ProjectMcpServiceShape["remove"] = (input) =>
     Effect.gen(function* () {
+      const catalog = yield* list(input.projectId);
+      if (!catalog.external.some((entry) => entry.id === input.id)) {
+        return yield* new ProjectMcpServerNotFoundError({ id: input.id });
+      }
       const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
       const commandId = CommandId.make(yield* crypto.randomUUIDv4);
       yield* engine.dispatch({

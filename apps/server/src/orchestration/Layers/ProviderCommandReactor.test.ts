@@ -331,6 +331,7 @@ describe("ProviderCommandReactor", () => {
         Effect.succeed({
           sessionModelSwitch: input?.sessionModelSwitch ?? "in-session",
           remoteHttpMcp: "next-session",
+          managedPreviewMcp: "next-session",
         }),
       getInstanceInfo: (instanceId) => {
         const raw = String(instanceId);

@@ -131,11 +131,13 @@ import {
 } from "./project.ts";
 import {
   ProjectMcpCreateInput,
+  ProjectMcpCreateError,
   ProjectMcpListInput,
   ProjectMcpCatalog,
-  ProjectMcpNameConflictError,
+  ProjectMcpRemoveError,
   ProjectMcpRemoveInput,
   ProjectMcpServer,
+  ProjectMcpUpdateError,
   ProjectMcpUpdateInput,
 } from "./projectMcp.ts";
 import {
@@ -717,19 +719,19 @@ export const WsProjectMcpListRpc = Rpc.make(WS_METHODS.projectMcpList, {
 export const WsProjectMcpCreateRpc = Rpc.make(WS_METHODS.projectMcpCreate, {
   payload: ProjectMcpCreateInput,
   success: ProjectMcpServer,
-  error: Schema.Union([ProjectMcpNameConflictError, EnvironmentAuthorizationError]),
+  error: Schema.Union([ProjectMcpCreateError, EnvironmentAuthorizationError]),
 });
 
 export const WsProjectMcpUpdateRpc = Rpc.make(WS_METHODS.projectMcpUpdate, {
   payload: ProjectMcpUpdateInput,
   success: ProjectMcpServer,
-  error: Schema.Union([ProjectMcpNameConflictError, EnvironmentAuthorizationError]),
+  error: Schema.Union([ProjectMcpUpdateError, EnvironmentAuthorizationError]),
 });
 
 export const WsProjectMcpRemoveRpc = Rpc.make(WS_METHODS.projectMcpRemove, {
   payload: ProjectMcpRemoveInput,
   success: Schema.Void,
-  error: EnvironmentAuthorizationError,
+  error: Schema.Union([ProjectMcpRemoveError, EnvironmentAuthorizationError]),
 });
 
 export const WsShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {

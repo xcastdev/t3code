@@ -28,6 +28,10 @@ import {
   ORCHESTRATION_WS_METHODS,
   type PreviewEvent,
   ProjectId,
+  ProjectMcpNameConflictError,
+  ProjectMcpProviderNotFoundError,
+  ProjectMcpServerLimitExceededError,
+  ProjectMcpServerNotFoundError,
   ProviderDriverKind,
   ProviderInstanceId,
   ResolvedKeybindingRule,
@@ -118,7 +122,10 @@ import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
-import { OrchestrationListenerCallbackError } from "./orchestration/Errors.ts";
+import {
+  OrchestrationCommandInvariantError,
+  OrchestrationListenerCallbackError,
+} from "./orchestration/Errors.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
@@ -5287,6 +5294,144 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         assert.equal(rpcError.requiredScope, "orchestration:read");
       }
       assert.equal(yield* Ref.get(listCalls), 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("returns actionable project MCP mutation failures over RPC", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-mcp-errors");
+      const missingId = McpServerId.make("missing-server");
+      const unknownProviderId = ProviderInstanceId.make("missing-provider");
+      const project = {
+        id: projectId,
+        title: "MCP errors",
+        workspaceRoot: "/tmp/project-mcp-errors",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: "2026-09-02T00:00:00.000Z",
+        updatedAt: "2026-09-02T00:00:00.000Z",
+      } as const;
+      const nameConflict = new ProjectMcpNameConflictError({
+        name: "Conflict",
+        message: "Project already contains an MCP server named 'Conflict'.",
+      });
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getProjectShellById: () => Effect.succeed(Option.some(project)),
+          },
+          projectMcpService: {
+            create: (input) => {
+              switch (input.name) {
+                case "Unknown provider":
+                  return Effect.fail(
+                    new ProjectMcpProviderNotFoundError({
+                      providerInstanceId: unknownProviderId,
+                    }),
+                  );
+                case "Overflow":
+                  return Effect.fail(
+                    new ProjectMcpServerLimitExceededError({
+                      limit: 50,
+                    }),
+                  );
+                case "Conflict":
+                  return Effect.fail(nameConflict);
+                default:
+                  return Effect.fail(
+                    new OrchestrationCommandInvariantError({
+                      commandType: "project.mcp-server.create",
+                      detail: nameConflict.message,
+                      cause: nameConflict,
+                    }),
+                  );
+              }
+            },
+            update: () => Effect.fail(new ProjectMcpServerNotFoundError({ id: missingId })),
+            remove: () => Effect.fail(new ProjectMcpServerNotFoundError({ id: missingId })),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const errors = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.all([
+            Effect.flip(
+              client[WS_METHODS.projectMcpCreate]({
+                projectId,
+                name: "Unknown provider",
+                url: "https://unknown.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [unknownProviderId],
+              }),
+            ),
+            Effect.flip(
+              client[WS_METHODS.projectMcpCreate]({
+                projectId,
+                name: "Overflow",
+                url: "https://overflow.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [],
+              }),
+            ),
+            Effect.flip(
+              client[WS_METHODS.projectMcpUpdate]({
+                projectId,
+                id: missingId,
+                name: "Missing",
+                url: "https://missing.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [],
+              }),
+            ),
+            Effect.flip(client[WS_METHODS.projectMcpRemove]({ projectId, id: missingId })),
+            Effect.flip(
+              client[WS_METHODS.projectMcpCreate]({
+                projectId,
+                name: "Conflict",
+                url: "https://conflict.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [],
+              }),
+            ),
+            Effect.flip(
+              client[WS_METHODS.projectMcpCreate]({
+                projectId,
+                name: "Race conflict",
+                url: "https://race.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [],
+              }),
+            ),
+          ]),
+        ),
+      );
+
+      assert.deepEqual(
+        errors.map((error) => error._tag),
+        [
+          "ProjectMcpProviderNotFoundError",
+          "ProjectMcpServerLimitExceededError",
+          "ProjectMcpServerNotFoundError",
+          "ProjectMcpServerNotFoundError",
+          "ProjectMcpNameConflictError",
+          "ProjectMcpNameConflictError",
+        ],
+      );
+      if (errors[0]?._tag === "ProjectMcpProviderNotFoundError") {
+        assert.equal(errors[0].providerInstanceId, unknownProviderId);
+      }
+      if (errors[1]?._tag === "ProjectMcpServerLimitExceededError") {
+        assert.equal(errors[1].limit, 50);
+      }
+      if (errors[2]?._tag === "ProjectMcpServerNotFoundError") {
+        assert.equal(errors[2].id, missingId);
+      }
+      if (errors[3]?._tag === "ProjectMcpServerNotFoundError") {
+        assert.equal(errors[3].id, missingId);
+      }
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

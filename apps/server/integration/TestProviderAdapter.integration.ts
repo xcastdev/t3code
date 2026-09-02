@@ -484,6 +484,7 @@ export const makeTestProviderAdapterHarness = (options?: MakeTestProviderAdapter
       capabilities: {
         sessionModelSwitch: "in-session",
         remoteHttpMcp: "next-session",
+        managedPreviewMcp: "next-session",
       },
       startSession,
       sendTurn,

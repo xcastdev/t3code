@@ -241,6 +241,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     capabilities: {
       sessionModelSwitch: "in-session",
       remoteHttpMcp: "next-session",
+      managedPreviewMcp: "next-session",
     },
     startSession,
     sendTurn,

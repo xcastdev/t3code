@@ -29,7 +29,11 @@ const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
 
 const fakeCodexAdapter: CodexAdapter.CodexAdapterShape = {
   provider: CODEX_DRIVER,
-  capabilities: { sessionModelSwitch: "in-session", remoteHttpMcp: "next-session" },
+  capabilities: {
+    sessionModelSwitch: "in-session",
+    remoteHttpMcp: "next-session",
+    managedPreviewMcp: "next-session",
+  },
   startSession: vi.fn(),
   sendTurn: vi.fn(),
   interruptTurn: vi.fn(),
@@ -47,7 +51,11 @@ const fakeCodexAdapter: CodexAdapter.CodexAdapterShape = {
 
 const fakeClaudeAdapter: ClaudeAdapter.ClaudeAdapterShape = {
   provider: CLAUDE_AGENT_DRIVER,
-  capabilities: { sessionModelSwitch: "in-session", remoteHttpMcp: "next-session" },
+  capabilities: {
+    sessionModelSwitch: "in-session",
+    remoteHttpMcp: "next-session",
+    managedPreviewMcp: "next-session",
+  },
   startSession: vi.fn(),
   sendTurn: vi.fn(),
   interruptTurn: vi.fn(),
@@ -64,7 +72,11 @@ const fakeClaudeAdapter: ClaudeAdapter.ClaudeAdapterShape = {
 
 const fakeOpenCodeAdapter: OpenCodeAdapter.OpenCodeAdapterShape = {
   provider: OPENCODE_DRIVER,
-  capabilities: { sessionModelSwitch: "in-session", remoteHttpMcp: "unsupported" },
+  capabilities: {
+    sessionModelSwitch: "in-session",
+    remoteHttpMcp: "unsupported",
+    managedPreviewMcp: "next-session",
+  },
   startSession: vi.fn(),
   sendTurn: vi.fn(),
   interruptTurn: vi.fn(),
@@ -81,7 +93,11 @@ const fakeOpenCodeAdapter: OpenCodeAdapter.OpenCodeAdapterShape = {
 
 const fakeCursorAdapter: CursorAdapter.CursorAdapterShape = {
   provider: CURSOR_DRIVER,
-  capabilities: { sessionModelSwitch: "in-session", remoteHttpMcp: "next-session" },
+  capabilities: {
+    sessionModelSwitch: "in-session",
+    remoteHttpMcp: "next-session",
+    managedPreviewMcp: "next-session",
+  },
   startSession: vi.fn(),
   sendTurn: vi.fn(),
   interruptTurn: vi.fn(),

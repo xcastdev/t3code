@@ -1,4 +1,11 @@
-import { CommandId, McpServerId, ProjectId, ProviderInstanceId } from "@t3tools/contracts";
+import {
+  CommandId,
+  McpServerId,
+  ProjectId,
+  ProviderDriverKind,
+  ProviderInstanceId,
+  type ServerProvider,
+} from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -27,6 +34,25 @@ const projectB = ProjectId.make("project-b");
 const codexInstance = ProviderInstanceId.make("codex");
 const openCodeInstance = ProviderInstanceId.make("opencode");
 const disabledCursorInstance = ProviderInstanceId.make("cursor-disabled");
+const unavailableInstance = ProviderInstanceId.make("fork-provider");
+
+const unavailableProvider = {
+  instanceId: unavailableInstance,
+  driver: ProviderDriverKind.make("fork-driver"),
+  displayName: "Fork provider",
+  enabled: false,
+  installed: false,
+  version: null,
+  status: "error",
+  auth: { status: "unknown" },
+  checkedAt: "2026-09-02T00:00:00.000Z",
+  message: "Provider driver is unavailable.",
+  availability: "unavailable",
+  unavailableReason: "Provider driver is unavailable.",
+  models: [],
+  slashCommands: [],
+  skills: [],
+} as const satisfies ServerProvider;
 
 const codexInput = {
   name: "Docs",
@@ -60,20 +86,26 @@ const providerInstanceRegistry = Layer.succeed(ProviderInstanceRegistry, {
     {
       instanceId: codexInstance,
       enabled: true,
-      adapter: { capabilities: { remoteHttpMcp: "next-session" } },
+      adapter: {
+        capabilities: { remoteHttpMcp: "next-session", managedPreviewMcp: "next-session" },
+      },
     },
     {
       instanceId: openCodeInstance,
       enabled: true,
-      adapter: { capabilities: { remoteHttpMcp: "unsupported" } },
+      adapter: {
+        capabilities: { remoteHttpMcp: "unsupported", managedPreviewMcp: "next-session" },
+      },
     },
     {
       instanceId: disabledCursorInstance,
       enabled: false,
-      adapter: { capabilities: { remoteHttpMcp: "next-session" } },
+      adapter: {
+        capabilities: { remoteHttpMcp: "next-session", managedPreviewMcp: "next-session" },
+      },
     },
   ]),
-  listUnavailable: Effect.succeed([]),
+  listUnavailable: Effect.succeed([unavailableProvider]),
   streamChanges: Effect.never,
   subscribeChanges: Effect.die("Unused in ProjectMcpService tests"),
 } as never);
@@ -124,7 +156,12 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
           id: McpServerId.make("t3-code"),
           name: "t3-code",
           url: "http://127.0.0.1:43123/mcp",
-          providerInstanceIds: [codexInstance, openCodeInstance, disabledCursorInstance],
+          providerInstanceIds: [
+            codexInstance,
+            openCodeInstance,
+            disabledCursorInstance,
+            unavailableInstance,
+          ],
         },
       ]);
       expect(catalog.applications).toEqual([
@@ -137,11 +174,16 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
         {
           serverId: McpServerId.make("t3-code"),
           providerInstanceId: openCodeInstance,
-          mode: "unsupported",
+          mode: "next-session",
         },
         {
           serverId: McpServerId.make("t3-code"),
           providerInstanceId: disabledCursorInstance,
+          mode: "unavailable",
+        },
+        {
+          serverId: McpServerId.make("t3-code"),
+          providerInstanceId: unavailableInstance,
           mode: "unavailable",
         },
       ]);
@@ -178,14 +220,61 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
         {
           serverId: McpServerId.make("t3-code"),
           providerInstanceId: openCodeInstance,
-          mode: "unsupported",
+          mode: "next-session",
         },
         {
           serverId: McpServerId.make("t3-code"),
           providerInstanceId: disabledCursorInstance,
           mode: "unavailable",
         },
+        {
+          serverId: McpServerId.make("t3-code"),
+          providerInstanceId: unavailableInstance,
+          mode: "unavailable",
+        },
       ]);
+    }),
+  );
+
+  it.effect("accepts configured unavailable provider instances but rejects truly absent IDs", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const shadowProject = ProjectId.make("shadow-provider-project");
+      const absentProviderId = ProviderInstanceId.make("absent-provider");
+      yield* createProject(shadowProject, "shadow-provider-project");
+
+      const entry = yield* service.create({
+        projectId: shadowProject,
+        ...codexInput,
+        providerInstanceIds: [unavailableInstance],
+      });
+      const catalog = yield* service.list(shadowProject);
+
+      expect(catalog.external).toEqual([entry]);
+      expect(
+        catalog.applications.find(
+          (application) =>
+            application.serverId === entry.id &&
+            application.providerInstanceId === unavailableInstance,
+        ),
+      ).toEqual({
+        serverId: entry.id,
+        providerInstanceId: unavailableInstance,
+        mode: "unavailable",
+      });
+
+      const error = yield* service
+        .create({
+          projectId: shadowProject,
+          ...codexInput,
+          name: "Absent",
+          providerInstanceIds: [absentProviderId],
+        })
+        .pipe(Effect.flip);
+      expect(error).toMatchObject({
+        _tag: "ProjectMcpProviderNotFoundError",
+        providerInstanceId: absentProviderId,
+      });
     }),
   );
 
@@ -246,6 +335,60 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
     }),
   );
 
+  it.effect("preserves a typed name conflict cause when the decider catches a race", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const engine = yield* OrchestrationEngineService;
+      const raceProject = ProjectId.make("name-race-project");
+      yield* createProject(raceProject, "name-race-project");
+      yield* service.create({ projectId: raceProject, ...codexInput });
+
+      const error = yield* engine
+        .dispatch({
+          type: "project.mcp-server.create",
+          commandId: CommandId.make("name-race-command"),
+          projectId: raceProject,
+          server: {
+            id: McpServerId.make("name-race-server"),
+            ...codexInput,
+            name: "docs",
+          },
+          createdAt: "2026-09-02T20:00:00.000Z",
+        })
+        .pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        cause: { _tag: "ProjectMcpNameConflictError", name: "docs" },
+      });
+    }),
+  );
+
+  it.effect("removes persisted MCP rows when their project is deleted", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const engine = yield* OrchestrationEngineService;
+      const sql = yield* SqlClient.SqlClient;
+      const deletedProject = ProjectId.make("deleted-mcp-project");
+      yield* createProject(deletedProject, "deleted-mcp-project");
+      yield* service.create({ projectId: deletedProject, ...codexInput });
+
+      yield* engine.dispatch({
+        type: "project.delete",
+        commandId: CommandId.make("delete-mcp-project"),
+        projectId: deletedProject,
+      });
+
+      expect(
+        yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count
+          FROM projection_project_mcp_servers
+          WHERE project_id = ${deletedProject}
+        `,
+      ).toEqual([{ count: 0 }]);
+    }),
+  );
+
   it.effect("keeps empty selections and stale provider IDs while rejecting newly unknown IDs", () =>
     Effect.gen(function* () {
       const service = yield* ProjectMcpService.ProjectMcpService;
@@ -303,11 +446,14 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
           providerInstanceIds: [staleProviderId],
         })
         .pipe(Effect.flip);
-      expect(unknown).toMatchObject({ _tag: "OrchestrationCommandInvariantError" });
+      expect(unknown).toMatchObject({
+        _tag: "ProjectMcpProviderNotFoundError",
+        providerInstanceId: staleProviderId,
+      });
     }),
   );
 
-  it.effect("rejects unsafe URLs, case-folded duplicate names, and a fifty-first record", () =>
+  it.effect("rejects unsafe URLs and case-folded duplicate names", () =>
     Effect.gen(function* () {
       const service = yield* ProjectMcpService.ProjectMcpService;
       const validationProject = ProjectId.make("validation-project-a");
@@ -328,8 +474,16 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
         })
         .pipe(Effect.flip);
       expect(unsafeUrl).toMatchObject({ _tag: "OrchestrationCommandInvariantError" });
+    }),
+  );
 
-      for (let index = 1; index < 50; index += 1) {
+  it.effect("returns a typed error when the project MCP limit is exhausted", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const validationProject = ProjectId.make("limit-project-a");
+      yield* createProject(validationProject, "limit-project-a");
+
+      for (let index = 0; index < 50; index += 1) {
         yield* service.create({
           projectId: validationProject,
           name: `Server ${index}`,
@@ -347,7 +501,30 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
           providerInstanceIds: [],
         })
         .pipe(Effect.flip);
-      expect(limit).toMatchObject({ _tag: "OrchestrationCommandInvariantError" });
+      expect(limit).toMatchObject({ _tag: "ProjectMcpServerLimitExceededError", limit: 50 });
+    }),
+  );
+
+  it.effect("returns typed errors for missing update and remove targets", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const missingProject = ProjectId.make("missing-target-project");
+      const missingId = McpServerId.make("missing-server");
+      yield* createProject(missingProject, "missing-target-project");
+
+      const updateError = yield* service
+        .update({
+          projectId: missingProject,
+          id: missingId,
+          ...codexInput,
+        })
+        .pipe(Effect.flip);
+      const removeError = yield* service
+        .remove({ projectId: missingProject, id: missingId })
+        .pipe(Effect.flip);
+
+      expect(updateError).toMatchObject({ _tag: "ProjectMcpServerNotFoundError", id: missingId });
+      expect(removeError).toMatchObject({ _tag: "ProjectMcpServerNotFoundError", id: missingId });
     }),
   );
 

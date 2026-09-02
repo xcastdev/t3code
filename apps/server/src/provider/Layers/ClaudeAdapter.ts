@@ -4730,6 +4730,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     capabilities: {
       sessionModelSwitch: "in-session",
       remoteHttpMcp: "next-session",
+      managedPreviewMcp: "next-session",
     },
     startSession,
     sendTurn,

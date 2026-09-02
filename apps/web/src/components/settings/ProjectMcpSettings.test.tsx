@@ -256,7 +256,13 @@ function catalog(providerInstanceIds: ReadonlyArray<ProviderInstanceId> = [codex
 
 const roots: Root[] = [];
 
-async function renderPanel(canMutate = true): Promise<void> {
+async function renderPanel(
+  canMutate = true,
+  scope: { readonly environmentId: EnvironmentId; readonly projectId: ProjectId } = {
+    environmentId,
+    projectId,
+  },
+): Promise<Root> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -265,8 +271,25 @@ async function renderPanel(canMutate = true): Promise<void> {
     root.render(
       <ProjectMcpCatalogSettings
         canMutate={canMutate}
-        environmentId={environmentId}
-        projectId={projectId}
+        environmentId={scope.environmentId}
+        projectId={scope.projectId}
+        providers={[provider()]}
+      />,
+    );
+  });
+  return root;
+}
+
+async function rerenderPanel(
+  root: Root,
+  scope: { readonly environmentId: EnvironmentId; readonly projectId: ProjectId },
+): Promise<void> {
+  await act(async () => {
+    root.render(
+      <ProjectMcpCatalogSettings
+        canMutate
+        environmentId={scope.environmentId}
+        projectId={scope.projectId}
         providers={[provider()]}
       />,
     );
@@ -428,5 +451,31 @@ describe("ProjectMcpSettings", () => {
       environmentId,
       input: { projectId, id: externalServer().id },
     });
+  });
+
+  it("discards open mutation state when the physical checkout changes", async () => {
+    const root = await renderPanel();
+    await click(button("Add server"));
+    await input(labelled<HTMLInputElement>("MCP server name"), "Stale draft");
+
+    await rerenderPanel(root, {
+      environmentId: EnvironmentId.make("environment-two"),
+      projectId: ProjectId.make("project-two"),
+    });
+
+    expect(document.querySelector("form")).toBeNull();
+    expect(document.body.textContent).not.toContain("Stale draft");
+
+    await click(labelled<HTMLButtonElement>("Remove External"));
+    expect(document.body.textContent).toContain('Remove "External"?');
+
+    await rerenderPanel(root, {
+      environmentId: EnvironmentId.make("environment-three"),
+      projectId: ProjectId.make("project-three"),
+    });
+
+    expect(document.body.textContent).not.toContain('Remove "External"?');
+    expect(commands.create).not.toHaveBeenCalled();
+    expect(commands.remove).not.toHaveBeenCalled();
   });
 });

@@ -124,7 +124,7 @@ function ProjectMcpEntryDetails({
   );
 }
 
-export function ProjectMcpCatalogSettings({
+function ScopedProjectMcpCatalogSettings({
   environmentId,
   projectId,
   providers,
@@ -217,15 +217,26 @@ export function ProjectMcpCatalogSettings({
         enabled: draft.enabled,
         providerInstanceIds: draft.providerInstanceIds,
       };
-      const result = editing
-        ? await updateEntry({ environmentId, input: { ...input, id: editing.id } })
-        : await createEntry({ environmentId, input });
-      if (result._tag === "Success") {
-        closeForm();
-        catalog.refresh();
-        return;
+      if (editing) {
+        const result = await updateEntry({
+          environmentId,
+          input: { ...input, id: editing.id },
+        });
+        if (result._tag === "Success") {
+          closeForm();
+          catalog.refresh();
+          return;
+        }
+        reportFailure("Failed to update MCP server", result);
+      } else {
+        const result = await createEntry({ environmentId, input });
+        if (result._tag === "Success") {
+          closeForm();
+          catalog.refresh();
+          return;
+        }
+        reportFailure("Failed to add MCP server", result);
       }
-      reportFailure(editing ? "Failed to update MCP server" : "Failed to add MCP server", result);
     } finally {
       setIsSaving(false);
     }
@@ -577,6 +588,28 @@ export function ProjectMcpCatalogSettings({
         </AlertDialogPopup>
       </AlertDialog>
     </SettingsSection>
+  );
+}
+
+export function ProjectMcpCatalogSettings({
+  environmentId,
+  projectId,
+  providers,
+  canMutate,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly projectId: ProjectId;
+  readonly providers: ReadonlyArray<ServerProvider>;
+  readonly canMutate: boolean;
+}) {
+  return (
+    <ScopedProjectMcpCatalogSettings
+      key={`${environmentId}:${projectId}`}
+      environmentId={environmentId}
+      projectId={projectId}
+      providers={providers}
+      canMutate={canMutate}
+    />
   );
 }
 

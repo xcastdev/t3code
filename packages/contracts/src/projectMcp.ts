@@ -104,6 +104,58 @@ export class ProjectMcpNameConflictError extends Schema.TaggedErrorClass<Project
   },
 ) {}
 
+export class ProjectMcpProviderNotFoundError extends Schema.TaggedErrorClass<ProjectMcpProviderNotFoundError>()(
+  "ProjectMcpProviderNotFoundError",
+  { providerInstanceId: ProviderInstanceId },
+) {
+  override get message(): string {
+    return `Provider instance '${this.providerInstanceId}' is not configured in this environment.`;
+  }
+}
+
+export class ProjectMcpServerLimitExceededError extends Schema.TaggedErrorClass<ProjectMcpServerLimitExceededError>()(
+  "ProjectMcpServerLimitExceededError",
+  { limit: Schema.Int },
+) {
+  override get message(): string {
+    return `This project cannot contain more than ${this.limit} MCP servers.`;
+  }
+}
+
+export class ProjectMcpServerNotFoundError extends Schema.TaggedErrorClass<ProjectMcpServerNotFoundError>()(
+  "ProjectMcpServerNotFoundError",
+  { id: McpServerId },
+) {
+  override get message(): string {
+    return `This project does not contain MCP server '${this.id}'.`;
+  }
+}
+
+export const ProjectMcpCreateError = Schema.Union([
+  ProjectMcpNameConflictError,
+  ProjectMcpProviderNotFoundError,
+  ProjectMcpServerLimitExceededError,
+]);
+export type ProjectMcpCreateError = typeof ProjectMcpCreateError.Type;
+
+export const ProjectMcpUpdateError = Schema.Union([
+  ProjectMcpNameConflictError,
+  ProjectMcpProviderNotFoundError,
+  ProjectMcpServerNotFoundError,
+]);
+export type ProjectMcpUpdateError = typeof ProjectMcpUpdateError.Type;
+
+export const ProjectMcpRemoveError = ProjectMcpServerNotFoundError;
+export type ProjectMcpRemoveError = typeof ProjectMcpRemoveError.Type;
+
+export const ProjectMcpMutationError = Schema.Union([
+  ProjectMcpNameConflictError,
+  ProjectMcpProviderNotFoundError,
+  ProjectMcpServerLimitExceededError,
+  ProjectMcpServerNotFoundError,
+]);
+export type ProjectMcpMutationError = typeof ProjectMcpMutationError.Type;
+
 export const ProjectMcpCreateInput = Schema.Struct({
   projectId: ProjectId,
   name: ProjectMcpServer.fields.name,

@@ -40,7 +40,10 @@ import {
   OrchestrationGetTurnDiffError,
   ORCHESTRATION_WS_METHODS,
   type ProjectId,
-  ProjectMcpNameConflictError,
+  ProjectMcpCreateError,
+  type ProjectMcpMutationError,
+  ProjectMcpRemoveError,
+  ProjectMcpUpdateError,
   type ProjectEntriesFailure,
   type ProjectFileFailure,
   type ProjectFileOperation,
@@ -88,6 +91,7 @@ import {
   normalizeDispatchCommand,
 } from "./orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
+import { OrchestrationCommandInvariantError } from "./orchestration/Errors.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
 import {
@@ -147,6 +151,10 @@ import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
+const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
+const isProjectMcpCreateError = Schema.is(ProjectMcpCreateError);
+const isProjectMcpUpdateError = Schema.is(ProjectMcpUpdateError);
+const isProjectMcpRemoveError = Schema.is(ProjectMcpRemoveError);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const CONFIG_DISCOVERY_TIMEOUT = Duration.seconds(5);
@@ -1304,10 +1312,17 @@ const makeWsRpcLayer = (
         projectId: ProjectId,
         operation: Effect.Effect<A, E, R>,
       ) => requireOwnedProject(method, projectId).pipe(Effect.andThen(operation));
-      const preserveProjectMcpNameConflict = <A, R>(operation: Effect.Effect<A, Error, R>) =>
+      const preserveProjectMcpMutationError = <A, E extends ProjectMcpMutationError, R>(
+        operation: Effect.Effect<A, Error, R>,
+        isExpected: (input: unknown) => input is E,
+      ): Effect.Effect<A, E, R> =>
         operation.pipe(
           Effect.catch((error) =>
-            error instanceof ProjectMcpNameConflictError ? Effect.fail(error) : Effect.die(error),
+            isExpected(error)
+              ? Effect.fail(error)
+              : isOrchestrationCommandInvariantError(error) && isExpected(error.cause)
+                ? Effect.fail(error.cause)
+                : Effect.die(error),
           ),
         );
 
@@ -1754,7 +1769,10 @@ const makeWsRpcLayer = (
             runProjectMcpOperation(
               WS_METHODS.projectMcpCreate,
               input.projectId,
-              preserveProjectMcpNameConflict(projectMcpService.create(input)),
+              preserveProjectMcpMutationError(
+                projectMcpService.create(input),
+                isProjectMcpCreateError,
+              ),
             ),
             { "rpc.aggregate": "project-mcp" },
           ),
@@ -1764,7 +1782,10 @@ const makeWsRpcLayer = (
             runProjectMcpOperation(
               WS_METHODS.projectMcpUpdate,
               input.projectId,
-              preserveProjectMcpNameConflict(projectMcpService.update(input)),
+              preserveProjectMcpMutationError(
+                projectMcpService.update(input),
+                isProjectMcpUpdateError,
+              ),
             ),
             { "rpc.aggregate": "project-mcp" },
           ),
@@ -1774,7 +1795,10 @@ const makeWsRpcLayer = (
             runProjectMcpOperation(
               WS_METHODS.projectMcpRemove,
               input.projectId,
-              projectMcpService.remove(input).pipe(Effect.orDie),
+              preserveProjectMcpMutationError(
+                projectMcpService.remove(input),
+                isProjectMcpRemoveError,
+              ),
             ),
             { "rpc.aggregate": "project-mcp" },
           ),

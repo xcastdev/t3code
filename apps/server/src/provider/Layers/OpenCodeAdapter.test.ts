@@ -553,6 +553,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       NodeAssert.equal(adapter.capabilities.remoteHttpMcp, "unsupported");
+      NodeAssert.equal(adapter.capabilities.managedPreviewMcp, "next-session");
     }),
   );
 

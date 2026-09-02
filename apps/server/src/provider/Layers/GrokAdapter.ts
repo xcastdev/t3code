@@ -2040,7 +2040,11 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
 
     return {
       provider: PROVIDER,
-      capabilities: { sessionModelSwitch: "in-session", remoteHttpMcp: "next-session" },
+      capabilities: {
+        sessionModelSwitch: "in-session",
+        remoteHttpMcp: "next-session",
+        managedPreviewMcp: "next-session",
+      },
       startSession,
       sendTurn,
       interruptTurn,

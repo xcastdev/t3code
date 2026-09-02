@@ -34,7 +34,10 @@ export interface ProviderAdapterCapabilities {
    * Declares whether changing the model on an existing session is supported.
    */
   readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
+  /** Application timing for user-configured remote HTTP MCP servers. */
   readonly remoteHttpMcp: ProviderRemoteHttpMcpMode;
+  /** Application timing for the T3-managed preview MCP server. */
+  readonly managedPreviewMcp: ProviderRemoteHttpMcpMode;
 }
 
 export type ProviderAdapterSessionStartInput = ProviderSessionStartInput & {

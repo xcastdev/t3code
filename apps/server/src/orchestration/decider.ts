@@ -3,6 +3,10 @@ import {
   type OrchestrationCommand,
   type OrchestrationEvent,
   type OrchestrationReadModel,
+  type ProjectMcpMutationError,
+  ProjectMcpNameConflictError,
+  ProjectMcpServerLimitExceededError,
+  ProjectMcpServerNotFoundError,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
@@ -31,6 +35,12 @@ const QUEUED_TURN_START_GRACE_MS = 2 * 60 * 1_000;
 const PROJECT_MCP_SERVER_LIMIT = 50;
 
 const foldProjectMcpName = (name: string): string => name.toLocaleLowerCase();
+
+const projectMcpInvariantError = (
+  commandType: string,
+  cause: ProjectMcpMutationError,
+): OrchestrationCommandInvariantError =>
+  new OrchestrationCommandInvariantError({ commandType, detail: cause.message, cause });
 
 /**
  * Blocked-on-you work derived from the thread's retained activities: an
@@ -372,12 +382,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         );
       }
       if (existingEntries.length >= PROJECT_MCP_SERVER_LIMIT) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `Project '${command.projectId}' cannot contain more than ${PROJECT_MCP_SERVER_LIMIT} MCP servers.`,
-          }),
-        );
+        const cause = new ProjectMcpServerLimitExceededError({
+          limit: PROJECT_MCP_SERVER_LIMIT,
+        });
+        return yield* projectMcpInvariantError(command.type, cause);
       }
       if (
         existingEntries.some(
@@ -385,12 +393,11 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
             foldProjectMcpName(entry.server.name) === foldProjectMcpName(command.server.name),
         )
       ) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `Project '${command.projectId}' already contains an MCP server named '${command.server.name}'.`,
-          }),
-        );
+        const cause = new ProjectMcpNameConflictError({
+          name: command.server.name,
+          message: `Project already contains an MCP server named '${command.server.name}'.`,
+        });
+        return yield* projectMcpInvariantError(command.type, cause);
       }
       return {
         ...(yield* withEventBase({
@@ -418,12 +425,8 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         (entry) => entry.projectId === command.projectId,
       );
       if (!existingEntries.some((entry) => entry.server.id === command.server.id)) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `Project '${command.projectId}' does not contain MCP server '${command.server.id}'.`,
-          }),
-        );
+        const cause = new ProjectMcpServerNotFoundError({ id: command.server.id });
+        return yield* projectMcpInvariantError(command.type, cause);
       }
       if (
         existingEntries.some(
@@ -432,12 +435,11 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
             foldProjectMcpName(entry.server.name) === foldProjectMcpName(command.server.name),
         )
       ) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `Project '${command.projectId}' already contains an MCP server named '${command.server.name}'.`,
-          }),
-        );
+        const cause = new ProjectMcpNameConflictError({
+          name: command.server.name,
+          message: `Project already contains an MCP server named '${command.server.name}'.`,
+        });
+        return yield* projectMcpInvariantError(command.type, cause);
       }
       return {
         ...(yield* withEventBase({
@@ -466,12 +468,8 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           (entry) => entry.projectId === command.projectId && entry.server.id === command.id,
         )
       ) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `Project '${command.projectId}' does not contain MCP server '${command.id}'.`,
-          }),
-        );
+        const cause = new ProjectMcpServerNotFoundError({ id: command.id });
+        return yield* projectMcpInvariantError(command.type, cause);
       }
       return {
         ...(yield* withEventBase({

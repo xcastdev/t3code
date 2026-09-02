@@ -111,7 +111,11 @@ function createProviderServiceHarness() {
     stopSession: () => unsupported(),
     listSessions: () => Effect.succeed([...runtimeSessions]),
     getCapabilities: () =>
-      Effect.succeed({ sessionModelSwitch: "in-session", remoteHttpMcp: "next-session" }),
+      Effect.succeed({
+        sessionModelSwitch: "in-session",
+        remoteHttpMcp: "next-session",
+        managedPreviewMcp: "next-session",
+      }),
     getInstanceInfo: (instanceId) => {
       const driverKind = ProviderDriverKind.make(String(instanceId));
       return Effect.succeed({

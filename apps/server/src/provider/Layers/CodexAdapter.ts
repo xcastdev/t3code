@@ -2028,6 +2028,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     capabilities: {
       sessionModelSwitch: "in-session",
       remoteHttpMcp: "next-session",
+      managedPreviewMcp: "next-session",
     },
     startSession,
     sendTurn,

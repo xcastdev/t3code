@@ -6,16 +6,26 @@ import {
   ProjectMcpApplicationMode,
   ProjectMcpCatalog,
   ProjectMcpCreateInput,
+  ProjectMcpProviderNotFoundError,
   ProjectMcpListInput,
   ProjectMcpManagedServer,
   ProjectMcpNameConflictError,
   ProjectMcpRemoveInput,
   ProjectMcpServer,
+  ProjectMcpServerLimitExceededError,
+  ProjectMcpServerNotFoundError,
   ProjectMcpUpdateInput,
   ProjectMcpUrl,
 } from "./projectMcp.ts";
 
 const decodeProjectMcpServer = Schema.decodeUnknownSync(ProjectMcpServer);
+const decodeProjectMcpProviderNotFoundError = Schema.decodeUnknownSync(
+  ProjectMcpProviderNotFoundError,
+);
+const decodeProjectMcpServerLimitExceededError = Schema.decodeUnknownSync(
+  ProjectMcpServerLimitExceededError,
+);
+const decodeProjectMcpServerNotFoundError = Schema.decodeUnknownSync(ProjectMcpServerNotFoundError);
 
 describe("ProjectMcpServer", () => {
   it("rejects an external HTTP URL", () => {
@@ -182,5 +192,24 @@ describe("Project MCP contract shapes", () => {
     expect(error._tag).toBe("ProjectMcpNameConflictError");
     expect(error.name).toBe("Docs");
     expect(error.message).toContain("already exists");
+  });
+
+  it("decodes actionable mutation errors", () => {
+    const unknownProvider = decodeProjectMcpProviderNotFoundError({
+      _tag: "ProjectMcpProviderNotFoundError",
+      providerInstanceId: "missing-provider",
+    });
+    const limit = decodeProjectMcpServerLimitExceededError({
+      _tag: "ProjectMcpServerLimitExceededError",
+      limit: 50,
+    });
+    const missingServer = decodeProjectMcpServerNotFoundError({
+      _tag: "ProjectMcpServerNotFoundError",
+      id: "missing-server",
+    });
+
+    expect(unknownProvider.message).toContain("missing-provider");
+    expect(limit.message).toContain("50");
+    expect(missingServer.message).toContain("missing-server");
   });
 });
