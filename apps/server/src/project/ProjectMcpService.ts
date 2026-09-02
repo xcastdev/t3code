@@ -17,13 +17,16 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import { HttpServer } from "effect/unstable/http";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { getMcpEndpoint } from "../mcp/McpSessionRegistry.ts";
 import { OrchestrationCommandInvariantError } from "../orchestration/Errors.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
 
 const PROJECT_MCP_SERVER_LIMIT = 50;
+const MANAGED_PREVIEW_MCP_ID = McpServerId.make("t3-code");
 
 const ProjectMcpProjectionRow = Schema.Struct({
   serverId: McpServerId,
@@ -78,6 +81,7 @@ const makeProjectMcpService = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const engine = yield* OrchestrationEngineService;
   const providerInstances = yield* ProviderInstanceRegistry;
+  const httpServer = yield* HttpServer.HttpServer;
   const crypto = yield* Crypto.Crypto;
 
   const list: ProjectMcpServiceShape["list"] = (projectId) =>
@@ -121,16 +125,28 @@ const makeProjectMcpService = Effect.gen(function* () {
       );
       return {
         external,
-        applications: external.flatMap((entry) =>
-          entry.providerInstanceIds.map((providerInstanceId) => ({
-            serverId: entry.id,
-            providerInstanceId,
-            mode: applicationModes.get(providerInstanceId) ?? "unavailable",
+        applications: [
+          ...external.flatMap((entry) =>
+            entry.providerInstanceIds.map((providerInstanceId) => ({
+              serverId: entry.id,
+              providerInstanceId,
+              mode: applicationModes.get(providerInstanceId) ?? "unavailable",
+            })),
+          ),
+          ...instances.map((instance) => ({
+            serverId: MANAGED_PREVIEW_MCP_ID,
+            providerInstanceId: instance.instanceId,
+            mode: applicationModes.get(instance.instanceId) ?? "unavailable",
           })),
-        ),
-        // Preview MCP is attached from session-scoped credentials, never from
-        // these mutable project records.
-        managed: [],
+        ],
+        managed: [
+          {
+            id: MANAGED_PREVIEW_MCP_ID,
+            name: "t3-code",
+            url: getMcpEndpoint(httpServer),
+            providerInstanceIds: instances.map((instance) => instance.instanceId),
+          },
+        ],
       };
     });
 

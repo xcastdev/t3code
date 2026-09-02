@@ -5176,8 +5176,22 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 calls.push("list");
                 return {
                   external: [server],
-                  managed: [],
-                  applications: [{ serverId, providerInstanceId, mode: "next-session" as const }],
+                  managed: [
+                    {
+                      id: McpServerId.make("t3-code"),
+                      name: "t3-code",
+                      url: "http://127.0.0.1:43123/mcp",
+                      providerInstanceIds: [providerInstanceId],
+                    },
+                  ],
+                  applications: [
+                    { serverId, providerInstanceId, mode: "next-session" as const },
+                    {
+                      serverId: McpServerId.make("t3-code"),
+                      providerInstanceId,
+                      mode: "next-session" as const,
+                    },
+                  ],
                 };
               }),
             create: () =>
@@ -5219,6 +5233,19 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.deepEqual(results[0].external, [server]);
       assert.deepEqual(results[0].applications, [
         { serverId, providerInstanceId, mode: "next-session" },
+        {
+          serverId: McpServerId.make("t3-code"),
+          providerInstanceId,
+          mode: "next-session",
+        },
+      ]);
+      assert.deepEqual(results[0].managed, [
+        {
+          id: McpServerId.make("t3-code"),
+          name: "t3-code",
+          url: "http://127.0.0.1:43123/mcp",
+          providerInstanceIds: [providerInstanceId],
+        },
       ]);
       assert.deepEqual(results[1], server);
       assert.deepEqual(results[2], server);

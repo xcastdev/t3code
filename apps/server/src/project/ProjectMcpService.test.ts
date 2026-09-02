@@ -3,6 +3,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import { HttpServer } from "effect/unstable/http";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as ServerConfig from "../config.ts";
@@ -48,6 +49,11 @@ const disabledInput = {
   providerInstanceIds: [codexInstance],
 };
 
+const mcpHttpServer = HttpServer.HttpServer.of({
+  address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: 43123 },
+  serve: (() => Effect.void) as HttpServer.HttpServer["Service"]["serve"],
+});
+
 const providerInstanceRegistry = Layer.succeed(ProviderInstanceRegistry, {
   getInstance: () => Effect.die("Unused in ProjectMcpService tests"),
   listInstances: Effect.succeed([
@@ -82,6 +88,7 @@ const testLayer = ProjectMcpService.layer.pipe(
   Layer.provideMerge(ThreadBackgroundLiveness.layer),
   Layer.provideMerge(ThreadPlanProgress.layer),
   Layer.provideMerge(providerInstanceRegistry),
+  Layer.provideMerge(Layer.succeed(HttpServer.HttpServer, mcpHttpServer)),
   Layer.provideMerge(SqlitePersistenceMemory),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-test-" })),
   Layer.provideMerge(NodeServices.layer),
@@ -101,6 +108,53 @@ const createProject = (projectId: ProjectId, commandId: string) =>
   });
 
 it.layer(testLayer)("ProjectMcpService", (it) => {
+  it.effect("returns the managed preview descriptor without persisting it as an external row", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const sql = yield* SqlClient.SqlClient;
+      const projectId = ProjectId.make("managed-preview-project");
+      yield* createProject(projectId, "managed-preview-project");
+      const external = yield* service.create({ projectId, ...codexInput });
+
+      const catalog = yield* service.list(projectId);
+
+      expect(catalog.external).toEqual([external]);
+      expect(catalog.managed).toEqual([
+        {
+          id: McpServerId.make("t3-code"),
+          name: "t3-code",
+          url: "http://127.0.0.1:43123/mcp",
+          providerInstanceIds: [codexInstance, openCodeInstance, disabledCursorInstance],
+        },
+      ]);
+      expect(catalog.applications).toEqual([
+        { serverId: external.id, providerInstanceId: codexInstance, mode: "next-session" },
+        {
+          serverId: McpServerId.make("t3-code"),
+          providerInstanceId: codexInstance,
+          mode: "next-session",
+        },
+        {
+          serverId: McpServerId.make("t3-code"),
+          providerInstanceId: openCodeInstance,
+          mode: "unsupported",
+        },
+        {
+          serverId: McpServerId.make("t3-code"),
+          providerInstanceId: disabledCursorInstance,
+          mode: "unavailable",
+        },
+      ]);
+      expect(
+        yield* sql<{ readonly count: number }>`
+          SELECT COUNT(*) AS count
+          FROM projection_project_mcp_servers
+          WHERE project_id = ${projectId}
+        `,
+      ).toEqual([{ count: 1 }]);
+    }),
+  );
+
   it.effect("derives application modes from live provider capabilities", () =>
     Effect.gen(function* () {
       const service = yield* ProjectMcpService.ProjectMcpService;
@@ -116,6 +170,21 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
         { serverId: entry.id, providerInstanceId: codexInstance, mode: "next-session" },
         { serverId: entry.id, providerInstanceId: openCodeInstance, mode: "unsupported" },
         { serverId: entry.id, providerInstanceId: disabledCursorInstance, mode: "unavailable" },
+        {
+          serverId: McpServerId.make("t3-code"),
+          providerInstanceId: codexInstance,
+          mode: "next-session",
+        },
+        {
+          serverId: McpServerId.make("t3-code"),
+          providerInstanceId: openCodeInstance,
+          mode: "unsupported",
+        },
+        {
+          serverId: McpServerId.make("t3-code"),
+          providerInstanceId: disabledCursorInstance,
+          mode: "unavailable",
+        },
       ]);
     }),
   );

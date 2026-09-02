@@ -62,10 +62,29 @@ export type ProjectMcpServer = typeof ProjectMcpServer.Type;
 
 export type ResolvedProjectMcpServer = Pick<ProjectMcpServer, "id" | "name" | "url">;
 
+const ManagedProjectMcpUrl = Schema.String.check(
+  Schema.isTrimmed(),
+  Schema.isNonEmpty(),
+  Schema.isMaxLength(PROJECT_MCP_URL_MAX_LENGTH),
+  Schema.makeFilter((value) => {
+    try {
+      const url = new URL(value);
+      return (
+        (url.protocol === "http:" || url.protocol === "https:") &&
+        url.username === "" &&
+        url.password === "" &&
+        url.search === ""
+      );
+    } catch {
+      return false;
+    }
+  }),
+);
+
 export const ProjectMcpManagedServer = Schema.Struct({
   id: McpServerId,
   name: TrimmedNonEmptyString,
-  url: ProjectMcpUrl,
+  url: ManagedProjectMcpUrl,
   providerInstanceIds: Schema.Array(ProviderInstanceId),
 });
 export type ProjectMcpManagedServer = typeof ProjectMcpManagedServer.Type;

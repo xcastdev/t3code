@@ -7,6 +7,7 @@ import {
   ProjectMcpCatalog,
   ProjectMcpCreateInput,
   ProjectMcpListInput,
+  ProjectMcpManagedServer,
   ProjectMcpNameConflictError,
   ProjectMcpRemoveInput,
   ProjectMcpServer,
@@ -79,6 +80,22 @@ describe("ProjectMcpServer", () => {
 });
 
 describe("Project MCP contract shapes", () => {
+  it("accepts a server-owned managed endpoint bound to a non-loopback host", () => {
+    expect(
+      Schema.decodeUnknownSync(ProjectMcpManagedServer)({
+        id: "t3-code",
+        name: "t3-code",
+        url: "http://100.64.0.40:43123/mcp",
+        providerInstanceIds: ["codex"],
+      }),
+    ).toEqual({
+      id: "t3-code",
+      name: "t3-code",
+      url: "http://100.64.0.40:43123/mcp",
+      providerInstanceIds: ["codex"],
+    });
+  });
+
   it("decodes the catalog's separate external and managed entries", () => {
     expect(
       Schema.decodeUnknownSync(ProjectMcpCatalog)({
