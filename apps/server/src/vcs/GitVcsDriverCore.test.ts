@@ -1493,6 +1493,34 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("requires confirmation before switching a dirty worktree", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.createRef({ cwd, refName: "feature/dirty-switch" });
+        yield* writeTextFile(cwd, "dirty.txt", "dirty\n");
+
+        const error = yield* driver
+          .switchRef({
+            cwd,
+            refName: "feature/dirty-switch",
+            confirmDirtyWorkingTree: false,
+          })
+          .pipe(Effect.flip);
+
+        assert.equal(error.code, "dirty_worktree_confirmation_required");
+        assert.equal(yield* git(cwd, ["branch", "--show-current"]), initialBranch);
+
+        const switched = yield* driver.switchRef({
+          cwd,
+          refName: "feature/dirty-switch",
+          confirmDirtyWorkingTree: true,
+        });
+        assert.equal(switched.refName, "feature/dirty-switch");
+      }),
+    );
+
     it.effect("returns the existing refName when rename source and target match", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -2001,6 +2029,89 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.equal(yield* git(cwd, ["log", "-1", "--pretty=%s"]), "commit staged file");
         assert.include(yield* git(cwd, ["status", "--porcelain"]), "?? sibling.txt");
         assert.notInclude(yield* git(cwd, ["status", "--porcelain"]), "staged.txt");
+      }),
+    );
+
+    it.effect("rejects an index commit when HEAD differs from the reviewed precondition", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* writeTextFile(cwd, "staged.txt", "staged\n");
+        yield* driver.stageFiles({ cwd, paths: ["staged.txt"] });
+        const expectedIndexTree = yield* git(cwd, ["write-tree"]);
+        const headBeforeCommit = yield* git(cwd, ["rev-parse", "HEAD"]);
+
+        const error = yield* driver
+          .commitIndex({
+            cwd,
+            message: "must not commit",
+            precondition: {
+              expectedHeadCommit: "0000000000000000000000000000000000000000",
+              expectedIndexTree,
+            },
+          })
+          .pipe(Effect.flip);
+
+        assert.equal(error.code, "stale_git_state");
+        assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), headBeforeCommit);
+      }),
+    );
+
+    it.effect(
+      "rejects an index commit when the index tree differs from the reviewed precondition",
+      () =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+          yield* writeTextFile(cwd, "staged.txt", "staged\n");
+          yield* driver.stageFiles({ cwd, paths: ["staged.txt"] });
+          const expectedHeadCommit = yield* git(cwd, ["rev-parse", "HEAD"]);
+          const headBeforeCommit = expectedHeadCommit;
+
+          const error = yield* driver
+            .commitIndex({
+              cwd,
+              message: "must not commit",
+              precondition: {
+                expectedHeadCommit,
+                expectedIndexTree: "0000000000000000000000000000000000000000",
+              },
+            })
+            .pipe(Effect.flip);
+
+          assert.equal(error.code, "stale_git_state");
+          assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), headBeforeCommit);
+        }),
+    );
+
+    it.effect("requires confirmation before committing the reviewed index on the default ref", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["branch", "-m", "main"]);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* writeTextFile(cwd, "staged.txt", "staged\n");
+        yield* driver.stageFiles({ cwd, paths: ["staged.txt"] });
+        const precondition = {
+          expectedHeadCommit: yield* git(cwd, ["rev-parse", "HEAD"]),
+          expectedIndexTree: yield* git(cwd, ["write-tree"]),
+        };
+
+        const error = yield* driver
+          .commitIndex({ cwd, message: "guarded commit", precondition })
+          .pipe(Effect.flip);
+        assert.equal(error.code, "default_ref_confirmation_required");
+
+        const committed = yield* driver.commitIndex({
+          cwd,
+          message: "guarded commit",
+          precondition,
+          confirmDefaultRef: true,
+        });
+        assert.match(committed.commitSha, /^[a-f0-9]{40}$/);
+        assert.equal(yield* git(cwd, ["log", "-1", "--pretty=%s"]), "guarded commit");
       }),
     );
 

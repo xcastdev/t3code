@@ -2308,9 +2308,14 @@ const makeWsRpcLayer = (
         [WS_METHODS.gitCommitIndex]: (input) =>
           observeRpcEffect(
             WS_METHODS.gitCommitIndex,
-            gitWorkflow
-              .commitIndex(input)
-              .pipe(Effect.tap(() => refreshGitStatusWithoutFetch(input.cwd))),
+            gitWorkflow.commitIndex(input).pipe(
+              Effect.tapError((error) =>
+                error.code === "stale_git_state"
+                  ? refreshGitStatusWithoutFetch(input.cwd)
+                  : Effect.void,
+              ),
+              Effect.tap(() => refreshGitStatusWithoutFetch(input.cwd)),
+            ),
             { "rpc.aggregate": "git" },
           ),
         [WS_METHODS.vcsListRefs]: (input) =>

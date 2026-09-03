@@ -6415,6 +6415,66 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("forwards stale index commit errors after refreshing local Git status", () =>
+    Effect.gen(function* () {
+      let refreshCalls = 0;
+      let refreshedWithoutFetch = false;
+      const staleError = new GitCommandError({
+        operation: "GitVcsDriver.commitIndex.precondition",
+        command: "git",
+        cwd: "/tmp/repo",
+        detail: "Repository state changed after review.",
+        code: "stale_git_state",
+      });
+      yield* buildAppUnderTest({
+        layers: {
+          gitVcsDriver: {
+            commitIndex: () => Effect.fail(staleError),
+          },
+          vcsStatusBroadcaster: {
+            refreshStatus: (_cwd, options) =>
+              Effect.sync(() => {
+                refreshCalls += 1;
+                refreshedWithoutFetch = options?.refreshUpstream === false;
+                return {
+                  isRepo: true,
+                  hasPrimaryRemote: true,
+                  isDefaultRef: true,
+                  refName: "main",
+                  hasWorkingTreeChanges: true,
+                  workingTree: { files: [], insertions: 0, deletions: 0 },
+                  hasUpstream: false,
+                  aheadCount: 0,
+                  behindCount: 0,
+                  aheadOfDefaultCount: 0,
+                  pr: null,
+                } as const;
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.gitCommitIndex]({
+            cwd: "/tmp/repo",
+            message: "commit staged",
+            precondition: {
+              expectedHeadCommit: "abc123",
+              expectedIndexTree: "def456",
+            },
+          }),
+        ).pipe(Effect.result),
+      );
+
+      assertFailure(result, staleError);
+      yield* Effect.yieldNow;
+      assert.equal(refreshCalls, 1);
+      assert.isTrue(refreshedWithoutFetch);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("routes websocket rpc git.pull errors", () =>
     Effect.gen(function* () {
       const gitError = new GitCommandError({

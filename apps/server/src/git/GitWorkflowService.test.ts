@@ -1,5 +1,7 @@
 import { assert, describe, expect, it, vi } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 
 import { VcsRepositoryDetectionError } from "@t3tools/contracts";
@@ -32,7 +34,15 @@ describe("GitWorkflowService", () => {
     const testLayer = GitWorkflowService.layer.pipe(
       Layer.provide(
         Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
-          resolve: () => Effect.succeed({ kind: "git" } as VcsDriverRegistry.VcsDriverHandle),
+          resolve: () =>
+            Effect.succeed({
+              kind: "git",
+              repository: {
+                kind: "git",
+                rootPath: "/repo",
+                metadataPath: "/repo/.git",
+              },
+            } as VcsDriverRegistry.VcsDriverHandle),
         }),
       ),
       Layer.provide(
@@ -69,6 +79,83 @@ describe("GitWorkflowService", () => {
       expect(commitIndex).toHaveBeenCalledWith({ cwd: "/repo", message: "commit a" });
     }).pipe(Effect.provide(testLayer));
   });
+
+  it.effect("serializes index and ref mutations by resolved repository identity", () =>
+    Effect.gen(function* () {
+      const stageStarted = yield* Deferred.make<void>();
+      const releaseStage = yield* Deferred.make<void>();
+      const queuedCallsResolved = yield* Deferred.make<void>();
+      let stageActive = false;
+      let resolveCalls = 0;
+      const overlappingMutations: string[] = [];
+      const recordMutation = (name: string) =>
+        Effect.sync(() => {
+          if (stageActive) overlappingMutations.push(name);
+        });
+      const testLayer = GitWorkflowService.layer.pipe(
+        Layer.provide(
+          Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
+            resolve: ({ cwd }) =>
+              Effect.sync(() => {
+                resolveCalls += 1;
+                return resolveCalls;
+              }).pipe(
+                Effect.tap((count) =>
+                  count === 4 ? Deferred.succeed(queuedCallsResolved, undefined) : Effect.void,
+                ),
+                Effect.as({
+                  kind: "git",
+                  repository: {
+                    kind: "git",
+                    rootPath: "/repo",
+                    metadataPath: cwd === "/repo" ? ".git" : "../.git",
+                  },
+                } as VcsDriverRegistry.VcsDriverHandle),
+              ),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(GitVcsDriver.GitVcsDriver)({
+            stageFiles: () =>
+              Effect.gen(function* () {
+                stageActive = true;
+                yield* Deferred.succeed(stageStarted, undefined);
+                yield* Deferred.await(releaseStage);
+                stageActive = false;
+              }),
+            unstageFiles: () => recordMutation("unstage"),
+            commitIndex: () => recordMutation("commit").pipe(Effect.as({ commitSha: "abc123" })),
+            switchRef: (input) =>
+              recordMutation("switch").pipe(Effect.as({ refName: input.refName })),
+          }),
+        ),
+        Layer.provide(Layer.mock(GitManager.GitManager)({})),
+      );
+
+      yield* Effect.gen(function* () {
+        const workflow = yield* GitWorkflowService.GitWorkflowService;
+        const stageFiber = yield* workflow
+          .stageFiles({ cwd: "/repo", paths: ["a.txt"] })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(stageStarted);
+        const queuedFibers = yield* Effect.forEach(
+          [
+            workflow.unstageFiles({ cwd: "/repo/nested", paths: ["a.txt"] }),
+            workflow.commitIndex({ cwd: "/repo/nested", message: "commit" }),
+            workflow.switchRef({ cwd: "/repo/nested", refName: "feature/test" }),
+          ],
+          (effect) => effect.pipe(Effect.forkChild),
+        );
+        yield* Deferred.await(queuedCallsResolved);
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseStage, undefined);
+        yield* Fiber.join(stageFiber);
+        yield* Effect.forEach(queuedFibers, Fiber.join);
+
+        assert.deepStrictEqual(overlappingMutations, []);
+      }).pipe(Effect.provide(testLayer));
+    }),
+  );
 
   it.effect("returns an empty local status when no VCS repository is detected", () =>
     Effect.gen(function* () {

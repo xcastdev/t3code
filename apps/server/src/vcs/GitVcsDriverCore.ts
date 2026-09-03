@@ -1033,6 +1033,49 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       ),
     );
 
+  const readMutationState = Effect.fn("GitVcsDriver.readMutationState")(function* (cwd: string) {
+    const [headResult, currentRefResult, indexTree, porcelainStatus] = yield* Effect.all(
+      [
+        executeGit("GitVcsDriver.readMutationState.head", cwd, ["rev-parse", "--verify", "HEAD"], {
+          allowNonZeroExit: true,
+        }),
+        executeGit(
+          "GitVcsDriver.readMutationState.currentRef",
+          cwd,
+          ["symbolic-ref", "--short", "-q", "HEAD"],
+          {
+            allowNonZeroExit: true,
+          },
+        ),
+        runGitStdout("GitVcsDriver.readMutationState.indexTree", cwd, ["write-tree"]),
+        runGitStdout("GitVcsDriver.readMutationState.status", cwd, ["status", "--porcelain"]),
+      ],
+      { concurrency: 4 },
+    );
+
+    return {
+      headCommit: headResult.exitCode === 0 ? headResult.stdout.trim() : null,
+      currentRef: currentRefResult.exitCode === 0 ? currentRefResult.stdout.trim() || null : null,
+      indexTree: indexTree.trim(),
+      porcelainStatus,
+    };
+  });
+
+  const mutationRejection = (
+    operation: string,
+    cwd: string,
+    code:
+      | "dirty_worktree_confirmation_required"
+      | "default_ref_confirmation_required"
+      | "stale_git_state",
+    detail: string,
+  ) =>
+    new GitCommandError({
+      ...gitCommandContext({ operation, cwd, args: [] }),
+      code,
+      detail,
+    });
+
   const branchExists = (cwd: string, refName: string): Effect.Effect<boolean, GitCommandError> =>
     executeGit(
       "GitVcsDriver.branchExists",
@@ -2788,6 +2831,37 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
   const commitIndex: GitVcsDriver.GitVcsDriver["Service"]["commitIndex"] = Effect.fn("commitIndex")(
     function* (input) {
+      if (input.precondition !== undefined || input.confirmDefaultRef !== undefined) {
+        const state = yield* readMutationState(input.cwd);
+        if (
+          input.precondition !== undefined &&
+          (state.headCommit !== input.precondition.expectedHeadCommit ||
+            state.indexTree !== input.precondition.expectedIndexTree)
+        ) {
+          return yield* mutationRejection(
+            "GitVcsDriver.commitIndex.precondition",
+            input.cwd,
+            "stale_git_state",
+            "Repository state changed after the staged changes were reviewed.",
+          );
+        }
+
+        const defaultRef = yield* resolveDefaultBranchName(input.cwd, "origin");
+        const isDefaultRef =
+          state.currentRef !== null &&
+          (state.currentRef === defaultRef ||
+            (defaultRef === null &&
+              (state.currentRef === "main" || state.currentRef === "master")));
+        if (isDefaultRef && input.confirmDefaultRef !== true) {
+          return yield* mutationRejection(
+            "GitVcsDriver.commitIndex.defaultRef",
+            input.cwd,
+            "default_ref_confirmation_required",
+            "Committing on the default ref requires confirmation.",
+          );
+        }
+      }
+
       yield* runGit("GitVcsDriver.commitIndex", input.cwd, ["commit", "-m", input.message]);
       const commitSha = yield* runGitStdout("GitVcsDriver.commitIndex.revParseHead", input.cwd, [
         "rev-parse",
@@ -3557,6 +3631,21 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
   const switchRef: GitVcsDriver.GitVcsDriver["Service"]["switchRef"] = Effect.fn("switchRef")(
     function* (input) {
+      if (input.confirmDirtyWorkingTree !== undefined && input.confirmDirtyWorkingTree !== true) {
+        const porcelainStatus = yield* runGitStdout("GitVcsDriver.switchRef.status", input.cwd, [
+          "status",
+          "--porcelain",
+        ]);
+        if (porcelainStatus.length > 0) {
+          return yield* mutationRejection(
+            "GitVcsDriver.switchRef.dirtyWorktree",
+            input.cwd,
+            "dirty_worktree_confirmation_required",
+            "Switching refs with working tree changes requires confirmation.",
+          );
+        }
+      }
+
       const [localInputExists, remoteExists] = yield* Effect.all(
         [
           executeGit(
