@@ -1,7 +1,7 @@
 import * as Schema from "effect/Schema";
 import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { SourceControlProviderError, SourceControlProviderInfo } from "./sourceControl.ts";
-import { VcsDriverKind } from "./vcs.ts";
+import { VcsDriverKind, VcsMutationRejectionCode } from "./vcs.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
 const GitPath = Schema.String.check(Schema.isNonEmpty()).check(
@@ -103,6 +103,12 @@ export const VcsWorkingTreeFile = Schema.Struct({
 });
 export type VcsWorkingTreeFile = typeof VcsWorkingTreeFile.Type;
 
+export const GitMutationPrecondition = Schema.Struct({
+  expectedHeadCommit: Schema.NullOr(Schema.String),
+  expectedIndexTree: Schema.String,
+});
+export type GitMutationPrecondition = typeof GitMutationPrecondition.Type;
+
 const VcsWorktree = Schema.Struct({
   path: TrimmedNonEmptyStringSchema,
   refName: TrimmedNonEmptyStringSchema,
@@ -140,8 +146,10 @@ export const VcsWorkingTreeDiffInput = Schema.Struct({
 export type VcsWorkingTreeDiffInput = typeof VcsWorkingTreeDiffInput.Type;
 
 export const GitCommitIndexInput = Schema.Struct({
-  cwd: TrimmedNonEmptyStringSchema,
-  message: TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(10_000)),
+  cwd: Schema.String,
+  message: Schema.String,
+  precondition: Schema.optional(GitMutationPrecondition),
+  confirmDefaultRef: Schema.optional(Schema.Boolean),
 });
 export type GitCommitIndexInput = typeof GitCommitIndexInput.Type;
 
@@ -218,8 +226,9 @@ export const VcsCreateRefResult = Schema.Struct({
 export type VcsCreateRefResult = typeof VcsCreateRefResult.Type;
 
 export const VcsSwitchRefInput = Schema.Struct({
-  cwd: TrimmedNonEmptyStringSchema,
-  refName: TrimmedNonEmptyStringSchema,
+  cwd: Schema.String,
+  refName: Schema.String,
+  confirmDirtyWorkingTree: Schema.optional(Schema.Boolean),
 });
 export type VcsSwitchRefInput = typeof VcsSwitchRefInput.Type;
 
@@ -254,6 +263,9 @@ const VcsStatusLocalShape = {
   hasPrimaryRemote: Schema.Boolean,
   isDefaultRef: Schema.Boolean,
   refName: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  localRevision: Schema.optional(Schema.String),
+  headCommit: Schema.optional(Schema.String),
+  indexTree: Schema.optional(Schema.String),
   hasWorkingTreeChanges: Schema.Boolean,
   workingTree: Schema.Struct({
     files: Schema.Array(VcsWorkingTreeFile),
@@ -391,6 +403,7 @@ export class GitCommandError extends Schema.TaggedErrorClass<GitCommandError>()(
   stderrLength: Schema.optional(Schema.Number),
   outputLength: Schema.optional(Schema.Number),
   detail: Schema.String,
+  code: Schema.optional(VcsMutationRejectionCode),
   cause: Schema.optional(Schema.Defect()),
 }) {
   override get message(): string {

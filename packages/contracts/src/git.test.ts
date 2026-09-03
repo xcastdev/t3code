@@ -13,6 +13,9 @@ import {
   VcsWorkingTreeDiffInput,
   VcsWorkingTreeDiffResult,
   GitCommitIndexInput,
+  GitCommandError,
+  GitManagerServiceError,
+  VcsSwitchRefInput,
 } from "./git.ts";
 
 const decodeCreateWorktreeInput = Schema.decodeUnknownSync(VcsCreateWorktreeInput);
@@ -28,6 +31,9 @@ const decodeVcsStageFilesInput = Schema.decodeUnknownSync(VcsStageFilesInput);
 const decodeVcsWorkingTreeDiffInput = Schema.decodeUnknownSync(VcsWorkingTreeDiffInput);
 const decodeVcsWorkingTreeDiffResult = Schema.decodeUnknownSync(VcsWorkingTreeDiffResult);
 const decodeGitCommitIndexInput = Schema.decodeUnknownSync(GitCommitIndexInput);
+const decodeVcsSwitchRefInput = Schema.decodeUnknownSync(VcsSwitchRefInput);
+const decodeGitManagerServiceError = Schema.decodeUnknownSync(GitManagerServiceError);
+const decodeGitCommandError = Schema.decodeUnknownSync(GitCommandError);
 
 describe("VcsCreateWorktreeInput", () => {
   it("accepts omitted newRefName for existing-refName worktrees", () => {
@@ -261,5 +267,74 @@ describe("Git index and diff contracts", () => {
     const parsed = decodeGitCommitIndexInput({ cwd: "/repo", message: "fix: stage it" });
 
     expect(parsed.message).toBe("fix: stage it");
+  });
+
+  it("decodes repository state needed to guard mutations", () => {
+    const parsed = decodeVcsStatus({
+      isRepo: true,
+      hasPrimaryRemote: false,
+      isDefaultRef: false,
+      refName: "main",
+      hasWorkingTreeChanges: false,
+      localRevision: "revision-1",
+      headCommit: "0123456789abcdef",
+      indexTree: "tree-1",
+      workingTree: { files: [], insertions: 0, deletions: 0 },
+      hasUpstream: false,
+      aheadCount: 0,
+      behindCount: 0,
+      pr: null,
+    });
+
+    expect(parsed.localRevision).toBe("revision-1");
+    expect(parsed.headCommit).toBe("0123456789abcdef");
+    expect(parsed.indexTree).toBe("tree-1");
+  });
+
+  it("accepts guarded commit and ref-switch requests", () => {
+    const precondition = {
+      expectedHeadCommit: null,
+      expectedIndexTree: "tree-1",
+    };
+
+    expect(
+      decodeGitCommitIndexInput({
+        cwd: "/repo",
+        message: "fix: stage it",
+        precondition,
+        confirmDefaultRef: true,
+      }),
+    ).toMatchObject({ precondition, confirmDefaultRef: true });
+    expect(
+      decodeVcsSwitchRefInput({
+        cwd: "/repo",
+        refName: "feature/workflow",
+        confirmDirtyWorkingTree: true,
+      }),
+    ).toMatchObject({ confirmDirtyWorkingTree: true });
+  });
+
+  it("decodes typed mutation rejection codes through the existing Git error channel", () => {
+    for (const code of [
+      "dirty_worktree_confirmation_required",
+      "default_ref_confirmation_required",
+      "stale_git_state",
+    ] as const) {
+      const parsed = decodeGitCommandError({
+        _tag: "GitCommandError",
+        operation: "git.commitIndex",
+        command: "git",
+        cwd: "/repo",
+        detail: "Mutation rejected.",
+        code,
+      });
+
+      expect(parsed.code).toBe(code);
+      const serviceError = decodeGitManagerServiceError(parsed);
+      expect(serviceError._tag).toBe("GitCommandError");
+      if (serviceError._tag === "GitCommandError") {
+        expect(serviceError.code).toBe(code);
+      }
+    }
   });
 });

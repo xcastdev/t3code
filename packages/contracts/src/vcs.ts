@@ -12,6 +12,13 @@ export const VcsFreshnessSource = Schema.Literals([
 ]);
 export type VcsFreshnessSource = typeof VcsFreshnessSource.Type;
 
+export const VcsMutationRejectionCode = Schema.Literals([
+  "dirty_worktree_confirmation_required",
+  "default_ref_confirmation_required",
+  "stale_git_state",
+]);
+export type VcsMutationRejectionCode = typeof VcsMutationRejectionCode.Type;
+
 export const VcsFreshness = Schema.Struct({
   source: VcsFreshnessSource,
   observedAt: Schema.DateTimeUtc,
