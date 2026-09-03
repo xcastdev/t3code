@@ -6013,7 +6013,23 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     Effect.gen(function* () {
       const firstLocalRefresh = yield* Deferred.make<void>();
       const secondLocalRefresh = yield* Deferred.make<void>();
+      const indexCommitRefresh = yield* Deferred.make<void>();
       let localRefreshCalls = 0;
+      let fullRefreshCalls = 0;
+      const fullRefreshOptions: Array<{ readonly refreshUpstream?: boolean } | undefined> = [];
+      const fullStatus = {
+        isRepo: true,
+        hasPrimaryRemote: true,
+        isDefaultRef: true,
+        refName: "main",
+        hasWorkingTreeChanges: false,
+        workingTree: { files: [], insertions: 0, deletions: 0 },
+        hasUpstream: true,
+        aheadCount: 1,
+        behindCount: 0,
+        aheadOfDefaultCount: 0,
+        pr: null,
+      } as const;
       yield* buildAppUnderTest({
         config: {
           cwd: "/tmp/repo",
@@ -6183,19 +6199,19 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                   workingTree: { files: [], insertions: 0, deletions: 0 },
                 }),
               ),
-            refreshStatus: () =>
-              Effect.succeed({
-                isRepo: true,
-                hasPrimaryRemote: true,
-                isDefaultRef: true,
-                refName: "main",
-                hasWorkingTreeChanges: false,
-                workingTree: { files: [], insertions: 0, deletions: 0 },
-                hasUpstream: true,
-                aheadCount: 0,
-                behindCount: 0,
-                pr: null,
-              }),
+            refreshStatus: (_cwd, options) =>
+              Effect.sync(() => {
+                fullRefreshCalls += 1;
+                fullRefreshOptions.push(options);
+                return options;
+              }).pipe(
+                Effect.tap((options) =>
+                  options?.refreshUpstream === false
+                    ? Deferred.succeed(indexCommitRefresh, undefined)
+                    : Effect.void,
+                ),
+                Effect.as(fullStatus),
+              ),
           },
           reviewService: {
             getDiffPreview: (input) =>
@@ -6267,7 +6283,10 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         ),
       );
       assert.deepEqual(indexCommit, { commitSha: "def456" });
-      assert.equal(localRefreshCalls, 3);
+      yield* Deferred.await(indexCommitRefresh);
+      assert.equal(localRefreshCalls, 2);
+      assert.equal(fullRefreshCalls, 1);
+      assert.deepEqual(fullRefreshOptions[0], { refreshUpstream: false });
 
       const pull = yield* Effect.scoped(
         withWsRpcClient(wsUrl, (client) => client[WS_METHODS.vcsPull]({ cwd: "/tmp/repo" })),

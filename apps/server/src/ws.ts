@@ -1287,6 +1287,10 @@ const makeWsRpcLayer = (
         vcsStatusBroadcaster
           .refreshLocalStatus(cwd)
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
+      const refreshGitStatusWithoutFetch = (cwd: string) =>
+        vcsStatusBroadcaster
+          .refreshStatus(cwd, { refreshUpstream: false })
+          .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
 
       return WsRpcGroup.of({
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
@@ -2304,7 +2308,9 @@ const makeWsRpcLayer = (
         [WS_METHODS.gitCommitIndex]: (input) =>
           observeRpcEffect(
             WS_METHODS.gitCommitIndex,
-            gitWorkflow.commitIndex(input).pipe(Effect.tap(() => refreshLocalGitStatus(input.cwd))),
+            gitWorkflow
+              .commitIndex(input)
+              .pipe(Effect.tap(() => refreshGitStatusWithoutFetch(input.cwd))),
             { "rpc.aggregate": "git" },
           ),
         [WS_METHODS.vcsListRefs]: (input) =>

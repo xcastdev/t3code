@@ -1,4 +1,4 @@
-import { assert, it, describe } from "@effect/vitest";
+import { assert, it, describe, vi } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
@@ -67,15 +67,18 @@ const baseStatus: VcsStatusResult = {
   ...baseRemoteStatus,
 };
 
-function makeTestLayer(state: {
-  currentLocalStatus: VcsStatusLocalResult;
-  currentRemoteStatus: VcsStatusRemoteResult | null;
-  localStatusCalls: number;
-  remoteStatusCalls: number;
-  localInvalidationCalls: number;
-  remoteInvalidationCalls: number;
-  remoteStatusRefreshUpstreamValues?: Array<boolean | undefined>;
-}) {
+function makeTestLayer(
+  state: {
+    currentLocalStatus: VcsStatusLocalResult;
+    currentRemoteStatus: VcsStatusRemoteResult | null;
+    localStatusCalls: number;
+    remoteStatusCalls: number;
+    localInvalidationCalls: number;
+    remoteInvalidationCalls: number;
+    remoteStatusRefreshUpstreamValues?: Array<boolean | undefined>;
+  },
+  workflowOverrides: Partial<GitWorkflowService.GitWorkflowService["Service"]> = {},
+) {
   return VcsStatusBroadcaster.layer.pipe(
     Layer.provideMerge(NodeServices.layer),
     Layer.provide(makeBackgroundPolicyLayer(() => true)),
@@ -105,6 +108,7 @@ function makeTestLayer(state: {
             state.localInvalidationCalls += 1;
             state.remoteInvalidationCalls += 1;
           }),
+        ...workflowOverrides,
       }),
     ),
   );
@@ -206,6 +210,67 @@ describe("VcsStatusBroadcaster", () => {
       assert.equal(state.localInvalidationCalls, 1);
       assert.equal(state.remoteInvalidationCalls, 1);
     }).pipe(Effect.provide(makeTestLayer(state)));
+  });
+
+  it.effect("refreshStatus forwards no-fetch options and preserves remote caches", () => {
+    const state = {
+      currentLocalStatus: baseLocalStatus,
+      currentRemoteStatus: baseRemoteStatus,
+      localStatusCalls: 0,
+      remoteStatusCalls: 0,
+      localInvalidationCalls: 0,
+      remoteInvalidationCalls: 0,
+    };
+    const remoteStatus = vi.fn(((_input, _options) =>
+      Effect.sync(() => {
+        state.remoteStatusCalls += 1;
+        return state.currentRemoteStatus;
+      })) satisfies GitWorkflowService.GitWorkflowService["Service"]["remoteStatus"]);
+
+    return Effect.gen(function* () {
+      const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+      yield* broadcaster.getStatus({ cwd: "/repo" });
+      const initialSnapshot = yield* Deferred.make<VcsStatusStreamEvent>();
+      const refreshedSnapshot = yield* Deferred.make<VcsStatusStreamEvent>();
+      let snapshotCalls = 0;
+      yield* Stream.runForEach(broadcaster.streamStatus({ cwd: "/repo" }), (event) => {
+        if (event._tag !== "snapshot") {
+          return Effect.void;
+        }
+        snapshotCalls += 1;
+        return Deferred.succeed(
+          snapshotCalls === 1 ? initialSnapshot : refreshedSnapshot,
+          event,
+        ).pipe(Effect.ignore);
+      }).pipe(Effect.forkScoped);
+      yield* Deferred.await(initialSnapshot);
+
+      state.currentLocalStatus = {
+        ...baseLocalStatus,
+        refName: "feature/no-fetch-refresh",
+        hasWorkingTreeChanges: true,
+      };
+      state.currentRemoteStatus = {
+        ...baseRemoteStatus,
+        aheadCount: 1,
+      };
+
+      yield* broadcaster.refreshStatus("/repo", { refreshUpstream: false });
+      const snapshot = yield* Deferred.await(refreshedSnapshot);
+
+      assert.deepStrictEqual(snapshot, {
+        _tag: "snapshot",
+        local: state.currentLocalStatus,
+        remote: state.currentRemoteStatus,
+      } satisfies VcsStatusStreamEvent);
+      assert.equal(snapshotCalls, 2);
+      assert.deepEqual(remoteStatus.mock.calls.at(-1), [
+        { cwd: "/repo" },
+        { refreshUpstream: false },
+      ]);
+      assert.equal(state.localInvalidationCalls, 1);
+      assert.equal(state.remoteInvalidationCalls, 0);
+    }).pipe(Effect.provide(makeTestLayer(state, { remoteStatus })));
   });
 
   it.effect("keeps the cached snapshot unchanged when a refresh branch fails", () => {
