@@ -12,8 +12,14 @@ thread's working directory and has two views.
 The **Changes** view shows the current branch, ahead and behind counts, file changes, and a
 selected-file diff. The status updates when another client changes the working tree.
 
-Click **Stage** or **Unstage** to change a complete file in the Git index. Source Control does not
-support partial staging by hunk.
+Click **Stage** or **Unstage** to change a complete file in the Git index. A file that is both
+staged and modified offers both actions. Its diff can switch between **Staged** and **Working
+tree**, so you can inspect what Commit will record and what remains outside the index. Source
+Control does not support partial staging by hunk.
+
+When the connected environment runs an older T3 Code server, repository status, branches, Git
+initialization, and pull requests remain available. Update that server before using per-file diffs,
+staging, unstaging, or index-only commits from Source Control.
 
 Enter a commit message and click **Commit** to commit only the files already staged in the index.
 The commit action never stages unstaged files. T3 Code asks you to confirm commits on the default

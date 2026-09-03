@@ -55,15 +55,14 @@ export interface SourceControlPanelProps {
   readonly supportsGitIndexWorkflow: boolean;
 }
 
-export interface SourceControlPanelContentProps {
+interface SourceControlPanelContentProps {
   readonly view: SourceControlPanelView;
   readonly onViewChange: (view: SourceControlPanelView) => void;
   readonly changes: ReactNode;
   readonly pullRequests: ReactNode;
 }
 
-/** Stable presentation shell kept separate so the panel's visual contract is easy to test. */
-export function SourceControlPanelContent({
+function SourceControlPanelContent({
   view,
   onViewChange,
   changes,
