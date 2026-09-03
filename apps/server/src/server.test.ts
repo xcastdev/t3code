@@ -6475,6 +6475,42 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("forwards dirty create-and-switch errors through the typed rpc", () =>
+    Effect.gen(function* () {
+      const dirtyError = new GitCommandError({
+        operation: "GitVcsDriver.createRef.dirtyWorktree",
+        command: "git",
+        cwd: "/tmp/repo",
+        detail: "Switching refs with working tree changes requires confirmation.",
+        code: "dirty_worktree_confirmation_required",
+      });
+      yield* buildAppUnderTest({
+        layers: {
+          gitVcsDriver: {
+            createRef: (input) =>
+              input.confirmDirtyWorkingTree === false
+                ? Effect.fail(dirtyError)
+                : Effect.succeed({ refName: input.refName }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.vcsCreateRef]({
+            cwd: "/tmp/repo",
+            refName: "feature/dirty-create",
+            switchRef: true,
+            confirmDirtyWorkingTree: false,
+          }),
+        ).pipe(Effect.result),
+      );
+
+      assertFailure(result, dirtyError);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("routes websocket rpc git.pull errors", () =>
     Effect.gen(function* () {
       const gitError = new GitCommandError({

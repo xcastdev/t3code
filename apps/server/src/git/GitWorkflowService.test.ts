@@ -101,7 +101,7 @@ describe("GitWorkflowService", () => {
                 return resolveCalls;
               }).pipe(
                 Effect.tap((count) =>
-                  count === 4 ? Deferred.succeed(queuedCallsResolved, undefined) : Effect.void,
+                  count === 5 ? Deferred.succeed(queuedCallsResolved, undefined) : Effect.void,
                 ),
                 Effect.as({
                   kind: "git",
@@ -125,6 +125,8 @@ describe("GitWorkflowService", () => {
               }),
             unstageFiles: () => recordMutation("unstage"),
             commitIndex: () => recordMutation("commit").pipe(Effect.as({ commitSha: "abc123" })),
+            createRef: (input) =>
+              recordMutation("create-and-switch").pipe(Effect.as({ refName: input.refName })),
             switchRef: (input) =>
               recordMutation("switch").pipe(Effect.as({ refName: input.refName })),
           }),
@@ -142,6 +144,11 @@ describe("GitWorkflowService", () => {
           [
             workflow.unstageFiles({ cwd: "/repo/nested", paths: ["a.txt"] }),
             workflow.commitIndex({ cwd: "/repo/nested", message: "commit" }),
+            workflow.createRef({
+              cwd: "/repo/nested",
+              refName: "feature/new",
+              switchRef: true,
+            }),
             workflow.switchRef({ cwd: "/repo/nested", refName: "feature/test" }),
           ],
           (effect) => effect.pipe(Effect.forkChild),

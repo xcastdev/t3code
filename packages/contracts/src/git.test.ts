@@ -15,6 +15,7 @@ import {
   GitCommitIndexInput,
   GitCommandError,
   GitManagerServiceError,
+  VcsCreateRefInput,
   VcsSwitchRefInput,
 } from "./git.ts";
 
@@ -31,6 +32,7 @@ const decodeVcsStageFilesInput = Schema.decodeUnknownSync(VcsStageFilesInput);
 const decodeVcsWorkingTreeDiffInput = Schema.decodeUnknownSync(VcsWorkingTreeDiffInput);
 const decodeVcsWorkingTreeDiffResult = Schema.decodeUnknownSync(VcsWorkingTreeDiffResult);
 const decodeGitCommitIndexInput = Schema.decodeUnknownSync(GitCommitIndexInput);
+const decodeVcsCreateRefInput = Schema.decodeUnknownSync(VcsCreateRefInput);
 const decodeVcsSwitchRefInput = Schema.decodeUnknownSync(VcsSwitchRefInput);
 const decodeGitManagerServiceError = Schema.decodeUnknownSync(GitManagerServiceError);
 const decodeGitCommandError = Schema.decodeUnknownSync(GitCommandError);
@@ -299,7 +301,7 @@ describe("Git index and diff contracts", () => {
     expect(parsed.indexTree).toBe("tree-1");
   });
 
-  it("accepts guarded commit and ref-switch requests", () => {
+  it("accepts guarded commit and ref mutation requests", () => {
     const precondition = {
       expectedHeadCommit: null,
       expectedIndexTree: "tree-1",
@@ -314,6 +316,14 @@ describe("Git index and diff contracts", () => {
       }),
     ).toMatchObject({ precondition, confirmDefaultRef: true });
     expect(
+      decodeVcsCreateRefInput({
+        cwd: "/repo",
+        refName: "feature/workflow",
+        switchRef: true,
+        confirmDirtyWorkingTree: true,
+      }),
+    ).toMatchObject({ switchRef: true, confirmDirtyWorkingTree: true });
+    expect(
       decodeVcsSwitchRefInput({
         cwd: "/repo",
         refName: "feature/workflow",
@@ -322,7 +332,9 @@ describe("Git index and diff contracts", () => {
     ).toMatchObject({ confirmDirtyWorkingTree: true });
   });
 
-  it("retains the existing non-empty validation for guarded ref switches", () => {
+  it("retains the existing non-empty validation for guarded ref mutations", () => {
+    expect(() => decodeVcsCreateRefInput({ cwd: "", refName: "feature/workflow" })).toThrow();
+    expect(() => decodeVcsCreateRefInput({ cwd: "/repo", refName: "   " })).toThrow();
     expect(() => decodeVcsSwitchRefInput({ cwd: "", refName: "feature/workflow" })).toThrow();
     expect(() => decodeVcsSwitchRefInput({ cwd: "/repo", refName: "   " })).toThrow();
   });

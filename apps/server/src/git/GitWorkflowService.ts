@@ -387,9 +387,7 @@ export const make = Effect.gen(function* () {
         Effect.andThen(git.pruneWorktrees(input)),
       ),
     createRef: (input) =>
-      ensureGitCommand("GitWorkflowService.createRef", input.cwd).pipe(
-        Effect.andThen(git.createRef(input)),
-      ),
+      serializedMutation("GitWorkflowService.createRef", input.cwd, git.createRef(input)),
     switchRef: (input) =>
       serializedMutation(
         "GitWorkflowService.switchRef",

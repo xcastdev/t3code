@@ -1521,6 +1521,37 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("rejects dirty create-and-switch before creating the ref", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* writeTextFile(cwd, "dirty.txt", "dirty\n");
+
+        const error = yield* driver
+          .createRef({
+            cwd,
+            refName: "feature/dirty-create",
+            switchRef: true,
+            confirmDirtyWorkingTree: false,
+          })
+          .pipe(Effect.flip);
+
+        assert.equal(error.code, "dirty_worktree_confirmation_required");
+        assert.equal(yield* git(cwd, ["branch", "--show-current"]), initialBranch);
+        assert.equal(yield* git(cwd, ["branch", "--list", "feature/dirty-create"]), "");
+
+        const created = yield* driver.createRef({
+          cwd,
+          refName: "feature/dirty-create",
+          switchRef: true,
+          confirmDirtyWorkingTree: true,
+        });
+        assert.equal(created.refName, "feature/dirty-create");
+        assert.equal(yield* git(cwd, ["branch", "--show-current"]), "feature/dirty-create");
+      }),
+    );
+
     it.effect("returns the existing refName when rename source and target match", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();

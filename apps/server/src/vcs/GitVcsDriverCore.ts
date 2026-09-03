@@ -1076,6 +1076,28 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       detail,
     });
 
+  const guardDirtyWorkingTree = Effect.fn("GitVcsDriver.guardDirtyWorkingTree")(function* (
+    operation: string,
+    input: { readonly cwd: string; readonly confirmDirtyWorkingTree?: boolean | undefined },
+  ) {
+    if (input.confirmDirtyWorkingTree === undefined || input.confirmDirtyWorkingTree === true) {
+      return;
+    }
+
+    const porcelainStatus = yield* runGitStdout(`${operation}.status`, input.cwd, [
+      "status",
+      "--porcelain",
+    ]);
+    if (porcelainStatus.length > 0) {
+      return yield* mutationRejection(
+        `${operation}.dirtyWorktree`,
+        input.cwd,
+        "dirty_worktree_confirmation_required",
+        "Switching refs with working tree changes requires confirmation.",
+      );
+    }
+  });
+
   const branchExists = (cwd: string, refName: string): Effect.Effect<boolean, GitCommandError> =>
     executeGit(
       "GitVcsDriver.branchExists",
@@ -3631,20 +3653,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
   const switchRef: GitVcsDriver.GitVcsDriver["Service"]["switchRef"] = Effect.fn("switchRef")(
     function* (input) {
-      if (input.confirmDirtyWorkingTree !== undefined && input.confirmDirtyWorkingTree !== true) {
-        const porcelainStatus = yield* runGitStdout("GitVcsDriver.switchRef.status", input.cwd, [
-          "status",
-          "--porcelain",
-        ]);
-        if (porcelainStatus.length > 0) {
-          return yield* mutationRejection(
-            "GitVcsDriver.switchRef.dirtyWorktree",
-            input.cwd,
-            "dirty_worktree_confirmation_required",
-            "Switching refs with working tree changes requires confirmation.",
-          );
-        }
-      }
+      yield* guardDirtyWorkingTree("GitVcsDriver.switchRef", input);
 
       const [localInputExists, remoteExists] = yield* Effect.all(
         [
@@ -3728,12 +3737,20 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
   const createRef: GitVcsDriver.GitVcsDriver["Service"]["createRef"] = Effect.fn("createRef")(
     function* (input) {
+      if (input.switchRef) {
+        yield* guardDirtyWorkingTree("GitVcsDriver.createRef", input);
+      }
+
       yield* executeGit("GitVcsDriver.createRef", input.cwd, ["branch", input.refName], {
         timeoutMs: 10_000,
         fallbackErrorDetail: "git branch create failed",
       });
       if (input.switchRef) {
-        yield* switchRef({ cwd: input.cwd, refName: input.refName });
+        yield* switchRef({
+          cwd: input.cwd,
+          refName: input.refName,
+          confirmDirtyWorkingTree: true,
+        });
       }
 
       return { refName: input.refName };
