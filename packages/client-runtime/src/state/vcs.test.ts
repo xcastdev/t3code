@@ -817,4 +817,92 @@ describe("Git workflow command atoms", () => {
       }),
     ),
   );
+
+  it.effect("refreshes a mounted working-tree diff after staging and unstaging files", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        let diffRequestCount = 0;
+        const client = {
+          [WS_METHODS.vcsStageFiles]: (_input: unknown) => Effect.void,
+          [WS_METHODS.vcsUnstageFiles]: (_input: unknown) => Effect.void,
+          [WS_METHODS.vcsGetWorkingTreeDiff]: (_input: unknown) =>
+            Effect.sync(() => {
+              diffRequestCount += 1;
+              return { diff: `diff-${diffRequestCount}`, truncated: false };
+            }),
+        } as unknown as WsRpcProtocolClient;
+        const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+          target: TARGET,
+          state: yield* SubscriptionRef.make(CONNECTED_CONNECTION_STATE),
+          session: yield* SubscriptionRef.make(Option.some(session(client))),
+          prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+          connect: Effect.void,
+          disconnect: Effect.void,
+          retryNow: Effect.void,
+        } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+        const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
+          run: <A, E, R>(_environmentId: EnvironmentId, effect: Effect.Effect<A, E, R>) =>
+            Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          followStream: <A, E, R>(_environmentId: EnvironmentId, stream: Stream.Stream<A, E, R>) =>
+            Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
+        const runtime = Atom.runtime(
+          Layer.merge(
+            Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
+            Layer.succeed(Persistence.EnvironmentCacheStore, cacheWithRefs(Option.none())),
+          ),
+        );
+        const atoms = createVcsEnvironmentAtoms(runtime);
+        const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (value) =>
+          Effect.sync(() => value.dispose()),
+        );
+        const diff = atoms.getWorkingTreeDiffQuery({
+          environmentId: TARGET.environmentId,
+          input: { cwd: "/repo", path: "a.txt", comparison: "index" },
+        });
+        const unsubscribe = registry.subscribe(diff, () => undefined, { immediate: true });
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+        yield* Effect.yieldNow;
+
+        expect(yield* AtomRegistry.getResult(registry, diff, { suspendOnWaiting: true })).toEqual({
+          diff: "diff-1",
+          truncated: false,
+        });
+
+        expect(
+          AsyncResult.isSuccess(
+            yield* Effect.promise(() =>
+              atoms.stageFiles.run(registry, {
+                environmentId: TARGET.environmentId,
+                input: { cwd: "/repo", paths: ["a.txt"] },
+              }),
+            ),
+          ),
+        ).toBe(true);
+
+        expect(yield* AtomRegistry.getResult(registry, diff, { suspendOnWaiting: true })).toEqual({
+          diff: "diff-2",
+          truncated: false,
+        });
+        expect(diffRequestCount).toBe(2);
+
+        expect(
+          AsyncResult.isSuccess(
+            yield* Effect.promise(() =>
+              atoms.unstageFiles.run(registry, {
+                environmentId: TARGET.environmentId,
+                input: { cwd: "/repo", paths: ["a.txt"] },
+              }),
+            ),
+          ),
+        ).toBe(true);
+
+        expect(yield* AtomRegistry.getResult(registry, diff, { suspendOnWaiting: true })).toEqual({
+          diff: "diff-3",
+          truncated: false,
+        });
+        expect(diffRequestCount).toBe(3);
+      }),
+    ),
+  );
 });

@@ -2,6 +2,7 @@ import {
   type EnvironmentId,
   type VcsListRefsInput,
   type VcsListRefsResult,
+  type VcsStageFilesInput,
   type VcsStatusResult,
   WS_METHODS,
 } from "@t3tools/contracts";
@@ -274,6 +275,27 @@ export function createVcsEnvironmentAtoms<R, E>(
       environmentId: target.environmentId,
       cwd: target.input.cwd,
     });
+  const getWorkingTreeDiffQuery = createEnvironmentRpcQueryAtomFamily(runtime, {
+    label: "environment-data:vcs:working-tree-diff-query",
+    tag: WS_METHODS.vcsGetWorkingTreeDiff,
+    idleTtlMs: 0,
+  });
+  const refreshWorkingTreeDiffs = (
+    target: { readonly environmentId: EnvironmentId; readonly input: VcsStageFilesInput },
+    registry: AtomRegistry.AtomRegistry,
+  ) =>
+    Effect.sync(() => {
+      for (const path of target.input.paths) {
+        for (const comparison of ["index", "head"] as const) {
+          registry.refresh(
+            getWorkingTreeDiffQuery({
+              environmentId: target.environmentId,
+              input: { cwd: target.input.cwd, path, comparison },
+            }),
+          );
+        }
+      }
+    });
 
   return {
     listRefs,
@@ -309,12 +331,14 @@ export function createVcsEnvironmentAtoms<R, E>(
       tag: WS_METHODS.vcsStageFiles,
       scheduler: vcsCommandScheduler,
       concurrency: vcsCommandConcurrency,
+      onSuccess: refreshWorkingTreeDiffs,
     }),
     unstageFiles: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:vcs:unstage-files",
       tag: WS_METHODS.vcsUnstageFiles,
       scheduler: vcsCommandScheduler,
       concurrency: vcsCommandConcurrency,
+      onSuccess: refreshWorkingTreeDiffs,
     }),
     getWorkingTreeDiff: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:vcs:working-tree-diff",
@@ -322,11 +346,7 @@ export function createVcsEnvironmentAtoms<R, E>(
       scheduler: vcsCommandScheduler,
       concurrency: vcsCommandConcurrency,
     }),
-    getWorkingTreeDiffQuery: createEnvironmentRpcQueryAtomFamily(runtime, {
-      label: "environment-data:vcs:working-tree-diff-query",
-      tag: WS_METHODS.vcsGetWorkingTreeDiff,
-      idleTtlMs: 0,
-    }),
+    getWorkingTreeDiffQuery,
     commitIndex: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:git:commit-index",
       tag: WS_METHODS.gitCommitIndex,
