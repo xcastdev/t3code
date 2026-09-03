@@ -521,6 +521,57 @@ describe("VcsStatusBroadcaster", () => {
     }).pipe(Effect.provide(testLayer));
   });
 
+  it.effect("shares local revisions for nested CWDs in one repository", () => {
+    const state = {
+      currentLocalStatus: baseLocalStatus,
+      currentRemoteStatus: baseRemoteStatus,
+      localStatusCalls: 0,
+      remoteStatusCalls: 0,
+      localInvalidationCalls: 0,
+      remoteInvalidationCalls: 0,
+    };
+
+    return Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const repositoryRoot = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-vcs-status-root-",
+      });
+      const nestedCwd = path.join(repositoryRoot, "nested");
+      yield* fileSystem.makeDirectory(nestedCwd);
+      state.currentLocalStatus = {
+        ...baseLocalStatus,
+        repositoryRoot,
+      };
+
+      const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+      const snapshotDeferred = yield* Deferred.make<VcsStatusStreamEvent>();
+      const updateDeferred = yield* Deferred.make<VcsStatusStreamEvent>();
+      yield* Stream.runForEach(broadcaster.streamStatus({ cwd: repositoryRoot }), (event) => {
+        if (event._tag === "snapshot") {
+          return Deferred.succeed(snapshotDeferred, event).pipe(Effect.ignore);
+        }
+        if (event._tag === "localUpdated") {
+          return Deferred.succeed(updateDeferred, event).pipe(Effect.ignore);
+        }
+        return Effect.void;
+      }).pipe(Effect.forkScoped);
+
+      const snapshot = yield* Deferred.await(snapshotDeferred);
+      yield* broadcaster.refreshLocalStatus(nestedCwd);
+      const update = yield* Deferred.await(updateDeferred);
+
+      assert.equal(snapshot._tag, "snapshot");
+      assert.equal(update._tag, "localUpdated");
+      if (snapshot._tag !== "snapshot" || update._tag !== "localUpdated") {
+        throw new Error("Expected local status events.");
+      }
+      assert.equal(snapshot.local.localRevision, "1");
+      assert.equal(update.local.localRevision, "2");
+      assert.equal(update.local.repositoryRoot, repositoryRoot);
+    }).pipe(Effect.provide(makeTestLayer(state)));
+  });
+
   it.effect("streams a local snapshot first and remote updates later", () => {
     const state = {
       currentLocalStatus: baseLocalStatus,

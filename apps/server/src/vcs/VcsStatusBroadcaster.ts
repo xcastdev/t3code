@@ -203,6 +203,32 @@ export const make = Effect.gen(function* () {
   );
   const cacheRef = yield* Ref.make(new Map<string, CachedVcsStatus>());
   const pollersRef = yield* SynchronizedRef.make(new Map<string, ActiveRemotePoller>());
+  const withFileSystem = Effect.provideService(FileSystem.FileSystem, fs);
+
+  const statusCacheKeyForLocal = Effect.fn("VcsStatusBroadcaster.statusCacheKeyForLocal")(
+    function* (requestedCwd: string, local: VcsStatusLocalResult) {
+      if (local.repositoryRoot === undefined) {
+        return requestedCwd;
+      }
+      return yield* withFileSystem(normalizeCwd(local.repositoryRoot));
+    },
+  );
+
+  const removeStatusCacheAlias = Effect.fn("VcsStatusBroadcaster.removeStatusCacheAlias")(
+    function* (requestedCwd: string, canonicalCwd: string) {
+      if (requestedCwd === canonicalCwd) {
+        return;
+      }
+      yield* Ref.update(cacheRef, (cache) => {
+        if (!cache.has(requestedCwd)) {
+          return cache;
+        }
+        const nextCache = new Map(cache);
+        nextCache.delete(requestedCwd);
+        return nextCache;
+      });
+    },
+  );
 
   const getCachedStatus = Effect.fn("VcsStatusBroadcaster.getCachedStatus")(function* (
     cwd: string,
@@ -334,7 +360,9 @@ export const make = Effect.gen(function* () {
     cwd: string,
   ) {
     const local = yield* workflow.localStatus({ cwd });
-    return yield* updateCachedLocalStatus(cwd, local);
+    const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
+    yield* removeStatusCacheAlias(cwd, canonicalCwd);
+    return yield* updateCachedLocalStatus(canonicalCwd, local);
   });
 
   const getOrLoadLocalStatus = Effect.fn("VcsStatusBroadcaster.getOrLoadLocalStatus")(function* (
@@ -347,31 +375,40 @@ export const make = Effect.gen(function* () {
     return yield* loadLocalStatus(cwd);
   });
 
-  const withFileSystem = Effect.provideService(FileSystem.FileSystem, fs);
-
   const getStatus: VcsStatusBroadcaster["Service"]["getStatus"] = Effect.fn(
     "VcsStatusBroadcaster.getStatus",
   )(function* (input) {
     const cwd = yield* withFileSystem(normalizeCwd(input.cwd));
     const cached = yield* getCachedStatus(cwd);
     if (cached?.local && cached.remote) {
-      return mergeGitStatusParts(cached.local.value, cached.remote.value);
+      const canonicalCwd = yield* statusCacheKeyForLocal(cwd, cached.local.value);
+      if (canonicalCwd === cwd) {
+        return mergeGitStatusParts(cached.local.value, cached.remote.value);
+      }
+      const canonicalCached = yield* getCachedStatus(canonicalCwd);
+      if (canonicalCached?.local && canonicalCached.remote) {
+        return mergeGitStatusParts(canonicalCached.local.value, canonicalCached.remote.value);
+      }
     }
-    const [local, remote] = yield* Effect.all(
-      [
-        cached?.local ? Effect.succeed(cached.local.value) : workflow.localStatus({ cwd }),
-        cached?.remote ? Effect.succeed(cached.remote.value) : workflow.remoteStatus({ cwd }),
-      ],
-      { concurrency: "unbounded" },
-    );
-    return yield* updateCachedStatus(cwd, local, remote);
+
+    const local = cached?.local?.value ?? (yield* workflow.localStatus({ cwd }));
+    const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
+    const canonicalCached = yield* getCachedStatus(canonicalCwd);
+    const remote =
+      canonicalCached?.remote?.value ??
+      cached?.remote?.value ??
+      (yield* workflow.remoteStatus({ cwd }));
+    yield* removeStatusCacheAlias(cwd, canonicalCwd);
+    return yield* updateCachedStatus(canonicalCwd, local, remote);
   });
 
   const refreshLocalStatusCore = Effect.fn("VcsStatusBroadcaster.refreshLocalStatusCore")(
     function* (cwd: string) {
       yield* workflow.invalidateLocalStatus(cwd);
       const local = yield* workflow.localStatus({ cwd });
-      return yield* updateCachedLocalStatus(cwd, local, { publish: true });
+      const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
+      yield* removeStatusCacheAlias(cwd, canonicalCwd);
+      return yield* updateCachedLocalStatus(canonicalCwd, local, { publish: true });
     },
   );
 
@@ -408,7 +445,9 @@ export const make = Effect.gen(function* () {
       [workflow.localStatus({ cwd }), workflow.remoteStatus({ cwd }, options)],
       { concurrency: "unbounded" },
     );
-    return yield* updateCachedStatus(cwd, local, remote, { publish: true });
+    const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
+    yield* removeStatusCacheAlias(cwd, canonicalCwd);
+    return yield* updateCachedStatus(canonicalCwd, local, remote, { publish: true });
   });
 
   const makeRemoteRefreshLoop = (
@@ -591,17 +630,21 @@ export const make = Effect.gen(function* () {
         const cwd = yield* withFileSystem(normalizeCwd(input.cwd));
         const subscription = yield* PubSub.subscribe(changesPubSub);
         const initialLocal = yield* getOrLoadLocalStatus(cwd);
-        const cachedStatus = yield* getCachedStatus(cwd);
+        const repositoryCwd = yield* statusCacheKeyForLocal(cwd, initialLocal);
+        const cachedStatus = yield* getCachedStatus(repositoryCwd);
         const initialRemote = cachedStatus?.remote?.value ?? null;
         yield* retainRemotePoller(
-          cwd,
+          repositoryCwd,
           input.cwd,
           options?.automaticRemoteRefreshInterval ??
             Effect.succeed(DEFAULT_VCS_STATUS_REFRESH_INTERVAL),
           cachedStatus?.remote === null || cachedStatus?.remote === undefined,
         );
 
-        const release = releaseRemotePoller(cwd, input.cwd).pipe(Effect.ignore, Effect.asVoid);
+        const release = releaseRemotePoller(repositoryCwd, input.cwd).pipe(
+          Effect.ignore,
+          Effect.asVoid,
+        );
 
         return Stream.concat(
           Stream.make({
@@ -610,7 +653,7 @@ export const make = Effect.gen(function* () {
             remote: initialRemote,
           }),
           Stream.fromSubscription(subscription).pipe(
-            Stream.filter((event) => event.cwd === cwd),
+            Stream.filter((event) => event.cwd === repositoryCwd),
             Stream.map((event) => event.event),
           ),
         ).pipe(Stream.ensuring(release));

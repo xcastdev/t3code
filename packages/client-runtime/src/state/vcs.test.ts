@@ -3,6 +3,7 @@ import {
   WS_METHODS,
   type VcsListRefsInput,
   type VcsListRefsResult,
+  type VcsStatusStreamEvent,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
@@ -986,6 +987,97 @@ describe("Git workflow command atoms", () => {
           { cwd: "/repo", path: "a.txt", comparison: "index" },
           { cwd: "/repo", path: "a.txt", comparison: "index" },
         ]);
+      }),
+    ),
+  );
+
+  it.effect("refreshes the mounted diff when a streamed local revision advances", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const firstDiffRequested = yield* Deferred.make<void>();
+        const secondDiffRequested = yield* Deferred.make<void>();
+        const statusUpdate = yield* Deferred.make<VcsStatusStreamEvent>();
+        let diffRequestCount = 0;
+        const local = {
+          isRepo: true,
+          repositoryRoot: "/repo",
+          hasPrimaryRemote: false,
+          isDefaultRef: true,
+          refName: "main",
+          localRevision: "1",
+          headCommit: "head-1",
+          indexTree: "tree-1",
+          hasWorkingTreeChanges: true,
+          workingTree: {
+            files: [
+              { path: "a.txt", insertions: 1, deletions: 0, indexStatus: "unstaged" as const },
+            ],
+            insertions: 1,
+            deletions: 0,
+          },
+        };
+        const client = {
+          [WS_METHODS.subscribeVcsStatus]: () =>
+            Stream.concat(
+              Stream.make({ _tag: "snapshot" as const, local, remote: null }),
+              Stream.fromEffect(Deferred.await(statusUpdate)),
+            ).pipe(Stream.concat(Stream.never)),
+          [WS_METHODS.vcsGetWorkingTreeDiff]: (_input: unknown) =>
+            Effect.sync(() => {
+              diffRequestCount += 1;
+              return { diff: `diff-${diffRequestCount}`, truncated: false };
+            }).pipe(
+              Effect.tap(() =>
+                diffRequestCount === 1
+                  ? Deferred.succeed(firstDiffRequested, undefined)
+                  : Deferred.succeed(secondDiffRequested, undefined),
+              ),
+            ),
+        } as unknown as WsRpcProtocolClient;
+        const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+          target: TARGET,
+          state: yield* SubscriptionRef.make(CONNECTED_CONNECTION_STATE),
+          session: yield* SubscriptionRef.make(Option.some(session(client))),
+          prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+          connect: Effect.void,
+          disconnect: Effect.void,
+          retryNow: Effect.void,
+        } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+        const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
+          run: <A, E, R>(_environmentId: EnvironmentId, effect: Effect.Effect<A, E, R>) =>
+            Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          followStream: <A, E, R>(_environmentId: EnvironmentId, stream: Stream.Stream<A, E, R>) =>
+            Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
+        const runtime = Atom.runtime(
+          Layer.merge(
+            Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
+            Layer.succeed(Persistence.EnvironmentCacheStore, cacheWithRefs(Option.none())),
+          ),
+        );
+        const atoms = createVcsEnvironmentAtoms(runtime);
+        const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (value) =>
+          Effect.sync(() => value.dispose()),
+        );
+        const diff = atoms.getWorkingTreeDiffQuery({
+          environmentId: TARGET.environmentId,
+          input: { cwd: "/repo", path: "a.txt", comparison: "head", localRevision: "1" },
+        });
+
+        const unsubscribe = registry.subscribe(diff, () => undefined, { immediate: true });
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+        yield* Deferred.await(firstDiffRequested);
+        expect(yield* AtomRegistry.getResult(registry, diff, { suspendOnWaiting: true })).toEqual({
+          diff: "diff-1",
+          truncated: false,
+        });
+
+        yield* Deferred.succeed(statusUpdate, {
+          _tag: "localUpdated",
+          local: { ...local, localRevision: "2", headCommit: "head-2", indexTree: "tree-2" },
+        });
+        yield* Deferred.await(secondDiffRequested);
+        expect(diffRequestCount).toBe(2);
       }),
     ),
   );

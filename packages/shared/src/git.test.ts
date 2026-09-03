@@ -136,6 +136,10 @@ describe("applyGitStatusStreamEvent", () => {
   it("preserves local-only fields when applying a remote update", () => {
     const current: VcsStatusResult = {
       isRepo: true,
+      repositoryRoot: "/repo",
+      localRevision: "7",
+      headCommit: "abc123",
+      indexTree: "def456",
       sourceControlProvider: {
         kind: "github",
         name: "GitHub",
@@ -169,6 +173,40 @@ describe("applyGitStatusStreamEvent", () => {
       aheadCount: 2,
       behindCount: 1,
       pr: null,
+    });
+  });
+
+  it("preserves local identity and freshness metadata across remote updates", () => {
+    const current: VcsStatusResult = {
+      isRepo: true,
+      repositoryRoot: "/repo",
+      localRevision: "11",
+      headCommit: "head-11",
+      indexTree: "tree-11",
+      hasPrimaryRemote: true,
+      isDefaultRef: false,
+      refName: "feature/demo",
+      hasWorkingTreeChanges: true,
+      workingTree: { files: [], insertions: 0, deletions: 0 },
+      hasUpstream: false,
+      aheadCount: 0,
+      behindCount: 0,
+      pr: null,
+    };
+
+    expect(
+      applyGitStatusStreamEvent(current, {
+        _tag: "remoteUpdated",
+        remote: { hasUpstream: true, aheadCount: 1, behindCount: 2, pr: null },
+      }),
+    ).toMatchObject({
+      repositoryRoot: "/repo",
+      localRevision: "11",
+      headCommit: "head-11",
+      indexTree: "tree-11",
+      hasUpstream: true,
+      aheadCount: 1,
+      behindCount: 2,
     });
   });
 });

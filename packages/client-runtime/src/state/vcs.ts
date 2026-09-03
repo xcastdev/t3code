@@ -14,7 +14,7 @@ import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { Atom, AtomRegistry } from "effect/unstable/reactivity";
+import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import {
   createEnvironmentRpcCommand,
@@ -275,6 +275,7 @@ export function createVcsEnvironmentAtoms<R, E>(
       environmentId: target.environmentId,
       cwd: target.input.cwd,
     });
+
   const status = createEnvironmentSubscriptionAtomFamily(runtime, {
     label: "environment-data:vcs:status",
     subscribe: (input: EnvironmentRpcInput<typeof WS_METHODS.subscribeVcsStatus>) =>
@@ -288,7 +289,7 @@ export function createVcsEnvironmentAtoms<R, E>(
         ),
       ),
   });
-  const getWorkingTreeDiffQuery = createEnvironmentQueryAtomFamily(runtime, {
+  const rawWorkingTreeDiffQuery = createEnvironmentQueryAtomFamily(runtime, {
     label: "environment-data:vcs:working-tree-diff-query",
     idleTtlMs: 0,
     execute: (
@@ -302,6 +303,42 @@ export function createVcsEnvironmentAtoms<R, E>(
         comparison: input.comparison,
       }),
   });
+  const workingTreeDiffQueryFamily = Atom.family((key: string) => {
+    const [environmentId, input] = JSON.parse(key) as [
+      EnvironmentId,
+      EnvironmentRpcInput<typeof WS_METHODS.vcsGetWorkingTreeDiff> & {
+        readonly localRevision?: string;
+      },
+    ];
+    const rawQuery = rawWorkingTreeDiffQuery({ environmentId, input });
+    return Atom.readable(
+      (get) => {
+        const statusResult = get(status({ environmentId, input: { cwd: input.cwd } }));
+        const statusValue = Option.getOrNull(AsyncResult.value(statusResult));
+        const localRevision = statusValue?.localRevision ?? input.localRevision;
+        return get(
+          rawWorkingTreeDiffQuery({
+            environmentId,
+            input: {
+              cwd: input.cwd,
+              path: input.path,
+              comparison: input.comparison,
+              ...(localRevision === undefined ? {} : { localRevision }),
+            },
+          }),
+        );
+      },
+      (refresh) => refresh(rawQuery),
+    ).pipe(Atom.setIdleTTL(0), Atom.withLabel(`environment-data:vcs:working-tree-diff:${key}`));
+  });
+  const getWorkingTreeDiffQuery = (target: {
+    readonly environmentId: EnvironmentId;
+    readonly input: EnvironmentRpcInput<typeof WS_METHODS.vcsGetWorkingTreeDiff> & {
+      readonly localRevision?: string;
+    };
+  }) => {
+    return workingTreeDiffQueryFamily(JSON.stringify([target.environmentId, target.input]));
+  };
   const refreshWorkingTreeDiffs = (
     target: { readonly environmentId: EnvironmentId; readonly input: VcsStageFilesInput },
     registry: AtomRegistry.AtomRegistry,
