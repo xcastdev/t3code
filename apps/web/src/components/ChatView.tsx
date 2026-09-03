@@ -2004,6 +2004,8 @@ function ChatViewContent(props: ChatViewProps) {
     : (primaryEnvironment?.serverConfig ?? null);
   const pullRequestsCapabilityKnown = serverConfig !== null;
   const supportsPullRequests = serverConfig?.environment.capabilities.pullRequests === true;
+  const gitIndexWorkflowCapabilityKnown = serverConfig !== null;
+  const supportsGitIndexWorkflow = serverConfig?.environment.capabilities.gitIndexWorkflow === true;
   const attachmentEnvironmentConfig = environmentById.get(environmentId)?.serverConfig ?? null;
   const attachmentUploadsCapabilityKnown = attachmentEnvironmentConfig !== null;
   const supportsAttachmentUploads =
@@ -6776,6 +6778,8 @@ function ChatViewContent(props: ChatViewProps) {
         }}
         supportsPullRequests={supportsPullRequests}
         pullRequestsCapabilityKnown={pullRequestsCapabilityKnown}
+        gitIndexWorkflowCapabilityKnown={gitIndexWorkflowCapabilityKnown}
+        supportsGitIndexWorkflow={supportsGitIndexWorkflow}
       />
     ) : activeRightPanelSurface?.kind === "pull-request" && !pullRequestsCapabilityKnown ? (
       <PullRequestDetailGhost />

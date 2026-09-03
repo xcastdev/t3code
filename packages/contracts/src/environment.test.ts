@@ -14,6 +14,19 @@ const descriptor = {
 } as const;
 
 describe("ExecutionEnvironmentDescriptor", () => {
+  it("treats a missing Git index workflow capability as unsupported", () => {
+    expect(decodeDescriptor(descriptor).capabilities.gitIndexWorkflow).toBeUndefined();
+  });
+
+  it("preserves an advertised Git index workflow capability", () => {
+    expect(
+      decodeDescriptor({
+        ...descriptor,
+        capabilities: { ...descriptor.capabilities, gitIndexWorkflow: true },
+      }).capabilities.gitIndexWorkflow,
+    ).toBe(true);
+  });
+
   it("treats a missing pull-request capability as unsupported under version skew", () => {
     expect(decodeDescriptor(descriptor).capabilities.pullRequests).toBeUndefined();
   });

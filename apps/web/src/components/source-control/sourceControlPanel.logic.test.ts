@@ -3,12 +3,19 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   canAttemptDirtyBranchSwitch,
   fileAction,
+  gitIndexWorkflowAvailability,
   isFileStaged,
   needsDirtyBranchConfirmation,
   pullRequestShortcutTarget,
 } from "./sourceControlPanel.logic";
 
 describe("source control panel logic", () => {
+  it("does not use Git index workflow RPCs until support is advertised", () => {
+    expect(gitIndexWorkflowAvailability(false, false)).toBe("loading");
+    expect(gitIndexWorkflowAvailability(true, false)).toBe("unsupported");
+    expect(gitIndexWorkflowAvailability(true, true)).toBe("available");
+  });
+
   it("blocks branch switching until status is known", () => {
     expect(canAttemptDirtyBranchSwitch(undefined)).toBe(false);
     expect(canAttemptDirtyBranchSwitch(false)).toBe(true);

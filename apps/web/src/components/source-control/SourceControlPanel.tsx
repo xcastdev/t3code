@@ -32,6 +32,7 @@ import { Spinner } from "../ui/spinner";
 import { Textarea } from "../ui/textarea";
 import {
   fileAction,
+  gitIndexWorkflowAvailability,
   isFileStaged,
   sourceControlFileStatusLabel,
   type SourceControlPanelView,
@@ -48,6 +49,8 @@ export interface SourceControlPanelProps {
   readonly onViewChange: (view: SourceControlPanelView) => void;
   readonly supportsPullRequests: boolean;
   readonly pullRequestsCapabilityKnown: boolean;
+  readonly gitIndexWorkflowCapabilityKnown: boolean;
+  readonly supportsGitIndexWorkflow: boolean;
 }
 
 export interface SourceControlPanelContentProps {
@@ -184,11 +187,15 @@ function ChangesView({
   threadId,
   cwd,
   envLocked,
+  gitIndexWorkflowCapabilityKnown,
+  supportsGitIndexWorkflow,
 }: {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly cwd: string | null;
   readonly envLocked: boolean;
+  readonly gitIndexWorkflowCapabilityKnown: boolean;
+  readonly supportsGitIndexWorkflow: boolean;
 }) {
   const statusQuery = useEnvironmentQuery(
     cwd === null ? null : vcsEnvironment.status({ environmentId, input: { cwd } }),
@@ -206,8 +213,14 @@ function ChangesView({
     if (selectedPath !== null && selectedFile === null) setSelectedPath(null);
   }, [selectedFile, selectedPath]);
 
+  const workflowAvailability = gitIndexWorkflowAvailability(
+    gitIndexWorkflowCapabilityKnown,
+    supportsGitIndexWorkflow,
+  );
+  const workflowAvailable = workflowAvailability === "available";
+
   const diffQuery = useEnvironmentQuery(
-    selectedFile !== null && cwd !== null
+    workflowAvailable && selectedFile !== null && cwd !== null
       ? vcsEnvironment.getWorkingTreeDiffQuery({
           environmentId,
           input: { cwd, path: selectedFile.path, comparison: "head" },
@@ -221,7 +234,7 @@ function ChangesView({
 
   const runIndexAction = useCallback(
     async (file: VcsWorkingTreeFile) => {
-      if (cwd === null) return;
+      if (!workflowAvailable || cwd === null) return;
       const action = fileAction(file);
       if (action.disabled) return;
       setPendingPath(file.path);
@@ -235,7 +248,7 @@ function ChangesView({
         setActionError(commandError(result));
       }
     },
-    [cwd, environmentId, stage, unstage],
+    [cwd, environmentId, stage, unstage, workflowAvailable],
   );
 
   const runInit = useCallback(async () => {
@@ -248,7 +261,14 @@ function ChangesView({
   }, [cwd, environmentId, init]);
 
   const submitCommit = useCallback(async () => {
-    if (cwd === null || status === null || commitMessage.trim().length === 0) return;
+    if (
+      !workflowAvailable ||
+      cwd === null ||
+      status === null ||
+      commitMessage.trim().length === 0
+    ) {
+      return;
+    }
     const staged = files.some(isFileStaged);
     if (!staged || commitPending) return;
     if (status.isDefaultRef) {
@@ -275,7 +295,7 @@ function ChangesView({
       return;
     }
     setCommitMessage("");
-  }, [commit, commitMessage, commitPending, cwd, environmentId, files, status]);
+  }, [commit, commitMessage, commitPending, cwd, environmentId, files, status, workflowAvailable]);
 
   if (statusQuery.isPending && status === null) {
     return <div className="p-3 text-xs text-muted-foreground">Loading repository status...</div>;
@@ -316,7 +336,8 @@ function ChangesView({
   }
 
   const stagedCount = files.filter(isFileStaged).length;
-  const canCommit = stagedCount > 0 && commitMessage.trim().length > 0 && !commitPending;
+  const canCommit =
+    workflowAvailable && stagedCount > 0 && commitMessage.trim().length > 0 && !commitPending;
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -357,6 +378,17 @@ function ChangesView({
           {status?.behindCount ? <span>{status.behindCount} behind</span> : null}
         </div>
       </div>
+
+      {workflowAvailability === "loading" ? (
+        <p className="mx-3 mt-2 text-xs text-muted-foreground" role="status">
+          Checking this server's Source Control capabilities...
+        </p>
+      ) : workflowAvailability === "unsupported" ? (
+        <p className="mx-3 mt-2 text-xs text-muted-foreground">
+          Update this environment's T3 Code server to review diffs, stage files, or commit from this
+          panel.
+        </p>
+      ) : null}
 
       {actionError ? (
         <div
@@ -401,7 +433,7 @@ function ChangesView({
                   <Button
                     size="xs"
                     variant={action.label === "Stage" ? "outline" : "ghost"}
-                    disabled={action.disabled || pendingPath !== null}
+                    disabled={!workflowAvailable || action.disabled || pendingPath !== null}
                     title={action.reason}
                     onClick={() => void runIndexAction(file)}
                   >
@@ -573,6 +605,8 @@ export function SourceControlPanel(props: SourceControlPanelProps) {
       threadId={props.threadId}
       cwd={props.cwd}
       envLocked={props.envLocked}
+      gitIndexWorkflowCapabilityKnown={props.gitIndexWorkflowCapabilityKnown}
+      supportsGitIndexWorkflow={props.supportsGitIndexWorkflow}
     />
   );
   const pullRequests = (

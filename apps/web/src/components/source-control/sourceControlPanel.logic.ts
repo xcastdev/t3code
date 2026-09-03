@@ -2,6 +2,14 @@ import type { VcsIndexStatus } from "@t3tools/contracts";
 
 export type SourceControlPanelView = "changes" | "pull-requests";
 
+export function gitIndexWorkflowAvailability(
+  capabilityKnown: boolean,
+  supported: boolean,
+): "loading" | "unsupported" | "available" {
+  if (!capabilityKnown) return "loading";
+  return supported ? "available" : "unsupported";
+}
+
 export interface SourceControlFileAction {
   readonly label: "Stage" | "Unstage" | "Unavailable";
   readonly disabled: boolean;
