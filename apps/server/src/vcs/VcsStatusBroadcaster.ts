@@ -125,9 +125,16 @@ interface CachedValue<T> {
 }
 
 interface CachedVcsStatus {
+  readonly localRevision: number;
   readonly local: CachedValue<VcsStatusLocalResult> | null;
   readonly remote: CachedValue<VcsStatusRemoteResult | null> | null;
 }
+
+const EMPTY_CACHED_VCS_STATUS: CachedVcsStatus = {
+  localRevision: 0,
+  local: null,
+  remote: null,
+};
 
 interface ActiveRemotePoller {
   readonly fiber: Fiber.Fiber<void, never>;
@@ -205,18 +212,27 @@ export const make = Effect.gen(function* () {
 
   const updateCachedLocalStatus = Effect.fn("VcsStatusBroadcaster.updateCachedLocalStatus")(
     function* (cwd: string, local: VcsStatusLocalResult, options?: { publish?: boolean }) {
-      const nextLocal = {
-        fingerprint: fingerprintStatusPart(local),
-        value: local,
-      } satisfies CachedValue<VcsStatusLocalResult>;
-      const shouldPublish = yield* Ref.modify(cacheRef, (cache) => {
-        const previous = cache.get(cwd) ?? { local: null, remote: null };
+      const [nextLocal, shouldPublish] = yield* Ref.modify(cacheRef, (cache) => {
+        const previous = cache.get(cwd) ?? EMPTY_CACHED_VCS_STATUS;
+        const localRevision = previous.localRevision + 1;
+        const value = {
+          ...local,
+          localRevision: String(localRevision),
+        };
+        const nextLocal = {
+          fingerprint: fingerprintStatusPart(value),
+          value,
+        } satisfies CachedValue<VcsStatusLocalResult>;
         const nextCache = new Map(cache);
         nextCache.set(cwd, {
           ...previous,
+          localRevision,
           local: nextLocal,
         });
-        return [previous.local?.fingerprint !== nextLocal.fingerprint, nextCache] as const;
+        return [
+          [nextLocal, previous.local?.fingerprint !== nextLocal.fingerprint] as const,
+          nextCache,
+        ] as const;
       });
 
       if (options?.publish && shouldPublish) {
@@ -224,12 +240,12 @@ export const make = Effect.gen(function* () {
           cwd,
           event: {
             _tag: "localUpdated",
-            local,
+            local: nextLocal.value,
           },
         });
       }
 
-      return local;
+      return nextLocal.value;
     },
   );
 
@@ -240,7 +256,7 @@ export const make = Effect.gen(function* () {
         value: remote,
       } satisfies CachedValue<VcsStatusRemoteResult | null>;
       const shouldPublish = yield* Ref.modify(cacheRef, (cache) => {
-        const previous = cache.get(cwd) ?? { local: null, remote: null };
+        const previous = cache.get(cwd) ?? EMPTY_CACHED_VCS_STATUS;
         const nextCache = new Map(cache);
         nextCache.set(cwd, {
           ...previous,
@@ -269,24 +285,33 @@ export const make = Effect.gen(function* () {
     remote: VcsStatusRemoteResult | null,
     options?: { publish?: boolean },
   ) {
-    const nextLocal = {
-      fingerprint: fingerprintStatusPart(local),
-      value: local,
-    } satisfies CachedValue<VcsStatusLocalResult>;
     const nextRemote = {
       fingerprint: fingerprintStatusPart(remote),
       value: remote,
     } satisfies CachedValue<VcsStatusRemoteResult | null>;
-    const shouldPublish = yield* Ref.modify(cacheRef, (cache) => {
-      const previous = cache.get(cwd) ?? { local: null, remote: null };
+    const [nextLocal, shouldPublish] = yield* Ref.modify(cacheRef, (cache) => {
+      const previous = cache.get(cwd) ?? EMPTY_CACHED_VCS_STATUS;
+      const localRevision = previous.localRevision + 1;
+      const value = {
+        ...local,
+        localRevision: String(localRevision),
+      };
+      const nextLocal = {
+        fingerprint: fingerprintStatusPart(value),
+        value,
+      } satisfies CachedValue<VcsStatusLocalResult>;
       const nextCache = new Map(cache);
       nextCache.set(cwd, {
+        localRevision,
         local: nextLocal,
         remote: nextRemote,
       });
       return [
-        previous.local?.fingerprint !== nextLocal.fingerprint ||
-          previous.remote?.fingerprint !== nextRemote.fingerprint,
+        [
+          nextLocal,
+          previous.local?.fingerprint !== nextLocal.fingerprint ||
+            previous.remote?.fingerprint !== nextRemote.fingerprint,
+        ] as const,
         nextCache,
       ] as const;
     });
@@ -296,13 +321,13 @@ export const make = Effect.gen(function* () {
         cwd,
         event: {
           _tag: "snapshot",
-          local,
+          local: nextLocal.value,
           remote,
         },
       });
     }
 
-    return mergeGitStatusParts(local, remote);
+    return mergeGitStatusParts(nextLocal.value, remote);
   });
 
   const loadLocalStatus = Effect.fn("VcsStatusBroadcaster.loadLocalStatus")(function* (

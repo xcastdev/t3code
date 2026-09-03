@@ -11,6 +11,7 @@ import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
@@ -64,6 +65,7 @@ const remoteStatusWithPr: VcsStatusRemoteResult = {
 
 const baseStatus: VcsStatusResult = {
   ...baseLocalStatus,
+  localRevision: "1",
   ...baseRemoteStatus,
 };
 
@@ -199,10 +201,12 @@ describe("VcsStatusBroadcaster", () => {
       assert.deepStrictEqual(initial, baseStatus);
       assert.deepStrictEqual(refreshed, {
         ...state.currentLocalStatus,
+        localRevision: "2",
         ...state.currentRemoteStatus,
       });
       assert.deepStrictEqual(cached, {
         ...state.currentLocalStatus,
+        localRevision: "2",
         ...state.currentRemoteStatus,
       });
       assert.equal(state.localStatusCalls, 2);
@@ -260,7 +264,10 @@ describe("VcsStatusBroadcaster", () => {
 
       assert.deepStrictEqual(snapshot, {
         _tag: "snapshot",
-        local: state.currentLocalStatus,
+        local: {
+          ...state.currentLocalStatus,
+          localRevision: "2",
+        },
         remote: state.currentRemoteStatus,
       } satisfies VcsStatusStreamEvent);
       assert.equal(snapshotCalls, 2);
@@ -369,15 +376,86 @@ describe("VcsStatusBroadcaster", () => {
       const cached = yield* broadcaster.getStatus({ cwd: "/repo" });
 
       assert.deepStrictEqual(initial, baseStatus);
-      assert.deepStrictEqual(refreshedLocal, state.currentLocalStatus);
+      assert.deepStrictEqual(refreshedLocal, {
+        ...state.currentLocalStatus,
+        localRevision: "2",
+      });
       assert.deepStrictEqual(cached, {
         ...state.currentLocalStatus,
+        localRevision: "2",
         ...baseRemoteStatus,
       });
       assert.equal(state.localStatusCalls, 2);
       assert.equal(state.remoteStatusCalls, 1);
       assert.equal(state.localInvalidationCalls, 1);
       assert.equal(state.remoteInvalidationCalls, 0);
+    }).pipe(Effect.provide(makeTestLayer(state)));
+  });
+
+  it.effect("advances the local revision for every accepted local refresh", () => {
+    const unchangedLocalStatus: VcsStatusLocalResult = {
+      ...baseLocalStatus,
+      hasWorkingTreeChanges: true,
+      workingTree: {
+        files: [
+          {
+            path: "src/unchanged.ts",
+            insertions: 1,
+            deletions: 1,
+            indexStatus: "both",
+          },
+        ],
+        insertions: 1,
+        deletions: 1,
+      },
+    };
+    const state = {
+      currentLocalStatus: unchangedLocalStatus,
+      currentRemoteStatus: baseRemoteStatus,
+      localStatusCalls: 0,
+      remoteStatusCalls: 0,
+      localInvalidationCalls: 0,
+      remoteInvalidationCalls: 0,
+    };
+
+    return Effect.gen(function* () {
+      const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+      const initialSnapshot = yield* Deferred.make<VcsStatusStreamEvent>();
+      const localUpdates = yield* Ref.make<ReadonlyArray<VcsStatusStreamEvent>>([]);
+      yield* Stream.runForEach(broadcaster.streamStatus({ cwd: "/repo" }), (event) => {
+        if (event._tag === "snapshot") {
+          return Deferred.succeed(initialSnapshot, event).pipe(Effect.ignore);
+        }
+        if (event._tag === "localUpdated") {
+          return Ref.update(localUpdates, (events) => [...events, event]);
+        }
+        return Effect.void;
+      }).pipe(Effect.forkScoped);
+
+      const initial = yield* Deferred.await(initialSnapshot);
+      const firstRefresh = yield* broadcaster.refreshLocalStatus("/repo");
+      const secondRefresh = yield* broadcaster.refreshLocalStatus("/repo");
+      yield* Effect.yieldNow;
+
+      if (initial._tag !== "snapshot") throw new Error("Expected an initial status snapshot.");
+      assert.equal(initial.local.localRevision, "1");
+      assert.equal(firstRefresh.localRevision, "2");
+      assert.equal(secondRefresh.localRevision, "3");
+      assert.deepStrictEqual(
+        [firstRefresh, secondRefresh].map((status) =>
+          status.workingTree.files.map(({ path, indexStatus }) => ({ path, indexStatus })),
+        ),
+        [
+          [{ path: "src/unchanged.ts", indexStatus: "both" }],
+          [{ path: "src/unchanged.ts", indexStatus: "both" }],
+        ],
+      );
+      assert.deepStrictEqual(
+        (yield* Ref.get(localUpdates)).map((event) =>
+          event._tag === "localUpdated" ? event.local.localRevision : null,
+        ),
+        ["2", "3"],
+      );
     }).pipe(Effect.provide(makeTestLayer(state)));
   });
 
@@ -473,7 +551,10 @@ describe("VcsStatusBroadcaster", () => {
 
       assert.deepStrictEqual(snapshot, {
         _tag: "snapshot",
-        local: baseLocalStatus,
+        local: {
+          ...baseLocalStatus,
+          localRevision: "1",
+        },
         remote: null,
       } satisfies VcsStatusStreamEvent);
       assert.deepStrictEqual(remoteUpdated, {
@@ -520,7 +601,10 @@ describe("VcsStatusBroadcaster", () => {
 
       assert.deepStrictEqual(snapshot, {
         _tag: "snapshot",
-        local: baseLocalStatus,
+        local: {
+          ...baseLocalStatus,
+          localRevision: "1",
+        },
         remote: null,
       } satisfies VcsStatusStreamEvent);
       assert.deepStrictEqual(remoteUpdated, {

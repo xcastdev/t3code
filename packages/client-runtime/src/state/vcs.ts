@@ -18,7 +18,7 @@ import { Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import {
   createEnvironmentRpcCommand,
-  createEnvironmentRpcQueryAtomFamily,
+  createEnvironmentQueryAtomFamily,
   createEnvironmentSubscriptionAtomFamily,
 } from "./runtime.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
@@ -275,10 +275,32 @@ export function createVcsEnvironmentAtoms<R, E>(
       environmentId: target.environmentId,
       cwd: target.input.cwd,
     });
-  const getWorkingTreeDiffQuery = createEnvironmentRpcQueryAtomFamily(runtime, {
+  const status = createEnvironmentSubscriptionAtomFamily(runtime, {
+    label: "environment-data:vcs:status",
+    subscribe: (input: EnvironmentRpcInput<typeof WS_METHODS.subscribeVcsStatus>) =>
+      subscribe(WS_METHODS.subscribeVcsStatus, input).pipe(
+        Stream.mapAccum(
+          () => null as VcsStatusResult | null,
+          (current, event) => {
+            const next = applyGitStatusStreamEvent(current, event);
+            return [next, [next]] as const;
+          },
+        ),
+      ),
+  });
+  const getWorkingTreeDiffQuery = createEnvironmentQueryAtomFamily(runtime, {
     label: "environment-data:vcs:working-tree-diff-query",
-    tag: WS_METHODS.vcsGetWorkingTreeDiff,
     idleTtlMs: 0,
+    execute: (
+      input: EnvironmentRpcInput<typeof WS_METHODS.vcsGetWorkingTreeDiff> & {
+        readonly localRevision?: string;
+      },
+    ) =>
+      request(WS_METHODS.vcsGetWorkingTreeDiff, {
+        cwd: input.cwd,
+        path: input.path,
+        comparison: input.comparison,
+      }),
   });
   const refreshWorkingTreeDiffs = (
     target: { readonly environmentId: EnvironmentId; readonly input: VcsStageFilesInput },
@@ -299,19 +321,7 @@ export function createVcsEnvironmentAtoms<R, E>(
 
   return {
     listRefs,
-    status: createEnvironmentSubscriptionAtomFamily(runtime, {
-      label: "environment-data:vcs:status",
-      subscribe: (input: EnvironmentRpcInput<typeof WS_METHODS.subscribeVcsStatus>) =>
-        subscribe(WS_METHODS.subscribeVcsStatus, input).pipe(
-          Stream.mapAccum(
-            () => null as VcsStatusResult | null,
-            (current, event) => {
-              const next = applyGitStatusStreamEvent(current, event);
-              return [next, [next]] as const;
-            },
-          ),
-        ),
-    }),
+    status,
     pull: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:vcs:pull",
       tag: WS_METHODS.vcsPull,

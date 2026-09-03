@@ -743,6 +743,8 @@ describe("Git workflow command atoms", () => {
         const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
           run: <A, E, R>(_environmentId: EnvironmentId, effect: Effect.Effect<A, E, R>) =>
             Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          followStream: <A, E, R>(_environmentId: EnvironmentId, stream: Stream.Stream<A, E, R>) =>
+            Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
         } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
         const runtime = Atom.runtime(
           Layer.merge(
@@ -902,6 +904,88 @@ describe("Git workflow command atoms", () => {
           truncated: false,
         });
         expect(diffRequestCount).toBe(3);
+      }),
+    ),
+  );
+
+  it.effect("keys only mounted working-tree diffs by the repository revision", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const diffRequests: Array<{
+          readonly cwd: string;
+          readonly path: string;
+          readonly comparison: "head" | "index";
+        }> = [];
+        const client = {
+          [WS_METHODS.vcsGetWorkingTreeDiff]: (input: {
+            readonly cwd: string;
+            readonly path: string;
+            readonly comparison: "head" | "index";
+          }) =>
+            Effect.sync(() => {
+              diffRequests.push(input);
+              return { diff: `diff-${diffRequests.length}`, truncated: false };
+            }),
+        } as unknown as WsRpcProtocolClient;
+        const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+          target: TARGET,
+          state: yield* SubscriptionRef.make(CONNECTED_CONNECTION_STATE),
+          session: yield* SubscriptionRef.make(Option.some(session(client))),
+          prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+          connect: Effect.void,
+          disconnect: Effect.void,
+          retryNow: Effect.void,
+        } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+        const environmentRegistry = EnvironmentRegistry.EnvironmentRegistry.of({
+          run: <A, E, R>(_environmentId: EnvironmentId, effect: Effect.Effect<A, E, R>) =>
+            Effect.provideService(effect, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          followStream: <A, E, R>(_environmentId: EnvironmentId, stream: Stream.Stream<A, E, R>) =>
+            Stream.provideService(stream, EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+        } as unknown as EnvironmentRegistry.EnvironmentRegistry["Service"]);
+        const runtime = Atom.runtime(
+          Layer.merge(
+            Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
+            Layer.succeed(Persistence.EnvironmentCacheStore, cacheWithRefs(Option.none())),
+          ),
+        );
+        const atoms = createVcsEnvironmentAtoms(runtime);
+        const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (value) =>
+          Effect.sync(() => value.dispose()),
+        );
+        const revisionOneDiff = atoms.getWorkingTreeDiffQuery({
+          environmentId: TARGET.environmentId,
+          input: { cwd: "/repo", path: "a.txt", comparison: "index", localRevision: "1" },
+        });
+        const unsubscribeRevisionOne = registry.subscribe(revisionOneDiff, () => undefined, {
+          immediate: true,
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribeRevisionOne));
+        expect(
+          yield* AtomRegistry.getResult(registry, revisionOneDiff, { suspendOnWaiting: true }),
+        ).toEqual({ diff: "diff-1", truncated: false });
+
+        const unmountedDiff = atoms.getWorkingTreeDiffQuery({
+          environmentId: TARGET.environmentId,
+          input: { cwd: "/repo", path: "unmounted.txt", comparison: "head", localRevision: "2" },
+        });
+        expect(unmountedDiff).not.toBe(revisionOneDiff);
+
+        const revisionTwoDiff = atoms.getWorkingTreeDiffQuery({
+          environmentId: TARGET.environmentId,
+          input: { cwd: "/repo", path: "a.txt", comparison: "index", localRevision: "2" },
+        });
+        const unsubscribeRevisionTwo = registry.subscribe(revisionTwoDiff, () => undefined, {
+          immediate: true,
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribeRevisionTwo));
+        expect(
+          yield* AtomRegistry.getResult(registry, revisionTwoDiff, { suspendOnWaiting: true }),
+        ).toEqual({ diff: "diff-2", truncated: false });
+
+        expect(diffRequests).toEqual([
+          { cwd: "/repo", path: "a.txt", comparison: "index" },
+          { cwd: "/repo", path: "a.txt", comparison: "index" },
+        ]);
       }),
     ),
   );
