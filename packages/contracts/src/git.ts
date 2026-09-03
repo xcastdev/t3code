@@ -146,8 +146,8 @@ export const VcsWorkingTreeDiffInput = Schema.Struct({
 export type VcsWorkingTreeDiffInput = typeof VcsWorkingTreeDiffInput.Type;
 
 export const GitCommitIndexInput = Schema.Struct({
-  cwd: Schema.String,
-  message: Schema.String,
+  cwd: TrimmedNonEmptyStringSchema,
+  message: TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(10_000)),
   precondition: Schema.optional(GitMutationPrecondition),
   confirmDefaultRef: Schema.optional(Schema.Boolean),
 });
@@ -226,8 +226,8 @@ export const VcsCreateRefResult = Schema.Struct({
 export type VcsCreateRefResult = typeof VcsCreateRefResult.Type;
 
 export const VcsSwitchRefInput = Schema.Struct({
-  cwd: Schema.String,
-  refName: Schema.String,
+  cwd: TrimmedNonEmptyStringSchema,
+  refName: TrimmedNonEmptyStringSchema,
   confirmDirtyWorkingTree: Schema.optional(Schema.Boolean),
 });
 export type VcsSwitchRefInput = typeof VcsSwitchRefInput.Type;

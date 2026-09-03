@@ -269,6 +269,14 @@ describe("Git index and diff contracts", () => {
     expect(parsed.message).toBe("fix: stage it");
   });
 
+  it("retains the existing non-empty and message-length validation for guarded commits", () => {
+    expect(() => decodeGitCommitIndexInput({ cwd: "", message: "fix" })).toThrow();
+    expect(() => decodeGitCommitIndexInput({ cwd: "/repo", message: "   " })).toThrow();
+    expect(() =>
+      decodeGitCommitIndexInput({ cwd: "/repo", message: "x".repeat(10_001) }),
+    ).toThrow();
+  });
+
   it("decodes repository state needed to guard mutations", () => {
     const parsed = decodeVcsStatus({
       isRepo: true,
@@ -312,6 +320,11 @@ describe("Git index and diff contracts", () => {
         confirmDirtyWorkingTree: true,
       }),
     ).toMatchObject({ confirmDirtyWorkingTree: true });
+  });
+
+  it("retains the existing non-empty validation for guarded ref switches", () => {
+    expect(() => decodeVcsSwitchRefInput({ cwd: "", refName: "feature/workflow" })).toThrow();
+    expect(() => decodeVcsSwitchRefInput({ cwd: "/repo", refName: "   " })).toThrow();
   });
 
   it("decodes typed mutation rejection codes through the existing Git error channel", () => {
