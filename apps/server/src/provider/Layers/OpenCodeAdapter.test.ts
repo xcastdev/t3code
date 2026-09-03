@@ -4273,7 +4273,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
   it.effect("interrupts a turn waiting on cancellation when the session stops", () =>
     Effect.gen(function* () {
-      const adapter = yield* OpenCodeAdapter;
+      const adapter = yield* makeOpenCodeAdapter(localOpenCodeAdapterTestSettings);
       const threadId = asThreadId("thread-stop-during-cancellation");
       const firstAbortStarted = promiseWithResolvers<void>();
       const teardownAbortStarted = promiseWithResolvers<void>();
