@@ -6,6 +6,7 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Logger from "effect/Logger";
@@ -110,6 +111,7 @@ function makeTestLayer(
             state.localInvalidationCalls += 1;
             state.remoteInvalidationCalls += 1;
           }),
+        withRepositoryPermit: (_operation, _cwd, effect) => effect,
         ...workflowOverrides,
       }),
     ),
@@ -608,6 +610,68 @@ describe("VcsStatusBroadcaster", () => {
       assert.equal(state.localStatusCalls, 1);
       assert.equal(state.remoteStatusCalls, 1);
     }).pipe(Effect.provide(makeTestLayer(state)));
+  });
+
+  it.effect("keeps concurrent alias reads on one canonical local revision", () => {
+    const state = {
+      currentLocalStatus: baseLocalStatus,
+      currentRemoteStatus: baseRemoteStatus,
+      localStatusCalls: 0,
+      remoteStatusCalls: 0,
+      localInvalidationCalls: 0,
+      remoteInvalidationCalls: 0,
+    };
+
+    return Effect.gen(function* () {
+      const repositoryRoot = "/repo";
+      const nestedCwd = "/repo/nested";
+      state.currentLocalStatus = { ...baseLocalStatus, repositoryRoot };
+
+      const localCallsStarted = yield* Deferred.make<void>();
+      const releaseLocalCalls = yield* Deferred.make<void>();
+      const remoteCallsStarted = yield* Deferred.make<void>();
+      const releaseRemoteCalls = yield* Deferred.make<void>();
+      const workflow = {
+        localStatus: () =>
+          Effect.gen(function* () {
+            state.localStatusCalls += 1;
+            if (state.localStatusCalls === 2) {
+              yield* Deferred.succeed(localCallsStarted, undefined);
+            }
+            yield* Deferred.await(releaseLocalCalls);
+            return state.currentLocalStatus;
+          }),
+        remoteStatus: () =>
+          Effect.gen(function* () {
+            state.remoteStatusCalls += 1;
+            if (state.remoteStatusCalls === 2) {
+              yield* Deferred.succeed(remoteCallsStarted, undefined);
+            }
+            yield* Deferred.await(releaseRemoteCalls);
+            return state.currentRemoteStatus;
+          }),
+      } satisfies Partial<GitWorkflowService.GitWorkflowService["Service"]>;
+      const broadcaster = yield* Effect.provide(
+        VcsStatusBroadcaster.VcsStatusBroadcaster,
+        makeTestLayer(state, workflow),
+      );
+      const reads = Effect.all(
+        [broadcaster.getStatus({ cwd: nestedCwd }), broadcaster.getStatus({ cwd: repositoryRoot })],
+        { concurrency: "unbounded" },
+      );
+      const readsFiber = yield* reads.pipe(Effect.forkScoped);
+
+      yield* Deferred.await(localCallsStarted);
+      yield* Deferred.succeed(releaseLocalCalls, undefined);
+      yield* Deferred.await(remoteCallsStarted);
+      yield* Deferred.succeed(releaseRemoteCalls, undefined);
+      const [nested, root] = yield* Fiber.join(readsFiber);
+
+      assert.equal(nested.localRevision, "1");
+      assert.equal(root.localRevision, "1");
+      assert.equal(state.localStatusCalls, 2);
+      assert.equal(state.remoteStatusCalls, 2);
+    }).pipe(Effect.scoped);
   });
 
   it.effect("streams a local snapshot first and remote updates later", () => {

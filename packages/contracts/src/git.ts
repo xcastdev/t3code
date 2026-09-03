@@ -106,6 +106,7 @@ export type VcsWorkingTreeFile = typeof VcsWorkingTreeFile.Type;
 export const GitMutationPrecondition = Schema.Struct({
   expectedHeadCommit: Schema.NullOr(Schema.String),
   expectedIndexTree: Schema.String,
+  expectedRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
 });
 export type GitMutationPrecondition = typeof GitMutationPrecondition.Type;
 
@@ -266,7 +267,7 @@ const VcsStatusLocalShape = {
   isDefaultRef: Schema.Boolean,
   refName: Schema.NullOr(TrimmedNonEmptyStringSchema),
   localRevision: Schema.optional(Schema.String),
-  headCommit: Schema.optional(Schema.String),
+  headCommit: Schema.optional(Schema.NullOr(Schema.String)),
   indexTree: Schema.optional(Schema.String),
   hasWorkingTreeChanges: Schema.Boolean,
   workingTree: Schema.Struct({

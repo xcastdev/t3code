@@ -1030,6 +1030,7 @@ describe("Git workflow command atoms", () => {
       Effect.gen(function* () {
         const firstDiffRequested = yield* Deferred.make<void>();
         const secondDiffRequested = yield* Deferred.make<void>();
+        const thirdDiffRequested = yield* Deferred.make<void>();
         const statusUpdate = yield* Deferred.make<VcsStatusStreamEvent>();
         let diffRequestCount = 0;
         const local = {
@@ -1064,9 +1065,12 @@ describe("Git workflow command atoms", () => {
               Effect.tap(() =>
                 diffRequestCount === 1
                   ? Deferred.succeed(firstDiffRequested, undefined)
-                  : Deferred.succeed(secondDiffRequested, undefined),
+                  : diffRequestCount === 2
+                    ? Deferred.succeed(secondDiffRequested, undefined)
+                    : Deferred.succeed(thirdDiffRequested, undefined),
               ),
             ),
+          [WS_METHODS.vcsStageFiles]: (_input: unknown) => Effect.void,
         } as unknown as WsRpcProtocolClient;
         const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
           target: TARGET,
@@ -1112,6 +1116,19 @@ describe("Git workflow command atoms", () => {
         });
         yield* Deferred.await(secondDiffRequested);
         expect(diffRequestCount).toBe(2);
+
+        expect(
+          AsyncResult.isSuccess(
+            yield* Effect.promise(() =>
+              atoms.stageFiles.run(registry, {
+                environmentId: TARGET.environmentId,
+                input: { cwd: "/repo", paths: ["a.txt"] },
+              }),
+            ),
+          ),
+        ).toBe(true);
+        yield* Deferred.await(thirdDiffRequested);
+        expect(diffRequestCount).toBe(3);
       }),
     ),
   );

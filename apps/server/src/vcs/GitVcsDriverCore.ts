@@ -52,7 +52,8 @@ const RANGE_DIFF_PATCH_MAX_OUTPUT_BYTES = 59_000;
 const REVIEW_DIFF_PATCH_MAX_OUTPUT_BYTES = 120_000;
 const REVIEW_UNTRACKED_DIFF_MAX_OUTPUT_BYTES = 80_000;
 const REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES = 1024 * 1024;
-const WORKING_TREE_DIFF_MAX_OUTPUT_BYTES = 120_000;
+const MAX_WORKING_TREE_DIFF_BYTES = 120_000;
+const MAX_WORKING_TREE_DIFF_LINES = 4_000;
 const WORKSPACE_FILES_MAX_OUTPUT_BYTES = 120_000;
 const STATUS_UPSTREAM_REFRESH_INTERVAL = Duration.seconds(15);
 const STATUS_UPSTREAM_REFRESH_TIMEOUT = Duration.seconds(5);
@@ -370,6 +371,48 @@ export function splitNullSeparatedGitStdoutPaths(
   result: Pick<GitVcsDriver.ExecuteGitResult, "stdout" | "stdoutTruncated">,
 ): string[] {
   return splitNullSeparatedPaths(result.stdout, result.stdoutTruncated);
+}
+
+function truncateWorkingTreeDiff(
+  diff: string,
+  inputTruncated: boolean,
+): { readonly diff: string; readonly truncated: boolean } {
+  const encoder = new TextEncoder();
+  let byteLength = 0;
+  let lineCount = 0;
+  let end = 0;
+  let truncated = inputTruncated;
+
+  while (end < diff.length) {
+    const newlineIndex = diff.indexOf("\n", end);
+    const isFinalLine = newlineIndex === -1;
+
+    // A byte-truncated process stream may end in the middle of a line. The
+    // final fragment is not safe to show, even when the decoder produced text.
+    if (isFinalLine && inputTruncated) {
+      truncated = true;
+      break;
+    }
+
+    const nextEnd = isFinalLine ? diff.length : newlineIndex + 1;
+    const lineBytes = encoder.encode(diff.slice(end, nextEnd)).byteLength;
+    if (
+      lineCount >= MAX_WORKING_TREE_DIFF_LINES ||
+      byteLength + lineBytes > MAX_WORKING_TREE_DIFF_BYTES
+    ) {
+      truncated = true;
+      break;
+    }
+
+    byteLength += lineBytes;
+    lineCount += 1;
+    end = nextEnd;
+  }
+
+  return {
+    diff: diff.slice(0, end),
+    truncated,
+  };
 }
 
 function sanitizeRemoteName(value: string): string {
@@ -1769,6 +1812,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       numstatEntries,
       defaultBranch,
       hasPrimaryRemote,
+      headResult,
+      indexTreeResult,
       stagedPathsResult,
       unstagedPathsResult,
       untrackedPathsResult,
@@ -1838,6 +1883,18 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         statusCacheKey
           ? Cache.get(originExistsCache, statusCacheKey).pipe(Effect.orElseSucceed(() => false))
           : originRemoteExists(cwd).pipe(Effect.orElseSucceed(() => false)),
+        executeGitWithStableDiagnostics(
+          "GitVcsDriver.statusDetails.head",
+          commandCwd,
+          ["rev-parse", "--verify", "HEAD"],
+          { allowNonZeroExit: true },
+        ),
+        executeGitWithStableDiagnostics(
+          "GitVcsDriver.statusDetails.indexTree",
+          commandCwd,
+          ["write-tree"],
+          { allowNonZeroExit: true },
+        ),
         executeGitWithStableDiagnostics(
           "GitVcsDriver.statusDetails.stagedPaths",
           commandCwd,
@@ -1938,6 +1995,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     return {
       isRepo: true,
       ...(repositoryPaths?.worktreeRoot ? { repositoryRoot: repositoryPaths.worktreeRoot } : {}),
+      headCommit: headResult.exitCode === 0 ? headResult.stdout.trim() : null,
+      ...(indexTreeResult.exitCode === 0 ? { indexTree: indexTreeResult.stdout.trim() } : {}),
       hasOriginRemote: hasPrimaryRemote,
       isDefaultBranch,
       branch: refName,
@@ -1993,6 +2052,8 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       Effect.map((details) => ({
         isRepo: details.isRepo,
         ...(details.repositoryRoot ? { repositoryRoot: details.repositoryRoot } : {}),
+        ...(details.headCommit !== undefined ? { headCommit: details.headCommit } : {}),
+        ...(details.indexTree ? { indexTree: details.indexTree } : {}),
         hasPrimaryRemote: details.hasOriginRemote,
         isDefaultRef: details.isDefaultBranch,
         refName: details.branch,
@@ -2831,7 +2892,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       diffArgs,
       {
         allowNonZeroExit: true,
-        maxOutputBytes: WORKING_TREE_DIFF_MAX_OUTPUT_BYTES,
+        maxOutputBytes: MAX_WORKING_TREE_DIFF_BYTES,
         appendTruncationMarker: true,
       },
     );
@@ -2850,7 +2911,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         stderrLength: result.stderr.length,
       });
     }
-    return { diff: result.stdout, truncated: result.stdoutTruncated };
+    return truncateWorkingTreeDiff(result.stdout, result.stdoutTruncated);
   });
 
   const commitIndex: GitVcsDriver.GitVcsDriver["Service"]["commitIndex"] = Effect.fn("commitIndex")(
@@ -2860,7 +2921,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         if (
           input.precondition !== undefined &&
           (state.headCommit !== input.precondition.expectedHeadCommit ||
-            state.indexTree !== input.precondition.expectedIndexTree)
+            state.indexTree !== input.precondition.expectedIndexTree ||
+            (input.precondition.expectedRefName !== undefined &&
+              state.currentRef !== input.precondition.expectedRefName))
         ) {
           return yield* mutationRejection(
             "GitVcsDriver.commitIndex.precondition",

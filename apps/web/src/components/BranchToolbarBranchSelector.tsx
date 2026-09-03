@@ -34,7 +34,7 @@ import { vcsEnvironment } from "../state/vcs";
 import { cn } from "../lib/utils";
 import { parsePullRequestReference } from "../pullRequestReference";
 import { getSourceControlPresentation } from "../sourceControlPresentation";
-import { canAttemptDirtyBranchSwitch } from "./source-control/sourceControlPanel.logic";
+import { runAuthoritativeDirtyBranchMutation } from "./source-control/sourceControlPanel.logic";
 import {
   deriveLocalBranchNameFromRemoteRef,
   resolveBranchTriggerLabel,
@@ -390,36 +390,21 @@ export function BranchToolbarBranchSelector({
     });
   };
 
-  const confirmDirtyBranchSwitch = useCallback(
-    async (branchName: string): Promise<boolean> => {
-      const hasWorkingTreeChanges = branchStatusQuery.data?.hasWorkingTreeChanges;
-      if (!canAttemptDirtyBranchSwitch(hasWorkingTreeChanges)) {
-        toastManager.add({
-          type: "error",
-          title: "Branch status is unavailable",
-          description: "Branch status is unavailable. Refresh before switching branches.",
-        });
-        return false;
-      }
-      if (hasWorkingTreeChanges === false) {
-        return true;
-      }
-      const api = readLocalApi();
-      if (!api) {
-        toastManager.add({
-          type: "error",
-          title: "Confirmation is unavailable",
-          description:
-            "This branch switch was canceled because the confirmation dialog is unavailable.",
-        });
-        return false;
-      }
-      return api.dialogs.confirm(
-        `Switch to \"${branchName}\" with uncommitted changes?\nYour working tree will carry over if Git can apply it cleanly.`,
-      );
-    },
-    [branchStatusQuery.data?.hasWorkingTreeChanges],
-  );
+  const confirmDirtyBranchSwitch = useCallback(async (branchName: string): Promise<boolean> => {
+    const api = readLocalApi();
+    if (!api) {
+      toastManager.add({
+        type: "error",
+        title: "Confirmation is unavailable",
+        description:
+          "This branch switch was canceled because the confirmation dialog is unavailable.",
+      });
+      return false;
+    }
+    return api.dialogs.confirm(
+      `Switch to \"${branchName}\" with uncommitted changes?\nYour working tree will carry over if Git can apply it cleanly.`,
+    );
+  }, []);
 
   const selectBranch = async (refName: VcsRef) => {
     if (!branchCwd || !activeProjectCwd || isBranchActionPending) return;
@@ -448,22 +433,36 @@ export function BranchToolbarBranchSelector({
       ? deriveLocalBranchNameFromRemoteRef(refName.name)
       : refName.name;
 
-    if (!(await confirmDirtyBranchSwitch(selectedBranchName))) return;
+    if (branchStatusQuery.data?.hasWorkingTreeChanges === undefined) {
+      toastManager.add({
+        type: "error",
+        title: "Branch status is unavailable",
+        description: "Branch status is unavailable. Refresh before switching branches.",
+      });
+      return;
+    }
 
     setIsBranchMenuOpen(false);
     onComposerFocusRequest?.();
 
     runBranchAction(async () => {
       const previousBranch = resolvedActiveBranch;
-      setOptimisticBranch(selectedBranchName);
-      const checkoutResult = await switchRef({
-        environmentId,
-        input: {
-          cwd: selectionTarget.checkoutCwd,
-          refName: refName.name,
-        },
+      const checkoutResult = await runAuthoritativeDirtyBranchMutation({
+        hasWorkingTreeChanges: branchStatusQuery.data?.hasWorkingTreeChanges,
+        confirm: () => confirmDirtyBranchSwitch(selectedBranchName),
+        mutate: (confirmDirtyWorkingTree) =>
+          switchRef({
+            environmentId,
+            input: {
+              cwd: selectionTarget.checkoutCwd,
+              refName: refName.name,
+              confirmDirtyWorkingTree,
+            },
+          }),
       });
+      if (checkoutResult === null) return;
       if (checkoutResult._tag === "Success") {
+        setOptimisticBranch(selectedBranchName);
         const nextBranchName = refName.isRemote
           ? (checkoutResult.value.refName ?? selectedBranchName)
           : selectedBranchName;
@@ -488,23 +487,37 @@ export function BranchToolbarBranchSelector({
     const name = sanitizeNewRefName(rawName);
     if (!branchCwd || !name || isBranchActionPending) return;
 
-    if (!(await confirmDirtyBranchSwitch(name))) return;
+    if (branchStatusQuery.data?.hasWorkingTreeChanges === undefined) {
+      toastManager.add({
+        type: "error",
+        title: "Branch status is unavailable",
+        description: "Branch status is unavailable. Refresh before switching branches.",
+      });
+      return;
+    }
 
     setIsBranchMenuOpen(false);
     onComposerFocusRequest?.();
 
     runBranchAction(async () => {
       const previousBranch = resolvedActiveBranch;
-      setOptimisticBranch(name);
-      const createBranchResult = await createRefMutation({
-        environmentId,
-        input: {
-          cwd: branchCwd,
-          refName: name,
-          switchRef: true,
-        },
+      const createBranchResult = await runAuthoritativeDirtyBranchMutation({
+        hasWorkingTreeChanges: branchStatusQuery.data?.hasWorkingTreeChanges,
+        confirm: () => confirmDirtyBranchSwitch(name),
+        mutate: (confirmDirtyWorkingTree) =>
+          createRefMutation({
+            environmentId,
+            input: {
+              cwd: branchCwd,
+              refName: name,
+              switchRef: true,
+              confirmDirtyWorkingTree,
+            },
+          }),
       });
+      if (createBranchResult === null) return;
       if (createBranchResult._tag === "Success") {
+        setOptimisticBranch(name);
         setOptimisticBranch(createBranchResult.value.refName);
         setThreadBranch(createBranchResult.value.refName, activeWorktreePath);
         return;

@@ -944,6 +944,8 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.equal(status.isRepo, true);
         assert.equal(status.branch, initialBranch);
         assert.equal(status.hasWorkingTreeChanges, true);
+        assert.equal(status.headCommit, yield* git(cwd, ["rev-parse", "HEAD"]));
+        assert.equal(status.indexTree, yield* git(cwd, ["write-tree"]));
         assert.include(
           status.workingTree.files.map((file) => file.path),
           "feature.ts",
@@ -1993,6 +1995,53 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }).pipe(Effect.provide(TestLayer)),
     );
 
+    it.effect("bounds working-tree diffs by complete lines and bytes", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(
+          cwd,
+          "large.txt",
+          `${Array.from({ length: 5_000 }, () => "x").join("\n")}\n`,
+        );
+
+        const result = yield* driver.getWorkingTreeDiff({
+          cwd,
+          path: "large.txt",
+          comparison: "head",
+        });
+        const completeLineCount = result.diff.endsWith("\n")
+          ? result.diff.split("\n").length - 1
+          : result.diff.split("\n").length;
+
+        assert.isTrue(result.truncated);
+        assert.isAtMost(completeLineCount, 4_000);
+        assert.isAtMost(new TextEncoder().encode(result.diff).byteLength, 120_000);
+        assert.isTrue(result.diff.endsWith("\n"));
+      }),
+    );
+
+    it.effect("does not return a byte-truncated UTF-8 line", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, "unicode.txt", `${"😀".repeat(40_000)}\n`);
+
+        const result = yield* driver.getWorkingTreeDiff({
+          cwd,
+          path: "unicode.txt",
+          comparison: "head",
+        });
+
+        assert.isTrue(result.truncated);
+        assert.isAtMost(new TextEncoder().encode(result.diff).byteLength, 120_000);
+        assert.isTrue(result.diff.endsWith("\n"));
+        assert.notInclude(result.diff, "�");
+      }),
+    );
+
     it.effect("does not turn a missing unborn worktree path into an empty diff", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -2114,6 +2163,36 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
 
           assert.equal(error.code, "stale_git_state");
           assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), headBeforeCommit);
+        }),
+    );
+
+    it.effect(
+      "rejects an index commit when the current ref differs from the reviewed precondition",
+      () =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+          yield* writeTextFile(cwd, "staged.txt", "staged\n");
+          yield* driver.stageFiles({ cwd, paths: ["staged.txt"] });
+          const expectedHeadCommit = yield* git(cwd, ["rev-parse", "HEAD"]);
+          const expectedIndexTree = yield* git(cwd, ["write-tree"]);
+          yield* git(cwd, ["checkout", "-b", "other-review-ref"]);
+
+          const error = yield* driver
+            .commitIndex({
+              cwd,
+              message: "must not commit on another ref",
+              precondition: {
+                expectedHeadCommit,
+                expectedIndexTree,
+                expectedRefName: initialBranch,
+              },
+            })
+            .pipe(Effect.flip);
+
+          assert.equal(error.code, "stale_git_state");
+          assert.equal(yield* git(cwd, ["log", "-1", "--pretty=%s"]), "initial commit");
         }),
     );
 

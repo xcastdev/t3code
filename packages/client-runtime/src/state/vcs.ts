@@ -303,6 +303,9 @@ export function createVcsEnvironmentAtoms<R, E>(
         comparison: input.comparison,
       }),
   });
+  const mountedWorkingTreeDiffsByScope = new Map<string, Set<WeakRef<Atom.Atom<unknown>>>>();
+  const workingTreeDiffScopeKey = (environmentId: EnvironmentId, cwd: string) =>
+    `${environmentId}\u0000${cwd}`;
   const workingTreeDiffQueryFamily = Atom.family((key: string) => {
     const [environmentId, input] = JSON.parse(key) as [
       EnvironmentId,
@@ -310,26 +313,38 @@ export function createVcsEnvironmentAtoms<R, E>(
         readonly localRevision?: string;
       },
     ];
-    const rawQuery = rawWorkingTreeDiffQuery({ environmentId, input });
-    return Atom.readable(
+    let activeRawQuery: Atom.Atom<unknown> | undefined;
+    const getRawQuery = (localRevision: string | undefined) => {
+      const rawQuery = rawWorkingTreeDiffQuery({
+        environmentId,
+        input: {
+          cwd: input.cwd,
+          path: input.path,
+          comparison: input.comparison,
+          ...(localRevision === undefined ? {} : { localRevision }),
+        },
+      });
+      activeRawQuery = rawQuery;
+      return rawQuery;
+    };
+    const query = Atom.readable(
       (get) => {
         const statusResult = get(status({ environmentId, input: { cwd: input.cwd } }));
         const statusValue = Option.getOrNull(AsyncResult.value(statusResult));
         const localRevision = statusValue?.localRevision ?? input.localRevision;
-        return get(
-          rawWorkingTreeDiffQuery({
-            environmentId,
-            input: {
-              cwd: input.cwd,
-              path: input.path,
-              comparison: input.comparison,
-              ...(localRevision === undefined ? {} : { localRevision }),
-            },
-          }),
-        );
+        return get(getRawQuery(localRevision));
       },
-      (refresh) => refresh(rawQuery),
+      (refresh) => {
+        if (activeRawQuery !== undefined) {
+          refresh(activeRawQuery);
+        }
+      },
     ).pipe(Atom.setIdleTTL(0), Atom.withLabel(`environment-data:vcs:working-tree-diff:${key}`));
+    const scopeKey = workingTreeDiffScopeKey(environmentId, input.cwd);
+    const mountedQueries = mountedWorkingTreeDiffsByScope.get(scopeKey) ?? new Set();
+    mountedQueries.add(new WeakRef(query));
+    mountedWorkingTreeDiffsByScope.set(scopeKey, mountedQueries);
+    return query;
   });
   const getWorkingTreeDiffQuery = (target: {
     readonly environmentId: EnvironmentId;
@@ -344,30 +359,27 @@ export function createVcsEnvironmentAtoms<R, E>(
     registry: AtomRegistry.AtomRegistry,
   ) =>
     Effect.sync(() => {
-      const statusAtom = status({
-        environmentId: target.environmentId,
-        input: { cwd: target.input.cwd },
-      });
-      const statusNode = registry.getNodes().get(statusAtom);
-      const statusValue =
-        statusNode === undefined
-          ? null
-          : Option.getOrNull(AsyncResult.value(registry.get(statusAtom)));
-      const localRevision = statusValue?.localRevision;
-      for (const path of target.input.paths) {
-        for (const comparison of ["index", "head"] as const) {
-          registry.refresh(
-            getWorkingTreeDiffQuery({
-              environmentId: target.environmentId,
-              input: {
-                cwd: target.input.cwd,
-                path,
-                comparison,
-                ...(localRevision === undefined ? {} : { localRevision }),
-              },
-            }),
-          );
+      const scopeKey = workingTreeDiffScopeKey(target.environmentId, target.input.cwd);
+      const mountedQueries = mountedWorkingTreeDiffsByScope.get(scopeKey);
+      if (mountedQueries === undefined) {
+        return;
+      }
+      for (const queryReference of mountedQueries) {
+        const query = queryReference.deref();
+        if (query === undefined) {
+          mountedQueries.delete(queryReference);
+          continue;
         }
+        const node = registry.getNodes().get(query);
+        if (node === undefined || node.listeners.size === 0) {
+          mountedQueries.delete(queryReference);
+          continue;
+        }
+        registry.refresh(query);
+        registry.get(query);
+      }
+      if (mountedQueries.size === 0) {
+        mountedWorkingTreeDiffsByScope.delete(scopeKey);
       }
     });
 

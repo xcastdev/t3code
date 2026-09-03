@@ -31,6 +31,13 @@ describe("GitWorkflowService", () => {
     const unstageFiles = vi.fn(() => Effect.succeed(undefined));
     const getWorkingTreeDiff = vi.fn(() => Effect.succeed({ diff: "diff", truncated: false }));
     const commitIndex = vi.fn(() => Effect.succeed({ commitSha: "abc123" }));
+    const pullCurrentBranch = vi.fn(() =>
+      Effect.succeed({
+        status: "skipped_up_to_date" as const,
+        refName: "main",
+        upstreamRef: null,
+      }),
+    );
     const testLayer = GitWorkflowService.layer.pipe(
       Layer.provide(
         Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
@@ -51,6 +58,7 @@ describe("GitWorkflowService", () => {
           unstageFiles,
           getWorkingTreeDiff,
           commitIndex,
+          pullCurrentBranch,
         }),
       ),
       Layer.provide(Layer.mock(GitManager.GitManager)({})),
@@ -66,9 +74,15 @@ describe("GitWorkflowService", () => {
         comparison: "head",
       });
       const commit = yield* workflow.commitIndex({ cwd: "/repo", message: "commit a" });
+      const pull = yield* workflow.pullCurrentBranch("/repo");
 
       expect(diff).toEqual({ diff: "diff", truncated: false });
       expect(commit).toEqual({ commitSha: "abc123" });
+      expect(pull).toEqual({
+        status: "skipped_up_to_date",
+        refName: "main",
+        upstreamRef: null,
+      });
       expect(stageFiles).toHaveBeenCalledWith({ cwd: "/repo", paths: ["a.txt"] });
       expect(unstageFiles).toHaveBeenCalledWith({ cwd: "/repo", paths: ["a.txt"] });
       expect(getWorkingTreeDiff).toHaveBeenCalledWith({
@@ -77,6 +91,7 @@ describe("GitWorkflowService", () => {
         comparison: "head",
       });
       expect(commitIndex).toHaveBeenCalledWith({ cwd: "/repo", message: "commit a" });
+      expect(pullCurrentBranch).toHaveBeenCalledWith("/repo");
     }).pipe(Effect.provide(testLayer));
   });
 
@@ -101,7 +116,7 @@ describe("GitWorkflowService", () => {
                 return resolveCalls;
               }).pipe(
                 Effect.tap((count) =>
-                  count === 5 ? Deferred.succeed(queuedCallsResolved, undefined) : Effect.void,
+                  count === 7 ? Deferred.succeed(queuedCallsResolved, undefined) : Effect.void,
                 ),
                 Effect.as({
                   kind: "git",
@@ -125,6 +140,14 @@ describe("GitWorkflowService", () => {
               }),
             unstageFiles: () => recordMutation("unstage"),
             commitIndex: () => recordMutation("commit").pipe(Effect.as({ commitSha: "abc123" })),
+            pullCurrentBranch: () =>
+              recordMutation("pull").pipe(
+                Effect.as({
+                  status: "skipped_up_to_date" as const,
+                  refName: "main",
+                  upstreamRef: null,
+                }),
+              ),
             createRef: (input) =>
               recordMutation("create-and-switch").pipe(Effect.as({ refName: input.refName })),
             switchRef: (input) =>
@@ -150,6 +173,12 @@ describe("GitWorkflowService", () => {
               switchRef: true,
             }),
             workflow.switchRef({ cwd: "/repo/nested", refName: "feature/test" }),
+            workflow.pullCurrentBranch("/repo/nested"),
+            workflow.withRepositoryPermit(
+              "GitWorkflowService.refreshLocalStatus",
+              "/repo/nested",
+              recordMutation("refresh"),
+            ),
           ],
           (effect) => effect.pipe(Effect.forkChild),
         );

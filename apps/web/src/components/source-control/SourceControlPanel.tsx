@@ -32,9 +32,15 @@ import { Spinner } from "../ui/spinner";
 import { Textarea } from "../ui/textarea";
 import {
   defaultSourceControlDiffComparison,
+  buildSourceControlCommitInput,
+  canSubmitSourceControlCommit,
   fileActions,
+  handleSourceControlCommitFailure,
   gitIndexWorkflowAvailability,
   isFileStaged,
+  submitSourceControlCommit,
+  sourceControlDiffRenderModel,
+  sourceControlDiffState,
   sourceControlDiffComparisons,
   sourceControlFileStatusLabel,
   type SourceControlPanelView,
@@ -127,18 +133,8 @@ type PendingIndexAction = Readonly<{
   kind: "stage" | "unstage";
 }>;
 
-function DiffPreview({
-  diff,
-  truncated,
-  pending,
-  error,
-}: {
-  readonly diff: string | null;
-  readonly truncated: boolean;
-  readonly pending: boolean;
-  readonly error: string | null;
-}) {
-  if (pending) {
+function DiffPreview({ state }: { readonly state: ReturnType<typeof sourceControlDiffState> }) {
+  if (state.kind === "loading") {
     return (
       <div
         className="flex items-center gap-2 px-3 py-4 text-xs text-muted-foreground"
@@ -149,37 +145,42 @@ function DiffPreview({
       </div>
     );
   }
-  if (error) {
+  if (state.kind === "unsupported") {
     return (
-      <p className="px-3 py-4 text-xs text-destructive" role="alert">
-        {error}
+      <p className="px-3 py-4 text-xs text-muted-foreground">
+        Diff review requires a newer T3 Code server.
       </p>
     );
   }
-  if (diff === null || diff.trim().length === 0) {
+  if (state.kind === "error") {
+    return (
+      <p className="px-3 py-4 text-xs text-destructive" role="alert">
+        {state.message}
+      </p>
+    );
+  }
+  if (state.kind === "empty") {
     return <p className="px-3 py-4 text-xs text-muted-foreground">No changes for this file.</p>;
   }
-  const lines = diff.split("\n");
+  const runs = sourceControlDiffRenderModel(state.diff);
+  const classNameForTone = {
+    addition: "text-emerald-700 dark:text-emerald-300",
+    deletion: "text-red-700 dark:text-red-300",
+    hunk: "text-blue-700 dark:text-blue-300",
+    context: "text-muted-foreground",
+  } as const;
   return (
     <div className="min-h-0 flex-1 overflow-auto bg-muted/20 px-3 py-2">
       <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed">
-        {lines.map((line, index) => {
-          const className = line.startsWith("+")
-            ? "text-emerald-700 dark:text-emerald-300"
-            : line.startsWith("-")
-              ? "text-red-700 dark:text-red-300"
-              : line.startsWith("@@")
-                ? "text-blue-700 dark:text-blue-300"
-                : "text-muted-foreground";
+        {runs.map((run, index) => {
           return (
-            <span className={className} key={`${index}:${line}`}>
-              {line}
-              {index < lines.length - 1 ? "\n" : null}
+            <span className={classNameForTone[run.tone]} key={`${index}:${run.tone}`}>
+              {run.text}
             </span>
           );
         })}
       </pre>
-      {truncated ? (
+      {state.truncated ? (
         <p className="mt-2 text-[11px] text-warning">
           Diff truncated to keep the panel responsive.
         </p>
@@ -243,10 +244,25 @@ function ChangesView({
     workflowAvailable && selectedFile !== null && cwd !== null
       ? vcsEnvironment.getWorkingTreeDiffQuery({
           environmentId,
-          input: { cwd, path: selectedFile.path, comparison: diffComparison },
+          input: {
+            cwd,
+            path: selectedFile.path,
+            comparison: diffComparison,
+            ...(status?.localRevision === undefined ? {} : { localRevision: status.localRevision }),
+          },
         })
       : null,
   );
+  const diffState = sourceControlDiffState({
+    capabilityKnown: gitIndexWorkflowCapabilityKnown,
+    supported: supportsGitIndexWorkflow,
+    pending: diffQuery.isPending,
+    error: diffQuery.error,
+    diff: diffQuery.data?.diff ?? null,
+    truncated: diffQuery.data?.truncated ?? false,
+  });
+  const refreshStatus = statusQuery.refresh;
+  const refreshDiff = diffQuery.refresh;
   const stage = useAtomCommand(vcsEnvironment.stageFiles, { reportFailure: false });
   const unstage = useAtomCommand(vcsEnvironment.unstageFiles, { reportFailure: false });
   const commit = useAtomCommand(vcsEnvironment.commitIndex, { reportFailure: false });
@@ -303,17 +319,46 @@ function ChangesView({
     }
     setCommitPending(true);
     setActionError(null);
-    const result = await commit({
-      environmentId,
-      input: { cwd, message: commitMessage.trim() },
+    let staleStateHandled = false;
+    const commitInput = buildSourceControlCommitInput({
+      cwd,
+      message: commitMessage.trim(),
+      headCommit: status.headCommit,
+      indexTree: status.indexTree,
+      refName: status.refName,
+      confirmDefaultRef: status.isDefaultRef,
+    });
+    const result = await submitSourceControlCommit({
+      commit: (input) => commit({ environmentId, input }),
+      commitInput,
+      onStale: (failure) => {
+        staleStateHandled = handleSourceControlCommitFailure(failure, {
+          refreshStatus,
+          refreshDiff,
+          setError: setActionError,
+        });
+      },
     });
     setCommitPending(false);
     if (result._tag === "Failure") {
-      if (!isAtomCommandInterrupted(result)) setActionError(commandError(result));
+      if (!isAtomCommandInterrupted(result) && !staleStateHandled) {
+        setActionError(commandError(result));
+      }
       return;
     }
     setCommitMessage("");
-  }, [commit, commitMessage, commitPending, cwd, environmentId, files, status, workflowAvailable]);
+  }, [
+    commit,
+    commitMessage,
+    commitPending,
+    cwd,
+    environmentId,
+    files,
+    refreshDiff,
+    refreshStatus,
+    status,
+    workflowAvailable,
+  ]);
 
   if (statusQuery.isPending && status === null) {
     return <div className="p-3 text-xs text-muted-foreground">Loading repository status...</div>;
@@ -354,8 +399,16 @@ function ChangesView({
   }
 
   const stagedCount = files.filter(isFileStaged).length;
-  const canCommit =
-    workflowAvailable && stagedCount > 0 && commitMessage.trim().length > 0 && !commitPending;
+  const diffReviewReady =
+    selectedFile === null || diffState.kind === "ready" || diffState.kind === "empty";
+  const canCommit = canSubmitSourceControlCommit({
+    workflowAvailable,
+    stagedCount,
+    message: commitMessage,
+    commitPending,
+    diffReviewReady,
+    reviewedStateAvailable: status?.headCommit !== undefined && status?.indexTree !== undefined,
+  });
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -510,6 +563,7 @@ function ChangesView({
                   size="xs"
                   variant={diffComparison === "index" ? "secondary" : "ghost"}
                   aria-pressed={diffComparison === "index"}
+                  disabled={!workflowAvailable}
                   onClick={() => setRequestedComparison("index")}
                 >
                   Staged
@@ -518,18 +572,14 @@ function ChangesView({
                   size="xs"
                   variant={diffComparison === "head" ? "secondary" : "ghost"}
                   aria-pressed={diffComparison === "head"}
+                  disabled={!workflowAvailable}
                   onClick={() => setRequestedComparison("head")}
                 >
                   Working tree
                 </Button>
               </div>
             ) : null}
-            <DiffPreview
-              diff={diffQuery.data?.diff ?? null}
-              truncated={diffQuery.data?.truncated ?? false}
-              pending={diffQuery.isPending}
-              error={diffQuery.error}
-            />
+            <DiffPreview state={diffState} />
           </div>
         ) : null}
       </ScrollArea>

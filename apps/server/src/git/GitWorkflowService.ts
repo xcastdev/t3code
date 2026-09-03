@@ -55,6 +55,11 @@ export class GitWorkflowService extends Context.Service<
     readonly invalidateLocalStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateRemoteStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateStatus: (cwd: string) => Effect.Effect<void, never>;
+    readonly withRepositoryPermit: <A, E, R>(
+      operation: string,
+      cwd: string,
+      effect: Effect.Effect<A, E, R>,
+    ) => Effect.Effect<A, E | GitCommandError, R>;
     readonly stageFiles: (input: VcsStageFilesInput) => Effect.Effect<void, GitCommandError>;
     readonly unstageFiles: (input: VcsStageFilesInput) => Effect.Effect<void, GitCommandError>;
     readonly getWorkingTreeDiff: (
@@ -330,6 +335,7 @@ export const make = Effect.gen(function* () {
     invalidateLocalStatus: gitManager.invalidateLocalStatus,
     invalidateRemoteStatus: gitManager.invalidateRemoteStatus,
     invalidateStatus: gitManager.invalidateStatus,
+    withRepositoryPermit: serializedMutation,
     stageFiles: (input) =>
       serializedMutation("GitWorkflowService.stageFiles", input.cwd, git.stageFiles(input)),
     unstageFiles: (input) =>
@@ -341,9 +347,7 @@ export const make = Effect.gen(function* () {
     commitIndex: (input) =>
       serializedMutation("GitWorkflowService.commitIndex", input.cwd, git.commitIndex(input)),
     pullCurrentBranch: (cwd) =>
-      ensureGitCommand("GitWorkflowService.pullCurrentBranch", cwd).pipe(
-        Effect.andThen(git.pullCurrentBranch(cwd)),
-      ),
+      serializedMutation("GitWorkflowService.pullCurrentBranch", cwd, git.pullCurrentBranch(cwd)),
     runStackedAction: (input, options) =>
       ensureGit("GitWorkflowService.runStackedAction", input.cwd).pipe(
         Effect.andThen(gitManager.runStackedAction(input, options)),

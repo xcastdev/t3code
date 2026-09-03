@@ -305,6 +305,7 @@ describe("Git index and diff contracts", () => {
     const precondition = {
       expectedHeadCommit: null,
       expectedIndexTree: "tree-1",
+      expectedRefName: "main",
     };
 
     expect(

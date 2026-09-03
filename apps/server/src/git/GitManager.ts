@@ -910,6 +910,8 @@ export const make = Effect.gen(function* () {
     return {
       isRepo: details.isRepo,
       ...(details.repositoryRoot ? { repositoryRoot: details.repositoryRoot } : {}),
+      ...(details.headCommit !== undefined ? { headCommit: details.headCommit } : {}),
+      ...(details.indexTree ? { indexTree: details.indexTree } : {}),
       ...(hostingProvider ? { sourceControlProvider: hostingProvider } : {}),
       hasPrimaryRemote: details.hasOriginRemote,
       isDefaultRef: details.isDefaultBranch,

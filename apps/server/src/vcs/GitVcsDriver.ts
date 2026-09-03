@@ -63,6 +63,8 @@ export interface ExecuteGitResult {
 export interface GitStatusDetails {
   isRepo: boolean;
   repositoryRoot?: string;
+  headCommit?: string | null;
+  indexTree?: string;
   sourceControlProvider?: VcsStatusResult["sourceControlProvider"];
   hasOriginRemote: boolean;
   isDefaultBranch: boolean;

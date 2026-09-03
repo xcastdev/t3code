@@ -710,6 +710,8 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       expect(status.hasPrimaryRemote).toBe(true);
       expect(status.isDefaultRef).toBe(false);
       expect(status.refName).toBe("feature/status-open-pr");
+      expect(status.headCommit).toBe((yield* runGit(repoDir, ["rev-parse", "HEAD"])).stdout.trim());
+      expect(status.indexTree).toBe((yield* runGit(repoDir, ["write-tree"])).stdout.trim());
       expect(status.pr).toEqual({
         number: 13,
         title: "Existing PR",

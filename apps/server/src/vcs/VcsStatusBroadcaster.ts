@@ -242,9 +242,20 @@ export const make = Effect.gen(function* () {
   });
 
   const updateCachedLocalStatus = Effect.fn("VcsStatusBroadcaster.updateCachedLocalStatus")(
-    function* (cwd: string, local: VcsStatusLocalResult, options?: { publish?: boolean }) {
+    function* (
+      cwd: string,
+      local: VcsStatusLocalResult,
+      options?: { publish?: boolean; onlyIfChanged?: boolean },
+    ) {
       const [nextLocal, shouldPublish] = yield* Ref.modify(cacheRef, (cache) => {
         const previous = cache.get(cwd) ?? EMPTY_CACHED_VCS_STATUS;
+        if (
+          options?.onlyIfChanged &&
+          previous.local &&
+          fingerprintLocalStatus(previous.local.value) === fingerprintLocalStatus(local)
+        ) {
+          return [[previous.local, false as boolean] as const, cache] as const;
+        }
         const localRevision = previous.localRevision + 1;
         const value = {
           ...local,
@@ -314,7 +325,7 @@ export const make = Effect.gen(function* () {
     cwd: string,
     local: VcsStatusLocalResult,
     remote: VcsStatusRemoteResult | null,
-    options?: { publish?: boolean },
+    options?: { publish?: boolean; preserveLocalRevisionIfUnchanged?: boolean },
   ) {
     const nextRemote = {
       fingerprint: fingerprintStatusPart(remote),
@@ -322,7 +333,11 @@ export const make = Effect.gen(function* () {
     } satisfies CachedValue<VcsStatusRemoteResult | null>;
     const [nextLocal, shouldPublish] = yield* Ref.modify(cacheRef, (cache) => {
       const previous = cache.get(cwd) ?? EMPTY_CACHED_VCS_STATUS;
-      const localRevision = previous.localRevision + 1;
+      const localUnchanged =
+        options?.preserveLocalRevisionIfUnchanged &&
+        previous.local !== null &&
+        fingerprintLocalStatus(previous.local.value) === fingerprintLocalStatus(local);
+      const localRevision = localUnchanged ? previous.localRevision : previous.localRevision + 1;
       const value = {
         ...local,
         localRevision: String(localRevision),
@@ -375,7 +390,7 @@ export const make = Effect.gen(function* () {
       return cached.local.value;
     }
     yield* removeStatusCacheAlias(cwd, canonicalCwd);
-    return yield* updateCachedLocalStatus(canonicalCwd, local);
+    return yield* updateCachedLocalStatus(canonicalCwd, local, { onlyIfChanged: true });
   });
 
   const getOrLoadLocalStatus = Effect.fn("VcsStatusBroadcaster.getOrLoadLocalStatus")(function* (
@@ -404,7 +419,7 @@ export const make = Effect.gen(function* () {
       }
     }
 
-    const local = cached?.local?.value ?? (yield* workflow.localStatus({ cwd }));
+    const local = cached?.local?.value ?? (yield* loadLocalStatus(cwd));
     const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
     const canonicalCached = yield* getCachedStatus(canonicalCwd);
     if (
@@ -420,16 +435,24 @@ export const make = Effect.gen(function* () {
       cached?.remote?.value ??
       (yield* workflow.remoteStatus({ cwd }));
     yield* removeStatusCacheAlias(cwd, canonicalCwd);
-    return yield* updateCachedStatus(canonicalCwd, local, remote);
+    return yield* updateCachedStatus(canonicalCwd, local, remote, {
+      preserveLocalRevisionIfUnchanged: true,
+    });
   });
 
   const refreshLocalStatusCore = Effect.fn("VcsStatusBroadcaster.refreshLocalStatusCore")(
     function* (cwd: string) {
-      yield* workflow.invalidateLocalStatus(cwd);
-      const local = yield* workflow.localStatus({ cwd });
-      const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
-      yield* removeStatusCacheAlias(cwd, canonicalCwd);
-      return yield* updateCachedLocalStatus(canonicalCwd, local, { publish: true });
+      return yield* workflow.withRepositoryPermit(
+        "VcsStatusBroadcaster.refreshLocalStatus",
+        cwd,
+        Effect.gen(function* () {
+          yield* workflow.invalidateLocalStatus(cwd);
+          const local = yield* workflow.localStatus({ cwd });
+          const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
+          yield* removeStatusCacheAlias(cwd, canonicalCwd);
+          return yield* updateCachedLocalStatus(canonicalCwd, local, { publish: true });
+        }),
+      );
     },
   );
 
