@@ -184,6 +184,11 @@ function fingerprintStatusPart(status: unknown): string {
   return JSON.stringify(status);
 }
 
+function fingerprintLocalStatus(local: VcsStatusLocalResult): string {
+  const { localRevision: _localRevision, ...withoutRevision } = local;
+  return fingerprintStatusPart(withoutRevision);
+}
+
 const normalizeCwd = (cwd: string) =>
   Effect.service(FileSystem.FileSystem).pipe(
     Effect.flatMap((fs) => fs.realPath(cwd)),
@@ -361,6 +366,14 @@ export const make = Effect.gen(function* () {
   ) {
     const local = yield* workflow.localStatus({ cwd });
     const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
+    const cached = yield* getCachedStatus(canonicalCwd);
+    if (
+      cached?.local &&
+      fingerprintLocalStatus(cached.local.value) === fingerprintLocalStatus(local)
+    ) {
+      yield* removeStatusCacheAlias(cwd, canonicalCwd);
+      return cached.local.value;
+    }
     yield* removeStatusCacheAlias(cwd, canonicalCwd);
     return yield* updateCachedLocalStatus(canonicalCwd, local);
   });
@@ -394,6 +407,14 @@ export const make = Effect.gen(function* () {
     const local = cached?.local?.value ?? (yield* workflow.localStatus({ cwd }));
     const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
     const canonicalCached = yield* getCachedStatus(canonicalCwd);
+    if (
+      canonicalCached?.local &&
+      canonicalCached.remote &&
+      fingerprintLocalStatus(canonicalCached.local.value) === fingerprintLocalStatus(local)
+    ) {
+      yield* removeStatusCacheAlias(cwd, canonicalCwd);
+      return mergeGitStatusParts(canonicalCached.local.value, canonicalCached.remote.value);
+    }
     const remote =
       canonicalCached?.remote?.value ??
       cached?.remote?.value ??

@@ -826,6 +826,29 @@ describe("Git workflow command atoms", () => {
       Effect.gen(function* () {
         let diffRequestCount = 0;
         const client = {
+          [WS_METHODS.subscribeVcsStatus]: () =>
+            Stream.make({
+              _tag: "snapshot" as const,
+              local: {
+                isRepo: true,
+                repositoryRoot: "/repo",
+                hasPrimaryRemote: false,
+                isDefaultRef: true,
+                refName: "main",
+                localRevision: "1",
+                headCommit: "head-1",
+                indexTree: "tree-1",
+                hasWorkingTreeChanges: true,
+                workingTree: {
+                  files: [
+                    { path: "a.txt", insertions: 1, deletions: 0, indexStatus: "both" as const },
+                  ],
+                  insertions: 1,
+                  deletions: 0,
+                },
+              },
+              remote: null,
+            }).pipe(Stream.concat(Stream.never)),
           [WS_METHODS.vcsStageFiles]: (_input: unknown) => Effect.void,
           [WS_METHODS.vcsUnstageFiles]: (_input: unknown) => Effect.void,
           [WS_METHODS.vcsGetWorkingTreeDiff]: (_input: unknown) =>
@@ -861,8 +884,19 @@ describe("Git workflow command atoms", () => {
         );
         const diff = atoms.getWorkingTreeDiffQuery({
           environmentId: TARGET.environmentId,
-          input: { cwd: "/repo", path: "a.txt", comparison: "index" },
+          input: { cwd: "/repo", path: "a.txt", comparison: "index", localRevision: "1" },
         });
+        const status = atoms.status({
+          environmentId: TARGET.environmentId,
+          input: { cwd: "/repo" },
+        });
+        const unsubscribeStatus = registry.subscribe(status, () => undefined, { immediate: true });
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribeStatus));
+        yield* Effect.yieldNow;
+        const statusResult = registry.get(status);
+        expect(statusResult._tag).toBe("Success");
+        if (statusResult._tag !== "Success") return;
+        expect(statusResult.value.localRevision).toBe("1");
         const unsubscribe = registry.subscribe(diff, () => undefined, { immediate: true });
         yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
         yield* Effect.yieldNow;

@@ -344,12 +344,27 @@ export function createVcsEnvironmentAtoms<R, E>(
     registry: AtomRegistry.AtomRegistry,
   ) =>
     Effect.sync(() => {
+      const statusAtom = status({
+        environmentId: target.environmentId,
+        input: { cwd: target.input.cwd },
+      });
+      const statusNode = registry.getNodes().get(statusAtom);
+      const statusValue =
+        statusNode === undefined
+          ? null
+          : Option.getOrNull(AsyncResult.value(registry.get(statusAtom)));
+      const localRevision = statusValue?.localRevision;
       for (const path of target.input.paths) {
         for (const comparison of ["index", "head"] as const) {
           registry.refresh(
             getWorkingTreeDiffQuery({
               environmentId: target.environmentId,
-              input: { cwd: target.input.cwd, path, comparison },
+              input: {
+                cwd: target.input.cwd,
+                path,
+                comparison,
+                ...(localRevision === undefined ? {} : { localRevision }),
+              },
             }),
           );
         }

@@ -572,6 +572,44 @@ describe("VcsStatusBroadcaster", () => {
     }).pipe(Effect.provide(makeTestLayer(state)));
   });
 
+  it.effect("reuses a canonical repository cache for alias-first status reads", () => {
+    const state = {
+      currentLocalStatus: baseLocalStatus,
+      currentRemoteStatus: baseRemoteStatus,
+      localStatusCalls: 0,
+      remoteStatusCalls: 0,
+      localInvalidationCalls: 0,
+      remoteInvalidationCalls: 0,
+    };
+
+    return Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const repositoryRoot = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-vcs-status-alias-",
+      });
+      const nestedCwd = path.join(repositoryRoot, "nested");
+      yield* fileSystem.makeDirectory(nestedCwd);
+      const linkParent = yield* fileSystem.makeTempDirectoryScoped({
+        prefix: "t3-vcs-status-alias-link-",
+      });
+      const symlinkCwd = path.join(linkParent, "repo-link");
+      yield* fileSystem.symlink(repositoryRoot, symlinkCwd);
+      state.currentLocalStatus = { ...baseLocalStatus, repositoryRoot };
+
+      const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+      const nested = yield* broadcaster.getStatus({ cwd: nestedCwd });
+      const root = yield* broadcaster.getStatus({ cwd: repositoryRoot });
+      const symlink = yield* broadcaster.getStatus({ cwd: symlinkCwd });
+
+      assert.equal(nested.localRevision, "1");
+      assert.equal(root.localRevision, "1");
+      assert.equal(symlink.localRevision, "1");
+      assert.equal(state.localStatusCalls, 1);
+      assert.equal(state.remoteStatusCalls, 1);
+    }).pipe(Effect.provide(makeTestLayer(state)));
+  });
+
   it.effect("streams a local snapshot first and remote updates later", () => {
     const state = {
       currentLocalStatus: baseLocalStatus,
