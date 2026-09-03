@@ -31,9 +31,11 @@ import { ScrollArea } from "../ui/scroll-area";
 import { Spinner } from "../ui/spinner";
 import { Textarea } from "../ui/textarea";
 import {
-  fileAction,
+  defaultSourceControlDiffComparison,
+  fileActions,
   gitIndexWorkflowAvailability,
   isFileStaged,
+  sourceControlDiffComparisons,
   sourceControlFileStatusLabel,
   type SourceControlPanelView,
 } from "./sourceControlPanel.logic";
@@ -121,6 +123,11 @@ function fileKey(file: VcsWorkingTreeFile): string {
   return file.path;
 }
 
+type PendingIndexAction = Readonly<{
+  path: string;
+  kind: "stage" | "unstage";
+}>;
+
 function DiffPreview({
   diff,
   truncated,
@@ -203,15 +210,29 @@ function ChangesView({
   const status = statusQuery.data;
   const files = status?.workingTree.files ?? [];
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
+  const [requestedComparison, setRequestedComparison] = useState<"index" | "head">("head");
   const [commitMessage, setCommitMessage] = useState("");
   const [actionError, setActionError] = useState<string | null>(null);
-  const [pendingPath, setPendingPath] = useState<string | null>(null);
+  const [pendingAction, setPendingAction] = useState<PendingIndexAction | null>(null);
   const [commitPending, setCommitPending] = useState(false);
 
   const selectedFile = files.find((file) => file.path === selectedPath) ?? null;
+  const selectedComparisons =
+    selectedFile === null ? [] : sourceControlDiffComparisons(selectedFile);
+  const diffComparison =
+    selectedFile !== null && selectedComparisons.includes(requestedComparison)
+      ? requestedComparison
+      : selectedFile !== null
+        ? defaultSourceControlDiffComparison(selectedFile)
+        : "head";
   useEffect(() => {
     if (selectedPath !== null && selectedFile === null) setSelectedPath(null);
   }, [selectedFile, selectedPath]);
+  useEffect(() => {
+    if (selectedFile !== null && requestedComparison !== diffComparison) {
+      setRequestedComparison(diffComparison);
+    }
+  }, [diffComparison, requestedComparison, selectedFile]);
 
   const workflowAvailability = gitIndexWorkflowAvailability(
     gitIndexWorkflowCapabilityKnown,
@@ -223,7 +244,7 @@ function ChangesView({
     workflowAvailable && selectedFile !== null && cwd !== null
       ? vcsEnvironment.getWorkingTreeDiffQuery({
           environmentId,
-          input: { cwd, path: selectedFile.path, comparison: "head" },
+          input: { cwd, path: selectedFile.path, comparison: diffComparison },
         })
       : null,
   );
@@ -233,17 +254,15 @@ function ChangesView({
   const init = useAtomCommand(vcsEnvironment.init, { reportFailure: false });
 
   const runIndexAction = useCallback(
-    async (file: VcsWorkingTreeFile) => {
-      if (!workflowAvailable || cwd === null) return;
-      const action = fileAction(file);
-      if (action.disabled) return;
-      setPendingPath(file.path);
+    async (file: VcsWorkingTreeFile, kind: "stage" | "unstage") => {
+      if (cwd === null || !workflowAvailable) return;
+      setPendingAction({ path: file.path, kind });
       setActionError(null);
-      const result = await (action.label === "Unstage" ? unstage : stage)({
+      const result = await (kind === "unstage" ? unstage : stage)({
         environmentId,
         input: { cwd, paths: [file.path] },
       });
-      setPendingPath(null);
+      setPendingAction(null);
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         setActionError(commandError(result));
       }
@@ -405,7 +424,7 @@ function ChangesView({
         ) : (
           <div className="space-y-0.5 p-2">
             {files.map((file) => {
-              const action = fileAction(file);
+              const actions = fileActions(file);
               const selected = file.path === selectedPath;
               return (
                 <div
@@ -419,7 +438,10 @@ function ChangesView({
                     type="button"
                     className="min-w-0 flex-1 truncate text-left font-mono focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                     aria-current={selected ? "true" : undefined}
-                    onClick={() => setSelectedPath(file.path)}
+                    onClick={() => {
+                      setSelectedPath(file.path);
+                      setRequestedComparison(defaultSourceControlDiffComparison(file));
+                    }}
                   >
                     <span className="block truncate">{file.path}</span>
                     <span className="mt-0.5 block font-sans text-[10px] text-muted-foreground">
@@ -430,19 +452,40 @@ function ChangesView({
                       <span className="ml-1 text-red-600 dark:text-red-400">-{file.deletions}</span>
                     </span>
                   </button>
-                  <Button
-                    size="xs"
-                    variant={action.label === "Stage" ? "outline" : "ghost"}
-                    disabled={!workflowAvailable || action.disabled || pendingPath !== null}
-                    title={action.reason}
-                    onClick={() => void runIndexAction(file)}
-                  >
-                    {pendingPath === file.path ? (
-                      <Spinner className="size-3" aria-hidden />
-                    ) : (
-                      action.label
-                    )}
-                  </Button>
+                  <div className="flex shrink-0 items-center gap-1">
+                    {actions.map((action) => {
+                      if (action.kind === "unavailable") {
+                        return (
+                          <Button
+                            key={action.kind}
+                            size="xs"
+                            variant="ghost"
+                            disabled
+                            title={action.reason}
+                          >
+                            {action.label}
+                          </Button>
+                        );
+                      }
+                      const kind = action.kind;
+                      return (
+                        <Button
+                          key={kind}
+                          size="xs"
+                          variant={kind === "stage" ? "outline" : "ghost"}
+                          disabled={!workflowAvailable || action.disabled || pendingAction !== null}
+                          title={action.reason}
+                          onClick={() => void runIndexAction(file, kind)}
+                        >
+                          {pendingAction?.path === file.path && pendingAction.kind === kind ? (
+                            <Spinner className="size-3" aria-hidden />
+                          ) : (
+                            action.label
+                          )}
+                        </Button>
+                      );
+                    })}
+                  </div>
                 </div>
               );
             })}
@@ -454,8 +497,34 @@ function ChangesView({
               <span className="min-w-0 flex-1 truncate font-mono text-xs font-medium">
                 {selectedFile.path}
               </span>
-              <span className="text-[10px] text-muted-foreground">HEAD</span>
+              <span className="text-[10px] text-muted-foreground">
+                {diffComparison === "index" ? "Staged vs HEAD" : "Working tree vs HEAD"}
+              </span>
             </div>
+            {selectedComparisons.length > 1 ? (
+              <div
+                className="flex items-center gap-1 border-t border-border/50 px-3 py-1.5"
+                role="group"
+                aria-label="Diff comparison"
+              >
+                <Button
+                  size="xs"
+                  variant={diffComparison === "index" ? "secondary" : "ghost"}
+                  aria-pressed={diffComparison === "index"}
+                  onClick={() => setRequestedComparison("index")}
+                >
+                  Staged
+                </Button>
+                <Button
+                  size="xs"
+                  variant={diffComparison === "head" ? "secondary" : "ghost"}
+                  aria-pressed={diffComparison === "head"}
+                  onClick={() => setRequestedComparison("head")}
+                >
+                  Working tree
+                </Button>
+              </div>
+            ) : null}
             <DiffPreview
               diff={diffQuery.data?.diff ?? null}
               truncated={diffQuery.data?.truncated ?? false}

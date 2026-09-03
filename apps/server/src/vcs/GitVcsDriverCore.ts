@@ -2768,7 +2768,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         appendTruncationMarker: true,
       },
     );
-    if (result.exitCode !== 0 && !(useUntrackedDiff && result.exitCode === 1)) {
+    const isExpectedNoIndexDifference =
+      useUntrackedDiff && result.exitCode === 1 && result.stdout.length > 0;
+    if (result.exitCode !== 0 && !isExpectedNoIndexDifference) {
       return yield* new GitCommandError({
         ...gitCommandContext({
           operation: "GitVcsDriver.getWorkingTreeDiff",

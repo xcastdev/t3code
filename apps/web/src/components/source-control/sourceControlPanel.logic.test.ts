@@ -2,11 +2,13 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   canAttemptDirtyBranchSwitch,
-  fileAction,
+  defaultSourceControlDiffComparison,
+  fileActions,
   gitIndexWorkflowAvailability,
   isFileStaged,
   needsDirtyBranchConfirmation,
   pullRequestShortcutTarget,
+  sourceControlDiffComparisons,
 } from "./sourceControlPanel.logic";
 
 describe("source control panel logic", () => {
@@ -22,15 +24,44 @@ describe("source control panel logic", () => {
     expect(canAttemptDirtyBranchSwitch(true)).toBe(true);
   });
 
-  it("shows stage and unstage actions from the index state", () => {
-    expect(fileAction({ indexStatus: "unstaged" })).toMatchObject({ label: "Stage" });
-    expect(fileAction({ indexStatus: "staged" })).toMatchObject({ label: "Unstage" });
-    expect(fileAction({ indexStatus: "both" })).toMatchObject({ label: "Stage" });
+  it("offers both reverse operations for staged and modified files", () => {
+    expect(fileActions({ indexStatus: "unstaged" }).map((action) => action.kind)).toEqual([
+      "stage",
+    ]);
+    expect(fileActions({ indexStatus: "staged" }).map((action) => action.kind)).toEqual([
+      "unstage",
+    ]);
+    expect(fileActions({ indexStatus: "both" }).map((action) => action.kind)).toEqual([
+      "unstage",
+      "stage",
+    ]);
+  });
+
+  it("defaults commit-ready files to the index diff", () => {
+    expect(defaultSourceControlDiffComparison({ indexStatus: "staged" })).toBe("index");
+    expect(defaultSourceControlDiffComparison({ indexStatus: "both" })).toBe("index");
+    expect(defaultSourceControlDiffComparison({ indexStatus: "unstaged" })).toBe("head");
+    expect(defaultSourceControlDiffComparison({ indexStatus: "untracked" })).toBe("head");
+    expect(sourceControlDiffComparisons({ indexStatus: "both" })).toEqual(["index", "head"]);
   });
 
   it("does not offer index mutations for conflicts or legacy status events", () => {
-    expect(fileAction({ indexStatus: "conflicted" })).toMatchObject({ disabled: true });
-    expect(fileAction({})).toMatchObject({ disabled: true });
+    expect(fileActions({ indexStatus: "conflicted" })).toEqual([
+      {
+        kind: "unavailable",
+        label: "Unavailable",
+        disabled: true,
+        reason: "Conflict resolution is not available in Source Control yet.",
+      },
+    ]);
+    expect(fileActions({})).toEqual([
+      {
+        kind: "unavailable",
+        label: "Unavailable",
+        disabled: true,
+        reason: "This server does not report index state. Update T3 Code to enable staging.",
+      },
+    ]);
   });
 
   it("counts staged index entries without treating conflicts as committable", () => {

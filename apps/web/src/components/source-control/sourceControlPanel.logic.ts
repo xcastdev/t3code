@@ -11,6 +11,7 @@ export function gitIndexWorkflowAvailability(
 }
 
 export interface SourceControlFileAction {
+  readonly kind: "stage" | "unstage" | "unavailable";
   readonly label: "Stage" | "Unstage" | "Unavailable";
   readonly disabled: boolean;
   readonly reason: string;
@@ -18,27 +19,58 @@ export interface SourceControlFileAction {
 
 type FileIndexState = { readonly indexStatus?: VcsIndexStatus | undefined };
 
-export function fileAction(input: FileIndexState): SourceControlFileAction {
+const STAGE_ACTION = {
+  kind: "stage",
+  label: "Stage",
+  disabled: false,
+  reason: "Stage the complete file.",
+} as const;
+const UNSTAGE_ACTION = {
+  kind: "unstage",
+  label: "Unstage",
+  disabled: false,
+  reason: "Remove this file from the index.",
+} as const;
+
+export function fileActions(input: FileIndexState): ReadonlyArray<SourceControlFileAction> {
   switch (input.indexStatus) {
     case "staged":
-      return { label: "Unstage", disabled: false, reason: "Remove this file from the index." };
+      return [UNSTAGE_ACTION];
     case "unstaged":
-    case "both":
     case "untracked":
-      return { label: "Stage", disabled: false, reason: "Stage the complete file." };
+      return [STAGE_ACTION];
+    case "both":
+      return [UNSTAGE_ACTION, STAGE_ACTION];
     case "conflicted":
-      return {
-        label: "Unavailable",
-        disabled: true,
-        reason: "Conflict resolution is not available in Source Control yet.",
-      };
+      return [
+        {
+          kind: "unavailable",
+          label: "Unavailable",
+          disabled: true,
+          reason: "Conflict resolution is not available in Source Control yet.",
+        },
+      ];
     case undefined:
-      return {
-        label: "Unavailable",
-        disabled: true,
-        reason: "This server does not report index state. Update T3 Code to enable staging.",
-      };
+      return [
+        {
+          kind: "unavailable",
+          label: "Unavailable",
+          disabled: true,
+          reason: "This server does not report index state. Update T3 Code to enable staging.",
+        },
+      ];
   }
+}
+
+export function sourceControlDiffComparisons(
+  input: FileIndexState,
+): ReadonlyArray<"index" | "head"> {
+  if (input.indexStatus === "both") return ["index", "head"];
+  return input.indexStatus === "staged" ? ["index"] : ["head"];
+}
+
+export function defaultSourceControlDiffComparison(input: FileIndexState): "index" | "head" {
+  return sourceControlDiffComparisons(input)[0] ?? "head";
 }
 
 export function isFileStaged(input: FileIndexState): boolean {

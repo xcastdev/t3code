@@ -1934,6 +1934,31 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }).pipe(Effect.provide(TestLayer)),
     );
 
+    it.effect("does not turn a missing unborn worktree path into an empty diff", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        yield* driver.initRepo({ cwd });
+        yield* writeTextFile(cwd, "new.txt", "staged contents\n");
+        yield* driver.stageFiles({ cwd, paths: ["new.txt"] });
+        yield* fileSystem.remove(pathService.join(cwd, "new.txt"));
+
+        const error = yield* driver
+          .getWorkingTreeDiff({ cwd, path: "new.txt", comparison: "head" })
+          .pipe(Effect.flip);
+        assert.equal(error._tag, "GitCommandError");
+
+        const indexDiff = yield* driver.getWorkingTreeDiff({
+          cwd,
+          path: "new.txt",
+          comparison: "index",
+        });
+        assert.include(indexDiff.diff, "+staged contents");
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
     it.effect("stages a deleted file after its parent directory is removed", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
