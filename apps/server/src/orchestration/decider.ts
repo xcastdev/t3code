@@ -374,12 +374,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       if (
         (readModel.projectMcpServers ?? []).some((entry) => entry.server.id === command.server.id)
       ) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `MCP server ID '${command.server.id}' is already in use.`,
-          }),
-        );
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `MCP server ID '${command.server.id}' is already in use.`,
+        });
       }
       if (existingEntries.length >= PROJECT_MCP_SERVER_LIMIT) {
         const cause = new ProjectMcpServerLimitExceededError({

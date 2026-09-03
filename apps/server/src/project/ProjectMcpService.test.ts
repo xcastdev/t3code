@@ -8,6 +8,7 @@ import {
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { HttpServer } from "effect/unstable/http";
@@ -332,6 +333,13 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
       );
 
       expect(exit._tag).toBe("Failure");
+      if (exit._tag === "Failure") {
+        expect(Cause.squash(exit.cause)).toMatchObject({
+          _tag: "OrchestrationCommandInvariantError",
+          commandType: "project.mcp-server.create",
+          detail: `MCP server ID '${server.id}' is already in use.`,
+        });
+      }
     }),
   );
 

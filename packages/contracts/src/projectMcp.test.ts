@@ -26,6 +26,18 @@ const decodeProjectMcpServerLimitExceededError = Schema.decodeUnknownSync(
   ProjectMcpServerLimitExceededError,
 );
 const decodeProjectMcpServerNotFoundError = Schema.decodeUnknownSync(ProjectMcpServerNotFoundError);
+const decodeProjectMcpManagedServer = Schema.decodeUnknownSync(ProjectMcpManagedServer);
+const decodeProjectMcpCatalog = Schema.decodeUnknownSync(ProjectMcpCatalog);
+const decodeProjectMcpApplicationModes = Schema.decodeUnknownSync(
+  Schema.Array(ProjectMcpApplicationMode),
+);
+const decodeProjectMcpListInput = Schema.decodeUnknownSync(ProjectMcpListInput);
+const decodeProjectMcpCreateInput = Schema.decodeUnknownSync(ProjectMcpCreateInput);
+const decodeProjectMcpUpdateInput = Schema.decodeUnknownSync(ProjectMcpUpdateInput);
+const decodeProjectMcpRemoveInput = Schema.decodeUnknownSync(ProjectMcpRemoveInput);
+const decodeMcpServerId = Schema.decodeUnknownSync(McpServerId);
+const decodeProjectMcpUrl = Schema.decodeUnknownSync(ProjectMcpUrl);
+const decodeProjectMcpNameConflictError = Schema.decodeUnknownSync(ProjectMcpNameConflictError);
 
 describe("ProjectMcpServer", () => {
   it("rejects an external HTTP URL", () => {
@@ -92,7 +104,7 @@ describe("ProjectMcpServer", () => {
 describe("Project MCP contract shapes", () => {
   it("accepts a server-owned managed endpoint bound to a non-loopback host", () => {
     expect(
-      Schema.decodeUnknownSync(ProjectMcpManagedServer)({
+      decodeProjectMcpManagedServer({
         id: "t3-code",
         name: "t3-code",
         url: "http://100.64.0.40:43123/mcp",
@@ -108,7 +120,7 @@ describe("Project MCP contract shapes", () => {
 
   it("decodes the catalog's separate external and managed entries", () => {
     expect(
-      Schema.decodeUnknownSync(ProjectMcpCatalog)({
+      decodeProjectMcpCatalog({
         external: [
           {
             id: "mcp-1",
@@ -138,7 +150,7 @@ describe("Project MCP contract shapes", () => {
 
   it("exposes the exact application modes", () => {
     expect(
-      Schema.decodeUnknownSync(Schema.Array(ProjectMcpApplicationMode))([
+      decodeProjectMcpApplicationModes([
         "active-session",
         "next-session",
         "unsupported",
@@ -148,11 +160,11 @@ describe("Project MCP contract shapes", () => {
   });
 
   it("requires project scope on every mutation and list input", () => {
-    expect(Schema.decodeUnknownSync(ProjectMcpListInput)({ projectId: "project-1" })).toEqual({
+    expect(decodeProjectMcpListInput({ projectId: "project-1" })).toEqual({
       projectId: "project-1",
     });
     expect(
-      Schema.decodeUnknownSync(ProjectMcpCreateInput)({
+      decodeProjectMcpCreateInput({
         projectId: "project-1",
         name: "Docs",
         url: "https://example.com/mcp",
@@ -161,7 +173,7 @@ describe("Project MCP contract shapes", () => {
       }),
     ).toMatchObject({ projectId: "project-1" });
     expect(
-      Schema.decodeUnknownSync(ProjectMcpUpdateInput)({
+      decodeProjectMcpUpdateInput({
         projectId: "project-1",
         id: "mcp-1",
         name: "Docs",
@@ -170,20 +182,19 @@ describe("Project MCP contract shapes", () => {
         providerInstanceIds: [],
       }),
     ).toMatchObject({ projectId: "project-1", id: "mcp-1" });
-    expect(
-      Schema.decodeUnknownSync(ProjectMcpRemoveInput)({ projectId: "project-1", id: "mcp-1" }),
-    ).toEqual({ projectId: "project-1", id: "mcp-1" });
+    expect(decodeProjectMcpRemoveInput({ projectId: "project-1", id: "mcp-1" })).toEqual({
+      projectId: "project-1",
+      id: "mcp-1",
+    });
   });
 
   it("brands MCP server ids and keeps URL values bounded", () => {
-    expect(Schema.decodeUnknownSync(McpServerId)("mcp-1")).toBe("mcp-1");
-    expect(Schema.decodeUnknownSync(ProjectMcpUrl)("https://example.com/mcp")).toBe(
-      "https://example.com/mcp",
-    );
+    expect(decodeMcpServerId("mcp-1")).toBe("mcp-1");
+    expect(decodeProjectMcpUrl("https://example.com/mcp")).toBe("https://example.com/mcp");
   });
 
   it("decodes an actionable case-folded name conflict error", () => {
-    const error = Schema.decodeUnknownSync(ProjectMcpNameConflictError)({
+    const error = decodeProjectMcpNameConflictError({
       _tag: "ProjectMcpNameConflictError",
       name: "Docs",
       message: 'An MCP server named "Docs" already exists in this project.',
