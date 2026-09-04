@@ -289,7 +289,45 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
       yield* service.create({ projectId: projectB, ...projectBInput });
 
       expect(yield* service.resolveForSession(projectA, codexInstance)).toEqual([
-        { id: codexEntry.id, name: codexEntry.name, url: codexEntry.url },
+        {
+          id: codexEntry.id,
+          name: codexEntry.name,
+          transport: { type: "streamable-http", url: codexEntry.url!, headers: [] },
+        },
+      ]);
+    }),
+  );
+
+  it.effect("persists and resolves an explicit stdio server without a URL", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const projectId = ProjectId.make("stdio-project");
+      yield* createProject(projectId, "create-stdio-project");
+
+      const server = yield* service.create({
+        projectId,
+        name: "Filesystem",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: {
+          type: "stdio",
+          command: "npx",
+          args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+          env: [],
+        },
+      });
+
+      expect(yield* service.resolveForSession(projectId, codexInstance)).toEqual([
+        {
+          id: server.id,
+          name: "Filesystem",
+          transport: {
+            type: "stdio",
+            command: "npx",
+            args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+            env: [],
+          },
+        },
       ]);
     }),
   );

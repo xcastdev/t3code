@@ -980,12 +980,22 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           });
 
           const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
-          const projectMcpServers = (input.projectMcpServers ?? []).map((server) => ({
-            type: "http" as const,
-            name: projectMcpNativeKey(server),
-            url: server.url,
-            headers: [],
-          }));
+          const projectMcpServers = (input.projectMcpServers ?? []).map((server) =>
+            server.transport.type === "stdio"
+              ? {
+                  type: "stdio" as const,
+                  name: projectMcpNativeKey(server),
+                  command: server.transport.command,
+                  args: [...server.transport.args],
+                  env: [],
+                }
+              : {
+                  type: "http" as const,
+                  name: projectMcpNativeKey(server),
+                  url: server.transport.url,
+                  headers: [],
+                },
+          );
           const acp = yield* makeGrokAcpRuntime({
             grokSettings,
             ...(options?.environment ? { environment: options.environment } : {}),

@@ -12,6 +12,7 @@ import {
   ProjectMcpNameConflictError,
   ProjectMcpRemoveInput,
   ProjectMcpServer,
+  ProjectMcpTransport,
   ProjectMcpServerLimitExceededError,
   ProjectMcpServerNotFoundError,
   ProjectMcpUpdateInput,
@@ -19,6 +20,7 @@ import {
 } from "./projectMcp.ts";
 
 const decodeProjectMcpServer = Schema.decodeUnknownSync(ProjectMcpServer);
+const decodeProjectMcpTransport = Schema.decodeUnknownSync(ProjectMcpTransport);
 const decodeProjectMcpProviderNotFoundError = Schema.decodeUnknownSync(
   ProjectMcpProviderNotFoundError,
 );
@@ -40,6 +42,55 @@ const decodeProjectMcpUrl = Schema.decodeUnknownSync(ProjectMcpUrl);
 const decodeProjectMcpNameConflictError = Schema.decodeUnknownSync(ProjectMcpNameConflictError);
 
 describe("ProjectMcpServer", () => {
+  it("accepts explicit modern HTTP, legacy SSE, and stdio transports", () => {
+    expect(
+      decodeProjectMcpTransport({
+        type: "streamable-http",
+        url: "https://example.com/mcp",
+        headers: [],
+      }),
+    ).toEqual({ type: "streamable-http", url: "https://example.com/mcp", headers: [] });
+    expect(
+      decodeProjectMcpTransport({
+        type: "legacy-sse",
+        url: "https://example.com/sse",
+        headers: [],
+      }),
+    ).toEqual({ type: "legacy-sse", url: "https://example.com/sse", headers: [] });
+    expect(
+      decodeProjectMcpTransport({
+        type: "stdio",
+        command: "npx",
+        args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+        cwd: "/tmp",
+        env: [{ name: "API_TOKEN", secretRef: "project-mcp-secret-1" }],
+      }),
+    ).toEqual({
+      type: "stdio",
+      command: "npx",
+      args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+      cwd: "/tmp",
+      env: [{ name: "API_TOKEN", secretRef: "project-mcp-secret-1" }],
+    });
+  });
+
+  it("rejects unsafe stdio transport fields and unsafe remote URLs", () => {
+    expect(() =>
+      decodeProjectMcpTransport({ type: "stdio", command: "", args: [], env: [] }),
+    ).toThrow();
+    expect(() =>
+      decodeProjectMcpTransport({
+        type: "stdio",
+        command: "node",
+        args: [],
+        env: [{ name: "not-valid", secretRef: "secret" }],
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeProjectMcpTransport({ type: "legacy-sse", url: "http://example.com/sse", headers: [] }),
+    ).toThrow();
+  });
+
   it("rejects an external HTTP URL", () => {
     expect(() =>
       decodeProjectMcpServer({
@@ -69,6 +120,27 @@ describe("ProjectMcpServer", () => {
         }),
       ).toMatchObject({ id: "mcp-1", name: "Docs", url, providerInstanceIds: [] });
     }
+  });
+
+  it("accepts a stdio server without a remote URL", () => {
+    expect(
+      decodeProjectMcpServer({
+        id: "mcp-stdio",
+        name: "Filesystem",
+        enabled: true,
+        providerInstanceIds: ["codex"],
+        transport: {
+          type: "stdio",
+          command: "npx",
+          args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+          env: [],
+        },
+      }),
+    ).toMatchObject({
+      id: "mcp-stdio",
+      name: "Filesystem",
+      transport: { type: "stdio", command: "npx" },
+    });
   });
 
   it.each([

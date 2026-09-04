@@ -1685,10 +1685,19 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
-        const projectMcpArgs = (input.projectMcpServers ?? []).flatMap((server) => [
-          "-c",
-          `mcp_servers.${projectMcpNativeKey(server)}.url=${JSON.stringify(server.url)}`,
-        ]);
+        const projectMcpArgs = (input.projectMcpServers ?? []).flatMap((server) =>
+          server.transport.type === "stdio"
+            ? [
+                "-c",
+                `mcp_servers.${projectMcpNativeKey(server)}.command=${JSON.stringify(server.transport.command)}`,
+                "-c",
+                `mcp_servers.${projectMcpNativeKey(server)}.args=${JSON.stringify(server.transport.args)}`,
+              ]
+            : [
+                "-c",
+                `mcp_servers.${projectMcpNativeKey(server)}.url=${JSON.stringify(server.transport.url)}`,
+              ],
+        );
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
           providerInstanceId: boundInstanceId,

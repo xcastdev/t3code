@@ -329,7 +329,7 @@ function makeProviderServiceLayer() {
   const projectMcpServer = {
     id: McpServerId.make("mcp-docs"),
     name: "t3-code",
-    url: "https://docs.example.test/mcp",
+    transport: { type: "streamable-http", url: "https://docs.example.test/mcp", headers: [] },
   } as const;
   const resolveProjectMcp = vi.fn<ProjectMcpService.ProjectMcpServiceShape["resolveForSession"]>(
     () => Effect.succeed([projectMcpServer]),

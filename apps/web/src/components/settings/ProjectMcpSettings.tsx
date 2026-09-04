@@ -171,7 +171,7 @@ function ScopedProjectMcpCatalogSettings({
     setEditing(entry);
     setDraft({
       name: entry.name,
-      url: entry.url,
+      url: entry.url ?? (entry.transport?.type === "stdio" ? "" : (entry.transport?.url ?? "")),
       enabled: entry.enabled,
       providerInstanceIds: entry.providerInstanceIds,
     });
@@ -361,7 +361,14 @@ function ScopedProjectMcpCatalogSettings({
           <SettingsRow
             key={entry.id}
             title={entry.name}
-            description={hostForUrl(entry.url)}
+            description={
+              editable
+                ? (entry.url ??
+                  (entry.transport?.type === "stdio"
+                    ? `stdio: ${entry.transport.command}`
+                    : hostForUrl(entry.transport?.url ?? "")))
+                : hostForUrl(entry.url)
+            }
             status={editable ? (entry.enabled ? "Enabled" : "Disabled") : "Managed by T3"}
             control={
               editable ? (

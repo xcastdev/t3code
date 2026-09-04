@@ -4285,7 +4285,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const projectMcpServers = Object.fromEntries(
         resolvedProjectMcpServers.map((server) => [
           projectMcpNativeKey(server),
-          { type: "http" as const, url: server.url },
+          server.transport.type === "stdio"
+            ? {
+                type: "stdio" as const,
+                command: server.transport.command,
+                args: [...server.transport.args],
+              }
+            : { type: "http" as const, url: server.transport.url },
         ]),
       );
       // The attachments dir grant lets the agent Read/copy pasted images at

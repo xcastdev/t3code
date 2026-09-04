@@ -68,6 +68,9 @@ function commandToAggregateRef(command: OrchestrationCommand): {
     case "project.create":
     case "project.meta.update":
     case "project.delete":
+    case "project.mcp-server.create":
+    case "project.mcp-server.update":
+    case "project.mcp-server.remove":
       return {
         aggregateKind: "project",
         aggregateId: command.projectId,

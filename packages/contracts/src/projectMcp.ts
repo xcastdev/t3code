@@ -36,6 +36,74 @@ export const ProjectMcpUrl = Schema.String.check(
 );
 export type ProjectMcpUrl = typeof ProjectMcpUrl.Type;
 
+const PROJECT_MCP_STDIO_COMMAND_MAX_LENGTH = 1024;
+const PROJECT_MCP_STDIO_ARGUMENT_MAX_LENGTH = 4096;
+const PROJECT_MCP_STDIO_ARGUMENT_LIMIT = 128;
+const PROJECT_MCP_ENVIRONMENT_VARIABLE_LIMIT = 64;
+
+const ProjectMcpSecretRef = TrimmedNonEmptyString.pipe(Schema.brand("ProjectMcpSecretRef"));
+export type ProjectMcpSecretRef = typeof ProjectMcpSecretRef.Type;
+
+const ProjectMcpEnvironmentVariableName = Schema.String.check(
+  Schema.isTrimmed(),
+  Schema.isNonEmpty(),
+  Schema.makeFilter((value) => /^[A-Za-z_][A-Za-z0-9_]*$/.test(value), {
+    message: "Expected an environment variable name",
+  }),
+);
+
+const ProjectMcpStdioArgument = Schema.String.check(
+  Schema.isMaxLength(PROJECT_MCP_STDIO_ARGUMENT_MAX_LENGTH),
+);
+
+const ProjectMcpStdioCommand = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(PROJECT_MCP_STDIO_COMMAND_MAX_LENGTH),
+);
+
+const ProjectMcpStdioEnvironmentVariable = Schema.Struct({
+  name: ProjectMcpEnvironmentVariableName,
+  secretRef: ProjectMcpSecretRef,
+});
+export type ProjectMcpStdioEnvironmentVariable = typeof ProjectMcpStdioEnvironmentVariable.Type;
+
+const ProjectMcpHeaderName = Schema.String.check(
+  Schema.isTrimmed(),
+  Schema.isNonEmpty(),
+  Schema.makeFilter((value) => /^[!#$%&'*+.^_|~0-9A-Za-z-]+$/.test(value), {
+    message: "Expected an HTTP header name",
+  }),
+);
+const ProjectMcpHeader = Schema.Struct({
+  name: ProjectMcpHeaderName,
+  secretRef: ProjectMcpSecretRef,
+});
+export type ProjectMcpHeader = typeof ProjectMcpHeader.Type;
+
+export const ProjectMcpTransport = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("streamable-http"),
+    url: ProjectMcpUrl,
+    headers: Schema.Array(ProjectMcpHeader).check(Schema.isMaxLength(64)),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("legacy-sse"),
+    url: ProjectMcpUrl,
+    headers: Schema.Array(ProjectMcpHeader).check(Schema.isMaxLength(64)),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("stdio"),
+    command: ProjectMcpStdioCommand,
+    args: Schema.Array(ProjectMcpStdioArgument).check(
+      Schema.isMaxLength(PROJECT_MCP_STDIO_ARGUMENT_LIMIT),
+    ),
+    cwd: Schema.optional(TrimmedNonEmptyString),
+    env: Schema.Array(ProjectMcpStdioEnvironmentVariable).check(
+      Schema.isMaxLength(PROJECT_MCP_ENVIRONMENT_VARIABLE_LIMIT),
+    ),
+  }),
+]);
+export type ProjectMcpTransport = typeof ProjectMcpTransport.Type;
+
 export const ProjectMcpApplicationMode = Schema.Literals([
   "active-session",
   "next-session",
@@ -51,16 +119,53 @@ export const ProjectMcpApplication = Schema.Struct({
 });
 export type ProjectMcpApplication = typeof ProjectMcpApplication.Type;
 
-export const ProjectMcpServer = Schema.Struct({
+const ProjectMcpServerFields = Schema.Struct({
   id: McpServerId,
   name: TrimmedNonEmptyString.check(Schema.isMaxLength(PROJECT_MCP_NAME_MAX_LENGTH)),
-  url: ProjectMcpUrl,
+  /** URL-only records are the persisted compatibility shape from the first catalog release. */
+  url: Schema.optional(ProjectMcpUrl),
+  /** New records declare the transport explicitly. */
+  transport: Schema.optional(ProjectMcpTransport),
   enabled: Schema.Boolean,
   providerInstanceIds: Schema.Array(ProviderInstanceId),
 });
+const hasProjectMcpTransport = (server: {
+  readonly url?: ProjectMcpUrl | undefined;
+  readonly transport?: ProjectMcpTransport | undefined;
+}): boolean => {
+  if (server.transport === undefined) return server.url !== undefined;
+  return server.url === undefined;
+};
+export const ProjectMcpServer = ProjectMcpServerFields.check(
+  Schema.makeFilter(hasProjectMcpTransport, {
+    message: "Expected either a legacy URL or an explicit MCP transport",
+  }),
+);
 export type ProjectMcpServer = typeof ProjectMcpServer.Type;
 
-export type ResolvedProjectMcpServer = Pick<ProjectMcpServer, "id" | "name" | "url">;
+const ProjectMcpServerDraftFields = Schema.Struct({
+  name: ProjectMcpServerFields.fields.name,
+  url: Schema.optional(ProjectMcpUrl),
+  transport: Schema.optional(ProjectMcpTransport),
+  enabled: Schema.Boolean,
+  providerInstanceIds: Schema.Array(ProviderInstanceId),
+});
+const ProjectMcpServerDraft = ProjectMcpServerDraftFields.check(
+  Schema.makeFilter(hasProjectMcpTransport, {
+    message: "Expected either a legacy URL or an explicit MCP transport",
+  }),
+);
+
+export const getProjectMcpTransport = (server: ProjectMcpServer): ProjectMcpTransport => {
+  if (server.transport !== undefined) return server.transport;
+  return { type: "streamable-http", url: server.url!, headers: [] };
+};
+
+export interface ResolvedProjectMcpServer {
+  readonly id: McpServerId;
+  readonly name: string;
+  readonly transport: ProjectMcpTransport;
+}
 
 const ManagedProjectMcpUrl = Schema.String.check(
   Schema.isTrimmed(),
@@ -158,21 +263,23 @@ export type ProjectMcpMutationError = typeof ProjectMcpMutationError.Type;
 
 export const ProjectMcpCreateInput = Schema.Struct({
   projectId: ProjectId,
-  name: ProjectMcpServer.fields.name,
-  url: ProjectMcpUrl,
-  enabled: Schema.Boolean,
-  providerInstanceIds: Schema.Array(ProviderInstanceId),
-});
+  ...ProjectMcpServerDraftFields.fields,
+}).check(
+  Schema.makeFilter((input) => hasProjectMcpTransport(input), {
+    message: "Expected either a legacy URL or an explicit MCP transport",
+  }),
+);
 export type ProjectMcpCreateInput = typeof ProjectMcpCreateInput.Type;
 
 export const ProjectMcpUpdateInput = Schema.Struct({
   projectId: ProjectId,
   id: McpServerId,
-  name: ProjectMcpServer.fields.name,
-  url: ProjectMcpUrl,
-  enabled: Schema.Boolean,
-  providerInstanceIds: Schema.Array(ProviderInstanceId),
-});
+  ...ProjectMcpServerDraftFields.fields,
+}).check(
+  Schema.makeFilter((input) => hasProjectMcpTransport(input), {
+    message: "Expected either a legacy URL or an explicit MCP transport",
+  }),
+);
 export type ProjectMcpUpdateInput = typeof ProjectMcpUpdateInput.Type;
 
 export const ProjectMcpListInput = Schema.Struct({ projectId: ProjectId });

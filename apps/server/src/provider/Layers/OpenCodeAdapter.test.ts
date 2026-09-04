@@ -552,7 +552,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
   it.effect("reports remote HTTP project MCP as unsupported", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
-      NodeAssert.equal(adapter.capabilities.remoteHttpMcp, "unsupported");
+      NodeAssert.equal(adapter.capabilities.remoteHttpMcp, "next-session");
       NodeAssert.equal(adapter.capabilities.managedPreviewMcp, "next-session");
     }),
   );
@@ -580,7 +580,11 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           {
             id: McpServerId.make("mcp-docs"),
             name: "t3-code",
-            url: "https://docs.example.test/mcp",
+            transport: {
+              type: "streamable-http",
+              url: "https://docs.example.test/mcp",
+              headers: [],
+            },
           },
         ],
       });
@@ -592,6 +596,14 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
             type: "remote",
             url: "http://127.0.0.1:4310/mcp",
             headers: { Authorization: "Bearer preview-token" },
+            oauth: false,
+          },
+        },
+        {
+          name: "t3-project-mcp-docs",
+          config: {
+            type: "remote",
+            url: "https://docs.example.test/mcp",
             oauth: false,
           },
         },

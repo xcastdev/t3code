@@ -1,5 +1,6 @@
 import {
   ApprovalRequestId,
+  ProjectMcpTransport,
   ProviderInstanceId,
   type ChatAttachment,
   type OrchestrationEvent,
@@ -73,6 +74,7 @@ export const ORCHESTRATION_PROJECTOR_NAMES = {
 const encodeProviderInstanceIds = Schema.encodeSync(
   Schema.fromJsonString(Schema.Array(ProviderInstanceId)),
 );
+const encodeProjectMcpTransport = Schema.encodeSync(Schema.fromJsonString(ProjectMcpTransport));
 
 type ProjectorName =
   (typeof ORCHESTRATION_PROJECTOR_NAMES)[keyof typeof ORCHESTRATION_PROJECTOR_NAMES];
@@ -593,12 +595,16 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             const providerInstanceIdsJson = encodeProviderInstanceIds(
               event.payload.server.providerInstanceIds,
             );
+            const transportJson = event.payload.server.transport
+              ? encodeProjectMcpTransport(event.payload.server.transport)
+              : null;
             yield* sql`
             INSERT INTO projection_project_mcp_servers (
               server_id,
               project_id,
               name,
               url,
+              transport_json,
               enabled,
               provider_instance_ids_json
             )
@@ -606,7 +612,8 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               ${event.payload.server.id},
               ${event.payload.projectId},
               ${event.payload.server.name},
-              ${event.payload.server.url},
+              ${event.payload.server.url ?? ""},
+              ${transportJson},
               ${event.payload.server.enabled ? 1 : 0},
               ${providerInstanceIdsJson}
             )
@@ -615,6 +622,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               project_id = excluded.project_id,
               name = excluded.name,
               url = excluded.url,
+              transport_json = excluded.transport_json,
               enabled = excluded.enabled,
               provider_instance_ids_json = excluded.provider_instance_ids_json
           `;

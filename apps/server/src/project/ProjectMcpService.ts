@@ -6,6 +6,8 @@ import {
   ProjectMcpServer,
   ProjectMcpServerLimitExceededError,
   ProjectMcpServerNotFoundError,
+  ProjectMcpTransport,
+  getProjectMcpTransport,
   type ProjectId,
   type ProjectMcpCatalog,
   type ProjectMcpCreateInput,
@@ -35,11 +37,15 @@ const ProjectMcpProjectionRow = Schema.Struct({
   serverId: McpServerId,
   name: Schema.String,
   url: Schema.String,
+  transportJson: Schema.NullOr(Schema.String),
   enabled: Schema.Number,
   providerInstanceIds: Schema.String,
 });
 
 const decodeProjectMcpServer = Schema.decodeUnknownEffect(ProjectMcpServer);
+const decodeProjectMcpTransportJson = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectMcpTransport),
+);
 const decodeProviderInstanceIds = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Array(ProviderInstanceId)),
 );
@@ -120,6 +126,7 @@ const makeProjectMcpService = Effect.gen(function* () {
         server_id AS "serverId",
         name,
         url,
+        transport_json AS "transportJson",
         enabled,
         provider_instance_ids_json AS "providerInstanceIds"
       FROM projection_project_mcp_servers
@@ -128,12 +135,17 @@ const makeProjectMcpService = Effect.gen(function* () {
     `.pipe(
         Effect.flatMap((rows) =>
           Effect.forEach(rows, (row) =>
-            decodeProviderInstanceIds(row.providerInstanceIds).pipe(
-              Effect.flatMap((providerInstanceIds) =>
+            Effect.all([
+              decodeProviderInstanceIds(row.providerInstanceIds),
+              row.transportJson === null
+                ? Effect.succeed(undefined)
+                : decodeProjectMcpTransportJson(row.transportJson),
+            ]).pipe(
+              Effect.flatMap(([providerInstanceIds, transport]) =>
                 decodeProjectMcpServer({
                   id: row.serverId,
                   name: row.name,
-                  url: row.url,
+                  ...(transport === undefined ? { url: row.url } : { transport }),
                   enabled: row.enabled === 1,
                   providerInstanceIds,
                 }),
@@ -180,6 +192,15 @@ const makeProjectMcpService = Effect.gen(function* () {
           }),
         );
 
+  const validateTransport = (
+    input: Pick<ProjectMcpCreateInput | ProjectMcpUpdateInput, "url" | "transport">,
+    commandType: string,
+  ) => {
+    const transport = input.transport;
+    if (transport === undefined) return validateUrl(input.url!, commandType);
+    return transport.type === "stdio" ? Effect.void : validateUrl(transport.url, commandType);
+  };
+
   const validateProviderIds = (
     providerInstanceIds: ReadonlyArray<ProviderInstanceId>,
     previouslyPersistedIds: ReadonlyArray<ProviderInstanceId> = [],
@@ -219,7 +240,7 @@ const makeProjectMcpService = Effect.gen(function* () {
 
   const create: ProjectMcpServiceShape["create"] = (input) =>
     Effect.gen(function* () {
-      yield* validateUrl(input.url, "project.mcp-server.create");
+      yield* validateTransport(input, "project.mcp-server.create");
       const catalog = yield* list(input.projectId);
       if (catalog.external.length >= PROJECT_MCP_SERVER_LIMIT) {
         return yield* new ProjectMcpServerLimitExceededError({
@@ -234,7 +255,7 @@ const makeProjectMcpService = Effect.gen(function* () {
       const server: ProjectMcpServer = {
         id: serverId,
         name: input.name,
-        url: input.url,
+        ...(input.transport === undefined ? { url: input.url! } : { transport: input.transport }),
         enabled: input.enabled,
         providerInstanceIds: input.providerInstanceIds,
       };
@@ -250,7 +271,7 @@ const makeProjectMcpService = Effect.gen(function* () {
 
   const update: ProjectMcpServiceShape["update"] = (input) =>
     Effect.gen(function* () {
-      yield* validateUrl(input.url, "project.mcp-server.update");
+      yield* validateTransport(input, "project.mcp-server.update");
       const catalog = yield* list(input.projectId);
       const existing = catalog.external.find((entry) => entry.id === input.id);
       if (existing === undefined) {
@@ -263,7 +284,7 @@ const makeProjectMcpService = Effect.gen(function* () {
       const server: ProjectMcpServer = {
         id: input.id,
         name: input.name,
-        url: input.url,
+        ...(input.transport === undefined ? { url: input.url! } : { transport: input.transport }),
         enabled: input.enabled,
         providerInstanceIds: input.providerInstanceIds,
       };
@@ -304,7 +325,11 @@ const makeProjectMcpService = Effect.gen(function* () {
           .filter(
             (entry) => entry.enabled && entry.providerInstanceIds.includes(providerInstanceId),
           )
-          .map(({ id, name, url }) => ({ id, name, url })),
+          .map((server) => ({
+            id: server.id,
+            name: server.name,
+            transport: getProjectMcpTransport(server),
+          })),
       ),
     );
 

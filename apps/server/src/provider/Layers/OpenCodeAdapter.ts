@@ -49,6 +49,7 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import { type OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
+import { projectMcpNativeKey } from "../Services/ProviderAdapter.ts";
 import {
   buildOpenCodePermissionRules,
   OpenCodeRuntime,
@@ -3704,6 +3705,29 @@ export function makeOpenCodeAdapter(
                   }),
                 );
               }
+              if (!server.external) {
+                yield* Effect.forEach(input.projectMcpServers ?? [], (projectMcpServer) =>
+                  runOpenCodeSdk("mcp.add", () =>
+                    client.mcp.add({
+                      name: projectMcpNativeKey(projectMcpServer),
+                      config:
+                        projectMcpServer.transport.type === "stdio"
+                          ? {
+                              type: "local",
+                              command: [
+                                projectMcpServer.transport.command,
+                                ...projectMcpServer.transport.args,
+                              ],
+                            }
+                          : {
+                              type: "remote",
+                              url: projectMcpServer.transport.url,
+                              oauth: false,
+                            },
+                    }),
+                  ),
+                );
+              }
               // Resume: re-adopt the session named by the durable cursor —
               // OpenCode scopes history by session id. The probe recovers only
               // a confirmed not-found (start fresh); transport/auth/server
@@ -4618,7 +4642,7 @@ export function makeOpenCodeAdapter(
       provider: PROVIDER,
       capabilities: {
         sessionModelSwitch: "in-session",
-        remoteHttpMcp: "unsupported",
+        remoteHttpMcp: "next-session",
         managedPreviewMcp: "next-session",
       },
       startSession,
