@@ -74,11 +74,90 @@ it("falls back from modern Streamable HTTP to legacy SSE only when the endpoint 
   expect(transports).toEqual(["streamable-http", "legacy-sse"]);
   expect(connected).toEqual(["streamable-http", "legacy-sse"]);
   expect(clients).toHaveLength(2);
+  expect(closedTransports).toEqual(["streamable-http"]);
   expect(connection.protocolEra).toBe("legacy");
   expect(connection.negotiatedProtocolVersion).toBe("2025-11-25");
   await connection.close();
   expect(closedClients).toBe(2);
-  expect(closedTransports).toEqual([]);
+  expect(closedTransports).toEqual(["streamable-http", "legacy-sse"]);
+});
+
+it("uses a fresh client and legacy transport for a 400 fallback", async () => {
+  const options: ClientOptions[] = [];
+  const clients: ProjectMcpClient[] = [];
+  const connected: string[] = [];
+  const dependencies: ProjectMcpConnectionDependencies = {
+    createClient: (clientOptions) => {
+      options.push(clientOptions);
+      const client: ProjectMcpClient = {
+        connect: async (transport) => {
+          connected.push(String((transport as { kind: string }).kind));
+          if (connected.length === 1) {
+            throw new SdkHttpError(SdkErrorCode.ClientHttpFailedToOpenStream, "bad request", {
+              status: 400,
+            });
+          }
+        },
+        close: async () => undefined,
+      };
+      clients.push(client);
+      return client;
+    },
+    createTransport: ({ transport }) => ({ kind: transport.type, close: async () => undefined }),
+  };
+
+  const connection = await connectProjectMcpServer({
+    serverId: McpServerId.make("mcp-http-400"),
+    transport: modern,
+    resolveSecret: () => undefined,
+    dependencies,
+  });
+
+  expect(options).toEqual([
+    { versionNegotiation: { mode: "auto" }, inputRequired: { autoFulfill: false, maxRounds: 10 } },
+    {
+      versionNegotiation: { mode: "legacy" },
+      inputRequired: { autoFulfill: false, maxRounds: 10 },
+    },
+  ]);
+  expect(clients[0]).not.toBe(clients[1]);
+  expect(connected).toEqual(["streamable-http", "legacy-sse"]);
+  await connection.close();
+});
+
+it("does not close an SDK-owned transport twice", async () => {
+  let transportCloseCount = 0;
+  let clientCloseCount = 0;
+  let attached: { close: () => Promise<void> } | undefined;
+  const client: ProjectMcpClient = {
+    connect: async (transport) => {
+      attached = transport as { close: () => Promise<void> };
+      (client as { transport?: unknown }).transport = transport;
+    },
+    close: async () => {
+      clientCloseCount += 1;
+      await attached?.close();
+    },
+  };
+  const dependencies: ProjectMcpConnectionDependencies = {
+    createClient: () => client,
+    createTransport: () => ({
+      close: async () => {
+        transportCloseCount += 1;
+      },
+    }),
+  };
+
+  const connection = await connectProjectMcpServer({
+    serverId: McpServerId.make("mcp-owned-transport"),
+    transport: modern,
+    resolveSecret: () => undefined,
+    dependencies,
+  });
+  await connection.close();
+
+  expect(clientCloseCount).toBe(1);
+  expect(transportCloseCount).toBe(1);
 });
 
 it("constructs each v2 client with automatic negotiation and manual input handling", async () => {

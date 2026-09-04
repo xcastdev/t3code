@@ -1,5 +1,7 @@
 import { McpServerId, ProjectMcpCredentialId, type ProjectMcpTransport } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
+import type { OAuthClientProvider } from "@modelcontextprotocol/client";
+import { getDefaultEnvironment } from "@modelcontextprotocol/client/stdio";
 
 import {
   makeProjectMcpTransport,
@@ -23,6 +25,16 @@ const constructors: ProjectMcpTransportConstructors = {
 const tokenId = ProjectMcpCredentialId.make("11111111-1111-4111-8111-111111111111");
 const secretValues = new Map<string, string>([[tokenId, "secret-token"]]);
 const resolveSecret = (ref: string) => secretValues.get(ref);
+const oauthProvider = {
+  redirectUrl: undefined,
+  clientMetadata: { redirect_uris: [] },
+  clientInformation: () => undefined,
+  tokens: () => undefined,
+  saveTokens: () => undefined,
+  redirectToAuthorization: () => undefined,
+  saveCodeVerifier: () => undefined,
+  codeVerifier: () => "verifier",
+} satisfies OAuthClientProvider;
 
 it("creates a stdio transport with resolved environment values", () => {
   const transport: ProjectMcpTransport = {
@@ -51,7 +63,7 @@ it("creates a stdio transport with resolved environment values", () => {
       command: "node",
       args: ["server.mjs"],
       cwd: "/workspace",
-      env: { TOKEN: "secret-token" },
+      env: { ...getDefaultEnvironment(), TOKEN: "secret-token" },
       stderr: "pipe",
     },
   });
@@ -100,6 +112,80 @@ it("creates Streamable HTTP and legacy SSE transports with request headers", () 
       requestInit: { headers: { Authorization: "secret-token" } },
     },
   });
+});
+
+it("lets configured stdio variables override the safe inherited environment", () => {
+  const transport: ProjectMcpTransport = {
+    type: "stdio",
+    command: "node",
+    args: [],
+    env: [
+      {
+        name: "PATH" as never,
+        credential: { id: tokenId, name: "path" },
+      },
+    ],
+  };
+
+  expect(
+    makeProjectMcpTransport({
+      serverId: McpServerId.make("mcp-stdio"),
+      transport,
+      resolveSecret: resolveSecret,
+      constructors,
+    }),
+  ).toEqual({
+    kind: "stdio",
+    options: {
+      command: "node",
+      args: [],
+      env: { ...getDefaultEnvironment(), PATH: "secret-token" },
+      stderr: "pipe",
+    },
+  });
+});
+
+it("passes an OAuth provider to both HTTP transport kinds without copying bearer headers", () => {
+  expect(
+    makeProjectMcpTransport({
+      serverId: McpServerId.make("mcp-oauth"),
+      transport: {
+        type: "streamable-http",
+        url: "https://example.test/mcp",
+        headers: [],
+        authorization: { type: "oauth", registration: { type: "automatic" } },
+      },
+      resolveSecret,
+      oauthProvider,
+      constructors,
+    }),
+  ).toEqual({
+    kind: "streamable-http",
+    url: "https://example.test/mcp",
+    options: { requestInit: { headers: {} }, authProvider: oauthProvider },
+  });
+});
+
+it("rejects a competing Authorization header when OAuth is selected", () => {
+  expect(() =>
+    makeProjectMcpTransport({
+      serverId: McpServerId.make("mcp-oauth-header"),
+      transport: {
+        type: "streamable-http",
+        url: "https://example.test/mcp",
+        headers: [
+          {
+            name: "Authorization" as never,
+            credential: { id: tokenId, name: "bearer" },
+          },
+        ],
+        authorization: { type: "oauth", registration: { type: "automatic" } },
+      },
+      resolveSecret,
+      oauthProvider,
+      constructors,
+    }),
+  ).toThrow("Authorization header");
 });
 
 it("fails closed when a configured secret reference cannot be resolved", () => {
