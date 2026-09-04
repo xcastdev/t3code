@@ -20,12 +20,16 @@ const atoms = vi.hoisted(() => ({
   create: Symbol("create"),
   update: Symbol("update"),
   remove: Symbol("remove"),
+  oauthBegin: Symbol("oauthBegin"),
+  oauthDisconnect: Symbol("oauthDisconnect"),
 }));
 
 const commands = vi.hoisted(() => ({
   create: vi.fn(),
   update: vi.fn(),
   remove: vi.fn(),
+  oauthBegin: vi.fn(),
+  oauthDisconnect: vi.fn(),
 }));
 
 const query = vi.hoisted(() => ({
@@ -41,6 +45,8 @@ vi.mock("../../state/projects", () => ({
     create: atoms.create,
     update: atoms.update,
     remove: atoms.remove,
+    oauthBegin: atoms.oauthBegin,
+    oauthDisconnect: atoms.oauthDisconnect,
   },
 }));
 
@@ -52,6 +58,8 @@ vi.mock("../../state/use-atom-command", () => ({
   useAtomCommand: (atom: symbol) => {
     if (atom === atoms.create) return commands.create;
     if (atom === atoms.update) return commands.update;
+    if (atom === atoms.oauthBegin) return commands.oauthBegin;
+    if (atom === atoms.oauthDisconnect) return commands.oauthDisconnect;
     return commands.remove;
   },
 }));
@@ -340,6 +348,14 @@ describe("ProjectMcpSettings", () => {
     commands.create.mockReset().mockResolvedValue({ _tag: "Success" });
     commands.update.mockReset().mockResolvedValue({ _tag: "Success" });
     commands.remove.mockReset().mockResolvedValue({ _tag: "Success" });
+    commands.oauthBegin.mockReset().mockResolvedValue({
+      _tag: "Success",
+      value: {
+        authorizationUrl: "https://auth.example.com",
+        expiresAt: "2026-09-02T00:00:00.000Z",
+      },
+    });
+    commands.oauthDisconnect.mockReset().mockResolvedValue({ _tag: "Success" });
   });
 
   afterEach(async () => {
@@ -404,11 +420,76 @@ describe("ProjectMcpSettings", () => {
       input: {
         projectId,
         name: "Detached",
-        url: "https://detached.example.com/mcp",
+        transport: {
+          type: "streamable-http",
+          url: "https://detached.example.com/mcp",
+          headers: [],
+          authorization: { type: "none" },
+        },
         enabled: true,
         providerInstanceIds: [],
       },
     });
+  });
+
+  it("selects streamable HTTP and saves named credentials without rendering their values", async () => {
+    await renderPanel();
+    await click(button("Add server"));
+    await input(labelled<HTMLInputElement>("MCP server name"), "Secure");
+    const transport = document.querySelector<HTMLSelectElement>('[aria-label="MCP transport"]')!;
+    transport.value = "streamable-http";
+    transport.dispatchEvent(new Event("change", { bubbles: true }));
+    await input(labelled<HTMLInputElement>("MCP server URL"), "https://secure.example.com/mcp");
+    await input(labelled<HTMLInputElement>("HTTP header name 1"), "X-API-Key");
+    await input(labelled<HTMLInputElement>("HTTP header value 1"), "secret-value");
+    await click(button("Add server", 1));
+    await settle();
+
+    expect(commands.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          transport: expect.objectContaining({
+            type: "streamable-http",
+            headers: [
+              { name: "X-API-Key", credential: { name: "X-API-Key", value: "secret-value" } },
+            ],
+          }),
+        }),
+      }),
+    );
+    expect(document.body.textContent).not.toContain("secret-value");
+  });
+
+  it("offers OAuth connect and disconnect actions", async () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          transport: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/endpoint",
+            headers: [],
+            authorization: { type: "oauth", registration: { type: "automatic" } },
+          },
+          url: undefined,
+          oauthStatus: "not-connected",
+        },
+      ],
+      managed: [managedEntry],
+      applications: [],
+    });
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    expect(document.body.textContent).toContain("OAuth");
+    await click(button("Connect OAuth"));
+    await settle();
+    expect(commands.oauthBegin).toHaveBeenCalledWith({
+      environmentId,
+      input: { projectId, id: McpServerId.make("external") },
+    });
+    expect(open).toHaveBeenCalledWith("https://auth.example.com", "_blank", "noopener,noreferrer");
+    open.mockRestore();
   });
 
   it("shows and removes stale providers while editing", async () => {

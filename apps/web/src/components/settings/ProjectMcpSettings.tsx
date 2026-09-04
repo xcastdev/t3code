@@ -4,15 +4,19 @@ import {
   squashAtomCommandFailure,
   type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
-import type {
+import {
   EnvironmentId,
   ProjectId,
   ProjectMcpApplicationMode,
+  ProjectMcpCredentialId,
+  ProjectMcpEnvironmentVariableName,
+  ProjectMcpHeaderName,
   ProjectMcpManagedServer,
   ProjectMcpServer,
   ProviderInstanceId,
   ServerProvider,
 } from "@t3tools/contracts";
+import type { ProjectMcpTransportDraft } from "@t3tools/contracts";
 import { PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
 import { useCallback, useMemo, useRef, useState } from "react";
 
@@ -59,19 +63,63 @@ type CatalogEntry = ProjectMcpServer | ProjectMcpManagedServer;
 
 interface ProjectMcpDraft {
   readonly name: string;
+  readonly transportType: "streamable-http" | "legacy-sse" | "stdio" | "legacy-url";
   readonly url: string;
+  readonly command: string;
+  readonly args: string;
+  readonly cwd: string;
+  readonly headers: ReadonlyArray<ProjectMcpCredentialDraft>;
+  readonly env: ReadonlyArray<ProjectMcpCredentialDraft>;
+  readonly authorization: "none" | "oauth";
+  readonly oauthRegistration: "automatic" | "pre-registered";
+  readonly oauthClientId: string;
+  readonly oauthClientSecret: ProjectMcpCredentialDraft;
   readonly enabled: boolean;
   readonly providerInstanceIds: ReadonlyArray<ProviderInstanceId>;
 }
 
-type ProjectMcpFieldErrors = Partial<Record<"name" | "url", string>>;
+interface ProjectMcpCredentialDraft {
+  readonly id?: ProjectMcpCredentialId;
+  readonly name: string;
+  readonly value: string;
+}
+
+type ProjectMcpFieldErrors = Partial<Record<"name" | "url" | "command", string>>;
 
 const EMPTY_DRAFT: ProjectMcpDraft = {
   name: "",
+  transportType: "streamable-http",
   url: "",
+  command: "",
+  args: "",
+  cwd: "",
+  headers: [{ name: "", value: "" }],
+  env: [{ name: "", value: "" }],
+  authorization: "none",
+  oauthRegistration: "automatic",
+  oauthClientId: "",
+  oauthClientSecret: { name: "OAuth client secret", value: "" },
   enabled: true,
   providerInstanceIds: [],
 };
+
+function credentialDraft(
+  credential: { readonly id: ProjectMcpCredentialId; readonly name: string } | undefined,
+): ProjectMcpCredentialDraft {
+  return credential
+    ? { id: credential.id, name: credential.name, value: "" }
+    : { name: "", value: "" };
+}
+
+function credentialInput(credential: ProjectMcpCredentialDraft): {
+  readonly id?: ProjectMcpCredentialId;
+  readonly name: string;
+  readonly value?: string;
+} {
+  return credential.id && credential.value === ""
+    ? { id: credential.id, name: credential.name }
+    : { name: credential.name, value: credential.value };
+}
 
 export function applicationLabel(mode: ProjectMcpApplicationMode): string {
   switch (mode) {
@@ -124,6 +172,62 @@ function ProjectMcpEntryDetails({
   );
 }
 
+function CredentialFields({
+  label,
+  entries,
+  onChange,
+}: {
+  readonly label: string;
+  readonly entries: ReadonlyArray<ProjectMcpCredentialDraft>;
+  readonly onChange: (entries: ReadonlyArray<ProjectMcpCredentialDraft>) => void;
+}) {
+  return (
+    <fieldset className="grid gap-2">
+      <legend className="text-sm font-medium">Credentials</legend>
+      {entries.map((entry, index) => (
+        <div key={`${entry.id ?? "new"}-${index}`} className="grid gap-1.5">
+          <Input
+            aria-label={`${label} name ${index + 1}`}
+            placeholder={`${label} name`}
+            value={entry.name}
+            onChange={(event) =>
+              onChange(
+                entries.map((current, i) =>
+                  i === index ? { ...current, name: event.target.value } : current,
+                ),
+              )
+            }
+          />
+          <Input
+            aria-label={`${label} value ${index + 1}`}
+            type="password"
+            placeholder={entry.id ? "Retained secret (leave blank to keep)" : `${label} value`}
+            value={entry.value}
+            onChange={(event) =>
+              onChange(
+                entries.map((current, i) =>
+                  i === index ? { ...current, value: event.target.value } : current,
+                ),
+              )
+            }
+          />
+          {entry.id ? (
+            <p className="text-xs text-muted-foreground">Configured; value hidden.</p>
+          ) : null}
+        </div>
+      ))}
+      <Button
+        type="button"
+        size="xs"
+        variant="outline"
+        onClick={() => onChange([...entries, { name: "", value: "" }])}
+      >
+        Add credential
+      </Button>
+    </fieldset>
+  );
+}
+
 function ScopedProjectMcpCatalogSettings({
   environmentId,
   projectId,
@@ -141,6 +245,10 @@ function ScopedProjectMcpCatalogSettings({
   const createEntry = useAtomCommand(projectMcpEnvironment.create, { reportFailure: false });
   const updateEntry = useAtomCommand(projectMcpEnvironment.update, { reportFailure: false });
   const removeEntry = useAtomCommand(projectMcpEnvironment.remove, { reportFailure: false });
+  const oauthBegin = useAtomCommand(projectMcpEnvironment.oauthBegin, { reportFailure: false });
+  const oauthDisconnect = useAtomCommand(projectMcpEnvironment.oauthDisconnect, {
+    reportFailure: false,
+  });
   const providerEntries = useMemo(() => deriveProviderInstanceEntries(providers), [providers]);
   const providerNameById = useMemo(
     () =>
@@ -161,6 +269,7 @@ function ScopedProjectMcpCatalogSettings({
   const [removalTarget, setRemovalTarget] = useState<ProjectMcpServer | null>(null);
   const nameInputRef = useRef<HTMLInputElement>(null);
   const urlInputRef = useRef<HTMLInputElement>(null);
+  const commandInputRef = useRef<HTMLInputElement>(null);
 
   const openCreate = useCallback(() => {
     setEditing(null);
@@ -169,9 +278,55 @@ function ScopedProjectMcpCatalogSettings({
   }, []);
   const openEdit = useCallback((entry: ProjectMcpServer) => {
     setEditing(entry);
+    const transport = entry.transport;
     setDraft({
       name: entry.name,
-      url: entry.url ?? (entry.transport?.type === "stdio" ? "" : (entry.transport?.url ?? "")),
+      transportType: transport?.type ?? "legacy-url",
+      url: entry.url ?? (transport?.type === "stdio" ? "" : (transport?.url ?? "")),
+      command: transport?.type === "stdio" ? transport.command : "",
+      args: transport?.type === "stdio" ? transport.args.join("\n") : "",
+      cwd: transport?.type === "stdio" ? (transport.cwd ?? "") : "",
+      headers:
+        transport?.type === "streamable-http" || transport?.type === "legacy-sse"
+          ? transport.headers.map((header) => ({
+              ...credentialDraft(header.credential),
+              name: header.name,
+            }))
+          : [{ name: "", value: "" }],
+      env:
+        transport?.type === "stdio"
+          ? transport.env.map((variable) => ({
+              ...credentialDraft(variable.credential),
+              name: variable.name,
+            }))
+          : [{ name: "", value: "" }],
+      authorization:
+        transport?.type === "streamable-http" || transport?.type === "legacy-sse"
+          ? transport.authorization.type
+          : "none",
+      oauthRegistration:
+        transport?.type === "streamable-http" || transport?.type === "legacy-sse"
+          ? transport.authorization.type === "oauth"
+            ? transport.authorization.registration.type
+            : "automatic"
+          : "automatic",
+      oauthClientId:
+        transport?.type === "streamable-http" || transport?.type === "legacy-sse"
+          ? transport.authorization.type === "oauth" &&
+            transport.authorization.registration.type === "pre-registered"
+            ? transport.authorization.registration.clientId
+            : ""
+          : "",
+      oauthClientSecret:
+        transport?.type === "streamable-http" || transport?.type === "legacy-sse"
+          ? transport.authorization.type === "oauth" &&
+            transport.authorization.registration.type === "pre-registered"
+            ? {
+                ...credentialDraft(transport.authorization.registration.clientSecret),
+                name: "OAuth client secret",
+              }
+            : { name: "OAuth client secret", value: "" }
+          : { name: "OAuth client secret", value: "" },
       enabled: entry.enabled,
       providerInstanceIds: entry.providerInstanceIds,
     });
@@ -197,14 +352,17 @@ function ScopedProjectMcpCatalogSettings({
     if (!draft || isSaving || !canMutate) return;
     const name = draft.name.trim();
     const url = draft.url.trim();
+    const isStdio = draft.transportType === "stdio";
     const errors: ProjectMcpFieldErrors = {
       ...(!name ? { name: "Name is required." } : {}),
-      ...(!url ? { url: "URL is required." } : {}),
+      ...(!isStdio && !url ? { url: "URL is required." } : {}),
+      ...(isStdio && !draft.command.trim() ? { command: "Command is required." } : {}),
     };
     if (Object.keys(errors).length > 0) {
       setFieldErrors(errors);
       if (errors.name) nameInputRef.current?.focus();
-      else urlInputRef.current?.focus();
+      else if (errors.url) urlInputRef.current?.focus();
+      else commandInputRef.current?.focus();
       return;
     }
 
@@ -213,9 +371,59 @@ function ScopedProjectMcpCatalogSettings({
       const input = {
         projectId,
         name,
-        url,
         enabled: draft.enabled,
         providerInstanceIds: draft.providerInstanceIds,
+        ...(draft.transportType === "legacy-url"
+          ? { url }
+          : {
+              transport: (draft.transportType === "stdio"
+                ? {
+                    type: "stdio" as const,
+                    command: draft.command.trim(),
+                    args: draft.args.split("\n").filter(Boolean),
+                    ...(draft.cwd.trim() ? { cwd: draft.cwd.trim() } : {}),
+                    env: draft.env
+                      .filter(
+                        (credential) =>
+                          credential.name.trim() && (credential.value !== "" || credential.id),
+                      )
+                      .map((credential) => ({
+                        name: ProjectMcpEnvironmentVariableName.make(credential.name.trim()),
+                        credential: credentialInput(credential),
+                      })),
+                  }
+                : {
+                    type: draft.transportType as "streamable-http" | "legacy-sse",
+                    url,
+                    headers: draft.headers
+                      .filter(
+                        (credential) =>
+                          credential.name.trim() && (credential.value !== "" || credential.id),
+                      )
+                      .map((credential) => ({
+                        name: ProjectMcpHeaderName.make(credential.name.trim()),
+                        credential: credentialInput(credential),
+                      })),
+                    authorization:
+                      draft.authorization === "oauth"
+                        ? {
+                            type: "oauth" as const,
+                            registration:
+                              draft.oauthRegistration === "automatic"
+                                ? { type: "automatic" as const }
+                                : {
+                                    type: "pre-registered" as const,
+                                    clientId: draft.oauthClientId.trim(),
+                                    ...(draft.oauthClientSecret.value || draft.oauthClientSecret.id
+                                      ? {
+                                          clientSecret: credentialInput(draft.oauthClientSecret),
+                                        }
+                                      : {}),
+                                  },
+                          }
+                        : { type: "none" as const },
+                  }) as ProjectMcpTransportDraft,
+            }),
       };
       if (editing) {
         const result = await updateEntry({
@@ -264,7 +472,7 @@ function ScopedProjectMcpCatalogSettings({
             projectId,
             id: entry.id,
             name: entry.name,
-            url: entry.url,
+            ...(entry.transport ? { transport: entry.transport } : { url: entry.url }),
             enabled: changes.enabled ?? entry.enabled,
             providerInstanceIds: changes.providerInstanceIds ?? entry.providerInstanceIds,
           },
@@ -279,6 +487,25 @@ function ScopedProjectMcpCatalogSettings({
       }
     },
     [canMutate, catalog, environmentId, isSaving, projectId, reportFailure, updateEntry],
+  );
+  const connectOAuth = useCallback(
+    async (entry: ProjectMcpServer) => {
+      const result = await oauthBegin({ environmentId, input: { projectId, id: entry.id } });
+      if (result._tag === "Success") {
+        window.open(result.value.authorizationUrl, "_blank", "noopener,noreferrer");
+      } else {
+        reportFailure("Failed to connect MCP OAuth", result);
+      }
+    },
+    [environmentId, oauthBegin, projectId, reportFailure],
+  );
+  const disconnectOAuth = useCallback(
+    async (entry: ProjectMcpServer) => {
+      const result = await oauthDisconnect({ environmentId, input: { projectId, id: entry.id } });
+      if (result._tag === "Success") catalog.refresh();
+      else reportFailure("Failed to disconnect MCP OAuth", result);
+    },
+    [catalog, environmentId, oauthDisconnect, projectId, reportFailure],
   );
   const removeExisting = useCallback(
     async (entry: ProjectMcpServer) => {
@@ -460,31 +687,190 @@ function ScopedProjectMcpCatalogSettings({
                   ) : null}
                 </label>
                 <label className="grid gap-1.5 text-sm font-medium">
-                  URL
-                  <Input
-                    ref={urlInputRef}
-                    aria-label="MCP server URL"
-                    aria-invalid={Boolean(fieldErrors.url)}
-                    aria-describedby={fieldErrors.url ? "project-mcp-url-error" : undefined}
-                    inputMode="url"
-                    placeholder="https://mcp.example.com"
-                    required
-                    value={draft.url}
+                  Transport
+                  <select
+                    aria-label="MCP transport"
+                    value={draft.transportType}
                     disabled={!canMutate || isSaving}
-                    onChange={(event) => {
-                      setDraft({ ...draft, url: event.target.value });
-                      if (fieldErrors.url) {
-                        const { url: _url, ...remainingErrors } = fieldErrors;
-                        setFieldErrors(remainingErrors);
-                      }
-                    }}
-                  />
-                  {fieldErrors.url ? (
-                    <p id="project-mcp-url-error" role="alert" className="text-sm text-destructive">
-                      {fieldErrors.url}
-                    </p>
-                  ) : null}
+                    onChange={(event) =>
+                      setDraft({
+                        ...draft,
+                        transportType: event.target.value as ProjectMcpDraft["transportType"],
+                      })
+                    }
+                  >
+                    <option value="streamable-http">Streamable HTTP</option>
+                    <option value="legacy-sse">Legacy SSE</option>
+                    <option value="stdio">stdio</option>
+                    {draft.transportType === "legacy-url" ? (
+                      <option value="legacy-url">Legacy URL</option>
+                    ) : null}
+                  </select>
                 </label>
+                {draft.transportType === "stdio" ? (
+                  <>
+                    <label className="grid gap-1.5 text-sm font-medium">
+                      Command
+                      <Input
+                        ref={commandInputRef}
+                        aria-label="MCP server command"
+                        aria-invalid={Boolean(fieldErrors.command)}
+                        required
+                        value={draft.command}
+                        disabled={!canMutate || isSaving}
+                        onChange={(event) => setDraft({ ...draft, command: event.target.value })}
+                      />
+                      {fieldErrors.command ? <p role="alert">{fieldErrors.command}</p> : null}
+                    </label>
+                    <label className="grid gap-1.5 text-sm font-medium">
+                      Arguments{" "}
+                      <textarea
+                        aria-label="MCP server arguments"
+                        value={draft.args}
+                        onChange={(event) => setDraft({ ...draft, args: event.target.value })}
+                        disabled={!canMutate || isSaving}
+                      />
+                    </label>
+                    <label className="grid gap-1.5 text-sm font-medium">
+                      Working directory{" "}
+                      <Input
+                        aria-label="MCP server working directory"
+                        value={draft.cwd}
+                        onChange={(event) => setDraft({ ...draft, cwd: event.target.value })}
+                        disabled={!canMutate || isSaving}
+                      />
+                    </label>
+                    <CredentialFields
+                      label="Environment variable"
+                      entries={draft.env}
+                      onChange={(env) => setDraft({ ...draft, env })}
+                    />
+                  </>
+                ) : (
+                  <>
+                    <label className="grid gap-1.5 text-sm font-medium">
+                      URL
+                      <Input
+                        ref={urlInputRef}
+                        aria-label="MCP server URL"
+                        aria-invalid={Boolean(fieldErrors.url)}
+                        aria-describedby={fieldErrors.url ? "project-mcp-url-error" : undefined}
+                        inputMode="url"
+                        placeholder="https://mcp.example.com"
+                        required
+                        value={draft.url}
+                        disabled={!canMutate || isSaving}
+                        onChange={(event) => setDraft({ ...draft, url: event.target.value })}
+                      />
+                      {fieldErrors.url ? (
+                        <p id="project-mcp-url-error" role="alert">
+                          {fieldErrors.url}
+                        </p>
+                      ) : null}
+                    </label>
+                    <CredentialFields
+                      label="HTTP header"
+                      entries={draft.headers}
+                      onChange={(headers) => setDraft({ ...draft, headers })}
+                    />
+                    <fieldset className="grid gap-2">
+                      <legend className="text-sm font-medium">Authorization</legend>
+                      <select
+                        aria-label="MCP authorization"
+                        value={draft.authorization}
+                        onChange={(event) =>
+                          setDraft({
+                            ...draft,
+                            authorization: event.target.value as "none" | "oauth",
+                          })
+                        }
+                        disabled={!canMutate || isSaving}
+                      >
+                        <option value="none">None</option>
+                        <option value="oauth">OAuth</option>
+                      </select>
+                      {draft.authorization === "oauth" ? (
+                        <>
+                          <select
+                            aria-label="OAuth registration"
+                            value={draft.oauthRegistration}
+                            onChange={(event) =>
+                              setDraft({
+                                ...draft,
+                                oauthRegistration: event.target.value as
+                                  | "automatic"
+                                  | "pre-registered",
+                              })
+                            }
+                            disabled={!canMutate || isSaving}
+                          >
+                            <option value="automatic">Automatic registration</option>
+                            <option value="pre-registered">Pre-registered client</option>
+                          </select>
+                          {draft.oauthRegistration === "pre-registered" ? (
+                            <>
+                              <Input
+                                aria-label="OAuth client ID"
+                                placeholder="Client ID"
+                                value={draft.oauthClientId}
+                                onChange={(event) =>
+                                  setDraft({ ...draft, oauthClientId: event.target.value })
+                                }
+                                disabled={!canMutate || isSaving}
+                              />
+                              <Input
+                                aria-label="OAuth client secret"
+                                type="password"
+                                placeholder={
+                                  draft.oauthClientSecret.id
+                                    ? "Retained secret (leave blank to keep)"
+                                    : "Client secret"
+                                }
+                                value={draft.oauthClientSecret.value}
+                                onChange={(event) =>
+                                  setDraft({
+                                    ...draft,
+                                    oauthClientSecret: {
+                                      ...draft.oauthClientSecret,
+                                      value: event.target.value,
+                                    },
+                                  })
+                                }
+                                disabled={!canMutate || isSaving}
+                              />
+                              {draft.oauthClientSecret.id ? (
+                                <p className="text-xs text-muted-foreground">
+                                  A client secret is configured; its value is never displayed.
+                                </p>
+                              ) : null}
+                            </>
+                          ) : null}
+                          {editing ? (
+                            editing.oauthStatus === "connected" ? (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                disabled={isSaving || !canMutate}
+                                onClick={() => void disconnectOAuth(editing)}
+                              >
+                                Disconnect OAuth
+                              </Button>
+                            ) : (
+                              <Button
+                                type="button"
+                                variant="outline"
+                                disabled={isSaving || !canMutate}
+                                onClick={() => void connectOAuth(editing)}
+                              >
+                                Connect OAuth
+                              </Button>
+                            )
+                          ) : null}
+                        </>
+                      ) : null}
+                    </fieldset>
+                  </>
+                )}
                 <div className="flex items-center justify-between gap-3">
                   <div>
                     <p className="text-sm font-medium">Enabled</p>

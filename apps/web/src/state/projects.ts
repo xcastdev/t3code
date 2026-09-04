@@ -43,6 +43,14 @@ export const projectMcpEnvironment = {
     label: "environment-data:projects:mcp-remove",
     tag: WS_METHODS.projectMcpRemove,
   }),
+  oauthBegin: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:projects:mcp-oauth-begin",
+    tag: WS_METHODS.projectMcpOauthBegin,
+  }),
+  oauthDisconnect: createEnvironmentRpcCommand(connectionAtomRuntime, {
+    label: "environment-data:projects:mcp-oauth-disconnect",
+    tag: WS_METHODS.projectMcpOauthDisconnect,
+  }),
 };
 
 export const environmentProjects = createEnvironmentProjectAtoms({
