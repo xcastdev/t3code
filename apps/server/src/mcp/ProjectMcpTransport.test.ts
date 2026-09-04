@@ -1,4 +1,4 @@
-import { McpServerId, type ProjectMcpTransport } from "@t3tools/contracts";
+import { McpServerId, ProjectMcpCredentialId, type ProjectMcpTransport } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 
 import {
@@ -7,12 +7,21 @@ import {
 } from "./ProjectMcpTransport.ts";
 
 const constructors: ProjectMcpTransportConstructors = {
-  streamableHttp: (url, options) => ({ kind: "streamable-http", url: String(url), options }),
-  legacySse: (url, options) => ({ kind: "legacy-sse", url: String(url), options }),
+  streamableHttp: (url, options) => ({
+    kind: "streamable-http",
+    url: String(url),
+    options,
+  }),
+  legacySse: (url, options) => ({
+    kind: "legacy-sse",
+    url: String(url),
+    options,
+  }),
   stdio: (options) => ({ kind: "stdio", options }),
 };
 
-const secretValues = new Map([["token-ref", "secret-token"]]);
+const tokenId = ProjectMcpCredentialId.make("11111111-1111-4111-8111-111111111111");
+const secretValues = new Map<string, string>([[tokenId, "secret-token"]]);
 const resolveSecret = (ref: string) => secretValues.get(ref);
 
 it("creates a stdio transport with resolved environment values", () => {
@@ -21,7 +30,12 @@ it("creates a stdio transport with resolved environment values", () => {
     command: "node",
     args: ["server.mjs"],
     cwd: "/workspace",
-    env: [{ name: "TOKEN", secretRef: "token-ref" as never }],
+    env: [
+      {
+        name: "TOKEN" as never,
+        credential: { id: tokenId, name: "token" },
+      },
+    ],
   };
 
   expect(
@@ -44,16 +58,31 @@ it("creates a stdio transport with resolved environment values", () => {
 });
 
 it("creates Streamable HTTP and legacy SSE transports with request headers", () => {
-  const header = [{ name: "Authorization", secretRef: "token-ref" as never }];
+  const header = [
+    {
+      name: "Authorization" as never,
+      credential: { id: tokenId, name: "token" },
+    },
+  ];
   const streamable = makeProjectMcpTransport({
     serverId: McpServerId.make("mcp-http"),
-    transport: { type: "streamable-http", url: "https://example.test/mcp", headers: header },
+    transport: {
+      type: "streamable-http",
+      url: "https://example.test/mcp",
+      headers: header,
+      authorization: { type: "none" },
+    },
     resolveSecret,
     constructors,
   });
   const legacy = makeProjectMcpTransport({
     serverId: McpServerId.make("mcp-sse"),
-    transport: { type: "legacy-sse", url: "https://example.test/sse", headers: header },
+    transport: {
+      type: "legacy-sse",
+      url: "https://example.test/sse",
+      headers: header,
+      authorization: { type: "none" },
+    },
     resolveSecret,
     constructors,
   });
@@ -81,7 +110,15 @@ it("fails closed when a configured secret reference cannot be resolved", () => {
         type: "stdio",
         command: "node",
         args: [],
-        env: [{ name: "TOKEN", secretRef: "missing" as never }],
+        env: [
+          {
+            name: "TOKEN" as never,
+            credential: {
+              id: ProjectMcpCredentialId.make("22222222-2222-4222-8222-222222222222"),
+              name: "missing",
+            },
+          },
+        ],
       },
       resolveSecret,
       constructors,
