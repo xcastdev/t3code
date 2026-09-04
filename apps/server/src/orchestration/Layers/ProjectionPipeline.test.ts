@@ -4,6 +4,7 @@ import {
   CorrelationId,
   EventId,
   MessageId,
+  McpServerId,
   ProjectId,
   ThreadId,
   TurnId,
@@ -323,6 +324,93 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
           unsettledAt: "2026-01-01T00:00:02.000Z",
         },
       ]);
+    }),
+  );
+
+  it.effect("hydrates explicit MCP transports from persisted projection rows", () =>
+    Effect.gen(function* () {
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const eventStore = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const projectId = ProjectId.make("project-mcp-transport-round-trip");
+      const createdAt = "2026-09-04T00:00:00.000Z";
+      const servers = [
+        {
+          id: McpServerId.make("stdio-server"),
+          name: "Stdio",
+          transport: {
+            type: "stdio" as const,
+            command: "node",
+            args: ["server.js"],
+            cwd: "/workspace",
+            env: [],
+          },
+        },
+        {
+          id: McpServerId.make("streamable-http-server"),
+          name: "Streamable HTTP",
+          transport: {
+            type: "streamable-http" as const,
+            url: "https://mcp.example.test/rpc",
+            headers: [],
+          },
+        },
+        {
+          id: McpServerId.make("legacy-sse-server"),
+          name: "Legacy SSE",
+          transport: {
+            type: "legacy-sse" as const,
+            url: "https://mcp.example.test/sse",
+            headers: [],
+          },
+        },
+      ];
+
+      for (const [index, server] of servers.entries()) {
+        yield* eventStore.append({
+          type: "project.mcp-server.created",
+          eventId: EventId.make(`evt-mcp-transport-${index}`),
+          aggregateKind: "project",
+          aggregateId: projectId,
+          occurredAt: createdAt,
+          commandId: CommandId.make(`cmd-mcp-transport-${index}`),
+          causationEventId: null,
+          correlationId: CommandId.make(`cmd-mcp-transport-${index}`),
+          metadata: {},
+          payload: {
+            projectId,
+            server: {
+              ...server,
+              enabled: true,
+              providerInstanceIds: [ProviderInstanceId.make("codex")],
+            },
+            createdAt,
+          },
+        });
+      }
+
+      yield* projectionPipeline.bootstrap;
+
+      const snapshotLayer = OrchestrationProjectionSnapshotQueryLive.pipe(
+        Layer.provide(ThreadBackgroundLiveness.layer),
+        Layer.provide(ThreadPlanProgress.layer),
+        Layer.provideMerge(RepositoryIdentityResolver.layer),
+        Layer.provideMerge(Layer.succeed(SqlClient.SqlClient, sql)),
+        Layer.provideMerge(NodeServices.layer),
+      );
+      const readModel = yield* Effect.gen(function* () {
+        const snapshotQuery = yield* ProjectionSnapshotQuery;
+        return yield* snapshotQuery.getCommandReadModel();
+      }).pipe(Effect.provide(snapshotLayer));
+
+      assert.deepEqual(
+        servers.map(({ id, transport }) => ({
+          id,
+          transport: readModel.projectMcpServers?.find((entry) => entry.server.id === id)?.server
+            .transport,
+        })),
+        servers.map(({ id, transport }) => ({ id, transport })),
+      );
     }),
   );
 });

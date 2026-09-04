@@ -17,7 +17,10 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as ServerConfig from "../config.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
-import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import {
+  makeSqlitePersistenceLive,
+  SqlitePersistenceMemory,
+} from "../persistence/Layers/Sqlite.ts";
 import { OrchestrationEngineLive } from "../orchestration/Layers/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "../orchestration/Layers/ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "../orchestration/Layers/ProjectionSnapshotQuery.ts";
@@ -127,6 +130,25 @@ const testLayer = ProjectMcpService.layer.pipe(
   Layer.provideMerge(NodeServices.layer),
 );
 
+const makeRestartTestLayer = (persistenceLayer: ReturnType<typeof makeSqlitePersistenceLive>) =>
+  ProjectMcpService.layer.pipe(
+    Layer.provideMerge(OrchestrationEngineLive),
+    Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
+    Layer.provideMerge(OrchestrationProjectionPipelineLive),
+    Layer.provideMerge(OrchestrationEventStoreLive),
+    Layer.provideMerge(OrchestrationCommandReceiptRepositoryLive),
+    Layer.provideMerge(RepositoryIdentityResolver.layer),
+    Layer.provideMerge(ThreadBackgroundLiveness.layer),
+    Layer.provideMerge(ThreadPlanProgress.layer),
+    Layer.provideMerge(providerInstanceRegistry),
+    Layer.provideMerge(Layer.succeed(HttpServer.HttpServer, mcpHttpServer)),
+    Layer.provideMerge(persistenceLayer),
+    Layer.provideMerge(
+      ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-restart-" }),
+    ),
+    Layer.provideMerge(NodeServices.layer),
+  );
+
 const createProject = (projectId: ProjectId, commandId: string) =>
   Effect.gen(function* () {
     const engine = yield* OrchestrationEngineService;
@@ -139,6 +161,59 @@ const createProject = (projectId: ProjectId, commandId: string) =>
       createdAt: "2026-09-02T20:00:00.000Z",
     });
   });
+
+it.effect("restores explicit MCP transports after the service restarts", () =>
+  Effect.gen(function* () {
+    const { dbPath } = yield* ServerConfig.ServerConfig;
+    const persistenceLayer = makeSqlitePersistenceLive(dbPath);
+    const firstServiceLayer = Layer.fresh(makeRestartTestLayer(persistenceLayer));
+    const secondServiceLayer = Layer.fresh(makeRestartTestLayer(persistenceLayer));
+    const projectId = ProjectId.make("restart-explicit-transport-project");
+    const transport = {
+      type: "stdio" as const,
+      command: "node",
+      args: ["server.js"],
+      cwd: "/workspace",
+      env: [],
+    };
+
+    const server = yield* Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      yield* createProject(projectId, "create-restart-explicit-transport-project");
+      return yield* service.create({
+        projectId,
+        name: "Restarted stdio",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport,
+      });
+    }).pipe(Effect.provide(firstServiceLayer));
+
+    const restored = yield* Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      return {
+        catalog: yield* service.list(projectId),
+        resolved: yield* service.resolveForSession(projectId, codexInstance),
+      };
+    }).pipe(Effect.provide(secondServiceLayer));
+
+    expect(restored.catalog.external).toEqual([server]);
+    expect(restored.resolved).toEqual([
+      {
+        id: server.id,
+        name: server.name,
+        transport,
+      },
+    ]);
+  }).pipe(
+    Effect.provide(
+      Layer.provideMerge(
+        ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-restart-" }),
+        NodeServices.layer,
+      ),
+    ),
+  ),
+);
 
 it.layer(testLayer)("ProjectMcpService", (it) => {
   it.effect("returns the managed preview descriptor without persisting it as an external row", () =>

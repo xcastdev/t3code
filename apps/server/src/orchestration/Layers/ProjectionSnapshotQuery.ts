@@ -11,6 +11,8 @@ import {
   OrchestrationShellSnapshot,
   OrchestrationThread,
   OrchestrationThreadDetailSnapshot,
+  ProjectMcpServer,
+  ProjectMcpTransport,
   ProjectScript,
   McpServerId,
   ProjectMcpUrl,
@@ -179,7 +181,8 @@ const ProjectionProjectMcpServerDbRowSchema = Schema.Struct({
   projectId: ProjectId,
   serverId: McpServerId,
   name: Schema.String,
-  url: ProjectMcpUrl,
+  url: Schema.String,
+  transportJson: Schema.NullOr(Schema.String),
   enabled: Schema.Number,
   providerInstanceIds: Schema.fromJsonString(Schema.Array(ProviderInstanceId)),
 });
@@ -204,6 +207,29 @@ const ProjectionFullThreadDiffContextRowSchema = Schema.Struct({
   latestCheckpointTurnCount: Schema.NullOr(NonNegativeInt),
   toCheckpointRef: Schema.NullOr(CheckpointRef),
 });
+const decodeProjectMcpServer = Schema.decodeUnknownEffect(ProjectMcpServer);
+const decodeProjectMcpTransportJson = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectMcpTransport),
+);
+const decodeProjectMcpUrl = Schema.decodeUnknownEffect(ProjectMcpUrl);
+
+const hydrateProjectMcpServerRow = (
+  row: Schema.Schema.Type<typeof ProjectionProjectMcpServerDbRowSchema>,
+) =>
+  Effect.gen(function* () {
+    const connection =
+      row.transportJson === null
+        ? { url: yield* decodeProjectMcpUrl(row.url) }
+        : { transport: yield* decodeProjectMcpTransportJson(row.transportJson) };
+    const server = yield* decodeProjectMcpServer({
+      id: row.serverId,
+      name: row.name,
+      ...connection,
+      enabled: row.enabled === 1,
+      providerInstanceIds: row.providerInstanceIds,
+    });
+    return { projectId: row.projectId, server };
+  });
 
 const REQUIRED_SNAPSHOT_PROJECTORS = [
   ORCHESTRATION_PROJECTOR_NAMES.projects,
@@ -633,6 +659,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           server_id AS "serverId",
           name,
           url,
+          transport_json AS "transportJson",
           enabled,
           provider_instance_ids_json AS "providerInstanceIds"
         FROM projection_project_mcp_servers
@@ -1790,6 +1817,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             ),
           ),
           listProjectMcpServerRows(undefined).pipe(
+            Effect.flatMap((rows) => Effect.forEach(rows, hydrateProjectMcpServerRow)),
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
                 "ProjectionSnapshotQuery.getCommandReadModel:listProjectMcpServers:query",
@@ -1877,22 +1905,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   deletedAt: row.deletedAt,
                 });
               }
-              for (let index = 0; index < projectMcpServerRows.length; index += 1) {
-                const row = projectMcpServerRows[index];
-                if (!row) {
-                  continue;
-                }
-                projectMcpServers.push({
-                  projectId: row.projectId,
-                  server: {
-                    id: row.serverId,
-                    name: row.name,
-                    url: row.url,
-                    enabled: row.enabled === 1,
-                    providerInstanceIds: row.providerInstanceIds,
-                  },
-                });
-              }
+              projectMcpServers.push(...projectMcpServerRows);
               for (let index = 0; index < threadRows.length; index += 1) {
                 const row = threadRows[index];
                 if (!row) {
