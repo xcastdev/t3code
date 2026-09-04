@@ -134,6 +134,9 @@ import {
   ProjectMcpCreateError,
   ProjectMcpListInput,
   ProjectMcpCatalog,
+  ProjectMcpOAuthBeginInput,
+  ProjectMcpOAuthBeginResult,
+  ProjectMcpOAuthDisconnectInput,
   ProjectMcpRemoveError,
   ProjectMcpRemoveInput,
   ProjectMcpServer,
@@ -238,6 +241,8 @@ export const WS_METHODS = {
   projectMcpCreate: "projectMcp.create",
   projectMcpUpdate: "projectMcp.update",
   projectMcpRemove: "projectMcp.remove",
+  projectMcpOauthBegin: "projectMcp.oauth.begin",
+  projectMcpOauthDisconnect: "projectMcp.oauth.disconnect",
 
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
@@ -734,6 +739,18 @@ export const WsProjectMcpRemoveRpc = Rpc.make(WS_METHODS.projectMcpRemove, {
   error: Schema.Union([ProjectMcpRemoveError, EnvironmentAuthorizationError]),
 });
 
+export const WsProjectMcpOAuthBeginRpc = Rpc.make(WS_METHODS.projectMcpOauthBegin, {
+  payload: ProjectMcpOAuthBeginInput,
+  success: ProjectMcpOAuthBeginResult,
+  error: Schema.Union([ProjectMcpUpdateError, EnvironmentAuthorizationError]),
+});
+
+export const WsProjectMcpOAuthDisconnectRpc = Rpc.make(WS_METHODS.projectMcpOauthDisconnect, {
+  payload: ProjectMcpOAuthDisconnectInput,
+  success: ProjectMcpServer,
+  error: Schema.Union([ProjectMcpUpdateError, EnvironmentAuthorizationError]),
+});
+
 export const WsShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
   payload: LaunchEditorInput,
   error: Schema.Union([ExternalLauncherError, EnvironmentAuthorizationError]),
@@ -1149,6 +1166,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectMcpCreateRpc,
   WsProjectMcpUpdateRpc,
   WsProjectMcpRemoveRpc,
+  WsProjectMcpOAuthBeginRpc,
+  WsProjectMcpOAuthDisconnectRpc,
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,

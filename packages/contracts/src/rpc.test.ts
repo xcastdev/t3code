@@ -2,7 +2,12 @@ import { describe, expect, it } from "vite-plus/test";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 
-import { WsSubscribeServerConfigRpc } from "./rpc.ts";
+import {
+  WS_METHODS,
+  WsProjectMcpOAuthBeginRpc,
+  WsProjectMcpOAuthDisconnectRpc,
+  WsSubscribeServerConfigRpc,
+} from "./rpc.ts";
 
 /**
  * The client always sends `environmentThemes`, including to servers built
@@ -27,5 +32,47 @@ describe("subscribeServerConfig payload compatibility", () => {
   it("stays optional, so a client that never sends it still subscribes", () => {
     const decoded = Schema.decodeUnknownSync(WsSubscribeServerConfigRpc.payloadSchema)({});
     expect(decoded).toEqual({});
+  });
+});
+
+describe("project MCP OAuth RPC contracts", () => {
+  it("publishes begin and disconnect methods without accepting a client redirect URL", () => {
+    expect(WS_METHODS).toMatchObject({
+      projectMcpOauthBegin: "projectMcp.oauth.begin",
+      projectMcpOauthDisconnect: "projectMcp.oauth.disconnect",
+    });
+
+    expect(
+      Schema.decodeUnknownSync(WsProjectMcpOAuthBeginRpc.payloadSchema)({
+        projectId: "project-1",
+        id: "mcp-1",
+      }),
+    ).toEqual({ projectId: "project-1", id: "mcp-1" });
+    expect(() =>
+      Schema.decodeUnknownSync(WsProjectMcpOAuthBeginRpc.payloadSchema)({
+        projectId: "project-1",
+        id: "mcp-1",
+        redirectUrl: "https://attacker.example/callback",
+      }),
+    ).toThrow();
+    expect(
+      Schema.decodeUnknownSync(WsProjectMcpOAuthBeginRpc.successSchema)({
+        authorizationUrl: "https://issuer.example/authorize?state=opaque",
+        expiresAt: "2026-09-04T12:00:00.000Z",
+      }),
+    ).toEqual({
+      authorizationUrl: "https://issuer.example/authorize?state=opaque",
+      expiresAt: "2026-09-04T12:00:00.000Z",
+    });
+    expect(
+      Schema.decodeUnknownSync(WsProjectMcpOAuthDisconnectRpc.successSchema)({
+        id: "mcp-1",
+        name: "OAuth docs",
+        url: "https://example.com/mcp",
+        enabled: true,
+        providerInstanceIds: [],
+        oauthStatus: "not-connected",
+      }),
+    ).toMatchObject({ oauthStatus: "not-connected" });
   });
 });

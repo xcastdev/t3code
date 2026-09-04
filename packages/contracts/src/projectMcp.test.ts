@@ -17,6 +17,7 @@ import {
   ProjectMcpServerNotFoundError,
   ProjectMcpUpdateInput,
   ProjectMcpUrl,
+  getProjectMcpTransport,
 } from "./projectMcp.ts";
 
 const decodeProjectMcpServer = Schema.decodeUnknownSync(ProjectMcpServer);
@@ -40,6 +41,7 @@ const decodeProjectMcpRemoveInput = Schema.decodeUnknownSync(ProjectMcpRemoveInp
 const decodeMcpServerId = Schema.decodeUnknownSync(McpServerId);
 const decodeProjectMcpUrl = Schema.decodeUnknownSync(ProjectMcpUrl);
 const decodeProjectMcpNameConflictError = Schema.decodeUnknownSync(ProjectMcpNameConflictError);
+const encodeProjectMcpServer = Schema.encodeSync(ProjectMcpServer);
 
 describe("ProjectMcpServer", () => {
   it("accepts explicit modern HTTP, legacy SSE, and stdio transports", () => {
@@ -49,28 +51,54 @@ describe("ProjectMcpServer", () => {
         url: "https://example.com/mcp",
         headers: [],
       }),
-    ).toEqual({ type: "streamable-http", url: "https://example.com/mcp", headers: [] });
+    ).toEqual({
+      type: "streamable-http",
+      url: "https://example.com/mcp",
+      headers: [],
+      authorization: { type: "none" },
+    });
     expect(
       decodeProjectMcpTransport({
         type: "legacy-sse",
         url: "https://example.com/sse",
         headers: [],
       }),
-    ).toEqual({ type: "legacy-sse", url: "https://example.com/sse", headers: [] });
+    ).toEqual({
+      type: "legacy-sse",
+      url: "https://example.com/sse",
+      headers: [],
+      authorization: { type: "none" },
+    });
     expect(
       decodeProjectMcpTransport({
         type: "stdio",
         command: "npx",
         args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
         cwd: "/tmp",
-        env: [{ name: "API_TOKEN", secretRef: "project-mcp-secret-1" }],
+        env: [
+          {
+            name: "API_TOKEN",
+            credential: {
+              id: "f6caec74-f44d-4fe3-babb-1d5f1c3bb2bc",
+              name: "API token",
+            },
+          },
+        ],
       }),
     ).toEqual({
       type: "stdio",
       command: "npx",
       args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
       cwd: "/tmp",
-      env: [{ name: "API_TOKEN", secretRef: "project-mcp-secret-1" }],
+      env: [
+        {
+          name: "API_TOKEN",
+          credential: {
+            id: "f6caec74-f44d-4fe3-babb-1d5f1c3bb2bc",
+            name: "API token",
+          },
+        },
+      ],
     });
   });
 
@@ -83,7 +111,15 @@ describe("ProjectMcpServer", () => {
         type: "stdio",
         command: "node",
         args: [],
-        env: [{ name: "not-valid", secretRef: "secret" }],
+        env: [
+          {
+            name: "not-valid",
+            credential: {
+              id: "f6caec74-f44d-4fe3-babb-1d5f1c3bb2bc",
+              name: "Secret",
+            },
+          },
+        ],
       }),
     ).toThrow();
     expect(() =>
@@ -174,6 +210,278 @@ describe("ProjectMcpServer", () => {
 });
 
 describe("Project MCP contract shapes", () => {
+  it("returns credential references without secret values from catalog servers", () => {
+    const server = decodeProjectMcpServer({
+      id: "mcp-credentials",
+      name: "Private docs",
+      enabled: true,
+      providerInstanceIds: [],
+      transport: {
+        type: "streamable-http",
+        url: "https://example.com/mcp",
+        headers: [
+          {
+            name: "X-Api-Key",
+            credential: {
+              id: "f6caec74-f44d-4fe3-babb-1d5f1c3bb2bc",
+              name: "Docs API key",
+              value: "catalog-secret-must-not-escape",
+            },
+          },
+        ],
+        authorization: {
+          type: "oauth",
+          registration: {
+            type: "pre-registered",
+            clientId: "docs-client",
+            clientSecret: {
+              id: "ad949dba-339d-48d5-8a15-b230711f50e3",
+              name: "Docs OAuth secret",
+              value: "oauth-secret-must-not-escape",
+            },
+          },
+        },
+      },
+    });
+
+    expect(encodeProjectMcpServer(server)).toEqual({
+      id: "mcp-credentials",
+      name: "Private docs",
+      enabled: true,
+      providerInstanceIds: [],
+      transport: {
+        type: "streamable-http",
+        url: "https://example.com/mcp",
+        headers: [
+          {
+            name: "X-Api-Key",
+            credential: {
+              id: "f6caec74-f44d-4fe3-babb-1d5f1c3bb2bc",
+              name: "Docs API key",
+            },
+          },
+        ],
+        authorization: {
+          type: "oauth",
+          registration: {
+            type: "pre-registered",
+            clientId: "docs-client",
+            clientSecret: {
+              id: "ad949dba-339d-48d5-8a15-b230711f50e3",
+              name: "Docs OAuth secret",
+            },
+          },
+        },
+      },
+    });
+  });
+
+  it("requires values for new credentials but retains identified credentials on update", () => {
+    const retained = {
+      id: "f6caec74-f44d-4fe3-babb-1d5f1c3bb2bc",
+      name: "Docs API key",
+    };
+    const base = {
+      projectId: "project-1",
+      name: "Docs",
+      enabled: true,
+      providerInstanceIds: [],
+      transport: {
+        type: "streamable-http",
+        url: "https://example.com/mcp",
+        headers: [{ name: "X-Api-Key", credential: retained }],
+      },
+    };
+
+    expect(() => decodeProjectMcpCreateInput(base)).toThrow();
+    expect(decodeProjectMcpUpdateInput({ ...base, id: "mcp-1" })).toMatchObject({
+      transport: { headers: [{ credential: retained }] },
+    });
+    expect(
+      decodeProjectMcpCreateInput({
+        ...base,
+        transport: {
+          ...base.transport,
+          headers: [
+            {
+              name: "X-Api-Key",
+              credential: { name: "Docs API key", value: "write-only-secret" },
+            },
+          ],
+        },
+      }),
+    ).toMatchObject({
+      transport: {
+        headers: [{ credential: { name: "Docs API key", value: "write-only-secret" } }],
+      },
+    });
+  });
+
+  it("requires UUID credential ids and rejects case-insensitive duplicate credential slots", () => {
+    const base = {
+      projectId: "project-1",
+      name: "Docs",
+      enabled: true,
+      providerInstanceIds: [],
+    };
+
+    expect(() =>
+      decodeProjectMcpUpdateInput({
+        ...base,
+        id: "mcp-1",
+        transport: {
+          type: "streamable-http",
+          url: "https://example.com/mcp",
+          headers: [
+            {
+              name: "X-Api-Key",
+              credential: { id: "../credentials/key", name: "Docs API key" },
+            },
+          ],
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeProjectMcpCreateInput({
+        ...base,
+        transport: {
+          type: "streamable-http",
+          url: "https://example.com/mcp",
+          headers: [
+            { name: "X-Api-Key", credential: { name: "One", value: "one" } },
+            { name: "x-api-key", credential: { name: "Two", value: "two" } },
+          ],
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeProjectMcpCreateInput({
+        ...base,
+        transport: {
+          type: "stdio",
+          command: "node",
+          args: [],
+          env: [
+            { name: "API_TOKEN", credential: { name: "One", value: "one" } },
+            { name: "api_token", credential: { name: "Two", value: "two" } },
+          ],
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("keeps URL-only records readable as unauthenticated Streamable HTTP", () => {
+    const server = decodeProjectMcpServer({
+      id: "mcp-legacy",
+      name: "Legacy docs",
+      url: "https://example.com/mcp",
+      enabled: true,
+      providerInstanceIds: [],
+    });
+
+    expect(getProjectMcpTransport(server)).toEqual({
+      type: "streamable-http",
+      url: "https://example.com/mcp",
+      headers: [],
+      authorization: { type: "none" },
+    });
+  });
+
+  it("models automatic and pre-registered OAuth without exposing client-secret values", () => {
+    const base = {
+      projectId: "project-1",
+      name: "OAuth docs",
+      enabled: true,
+      providerInstanceIds: [],
+    };
+    const automatic = decodeProjectMcpCreateInput({
+      ...base,
+      transport: {
+        type: "streamable-http",
+        url: "https://example.com/mcp",
+        headers: [],
+        authorization: { type: "oauth", registration: { type: "automatic" } },
+      },
+    });
+    const preRegistered = decodeProjectMcpCreateInput({
+      ...base,
+      transport: {
+        type: "legacy-sse",
+        url: "https://example.com/sse",
+        headers: [],
+        authorization: {
+          type: "oauth",
+          registration: {
+            type: "pre-registered",
+            clientId: "client-id",
+            clientSecret: { name: "OAuth client secret", value: "write-only-secret" },
+          },
+        },
+      },
+    });
+
+    expect(automatic.transport).toMatchObject({ authorization: { type: "oauth" } });
+    expect(preRegistered.transport).toMatchObject({
+      authorization: {
+        registration: { clientSecret: { name: "OAuth client secret", value: "write-only-secret" } },
+      },
+    });
+    expect(() =>
+      decodeProjectMcpCreateInput({
+        ...base,
+        transport: {
+          type: "streamable-http",
+          url: "https://example.com/mcp",
+          headers: [{ name: "Authorization", credential: { name: "Token", value: "secret" } }],
+          authorization: { type: "oauth", registration: { type: "automatic" } },
+        },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeProjectMcpCreateInput({
+        ...base,
+        transport: {
+          type: "stdio",
+          command: "node",
+          args: [],
+          env: [],
+          authorization: { type: "oauth", registration: { type: "automatic" } },
+        },
+      }),
+    ).toThrow();
+  });
+
+  it("keeps application reasons optional and bounded", () => {
+    const catalog = decodeProjectMcpCatalog({
+      external: [],
+      managed: [],
+      applications: [
+        {
+          serverId: "mcp-1",
+          providerInstanceId: "external-opencode",
+          mode: "unsupported",
+          reason: "T3 cannot configure externally managed OpenCode servers.",
+        },
+      ],
+    });
+
+    expect(catalog.applications[0]?.reason).toContain("externally managed OpenCode");
+    expect(() =>
+      decodeProjectMcpCatalog({
+        external: [],
+        managed: [],
+        applications: [
+          {
+            serverId: "mcp-1",
+            providerInstanceId: "external-opencode",
+            mode: "unsupported",
+            reason: "x".repeat(1_001),
+          },
+        ],
+      }),
+    ).toThrow();
+  });
+
   it("accepts a server-owned managed endpoint bound to a non-loopback host", () => {
     expect(
       decodeProjectMcpManagedServer({
