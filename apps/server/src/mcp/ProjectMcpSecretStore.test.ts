@@ -96,6 +96,7 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
 
         yield* prepared.commit;
         assert.equal(yield* secrets.resolve(serverA, id), "stdio-sentinel");
+        assert.deepEqual(yield* secrets.listServerIds(), [serverA]);
         assert.include(config.secretsDir, "secrets");
       }).pipe(Effect.provide(makeSecretLayer(config)));
     }).pipe(

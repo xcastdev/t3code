@@ -125,6 +125,38 @@ it("uses a fresh client and legacy transport for a 400 fallback", async () => {
   await connection.close();
 });
 
+it("uses explicit legacy negotiation for a legacy SSE transport", async () => {
+  let options: ClientOptions | undefined;
+  const dependencies: ProjectMcpConnectionDependencies = {
+    createClient: (clientOptions) => {
+      options = clientOptions;
+      return {
+        connect: async () => undefined,
+        close: async () => undefined,
+      };
+    },
+    createTransport: ({ transport }) => ({ kind: transport.type }),
+  };
+
+  const connection = await connectProjectMcpServer({
+    serverId: McpServerId.make("mcp-explicit-sse"),
+    transport: {
+      type: "legacy-sse",
+      url: "https://example.test/sse",
+      headers: [],
+      authorization: { type: "none" },
+    },
+    resolveSecret: () => undefined,
+    dependencies,
+  });
+
+  expect(options).toEqual({
+    versionNegotiation: { mode: "legacy" },
+    inputRequired: { autoFulfill: false, maxRounds: 10 },
+  });
+  await connection.close();
+});
+
 it("does not close an SDK-owned transport twice", async () => {
   let transportCloseCount = 0;
   let clientCloseCount = 0;

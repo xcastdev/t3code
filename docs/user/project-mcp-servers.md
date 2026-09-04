@@ -1,44 +1,91 @@
 # Project MCP servers
 
-Use **Settings** → **Projects** to manage external MCP servers for a project in the web and
-desktop clients. Mobile does not include project MCP server management.
+Use **Settings** → **Projects** to manage MCP servers for a project and checkout in the web or
+desktop app. Mobile can use the server-side configuration, but does not include management UI.
 
-## Add an external MCP server
+## Supported transports
+
+T3 Code supports these upstream MCP transports:
+
+- **Streamable HTTP** for current MCP servers and automatic compatibility negotiation.
+- **Legacy HTTP + SSE** when a server requires the older transport.
+- **Local stdio** for a command that runs on the T3 environment machine.
+
+For HTTP transports, use an HTTPS URL or an HTTP URL on a loopback host. URLs cannot contain
+embedded usernames, passwords, or query strings. For stdio, provide the executable command,
+optional arguments, working directory, and environment variables.
+
+## Add or edit a server
 
 1. Select the environment, project, and **Checkout**.
-2. Add the server name and URL.
-3. Select the **Providers** that should receive the server.
-4. Save the server.
+2. Open **MCP servers** and choose **Add server**.
+3. Enter a name and select the transport.
+4. Enter the transport settings and select the providers that should receive the server.
+5. Save the server and start a new provider session.
 
-Each external MCP server applies only to the configured project and **Checkout** selected in
-**Settings**. Other projects and checkouts cannot use it.
+The server applies only to the selected project and checkout. T3 gives each provider session an
+authenticated, server-specific proxy endpoint. Providers never receive the upstream command,
+working directory, headers, or environment values.
 
-T3 Code accepts HTTPS URLs and HTTP URLs with loopback hosts. It rejects HTTP URLs for other hosts.
-It also rejects URLs with an embedded username or password or a query string. Saving or viewing an
-entry does not check whether its URL is reachable.
+Catalog changes apply to new provider sessions. Existing sessions keep their issued endpoints and
+configuration until they stop.
 
-Project MCP servers support remote HTTP MCP URLs. T3 Code does not support custom headers, secrets,
-OAuth, local stdio MCP servers, or live reload for project MCP servers.
+## Credentials and OAuth
 
-## Check provider support and application labels
+Header values, stdio environment values, and OAuth client secrets are write-only. An existing
+credential is shown as **Configured**; its value is never returned or placed in the page. Leave a
+retained credential blank to keep it, or choose **Remove credential** to delete it explicitly.
 
-T3 Code sends a server only to selected providers that support it. OpenCode or another
-unsupported provider may remain selected, but it shows **Not supported by this provider** and does
-not receive the server.
+For an OAuth server, select **OAuth** and choose automatic registration or a pre-registered client.
+Use **Connect OAuth** to start authorization and **Disconnect OAuth** to revoke T3's stored grant.
+T3 stores tokens, PKCE verifiers, client details, and authorization state in the server secret
+store, not in the project catalog or event history.
 
-The application label for each selected provider shows support and timing:
+If the browser blocks the authorization window, allow pop-ups for the T3 page and try again. The
+callback must return to the T3 server that started authorization; a different browser origin or
+server address cannot complete that state.
+
+Completing OAuth or disconnecting OAuth closes active upstream connections for that server. Rotating
+a header, environment value, or pre-registered client secret applies to new provider sessions;
+existing sessions retain their current leased credential until they stop. Start a new provider
+session after changing a catalog credential.
+
+## Provider status
+
+Each selected provider has an application status:
 
 - **Applies to new sessions** means the provider receives the server when a new session starts.
-  Existing sessions do not change.
-- **Not supported by this provider** means the provider does not receive the server, even if
-  selected.
-- **Provider unavailable** means the provider is not available to receive the server.
+- **Applies to this session** means the provider can apply it without restarting the session.
+- **Not supported by this provider** means the provider cannot receive the server.
+- **Provider unavailable** means that provider instance is not currently available.
 
-If you select no providers, T3 Code saves the server but attaches it nowhere. After you add, edit,
-enable, disable, or reassign a server, start a new session when the application label says
-**Applies to new sessions**.
+External OpenCode instances are explicitly unsupported because T3 cannot safely configure an
+OpenCode server managed outside T3. T3-managed OpenCode instances use the same authenticated
+proxy endpoint as the other supported providers.
 
-## T3-managed servers are read-only
+If no providers are selected, the server is saved but is not attached to a provider session.
 
-T3-managed MCP entries may appear in the same list as your external servers. These entries are
-read-only. You cannot rename, remove, or replace them.
+T3-managed entries, including the `t3-code` preview server, are read-only and cannot be renamed,
+removed, or replaced.
+
+## Troubleshooting
+
+### Streamable HTTP and legacy SSE
+
+Choose **Streamable HTTP** unless the upstream documents that it requires the older HTTP + SSE
+transport. Streamable HTTP attempts current protocol negotiation and falls back to a legacy SSE
+connection only for an initialization response with status 400, 404, or 405. Authentication,
+rate-limit, timeout, network, and server failures are reported instead of being hidden by a
+fallback.
+
+### Stdio does not start
+
+The command runs on the T3 environment machine, not on the browser or phone. Check that the
+executable is installed there, that the selected working directory exists, and that required
+environment variables are configured. The inherited environment, including `PATH`, is retained.
+
+### OAuth does not reconnect
+
+Confirm that the OAuth callback returned to the same T3 server and that the authorization popup
+was not blocked. If the client secret or grant was replaced, disconnect the old grant, connect
+again, and start a new provider session.

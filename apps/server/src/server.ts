@@ -48,6 +48,10 @@ import { ProviderInstanceRegistryHydrationLive } from "./provider/Layers/Provide
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
+import * as ProjectMcpProxyHttpServer from "./mcp/ProjectMcpProxyHttpServer.ts";
+import * as ProjectMcpProxyRegistry from "./mcp/ProjectMcpProxyRegistry.ts";
+import * as ProjectMcpOAuth from "./mcp/ProjectMcpOAuth.ts";
+import * as ProjectMcpOAuthHttp from "./mcp/ProjectMcpOAuthHttp.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as PreviewManager from "./preview/Manager.ts";
 import * as PortScanner from "./preview/PortScanner.ts";
@@ -273,8 +277,41 @@ const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
   Layer.provide(ProviderSessionRuntime.layer),
 );
 
+const ProjectMcpSecretStoreLayerLive = ProjectMcpSecretStore.layer.pipe(
+  Layer.provide(ServerSecretStore.layer),
+);
+
+const ProjectMcpOAuthLayerLive = ProjectMcpOAuth.layer({ servers: [] }).pipe(
+  Layer.provideMerge(ProjectMcpSecretStoreLayerLive),
+);
+
 const ProjectMcpServiceLayerLive = ProjectMcpService.layer.pipe(
-  Layer.provideMerge(ProjectMcpSecretStore.layer.pipe(Layer.provide(ServerSecretStore.layer))),
+  Layer.provideMerge(ProjectMcpSecretStoreLayerLive),
+  Layer.provideMerge(ProjectMcpOAuthLayerLive),
+);
+
+const ProjectMcpProxyRegistryLayerLive = ProjectMcpProxyRegistry.layer.pipe(
+  Layer.provide(ProjectMcpOAuthLayerLive),
+);
+
+const McpSessionRegistryLayerLive = McpSessionRegistry.layer.pipe(
+  Layer.provide(ProjectMcpProxyRegistryLayerLive),
+);
+
+const ProjectMcpRouteServicesLive = Layer.mergeAll(
+  McpSessionRegistryLayerLive,
+  ProjectMcpProxyRegistryLayerLive,
+  ProjectMcpOAuthLayerLive,
+).pipe(Layer.provideMerge(ProjectMcpSecretStoreLayerLive));
+
+const ProjectMcpHttpRoutesLive = Layer.mergeAll(
+  McpHttpServer.layer.pipe(Layer.provide(ProjectMcpRouteServicesLive)),
+  ProjectMcpProxyHttpServer.layer.pipe(Layer.provide(ProjectMcpRouteServicesLive)),
+  ProjectMcpOAuthHttp.layer.pipe(Layer.provide(ProjectMcpOAuthLayerLive)),
+).pipe(Layer.provide(ProjectMcpSecretStoreLayerLive));
+
+const ProjectMcpWebsocketRpcRouteLayer = websocketRpcRouteLayer.pipe(
+  Layer.provide(ProjectMcpRouteServicesLive),
 );
 
 // `ProviderAdapterRegistryLive` is now a facade that resolves kind → adapter
@@ -488,9 +525,9 @@ export const makeRoutesLayer = Layer.mergeAll(
     assetRouteLayer,
     attachmentUploadRouteLayer,
     staticAndDevRouteLayer,
-    websocketRpcRouteLayer,
+    ProjectMcpWebsocketRpcRouteLayer,
   ),
-  McpHttpServer.layer.pipe(Layer.provide(McpSessionRegistry.layer)),
+  ProjectMcpHttpRoutesLive,
 ).pipe(
   // Both transports consume the same service instance, so caches single-flight across clients
   // and mutations observed on WebSocket invalidate patches subsequently read over HTTP.
@@ -500,6 +537,7 @@ export const makeRoutesLayer = Layer.mergeAll(
   Layer.provide(commandReadinessLayer),
   Layer.provide(browserApiCorsLayer),
   Layer.provide(httpCompressionLayer),
+  Layer.provide(ProjectMcpRouteServicesLive),
 );
 
 export const makeServerLayer = Layer.unwrap(

@@ -549,18 +549,49 @@ const questionRequest = (id: string, sessionID: string): QuestionRequest => ({
 });
 
 it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
-  it.effect("reports remote HTTP project MCP as unsupported", () =>
+  it.effect("reports project MCP as unsupported for externally managed OpenCode", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
-      NodeAssert.equal(adapter.capabilities.remoteHttpMcp, "next-session");
+      NodeAssert.equal(adapter.capabilities.remoteHttpMcp, "unsupported");
+      NodeAssert.equal(adapter.capabilities.projectMcpProxy, "unsupported");
+      NodeAssert.equal(
+        adapter.capabilities.projectMcpUnsupportedReason,
+        "T3 cannot configure externally managed OpenCode servers.",
+      );
       NodeAssert.equal(adapter.capabilities.managedPreviewMcp, "next-session");
     }),
   );
 
-  it.effect("preserves preview MCP while leaving project MCP unsupported", () =>
+  it.effect("rejects project MCP startup for externally managed OpenCode", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const result = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId: asThreadId("thread-opencode-external-project-mcp"),
+          runtimeMode: "full-access",
+          projectMcpServers: [
+            {
+              id: McpServerId.make("mcp-docs"),
+              name: "Docs",
+              endpoint: new URL("http://127.0.0.1:4311/mcp/project/docs-endpoint"),
+              authorizationHeader: "Bearer project-token",
+            },
+          ],
+        })
+        .pipe(Effect.result);
+
+      NodeAssert.equal(result._tag, "Failure");
+      NodeAssert.deepEqual(runtimeMock.state.mcpAddCalls, []);
+    }),
+  );
+
+  it.effect("configures project MCP through the scoped T3 proxy", () =>
     Effect.gen(function* () {
       const threadId = asThreadId("thread-opencode-project-mcp");
       const adapter = yield* makeOpenCodeAdapter(localOpenCodeAdapterTestSettings);
+      NodeAssert.equal(adapter.capabilities.remoteHttpMcp, "next-session");
+      NodeAssert.equal(adapter.capabilities.projectMcpProxy, "next-session");
       yield* Effect.sync(() =>
         McpProviderSession.setMcpProviderSession({
           environmentId: EnvironmentId.make("environment-test"),
@@ -579,13 +610,15 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         projectMcpServers: [
           {
             id: McpServerId.make("mcp-docs"),
-            name: "t3-code",
-            transport: {
-              type: "streamable-http",
-              url: "https://docs.example.test/mcp",
-              headers: [],
-              authorization: { type: "none" },
-            },
+            name: "Docs",
+            endpoint: new URL("http://127.0.0.1:4311/mcp/project/docs-endpoint"),
+            authorizationHeader: "Bearer project-token",
+          },
+          {
+            id: McpServerId.make("mcp-calendar"),
+            name: "Calendar",
+            endpoint: new URL("http://127.0.0.1:4311/mcp/project/calendar-endpoint"),
+            authorizationHeader: "Bearer calendar-token",
           },
         ],
       });
@@ -604,7 +637,17 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           name: "t3-project-mcp-docs",
           config: {
             type: "remote",
-            url: "https://docs.example.test/mcp",
+            url: "http://127.0.0.1:4311/mcp/project/docs-endpoint",
+            headers: { Authorization: "Bearer project-token" },
+            oauth: false,
+          },
+        },
+        {
+          name: "t3-project-mcp-calendar",
+          config: {
+            type: "remote",
+            url: "http://127.0.0.1:4311/mcp/project/calendar-endpoint",
+            headers: { Authorization: "Bearer calendar-token" },
             oauth: false,
           },
         },

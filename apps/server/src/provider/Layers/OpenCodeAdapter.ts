@@ -3705,25 +3705,27 @@ export function makeOpenCodeAdapter(
                   }),
                 );
               }
+              if (server.external && (input.projectMcpServers?.length ?? 0) > 0) {
+                return yield* new ProviderAdapterValidationError({
+                  provider: PROVIDER,
+                  operation: "startSession",
+                  issue:
+                    "T3 cannot configure project MCP servers on externally managed OpenCode servers.",
+                });
+              }
               if (!server.external) {
                 yield* Effect.forEach(input.projectMcpServers ?? [], (projectMcpServer) =>
                   runOpenCodeSdk("mcp.add", () =>
                     client.mcp.add({
                       name: projectMcpNativeKey(projectMcpServer),
-                      config:
-                        projectMcpServer.transport.type === "stdio"
-                          ? {
-                              type: "local",
-                              command: [
-                                projectMcpServer.transport.command,
-                                ...projectMcpServer.transport.args,
-                              ],
-                            }
-                          : {
-                              type: "remote",
-                              url: projectMcpServer.transport.url,
-                              oauth: false,
-                            },
+                      config: {
+                        type: "remote",
+                        url: projectMcpServer.endpoint.toString(),
+                        headers: {
+                          Authorization: projectMcpServer.authorizationHeader,
+                        },
+                        oauth: false,
+                      },
                     }),
                   ),
                 );
@@ -4642,7 +4644,14 @@ export function makeOpenCodeAdapter(
       provider: PROVIDER,
       capabilities: {
         sessionModelSwitch: "in-session",
-        remoteHttpMcp: "next-session",
+        remoteHttpMcp: openCodeSettings.serverUrl ? "unsupported" : "next-session",
+        projectMcpProxy: openCodeSettings.serverUrl ? "unsupported" : "next-session",
+        ...(openCodeSettings.serverUrl
+          ? {
+              projectMcpUnsupportedReason:
+                "T3 cannot configure externally managed OpenCode servers.",
+            }
+          : {}),
         managedPreviewMcp: "next-session",
       },
       startSession,

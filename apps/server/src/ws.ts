@@ -40,10 +40,14 @@ import {
   OrchestrationGetTurnDiffError,
   ORCHESTRATION_WS_METHODS,
   type ProjectId,
+  type McpServerId,
   ProjectMcpCreateError,
   type ProjectMcpMutationError,
   ProjectMcpRemoveError,
   ProjectMcpUpdateError,
+  ProjectMcpServerNotFoundError,
+  ProjectMcpOAuthActionError,
+  getProjectMcpTransport,
   type ProjectEntriesFailure,
   type ProjectFileFailure,
   type ProjectFileOperation,
@@ -123,6 +127,10 @@ import * as GitWorkflowService from "./git/GitWorkflowService.ts";
 import * as ReviewService from "./review/ReviewService.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
 import * as ProjectMcpService from "./project/ProjectMcpService.ts";
+import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
+import * as ProjectMcpProxyRegistry from "./mcp/ProjectMcpProxyRegistry.ts";
+import * as ProjectMcpOAuth from "./mcp/ProjectMcpOAuth.ts";
+import * as ProjectMcpSecretStore from "./mcp/ProjectMcpSecretStore.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
@@ -417,6 +425,20 @@ function readClientConnectionOrigin(
   };
 }
 
+function readTrustedRequestOrigin(
+  request: HttpServerRequest.HttpServerRequest,
+): string | undefined {
+  const url = HttpServerRequest.toURL(request);
+  if (Option.isNone(url)) return undefined;
+  const origin = url.value.origin;
+  const parsed = new URL(origin);
+  const loopback = new Set(["localhost", "127.0.0.1", "::1"]);
+  return parsed.protocol === "https:" ||
+    (parsed.protocol === "http:" && loopback.has(parsed.hostname))
+    ? origin
+    : undefined;
+}
+
 // Client telemetry stays in this socket's RPC layer. It must not become a
 // server-global "current client" because several client types can connect at once.
 function readClientAnalyticsProps(request: HttpServerRequest.HttpServerRequest) {
@@ -468,6 +490,7 @@ const makeWsRpcLayer = (
   clientOrigin: OrchestrationClientOrigin,
   clientAnalyticsProps: Readonly<Record<string, unknown>>,
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
+  requestOrigin: string | undefined,
 ) =>
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
@@ -543,6 +566,9 @@ const makeWsRpcLayer = (
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
       const projectSetupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
       const projectMcpService = yield* ProjectMcpService.ProjectMcpService;
+      const projectMcpProxy = yield* ProjectMcpProxyRegistry.ProjectMcpProxyRegistry;
+      const projectMcpOAuth = yield* ProjectMcpOAuth.ProjectMcpOAuth;
+      const projectMcpSecrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
       const backgroundPolicy = yield* BackgroundPolicy.BackgroundPolicy;
       const rpcClientIds = yield* Ref.make(new Set<RpcClientId>());
@@ -1326,6 +1352,48 @@ const makeWsRpcLayer = (
           ),
         );
 
+      const oauthServerFor = (projectId: ProjectId, id: McpServerId) =>
+        Effect.gen(function* () {
+          const catalog = yield* projectMcpService.list(projectId);
+          const entry = catalog.external.find((server) => server.id === id);
+          if (!entry) return yield* new ProjectMcpServerNotFoundError({ id });
+          const transport = getProjectMcpTransport(entry);
+          if (transport.type === "stdio" || transport.authorization.type !== "oauth") {
+            return yield* new ProjectMcpOAuthActionError({
+              id,
+              reason: "This MCP server does not use OAuth authorization.",
+            });
+          }
+          const registration = transport.authorization.registration;
+          const clientSecret =
+            registration.type === "pre-registered" && registration.clientSecret !== undefined
+              ? yield* projectMcpSecrets.resolve(entry.id, registration.clientSecret.id)
+              : undefined;
+          return {
+            serverId: entry.id,
+            resource: transport.url,
+            ...(registration.type === "pre-registered"
+              ? {
+                  clientId: registration.clientId,
+                  ...(clientSecret === undefined ? {} : { clientSecret }),
+                }
+              : {}),
+            ...(requestOrigin === undefined
+              ? {}
+              : {
+                  redirectUrl: new URL("/oauth/project-mcp/callback", requestOrigin).toString(),
+                  ...(new URL(requestOrigin).protocol === "https:"
+                    ? {
+                        clientMetadataUrl: new URL(
+                          "/oauth/project-mcp/client-metadata",
+                          requestOrigin,
+                        ).toString(),
+                      }
+                    : {}),
+                }),
+          } satisfies ProjectMcpOAuth.ProjectMcpOAuthServer;
+        });
+
       const refreshGitStatus = (cwd: string) =>
         vcsStatusBroadcaster
           .refreshStatus(cwd)
@@ -1798,6 +1866,57 @@ const makeWsRpcLayer = (
               preserveProjectMcpMutationError(
                 projectMcpService.remove(input),
                 isProjectMcpRemoveError,
+              ),
+            ),
+            { "rpc.aggregate": "project-mcp" },
+          ),
+        [WS_METHODS.projectMcpOauthBegin]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectMcpOauthBegin,
+            runProjectMcpOperation(
+              WS_METHODS.projectMcpOauthBegin,
+              input.projectId,
+              oauthServerFor(input.projectId, input.id).pipe(
+                Effect.flatMap((server) =>
+                  projectMcpOAuth.begin({
+                    serverId: input.id,
+                    server,
+                    ...(requestOrigin === undefined ? {} : { redirectOrigin: requestOrigin }),
+                  }),
+                ),
+                Effect.mapError(
+                  () =>
+                    new ProjectMcpOAuthActionError({
+                      id: input.id,
+                      reason: "The authorization server could not start authorization.",
+                    }),
+                ),
+              ),
+            ),
+            { "rpc.aggregate": "project-mcp" },
+          ),
+        [WS_METHODS.projectMcpOauthDisconnect]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectMcpOauthDisconnect,
+            runProjectMcpOperation(
+              WS_METHODS.projectMcpOauthDisconnect,
+              input.projectId,
+              projectMcpOAuth.disconnect(input.id).pipe(
+                Effect.andThen(projectMcpService.list(input.projectId)),
+                Effect.flatMap((catalog) => {
+                  const server = catalog.external.find((entry) => entry.id === input.id);
+                  return server
+                    ? Effect.succeed(server)
+                    : Effect.fail(new ProjectMcpServerNotFoundError({ id: input.id }));
+                }),
+                Effect.mapError(
+                  () =>
+                    new ProjectMcpOAuthActionError({
+                      id: input.id,
+                      reason: "The OAuth credentials could not be disconnected.",
+                    }),
+                ),
+                Effect.tap(() => projectMcpProxy.revokeServer(input.id)),
               ),
             ),
             { "rpc.aggregate": "project-mcp" },
@@ -2703,6 +2822,10 @@ export const websocketRpcRouteLayer = Layer.unwrap(
     const previewAutomationBroker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const pullRequests = yield* PullRequestService.PullRequestService;
+    const mcpSessions = yield* McpSessionRegistry.McpSessionRegistry;
+    const projectMcpProxy = yield* ProjectMcpProxyRegistry.ProjectMcpProxyRegistry;
+    const projectMcpOAuth = yield* ProjectMcpOAuth.ProjectMcpOAuth;
+    const projectMcpSecrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
     return HttpRouter.add(
       "GET",
       "/ws",
@@ -2723,6 +2846,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
           ),
         );
         const clientOrigin = readClientConnectionOrigin(request);
+        const requestOrigin = readTrustedRequestOrigin(request);
         const clientAnalyticsProps = readClientAnalyticsProps(request);
         yield* sessions.recordClientConnection(session.sessionId, clientOrigin);
         yield* analytics.record("client.connected", clientAnalyticsProps);
@@ -2735,6 +2859,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               clientOrigin,
               clientAnalyticsProps,
               previewAutomationBroker,
+              requestOrigin,
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(ProviderMaintenanceRunner.layer),
@@ -2742,6 +2867,14 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               // One server-lifetime service means clients share the same PR caches, and a WS
               // mutation invalidates the HTTP diff cache that every client reads from.
               Layer.provide(Layer.succeed(PullRequestService.PullRequestService, pullRequests)),
+              Layer.provide(Layer.succeed(McpSessionRegistry.McpSessionRegistry, mcpSessions)),
+              Layer.provide(
+                Layer.succeed(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, projectMcpProxy),
+              ),
+              Layer.provide(Layer.succeed(ProjectMcpOAuth.ProjectMcpOAuth, projectMcpOAuth)),
+              Layer.provide(
+                Layer.succeed(ProjectMcpSecretStore.ProjectMcpSecretStore, projectMcpSecrets),
+              ),
               Layer.provide(
                 SourceControlDiscovery.layer.pipe(
                   Layer.provide(

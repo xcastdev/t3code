@@ -266,7 +266,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     ),
   );
 
-  const prepareMcpSession = (threadId: ThreadId, providerInstanceId: ProviderInstanceId) =>
+  const prepareMcpSession = (
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    projectMcpServers: Parameters<
+      typeof McpSessionRegistry.issueActiveMcpCredential
+    >[0]["projectMcpServers"],
+  ) =>
     Effect.gen(function* () {
       if (!(yield* agentBrowserAccessEnabled)) {
         // Revoke as well as clear. Every other prepare path reaches
@@ -279,7 +285,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         yield* Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId));
         return undefined;
       }
-      const credential = yield* issueMcpCredential({ threadId, providerInstanceId });
+      const credential = yield* issueMcpCredential({
+        threadId,
+        providerInstanceId,
+        ...(projectMcpServers && projectMcpServers.length > 0 ? { projectMcpServers } : {}),
+      });
       if (credential) {
         yield* Effect.sync(() => McpProviderSession.setMcpProviderSession(credential.config));
       }
@@ -367,8 +377,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         Effect.onError(() => closeProjectMcpLeaseScope(sessionScope)),
       );
     const started = yield* Effect.gen(function* () {
-      yield* prepareMcpSession(input.sessionInput.threadId, input.providerInstanceId);
-      return yield* input.adapter.startSession({ ...input.sessionInput, projectMcpServers });
+      const credential = yield* prepareMcpSession(
+        input.sessionInput.threadId,
+        input.providerInstanceId,
+        projectMcpServers,
+      );
+      const issuedProjectMcpServers = credential?.config.projectServers;
+      return yield* input.adapter.startSession({
+        ...input.sessionInput,
+        ...(issuedProjectMcpServers && issuedProjectMcpServers.length > 0
+          ? { projectMcpServers: issuedProjectMcpServers }
+          : {}),
+      });
     }).pipe(
       Effect.onExit((exit) =>
         Exit.isSuccess(exit)

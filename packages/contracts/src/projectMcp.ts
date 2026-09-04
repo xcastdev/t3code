@@ -446,6 +446,18 @@ export class ProjectMcpServerNotFoundError extends Schema.TaggedErrorClass<Proje
   }
 }
 
+export class ProjectMcpOAuthActionError extends Schema.TaggedErrorClass<ProjectMcpOAuthActionError>()(
+  "ProjectMcpOAuthActionError",
+  {
+    id: McpServerId,
+    reason: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+  },
+) {
+  override get message(): string {
+    return `OAuth could not be completed for project MCP server '${this.id}': ${this.reason}`;
+  }
+}
+
 export const ProjectMcpCreateError = Schema.Union([
   ProjectMcpNameConflictError,
   ProjectMcpProviderNotFoundError,
@@ -457,6 +469,7 @@ export const ProjectMcpUpdateError = Schema.Union([
   ProjectMcpNameConflictError,
   ProjectMcpProviderNotFoundError,
   ProjectMcpServerNotFoundError,
+  ProjectMcpOAuthActionError,
 ]);
 export type ProjectMcpUpdateError = typeof ProjectMcpUpdateError.Type;
 
@@ -468,6 +481,7 @@ export const ProjectMcpMutationError = Schema.Union([
   ProjectMcpProviderNotFoundError,
   ProjectMcpServerLimitExceededError,
   ProjectMcpServerNotFoundError,
+  ProjectMcpOAuthActionError,
 ]);
 export type ProjectMcpMutationError = typeof ProjectMcpMutationError.Type;
 

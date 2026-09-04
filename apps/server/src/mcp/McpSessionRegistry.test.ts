@@ -2,6 +2,8 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as Duration from "effect/Duration";
+import * as TestClock from "effect/testing/TestClock";
 import { HttpServer } from "effect/unstable/http";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
@@ -86,6 +88,27 @@ it.effect("expires credentials once their session stops showing signs of life", 
     timestamp += 101;
     expect(yield* registry.resolve(token)).toBeUndefined();
   }),
+);
+
+it.effect("revokes an idle credential at its deadline without a request poll", () =>
+  Effect.gen(function* () {
+    const registry = yield* McpSessionRegistry.__testing
+      .make({ livenessWindowMs: 100 })
+      .pipe(
+        Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+        Effect.provide(NodeServices.layer),
+      );
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("thread-clock-expiry"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    yield* TestClock.adjust(Duration.millis(101));
+    yield* Effect.yieldNow;
+    expect(yield* registry.resolve(token)).toBeUndefined();
+  }).pipe(Effect.provide(TestClock.layer())),
 );
 
 it.effect("keeps a credential alive across turns that never touch an MCP tool", () =>

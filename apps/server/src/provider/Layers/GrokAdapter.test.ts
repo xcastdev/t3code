@@ -246,13 +246,15 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
         projectMcpServers: [
           {
             id: McpServerId.make("mcp-docs"),
-            name: "t3-code",
-            transport: {
-              type: "streamable-http",
-              url: "https://docs.example.test/mcp",
-              headers: [],
-              authorization: { type: "none" },
-            },
+            name: "Docs",
+            endpoint: new URL("http://127.0.0.1:4311/mcp/project/docs-endpoint"),
+            authorizationHeader: "Bearer project-token",
+          },
+          {
+            id: McpServerId.make("mcp-calendar"),
+            name: "Calendar",
+            endpoint: new URL("http://127.0.0.1:4311/mcp/project/calendar-endpoint"),
+            authorizationHeader: "Bearer calendar-token",
           },
         ],
       });
@@ -263,8 +265,14 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
         {
           type: "http",
           name: "t3-project-mcp-docs",
-          url: "https://docs.example.test/mcp",
-          headers: [],
+          url: "http://127.0.0.1:4311/mcp/project/docs-endpoint",
+          headers: [{ name: "Authorization", value: "Bearer project-token" }],
+        },
+        {
+          type: "http",
+          name: "t3-project-mcp-calendar",
+          url: "http://127.0.0.1:4311/mcp/project/calendar-endpoint",
+          headers: [{ name: "Authorization", value: "Bearer calendar-token" }],
         },
         {
           type: "http",

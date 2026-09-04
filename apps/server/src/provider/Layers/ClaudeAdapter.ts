@@ -4281,17 +4281,14 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           : {}),
       };
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
-      const resolvedProjectMcpServers = input.projectMcpServers ?? [];
       const projectMcpServers = Object.fromEntries(
-        resolvedProjectMcpServers.map((server) => [
+        (input.projectMcpServers ?? []).map((server) => [
           projectMcpNativeKey(server),
-          server.transport.type === "stdio"
-            ? {
-                type: "stdio" as const,
-                command: server.transport.command,
-                args: [...server.transport.args],
-              }
-            : { type: "http" as const, url: server.transport.url },
+          {
+            type: "http" as const,
+            url: server.endpoint.toString(),
+            headers: { Authorization: server.authorizationHeader },
+          },
         ]),
       );
       // The attachments dir grant lets the agent Read/copy pasted images at
@@ -4329,7 +4326,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         env: claudeEnvironment,
         additionalDirectories,
         ...(Object.keys(extraArgs).length > 0 ? { extraArgs } : {}),
-        ...(resolvedProjectMcpServers.length > 0 || mcpSession
+        ...((input.projectMcpServers?.length ?? 0) > 0 || mcpSession
           ? {
               mcpServers: {
                 ...projectMcpServers,
@@ -4736,6 +4733,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     capabilities: {
       sessionModelSwitch: "in-session",
       remoteHttpMcp: "next-session",
+      projectMcpProxy: "next-session",
       managedPreviewMcp: "next-session",
     },
     startSession,

@@ -13,6 +13,7 @@ import type {
   ProviderUploadFeedbackResult,
 } from "@t3tools/contracts";
 import {
+  EnvironmentId,
   ApprovalRequestId,
   EventId,
   McpServerId,
@@ -52,7 +53,7 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
-import { makeProviderServiceLive } from "./ProviderService.ts";
+import { makeProviderServiceLive, type ProviderServiceLiveOptions } from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -311,7 +312,9 @@ const hasMetricSnapshot = (
       Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value),
   );
 
-function makeProviderServiceLayer() {
+function makeProviderServiceLayer(
+  issueMcpCredential?: ProviderServiceLiveOptions["issueMcpCredential"],
+) {
   const codex = makeFakeCodexAdapter();
   const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
@@ -339,6 +342,12 @@ function makeProviderServiceLayer() {
       authorization: { type: "none" },
     },
   } as const;
+  const issuedProjectMcpServer = {
+    id: projectMcpServer.id,
+    name: projectMcpServer.name,
+    endpoint: new URL("http://127.0.0.1:43123/mcp/project/project-endpoint"),
+    authorizationHeader: "Bearer project-token",
+  } as const;
   const resolveProjectMcp = vi.fn<ProjectMcpService.ProjectMcpServiceShape["resolveForSession"]>(
     () => Effect.succeed([projectMcpServer]),
   );
@@ -356,7 +365,7 @@ function makeProviderServiceLayer() {
   const layer = it.layer(
     Layer.mergeAll(
       makeTestProviderServiceLive(
-        undefined,
+        issueMcpCredential === undefined ? undefined : { issueMcpCredential },
         makeProviderProjectContextTestLayer(resolveProjectMcp, acquireProjectMcpLease),
       ).pipe(
         Layer.provide(providerAdapterLayer),
@@ -383,6 +392,7 @@ function makeProviderServiceLayer() {
     claude,
     cursor,
     projectMcpServer,
+    issuedProjectMcpServer,
     resolveProjectMcp,
     acquireProjectMcpLease,
     get releasedSessionLeases() {
@@ -664,7 +674,26 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
-const routing = makeProviderServiceLayer();
+const routing = makeProviderServiceLayer((request) =>
+  Effect.succeed({
+    config: {
+      environmentId: EnvironmentId.make("provider-service-environment"),
+      threadId: request.threadId,
+      providerSessionId: `provider-session-${request.threadId}`,
+      providerInstanceId: request.providerInstanceId,
+      endpoint: "http://127.0.0.1:43123/mcp",
+      authorizationHeader: "Bearer preview-token",
+      projectServers: [
+        {
+          id: McpServerId.make("mcp-docs"),
+          name: "t3-code",
+          endpoint: new URL("http://127.0.0.1:43123/mcp/project/project-endpoint"),
+          authorizationHeader: "Bearer project-token",
+        },
+      ],
+    },
+  }),
+);
 
 it.effect(
   "ProviderServiceLive uploads feedback through the adapter that recovered the session",
@@ -1009,7 +1038,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.deepEqual(
         (routing.codex.startSession.mock.calls[0]?.[0] as { projectMcpServers?: unknown })
           .projectMcpServers,
-        [routing.projectMcpServer],
+        [routing.issuedProjectMcpServer],
       );
 
       yield* routing.codex.stopSession(threadId);
@@ -1023,7 +1052,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.deepEqual(
         (routing.codex.startSession.mock.calls[0]?.[0] as { projectMcpServers?: unknown })
           .projectMcpServers,
-        [routing.projectMcpServer],
+        [routing.issuedProjectMcpServer],
       );
       yield* provider.stopSession({ threadId });
       routing.codex.startSession.mockClear();

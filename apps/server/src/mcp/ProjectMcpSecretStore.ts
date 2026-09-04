@@ -210,6 +210,8 @@ export interface ProjectMcpSecretStoreShape {
   readonly listAuxiliarySecrets: (
     serverId: McpServerId,
   ) => Effect.Effect<ReadonlyArray<ProjectMcpCredentialIdType>, ProjectMcpSecretError>;
+  /** Returns server IDs present in the encrypted manifest without exposing secret values. */
+  readonly listServerIds: () => Effect.Effect<ReadonlyArray<McpServerId>, ProjectMcpSecretError>;
   readonly removeAuxiliarySecret: (
     serverId: McpServerId,
     credentialId: ProjectMcpCredentialIdType,
@@ -673,6 +675,11 @@ const make = Effect.gen(function* () {
   const listAuxiliarySecrets: ProjectMcpSecretStoreShape["listAuxiliarySecrets"] = (serverId) =>
     Ref.get(manifests).pipe(Effect.map((manifest) => manifest.servers[serverId]?.auxiliary ?? []));
 
+  const listServerIds: ProjectMcpSecretStoreShape["listServerIds"] = () =>
+    Ref.get(manifests).pipe(
+      Effect.map((manifest) => Object.keys(manifest.servers).map((id) => McpServerId.make(id))),
+    );
+
   const removeAuxiliarySecret: ProjectMcpSecretStoreShape["removeAuxiliarySecret"] = (
     serverId,
     credentialId,
@@ -807,6 +814,7 @@ const make = Effect.gen(function* () {
     retireTransport,
     createAuxiliarySecret,
     listAuxiliarySecrets,
+    listServerIds,
     removeAuxiliarySecret,
     removeServer,
     resolve,

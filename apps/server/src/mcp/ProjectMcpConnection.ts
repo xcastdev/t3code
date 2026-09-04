@@ -6,6 +6,8 @@ import {
   type DiscoverResult,
   type OAuthClientProvider,
   type ProtocolEra,
+  type ServerCapabilities,
+  type Implementation,
 } from "@modelcontextprotocol/client";
 
 import { makeProjectMcpTransport } from "./ProjectMcpTransport.ts";
@@ -36,6 +38,8 @@ export interface ProjectMcpClient {
   readonly getProtocolEra?: () => ProtocolEra | undefined;
   readonly getNegotiatedProtocolVersion?: () => string | undefined;
   readonly getDiscoverResult?: () => DiscoverResult | undefined;
+  readonly getServerCapabilities?: () => ServerCapabilities | undefined;
+  readonly getServerVersion?: () => Implementation | undefined;
 }
 
 export interface ProjectMcpConnectionDependencies {
@@ -111,6 +115,8 @@ export interface ProjectMcpConnection {
   readonly protocolEra: ProtocolEra | undefined;
   readonly negotiatedProtocolVersion: string | undefined;
   readonly discoverResult: DiscoverResult | undefined;
+  readonly serverCapabilities?: ServerCapabilities;
+  readonly serverVersion?: Implementation;
   readonly close: () => Promise<void>;
 }
 
@@ -142,12 +148,16 @@ export const connectProjectMcpServer = async ({
     }
 
     let closed = false;
+    const serverCapabilities = client.getServerCapabilities?.();
+    const serverVersion = client.getServerVersion?.();
     return {
       client,
       transport: selectedTransport,
       protocolEra: client.getProtocolEra?.(),
       negotiatedProtocolVersion: client.getNegotiatedProtocolVersion?.(),
       discoverResult: client.getDiscoverResult?.(),
+      ...(serverCapabilities === undefined ? {} : { serverCapabilities }),
+      ...(serverVersion === undefined ? {} : { serverVersion }),
       close: async () => {
         if (closed) return;
         closed = true;
@@ -157,7 +167,10 @@ export const connectProjectMcpServer = async ({
   };
 
   try {
-    return await connect(transport, automaticClientOptions);
+    return await connect(
+      transport,
+      transport.type === "legacy-sse" ? legacyClientOptions : automaticClientOptions,
+    );
   } catch (error) {
     if (transport.type !== "streamable-http" || !isLegacyFallbackStatus(error)) throw error;
     return connect(

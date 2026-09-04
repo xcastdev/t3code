@@ -151,6 +151,7 @@ function ProjectMcpEntryDetails({
   readonly applications: ReadonlyArray<{
     readonly providerInstanceId: ProviderInstanceId;
     readonly mode: ProjectMcpApplicationMode;
+    readonly reason?: string | undefined;
   }>;
   readonly providerNameForId: (providerInstanceId: ProviderInstanceId) => string;
 }) {
@@ -164,9 +165,13 @@ function ProjectMcpEntryDetails({
             <li key={application.providerInstanceId}>
               {providerNameForId(application.providerInstanceId)} ·{" "}
               {applicationLabel(application.mode)}
+              {application.reason ? ` (${application.reason})` : ""}
             </li>
           ))}
         </ul>
+      ) : null}
+      {"oauthStatus" in entry && entry.oauthStatus ? (
+        <p>OAuth: {entry.oauthStatus === "connected" ? "Connected" : entry.oauthStatus}</p>
       ) : null}
     </div>
   );
@@ -214,6 +219,15 @@ function CredentialFields({
           {entry.id ? (
             <p className="text-xs text-muted-foreground">Configured; value hidden.</p>
           ) : null}
+          <Button
+            type="button"
+            size="xs"
+            variant="ghost"
+            className="justify-self-start"
+            onClick={() => onChange(entries.filter((_, i) => i !== index))}
+          >
+            Remove credential
+          </Button>
         </div>
       ))}
       <Button

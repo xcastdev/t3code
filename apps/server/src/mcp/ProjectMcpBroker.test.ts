@@ -166,6 +166,26 @@ it("rejects a custom request across eras without an explicit adapter", async () 
   ).rejects.toMatchObject({ code: "unsupported_extension_across_protocol_eras" });
 });
 
+it("does not treat standard protocol methods as extensions", async () => {
+  const broker = new ProjectMcpBroker({
+    connection: connection(makeClient({ request: async () => ({}) })),
+    serverId,
+    providerSessionId: "provider-session",
+  });
+
+  for (const method of [
+    "initialize",
+    "roots/list",
+    "sampling/createMessage",
+    "elicitation/create",
+    "subscriptions/listen",
+  ]) {
+    await expect(
+      broker.requestExtension(method, {}, { params: JSONObjectSchema, result: JSONValueSchema }),
+    ).rejects.toMatchObject({ code: "invalid_extension_params" });
+  }
+});
+
 it("relays list-change notifications through the semantic handler surface", async () => {
   let toolsChanged: unknown;
   let registered: (() => void | Promise<void>) | undefined;

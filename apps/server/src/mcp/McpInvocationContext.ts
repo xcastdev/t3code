@@ -7,7 +7,7 @@ import {
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 
-export type McpCapability = "preview";
+export type McpCapability = "preview" | "project";
 
 export interface McpInvocationScope {
   readonly environmentId: EnvironmentId;
@@ -23,18 +23,38 @@ export class McpInvocationContext extends Context.Service<
   McpInvocationScope
 >()("t3/mcp/McpInvocationContext") {}
 
-export const requireMcpCapability = Effect.fn("mcp.requireCapability")(function* (
-  capability: McpCapability,
-) {
-  const invocation = yield* McpInvocationContext;
-  if (!invocation.capabilities.has(capability)) {
-    return yield* new PreviewAutomationUnavailableError({
-      capability,
-      environmentId: invocation.environmentId,
-      threadId: invocation.threadId,
-      providerSessionId: invocation.providerSessionId,
-      providerInstanceId: invocation.providerInstanceId,
-    });
+export class McpCapabilityUnavailableError extends Error {
+  readonly _tag = "McpCapabilityUnavailableError";
+  readonly capability: McpCapability;
+
+  constructor(capability: McpCapability) {
+    super(`MCP invocation does not grant the '${capability}' capability.`);
+    this.capability = capability;
+    this.name = "McpCapabilityUnavailableError";
   }
-  return invocation;
-});
+}
+
+export function requireMcpCapability(
+  capability: "preview",
+): Effect.Effect<McpInvocationScope, PreviewAutomationUnavailableError, McpInvocationContext>;
+export function requireMcpCapability(
+  capability: "project",
+): Effect.Effect<McpInvocationScope, McpCapabilityUnavailableError, McpInvocationContext>;
+export function requireMcpCapability(capability: McpCapability) {
+  return Effect.gen(function* () {
+    const invocation = yield* McpInvocationContext;
+    if (!invocation.capabilities.has(capability)) {
+      if (capability === "preview") {
+        return yield* new PreviewAutomationUnavailableError({
+          capability,
+          environmentId: invocation.environmentId,
+          threadId: invocation.threadId,
+          providerSessionId: invocation.providerSessionId,
+          providerInstanceId: invocation.providerInstanceId,
+        });
+      }
+      return yield* Effect.fail(new McpCapabilityUnavailableError(capability));
+    }
+    return invocation;
+  });
+}

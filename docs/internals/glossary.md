@@ -10,6 +10,7 @@ This is a living glossary for T3 Code. It explains what common terms mean in thi
 - [Thread timeline](#thread-timeline)
 - [Orchestration](#orchestration)
 - [Provider runtime](#provider-runtime)
+- [Project MCP](#project-mcp)
 - [Checkpointing](#checkpointing)
 - [Appearance](#appearance)
 
@@ -120,6 +121,34 @@ A point-in-time view of state. The word is used in multiple layers, including or
 #### Model manifest
 
 The per-driver list of current model slugs that decides which models land in the model picker's legacy section. Bundled at `apps/server/src/provider/model-manifest.json` and refreshed at runtime from the same file on `main`, so classification updates ship as commits instead of releases. See the [provider architecture][16] model manifest section.
+
+### Project MCP
+
+#### Project MCP catalog
+
+The project-scoped, event-backed list of user-configured MCP servers. Each entry belongs to one
+project and checkout, records an explicit stdio, Streamable HTTP, or legacy HTTP + SSE transport,
+and names the provider instances allowed to receive it. Catalog edits apply to the next provider
+session.
+
+#### Project MCP proxy
+
+The T3-owned, authenticated MCP endpoint issued per project server and provider session. It keeps
+the upstream transport and credentials on the environment machine, opens the upstream lazily, and
+brokers MCP operations between current and legacy protocol eras. Its path uses a random opaque
+endpoint handle rather than the catalog server ID.
+
+#### Upstream MCP server
+
+The external MCP implementation reached by a project MCP proxy. It may be a local stdio process or
+an HTTP/SSE service. Providers do not connect to it directly; T3 owns its client lifecycle and
+closes it when the provider session ends or is revoked.
+
+#### Provider MCP session
+
+The immutable project MCP snapshot and bearer scope issued immediately before a provider adapter
+starts. It contains provider-safe proxy URLs and authorization material, never upstream commands,
+headers, environment values, or OAuth secrets.
 
 ### Checkpointing
 

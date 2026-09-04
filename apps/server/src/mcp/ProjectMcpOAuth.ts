@@ -18,6 +18,7 @@ import {
   type StoredOAuthClientInformation,
   type StoredOAuthTokens,
 } from "@modelcontextprotocol/client";
+import type { ProjectMcpOAuthStatus } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -26,6 +27,12 @@ import * as ProjectMcpSecretStore from "./ProjectMcpSecretStore.ts";
 
 const STATE_TTL_MS = 10 * 60 * 1000;
 const RECORD_NAME = "project-mcp-oauth";
+
+const oauthErrorResponse = (message: string): Response =>
+  new Response(message, {
+    status: 400,
+    headers: { "cache-control": "no-store" },
+  });
 
 export class ProjectMcpOAuthError extends Schema.TaggedErrorClass<ProjectMcpOAuthError>()(
   "ProjectMcpOAuthError",
@@ -41,6 +48,7 @@ export interface ProjectMcpOAuthServer {
   readonly clientSecret?: string;
   readonly scopes?: ReadonlyArray<string>;
   readonly clientMetadata?: OAuthClientMetadata;
+  readonly clientMetadataUrl?: string;
 }
 
 export interface ProjectMcpOAuthConfig {
@@ -50,20 +58,32 @@ export interface ProjectMcpOAuthConfig {
   readonly redirectOrigin?: string;
 }
 
+export type ProjectMcpOAuthAuthorizedHandler = (serverId: McpServerId) => void | Promise<void>;
+
 export interface BeginProjectMcpOAuthInput {
   readonly serverId: McpServerId;
   readonly scope?: string;
+  /** A live redacted catalog projection, supplied by the RPC boundary. */
+  readonly server?: ProjectMcpOAuthServer;
+  /** Trusted origin derived from the authenticated T3 HTTP request, never client input. */
+  readonly redirectOrigin?: string;
 }
 
 export interface ProjectMcpOAuthShape {
+  readonly status: (
+    serverId: McpServerId,
+  ) => Effect.Effect<ProjectMcpOAuthStatus, ProjectMcpOAuthError>;
   readonly providerFor: (
     serverId: McpServerId,
+    server?: ProjectMcpOAuthServer,
   ) => Effect.Effect<OAuthClientProvider, ProjectMcpOAuthError>;
   readonly begin: (
     input: BeginProjectMcpOAuthInput,
   ) => Effect.Effect<ProjectMcpOAuthBeginResult, ProjectMcpOAuthError>;
   readonly completeCallback: (request: Request) => Effect.Effect<Response, ProjectMcpOAuthError>;
   readonly disconnect: (serverId: McpServerId) => Effect.Effect<void, ProjectMcpOAuthError>;
+  /** Installed by the proxy registry so a new grant invalidates cached upstream clients. */
+  readonly setAuthorizedHandler?: (handler: ProjectMcpOAuthAuthorizedHandler | undefined) => void;
 }
 
 export class ProjectMcpOAuth extends Context.Service<ProjectMcpOAuth, ProjectMcpOAuthShape>()(
@@ -75,6 +95,7 @@ type StoredRecord = {
   readonly serverId: string;
   readonly resource: string;
   readonly issuer?: string;
+  readonly redirectUrl?: string;
   readonly state?: string;
   readonly expiresAt?: number;
   readonly codeVerifier?: string;
@@ -109,16 +130,34 @@ const make = (config: ProjectMcpOAuthConfig) =>
   Effect.gen(function* () {
     const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
     const byId = new Map(config.servers.map((server) => [server.serverId, server]));
+    const pendingStates = new Map<string, McpServerId>();
+    let authorizedHandler: ProjectMcpOAuthAuthorizedHandler | undefined;
     const fetchFn = config.fetch ?? fetch;
     const now = config.now ?? Date.now;
     const defaultRedirect = config.redirectOrigin
       ? new URL("/oauth/project-mcp/callback", config.redirectOrigin).toString()
       : "http://127.0.0.1/oauth/project-mcp/callback";
 
-    const serverFor = (id: McpServerId) => {
-      const server = byId.get(id);
-      if (!server) throw new Error("Unknown MCP server");
-      return server;
+    const serverFor = async (
+      id: McpServerId,
+      supplied?: ProjectMcpOAuthServer,
+    ): Promise<ProjectMcpOAuthServer> => {
+      if (supplied) return supplied;
+      const configured = byId.get(id);
+      if (configured) return configured;
+      const persisted = await Effect.runPromise(current(id));
+      if (persisted) {
+        const clientId = persisted.client?.client_id;
+        const clientSecret = persisted.client?.client_secret;
+        return {
+          serverId: id,
+          resource: persisted.resource,
+          ...(persisted.redirectUrl === undefined ? {} : { redirectUrl: persisted.redirectUrl }),
+          ...(typeof clientId === "string" ? { clientId } : {}),
+          ...(typeof clientSecret === "string" ? { clientSecret } : {}),
+        };
+      }
+      throw new Error("Unknown MCP server");
     };
     const recordsFor = (id: McpServerId) =>
       Effect.gen(function* () {
@@ -146,10 +185,10 @@ const make = (config: ProjectMcpOAuthConfig) =>
         ),
       );
 
-    const providerFor: ProjectMcpOAuthShape["providerFor"] = (id) =>
-      Effect.try({
-        try: () => {
-          const server = serverFor(id);
+    const providerFor: ProjectMcpOAuthShape["providerFor"] = (id, supplied) =>
+      Effect.tryPromise({
+        try: async () => {
+          const server = await serverFor(id, supplied);
           const provider: OAuthClientProvider = {
             get redirectUrl() {
               return server.redirectUrl ?? defaultRedirect;
@@ -167,6 +206,9 @@ const make = (config: ProjectMcpOAuthConfig) =>
                   } satisfies OAuthClientMetadata),
               });
             },
+            ...(server.clientMetadataUrl === undefined
+              ? {}
+              : { clientMetadataUrl: server.clientMetadataUrl }),
             clientInformation: async (ctx) => {
               const record = await Effect.runPromise(current(id));
               return record?.client && (!ctx?.issuer || record.client.issuer === ctx.issuer)
@@ -281,8 +323,46 @@ const make = (config: ProjectMcpOAuthConfig) =>
 
     const begin: ProjectMcpOAuthShape["begin"] = (input) =>
       Effect.gen(function* () {
-        const server = serverFor(input.serverId);
-        const provider = yield* providerFor(input.serverId);
+        const server = yield* Effect.tryPromise({
+          try: () => serverFor(input.serverId, input.server),
+          catch: (cause) => new ProjectMcpOAuthError({ operation: "resolve server", cause }),
+        });
+        let providerServer = server;
+        if (input.redirectOrigin !== undefined) {
+          let redirectOrigin: URL;
+          try {
+            redirectOrigin = new URL(input.redirectOrigin);
+          } catch (cause) {
+            return yield* new ProjectMcpOAuthError({ operation: "resolve redirect", cause });
+          }
+          const loopback = new Set(["localhost", "127.0.0.1", "::1"]);
+          if (
+            redirectOrigin.username !== "" ||
+            redirectOrigin.password !== "" ||
+            redirectOrigin.search !== "" ||
+            redirectOrigin.hash !== "" ||
+            (redirectOrigin.protocol !== "https:" &&
+              !(redirectOrigin.protocol === "http:" && loopback.has(redirectOrigin.hostname)))
+          ) {
+            return yield* new ProjectMcpOAuthError({
+              operation: "resolve redirect",
+              cause: new Error("OAuth redirects require HTTPS or loopback HTTP."),
+            });
+          }
+          providerServer = {
+            ...server,
+            redirectUrl: new URL("/oauth/project-mcp/callback", redirectOrigin.origin).toString(),
+            ...(redirectOrigin.protocol === "https:"
+              ? {
+                  clientMetadataUrl: new URL(
+                    "/oauth/project-mcp/client-metadata",
+                    redirectOrigin.origin,
+                  ).toString(),
+                }
+              : {}),
+          };
+        }
+        const provider = yield* providerFor(input.serverId, providerServer);
         const info = yield* Effect.tryPromise({
           try: () => discoverOAuthServerInfo(server.resource, { fetchFn }),
           catch: (cause) => new ProjectMcpOAuthError({ operation: "discover", cause }),
@@ -301,18 +381,24 @@ const make = (config: ProjectMcpOAuthConfig) =>
               ...(server.clientSecret ? { client_secret: server.clientSecret } : {}),
               redirect_uris: [String(provider.redirectUrl)],
             }
-          : yield* Effect.tryPromise({
-              try: () =>
-                registerClient(issuer, {
-                  ...(info.authorizationServerMetadata
-                    ? { metadata: info.authorizationServerMetadata }
-                    : {}),
-                  clientMetadata: provider.clientMetadata,
-                  ...(requestedScope ? { scope: requestedScope } : {}),
-                  fetchFn,
-                }),
-              catch: (cause) => new ProjectMcpOAuthError({ operation: "register client", cause }),
-            });
+          : server.clientMetadataUrl &&
+              info.authorizationServerMetadata?.client_id_metadata_document_supported === true
+            ? {
+                client_id: server.clientMetadataUrl,
+                redirect_uris: [String(provider.redirectUrl)],
+              }
+            : yield* Effect.tryPromise({
+                try: () =>
+                  registerClient(issuer, {
+                    ...(info.authorizationServerMetadata
+                      ? { metadata: info.authorizationServerMetadata }
+                      : {}),
+                    clientMetadata: provider.clientMetadata,
+                    ...(requestedScope ? { scope: requestedScope } : {}),
+                    fetchFn,
+                  }),
+                catch: (cause) => new ProjectMcpOAuthError({ operation: "register client", cause }),
+              });
         const started = yield* Effect.tryPromise({
           try: () =>
             startAuthorization(issuer, {
@@ -327,20 +413,26 @@ const make = (config: ProjectMcpOAuthConfig) =>
             }),
           catch: (cause) => new ProjectMcpOAuthError({ operation: "begin", cause }),
         });
+        const authorizationState = new URL(started.authorizationUrl).searchParams.get("state");
+        if (!authorizationState) {
+          return yield* new ProjectMcpOAuthError({
+            operation: "begin",
+            cause: new Error("Authorization server did not return state."),
+          });
+        }
+        pendingStates.set(authorizationState, input.serverId);
         yield* save(input.serverId, {
           kind: RECORD_NAME,
           serverId: input.serverId,
           resource: server.resource,
+          redirectUrl: String(provider.redirectUrl),
           issuer,
-          ...(new URL(started.authorizationUrl).searchParams.get("state")
-            ? { state: new URL(started.authorizationUrl).searchParams.get("state")! }
-            : {}),
+          state: authorizationState,
           expiresAt: now() + STATE_TTL_MS,
           codeVerifier: started.codeVerifier,
           client: { ...client, issuer },
           discovery: info,
         });
-        // @effect-diagnostics-next-line globalDateInEffect:off
         return {
           authorizationUrl: started.authorizationUrl.toString(),
           // @effect-diagnostics-next-line globalDateInEffect:off
@@ -359,45 +451,90 @@ const make = (config: ProjectMcpOAuthConfig) =>
         const url = new URL(request.url);
         const state = url.searchParams.get("state");
         const code = url.searchParams.get("code");
-        if (!state || !code) return new Response("Invalid OAuth callback.", { status: 400 });
-        const matches = yield* Effect.forEach(config.servers, (server) =>
-          current(server.serverId).pipe(Effect.map((record) => ({ server, record }))),
+        if (!state || !code) return oauthErrorResponse("Invalid OAuth callback.");
+        const pendingServerId = pendingStates.get(state);
+        const serverIds = [
+          ...new Set([
+            ...config.servers.map(({ serverId }) => serverId),
+            ...(yield* secrets
+              .listServerIds()
+              .pipe(
+                Effect.mapError(
+                  (cause) => new ProjectMcpOAuthError({ operation: "read server IDs", cause }),
+                ),
+              )),
+          ]),
+        ];
+        const matches = yield* Effect.forEach(serverIds, (serverId) =>
+          current(serverId).pipe(Effect.map((record) => ({ serverId, record }))),
         );
-        const found = matches.find(({ record }) => record?.state === state);
-        if (!found?.record || (found.record.expiresAt ?? 0) < now())
-          return new Response("Invalid OAuth state.", { status: 400 });
-        if (
-          url.searchParams.get("iss") !== null &&
-          url.searchParams.get("iss") !== found.record.issuer
-        )
-          return new Response("Invalid OAuth issuer.", { status: 400 });
-        const { state: _state, ...consumed } = found.record;
-        yield* save(found.server.serverId, consumed);
-        const provider = yield* providerFor(found.server.serverId);
+        const persistedFound = matches.find(({ record }) => record?.state === state);
+        const pendingFound =
+          pendingServerId === undefined
+            ? undefined
+            : matches.find(
+                ({ serverId: candidateServerId, record }) =>
+                  candidateServerId === pendingServerId && record?.state === state,
+              );
+        const found = persistedFound ?? pendingFound;
+        const record = found?.record;
+        if (!found || !record || (record.expiresAt ?? 0) < now())
+          return oauthErrorResponse("Invalid OAuth state.");
+        if (url.searchParams.get("iss") !== null && url.searchParams.get("iss") !== record.issuer)
+          return oauthErrorResponse("Invalid OAuth issuer.");
+        const callbackServer = yield* Effect.tryPromise({
+          try: () => serverFor(found.serverId),
+          catch: (cause) => new ProjectMcpOAuthError({ operation: "resolve callback", cause }),
+        });
+        const provider = yield* providerFor(found.serverId, {
+          ...callbackServer,
+          ...(record.redirectUrl === undefined ? {} : { redirectUrl: record.redirectUrl }),
+        });
         yield* Effect.tryPromise({
           try: () =>
             auth(provider, {
-              serverUrl: found.server.resource,
+              serverUrl: record.resource,
               authorizationCode: code,
               fetchFn,
               ...(url.searchParams.get("iss") ? { iss: url.searchParams.get("iss")! } : {}),
             }),
           catch: (cause) => new ProjectMcpOAuthError({ operation: "callback", cause }),
         });
-        const after = yield* current(found.server.serverId);
+        pendingStates.delete(state);
+        const after = yield* current(found.serverId);
         if (after) {
-          const { codeVerifier: _codeVerifier, ...withoutVerifier } = after;
-          yield* save(found.server.serverId, withoutVerifier);
+          const { state: _state, codeVerifier: _codeVerifier, ...withoutVerifier } = after;
+          yield* save(found.serverId, withoutVerifier);
+        }
+        if (authorizedHandler !== undefined) {
+          yield* Effect.promise(async () => {
+            await authorizedHandler!(found.serverId);
+          }).pipe(Effect.ignore);
         }
         return new Response("OAuth authorization complete.", {
           headers: { "cache-control": "no-store" },
         });
       });
 
+    const status: ProjectMcpOAuthShape["status"] = (id) =>
+      current(id).pipe(
+        Effect.map((record) => {
+          if (record?.state !== undefined && (record.expiresAt ?? 0) >= now()) {
+            return "authorization-pending" as const;
+          }
+          return record?.tokens === undefined ? "not-connected" : "connected";
+        }),
+        Effect.mapError((cause) => new ProjectMcpOAuthError({ operation: "read status", cause })),
+      );
+
     return ProjectMcpOAuth.of({
+      status,
       providerFor,
       begin,
       completeCallback,
+      setAuthorizedHandler: (handler) => {
+        authorizedHandler = handler;
+      },
       disconnect: (id) =>
         Effect.gen(function* () {
           for (const record of yield* recordsFor(id)) {
@@ -414,3 +551,5 @@ const make = (config: ProjectMcpOAuthConfig) =>
   });
 
 export const layer = (config: ProjectMcpOAuthConfig) => Layer.effect(ProjectMcpOAuth, make(config));
+
+export const __testing = { make };

@@ -475,13 +475,15 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
         projectMcpServers: [
           {
             id: McpServerId.make("mcp-docs"),
-            name: "t3-code",
-            transport: {
-              type: "streamable-http",
-              url: "https://docs.example.test/mcp",
-              headers: [],
-              authorization: { type: "none" },
-            },
+            name: "Docs",
+            endpoint: new URL("http://127.0.0.1:4311/mcp/project/docs-endpoint"),
+            authorizationHeader: "Bearer project-token",
+          },
+          {
+            id: McpServerId.make("mcp-calendar"),
+            name: "Calendar",
+            endpoint: new URL("http://127.0.0.1:4311/mcp/project/calendar-endpoint"),
+            authorizationHeader: "Bearer calendar-token",
           },
         ],
       });
@@ -490,13 +492,24 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
       NodeAssert.ok(runtime);
       NodeAssert.deepEqual(runtime.options.appServerArgs, [
         "-c",
-        'mcp_servers.t3-project-mcp-docs.url="https://docs.example.test/mcp"',
+        'mcp_servers.t3-project-mcp-docs.url="http://127.0.0.1:4311/mcp/project/docs-endpoint"',
+        "-c",
+        'mcp_servers.t3-project-mcp-docs.bearer_token_env_var="T3_PROJECT_MCP_mcp_2D_docs"',
+        "-c",
+        'mcp_servers.t3-project-mcp-calendar.url="http://127.0.0.1:4311/mcp/project/calendar-endpoint"',
+        "-c",
+        'mcp_servers.t3-project-mcp-calendar.bearer_token_env_var="T3_PROJECT_MCP_mcp_2D_calendar"',
         "-c",
         "mcp_servers.t3-code.url=http://127.0.0.1:4310/mcp",
         "-c",
         'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
       ]);
       NodeAssert.equal(runtime.options.environment?.T3_MCP_BEARER_TOKEN, "preview-token");
+      NodeAssert.equal(runtime.options.environment?.T3_PROJECT_MCP_mcp_2D_docs, "project-token");
+      NodeAssert.equal(
+        runtime.options.environment?.T3_PROJECT_MCP_mcp_2D_calendar,
+        "calendar-token",
+      );
     }).pipe(
       Effect.ensuring(
         Effect.sync(() =>

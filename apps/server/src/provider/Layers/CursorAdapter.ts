@@ -533,22 +533,17 @@ export function makeCursorAdapter(
             : cursorSettings;
 
           const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
-          const projectMcpServers = (input.projectMcpServers ?? []).map((server) =>
-            server.transport.type === "stdio"
-              ? {
-                  type: "stdio" as const,
-                  name: projectMcpNativeKey(server),
-                  command: server.transport.command,
-                  args: [...server.transport.args],
-                  env: [],
-                }
-              : {
-                  type: "http" as const,
-                  name: projectMcpNativeKey(server),
-                  url: server.transport.url,
-                  headers: [],
-                },
-          );
+          const projectMcpServers = (input.projectMcpServers ?? []).map((server) => ({
+            type: "http" as const,
+            name: projectMcpNativeKey(server),
+            url: server.endpoint.toString(),
+            headers: [
+              {
+                name: "Authorization",
+                value: server.authorizationHeader,
+              },
+            ],
+          }));
           const acp = yield* makeCursorAcpRuntime({
             cursorSettings: effectiveCursorSettings,
             ...(options?.environment ? { environment: options.environment } : {}),
@@ -1200,6 +1195,7 @@ export function makeCursorAdapter(
       capabilities: {
         sessionModelSwitch: "in-session",
         remoteHttpMcp: "next-session",
+        projectMcpProxy: "next-session",
         managedPreviewMcp: "next-session",
       },
       startSession,

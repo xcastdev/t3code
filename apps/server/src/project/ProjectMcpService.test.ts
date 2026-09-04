@@ -25,6 +25,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as ServerConfig from "../config.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ProjectMcpSecretStore from "../mcp/ProjectMcpSecretStore.ts";
+import * as ProjectMcpOAuth from "../mcp/ProjectMcpOAuth.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
 import {
@@ -95,6 +96,17 @@ const mcpHttpServer = HttpServer.HttpServer.of({
   serve: (() => Effect.void) as HttpServer.HttpServer["Service"]["serve"],
 });
 
+const projectMcpOAuthTestLayer = Layer.succeed(
+  ProjectMcpOAuth.ProjectMcpOAuth,
+  ProjectMcpOAuth.ProjectMcpOAuth.of({
+    status: () => Effect.succeed("not-connected"),
+    providerFor: () => Effect.die("unused"),
+    begin: () => Effect.die("unused"),
+    completeCallback: () => Effect.die("unused"),
+    disconnect: () => Effect.die("unused"),
+  }),
+);
+
 const providerInstanceRegistry = Layer.succeed(ProviderInstanceRegistry, {
   getInstance: () => Effect.die("Unused in ProjectMcpService tests"),
   listInstances: Effect.succeed([
@@ -128,6 +140,7 @@ const providerInstanceRegistry = Layer.succeed(ProviderInstanceRegistry, {
 const makeTestLayer = (engineLayer = OrchestrationEngineLive) =>
   ProjectMcpService.layer.pipe(
     Layer.provideMerge(ProjectMcpSecretStore.layer),
+    Layer.provideMerge(projectMcpOAuthTestLayer),
     Layer.provideMerge(ServerSecretStore.layer),
     Layer.provideMerge(engineLayer),
     Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
@@ -152,6 +165,7 @@ const makeRestartTestLayer = (
 ) =>
   ProjectMcpService.layer.pipe(
     Layer.provideMerge(ProjectMcpSecretStore.layer),
+    Layer.provideMerge(projectMcpOAuthTestLayer),
     Layer.provideMerge(ServerSecretStore.layer),
     Layer.provideMerge(OrchestrationEngineLive),
     Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
@@ -345,6 +359,30 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
           providerInstanceId: unavailableInstance,
           mode: "unavailable",
         },
+      ]);
+    }),
+  );
+
+  it.effect("projects a redacted OAuth connection status", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const projectId = ProjectId.make("oauth-status-project");
+      yield* createProject(projectId, "oauth-status-project");
+      const entry = yield* service.create({
+        projectId,
+        name: "OAuth server",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: {
+          type: "streamable-http",
+          url: "https://oauth.example.test/mcp",
+          headers: [],
+          authorization: { type: "oauth", registration: { type: "automatic" } },
+        },
+      });
+
+      expect((yield* service.list(projectId)).external).toEqual([
+        { ...entry, oauthStatus: "not-connected" },
       ]);
     }),
   );

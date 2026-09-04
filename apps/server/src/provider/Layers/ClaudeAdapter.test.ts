@@ -291,13 +291,15 @@ describe("ClaudeAdapterLive", () => {
         projectMcpServers: [
           {
             id: McpServerId.make("mcp-docs"),
-            name: "t3-code",
-            transport: {
-              type: "streamable-http",
-              url: "https://docs.example.test/mcp",
-              headers: [],
-              authorization: { type: "none" },
-            },
+            name: "Docs",
+            endpoint: new URL("http://127.0.0.1:4311/mcp/project/docs-endpoint"),
+            authorizationHeader: "Bearer project-token",
+          },
+          {
+            id: McpServerId.make("mcp-calendar"),
+            name: "Calendar",
+            endpoint: new URL("http://127.0.0.1:4311/mcp/project/calendar-endpoint"),
+            authorizationHeader: "Bearer calendar-token",
           },
         ],
       });
@@ -305,7 +307,13 @@ describe("ClaudeAdapterLive", () => {
       assert.deepEqual(harness.getLastCreateQueryInput()?.options.mcpServers, {
         "t3-project-mcp-docs": {
           type: "http",
-          url: "https://docs.example.test/mcp",
+          url: "http://127.0.0.1:4311/mcp/project/docs-endpoint",
+          headers: { Authorization: "Bearer project-token" },
+        },
+        "t3-project-mcp-calendar": {
+          type: "http",
+          url: "http://127.0.0.1:4311/mcp/project/calendar-endpoint",
+          headers: { Authorization: "Bearer calendar-token" },
         },
         "t3-code": {
           type: "http",

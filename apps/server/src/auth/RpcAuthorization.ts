@@ -87,6 +87,8 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.projectMcpCreate]: AuthOrchestrationOperateScope,
   [WS_METHODS.projectMcpUpdate]: AuthOrchestrationOperateScope,
   [WS_METHODS.projectMcpRemove]: AuthOrchestrationOperateScope,
+  [WS_METHODS.projectMcpOauthBegin]: AuthOrchestrationOperateScope,
+  [WS_METHODS.projectMcpOauthDisconnect]: AuthOrchestrationOperateScope,
   [WS_METHODS.shellOpenInEditor]: AuthOrchestrationOperateScope,
   [WS_METHODS.filesystemBrowse]: AuthOrchestrationReadScope,
   [WS_METHODS.assetsCreateUrl]: AuthOrchestrationReadScope,

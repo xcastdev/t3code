@@ -20,9 +20,9 @@ import type {
   ProviderUploadFeedbackResult,
   ThreadId,
   ProviderTurnStartResult,
-  ResolvedProjectMcpServer,
   TurnId,
 } from "@t3tools/contracts";
+import type { McpIssuedProjectServer } from "../../mcp/McpProviderSession.ts";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
@@ -36,16 +36,39 @@ export interface ProviderAdapterCapabilities {
   readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
   /** Application timing for user-configured remote HTTP MCP servers. */
   readonly remoteHttpMcp: ProviderRemoteHttpMcpMode;
+  /** Application timing for the T3-scoped project MCP proxy. */
+  readonly projectMcpProxy?: ProviderRemoteHttpMcpMode;
+  /** Human-readable reason when project MCP is unavailable for this adapter. */
+  readonly projectMcpUnsupportedReason?: string;
   /** Application timing for the T3-managed preview MCP server. */
   readonly managedPreviewMcp: ProviderRemoteHttpMcpMode;
 }
 
 export type ProviderAdapterSessionStartInput = ProviderSessionStartInput & {
-  readonly projectMcpServers?: ReadonlyArray<ResolvedProjectMcpServer>;
+  /** T3-issued proxy records only; upstream transport details never cross this seam. */
+  readonly projectMcpServers?: ReadonlyArray<McpIssuedProjectServer>;
 };
 
-export const projectMcpNativeKey = (server: ResolvedProjectMcpServer): string =>
-  `t3-project-${server.id}`;
+const encodeProjectMcpId = (id: Pick<McpIssuedProjectServer, "id">["id"]): string =>
+  Array.from(String(id), (character) =>
+    /^[A-Za-z0-9-]$/.test(character)
+      ? character
+      : `_${character.codePointAt(0)?.toString(16).toUpperCase() ?? "00"}_`,
+  ).join("");
+
+export const projectMcpNativeKey = (server: Pick<McpIssuedProjectServer, "id">): string =>
+  `t3-project-${encodeProjectMcpId(server.id)}`;
+
+export const projectMcpTokenEnvironmentKey = (
+  server: Pick<McpIssuedProjectServer, "id">,
+): string => {
+  const suffix = Array.from(String(server.id), (character) =>
+    /^[A-Za-z0-9]$/.test(character)
+      ? character
+      : `_${character.codePointAt(0)?.toString(16).toUpperCase() ?? "00"}_`,
+  ).join("");
+  return `T3_PROJECT_MCP_${suffix}`;
+};
 
 export interface ProviderThreadTurnSnapshot {
   readonly id: TurnId;

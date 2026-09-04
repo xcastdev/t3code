@@ -1,5 +1,6 @@
 import {
   defaultInstanceIdForDriver,
+  McpServerId,
   ProviderDriverKind,
   type ServerProvider,
 } from "@t3tools/contracts";
@@ -20,6 +21,7 @@ import type { ProviderInstance } from "../ProviderDriver.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import type * as TextGeneration from "../../textGeneration/TextGeneration.ts";
 import * as ProviderAdapterRegistryLayer from "./ProviderAdapterRegistry.ts";
+import { projectMcpNativeKey, projectMcpTokenEnvironmentKey } from "../Services/ProviderAdapter.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
@@ -170,6 +172,21 @@ const layer = Layer.mergeAll(
   ),
   NodeServices.layer,
 );
+
+it("derives safe, collision-resistant project MCP provider identifiers", () => {
+  const slashId = { id: McpServerId.make("mcp/docs") } as const;
+  const escapedId = { id: McpServerId.make("mcp_2F_docs") } as const;
+  const caseVariantId = { id: McpServerId.make("MCP/DOCS") } as const;
+
+  assert.notInclude(projectMcpNativeKey(slashId), "/");
+  assert.notInclude(projectMcpTokenEnvironmentKey(slashId), "/");
+  assert.notEqual(projectMcpNativeKey(slashId), projectMcpNativeKey(escapedId));
+  assert.notEqual(projectMcpTokenEnvironmentKey(slashId), projectMcpTokenEnvironmentKey(escapedId));
+  assert.notEqual(
+    projectMcpTokenEnvironmentKey(slashId),
+    projectMcpTokenEnvironmentKey(caseVariantId),
+  );
+});
 
 it.layer(layer)("ProviderAdapterRegistryLive", (it) => {
   it("resolves adapters and routing metadata from provider instances", () =>

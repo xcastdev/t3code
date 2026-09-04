@@ -30,6 +30,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { getMcpEndpoint } from "../mcp/McpSessionRegistry.ts";
 import * as ProjectMcpSecretStore from "../mcp/ProjectMcpSecretStore.ts";
+import * as ProjectMcpOAuth from "../mcp/ProjectMcpOAuth.ts";
 import {
   OrchestrationCommandIdConflictError,
   OrchestrationCommandInvariantError,
@@ -105,6 +106,7 @@ const makeProjectMcpService = Effect.gen(function* () {
   const httpServer = yield* HttpServer.HttpServer;
   const crypto = yield* Crypto.Crypto;
   const mcpSecrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+  const mcpOAuth = yield* Effect.serviceOption(ProjectMcpOAuth.ProjectMcpOAuth);
   const catalogMutationLock = yield* Semaphore.make(1);
   const mutationLocks = new Map<McpServerId, Semaphore.Semaphore>();
 
@@ -150,11 +152,22 @@ const makeProjectMcpService = Effect.gen(function* () {
         providerInstances.listUnavailable,
       ]);
       const externalApplicationModes = new Map(
+        instances.map((instance) => {
+          const mode = instance.enabled
+            ? (instance.adapter.capabilities.projectMcpProxy ??
+              instance.adapter.capabilities.remoteHttpMcp)
+            : "unavailable";
+          return [instance.instanceId, mode] as const;
+        }),
+      );
+      const externalApplicationReasons = new Map(
         instances.map(
           (instance) =>
             [
               instance.instanceId,
-              instance.enabled ? instance.adapter.capabilities.remoteHttpMcp : "unavailable",
+              instance.enabled
+                ? instance.adapter.capabilities.projectMcpUnsupportedReason
+                : undefined,
             ] as const,
         ),
       );
@@ -204,14 +217,29 @@ const makeProjectMcpService = Effect.gen(function* () {
           ),
         ),
       );
+      const externalWithOAuthStatus = yield* Effect.forEach(external, (entry) => {
+        const transport = getProjectMcpTransport(entry);
+        if (transport.type === "stdio" || transport.authorization.type !== "oauth") {
+          return Effect.succeed(entry);
+        }
+        return mcpOAuth._tag === "Some"
+          ? mcpOAuth.value.status(entry.id).pipe(
+              Effect.map((oauthStatus) => ({ ...entry, oauthStatus })),
+              Effect.orElseSucceed(() => entry),
+            )
+          : Effect.succeed(entry);
+      });
       return {
-        external,
+        external: externalWithOAuthStatus,
         applications: [
-          ...external.flatMap((entry) =>
+          ...externalWithOAuthStatus.flatMap((entry) =>
             entry.providerInstanceIds.map((providerInstanceId) => ({
               serverId: entry.id,
               providerInstanceId,
               mode: externalApplicationModes.get(providerInstanceId) ?? "unavailable",
+              ...(externalApplicationReasons.get(providerInstanceId) === undefined
+                ? {}
+                : { reason: externalApplicationReasons.get(providerInstanceId) }),
             })),
           ),
           ...knownProviderInstanceIds.map((providerInstanceId) => ({

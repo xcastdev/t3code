@@ -52,7 +52,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
-import { projectMcpNativeKey } from "../Services/ProviderAdapter.ts";
+import { projectMcpNativeKey, projectMcpTokenEnvironmentKey } from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
@@ -1685,19 +1685,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
-        const projectMcpArgs = (input.projectMcpServers ?? []).flatMap((server) =>
-          server.transport.type === "stdio"
-            ? [
-                "-c",
-                `mcp_servers.${projectMcpNativeKey(server)}.command=${JSON.stringify(server.transport.command)}`,
-                "-c",
-                `mcp_servers.${projectMcpNativeKey(server)}.args=${JSON.stringify(server.transport.args)}`,
-              ]
-            : [
-                "-c",
-                `mcp_servers.${projectMcpNativeKey(server)}.url=${JSON.stringify(server.transport.url)}`,
-              ],
-        );
+        const projectMcpServers = input.projectMcpServers ?? [];
+        const projectMcpArgs = projectMcpServers.flatMap((server) => {
+          const nativeKey = projectMcpNativeKey(server);
+          const tokenEnvironmentKey = projectMcpTokenEnvironmentKey(server);
+          return [
+            "-c",
+            `mcp_servers.${nativeKey}.url=${JSON.stringify(server.endpoint.toString())}`,
+            "-c",
+            `mcp_servers.${nativeKey}.bearer_token_env_var=${JSON.stringify(tokenEnvironmentKey)}`,
+          ];
+        });
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
           providerInstanceId: boundInstanceId,
@@ -1718,6 +1716,12 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? {
                 environment: {
                   ...(options?.environment ?? process.env),
+                  ...Object.fromEntries(
+                    projectMcpServers.map((server) => [
+                      projectMcpTokenEnvironmentKey(server),
+                      server.authorizationHeader.replace(/^Bearer\s+/i, ""),
+                    ]),
+                  ),
                   ...(mcpSession
                     ? {
                         T3_MCP_BEARER_TOKEN: mcpSession.authorizationHeader.replace(
@@ -2037,6 +2041,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     capabilities: {
       sessionModelSwitch: "in-session",
       remoteHttpMcp: "next-session",
+      projectMcpProxy: "next-session",
       managedPreviewMcp: "next-session",
     },
     startSession,

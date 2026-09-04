@@ -139,6 +139,7 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 
 const methodNames = new Set([
+  "initialize",
   "tools/call",
   "tools/list",
   "resources/list",
@@ -152,12 +153,18 @@ const methodNames = new Set([
   "ping",
   "server/discover",
   "logging/setLevel",
+  "roots/list",
+  "sampling/createMessage",
+  "elicitation/create",
+  "subscriptions/listen",
 ]);
 
 export class ProjectMcpBroker {
   readonly protocolEra: ProtocolEra | undefined;
   readonly negotiatedProtocolVersion: string | undefined;
   readonly discoverResult: DiscoverResult | undefined;
+  readonly serverCapabilities: ProjectMcpConnection["serverCapabilities"];
+  readonly serverVersion: ProjectMcpConnection["serverVersion"];
 
   private readonly connection: ProjectMcpConnection;
   private readonly serverId: McpServerId;
@@ -174,12 +181,14 @@ export class ProjectMcpBroker {
     this.protocolEra = options.connection.protocolEra;
     this.negotiatedProtocolVersion = options.connection.negotiatedProtocolVersion;
     this.discoverResult = options.connection.discoverResult;
+    this.serverCapabilities = options.connection.serverCapabilities;
+    this.serverVersion = options.connection.serverVersion;
     this.downstreamProtocolEra =
       options.downstreamProtocolEra ?? options.connection.protocolEra ?? "legacy";
     this.requestStateSecret = options.requestStateSecret ?? randomBytes(32);
     this.now = options.now ?? Date.now;
     this.extensionAdapters = options.extensionAdapters ?? new Map();
-    this.installHandlers(options.handlers);
+    this.setHandlers(options.handlers);
   }
 
   async close(): Promise<void> {
@@ -401,7 +410,7 @@ export class ProjectMcpBroker {
       : { ...withoutBrokerState, requestState: state.upstreamRequestState };
   }
 
-  private installHandlers(handlers: ProjectMcpBrokerHandlers | undefined): void {
+  setHandlers(handlers: ProjectMcpBrokerHandlers | undefined): void {
     if (!handlers) return;
     const client = this.connection.client;
     if (typeof client.setNotificationHandler === "function") {
