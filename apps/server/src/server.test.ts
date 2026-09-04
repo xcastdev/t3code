@@ -636,6 +636,24 @@ const buildAppUnderTest = (options?: {
     const serviceLauncherClientLayer = ServiceLauncherClient.layer.pipe(
       Layer.provide(Layer.succeed(HostProcessEnvironment, {})),
     );
+    const projectSetupScriptRunnerLayer = Layer.mock(
+      ProjectSetupScriptRunner.ProjectSetupScriptRunner,
+    )({
+      runForThread: () => Effect.succeed({ status: "no-script" as const }),
+      ...options?.layers?.projectSetupScriptRunner,
+    });
+    const projectMcpServiceLayer = Layer.mock(ProjectMcpService.ProjectMcpService)({
+      list: () => Effect.succeed({ external: [], managed: [], applications: [] }),
+      create: () => Effect.die("Project MCP create is not stubbed in this test"),
+      update: () => Effect.die("Project MCP update is not stubbed in this test"),
+      remove: () => Effect.die("Project MCP remove is not stubbed in this test"),
+      resolveForSession: () => Effect.succeed([]),
+      ...options?.layers?.projectMcpService,
+    });
+    const projectServicesLayer = Layer.mergeAll(
+      projectSetupScriptRunnerLayer,
+      projectMcpServiceLayer,
+    );
 
     const servedRoutesLayer = HttpRouter.serve(
       makeRoutesLayer.pipe(Layer.provide(serviceLauncherClientLayer)),
@@ -783,22 +801,7 @@ const buildAppUnderTest = (options?: {
         }),
       ),
       Layer.provideMerge(vcsStatusBroadcasterLayer),
-      Layer.provide(
-        Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
-          runForThread: () => Effect.succeed({ status: "no-script" as const }),
-          ...options?.layers?.projectSetupScriptRunner,
-        }),
-      ),
-      Layer.provide(
-        Layer.mock(ProjectMcpService.ProjectMcpService)({
-          list: () => Effect.succeed({ external: [], managed: [], applications: [] }),
-          create: () => Effect.die("Project MCP create is not stubbed in this test"),
-          update: () => Effect.die("Project MCP update is not stubbed in this test"),
-          remove: () => Effect.die("Project MCP remove is not stubbed in this test"),
-          resolveForSession: () => Effect.succeed([]),
-          ...options?.layers?.projectMcpService,
-        }),
-      ),
+      Layer.provide(projectServicesLayer),
       Layer.provide(
         Layer.mock(TerminalManager.TerminalManager)({
           ...options?.layers?.terminalManager,
