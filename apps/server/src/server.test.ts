@@ -28,6 +28,8 @@ import {
   ORCHESTRATION_WS_METHODS,
   type PreviewEvent,
   ProjectId,
+  ProjectMcpCredentialId,
+  ProjectMcpHeaderName,
   ProjectMcpNameConflictError,
   ProjectMcpProviderNotFoundError,
   ProjectMcpServerLimitExceededError,
@@ -86,6 +88,7 @@ const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 const decodeTransferThreadSnapshot = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationThreadDetailSnapshot),
 );
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const collectQueueUntil = Effect.fn("TransferBudget.collectQueueUntil")(function* <A>(
   queue: Queue.Queue<A>,
@@ -5153,11 +5156,22 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     Effect.gen(function* () {
       const projectId = ProjectId.make("project-mcp-catalog");
       const serverId = McpServerId.make("mcp-docs");
+      const credentialId = ProjectMcpCredentialId.make("2aef2447-b6f4-4c4f-b35e-89b59a0841ef");
       const providerInstanceId = ProviderInstanceId.make("codex-primary");
       const server = {
         id: serverId,
         name: "t3-code",
-        url: "https://docs.example.test/mcp",
+        transport: {
+          type: "streamable-http" as const,
+          url: "https://docs.example.test/mcp",
+          headers: [
+            {
+              name: ProjectMcpHeaderName.make("X-Api-Key"),
+              credential: { id: credentialId, name: "Docs API key" },
+            },
+          ],
+          authorization: { type: "none" as const },
+        },
         enabled: true,
         providerInstanceIds: [providerInstanceId],
       } as const;
@@ -5230,9 +5244,19 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             client[WS_METHODS.projectMcpCreate]({
               projectId,
               name: server.name,
-              url: server.url,
               enabled: server.enabled,
               providerInstanceIds: server.providerInstanceIds,
+              transport: {
+                type: "streamable-http",
+                url: "https://docs.example.test/mcp",
+                headers: [
+                  {
+                    name: ProjectMcpHeaderName.make("X-Api-Key"),
+                    credential: { name: "Docs API key", value: "rpc-secret-sentinel" },
+                  },
+                ],
+                authorization: { type: "none" },
+              },
             }),
             client[WS_METHODS.projectMcpUpdate]({ projectId, ...server }),
             client[WS_METHODS.projectMcpRemove]({ projectId, id: serverId }),
@@ -5259,6 +5283,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       ]);
       assert.deepEqual(results[1], server);
       assert.deepEqual(results[2], server);
+      assert.notInclude(encodeUnknownJson(results), "rpc-secret-sentinel");
       assert.deepEqual(calls, ["list", "create", "update", "remove"]);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );

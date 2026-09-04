@@ -87,6 +87,7 @@ import * as SourceControlRateLimit from "./sourceControl/SourceControlRateLimit.
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
 import * as ProjectMcpService from "./project/ProjectMcpService.ts";
+import * as ProjectMcpSecretStore from "./mcp/ProjectMcpSecretStore.ts";
 import { ObservabilityLive } from "./observability/Layers/Observability.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
@@ -272,6 +273,10 @@ const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
   Layer.provide(ProviderSessionRuntime.layer),
 );
 
+const ProjectMcpServiceLayerLive = ProjectMcpService.layer.pipe(
+  Layer.provideMerge(ProjectMcpSecretStore.layer.pipe(Layer.provide(ServerSecretStore.layer))),
+);
+
 // `ProviderAdapterRegistryLive` is now a facade that resolves kind → adapter
 // by looking up the default `ProviderInstance` per driver in the instance
 // registry. Adapter construction itself moved inside each driver's
@@ -281,7 +286,7 @@ const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
 const ProviderLayerLive = ProviderServiceLive.pipe(
   Layer.provide(ProviderAdapterRegistryLive),
   Layer.provideMerge(ProviderSessionDirectoryLayerLive),
-  Layer.provideMerge(ProjectMcpService.layer),
+  Layer.provideMerge(ProjectMcpServiceLayerLive),
 );
 
 const PersistenceLayerLive = Layer.empty.pipe(Layer.provideMerge(SqlitePersistenceLayerLive));

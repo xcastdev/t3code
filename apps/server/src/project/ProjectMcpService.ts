@@ -26,6 +26,7 @@ import { HttpServer } from "effect/unstable/http";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { getMcpEndpoint } from "../mcp/McpSessionRegistry.ts";
+import * as ProjectMcpSecretStore from "../mcp/ProjectMcpSecretStore.ts";
 import { OrchestrationCommandInvariantError } from "../orchestration/Errors.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
@@ -92,6 +93,7 @@ const makeProjectMcpService = Effect.gen(function* () {
   const providerInstances = yield* ProviderInstanceRegistry;
   const httpServer = yield* HttpServer.HttpServer;
   const crypto = yield* Crypto.Crypto;
+  const mcpSecrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
 
   const list: ProjectMcpServiceShape["list"] = (projectId) =>
     Effect.gen(function* () {
@@ -138,7 +140,7 @@ const makeProjectMcpService = Effect.gen(function* () {
             Effect.all([
               decodeProviderInstanceIds(row.providerInstanceIds),
               row.transportJson === null
-                ? Effect.succeed(undefined)
+                ? Effect.void
                 : decodeProjectMcpTransportJson(row.transportJson),
             ]).pipe(
               Effect.flatMap(([providerInstanceIds, transport]) =>
@@ -252,20 +254,33 @@ const makeProjectMcpService = Effect.gen(function* () {
       const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
       const serverId = McpServerId.make(yield* crypto.randomUUIDv4);
       const commandId = CommandId.make(yield* crypto.randomUUIDv4);
+      const prepared =
+        input.transport === undefined
+          ? undefined
+          : yield* mcpSecrets.prepareCreate(serverId, input.transport);
       const server: ProjectMcpServer = {
         id: serverId,
         name: input.name,
-        ...(input.transport === undefined ? { url: input.url! } : { transport: input.transport }),
+        ...(prepared === undefined ? { url: input.url! } : { transport: prepared.transport }),
         enabled: input.enabled,
         providerInstanceIds: input.providerInstanceIds,
       };
-      yield* engine.dispatch({
-        type: "project.mcp-server.create",
-        commandId,
-        projectId: input.projectId,
-        server,
-        createdAt: now,
-      });
+      yield* engine
+        .dispatch({
+          type: "project.mcp-server.create",
+          commandId,
+          projectId: input.projectId,
+          server,
+          createdAt: now,
+        })
+        .pipe(
+          Effect.catch((error) =>
+            prepared === undefined
+              ? Effect.fail(error)
+              : prepared.rollback.pipe(Effect.andThen(Effect.fail(error))),
+          ),
+        );
+      if (prepared !== undefined) yield* prepared.commit;
       return server;
     });
 
@@ -281,20 +296,40 @@ const makeProjectMcpService = Effect.gen(function* () {
       yield* validateProviderIds(input.providerInstanceIds, existing.providerInstanceIds);
       const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
       const commandId = CommandId.make(yield* crypto.randomUUIDv4);
+      const prepared =
+        input.transport === undefined
+          ? undefined
+          : yield* mcpSecrets.prepareUpdate(
+              input.id,
+              getProjectMcpTransport(existing),
+              input.transport,
+            );
       const server: ProjectMcpServer = {
         id: input.id,
         name: input.name,
-        ...(input.transport === undefined ? { url: input.url! } : { transport: input.transport }),
+        ...(prepared === undefined ? { url: input.url! } : { transport: prepared.transport }),
         enabled: input.enabled,
         providerInstanceIds: input.providerInstanceIds,
       };
-      yield* engine.dispatch({
-        type: "project.mcp-server.update",
-        commandId,
-        projectId: input.projectId,
-        server,
-        updatedAt: now,
-      });
+      yield* engine
+        .dispatch({
+          type: "project.mcp-server.update",
+          commandId,
+          projectId: input.projectId,
+          server,
+          updatedAt: now,
+        })
+        .pipe(
+          Effect.catch((error) =>
+            prepared === undefined
+              ? Effect.fail(error)
+              : prepared.rollback.pipe(Effect.andThen(Effect.fail(error))),
+          ),
+        );
+      if (prepared !== undefined) yield* prepared.commit;
+      if (prepared === undefined && existing.transport !== undefined) {
+        yield* mcpSecrets.retireTransport(input.id, existing.transport);
+      }
       return server;
     });
 
@@ -313,6 +348,7 @@ const makeProjectMcpService = Effect.gen(function* () {
         id: input.id,
         removedAt: now,
       });
+      yield* mcpSecrets.removeServer(input.id);
     });
 
   const resolveForSession: ProjectMcpServiceShape["resolveForSession"] = (
@@ -332,6 +368,39 @@ const makeProjectMcpService = Effect.gen(function* () {
           })),
       ),
     );
+
+  const persistedServers = yield* sql<Schema.Schema.Type<typeof ProjectMcpProjectionRow>>`
+    SELECT
+      server_id AS "serverId",
+      name,
+      url,
+      transport_json AS "transportJson",
+      enabled,
+      provider_instance_ids_json AS "providerInstanceIds"
+    FROM projection_project_mcp_servers
+  `.pipe(
+    Effect.flatMap((rows) =>
+      Effect.forEach(rows, (row) =>
+        Effect.all([
+          decodeProviderInstanceIds(row.providerInstanceIds),
+          row.transportJson === null
+            ? Effect.void
+            : decodeProjectMcpTransportJson(row.transportJson),
+        ]).pipe(
+          Effect.flatMap(([providerInstanceIds, transport]) =>
+            decodeProjectMcpServer({
+              id: row.serverId,
+              name: row.name,
+              ...(transport === undefined ? { url: row.url } : { transport }),
+              enabled: row.enabled === 1,
+              providerInstanceIds,
+            }),
+          ),
+        ),
+      ),
+    ),
+  );
+  yield* mcpSecrets.reconcile(persistedServers);
 
   return ProjectMcpService.of({ list, create, update, remove, resolveForSession });
 });

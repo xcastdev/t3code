@@ -2,6 +2,8 @@ import {
   CommandId,
   McpServerId,
   ProjectId,
+  ProjectMcpEnvironmentVariableName,
+  ProjectMcpHeaderName,
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
@@ -10,11 +12,15 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import { HttpServer } from "effect/unstable/http";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as ServerConfig from "../config.ts";
+import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
+import * as ProjectMcpSecretStore from "../mcp/ProjectMcpSecretStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
 import {
@@ -26,6 +32,7 @@ import { OrchestrationProjectionPipelineLive } from "../orchestration/Layers/Pro
 import { OrchestrationProjectionSnapshotQueryLive } from "../orchestration/Layers/ProjectionSnapshotQuery.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipeline } from "../orchestration/Services/ProjectionPipeline.ts";
+import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ThreadBackgroundLiveness from "../orchestration/ThreadBackgroundLiveness.ts";
 import * as ThreadPlanProgress from "../orchestration/ThreadPlanProgress.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
@@ -115,6 +122,8 @@ const providerInstanceRegistry = Layer.succeed(ProviderInstanceRegistry, {
 } as never);
 
 const testLayer = ProjectMcpService.layer.pipe(
+  Layer.provideMerge(ProjectMcpSecretStore.layer),
+  Layer.provideMerge(ServerSecretStore.layer),
   Layer.provideMerge(OrchestrationEngineLive),
   Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
   Layer.provideMerge(OrchestrationProjectionPipelineLive),
@@ -130,8 +139,13 @@ const testLayer = ProjectMcpService.layer.pipe(
   Layer.provideMerge(NodeServices.layer),
 );
 
-const makeRestartTestLayer = (persistenceLayer: ReturnType<typeof makeSqlitePersistenceLive>) =>
+const makeRestartTestLayer = (
+  persistenceLayer: ReturnType<typeof makeSqlitePersistenceLive>,
+  config: ServerConfig.ServerConfig["Service"],
+) =>
   ProjectMcpService.layer.pipe(
+    Layer.provideMerge(ProjectMcpSecretStore.layer),
+    Layer.provideMerge(ServerSecretStore.layer),
     Layer.provideMerge(OrchestrationEngineLive),
     Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
     Layer.provideMerge(OrchestrationProjectionPipelineLive),
@@ -143,9 +157,7 @@ const makeRestartTestLayer = (persistenceLayer: ReturnType<typeof makeSqlitePers
     Layer.provideMerge(providerInstanceRegistry),
     Layer.provideMerge(Layer.succeed(HttpServer.HttpServer, mcpHttpServer)),
     Layer.provideMerge(persistenceLayer),
-    Layer.provideMerge(
-      ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-restart-" }),
-    ),
+    Layer.provideMerge(Layer.succeed(ServerConfig.ServerConfig, config)),
     Layer.provideMerge(NodeServices.layer),
   );
 
@@ -162,19 +174,29 @@ const createProject = (projectId: ProjectId, commandId: string) =>
     });
   });
 
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+
 it.effect("restores explicit MCP transports after the service restarts", () =>
   Effect.gen(function* () {
-    const { dbPath } = yield* ServerConfig.ServerConfig;
+    const config = yield* ServerConfig.ServerConfig;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const { dbPath } = config;
     const persistenceLayer = makeSqlitePersistenceLive(dbPath);
-    const firstServiceLayer = Layer.fresh(makeRestartTestLayer(persistenceLayer));
-    const secondServiceLayer = Layer.fresh(makeRestartTestLayer(persistenceLayer));
+    const firstServiceLayer = Layer.fresh(makeRestartTestLayer(persistenceLayer, config));
+    const secondServiceLayer = Layer.fresh(makeRestartTestLayer(persistenceLayer, config));
     const projectId = ProjectId.make("restart-explicit-transport-project");
+    const sentinel = "restart-stdio-sentinel";
     const transport = {
       type: "stdio" as const,
       command: "node",
       args: ["server.js"],
       cwd: "/workspace",
-      env: [],
+      env: [
+        {
+          name: ProjectMcpEnvironmentVariableName.make("RESTART_TOKEN"),
+          credential: { name: "restart token", value: sentinel },
+        },
+      ],
     };
 
     const server = yield* Effect.gen(function* () {
@@ -188,12 +210,19 @@ it.effect("restores explicit MCP transports after the service restarts", () =>
         transport,
       });
     }).pipe(Effect.provide(firstServiceLayer));
+    const serverTransport = server.transport!;
+    if (serverTransport.type !== "stdio") return yield* Effect.die("Expected stdio transport");
+    const credentialId = serverTransport.env[0]!.credential.id;
+
+    expect(new TextDecoder().decode(yield* fileSystem.readFile(dbPath))).not.toContain(sentinel);
 
     const restored = yield* Effect.gen(function* () {
       const service = yield* ProjectMcpService.ProjectMcpService;
+      const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
       return {
         catalog: yield* service.list(projectId),
         resolved: yield* service.resolveForSession(projectId, codexInstance),
+        credential: yield* secrets.resolve(server.id, credentialId),
       };
     }).pipe(Effect.provide(secondServiceLayer));
 
@@ -202,9 +231,10 @@ it.effect("restores explicit MCP transports after the service restarts", () =>
       {
         id: server.id,
         name: server.name,
-        transport,
+        transport: serverTransport,
       },
     ]);
+    expect(restored.credential).toBe(sentinel);
   }).pipe(
     Effect.provide(
       Layer.provideMerge(
@@ -367,7 +397,12 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
         {
           id: codexEntry.id,
           name: codexEntry.name,
-          transport: { type: "streamable-http", url: codexEntry.url!, headers: [] },
+          transport: {
+            type: "streamable-http",
+            url: codexEntry.url!,
+            headers: [],
+            authorization: { type: "none" },
+          },
         },
       ]);
     }),
@@ -404,6 +439,216 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
           },
         },
       ]);
+    }),
+  );
+
+  it.effect(
+    "persists only credential references while retaining, rotating, and retiring values",
+    () =>
+      Effect.gen(function* () {
+        const service = yield* ProjectMcpService.ProjectMcpService;
+        const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+        const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+        const sql = yield* SqlClient.SqlClient;
+        const projectId = ProjectId.make("secret-lifecycle-project");
+        const sentinel = "header-create-sentinel";
+        yield* createProject(projectId, "create-secret-lifecycle-project");
+
+        const created = yield* service.create({
+          projectId,
+          name: "Secret lifecycle",
+          enabled: true,
+          providerInstanceIds: [codexInstance],
+          transport: {
+            type: "streamable-http",
+            url: "https://secrets.example.test/mcp",
+            headers: [
+              {
+                name: ProjectMcpHeaderName.make("X-Api-Key"),
+                credential: { name: "API key", value: sentinel },
+              },
+            ],
+            authorization: {
+              type: "oauth",
+              registration: {
+                type: "pre-registered",
+                clientId: "project-mcp-client",
+                clientSecret: { name: "client secret", value: "oauth-client-sentinel" },
+              },
+            },
+          },
+        });
+        const createdTransport = created.transport!;
+        if (createdTransport.type !== "streamable-http")
+          return yield* Effect.die("Expected HTTP transport");
+        const headerId = createdTransport.headers[0]!.credential.id;
+        const clientSecretId =
+          createdTransport.authorization.type === "oauth" &&
+          createdTransport.authorization.registration.type === "pre-registered"
+            ? createdTransport.authorization.registration.clientSecret?.id
+            : undefined;
+
+        expect(yield* secrets.resolve(created.id, headerId)).toBe(sentinel);
+        expect(yield* secrets.resolve(created.id, clientSecretId!)).toBe("oauth-client-sentinel");
+        expect(encodeUnknownJson(created)).not.toContain(sentinel);
+        expect(encodeUnknownJson(yield* service.list(projectId))).not.toContain(sentinel);
+        expect(
+          encodeUnknownJson(yield* projectionSnapshotQuery.getCommandReadModel()),
+        ).not.toContain(sentinel);
+        const persisted = yield* sql<{
+          readonly transportJson: string;
+          readonly payloadJson: string;
+        }>`
+        SELECT
+          projection.transport_json AS "transportJson",
+          event.payload_json AS "payloadJson"
+        FROM projection_project_mcp_servers AS projection
+        INNER JOIN orchestration_events AS event
+          ON event.event_type = 'project.mcp-server.created'
+          AND json_extract(event.payload_json, '$.server.id') = projection.server_id
+        WHERE projection.server_id = ${created.id}
+      `;
+        expect(persisted).toHaveLength(1);
+        expect(persisted[0]!.transportJson).not.toContain(sentinel);
+        expect(persisted[0]!.payloadJson).not.toContain(sentinel);
+
+        const retained = yield* service.update({
+          projectId,
+          id: created.id,
+          name: "Secret lifecycle",
+          enabled: true,
+          providerInstanceIds: [codexInstance],
+          transport: {
+            type: "streamable-http",
+            url: "https://secrets.example.test/mcp",
+            headers: [
+              {
+                name: ProjectMcpHeaderName.make("X-Api-Key"),
+                credential: { id: headerId, name: "renamed API key" },
+              },
+            ],
+            authorization: { type: "none" },
+          },
+        });
+        const retainedTransport = retained.transport!;
+        if (retainedTransport.type !== "streamable-http")
+          return yield* Effect.die("Expected HTTP transport");
+        expect(retainedTransport.headers[0]!.credential.id).toBe(headerId);
+        expect(yield* secrets.resolve(created.id, headerId)).toBe(sentinel);
+
+        const rotated = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const lease = yield* secrets.acquireLease(created.id, [headerId]);
+            const updated = yield* service.update({
+              projectId,
+              id: created.id,
+              name: "Secret lifecycle",
+              enabled: true,
+              providerInstanceIds: [codexInstance],
+              transport: {
+                type: "streamable-http",
+                url: "https://secrets.example.test/mcp",
+                headers: [
+                  {
+                    name: ProjectMcpHeaderName.make("X-Api-Key"),
+                    credential: {
+                      id: headerId,
+                      name: "renamed API key",
+                      value: "header-rotated-sentinel",
+                    },
+                  },
+                ],
+                authorization: { type: "none" },
+              },
+            });
+            const transport = updated.transport!;
+            if (transport.type !== "streamable-http")
+              return yield* Effect.die("Expected HTTP transport");
+            return {
+              id: transport.headers[0]!.credential.id,
+              oldValue: yield* lease.resolve(headerId),
+            };
+          }),
+        );
+        expect(rotated.id).not.toBe(headerId);
+        expect(rotated.oldValue).toBe(sentinel);
+        expect(yield* secrets.resolve(created.id, rotated.id)).toBe("header-rotated-sentinel");
+
+        yield* service.remove({ projectId, id: created.id });
+        const removed = yield* secrets.resolve(created.id, rotated.id).pipe(Effect.flip);
+        expect(removed).toMatchObject({
+          _tag: "ProjectMcpSecretOwnershipError",
+          serverId: created.id,
+          credentialId: rotated.id,
+        });
+      }),
+  );
+
+  it.effect("rolls back prepared create credentials when catalog dispatch fails", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+      const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const projectId = ProjectId.make("create-rollback-project");
+      const missingProjectId = ProjectId.make("missing-create-rollback-project");
+      yield* createProject(projectId, "create-create-rollback-project");
+      const active = yield* service.create({
+        projectId,
+        name: "Existing secret",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: {
+          type: "streamable-http",
+          url: "https://existing-secret.example.test/mcp",
+          headers: [
+            {
+              name: ProjectMcpHeaderName.make("X-Api-Key"),
+              credential: { name: "existing", value: "existing-rollback-sentinel" },
+            },
+          ],
+          authorization: { type: "none" },
+        },
+      });
+      const activeTransport = active.transport!;
+      if (activeTransport.type !== "streamable-http")
+        return yield* Effect.die("Expected HTTP transport");
+      const activeCredentialId = activeTransport.headers[0]!.credential.id;
+
+      const error = yield* service
+        .create({
+          projectId: missingProjectId,
+          name: "Rejected secret",
+          enabled: true,
+          providerInstanceIds: [codexInstance],
+          transport: {
+            type: "streamable-http",
+            url: "https://rejected-secret.example.test/mcp",
+            headers: [
+              {
+                name: ProjectMcpHeaderName.make("X-Api-Key"),
+                credential: { name: "rejected", value: "rejected-rollback-sentinel" },
+              },
+            ],
+            authorization: { type: "none" },
+          },
+        })
+        .pipe(Effect.flip);
+
+      expect(error).toMatchObject({
+        _tag: "OrchestrationCommandInvariantError",
+        commandType: "project.mcp-server.create",
+      });
+      expect(yield* secrets.resolve(active.id, activeCredentialId)).toBe(
+        "existing-rollback-sentinel",
+      );
+      const secretFiles = yield* fileSystem.readDirectory(config.secretsDir);
+      const contents = yield* Effect.forEach(secretFiles, (file) =>
+        fileSystem.readFile(`${config.secretsDir}/${file}`),
+      );
+      expect(contents.map((content) => new TextDecoder().decode(content)).join("\n")).not.toContain(
+        "rejected-rollback-sentinel",
+      );
     }),
   );
 
