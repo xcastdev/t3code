@@ -207,6 +207,13 @@ export interface ProjectMcpSecretStoreShape {
     serverId: McpServerId,
     value: string,
   ) => Effect.Effect<ProjectMcpCredentialIdType, ProjectMcpSecretError>;
+  readonly listAuxiliarySecrets: (
+    serverId: McpServerId,
+  ) => Effect.Effect<ReadonlyArray<ProjectMcpCredentialIdType>, ProjectMcpSecretError>;
+  readonly removeAuxiliarySecret: (
+    serverId: McpServerId,
+    credentialId: ProjectMcpCredentialIdType,
+  ) => Effect.Effect<void, ProjectMcpSecretError>;
   readonly removeServer: (serverId: McpServerId) => Effect.Effect<void, ProjectMcpSecretError>;
   readonly resolve: (
     serverId: McpServerId,
@@ -663,10 +670,38 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const listAuxiliarySecrets: ProjectMcpSecretStoreShape["listAuxiliarySecrets"] = (serverId) =>
+    Ref.get(manifests).pipe(Effect.map((manifest) => manifest.servers[serverId]?.auxiliary ?? []));
+
+  const removeAuxiliarySecret: ProjectMcpSecretStoreShape["removeAuxiliarySecret"] = (
+    serverId,
+    credentialId,
+  ) =>
+    mutex.withPermits(1)(
+      Effect.gen(function* () {
+        const manifest = yield* Ref.get(manifests);
+        const server = manifest.servers[serverId];
+        if (server === undefined || !server.auxiliary.includes(credentialId)) {
+          return yield* new ProjectMcpSecretOwnershipError({ serverId, credentialId });
+        }
+        yield* persistManifest(
+          serverSecretsWith(manifest, serverId, {
+            credentials: server.credentials,
+            retired: server.retired,
+            auxiliary: removeIds(server.auxiliary, [credentialId]),
+          }),
+        );
+        yield* removeCredential(credentialId);
+      }),
+    );
+
   const resolve: ProjectMcpSecretStoreShape["resolve"] = (serverId, credentialId) =>
     Effect.gen(function* () {
       const manifest = yield* Ref.get(manifests);
-      if (!hasActiveCredential(manifest.servers[serverId], credentialId)) {
+      if (
+        !hasActiveCredential(manifest.servers[serverId], credentialId) &&
+        !(manifest.servers[serverId]?.auxiliary.includes(credentialId) ?? false)
+      ) {
         return yield* new ProjectMcpSecretOwnershipError({ serverId, credentialId });
       }
       return yield* resolveValue(serverId, credentialId);
@@ -771,6 +806,8 @@ const make = Effect.gen(function* () {
     prepareUpdate,
     retireTransport,
     createAuxiliarySecret,
+    listAuxiliarySecrets,
+    removeAuxiliarySecret,
     removeServer,
     resolve,
     acquireLease,
