@@ -144,6 +144,8 @@ const credentialIds = (
   ];
 };
 
+export const credentialIdsForTransport = credentialIds;
+
 const hasCredential = (
   server: ServerSecrets | undefined,
   id: ProjectMcpCredentialIdType,

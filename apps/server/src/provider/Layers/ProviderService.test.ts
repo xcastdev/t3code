@@ -76,6 +76,8 @@ const defaultProjectId = ProjectId.make("provider-service-project");
 const makeProviderProjectContextTestLayer = (
   resolveForSession: ProjectMcpService.ProjectMcpServiceShape["resolveForSession"] = () =>
     Effect.succeed([]),
+  acquireSessionLease: ProjectMcpService.ProjectMcpServiceShape["acquireSessionLease"] = () =>
+    Effect.void,
 ) =>
   Layer.mergeAll(
     Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
@@ -83,6 +85,7 @@ const makeProviderProjectContextTestLayer = (
     } as never),
     Layer.succeed(ProjectMcpService.ProjectMcpService, {
       resolveForSession,
+      acquireSessionLease,
     } as never),
   );
 
@@ -329,17 +332,32 @@ function makeProviderServiceLayer() {
   const projectMcpServer = {
     id: McpServerId.make("mcp-docs"),
     name: "t3-code",
-    transport: { type: "streamable-http", url: "https://docs.example.test/mcp", headers: [] },
+    transport: {
+      type: "streamable-http",
+      url: "https://docs.example.test/mcp",
+      headers: [],
+      authorization: { type: "none" },
+    },
   } as const;
   const resolveProjectMcp = vi.fn<ProjectMcpService.ProjectMcpServiceShape["resolveForSession"]>(
     () => Effect.succeed([projectMcpServer]),
+  );
+  let releasedSessionLeases = 0;
+  const acquireProjectMcpLease = vi.fn<
+    ProjectMcpService.ProjectMcpServiceShape["acquireSessionLease"]
+  >(() =>
+    Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        releasedSessionLeases += 1;
+      }),
+    ),
   );
 
   const layer = it.layer(
     Layer.mergeAll(
       makeTestProviderServiceLive(
         undefined,
-        makeProviderProjectContextTestLayer(resolveProjectMcp),
+        makeProviderProjectContextTestLayer(resolveProjectMcp, acquireProjectMcpLease),
       ).pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
@@ -366,6 +384,10 @@ function makeProviderServiceLayer() {
     cursor,
     projectMcpServer,
     resolveProjectMcp,
+    acquireProjectMcpLease,
+    get releasedSessionLeases() {
+      return releasedSessionLeases;
+    },
     layer,
   };
 }
@@ -1005,6 +1027,28 @@ routing.layer("ProviderServiceLive routing", (it) => {
       routing.codex.startSession.mockClear();
       routing.codex.sendTurn.mockClear();
       routing.codex.stopSession.mockClear();
+    }),
+  );
+
+  it.effect("owns the project MCP lease for the provider session lifetime", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-project-mcp-lease");
+      const releasedBefore = routing.releasedSessionLeases;
+      routing.acquireProjectMcpLease.mockClear();
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      assert.equal(routing.acquireProjectMcpLease.mock.calls.length, 1);
+      assert.equal(routing.releasedSessionLeases, releasedBefore);
+
+      yield* provider.stopSession({ threadId });
+      assert.equal(routing.releasedSessionLeases, releasedBefore + 1);
     }),
   );
 

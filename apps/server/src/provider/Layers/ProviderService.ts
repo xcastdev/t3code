@@ -28,6 +28,7 @@ import {
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
@@ -35,6 +36,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
 import * as Stream from "effect/Stream";
+import * as Scope from "effect/Scope";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import * as ServerConfig from "../../config.ts";
@@ -236,6 +238,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const revokeMcpCredential =
     options?.revokeMcpCredential ?? McpSessionRegistry.revokeActiveMcpThread;
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
+  const projectMcpLeaseScopes = yield* Ref.make(new Map<ThreadId, Scope.Scope>());
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
   /**
    * Attach the `t3-code` MCP server to the session that is about to start.
@@ -287,6 +290,42 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       Effect.tap(() => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
     );
 
+  const closeProjectMcpLeaseScope = (scope: Scope.Scope) =>
+    Effect.uninterruptible(Scope.close(scope, Exit.void).pipe(Effect.ignore));
+
+  const replaceProjectMcpLeaseScope = (threadId: ThreadId, scope: Scope.Scope) =>
+    Ref.modify(projectMcpLeaseScopes, (current) => {
+      const previous = current.get(threadId);
+      const next = new Map(current);
+      next.set(threadId, scope);
+      return [previous, next] as const;
+    }).pipe(
+      Effect.flatMap((previous) =>
+        previous === undefined ? Effect.void : closeProjectMcpLeaseScope(previous),
+      ),
+    );
+
+  const releaseProjectMcpLease = (threadId: ThreadId) =>
+    Ref.modify(projectMcpLeaseScopes, (current) => {
+      const scope = current.get(threadId);
+      const next = new Map(current);
+      next.delete(threadId);
+      return [scope, next] as const;
+    }).pipe(
+      Effect.flatMap((scope) =>
+        scope === undefined ? Effect.void : closeProjectMcpLeaseScope(scope),
+      ),
+    );
+
+  const releaseAllProjectMcpLeases = Ref.modify(
+    projectMcpLeaseScopes,
+    (current) => [Array.from(current.values()), new Map<ThreadId, Scope.Scope>()] as const,
+  ).pipe(
+    Effect.flatMap((scopes) =>
+      Effect.forEach(scopes, closeProjectMcpLeaseScope, { discard: true }),
+    ),
+  );
+
   const startAdapterSession = Effect.fn("ProviderService.startAdapterSession")(function* (input: {
     readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
     readonly providerInstanceId: ProviderInstanceId;
@@ -320,10 +359,33 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           toValidationError(input.operation, "Could not resolve project MCP servers.", cause),
         ),
       );
-    yield* prepareMcpSession(input.sessionInput.threadId, input.providerInstanceId);
-    return yield* input.adapter
-      .startSession({ ...input.sessionInput, projectMcpServers })
-      .pipe(Effect.onError(() => clearMcpSession(input.sessionInput.threadId)));
+    const sessionScope = yield* Scope.make("sequential");
+    const started = yield* Effect.gen(function* () {
+      yield* projectMcpService
+        .acquireSessionLease(thread.value.projectId, input.providerInstanceId)
+        .pipe(
+          Effect.mapError((cause) =>
+            toValidationError(
+              input.operation,
+              "Could not acquire project MCP secret lease.",
+              cause,
+            ),
+          ),
+          Effect.provideService(Scope.Scope, sessionScope),
+        );
+      yield* prepareMcpSession(input.sessionInput.threadId, input.providerInstanceId);
+      return yield* input.adapter.startSession({ ...input.sessionInput, projectMcpServers });
+    }).pipe(
+      Effect.onExit((exit) =>
+        Exit.isSuccess(exit)
+          ? Effect.void
+          : closeProjectMcpLeaseScope(sessionScope).pipe(
+              Effect.andThen(clearMcpSession(input.sessionInput.threadId)),
+            ),
+      ),
+    );
+    yield* replaceProjectMcpLeaseScope(input.sessionInput.threadId, sessionScope);
+    return started;
   });
 
   const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
@@ -1004,6 +1066,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         if (routed.isActive) {
           yield* routed.adapter.stopSession(routed.threadId);
         }
+        yield* releaseProjectMcpLease(input.threadId);
         yield* clearMcpSession(input.threadId);
         yield* directory.upsert({
           threadId: input.threadId,
@@ -1225,7 +1288,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }),
       ),
     ).pipe(Effect.asVoid);
-    yield* Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll()).pipe(Effect.asVoid);
+    yield* Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll()).pipe(
+      Effect.asVoid,
+      Effect.ensuring(releaseAllProjectMcpLeases),
+    );
     yield* McpSessionRegistry.revokeAllActiveMcpCredentials();
     McpProviderSession.clearAllMcpProviderSessions();
     const bindings = yield* directory.listBindings().pipe(Effect.orElseSucceed(() => []));

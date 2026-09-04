@@ -12,9 +12,13 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
 import { HttpServer } from "effect/unstable/http";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -121,23 +125,26 @@ const providerInstanceRegistry = Layer.succeed(ProviderInstanceRegistry, {
   subscribeChanges: Effect.die("Unused in ProjectMcpService tests"),
 } as never);
 
-const testLayer = ProjectMcpService.layer.pipe(
-  Layer.provideMerge(ProjectMcpSecretStore.layer),
-  Layer.provideMerge(ServerSecretStore.layer),
-  Layer.provideMerge(OrchestrationEngineLive),
-  Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
-  Layer.provideMerge(OrchestrationProjectionPipelineLive),
-  Layer.provideMerge(OrchestrationEventStoreLive),
-  Layer.provideMerge(OrchestrationCommandReceiptRepositoryLive),
-  Layer.provideMerge(RepositoryIdentityResolver.layer),
-  Layer.provideMerge(ThreadBackgroundLiveness.layer),
-  Layer.provideMerge(ThreadPlanProgress.layer),
-  Layer.provideMerge(providerInstanceRegistry),
-  Layer.provideMerge(Layer.succeed(HttpServer.HttpServer, mcpHttpServer)),
-  Layer.provideMerge(SqlitePersistenceMemory),
-  Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-test-" })),
-  Layer.provideMerge(NodeServices.layer),
-);
+const makeTestLayer = (engineLayer = OrchestrationEngineLive) =>
+  ProjectMcpService.layer.pipe(
+    Layer.provideMerge(ProjectMcpSecretStore.layer),
+    Layer.provideMerge(ServerSecretStore.layer),
+    Layer.provideMerge(engineLayer),
+    Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
+    Layer.provideMerge(OrchestrationProjectionPipelineLive),
+    Layer.provideMerge(OrchestrationEventStoreLive),
+    Layer.provideMerge(OrchestrationCommandReceiptRepositoryLive),
+    Layer.provideMerge(RepositoryIdentityResolver.layer),
+    Layer.provideMerge(ThreadBackgroundLiveness.layer),
+    Layer.provideMerge(ThreadPlanProgress.layer),
+    Layer.provideMerge(providerInstanceRegistry),
+    Layer.provideMerge(Layer.succeed(HttpServer.HttpServer, mcpHttpServer)),
+    Layer.provideMerge(SqlitePersistenceMemory),
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-test-" })),
+    Layer.provideMerge(NodeServices.layer),
+  );
+
+const testLayer = makeTestLayer();
 
 const makeRestartTestLayer = (
   persistenceLayer: ReturnType<typeof makeSqlitePersistenceLive>,
@@ -582,6 +589,132 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
           credentialId: rotated.id,
         });
       }),
+  );
+
+  it.effect("holds every session credential until its provider scope closes", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const secretFiles = yield* ServerSecretStore.ServerSecretStore;
+      const projectId = ProjectId.make("session-lease-project");
+      yield* createProject(projectId, "create-session-lease-project");
+      const server = yield* service.create({
+        projectId,
+        name: "Leased credentials",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: {
+          type: "streamable-http",
+          url: "https://leased.example.test/mcp",
+          headers: [
+            {
+              name: ProjectMcpHeaderName.make("X-Api-Key"),
+              credential: { name: "key", value: "session-lease-sentinel" },
+            },
+          ],
+          authorization: { type: "none" },
+        },
+      });
+      const transport = server.transport!;
+      if (transport.type === "stdio") return yield* Effect.die("Expected HTTP transport");
+      const credentialId = transport.headers[0]!.credential.id;
+      const scope = yield* Scope.make();
+
+      yield* service
+        .acquireSessionLease(projectId, codexInstance)
+        .pipe(Effect.provideService(Scope.Scope, scope));
+      yield* service.remove({ projectId, id: server.id });
+
+      expect(
+        Option.isSome(
+          yield* secretFiles.get(ProjectMcpSecretStore.credentialSecretName(credentialId)),
+        ),
+      ).toBe(true);
+
+      yield* Scope.close(scope, Exit.void);
+      expect(
+        Option.isNone(
+          yield* secretFiles.get(ProjectMcpSecretStore.credentialSecretName(credentialId)),
+        ),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect("serializes each server mutation through dispatch and secret commit", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const config = yield* ServerConfig.ServerConfig;
+      const projectId = ProjectId.make("serialized-mutation-project");
+      yield* createProject(projectId, "create-serialized-mutation-project");
+      const initial = yield* service.create({
+        projectId,
+        name: "Serialized",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: {
+          type: "streamable-http",
+          url: "https://serialized.example.test/mcp",
+          headers: [
+            {
+              name: ProjectMcpHeaderName.make("X-Api-Key"),
+              credential: { name: "key", value: "serialized-initial-sentinel" },
+            },
+          ],
+          authorization: { type: "none" },
+        },
+      });
+
+      yield* Effect.all(
+        [
+          service.update({
+            projectId,
+            id: initial.id,
+            name: "First update",
+            enabled: true,
+            providerInstanceIds: [codexInstance],
+            transport: {
+              type: "streamable-http",
+              url: "https://first.example.test/mcp",
+              headers: [
+                {
+                  name: ProjectMcpHeaderName.make("X-Api-Key"),
+                  credential: { name: "key", value: "serialized-first-sentinel" },
+                },
+              ],
+              authorization: { type: "none" },
+            },
+          }),
+          service.update({
+            projectId,
+            id: initial.id,
+            name: "Second update",
+            enabled: true,
+            providerInstanceIds: [codexInstance],
+            transport: {
+              type: "streamable-http",
+              url: "https://second.example.test/mcp",
+              headers: [
+                {
+                  name: ProjectMcpHeaderName.make("X-Api-Key"),
+                  credential: { name: "key", value: "serialized-second-sentinel" },
+                },
+              ],
+              authorization: { type: "none" },
+            },
+          }),
+        ],
+        { concurrency: "unbounded" },
+      );
+
+      const secretFiles = yield* fileSystem.readDirectory(config.secretsDir);
+      const contents = yield* Effect.forEach(secretFiles, (file) =>
+        fileSystem.readFile(`${config.secretsDir}/${file}`),
+      );
+      const secretText = contents.map((content) => new TextDecoder().decode(content)).join("\n");
+      expect(secretText).not.toContain("serialized-first-sentinel");
+      expect(secretText).toContain("serialized-second-sentinel");
+      expect((yield* service.list(projectId)).external[0]?.name).toBe("Second update");
+    }),
   );
 
   it.effect("rolls back prepared create credentials when catalog dispatch fails", () =>

@@ -651,6 +651,7 @@ const buildAppUnderTest = (options?: {
       update: () => Effect.die("Project MCP update is not stubbed in this test"),
       remove: () => Effect.die("Project MCP remove is not stubbed in this test"),
       resolveForSession: () => Effect.succeed([]),
+      acquireSessionLease: () => Effect.void,
       ...options?.layers?.projectMcpService,
     });
     const projectServicesLayer = Layer.mergeAll(
