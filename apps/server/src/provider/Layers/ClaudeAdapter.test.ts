@@ -296,6 +296,7 @@ describe("ClaudeAdapterLive", () => {
               type: "streamable-http",
               url: "https://docs.example.test/mcp",
               headers: [],
+              authorization: { type: "none" },
             },
           },
         ],

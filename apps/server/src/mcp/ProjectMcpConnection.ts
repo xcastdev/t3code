@@ -1,6 +1,7 @@
 import type { McpServerId, ProjectMcpTransport } from "@t3tools/contracts";
 import {
   Client,
+  SdkHttpError,
   type ClientOptions,
   type DiscoverResult,
   type ProtocolEra,
@@ -11,6 +12,7 @@ import { makeProjectMcpTransport } from "./ProjectMcpTransport.ts";
 export interface ProjectMcpClient {
   readonly connect: (transport: unknown) => Promise<void>;
   readonly close: () => Promise<void>;
+  readonly terminateSession?: () => Promise<void>;
   readonly getProtocolEra?: () => ProtocolEra | undefined;
   readonly getNegotiatedProtocolVersion?: () => string | undefined;
   readonly getDiscoverResult?: () => DiscoverResult | undefined;
@@ -26,17 +28,7 @@ export interface ProjectMcpConnectionDependencies {
 }
 
 const isLegacyFallbackStatus = (error: unknown): boolean => {
-  if (typeof error !== "object" || error === null) return false;
-  const data = "data" in error ? error.data : undefined;
-  const status =
-    typeof data === "object" && data !== null && "status" in data
-      ? data.status
-      : "status" in error
-        ? error.status
-        : "code" in error && typeof error.code === "number"
-          ? error.code
-          : undefined;
-  return status === 400 || status === 404 || status === 405;
+  return error instanceof SdkHttpError && [400, 404, 405].includes(error.status);
 };
 
 const automaticClientOptions: ClientOptions = {
@@ -49,27 +41,18 @@ const legacyClientOptions: ClientOptions = {
   inputRequired: { autoFulfill: false, maxRounds: 10 },
 };
 
-const closeResources = async (client: ProjectMcpClient, transport: unknown): Promise<void> => {
+const closeResources = async (client: ProjectMcpClient): Promise<void> => {
   let firstError: unknown;
   try {
-    await client.close();
+    await client.terminateSession?.();
   } catch (error) {
     firstError = error;
   }
-
-  if (
-    typeof transport === "object" &&
-    transport !== null &&
-    "close" in transport &&
-    typeof transport.close === "function"
-  ) {
-    try {
-      await transport.close();
-    } catch (error) {
-      firstError ??= error;
-    }
+  try {
+    await client.close();
+  } catch (error) {
+    firstError ??= error;
   }
-
   if (firstError !== undefined) throw firstError;
 };
 
@@ -113,7 +96,7 @@ export const connectProjectMcpServer = async ({
       await client.connect(sdkTransport);
     } catch (error) {
       try {
-        await closeResources(client, sdkTransport);
+        await closeResources(client);
       } catch {
         // Preserve the connection error. Cleanup is best effort on a failed attempt.
       }
@@ -130,7 +113,7 @@ export const connectProjectMcpServer = async ({
       close: async () => {
         if (closed) return;
         closed = true;
-        await closeResources(client, sdkTransport);
+        await closeResources(client);
       },
     } satisfies ProjectMcpConnection;
   };

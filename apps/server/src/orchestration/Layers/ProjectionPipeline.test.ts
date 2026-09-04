@@ -9,6 +9,7 @@ import {
   ThreadId,
   TurnId,
   ProviderInstanceId,
+  type ProjectMcpTransport,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -334,7 +335,11 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
       const sql = yield* SqlClient.SqlClient;
       const projectId = ProjectId.make("project-mcp-transport-round-trip");
       const createdAt = "2026-09-04T00:00:00.000Z";
-      const servers = [
+      const servers: ReadonlyArray<{
+        readonly id: McpServerId;
+        readonly name: string;
+        readonly transport: ProjectMcpTransport;
+      }> = [
         {
           id: McpServerId.make("stdio-server"),
           name: "Stdio",
@@ -353,6 +358,7 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
             type: "streamable-http" as const,
             url: "https://mcp.example.test/rpc",
             headers: [],
+            authorization: { type: "none" },
           },
         },
         {
@@ -362,6 +368,7 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
             type: "legacy-sse" as const,
             url: "https://mcp.example.test/sse",
             headers: [],
+            authorization: { type: "none" },
           },
         },
       ];

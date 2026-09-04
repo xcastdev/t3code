@@ -480,6 +480,7 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
               type: "streamable-http",
               url: "https://docs.example.test/mcp",
               headers: [],
+              authorization: { type: "none" },
             },
           },
         ],

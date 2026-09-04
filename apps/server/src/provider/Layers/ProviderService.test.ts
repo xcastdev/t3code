@@ -77,7 +77,7 @@ const makeProviderProjectContextTestLayer = (
   resolveForSession: ProjectMcpService.ProjectMcpServiceShape["resolveForSession"] = () =>
     Effect.succeed([]),
   acquireSessionLease: ProjectMcpService.ProjectMcpServiceShape["acquireSessionLease"] = () =>
-    Effect.void,
+    Effect.succeed([]),
 ) =>
   Layer.mergeAll(
     Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
@@ -350,7 +350,7 @@ function makeProviderServiceLayer() {
       Effect.sync(() => {
         releasedSessionLeases += 1;
       }),
-    ),
+    ).pipe(Effect.as([projectMcpServer])),
   );
 
   const layer = it.layer(
@@ -992,7 +992,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
       const threadId = asThreadId("thread-project-mcp");
-      routing.resolveProjectMcp.mockClear();
+      routing.acquireProjectMcpLease.mockClear();
       routing.codex.startSession.mockClear();
 
       yield* provider.startSession(threadId, {
@@ -1003,7 +1003,9 @@ routing.layer("ProviderServiceLive routing", (it) => {
         runtimeMode: "full-access",
       });
 
-      assert.deepEqual(routing.resolveProjectMcp.mock.calls, [[defaultProjectId, codexInstanceId]]);
+      assert.deepEqual(routing.acquireProjectMcpLease.mock.calls, [
+        [defaultProjectId, codexInstanceId],
+      ]);
       assert.deepEqual(
         (routing.codex.startSession.mock.calls[0]?.[0] as { projectMcpServers?: unknown })
           .projectMcpServers,
@@ -1014,7 +1016,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       routing.codex.startSession.mockClear();
       yield* provider.sendTurn({ threadId, input: "recover", attachments: [] });
 
-      assert.deepEqual(routing.resolveProjectMcp.mock.calls, [
+      assert.deepEqual(routing.acquireProjectMcpLease.mock.calls, [
         [defaultProjectId, codexInstanceId],
         [defaultProjectId, codexInstanceId],
       ]);

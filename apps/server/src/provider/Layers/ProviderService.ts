@@ -352,27 +352,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         `Cannot start thread '${input.sessionInput.threadId}' because it is not in the durable read model.`,
       );
     }
+    const sessionScope = yield* Scope.make("sequential");
     const projectMcpServers = yield* projectMcpService
-      .resolveForSession(thread.value.projectId, input.providerInstanceId)
+      .acquireSessionLease(thread.value.projectId, input.providerInstanceId)
       .pipe(
         Effect.mapError((cause) =>
-          toValidationError(input.operation, "Could not resolve project MCP servers.", cause),
-        ),
-      );
-    const sessionScope = yield* Scope.make("sequential");
-    const started = yield* Effect.gen(function* () {
-      yield* projectMcpService
-        .acquireSessionLease(thread.value.projectId, input.providerInstanceId)
-        .pipe(
-          Effect.mapError((cause) =>
-            toValidationError(
-              input.operation,
-              "Could not acquire project MCP secret lease.",
-              cause,
-            ),
+          toValidationError(
+            input.operation,
+            "Could not resolve and lease project MCP servers.",
+            cause,
           ),
-          Effect.provideService(Scope.Scope, sessionScope),
-        );
+        ),
+        Effect.provideService(Scope.Scope, sessionScope),
+        Effect.onError(() => closeProjectMcpLeaseScope(sessionScope)),
+      );
+    const started = yield* Effect.gen(function* () {
       yield* prepareMcpSession(input.sessionInput.threadId, input.providerInstanceId);
       return yield* input.adapter.startSession({ ...input.sessionInput, projectMcpServers });
     }).pipe(

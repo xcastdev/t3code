@@ -1,6 +1,12 @@
 import { McpServerId, type ProjectMcpTransport } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
-import { Client, type ClientOptions, type Transport } from "@modelcontextprotocol/client";
+import {
+  Client,
+  SdkErrorCode,
+  SdkHttpError,
+  type ClientOptions,
+  type Transport,
+} from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 
 import {
@@ -20,15 +26,26 @@ it("falls back from modern Streamable HTTP to legacy SSE only when the endpoint 
   const connected: string[] = [];
   const transports: string[] = [];
   const closedTransports: string[] = [];
+  let closedClients = 0;
   const clients: ProjectMcpClient[] = [];
   const dependencies: ProjectMcpConnectionDependencies = {
     createClient: (options) => {
       const client: ProjectMcpClient = {
         connect: async (transport) => {
           connected.push(String((transport as { kind: string }).kind));
-          if (connected.length === 1) throw { data: { status: 405 } };
+          if (connected.length === 1) {
+            throw new SdkHttpError(
+              SdkErrorCode.ClientHttpFailedToOpenStream,
+              "method not allowed",
+              {
+                status: 405,
+              },
+            );
+          }
         },
-        close: async () => undefined,
+        close: async () => {
+          closedClients += 1;
+        },
         getProtocolEra: () => "legacy",
         getNegotiatedProtocolVersion: () => "2025-11-25",
         getDiscoverResult: () => undefined,
@@ -60,7 +77,8 @@ it("falls back from modern Streamable HTTP to legacy SSE only when the endpoint 
   expect(connection.protocolEra).toBe("legacy");
   expect(connection.negotiatedProtocolVersion).toBe("2025-11-25");
   await connection.close();
-  expect(closedTransports).toEqual(["streamable-http", "legacy-sse"]);
+  expect(closedClients).toBe(2);
+  expect(closedTransports).toEqual([]);
 });
 
 it("constructs each v2 client with automatic negotiation and manual input handling", async () => {

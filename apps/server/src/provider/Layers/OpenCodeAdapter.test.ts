@@ -584,6 +584,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
               type: "streamable-http",
               url: "https://docs.example.test/mcp",
               headers: [],
+              authorization: { type: "none" },
             },
           },
         ],
