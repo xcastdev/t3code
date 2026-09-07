@@ -57,11 +57,21 @@ const isLegacyFallbackStatus = (error: unknown): boolean => {
 };
 
 const automaticClientOptions: ClientOptions = {
+  capabilities: {
+    roots: { listChanged: true },
+    sampling: {},
+    elicitation: { form: {}, url: {} },
+  },
   versionNegotiation: { mode: "auto" },
   inputRequired: { autoFulfill: false, maxRounds: 10 },
 };
 
 const legacyClientOptions: ClientOptions = {
+  capabilities: {
+    roots: { listChanged: true },
+    sampling: {},
+    elicitation: { form: {}, url: {} },
+  },
   versionNegotiation: { mode: "legacy" },
   inputRequired: { autoFulfill: false, maxRounds: 10 },
 };

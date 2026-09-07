@@ -114,8 +114,21 @@ it("uses a fresh client and legacy transport for a 400 fallback", async () => {
   });
 
   expect(options).toEqual([
-    { versionNegotiation: { mode: "auto" }, inputRequired: { autoFulfill: false, maxRounds: 10 } },
     {
+      capabilities: {
+        roots: { listChanged: true },
+        sampling: {},
+        elicitation: { form: {}, url: {} },
+      },
+      versionNegotiation: { mode: "auto" },
+      inputRequired: { autoFulfill: false, maxRounds: 10 },
+    },
+    {
+      capabilities: {
+        roots: { listChanged: true },
+        sampling: {},
+        elicitation: { form: {}, url: {} },
+      },
       versionNegotiation: { mode: "legacy" },
       inputRequired: { autoFulfill: false, maxRounds: 10 },
     },
@@ -151,6 +164,11 @@ it("uses explicit legacy negotiation for a legacy SSE transport", async () => {
   });
 
   expect(options).toEqual({
+    capabilities: {
+      roots: { listChanged: true },
+      sampling: {},
+      elicitation: { form: {}, url: {} },
+    },
     versionNegotiation: { mode: "legacy" },
     inputRequired: { autoFulfill: false, maxRounds: 10 },
   });
@@ -225,6 +243,11 @@ it("constructs each v2 client with automatic negotiation and manual input handli
 
   expect(options).toEqual([
     {
+      capabilities: {
+        roots: { listChanged: true },
+        sampling: {},
+        elicitation: { form: {}, url: {} },
+      },
       versionNegotiation: { mode: "auto" },
       inputRequired: { autoFulfill: false, maxRounds: 10 },
     },

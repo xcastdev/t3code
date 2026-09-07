@@ -500,31 +500,6 @@ const makeProjectMcpService = Effect.gen(function* () {
                 for (const [credentialId, value] of credentials)
                   secretValues.set(credentialId, value);
               }
-              if (mcpOAuth._tag === "Some") {
-                for (const { server } of leased) {
-                  if (
-                    server.transport.type === "stdio" ||
-                    server.transport.authorization.type !== "oauth"
-                  )
-                    continue;
-                  const registration = server.transport.authorization.registration;
-                  const clientSecret =
-                    registration.type === "pre-registered" &&
-                    registration.clientSecret !== undefined
-                      ? secretValues.get(registration.clientSecret.id)
-                      : undefined;
-                  mcpOAuth.value.bindServer?.({
-                    serverId: server.id,
-                    resource: server.transport.url,
-                    ...(registration.type === "pre-registered"
-                      ? {
-                          clientId: registration.clientId,
-                          ...(clientSecret === undefined ? {} : { clientSecret }),
-                        }
-                      : {}),
-                  });
-                }
-              }
               return {
                 servers: leased.map(({ server }) => server),
                 resolveSecret: (_serverId, credentialId) => secretValues.get(credentialId),

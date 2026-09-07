@@ -39,18 +39,7 @@ const bearerFromRequest = (request: HttpServerRequest.HttpServerRequest): string
 
 const toWebRequest = (
   request: HttpServerRequest.HttpServerRequest,
-): Effect.Effect<Request, never> =>
-  Effect.gen(function* () {
-    const body =
-      request.method === "GET" || request.method === "DELETE"
-        ? undefined
-        : yield* request.arrayBuffer;
-    return new Request(request.originalUrl, {
-      method: request.method,
-      headers: new Headers(request.headers),
-      ...(body === undefined ? {} : { body, duplex: "half" as const }),
-    });
-  }).pipe(Effect.orDie);
+): Effect.Effect<Request, never> => HttpServerRequest.toWeb(request).pipe(Effect.orDie);
 
 export const handleProjectMcpProxyRequest = Effect.fn("ProjectMcpProxyHttpServer.handle")(
   function* (request: HttpServerRequest.HttpServerRequest) {
