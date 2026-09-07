@@ -111,6 +111,34 @@ it.effect("revokes an idle credential at its deadline without a request poll", (
   }).pipe(Effect.provide(TestClock.layer())),
 );
 
+it.effect("extends a credential deadline when successful MCP traffic resolves it", () =>
+  Effect.gen(function* () {
+    const registry = yield* McpSessionRegistry.__testing
+      .make({ livenessWindowMs: 100 })
+      .pipe(
+        Effect.provideService(HttpServer.HttpServer, fakeHttpServer),
+        Effect.provideService(ServerEnvironment.ServerEnvironment, fakeEnvironment),
+        Effect.provide(NodeServices.layer),
+      );
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("thread-clock-traffic"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+    yield* TestClock.adjust(Duration.millis(80));
+    expect(yield* registry.resolve(token)).toBeDefined();
+
+    yield* TestClock.adjust(Duration.millis(21));
+    yield* Effect.yieldNow;
+    expect(yield* registry.resolve(token)).toBeDefined();
+
+    yield* TestClock.adjust(Duration.millis(101));
+    yield* Effect.yieldNow;
+    expect(yield* registry.resolve(token)).toBeUndefined();
+  }).pipe(Effect.provide(TestClock.layer())),
+);
+
 it.effect("keeps a credential alive across turns that never touch an MCP tool", () =>
   Effect.gen(function* () {
     let timestamp = 1_000;

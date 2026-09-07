@@ -85,7 +85,9 @@ export const makeProjectMcpTransport = ({
         args: [...transport.args],
         ...(transport.cwd ? { cwd: transport.cwd } : {}),
         env: { ...getDefaultEnvironment(), ...env },
-        stderr: "pipe",
+        // Stdio servers may write arbitrary diagnostics, including secrets.
+        // Discard them at the OS boundary so an unread pipe cannot block the child.
+        stderr: "ignore",
       }) as Transport;
     }
     case "streamable-http": {

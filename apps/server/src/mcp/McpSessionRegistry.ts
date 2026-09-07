@@ -227,6 +227,9 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
           { discard: true },
         );
       }
+      if (resolved.scope !== undefined) {
+        yield* scheduleExpiry(resolved.scope.providerSessionId);
+      }
       return resolved.scope;
     },
   );

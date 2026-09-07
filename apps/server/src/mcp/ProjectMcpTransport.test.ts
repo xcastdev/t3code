@@ -1,7 +1,7 @@
 import { McpServerId, ProjectMcpCredentialId, type ProjectMcpTransport } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import type { OAuthClientProvider } from "@modelcontextprotocol/client";
-import { getDefaultEnvironment } from "@modelcontextprotocol/client/stdio";
+import { StdioClientTransport, getDefaultEnvironment } from "@modelcontextprotocol/client/stdio";
 
 import {
   makeProjectMcpTransport,
@@ -64,7 +64,7 @@ it("creates a stdio transport with resolved environment values", () => {
       args: ["server.mjs"],
       cwd: "/workspace",
       env: { ...getDefaultEnvironment(), TOKEN: "secret-token" },
-      stderr: "pipe",
+      stderr: "ignore",
     },
   });
 });
@@ -140,9 +140,39 @@ it("lets configured stdio variables override the safe inherited environment", ()
       command: "node",
       args: [],
       env: { ...getDefaultEnvironment(), PATH: "secret-token" },
-      stderr: "pipe",
+      stderr: "ignore",
     },
   });
+});
+
+it("starts a noisy stdio child without retaining its stderr", async () => {
+  const transport = makeProjectMcpTransport({
+    serverId: McpServerId.make("mcp-noisy-stdio"),
+    transport: {
+      type: "stdio",
+      command: process.execPath,
+      args: [
+        "-e",
+        [
+          'process.stderr.write("secret-value:" + "x".repeat(4 * 1024 * 1024), () => {',
+          '  process.stdout.write(JSON.stringify({ jsonrpc: "2.0", method: "ready" }) + "\\n")',
+          "})",
+        ].join(""),
+      ],
+      env: [],
+    },
+    resolveSecret,
+  }) as StdioClientTransport;
+  const ready = new Promise<void>((resolve) => {
+    transport.onmessage = (message) => {
+      if ("method" in message && message.method === "ready") resolve();
+    };
+  });
+
+  await transport.start();
+  expect(transport.stderr).toBeNull();
+  await ready;
+  await transport.close();
 });
 
 it("passes an OAuth provider to both HTTP transport kinds without copying bearer headers", () => {
