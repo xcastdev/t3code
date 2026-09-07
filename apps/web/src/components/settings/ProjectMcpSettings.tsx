@@ -18,7 +18,7 @@ import {
 } from "@t3tools/contracts";
 import type { ProjectMcpTransportDraft } from "@t3tools/contracts";
 import { PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
-import { useCallback, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { isElectron } from "../../env";
 import { usePrimarySessionState } from "../../environments/primary";
@@ -263,6 +263,11 @@ function ScopedProjectMcpCatalogSettings({
   const oauthDisconnect = useAtomCommand(projectMcpEnvironment.oauthDisconnect, {
     reportFailure: false,
   });
+  useEffect(() => {
+    const refreshOnFocus = () => catalog.refresh();
+    window.addEventListener("focus", refreshOnFocus);
+    return () => window.removeEventListener("focus", refreshOnFocus);
+  }, [catalog]);
   const providerEntries = useMemo(() => deriveProviderInstanceEntries(providers), [providers]);
   const providerNameById = useMemo(
     () =>
@@ -367,6 +372,14 @@ function ScopedProjectMcpCatalogSettings({
     const name = draft.name.trim();
     const url = draft.url.trim();
     const isStdio = draft.transportType === "stdio";
+    const preserveLegacyUrl =
+      draft.transportType === "legacy-url" &&
+      draft.authorization === "none" &&
+      draft.headers.every(
+        (credential) => !credential.name.trim() || (credential.value === "" && !credential.id),
+      );
+    const httpTransportType =
+      draft.transportType === "legacy-url" ? "streamable-http" : draft.transportType;
     const errors: ProjectMcpFieldErrors = {
       ...(!name ? { name: "Name is required." } : {}),
       ...(!isStdio && !url ? { url: "URL is required." } : {}),
@@ -387,10 +400,10 @@ function ScopedProjectMcpCatalogSettings({
         name,
         enabled: draft.enabled,
         providerInstanceIds: draft.providerInstanceIds,
-        ...(draft.transportType === "legacy-url"
+        ...(preserveLegacyUrl
           ? { url }
           : {
-              transport: (draft.transportType === "stdio"
+              transport: (isStdio
                 ? {
                     type: "stdio" as const,
                     command: draft.command.trim(),
@@ -407,7 +420,7 @@ function ScopedProjectMcpCatalogSettings({
                       })),
                   }
                 : {
-                    type: draft.transportType as "streamable-http" | "legacy-sse",
+                    type: httpTransportType as "streamable-http" | "legacy-sse",
                     url,
                     headers: draft.headers
                       .filter(
@@ -506,12 +519,13 @@ function ScopedProjectMcpCatalogSettings({
     async (entry: ProjectMcpServer) => {
       const result = await oauthBegin({ environmentId, input: { projectId, id: entry.id } });
       if (result._tag === "Success") {
+        catalog.refresh();
         window.open(result.value.authorizationUrl, "_blank", "noopener,noreferrer");
       } else {
         reportFailure("Failed to connect MCP OAuth", result);
       }
     },
-    [environmentId, oauthBegin, projectId, reportFailure],
+    [catalog, environmentId, oauthBegin, projectId, reportFailure],
   );
   const disconnectOAuth = useCallback(
     async (entry: ProjectMcpServer) => {
@@ -550,6 +564,10 @@ function ScopedProjectMcpCatalogSettings({
     ...(catalog.data?.external ?? []),
     ...(catalog.data?.managed ?? []),
   ];
+  const currentEditing =
+    editing === null
+      ? null
+      : (catalog.data?.external.find((entry) => entry.id === editing.id) ?? editing);
   const unavailableProviderIds =
     draft?.providerInstanceIds.filter(
       (providerInstanceId) => !providerNameById.has(providerInstanceId),
@@ -859,22 +877,41 @@ function ScopedProjectMcpCatalogSettings({
                               ) : null}
                             </>
                           ) : null}
-                          {editing ? (
-                            editing.oauthStatus === "connected" ? (
+                          {currentEditing ? (
+                            currentEditing.oauthStatus === "connected" ? (
+                              <>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  disabled={isSaving || !canMutate}
+                                  onClick={() => void connectOAuth(currentEditing)}
+                                >
+                                  Reconnect OAuth
+                                </Button>
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  disabled={isSaving || !canMutate}
+                                  onClick={() => void disconnectOAuth(currentEditing)}
+                                >
+                                  Disconnect OAuth
+                                </Button>
+                              </>
+                            ) : currentEditing.oauthStatus === "authorization-pending" ? (
                               <Button
                                 type="button"
                                 variant="outline"
                                 disabled={isSaving || !canMutate}
-                                onClick={() => void disconnectOAuth(editing)}
+                                onClick={() => void connectOAuth(currentEditing)}
                               >
-                                Disconnect OAuth
+                                Continue authorization
                               </Button>
                             ) : (
                               <Button
                                 type="button"
                                 variant="outline"
                                 disabled={isSaving || !canMutate}
-                                onClick={() => void connectOAuth(editing)}
+                                onClick={() => void connectOAuth(currentEditing)}
                               >
                                 Connect OAuth
                               </Button>

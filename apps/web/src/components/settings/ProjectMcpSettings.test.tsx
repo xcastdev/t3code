@@ -460,6 +460,34 @@ describe("ProjectMcpSettings", () => {
     expect(document.body.textContent).not.toContain("secret-value");
   });
 
+  it("normalizes a legacy URL entry to streamable HTTP when adding authentication", async () => {
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await input(labelled<HTMLInputElement>("HTTP header name 1"), "X-API-Key");
+    await input(labelled<HTMLInputElement>("HTTP header value 1"), "secret-value");
+    await click(button("Save changes"));
+    await settle();
+
+    expect(commands.update).toHaveBeenCalledWith({
+      environmentId,
+      input: {
+        projectId,
+        id: McpServerId.make("external"),
+        name: "External",
+        transport: {
+          type: "streamable-http",
+          url: "https://mcp.example.com/endpoint",
+          headers: [
+            { name: "X-API-Key", credential: { name: "X-API-Key", value: "secret-value" } },
+          ],
+          authorization: { type: "none" },
+        },
+        enabled: true,
+        providerInstanceIds: [codexId],
+      },
+    });
+  });
+
   it("offers OAuth connect and disconnect actions", async () => {
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
     query.data = decodeProjectMcpCatalog({
@@ -489,7 +517,84 @@ describe("ProjectMcpSettings", () => {
       input: { projectId, id: McpServerId.make("external") },
     });
     expect(open).toHaveBeenCalledWith("https://auth.example.com", "_blank", "noopener,noreferrer");
+    expect(query.refresh).toHaveBeenCalledTimes(1);
     open.mockRestore();
+  });
+
+  it("refreshes OAuth status on focus and uses the current catalog entry in an open edit form", async () => {
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          transport: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/endpoint",
+            headers: [],
+            authorization: { type: "oauth", registration: { type: "automatic" } },
+          },
+          url: undefined,
+          oauthStatus: "connected",
+        },
+      ],
+      managed: [managedEntry],
+      applications: [],
+    });
+    const root = await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    expect(document.body.textContent).toContain("Reconnect OAuth");
+    expect(document.body.textContent).toContain("Disconnect OAuth");
+
+    await act(async () => {
+      window.dispatchEvent(new Event("focus"));
+    });
+    expect(query.refresh).toHaveBeenCalledTimes(1);
+
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          transport: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/endpoint",
+            headers: [],
+            authorization: { type: "oauth", registration: { type: "automatic" } },
+          },
+          url: undefined,
+          oauthStatus: "not-connected",
+        },
+      ],
+      managed: [managedEntry],
+      applications: [],
+    });
+    await rerenderPanel(root, { environmentId, projectId });
+
+    expect(document.body.textContent).toContain("Connect OAuth");
+    expect(document.body.textContent).not.toContain("Disconnect OAuth");
+  });
+
+  it("offers an authorization continuation while OAuth is pending", async () => {
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          transport: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/endpoint",
+            headers: [],
+            authorization: { type: "oauth", registration: { type: "automatic" } },
+          },
+          url: undefined,
+          oauthStatus: "authorization-pending",
+        },
+      ],
+      managed: [managedEntry],
+      applications: [],
+    });
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+
+    expect(document.body.textContent).toContain("Continue authorization");
+    expect(document.body.textContent).not.toContain("Connect OAuth");
   });
 
   it("shows and removes stale providers while editing", async () => {
