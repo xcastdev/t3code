@@ -1901,14 +1901,14 @@ const makeWsRpcLayer = (
             runProjectMcpOperation(
               WS_METHODS.projectMcpOauthDisconnect,
               input.projectId,
-              projectMcpOAuth.disconnect(input.id).pipe(
-                Effect.andThen(projectMcpService.list(input.projectId)),
+              projectMcpService.list(input.projectId).pipe(
                 Effect.flatMap((catalog) => {
                   const server = catalog.external.find((entry) => entry.id === input.id);
                   return server
                     ? Effect.succeed(server)
                     : Effect.fail(new ProjectMcpServerNotFoundError({ id: input.id }));
                 }),
+                Effect.tap(() => projectMcpOAuth.disconnect(input.id)),
                 Effect.mapError(
                   () =>
                     new ProjectMcpOAuthActionError({

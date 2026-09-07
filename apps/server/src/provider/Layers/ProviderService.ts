@@ -272,9 +272,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     projectMcpServers: Parameters<
       typeof McpSessionRegistry.issueActiveMcpCredential
     >[0]["projectMcpServers"],
+    resolveProjectMcpSecret?: Parameters<
+      typeof McpSessionRegistry.issueActiveMcpCredential
+    >[0]["resolveProjectMcpSecret"],
   ) =>
     Effect.gen(function* () {
-      if (!(yield* agentBrowserAccessEnabled)) {
+      const includePreview = yield* agentBrowserAccessEnabled;
+      if (!includePreview && (!projectMcpServers || projectMcpServers.length === 0)) {
         // Revoke as well as clear. Every other prepare path reaches
         // `issueActiveMcpCredential`, which revokes the thread first, so
         // skipping it here would leave a previously issued bearer token valid
@@ -288,7 +292,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const credential = yield* issueMcpCredential({
         threadId,
         providerInstanceId,
+        ...(includePreview ? {} : { includePreview: false as const }),
         ...(projectMcpServers && projectMcpServers.length > 0 ? { projectMcpServers } : {}),
+        ...(resolveProjectMcpSecret === undefined ? {} : { resolveProjectMcpSecret }),
       });
       if (credential) {
         yield* Effect.sync(() => McpProviderSession.setMcpProviderSession(credential.config));
@@ -363,7 +369,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       );
     }
     const sessionScope = yield* Scope.make("sequential");
-    const projectMcpServers = yield* projectMcpService
+    const projectMcpSession = yield* projectMcpService
       .acquireSessionLease(thread.value.projectId, input.providerInstanceId)
       .pipe(
         Effect.mapError((cause) =>
@@ -380,7 +386,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const credential = yield* prepareMcpSession(
         input.sessionInput.threadId,
         input.providerInstanceId,
-        projectMcpServers,
+        projectMcpSession.servers,
+        projectMcpSession.resolveSecret,
       );
       const issuedProjectMcpServers = credential?.config.projectServers;
       return yield* input.adapter.startSession({

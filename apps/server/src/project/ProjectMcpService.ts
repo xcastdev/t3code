@@ -80,6 +80,11 @@ const isAllowedUrl = (value: string): boolean => {
   }
 };
 
+export interface AcquiredProjectMcpSessionServers {
+  readonly servers: ReadonlyArray<ResolvedProjectMcpServer>;
+  readonly resolveSecret: (serverId: McpServerId, credentialId: string) => string | undefined;
+}
+
 export interface ProjectMcpServiceShape {
   readonly list: (projectId: ProjectId) => Effect.Effect<ProjectMcpCatalog, Error>;
   readonly create: (input: ProjectMcpCreateInput) => Effect.Effect<ProjectMcpServer, Error>;
@@ -92,7 +97,7 @@ export interface ProjectMcpServiceShape {
   readonly acquireSessionLease: (
     projectId: ProjectId,
     providerInstanceId: ProviderInstanceId,
-  ) => Effect.Effect<ReadonlyArray<ResolvedProjectMcpServer>, Error, Scope.Scope>;
+  ) => Effect.Effect<AcquiredProjectMcpSessionServers, Error, Scope.Scope>;
 }
 
 export class ProjectMcpService extends Context.Service<ProjectMcpService, ProjectMcpServiceShape>()(
@@ -443,7 +448,15 @@ const makeProjectMcpService = Effect.gen(function* () {
       Effect.map((catalog) =>
         catalog.external
           .filter(
-            (entry) => entry.enabled && entry.providerInstanceIds.includes(providerInstanceId),
+            (entry) =>
+              entry.enabled &&
+              entry.providerInstanceIds.includes(providerInstanceId) &&
+              catalog.applications.some(
+                (application) =>
+                  application.serverId === entry.id &&
+                  application.providerInstanceId === providerInstanceId &&
+                  application.mode !== "unsupported",
+              ),
           )
           .map((server) => ({
             id: server.id,
@@ -468,8 +481,55 @@ const makeProjectMcpService = Effect.gen(function* () {
                   server.id,
                   ProjectMcpSecretStore.credentialIdsForTransport(server.transport),
                 )
-                .pipe(Effect.as(server)),
+                .pipe(
+                  Effect.flatMap((lease) =>
+                    Effect.forEach(
+                      ProjectMcpSecretStore.credentialIdsForTransport(server.transport),
+                      (credentialId) =>
+                        lease
+                          .resolve(credentialId)
+                          .pipe(Effect.map((value) => [credentialId, value] as const)),
+                    ).pipe(Effect.map((credentials) => ({ server, credentials }))),
+                  ),
+                ),
             { concurrency: 1 },
+          ).pipe(
+            Effect.map((leased) => {
+              const secretValues = new Map<string, string>();
+              for (const { credentials } of leased) {
+                for (const [credentialId, value] of credentials)
+                  secretValues.set(credentialId, value);
+              }
+              if (mcpOAuth._tag === "Some") {
+                for (const { server } of leased) {
+                  if (
+                    server.transport.type === "stdio" ||
+                    server.transport.authorization.type !== "oauth"
+                  )
+                    continue;
+                  const registration = server.transport.authorization.registration;
+                  const clientSecret =
+                    registration.type === "pre-registered" &&
+                    registration.clientSecret !== undefined
+                      ? secretValues.get(registration.clientSecret.id)
+                      : undefined;
+                  mcpOAuth.value.bindServer?.({
+                    serverId: server.id,
+                    resource: server.transport.url,
+                    ...(registration.type === "pre-registered"
+                      ? {
+                          clientId: registration.clientId,
+                          ...(clientSecret === undefined ? {} : { clientSecret }),
+                        }
+                      : {}),
+                  });
+                }
+              }
+              return {
+                servers: leased.map(({ server }) => server),
+                resolveSecret: (_serverId, credentialId) => secretValues.get(credentialId),
+              } satisfies AcquiredProjectMcpSessionServers;
+            }),
           ),
         ),
       ),

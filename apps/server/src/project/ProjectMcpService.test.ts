@@ -453,6 +453,22 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
     }),
   );
 
+  it.effect("does not resolve project MCP for an unsupported provider instance", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const projectId = ProjectId.make("unsupported-provider-project");
+      yield* createProject(projectId, "unsupported-provider-project");
+      yield* service.create({
+        projectId,
+        ...codexInput,
+        providerInstanceIds: [openCodeInstance],
+      });
+
+      expect(yield* service.resolveForSession(projectId, openCodeInstance)).toEqual([]);
+      expect((yield* service.acquireSessionLease(projectId, openCodeInstance)).servers).toEqual([]);
+    }),
+  );
+
   it.effect("persists and resolves an explicit stdio server without a URL", () =>
     Effect.gen(function* () {
       const service = yield* ProjectMcpService.ProjectMcpService;
@@ -657,10 +673,12 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
       const credentialId = transport.headers[0]!.credential.id;
       const scope = yield* Scope.make();
 
-      yield* service
+      const acquired = yield* service
         .acquireSessionLease(projectId, codexInstance)
         .pipe(Effect.provideService(Scope.Scope, scope));
       yield* service.remove({ projectId, id: server.id });
+
+      expect(acquired.resolveSecret(server.id, credentialId)).toBe("session-lease-sentinel");
 
       expect(
         Option.isSome(

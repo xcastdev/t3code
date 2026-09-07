@@ -688,17 +688,24 @@ const make = Effect.gen(function* () {
       Effect.gen(function* () {
         const manifest = yield* Ref.get(manifests);
         const server = manifest.servers[serverId];
-        if (server === undefined || !server.auxiliary.includes(credentialId)) {
+        if (
+          server === undefined ||
+          (!server.auxiliary.includes(credentialId) && !server.retired.includes(credentialId))
+        ) {
           return yield* new ProjectMcpSecretOwnershipError({ serverId, credentialId });
         }
-        yield* persistManifest(
-          serverSecretsWith(manifest, serverId, {
-            credentials: server.credentials,
-            retired: server.retired,
-            auxiliary: removeIds(server.auxiliary, [credentialId]),
-          }),
-        );
-        yield* removeCredential(credentialId);
+        if (server.auxiliary.includes(credentialId)) {
+          // Keep a durable retirement record until deletion succeeds. A failed
+          // delete can then be retried by this call or by reconciliation.
+          yield* persistManifest(
+            serverSecretsWith(manifest, serverId, {
+              credentials: server.credentials,
+              retired: unique([...server.retired, credentialId]),
+              auxiliary: removeIds(server.auxiliary, [credentialId]),
+            }),
+          );
+        }
+        yield* cleanupRetired(serverId);
       }),
     );
 

@@ -107,7 +107,7 @@ const makeIntegrationFixture = (options?: { readonly analytics?: Layer.Layer<Ana
       } as never),
       Layer.succeed(ProjectMcpService.ProjectMcpService, {
         resolveForSession: () => Effect.succeed([]),
-        acquireSessionLease: () => Effect.succeed([]),
+        acquireSessionLease: () => Effect.succeed({ servers: [], resolveSecret: () => undefined }),
       } as never),
     ).pipe(Layer.provide(SqlitePersistenceMemory));
 

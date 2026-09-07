@@ -127,3 +127,125 @@ it.effect("begins and completes an authorization-code flow with an in-process au
     ),
   ),
 );
+
+it.effect("does not return a grant bound to a replaced resource", () =>
+  Effect.gen(function* () {
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    const replacementResource = "https://replacement.example.test/mcp";
+    const prepared = yield* secrets.prepareCreate(serverId, {
+      type: "streamable-http",
+      url: resource,
+      headers: [],
+      authorization: { type: "oauth", registration: { type: "automatic" } },
+    });
+    yield* prepared.commit;
+    const oauth = yield* ProjectMcpOAuth.ProjectMcpOAuth;
+    const providerForOriginal = yield* oauth.providerFor(serverId, { serverId, resource });
+    yield* Effect.promise(() =>
+      Promise.resolve(
+        providerForOriginal.saveTokens(
+          { access_token: "original-resource-token", token_type: "Bearer" },
+          { issuer: "https://issuer.example.test" },
+        ),
+      ),
+    );
+
+    const providerForReplacement = yield* oauth.providerFor(serverId, {
+      serverId,
+      resource: replacementResource,
+    });
+
+    assert.isUndefined(
+      yield* Effect.promise(() => Promise.resolve(providerForReplacement.tokens())),
+    );
+  }).pipe(
+    Effect.provide(
+      Layer.merge(
+        ProjectMcpOAuth.layer({ servers: [], fetch: fetchOAuthFixture }).pipe(
+          Layer.provideMerge(secretLayer),
+        ),
+        NodeServices.layer,
+      ),
+    ),
+  ),
+);
+
+it.effect("persists headless step-up authorization for callback recovery", () =>
+  Effect.gen(function* () {
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    const prepared = yield* secrets.prepareCreate(serverId, {
+      type: "streamable-http",
+      url: resource,
+      headers: [],
+      authorization: { type: "oauth", registration: { type: "automatic" } },
+    });
+    yield* prepared.commit;
+    const oauth = yield* ProjectMcpOAuth.ProjectMcpOAuth;
+    const started = yield* oauth.begin({ serverId });
+    const initialCallbackUrl = new URL("https://t3.example.test/oauth/project-mcp/callback");
+    initialCallbackUrl.searchParams.set(
+      "state",
+      new URL(started.authorizationUrl).searchParams.get("state")!,
+    );
+    initialCallbackUrl.searchParams.set("code", "initial-code");
+    initialCallbackUrl.searchParams.set("iss", "https://issuer.example.test");
+    assert.equal((yield* oauth.completeCallback(new Request(initialCallbackUrl))).status, 200);
+
+    const provider = yield* oauth.providerFor(serverId);
+    yield* Effect.promise(() => Promise.resolve(provider.saveCodeVerifier("v".repeat(48))));
+    const stepUpAuthorizationUrl = new URL("https://issuer.example.test/authorize");
+    stepUpAuthorizationUrl.searchParams.set("state", "step-up-state");
+    stepUpAuthorizationUrl.searchParams.set("scope", "mcp:read mcp:write");
+    yield* Effect.promise(() =>
+      Promise.resolve(provider.redirectToAuthorization(stepUpAuthorizationUrl)),
+    );
+
+    const pendingIds = yield* secrets.listAuxiliarySecrets(serverId);
+    const pendingRecord = JSON.parse(yield* secrets.resolve(serverId, pendingIds.at(-1)!)) as {
+      authorizationUrl?: string;
+      scope?: string;
+      state?: string;
+    };
+    assert.equal(pendingRecord.authorizationUrl, stepUpAuthorizationUrl.toString());
+    assert.equal(pendingRecord.scope, "mcp:read mcp:write");
+    assert.equal(pendingRecord.state, "step-up-state");
+
+    const restarted = yield* ProjectMcpOAuth.__testing.make({
+      servers: [],
+      fetch: fetchOAuthFixture,
+    });
+    const stepUpCallbackUrl = new URL("https://t3.example.test/oauth/project-mcp/callback");
+    stepUpCallbackUrl.searchParams.set("state", "step-up-state");
+    stepUpCallbackUrl.searchParams.set("code", "step-up-code");
+    stepUpCallbackUrl.searchParams.set("iss", "https://issuer.example.test");
+    assert.equal((yield* restarted.completeCallback(new Request(stepUpCallbackUrl))).status, 200);
+    assert.equal(yield* restarted.status(serverId), "connected");
+
+    const completedIds = yield* secrets.listAuxiliarySecrets(serverId);
+    const completedRecord = JSON.parse(yield* secrets.resolve(serverId, completedIds.at(-1)!)) as {
+      authorizationUrl?: string;
+      scope?: string;
+      state?: string;
+    };
+    assert.isUndefined(completedRecord.authorizationUrl);
+    assert.isUndefined(completedRecord.scope);
+    assert.isUndefined(completedRecord.state);
+  }).pipe(
+    Effect.provide(
+      Layer.merge(
+        ProjectMcpOAuth.layer({
+          servers: [
+            {
+              serverId,
+              resource,
+              authorizationServers: ["https://issuer.example.test"],
+              clientId: "registered-client",
+            },
+          ],
+          fetch: fetchOAuthFixture,
+        }).pipe(Layer.provideMerge(secretLayer)),
+        NodeServices.layer,
+      ),
+    ),
+  ),
+);

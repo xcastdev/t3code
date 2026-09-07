@@ -22,6 +22,7 @@ import {
   ProjectId,
   ProviderSessionStartInput,
   ThreadId,
+  type ResolvedProjectMcpServer,
   TurnId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
@@ -78,7 +79,7 @@ const makeProviderProjectContextTestLayer = (
   resolveForSession: ProjectMcpService.ProjectMcpServiceShape["resolveForSession"] = () =>
     Effect.succeed([]),
   acquireSessionLease: ProjectMcpService.ProjectMcpServiceShape["acquireSessionLease"] = () =>
-    Effect.succeed([]),
+    Effect.succeed({ servers: [], resolveSecret: () => undefined }),
 ) =>
   Layer.mergeAll(
     Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
@@ -359,7 +360,12 @@ function makeProviderServiceLayer(
       Effect.sync(() => {
         releasedSessionLeases += 1;
       }),
-    ).pipe(Effect.as([projectMcpServer])),
+    ).pipe(
+      Effect.as({
+        servers: [projectMcpServer],
+        resolveSecret: () => undefined,
+      }),
+    ),
   );
 
   const layer = it.layer(
@@ -2365,6 +2371,17 @@ validation.layer("ProviderServiceLive validation", (it) => {
 describe("agent browser access", () => {
   const revokedThreads: Array<ThreadId> = [];
 
+  const projectMcpServer = {
+    id: McpServerId.make("project-mcp-server"),
+    name: "Project MCP",
+    transport: {
+      type: "streamable-http",
+      url: "https://project-mcp.example.test/mcp",
+      headers: [],
+      authorization: { type: "none" },
+    },
+  } satisfies ResolvedProjectMcpServer;
+
   const startSessionWith = (enableAgentBrowserAccess: boolean, threadId: ThreadId) =>
     Effect.gen(function* () {
       const issued: Array<ThreadId> = [];
@@ -2445,6 +2462,75 @@ describe("agent browser access", () => {
       const issued = yield* startSessionWith(true, threadId);
 
       assert.deepEqual(issued, [threadId]);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps project MCP when browser preview access is off", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-project-mcp-browser-off");
+      const requests: Array<{
+        readonly includePreview?: boolean;
+        readonly projectMcpServers?: ReadonlyArray<ResolvedProjectMcpServer>;
+      }> = [];
+      const codex = makeFakeCodexAdapter();
+      const providerAdapterLayer = Layer.succeed(
+        ProviderAdapterRegistry.ProviderAdapterRegistry,
+        makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter }),
+      );
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerLayer = makeTestProviderServiceLive(
+        {
+          issueMcpCredential: (request) =>
+            Effect.sync(() => {
+              requests.push(request);
+              return undefined;
+            }),
+        },
+        makeProviderProjectContextTestLayer(
+          () => Effect.succeed([]),
+          () =>
+            Effect.succeed({
+              servers: [projectMcpServer],
+              resolveSecret: () => undefined,
+            }),
+        ),
+      ).pipe(
+        Layer.provide(providerAdapterLayer),
+        Layer.provide(directoryLayer),
+        Layer.provide(
+          ServerSettings.ServerSettingsService.layerTest({ enableAgentBrowserAccess: false }),
+        ),
+        Layer.provide(serverConfigTestLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        yield* provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+      }).pipe(Effect.provide(providerLayer));
+
+      assert.equal(requests.length, 1);
+      const request = requests[0]!;
+      assert.equal(request.threadId, threadId);
+      assert.equal(request.providerInstanceId, codexInstanceId);
+      assert.equal(request.includePreview, false);
+      assert.deepEqual(request.projectMcpServers, [projectMcpServer]);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

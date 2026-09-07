@@ -295,7 +295,7 @@ export const makeOrchestrationIntegrationHarness = (
       update: () => Effect.die("Project MCP catalog writes are not used by this harness"),
       remove: () => Effect.die("Project MCP catalog writes are not used by this harness"),
       resolveForSession: () => Effect.succeed([]),
-      acquireSessionLease: () => Effect.succeed([]),
+      acquireSessionLease: () => Effect.succeed({ servers: [], resolveSecret: () => undefined }),
     });
     const providerLayer = useRealCodex
       ? makeProviderServiceLive().pipe(
