@@ -21,6 +21,7 @@ const atoms = vi.hoisted(() => ({
   update: Symbol("update"),
   remove: Symbol("remove"),
   oauthBegin: Symbol("oauthBegin"),
+  oauthContinue: Symbol("oauthContinue"),
   oauthDisconnect: Symbol("oauthDisconnect"),
 }));
 
@@ -29,6 +30,7 @@ const commands = vi.hoisted(() => ({
   update: vi.fn(),
   remove: vi.fn(),
   oauthBegin: vi.fn(),
+  oauthContinue: vi.fn(),
   oauthDisconnect: vi.fn(),
 }));
 
@@ -46,6 +48,7 @@ vi.mock("../../state/projects", () => ({
     update: atoms.update,
     remove: atoms.remove,
     oauthBegin: atoms.oauthBegin,
+    oauthContinue: atoms.oauthContinue,
     oauthDisconnect: atoms.oauthDisconnect,
   },
 }));
@@ -59,6 +62,7 @@ vi.mock("../../state/use-atom-command", () => ({
     if (atom === atoms.create) return commands.create;
     if (atom === atoms.update) return commands.update;
     if (atom === atoms.oauthBegin) return commands.oauthBegin;
+    if (atom === atoms.oauthContinue) return commands.oauthContinue;
     if (atom === atoms.oauthDisconnect) return commands.oauthDisconnect;
     return commands.remove;
   },
@@ -355,6 +359,13 @@ describe("ProjectMcpSettings", () => {
         expiresAt: "2026-09-02T00:00:00.000Z",
       },
     });
+    commands.oauthContinue.mockReset().mockResolvedValue({
+      _tag: "Success",
+      value: {
+        authorizationUrl: "https://auth.example.com/step-up",
+        expiresAt: "2026-09-02T00:00:00.000Z",
+      },
+    });
     commands.oauthDisconnect.mockReset().mockResolvedValue({ _tag: "Success" });
   });
 
@@ -595,6 +606,18 @@ describe("ProjectMcpSettings", () => {
 
     expect(document.body.textContent).toContain("Continue authorization");
     expect(document.body.textContent).not.toContain("Connect OAuth");
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    await click(button("Continue authorization"));
+    expect(commands.oauthContinue).toHaveBeenCalledWith({
+      environmentId,
+      input: { projectId, id: McpServerId.make("external") },
+    });
+    expect(open).toHaveBeenCalledWith(
+      "https://auth.example.com/step-up",
+      "_blank",
+      "noopener,noreferrer",
+    );
+    open.mockRestore();
   });
 
   it("shows and removes stale providers while editing", async () => {

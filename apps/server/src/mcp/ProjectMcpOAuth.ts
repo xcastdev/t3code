@@ -20,6 +20,7 @@ import {
 } from "@modelcontextprotocol/client";
 import type { ProjectMcpOAuthStatus } from "@t3tools/contracts";
 import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -81,10 +82,12 @@ export interface ProjectMcpOAuthShape {
   readonly begin: (
     input: BeginProjectMcpOAuthInput,
   ) => Effect.Effect<ProjectMcpOAuthBeginResult, ProjectMcpOAuthError>;
+  readonly continuePending: (
+    serverId: McpServerId,
+    server?: ProjectMcpOAuthServer,
+  ) => Effect.Effect<ProjectMcpOAuthBeginResult, ProjectMcpOAuthError>;
   readonly completeCallback: (request: Request) => Effect.Effect<Response, ProjectMcpOAuthError>;
   readonly disconnect: (serverId: McpServerId) => Effect.Effect<void, ProjectMcpOAuthError>;
-  /** Binds the immutable session snapshot used by a proxy-created provider. */
-  readonly bindServer?: (server: ProjectMcpOAuthServer) => void;
   /** Installed by the proxy registry so a new grant invalidates cached upstream clients. */
   readonly setAuthorizedHandler?: (handler: ProjectMcpOAuthAuthorizedHandler | undefined) => void;
 }
@@ -102,6 +105,8 @@ type StoredRecord = {
   readonly state?: string;
   readonly expiresAt?: number;
   readonly codeVerifier?: string;
+  readonly authorizationUrl?: string;
+  readonly scope?: string;
   readonly client?: StoredOAuthClientInformation;
   readonly tokens?: StoredOAuthTokens;
   readonly discovery?: OAuthDiscoveryState;
@@ -139,7 +144,6 @@ const make = (config: ProjectMcpOAuthConfig) =>
   Effect.gen(function* () {
     const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
     const byId = new Map(config.servers.map((server) => [server.serverId, server]));
-    const boundServers = new Map<McpServerId, ProjectMcpOAuthServer>();
     const pendingStates = new Map<string, McpServerId>();
     const generations = new Map<string, number>();
     const mutex = yield* Semaphore.make(1);
@@ -157,8 +161,18 @@ const make = (config: ProjectMcpOAuthConfig) =>
       if (supplied) return supplied;
       const configured = byId.get(id);
       if (configured) return configured;
-      const bound = boundServers.get(id);
-      if (bound) return bound;
+      const persisted = await Effect.runPromise(current(id));
+      if (persisted) {
+        const clientId = persisted.client?.client_id;
+        const clientSecret = persisted.client?.client_secret;
+        return {
+          serverId: id,
+          resource: persisted.resource,
+          ...(persisted.redirectUrl === undefined ? {} : { redirectUrl: persisted.redirectUrl }),
+          ...(typeof clientId === "string" ? { clientId } : {}),
+          ...(typeof clientSecret === "string" ? { clientSecret } : {}),
+        };
+      }
       throw new Error("Unknown MCP server");
     };
     const recordsFor = (id: McpServerId) =>
@@ -187,9 +201,9 @@ const make = (config: ProjectMcpOAuthConfig) =>
     const save = (id: McpServerId, record: StoredRecord) =>
       Effect.gen(function* () {
         // @effect-diagnostics-next-line preferSchemaOverJson:off
-        yield* secrets.createAuxiliarySecret(id, JSON.stringify(record));
+        const replacementId = yield* secrets.createAuxiliarySecret(id, JSON.stringify(record));
         for (const old of yield* recordsFor(id)) {
-          if (old.record.generation !== record.generation && hasSameResource(old.record, record)) {
+          if (old.id !== replacementId && hasSameResource(old.record, record)) {
             yield* secrets.removeAuxiliarySecret(id, old.id);
           }
         }
@@ -211,11 +225,17 @@ const make = (config: ProjectMcpOAuthConfig) =>
     ) =>
       mutex.withPermits(1)(
         current(id, server).pipe(
-          Effect.flatMap((active) =>
-            active?.generation === generation
-              ? save(id, record).pipe(Effect.as(true))
-              : Effect.succeed(false),
-          ),
+          Effect.flatMap((active) => {
+            const isCurrent =
+              active === undefined
+                ? generation === 0 && !generations.has(id)
+                : (active.generation ?? 0) === generation;
+            return isCurrent
+              ? save(id, { ...record, generation: record.generation ?? generation }).pipe(
+                  Effect.as(true),
+                )
+              : Effect.succeed(false);
+          }),
         ),
       );
 
@@ -319,7 +339,23 @@ const make = (config: ProjectMcpOAuthConfig) =>
                 }),
               );
             },
-            redirectToAuthorization: async () => undefined,
+            redirectToAuthorization: async (authorizationUrl) => {
+              const record = await Effect.runPromise(current(id, server));
+              if (record === undefined) throw new Error("OAuth authorization state is unavailable");
+              const state = authorizationUrl.searchParams.get("state");
+              if (!state) throw new Error("OAuth authorization URL did not include state");
+              const scope = authorizationUrl.searchParams.get("scope") ?? undefined;
+              const saved = await Effect.runPromise(
+                saveIfCurrent(id, server, record.generation ?? generation, {
+                  ...record,
+                  state,
+                  expiresAt: now() + STATE_TTL_MS,
+                  authorizationUrl: authorizationUrl.toString(),
+                  ...(scope === undefined ? {} : { scope }),
+                }),
+              );
+              if (!saved) throw new Error("OAuth authorization state is stale");
+            },
             saveCodeVerifier: async (codeVerifier) => {
               const record = (await Effect.runPromise(current(id, server))) ?? {
                 kind: RECORD_NAME,
@@ -487,6 +523,10 @@ const make = (config: ProjectMcpOAuthConfig) =>
             client: { ...client, issuer },
             discovery: info,
             generation,
+            authorizationUrl: started.authorizationUrl.toString(),
+            ...(started.authorizationUrl.searchParams.get("scope") === null
+              ? {}
+              : { scope: started.authorizationUrl.searchParams.get("scope")! }),
           }),
         );
         return {
@@ -500,6 +540,29 @@ const make = (config: ProjectMcpOAuthConfig) =>
             ? Effect.fail(cause)
             : Effect.fail(new ProjectMcpOAuthError({ operation: "begin", cause })),
         ),
+      );
+
+    const continuePending: ProjectMcpOAuthShape["continuePending"] = (id, server) =>
+      current(id, server).pipe(
+        Effect.flatMap((record) => {
+          if (
+            record?.authorizationUrl === undefined ||
+            record.state === undefined ||
+            record.expiresAt === undefined ||
+            record.expiresAt < now()
+          ) {
+            return Effect.fail(
+              new ProjectMcpOAuthError({
+                operation: "continue authorization",
+                cause: new Error("No pending OAuth authorization is available."),
+              }),
+            );
+          }
+          return Effect.succeed({
+            authorizationUrl: record.authorizationUrl,
+            expiresAt: DateTime.formatIso(DateTime.makeUnsafe(record.expiresAt)),
+          });
+        }),
       );
 
     const completeCallback: ProjectMcpOAuthShape["completeCallback"] = (request) =>
@@ -573,7 +636,14 @@ const make = (config: ProjectMcpOAuthConfig) =>
         pendingStates.delete(state);
         const after = yield* current(found.serverId);
         if (after && after.generation === record.generation) {
-          const { state: _state, codeVerifier: _codeVerifier, ...withoutVerifier } = after;
+          const {
+            state: _state,
+            codeVerifier: _codeVerifier,
+            authorizationUrl: _authorizationUrl,
+            scope: _scope,
+            expiresAt: _expiresAt,
+            ...withoutVerifier
+          } = after;
           yield* saveIfCurrent(
             found.serverId,
             callbackServer,
@@ -606,12 +676,10 @@ const make = (config: ProjectMcpOAuthConfig) =>
       status,
       providerFor,
       begin,
+      continuePending,
       completeCallback,
       setAuthorizedHandler: (handler) => {
         authorizedHandler = handler;
-      },
-      bindServer: (server) => {
-        boundServers.set(server.serverId, server);
       },
       disconnect: (id) =>
         mutex.withPermits(1)(

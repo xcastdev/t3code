@@ -242,6 +242,7 @@ export const WS_METHODS = {
   projectMcpUpdate: "projectMcp.update",
   projectMcpRemove: "projectMcp.remove",
   projectMcpOauthBegin: "projectMcp.oauth.begin",
+  projectMcpOauthContinue: "projectMcp.oauth.continue",
   projectMcpOauthDisconnect: "projectMcp.oauth.disconnect",
 
   // Shell methods
@@ -745,6 +746,12 @@ export const WsProjectMcpOAuthBeginRpc = Rpc.make(WS_METHODS.projectMcpOauthBegi
   error: Schema.Union([ProjectMcpUpdateError, EnvironmentAuthorizationError]),
 });
 
+export const WsProjectMcpOAuthContinueRpc = Rpc.make(WS_METHODS.projectMcpOauthContinue, {
+  payload: ProjectMcpOAuthBeginInput,
+  success: ProjectMcpOAuthBeginResult,
+  error: Schema.Union([ProjectMcpUpdateError, EnvironmentAuthorizationError]),
+});
+
 export const WsProjectMcpOAuthDisconnectRpc = Rpc.make(WS_METHODS.projectMcpOauthDisconnect, {
   payload: ProjectMcpOAuthDisconnectInput,
   success: ProjectMcpServer,
@@ -1167,6 +1174,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectMcpUpdateRpc,
   WsProjectMcpRemoveRpc,
   WsProjectMcpOAuthBeginRpc,
+  WsProjectMcpOAuthContinueRpc,
   WsProjectMcpOAuthDisconnectRpc,
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,

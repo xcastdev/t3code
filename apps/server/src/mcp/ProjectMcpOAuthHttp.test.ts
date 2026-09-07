@@ -27,6 +27,7 @@ it.effect("returns a generic non-cacheable response when callback validation fai
         status: () => Effect.succeed("not-connected"),
         providerFor: () => Effect.die("unused"),
         begin: () => Effect.die("unused"),
+        continuePending: () => Effect.die("unused"),
         completeCallback: () =>
           Effect.fail(
             new ProjectMcpOAuth.ProjectMcpOAuthError({
@@ -61,6 +62,7 @@ it.effect("passes a successful OAuth callback response through unchanged", () =>
         status: () => Effect.succeed("not-connected"),
         providerFor: () => Effect.die("unused"),
         begin: () => Effect.die("unused"),
+        continuePending: () => Effect.die("unused"),
         completeCallback: () => Effect.succeed(new Response("complete", { status: 200 })),
         disconnect: () => Effect.die("unused"),
       }),

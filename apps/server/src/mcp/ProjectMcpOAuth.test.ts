@@ -64,6 +64,15 @@ const secretLayer = ProjectMcpSecretStore.layer.pipe(
 const decodePersistedRecord = Schema.decodeUnknownSync(
   Schema.fromJsonString(Schema.Struct({ redirectUrl: Schema.optional(Schema.String) })),
 );
+const decodePendingRecord = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      authorizationUrl: Schema.optional(Schema.String),
+      scope: Schema.optional(Schema.String),
+      state: Schema.optional(Schema.String),
+    }),
+  ),
+);
 
 it.effect("begins and completes an authorization-code flow with an in-process authority", () =>
   Effect.gen(function* () {
@@ -170,6 +179,44 @@ it.effect("does not return a grant bound to a replaced resource", () =>
   ),
 );
 
+it.effect("retires an older grant for the same resource after its replacement is durable", () =>
+  Effect.gen(function* () {
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    const prepared = yield* secrets.prepareCreate(serverId, {
+      type: "streamable-http",
+      url: resource,
+      headers: [],
+      authorization: { type: "oauth", registration: { type: "automatic" } },
+    });
+    yield* prepared.commit;
+    const oauth = yield* ProjectMcpOAuth.ProjectMcpOAuth;
+    const provider = yield* oauth.providerFor(serverId, { serverId, resource });
+    yield* Effect.promise(async () => {
+      await provider.saveTokens(
+        { access_token: "first-token", token_type: "Bearer" },
+        { issuer: "https://issuer.example.test" },
+      );
+    });
+    yield* Effect.promise(async () => {
+      await provider.saveTokens(
+        { access_token: "replacement-token", token_type: "Bearer" },
+        { issuer: "https://issuer.example.test" },
+      );
+    });
+
+    assert.lengthOf(yield* secrets.listAuxiliarySecrets(serverId), 1);
+  }).pipe(
+    Effect.provide(
+      Layer.merge(
+        ProjectMcpOAuth.layer({ servers: [], fetch: fetchOAuthFixture }).pipe(
+          Layer.provideMerge(secretLayer),
+        ),
+        NodeServices.layer,
+      ),
+    ),
+  ),
+);
+
 it.effect("persists headless step-up authorization for callback recovery", () =>
   Effect.gen(function* () {
     const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
@@ -189,44 +236,52 @@ it.effect("persists headless step-up authorization for callback recovery", () =>
     );
     initialCallbackUrl.searchParams.set("code", "initial-code");
     initialCallbackUrl.searchParams.set("iss", "https://issuer.example.test");
-    assert.equal((yield* oauth.completeCallback(new Request(initialCallbackUrl))).status, 200);
+    assert.equal(
+      (yield* oauth.completeCallback(new Request(initialCallbackUrl.toString()))).status,
+      200,
+    );
 
     const provider = yield* oauth.providerFor(serverId);
-    yield* Effect.promise(() => Promise.resolve(provider.saveCodeVerifier("v".repeat(48))));
+    yield* Effect.promise(async () => {
+      await provider.saveCodeVerifier("v".repeat(48));
+    });
     const stepUpAuthorizationUrl = new URL("https://issuer.example.test/authorize");
     stepUpAuthorizationUrl.searchParams.set("state", "step-up-state");
     stepUpAuthorizationUrl.searchParams.set("scope", "mcp:read mcp:write");
-    yield* Effect.promise(() =>
-      Promise.resolve(provider.redirectToAuthorization(stepUpAuthorizationUrl)),
-    );
+    yield* Effect.promise(async () => {
+      await provider.redirectToAuthorization(stepUpAuthorizationUrl);
+    });
 
     const pendingIds = yield* secrets.listAuxiliarySecrets(serverId);
-    const pendingRecord = JSON.parse(yield* secrets.resolve(serverId, pendingIds.at(-1)!)) as {
-      authorizationUrl?: string;
-      scope?: string;
-      state?: string;
-    };
+    const pendingRecord = decodePendingRecord(yield* secrets.resolve(serverId, pendingIds.at(-1)!));
     assert.equal(pendingRecord.authorizationUrl, stepUpAuthorizationUrl.toString());
     assert.equal(pendingRecord.scope, "mcp:read mcp:write");
     assert.equal(pendingRecord.state, "step-up-state");
+    const continued = yield* oauth.continuePending(serverId);
+    assert.equal(continued.authorizationUrl, stepUpAuthorizationUrl.toString());
+    assert.isTrue(continued.expiresAt.length > 0);
 
     const restarted = yield* ProjectMcpOAuth.__testing.make({
       servers: [],
       fetch: fetchOAuthFixture,
     });
+    const restartedContinuation = yield* restarted.continuePending(serverId);
+    assert.equal(restartedContinuation.authorizationUrl, stepUpAuthorizationUrl.toString());
+    assert.isTrue(restartedContinuation.expiresAt.length > 0);
     const stepUpCallbackUrl = new URL("https://t3.example.test/oauth/project-mcp/callback");
     stepUpCallbackUrl.searchParams.set("state", "step-up-state");
     stepUpCallbackUrl.searchParams.set("code", "step-up-code");
     stepUpCallbackUrl.searchParams.set("iss", "https://issuer.example.test");
-    assert.equal((yield* restarted.completeCallback(new Request(stepUpCallbackUrl))).status, 200);
+    assert.equal(
+      (yield* restarted.completeCallback(new Request(stepUpCallbackUrl.toString()))).status,
+      200,
+    );
     assert.equal(yield* restarted.status(serverId), "connected");
 
     const completedIds = yield* secrets.listAuxiliarySecrets(serverId);
-    const completedRecord = JSON.parse(yield* secrets.resolve(serverId, completedIds.at(-1)!)) as {
-      authorizationUrl?: string;
-      scope?: string;
-      state?: string;
-    };
+    const completedRecord = decodePendingRecord(
+      yield* secrets.resolve(serverId, completedIds.at(-1)!),
+    );
     assert.isUndefined(completedRecord.authorizationUrl);
     assert.isUndefined(completedRecord.scope);
     assert.isUndefined(completedRecord.state);

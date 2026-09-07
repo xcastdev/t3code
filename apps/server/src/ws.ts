@@ -1895,6 +1895,25 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "project-mcp" },
           ),
+        [WS_METHODS.projectMcpOauthContinue]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectMcpOauthContinue,
+            runProjectMcpOperation(
+              WS_METHODS.projectMcpOauthContinue,
+              input.projectId,
+              oauthServerFor(input.projectId, input.id).pipe(
+                Effect.flatMap((server) => projectMcpOAuth.continuePending(input.id, server)),
+                Effect.mapError(
+                  () =>
+                    new ProjectMcpOAuthActionError({
+                      id: input.id,
+                      reason: "The pending authorization could not be continued.",
+                    }),
+                ),
+              ),
+            ),
+            { "rpc.aggregate": "project-mcp" },
+          ),
         [WS_METHODS.projectMcpOauthDisconnect]: (input) =>
           observeRpcEffect(
             WS_METHODS.projectMcpOauthDisconnect,

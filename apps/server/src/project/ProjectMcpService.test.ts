@@ -102,6 +102,7 @@ const projectMcpOAuthTestLayer = Layer.succeed(
     status: () => Effect.succeed("not-connected"),
     providerFor: () => Effect.die("unused"),
     begin: () => Effect.die("unused"),
+    continuePending: () => Effect.die("unused"),
     completeCallback: () => Effect.die("unused"),
     disconnect: () => Effect.die("unused"),
   }),

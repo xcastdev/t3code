@@ -260,6 +260,9 @@ function ScopedProjectMcpCatalogSettings({
   const updateEntry = useAtomCommand(projectMcpEnvironment.update, { reportFailure: false });
   const removeEntry = useAtomCommand(projectMcpEnvironment.remove, { reportFailure: false });
   const oauthBegin = useAtomCommand(projectMcpEnvironment.oauthBegin, { reportFailure: false });
+  const oauthContinue = useAtomCommand(projectMcpEnvironment.oauthContinue, {
+    reportFailure: false,
+  });
   const oauthDisconnect = useAtomCommand(projectMcpEnvironment.oauthDisconnect, {
     reportFailure: false,
   });
@@ -534,6 +537,18 @@ function ScopedProjectMcpCatalogSettings({
       else reportFailure("Failed to disconnect MCP OAuth", result);
     },
     [catalog, environmentId, oauthDisconnect, projectId, reportFailure],
+  );
+  const continueOAuth = useCallback(
+    async (entry: ProjectMcpServer) => {
+      const result = await oauthContinue({ environmentId, input: { projectId, id: entry.id } });
+      if (result._tag === "Success") {
+        catalog.refresh();
+        window.open(result.value.authorizationUrl, "_blank", "noopener,noreferrer");
+      } else {
+        reportFailure("Failed to continue MCP OAuth", result);
+      }
+    },
+    [catalog, environmentId, oauthContinue, projectId, reportFailure],
   );
   const removeExisting = useCallback(
     async (entry: ProjectMcpServer) => {
@@ -902,7 +917,7 @@ function ScopedProjectMcpCatalogSettings({
                                 type="button"
                                 variant="outline"
                                 disabled={isSaving || !canMutate}
-                                onClick={() => void connectOAuth(currentEditing)}
+                                onClick={() => void continueOAuth(currentEditing)}
                               >
                                 Continue authorization
                               </Button>
