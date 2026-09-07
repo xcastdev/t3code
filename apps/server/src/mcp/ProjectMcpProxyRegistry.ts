@@ -18,6 +18,7 @@ import {
   type ServerContext,
   type ServerNotifier,
 } from "@modelcontextprotocol/server";
+import { JSONObjectSchema, JSONValueSchema } from "@modelcontextprotocol/core";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -173,6 +174,29 @@ const credentialIds = (server: ResolvedProjectMcpServer): ReadonlyArray<ProjectM
   ];
 };
 
+const oauthServerFor = (
+  server: ResolvedProjectMcpServer,
+  secretValues: ReadonlyMap<string, string>,
+): ProjectMcpOAuth.ProjectMcpOAuthServer | undefined => {
+  if (server.transport.type === "stdio" || server.transport.authorization.type !== "oauth")
+    return undefined;
+  const registration = server.transport.authorization.registration;
+  const clientSecret =
+    registration.type === "pre-registered" && registration.clientSecret !== undefined
+      ? secretValues.get(registration.clientSecret.id)
+      : undefined;
+  return {
+    serverId: server.id,
+    resource: server.transport.url,
+    ...(registration.type === "pre-registered"
+      ? {
+          clientId: registration.clientId,
+          ...(clientSecret === undefined ? {} : { clientSecret }),
+        }
+      : {}),
+  };
+};
+
 const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server => {
   const discovered = broker.discoverResult;
   const discoveredInfo: unknown = discovered?.serverInfo ?? broker.serverVersion;
@@ -199,12 +223,39 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
     },
   });
   server.setRequestHandler("ping", (_request, context) => broker.ping(requestOptions(context)));
+  (
+    server as unknown as {
+      fallbackRequestHandler: (request: unknown, context: ServerContext) => Promise<unknown>;
+    }
+  ).fallbackRequestHandler = (request, context) => {
+    const extension = request as {
+      readonly method: string;
+      readonly params?: Record<string, unknown>;
+    };
+    return broker.requestExtension(
+      extension.method,
+      extension.params ?? {},
+      { params: JSONObjectSchema, result: JSONValueSchema },
+      requestOptions(context),
+    );
+  };
   if (capabilities.tools) {
     server.setRequestHandler("tools/list", (request, context) =>
       broker.listTools(request.params, requestOptions(context)),
     );
     server.setRequestHandler("tools/call", (request, context) =>
-      broker.callTool(request.params, requestOptions(context)),
+      broker.callTool(
+        {
+          ...request.params,
+          ...(context.mcpReq.inputResponses === undefined
+            ? {}
+            : { inputResponses: context.mcpReq.inputResponses }),
+          ...(typeof context.mcpReq.requestState() !== "string"
+            ? {}
+            : { requestState: context.mcpReq.requestState() }),
+        } as Parameters<ProjectMcpBroker["callTool"]>[0],
+        requestOptions(context),
+      ),
     );
   }
   if (capabilities.resources) {
@@ -464,7 +515,9 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
         server.transport.type !== "stdio" &&
         server.transport.authorization.type === "oauth" &&
         oauth._tag === "Some"
-          ? await Effect.runPromise(oauth.value.providerFor(server.id))
+          ? await Effect.runPromise(
+              oauth.value.providerFor(server.id, oauthServerFor(server, secretValues)),
+            )
           : undefined;
       return connect({
         serverId: server.id,
@@ -703,7 +756,9 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
     });
   }
 
-  const revokeAll = Effect.forEach([...sessions.keys()], revokeProviderSession, { discard: true });
+  const revokeAll = Effect.suspend(() =>
+    Effect.forEach([...sessions.keys()], revokeProviderSession, { discard: true }),
+  );
   return ProjectMcpProxyRegistry.of({
     registerSession,
     resolve,

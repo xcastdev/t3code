@@ -5,6 +5,7 @@ import {
   StreamableHTTPClientTransport,
   type FetchLike,
 } from "@modelcontextprotocol/client";
+import { InMemoryTransport, Server } from "@modelcontextprotocol/server";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
@@ -122,6 +123,21 @@ it.effect("issues opaque immutable endpoints and isolates sessions", () =>
     expect(Object.isFrozen(first[0]!.endpoint)).toBe(true);
     const resolved = yield* registry.resolve("provider-a", first[0]!.endpointHandle);
     expect(resolved?.server.id).toBe(serverId);
+  }),
+);
+
+it.effect("revokes sessions registered after the registry was created", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(async () => connection(async () => undefined));
+    const [issued] = yield* registry.registerSession({
+      providerSessionId: "provider-a",
+      threadId: ThreadId.make("thread-a"),
+      servers: [server],
+    });
+
+    yield* registry.revokeAll;
+
+    expect(yield* registry.resolve("provider-a", issued!.endpointHandle)).toBeUndefined();
   }),
 );
 
@@ -379,5 +395,157 @@ it.effect("accepts a legacy streamable HTTP client through a stateful session", 
     yield* Effect.promise(() => client.close());
 
     expect(tools.tools.map((tool) => tool.name)).toEqual(["echo"]);
+  }),
+);
+
+it.effect("bridges legacy upstream server requests to a modern downstream client", () =>
+  Effect.gen(function* () {
+    const [upstreamClientTransport, upstreamServerTransport] = InMemoryTransport.createLinkedPair();
+    const upstreamServer = new Server({ name: "legacy-upstream", version: "1" });
+    const roots = { roots: [{ uri: "file:///workspace", name: "workspace" }] };
+    upstreamServer.registerCapabilities({ tools: {} });
+    upstreamServer.setRequestHandler("tools/list", () => ({
+      tools: [
+        { name: "needs-roots", description: "Needs roots", inputSchema: { type: "object" } },
+        {
+          name: "needs-sampling",
+          description: "Needs sampling",
+          inputSchema: { type: "object" },
+        },
+        {
+          name: "needs-elicitation",
+          description: "Needs elicitation",
+          inputSchema: { type: "object" },
+        },
+      ],
+    }));
+    upstreamServer.setRequestHandler("tools/call", async (request, context) => {
+      const method =
+        request.params.name === "needs-roots"
+          ? ("roots/list" as const)
+          : request.params.name === "needs-sampling"
+            ? ("sampling/createMessage" as const)
+            : ("elicitation/create" as const);
+      const result =
+        method === "roots/list"
+          ? await context.mcpReq.send({ method })
+          : method === "sampling/createMessage"
+            ? await context.mcpReq.send({
+                method,
+                params: {
+                  messages: [{ role: "user", content: { type: "text", text: "Continue?" } }],
+                  maxTokens: 16,
+                },
+              })
+            : await context.mcpReq.send({
+                method,
+                params: {
+                  mode: "form",
+                  message: "Continue?",
+                  requestedSchema: {
+                    type: "object",
+                    properties: { approved: { type: "boolean" } },
+                    required: ["approved"],
+                  },
+                },
+              });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        isError: false,
+      };
+    });
+    const upstreamClient = new Client(
+      { name: "legacy-upstream-client", version: "1" },
+      {
+        capabilities: { roots: { listChanged: true }, sampling: {}, elicitation: {} },
+        versionNegotiation: { mode: "legacy" },
+      },
+    );
+    yield* Effect.promise(() => upstreamServer.connect(upstreamServerTransport));
+    yield* Effect.promise(() => upstreamClient.connect(upstreamClientTransport));
+
+    const registry = yield* makeRegistry(async () => ({
+      client: upstreamClient as unknown as ProjectMcpClient,
+      transport,
+      protocolEra: "legacy" as const,
+      negotiatedProtocolVersion: "2025-11-25",
+      discoverResult: undefined,
+      serverCapabilities: { tools: {} },
+      serverVersion: { name: "legacy-upstream", version: "1" },
+      close: async () => {
+        await Promise.allSettled([upstreamClient.close(), upstreamServer.close()]);
+      },
+    }));
+    const [issued] = yield* registry.registerSession({
+      providerSessionId: "provider-a",
+      threadId: ThreadId.make("thread-a"),
+      servers: [server],
+    });
+    const sessions = fixtureSessionRegistry();
+    const fetchFn: FetchLike = async (input, init) => {
+      const request = new Request(String(input), init);
+      const effectRequest = HttpServerRequest.fromWeb(request);
+      const response = await Effect.runPromise(
+        ProjectMcpProxyHttpServer.handleProjectMcpProxyRequest(effectRequest).pipe(
+          Effect.provideService(McpSessionRegistry.McpSessionRegistry, sessions),
+          Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, registry),
+        ),
+      );
+      return HttpServerResponse.toWeb(response);
+    };
+    const downstreamClient = new Client(
+      { name: "modern-downstream-client", version: "1" },
+      {
+        capabilities: {
+          roots: { listChanged: true },
+          sampling: {},
+          elicitation: { form: {} },
+        },
+      },
+    );
+    downstreamClient.setRequestHandler("roots/list", async () => roots);
+    downstreamClient.setRequestHandler("sampling/createMessage", async () => ({
+      model: "fixture",
+      role: "assistant",
+      content: { type: "text", text: "sampled" },
+    }));
+    downstreamClient.setRequestHandler("elicitation/create", async () => ({
+      action: "accept",
+      content: { approved: true },
+    }));
+    const downstreamTransport = new StreamableHTTPClientTransport(issued!.endpoint, {
+      authProvider: { token: async () => "provider-token" },
+      fetch: fetchFn,
+    });
+
+    yield* Effect.promise(() => downstreamClient.connect(downstreamTransport));
+    const results = [];
+    for (const name of ["needs-roots", "needs-sampling", "needs-elicitation"] as const) {
+      results.push(yield* Effect.promise(() => downstreamClient.callTool({ name, arguments: {} })));
+    }
+    yield* Effect.promise(() => downstreamClient.close());
+    yield* registry.revokeProviderSession("provider-a");
+
+    expect(results.map((result) => result.isError)).toEqual([false, false, false]);
+    // @effect-diagnostics-next-line preferSchemaOverJson:off
+    expect(results[0]?.content).toEqual([{ type: "text", text: JSON.stringify(roots) }]);
+    expect(results[1]?.content).toEqual([
+      {
+        type: "text",
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        text: JSON.stringify({
+          model: "fixture",
+          role: "assistant",
+          content: { type: "text", text: "sampled" },
+        }),
+      },
+    ]);
+    expect(results[2]?.content).toEqual([
+      {
+        type: "text",
+        // @effect-diagnostics-next-line preferSchemaOverJson:off
+        text: JSON.stringify({ action: "accept", content: { approved: true } }),
+      },
+    ]);
   }),
 );

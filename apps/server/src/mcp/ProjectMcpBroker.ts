@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { McpServerId } from "@t3tools/contracts";
 import type {
@@ -10,6 +11,7 @@ import type {
   GetPromptRequestParams,
   GetPromptResult,
   InputRequiredResult,
+  InputRequest,
   ListPromptsRequest,
   ListPromptsResult,
   ListResourceTemplatesRequest,
@@ -27,7 +29,11 @@ import type {
   StandardSchemaV1,
   SubscriptionFilter,
 } from "@modelcontextprotocol/client";
-import { isInputRequiredResult } from "@modelcontextprotocol/client";
+import {
+  isInputRequiredResult,
+  ProtocolError,
+  ProtocolErrorCode,
+} from "@modelcontextprotocol/client";
 
 import type { ProjectMcpClient, ProjectMcpConnection } from "./ProjectMcpConnection.ts";
 
@@ -115,9 +121,45 @@ interface InputState {
   readonly method: "tools/call";
   readonly paramsHash: string;
   readonly upstreamRequestState?: string;
+  readonly legacyInput?: {
+    readonly key: string;
+    readonly method: LegacyServerRequestMethod;
+  };
   readonly round: number;
   readonly expiresAt: number;
 }
+
+type LegacyServerRequestMethod = "roots/list" | "sampling/createMessage" | "elicitation/create";
+
+interface LegacyInputContext {
+  readonly inputResponses?: Record<string, unknown>;
+  readonly inputKey?: string;
+  readonly inputMethod?: LegacyServerRequestMethod;
+}
+
+interface LegacyInputRequiredData {
+  readonly t3LegacyInputRequired: true;
+  readonly key?: string;
+  readonly request: InputRequest;
+}
+
+const LEGACY_INPUT_REQUIRED_MARKER = "t3LegacyInputRequired";
+
+const isLegacyServerRequestMethod = (value: unknown): value is LegacyServerRequestMethod =>
+  value === "roots/list" || value === "sampling/createMessage" || value === "elicitation/create";
+
+const legacyInputRequiredData = (error: unknown): LegacyInputRequiredData | undefined => {
+  if (!(error instanceof ProtocolError) || !isRecord(error.data)) return undefined;
+  if (error.data[LEGACY_INPUT_REQUIRED_MARKER] !== true) return undefined;
+  const request = error.data.request;
+  if (!isRecord(request) || !isLegacyServerRequestMethod(request.method)) return undefined;
+  const key = error.data.key;
+  return {
+    t3LegacyInputRequired: true,
+    ...(typeof key === "string" ? { key } : {}),
+    request: request as unknown as InputRequest,
+  };
+};
 
 const canonicalJson = (value: unknown): string => {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -173,6 +215,7 @@ export class ProjectMcpBroker {
   private readonly requestStateSecret: string | Uint8Array;
   private readonly now: () => number;
   private readonly extensionAdapters: ReadonlyMap<string, ProjectMcpExtensionAdapter>;
+  private readonly legacyInputContext = new AsyncLocalStorage<LegacyInputContext>();
 
   constructor(options: ProjectMcpBrokerOptions) {
     this.connection = options.connection;
@@ -228,10 +271,53 @@ export class ProjectMcpBroker {
         ? this.verifyInputState(input.requestState, input)
         : undefined;
     const outbound = state ? this.retryParams(input, state) : params;
-    const result = (await this.method("callTool")(outbound as ProjectMcpCallToolParams, {
-      ...options,
-      allowInputRequired: true,
-    })) as ProjectMcpCallToolResult;
+    let result: ProjectMcpCallToolResult;
+    const invoke = () =>
+      this.method("callTool")(outbound as ProjectMcpCallToolParams, {
+        ...options,
+        allowInputRequired: true,
+      }) as Promise<ProjectMcpCallToolResult>;
+    try {
+      result = this.shouldBridgeLegacyServerRequests()
+        ? await this.legacyInputContext.run(
+            {
+              ...(isRecord(input.inputResponses) && !Array.isArray(input.inputResponses)
+                ? { inputResponses: input.inputResponses }
+                : {}),
+              ...(state?.legacyInput?.key === undefined ? {} : { inputKey: state.legacyInput.key }),
+              ...(state?.legacyInput?.method === undefined
+                ? {}
+                : { inputMethod: state.legacyInput.method }),
+            },
+            invoke,
+          )
+        : await invoke();
+    } catch (error) {
+      const pending = this.shouldBridgeLegacyServerRequests()
+        ? legacyInputRequiredData(error)
+        : undefined;
+      if (pending === undefined) throw error;
+      const key = pending.key ?? `legacy-input-${state?.round ?? 0}`;
+      result = {
+        resultType: "input_required",
+        inputRequests: { [key]: pending.request },
+      };
+      const round = state ? state.round + 1 : 0;
+      if (round > MAX_INPUT_ROUNDS) throw new ProjectMcpBrokerError("input_round_limit");
+      return {
+        ...result,
+        requestState: this.signInputState({
+          version: 1,
+          serverId: String(this.serverId),
+          providerSessionId: this.providerSessionId,
+          method: "tools/call",
+          paramsHash: canonicalJson(paramsForHash(input)),
+          legacyInput: { key, method: pending.request.method as LegacyServerRequestMethod },
+          round,
+          expiresAt: this.now() + INPUT_STATE_TTL_MS,
+        }),
+      };
+    }
     if (!isInputRequiredResult(result)) return result;
     const round = state ? state.round + 1 : 0;
     if (round > MAX_INPUT_ROUNDS) throw new ProjectMcpBrokerError("input_round_limit");
@@ -410,6 +496,43 @@ export class ProjectMcpBroker {
       : { ...withoutBrokerState, requestState: state.upstreamRequestState };
   }
 
+  private shouldBridgeLegacyServerRequests(): boolean {
+    return this.protocolEra === "legacy" && this.downstreamProtocolEra === "modern";
+  }
+
+  private handleUpstreamServerRequest(
+    method: LegacyServerRequestMethod,
+    request: unknown,
+    handler: (request: unknown) => unknown | Promise<unknown>,
+  ): unknown | Promise<unknown> {
+    if (!this.shouldBridgeLegacyServerRequests()) return handler(request);
+    const context = this.legacyInputContext.getStore();
+    if (!context) return handler(request);
+    const key = context.inputMethod === method ? context.inputKey : undefined;
+    if (
+      key !== undefined &&
+      context.inputResponses !== undefined &&
+      key in context.inputResponses
+    ) {
+      return context.inputResponses[key];
+    }
+    const params =
+      isRecord(request) && isRecord(request.params) ? { params: request.params } : undefined;
+    const inputRequest = {
+      method,
+      ...(params ?? {}),
+    } as InputRequest;
+    throw new ProtocolError(
+      ProtocolErrorCode.InternalError,
+      "The MCP proxy needs downstream input.",
+      {
+        [LEGACY_INPUT_REQUIRED_MARKER]: true,
+        ...(key === undefined ? {} : { key }),
+        request: inputRequest,
+      },
+    );
+  }
+
   setHandlers(handlers: ProjectMcpBrokerHandlers | undefined): void {
     if (!handlers) return;
     const client = this.connection.client;
@@ -460,11 +583,26 @@ export class ProjectMcpBroker {
         method: string,
         handler: (request: unknown) => unknown | Promise<unknown>,
       ) => void;
-      if (handlers.onRootsRequest) setRequestHandler("roots/list", handlers.onRootsRequest);
+      if (handlers.onRootsRequest)
+        setRequestHandler("roots/list", (request) =>
+          this.handleUpstreamServerRequest("roots/list", request, handlers.onRootsRequest!),
+        );
       if (handlers.onSamplingRequest)
-        setRequestHandler("sampling/createMessage", handlers.onSamplingRequest);
+        setRequestHandler("sampling/createMessage", (request) =>
+          this.handleUpstreamServerRequest(
+            "sampling/createMessage",
+            request,
+            handlers.onSamplingRequest!,
+          ),
+        );
       if (handlers.onElicitationRequest)
-        setRequestHandler("elicitation/create", handlers.onElicitationRequest);
+        setRequestHandler("elicitation/create", (request) =>
+          this.handleUpstreamServerRequest(
+            "elicitation/create",
+            request,
+            handlers.onElicitationRequest!,
+          ),
+        );
     }
   }
 }

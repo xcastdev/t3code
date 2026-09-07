@@ -89,6 +89,62 @@ it("signs input-required state and restores the upstream request state on retry"
   });
 });
 
+it("bridges legacy upstream server requests through modern input-required rounds", async () => {
+  let rootsHandler: ((request: unknown) => unknown | Promise<unknown>) | undefined;
+  const roots = { roots: [{ uri: "file:///workspace", name: "workspace" }] };
+  const client = makeClient({
+    setRequestHandler: ((method: string, handler: (request: unknown) => unknown) => {
+      if (method === "roots/list") rootsHandler = handler;
+    }) as NonNullable<ProjectMcpClient["setRequestHandler"]>,
+    callTool: (async () => {
+      if (rootsHandler === undefined) throw new Error("roots handler was not installed");
+      const result = await rootsHandler({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "roots/list",
+      });
+      return {
+        content: [{ type: "text", text: JSON.stringify(result) }],
+        isError: false,
+      };
+    }) as NonNullable<ProjectMcpClient["callTool"]>,
+  });
+  let forwarded = 0;
+  const broker = new ProjectMcpBroker({
+    connection: connection(client, "legacy"),
+    serverId,
+    providerSessionId: "provider-session",
+    downstreamProtocolEra: "modern",
+    requestStateSecret: "broker-secret",
+    handlers: {
+      onRootsRequest: async () => {
+        forwarded += 1;
+        return roots;
+      },
+    },
+  });
+
+  const pending = await broker.callTool({ name: "needs-roots", arguments: {} });
+  expect(pending).toMatchObject({
+    resultType: "input_required",
+    inputRequests: { "legacy-input-0": { method: "roots/list" } },
+  });
+  if (pending.resultType !== "input_required" || typeof pending.requestState !== "string")
+    throw new Error("expected a signed input-required state");
+
+  const complete = await broker.callTool({
+    name: "needs-roots",
+    arguments: {},
+    inputResponses: { "legacy-input-0": roots },
+    requestState: pending.requestState,
+  });
+  expect(complete).toEqual({
+    content: [{ type: "text", text: JSON.stringify(roots) }],
+    isError: false,
+  });
+  expect(forwarded).toBe(0);
+});
+
 it("rejects tampered input state before contacting the upstream server", async () => {
   let calls = 0;
   const broker = new ProjectMcpBroker({
