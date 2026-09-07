@@ -68,6 +68,7 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProjectMcpService from "../../project/ProjectMcpService.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
@@ -2469,6 +2470,8 @@ describe("agent browser access", () => {
     Effect.gen(function* () {
       const threadId = asThreadId("thread-project-mcp-browser-off");
       const requests: Array<{
+        readonly threadId: ThreadId;
+        readonly providerInstanceId: ProviderInstanceId;
         readonly includePreview?: boolean;
         readonly projectMcpServers?: ReadonlyArray<ResolvedProjectMcpServer>;
       }> = [];
@@ -2488,7 +2491,24 @@ describe("agent browser access", () => {
           issueMcpCredential: (request) =>
             Effect.sync(() => {
               requests.push(request);
-              return undefined;
+              return {
+                config: {
+                  environmentId: EnvironmentId.make("provider-service-environment"),
+                  threadId: request.threadId,
+                  providerSessionId: "project-only-provider-session",
+                  providerInstanceId: request.providerInstanceId,
+                  endpoint: "http://127.0.0.1:43123/mcp",
+                  authorizationHeader: "Bearer preview-token",
+                  projectServers: [
+                    {
+                      id: projectMcpServer.id,
+                      name: projectMcpServer.name,
+                      endpoint: new URL("http://127.0.0.1:43123/mcp/project/project-only"),
+                      authorizationHeader: "Bearer project-token",
+                    },
+                  ],
+                },
+              };
             }),
         },
         makeProviderProjectContextTestLayer(
@@ -2523,6 +2543,8 @@ describe("agent browser access", () => {
           threadId,
           runtimeMode: "full-access",
         });
+
+        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
       }).pipe(Effect.provide(providerLayer));
 
       assert.equal(requests.length, 1);
@@ -2531,6 +2553,18 @@ describe("agent browser access", () => {
       assert.equal(request.providerInstanceId, codexInstanceId);
       assert.equal(request.includePreview, false);
       assert.deepEqual(request.projectMcpServers, [projectMcpServer]);
+      assert.deepEqual(
+        (codex.startSession.mock.calls[0]?.[0] as { projectMcpServers?: unknown })
+          .projectMcpServers,
+        [
+          {
+            id: projectMcpServer.id,
+            name: projectMcpServer.name,
+            endpoint: new URL("http://127.0.0.1:43123/mcp/project/project-only"),
+            authorizationHeader: "Bearer project-token",
+          },
+        ],
+      );
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

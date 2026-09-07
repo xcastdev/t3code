@@ -296,9 +296,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         ...(projectMcpServers && projectMcpServers.length > 0 ? { projectMcpServers } : {}),
         ...(resolveProjectMcpSecret === undefined ? {} : { resolveProjectMcpSecret }),
       });
-      if (credential) {
-        yield* Effect.sync(() => McpProviderSession.setMcpProviderSession(credential.config));
-      }
+      yield* Effect.sync(() => {
+        if (!includePreview) {
+          // Project MCP endpoints are passed explicitly to the adapter below.
+          // Do not leave the shared session config populated: adapters use
+          // its presence to attach the managed `t3-code` preview server.
+          McpProviderSession.clearMcpProviderSession(threadId);
+        } else if (credential) {
+          McpProviderSession.setMcpProviderSession(credential.config);
+        }
+      });
       return credential;
     });
   const clearMcpSession = (threadId: ThreadId) =>

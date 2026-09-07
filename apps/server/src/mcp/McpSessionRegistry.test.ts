@@ -56,6 +56,21 @@ it.effect("stores only a token hash, resolves the bearer token, and revokes by t
   }),
 );
 
+it.effect("can issue a project-only credential without preview capability", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry(() => 1_000);
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("thread-project-only"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      includePreview: false,
+    });
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    const scope = yield* registry.resolve(token);
+
+    expect(scope?.capabilities.has("preview")).toBe(false);
+  }),
+);
+
 it.effect("builds MCP endpoints from the bound server host", () =>
   Effect.gen(function* () {
     const cases = [

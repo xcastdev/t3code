@@ -22,6 +22,12 @@ import * as ProjectMcpProxyRegistry from "./ProjectMcpProxyRegistry.ts";
 export interface McpCredentialRequest {
   readonly threadId: ThreadId;
   readonly providerInstanceId: ProviderInstanceId;
+  /**
+   * Project MCP may remain available when the managed browser preview is
+   * disabled. The default keeps the existing preview-enabled behavior for
+   * callers that do not need the narrower scope.
+   */
+  readonly includePreview?: boolean;
   readonly projectMcpServers?: ReadonlyArray<ResolvedProjectMcpServer>;
   readonly resolveProjectMcpSecret?: (
     serverId: McpServerId,
@@ -159,7 +165,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         providerSessionId,
         providerInstanceId: ProviderInstanceId.make(request.providerInstanceId),
         capabilities: new Set<McpInvocationContext.McpCapability>([
-          "preview",
+          ...(request.includePreview === false ? [] : ["preview" as const]),
           ...(projectEndpoints.length > 0 ? ["project" as const] : []),
         ]),
         issuedAt,
