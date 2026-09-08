@@ -150,7 +150,7 @@ interface RootsOwner {
   readonly owner: object;
   readonly handler: PushHandler;
   readonly generation: number;
-  readonly previous: RootsOwner | undefined;
+  previous: RootsOwner | undefined;
   state: RootsOwnerState;
 }
 
@@ -165,6 +165,7 @@ export class ProjectMcpConnectionCoordinator {
   private owner: PushHandler | undefined;
   private rootsOwner: RootsOwner | undefined;
   private rootsOwnerGeneration = 0;
+  private pendingRootsOwnerCount = 0;
   private readonly releasedRootsOwners = new WeakSet<object>();
   private readonly queue: Array<() => void> = [];
   private readonly listeners = new Set<(notification: Notification) => void | Promise<void>>();
@@ -326,18 +327,38 @@ export class ProjectMcpConnectionCoordinator {
       state: "pending",
     };
     this.rootsOwner = record;
+    this.pendingRootsOwnerCount += 1;
     return { record };
   }
 
   commitRootsOwner(replacement: RootsOwnerReplacement): void {
-    if (replacement.record.state === "pending") replacement.record.state = "committed";
+    if (this.settleRootsOwner(replacement, "committed") === undefined) return;
+    this.compactRootsOwnerHistory();
   }
 
   rollbackRootsOwner(replacement: RootsOwnerReplacement): void {
-    const failed = replacement.record;
-    failed.state = "failed";
-    if (this.rootsOwner !== failed) return;
-    this.rootsOwner = this.nearestViableRootsOwner(failed.previous);
+    const failed = this.settleRootsOwner(replacement, "failed");
+    if (failed === undefined) return;
+    if (this.rootsOwner === failed) {
+      this.rootsOwner = this.nearestViableRootsOwner(failed.previous);
+    }
+    this.compactRootsOwnerHistory();
+  }
+
+  private settleRootsOwner(
+    replacement: RootsOwnerReplacement,
+    state: Exclude<RootsOwnerState, "pending">,
+  ): RootsOwner | undefined {
+    const record = replacement.record;
+    if (record.state !== "pending") return undefined;
+    record.state = state;
+    this.pendingRootsOwnerCount -= 1;
+    return record;
+  }
+
+  private compactRootsOwnerHistory(): void {
+    if (this.pendingRootsOwnerCount !== 0) return;
+    if (this.rootsOwner !== undefined) this.rootsOwner.previous = undefined;
   }
 
   private isViableRootsOwner(record: RootsOwner | undefined): boolean {
