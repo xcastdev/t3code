@@ -405,9 +405,16 @@ export class ProjectMcpConnectionCoordinator {
   }
 
   releaseRootsOwner(owner: object): void {
+    const current = this.rootsOwner;
     this.releasedRootsOwners.add(owner);
-    if (this.rootsOwner?.owner === owner) this.rootsOwner = undefined;
-    else this.compactRootsOwnerHistory();
+    if (current?.owner === owner) {
+      this.rootsOwner =
+        current.state === "pending" ? this.nearestViableRootsOwner(current.previous) : undefined;
+      current.previous = undefined;
+      this.compactRootsOwnerHistory();
+      return;
+    }
+    this.compactRootsOwnerHistory();
   }
 
   private resourceTransition(

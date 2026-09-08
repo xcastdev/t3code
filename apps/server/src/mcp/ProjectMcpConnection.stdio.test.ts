@@ -549,4 +549,162 @@ it("tracks roots owner generations through failure, release, and close", async (
     coordinator.commitRootsOwner(second);
     await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///b" }] });
   }
+
+  {
+    // A committed; B pending; release B; B later fails.
+    const { coordinator, rootsList } = makeCoordinator();
+    const healthyOwner = {};
+    const healthy = coordinator.replaceRootsOwner(healthyOwner, () => ({
+      roots: [{ uri: "file:///healthy" }],
+    }))!;
+    coordinator.commitRootsOwner(healthy);
+
+    const pendingOwner = {};
+    const pending = coordinator.replaceRootsOwner(pendingOwner, () => ({
+      roots: [{ uri: "file:///pending" }],
+    }))!;
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///pending" }] });
+
+    coordinator.releaseRootsOwner(pendingOwner);
+    expect(retainedRootsGenerations(coordinator)).toBe(1);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///healthy" }] });
+
+    coordinator.rollbackRootsOwner(pending);
+    expect(retainedRootsGenerations(coordinator)).toBe(1);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///healthy" }] });
+  }
+
+  {
+    // A committed; B pending; release B; B later commits.
+    const { coordinator, rootsList } = makeCoordinator();
+    const healthyOwner = {};
+    const healthy = coordinator.replaceRootsOwner(healthyOwner, () => ({
+      roots: [{ uri: "file:///healthy" }],
+    }))!;
+    coordinator.commitRootsOwner(healthy);
+
+    const pendingOwner = {};
+    const pending = coordinator.replaceRootsOwner(pendingOwner, () => ({
+      roots: [{ uri: "file:///pending" }],
+    }))!;
+    coordinator.releaseRootsOwner(pendingOwner);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///healthy" }] });
+
+    coordinator.commitRootsOwner(pending);
+    expect(retainedRootsGenerations(coordinator)).toBe(1);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///healthy" }] });
+  }
+
+  {
+    // A committed; B pending and released; C becomes current and commits; B settles late.
+    const { coordinator, rootsList } = makeCoordinator();
+    const healthy = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///healthy" }],
+    }))!;
+    coordinator.commitRootsOwner(healthy);
+
+    const releasedOwner = {};
+    const released = coordinator.replaceRootsOwner(releasedOwner, () => ({
+      roots: [{ uri: "file:///released" }],
+    }))!;
+    coordinator.releaseRootsOwner(releasedOwner);
+
+    const current = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///current" }],
+    }))!;
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///current" }] });
+    coordinator.commitRootsOwner(current);
+    expect(retainedRootsGenerations(coordinator)).toBe(1);
+
+    coordinator.rollbackRootsOwner(released);
+    expect(retainedRootsGenerations(coordinator)).toBe(1);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///current" }] });
+  }
+
+  {
+    // A committed; B pending; C pending; release active C.
+    const { coordinator, rootsList } = makeCoordinator();
+    const healthy = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///healthy" }],
+    }))!;
+    coordinator.commitRootsOwner(healthy);
+    const pendingOwner = {};
+    const pending = coordinator.replaceRootsOwner(pendingOwner, () => ({
+      roots: [{ uri: "file:///pending" }],
+    }))!;
+    const activeOwner = {};
+    const active = coordinator.replaceRootsOwner(activeOwner, () => ({
+      roots: [{ uri: "file:///active" }],
+    }))!;
+
+    coordinator.releaseRootsOwner(activeOwner);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///pending" }] });
+    coordinator.rollbackRootsOwner(active);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///pending" }] });
+    coordinator.rollbackRootsOwner(pending);
+    expect(retainedRootsGenerations(coordinator)).toBe(1);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///healthy" }] });
+  }
+
+  {
+    // A committed; B pending; C pending; release non-current B.
+    const { coordinator, rootsList } = makeCoordinator();
+    const healthy = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///healthy" }],
+    }))!;
+    coordinator.commitRootsOwner(healthy);
+    const releasedOwner = {};
+    const released = coordinator.replaceRootsOwner(releasedOwner, () => ({
+      roots: [{ uri: "file:///released" }],
+    }))!;
+    const active = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///active" }],
+    }))!;
+
+    coordinator.releaseRootsOwner(releasedOwner);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///active" }] });
+    coordinator.rollbackRootsOwner(active);
+    expect(retainedRootsGenerations(coordinator)).toBe(1);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///healthy" }] });
+    coordinator.rollbackRootsOwner(released);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///healthy" }] });
+  }
+
+  {
+    // A committed; B committed; release B must not resurrect A.
+    const { coordinator, rootsList } = makeCoordinator();
+    const healthy = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///healthy" }],
+    }))!;
+    coordinator.commitRootsOwner(healthy);
+    const activeOwner = {};
+    const active = coordinator.replaceRootsOwner(activeOwner, () => ({
+      roots: [{ uri: "file:///active" }],
+    }))!;
+    coordinator.commitRootsOwner(active);
+
+    coordinator.releaseRootsOwner(activeOwner);
+    expect(retainedRootsGenerations(coordinator)).toBe(0);
+    await expectNoRootsOwner(rootsList);
+  }
+
+  {
+    // Close permanently clears a pending owner, including release and late settlement.
+    const { coordinator, rootsList } = makeCoordinator();
+    const healthy = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///healthy" }],
+    }))!;
+    coordinator.commitRootsOwner(healthy);
+    const pendingOwner = {};
+    const pending = coordinator.replaceRootsOwner(pendingOwner, () => ({
+      roots: [{ uri: "file:///pending" }],
+    }))!;
+
+    await coordinator.close();
+    coordinator.releaseRootsOwner(pendingOwner);
+    coordinator.commitRootsOwner(pending);
+    coordinator.rollbackRootsOwner(pending);
+    expect(retainedRootsGenerations(coordinator)).toBe(0);
+    await expectNoRootsOwner(rootsList);
+  }
 });
