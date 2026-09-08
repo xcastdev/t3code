@@ -310,6 +310,13 @@ function ScopedProjectMcpCatalogSettings({
   const [editing, setEditing] = useState<ProjectMcpServer | null>(null);
   const [draft, setDraft] = useState<ProjectMcpDraft | null>(null);
   const savedDraft = useRef<ProjectMcpDraft | null>(null);
+  const oauthOperation = useRef(0);
+  useEffect(
+    () => () => {
+      oauthOperation.current++;
+    },
+    [],
+  );
   const [authorizationLink, setAuthorizationLink] = useState<{
     url: string;
     draft: ProjectMcpDraft | null;
@@ -323,12 +330,14 @@ function ScopedProjectMcpCatalogSettings({
   const nextArgumentKey = useRef(0);
 
   const openCreate = useCallback(() => {
+    oauthOperation.current++;
     setAuthorizationLink(null);
     setEditing(null);
     setDraft(EMPTY_DRAFT);
     setFieldErrors({});
   }, []);
   const openEdit = useCallback((entry: ProjectMcpServer) => {
+    oauthOperation.current++;
     setAuthorizationLink(null);
     setEditing(entry);
     const transport = entry.transport;
@@ -391,6 +400,7 @@ function ScopedProjectMcpCatalogSettings({
     setFieldErrors({});
   }, []);
   const closeForm = useCallback(() => {
+    oauthOperation.current++;
     setAuthorizationLink(null);
     setDraft(null);
     setEditing(null);
@@ -549,7 +559,10 @@ function ScopedProjectMcpCatalogSettings({
   );
   const connectOAuth = useCallback(
     async (entry: ProjectMcpServer) => {
+      const operation = ++oauthOperation.current;
+      setAuthorizationLink(null);
       const result = await oauthBegin({ environmentId, input: { projectId, id: entry.id } });
+      if (operation !== oauthOperation.current) return;
       if (result._tag === "Success") {
         catalog.refresh();
         setAuthorizationLink({ url: result.value.authorizationUrl, draft });
@@ -561,8 +574,10 @@ function ScopedProjectMcpCatalogSettings({
   );
   const disconnectOAuth = useCallback(
     async (entry: ProjectMcpServer) => {
+      const operation = ++oauthOperation.current;
       setAuthorizationLink(null);
       const result = await oauthDisconnect({ environmentId, input: { projectId, id: entry.id } });
+      if (operation !== oauthOperation.current) return;
       if (result._tag === "Success") catalog.refresh();
       else reportFailure("Failed to disconnect MCP OAuth", result);
     },
@@ -570,7 +585,10 @@ function ScopedProjectMcpCatalogSettings({
   );
   const continueOAuth = useCallback(
     async (entry: ProjectMcpServer) => {
+      const operation = ++oauthOperation.current;
+      setAuthorizationLink(null);
       const result = await oauthContinue({ environmentId, input: { projectId, id: entry.id } });
+      if (operation !== oauthOperation.current) return;
       if (result._tag === "Success") {
         catalog.refresh();
         setAuthorizationLink({ url: result.value.authorizationUrl, draft });

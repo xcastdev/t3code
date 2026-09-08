@@ -10,6 +10,7 @@ import {
   refreshAuthorization,
   registerClient,
   resolveClientMetadata,
+  selectClientAuthMethod,
   startAuthorization,
   type FetchLike,
   type OAuthClientInformationMixed,
@@ -326,6 +327,24 @@ const make = (config: ProjectMcpOAuthConfig) =>
             return (record?.generation ?? 0) === generation ? record : undefined;
           };
           const provider: OAuthClientProvider = {
+            // SDK 2.0's default token helper treats an empty secret as absent.
+            ...(server.clientSecret === "" && server.clientId !== undefined
+              ? ({
+                  addClientAuthentication: (headers, params, _url, metadata) => {
+                    const clientId = server.clientId!;
+                    const method = selectClientAuthMethod(
+                      { client_id: clientId, client_secret: "" },
+                      metadata?.token_endpoint_auth_methods_supported ?? [],
+                    );
+                    if (method === "client_secret_basic") {
+                      headers.set("Authorization", `Basic ${btoa(`${clientId}:`)}`);
+                    } else {
+                      params.set("client_id", clientId);
+                      if (method === "client_secret_post") params.set("client_secret", "");
+                    }
+                  },
+                } satisfies Pick<OAuthClientProvider, "addClientAuthentication">)
+              : {}),
             get redirectUrl() {
               return server.redirectUrl ?? initial?.redirectUrl ?? defaultRedirect;
             },
@@ -338,7 +357,8 @@ const make = (config: ProjectMcpOAuthConfig) =>
                     redirect_uris: [String(provider.redirectUrl)],
                     response_types: ["code"],
                     grant_types: ["authorization_code", "refresh_token"],
-                    token_endpoint_auth_method: server.clientSecret ? "client_secret_post" : "none",
+                    token_endpoint_auth_method:
+                      server.clientSecret !== undefined ? "client_secret_post" : "none",
                   } satisfies OAuthClientMetadata),
               });
             },
@@ -387,6 +407,9 @@ const make = (config: ProjectMcpOAuthConfig) =>
                     ? { metadata: info.authorizationServerMetadata }
                     : {}),
                   clientInformation,
+                  ...(provider.addClientAuthentication === undefined
+                    ? {}
+                    : { addClientAuthentication: provider.addClientAuthentication }),
                   refreshToken: record.tokens.refresh_token,
                   resource: new URL(server.resource),
                   fetchFn,
@@ -603,7 +626,7 @@ const make = (config: ProjectMcpOAuthConfig) =>
         const client: OAuthClientInformationMixed = server.clientId
           ? {
               client_id: server.clientId,
-              ...(server.clientSecret ? { client_secret: server.clientSecret } : {}),
+              ...(server.clientSecret !== undefined ? { client_secret: server.clientSecret } : {}),
               redirect_uris: [String(provider.redirectUrl)],
             }
           : providerServer.clientMetadataUrl &&

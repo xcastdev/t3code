@@ -832,6 +832,44 @@ describe("ProjectMcpSettings", () => {
     expect(commands.update).toHaveBeenCalledTimes(1);
   });
 
+  it("ignores a delayed OAuth response after disconnect", async () => {
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          url: undefined,
+          oauthStatus: "connected",
+          transport: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/endpoint",
+            headers: [],
+            authorization: { type: "oauth", registration: { type: "automatic" } },
+          },
+        },
+      ],
+      managed: [],
+      applications: [],
+    });
+    let finishBegin = () => {};
+    commands.oauthBegin.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishBegin = () =>
+          resolve({
+            _tag: "Success",
+            value: { authorizationUrl: "https://auth.example.com/stale" },
+          });
+      }),
+    );
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await click(button("Reconnect OAuth"));
+    await click(button("Disconnect OAuth"));
+    await act(async () => {
+      finishBegin();
+    });
+    expect(document.querySelector('a[href="https://auth.example.com/stale"]')).toBeNull();
+  });
+
   it("offers OAuth connect and disconnect actions", async () => {
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
     query.data = decodeProjectMcpCatalog({
@@ -865,6 +903,25 @@ describe("ProjectMcpSettings", () => {
       "https://auth.example.com/",
     );
     expect(query.refresh).toHaveBeenCalledTimes(1);
+    let finishOlder = () => {};
+    commands.oauthBegin.mockReturnValueOnce(
+      new Promise((resolve) => {
+        finishOlder = () =>
+          resolve({
+            _tag: "Success",
+            value: { authorizationUrl: "https://auth.example.com/older" },
+          });
+      }),
+    );
+    await click(button("Connect OAuth"));
+    expect(document.querySelector('a[target="_blank"]')).toBeNull();
+    await click(button("Connect OAuth"));
+    await act(async () => {
+      finishOlder();
+    });
+    expect(document.querySelector<HTMLAnchorElement>('a[target="_blank"]')?.href).toBe(
+      "https://auth.example.com/",
+    );
     open.mockRestore();
   });
 

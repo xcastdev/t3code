@@ -218,6 +218,70 @@ const prepareOAuth = Effect.fn(function* (
   });
 });
 
+for (const method of ["client_secret_post", "client_secret_basic"] as const) {
+  it.effect(
+    `preserves an explicit empty client secret through authorization and refresh using ${method}`,
+    () =>
+      Effect.gen(function* () {
+        const server = { ...fixtureServer, clientSecret: "" };
+        let exchanges = 0;
+        let clock = 1_800_000_000_000;
+        const fetchEmpty: FetchLike = async (input, init) => {
+          if (String(input).endsWith("/.well-known/oauth-authorization-server")) {
+            const response = await fetchRegistrationFixture(input, init);
+            return Response.json({
+              ...decodeObject(await response.json()),
+              token_endpoint_auth_methods_supported: [method],
+            });
+          }
+          if (String(input).endsWith("/token")) {
+            const body = new URLSearchParams(init?.body as string);
+            if (method === "client_secret_post") assert.equal(body.get("client_secret"), "");
+            else
+              assert.equal(
+                new Headers(init?.headers).get("authorization"),
+                `Basic ${btoa("registered-client:")}`,
+              );
+            exchanges++;
+            return Response.json({
+              access_token: `token-${exchanges}`,
+              token_type: "Bearer",
+              expires_in: 1,
+              refresh_token: "refresh",
+            });
+          }
+          return fetchRegistrationFixture(input, init);
+        };
+        const oauth = yield* prepareOAuth({
+          servers: [server],
+          fetch: fetchEmpty,
+          now: () => clock,
+        });
+        const started = yield* oauth.begin({ serverId });
+        assert.equal(yield* oauth.status(serverId, server), "authorization-pending");
+        assert.equal(
+          (yield* oauth.continuePending(serverId, server)).authorizationUrl,
+          started.authorizationUrl,
+        );
+        const provider = yield* oauth.providerFor(serverId, server);
+        assert.equal(provider.clientMetadata.token_endpoint_auth_method, "client_secret_post");
+        assert.equal(
+          (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+          200,
+        );
+        assert.equal(exchanges, 1);
+        assert.equal(yield* oauth.status(serverId, server), "connected");
+        clock += 2000;
+        const connected = yield* oauth.providerFor(serverId, server);
+        assert.equal(
+          (yield* Effect.promise(async () => connected.tokens()))?.access_token,
+          "token-2",
+        );
+        assert.equal(exchanges, 2);
+      }).pipe(Effect.provide(secretLayer)),
+  );
+}
+
 const callbackRequest = (authorizationUrl: string) => {
   const url = new URL("https://t3.example.test/oauth/project-mcp/callback");
   url.searchParams.set("state", new URL(authorizationUrl).searchParams.get("state")!);
