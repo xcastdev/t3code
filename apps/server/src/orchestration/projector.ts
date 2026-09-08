@@ -268,8 +268,22 @@ function upsertProjectCatalogDefinition(
     projectId,
     revision,
   );
+  const server: ProjectMcpServer = {
+    id: definition.logicalServerId,
+    name: definition.name,
+    transport: definition.transport,
+    enabled: definition.enabled,
+    providerInstanceIds: definition.providerInstanceIds,
+  };
   return {
     ...model,
+    projectMcpServers: [
+      ...(model.projectMcpServers ?? []).filter(
+        (entry) =>
+          !(entry.projectId === projectId && entry.server.id === definition.logicalServerId),
+      ),
+      { projectId: projectId as ProjectId, server },
+    ],
     mcpCatalog: {
       ...catalog,
       projectDefinitions: [
@@ -299,6 +313,9 @@ function removeProjectCatalogDefinition(
   );
   return {
     ...model,
+    projectMcpServers: (model.projectMcpServers ?? []).filter(
+      (entry) => !(entry.projectId === projectId && entry.server.id === logicalServerId),
+    ),
     mcpCatalog: {
       ...catalog,
       projectDefinitions: catalog.projectDefinitions.filter(
@@ -1222,8 +1239,9 @@ export function projectEvent(
                   ? {
                       ...entry,
                       ...(entry.disposedAt === undefined &&
-                      payload.revision > entry.appliedRevision &&
-                      payload.revision <= entry.desiredRevision
+                      payload.revision <= entry.desiredRevision &&
+                      (payload.revision > entry.appliedRevision ||
+                        (payload.revision === 0 && entry.application === undefined))
                         ? {
                             appliedRevision: payload.revision,
                             application: {
@@ -1262,8 +1280,9 @@ export function projectEvent(
                   ? {
                       ...entry,
                       ...(entry.disposedAt === undefined &&
-                      payload.revision > entry.appliedRevision &&
-                      payload.revision <= entry.desiredRevision
+                      payload.revision <= entry.desiredRevision &&
+                      (payload.revision > entry.appliedRevision ||
+                        (payload.revision === 0 && entry.application === undefined))
                         ? {
                             application: {
                               status: "failed" as const,

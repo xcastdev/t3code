@@ -46,6 +46,7 @@ import {
   McpCatalogMutationError,
   McpCatalogOperationError,
   McpCatalogSnapshot,
+  McpCatalogStaleRevisionError,
   McpCatalogStaleSessionError,
   McpDefinitionId,
   type ProjectMcpTransport,
@@ -106,6 +107,10 @@ import {
 } from "./orchestration/Normalizer.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
 import { OrchestrationCommandInvariantError } from "./orchestration/Errors.ts";
+import {
+  OrchestrationCommandIdConflictError,
+  OrchestrationCommandPreviouslyRejectedError,
+} from "./orchestration/Errors.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
 import {
@@ -138,7 +143,10 @@ import * as ReviewService from "./review/ReviewService.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
 import * as ProjectMcpService from "./project/ProjectMcpService.ts";
 import * as McpCatalogService from "./mcp/McpCatalogService.ts";
-import { applyMcpCatalogOverrides, resolveProjectCatalog } from "./mcp/McpCatalogResolver.ts";
+import {
+  catalogBaselineForProject as buildCatalogBaselineForProject,
+  resolveProjectCatalog,
+} from "./mcp/McpCatalogResolver.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as ProjectMcpProxyRegistry from "./mcp/ProjectMcpProxyRegistry.ts";
 import * as ProjectMcpOAuth from "./mcp/ProjectMcpOAuth.ts";
@@ -172,6 +180,10 @@ import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http
 import * as RelayClient from "@t3tools/shared/relayClient";
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
+const isOrchestrationCommandIdConflictError = Schema.is(OrchestrationCommandIdConflictError);
+const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
+  OrchestrationCommandPreviouslyRejectedError,
+);
 const isEnvironmentAuthorizationError = Schema.is(EnvironmentAuthorizationError);
 const isProjectMcpCreateError = Schema.is(ProjectMcpCreateError);
 const isProjectMcpUpdateError = Schema.is(ProjectMcpUpdateError);
@@ -1396,11 +1408,13 @@ const makeWsRpcLayer = (
       const preserveCatalogMutationError = <A, E, R>(
         operation: Effect.Effect<A, E, R>,
       ): Effect.Effect<A, McpCatalogMutationError | EnvironmentAuthorizationError, R> =>
-        operation.pipe(
-          Effect.mapError((error) =>
-            isEnvironmentAuthorizationError(error) ? error : toCatalogMutationError(error),
-          ),
-        );
+        projectMcpService
+          .withCatalogMutation(operation)
+          .pipe(
+            Effect.mapError((error) =>
+              isEnvironmentAuthorizationError(error) ? error : toCatalogMutationError(error),
+            ),
+          );
 
       const refreshMcpCatalog = () =>
         projectionSnapshotQuery.getCommandReadModel().pipe(
@@ -1418,14 +1432,19 @@ const makeWsRpcLayer = (
         dispatch: Effect.Effect<A, Error, never>,
         prepared: ProjectMcpSecretStore.PreparedProjectMcpSecrets | undefined,
       ) =>
-        dispatch.pipe(
-          Effect.catch((error) =>
-            (prepared?.rollback ?? Effect.void).pipe(
-              Effect.andThen(Effect.fail(toCatalogMutationError(error))),
+        Effect.uninterruptibleMask((restore) =>
+          restore(dispatch).pipe(
+            Effect.catch((error) =>
+              (isOrchestrationCommandInvariantError(error) ||
+              isOrchestrationCommandPreviouslyRejectedError(error) ||
+              isOrchestrationCommandIdConflictError(error)
+                ? (prepared?.rollback ?? Effect.void)
+                : Effect.void
+              ).pipe(Effect.andThen(Effect.fail(toCatalogMutationError(error)))),
             ),
+            Effect.andThen(prepared?.commit ?? Effect.void),
+            Effect.catch((error) => Effect.fail(toCatalogMutationError(error))),
           ),
-          Effect.andThen(prepared?.commit ?? Effect.void),
-          Effect.catch((error) => Effect.fail(toCatalogMutationError(error))),
         );
 
       const catalogDefinition = (input: {
@@ -1456,17 +1475,43 @@ const makeWsRpcLayer = (
       ): ReadonlyArray<McpCatalogDefinition> => {
         const catalog = readModel.mcpCatalog;
         if (catalog === undefined) return [];
-        return [
-          ...applyMcpCatalogOverrides(
-            catalog.globalDefinitions,
-            catalog.projectOverrides
-              .filter((entry) => entry.projectId === projectId)
-              .map((entry) => entry.override),
-          ),
-          ...catalog.projectDefinitions
-            .filter((entry) => entry.projectId === projectId)
-            .map((entry) => entry.definition),
-        ];
+        return buildCatalogBaselineForProject({
+          globalDefinitions: catalog.globalDefinitions,
+          projectDefinitions: catalog.projectDefinitions.map((entry) => entry.definition),
+          projectOverrides: catalog.projectOverrides.map((entry) => entry.override),
+          projectId,
+        });
+      };
+
+      const rejectExplicitCatalogLogicalId = (
+        readModel: OrchestrationReadModel,
+        logicalServerId: McpServerId,
+        except?: { readonly scope: "global" | "project"; readonly scopeId: string },
+      ) => {
+        const catalog = readModel.mcpCatalog;
+        const ownedByGlobal = catalog?.globalDefinitions.some(
+          (entry) =>
+            entry.logicalServerId === logicalServerId &&
+            !(except?.scope === "global" && except.scopeId === String(entry.scopeId)),
+        );
+        const ownedByProject = catalog?.projectDefinitions.find(
+          (entry) =>
+            entry.definition.logicalServerId === logicalServerId &&
+            !(except?.scope === "project" && except.scopeId === String(entry.projectId)),
+        );
+        const ownedByLegacy = readModel.projectMcpServers?.find(
+          (entry) =>
+            entry.server.id === logicalServerId &&
+            !(except?.scope === "project" && except.scopeId === String(entry.projectId)),
+        );
+        if (ownedByGlobal || ownedByProject !== undefined || ownedByLegacy !== undefined) {
+          return Effect.fail(
+            new McpCatalogOperationError({
+              message: `MCP logical server ID '${logicalServerId}' is already owned by another catalog definition.`,
+            }),
+          );
+        }
+        return Effect.void;
       };
 
       const oauthServerFor = (projectId: ProjectId, id: McpServerId) =>
@@ -1994,8 +2039,21 @@ const makeWsRpcLayer = (
             preserveCatalogMutationError(
               Effect.gen(function* () {
                 const environmentId = yield* serverEnvironment.getEnvironmentId;
+                const readModel = yield* readMcpCatalog();
                 const logicalServerId =
                   input.logicalServerId ?? McpServerId.make(yield* crypto.randomUUIDv4);
+                if (input.logicalServerId !== undefined) {
+                  yield* rejectExplicitCatalogLogicalId(readModel, logicalServerId);
+                }
+                const actualRevision = readModel.mcpCatalog?.globalRevision ?? 0;
+                if (input.expectedRevision !== actualRevision) {
+                  return yield* new McpCatalogStaleRevisionError({
+                    scope: "global",
+                    scopeId: environmentId,
+                    expectedRevision: input.expectedRevision,
+                    actualRevision,
+                  });
+                }
                 const prepared = yield* projectMcpSecrets.prepareCreate(
                   logicalServerId,
                   input.definition.transport,
@@ -2041,6 +2099,15 @@ const makeWsRpcLayer = (
                 if (existing === undefined) {
                   return yield* new McpCatalogOperationError({
                     message: "Global MCP definition was not found.",
+                  });
+                }
+                const actualRevision = readModel.mcpCatalog?.globalRevision ?? 0;
+                if (input.expectedRevision !== actualRevision) {
+                  return yield* new McpCatalogStaleRevisionError({
+                    scope: "global",
+                    scopeId: environmentId,
+                    expectedRevision: input.expectedRevision,
+                    actualRevision,
                   });
                 }
                 const prepared = yield* projectMcpSecrets.prepareUpdate(
@@ -2137,8 +2204,24 @@ const makeWsRpcLayer = (
               preserveCatalogMutationError(
                 Effect.gen(function* () {
                   const projectId = input.scopeId as ProjectId;
+                  const readModel = yield* readMcpCatalog();
                   const logicalServerId =
                     input.logicalServerId ?? McpServerId.make(yield* crypto.randomUUIDv4);
+                  if (input.logicalServerId !== undefined) {
+                    yield* rejectExplicitCatalogLogicalId(readModel, logicalServerId);
+                  }
+                  const actualRevision =
+                    readModel.mcpCatalog?.projectRevisions.find(
+                      (entry) => entry.projectId === projectId,
+                    )?.revision ?? 0;
+                  if (input.expectedRevision !== actualRevision) {
+                    return yield* new McpCatalogStaleRevisionError({
+                      scope: "project",
+                      scopeId: projectId,
+                      expectedRevision: input.expectedRevision,
+                      actualRevision,
+                    });
+                  }
                   const prepared = yield* projectMcpSecrets.prepareCreate(
                     logicalServerId,
                     input.definition.transport,
@@ -2190,6 +2273,18 @@ const makeWsRpcLayer = (
                   if (existing === undefined) {
                     return yield* new McpCatalogOperationError({
                       message: "Project MCP definition was not found.",
+                    });
+                  }
+                  const actualRevision =
+                    readModel.mcpCatalog?.projectRevisions.find(
+                      (entry) => entry.projectId === projectId,
+                    )?.revision ?? 0;
+                  if (input.expectedRevision !== actualRevision) {
+                    return yield* new McpCatalogStaleRevisionError({
+                      scope: "project",
+                      scopeId: projectId,
+                      expectedRevision: input.expectedRevision,
+                      actualRevision,
                     });
                   }
                   const prepared = yield* projectMcpSecrets.prepareUpdate(
@@ -2346,48 +2441,68 @@ const makeWsRpcLayer = (
                     activeSessionId: existing.catalogSessionId,
                   });
                 }
+                if (
+                  existing !== undefined &&
+                  thread.session?.mcpCatalogSessionId !== existing.catalogSessionId
+                ) {
+                  return yield* new McpCatalogStaleSessionError({
+                    threadId: input.threadId,
+                    requestedSessionId: input.mcpCatalogSessionId,
+                    activeSessionId:
+                      thread.session?.mcpCatalogSessionId ?? input.mcpCatalogSessionId,
+                  });
+                }
+                if (
+                  existing === undefined &&
+                  thread.session?.mcpCatalogSessionId !== undefined &&
+                  thread.session.mcpCatalogSessionId !== input.mcpCatalogSessionId
+                ) {
+                  return yield* new McpCatalogStaleSessionError({
+                    threadId: input.threadId,
+                    requestedSessionId: input.mcpCatalogSessionId,
+                    activeSessionId: thread.session.mcpCatalogSessionId,
+                  });
+                }
                 const providerInstanceId =
-                  thread.session?.providerInstanceId ?? thread.modelSelection.instanceId;
+                  existing?.providerInstanceId ??
+                  thread.session?.providerInstanceId ??
+                  thread.modelSelection.instanceId;
+                if (existing !== undefined && input.expectedRevision !== existing.desiredRevision) {
+                  return yield* new McpCatalogStaleRevisionError({
+                    scope: "session",
+                    scopeId: input.mcpCatalogSessionId,
+                    expectedRevision: input.expectedRevision,
+                    actualRevision: existing.desiredRevision,
+                  });
+                }
                 const baseline =
                   existing?.baseline ?? catalogBaselineForProject(readModel, thread.projectId);
                 const logicalServerId =
                   input.logicalServerId ?? McpServerId.make(yield* crypto.randomUUIDv4);
-                const prepared = yield* projectMcpSecrets.prepareCreate(
-                  logicalServerId,
-                  input.definition.transport,
-                );
-                const sessionSnapshot =
-                  existing ??
-                  ({
-                    catalogSessionId: input.mcpCatalogSessionId,
-                    threadId: input.threadId,
-                    providerInstanceId,
-                    baseline,
-                    desired: baseline,
-                    desiredRevision: 0,
-                    appliedRevision: 0,
-                  } satisfies McpCatalogSnapshot);
-                if (
-                  existing === undefined ||
-                  thread.session?.mcpCatalogSessionId !== existing.catalogSessionId
-                ) {
-                  yield* dispatchFromClient({
-                    type: "thread.mcp-catalog.initialize",
-                    commandId: yield* serverCommandId("mcp-catalog-session-initialize"),
-                    threadId: input.threadId,
-                    snapshot: sessionSnapshot,
-                    createdAt: yield* nowIso,
-                  });
+                if (input.logicalServerId !== undefined) {
+                  yield* rejectExplicitCatalogLogicalId(readModel, logicalServerId);
                 }
                 if (
-                  sessionSnapshot.desired.some((entry) => entry.logicalServerId === logicalServerId)
+                  baseline.some((entry) => entry.logicalServerId === logicalServerId) ||
+                  existing?.desired.some((entry) => entry.logicalServerId === logicalServerId)
                 ) {
-                  yield* prepared.rollback;
                   return yield* new McpCatalogOperationError({
                     message:
                       "An MCP definition with this logical ID already exists in the session.",
                   });
                 }
+                if (existing === undefined && input.expectedRevision !== 0) {
+                  return yield* new McpCatalogStaleRevisionError({
+                    scope: "session",
+                    scopeId: input.mcpCatalogSessionId,
+                    expectedRevision: input.expectedRevision,
+                    actualRevision: 0,
+                  });
+                }
+                const prepared = yield* projectMcpSecrets.prepareCreate(
+                  logicalServerId,
+                  input.definition.transport,
+                );
                 const definition = catalogDefinition({
                   scope: "session",
                   scopeId: String(input.mcpCatalogSessionId),
@@ -2397,27 +2512,53 @@ const makeWsRpcLayer = (
                   transport: prepared.transport,
                   enabled: input.definition.enabled,
                   providerInstanceIds: input.definition.providerInstanceIds,
-                  revision: sessionSnapshot.desiredRevision + 1,
+                  revision: (existing?.desiredRevision ?? 0) + 1,
                 });
-                yield* dispatchPreparedCatalog(
-                  dispatchFromClient({
-                    type: "thread.mcp-catalog.update",
-                    commandId: yield* serverCommandId("mcp-catalog-session-create"),
+                if (existing === undefined) {
+                  const snapshot = {
+                    catalogSessionId: input.mcpCatalogSessionId,
                     threadId: input.threadId,
-                    mcpCatalogSessionId: input.mcpCatalogSessionId,
-                    desiredCatalog: [...sessionSnapshot.desired, definition],
-                    expectedRevision: input.expectedRevision,
-                    updatedAt: yield* nowIso,
-                  }),
-                  prepared,
-                );
+                    providerInstanceId,
+                    baseline,
+                    desired: [...baseline, definition],
+                    desiredRevision: 1,
+                    appliedRevision: 0,
+                  } satisfies McpCatalogSnapshot;
+                  yield* dispatchPreparedCatalog(
+                    dispatchFromClient({
+                      type: "thread.mcp-catalog.initialize",
+                      commandId: yield* serverCommandId("mcp-catalog-session-initialize"),
+                      threadId: input.threadId,
+                      snapshot,
+                      createdAt: yield* nowIso,
+                    }),
+                    prepared,
+                  );
+                } else {
+                  yield* dispatchPreparedCatalog(
+                    dispatchFromClient({
+                      type: "thread.mcp-catalog.update",
+                      commandId: yield* serverCommandId("mcp-catalog-session-create"),
+                      threadId: input.threadId,
+                      mcpCatalogSessionId: input.mcpCatalogSessionId,
+                      desiredCatalog: [...existing.desired, definition],
+                      expectedRevision: input.expectedRevision,
+                      updatedAt: yield* nowIso,
+                    }),
+                    prepared,
+                  );
+                }
                 yield* refreshMcpCatalog();
                 const finalReadModel = yield* readMcpCatalog();
-                return (
-                  finalReadModel.mcpCatalog?.sessions.find(
-                    (entry) => entry.catalogSessionId === input.mcpCatalogSessionId,
-                  ) ?? sessionSnapshot
+                const finalSnapshot = finalReadModel.mcpCatalog?.sessions.find(
+                  (entry) => entry.catalogSessionId === input.mcpCatalogSessionId,
                 );
+                if (finalSnapshot === undefined) {
+                  return yield* new McpCatalogOperationError({
+                    message: "MCP catalog session initialization was not projected.",
+                  });
+                }
+                return finalSnapshot;
               }),
             ),
             { "rpc.aggregate": "mcp-catalog" },
@@ -2569,96 +2710,100 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "mcp-catalog" },
           ),
-        [WS_METHODS.mcpCatalogSubscribe]: (_input) =>
+        [WS_METHODS.mcpCatalogSubscribe]: (input) =>
           observeRpcStreamEffect(
             WS_METHODS.mcpCatalogSubscribe,
-            Effect.gen(function* () {
-              const subscription = yield* orchestrationEngine.subscribeDomainEvents;
-              const toChange = (event: OrchestrationEvent) => {
-                switch (event.type) {
-                  case "environment.mcp-definition.created":
-                  case "environment.mcp-definition.updated":
-                  case "environment.mcp-definition.removed":
-                    return {
-                      scope: "global" as const,
-                      scopeId: event.payload.environmentId,
-                      revision: event.payload.revision,
-                    };
-                  case "project.mcp-definition.created":
-                  case "project.mcp-definition.updated":
-                  case "project.mcp-definition.removed":
-                  case "project.mcp-override.upserted":
-                  case "project.mcp-override.removed":
-                    return {
-                      scope: "project" as const,
-                      scopeId: event.payload.projectId,
-                      revision: event.payload.revision,
-                    };
-                  case "project.mcp-server.created":
-                  case "project.mcp-server.updated":
-                  case "project.mcp-server.removed":
-                  case "project.deleted":
-                    return {
-                      scope: "project" as const,
-                      scopeId: event.payload.projectId,
-                      revision: 0,
-                    };
-                  case "thread.mcp-catalog.initialized":
-                    return {
-                      scope: "session" as const,
-                      scopeId: String(event.payload.snapshot.catalogSessionId),
-                      revision: event.payload.snapshot.desiredRevision,
-                    };
-                  case "thread.mcp-catalog.updated":
-                  case "thread.mcp-catalog.reset":
-                    return {
-                      scope: "session" as const,
-                      scopeId: String(event.payload.mcpCatalogSessionId),
-                      revision: event.payload.desiredRevision,
-                    };
-                  case "thread.mcp-catalog.disposed":
-                    return {
-                      scope: "session" as const,
-                      scopeId: String(event.payload.mcpCatalogSessionId),
-                      revision: event.payload.revision,
-                    };
-                  case "thread.mcp-catalog.applied":
-                  case "thread.mcp-catalog.apply-failed":
-                    return {
-                      scope: "session" as const,
-                      scopeId: String(event.payload.mcpCatalogSessionId),
-                      revision: event.payload.revision,
-                    };
-                  default:
-                    return undefined;
-                }
-              };
-              return Stream.fromSubscription(subscription).pipe(
-                Stream.mapEffect((event) => {
-                  const change = toChange(event);
-                  if (change === undefined || change.revision !== 0) {
-                    return Effect.succeed(change);
-                  }
-                  // Legacy project MCP events predate catalog revisions. The
-                  // subscription is already attached, so this read observes
-                  // the projection written for that event and preserves the
-                  // same revision clients use for new catalog commands.
-                  return readMcpCatalog().pipe(
-                    Effect.map((readModel) => ({
-                      ...change,
-                      revision:
-                        readModel.mcpCatalog?.projectRevisions.find(
-                          (entry) => entry.projectId === change.scopeId,
-                        )?.revision ?? 0,
-                    })),
-                    Effect.orDie,
+            input.catalog === false
+              ? Effect.succeed(Stream.empty)
+              : Effect.gen(function* () {
+                  // `catalog` is optional for compatibility with older clients:
+                  // omitted means subscribe, while an explicit false opts out.
+                  const subscription = yield* orchestrationEngine.subscribeDomainEvents;
+                  const toChange = (event: OrchestrationEvent) => {
+                    switch (event.type) {
+                      case "environment.mcp-definition.created":
+                      case "environment.mcp-definition.updated":
+                      case "environment.mcp-definition.removed":
+                        return {
+                          scope: "global" as const,
+                          scopeId: event.payload.environmentId,
+                          revision: event.payload.revision,
+                        };
+                      case "project.mcp-definition.created":
+                      case "project.mcp-definition.updated":
+                      case "project.mcp-definition.removed":
+                      case "project.mcp-override.upserted":
+                      case "project.mcp-override.removed":
+                        return {
+                          scope: "project" as const,
+                          scopeId: event.payload.projectId,
+                          revision: event.payload.revision,
+                        };
+                      case "project.mcp-server.created":
+                      case "project.mcp-server.updated":
+                      case "project.mcp-server.removed":
+                      case "project.deleted":
+                        return {
+                          scope: "project" as const,
+                          scopeId: event.payload.projectId,
+                          revision: 0,
+                        };
+                      case "thread.mcp-catalog.initialized":
+                        return {
+                          scope: "session" as const,
+                          scopeId: String(event.payload.snapshot.catalogSessionId),
+                          revision: event.payload.snapshot.desiredRevision,
+                        };
+                      case "thread.mcp-catalog.updated":
+                      case "thread.mcp-catalog.reset":
+                        return {
+                          scope: "session" as const,
+                          scopeId: String(event.payload.mcpCatalogSessionId),
+                          revision: event.payload.desiredRevision,
+                        };
+                      case "thread.mcp-catalog.disposed":
+                        return {
+                          scope: "session" as const,
+                          scopeId: String(event.payload.mcpCatalogSessionId),
+                          revision: event.payload.revision,
+                        };
+                      case "thread.mcp-catalog.applied":
+                      case "thread.mcp-catalog.apply-failed":
+                        return {
+                          scope: "session" as const,
+                          scopeId: String(event.payload.mcpCatalogSessionId),
+                          revision: event.payload.revision,
+                        };
+                      default:
+                        return undefined;
+                    }
+                  };
+                  return Stream.fromSubscription(subscription).pipe(
+                    Stream.mapEffect((event) => {
+                      const change = toChange(event);
+                      if (change === undefined || change.revision !== 0) {
+                        return Effect.succeed(change);
+                      }
+                      // Legacy project MCP events predate catalog revisions. The
+                      // subscription is already attached, so this read observes
+                      // the projection written for that event and preserves the
+                      // same revision clients use for new catalog commands.
+                      return readMcpCatalog().pipe(
+                        Effect.map((readModel) => ({
+                          ...change,
+                          revision:
+                            readModel.mcpCatalog?.projectRevisions.find(
+                              (entry) => entry.projectId === change.scopeId,
+                            )?.revision ?? 0,
+                        })),
+                        Effect.orDie,
+                      );
+                    }),
+                    Stream.filter(
+                      (change): change is NonNullable<typeof change> => change !== undefined,
+                    ),
                   );
                 }),
-                Stream.filter(
-                  (change): change is NonNullable<typeof change> => change !== undefined,
-                ),
-              );
-            }),
             { "rpc.aggregate": "mcp-catalog" },
           ),
         [WS_METHODS.projectMcpOauthBegin]: (input) =>

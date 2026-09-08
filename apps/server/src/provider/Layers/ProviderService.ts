@@ -11,6 +11,7 @@
  */
 import {
   CommandId,
+  McpCatalogSessionId,
   ModelSelection,
   NonNegativeInt,
   ThreadId,
@@ -20,6 +21,7 @@ import {
   ProviderSendTurnInput,
   ProviderSessionStartInput,
   ProviderStopSessionInput,
+  type OrchestrationCommand,
   ProviderUploadFeedbackInput,
   type ProviderInstanceId,
   type ProviderDriverKind,
@@ -48,7 +50,7 @@ import * as ServerConfig from "../../config.ts";
 import * as OrchestrationEngine from "../../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProjectMcpService from "../../project/ProjectMcpService.ts";
-import { resolveSessionCatalog } from "../../mcp/McpCatalogResolver.ts";
+import { catalogBaselineForProject, resolveSessionCatalog } from "../../mcp/McpCatalogResolver.ts";
 import {
   increment,
   providerMetricAttributes,
@@ -277,6 +279,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const projectMcpLeaseScopes = yield* Ref.make(new Map<ThreadId, ProjectMcpLeaseOwner>());
   let startGeneration = 0;
+  let catalogOperationGeneration = 0;
   const lifecycleLocks = new Map<ThreadId, { mutex: Semaphore.Semaphore; users: number }>();
   const withThreadLifecycle = <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
     Effect.acquireUseRelease(
@@ -439,27 +442,135 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           `Cannot start thread '${input.sessionInput.threadId}' because it is not in the durable read model.`,
         );
       }
-      const durableCatalogSnapshot: McpCatalogSnapshot | undefined =
-        typeof projectionSnapshotQuery.getCommandReadModel !== "function"
-          ? undefined
-          : yield* projectionSnapshotQuery.getCommandReadModel().pipe(
-              Effect.mapError((cause) =>
-                toValidationError(
-                  input.operation,
-                  "Could not read the durable MCP catalog session.",
-                  cause,
-                ),
+      type CatalogStartupCommand = Extract<
+        OrchestrationCommand,
+        {
+          type:
+            | "thread.mcp-catalog.initialize"
+            | "thread.mcp-catalog.dispose"
+            | "thread.mcp-catalog.applied"
+            | "thread.mcp-catalog.apply-failed";
+        }
+      >;
+      const dispatchCatalogCommand = (command: CatalogStartupCommand) =>
+        Option.isNone(orchestrationEngine)
+          ? Effect.fail(
+              toValidationError(
+                input.operation,
+                "The orchestration engine is unavailable for the durable MCP catalog.",
               ),
-              Effect.map((readModel) => {
-                const sessionId = thread.value.session?.mcpCatalogSessionId;
-                if (sessionId === undefined || readModel.mcpCatalog === undefined) return undefined;
-                const snapshot = readModel.mcpCatalog.sessions.find(
-                  (entry) => entry.catalogSessionId === sessionId,
+            )
+          : orchestrationEngine.value
+              .dispatch(command)
+              .pipe(
+                Effect.mapError((cause) =>
+                  toValidationError(
+                    input.operation,
+                    "Could not persist the durable MCP catalog session.",
+                    cause,
+                  ),
+                ),
+              );
+      const durableCatalogSnapshot: McpCatalogSnapshot | undefined =
+        typeof projectionSnapshotQuery.getCommandReadModel !== "function" ||
+        Option.isNone(orchestrationEngine)
+          ? undefined
+          : yield* projectMcpService.withCatalogMutation(
+              Effect.gen(function* () {
+                const commandReadModel = yield* projectionSnapshotQuery.getCommandReadModel!().pipe(
+                  Effect.mapError((cause) =>
+                    toValidationError(
+                      input.operation,
+                      "Could not read the durable MCP catalog session.",
+                      cause,
+                    ),
+                  ),
                 );
-                return snapshot?.threadId === input.sessionInput.threadId &&
-                  snapshot.providerInstanceId === input.providerInstanceId
-                  ? snapshot
-                  : undefined;
+                const catalog = commandReadModel.mcpCatalog;
+                const currentThread = commandReadModel.threads.find(
+                  (entry) => entry.id === input.sessionInput.threadId,
+                );
+                const linkedSessionId =
+                  currentThread?.session?.mcpCatalogSessionId ??
+                  thread.value.session?.mcpCatalogSessionId;
+                const linkedSnapshot =
+                  linkedSessionId === undefined || catalog === undefined
+                    ? undefined
+                    : catalog.sessions.find((entry) => entry.catalogSessionId === linkedSessionId);
+                const reusableSnapshot = catalog?.sessions.find(
+                  (entry) =>
+                    entry.threadId === input.sessionInput.threadId &&
+                    entry.providerInstanceId === input.providerInstanceId &&
+                    entry.disposedAt === undefined,
+                );
+
+                if (
+                  linkedSnapshot !== undefined &&
+                  linkedSnapshot.disposedAt === undefined &&
+                  linkedSnapshot.providerInstanceId !== input.providerInstanceId
+                ) {
+                  yield* dispatchCatalogCommand({
+                    type: "thread.mcp-catalog.dispose",
+                    commandId: CommandId.make(
+                      `server:mcp-catalog-dispose:${input.sessionInput.threadId}:${linkedSnapshot.catalogSessionId}:${++catalogOperationGeneration}`,
+                    ),
+                    threadId: input.sessionInput.threadId,
+                    mcpCatalogSessionId: linkedSnapshot.catalogSessionId,
+                    revision: linkedSnapshot.desiredRevision,
+                    disposedAt: yield* nowIso,
+                  });
+                }
+
+                if (
+                  reusableSnapshot !== undefined &&
+                  reusableSnapshot.catalogSessionId === linkedSessionId
+                ) {
+                  return reusableSnapshot;
+                }
+                if (reusableSnapshot !== undefined && linkedSessionId === undefined) {
+                  yield* dispatchCatalogCommand({
+                    type: "thread.mcp-catalog.initialize",
+                    commandId: CommandId.make(
+                      `server:mcp-catalog-link:${input.sessionInput.threadId}:${reusableSnapshot.catalogSessionId}:${++catalogOperationGeneration}`,
+                    ),
+                    threadId: input.sessionInput.threadId,
+                    snapshot: reusableSnapshot,
+                    createdAt: yield* nowIso,
+                  });
+                  return reusableSnapshot;
+                }
+                const baseline =
+                  catalog === undefined
+                    ? []
+                    : catalogBaselineForProject({
+                        globalDefinitions: catalog.globalDefinitions,
+                        projectDefinitions: catalog.projectDefinitions.map(
+                          (entry) => entry.definition,
+                        ),
+                        projectOverrides: catalog.projectOverrides.map((entry) => entry.override),
+                        projectId: String(thread.value.projectId),
+                      });
+                const snapshot: McpCatalogSnapshot = {
+                  catalogSessionId: McpCatalogSessionId.make(
+                    `catalog-session:${input.sessionInput.threadId}:${input.providerInstanceId}:${commandReadModel.snapshotSequence}:${++catalogOperationGeneration}`,
+                  ),
+                  threadId: input.sessionInput.threadId,
+                  providerInstanceId: input.providerInstanceId,
+                  baseline,
+                  desired: baseline,
+                  desiredRevision: 0,
+                  appliedRevision: 0,
+                };
+                yield* dispatchCatalogCommand({
+                  type: "thread.mcp-catalog.initialize",
+                  commandId: CommandId.make(
+                    `server:mcp-catalog-initialize:${input.sessionInput.threadId}:${snapshot.catalogSessionId}`,
+                  ),
+                  threadId: input.sessionInput.threadId,
+                  snapshot,
+                  createdAt: yield* nowIso,
+                });
+                return snapshot;
               }),
             );
       const durableCatalogServers: ReadonlyArray<ResolvedProjectMcpServer> | undefined =
@@ -468,17 +579,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           : yield* Effect.try({
               try: () =>
                 resolveSessionCatalog({
-                  baseline: durableCatalogSnapshot.baseline,
-                  sessionDefinitions: durableCatalogSnapshot.desired.filter(
-                    (definition) =>
-                      definition.scope === "session" &&
-                      definition.scopeId === String(durableCatalogSnapshot.catalogSessionId),
-                  ),
-                  sessionOverrides: [],
+                  desired: durableCatalogSnapshot.desired,
                   providerInstanceId: input.providerInstanceId,
-                  // Current adapters consume MCP configuration at process
-                  // start. A later catalog revision is applied on restart.
-                  providerCapability: "restart-required",
+                  providerCapability:
+                    input.adapter.capabilities.sessionMcpCatalog ?? "restart-required",
                 }).map((entry) => ({
                   id: entry.logicalServerId,
                   name: entry.name,
@@ -491,6 +595,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   cause,
                 ),
             });
+      const durableCatalogCapability =
+        input.adapter.capabilities.sessionMcpCatalog ?? "restart-required";
       const sessionScope = yield* Scope.make("sequential");
       const projectMcpSession = yield* (
         durableCatalogServers === undefined
@@ -558,23 +664,43 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           Exit.isSuccess(exit) ? Effect.void : cleanupOwner(input.sessionInput.threadId, owner),
         ),
       );
-      if (
-        durableCatalogSnapshot !== undefined &&
-        durableCatalogSnapshot.desiredRevision > durableCatalogSnapshot.appliedRevision &&
-        Option.isSome(orchestrationEngine)
-      ) {
-        yield* orchestrationEngine.value
-          .dispatch({
-            type: "thread.mcp-catalog.applied",
-            commandId: CommandId.make(
-              `server:mcp-catalog-applied:${input.sessionInput.threadId}:${durableCatalogSnapshot.catalogSessionId}:${durableCatalogSnapshot.desiredRevision}`,
-            ),
-            threadId: input.sessionInput.threadId,
-            mcpCatalogSessionId: durableCatalogSnapshot.catalogSessionId,
-            revision: durableCatalogSnapshot.desiredRevision,
-            appliedAt: yield* nowIso,
-          })
-          .pipe(Effect.ignoreCause({ log: true }));
+      if (durableCatalogSnapshot !== undefined && Option.isSome(orchestrationEngine)) {
+        const shouldRecordUnsupported =
+          durableCatalogCapability === "unsupported" &&
+          (durableCatalogSnapshot.application === undefined ||
+            durableCatalogSnapshot.application.revision !==
+              durableCatalogSnapshot.desiredRevision ||
+            durableCatalogSnapshot.application.status !== "failed");
+        const shouldRecordApplied =
+          durableCatalogCapability !== "unsupported" &&
+          (durableCatalogSnapshot.desiredRevision > durableCatalogSnapshot.appliedRevision ||
+            (durableCatalogSnapshot.desiredRevision === 0 &&
+              durableCatalogSnapshot.application?.status !== "applied"));
+        if (shouldRecordUnsupported || shouldRecordApplied)
+          yield* dispatchCatalogCommand(
+            shouldRecordUnsupported
+              ? {
+                  type: "thread.mcp-catalog.apply-failed",
+                  commandId: CommandId.make(
+                    `server:mcp-catalog-unsupported:${input.sessionInput.threadId}:${durableCatalogSnapshot.catalogSessionId}:${durableCatalogSnapshot.desiredRevision}`,
+                  ),
+                  threadId: input.sessionInput.threadId,
+                  mcpCatalogSessionId: durableCatalogSnapshot.catalogSessionId,
+                  revision: durableCatalogSnapshot.desiredRevision,
+                  reason: "Provider does not support session MCP catalog configuration.",
+                  failedAt: yield* nowIso,
+                }
+              : {
+                  type: "thread.mcp-catalog.applied",
+                  commandId: CommandId.make(
+                    `server:mcp-catalog-applied:${input.sessionInput.threadId}:${durableCatalogSnapshot.catalogSessionId}:${durableCatalogSnapshot.desiredRevision}`,
+                  ),
+                  threadId: input.sessionInput.threadId,
+                  mcpCatalogSessionId: durableCatalogSnapshot.catalogSessionId,
+                  revision: durableCatalogSnapshot.desiredRevision,
+                  appliedAt: yield* nowIso,
+                },
+          ).pipe(Effect.ignoreCause({ log: true }));
       }
       owner.nativeSessionId = nativeSessionId(started.resumeCursor);
       return started;

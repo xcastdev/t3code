@@ -689,6 +689,12 @@ const make = Effect.gen(function* () {
             detail: `Provider session '${session.threadId}' started without a provider instance id.`,
           });
         }
+        // The provider start can initialize or replace the durable catalog
+        // while this reactor still holds the shell that triggered the start.
+        // Read the latest thread before binding so an old captured session
+        // cannot overwrite the newer catalog-session link.
+        const latestThread = yield* resolveThread(threadId);
+        const catalogSessionId = catalogSessionIdForThread(latestThread ?? thread);
         yield* setThreadSession({
           threadId,
           session: {
@@ -700,7 +706,7 @@ const make = Effect.gen(function* () {
             providerName: session.provider,
             providerInstanceId: session.providerInstanceId,
             runtimeMode: desiredRuntimeMode,
-            mcpCatalogSessionId: catalogSessionIdForThread(thread),
+            mcpCatalogSessionId: catalogSessionId,
             // Provider turn ids are not orchestration turn ids.
             activeTurnId: null,
             lastError: session.lastError ?? null,

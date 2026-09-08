@@ -18,11 +18,20 @@ export interface ResolveProjectCatalogInput {
   readonly providerCapability: ProviderSessionMcpCatalogMode;
 }
 
+export interface CatalogBaselineInput {
+  readonly globalDefinitions: ReadonlyArray<McpCatalogDefinition>;
+  readonly projectDefinitions: ReadonlyArray<McpCatalogDefinition>;
+  readonly projectOverrides: ReadonlyArray<McpCatalogOverride>;
+  readonly projectId: string;
+}
+
 export interface ResolveSessionCatalogInput {
-  /** Captured global + project effective definitions at session start. */
-  readonly baseline: ReadonlyArray<McpCatalogDefinition>;
-  readonly sessionDefinitions: ReadonlyArray<McpCatalogDefinition>;
-  readonly sessionOverrides: ReadonlyArray<McpCatalogOverride>;
+  /** The fully materialized desired state. Preferred for durable sessions. */
+  readonly desired?: ReadonlyArray<McpCatalogDefinition>;
+  /** Legacy inputs retained for callers that still compose an old snapshot. */
+  readonly baseline?: ReadonlyArray<McpCatalogDefinition>;
+  readonly sessionDefinitions?: ReadonlyArray<McpCatalogDefinition>;
+  readonly sessionOverrides?: ReadonlyArray<McpCatalogOverride>;
   readonly providerInstanceId: ProviderInstanceId;
   readonly providerCapability: ProviderSessionMcpCatalogMode;
 }
@@ -132,6 +141,19 @@ const scopeDefinitions = (
 ): ReadonlyArray<McpCatalogDefinition> =>
   definitions.filter((definition) => definition.scope === scope);
 
+/** Capture the global/project state that a new catalog session should start with. */
+export const catalogBaselineForProject = (input: CatalogBaselineInput) => [
+  ...applyOverrides(
+    scopeDefinitions(input.globalDefinitions, "global"),
+    input.projectOverrides
+      .filter((entry) => entry.scopeId === input.projectId)
+      .map((entry) => entry),
+  ),
+  ...input.projectDefinitions.filter(
+    (definition) => definition.scope === "project" && definition.scopeId === input.projectId,
+  ),
+];
+
 /** Resolve global defaults, project overrides, and project-local definitions. */
 export const resolveProjectCatalog = (
   input: ResolveProjectCatalogInput,
@@ -144,17 +166,16 @@ export const resolveProjectCatalog = (
   return resolve([...global, ...projectLocal], input.providerInstanceId, input.providerCapability);
 };
 
-/** Resolve a logical session against its immutable baseline snapshot. */
+/** Resolve a logical session against its current desired snapshot. */
 export const resolveSessionCatalog = (
   input: ResolveSessionCatalogInput,
 ): ReadonlyArray<ResolvedMcpCatalogEntry> => {
-  const baseline = applyOverrides(input.baseline, input.sessionOverrides);
-  const sessionLocal = scopeDefinitions(input.sessionDefinitions, "session");
-  return resolve(
-    [...baseline, ...sessionLocal],
-    input.providerInstanceId,
-    input.providerCapability,
-  );
+  const desired =
+    input.desired ??
+    applyOverrides(input.baseline ?? [], input.sessionOverrides ?? []).concat(
+      scopeDefinitions(input.sessionDefinitions ?? [], "session"),
+    );
+  return resolve(desired, input.providerInstanceId, input.providerCapability);
 };
 
 export const applyMcpCatalogOverrides = applyOverrides;

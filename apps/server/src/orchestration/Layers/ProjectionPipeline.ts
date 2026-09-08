@@ -949,8 +949,11 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
                 AND thread_id = ${event.payload.threadId}
                 AND disposed_at IS NULL
-                AND ${event.payload.revision} > applied_revision
                 AND ${event.payload.revision} <= desired_revision
+                AND (
+                  ${event.payload.revision} > applied_revision
+                  OR (${event.payload.revision} = 0 AND application_revision IS NULL)
+                )
             `;
             return;
 
@@ -965,8 +968,11 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
                 AND thread_id = ${event.payload.threadId}
                 AND disposed_at IS NULL
-                AND ${event.payload.revision} > applied_revision
                 AND ${event.payload.revision} <= desired_revision
+                AND (
+                  ${event.payload.revision} > applied_revision
+                  OR (${event.payload.revision} = 0 AND application_revision IS NULL)
+                )
             `;
             return;
 

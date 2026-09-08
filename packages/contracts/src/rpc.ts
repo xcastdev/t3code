@@ -897,6 +897,8 @@ export const WsMcpCatalogSessionResetRpc = Rpc.make(WS_METHODS.mcpCatalogSession
 });
 
 export const WsMcpCatalogSubscribeRpc = Rpc.make(WS_METHODS.mcpCatalogSubscribe, {
+  // Omitted preserves the original always-on stream behavior. Clients can
+  // explicitly send false when they only need the RPC connection.
   payload: Schema.Struct({ catalog: Schema.optional(Schema.Boolean) }),
   success: McpCatalogChanged,
   error: EnvironmentAuthorizationError,

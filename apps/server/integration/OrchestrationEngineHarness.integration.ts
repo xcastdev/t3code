@@ -309,6 +309,7 @@ export const makeOrchestrationIntegrationHarness = (
           resolveSecret: () => undefined,
           oauthStateLeases: new Map(),
         }),
+      withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
     });
     const providerLayer = useRealCodex
       ? makeProviderServiceLive().pipe(

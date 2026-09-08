@@ -144,6 +144,8 @@ export interface AcquiredProjectMcpSessionServers {
 export interface ProjectMcpServiceShape {
   /** Subscribe and reconcile before accepting normal operations; owns scoped cleanup fibers. */
   readonly startCleanup: () => Effect.Effect<void, Error, Scope.Scope>;
+  /** Serialize catalog secret preparation/dispatch with cleanup and leases. */
+  readonly withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
   /** Wait for events through this sequence and cleanup, reporting unresolved cleanup failures. */
   readonly drainThrough: (sequence: number) => Effect.Effect<void, Error>;
   readonly list: (projectId: ProjectId) => Effect.Effect<ProjectMcpCatalog, Error>;
@@ -606,9 +608,7 @@ const makeProjectMcpService = Effect.gen(function* () {
             input.id,
             server,
             prepared,
-            prepared === undefined && existing.transport !== undefined
-              ? mcpSecrets.retireTransport(input.id, existing.transport)
-              : Effect.void,
+            Effect.void,
           );
         }),
       );
@@ -636,7 +636,12 @@ const makeProjectMcpService = Effect.gen(function* () {
             input.id,
             undefined,
             undefined,
-            mcpSecrets.removeServer(input.id),
+            // Reconciliation decides whether this server's credentials can be
+            // retired after the durable legacy row is gone. A session
+            // baseline or desired catalog may still reference the old
+            // transport, so removing it eagerly would make a valid session
+            // impossible to lease on its next start.
+            Effect.void,
           );
         }),
       );
@@ -776,8 +781,12 @@ const makeProjectMcpService = Effect.gen(function* () {
       WHERE scope_type = 'project'
     `;
     const sessions = yield* sql<Schema.Schema.Type<typeof McpCatalogSessionProjectionRow>>`
-      SELECT baseline_json AS "baselineJson", desired_catalog_json AS "desiredJson"
-      FROM projection_mcp_catalog_sessions
+      SELECT sessions.baseline_json AS "baselineJson", sessions.desired_catalog_json AS "desiredJson"
+      FROM projection_mcp_catalog_sessions AS sessions
+      INNER JOIN projection_threads AS threads
+        ON threads.thread_id = sessions.thread_id
+      WHERE sessions.disposed_at IS NULL
+        AND threads.deleted_at IS NULL
     `;
     const references: Array<{
       readonly id: McpServerId;
@@ -921,6 +930,8 @@ const makeProjectMcpService = Effect.gen(function* () {
   return ProjectMcpService.of({
     startCleanup,
     drainThrough,
+    withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+      catalogMutationLock.withPermits(1)(effect),
     list,
     create,
     update,

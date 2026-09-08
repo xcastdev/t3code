@@ -157,4 +157,40 @@ describe("McpCatalogResolver", () => {
       resolveProjectCatalog(projectInput({ globalDefinitions: [], projectDefinitions: many })),
     ).toThrow(McpCatalogProviderLimitExceededError);
   });
+
+  it("resolves the session's desired catalog directly, including inherited edits and removals", () => {
+    const inherited = server("inherited", "Inherited");
+    const updated = {
+      ...inherited,
+      name: "Updated inherited",
+      transport: {
+        ...inherited.transport,
+        url: "https://updated.example.test/mcp",
+      },
+    };
+    const local = server("local", "Local", "session");
+
+    expect(
+      resolveSessionCatalog({
+        desired: [updated, local],
+        providerInstanceId: provider,
+        providerCapability: "restart-required",
+      }),
+    ).toEqual([
+      expect.objectContaining({
+        logicalServerId: inherited.logicalServerId,
+        name: "Updated inherited",
+        transport: updated.transport,
+      }),
+      expect.objectContaining({ logicalServerId: local.logicalServerId }),
+    ]);
+
+    expect(
+      resolveSessionCatalog({
+        desired: [local],
+        providerInstanceId: provider,
+        providerCapability: "restart-required",
+      }),
+    ).toEqual([expect.objectContaining({ logicalServerId: local.logicalServerId })]);
+  });
 });

@@ -432,7 +432,9 @@ const make = Effect.gen(function* () {
     const next = {
       removed: operation.kind === "catalog" ? false : server.removed,
       credentials:
-        operation.kind === "catalog" ? unique(operation.nextCredentialIds) : server.credentials,
+        operation.kind === "catalog"
+          ? unique([...operation.nextCredentialIds, ...operation.replacedCredentialIds])
+          : server.credentials,
       retired:
         operation.kind === "catalog"
           ? unique([...server.retired, ...operation.replacedCredentialIds])
@@ -989,8 +991,8 @@ const make = Effect.gen(function* () {
           if (
             operation.kind === "auxiliary"
               ? current !== undefined
-              : operation.nextCredentialIds.every((id) => currentIds.includes(id)) &&
-                operation.replacedCredentialIds.every((id) => !currentIds.includes(id))
+              : current !== undefined &&
+                operation.nextCredentialIds.every((id) => currentIds.includes(id))
           ) {
             yield* commitOperation(operationId);
           } else {

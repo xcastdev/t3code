@@ -140,10 +140,13 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
               authorization: { type: "none" },
             });
             yield* prepared.commit;
-            const newLeaseError = yield* secrets.acquireLease(serverA, [firstId]).pipe(Effect.flip);
-            assert.instanceOf(newLeaseError, ProjectMcpSecretStore.ProjectMcpSecretOwnershipError);
+            // Catalog reconciliation may still need the previous credential
+            // immediately after dispatch commits, before it has observed the
+            // durable session references.
+            yield* secrets.acquireLease(serverA, [firstId]);
             return {
               id: credentialId(prepared.transport),
+              transport: prepared.transport,
               leaseValue: yield* lease.resolve(firstId),
             };
           }),
@@ -152,6 +155,9 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
         assert.notEqual(rotated.id, firstId);
         assert.equal(rotated.leaseValue, "first-sentinel");
         assert.equal(yield* secrets.resolve(serverA, rotated.id), "second-sentinel");
+        yield* secrets.reconcile([{ id: serverA, transport: rotated.transport }]);
+        const retiredError = yield* secrets.resolve(serverA, firstId).pipe(Effect.flip);
+        assert.instanceOf(retiredError, ProjectMcpSecretStore.ProjectMcpSecretOwnershipError);
         assert.isTrue(
           Option.isNone(
             yield* secretFiles.get(ProjectMcpSecretStore.credentialSecretName(firstId)),
@@ -582,5 +588,48 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
         ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-secret-store-restart-" }),
       ),
     ),
+  );
+
+  it.effect(
+    "commits a recovered rotation while an older session baseline retains the old credential",
+    () =>
+      Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        const firstLayer = Layer.fresh(makeSecretLayer(config));
+        const recoveryLayer = Layer.fresh(makeSecretLayer(config));
+
+        const original = yield* Effect.gen(function* () {
+          const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+          const prepared = yield* secrets.prepareCreate(serverA, httpDraft("rotation-old"));
+          yield* prepared.commit;
+          return prepared;
+        }).pipe(Effect.provide(firstLayer));
+        const replacement = yield* Effect.gen(function* () {
+          const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+          return yield* secrets.prepareUpdate(
+            serverA,
+            original.transport,
+            httpDraft("rotation-new"),
+          );
+        }).pipe(Effect.provide(Layer.fresh(makeSecretLayer(config))));
+        const oldId = credentialId(original.transport);
+        const newId = credentialId(replacement.transport);
+
+        yield* Effect.gen(function* () {
+          const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+          yield* secrets.reconcile([
+            { id: serverA, transport: replacement.transport },
+            { id: serverA, transport: original.transport },
+          ]);
+          assert.equal(yield* secrets.resolve(serverA, oldId), "rotation-old");
+          assert.equal(yield* secrets.resolve(serverA, newId), "rotation-new");
+        }).pipe(Effect.provide(recoveryLayer));
+      }).pipe(
+        Effect.provide(
+          ServerConfig.layerTest(process.cwd(), {
+            prefix: "t3-project-mcp-secret-rotation-recovery-",
+          }),
+        ),
+      ),
   );
 });

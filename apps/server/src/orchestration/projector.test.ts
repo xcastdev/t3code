@@ -43,6 +43,59 @@ function makeEvent(input: {
 }
 
 describe("orchestration projector", () => {
+  it("records an initial revision-zero application failure", async () => {
+    const snapshot = {
+      catalogSessionId: "catalog-session-zero",
+      threadId: "thread-zero",
+      providerInstanceId: "codex",
+      baseline: [],
+      desired: [],
+      desiredRevision: 0,
+      appliedRevision: 0,
+    };
+    let model = createEmptyReadModel("2026-01-01T00:00:00.000Z");
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        makeEvent({
+          sequence: 1,
+          type: "thread.mcp-catalog.initialized",
+          occurredAt: "2026-01-01T00:00:01.000Z",
+          aggregateKind: "thread",
+          aggregateId: "thread-zero",
+          commandId: "catalog-zero-init",
+          payload: { threadId: "thread-zero", snapshot },
+        }),
+      ),
+    );
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        makeEvent({
+          sequence: 2,
+          type: "thread.mcp-catalog.apply-failed",
+          occurredAt: "2026-01-01T00:00:02.000Z",
+          aggregateKind: "thread",
+          aggregateId: "thread-zero",
+          commandId: "catalog-zero-failed",
+          payload: {
+            threadId: "thread-zero",
+            mcpCatalogSessionId: "catalog-session-zero",
+            revision: 0,
+            reason: "unsupported",
+            failedAt: "2026-01-01T00:00:02.000Z",
+          },
+        }),
+      ),
+    );
+    expect(model.mcpCatalog?.sessions[0]?.application).toEqual({
+      status: "failed",
+      revision: 0,
+      failedAt: "2026-01-01T00:00:02.000Z",
+      reason: "unsupported",
+    });
+  });
+
   it("keeps catalog replacement and final-deletion revisions in the pure read model", async () => {
     const first = {
       definitionId: McpDefinitionId.make("definition-global-1"),
@@ -151,6 +204,18 @@ describe("orchestration projector", () => {
         }),
       ),
     );
+    expect(model.projectMcpServers).toEqual([
+      {
+        projectId: "project-1",
+        server: {
+          id: "project-server",
+          name: "Project server",
+          transport: projectDefinition.transport,
+          enabled: true,
+          providerInstanceIds: ["codex"],
+        },
+      },
+    ]);
     model = await Effect.runPromise(
       projectEvent(
         model,

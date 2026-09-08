@@ -19,6 +19,7 @@ import {
   ApprovalRequestId,
   EventId,
   McpCatalogSessionId,
+  McpDefinitionId,
   McpServerId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -118,6 +119,7 @@ const makeProviderProjectContextTestLayer = (
       resolveForSession,
       acquireSessionLease,
       acquireResolvedSessionLease,
+      withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
     } as never),
   );
 
@@ -589,6 +591,106 @@ it.effect("starts providers from the durable catalog and persists application", 
         revision: 1,
         appliedAt: "1970-01-01T00:00:00.000Z",
       });
+    }).pipe(Effect.provide(providerLayer));
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("initializes the durable catalog from global definitions on first provider start", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("thread-first-catalog-start");
+    const projectId = ProjectId.make("project-first-catalog-start");
+    const definition = {
+      definitionId: McpDefinitionId.make("definition-first-catalog"),
+      logicalServerId: McpServerId.make("first-catalog-server"),
+      scope: "global" as const,
+      scopeId: "environment-first-catalog",
+      name: "First catalog server",
+      transport: {
+        type: "streamable-http" as const,
+        url: "https://first-catalog.example.test/mcp",
+        headers: [],
+        authorization: { type: "none" as const },
+      },
+      enabled: true,
+      providerInstanceIds: [codexInstanceId],
+      revision: 1,
+    };
+    const readModel = {
+      threads: [{ id: threadId, projectId, session: null }],
+      mcpCatalog: {
+        environmentId: "environment-first-catalog",
+        globalRevision: 1,
+        globalDefinitions: [definition],
+        projectRevisions: [],
+        projectDefinitions: [],
+        projectOverrides: [],
+        sessions: [],
+      },
+    };
+    const acquired = vi.fn((servers: ReadonlyArray<ResolvedProjectMcpServer>) =>
+      Effect.succeed({ servers, resolveSecret: () => undefined, oauthStateLeases: new Map() }),
+    );
+    const dispatch = vi.fn((_command: OrchestrationCommand) => Effect.succeed({ sequence: 1 }));
+    const adapter = makeFakeCodexAdapter();
+    const providerLayer = makeTestProviderServiceLive(
+      {},
+      makeProviderProjectContextTestLayer(
+        undefined,
+        () => Effect.die("legacy lease should not be used"),
+        readModel,
+        acquired,
+      ),
+    ).pipe(
+      Layer.provide(
+        Layer.succeed(
+          ProviderAdapterRegistry.ProviderAdapterRegistry,
+          makeAdapterRegistryMock({ [CODEX_DRIVER]: adapter.adapter }),
+        ),
+      ),
+      Layer.provide(
+        ProviderSessionDirectoryLive.pipe(
+          Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+        ),
+      ),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(serverConfigTestLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+      Layer.provide(
+        Layer.succeed(OrchestrationEngine.OrchestrationEngineService, { dispatch } as never),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      assert.equal(acquired.mock.calls.length, 1);
+      assert.deepEqual(
+        acquired.mock.calls[0]?.[0].map(({ id }) => id),
+        [definition.logicalServerId],
+      );
+      assert.equal(dispatch.mock.calls.length, 2);
+      assert.equal(dispatch.mock.calls[0]?.[0].type, "thread.mcp-catalog.initialize");
+      assert.equal(
+        (
+          dispatch.mock.calls[0]?.[0] as Extract<
+            OrchestrationCommand,
+            { type: "thread.mcp-catalog.initialize" }
+          >
+        ).snapshot.baseline[0]?.logicalServerId,
+        definition.logicalServerId,
+      );
+      assert.equal(dispatch.mock.calls[1]?.[0].type, "thread.mcp-catalog.applied");
     }).pipe(Effect.provide(providerLayer));
   }).pipe(Effect.provide(NodeServices.layer)),
 );
