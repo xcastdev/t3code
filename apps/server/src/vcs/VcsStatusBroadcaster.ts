@@ -478,22 +478,18 @@ export const make = Effect.gen(function* () {
   });
 
   const refreshRemoteStatus = Effect.fn("VcsStatusBroadcaster.refreshRemoteStatus")(function* (
-    cwd: string,
+    canonicalCwd: string,
     options?: { readonly refreshUpstream?: boolean },
     shouldInvalidateRemote = true,
   ) {
-    const cached = yield* getCachedStatus(cwd);
-    const canonicalCwd = cached?.local
-      ? yield* statusCacheKeyForLocal(cwd, cached.local.value)
-      : cwd;
     const generation = yield* allocateRemoteGeneration(canonicalCwd);
     if (shouldInvalidateRemote && options?.refreshUpstream !== false) {
-      yield* workflow.invalidateRemoteStatus(cwd);
+      yield* workflow.invalidateRemoteStatus(canonicalCwd);
     }
     const remote = yield* withDetectedRepositoryPermit(
       "VcsStatusBroadcaster.refreshRemoteStatus",
-      cwd,
-      workflow.remoteStatus({ cwd }, options),
+      canonicalCwd,
+      workflow.remoteStatus({ cwd: canonicalCwd }, options),
     );
     return yield* updateCachedRemoteStatus(canonicalCwd, remote, {
       publish: true,
@@ -512,15 +508,13 @@ export const make = Effect.gen(function* () {
       // read and publication remain serialized by refreshLocalStatusCore.
       yield* workflow.invalidateStatus(cwd);
     }
-    const [local, remote] = yield* Effect.all(
-      [
-        refreshLocalStatusCore(cwd, fullRefresh ? "none" : "local"),
-        refreshRemoteStatus(cwd, options, false),
-      ],
-      { concurrency: "unbounded" },
-    );
+    const local = yield* refreshLocalStatusCore(cwd, fullRefresh ? "none" : "local");
+    if (!local.isRepo) {
+      return mergeGitStatusParts(local, null);
+    }
     const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
     yield* removeStatusCacheAlias(cwd, canonicalCwd);
+    const remote = yield* refreshRemoteStatus(canonicalCwd, options, false);
     const latestCached = yield* getCachedStatus(canonicalCwd);
     return mergeGitStatusParts(
       latestCached?.local?.value ?? local,

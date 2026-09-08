@@ -1556,6 +1556,158 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("preserves a same-commit target created by another writer", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const targetBranch = "feature/raced-create";
+          const fileSystem = yield* FileSystem.FileSystem;
+          const pathService = yield* Path.Path;
+          let injectedRace = false;
+          const coordinator = ChildProcessSpawner.make((command) =>
+            Effect.gen(function* () {
+              if (!ChildProcess.isStandardCommand(command)) {
+                return yield* Effect.die("expected a standard Git command");
+              }
+              if (
+                !injectedRace &&
+                command.args[0] === "checkout" &&
+                command.args[1] === "-b" &&
+                command.args[2] === targetBranch
+              ) {
+                injectedRace = true;
+                const racedBranch = yield* delegate.spawn(
+                  ChildProcess.make("git", ["branch", targetBranch], { cwd }),
+                );
+                yield* racedBranch.exitCode;
+                yield* fileSystem.writeFileString(pathService.join(cwd, "raced.txt"), "raced\n");
+              }
+              return yield* delegate.spawn(command);
+            }),
+          );
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, coordinator),
+            Effect.provide(ServerConfigLayer),
+          );
+
+          const error = yield* driver
+            .createRef({
+              cwd,
+              refName: targetBranch,
+              switchRef: true,
+              confirmDirtyWorkingTree: false,
+            })
+            .pipe(Effect.flip);
+
+          assert.equal(error._tag, "GitCommandError");
+          assert.include(error.detail, "checkout -b failed");
+          assert.equal(yield* git(cwd, ["branch", "--show-current"]), initialBranch);
+          assert.equal(
+            yield* git(cwd, ["rev-parse", `refs/heads/${targetBranch}`]),
+            yield* git(cwd, ["rev-parse", `refs/heads/${initialBranch}`]),
+          );
+          assert.equal(yield* git(cwd, ["status", "--porcelain"]), "?? raced.txt");
+        }),
+      ),
+    );
+
+    it.effect("never removes a pre-existing target during create-and-switch failure", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* git(cwd, ["branch", "feature/existing-create"]);
+        const targetCommit = yield* git(cwd, ["rev-parse", "refs/heads/feature/existing-create"]);
+
+        const error = yield* driver
+          .createRef({
+            cwd,
+            refName: "feature/existing-create",
+            switchRef: true,
+            confirmDirtyWorkingTree: true,
+          })
+          .pipe(Effect.flip);
+
+        assert.equal(error._tag, "GitCommandError");
+        assert.equal(yield* git(cwd, ["branch", "--show-current"]), initialBranch);
+        assert.equal(
+          yield* git(cwd, ["rev-parse", "refs/heads/feature/existing-create"]),
+          targetCommit,
+        );
+      }),
+    );
+
+    it.effect("does not remove a raced target that another writer advances", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const targetBranch = "feature/advanced-race";
+          const sourceHead = yield* git(cwd, ["rev-parse", "HEAD"]);
+          const competingCommit = yield* git(cwd, [
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "HEAD",
+            "-m",
+            "competing target writer",
+          ]);
+          let injectedRace = false;
+          const coordinator = ChildProcessSpawner.make((command) =>
+            Effect.gen(function* () {
+              if (!ChildProcess.isStandardCommand(command)) {
+                return yield* Effect.die("expected a standard Git command");
+              }
+              if (
+                !injectedRace &&
+                command.args[0] === "checkout" &&
+                command.args[1] === "-b" &&
+                command.args[2] === targetBranch
+              ) {
+                injectedRace = true;
+                const racedBranch = yield* delegate.spawn(
+                  ChildProcess.make("git", ["branch", targetBranch], { cwd }),
+                );
+                yield* racedBranch.exitCode;
+                const advancedBranch = yield* delegate.spawn(
+                  ChildProcess.make(
+                    "git",
+                    ["update-ref", `refs/heads/${targetBranch}`, competingCommit, sourceHead],
+                    { cwd },
+                  ),
+                );
+                yield* advancedBranch.exitCode;
+              }
+              return yield* delegate.spawn(command);
+            }),
+          );
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, coordinator),
+            Effect.provide(ServerConfigLayer),
+          );
+
+          const error = yield* driver
+            .createRef({
+              cwd,
+              refName: targetBranch,
+              switchRef: true,
+              confirmDirtyWorkingTree: true,
+            })
+            .pipe(Effect.flip);
+
+          assert.equal(error._tag, "GitCommandError");
+          assert.equal(yield* git(cwd, ["branch", "--show-current"]), initialBranch);
+          assert.equal(
+            yield* git(cwd, ["rev-parse", `refs/heads/${targetBranch}`]),
+            competingCommit,
+          );
+        }),
+      ),
+    );
+
     it.effect("returns the existing refName when rename source and target match", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -2257,6 +2409,132 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("rejects a guarded empty commit before creating a commit object", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        yield* git(cwd, ["checkout", "-b", "feature/empty-guarded"]);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const headBefore = yield* git(cwd, ["rev-parse", "HEAD"]);
+        const expectedIndexTree = yield* git(cwd, ["write-tree"]);
+        const reachableBefore = yield* git(cwd, ["rev-list", "--all", "--count"]);
+
+        const error = yield* driver
+          .commitIndex({
+            cwd,
+            message: "must not create an empty commit",
+            precondition: {
+              expectedHeadCommit: headBefore,
+              expectedIndexTree,
+              expectedRefName: "feature/empty-guarded",
+            },
+          })
+          .pipe(Effect.flip);
+
+        assert.equal(error._tag, "GitCommandError");
+        assert.include(error.detail.toLowerCase(), "nothing");
+        assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), headBefore);
+        assert.equal(yield* git(cwd, ["rev-parse", `refs/heads/${initialBranch}`]), headBefore);
+        assert.equal(yield* git(cwd, ["rev-list", "--all", "--count"]), reachableBefore);
+      }),
+    );
+
+    it.effect("rejects an unresolved merge before guarded publication", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* git(cwd, ["checkout", "-b", "feature/merge-ours"]);
+        yield* writeTextFile(cwd, "README.md", "ours\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "ours"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* writeTextFile(cwd, "README.md", "theirs\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "theirs"]);
+        const mergeResult = yield* driver.execute({
+          operation: "GitVcsDriver.test.merge",
+          cwd,
+          args: ["merge", "feature/merge-ours"],
+          allowNonZeroExit: true,
+        });
+        assert.equal(mergeResult.exitCode, 1);
+
+        const headBefore = yield* git(cwd, ["rev-parse", "HEAD"]);
+        const error = yield* driver
+          .commitIndex({
+            cwd,
+            message: "must not publish unresolved merge",
+            precondition: {
+              expectedHeadCommit: headBefore,
+              expectedIndexTree: yield* git(cwd, ["rev-parse", "HEAD^{tree}"]),
+              expectedRefName: initialBranch,
+            },
+          })
+          .pipe(Effect.flip);
+
+        assert.equal(error._tag, "GitCommandError");
+        assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), headBefore);
+        assert.notEqual(yield* git(cwd, ["rev-parse", "--git-path", "MERGE_HEAD"]), "");
+      }),
+    );
+
+    it.effect("preserves merge parents and clears MERGE_HEAD for a guarded merge commit", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* git(cwd, ["checkout", "-b", "feature/merge-ours"]);
+        yield* writeTextFile(cwd, "README.md", "ours\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "ours"]);
+        const oursCommit = yield* git(cwd, ["rev-parse", "HEAD"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* writeTextFile(cwd, "README.md", "theirs\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "theirs"]);
+        const theirsCommit = yield* git(cwd, ["rev-parse", "HEAD"]);
+        const mergeResult = yield* driver.execute({
+          operation: "GitVcsDriver.test.merge",
+          cwd,
+          args: ["merge", "feature/merge-ours"],
+          allowNonZeroExit: true,
+        });
+        assert.equal(mergeResult.exitCode, 1);
+        yield* writeTextFile(cwd, "README.md", "resolved\n");
+        yield* driver.stageFiles({ cwd, paths: ["README.md"] });
+        const precondition = {
+          expectedHeadCommit: yield* git(cwd, ["rev-parse", "HEAD"]),
+          expectedIndexTree: yield* git(cwd, ["write-tree"]),
+          expectedRefName: initialBranch,
+        };
+
+        const committed = yield* driver.commitIndex({
+          cwd,
+          message: "resolve merge",
+          precondition,
+          confirmDefaultRef: true,
+        });
+        const parents = (yield* git(cwd, [
+          "rev-list",
+          "--parents",
+          "-1",
+          committed.commitSha,
+        ])).split(" ");
+        const mergeHeadPath = yield* git(cwd, ["rev-parse", "--git-path", "MERGE_HEAD"]);
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        const mergeHeadExists = yield* fileSystem.exists(pathService.resolve(cwd, mergeHeadPath));
+
+        assert.equal(parents.length, 3);
+        assert.equal(parents[1], theirsCommit);
+        assert.equal(parents[2], oursCommit);
+        assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), committed.commitSha);
+        assert.isFalse(mergeHeadExists);
+        assert.equal(yield* git(cwd, ["show", `${committed.commitSha}:README.md`]), "resolved");
+      }),
+    );
+
     it.effect("uses the only configured remote when guarding its default branch", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -2289,7 +2567,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
-    it.effect("commits the reviewed tree when another process stages during validation", () =>
+    it.effect("rejects publication when another process stages during validation", () =>
       Effect.scoped(
         Effect.gen(function* () {
           const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -2321,24 +2599,26 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           );
           yield* writeTextFile(cwd, "reviewed.txt", "reviewed\n");
           yield* driver.stageFiles({ cwd, paths: ["reviewed.txt"] });
+          const headBefore = yield* git(cwd, ["rev-parse", "HEAD"]);
           const precondition = {
-            expectedHeadCommit: yield* git(cwd, ["rev-parse", "HEAD"]),
+            expectedHeadCommit: headBefore,
             expectedIndexTree: yield* git(cwd, ["write-tree"]),
             expectedRefName: initialBranch,
           };
           yield* writeTextFile(cwd, "external.txt", "external\n");
 
-          const commit = yield* driver.commitIndex({
-            cwd,
-            message: "commit reviewed tree",
-            precondition,
-          });
+          const error = yield* driver
+            .commitIndex({
+              cwd,
+              message: "commit reviewed tree",
+              precondition,
+            })
+            .pipe(Effect.flip);
 
-          assert.equal(
-            yield* git(cwd, ["show", "--format=", "--name-only", commit.commitSha]),
-            "reviewed.txt",
-          );
-          assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), "external.txt");
+          assert.equal(error.code, "stale_git_state");
+          assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), headBefore);
+          assert.include(yield* git(cwd, ["diff", "--cached", "--name-only"]), "reviewed.txt");
+          assert.include(yield* git(cwd, ["diff", "--cached", "--name-only"]), "external.txt");
         }),
       ),
     );

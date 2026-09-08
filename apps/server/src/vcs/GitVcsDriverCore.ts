@@ -563,6 +563,11 @@ function isUnbornHeadStderr(stderr: string): boolean {
   );
 }
 
+function isExistingBranchCheckoutStderr(stderr: string): boolean {
+  const normalized = stderr.toLowerCase();
+  return normalized.includes("a branch named") && normalized.includes("already exists");
+}
+
 // Matches `git worktree remove` on a path git no longer tracks: "is not a
 // working tree" when the registration is gone, "cannot remove working tree"
 // when older gits fail validation on a registered-but-deleted directory.
@@ -1109,6 +1114,57 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       porcelainStatus,
     };
   });
+
+  const readGuardedCommitMergeState = Effect.fn("GitVcsDriver.readGuardedCommitMergeState")(
+    function* (cwd: string) {
+      const mergeHeadPathValue = yield* runGitStdout(
+        "GitVcsDriver.readGuardedCommitMergeState.path",
+        cwd,
+        ["rev-parse", "--git-path", "MERGE_HEAD"],
+      ).pipe(Effect.map((value) => value.trim()));
+      const mergeHeadPath = path.isAbsolute(mergeHeadPathValue)
+        ? mergeHeadPathValue
+        : path.resolve(cwd, mergeHeadPathValue);
+      const mergeHeadContents = yield* fileSystem.readFileString(mergeHeadPath).pipe(
+        Effect.catchTags({
+          PlatformError: (cause) =>
+            cause.reason._tag === "NotFound"
+              ? Effect.succeed(null)
+              : Effect.fail(
+                  new GitCommandError({
+                    ...gitCommandContext({
+                      operation: "GitVcsDriver.readGuardedCommitMergeState.read",
+                      cwd,
+                      args: ["rev-parse", "--git-path", "MERGE_HEAD"],
+                    }),
+                    detail: "Could not read the repository merge state.",
+                    cause,
+                  }),
+                ),
+        }),
+      );
+      if (mergeHeadContents === null) {
+        return { path: mergeHeadPath, heads: [] as ReadonlyArray<string> };
+      }
+
+      const mergeHeadLines = mergeHeadContents
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+      const heads = yield* Effect.forEach(mergeHeadLines, (mergeHead) =>
+        runGitStdout("GitVcsDriver.readGuardedCommitMergeState.verify", cwd, [
+          "rev-parse",
+          "--verify",
+          "--end-of-options",
+          `${mergeHead}^{commit}`,
+        ]).pipe(Effect.map((value) => value.trim())),
+      );
+      return { path: mergeHeadPath, heads };
+    },
+  );
+
+  const mergeHeadsEqual = (left: ReadonlyArray<string>, right: ReadonlyArray<string>): boolean =>
+    left.length === right.length && left.every((head, index) => head === right[index]);
 
   const guardedCommitHookNames = Effect.fn("GitVcsDriver.guardedCommitHookNames")(function* (
     cwd: string,
@@ -3118,7 +3174,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
       const precondition = input.precondition;
       return yield* Effect.gen(function* () {
-        const state = yield* readMutationState(input.cwd);
+        const [state, mergeState] = yield* Effect.all([
+          readMutationState(input.cwd),
+          readGuardedCommitMergeState(input.cwd),
+        ]);
         const expectedRefName = precondition.expectedRefName;
         if (
           expectedRefName === undefined ||
@@ -3178,10 +3237,34 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           });
         }
 
+        const headTree =
+          state.headCommit === null
+            ? yield* executeGit(
+                "GitVcsDriver.commitIndex.emptyTree",
+                input.cwd,
+                ["hash-object", "-t", "tree", "--stdin"],
+                { stdin: "" },
+              ).pipe(Effect.map((result) => result.stdout.trim()))
+            : yield* runGitStdout("GitVcsDriver.commitIndex.headTree", input.cwd, [
+                "rev-parse",
+                `${state.headCommit}^{tree}`,
+              ]).pipe(Effect.map((value) => value.trim()));
+        if (headTree === precondition.expectedIndexTree) {
+          return yield* new GitCommandError({
+            ...gitCommandContext({
+              operation: "GitVcsDriver.commitIndex.empty",
+              cwd: input.cwd,
+              args: ["commit-tree"],
+            }),
+            detail: "There is nothing staged to commit.",
+          });
+        }
+
         const commitTreeArgs = [
           "commit-tree",
           precondition.expectedIndexTree,
           ...(state.headCommit === null ? [] : ["-p", state.headCommit]),
+          ...mergeState.heads.flatMap((mergeHead) => ["-p", mergeHead]),
           ...(yield* guardedCommitSigningArgs(input.cwd)),
           "-m",
           input.message,
@@ -3205,10 +3288,15 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         // commit-tree is deliberately based on the reviewed tree. Re-check
         // the checked-out branch and its tip before publishing so a checkout
         // or branch movement during object creation fails closed.
-        const stateBeforePublication = yield* readMutationState(input.cwd);
+        const [stateBeforePublication, mergeStateBeforePublication] = yield* Effect.all([
+          readMutationState(input.cwd),
+          readGuardedCommitMergeState(input.cwd),
+        ]);
         if (
           stateBeforePublication.currentRef !== state.currentRef ||
-          stateBeforePublication.headCommit !== state.headCommit
+          stateBeforePublication.headCommit !== state.headCommit ||
+          stateBeforePublication.indexTree !== state.indexTree ||
+          !mergeHeadsEqual(mergeStateBeforePublication.heads, mergeState.heads)
         ) {
           return yield* mutationRejection(
             "GitVcsDriver.commitIndex.publicationPrecondition",
@@ -3262,6 +3350,91 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             "stale_git_state",
             "The checked-out branch changed while publishing the reviewed commit.",
           );
+        }
+
+        if (mergeState.heads.length > 0) {
+          const mergeStateBeforeCleanup = yield* readGuardedCommitMergeState(input.cwd).pipe(
+            Effect.mapError(
+              (error) =>
+                new GitCommandError({
+                  ...gitCommandContext({
+                    operation: "GitVcsDriver.commitIndex.mergeCleanup",
+                    cwd: input.cwd,
+                    args: ["merge", "--quit"],
+                  }),
+                  detail: `Guarded commit ${commitSha} was published, but its merge state could not be read for cleanup.`,
+                  cause: error,
+                }),
+            ),
+          );
+          if (!mergeHeadsEqual(mergeStateBeforeCleanup.heads, mergeState.heads)) {
+            return yield* new GitCommandError({
+              ...gitCommandContext({
+                operation: "GitVcsDriver.commitIndex.mergeCleanup",
+                cwd: input.cwd,
+                args: ["merge", "--quit"],
+              }),
+              detail: `Guarded commit ${commitSha} was published, but the reviewed merge state changed before cleanup.`,
+            });
+          }
+
+          const quitResult = yield* executeGit(
+            "GitVcsDriver.commitIndex.mergeQuit",
+            input.cwd,
+            ["merge", "--quit"],
+            { allowNonZeroExit: true },
+          ).pipe(
+            Effect.mapError(
+              (error) =>
+                new GitCommandError({
+                  ...gitCommandContext({
+                    operation: "GitVcsDriver.commitIndex.mergeQuit",
+                    cwd: input.cwd,
+                    args: ["merge", "--quit"],
+                  }),
+                  detail: `Guarded commit ${commitSha} was published, but merge cleanup failed.`,
+                  cause: error,
+                }),
+            ),
+          );
+          if (quitResult.exitCode !== 0) {
+            return yield* new GitCommandError({
+              ...gitCommandContext({
+                operation: "GitVcsDriver.commitIndex.mergeQuit",
+                cwd: input.cwd,
+                args: ["merge", "--quit"],
+              }),
+              detail: `Guarded commit ${commitSha} was published, but merge cleanup failed.`,
+              ...(quitResult.exitCode === null ? {} : { exitCode: quitResult.exitCode }),
+              stdoutLength: quitResult.stdout.length,
+              stderrLength: quitResult.stderr.length,
+            });
+          }
+
+          const mergeStateAfterCleanup = yield* readGuardedCommitMergeState(input.cwd).pipe(
+            Effect.mapError(
+              (error) =>
+                new GitCommandError({
+                  ...gitCommandContext({
+                    operation: "GitVcsDriver.commitIndex.mergeCleanup",
+                    cwd: input.cwd,
+                    args: ["merge", "--quit"],
+                  }),
+                  detail: `Guarded commit ${commitSha} was published, but merge cleanup could not be verified.`,
+                  cause: error,
+                }),
+            ),
+          );
+          if (mergeStateAfterCleanup.heads.length > 0) {
+            return yield* new GitCommandError({
+              ...gitCommandContext({
+                operation: "GitVcsDriver.commitIndex.mergeCleanup",
+                cwd: input.cwd,
+                args: ["merge", "--quit"],
+              }),
+              detail: `Guarded commit ${commitSha} was published, but MERGE_HEAD cleanup could not be verified.`,
+            });
+          }
         }
 
         return { commitSha };
@@ -4117,19 +4290,95 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
   const createRef: GitVcsDriver.GitVcsDriver["Service"]["createRef"] = Effect.fn("createRef")(
     function* (input) {
-      if (input.switchRef) {
-        yield* guardDirtyWorkingTree("GitVcsDriver.createRef", input);
+      if (!input.switchRef) {
+        yield* executeGit("GitVcsDriver.createRef", input.cwd, ["branch", input.refName], {
+          timeoutMs: 10_000,
+          fallbackErrorDetail: "git branch create failed",
+        });
+        return { refName: input.refName };
       }
 
-      yield* executeGit("GitVcsDriver.createRef", input.cwd, ["branch", input.refName], {
-        timeoutMs: 10_000,
-        fallbackErrorDetail: "git branch create failed",
-      });
-      if (input.switchRef) {
-        yield* switchRef({
-          cwd: input.cwd,
-          refName: input.refName,
-          confirmDirtyWorkingTree: input.confirmDirtyWorkingTree,
+      const sourceRef = yield* runGitStdout(
+        "GitVcsDriver.createRef.sourceRef",
+        input.cwd,
+        ["symbolic-ref", "--short", "-q", "HEAD"],
+        true,
+      ).pipe(Effect.map((value) => value.trim() || null));
+      const sourceHead = yield* runGitStdout(
+        "GitVcsDriver.createRef.sourceHead",
+        input.cwd,
+        ["rev-parse", "--verify", "HEAD"],
+        true,
+      ).pipe(Effect.map((value) => value.trim() || null));
+      const targetExistedBefore = yield* branchExists(input.cwd, input.refName);
+      // Keep the confirmation check as the final read before the combined
+      // checkout/create operation. Preparatory ref reads must not reopen the
+      // race that this confirmation is meant to close.
+      yield* guardDirtyWorkingTree("GitVcsDriver.createRef", input);
+      const checkoutArgs = ["checkout", "-b", input.refName] as const;
+      const result = yield* executeGitWithStableDiagnostics(
+        "GitVcsDriver.createRef.checkout",
+        input.cwd,
+        checkoutArgs,
+        { timeoutMs: 10_000, allowNonZeroExit: true },
+      );
+      if (result.exitCode !== 0) {
+        const targetAlreadyExists = isExistingBranchCheckoutStderr(result.stderr);
+        const becameDirtyWithoutConfirmation =
+          input.confirmDirtyWorkingTree === false && !targetAlreadyExists
+            ? yield* runGitStdout("GitVcsDriver.createRef.failureStatus", input.cwd, [
+                "status",
+                "--porcelain",
+              ]).pipe(Effect.orElseSucceed(() => ""))
+            : "";
+        if (!targetExistedBefore && !targetAlreadyExists) {
+          const currentRef = yield* runGitStdout(
+            "GitVcsDriver.createRef.cleanup.currentRef",
+            input.cwd,
+            ["symbolic-ref", "--short", "-q", "HEAD"],
+            true,
+          ).pipe(Effect.map((value) => value.trim() || null));
+          const currentHead = yield* runGitStdout(
+            "GitVcsDriver.createRef.cleanup.currentHead",
+            input.cwd,
+            ["rev-parse", "--verify", "HEAD"],
+            true,
+          ).pipe(Effect.map((value) => value.trim() || null));
+          if (currentRef === sourceRef && currentHead === sourceHead && sourceHead !== null) {
+            const targetRef = `refs/heads/${input.refName}`;
+            // A checkout from the captured source must have created the new
+            // ref at sourceHead. Use that captured value as the compare-and-
+            // swap expectation; reading the ref's current value first could
+            // accidentally authorize deleting a branch another writer has
+            // since advanced.
+            yield* executeGit(
+              "GitVcsDriver.createRef.cleanup",
+              input.cwd,
+              ["update-ref", "-d", targetRef, sourceHead],
+              { allowNonZeroExit: true },
+            );
+          }
+        }
+
+        if (becameDirtyWithoutConfirmation.length > 0) {
+          return yield* mutationRejection(
+            "GitVcsDriver.createRef.dirtyWorktree",
+            input.cwd,
+            "dirty_worktree_confirmation_required",
+            "Creating and switching refs with working tree changes requires confirmation.",
+          );
+        }
+
+        return yield* new GitCommandError({
+          ...gitCommandContext({
+            operation: "GitVcsDriver.createRef.checkout",
+            cwd: input.cwd,
+            args: checkoutArgs,
+          }),
+          detail: "git checkout -b failed",
+          ...(result.exitCode === null ? {} : { exitCode: result.exitCode }),
+          stdoutLength: result.stdout.length,
+          stderrLength: result.stderr.length,
         });
       }
 

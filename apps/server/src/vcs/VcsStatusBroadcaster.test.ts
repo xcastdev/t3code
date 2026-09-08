@@ -246,6 +246,45 @@ describe("VcsStatusBroadcaster", () => {
     }).pipe(Effect.provide(makeTestLayer(state)));
   });
 
+  it.effect("returns fresh remote state for nested refreshes from the canonical root", () => {
+    const state = {
+      currentLocalStatus: { ...baseLocalStatus, repositoryRoot: "/repo" },
+      currentRemoteStatus: baseRemoteStatus,
+      localStatusCalls: 0,
+      remoteStatusCalls: 0,
+      localInvalidationCalls: 0,
+      remoteInvalidationCalls: 0,
+    };
+    const remoteCwds: Array<string> = [];
+
+    return Effect.gen(function* () {
+      const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+      yield* broadcaster.getStatus({ cwd: "/repo" });
+      state.currentRemoteStatus = { ...baseRemoteStatus, aheadCount: 7 };
+
+      const refreshed = yield* broadcaster.refreshStatus("/repo/nested");
+      const root = yield* broadcaster.getStatus({ cwd: "/repo" });
+      const nested = yield* broadcaster.getStatus({ cwd: "/repo/nested" });
+
+      assert.equal(refreshed.aheadCount, 7);
+      assert.equal(root.aheadCount, 7);
+      assert.equal(nested.aheadCount, 7);
+      assert.deepStrictEqual(remoteCwds, ["/repo", "/repo"]);
+    }).pipe(
+      Effect.provide(
+        makeTestLayer(state, {
+          remoteStatus: (input, options) =>
+            Effect.sync(() => {
+              remoteCwds.push(input.cwd);
+              state.remoteStatusCalls += 1;
+              if (options?.refreshUpstream !== false) return state.currentRemoteStatus;
+              return state.currentRemoteStatus;
+            }),
+        }),
+      ),
+    );
+  });
+
   it.effect("keeps a newer local mutation after a delayed full refresh", () => {
     const state = {
       currentLocalStatus: baseLocalStatus,
@@ -399,6 +438,56 @@ describe("VcsStatusBroadcaster", () => {
       assert.equal(cached.aheadCount, 2);
     }).pipe(Effect.scoped);
   });
+
+  it.effect(
+    "orders overlapping nested and root remote refreshes on one canonical generation",
+    () => {
+      const state = {
+        currentLocalStatus: { ...baseLocalStatus, repositoryRoot: "/repo" },
+        currentRemoteStatus: baseRemoteStatus,
+        localStatusCalls: 0,
+        remoteStatusCalls: 0,
+        localInvalidationCalls: 0,
+        remoteInvalidationCalls: 0,
+      };
+
+      return Effect.gen(function* () {
+        const olderRefreshStarted = yield* Deferred.make<void>();
+        const releaseOlderRefresh = yield* Deferred.make<void>();
+        const layer = makeTestLayer(state, {
+          remoteStatus: (input) =>
+            Effect.gen(function* () {
+              state.remoteStatusCalls += 1;
+              if (state.remoteStatusCalls === 2) {
+                assert.equal(input.cwd, "/repo");
+                yield* Deferred.succeed(olderRefreshStarted, undefined);
+                yield* Deferred.await(releaseOlderRefresh);
+                return { ...baseRemoteStatus, aheadCount: 1 };
+              }
+              if (state.remoteStatusCalls === 3) {
+                assert.equal(input.cwd, "/repo");
+                return { ...baseRemoteStatus, aheadCount: 2 };
+              }
+              return state.currentRemoteStatus;
+            }),
+        });
+        const broadcaster = yield* Effect.provide(VcsStatusBroadcaster.VcsStatusBroadcaster, layer);
+        yield* broadcaster.getStatus({ cwd: "/repo" });
+
+        const older = yield* broadcaster.refreshStatus("/repo").pipe(Effect.forkScoped);
+        yield* Deferred.await(olderRefreshStarted);
+        const newer = yield* broadcaster.refreshStatus("/repo/nested");
+        yield* Deferred.succeed(releaseOlderRefresh, undefined);
+        yield* Fiber.join(older);
+
+        const root = yield* broadcaster.getStatus({ cwd: "/repo" });
+        const nested = yield* broadcaster.getStatus({ cwd: "/repo/nested" });
+        assert.equal(newer.aheadCount, 2);
+        assert.equal(root.aheadCount, 2);
+        assert.equal(nested.aheadCount, 2);
+      }).pipe(Effect.scoped);
+    },
+  );
 
   it.effect(
     "refreshStatus forwards no-fetch options and publishes local and remote separately",
