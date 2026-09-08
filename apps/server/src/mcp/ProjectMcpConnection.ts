@@ -360,23 +360,19 @@ export class ProjectMcpConnectionCoordinator {
     const current = this.rootsOwner;
     if (!current) return;
 
-    const required = new Set<RootsOwner>([current]);
-    for (let record: RootsOwner | undefined = current; record; record = record.previous) {
-      if (record.state !== "pending") continue;
-      required.add(record);
-      const fallback = this.nearestViableRootsOwner(record.previous);
-      if (fallback) {
-        required.add(fallback);
-        const fallbackPredecessor = this.nearestViableRootsOwner(fallback.previous);
-        if (fallbackPredecessor) required.add(fallbackPredecessor);
-      }
+    if (current.state === "committed") {
+      current.previous = undefined;
+      return;
     }
 
     const retained: RootsOwner[] = [];
     for (let record: RootsOwner | undefined = current; record; ) {
       const next: RootsOwner | undefined = record.previous;
-      if (required.has(record)) retained.push(record);
-      else record.previous = undefined;
+      if (record === current || record.state === "pending" || this.isViableRootsOwner(record)) {
+        retained.push(record);
+      } else {
+        record.previous = undefined;
+      }
       record = next;
     }
     for (let index = 0; index < retained.length; index += 1) {
@@ -411,6 +407,7 @@ export class ProjectMcpConnectionCoordinator {
   releaseRootsOwner(owner: object): void {
     this.releasedRootsOwners.add(owner);
     if (this.rootsOwner?.owner === owner) this.rootsOwner = undefined;
+    else this.compactRootsOwnerHistory();
   }
 
   private resourceTransition(

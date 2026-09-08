@@ -228,8 +228,9 @@ it("tracks roots owner generations through failure, release, and close", async (
         roots: [{ uri: `file:///success-${index}` }],
       }))!;
       coordinator.commitRootsOwner(replacement);
+      expect(retainedRootsGenerations(coordinator)).toBe(1);
     }
-    expect(retainedRootsGenerations(coordinator)).toBeLessThanOrEqual(3);
+    expect(retainedRootsGenerations(coordinator)).toBe(1);
     await expect(rootsList()).resolves.toEqual({
       roots: [{ uri: "file:///success-127" }],
     });
@@ -250,6 +251,7 @@ it("tracks roots owner generations through failure, release, and close", async (
         roots: [{ uri: `file:///success-${index}` }],
       }))!;
       coordinator.commitRootsOwner(replacement);
+      expect(retainedRootsGenerations(coordinator)).toBe(1);
     }
     coordinator.rollbackRootsOwner(stalled);
     expect(retainedRootsGenerations(coordinator)).toBe(1);
@@ -275,6 +277,35 @@ it("tracks roots owner generations through failure, release, and close", async (
     await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///a" }] });
     coordinator.rollbackRootsOwner(first);
     await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///healthy" }] });
+  }
+
+  {
+    for (const intermediateCount of [2, 3, 5]) {
+      const { coordinator, rootsList } = makeCoordinator();
+      const healthy = coordinator.replaceRootsOwner({}, () => ({
+        roots: [{ uri: "file:///healthy" }],
+      }))!;
+      coordinator.commitRootsOwner(healthy);
+
+      const owners = Array.from({ length: intermediateCount }, () => ({}));
+      const intermediates = owners.map(
+        (owner, index) =>
+          coordinator.replaceRootsOwner(owner, () => ({
+            roots: [{ uri: `file:///intermediate-${index}` }],
+          }))!,
+      );
+      const pending = coordinator.replaceRootsOwner({}, () => ({
+        roots: [{ uri: "file:///pending" }],
+      }))!;
+
+      await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///pending" }] });
+      for (const replacement of intermediates) coordinator.commitRootsOwner(replacement);
+      for (const owner of owners) coordinator.releaseRootsOwner(owner);
+      coordinator.rollbackRootsOwner(pending);
+
+      expect(retainedRootsGenerations(coordinator)).toBe(1);
+      await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///healthy" }] });
+    }
   }
 
   {

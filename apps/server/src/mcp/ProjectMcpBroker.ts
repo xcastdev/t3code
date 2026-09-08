@@ -483,7 +483,11 @@ export class ProjectMcpBroker {
       const release = await this.acquire(signal);
       try {
         signal.throwIfAborted();
-        return await Reflect.apply(bound, undefined, args);
+        const invocationArgs =
+          key === "callTool" || key === "getPrompt" || key === "readResource"
+            ? [args[0], { ...(args[1] as RequestOptions | undefined), signal }]
+            : args;
+        return await Reflect.apply(bound, undefined, invocationArgs);
       } finally {
         release();
       }

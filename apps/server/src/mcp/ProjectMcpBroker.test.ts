@@ -28,6 +28,12 @@ const connection = (client: ProjectMcpClient, protocolEra: "legacy" | "modern" =
   close: async () => undefined,
 });
 
+const cancellableOperations = [
+  ["callTool", { name: "hold" }, { name: "peer" }, { content: [], isError: false }],
+  ["getPrompt", { name: "hold" }, { name: "peer" }, { messages: [] }],
+  ["readResource", { uri: "file:///hold" }, { uri: "file:///peer" }, { contents: [] }],
+] as const;
+
 it("exposes standard SDK operations without exposing the upstream client", async () => {
   const result = {
     tools: [{ name: "echo", inputSchema: { type: "object" as const } }],
@@ -686,56 +692,211 @@ it.each([
   },
 );
 
-it("checks facade disposal after a legacy-to-modern acquire resolves", async () => {
-  const calls: string[] = [];
-  const client = makeClient({
-    callTool: (async (params) => {
-      calls.push(params.name);
-      return { content: [], isError: false };
-    }) as NonNullable<ProjectMcpClient["callTool"]>,
-  });
-  const shared = connection(client, "legacy");
-  const second = new ProjectMcpBroker({
-    connection: shared,
-    serverId,
-    providerSessionId: "acquire-race-second",
-    downstreamProtocolEra: "modern",
-  });
-  const third = new ProjectMcpBroker({
-    connection: shared,
-    serverId,
-    providerSessionId: "acquire-race-third",
-    downstreamProtocolEra: "modern",
-  });
-  const coordinator = projectMcpConnectionCoordinator(shared);
-  const originalAcquire = coordinator.acquire.bind(coordinator);
-  const mutableCoordinator = coordinator as unknown as {
-    acquire: ProjectMcpConnectionCoordinator["acquire"];
-  };
-  let disposeStarted = false;
-  mutableCoordinator.acquire = ((handler, signal) => {
-    const permit = originalAcquire(handler, signal);
-    if (disposeStarted) return permit;
-    disposeStarted = true;
-    return permit.then((release) => {
-      void second.dispose();
-      return release;
+it.each(["legacy", "modern"] as const)(
+  "aborts an active %s operation when its facade is disposed",
+  async (downstreamProtocolEra) => {
+    for (const [operationMethod, holdParams, peerParams, result] of cancellableOperations) {
+      const firstSignal = Promise.withResolvers<AbortSignal | undefined>();
+      const peerEntered = Promise.withResolvers<void>();
+      const firstCompleted = Promise.withResolvers<void>();
+      let calls = 0;
+      const invokeUpstream = async (
+        _params: unknown,
+        options?: { signal?: AbortSignal },
+      ): Promise<unknown> => {
+        if (calls++ === 0) {
+          firstSignal.resolve(options?.signal);
+          if (options?.signal) {
+            await new Promise<never>((_resolve, reject) => {
+              const abort = () => reject(options.signal!.reason);
+              if (options.signal!.aborted) abort();
+              else options.signal!.addEventListener("abort", abort, { once: true });
+            });
+          } else {
+            await firstCompleted.promise;
+          }
+        }
+        peerEntered.resolve();
+        return result;
+      };
+      const client = makeClient({
+        callTool: invokeUpstream as NonNullable<ProjectMcpClient["callTool"]>,
+        getPrompt: invokeUpstream as NonNullable<ProjectMcpClient["getPrompt"]>,
+        readResource: invokeUpstream as NonNullable<ProjectMcpClient["readResource"]>,
+      });
+      const shared = connection(client, "legacy");
+      const first = new ProjectMcpBroker({
+        connection: shared,
+        serverId,
+        providerSessionId: `${downstreamProtocolEra}-${operationMethod}-hold`,
+        downstreamProtocolEra,
+      });
+      const second = new ProjectMcpBroker({
+        connection: shared,
+        serverId,
+        providerSessionId: `${downstreamProtocolEra}-${operationMethod}-peer`,
+        downstreamProtocolEra,
+      });
+      const invoke = (broker: ProjectMcpBroker, params: Record<string, unknown>) => {
+        if (operationMethod === "callTool") return broker.callTool(params as never);
+        if (operationMethod === "getPrompt") return broker.getPrompt(params as never);
+        return broker.readResource(params as never);
+      };
+      try {
+        const firstRequest = invoke(first, holdParams);
+        const signal = await firstSignal.promise;
+        const peerRequest = invoke(second, peerParams);
+        await first.dispose();
+        await Promise.resolve();
+
+        expect(signal).toBeDefined();
+        if (signal === undefined) return;
+        expect(signal.aborted).toBe(true);
+        expect(signal.reason).toBeInstanceOf(Error);
+        expect((signal.reason as Error).message).toBe("MCP facade disposed");
+        await expect(firstRequest).rejects.toThrow("MCP facade disposed");
+        await expect(peerEntered.promise).resolves.toBeUndefined();
+        await expect(peerRequest).resolves.toEqual(result);
+      } finally {
+        firstCompleted.resolve();
+        await first.dispose();
+        await second.dispose();
+      }
+    }
+  },
+);
+
+it.each(cancellableOperations)(
+  "preserves caller cancellation for legacy %s",
+  async (operationMethod, holdParams, peerParams, result) => {
+    const caller = new AbortController();
+    const firstSignal = Promise.withResolvers<AbortSignal | undefined>();
+    const peerEntered = Promise.withResolvers<void>();
+    const firstCompleted = Promise.withResolvers<void>();
+    let calls = 0;
+    const invokeUpstream = async (
+      _params: unknown,
+      options?: { signal?: AbortSignal },
+    ): Promise<unknown> => {
+      if (calls++ === 0) {
+        firstSignal.resolve(options?.signal);
+        if (options?.signal) {
+          await new Promise<never>((_resolve, reject) => {
+            const abort = () => reject(options.signal!.reason);
+            if (options.signal!.aborted) abort();
+            else options.signal!.addEventListener("abort", abort, { once: true });
+          });
+        } else {
+          await firstCompleted.promise;
+        }
+      }
+      peerEntered.resolve();
+      return result;
+    };
+    const client = makeClient({
+      callTool: invokeUpstream as NonNullable<ProjectMcpClient["callTool"]>,
+      getPrompt: invokeUpstream as NonNullable<ProjectMcpClient["getPrompt"]>,
+      readResource: invokeUpstream as NonNullable<ProjectMcpClient["readResource"]>,
     });
-  }) as ProjectMcpConnectionCoordinator["acquire"];
-  try {
-    await expect(second.callTool({ name: "disposed" })).rejects.toThrow("MCP facade disposed");
-    expect(calls).toEqual([]);
-    await expect(third.callTool({ name: "third" })).resolves.toEqual({
-      content: [],
-      isError: false,
+    const shared = connection(client, "legacy");
+    const first = new ProjectMcpBroker({
+      connection: shared,
+      serverId,
+      providerSessionId: `caller-${operationMethod}-hold`,
+      downstreamProtocolEra: "legacy",
     });
-    expect(calls).toEqual(["third"]);
-  } finally {
-    mutableCoordinator.acquire = originalAcquire;
-    await second.dispose();
-    await third.close();
-  }
-});
+    const second = new ProjectMcpBroker({
+      connection: shared,
+      serverId,
+      providerSessionId: `caller-${operationMethod}-peer`,
+      downstreamProtocolEra: "legacy",
+    });
+    const invoke = (
+      broker: ProjectMcpBroker,
+      params: Record<string, unknown>,
+      options?: unknown,
+    ) => {
+      if (operationMethod === "callTool") return broker.callTool(params as never, options as never);
+      if (operationMethod === "getPrompt")
+        return broker.getPrompt(params as never, options as never);
+      return broker.readResource(params as never, options as never);
+    };
+    try {
+      const firstRequest = invoke(first, holdParams, { signal: caller.signal });
+      const signal = await firstSignal.promise;
+      const peerRequest = invoke(second, peerParams);
+      const reason = new Error("caller cancelled");
+      caller.abort(reason);
+      await Promise.resolve();
+
+      expect(signal).toBeDefined();
+      if (signal === undefined) return;
+      expect(signal).not.toBe(caller.signal);
+      expect(signal.reason).toBe(reason);
+      await expect(firstRequest).rejects.toBe(reason);
+      await expect(peerEntered.promise).resolves.toBeUndefined();
+      await expect(peerRequest).resolves.toEqual(result);
+    } finally {
+      firstCompleted.resolve();
+      await first.dispose();
+      await second.dispose();
+    }
+  },
+);
+
+it.each(["legacy", "modern"] as const)(
+  "checks facade disposal after a %s acquire resolves",
+  async (downstreamProtocolEra) => {
+    const calls: string[] = [];
+    const client = makeClient({
+      callTool: (async (params) => {
+        calls.push(params.name);
+        return { content: [], isError: false };
+      }) as NonNullable<ProjectMcpClient["callTool"]>,
+    });
+    const shared = connection(client, "legacy");
+    const second = new ProjectMcpBroker({
+      connection: shared,
+      serverId,
+      providerSessionId: "acquire-race-second",
+      downstreamProtocolEra,
+    });
+    const third = new ProjectMcpBroker({
+      connection: shared,
+      serverId,
+      providerSessionId: "acquire-race-third",
+      downstreamProtocolEra,
+    });
+    const coordinator = projectMcpConnectionCoordinator(shared);
+    const originalAcquire = coordinator.acquire.bind(coordinator);
+    const mutableCoordinator = coordinator as unknown as {
+      acquire: ProjectMcpConnectionCoordinator["acquire"];
+    };
+    let disposeStarted = false;
+    mutableCoordinator.acquire = ((handler, signal) => {
+      const permit = originalAcquire(handler, signal);
+      if (disposeStarted) return permit;
+      disposeStarted = true;
+      return permit.then((release) => {
+        void second.dispose();
+        return release;
+      });
+    }) as ProjectMcpConnectionCoordinator["acquire"];
+    try {
+      await expect(second.callTool({ name: "disposed" })).rejects.toThrow("MCP facade disposed");
+      expect(calls).toEqual([]);
+      await expect(third.callTool({ name: "third" })).resolves.toEqual({
+        content: [],
+        isError: false,
+      });
+      expect(calls).toEqual(["third"]);
+    } finally {
+      mutableCoordinator.acquire = originalAcquire;
+      await second.dispose();
+      await third.close();
+    }
+  },
+);
 
 it("rejects tampered input state before contacting the upstream server", async () => {
   let calls = 0;
