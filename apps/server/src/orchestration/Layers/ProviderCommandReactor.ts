@@ -451,6 +451,12 @@ const make = Effect.gen(function* () {
       return;
     }
     const session = thread.session;
+    const attachedProviderSession = (yield* providerService.listSessions()).some(
+      (providerSession) =>
+        providerSession.threadId === input.threadId && providerSession.status !== "closed",
+    );
+    const preserveAttachedSession =
+      session !== null && session.status !== "stopped" && attachedProviderSession;
     yield* setThreadSession({
       threadId: input.threadId,
       session: {
@@ -460,8 +466,12 @@ const make = Effect.gen(function* () {
           providerInstanceId: thread.modelSelection.instanceId,
           runtimeMode: thread.runtimeMode,
         }),
-        status: session?.status === "stopped" ? "stopped" : "error",
-        activeTurnId: null,
+        status: preserveAttachedSession
+          ? session.status
+          : session?.status === "stopped"
+            ? "stopped"
+            : "error",
+        activeTurnId: preserveAttachedSession ? session.activeTurnId : null,
         lastError: input.detail,
         updatedAt: input.createdAt,
       },
@@ -698,9 +708,23 @@ const make = Effect.gen(function* () {
       projects: project ? [project] : [],
     });
 
-    const buildRecoveryInput = (): ProviderSessionRecovery | undefined => {
+    const supportsSessionRecovery = (driverKind: unknown): boolean =>
+      driverKind === ProviderDriverKind.make("opencode");
+
+    const buildRecoveryInput = (input: {
+      readonly driverKind: unknown;
+      readonly cwdChanged: boolean;
+      readonly incompatibleModelChange: boolean;
+    }): ProviderSessionRecovery | undefined => {
       const session = thread.session;
-      if (!session || session.status !== "running" || session.activeTurnId === null) {
+      if (
+        input.incompatibleModelChange ||
+        input.cwdChanged ||
+        !supportsSessionRecovery(input.driverKind) ||
+        !session ||
+        session.status !== "running" ||
+        session.activeTurnId === null
+      ) {
         return undefined;
       }
       const recoveryUserMessage = thread.messages.findLast((message) => message.role === "user");
@@ -770,6 +794,7 @@ const make = Effect.gen(function* () {
     if (existingSessionThreadId) {
       const runtimeModeChanged = thread.runtimeMode !== thread.session?.runtimeMode;
       const cwdChanged = effectiveCwd !== activeSession?.cwd;
+      const resolvedDriverKind = activeSession?.provider ?? currentInfo.driverKind;
       const sessionModelSwitch = (yield* providerService.getCapabilities(desiredInstanceId))
         .sessionModelSwitch;
       const modelChanged =
@@ -798,7 +823,11 @@ const make = Effect.gen(function* () {
       const resumeCursor = shouldRestartForModelChange
         ? undefined
         : (activeSession?.resumeCursor ?? undefined);
-      const recovery = shouldRestartForModelChange ? undefined : buildRecoveryInput();
+      const recovery = buildRecoveryInput({
+        driverKind: resolvedDriverKind,
+        cwdChanged,
+        incompatibleModelChange: shouldRestartForModelChange,
+      });
       yield* Effect.logInfo("provider command reactor restarting provider session", {
         threadId,
         existingSessionThreadId,
@@ -835,7 +864,10 @@ const make = Effect.gen(function* () {
         runtimeMode: restartedSession.runtimeMode,
         cwd: restartedSession.cwd,
       });
-      yield* bindSessionToThread(restartedSession, recovery?.turnId);
+      yield* bindSessionToThread(
+        restartedSession,
+        supportsSessionRecovery(resolvedDriverKind) ? recovery?.turnId : undefined,
+      );
       return restartedSession.threadId;
     }
 

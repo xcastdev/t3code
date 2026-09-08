@@ -208,10 +208,12 @@ describe("ProviderCommandReactor", () => {
         typeof input.recovery.turnId === "string"
           ? asTurnId(input.recovery.turnId)
           : undefined;
+      const recoveredByOpenCode =
+        provider === ProviderDriverKind.make("opencode") && recoveryTurnId !== undefined;
       const session: ProviderSession = {
         provider,
         ...(providerInstanceId ? { providerInstanceId } : {}),
-        status: recoveryTurnId ? ("running" as const) : ("ready" as const),
+        status: recoveredByOpenCode ? ("running" as const) : ("ready" as const),
         runtimeMode:
           typeof input === "object" &&
           input !== null &&
@@ -230,7 +232,7 @@ describe("ProviderCommandReactor", () => {
           : {}),
         threadId,
         resumeCursor: resumeCursor ?? { opaque: `resume-${sessionIndex}` },
-        ...(recoveryTurnId ? { activeTurnId: recoveryTurnId } : {}),
+        ...(recoveredByOpenCode ? { activeTurnId: recoveryTurnId } : {}),
         createdAt: now,
         updatedAt: now,
       };
@@ -2150,17 +2152,12 @@ describe("ProviderCommandReactor", () => {
         model: "claude-sonnet-4-6",
       },
       runtimeMode: "approval-required",
-      recovery: {
-        turnId: asTurnId("turn-1"),
-        state: "running",
-        userMessageId: asMessageId("user-message-workspace-2"),
-      },
     });
     const readModel = await harness.readModel();
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.session).toMatchObject({
-      status: "running",
-      activeTurnId: asTurnId("turn-1"),
+      status: "starting",
+      activeTurnId: null,
     });
   });
 
@@ -2232,8 +2229,13 @@ describe("ProviderCommandReactor", () => {
     });
   });
 
-  it("restarts the provider session when runtime mode is updated on the thread", async () => {
-    const harness = await createHarness();
+  it("recovers an active OpenCode session when runtime mode is updated on the thread", async () => {
+    const harness = await createHarness({
+      threadModelSelection: {
+        instanceId: ProviderInstanceId.make("opencode"),
+        model: "opencode/kimi-k3",
+      },
+    });
     const now = "2026-01-01T00:00:00.000Z";
 
     await Effect.runPromise(
@@ -2274,8 +2276,8 @@ describe("ProviderCommandReactor", () => {
         session: {
           threadId: ThreadId.make("thread-1"),
           status: "running",
-          providerName: "codex",
-          providerInstanceId: ProviderInstanceId.make("codex"),
+          providerName: "opencode",
+          providerInstanceId: ProviderInstanceId.make("opencode"),
           runtimeMode: "full-access",
           activeTurnId: asTurnId("turn-1"),
           lastError: null,
@@ -2379,6 +2381,172 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.runtimeMode).toBe("approval-required");
     expect(thread?.session?.status).toBe("running");
     expect(thread?.session?.activeTurnId).toBe(asTurnId("turn-1"));
+  });
+
+  it("does not recover an active Codex turn when runtime mode restarts the session", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("cmd-runtime-mode-set-codex-full-access"),
+        threadId: ThreadId.make("thread-1"),
+        runtimeMode: "full-access",
+        createdAt: now,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-codex-active"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-codex-active"),
+          role: "user",
+          text: "first",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "full-access",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-codex-active"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "full-access",
+          activeTurnId: asTurnId("turn-1"),
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.runtime-mode.set",
+        commandId: CommandId.make("cmd-runtime-mode-set-codex-restart"),
+        threadId: ThreadId.make("thread-1"),
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 2);
+    expect(harness.startSession.mock.calls[1]?.[1]).toMatchObject({
+      resumeCursor: { opaque: "resume-1" },
+      runtimeMode: "approval-required",
+    });
+    expect(harness.startSession.mock.calls[1]?.[1]).not.toHaveProperty("recovery");
+    await waitFor(async () => {
+      const current = (await harness.readModel()).threads.find(
+        (entry) => entry.id === ThreadId.make("thread-1"),
+      );
+      return current?.session?.runtimeMode === "approval-required";
+    });
+
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.session).toMatchObject({
+      status: "ready",
+      activeTurnId: null,
+    });
+  });
+
+  it("forks an OpenCode cwd replacement without recovering the old turn", async () => {
+    const harness = await createHarness({
+      threadModelSelection: {
+        instanceId: ProviderInstanceId.make("opencode"),
+        model: "opencode/kimi-k3",
+      },
+    });
+    const now = "2026-01-01T00:00:00.000Z";
+
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-opencode-cwd-1"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-opencode-cwd-1"),
+          role: "user",
+          text: "first",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-opencode-cwd-active"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "running",
+          providerName: "opencode",
+          providerInstanceId: ProviderInstanceId.make("opencode"),
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("turn-1"),
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-opencode-cwd-change"),
+        threadId: ThreadId.make("thread-1"),
+        worktreePath: "/tmp/provider-project-opencode-worktree",
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-opencode-cwd-2"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-opencode-cwd-2"),
+          role: "user",
+          text: "second",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+
+    await waitFor(() => harness.startSession.mock.calls.length === 2);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 2);
+    expect(harness.startSession.mock.calls[1]?.[1]).toMatchObject({
+      cwd: "/tmp/provider-project-opencode-worktree",
+      resumeCursor: { opaque: "resume-1" },
+    });
+    expect(harness.startSession.mock.calls[1]?.[1]).not.toHaveProperty("recovery");
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.session?.activeTurnId).toBeNull();
+    expect(harness.sendTurn.mock.calls[1]?.[0]).toMatchObject({
+      threadId: ThreadId.make("thread-1"),
+    });
   });
 
   it("does not inject derived model options when restarting claude on runtime mode changes", async () => {

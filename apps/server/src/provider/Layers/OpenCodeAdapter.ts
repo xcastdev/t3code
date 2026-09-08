@@ -478,8 +478,10 @@ interface OpenCodeSessionContext {
   awaitingBusyAfterInterruption: boolean;
   pendingIdleReconciliation: OpenCodeIdleReconciliation | undefined;
   pendingRequestRecovery: OpenCodePendingRequestRecovery | undefined;
+  recoveryReconciliationDeferred: boolean;
   promptGeneration: number;
   promptAdmission: OpenCodePromptAdmission | undefined;
+  unpublished: boolean;
   closingIntent: OpenCodeContextCloseIntent | undefined;
   readonly promptSemaphore: Semaphore.Semaphore;
   readonly firstConnection: Deferred.Deferred<void, ProviderAdapterRequestError>;
@@ -2938,6 +2940,13 @@ export function makeOpenCodeAdapter(
       context: OpenCodeSessionContext,
       event: OpenCodeSubscribedEvent,
     ) {
+      if (
+        event.type !== "server.connected" &&
+        context.unpublished &&
+        sessions.get(context.session.threadId) !== context
+      ) {
+        return;
+      }
       // Record every upstream stream event before relation checks or routing.
       // Canonical provider events retain this same payload in `raw`, so the
       // provider event log can correlate a translation by upstream event id.
@@ -2956,19 +2965,29 @@ export function makeOpenCodeAdapter(
       if (event.type === "server.connected") {
         if (
           (yield* Ref.get(context.stopped)) ||
-          sessions.get(context.session.threadId) !== context
+          (sessions.get(context.session.threadId) !== context && !context.unpublished)
         ) {
           return;
         }
         const isFirstConnection = !(yield* Deferred.isDone(context.firstConnection));
         if (isFirstConnection) {
           if (context.recovery !== undefined) {
-            yield* reconcileRecoveredOpenCodeSession(context);
-            if (
-              (yield* Ref.get(context.stopped)) ||
-              sessions.get(context.session.threadId) !== context
-            ) {
-              return;
+            const deferRecoveryReconciliation =
+              context.unpublished && sessions.get(context.session.threadId) !== context;
+            if (deferRecoveryReconciliation) {
+              // A replacement candidate may be connected to the same remote
+              // session while the old context still owns the thread. Do not
+              // reconcile or emit recovered-turn events until the candidate
+              // has won the replacement handoff.
+              context.recoveryReconciliationDeferred = true;
+            } else {
+              yield* reconcileRecoveredOpenCodeSession(context);
+              if (
+                (yield* Ref.get(context.stopped)) ||
+                sessions.get(context.session.threadId) !== context
+              ) {
+                return;
+              }
             }
           }
           const updatedAt = yield* nowIso;
@@ -2979,7 +2998,10 @@ export function makeOpenCodeAdapter(
             return;
           }
         }
-        if (context.recovery === undefined || context.activeTurnId !== undefined) {
+        if (
+          (context.recovery === undefined || context.activeTurnId !== undefined) &&
+          !context.recoveryReconciliationDeferred
+        ) {
           yield* schedulePendingRequestRecovery(
             context,
             context.recovery !== undefined ? { maxRetries: 3 } : undefined,
@@ -3773,8 +3795,9 @@ export function makeOpenCodeAdapter(
           if (existing.session.status === "connecting" && !(yield* Ref.get(existing.stopped))) {
             return (yield* awaitOpenCodeContextReady(existing)).session;
           }
-          yield* closeOpenCodeContext(existing, "detach", settlePendingOpenCodeRequests);
-          deleteContextIfCurrent(existing);
+          if (yield* Ref.get(existing.stopped)) {
+            deleteContextIfCurrent(existing);
+          }
         }
 
         const started = yield* Effect.gen(function* () {
@@ -3983,8 +4006,10 @@ export function makeOpenCodeAdapter(
           awaitingBusyAfterInterruption: false,
           pendingIdleReconciliation: undefined,
           pendingRequestRecovery: undefined,
+          recoveryReconciliationDeferred: false,
           promptGeneration: 0,
           promptAdmission: undefined,
+          unpublished: true,
           closingIntent: undefined,
           promptSemaphore: Semaphore.makeUnsafe(1),
           firstConnection: Deferred.makeUnsafe<void, ProviderAdapterRequestError>(),
@@ -4000,23 +4025,14 @@ export function makeOpenCodeAdapter(
             ),
           );
         }
-        const raceWinner = sessions.get(input.threadId);
-        if (raceWinner) {
-          // Another start published first. A newly created remote session
-          // belongs to this loser; a resumed session is shared upstream state.
-          yield* closeStartingOpenCodeContext(
-            context,
-            started.created ? "terminate" : "detach",
-            settlePendingOpenCodeRequests,
-          );
-          return (yield* awaitOpenCodeContextReady(raceWinner)).session;
-        }
-        sessions.set(input.threadId, context);
         const cleanupStartingContext = closeStartingOpenCodeContext(
           context,
           started.created ? "terminate" : "detach",
           settlePendingOpenCodeRequests,
         ).pipe(Effect.ensuring(Effect.sync(() => deleteContextIfCurrent(context))));
+        if (existing === undefined) {
+          sessions.set(input.threadId, context);
+        }
         const connectionExit = yield* Effect.gen(function* () {
           yield* startEventPump(context);
           yield* Deferred.await(context.firstConnection).pipe(
@@ -4039,7 +4055,40 @@ export function makeOpenCodeAdapter(
           yield* cleanupStartingContext;
           return yield* Effect.failCause(connectionExit.cause);
         }
+
+        const raceWinner = sessions.get(input.threadId);
+        if (raceWinner && raceWinner !== existing && raceWinner !== context) {
+          // Another start published while this candidate was connecting. A
+          // newly created remote session belongs to this loser; a resumed
+          // session is shared upstream state.
+          yield* cleanupStartingContext;
+          return (yield* awaitOpenCodeContextReady(raceWinner)).session;
+        }
+
+        if (existing && raceWinner === existing && !(yield* Ref.get(existing.stopped))) {
+          const terminated = yield* Effect.exit(terminateOpenCodeContext(existing));
+          if (Exit.isFailure(terminated)) {
+            yield* cleanupStartingContext;
+            return yield* Effect.failCause(terminated.cause);
+          }
+        } else if (existing && raceWinner === existing) {
+          deleteContextIfCurrent(existing);
+        }
+
+        context.unpublished = false;
+        sessions.set(input.threadId, context);
         yield* awaitOpenCodeContextReady(context);
+        if (context.recoveryReconciliationDeferred) {
+          context.recoveryReconciliationDeferred = false;
+          yield* reconcileRecoveredOpenCodeSession(context);
+          // Reconciliation can fail the candidate and remove it from the
+          // session map. Do not publish lifecycle events for that failed
+          // startup.
+          yield* awaitOpenCodeContextReady(context);
+          if (context.activeTurnId !== undefined) {
+            yield* schedulePendingRequestRecovery(context, { maxRetries: 3 });
+          }
+        }
         if (!started.created && input.recovery === undefined) {
           yield* schedulePendingRequestRecovery(context);
         }
@@ -4574,6 +4623,33 @@ export function makeOpenCodeAdapter(
       ).pipe(Effect.mapError(toRequestError));
     });
 
+    const terminateOpenCodeContext = Effect.fn("terminateOpenCodeContext")(function* (
+      context: OpenCodeSessionContext,
+    ) {
+      context.closingIntent = "terminate";
+      const activeTurnId = context.activeTurnId;
+      const interruptExit =
+        activeTurnId === undefined
+          ? Exit.succeed(undefined)
+          : yield* Effect.exit(interruptTurn(context.session.threadId, activeTurnId));
+      if (Exit.isFailure(interruptExit)) {
+        context.closingIntent = undefined;
+        return yield* Effect.failCause(interruptExit.cause);
+      }
+
+      const closeExit = yield* Effect.exit(
+        closeOpenCodeContext(context, "terminate", settlePendingOpenCodeRequests, {
+          remoteTerminationConfirmed: activeTurnId !== undefined,
+        }),
+      );
+      if (Exit.isFailure(closeExit)) {
+        context.closingIntent = undefined;
+        return yield* Effect.failCause(closeExit.cause);
+      }
+      deleteContextIfCurrent(context);
+      return closeExit.value;
+    });
+
     const stopSession: OpenCodeAdapterShape["stopSession"] = Effect.fn("stopSession")(
       function* (threadId) {
         const context = sessions.get(threadId);
@@ -4583,22 +4659,7 @@ export function makeOpenCodeAdapter(
             threadId,
           });
         }
-        context.closingIntent = "terminate";
-        const activeTurnId = context.activeTurnId;
-        if (activeTurnId !== undefined) {
-          const interruptExit = yield* Effect.exit(interruptTurn(threadId, activeTurnId));
-          if (Exit.isFailure(interruptExit)) {
-            context.closingIntent = undefined;
-            return yield* Effect.failCause(interruptExit.cause);
-          }
-        }
-        const stopped = yield* closeOpenCodeContext(
-          context,
-          "terminate",
-          settlePendingOpenCodeRequests,
-          { remoteTerminationConfirmed: activeTurnId !== undefined },
-        );
-        deleteContextIfCurrent(context);
+        const stopped = yield* terminateOpenCodeContext(context);
         if (!stopped) {
           return;
         }

@@ -1409,6 +1409,19 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       Effect.gen(function* () {
         const adapter = yield* OpenCodeAdapter;
         const threadId = asThreadId("thread-opencode-cwd");
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Keep the original turn active",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "opencode/kimi-k3",
+          ),
+        });
         // The persisted session still exists but was created in another working dir
         // (e.g. the thread moved from the project root into a git worktree).
         runtimeMock.state.sessionDirectoryById.set("ses_otherdir", "/some/other/worktree");
@@ -1423,7 +1436,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         // A cwd change must not mint an empty session: the adapter forks the
         // persisted session into the requested cwd, carrying history forward.
         NodeAssert.deepEqual(runtimeMock.state.sessionGetIds, ["ses_otherdir"]);
-        NodeAssert.deepEqual(runtimeMock.state.sessionCreateUrls, []);
+        NodeAssert.deepEqual(runtimeMock.state.sessionCreateUrls, ["http://127.0.0.1:9999"]);
         NodeAssert.equal(runtimeMock.state.forkCalls.length, 1);
         NodeAssert.equal(runtimeMock.state.forkCalls[0]?.sessionID, "ses_otherdir");
         NodeAssert.equal(typeof runtimeMock.state.forkCalls[0]?.directory, "string");
@@ -1435,9 +1448,150 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           schemaVersion: 1,
           sessionId: "ses_otherdir_fork",
         });
+        NodeAssert.equal(session.activeTurnId, undefined);
+        NodeAssert.deepEqual(runtimeMock.state.abortCalls, ["http://127.0.0.1:9999/session"]);
 
         yield* adapter.stopSession(threadId);
       }),
+  );
+
+  it.effect("terminates an external active session before publishing its cwd fork", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-external-replacement");
+      runtimeMock.state.createdSessionIds.push("ses_original");
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const originalTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "Keep working in the original directory",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+      runtimeMock.state.sessionDirectoryById.set("ses_resumable", "/some/other/worktree");
+
+      const fork = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        cwd: "/requested/worktree",
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId: "ses_resumable" },
+      });
+
+      NodeAssert.deepEqual(runtimeMock.state.forkCalls, [
+        { sessionID: "ses_resumable", directory: "/requested/worktree" },
+      ]);
+      NodeAssert.deepEqual(runtimeMock.state.abortCalls, ["ses_original"]);
+      NodeAssert.equal(fork.activeTurnId, undefined);
+      NodeAssert.notEqual(fork.resumeCursor, originalTurn.resumeCursor);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("leaves the original context attached when a replacement candidate fails", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-candidate-failure");
+      runtimeMock.state.createdSessionIds.push("ses_original");
+
+      const original = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const originalTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "Keep the original turn alive",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+      runtimeMock.state.transientErrorSessionIds.add("ses_failed_candidate");
+
+      const result = yield* Effect.exit(
+        adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+          resumeCursor: { schemaVersion: 1, sessionId: "ses_failed_candidate" },
+        }),
+      );
+      const sessions = (yield* adapter.listSessions()).filter(
+        (session) => session.threadId === threadId,
+      );
+
+      NodeAssert.equal(Exit.isFailure(result), true);
+      NodeAssert.equal(sessions.length, 1);
+      NodeAssert.deepEqual(sessions[0]?.resumeCursor, original.resumeCursor);
+      NodeAssert.equal(sessions[0]?.activeTurnId, originalTurn.turnId);
+      NodeAssert.deepEqual(runtimeMock.state.abortCalls, []);
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("discards a candidate when terminating the old active session fails", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-termination-failure");
+
+      const original = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const originalTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "Keep working while replacement fails",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+      runtimeMock.state.sessionDirectoryById.set("ses_candidate", "/some/other/worktree");
+      runtimeMock.state.sessionStatus = "busy";
+      const abortStarted = promiseWithResolvers<void>();
+      runtimeMock.state.abortImplementation = async (sessionID) => {
+        if (sessionID === "http://127.0.0.1:9999/session") {
+          abortStarted.resolve(undefined);
+        }
+      };
+
+      const startFiber = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          cwd: "/requested/worktree",
+          runtimeMode: "full-access",
+          resumeCursor: { schemaVersion: 1, sessionId: "ses_candidate" },
+        })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Effect.promise(() => abortStarted.promise);
+      yield* advanceTestClock(10_001);
+      const result = yield* Fiber.join(startFiber);
+      const sessions = (yield* adapter.listSessions()).filter(
+        (session) => session.threadId === threadId,
+      );
+
+      NodeAssert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        NodeAssert.equal(result.failure._tag, "ProviderAdapterRequestError");
+      }
+      NodeAssert.equal(sessions.length, 1);
+      NodeAssert.deepEqual(sessions[0]?.resumeCursor, original.resumeCursor);
+      NodeAssert.equal(sessions[0]?.activeTurnId, originalTurn.turnId);
+
+      runtimeMock.state.sessionStatus = "idle";
+      yield* adapter.stopSession(threadId);
+    }),
   );
 
   it.effect("reuses the resumed session when the stored directory differs only lexically", () =>
@@ -1462,6 +1616,41 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         schemaVersion: 1,
         sessionId: "ses_samedir",
       });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("reconciles a same-cwd recovery after publishing its replacement", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-same-cwd-recovery");
+      const sessionId = "ses_same_cwd_recovery";
+      const cwd = process.cwd();
+      runtimeMock.state.createdSessionIds.push(sessionId);
+      runtimeMock.state.sessionDirectoryById.set(sessionId, cwd);
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        cwd,
+        runtimeMode: "full-access",
+      });
+
+      const recovered = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        cwd,
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId },
+        recovery: { turnId: TurnId.make("turn-same-cwd-recovery"), state: "running" },
+      });
+
+      NodeAssert.equal(recovered.status, "ready");
+      NodeAssert.equal(recovered.activeTurnId, undefined);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), true);
+      NodeAssert.deepEqual(runtimeMock.state.sessionGetIds, [sessionId]);
+      NodeAssert.deepEqual(runtimeMock.state.sessionCreateUrls, ["http://127.0.0.1:9999"]);
 
       yield* adapter.stopSession(threadId);
     }),
@@ -3944,50 +4133,59 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
-  it.effect(
-    "fails an explicit stop when same-thread replacement detaches during remote abort confirmation",
-    () =>
-      Effect.gen(function* () {
-        const adapter = yield* OpenCodeAdapter;
-        const threadId = asThreadId("thread-replacement-during-interrupt");
-        const abortStarted = promiseWithResolvers<void>();
-        const abortRelease = promiseWithResolvers<void>();
-        runtimeMock.state.abortImplementation = async () => {
-          abortStarted.resolve(undefined);
-          await abortRelease.promise;
-        };
+  it.effect("waits for an explicit stop before publishing a same-thread replacement", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-replacement-during-interrupt");
+      const abortStarted = promiseWithResolvers<void>();
+      const abortRelease = promiseWithResolvers<void>();
+      runtimeMock.state.abortImplementation = async () => {
+        abortStarted.resolve(undefined);
+        await abortRelease.promise;
+      };
 
-        yield* adapter.startSession({
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Keep working",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+
+      const stopFiber = yield* Effect.exit(adapter.stopSession(threadId)).pipe(Effect.forkChild);
+      yield* Effect.promise(() => abortStarted.promise);
+      const replacementFiber = yield* Effect.exit(
+        adapter.startSession({
           provider: ProviderDriverKind.make("opencode"),
           threadId,
           runtimeMode: "full-access",
-        });
-        yield* adapter.sendTurn({
-          threadId,
-          input: "Keep working",
-          modelSelection: createModelSelection(
-            ProviderInstanceId.make("opencode"),
-            "opencode/kimi-k3",
-          ),
-        });
+        }),
+      ).pipe(Effect.forkChild);
 
-        const stopFiber = yield* Effect.exit(adapter.stopSession(threadId)).pipe(Effect.forkChild);
-        yield* Effect.promise(() => abortStarted.promise);
-        const replacement = yield* adapter.startSession({
-          provider: ProviderDriverKind.make("opencode"),
-          threadId,
-          runtimeMode: "full-access",
-        });
+      // The replacement remains unpublished until the in-flight stop has
+      // finished its remote abort confirmation.
+      yield* Effect.yieldNow;
+      NodeAssert.equal(replacementFiber.pollUnsafe(), undefined);
 
-        const stopExit = yield* Fiber.join(stopFiber);
-        NodeAssert.equal(Exit.isFailure(stopExit), true);
-        NodeAssert.equal(replacement.status, "ready");
-        NodeAssert.equal(replacement.activeTurnId, undefined);
-        NodeAssert.equal(yield* adapter.hasSession(threadId), true);
+      abortRelease.resolve(undefined);
+      const stopExit = yield* Fiber.join(stopFiber);
+      const replacementExit = yield* Fiber.join(replacementFiber);
+      NodeAssert.equal(Exit.isSuccess(stopExit), true);
+      NodeAssert.equal(Exit.isSuccess(replacementExit), true);
+      if (Exit.isSuccess(replacementExit)) {
+        NodeAssert.equal(replacementExit.value.status, "ready");
+        NodeAssert.equal(replacementExit.value.activeTurnId, undefined);
+      }
+      NodeAssert.equal(yield* adapter.hasSession(threadId), true);
 
-        abortRelease.resolve(undefined);
-        yield* adapter.stopSession(threadId);
-      }),
+      yield* adapter.stopSession(threadId);
+    }),
   );
 
   it.effect("releases stop and send waiters when a native abort times out", () =>
