@@ -3923,6 +3923,24 @@ export function makeOpenCodeAdapter(
             });
 
           if (requestedDirectoryMatches && (yield* isCurrentContext())) {
+            const previousRuntimeMode = existing.session.runtimeMode;
+            let permissionsUpdated = false;
+            const restorePermissions = Effect.gen(function* () {
+              if (!permissionsUpdated || !(yield* isCurrentContext())) {
+                return;
+              }
+              yield* runOpenCodeSdk("session.update", () =>
+                existing.client.session.update({
+                  sessionID: existing.openCodeSessionId,
+                  permission: buildOpenCodePermissionRules(previousRuntimeMode),
+                }),
+              ).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("OpenCode permission rollback failed", { cause }),
+                ),
+                Effect.asVoid,
+              );
+            });
             const inPlaceResult = yield* Effect.gen(function* () {
               yield* runOpenCodeSdk("session.update", () =>
                 existing.client.session.update({
@@ -3930,6 +3948,7 @@ export function makeOpenCodeAdapter(
                   permission: buildOpenCodePermissionRules(input.runtimeMode),
                 }),
               ).pipe(Effect.mapError(toRequestError));
+              permissionsUpdated = true;
               if (!(yield* isCurrentContext())) {
                 return undefined;
               }
@@ -3980,7 +3999,12 @@ export function makeOpenCodeAdapter(
               }
               return session;
             }).pipe(
-              Effect.onError(() => restoreMcpConfiguration(existing.client, existing.server)),
+              Effect.onError(() =>
+                Effect.gen(function* () {
+                  yield* restoreMcpConfiguration(existing.client, existing.server);
+                  yield* restorePermissions;
+                }),
+              ),
             );
 
             if (inPlaceResult !== undefined) {

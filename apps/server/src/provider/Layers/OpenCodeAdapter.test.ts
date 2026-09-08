@@ -119,9 +119,12 @@ const runtimeMock = {
     sessionUpdateError: null as Error | null,
     forkCalls: [] as Array<{ sessionID: string; directory?: string }>,
     mcpAddCalls: [] as Array<{ name: string; config: unknown }>,
+    mcpAddError: null as Error | null,
     mcpDisconnectCalls: [] as string[],
+    mcpDisconnectError: null as Error | null,
     mcpConfig: {} as Record<string, unknown>,
     configGetCalls: 0,
+    configGetError: null as Error | null,
     configUpdateCalls: [] as Array<{ config: unknown }>,
   },
   reset() {
@@ -174,9 +177,12 @@ const runtimeMock = {
     this.state.sessionUpdateError = null;
     this.state.forkCalls.length = 0;
     this.state.mcpAddCalls.length = 0;
+    this.state.mcpAddError = null;
     this.state.mcpDisconnectCalls.length = 0;
+    this.state.mcpDisconnectError = null;
     this.state.mcpConfig = {};
     this.state.configGetCalls = 0;
+    this.state.configGetError = null;
     this.state.configUpdateCalls.length = 0;
   },
 };
@@ -457,17 +463,26 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
       mcp: {
         add: async ({ name, config }: { name: string; config: unknown }) => {
           runtimeMock.state.mcpAddCalls.push({ name, config });
+          if (runtimeMock.state.mcpAddError) {
+            throw runtimeMock.state.mcpAddError;
+          }
           runtimeMock.state.mcpConfig[name] = config;
           return { data: {} };
         },
         disconnect: async ({ name }: { name: string }) => {
           runtimeMock.state.mcpDisconnectCalls.push(name);
+          if (runtimeMock.state.mcpDisconnectError) {
+            throw runtimeMock.state.mcpDisconnectError;
+          }
           return { data: {} };
         },
       },
       config: {
         get: async () => {
           runtimeMock.state.configGetCalls += 1;
+          if (runtimeMock.state.configGetError) {
+            throw runtimeMock.state.configGetError;
+          }
           return { data: { mcp: { ...runtimeMock.state.mcpConfig } } };
         },
         update: async ({ config }: { config: unknown }) => {
@@ -6814,6 +6829,177 @@ it.layer(OpenCodeAdapterManagedTestLayer)("OpenCodeAdapterManaged", (it) => {
       yield* adapter.stopSession(threadId);
       NodeAssert.deepEqual(runtimeMock.state.closeCalls, [""]);
     }),
+  );
+
+  it.effect("rolls back permissions when in-place recovery config lookup fails", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-managed-in-place-config-failure");
+      const mcpSession = {
+        environmentId: EnvironmentId.make("environment-1"),
+        threadId,
+        providerSessionId: "provider-session-config-failure",
+        providerInstanceId: ProviderInstanceId.make("opencode"),
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer token",
+      } satisfies McpProviderSession.McpProviderSessionConfig;
+      McpProviderSession.setMcpProviderSession(mcpSession);
+
+      const original = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      runtimeMock.state.configGetError = new Error("config lookup failed");
+
+      const result = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+          resumeCursor: original.resumeCursor,
+        })
+        .pipe(Effect.result);
+
+      NodeAssert.equal(result._tag, "Failure");
+      NodeAssert.deepEqual(runtimeMock.state.sessionUpdateCalls, [
+        {
+          sessionID: "/session",
+          permission: buildOpenCodePermissionRules("full-access"),
+        },
+        {
+          sessionID: "/session",
+          permission: buildOpenCodePermissionRules("approval-required"),
+        },
+      ]);
+      NodeAssert.equal((yield* adapter.listSessions())[0]?.runtimeMode, "approval-required");
+      NodeAssert.equal(yield* adapter.hasSession(threadId), true);
+      NodeAssert.deepEqual(runtimeMock.state.connectCalls, [""]);
+      NodeAssert.deepEqual(runtimeMock.state.closeCalls, []);
+      NodeAssert.deepEqual(runtimeMock.state.abortCalls, []);
+
+      runtimeMock.state.configGetError = null;
+      yield* adapter.stopSession(threadId);
+      NodeAssert.deepEqual(runtimeMock.state.closeCalls, [""]);
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
+  );
+
+  it.effect("rolls back permissions when in-place recovery MCP add fails", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-managed-in-place-add-failure");
+      const mcpSession = {
+        environmentId: EnvironmentId.make("environment-1"),
+        threadId,
+        providerSessionId: "provider-session-add-failure",
+        providerInstanceId: ProviderInstanceId.make("opencode"),
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer token",
+      } satisfies McpProviderSession.McpProviderSessionConfig;
+      McpProviderSession.setMcpProviderSession(mcpSession);
+
+      const original = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      runtimeMock.state.mcpAddError = new Error("MCP add failed");
+
+      const result = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+          resumeCursor: original.resumeCursor,
+        })
+        .pipe(Effect.result);
+
+      NodeAssert.equal(result._tag, "Failure");
+      NodeAssert.deepEqual(runtimeMock.state.sessionUpdateCalls, [
+        {
+          sessionID: "/session",
+          permission: buildOpenCodePermissionRules("full-access"),
+        },
+        {
+          sessionID: "/session",
+          permission: buildOpenCodePermissionRules("approval-required"),
+        },
+      ]);
+      NodeAssert.equal((yield* adapter.listSessions())[0]?.runtimeMode, "approval-required");
+      NodeAssert.equal(yield* adapter.hasSession(threadId), true);
+      NodeAssert.deepEqual(runtimeMock.state.connectCalls, [""]);
+      NodeAssert.deepEqual(runtimeMock.state.closeCalls, []);
+      NodeAssert.deepEqual(runtimeMock.state.abortCalls, []);
+
+      runtimeMock.state.mcpAddError = null;
+      McpProviderSession.clearMcpProviderSession(threadId);
+      yield* adapter.stopSession(threadId);
+      NodeAssert.deepEqual(runtimeMock.state.closeCalls, [""]);
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
+  );
+
+  it.effect("rolls back permissions when in-place recovery MCP disconnect fails", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-managed-in-place-disconnect-failure");
+      const previous = {
+        environmentId: EnvironmentId.make("environment-1"),
+        threadId,
+        providerSessionId: "previous-provider-session-disconnect-failure",
+        providerInstanceId: ProviderInstanceId.make("opencode"),
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer previous-token",
+      } satisfies McpProviderSession.McpProviderSessionConfig;
+      McpProviderSession.beginMcpProviderSessionReplacement(threadId, {
+        previous,
+        candidate: undefined,
+        accessWasDisabled: true,
+      });
+
+      const original = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      runtimeMock.state.mcpDisconnectError = new Error("MCP disconnect failed");
+
+      const result = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+          resumeCursor: original.resumeCursor,
+        })
+        .pipe(Effect.result);
+
+      NodeAssert.equal(result._tag, "Failure");
+      NodeAssert.deepEqual(runtimeMock.state.sessionUpdateCalls, [
+        {
+          sessionID: "/session",
+          permission: buildOpenCodePermissionRules("full-access"),
+        },
+        {
+          sessionID: "/session",
+          permission: buildOpenCodePermissionRules("approval-required"),
+        },
+      ]);
+      NodeAssert.equal((yield* adapter.listSessions())[0]?.runtimeMode, "approval-required");
+      NodeAssert.equal(yield* adapter.hasSession(threadId), true);
+      NodeAssert.deepEqual(runtimeMock.state.connectCalls, [""]);
+      NodeAssert.deepEqual(runtimeMock.state.closeCalls, []);
+      NodeAssert.deepEqual(runtimeMock.state.abortCalls, []);
+
+      runtimeMock.state.mcpDisconnectError = null;
+      McpProviderSession.rollbackMcpProviderSessionReplacement(threadId);
+      yield* adapter.stopSession(threadId);
+      NodeAssert.deepEqual(runtimeMock.state.closeCalls, [""]);
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
   );
 
   it.effect("disconnects managed MCP when in-place recovery disables access", () =>
