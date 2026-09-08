@@ -144,16 +144,18 @@ type PushHandler = (
   context?: ClientContext,
 ) => unknown | Promise<unknown>;
 
+type RootsOwnerState = "pending" | "committed" | "failed";
+
 interface RootsOwner {
   readonly owner: object;
   readonly handler: PushHandler;
   readonly generation: number;
+  readonly previous: RootsOwner | undefined;
+  state: RootsOwnerState;
 }
 
 interface RootsOwnerReplacement {
-  readonly owner: object;
-  readonly generation: number;
-  readonly previous: RootsOwner | undefined;
+  readonly record: RootsOwner;
 }
 
 /** One owner at a time on legacy transports, which carry no parent request correlation. */
@@ -200,8 +202,14 @@ export class ProjectMcpConnectionCoordinator {
       | undefined;
     for (const method of ["roots/list", "sampling/createMessage", "elicitation/create"] as const) {
       setRequestHandler?.(method, (request: unknown, context: ClientContext) => {
+        const rootsOwner = this.rootsOwner;
         const handler =
-          this.owner ?? (method === "roots/list" ? this.rootsOwner?.handler : undefined);
+          this.owner ??
+          (method === "roots/list" &&
+          rootsOwner !== undefined &&
+          this.isViableRootsOwner(rootsOwner)
+            ? rootsOwner.handler
+            : undefined);
         if (!handler)
           throw new ProtocolError(
             ProtocolErrorCode.MethodNotFound,
@@ -310,26 +318,50 @@ export class ProjectMcpConnectionCoordinator {
 
   replaceRootsOwner(owner: object, handler: PushHandler): RootsOwnerReplacement | undefined {
     if (this.controller.signal.aborted || this.releasedRootsOwners.has(owner)) return undefined;
-    const previous = this.rootsOwner;
-    const generation = ++this.rootsOwnerGeneration;
-    this.rootsOwner = { owner, handler, generation };
-    return { owner, generation, previous };
+    const record: RootsOwner = {
+      owner,
+      handler,
+      generation: ++this.rootsOwnerGeneration,
+      previous: this.rootsOwner,
+      state: "pending",
+    };
+    this.rootsOwner = record;
+    return { record };
+  }
+
+  commitRootsOwner(replacement: RootsOwnerReplacement): void {
+    if (replacement.record.state === "pending") replacement.record.state = "committed";
   }
 
   rollbackRootsOwner(replacement: RootsOwnerReplacement): void {
-    const current = this.rootsOwner;
-    if (current?.owner !== replacement.owner || current.generation !== replacement.generation) {
-      return;
+    const failed = replacement.record;
+    failed.state = "failed";
+    if (this.rootsOwner !== failed) return;
+    this.rootsOwner = this.nearestViableRootsOwner(failed.previous);
+  }
+
+  private isViableRootsOwner(record: RootsOwner | undefined): boolean {
+    return (
+      record !== undefined &&
+      record.state !== "failed" &&
+      !this.releasedRootsOwners.has(record.owner)
+    );
+  }
+
+  private nearestViableRootsOwner(record: RootsOwner | undefined): RootsOwner | undefined {
+    let candidate = record;
+    while (candidate !== undefined) {
+      if (this.isViableRootsOwner(candidate)) return candidate;
+      candidate = candidate.previous;
     }
-    const previous = replacement.previous;
-    this.rootsOwner =
-      previous !== undefined && !this.releasedRootsOwners.has(previous.owner)
-        ? previous
-        : undefined;
+    return undefined;
   }
 
   ownsRootsOwner(owner: object): boolean {
-    return this.rootsOwner?.owner === owner && !this.releasedRootsOwners.has(owner);
+    const rootsOwner = this.rootsOwner;
+    return (
+      rootsOwner !== undefined && this.isViableRootsOwner(rootsOwner) && rootsOwner.owner === owner
+    );
   }
 
   releaseRootsOwner(owner: object): void {

@@ -414,6 +414,7 @@ export class ProjectMcpBroker {
     });
     try {
       await this.method("notification")({ method: "notifications/roots/list_changed" }, options);
+      if (replacement !== undefined) this.coordinator.commitRootsOwner(replacement);
     } catch (error) {
       if (replacement !== undefined) this.coordinator.rollbackRootsOwner(replacement);
       throw error;

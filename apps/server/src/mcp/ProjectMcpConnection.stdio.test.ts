@@ -138,3 +138,123 @@ it("releases roots ownership on replacement and connection close", async () => {
     Promise.resolve().then(() => rootsRequest!({ method: "roots/list" }, context)),
   ).rejects.toMatchObject({ code: ProtocolErrorCode.MethodNotFound });
 });
+
+it("tracks roots owner generations through failure, release, and close", async () => {
+  const makeCoordinator = () => {
+    let rootsRequest:
+      | ((request: unknown, context: unknown) => unknown | Promise<unknown>)
+      | undefined;
+    const client = {
+      connect: async () => undefined,
+      close: async () => undefined,
+      setRequestHandler: (
+        method: string,
+        handler: (request: unknown, context: unknown) => unknown,
+      ) => {
+        if (method === "roots/list") rootsRequest = handler;
+      },
+    };
+    const connection = {
+      client,
+      transport: { type: "stdio", command: "fixture", args: [], env: [] } as const,
+      protocolEra: "legacy" as const,
+      negotiatedProtocolVersion: "2025-11-25",
+      discoverResult: undefined,
+      close: async () => undefined,
+    };
+    const coordinator = projectMcpConnectionCoordinator(
+      connection as unknown as ProjectMcpConnection,
+    );
+    if (!rootsRequest) throw new Error("roots request handler was not registered");
+    const context = { mcpReq: { signal: new AbortController().signal } };
+    return {
+      coordinator,
+      rootsList: () =>
+        Promise.resolve().then(() => rootsRequest!({ method: "roots/list" }, context)),
+    };
+  };
+  const expectNoRootsOwner = async (rootsList: () => Promise<unknown>) => {
+    await expect(rootsList()).rejects.toMatchObject({ code: ProtocolErrorCode.MethodNotFound });
+  };
+
+  {
+    const { coordinator, rootsList } = makeCoordinator();
+    const first = coordinator.replaceRootsOwner({}, () => ({ roots: [{ uri: "file:///a" }] }))!;
+    const second = coordinator.replaceRootsOwner({}, () => ({ roots: [{ uri: "file:///b" }] }))!;
+    coordinator.rollbackRootsOwner(first);
+    coordinator.rollbackRootsOwner(second);
+    await expectNoRootsOwner(rootsList);
+  }
+
+  {
+    const { coordinator, rootsList } = makeCoordinator();
+    const first = coordinator.replaceRootsOwner({}, () => ({ roots: [{ uri: "file:///a" }] }))!;
+    const second = coordinator.replaceRootsOwner({}, () => ({ roots: [{ uri: "file:///b" }] }))!;
+    coordinator.rollbackRootsOwner(second);
+    coordinator.rollbackRootsOwner(first);
+    await expectNoRootsOwner(rootsList);
+  }
+
+  {
+    const { coordinator, rootsList } = makeCoordinator();
+    const owner = {};
+    const first = coordinator.replaceRootsOwner(owner, () => ({ roots: [{ uri: "file:///a1" }] }))!;
+    const second = coordinator.replaceRootsOwner(owner, () => ({
+      roots: [{ uri: "file:///a2" }],
+    }))!;
+    coordinator.rollbackRootsOwner(first);
+    coordinator.rollbackRootsOwner(second);
+    await expectNoRootsOwner(rootsList);
+  }
+
+  {
+    const { coordinator, rootsList } = makeCoordinator();
+    const healthy = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///healthy" }],
+    }))!;
+    coordinator.commitRootsOwner(healthy);
+    const firstOwner = {};
+    const first = coordinator.replaceRootsOwner(firstOwner, () => ({
+      roots: [{ uri: "file:///a" }],
+    }))!;
+    const second = coordinator.replaceRootsOwner({}, () => ({ roots: [{ uri: "file:///b" }] }))!;
+    coordinator.releaseRootsOwner(firstOwner);
+    coordinator.rollbackRootsOwner(first);
+    coordinator.rollbackRootsOwner(second);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///healthy" }] });
+  }
+
+  {
+    const { coordinator, rootsList } = makeCoordinator();
+    const first = coordinator.replaceRootsOwner({}, () => ({ roots: [{ uri: "file:///a" }] }))!;
+    const secondOwner = {};
+    const second = coordinator.replaceRootsOwner(secondOwner, () => ({
+      roots: [{ uri: "file:///b" }],
+    }))!;
+    coordinator.releaseRootsOwner(secondOwner);
+    coordinator.rollbackRootsOwner(first);
+    coordinator.rollbackRootsOwner(second);
+    await expectNoRootsOwner(rootsList);
+  }
+
+  {
+    const { coordinator, rootsList } = makeCoordinator();
+    const first = coordinator.replaceRootsOwner({}, () => ({ roots: [{ uri: "file:///a" }] }))!;
+    const second = coordinator.replaceRootsOwner({}, () => ({ roots: [{ uri: "file:///b" }] }))!;
+    await coordinator.close();
+    coordinator.commitRootsOwner(first);
+    coordinator.rollbackRootsOwner(first);
+    coordinator.commitRootsOwner(second);
+    coordinator.rollbackRootsOwner(second);
+    await expectNoRootsOwner(rootsList);
+  }
+
+  {
+    const { coordinator, rootsList } = makeCoordinator();
+    const first = coordinator.replaceRootsOwner({}, () => ({ roots: [{ uri: "file:///a" }] }))!;
+    const second = coordinator.replaceRootsOwner({}, () => ({ roots: [{ uri: "file:///b" }] }))!;
+    coordinator.rollbackRootsOwner(first);
+    coordinator.commitRootsOwner(second);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///b" }] });
+  }
+});

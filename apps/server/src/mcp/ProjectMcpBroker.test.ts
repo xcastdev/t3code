@@ -907,6 +907,127 @@ it("does not let a stale failed roots notification erase a newer owner", async (
   await third.dispose();
 });
 
+it("does not restore a failed ancestor after overlapping failures", async () => {
+  let rootsRequest:
+    | ((request: unknown, context: unknown) => unknown | Promise<unknown>)
+    | undefined;
+  const notifications: Array<PromiseWithResolvers<void>> = [];
+  const firstFailure = new Error("first notification failed");
+  const secondFailure = new Error("second notification failed");
+  const client = makeClient({
+    notification: () => {
+      const pending = Promise.withResolvers<void>();
+      notifications.push(pending);
+      return pending.promise;
+    },
+    setRequestHandler: ((
+      method: string,
+      handler: (request: unknown, context: unknown) => unknown,
+    ) => {
+      if (method === "roots/list") rootsRequest = handler;
+    }) as NonNullable<ProjectMcpClient["setRequestHandler"]>,
+  });
+  const shared = connection(client, "legacy");
+  const first = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "roots-overlap-a",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => ({ roots: [{ uri: "file:///a" }] }) },
+  });
+  const second = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "roots-overlap-b",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => ({ roots: [{ uri: "file:///b" }] }) },
+  });
+  if (!rootsRequest) throw new Error("roots handler was not installed");
+  const request = rootsRequest;
+  const firstPending = first.notifyRootsListChanged();
+  while (notifications.length < 1) await Promise.resolve();
+  const secondPending = second.notifyRootsListChanged();
+  while (notifications.length < 2) await Promise.resolve();
+
+  notifications[0]!.reject(firstFailure);
+  await expect(firstPending).rejects.toBe(firstFailure);
+  notifications[1]!.reject(secondFailure);
+  await expect(secondPending).rejects.toBe(secondFailure);
+
+  await expect(
+    Promise.resolve().then(() => request({}, { mcpReq: { signal: new AbortController().signal } })),
+  ).rejects.toMatchObject({ code: -32601 });
+  await first.dispose();
+  await second.dispose();
+});
+
+it("restores the latest healthy roots owner past overlapping failed ancestors", async () => {
+  let rootsRequest:
+    | ((request: unknown, context: unknown) => unknown | Promise<unknown>)
+    | undefined;
+  const notifications: Array<PromiseWithResolvers<void>> = [];
+  const firstFailure = new Error("first replacement failed");
+  const secondFailure = new Error("second replacement failed");
+  const client = makeClient({
+    notification: () => {
+      const pending = Promise.withResolvers<void>();
+      notifications.push(pending);
+      return pending.promise;
+    },
+    setRequestHandler: ((
+      method: string,
+      handler: (request: unknown, context: unknown) => unknown,
+    ) => {
+      if (method === "roots/list") rootsRequest = handler;
+    }) as NonNullable<ProjectMcpClient["setRequestHandler"]>,
+  });
+  const shared = connection(client, "legacy");
+  const healthy = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "roots-overlap-healthy",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => ({ roots: [{ uri: "file:///healthy" }] }) },
+  });
+  const first = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "roots-overlap-failed-a",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => ({ roots: [{ uri: "file:///a" }] }) },
+  });
+  const second = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "roots-overlap-failed-b",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => ({ roots: [{ uri: "file:///b" }] }) },
+  });
+  if (!rootsRequest) throw new Error("roots handler was not installed");
+  const request = rootsRequest;
+  const healthyPending = healthy.notifyRootsListChanged();
+  while (notifications.length < 1) await Promise.resolve();
+  notifications[0]!.resolve();
+  await healthyPending;
+
+  const firstPending = first.notifyRootsListChanged();
+  while (notifications.length < 2) await Promise.resolve();
+  const secondPending = second.notifyRootsListChanged();
+  while (notifications.length < 3) await Promise.resolve();
+
+  notifications[1]!.reject(firstFailure);
+  await expect(firstPending).rejects.toBe(firstFailure);
+  notifications[2]!.reject(secondFailure);
+  await expect(secondPending).rejects.toBe(secondFailure);
+
+  await expect(
+    Promise.resolve().then(() => request({}, { mcpReq: { signal: new AbortController().signal } })),
+  ).resolves.toEqual({ roots: [{ uri: "file:///healthy" }] });
+  await healthy.dispose();
+  await first.dispose();
+  await second.dispose();
+});
+
 it("does not restore a released roots owner after a failed replacement", async () => {
   let rootsRequest:
     | ((request: unknown, context: unknown) => unknown | Promise<unknown>)
