@@ -4646,6 +4646,7 @@ export function makeOpenCodeAdapter(
         sessionModelSwitch: "in-session",
         remoteHttpMcp: openCodeSettings.serverUrl ? "unsupported" : "next-session",
         projectMcpProxy: openCodeSettings.serverUrl ? "unsupported" : "next-session",
+        sessionMcpCatalog: openCodeSettings.serverUrl ? "unsupported" : "restart-required",
         ...(openCodeSettings.serverUrl
           ? {
               projectMcpUnsupportedReason:

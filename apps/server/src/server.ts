@@ -91,6 +91,7 @@ import * as SourceControlRateLimit from "./sourceControl/SourceControlRateLimit.
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
 import * as ProjectMcpService from "./project/ProjectMcpService.ts";
+import * as McpCatalogService from "./mcp/McpCatalogService.ts";
 import * as ProjectMcpSecretStore from "./mcp/ProjectMcpSecretStore.ts";
 import { ObservabilityLive } from "./observability/Layers/Observability.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
@@ -312,6 +313,7 @@ const ProjectMcpHttpRoutesLive = Layer.mergeAll(
 
 const ProjectMcpWebsocketRpcRouteLayer = websocketRpcRouteLayer.pipe(
   Layer.provide(ProjectMcpRouteServicesLive),
+  Layer.provide(McpCatalogService.layer),
 );
 
 // `ProviderAdapterRegistryLive` is now a facade that resolves kind → adapter

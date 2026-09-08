@@ -1,7 +1,15 @@
 # Project MCP servers
 
-Use **Settings** → **Projects** to manage MCP servers for a project and checkout in the web or
-desktop app. Mobile can use the server-side configuration, but does not include management UI.
+Use **Settings** → **Integrations** → **MCP servers** to manage environment-global MCP servers.
+Use a project's **MCP servers** section for project-local definitions and project overrides. The
+active thread settings expose session-only definitions and overrides. The same server-side catalog
+works from web, desktop, mobile, local, remote, relay, and tunnel connections.
+
+The effective catalog is resolved in this order: global definitions, project overrides, project-local
+definitions, the logical session baseline, session overrides, and session-local definitions. Disabled
+entries are filtered after overrides, so a lower scope can re-enable an inherited definition. Names
+must be unique among enabled entries assigned to the same provider, and each provider receives at
+most 50 entries.
 
 ## Supported transports
 
@@ -29,8 +37,11 @@ The server applies only to the selected project and checkout. T3 gives each prov
 authenticated, server-specific proxy endpoint. Providers never receive the upstream command,
 working directory, headers, or environment values.
 
-Catalog changes apply to new provider sessions. Existing sessions keep their issued endpoints and
-configuration until they stop.
+Global and project changes apply to future logical catalog sessions. Existing sessions keep their
+captured baseline until you use **Reset to current defaults** or make a session mutation. A live
+provider applies a session mutation immediately; a restart-required provider shows a pending desired
+revision and applies it at the next provider runtime. Unsupported providers cannot receive the user
+catalog. The T3-managed preview entry remains separate and read-only.
 
 For stdio, each argument has its own text field. Choose **Add argument** to append an argument or
 **Remove argument** to delete one. An empty field passes one empty argument; remove all fields to
@@ -89,6 +100,10 @@ If no providers are selected, the server is saved but is not attached to a provi
 
 T3-managed entries, including the `t3-code` preview server, are read-only and cannot be renamed,
 removed, or replaced.
+
+If a global source is removed, its project override remains as **Source removed**. Delete that
+tombstone to remove the override history; restoring the same server from event history does not
+silently alter it.
 
 ## Troubleshooting
 

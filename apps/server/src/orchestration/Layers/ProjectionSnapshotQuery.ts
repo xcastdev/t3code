@@ -1,5 +1,6 @@
 import {
   ChatAttachment,
+  EnvironmentId,
   CheckpointRef,
   IsoDateTime,
   MessageId,
@@ -15,6 +16,11 @@ import {
   ProjectMcpTransport,
   ProjectScript,
   McpServerId,
+  McpCatalogDefinition,
+  McpCatalogOverride,
+  McpCatalogSessionId,
+  McpCatalogScope,
+  McpDefinitionId,
   ProjectMcpUrl,
   ProviderInstanceId,
   TurnId,
@@ -186,6 +192,33 @@ const ProjectionProjectMcpServerDbRowSchema = Schema.Struct({
   enabled: Schema.Number,
   providerInstanceIds: Schema.fromJsonString(Schema.Array(ProviderInstanceId)),
 });
+const ProjectionMcpCatalogDefinitionDbRowSchema = Schema.Struct({
+  definitionId: McpDefinitionId,
+  logicalServerId: McpServerId,
+  scopeType: McpCatalogScope,
+  scopeId: Schema.String,
+  name: Schema.String,
+  transport: Schema.fromJsonString(ProjectMcpTransport),
+  enabled: Schema.Number,
+  providerInstanceIds: Schema.fromJsonString(Schema.Array(ProviderInstanceId)),
+  revision: NonNegativeInt,
+});
+const ProjectionMcpCatalogOverrideDbRowSchema = Schema.Struct({
+  projectId: ProjectId,
+  override: Schema.fromJsonString(McpCatalogOverride),
+  revision: NonNegativeInt,
+});
+const ProjectionMcpCatalogSessionDbRowSchema = Schema.Struct({
+  catalogSessionId: McpCatalogSessionId,
+  threadId: ThreadId,
+  providerInstanceId: ProviderInstanceId,
+  baseline: Schema.fromJsonString(Schema.Array(McpCatalogDefinition)),
+  desired: Schema.fromJsonString(Schema.Array(McpCatalogDefinition)),
+  desiredRevision: NonNegativeInt,
+  appliedRevision: NonNegativeInt,
+  applicationError: Schema.NullOr(Schema.String),
+  disposedAt: Schema.NullOr(IsoDateTime),
+});
 const ProjectionThreadIdLookupRowSchema = Schema.Struct({
   threadId: ThreadId,
 });
@@ -344,6 +377,7 @@ function mapSessionRow(
     ...(row.providerInstanceId !== null ? { providerInstanceId: row.providerInstanceId } : {}),
     runtimeMode: row.runtimeMode,
     activeTurnId: row.activeTurnId,
+    ...(row.mcpCatalogSessionId != null ? { mcpCatalogSessionId: row.mcpCatalogSessionId } : {}),
     lastError: row.lastError,
     updatedAt: row.updatedAt,
   };
@@ -642,6 +676,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           provider_thread_id AS "providerThreadId",
           runtime_mode AS "runtimeMode",
           active_turn_id AS "activeTurnId",
+          mcp_catalog_session_id AS "mcpCatalogSessionId",
           last_error AS "lastError",
           updated_at AS "updatedAt"
         FROM projection_thread_sessions
@@ -667,6 +702,61 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       `,
   });
 
+  const listMcpCatalogDefinitionRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionMcpCatalogDefinitionDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          definition_id AS "definitionId",
+          logical_server_id AS "logicalServerId",
+          scope_type AS "scopeType",
+          scope_id AS "scopeId",
+          name,
+          transport_json AS "transport",
+          enabled,
+          provider_instance_ids_json AS "providerInstanceIds",
+          revision
+        FROM projection_mcp_definitions
+        ORDER BY scope_type ASC, scope_id ASC, name COLLATE NOCASE ASC, definition_id ASC
+      `,
+  });
+
+  const listMcpCatalogOverrideRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionMcpCatalogOverrideDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          scope_id AS "projectId",
+          patch_json AS "override",
+          revision
+        FROM projection_mcp_overrides
+        WHERE scope_type = 'project'
+        ORDER BY scope_id ASC, override_id ASC
+      `,
+  });
+
+  const listMcpCatalogSessionRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionMcpCatalogSessionDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          catalog_session_id AS "catalogSessionId",
+          thread_id AS "threadId",
+          provider_instance_id AS "providerInstanceId",
+          baseline_json AS "baseline",
+          desired_catalog_json AS "desired",
+          desired_revision AS "desiredRevision",
+          applied_revision AS "appliedRevision",
+          application_error AS "applicationError",
+          disposed_at AS "disposedAt"
+        FROM projection_mcp_catalog_sessions
+        ORDER BY thread_id ASC, catalog_session_id ASC
+      `,
+  });
+
   const listActiveThreadSessionRows = SqlSchema.findAll({
     Request: Schema.Void,
     Result: ProjectionThreadSessionDbRowSchema,
@@ -681,6 +771,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           sessions.provider_thread_id AS "providerThreadId",
           sessions.runtime_mode AS "runtimeMode",
           sessions.active_turn_id AS "activeTurnId",
+          sessions.mcp_catalog_session_id AS "mcpCatalogSessionId",
           sessions.last_error AS "lastError",
           sessions.updated_at AS "updatedAt"
         FROM projection_thread_sessions sessions
@@ -706,6 +797,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           sessions.provider_thread_id AS "providerThreadId",
           sessions.runtime_mode AS "runtimeMode",
           sessions.active_turn_id AS "activeTurnId",
+          sessions.mcp_catalog_session_id AS "mcpCatalogSessionId",
           sessions.last_error AS "lastError",
           sessions.updated_at AS "updatedAt"
         FROM projection_thread_sessions sessions
@@ -1122,6 +1214,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           provider_instance_id AS "providerInstanceId",
           runtime_mode AS "runtimeMode",
           active_turn_id AS "activeTurnId",
+          mcp_catalog_session_id AS "mcpCatalogSessionId",
           last_error AS "lastError",
           updated_at AS "updatedAt"
         FROM projection_thread_sessions
@@ -1726,6 +1819,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                     : {}),
                   runtimeMode: row.runtimeMode,
                   activeTurnId: row.activeTurnId,
+                  ...(row.mcpCatalogSessionId != null
+                    ? { mcpCatalogSessionId: row.mcpCatalogSessionId }
+                    : {}),
                   lastError: row.lastError,
                   updatedAt: row.updatedAt,
                 });
@@ -1825,6 +1921,30 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
+          listMcpCatalogDefinitionRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogDefinitions:query",
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogDefinitions:decodeRows",
+              ),
+            ),
+          ),
+          listMcpCatalogOverrideRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogOverrides:query",
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogOverrides:decodeRows",
+              ),
+            ),
+          ),
+          listMcpCatalogSessionRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogSessions:query",
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogSessions:decodeRows",
+              ),
+            ),
+          ),
           listThreadRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
@@ -1872,6 +1992,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           ([
             projectRows,
             projectMcpServerRows,
+            mcpCatalogDefinitionRows,
+            mcpCatalogOverrideRows,
+            mcpCatalogSessionRows,
             threadRows,
             proposedPlanRows,
             sessionRows,
@@ -1885,6 +2008,60 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 NonNullable<OrchestrationReadModel["projectMcpServers"]>[number]
               > = [];
               const threads: OrchestrationThread[] = [];
+              const globalDefinitions = mcpCatalogDefinitionRows
+                .filter((row) => row.scopeType === "global")
+                .map((row) => ({
+                  definitionId: row.definitionId,
+                  logicalServerId: row.logicalServerId,
+                  scope: row.scopeType,
+                  scopeId: row.scopeId,
+                  name: row.name,
+                  transport: row.transport,
+                  enabled: row.enabled === 1,
+                  providerInstanceIds: row.providerInstanceIds,
+                  revision: row.revision,
+                }));
+              const projectDefinitions = mcpCatalogDefinitionRows
+                .filter((row) => row.scopeType === "project")
+                .map((row) => ({
+                  projectId: ProjectId.make(row.scopeId),
+                  definition: {
+                    definitionId: row.definitionId,
+                    logicalServerId: row.logicalServerId,
+                    scope: row.scopeType,
+                    scopeId: row.scopeId,
+                    name: row.name,
+                    transport: row.transport,
+                    enabled: row.enabled === 1,
+                    providerInstanceIds: row.providerInstanceIds,
+                    revision: row.revision,
+                  },
+                }));
+              const projectRevisions = new Map<string, number>();
+              for (const row of mcpCatalogDefinitionRows) {
+                if (row.scopeType === "project") {
+                  projectRevisions.set(
+                    row.scopeId,
+                    Math.max(projectRevisions.get(row.scopeId) ?? 0, row.revision),
+                  );
+                }
+              }
+              for (const row of mcpCatalogOverrideRows) {
+                projectRevisions.set(
+                  row.projectId,
+                  Math.max(projectRevisions.get(row.projectId) ?? 0, row.revision),
+                );
+              }
+              const sessions = mcpCatalogSessionRows.map((row) => ({
+                catalogSessionId: row.catalogSessionId,
+                threadId: row.threadId,
+                providerInstanceId: row.providerInstanceId,
+                baseline: row.baseline,
+                desired: row.desired,
+                desiredRevision: row.desiredRevision,
+                appliedRevision: row.appliedRevision,
+                ...(row.disposedAt === null ? {} : { disposedAt: row.disposedAt }),
+              }));
 
               for (let index = 0; index < projectRows.length; index += 1) {
                 const row = projectRows[index];
@@ -2019,6 +2196,32 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 snapshotSequence: computeSnapshotSequence(stateRows),
                 projects,
                 projectMcpServers,
+                ...(mcpCatalogDefinitionRows.length === 0 &&
+                mcpCatalogOverrideRows.length === 0 &&
+                mcpCatalogSessionRows.length === 0
+                  ? {}
+                  : {
+                      mcpCatalog: {
+                        environmentId: EnvironmentId.make(
+                          globalDefinitions[0]?.scopeId ?? "unknown",
+                        ),
+                        globalRevision: globalDefinitions.reduce(
+                          (revision, definition) => Math.max(revision, definition.revision),
+                          0,
+                        ),
+                        globalDefinitions,
+                        projectRevisions: [...projectRevisions].map(([projectId, revision]) => ({
+                          projectId: ProjectId.make(projectId),
+                          revision,
+                        })),
+                        projectDefinitions,
+                        projectOverrides: mcpCatalogOverrideRows.map((row) => ({
+                          projectId: row.projectId,
+                          override: row.override,
+                        })),
+                        sessions,
+                      },
+                    }),
                 threads,
                 updatedAt: updatedAt ?? "1970-01-01T00:00:00.000Z",
               } satisfies OrchestrationReadModel;

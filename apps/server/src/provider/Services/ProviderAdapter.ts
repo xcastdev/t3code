@@ -28,6 +28,7 @@ import type * as Stream from "effect/Stream";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
 export type ProviderRemoteHttpMcpMode = "active-session" | "next-session" | "unsupported";
+export type ProviderSessionMcpCatalogMode = "live" | "restart-required" | "unsupported";
 
 export interface ProviderAdapterCapabilities {
   /**
@@ -42,6 +43,8 @@ export interface ProviderAdapterCapabilities {
   readonly projectMcpUnsupportedReason?: string;
   /** Application timing for the T3-managed preview MCP server. */
   readonly managedPreviewMcp: ProviderRemoteHttpMcpMode;
+  /** Whether the resolved user catalog can change in the active session. */
+  readonly sessionMcpCatalog?: ProviderSessionMcpCatalogMode;
 }
 
 export type ProviderAdapterSessionStartInput = ProviderSessionStartInput & {

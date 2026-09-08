@@ -1216,6 +1216,7 @@ export function makeCursorAdapter(
         remoteHttpMcp: "next-session",
         projectMcpProxy: "next-session",
         managedPreviewMcp: "next-session",
+        sessionMcpCatalog: "restart-required",
       },
       startSession,
       sendTurn,

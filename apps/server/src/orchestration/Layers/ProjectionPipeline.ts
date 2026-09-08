@@ -1,4 +1,6 @@
 import {
+  McpCatalogDefinition,
+  McpCatalogOverride,
   ApprovalRequestId,
   ProjectMcpTransport,
   ProviderInstanceId,
@@ -69,12 +71,17 @@ export const ORCHESTRATION_PROJECTOR_NAMES = {
   threadTurns: "projection.thread-turns",
   checkpoints: "projection.checkpoints",
   pendingApprovals: "projection.pending-approvals",
+  mcpCatalog: "projection.mcp-catalog",
 } as const;
 
 const encodeProviderInstanceIds = Schema.encodeSync(
   Schema.fromJsonString(Schema.Array(ProviderInstanceId)),
 );
 const encodeProjectMcpTransport = Schema.encodeSync(Schema.fromJsonString(ProjectMcpTransport));
+const encodeMcpCatalogDefinitionArray = Schema.encodeSync(
+  Schema.fromJsonString(Schema.Array(McpCatalogDefinition)),
+);
+const encodeMcpCatalogOverride = Schema.encodeSync(Schema.fromJsonString(McpCatalogOverride));
 
 type ProjectorName =
   (typeof ORCHESTRATION_PROJECTOR_NAMES)[keyof typeof ORCHESTRATION_PROJECTOR_NAMES];
@@ -647,6 +654,157 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             return;
         }
       }).pipe(Effect.mapError(toPersistenceSqlError("ProjectionPipeline.projectMcpServers:query")));
+
+    const applyMcpCatalogProjection: ProjectorDefinition["apply"] = (
+      event,
+      _attachmentSideEffects,
+    ) =>
+      Effect.gen(function* () {
+        switch (event.type) {
+          case "environment.mcp-definition.created":
+          case "environment.mcp-definition.updated": {
+            const definition = event.payload.definition;
+            yield* sql`
+              INSERT INTO projection_mcp_definitions (
+                definition_id, logical_server_id, scope_type, scope_id, name,
+                transport_json, enabled, provider_instance_ids_json, revision
+              ) VALUES (
+                ${definition.definitionId}, ${definition.logicalServerId}, ${definition.scope},
+                ${definition.scopeId}, ${definition.name},
+                ${encodeProjectMcpTransport(definition.transport)},
+                ${definition.enabled ? 1 : 0},
+                ${encodeProviderInstanceIds(definition.providerInstanceIds)},
+                ${definition.revision}
+              )
+              ON CONFLICT (definition_id) DO UPDATE SET
+                logical_server_id = excluded.logical_server_id,
+                scope_type = excluded.scope_type,
+                scope_id = excluded.scope_id,
+                name = excluded.name,
+                transport_json = excluded.transport_json,
+                enabled = excluded.enabled,
+                provider_instance_ids_json = excluded.provider_instance_ids_json,
+                revision = excluded.revision
+            `;
+            return;
+          }
+
+          case "environment.mcp-definition.removed":
+            yield* sql`
+              DELETE FROM projection_mcp_definitions
+              WHERE scope_type = 'global'
+                AND scope_id = ${event.payload.environmentId}
+                AND logical_server_id = ${event.payload.logicalServerId}
+            `;
+            return;
+
+          case "project.mcp-override.upserted":
+            yield* sql`
+              INSERT INTO projection_mcp_overrides (
+                override_id, scope_type, scope_id, target_logical_server_id,
+                patch_json, revision
+              ) VALUES (
+                ${event.payload.override.id}, ${event.payload.override.scope},
+                ${event.payload.projectId}, ${event.payload.override.targetId},
+                ${encodeMcpCatalogOverride(event.payload.override)}, ${event.payload.revision}
+              )
+              ON CONFLICT (override_id) DO UPDATE SET
+                scope_type = excluded.scope_type,
+                scope_id = excluded.scope_id,
+                target_logical_server_id = excluded.target_logical_server_id,
+                patch_json = excluded.patch_json,
+                revision = excluded.revision
+            `;
+            return;
+
+          case "project.mcp-override.removed":
+            yield* sql`
+              DELETE FROM projection_mcp_overrides
+              WHERE override_id = ${event.payload.overrideId}
+                AND scope_id = ${event.payload.projectId}
+            `;
+            return;
+
+          case "thread.mcp-catalog.initialized": {
+            const snapshot = event.payload.snapshot;
+            yield* sql`
+              INSERT INTO projection_mcp_catalog_sessions (
+                catalog_session_id, thread_id, provider_instance_id,
+                baseline_json, desired_catalog_json, desired_revision,
+                applied_revision, application_error, disposed_at
+              ) VALUES (
+                ${snapshot.catalogSessionId}, ${snapshot.threadId}, ${snapshot.providerInstanceId},
+                ${encodeMcpCatalogDefinitionArray(snapshot.baseline)},
+                ${encodeMcpCatalogDefinitionArray(snapshot.desired)},
+                ${snapshot.desiredRevision}, ${snapshot.appliedRevision}, NULL, NULL
+              )
+              ON CONFLICT (catalog_session_id) DO UPDATE SET
+                thread_id = excluded.thread_id,
+                provider_instance_id = excluded.provider_instance_id,
+                baseline_json = excluded.baseline_json,
+                desired_catalog_json = excluded.desired_catalog_json,
+                desired_revision = excluded.desired_revision,
+                applied_revision = excluded.applied_revision,
+                application_error = excluded.application_error,
+                disposed_at = excluded.disposed_at
+            `;
+            return;
+          }
+
+          case "thread.mcp-catalog.updated":
+            yield* sql`
+              UPDATE projection_mcp_catalog_sessions
+              SET desired_catalog_json = ${encodeMcpCatalogDefinitionArray(event.payload.desiredCatalog)},
+                  desired_revision = ${event.payload.desiredRevision},
+                  application_error = NULL
+              WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                AND thread_id = ${event.payload.threadId}
+            `;
+            return;
+
+          case "thread.mcp-catalog.reset":
+            yield* sql`
+              UPDATE projection_mcp_catalog_sessions
+              SET baseline_json = ${encodeMcpCatalogDefinitionArray(event.payload.baseline)},
+                  desired_catalog_json = ${encodeMcpCatalogDefinitionArray(event.payload.baseline)},
+                  desired_revision = ${event.payload.desiredRevision},
+                  application_error = NULL
+              WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                AND thread_id = ${event.payload.threadId}
+            `;
+            return;
+
+          case "thread.mcp-catalog.disposed":
+            yield* sql`
+              UPDATE projection_mcp_catalog_sessions
+              SET disposed_at = ${event.payload.disposedAt}
+              WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                AND thread_id = ${event.payload.threadId}
+            `;
+            return;
+
+          case "thread.mcp-catalog.applied":
+            yield* sql`
+              UPDATE projection_mcp_catalog_sessions
+              SET applied_revision = ${event.payload.revision}, application_error = NULL
+              WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                AND thread_id = ${event.payload.threadId}
+            `;
+            return;
+
+          case "thread.mcp-catalog.apply-failed":
+            yield* sql`
+              UPDATE projection_mcp_catalog_sessions
+              SET application_error = ${event.payload.reason}
+              WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                AND thread_id = ${event.payload.threadId}
+            `;
+            return;
+
+          default:
+            return;
+        }
+      }).pipe(Effect.mapError(toPersistenceSqlError("ProjectionPipeline.mcpCatalog:query")));
 
     const refreshThreadShellSummary = Effect.fn("refreshThreadShellSummary")(function* (
       threadId: ThreadId,
@@ -1289,6 +1447,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         providerInstanceId: event.payload.session.providerInstanceId ?? null,
         runtimeMode: event.payload.session.runtimeMode,
         activeTurnId: event.payload.session.activeTurnId,
+        mcpCatalogSessionId: event.payload.session.mcpCatalogSessionId ?? null,
         lastError: event.payload.session.lastError,
         updatedAt: event.payload.session.updatedAt,
       });
@@ -1776,6 +1935,10 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
       {
         name: ORCHESTRATION_PROJECTOR_NAMES.projectMcpServers,
         apply: applyProjectMcpServersProjection,
+      },
+      {
+        name: ORCHESTRATION_PROJECTOR_NAMES.mcpCatalog,
+        apply: applyMcpCatalogProjection,
       },
       {
         name: ORCHESTRATION_PROJECTOR_NAMES.threadMessages,

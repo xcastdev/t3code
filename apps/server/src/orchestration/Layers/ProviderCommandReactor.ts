@@ -1,4 +1,5 @@
 import {
+  McpCatalogSessionId,
   type ChatAttachment,
   CommandId,
   EventId,
@@ -399,6 +400,12 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const catalogSessionIdForThread = (thread: {
+    readonly id: ThreadId;
+    readonly session: OrchestrationSession | null;
+  }) =>
+    thread.session?.mcpCatalogSessionId ?? McpCatalogSessionId.make(`catalog-session:${thread.id}`);
+
   const setThreadSessionErrorOnTurnStartFailure = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
     readonly detail: string;
@@ -417,6 +424,7 @@ const make = Effect.gen(function* () {
           providerName: null,
           providerInstanceId: thread.modelSelection.instanceId,
           runtimeMode: thread.runtimeMode,
+          mcpCatalogSessionId: McpCatalogSessionId.make(`catalog-session:${thread.id}`),
         }),
         status: session?.status === "stopped" ? "stopped" : "error",
         activeTurnId: null,
@@ -607,6 +615,7 @@ const make = Effect.gen(function* () {
           providerInstanceId: activeSession?.providerInstanceId ?? desiredInstanceId,
           runtimeMode: desiredRuntimeMode,
           activeTurnId: null,
+          mcpCatalogSessionId: catalogSessionIdForThread(thread),
           lastError: null,
           updatedAt: createdAt,
         },
@@ -691,6 +700,7 @@ const make = Effect.gen(function* () {
             providerName: session.provider,
             providerInstanceId: session.providerInstanceId,
             runtimeMode: desiredRuntimeMode,
+            mcpCatalogSessionId: catalogSessionIdForThread(thread),
             // Provider turn ids are not orchestration turn ids.
             activeTurnId: null,
             lastError: session.lastError ?? null,

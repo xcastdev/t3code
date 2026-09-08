@@ -2,6 +2,7 @@ import type {
   OrchestrationClientOrigin,
   OrchestrationEvent,
   OrchestrationReadModel,
+  EnvironmentId,
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -61,10 +62,19 @@ interface CommandEnvelope {
 }
 
 function commandToAggregateRef(command: OrchestrationCommand): {
-  readonly aggregateKind: "project" | "thread";
-  readonly aggregateId: ProjectId | ThreadId;
+  readonly aggregateKind: "environment" | "project" | "thread";
+  readonly aggregateId: EnvironmentId | ProjectId | ThreadId;
 } {
   switch (command.type) {
+    case "environment.mcp-definition.create":
+    case "environment.mcp-definition.update":
+    case "environment.mcp-definition.remove":
+      return {
+        aggregateKind: "environment",
+        aggregateId: command.environmentId,
+      };
+    case "project.mcp-override.upsert":
+    case "project.mcp-override.remove":
     case "project.create":
     case "project.meta.update":
     case "project.delete":

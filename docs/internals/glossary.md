@@ -11,6 +11,7 @@ This is a living glossary for T3 Code. It explains what common terms mean in thi
 - [Orchestration](#orchestration)
 - [Provider runtime](#provider-runtime)
 - [Project MCP](#project-mcp)
+- [Scoped MCP catalogs](#scoped-mcp-catalogs)
 - [Checkpointing](#checkpointing)
 - [Appearance](#appearance)
 
@@ -149,6 +150,37 @@ closes it when the provider session ends or is revoked.
 The immutable project MCP snapshot and bearer scope issued immediately before a provider adapter
 starts. It contains provider-safe proxy URLs and authorization material, never upstream commands,
 headers, environment values, or OAuth secrets.
+
+### Scoped MCP catalogs
+
+#### Global MCP catalog
+
+The environment-wide set of saved MCP definitions. Projects inherit global definitions unless a
+project override disables or changes one. Global edits set defaults for future logical catalog
+sessions.
+
+#### Project override
+
+A project-scoped patch targeting an immutable logical MCP server id. Metadata patches retain the
+inherited transport definition; a transport replacement owns a new definition id. Overrides remain
+as source-removed tombstones when a global source is deleted.
+
+#### Logical catalog session
+
+The durable MCP catalog identity attached to a thread/provider path. It captures the effective
+global/project catalog at session start and survives recoverable provider process recovery.
+Session-local definitions and overrides belong only to this identity.
+
+#### Runtime provider session
+
+The short-lived credential and proxy runtime process identity. Recovery creates a new runtime
+provider session under the same logical catalog session.
+
+#### Desired revision and applied revision
+
+The desired revision records the latest saved session catalog mutation. The applied revision records
+the revision successfully installed in a live provider runtime. They may differ while a reactor is
+applying a mutation or when a provider requires a restart.
 
 ### Checkpointing
 

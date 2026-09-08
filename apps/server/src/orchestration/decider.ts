@@ -7,6 +7,8 @@ import {
   ProjectMcpNameConflictError,
   ProjectMcpServerLimitExceededError,
   ProjectMcpServerNotFoundError,
+  McpCatalogStaleRevisionError,
+  McpCatalogStaleSessionError,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Crypto from "effect/Crypto";
@@ -41,6 +43,26 @@ const projectMcpInvariantError = (
   cause: ProjectMcpMutationError,
 ): OrchestrationCommandInvariantError =>
   new OrchestrationCommandInvariantError({ commandType, detail: cause.message, cause });
+
+const catalogRevisionInvariantError = (
+  commandType: string,
+  scope: "global" | "project" | "session",
+  scopeId: string,
+  expectedRevision: number,
+  actualRevision: number,
+): OrchestrationCommandInvariantError => {
+  const cause = new McpCatalogStaleRevisionError({
+    scope,
+    scopeId,
+    expectedRevision,
+    actualRevision,
+  });
+  return new OrchestrationCommandInvariantError({
+    commandType,
+    detail: cause.message,
+    cause,
+  });
+};
 
 /**
  * Blocked-on-you work derived from the thread's retained activities: an
@@ -237,6 +259,264 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
   Crypto.Crypto
 > {
   switch (command.type) {
+    case "environment.mcp-definition.create":
+    case "environment.mcp-definition.update": {
+      const actualRevision = readModel.mcpCatalog?.globalRevision ?? 0;
+      if (command.expectedRevision !== actualRevision) {
+        return yield* catalogRevisionInvariantError(
+          command.type,
+          "global",
+          command.environmentId,
+          command.expectedRevision,
+          actualRevision,
+        );
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "environment",
+          aggregateId: command.environmentId,
+          occurredAt: "createdAt" in command ? command.createdAt : command.updatedAt,
+          commandId: command.commandId,
+        })),
+        type:
+          command.type === "environment.mcp-definition.create"
+            ? "environment.mcp-definition.created"
+            : "environment.mcp-definition.updated",
+        payload: {
+          environmentId: command.environmentId,
+          definition: command.definition,
+          revision: actualRevision + 1,
+          ...("createdAt" in command
+            ? { createdAt: command.createdAt }
+            : { updatedAt: command.updatedAt }),
+        },
+      } as PlannedOrchestrationEvent;
+    }
+
+    case "environment.mcp-definition.remove": {
+      const actualRevision = readModel.mcpCatalog?.globalRevision ?? 0;
+      if (command.expectedRevision !== actualRevision) {
+        return yield* catalogRevisionInvariantError(
+          command.type,
+          "global",
+          command.environmentId,
+          command.expectedRevision,
+          actualRevision,
+        );
+      }
+      const definitionId = readModel.mcpCatalog?.globalDefinitions.find(
+        (definition) => definition.logicalServerId === command.logicalServerId,
+      )?.definitionId;
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "environment",
+          aggregateId: command.environmentId,
+          occurredAt: command.removedAt,
+          commandId: command.commandId,
+        })),
+        type: "environment.mcp-definition.removed",
+        payload: {
+          environmentId: command.environmentId,
+          logicalServerId: command.logicalServerId,
+          ...(definitionId === undefined ? {} : { definitionId }),
+          revision: actualRevision + 1,
+          removedAt: command.removedAt,
+        },
+      };
+    }
+
+    case "project.mcp-override.upsert": {
+      yield* requireProject({ readModel, command, projectId: command.projectId });
+      const actualRevision =
+        readModel.mcpCatalog?.projectRevisions.find(
+          (entry) => entry.projectId === command.projectId,
+        )?.revision ?? 0;
+      if (command.expectedRevision !== actualRevision) {
+        return yield* catalogRevisionInvariantError(
+          command.type,
+          "project",
+          command.projectId,
+          command.expectedRevision,
+          actualRevision,
+        );
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "project",
+          aggregateId: command.projectId,
+          occurredAt: command.updatedAt,
+          commandId: command.commandId,
+        })),
+        type: "project.mcp-override.upserted",
+        payload: {
+          projectId: command.projectId,
+          override: command.override,
+          revision: actualRevision + 1,
+          updatedAt: command.updatedAt,
+        },
+      };
+    }
+
+    case "project.mcp-override.remove": {
+      yield* requireProject({ readModel, command, projectId: command.projectId });
+      const actualRevision =
+        readModel.mcpCatalog?.projectRevisions.find(
+          (entry) => entry.projectId === command.projectId,
+        )?.revision ?? 0;
+      if (command.expectedRevision !== actualRevision) {
+        return yield* catalogRevisionInvariantError(
+          command.type,
+          "project",
+          command.projectId,
+          command.expectedRevision,
+          actualRevision,
+        );
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "project",
+          aggregateId: command.projectId,
+          occurredAt: command.removedAt,
+          commandId: command.commandId,
+        })),
+        type: "project.mcp-override.removed",
+        payload: {
+          projectId: command.projectId,
+          overrideId: command.overrideId,
+          revision: actualRevision + 1,
+          removedAt: command.removedAt,
+        },
+      };
+    }
+
+    case "thread.mcp-catalog.initialize": {
+      yield* requireThread({ readModel, command, threadId: command.threadId });
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.mcp-catalog.initialized",
+        payload: { threadId: command.threadId, snapshot: command.snapshot },
+      };
+    }
+
+    case "thread.mcp-catalog.update":
+    case "thread.mcp-catalog.reset": {
+      const thread = yield* requireThread({ readModel, command, threadId: command.threadId });
+      const activeSessionId = thread.session?.mcpCatalogSessionId;
+      if (activeSessionId !== command.mcpCatalogSessionId) {
+        const cause = new McpCatalogStaleSessionError({
+          threadId: command.threadId,
+          requestedSessionId: command.mcpCatalogSessionId,
+          activeSessionId: activeSessionId ?? command.mcpCatalogSessionId,
+        });
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: cause.message,
+          cause,
+        });
+      }
+      const actualRevision =
+        readModel.mcpCatalog?.sessions.find(
+          (snapshot) => snapshot.catalogSessionId === command.mcpCatalogSessionId,
+        )?.desiredRevision ?? 0;
+      if (command.expectedRevision !== actualRevision) {
+        return yield* catalogRevisionInvariantError(
+          command.type,
+          "session",
+          command.mcpCatalogSessionId,
+          command.expectedRevision,
+          actualRevision,
+        );
+      }
+      const isUpdate = command.type === "thread.mcp-catalog.update";
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.updatedAt,
+          commandId: command.commandId,
+        })),
+        type: isUpdate ? "thread.mcp-catalog.updated" : "thread.mcp-catalog.reset",
+        payload: isUpdate
+          ? {
+              threadId: command.threadId,
+              mcpCatalogSessionId: command.mcpCatalogSessionId,
+              desiredCatalog: command.desiredCatalog,
+              desiredRevision: actualRevision + 1,
+            }
+          : {
+              threadId: command.threadId,
+              mcpCatalogSessionId: command.mcpCatalogSessionId,
+              baseline: command.baseline,
+              desiredRevision: actualRevision + 1,
+            },
+      } as PlannedOrchestrationEvent;
+    }
+
+    case "thread.mcp-catalog.dispose":
+    case "thread.mcp-catalog.applied":
+    case "thread.mcp-catalog.apply-failed": {
+      const thread = yield* requireThread({ readModel, command, threadId: command.threadId });
+      const activeSessionId = thread.session?.mcpCatalogSessionId;
+      if (activeSessionId !== command.mcpCatalogSessionId) {
+        const cause = new McpCatalogStaleSessionError({
+          threadId: command.threadId,
+          requestedSessionId: command.mcpCatalogSessionId,
+          activeSessionId: activeSessionId ?? command.mcpCatalogSessionId,
+        });
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: cause.message,
+          cause,
+        });
+      }
+      const eventType =
+        command.type === "thread.mcp-catalog.dispose"
+          ? "thread.mcp-catalog.disposed"
+          : command.type === "thread.mcp-catalog.applied"
+            ? "thread.mcp-catalog.applied"
+            : "thread.mcp-catalog.apply-failed";
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt:
+            command.type === "thread.mcp-catalog.dispose"
+              ? command.disposedAt
+              : command.type === "thread.mcp-catalog.applied"
+                ? command.appliedAt
+                : command.failedAt,
+          commandId: command.commandId,
+        })),
+        type: eventType,
+        payload:
+          command.type === "thread.mcp-catalog.dispose"
+            ? {
+                threadId: command.threadId,
+                mcpCatalogSessionId: command.mcpCatalogSessionId,
+                disposedAt: command.disposedAt,
+              }
+            : command.type === "thread.mcp-catalog.applied"
+              ? {
+                  threadId: command.threadId,
+                  mcpCatalogSessionId: command.mcpCatalogSessionId,
+                  revision: command.revision,
+                  appliedAt: command.appliedAt,
+                }
+              : {
+                  threadId: command.threadId,
+                  mcpCatalogSessionId: command.mcpCatalogSessionId,
+                  revision: command.revision,
+                  reason: command.reason,
+                  failedAt: command.failedAt,
+                },
+      } as PlannedOrchestrationEvent;
+    }
+
     case "project.create": {
       yield* requireProjectAbsent({
         readModel,

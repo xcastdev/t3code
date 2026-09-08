@@ -1,0 +1,283 @@
+import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+
+import {
+  EnvironmentId,
+  IsoDateTime,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
+import { McpServerId, ProjectMcpTransport, ProjectMcpTransportDraft } from "./projectMcp.ts";
+import { ProviderInstanceId } from "./providerInstance.ts";
+
+const MCP_CATALOG_NAME_MAX_LENGTH = 120;
+const MCP_CATALOG_PROVIDER_LIMIT = 50;
+
+export const McpDefinitionId = TrimmedNonEmptyString.pipe(Schema.brand("McpDefinitionId"));
+export type McpDefinitionId = typeof McpDefinitionId.Type;
+
+export const McpCatalogSessionId = TrimmedNonEmptyString.pipe(Schema.brand("McpCatalogSessionId"));
+export type McpCatalogSessionId = typeof McpCatalogSessionId.Type;
+
+export const McpCatalogOverrideId = TrimmedNonEmptyString.pipe(
+  Schema.brand("McpCatalogOverrideId"),
+);
+export type McpCatalogOverrideId = typeof McpCatalogOverrideId.Type;
+
+export const McpCatalogName = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(MCP_CATALOG_NAME_MAX_LENGTH),
+);
+export type McpCatalogName = typeof McpCatalogName.Type;
+
+export const McpCatalogScope = Schema.Literals(["global", "project", "session"]);
+export type McpCatalogScope = typeof McpCatalogScope.Type;
+
+export const McpCatalogDefinition = Schema.Struct({
+  definitionId: McpDefinitionId,
+  logicalServerId: McpServerId,
+  scope: McpCatalogScope,
+  /** Environment id for global definitions, project id for project definitions,
+   * and the logical catalog session id for session definitions. */
+  scopeId: TrimmedNonEmptyString,
+  name: McpCatalogName,
+  transport: ProjectMcpTransport,
+  enabled: Schema.Boolean,
+  providerInstanceIds: Schema.Array(ProviderInstanceId).check(
+    Schema.isMaxLength(MCP_CATALOG_PROVIDER_LIMIT),
+  ),
+  revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+});
+export type McpCatalogDefinition = typeof McpCatalogDefinition.Type;
+
+/**
+ * A definition draft deliberately accepts only the persisted transport shape.
+ * Credential values are prepared by the server's secret store before this
+ * contract crosses into orchestration; they never enter events or snapshots.
+ */
+export const McpCatalogDefinitionDraft = Schema.Struct({
+  name: McpCatalogName,
+  transport: ProjectMcpTransportDraft,
+  enabled: Schema.Boolean,
+  providerInstanceIds: Schema.Array(ProviderInstanceId).check(
+    Schema.isMaxLength(MCP_CATALOG_PROVIDER_LIMIT),
+  ),
+});
+export type McpCatalogDefinitionDraft = typeof McpCatalogDefinitionDraft.Type;
+
+const McpCatalogOverrideFields = Schema.Struct({
+  id: McpCatalogOverrideId,
+  scope: Schema.Literals(["project", "session"]),
+  scopeId: TrimmedNonEmptyString,
+  targetId: McpServerId,
+  enabled: Schema.optional(Schema.Boolean),
+  name: Schema.optional(McpCatalogName),
+  providerInstanceIds: Schema.optional(
+    Schema.Array(ProviderInstanceId).check(Schema.isMaxLength(MCP_CATALOG_PROVIDER_LIMIT)),
+  ),
+  transport: Schema.optional(ProjectMcpTransport),
+  transportDefinitionId: Schema.optional(McpDefinitionId),
+});
+
+/** A lower-scope patch. Transport replacement is intentionally all-or-nothing. */
+export const McpCatalogOverride = McpCatalogOverrideFields.check(
+  Schema.makeFilter(
+    (override) =>
+      (override.transport === undefined && override.transportDefinitionId === undefined) ||
+      (override.transport !== undefined && override.transportDefinitionId !== undefined),
+    { message: "A transport override requires a complete transport definition id" },
+  ),
+);
+export type McpCatalogOverride = typeof McpCatalogOverride.Type;
+
+export const ResolvedMcpCatalogEntry = Schema.Struct({
+  logicalServerId: McpServerId,
+  transportDefinitionId: McpDefinitionId,
+  name: McpCatalogName,
+  transport: ProjectMcpTransport,
+  providerInstanceId: ProviderInstanceId,
+  scope: McpCatalogScope,
+  scopeId: TrimmedNonEmptyString,
+});
+export type ResolvedMcpCatalogEntry = typeof ResolvedMcpCatalogEntry.Type;
+
+export const McpCatalogApplication = Schema.Union([
+  Schema.Struct({
+    status: Schema.Literal("applied"),
+    revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+    appliedAt: IsoDateTime,
+  }),
+  Schema.Struct({
+    status: Schema.Literal("failed"),
+    revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+    failedAt: IsoDateTime,
+    reason: TrimmedNonEmptyString,
+  }),
+]);
+export type McpCatalogApplication = typeof McpCatalogApplication.Type;
+
+/**
+ * The logical-session snapshot owns the complete resolved transport and its
+ * definition id. This is what lets runtime recovery resolve credentials for
+ * an old definition after the saved global/project catalog has rotated.
+ */
+export const McpCatalogSnapshot = Schema.Struct({
+  catalogSessionId: McpCatalogSessionId,
+  threadId: ThreadId,
+  providerInstanceId: ProviderInstanceId,
+  baseline: Schema.Array(McpCatalogDefinition),
+  desired: Schema.Array(McpCatalogDefinition),
+  desiredRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  appliedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  application: Schema.optional(McpCatalogApplication),
+  disposedAt: Schema.optional(IsoDateTime),
+});
+export type McpCatalogSnapshot = typeof McpCatalogSnapshot.Type;
+
+export class McpCatalogNameConflictError extends Schema.TaggedErrorClass<McpCatalogNameConflictError>()(
+  "McpCatalogNameConflictError",
+  {
+    conflicts: Schema.Array(
+      Schema.Struct({
+        logicalServerId: McpServerId,
+        name: McpCatalogName,
+        scope: McpCatalogScope,
+        scopeId: TrimmedNonEmptyString,
+        providerInstanceIds: Schema.Array(ProviderInstanceId),
+      }),
+    ),
+  },
+) {
+  override get message(): string {
+    return `MCP catalog names conflict for ${this.conflicts.length} definition(s).`;
+  }
+}
+
+export class McpCatalogProviderLimitExceededError extends Schema.TaggedErrorClass<McpCatalogProviderLimitExceededError>()(
+  "McpCatalogProviderLimitExceededError",
+  {
+    providerInstanceId: ProviderInstanceId,
+    limit: Schema.Int,
+  },
+) {
+  override get message(): string {
+    return `Provider '${this.providerInstanceId}' cannot expose more than ${this.limit} MCP servers.`;
+  }
+}
+
+export class McpCatalogStaleRevisionError extends Schema.TaggedErrorClass<McpCatalogStaleRevisionError>()(
+  "McpCatalogStaleRevisionError",
+  {
+    scope: McpCatalogScope,
+    scopeId: TrimmedNonEmptyString,
+    expectedRevision: Schema.Int,
+    actualRevision: Schema.Int,
+  },
+) {}
+
+export class McpCatalogStaleSessionError extends Schema.TaggedErrorClass<McpCatalogStaleSessionError>()(
+  "McpCatalogStaleSessionError",
+  {
+    threadId: ThreadId,
+    requestedSessionId: McpCatalogSessionId,
+    activeSessionId: McpCatalogSessionId,
+  },
+) {}
+
+export class McpCatalogUnsupportedProviderError extends Schema.TaggedErrorClass<McpCatalogUnsupportedProviderError>()(
+  "McpCatalogUnsupportedProviderError",
+  {
+    providerInstanceId: ProviderInstanceId,
+  },
+) {}
+
+export const McpCatalogListInput = Schema.Struct({
+  scope: McpCatalogScope,
+  scopeId: TrimmedNonEmptyString,
+  providerInstanceId: Schema.optional(ProviderInstanceId),
+});
+export type McpCatalogListInput = typeof McpCatalogListInput.Type;
+
+export const McpCatalogMutationBase = Schema.Struct({
+  scope: McpCatalogScope,
+  scopeId: TrimmedNonEmptyString,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+});
+export type McpCatalogMutationBase = typeof McpCatalogMutationBase.Type;
+
+export const McpCatalogCreateInput = Schema.Struct({
+  ...McpCatalogMutationBase.fields,
+  scope: Schema.Literals(["global", "project", "session"]),
+  definition: McpCatalogDefinitionDraft,
+  logicalServerId: Schema.optional(McpServerId),
+});
+export type McpCatalogCreateInput = typeof McpCatalogCreateInput.Type;
+
+export const McpCatalogUpdateInput = Schema.Struct({
+  ...McpCatalogMutationBase.fields,
+  logicalServerId: McpServerId,
+  definition: McpCatalogDefinitionDraft,
+});
+export type McpCatalogUpdateInput = typeof McpCatalogUpdateInput.Type;
+
+export const McpCatalogRemoveInput = Schema.Struct({
+  ...McpCatalogMutationBase.fields,
+  logicalServerId: McpServerId,
+});
+export type McpCatalogRemoveInput = typeof McpCatalogRemoveInput.Type;
+
+export const McpCatalogOverrideInput = Schema.Struct({
+  scope: Schema.Literals(["project", "session"]),
+  scopeId: TrimmedNonEmptyString,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  override: McpCatalogOverride,
+});
+export type McpCatalogOverrideInput = typeof McpCatalogOverrideInput.Type;
+
+export const McpCatalogDeleteOverrideInput = Schema.Struct({
+  scope: Schema.Literals(["project", "session"]),
+  scopeId: TrimmedNonEmptyString,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  overrideId: McpCatalogOverrideId,
+});
+export type McpCatalogDeleteOverrideInput = typeof McpCatalogDeleteOverrideInput.Type;
+
+export const McpCatalogSessionRequest = Schema.Struct({
+  threadId: ThreadId,
+  mcpCatalogSessionId: McpCatalogSessionId,
+});
+export type McpCatalogSessionRequest = typeof McpCatalogSessionRequest.Type;
+
+export const McpCatalogSessionMutationInput = Schema.Struct({
+  ...McpCatalogSessionRequest.fields,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+});
+export type McpCatalogSessionMutationInput = typeof McpCatalogSessionMutationInput.Type;
+
+export const McpCatalogChanged = Schema.Struct({
+  scope: McpCatalogScope,
+  scopeId: TrimmedNonEmptyString,
+  revision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+});
+export type McpCatalogChanged = typeof McpCatalogChanged.Type;
+
+export const McpCatalogSubscriptionInput = Schema.Struct({
+  catalog: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+});
+export type McpCatalogSubscriptionInput = typeof McpCatalogSubscriptionInput.Type;
+
+export const McpCatalogMutationError = Schema.Union([
+  McpCatalogNameConflictError,
+  McpCatalogProviderLimitExceededError,
+  McpCatalogStaleRevisionError,
+  McpCatalogStaleSessionError,
+  McpCatalogUnsupportedProviderError,
+]);
+export type McpCatalogMutationError = typeof McpCatalogMutationError.Type;
+
+export const MCP_CATALOG_PROVIDER_ENTRY_LIMIT = MCP_CATALOG_PROVIDER_LIMIT;
+export const MCP_CATALOG_NAME_MAX_CHARS = MCP_CATALOG_NAME_MAX_LENGTH;
+
+// Keep the environment/project aliases discoverable to callers that need to
+// build a scope-specific request without importing implementation details.
+export type McpCatalogScopeId = EnvironmentId | ProjectId | McpCatalogSessionId;

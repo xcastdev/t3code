@@ -41,6 +41,7 @@ import {
   ORCHESTRATION_WS_METHODS,
   type ProjectId,
   type McpServerId,
+  ProviderInstanceId,
   ProjectMcpCreateError,
   ProjectMcpCatalogCommittedCleanupPendingError,
   type ProjectMcpMutationError,
@@ -128,6 +129,7 @@ import * as GitWorkflowService from "./git/GitWorkflowService.ts";
 import * as ReviewService from "./review/ReviewService.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
 import * as ProjectMcpService from "./project/ProjectMcpService.ts";
+import * as McpCatalogService from "./mcp/McpCatalogService.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as ProjectMcpProxyRegistry from "./mcp/ProjectMcpProxyRegistry.ts";
 import * as ProjectMcpOAuth from "./mcp/ProjectMcpOAuth.ts";
@@ -564,6 +566,25 @@ const makeWsRpcLayer = (
       const workspaceFileSystem = yield* WorkspaceFileSystem.WorkspaceFileSystem;
       const projectSetupScriptRunner = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
       const projectMcpService = yield* ProjectMcpService.ProjectMcpService;
+      const mcpCatalogService = yield* McpCatalogService.McpCatalogService;
+      // The catalog service is process-local because RPC mutations need a
+      // small synchronous read model. Seed it from the durable projection
+      // before serving the first request after a restart. The service guards
+      // this operation so later websocket connections cannot overwrite live
+      // mutations with an older snapshot.
+      yield* projectionSnapshotQuery.getCommandReadModel().pipe(
+        Effect.flatMap((readModel) =>
+          mcpCatalogService.hydrate({
+            mcpCatalog: readModel.mcpCatalog,
+            threads: readModel.threads,
+          }),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.logWarning("MCP catalog hydration failed; using an empty in-memory catalog", {
+            cause,
+          }),
+        ),
+      );
       const projectMcpProxy = yield* ProjectMcpProxyRegistry.ProjectMcpProxyRegistry;
       const projectMcpOAuth = yield* ProjectMcpOAuth.ProjectMcpOAuth;
       const projectMcpSecrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
@@ -1862,6 +1883,115 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "project-mcp" },
           ),
+        [WS_METHODS.mcpCatalogGlobalList]: (_input) =>
+          observeRpcEffect(WS_METHODS.mcpCatalogGlobalList, mcpCatalogService.listGlobal(), {
+            "rpc.aggregate": "mcp-catalog",
+          }),
+        [WS_METHODS.mcpCatalogGlobalCreate]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogGlobalCreate,
+            mcpCatalogService.createGlobal(input),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogGlobalUpdate]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogGlobalUpdate,
+            mcpCatalogService.updateGlobal(input),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogGlobalRemove]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogGlobalRemove,
+            mcpCatalogService.removeGlobal(input),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogProjectList]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogProjectList,
+            mcpCatalogService.listProject(
+              input.scopeId,
+              input.providerInstanceId ?? ProviderInstanceId.make("default"),
+            ),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogProjectCreate]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogProjectCreate,
+            mcpCatalogService.createProject(input),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogProjectUpdate]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogProjectUpdate,
+            mcpCatalogService.updateProject(input),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogProjectRemove]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogProjectRemove,
+            mcpCatalogService.removeProject(input),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogProjectOverride]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogProjectOverride,
+            mcpCatalogService.putProjectOverride(input),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogProjectDeleteOverride]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogProjectDeleteOverride,
+            mcpCatalogService.removeProjectOverride({
+              scopeId: input.scopeId,
+              expectedRevision: input.expectedRevision,
+              overrideId: input.overrideId,
+            }),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogSessionGet]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogSessionGet,
+            mcpCatalogService.listSession(input.mcpCatalogSessionId),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogSessionCreate]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogSessionCreate,
+            Effect.gen(function* () {
+              const providerInstanceId =
+                input.definition.providerInstanceIds[0] ?? ProviderInstanceId.make("default");
+              yield* mcpCatalogService.materializeSession({
+                threadId: input.threadId,
+                projectId: input.scopeId,
+                providerInstanceId,
+                mcpCatalogSessionId: input.mcpCatalogSessionId,
+              });
+              return yield* mcpCatalogService.addSession(input);
+            }),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogSessionUpdate]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogSessionUpdate,
+            mcpCatalogService.updateSession(input),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogSessionRemove]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogSessionRemove,
+            mcpCatalogService.removeSession(input),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogSessionReset]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogSessionReset,
+            mcpCatalogService.resetSession(input),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogSubscribe]: (_input) =>
+          observeRpcStream(WS_METHODS.mcpCatalogSubscribe, Stream.empty, {
+            "rpc.aggregate": "mcp-catalog",
+          }),
         [WS_METHODS.projectMcpOauthBegin]: (input) =>
           observeRpcEffect(
             WS_METHODS.projectMcpOauthBegin,
@@ -2842,6 +2972,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
     const serverSelfUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
     const pullRequests = yield* PullRequestService.PullRequestService;
     const mcpSessions = yield* McpSessionRegistry.McpSessionRegistry;
+    const mcpCatalogService = yield* McpCatalogService.McpCatalogService;
     const projectMcpProxy = yield* ProjectMcpProxyRegistry.ProjectMcpProxyRegistry;
     const projectMcpOAuth = yield* ProjectMcpOAuth.ProjectMcpOAuth;
     const projectMcpSecrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
@@ -2887,6 +3018,7 @@ export const websocketRpcRouteLayer = Layer.unwrap(
               // mutation invalidates the HTTP diff cache that every client reads from.
               Layer.provide(Layer.succeed(PullRequestService.PullRequestService, pullRequests)),
               Layer.provide(Layer.succeed(McpSessionRegistry.McpSessionRegistry, mcpSessions)),
+              Layer.provide(Layer.succeed(McpCatalogService.McpCatalogService, mcpCatalogService)),
               Layer.provide(
                 Layer.succeed(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, projectMcpProxy),
               ),

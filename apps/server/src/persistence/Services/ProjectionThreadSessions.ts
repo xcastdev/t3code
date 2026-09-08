@@ -7,6 +7,7 @@
  * @module ProjectionThreadSessionRepository
  */
 import {
+  McpCatalogSessionId,
   RuntimeMode,
   IsoDateTime,
   OrchestrationSessionStatus,
@@ -28,6 +29,7 @@ export const ProjectionThreadSession = Schema.Struct({
   providerInstanceId: Schema.NullOr(ProviderInstanceId),
   runtimeMode: RuntimeMode,
   activeTurnId: Schema.NullOr(TurnId),
+  mcpCatalogSessionId: Schema.optional(Schema.NullOr(McpCatalogSessionId)),
   lastError: Schema.NullOr(Schema.String),
   updatedAt: IsoDateTime,
 });

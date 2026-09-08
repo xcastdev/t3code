@@ -226,6 +226,21 @@ import {
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
+import {
+  McpCatalogChanged,
+  McpCatalogCreateInput,
+  McpCatalogDefinition,
+  McpCatalogDeleteOverrideInput,
+  McpCatalogListInput,
+  McpCatalogMutationError,
+  McpCatalogOverrideInput,
+  McpCatalogRemoveInput,
+  McpCatalogSessionMutationInput,
+  McpCatalogSessionRequest,
+  McpCatalogSnapshot,
+  McpCatalogUpdateInput,
+  ResolvedMcpCatalogEntry,
+} from "./mcpCatalog.ts";
 
 export const WS_METHODS = {
   // Project registry methods
@@ -244,6 +259,25 @@ export const WS_METHODS = {
   projectMcpOauthBegin: "projectMcp.oauth.begin",
   projectMcpOauthContinue: "projectMcp.oauth.continue",
   projectMcpOauthDisconnect: "projectMcp.oauth.disconnect",
+
+  // Scoped MCP catalog methods. Legacy projectMcp.* methods above remain
+  // available during the compatibility window.
+  mcpCatalogGlobalList: "mcpCatalog.global.list",
+  mcpCatalogGlobalCreate: "mcpCatalog.global.create",
+  mcpCatalogGlobalUpdate: "mcpCatalog.global.update",
+  mcpCatalogGlobalRemove: "mcpCatalog.global.remove",
+  mcpCatalogProjectList: "mcpCatalog.project.list",
+  mcpCatalogProjectCreate: "mcpCatalog.project.create",
+  mcpCatalogProjectUpdate: "mcpCatalog.project.update",
+  mcpCatalogProjectRemove: "mcpCatalog.project.remove",
+  mcpCatalogProjectOverride: "mcpCatalog.project.override",
+  mcpCatalogProjectDeleteOverride: "mcpCatalog.project.deleteOverride",
+  mcpCatalogSessionGet: "mcpCatalog.session.get",
+  mcpCatalogSessionCreate: "mcpCatalog.session.create",
+  mcpCatalogSessionUpdate: "mcpCatalog.session.update",
+  mcpCatalogSessionRemove: "mcpCatalog.session.remove",
+  mcpCatalogSessionReset: "mcpCatalog.session.reset",
+  mcpCatalogSubscribe: "mcpCatalog.subscribe",
 
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
@@ -758,6 +792,117 @@ export const WsProjectMcpOAuthDisconnectRpc = Rpc.make(WS_METHODS.projectMcpOaut
   error: Schema.Union([ProjectMcpUpdateError, EnvironmentAuthorizationError]),
 });
 
+const mcpCatalogMutationError = Schema.Union([
+  McpCatalogMutationError,
+  EnvironmentAuthorizationError,
+]);
+
+export const WsMcpCatalogGlobalListRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalList, {
+  payload: McpCatalogListInput,
+  success: Schema.Array(McpCatalogDefinition),
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsMcpCatalogGlobalCreateRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalCreate, {
+  payload: McpCatalogCreateInput,
+  success: McpCatalogDefinition,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogGlobalUpdateRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalUpdate, {
+  payload: McpCatalogUpdateInput,
+  success: McpCatalogDefinition,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogGlobalRemoveRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalRemove, {
+  payload: McpCatalogRemoveInput,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectListRpc = Rpc.make(WS_METHODS.mcpCatalogProjectList, {
+  payload: McpCatalogListInput,
+  success: Schema.Array(ResolvedMcpCatalogEntry),
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectCreateRpc = Rpc.make(WS_METHODS.mcpCatalogProjectCreate, {
+  payload: McpCatalogCreateInput,
+  success: McpCatalogDefinition,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectUpdateRpc = Rpc.make(WS_METHODS.mcpCatalogProjectUpdate, {
+  payload: McpCatalogUpdateInput,
+  success: McpCatalogDefinition,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectRemoveRpc = Rpc.make(WS_METHODS.mcpCatalogProjectRemove, {
+  payload: McpCatalogRemoveInput,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectOverrideRpc = Rpc.make(WS_METHODS.mcpCatalogProjectOverride, {
+  payload: McpCatalogOverrideInput,
+  success: Schema.Void,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectDeleteOverrideRpc = Rpc.make(
+  WS_METHODS.mcpCatalogProjectDeleteOverride,
+  {
+    payload: McpCatalogDeleteOverrideInput,
+    error: mcpCatalogMutationError,
+  },
+);
+
+export const WsMcpCatalogSessionGetRpc = Rpc.make(WS_METHODS.mcpCatalogSessionGet, {
+  payload: McpCatalogSessionRequest,
+  success: McpCatalogSnapshot,
+  error: Schema.Union([McpCatalogMutationError, EnvironmentAuthorizationError]),
+});
+
+export const WsMcpCatalogSessionCreateRpc = Rpc.make(WS_METHODS.mcpCatalogSessionCreate, {
+  payload: Schema.Struct({
+    ...McpCatalogCreateInput.fields,
+    ...McpCatalogSessionRequest.fields,
+  }),
+  success: McpCatalogSnapshot,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogSessionUpdateRpc = Rpc.make(WS_METHODS.mcpCatalogSessionUpdate, {
+  payload: Schema.Struct({
+    ...McpCatalogSessionMutationInput.fields,
+    ...McpCatalogUpdateInput.fields,
+  }),
+  success: McpCatalogSnapshot,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogSessionRemoveRpc = Rpc.make(WS_METHODS.mcpCatalogSessionRemove, {
+  payload: Schema.Struct({
+    ...McpCatalogSessionMutationInput.fields,
+    ...McpCatalogRemoveInput.fields,
+  }),
+  success: McpCatalogSnapshot,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogSessionResetRpc = Rpc.make(WS_METHODS.mcpCatalogSessionReset, {
+  payload: McpCatalogSessionMutationInput,
+  success: McpCatalogSnapshot,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogSubscribeRpc = Rpc.make(WS_METHODS.mcpCatalogSubscribe, {
+  payload: Schema.Struct({ catalog: Schema.optional(Schema.Boolean) }),
+  success: McpCatalogChanged,
+  error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
 export const WsShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
   payload: LaunchEditorInput,
   error: Schema.Union([ExternalLauncherError, EnvironmentAuthorizationError]),
@@ -1176,6 +1321,22 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectMcpOAuthBeginRpc,
   WsProjectMcpOAuthContinueRpc,
   WsProjectMcpOAuthDisconnectRpc,
+  WsMcpCatalogGlobalListRpc,
+  WsMcpCatalogGlobalCreateRpc,
+  WsMcpCatalogGlobalUpdateRpc,
+  WsMcpCatalogGlobalRemoveRpc,
+  WsMcpCatalogProjectListRpc,
+  WsMcpCatalogProjectCreateRpc,
+  WsMcpCatalogProjectUpdateRpc,
+  WsMcpCatalogProjectRemoveRpc,
+  WsMcpCatalogProjectOverrideRpc,
+  WsMcpCatalogProjectDeleteOverrideRpc,
+  WsMcpCatalogSessionGetRpc,
+  WsMcpCatalogSessionCreateRpc,
+  WsMcpCatalogSessionUpdateRpc,
+  WsMcpCatalogSessionRemoveRpc,
+  WsMcpCatalogSessionResetRpc,
+  WsMcpCatalogSubscribeRpc,
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,

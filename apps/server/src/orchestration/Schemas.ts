@@ -5,6 +5,11 @@ import {
   ProjectMcpServerCreatedPayload as ContractsProjectMcpServerCreatedPayloadSchema,
   ProjectMcpServerRemovedPayload as ContractsProjectMcpServerRemovedPayloadSchema,
   ProjectMcpServerUpdatedPayload as ContractsProjectMcpServerUpdatedPayloadSchema,
+  EnvironmentMcpDefinitionCreatedPayload as ContractsEnvironmentMcpDefinitionCreatedPayloadSchema,
+  EnvironmentMcpDefinitionUpdatedPayload as ContractsEnvironmentMcpDefinitionUpdatedPayloadSchema,
+  EnvironmentMcpDefinitionRemovedPayload as ContractsEnvironmentMcpDefinitionRemovedPayloadSchema,
+  ProjectMcpOverrideUpsertedPayload as ContractsProjectMcpOverrideUpsertedPayloadSchema,
+  ProjectMcpOverrideRemovedPayload as ContractsProjectMcpOverrideRemovedPayloadSchema,
   ThreadCreatedPayload as ContractsThreadCreatedPayloadSchema,
   ThreadArchivedPayload as ContractsThreadArchivedPayloadSchema,
   ThreadSettledPayload as ContractsThreadSettledPayloadSchema,
@@ -30,6 +35,12 @@ import {
   ThreadApprovalResponseRequestedPayload as ContractsThreadApprovalResponseRequestedPayloadSchema,
   ThreadCheckpointRevertRequestedPayload as ContractsThreadCheckpointRevertRequestedPayloadSchema,
   ThreadSessionStopRequestedPayload as ContractsThreadSessionStopRequestedPayloadSchema,
+  ThreadMcpCatalogInitializedPayload as ContractsThreadMcpCatalogInitializedPayloadSchema,
+  ThreadMcpCatalogUpdatedPayload as ContractsThreadMcpCatalogUpdatedPayloadSchema,
+  ThreadMcpCatalogResetPayload as ContractsThreadMcpCatalogResetPayloadSchema,
+  ThreadMcpCatalogDisposedPayload as ContractsThreadMcpCatalogDisposedPayloadSchema,
+  ThreadMcpCatalogAppliedPayload as ContractsThreadMcpCatalogAppliedPayloadSchema,
+  ThreadMcpCatalogApplyFailedPayload as ContractsThreadMcpCatalogApplyFailedPayloadSchema,
 } from "@t3tools/contracts";
 
 // Server-internal alias surface, backed by contract schemas as the source of truth.
@@ -39,6 +50,14 @@ export const ProjectDeletedPayload = ContractsProjectDeletedPayloadSchema;
 export const ProjectMcpServerCreatedPayload = ContractsProjectMcpServerCreatedPayloadSchema;
 export const ProjectMcpServerUpdatedPayload = ContractsProjectMcpServerUpdatedPayloadSchema;
 export const ProjectMcpServerRemovedPayload = ContractsProjectMcpServerRemovedPayloadSchema;
+export const EnvironmentMcpDefinitionCreatedPayload =
+  ContractsEnvironmentMcpDefinitionCreatedPayloadSchema;
+export const EnvironmentMcpDefinitionUpdatedPayload =
+  ContractsEnvironmentMcpDefinitionUpdatedPayloadSchema;
+export const EnvironmentMcpDefinitionRemovedPayload =
+  ContractsEnvironmentMcpDefinitionRemovedPayloadSchema;
+export const ProjectMcpOverrideUpsertedPayload = ContractsProjectMcpOverrideUpsertedPayloadSchema;
+export const ProjectMcpOverrideRemovedPayload = ContractsProjectMcpOverrideRemovedPayloadSchema;
 
 export const ThreadCreatedPayload = ContractsThreadCreatedPayloadSchema;
 export const ThreadArchivedPayload = ContractsThreadArchivedPayloadSchema;
@@ -70,3 +89,9 @@ export const ThreadApprovalResponseRequestedPayload =
 export const ThreadCheckpointRevertRequestedPayload =
   ContractsThreadCheckpointRevertRequestedPayloadSchema;
 export const ThreadSessionStopRequestedPayload = ContractsThreadSessionStopRequestedPayloadSchema;
+export const ThreadMcpCatalogInitializedPayload = ContractsThreadMcpCatalogInitializedPayloadSchema;
+export const ThreadMcpCatalogUpdatedPayload = ContractsThreadMcpCatalogUpdatedPayloadSchema;
+export const ThreadMcpCatalogResetPayload = ContractsThreadMcpCatalogResetPayloadSchema;
+export const ThreadMcpCatalogDisposedPayload = ContractsThreadMcpCatalogDisposedPayloadSchema;
+export const ThreadMcpCatalogAppliedPayload = ContractsThreadMcpCatalogAppliedPayloadSchema;
+export const ThreadMcpCatalogApplyFailedPayload = ContractsThreadMcpCatalogApplyFailedPayloadSchema;
