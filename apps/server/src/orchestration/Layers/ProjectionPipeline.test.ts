@@ -4,6 +4,7 @@ import {
   CorrelationId,
   EnvironmentId,
   EventId,
+  McpCatalogOverrideId,
   MessageId,
   McpDefinitionId,
   McpServerId,
@@ -328,6 +329,51 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
           unsettledAt: "2026-01-01T00:00:02.000Z",
         },
       ]);
+    }),
+  );
+
+  it.effect("does not move an override row across project identities", () =>
+    Effect.gen(function* () {
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const eventStore = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const overrideId = "shared-override-id";
+      const at = (sequence: number, projectId: string) => ({
+        type: "project.mcp-override.upserted" as const,
+        eventId: EventId.make(`evt-override-identity-${sequence}`),
+        aggregateKind: "project" as const,
+        aggregateId: ProjectId.make(projectId),
+        occurredAt: `2026-01-01T00:00:0${sequence}.000Z`,
+        commandId: CommandId.make(`cmd-override-identity-${sequence}`),
+        causationEventId: null,
+        correlationId: CommandId.make(`cmd-override-identity-${sequence}`),
+        metadata: {},
+        payload: {
+          projectId: ProjectId.make(projectId),
+          override: {
+            id: McpCatalogOverrideId.make(overrideId),
+            scope: "project" as const,
+            scopeId: projectId,
+            targetId: McpServerId.make("global-target"),
+            enabled: false,
+          },
+          revision: 1,
+          updatedAt: `2026-01-01T00:00:0${sequence}.000Z`,
+        },
+      });
+
+      yield* eventStore.append(at(1, "project-a"));
+      yield* eventStore.append(at(2, "project-b"));
+      yield* projectionPipeline.bootstrap;
+
+      const rows = yield* sql<{
+        readonly overrideId: string;
+        readonly scopeId: string;
+      }>`
+        SELECT override_id AS "overrideId", scope_id AS "scopeId"
+        FROM projection_mcp_overrides
+      `;
+      assert.deepEqual(rows, [{ overrideId, scopeId: "project-a" }]);
     }),
   );
 

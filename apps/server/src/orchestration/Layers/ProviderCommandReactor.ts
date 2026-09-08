@@ -1458,6 +1458,10 @@ const make = Effect.gen(function* () {
         activeTurnId: null,
         lastError: thread.session?.lastError ?? null,
         updatedAt: now,
+        ...(event.payload.onlyIfSettled === true &&
+        thread.session?.mcpCatalogSessionId !== undefined
+          ? { mcpCatalogSessionId: thread.session.mcpCatalogSessionId }
+          : {}),
       },
       createdAt: now,
     });

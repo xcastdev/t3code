@@ -17,6 +17,7 @@ import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   EventId,
   MessageId,
+  McpCatalogSessionId,
   ProjectId,
   ThreadId,
   TurnId,
@@ -3236,5 +3237,53 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.providerInstanceId).toBe(ProviderInstanceId.make("codex_work"));
     expect(thread?.session?.activeTurnId).toBeNull();
+  });
+
+  it("preserves the catalog link for a conditional settle cleanup stop", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const catalogSessionId = McpCatalogSessionId.make("catalog-session-stop");
+
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-for-settle-stop"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "full-access",
+          mcpCatalogSessionId: catalogSessionId,
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.settle",
+        commandId: CommandId.make("cmd-settle-before-stop"),
+        threadId: ThreadId.make("thread-1"),
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.session.stop",
+        commandId: CommandId.make("cmd-conditional-session-stop"),
+        threadId: ThreadId.make("thread-1"),
+        createdAt: now,
+        onlyIfSettled: true,
+      }),
+    );
+
+    await waitFor(() => harness.stopSession.mock.calls.length === 1);
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.session?.status).toBe("stopped");
+    expect(thread?.session?.mcpCatalogSessionId).toBe(catalogSessionId);
   });
 });

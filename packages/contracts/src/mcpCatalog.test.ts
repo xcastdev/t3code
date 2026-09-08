@@ -4,6 +4,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   McpCatalogDefinition,
   McpCatalogOverride,
+  McpCatalogOverrideDraft,
   McpCatalogSnapshot,
   McpCatalogStaleRevisionError,
   McpCatalogStaleSessionError,
@@ -11,6 +12,7 @@ import {
 
 const decodeDefinition = Schema.decodeUnknownSync(McpCatalogDefinition);
 const decodeOverride = Schema.decodeUnknownSync(McpCatalogOverride);
+const decodeOverrideDraft = Schema.decodeUnknownSync(McpCatalogOverrideDraft);
 
 const transport = {
   type: "streamable-http" as const,
@@ -65,6 +67,26 @@ describe("MCP catalog contracts", () => {
         transportDefinitionId: "definition-2",
       }),
     ).toMatchObject({ transportDefinitionId: "definition-2" });
+  });
+
+  it("accepts credential drafts for RPC transport overrides without a paired id", () => {
+    expect(
+      decodeOverrideDraft({
+        id: "override-1",
+        scope: "project",
+        scopeId: "project-1",
+        targetId: "server-1",
+        transport: {
+          type: "streamable-http",
+          url: "https://example.test/mcp",
+          headers: [{ name: "Authorization", credential: { name: "token", value: "secret" } }],
+          authorization: { type: "none" },
+        },
+      }),
+    ).toMatchObject({
+      targetId: "server-1",
+      transport: { headers: [{ credential: { value: "secret" } }] },
+    });
   });
 
   it("decodes a session snapshot with retained transport ownership", () => {

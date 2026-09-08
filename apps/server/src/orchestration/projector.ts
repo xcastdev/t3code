@@ -674,9 +674,19 @@ export function projectEvent(
         "payload",
       ).pipe(
         Effect.map((payload) => {
+          if (
+            payload.override.scope !== "project" ||
+            String(payload.override.scopeId) !== String(payload.projectId)
+          ) {
+            return nextBase;
+          }
           const catalog = ensureMcpCatalog(
             nextBase,
             nextBase.mcpCatalog?.environmentId ?? EnvironmentId.make("unknown"),
+          );
+          const ownedByAnotherProject = catalog.projectOverrides.some(
+            (entry) =>
+              entry.override.id === payload.override.id && entry.projectId !== payload.projectId,
           );
           return {
             ...nextBase,
@@ -696,7 +706,9 @@ export function projectEvent(
                       entry.override.id === payload.override.id
                     ),
                 ),
-                { projectId: payload.projectId, override: payload.override },
+                ...(ownedByAnotherProject
+                  ? []
+                  : [{ projectId: payload.projectId, override: payload.override }]),
               ],
             },
           };

@@ -79,6 +79,22 @@ const McpCatalogOverrideFields = Schema.Struct({
   transportDefinitionId: Schema.optional(McpDefinitionId),
 });
 
+const McpCatalogOverrideDraftFields = Schema.Struct({
+  id: McpCatalogOverrideId,
+  scope: Schema.Literals(["project", "session"]),
+  scopeId: TrimmedNonEmptyString,
+  targetId: McpServerId,
+  enabled: Schema.optional(Schema.Boolean),
+  name: Schema.optional(McpCatalogName),
+  providerInstanceIds: Schema.optional(
+    Schema.Array(ProviderInstanceId).check(Schema.isMaxLength(MCP_CATALOG_PROVIDER_LIMIT)),
+  ),
+  transport: Schema.optional(ProjectMcpTransportDraft),
+  /** Accepted for clients that already send the persisted shape, but replaced
+   * by a server-generated id whenever a draft transport is submitted. */
+  transportDefinitionId: Schema.optional(McpDefinitionId),
+});
+
 /** A lower-scope patch. Transport replacement is intentionally all-or-nothing. */
 export const McpCatalogOverride = McpCatalogOverrideFields.check(
   Schema.makeFilter(
@@ -89,6 +105,18 @@ export const McpCatalogOverride = McpCatalogOverrideFields.check(
   ),
 );
 export type McpCatalogOverride = typeof McpCatalogOverride.Type;
+
+/**
+ * The RPC form of an override may contain credential values. The server
+ * prepares those values before converting this draft into McpCatalogOverride.
+ */
+export const McpCatalogOverrideDraft = McpCatalogOverrideDraftFields.check(
+  Schema.makeFilter(
+    (override) => override.transport !== undefined || override.transportDefinitionId === undefined,
+    { message: "A transport definition id requires a transport override" },
+  ),
+);
+export type McpCatalogOverrideDraft = typeof McpCatalogOverrideDraft.Type;
 
 export const ResolvedMcpCatalogEntry = Schema.Struct({
   logicalServerId: McpServerId,
@@ -235,7 +263,7 @@ export const McpCatalogOverrideInput = Schema.Struct({
   scope: Schema.Literals(["project", "session"]),
   scopeId: TrimmedNonEmptyString,
   expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
-  override: McpCatalogOverride,
+  override: McpCatalogOverrideDraft,
 });
 export type McpCatalogOverrideInput = typeof McpCatalogOverrideInput.Type;
 

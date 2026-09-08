@@ -43,6 +43,7 @@ import {
   type ProjectId,
   McpServerId,
   McpCatalogDefinition,
+  type McpCatalogOverride,
   McpCatalogMutationError,
   McpCatalogOperationError,
   McpCatalogSnapshot,
@@ -145,6 +146,7 @@ import * as ProjectMcpService from "./project/ProjectMcpService.ts";
 import * as McpCatalogService from "./mcp/McpCatalogService.ts";
 import {
   catalogBaselineForProject as buildCatalogBaselineForProject,
+  applyMcpCatalogOverrides,
   resolveProjectCatalog,
 } from "./mcp/McpCatalogResolver.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
@@ -2351,14 +2353,76 @@ const makeWsRpcLayer = (
               input.scopeId as ProjectId,
               preserveCatalogMutationError(
                 Effect.gen(function* () {
-                  yield* dispatchFromClient({
-                    type: "project.mcp-override.upsert",
-                    commandId: yield* serverCommandId("mcp-catalog-project-override"),
-                    projectId: input.scopeId as ProjectId,
-                    override: input.override,
-                    expectedRevision: input.expectedRevision,
-                    updatedAt: yield* nowIso,
-                  });
+                  const projectId = input.scopeId as ProjectId;
+                  const readModel = yield* readMcpCatalog();
+                  if (
+                    input.override.scope !== "project" ||
+                    String(input.override.scopeId) !== String(projectId)
+                  ) {
+                    return yield* new McpCatalogOperationError({
+                      message: "MCP project override scope does not match the command project.",
+                    });
+                  }
+                  if (
+                    readModel.mcpCatalog?.projectOverrides.some(
+                      (entry) =>
+                        entry.override.id === input.override.id && entry.projectId !== projectId,
+                    )
+                  ) {
+                    return yield* new McpCatalogOperationError({
+                      message: "MCP project override ID is already owned by another project.",
+                    });
+                  }
+                  const globalDefinition = readModel.mcpCatalog?.globalDefinitions.find(
+                    (definition) => definition.logicalServerId === input.override.targetId,
+                  );
+                  if (globalDefinition === undefined) {
+                    return yield* new McpCatalogOperationError({
+                      message:
+                        "MCP project override target was not found in the inherited global catalog.",
+                    });
+                  }
+                  const projectOverrides =
+                    readModel.mcpCatalog?.projectOverrides
+                      .filter((entry) => entry.projectId === projectId)
+                      .map((entry) => entry.override) ?? [];
+                  const previousEffectiveTransport =
+                    applyMcpCatalogOverrides([globalDefinition], projectOverrides)[0]?.transport ??
+                    globalDefinition.transport;
+                  const draftTransport = input.override.transport;
+                  const prepared =
+                    draftTransport === undefined
+                      ? undefined
+                      : yield* projectMcpSecrets.prepareUpdate(
+                          globalDefinition.logicalServerId,
+                          previousEffectiveTransport,
+                          draftTransport,
+                        );
+                  const {
+                    transport: _draftTransport,
+                    transportDefinitionId: _clientTransportDefinitionId,
+                    ...overrideMetadata
+                  } = input.override;
+                  const override: McpCatalogOverride = {
+                    ...overrideMetadata,
+                    ...(prepared === undefined
+                      ? {}
+                      : {
+                          transport: prepared.transport,
+                          transportDefinitionId: McpDefinitionId.make(yield* crypto.randomUUIDv4),
+                        }),
+                  };
+                  yield* dispatchPreparedCatalog(
+                    dispatchFromClient({
+                      type: "project.mcp-override.upsert",
+                      commandId: yield* serverCommandId("mcp-catalog-project-override"),
+                      projectId,
+                      override,
+                      expectedRevision: input.expectedRevision,
+                      updatedAt: yield* nowIso,
+                    }),
+                    prepared,
+                  );
                   yield* refreshMcpCatalog();
                 }),
               ),

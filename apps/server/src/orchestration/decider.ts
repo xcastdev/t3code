@@ -11,6 +11,7 @@ import {
   ProjectMcpNameConflictError,
   ProjectMcpServerLimitExceededError,
   ProjectMcpServerNotFoundError,
+  McpCatalogOperationError,
   McpCatalogStaleRevisionError,
   McpCatalogStaleSessionError,
 } from "@t3tools/contracts";
@@ -152,6 +153,18 @@ const catalogRevisionInvariantError = (
     expectedRevision,
     actualRevision,
   });
+  return new OrchestrationCommandInvariantError({
+    commandType,
+    detail: cause.message,
+    cause,
+  });
+};
+
+const catalogOperationInvariantError = (
+  commandType: string,
+  message: string,
+): OrchestrationCommandInvariantError => {
+  const cause = new McpCatalogOperationError({ message });
   return new OrchestrationCommandInvariantError({
     commandType,
     detail: cause.message,
@@ -470,6 +483,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       const definitionId = readModel.mcpCatalog?.globalDefinitions.find(
         (definition) => definition.logicalServerId === command.logicalServerId,
       )?.definitionId;
+      if (definitionId === undefined) {
+        return yield* catalogOperationInvariantError(
+          command.type,
+          "Global MCP definition was not found.",
+        );
+      }
       return {
         ...(yield* withEventBase({
           aggregateKind: "environment",
@@ -554,6 +573,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           entry.projectId === command.projectId &&
           entry.definition.logicalServerId === command.logicalServerId,
       )?.definition.definitionId;
+      if (definitionId === undefined) {
+        return yield* catalogOperationInvariantError(
+          command.type,
+          "Project MCP definition was not found.",
+        );
+      }
       return {
         ...(yield* withEventBase({
           aggregateKind: "project",
@@ -574,6 +599,36 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
 
     case "project.mcp-override.upsert": {
       yield* requireProject({ readModel, command, projectId: command.projectId });
+      if (
+        command.override.scope !== "project" ||
+        String(command.override.scopeId) !== String(command.projectId)
+      ) {
+        return yield* catalogOperationInvariantError(
+          command.type,
+          "MCP project override scope does not match the command project.",
+        );
+      }
+      if (
+        !readModel.mcpCatalog?.globalDefinitions.some(
+          (definition) => definition.logicalServerId === command.override.targetId,
+        )
+      ) {
+        return yield* catalogOperationInvariantError(
+          command.type,
+          "MCP project override target was not found in the inherited global catalog.",
+        );
+      }
+      if (
+        readModel.mcpCatalog?.projectOverrides.some(
+          (entry) =>
+            entry.override.id === command.override.id && entry.projectId !== command.projectId,
+        )
+      ) {
+        return yield* catalogOperationInvariantError(
+          command.type,
+          "MCP project override ID is already owned by another project.",
+        );
+      }
       const actualRevision =
         readModel.mcpCatalog?.projectRevisions.find(
           (entry) => entry.projectId === command.projectId,
@@ -617,6 +672,17 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           command.projectId,
           command.expectedRevision,
           actualRevision,
+        );
+      }
+      if (
+        !readModel.mcpCatalog?.projectOverrides.some(
+          (entry) =>
+            entry.projectId === command.projectId && entry.override.id === command.overrideId,
+        )
+      ) {
+        return yield* catalogOperationInvariantError(
+          command.type,
+          "MCP project override was not found.",
         );
       }
       return {
@@ -2063,7 +2129,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           );
         }
       }
-      return {
+      const stopEvent = {
         ...(yield* withEventBase({
           aggregateKind: "thread",
           aggregateId: command.threadId,
@@ -2074,8 +2140,30 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           threadId: command.threadId,
           createdAt: command.createdAt,
+          ...(command.onlyIfSettled === undefined ? {} : { onlyIfSettled: command.onlyIfSettled }),
         },
-      };
+      } satisfies PlannedOrchestrationEvent;
+      if (command.onlyIfSettled === true) return stopEvent;
+
+      const catalogSessionId = thread.session?.mcpCatalogSessionId;
+      const catalogSnapshot =
+        catalogSessionId === undefined
+          ? undefined
+          : readModel.mcpCatalog?.sessions.find(
+              (snapshot) => snapshot.catalogSessionId === catalogSessionId,
+            );
+      if (catalogSessionId === undefined || catalogSnapshot?.disposedAt !== undefined) {
+        return stopEvent;
+      }
+      if (catalogSnapshot === undefined) return stopEvent;
+      const disposeEvent = yield* makeCatalogSessionDisposeEvent({
+        threadId: command.threadId,
+        mcpCatalogSessionId: catalogSessionId,
+        revision: catalogSnapshot.desiredRevision,
+        disposedAt: command.createdAt,
+        commandId: command.commandId,
+      });
+      return [stopEvent, disposeEvent];
     }
 
     case "thread.session.set": {

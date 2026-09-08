@@ -3,6 +3,7 @@ import {
   EnvironmentId,
   EventId,
   McpDefinitionId,
+  McpCatalogOverrideId,
   ProjectId,
   ProviderDriverKind,
   ThreadId,
@@ -243,6 +244,44 @@ describe("orchestration projector", () => {
       projectDefinitions: [],
       projectRevisions: [{ projectId: "project-1", revision: 3 }],
     });
+  });
+
+  it("does not move a project override identity across projects", async () => {
+    const overrideId = McpCatalogOverrideId.make("shared-override-id");
+    const makeOverride = (projectId: string) => ({
+      id: overrideId,
+      scope: "project" as const,
+      scopeId: projectId,
+      targetId: "global-server",
+      enabled: false,
+    });
+    const projectOverrideEvent = (sequence: number, projectId: string) =>
+      makeEvent({
+        sequence,
+        type: "project.mcp-override.upserted",
+        occurredAt: `2026-01-01T00:00:0${sequence}.000Z`,
+        aggregateKind: "project",
+        aggregateId: projectId,
+        commandId: `override-${sequence}`,
+        payload: {
+          projectId,
+          override: makeOverride(projectId),
+          revision: 1,
+          updatedAt: `2026-01-01T00:00:0${sequence}.000Z`,
+        },
+      });
+
+    let model = createEmptyReadModel("2026-01-01T00:00:00.000Z");
+    model = await Effect.runPromise(projectEvent(model, projectOverrideEvent(1, "project-a")));
+    model = await Effect.runPromise(projectEvent(model, projectOverrideEvent(2, "project-b")));
+
+    expect(model.mcpCatalog?.projectOverrides).toEqual([
+      { projectId: "project-a", override: makeOverride("project-a") },
+    ]);
+    expect(model.mcpCatalog?.projectRevisions).toEqual([
+      { projectId: "project-a", revision: 1 },
+      { projectId: "project-b", revision: 1 },
+    ]);
   });
 
   it("applies thread.created events", async () => {

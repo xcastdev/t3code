@@ -842,6 +842,12 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             return;
 
           case "project.mcp-override.upserted":
+            if (
+              event.payload.override.scope !== "project" ||
+              String(event.payload.override.scopeId) !== String(event.payload.projectId)
+            ) {
+              return;
+            }
             yield* sql`
               INSERT INTO projection_mcp_overrides (
                 override_id, scope_type, scope_id, target_logical_server_id,
@@ -857,6 +863,8 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
                 target_logical_server_id = excluded.target_logical_server_id,
                 patch_json = excluded.patch_json,
                 revision = excluded.revision
+              WHERE projection_mcp_overrides.scope_type = excluded.scope_type
+                AND projection_mcp_overrides.scope_id = excluded.scope_id
             `;
             yield* recordRevision("project", event.payload.projectId, event.payload.revision);
             return;

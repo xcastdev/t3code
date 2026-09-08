@@ -17,18 +17,23 @@ import {
   GitCommandError,
   KeybindingRule,
   McpServerId,
+  McpCatalogOverrideId,
+  McpDefinitionId,
   MessageId,
   ExternalLauncherCommandNotFoundError,
   OrchestrationThreadDetailSnapshot,
   type OrchestrationThreadStreamItem,
   type OrchestrationThreadShell,
+  type OrchestrationReadModel,
   TerminalNotRunningError,
   type OrchestrationCommand,
   type OrchestrationEvent,
+  type ProjectMcpTransportDraft,
   ORCHESTRATION_WS_METHODS,
   type PreviewEvent,
   ProjectId,
   ProjectMcpCredentialId,
+  ProjectMcpEnvironmentVariableName,
   ProjectMcpCatalogCommittedCleanupPendingError,
   ProjectMcpHeaderName,
   ProjectMcpNameConflictError,
@@ -5323,6 +5328,188 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.deepEqual(results[2], server);
       assert.notInclude(encodeUnknownJson(results), "rpc-secret-sentinel");
       assert.deepEqual(calls, ["list", "create", "update", "remove"]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("prepares project catalog override credentials before dispatch", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-mcp-override-preparation");
+      const serverId = McpServerId.make("mcp-override-target");
+      const providerInstanceId = ProviderInstanceId.make("codex-primary");
+      const project = {
+        id: projectId,
+        title: "MCP override preparation",
+        workspaceRoot: "/tmp/project-mcp-override-preparation",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: "2026-09-02T00:00:00.000Z",
+        updatedAt: "2026-09-02T00:00:00.000Z",
+      } as const;
+      const globalDefinition = {
+        definitionId: McpDefinitionId.make("mcp-override-global-definition"),
+        logicalServerId: serverId,
+        scope: "global" as const,
+        scopeId: testEnvironmentDescriptor.environmentId,
+        name: "Override target",
+        transport: {
+          type: "streamable-http" as const,
+          url: "https://override-target.example.test/mcp",
+          headers: [],
+          authorization: { type: "none" as const },
+        },
+        enabled: true,
+        providerInstanceIds: [providerInstanceId],
+        revision: 1,
+      };
+      const readModel = {
+        ...makeDefaultOrchestrationReadModel(),
+        projects: [{ ...project, deletedAt: null }],
+        mcpCatalog: {
+          environmentId: testEnvironmentDescriptor.environmentId,
+          globalRevision: 1,
+          globalDefinitions: [globalDefinition],
+          projectRevisions: [],
+          projectDefinitions: [],
+          projectOverrides: [],
+          sessions: [],
+        },
+      } satisfies OrchestrationReadModel;
+      const dispatched: Array<OrchestrationCommand> = [];
+      const foreignCredentialId = ProjectMcpCredentialId.make(
+        "2aef2447-b6f4-4c4f-b35e-89b59a0841ef",
+      );
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command);
+                return { sequence: dispatched.length };
+              }),
+          },
+          projectionSnapshotQuery: {
+            getCommandReadModel: () => Effect.succeed(readModel),
+            getProjectShellById: (requestedProjectId) =>
+              Effect.succeed(
+                requestedProjectId === projectId ? Option.some(project) : Option.none(),
+              ),
+          },
+          projectMcpService: {
+            withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const foreignError = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.mcpCatalogProjectOverride]({
+              scope: "project",
+              scopeId: projectId,
+              expectedRevision: 0,
+              override: {
+                id: McpCatalogOverrideId.make("override-foreign"),
+                scope: "project",
+                scopeId: projectId,
+                targetId: serverId,
+                transport: {
+                  type: "streamable-http",
+                  url: globalDefinition.transport.url,
+                  headers: [
+                    {
+                      name: ProjectMcpHeaderName.make("Authorization"),
+                      credential: { id: foreignCredentialId, name: "foreign credential" },
+                    },
+                  ],
+                  authorization: { type: "none" },
+                },
+              },
+            }),
+          ),
+        ),
+      );
+      assert.equal(foreignError._tag, "McpCatalogOperationError");
+      assert.equal(dispatched.length, 0);
+
+      const drafts: ReadonlyArray<{
+        readonly id: string;
+        readonly transport: ProjectMcpTransportDraft;
+      }> = [
+        {
+          id: "override-header",
+          transport: {
+            type: "streamable-http" as const,
+            url: "https://override-header.example.test/mcp",
+            headers: [
+              {
+                name: ProjectMcpHeaderName.make("Authorization"),
+                credential: { name: "header", value: "override-header-sentinel" },
+              },
+            ],
+            authorization: { type: "none" as const },
+          },
+        },
+        {
+          id: "override-stdio",
+          transport: {
+            type: "stdio" as const,
+            command: "node",
+            args: ["server.mjs"],
+            env: [
+              {
+                name: ProjectMcpEnvironmentVariableName.make("TOKEN"),
+                credential: { name: "stdio", value: "override-stdio-sentinel" },
+              },
+            ],
+          },
+        },
+        {
+          id: "override-oauth",
+          transport: {
+            type: "streamable-http" as const,
+            url: "https://override-oauth.example.test/mcp",
+            headers: [],
+            authorization: {
+              type: "oauth" as const,
+              registration: {
+                type: "pre-registered" as const,
+                clientId: "override-client",
+                clientSecret: { name: "client secret", value: "override-oauth-sentinel" },
+              },
+            },
+          },
+        },
+      ];
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.forEach(drafts, (draft) =>
+            client[WS_METHODS.mcpCatalogProjectOverride]({
+              scope: "project",
+              scopeId: projectId,
+              expectedRevision: 0,
+              override: {
+                id: McpCatalogOverrideId.make(draft.id),
+                scope: "project",
+                scopeId: projectId,
+                targetId: serverId,
+                transport: draft.transport,
+              },
+            }),
+          ),
+        ),
+      );
+
+      assert.equal(dispatched.length, 3);
+      assert.notInclude(encodeUnknownJson(dispatched), "override-header-sentinel");
+      assert.notInclude(encodeUnknownJson(dispatched), "override-stdio-sentinel");
+      assert.notInclude(encodeUnknownJson(dispatched), "override-oauth-sentinel");
+      for (const command of dispatched) {
+        if (command.type !== "project.mcp-override.upsert") continue;
+        assert.isDefined(command.override.transportDefinitionId);
+        assert.isDefined(command.override.transport);
+      }
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

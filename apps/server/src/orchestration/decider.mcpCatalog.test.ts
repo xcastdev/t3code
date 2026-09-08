@@ -1,0 +1,197 @@
+import {
+  CommandId,
+  McpCatalogOperationError,
+  McpCatalogOverrideId,
+  McpDefinitionId,
+  McpServerId,
+  EnvironmentId,
+  ProjectId,
+  ProviderInstanceId,
+  type McpCatalogDefinition,
+  type McpCatalogOverride,
+  type OrchestrationCommand,
+  type OrchestrationReadModel,
+} from "@t3tools/contracts";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Effect from "effect/Effect";
+import { expect, it } from "@effect/vitest";
+
+import { decideOrchestrationCommand } from "./decider.ts";
+import { createEmptyReadModel } from "./projector.ts";
+
+const projectId = ProjectId.make("project-1");
+const otherProjectId = ProjectId.make("project-2");
+const globalServerId = McpServerId.make("global-server");
+const globalDefinition: McpCatalogDefinition = {
+  definitionId: McpDefinitionId.make("global-definition"),
+  logicalServerId: globalServerId,
+  scope: "global",
+  scopeId: "environment-1",
+  name: "Global server",
+  transport: {
+    type: "streamable-http",
+    url: "https://global.example.test/mcp",
+    headers: [],
+    authorization: { type: "none" },
+  },
+  enabled: true,
+  providerInstanceIds: [ProviderInstanceId.make("codex")],
+  revision: 1,
+};
+
+const makeOverride = (overrides: Partial<McpCatalogOverride> = {}): McpCatalogOverride => ({
+  id: McpCatalogOverrideId.make("override-1"),
+  scope: "project",
+  scopeId: projectId,
+  targetId: globalServerId,
+  ...overrides,
+});
+
+const makeReadModel = (
+  overrides: {
+    readonly projectOverrides?: ReadonlyArray<{
+      projectId: ProjectId;
+      override: McpCatalogOverride;
+    }>;
+    readonly projectDefinitions?: ReadonlyArray<{
+      readonly projectId: ProjectId;
+      readonly definition: McpCatalogDefinition;
+    }>;
+  } = {},
+): OrchestrationReadModel => ({
+  ...createEmptyReadModel("2026-01-01T00:00:00.000Z"),
+  projects: [
+    { id: projectId, deletedAt: null },
+    { id: otherProjectId, deletedAt: null },
+  ] as never,
+  mcpCatalog: {
+    environmentId: EnvironmentId.make("environment-1"),
+    globalRevision: 1,
+    globalDefinitions: [globalDefinition],
+    projectRevisions: [],
+    projectDefinitions: overrides.projectDefinitions ?? [],
+    projectOverrides: overrides.projectOverrides ?? [],
+    sessions: [],
+  },
+});
+
+const decide = (command: OrchestrationCommand, readModel = makeReadModel()) =>
+  decideOrchestrationCommand({ command, readModel });
+
+const expectCatalogError = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const error = yield* Effect.flip(effect);
+    expect(error).toMatchObject({
+      cause: expect.objectContaining({ _tag: "McpCatalogOperationError" }),
+    });
+    return error;
+  });
+
+it.layer(NodeServices.layer)("MCP catalog decider invariants", (it) => {
+  it.effect("rejects missing definition and override removals without emitting events", () =>
+    Effect.gen(function* () {
+      const globalError = yield* expectCatalogError(
+        decide({
+          type: "environment.mcp-definition.remove",
+          commandId: CommandId.make("remove-global-missing"),
+          environmentId: EnvironmentId.make("environment-1"),
+          logicalServerId: McpServerId.make("missing-global"),
+          expectedRevision: 1,
+          removedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+      const projectError = yield* expectCatalogError(
+        decide({
+          type: "project.mcp-definition.remove",
+          commandId: CommandId.make("remove-project-missing"),
+          projectId,
+          logicalServerId: McpServerId.make("missing-project"),
+          expectedRevision: 0,
+          removedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+      const overrideError = yield* expectCatalogError(
+        decide({
+          type: "project.mcp-override.remove",
+          commandId: CommandId.make("remove-override-missing"),
+          projectId,
+          overrideId: McpCatalogOverrideId.make("missing-override"),
+          expectedRevision: 0,
+          removedAt: "2026-01-01T00:00:00.000Z",
+        }),
+      );
+      expect((globalError.cause as McpCatalogOperationError).message).toContain("not found");
+      expect((projectError.cause as McpCatalogOperationError).message).toContain("not found");
+      expect((overrideError.cause as McpCatalogOperationError).message).toContain("not found");
+    }),
+  );
+
+  it.effect("rejects ineffective, out-of-scope, and colliding project overrides", () =>
+    Effect.gen(function* () {
+      const projectDefinition: McpCatalogDefinition = {
+        ...globalDefinition,
+        definitionId: McpDefinitionId.make("project-definition"),
+        logicalServerId: McpServerId.make("project-server"),
+        scope: "project",
+        scopeId: projectId,
+      };
+      const cases: ReadonlyArray<[string, McpCatalogOverride, OrchestrationReadModel]> = [
+        [
+          "missing target",
+          makeOverride({ targetId: McpServerId.make("missing-target") }),
+          makeReadModel(),
+        ],
+        [
+          "project-local target",
+          makeOverride({ targetId: projectDefinition.logicalServerId }),
+          makeReadModel({ projectDefinitions: [{ projectId, definition: projectDefinition }] }),
+        ],
+        ["scope mismatch", makeOverride({ scopeId: otherProjectId }), makeReadModel()],
+        [
+          "cross-project override id",
+          makeOverride(),
+          makeReadModel({
+            projectOverrides: [{ projectId: otherProjectId, override: makeOverride() }],
+          }),
+        ],
+      ];
+
+      for (const [label, override, readModel] of cases) {
+        const error = yield* Effect.flip(
+          decide(
+            {
+              type: "project.mcp-override.upsert",
+              commandId: CommandId.make(`override-${label.replaceAll(" ", "-")}`),
+              projectId,
+              override,
+              expectedRevision: 0,
+              updatedAt: "2026-01-01T00:00:00.000Z",
+            },
+            readModel,
+          ),
+        );
+        expect(error.cause).toBeInstanceOf(McpCatalogOperationError);
+      }
+    }),
+  );
+
+  it.effect("accepts a project override for an inherited global definition", () =>
+    Effect.gen(function* () {
+      const event = yield* decide({
+        type: "project.mcp-override.upsert",
+        commandId: CommandId.make("override-global"),
+        projectId,
+        override: makeOverride({
+          id: McpCatalogOverrideId.make("override-global"),
+          targetId: globalServerId,
+        }),
+        expectedRevision: 0,
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      });
+      expect(event).toMatchObject({
+        type: "project.mcp-override.upserted",
+        payload: { projectId, revision: 1 },
+      });
+    }),
+  );
+});

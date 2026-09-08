@@ -207,6 +207,59 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
     ),
   );
 
+  it.effect("preserves credentials referenced by another active catalog transport", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      yield* Effect.gen(function* () {
+        const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+        const first = yield* secrets.prepareCreate(serverA, httpDraft("base-sentinel"));
+        yield* first.commit;
+        const otherOverride = yield* secrets.prepareUpdate(
+          serverA,
+          first.transport,
+          httpDraft("other-override-sentinel"),
+        );
+        yield* otherOverride.commit;
+        const baseUpdate = yield* secrets.prepareUpdate(
+          serverA,
+          first.transport,
+          httpDraft("base-update-sentinel"),
+        );
+        yield* baseUpdate.commit;
+
+        const otherOverrideId = credentialId(otherOverride.transport);
+        const retiredBaseId = credentialId(first.transport);
+        const secretFiles = yield* ServerSecretStore.ServerSecretStore;
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* secrets.acquireLease(serverA, [retiredBaseId]);
+          }),
+        );
+        // Closing a lease before reconciliation must not erase a retired
+        // version that another durable catalog reference may still use.
+        assert.isTrue(
+          Option.isSome(
+            yield* secretFiles.get(ProjectMcpSecretStore.credentialSecretName(retiredBaseId)),
+          ),
+        );
+        yield* secrets.reconcile([
+          { id: serverA, transport: baseUpdate.transport },
+          { id: serverA, transport: otherOverride.transport },
+          { id: serverA, transport: first.transport },
+        ]);
+
+        assert.equal(yield* secrets.resolve(serverA, retiredBaseId), "base-sentinel");
+        assert.equal(yield* secrets.resolve(serverA, otherOverrideId), "other-override-sentinel");
+      }).pipe(Effect.provide(makeSecretLayer(config)));
+    }).pipe(
+      Effect.provide(
+        ServerConfig.layerTest(process.cwd(), {
+          prefix: "t3-project-mcp-secret-store-multiple-refs-",
+        }),
+      ),
+    ),
+  );
+
   it.effect("rolls back a prepared replacement and leaves its active value usable", () =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;
@@ -293,6 +346,49 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
       ),
   );
 
+  it.effect("does not retire or delete a credential from a malformed foreign override", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      yield* Effect.gen(function* () {
+        const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+        const first = yield* secrets.prepareCreate(serverA, httpDraft("owned-value"));
+        const second = yield* secrets.prepareCreate(serverB, httpDraft("foreign-value"));
+        yield* first.commit;
+        yield* second.commit;
+        const foreignId = credentialId(second.transport);
+        const malformedPrevious: ProjectMcpTransport = {
+          type: "streamable-http",
+          url: "https://malformed.example.test/mcp",
+          headers: [
+            {
+              name: ProjectMcpHeaderName.make("X-Api-Key"),
+              credential: { id: foreignId, name: "foreign value" },
+            },
+          ],
+          authorization: { type: "none" },
+        };
+        const replacement = yield* secrets.prepareUpdate(
+          serverA,
+          malformedPrevious,
+          httpDraft("safe-replacement-value"),
+        );
+        yield* replacement.commit;
+
+        yield* secrets.reconcile([
+          { id: serverA, transport: replacement.transport },
+          { id: serverB, transport: second.transport },
+        ]);
+        assert.equal(yield* secrets.resolve(serverB, foreignId), "foreign-value");
+      }).pipe(Effect.provide(makeSecretLayer(config)));
+    }).pipe(
+      Effect.provide(
+        ServerConfig.layerTest(process.cwd(), {
+          prefix: "t3-project-mcp-secret-foreign-override-",
+        }),
+      ),
+    ),
+  );
+
   it.effect("retires all server-owned credentials and deletes them after their final lease", () =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;
@@ -356,6 +452,7 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
           }),
         );
         assert.equal(retainedHeader, "header-remove-sentinel");
+        yield* secrets.reconcile([]);
         assert.isTrue(
           Option.isNone(
             yield* secretFiles.get(ProjectMcpSecretStore.credentialSecretName(headerId)),

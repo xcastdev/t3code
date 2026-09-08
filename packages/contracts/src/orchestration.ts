@@ -1702,6 +1702,10 @@ export const ThreadRevertedPayload = Schema.Struct({
 export const ThreadSessionStopRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   createdAt: IsoDateTime,
+  // Cleanup stops are conditional so the provider reactor can preserve the
+  // catalog link for a later restart. Explicit stops leave this absent (or
+  // false) and are allowed to clear the link after disposal.
+  onlyIfSettled: Schema.optional(Schema.Boolean),
 });
 
 export const ThreadSessionSetPayload = Schema.Struct({

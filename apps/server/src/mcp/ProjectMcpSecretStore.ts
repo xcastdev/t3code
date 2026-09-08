@@ -320,6 +320,9 @@ const make = Effect.gen(function* () {
   const oauthStateLeaseCounts = yield* Ref.make(new Map<McpServerId, number>());
   const oauthStateEpochs = yield* Ref.make(new Map<McpServerId, number>());
   const mutex = yield* Semaphore.make(1);
+  // A retired catalog credential is not safe to clean up until a reconcile
+  // has observed the durable catalog after the retirement was recorded.
+  const catalogReconciliationPending = yield* Ref.make(new Set<McpServerId>());
 
   const persistManifest = (manifest: Manifest) =>
     writeJson(MANIFEST_SECRET_NAME, manifest, encodeManifest).pipe(
@@ -374,6 +377,7 @@ const make = Effect.gen(function* () {
   const cleanupRetired = Effect.fn("ProjectMcpSecretStore.cleanupRetired")(function* (
     serverId: McpServerId,
   ): Effect.fn.Return<void, ProjectMcpSecretError> {
+    if ((yield* Ref.get(catalogReconciliationPending)).has(serverId)) return;
     const manifest = yield* Ref.get(manifests);
     const server = manifest.servers[serverId];
     if (server === undefined) return;
@@ -433,7 +437,11 @@ const make = Effect.gen(function* () {
       removed: operation.kind === "catalog" ? false : server.removed,
       credentials:
         operation.kind === "catalog"
-          ? unique([...operation.nextCredentialIds, ...operation.replacedCredentialIds])
+          ? unique([
+              ...server.credentials,
+              ...operation.nextCredentialIds,
+              ...operation.replacedCredentialIds,
+            ])
           : server.credentials,
       retired:
         operation.kind === "catalog"
@@ -451,6 +459,12 @@ const make = Effect.gen(function* () {
     // no catalog replacement and can be cleaned immediately.
     if (operation.kind === "auxiliary") {
       yield* cleanupRetired(operation.serverId);
+    } else if (operation.replacedCredentialIds.length > 0) {
+      yield* Ref.update(catalogReconciliationPending, (pending) => {
+        const next = new Set(pending);
+        next.add(operation.serverId);
+        return next;
+      });
     }
     const { [operationId]: _removed, ...operations } = (yield* Ref.get(journals)).operations;
     yield* persistJournal({ version: 1, operations });
@@ -599,7 +613,15 @@ const make = Effect.gen(function* () {
         const preparedTransport = yield* prepareTransport(serverId, draft, previous === undefined);
         const operationId = yield* newOperationId;
         const nextCredentialIds = credentialIds(preparedTransport.transport);
-        const previousCredentialIds = previous === undefined ? [] : credentialIds(previous);
+        const manifest = yield* Ref.get(manifests);
+        // A malformed durable override can contain a credential owned by a
+        // different logical server. It must not turn that id into a retired
+        // credential here, because cleanup is keyed by the global secret id
+        // and could otherwise delete the other server's value.
+        const previousCredentialIds =
+          previous === undefined
+            ? []
+            : credentialIds(previous).filter((id) => hasCredential(manifest.servers[serverId], id));
         const operation = {
           state: "prepared" as const,
           kind: "catalog" as const,
@@ -818,6 +840,9 @@ const make = Effect.gen(function* () {
       return yield* resolveValue(serverId, credentialId);
     });
 
+  // Catalog reconciliation must observe durable definition, override, and
+  // session references before deleting retired credentials. A lease can close
+  // before that pass runs, so lease release only drops the in-memory count.
   const releaseLease = (
     serverId: McpServerId,
     credentialIds: ReadonlyArray<ProjectMcpCredentialIdType>,
@@ -833,7 +858,9 @@ const make = Effect.gen(function* () {
           }
           return next;
         });
-        yield* cleanupRetired(serverId);
+        if (!(yield* Ref.get(catalogReconciliationPending)).has(serverId)) {
+          yield* cleanupRetired(serverId);
+        }
       }),
     );
 
@@ -966,6 +993,22 @@ const make = Effect.gen(function* () {
   const reconcile: ProjectMcpSecretStoreShape["reconcile"] = (catalog) =>
     mutex.withPermits(1)(
       Effect.gen(function* () {
+        const manifest = yield* Ref.get(manifests);
+        const credentialOwners = new Map<string, McpServerId | null>();
+        for (const [serverId, server] of Object.entries(manifest.servers)) {
+          const typedServerId = McpServerId.make(serverId);
+          for (const credentialId of [
+            ...server.credentials,
+            ...server.retired,
+            ...server.auxiliary,
+          ]) {
+            const owner = credentialOwners.get(credentialId);
+            credentialOwners.set(
+              credentialId,
+              owner === undefined || owner === typedServerId ? typedServerId : null,
+            );
+          }
+        }
         const currentByServer = new Map<McpServerId, ReadonlyArray<ProjectMcpTransport>>();
         for (const server of catalog) {
           if (server.transport !== undefined) {
@@ -981,7 +1024,15 @@ const make = Effect.gen(function* () {
           serverId: McpServerId,
         ): ReadonlyArray<ProjectMcpCredentialIdType> =>
           unique(
-            (currentByServer.get(serverId) ?? []).flatMap((transport) => credentialIds(transport)),
+            (currentByServer.get(serverId) ?? [])
+              .flatMap((transport) => credentialIds(transport))
+              .filter((credentialId) => {
+                const owner = credentialOwners.get(credentialId);
+                // Unknown ids may be newly prepared and are resolved by the
+                // journal below. Known ids must not be reassigned by a
+                // malformed foreign catalog reference.
+                return owner === undefined || owner === serverId;
+              }),
           );
         for (const [operationId, operation] of Object.entries(
           (yield* Ref.get(journals)).operations,
@@ -999,6 +1050,7 @@ const make = Effect.gen(function* () {
             yield* rollbackOperation(operationId);
           }
         }
+        yield* Ref.set(catalogReconciliationPending, new Set());
         for (const [serverId, server] of Object.entries((yield* Ref.get(manifests)).servers)) {
           const typedServerId = McpServerId.make(serverId);
           const current = currentByServer.get(typedServerId);

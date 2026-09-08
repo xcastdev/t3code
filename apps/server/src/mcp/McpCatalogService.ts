@@ -34,6 +34,9 @@ import {
 } from "./McpCatalogResolver.ts";
 
 type CatalogDefinition = McpCatalogDefinition;
+type PersistedMcpCatalogOverrideInput = Omit<McpCatalogOverrideInput, "override"> & {
+  readonly override: McpCatalogOverride;
+};
 
 interface SessionState {
   readonly snapshot: McpCatalogSnapshot;
@@ -95,7 +98,7 @@ export interface McpCatalogServiceShape {
     input: McpCatalogRemoveInput,
   ) => Effect.Effect<void, McpCatalogMutationError>;
   readonly putProjectOverride: (
-    input: McpCatalogOverrideInput,
+    input: PersistedMcpCatalogOverrideInput,
   ) => Effect.Effect<void, McpCatalogMutationError>;
   readonly removeProjectOverride: (input: {
     readonly scopeId: string;
