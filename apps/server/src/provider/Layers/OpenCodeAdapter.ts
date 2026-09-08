@@ -1060,11 +1060,12 @@ const closeOpenCodeContext = Effect.fn("closeOpenCodeContext")(function* (
     }),
   ).pipe(Effect.ignore);
   yield* cancelPendingOpenCodePrompt(context);
-  const cancellation = context.cancellation;
-  context.cancellation = undefined;
-  if (cancellation) {
-    yield* Deferred.succeed(cancellation.completion, undefined).pipe(Effect.ignore);
-  }
+  yield* failPendingOpenCodeCancellation(
+    context,
+    intent === "detach"
+      ? "OpenCode session detached while cancellation awaited remote confirmation."
+      : "OpenCode session terminated while cancellation awaited remote confirmation.",
+  );
   context.promptAdmission = undefined;
 
   // Scope close only tears down our local handles (the event pump and event
@@ -2033,10 +2034,11 @@ export function makeOpenCodeAdapter(
             continue;
           }
 
-          const statusData = Option.getOrUndefined(
-            decodeOpenCodeSessionStatusMap(statusExit.value.data),
-          );
-          const status = statusData?.[context.openCodeSessionId];
+          const statusData = decodeOpenCodeSessionStatusMap(statusExit.value.data);
+          if (Option.isNone(statusData)) {
+            continue;
+          }
+          const status = statusData.value[context.openCodeSessionId];
           const confirmed =
             status === undefined || (status.type !== "busy" && status.type !== "retry");
           if (!confirmed) {

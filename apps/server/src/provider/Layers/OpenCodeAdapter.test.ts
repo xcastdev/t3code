@@ -3906,6 +3906,90 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("fails an explicit stop when stopAll detaches during remote abort confirmation", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-stop-all-during-interrupt");
+      const abortStarted = promiseWithResolvers<void>();
+      const abortRelease = promiseWithResolvers<void>();
+      runtimeMock.state.abortImplementation = async () => {
+        abortStarted.resolve(undefined);
+        await abortRelease.promise;
+      };
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Keep working",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+
+      const stopFiber = yield* Effect.exit(adapter.stopSession(threadId)).pipe(Effect.forkChild);
+      yield* Effect.promise(() => abortStarted.promise);
+      yield* adapter.stopAll();
+
+      const stopExit = yield* Fiber.join(stopFiber);
+      NodeAssert.equal(Exit.isFailure(stopExit), true);
+      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+      NodeAssert.equal(runtimeMock.state.abortCalls.length, 1);
+
+      abortRelease.resolve(undefined);
+    }),
+  );
+
+  it.effect(
+    "fails an explicit stop when same-thread replacement detaches during remote abort confirmation",
+    () =>
+      Effect.gen(function* () {
+        const adapter = yield* OpenCodeAdapter;
+        const threadId = asThreadId("thread-replacement-during-interrupt");
+        const abortStarted = promiseWithResolvers<void>();
+        const abortRelease = promiseWithResolvers<void>();
+        runtimeMock.state.abortImplementation = async () => {
+          abortStarted.resolve(undefined);
+          await abortRelease.promise;
+        };
+
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+        yield* adapter.sendTurn({
+          threadId,
+          input: "Keep working",
+          modelSelection: createModelSelection(
+            ProviderInstanceId.make("opencode"),
+            "opencode/kimi-k3",
+          ),
+        });
+
+        const stopFiber = yield* Effect.exit(adapter.stopSession(threadId)).pipe(Effect.forkChild);
+        yield* Effect.promise(() => abortStarted.promise);
+        const replacement = yield* adapter.startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+        });
+
+        const stopExit = yield* Fiber.join(stopFiber);
+        NodeAssert.equal(Exit.isFailure(stopExit), true);
+        NodeAssert.equal(replacement.status, "ready");
+        NodeAssert.equal(replacement.activeTurnId, undefined);
+        NodeAssert.equal(yield* adapter.hasSession(threadId), true);
+
+        abortRelease.resolve(undefined);
+        yield* adapter.stopSession(threadId);
+      }),
+  );
+
   it.effect("releases stop and send waiters when a native abort times out", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
@@ -3998,6 +4082,50 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
       yield* Fiber.interrupt(unexpectedEventFiber);
       yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("does not confirm an abort from schema-invalid successful status data", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-interrupt-invalid-status");
+      const abortedEvent = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "turn.aborted"),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      runtimeMock.state.sessionStatusImplementation = async () => ({
+        data: { "http://127.0.0.1:9999/session": { type: 42 } },
+      });
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId,
+        input: "Keep working",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+
+      const interruptFiber = yield* Effect.exit(adapter.interruptTurn(threadId, turn.turnId)).pipe(
+        Effect.forkChild,
+      );
+      yield* advanceTestClock(10_000);
+      const interruptExit = yield* Fiber.join(interruptFiber);
+      NodeAssert.equal(Exit.isFailure(interruptExit), true);
+      NodeAssert.equal(abortedEvent.pollUnsafe(), undefined);
+
+      const session = (yield* adapter.listSessions()).find(
+        (candidate) => candidate.threadId === threadId,
+      );
+      NodeAssert.equal(session?.status, "running");
+      NodeAssert.equal(session?.activeTurnId, turn.turnId);
+      yield* Fiber.interrupt(abortedEvent);
     }),
   );
 

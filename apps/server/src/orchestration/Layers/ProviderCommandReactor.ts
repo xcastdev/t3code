@@ -7,6 +7,7 @@ import {
   ProviderDriverKind,
   type ProjectId,
   type OrchestrationSession,
+  type ProviderSessionRecovery,
   ThreadId,
   type ProviderSession,
   type RuntimeMode,
@@ -19,6 +20,7 @@ import * as Crypto from "effect/Crypto";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -68,6 +70,46 @@ type ProviderIntentEvent = Extract<
 function toNonEmptyProviderInput(value: string | undefined): string | undefined {
   const normalized = value?.trim();
   return normalized && normalized.length > 0 ? normalized : undefined;
+}
+
+function isStaleProviderRequestFailureDetail(payload: Record<string, unknown>): boolean {
+  const detail = typeof payload.detail === "string" ? payload.detail.toLowerCase() : "";
+  return (
+    detail.includes("stale pending approval request") ||
+    detail.includes("unknown pending approval request") ||
+    detail.includes("unknown pending permission request") ||
+    detail.includes("stale pending user-input request") ||
+    detail.includes("unknown pending user-input request") ||
+    detail.includes("unknown pending user input request") ||
+    detail.includes("unknown pending codex user input request")
+  );
+}
+
+function hasOpenBlockingRequestForRecovery(thread: {
+  readonly activities: ReadonlyArray<{ readonly kind: string; readonly payload: unknown }>;
+}): boolean {
+  const openRequestIds = new Set<string>();
+  for (const activity of thread.activities) {
+    if (typeof activity.payload !== "object" || activity.payload === null) {
+      continue;
+    }
+    const requestId = (activity.payload as Record<string, unknown>).requestId;
+    if (typeof requestId !== "string") {
+      continue;
+    }
+    if (activity.kind === "approval.requested" || activity.kind === "user-input.requested") {
+      openRequestIds.add(requestId);
+    } else if (activity.kind === "approval.resolved" || activity.kind === "user-input.resolved") {
+      openRequestIds.delete(requestId);
+    } else if (
+      (activity.kind === "provider.approval.respond.failed" ||
+        activity.kind === "provider.user-input.respond.failed") &&
+      isStaleProviderRequestFailureDetail(activity.payload as Record<string, unknown>)
+    ) {
+      openRequestIds.delete(requestId);
+    }
+  }
+  return openRequestIds.size > 0;
 }
 
 function mapProviderSessionStatusToOrchestrationStatus(
@@ -656,9 +698,31 @@ const make = Effect.gen(function* () {
       projects: project ? [project] : [],
     });
 
+    const buildRecoveryInput = (): ProviderSessionRecovery | undefined => {
+      const session = thread.session;
+      if (!session || session.status !== "running" || session.activeTurnId === null) {
+        return undefined;
+      }
+      const recoveryUserMessage = thread.messages.findLast((message) => message.role === "user");
+      const recoveryAssistantMessages = thread.messages
+        .filter(
+          (message) => message.role === "assistant" && message.turnId === session.activeTurnId,
+        )
+        .map(({ id, text, streaming }) => ({ messageId: id, text, streaming }));
+      return {
+        turnId: session.activeTurnId,
+        state: hasOpenBlockingRequestForRecovery(thread) ? "waiting" : "running",
+        ...(recoveryUserMessage ? { userMessageId: recoveryUserMessage.id } : {}),
+        ...(recoveryAssistantMessages.length > 0
+          ? { assistantMessages: recoveryAssistantMessages }
+          : {}),
+      };
+    };
+
     const startProviderSession = (input?: {
       readonly resumeCursor?: unknown;
       readonly provider?: ProviderDriverKind;
+      readonly recovery?: ProviderSessionRecovery;
     }) =>
       providerService.startSession(threadId, {
         threadId,
@@ -668,10 +732,11 @@ const make = Effect.gen(function* () {
         ...(thread.title ? { title: thread.title } : {}),
         modelSelection: desiredModelSelection,
         ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
+        ...(input?.recovery !== undefined ? { recovery: input.recovery } : {}),
         runtimeMode: desiredRuntimeMode,
       });
 
-    const bindSessionToThread = (session: ProviderSession) =>
+    const bindSessionToThread = (session: ProviderSession, recoveryTurnId?: TurnId) =>
       Effect.gen(function* () {
         if (session.providerInstanceId === undefined) {
           return yield* new ProviderAdapterRequestError({
@@ -692,7 +757,7 @@ const make = Effect.gen(function* () {
             providerInstanceId: session.providerInstanceId,
             runtimeMode: desiredRuntimeMode,
             // Provider turn ids are not orchestration turn ids.
-            activeTurnId: null,
+            activeTurnId: recoveryTurnId ?? null,
             lastError: session.lastError ?? null,
             updatedAt: session.updatedAt,
           },
@@ -733,6 +798,7 @@ const make = Effect.gen(function* () {
       const resumeCursor = shouldRestartForModelChange
         ? undefined
         : (activeSession?.resumeCursor ?? undefined);
+      const recovery = shouldRestartForModelChange ? undefined : buildRecoveryInput();
       yield* Effect.logInfo("provider command reactor restarting provider session", {
         threadId,
         existingSessionThreadId,
@@ -751,9 +817,15 @@ const make = Effect.gen(function* () {
         shouldRestartForModelChange,
         shouldRestartForModelSelectionChange,
         hasResumeCursor: resumeCursor !== undefined,
+        hasRecovery: recovery !== undefined,
       });
       const restartedSession = yield* startProviderSession(
-        resumeCursor !== undefined ? { resumeCursor } : undefined,
+        resumeCursor !== undefined || recovery !== undefined
+          ? {
+              ...(resumeCursor !== undefined ? { resumeCursor } : {}),
+              ...(recovery !== undefined ? { recovery } : {}),
+            }
+          : undefined,
       );
       yield* Effect.logInfo("provider command reactor restarted provider session", {
         threadId,
@@ -763,7 +835,7 @@ const make = Effect.gen(function* () {
         runtimeMode: restartedSession.runtimeMode,
         cwd: restartedSession.cwd,
       });
-      yield* bindSessionToThread(restartedSession);
+      yield* bindSessionToThread(restartedSession, recovery?.turnId);
       return restartedSession.threadId;
     }
 
@@ -1387,7 +1459,21 @@ const make = Effect.gen(function* () {
 
     const now = event.payload.createdAt;
     if (thread.session && thread.session.status !== "stopped") {
-      yield* providerService.stopSession({ threadId: thread.id });
+      const stopExit = yield* Effect.exit(providerService.stopSession({ threadId: thread.id }));
+      if (Exit.isFailure(stopExit)) {
+        if (Cause.hasInterruptsOnly(stopExit.cause)) {
+          return yield* Effect.failCause(stopExit.cause);
+        }
+        yield* appendProviderFailureActivity({
+          threadId: thread.id,
+          kind: "provider.session.stop.failed",
+          summary: "Provider session stop failed",
+          detail: formatFailureDetail(stopExit.cause),
+          turnId: thread.session.activeTurnId,
+          createdAt: now,
+        });
+        return;
+      }
     }
 
     yield* setThreadSession({

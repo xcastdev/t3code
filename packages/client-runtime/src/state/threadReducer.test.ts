@@ -573,7 +573,7 @@ describe("applyThreadDetailEvent", () => {
   });
 
   describe("thread.session-stop-requested", () => {
-    it("marks session as stopped", () => {
+    it("leaves an existing session unchanged until the stop is confirmed", () => {
       const threadWithSession: OrchestrationThread = {
         ...baseThread,
         session: {
@@ -600,11 +600,7 @@ describe("applyThreadDetailEvent", () => {
         },
       });
 
-      expect(result.kind).toBe("updated");
-      if (result.kind === "updated") {
-        expect(result.thread.session?.status).toBe("stopped");
-        expect(result.thread.session?.activeTurnId).toBeNull();
-      }
+      expect(result.kind).toBe("unchanged");
     });
 
     it("returns unchanged when no session exists", () => {
