@@ -337,7 +337,10 @@ const make = (config: ProjectMcpOAuthConfig) =>
                       metadata?.token_endpoint_auth_methods_supported ?? [],
                     );
                     if (method === "client_secret_basic") {
-                      headers.set("Authorization", `Basic ${btoa(`${clientId}:`)}`);
+                      const encodedClientId = new URLSearchParams({ id: clientId })
+                        .toString()
+                        .slice(3);
+                      headers.set("Authorization", `Basic ${btoa(`${encodedClientId}:`)}`);
                     } else {
                       params.set("client_id", clientId);
                       if (method === "client_secret_post") params.set("client_secret", "");
