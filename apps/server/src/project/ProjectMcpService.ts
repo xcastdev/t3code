@@ -94,6 +94,10 @@ const isAllowedUrl = (value: string): boolean => {
 export interface AcquiredProjectMcpSessionServers {
   readonly servers: ReadonlyArray<ResolvedProjectMcpServer>;
   readonly resolveSecret: (serverId: McpServerId, credentialId: string) => string | undefined;
+  readonly oauthStateLeases: ReadonlyMap<
+    McpServerId,
+    ProjectMcpSecretStore.ProjectMcpOAuthStateLease
+  >;
 }
 
 export interface ProjectMcpServiceShape {
@@ -531,34 +535,48 @@ const makeProjectMcpService = Effect.gen(function* () {
         Effect.flatMap((servers) =>
           Effect.forEach(
             servers,
-            (server) =>
-              mcpSecrets
-                .acquireLease(
-                  server.id,
-                  ProjectMcpSecretStore.credentialIdsForTransport(server.transport),
-                )
-                .pipe(
-                  Effect.flatMap((lease) =>
-                    Effect.forEach(
-                      ProjectMcpSecretStore.credentialIdsForTransport(server.transport),
-                      (credentialId) =>
-                        lease
-                          .resolve(credentialId)
-                          .pipe(Effect.map((value) => [credentialId, value] as const)),
-                    ).pipe(Effect.map((credentials) => ({ server, credentials }))),
+            (server) => {
+              const oauthStateLease =
+                server.transport.type !== "stdio" && server.transport.authorization.type === "oauth"
+                  ? mcpSecrets.acquireOAuthStateLease(server.id)
+                  : Effect.succeed(undefined);
+              return Effect.flatMap(oauthStateLease, (stateLease) =>
+                Effect.flatMap(
+                  mcpSecrets.acquireLease(
+                    server.id,
+                    ProjectMcpSecretStore.credentialIdsForTransport(server.transport),
                   ),
+                  (lease) =>
+                    Effect.map(
+                      Effect.forEach(
+                        ProjectMcpSecretStore.credentialIdsForTransport(server.transport),
+                        (credentialId) =>
+                          lease
+                            .resolve(credentialId)
+                            .pipe(Effect.map((value) => [credentialId, value] as const)),
+                      ),
+                      (credentials) => ({ server, credentials, oauthStateLease: stateLease }),
+                    ),
                 ),
+              );
+            },
             { concurrency: 1 },
           ).pipe(
             Effect.map((leased) => {
               const secretValues = new Map<string, string>();
-              for (const { credentials } of leased) {
+              const oauthStateLeases = new Map<
+                McpServerId,
+                ProjectMcpSecretStore.ProjectMcpOAuthStateLease
+              >();
+              for (const { credentials, oauthStateLease, server } of leased) {
                 for (const [credentialId, value] of credentials)
                   secretValues.set(credentialId, value);
+                if (oauthStateLease !== undefined) oauthStateLeases.set(server.id, oauthStateLease);
               }
               return {
                 servers: leased.map(({ server }) => server),
                 resolveSecret: (_serverId, credentialId) => secretValues.get(credentialId),
+                oauthStateLeases,
               } satisfies AcquiredProjectMcpSessionServers;
             }),
           ),

@@ -77,6 +77,15 @@ export class ProjectMcpSecretUnavailableError extends Schema.TaggedErrorClass<Pr
   }
 }
 
+export class ProjectMcpOAuthStateUnavailableError extends Schema.TaggedErrorClass<ProjectMcpOAuthStateUnavailableError>()(
+  "ProjectMcpOAuthStateUnavailableError",
+  { serverId: McpServerId },
+) {
+  override get message(): string {
+    return `OAuth state is unavailable for MCP server '${this.serverId}'.`;
+  }
+}
+
 export class ProjectMcpSecretDraftError extends Schema.TaggedErrorClass<ProjectMcpSecretDraftError>()(
   "ProjectMcpSecretDraftError",
   { message: Schema.String },
@@ -87,6 +96,7 @@ export const ProjectMcpSecretError = Schema.Union([
   ProjectMcpSecretCleanupError,
   ProjectMcpSecretOwnershipError,
   ProjectMcpSecretUnavailableError,
+  ProjectMcpOAuthStateUnavailableError,
   ProjectMcpSecretDraftError,
 ]);
 export type ProjectMcpSecretError = typeof ProjectMcpSecretError.Type;
@@ -190,6 +200,22 @@ export interface ProjectMcpSecretLease {
   ) => Effect.Effect<string, ProjectMcpSecretError>;
 }
 
+export interface ProjectMcpOAuthStateLease {
+  readonly listAuxiliarySecrets: () => Effect.Effect<
+    ReadonlyArray<ProjectMcpCredentialIdType>,
+    ProjectMcpSecretError
+  >;
+  readonly resolve: (
+    credentialId: ProjectMcpCredentialIdType,
+  ) => Effect.Effect<string, ProjectMcpSecretError>;
+  readonly create: (
+    value: string,
+  ) => Effect.Effect<ProjectMcpCredentialIdType, ProjectMcpSecretError>;
+  readonly remove: (
+    credentialId: ProjectMcpCredentialIdType,
+  ) => Effect.Effect<void, ProjectMcpSecretError>;
+}
+
 export interface ProjectMcpSecretStoreShape {
   readonly prepareCreate: (
     serverId: McpServerId,
@@ -226,6 +252,10 @@ export interface ProjectMcpSecretStoreShape {
     serverId: McpServerId,
     credentialIds: ReadonlyArray<ProjectMcpCredentialIdType>,
   ) => Effect.Effect<ProjectMcpSecretLease, ProjectMcpSecretError, Scope.Scope>;
+  readonly acquireOAuthStateLease: (
+    serverId: McpServerId,
+  ) => Effect.Effect<ProjectMcpOAuthStateLease, ProjectMcpSecretError, Scope.Scope>;
+  readonly revokeOAuthState: (serverId: McpServerId) => Effect.Effect<void, ProjectMcpSecretError>;
   readonly reconcile: (
     catalog: ReadonlyArray<{
       readonly id: McpServerId;
@@ -287,6 +317,8 @@ const make = Effect.gen(function* () {
     yield* readJson(JOURNAL_SECRET_NAME, decodeJournal, emptyJournal),
   );
   const leases = yield* Ref.make(new Map<ProjectMcpCredentialIdType, number>());
+  const oauthStateLeaseCounts = yield* Ref.make(new Map<McpServerId, number>());
+  const oauthStateEpochs = yield* Ref.make(new Map<McpServerId, number>());
   const mutex = yield* Semaphore.make(1);
 
   const persistManifest = (manifest: Manifest) =>
@@ -346,13 +378,15 @@ const make = Effect.gen(function* () {
     const server = manifest.servers[serverId];
     if (server === undefined) return;
     const leaseCounts = yield* Ref.get(leases);
+    const oauthStateLeaseCount = (yield* Ref.get(oauthStateLeaseCounts)).get(serverId) ?? 0;
     const deletable = server.retired.filter((id) => (leaseCounts.get(id) ?? 0) === 0);
     if (
       deletable.length === 0 &&
       (server.removed !== true ||
         server.credentials.length > 0 ||
         server.retired.length > 0 ||
-        server.auxiliary.length > 0)
+        server.auxiliary.length > 0 ||
+        oauthStateLeaseCount > 0)
     )
       return;
     yield* Effect.forEach(deletable, removeCredential, { discard: true }).pipe(
@@ -369,7 +403,8 @@ const make = Effect.gen(function* () {
       updated.removed === true &&
         updated.credentials.length === 0 &&
         updated.retired.length === 0 &&
-        updated.auxiliary.length === 0
+        updated.auxiliary.length === 0 &&
+        oauthStateLeaseCount === 0
         ? withoutServer(current, serverId)
         : serverSecretsWith(current, serverId, updated),
     ).pipe(Effect.mapError((cause) => new ProjectMcpSecretCleanupError({ serverId, cause })));
@@ -395,7 +430,7 @@ const make = Effect.gen(function* () {
     const manifest = yield* Ref.get(manifests);
     const server = manifest.servers[operation.serverId] ?? noServerSecrets();
     const next = {
-      removed: false,
+      removed: operation.kind === "catalog" ? false : server.removed,
       credentials:
         operation.kind === "catalog" ? unique(operation.nextCredentialIds) : server.credentials,
       retired:
@@ -620,14 +655,24 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const createAuxiliarySecret: ProjectMcpSecretStoreShape["createAuxiliarySecret"] = (
-    serverId,
-    value,
-  ) =>
+  const assertOAuthLease = (serverId: McpServerId, epoch: number) =>
+    Effect.gen(function* () {
+      const manifest = yield* Ref.get(manifests);
+      const server = manifest.servers[serverId];
+      const epochs = yield* Ref.get(oauthStateEpochs);
+      const count = (yield* Ref.get(oauthStateLeaseCounts)).get(serverId) ?? 0;
+      if (server === undefined || (epochs.get(serverId) ?? 0) !== epoch || count === 0) {
+        return yield* new ProjectMcpOAuthStateUnavailableError({ serverId });
+      }
+      return server;
+    });
+
+  const createAuxiliarySecretFor = (serverId: McpServerId, value: string, epoch?: number) =>
     mutex.withPermits(1)(
       Effect.gen(function* () {
         const manifest = yield* Ref.get(manifests);
-        if (
+        if (epoch !== undefined) yield* assertOAuthLease(serverId, epoch);
+        else if (
           manifest.servers[serverId] === undefined ||
           manifest.servers[serverId].removed === true
         ) {
@@ -669,6 +714,11 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const createAuxiliarySecret: ProjectMcpSecretStoreShape["createAuxiliarySecret"] = (
+    serverId,
+    value,
+  ) => createAuxiliarySecretFor(serverId, value);
+
   const removeServer: ProjectMcpSecretStoreShape["removeServer"] = (serverId) =>
     mutex.withPermits(1)(
       Effect.gen(function* () {
@@ -679,8 +729,17 @@ const make = Effect.gen(function* () {
           serverSecretsWith(manifest, serverId, {
             removed: true,
             credentials: [],
-            retired: unique([...server.credentials, ...server.retired, ...server.auxiliary]),
-            auxiliary: [],
+            retired: unique([
+              ...server.credentials,
+              ...server.retired,
+              ...(((yield* Ref.get(oauthStateLeaseCounts)).get(serverId) ?? 0) > 0
+                ? []
+                : server.auxiliary),
+            ]),
+            auxiliary:
+              ((yield* Ref.get(oauthStateLeaseCounts)).get(serverId) ?? 0) > 0
+                ? server.auxiliary
+                : [],
           }),
         );
         yield* cleanupRetired(serverId);
@@ -688,23 +747,31 @@ const make = Effect.gen(function* () {
     );
 
   const listAuxiliarySecrets: ProjectMcpSecretStoreShape["listAuxiliarySecrets"] = (serverId) =>
-    Ref.get(manifests).pipe(Effect.map((manifest) => manifest.servers[serverId]?.auxiliary ?? []));
+    Ref.get(manifests).pipe(
+      Effect.map((manifest) => {
+        const server = manifest.servers[serverId];
+        return server?.removed === true ? [] : (server?.auxiliary ?? []);
+      }),
+    );
 
   const listServerIds: ProjectMcpSecretStoreShape["listServerIds"] = () =>
     Ref.get(manifests).pipe(
       Effect.map((manifest) => Object.keys(manifest.servers).map((id) => McpServerId.make(id))),
     );
 
-  const removeAuxiliarySecret: ProjectMcpSecretStoreShape["removeAuxiliarySecret"] = (
-    serverId,
-    credentialId,
+  const removeAuxiliarySecretFor = (
+    serverId: McpServerId,
+    credentialId: ProjectMcpCredentialIdType,
+    epoch?: number,
   ) =>
     mutex.withPermits(1)(
       Effect.gen(function* () {
         const manifest = yield* Ref.get(manifests);
         const server = manifest.servers[serverId];
+        if (epoch !== undefined) yield* assertOAuthLease(serverId, epoch);
         if (
           server === undefined ||
+          (epoch === undefined && server.removed === true) ||
           (!server.auxiliary.includes(credentialId) && !server.retired.includes(credentialId))
         ) {
           return yield* new ProjectMcpSecretOwnershipError({ serverId, credentialId });
@@ -725,12 +792,18 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const removeAuxiliarySecret: ProjectMcpSecretStoreShape["removeAuxiliarySecret"] = (
+    serverId,
+    credentialId,
+  ) => removeAuxiliarySecretFor(serverId, credentialId);
+
   const resolve: ProjectMcpSecretStoreShape["resolve"] = (serverId, credentialId) =>
     Effect.gen(function* () {
       const manifest = yield* Ref.get(manifests);
       if (
-        !hasActiveCredential(manifest.servers[serverId], credentialId) &&
-        !(manifest.servers[serverId]?.auxiliary.includes(credentialId) ?? false)
+        manifest.servers[serverId]?.removed === true ||
+        (!hasActiveCredential(manifest.servers[serverId], credentialId) &&
+          !(manifest.servers[serverId]?.auxiliary.includes(credentialId) ?? false))
       ) {
         return yield* new ProjectMcpSecretOwnershipError({ serverId, credentialId });
       }
@@ -789,6 +862,99 @@ const make = Effect.gen(function* () {
       }),
     );
 
+  const releaseOAuthStateLease = (serverId: McpServerId) =>
+    mutex.withPermits(1)(
+      Effect.gen(function* () {
+        const counts = yield* Ref.get(oauthStateLeaseCounts);
+        const remaining = (counts.get(serverId) ?? 1) - 1;
+        const nextCounts = new Map(counts);
+        if (remaining <= 0) nextCounts.delete(serverId);
+        else nextCounts.set(serverId, remaining);
+        yield* Ref.set(oauthStateLeaseCounts, nextCounts);
+
+        if (remaining === 0) {
+          const manifest = yield* Ref.get(manifests);
+          const server = manifest.servers[serverId];
+          if (server?.removed === true && server.auxiliary.length > 0) {
+            yield* persistManifest(
+              serverSecretsWith(manifest, serverId, {
+                ...server,
+                retired: unique([...server.retired, ...server.auxiliary]),
+                auxiliary: [],
+              }),
+            );
+          }
+        }
+        yield* cleanupRetired(serverId);
+      }),
+    );
+
+  const acquireOAuthStateLease: ProjectMcpSecretStoreShape["acquireOAuthStateLease"] = (serverId) =>
+    mutex.withPermits(1)(
+      Effect.gen(function* () {
+        const manifest = yield* Ref.get(manifests);
+        const server = manifest.servers[serverId];
+        if (server === undefined || server.removed === true) {
+          return yield* new ProjectMcpSecretDraftError({
+            message: `Cannot lease OAuth state for unknown MCP server '${serverId}'.`,
+          });
+        }
+        const epoch = (yield* Ref.get(oauthStateEpochs)).get(serverId) ?? 0;
+        yield* Ref.update(oauthStateLeaseCounts, (current) => {
+          const next = new Map(current);
+          next.set(serverId, (next.get(serverId) ?? 0) + 1);
+          return next;
+        });
+        yield* Effect.addFinalizer(() =>
+          releaseOAuthStateLease(serverId).pipe(
+            Effect.tapError((error) => Effect.logError(error.message)),
+            Effect.ignore,
+          ),
+        );
+        return {
+          listAuxiliarySecrets: () =>
+            mutex.withPermits(1)(
+              assertOAuthLease(serverId, epoch).pipe(Effect.map(({ auxiliary }) => auxiliary)),
+            ),
+          resolve: (credentialId) =>
+            mutex.withPermits(1)(
+              Effect.gen(function* () {
+                const current = yield* assertOAuthLease(serverId, epoch);
+                if (!current.auxiliary.includes(credentialId)) {
+                  return yield* new ProjectMcpSecretOwnershipError({ serverId, credentialId });
+                }
+                return yield* resolveValue(serverId, credentialId);
+              }),
+            ),
+          create: (value) => createAuxiliarySecretFor(serverId, value, epoch),
+          remove: (credentialId) => removeAuxiliarySecretFor(serverId, credentialId, epoch),
+        } satisfies ProjectMcpOAuthStateLease;
+      }),
+    );
+
+  const revokeOAuthState: ProjectMcpSecretStoreShape["revokeOAuthState"] = (serverId) =>
+    mutex.withPermits(1)(
+      Effect.gen(function* () {
+        const manifest = yield* Ref.get(manifests);
+        const server = manifest.servers[serverId];
+        if (server === undefined) return;
+        yield* Ref.update(oauthStateEpochs, (current) => {
+          const next = new Map(current);
+          next.set(serverId, (next.get(serverId) ?? 0) + 1);
+          return next;
+        });
+        if (server.auxiliary.length === 0) return;
+        yield* persistManifest(
+          serverSecretsWith(manifest, serverId, {
+            ...server,
+            retired: unique([...server.retired, ...server.auxiliary]),
+            auxiliary: [],
+          }),
+        );
+        yield* cleanupRetired(serverId);
+      }),
+    );
+
   const reconcile: ProjectMcpSecretStoreShape["reconcile"] = (catalog) =>
     mutex.withPermits(1)(
       Effect.gen(function* () {
@@ -818,13 +984,19 @@ const make = Effect.gen(function* () {
           const retired = unique([
             ...server.retired,
             ...server.credentials.filter((id) => !currentIds.includes(id)),
-            ...(current === undefined ? server.auxiliary : []),
+            ...(current === undefined &&
+            ((yield* Ref.get(oauthStateLeaseCounts)).get(typedServerId) ?? 0) === 0
+              ? server.auxiliary
+              : []),
           ]);
+          const retainedOAuthState =
+            current === undefined &&
+            ((yield* Ref.get(oauthStateLeaseCounts)).get(typedServerId) ?? 0) > 0;
           const next = {
             removed: current === undefined,
             credentials: currentIds.filter((id) => hasCredential(server, id)),
             retired,
-            auxiliary: current === undefined ? [] : server.auxiliary,
+            auxiliary: current === undefined && !retainedOAuthState ? [] : server.auxiliary,
           } satisfies ServerSecrets;
           yield* persistManifest(serverSecretsWith(yield* Ref.get(manifests), typedServerId, next));
           yield* cleanupRetired(typedServerId);
@@ -843,6 +1015,8 @@ const make = Effect.gen(function* () {
     removeServer,
     resolve,
     acquireLease,
+    acquireOAuthStateLease,
+    revokeOAuthState,
     reconcile,
   });
 });

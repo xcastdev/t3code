@@ -18,6 +18,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpProviderSession from "./McpProviderSession.ts";
 import * as ProjectMcpProxyRegistry from "./ProjectMcpProxyRegistry.ts";
+import * as ProjectMcpSecretStore from "./ProjectMcpSecretStore.ts";
 
 export interface McpCredentialRequest {
   readonly threadId: ThreadId;
@@ -33,6 +34,10 @@ export interface McpCredentialRequest {
     serverId: McpServerId,
     credentialId: string,
   ) => string | undefined;
+  readonly oauthStateLeases?: ReadonlyMap<
+    McpServerId,
+    ProjectMcpSecretStore.ProjectMcpOAuthStateLease
+  >;
 }
 
 export interface McpIssuedCredential {
@@ -321,6 +326,9 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
                     ...(request.resolveProjectMcpSecret === undefined
                       ? {}
                       : { resolveSecret: request.resolveProjectMcpSecret }),
+                    ...(request.oauthStateLeases === undefined
+                      ? {}
+                      : { oauthStateLeases: request.oauthStateLeases }),
                   }),
                 )
               : [];

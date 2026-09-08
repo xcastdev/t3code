@@ -9,9 +9,11 @@ import {
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 
 import * as ServerConfig from "../config.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
@@ -42,6 +44,13 @@ const stdioDraft = (value: string): ProjectMcpTransportDraft => ({
       credential: { name: "session token", value },
     },
   ],
+});
+
+const oauthDraft = (): ProjectMcpTransportDraft => ({
+  type: "streamable-http",
+  url: "https://oauth.example.test/rpc",
+  headers: [],
+  authorization: { type: "oauth", registration: { type: "automatic" } },
 });
 
 const credentialId = (transport: ProjectMcpTransport): ProjectMcpCredentialId => {
@@ -321,6 +330,132 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
     }).pipe(
       Effect.provide(
         ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-secret-store-test-" }),
+      ),
+    ),
+  );
+
+  it.effect("retains leased OAuth state through removal and deletes it at final scope close", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      yield* Effect.gen(function* () {
+        const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+        const secretFiles = yield* ServerSecretStore.ServerSecretStore;
+        const prepared = yield* secrets.prepareCreate(serverA, oauthDraft());
+        yield* prepared.commit;
+        const initialId = yield* secrets.createAuxiliarySecret(serverA, "oauth-grant-1");
+        const scope = yield* Scope.make();
+        const lease = yield* secrets
+          .acquireOAuthStateLease(serverA)
+          .pipe(Effect.provideService(Scope.Scope, scope));
+
+        yield* secrets.removeServer(serverA);
+
+        const publicError = yield* secrets.resolve(serverA, initialId).pipe(Effect.flip);
+        assert.instanceOf(publicError, ProjectMcpSecretStore.ProjectMcpSecretOwnershipError);
+        assert.deepEqual(yield* secrets.listAuxiliarySecrets(serverA), []);
+        assert.deepEqual(yield* lease.listAuxiliarySecrets(), [initialId]);
+        assert.equal(yield* lease.resolve(initialId), "oauth-grant-1");
+
+        const replacementId = yield* lease.create("oauth-grant-2");
+        yield* lease.remove(initialId);
+        assert.equal(yield* lease.resolve(replacementId), "oauth-grant-2");
+        assert.isTrue(
+          Option.isSome(
+            yield* secretFiles.get(ProjectMcpSecretStore.credentialSecretName(replacementId)),
+          ),
+        );
+
+        yield* Scope.close(scope, Exit.void);
+        assert.isTrue(
+          Option.isNone(
+            yield* secretFiles.get(ProjectMcpSecretStore.credentialSecretName(replacementId)),
+          ),
+        );
+        assert.deepEqual(yield* secrets.listServerIds(), []);
+      }).pipe(Effect.provide(makeSecretLayer(config)));
+    }).pipe(
+      Effect.provide(
+        ServerConfig.layerTest(process.cwd(), {
+          prefix: "t3-project-mcp-secret-store-oauth-lease-",
+        }),
+      ),
+    ),
+  );
+
+  it.effect("keeps retained OAuth state until the last of two leases closes", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      yield* Effect.gen(function* () {
+        const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+        const secretFiles = yield* ServerSecretStore.ServerSecretStore;
+        const prepared = yield* secrets.prepareCreate(serverA, oauthDraft());
+        yield* prepared.commit;
+        const id = yield* secrets.createAuxiliarySecret(serverA, "multi-owner-grant");
+        const firstScope = yield* Scope.make();
+        const secondScope = yield* Scope.make();
+        yield* secrets
+          .acquireOAuthStateLease(serverA)
+          .pipe(Effect.provideService(Scope.Scope, firstScope));
+        const secondLease = yield* secrets
+          .acquireOAuthStateLease(serverA)
+          .pipe(Effect.provideService(Scope.Scope, secondScope));
+
+        yield* secrets.removeServer(serverA);
+        yield* Scope.close(firstScope, Exit.void);
+        assert.equal(yield* secondLease.resolve(id), "multi-owner-grant");
+        assert.isTrue(
+          Option.isSome(yield* secretFiles.get(ProjectMcpSecretStore.credentialSecretName(id))),
+        );
+
+        yield* Scope.close(secondScope, Exit.void);
+        assert.isTrue(
+          Option.isNone(yield* secretFiles.get(ProjectMcpSecretStore.credentialSecretName(id))),
+        );
+      }).pipe(Effect.provide(makeSecretLayer(config)));
+    }).pipe(
+      Effect.provide(
+        ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-secret-store-oauth-two-" }),
+      ),
+    ),
+  );
+
+  it.effect("invalidates OAuth state leases and removes their records on explicit revocation", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      yield* Effect.gen(function* () {
+        const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+        const secretFiles = yield* ServerSecretStore.ServerSecretStore;
+        const prepared = yield* secrets.prepareCreate(serverA, oauthDraft());
+        yield* prepared.commit;
+        const id = yield* secrets.createAuxiliarySecret(serverA, "revoked-grant");
+        const scope = yield* Scope.make();
+        const lease = yield* secrets
+          .acquireOAuthStateLease(serverA)
+          .pipe(Effect.provideService(Scope.Scope, scope));
+
+        yield* secrets.revokeOAuthState(serverA);
+        assert.deepEqual(yield* secrets.listAuxiliarySecrets(serverA), []);
+        assert.isTrue(
+          Option.isNone(yield* secretFiles.get(ProjectMcpSecretStore.credentialSecretName(id))),
+        );
+        for (const operation of [
+          lease.listAuxiliarySecrets(),
+          lease.resolve(id),
+          lease.create("stale-grant"),
+          lease.remove(id),
+        ]) {
+          const error = yield* operation.pipe(Effect.flip);
+          assert.instanceOf(error, ProjectMcpSecretStore.ProjectMcpOAuthStateUnavailableError);
+        }
+
+        yield* Scope.close(scope, Exit.void);
+        assert.deepEqual(yield* secrets.listServerIds(), [serverA]);
+      }).pipe(Effect.provide(makeSecretLayer(config)));
+    }).pipe(
+      Effect.provide(
+        ServerConfig.layerTest(process.cwd(), {
+          prefix: "t3-project-mcp-secret-store-oauth-revoke-",
+        }),
       ),
     ),
   );

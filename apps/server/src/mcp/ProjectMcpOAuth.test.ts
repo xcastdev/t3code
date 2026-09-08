@@ -9,6 +9,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as NodeCrypto from "node:crypto";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import { McpServerId, ProjectMcpCredentialId } from "@t3tools/contracts";
 import * as ServerConfig from "../config.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
@@ -425,6 +426,80 @@ const prepareOAuth = Effect.fn(function* (
     ...config,
   });
 });
+
+it.effect("retains bearer and refresh access through catalog removal for a live provider", () =>
+  Effect.gen(function* () {
+    let clock = 1_800_000_000_000;
+    let exchanges = 0;
+    const oauth = yield* prepareOAuth({
+      now: () => clock,
+      fetch: async (input, init) => {
+        if (String(input).endsWith("/token")) {
+          exchanges++;
+          return Response.json({
+            access_token: `grant-${exchanges}`,
+            token_type: "Bearer",
+            expires_in: 3600,
+            refresh_token: "refresh-grant",
+          });
+        }
+        return fetchOAuthFixture(input, init);
+      },
+    });
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    const started = yield* oauth.begin({ serverId });
+    const scope = yield* Scope.make();
+    const stateLease = yield* secrets
+      .acquireOAuthStateLease(serverId)
+      .pipe(Effect.provideService(Scope.Scope, scope));
+    assert.equal(
+      (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+      200,
+    );
+
+    const provider = yield* oauth.providerFor(serverId, fixtureServer, stateLease);
+    yield* secrets.removeServer(serverId);
+    assert.equal((yield* Effect.promise(async () => provider.tokens()))?.access_token, "grant-1");
+    clock += 3_600_001;
+    assert.equal((yield* Effect.promise(async () => provider.tokens()))?.access_token, "grant-2");
+    assert.equal(exchanges, 2);
+
+    yield* Scope.close(scope, Exit.void);
+    assert.deepEqual(yield* secrets.listServerIds(), []);
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+it.effect("invalidates old OAuth providers immediately on explicit disconnect", () =>
+  Effect.gen(function* () {
+    const oauth = yield* prepareOAuth();
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    const started = yield* oauth.begin({ serverId });
+    const scope = yield* Scope.make();
+    const stateLease = yield* secrets
+      .acquireOAuthStateLease(serverId)
+      .pipe(Effect.provideService(Scope.Scope, scope));
+    assert.equal(
+      (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+      200,
+    );
+    const oldProvider = yield* oauth.providerFor(serverId, fixtureServer, stateLease);
+
+    yield* oauth.disconnect(serverId);
+    assert.isUndefined(yield* Effect.promise(async () => oldProvider.tokens()));
+    const staleWrite = yield* Effect.promise(async () => {
+      try {
+        await oldProvider.saveTokens({ access_token: "stale", token_type: "Bearer" });
+        return false;
+      } catch {
+        return true;
+      }
+    });
+    assert.isTrue(staleWrite);
+    const reconnected = yield* oauth.providerFor(serverId, fixtureServer);
+    assert.isUndefined(yield* Effect.promise(async () => reconnected.tokens()));
+    yield* Scope.close(scope, Exit.void);
+  }).pipe(Effect.provide(secretLayer)),
+);
 
 for (const method of ["client_secret_post", "client_secret_basic"] as const) {
   for (const [clientId, encodedClientId] of [

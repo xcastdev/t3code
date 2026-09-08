@@ -74,6 +74,11 @@ export class ProjectMcpOAuthError extends Schema.TaggedErrorClass<ProjectMcpOAut
   { operation: Schema.String, cause: Schema.Defect() },
 ) {}
 const isProjectMcpOAuthError = Schema.is(ProjectMcpOAuthError);
+const isProjectMcpOAuthStateUnavailableError = Schema.is(
+  ProjectMcpSecretStore.ProjectMcpOAuthStateUnavailableError,
+);
+const isOAuthStateUnavailable = (cause: unknown): boolean =>
+  isProjectMcpOAuthError(cause) && isProjectMcpOAuthStateUnavailableError(cause.cause);
 
 export interface ProjectMcpOAuthServer {
   readonly serverId: McpServerId;
@@ -139,6 +144,7 @@ export interface ProjectMcpOAuthShape {
   readonly providerFor: (
     serverId: McpServerId,
     server?: ProjectMcpOAuthServer,
+    stateLease?: ProjectMcpSecretStore.ProjectMcpOAuthStateLease,
   ) => Effect.Effect<OAuthClientProvider, ProjectMcpOAuthError>;
   readonly begin: (
     input: BeginProjectMcpOAuthInput,
@@ -225,6 +231,8 @@ const decode = (value: string): StoredRecord | undefined => {
   return undefined;
 };
 
+const encodeStoredRecord = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+
 const random = () => {
   const bytes = new Uint8Array(32);
   crypto.getRandomValues(bytes);
@@ -284,11 +292,21 @@ const make = (config: ProjectMcpOAuthConfig) =>
       }
       throw new Error("Unknown MCP server");
     };
-    const recordsFor = (id: McpServerId) =>
+    const recordsFor = (
+      id: McpServerId,
+      stateLease?: ProjectMcpSecretStore.ProjectMcpOAuthStateLease,
+    ) =>
       Effect.gen(function* () {
         const records: Array<{ id: ProjectMcpCredentialId; record: StoredRecord }> = [];
-        for (const credentialId of yield* secrets.listAuxiliarySecrets(id)) {
-          const record = decode(yield* secrets.resolve(id, credentialId));
+        const credentialIds = yield* stateLease
+          ? stateLease.listAuxiliarySecrets()
+          : secrets.listAuxiliarySecrets(id);
+        for (const credentialId of credentialIds) {
+          const record = decode(
+            yield* stateLease
+              ? stateLease.resolve(credentialId)
+              : secrets.resolve(id, credentialId),
+          );
           if (record?.serverId === id) records.push({ id: credentialId, record });
         }
         return records;
@@ -318,8 +336,12 @@ const make = (config: ProjectMcpOAuthConfig) =>
         ),
       )
       .pipe(Effect.orDie);
-    const currentUnlocked = (id: McpServerId, server?: ProjectMcpOAuthServer) =>
-      recordsFor(id).pipe(
+    const currentUnlocked = (
+      id: McpServerId,
+      server?: ProjectMcpOAuthServer,
+      stateLease?: ProjectMcpSecretStore.ProjectMcpOAuthStateLease,
+    ) =>
+      recordsFor(id, stateLease).pipe(
         Effect.map(
           (records) =>
             (server === undefined
@@ -328,21 +350,31 @@ const make = (config: ProjectMcpOAuthConfig) =>
             ).at(-1)?.record,
         ),
       );
-    const current = (id: McpServerId, server?: ProjectMcpOAuthServer) =>
-      mutex.withPermits(1)(currentUnlocked(id, server));
+    const current = (
+      id: McpServerId,
+      server?: ProjectMcpOAuthServer,
+      stateLease?: ProjectMcpSecretStore.ProjectMcpOAuthStateLease,
+    ) => mutex.withPermits(1)(currentUnlocked(id, server, stateLease));
     const recordForPendingState = (id: McpServerId, state: string) =>
       mutex.withPermits(1)(
         recordsFor(id).pipe(
           Effect.map((records) => records.findLast(({ record }) => record.state === state)),
         ),
       );
-    const save = (id: McpServerId, record: StoredRecord) =>
+    const save = (
+      id: McpServerId,
+      record: StoredRecord,
+      stateLease?: ProjectMcpSecretStore.ProjectMcpOAuthStateLease,
+    ) =>
       Effect.gen(function* () {
-        // @effect-diagnostics-next-line preferSchemaOverJson:off
-        const replacementId = yield* secrets.createAuxiliarySecret(id, JSON.stringify(record));
-        for (const old of yield* recordsFor(id)) {
+        const replacementId = yield* stateLease
+          ? stateLease.create(encodeStoredRecord(record))
+          : secrets.createAuxiliarySecret(id, encodeStoredRecord(record));
+        for (const old of yield* recordsFor(id, stateLease)) {
           if (old.id !== replacementId && hasSameResource(old.record, record)) {
-            yield* secrets.removeAuxiliarySecret(id, old.id);
+            yield* stateLease
+              ? stateLease.remove(old.id)
+              : secrets.removeAuxiliarySecret(id, old.id);
             if (old.record.state !== undefined) forgetPendingState(old.record.state, id);
           }
         }
@@ -363,9 +395,10 @@ const make = (config: ProjectMcpOAuthConfig) =>
       server: ProjectMcpOAuthServer,
       generation: string | number,
       update: (record: StoredRecord) => StoredRecord | undefined,
+      stateLease?: ProjectMcpSecretStore.ProjectMcpOAuthStateLease,
     ) =>
       mutex.withPermits(1)(
-        recordsFor(id).pipe(
+        recordsFor(id, stateLease).pipe(
           Effect.flatMap((records) => {
             const active = records.findLast(({ record }) => matchesServer(record, server))?.record;
             const isCurrent =
@@ -380,33 +413,51 @@ const make = (config: ProjectMcpOAuthConfig) =>
             );
             return record === undefined
               ? Effect.succeed(false)
-              : save(id, {
-                  ...record,
-                  generation: record.generation ?? generation,
-                  registration: registrationFor(server),
-                }).pipe(Effect.as(true));
+              : save(
+                  id,
+                  {
+                    ...record,
+                    generation: record.generation ?? generation,
+                    registration: registrationFor(server),
+                  },
+                  stateLease,
+                ).pipe(Effect.as(true));
           }),
         ),
       );
 
-    const providerFor = (
+    interface ProviderForAuthorization {
+      readonly generation: string | number;
+      readonly state: string;
+      readonly onSaved: (generation: string) => void;
+    }
+
+    interface ProviderForOptions {
+      readonly stateLease?: ProjectMcpSecretStore.ProjectMcpOAuthStateLease;
+      readonly authorization?: ProviderForAuthorization;
+    }
+
+    const providerForWithOptions = (
       id: McpServerId,
       supplied?: ProjectMcpOAuthServer,
-      authorization?: {
-        readonly generation: string | number;
-        readonly state: string;
-        readonly onSaved: (generation: string) => void;
-      },
+      options?: ProviderForOptions,
     ) =>
       Effect.tryPromise({
         try: async () => {
+          const authorization = options?.authorization;
+          const stateLease = options?.stateLease;
           const server = await serverFor(id, supplied);
-          const initial = await Effect.runPromise(current(id, server));
+          const initial = await Effect.runPromise(current(id, server, stateLease));
           const generation =
             authorization?.generation ?? initial?.generation ?? generations.get(id) ?? 0;
           const readRecord = async () => {
-            const record = await Effect.runPromise(current(id, server));
-            return (record?.generation ?? 0) === generation ? record : undefined;
+            try {
+              const record = await Effect.runPromise(current(id, server, stateLease));
+              return (record?.generation ?? 0) === generation ? record : undefined;
+            } catch (cause) {
+              if (isOAuthStateUnavailable(cause)) return undefined;
+              throw cause;
+            }
           };
           const clientAuthentication: OAuthClientProvider["addClientAuthentication"] = async (
             headers,
@@ -514,14 +565,20 @@ const make = (config: ProjectMcpOAuthConfig) =>
                 });
                 const next = { ...refreshed, issuer: record.issuer };
                 const saved = await Effect.runPromise(
-                  updateIfCurrent(id, server, generation, (active) => {
-                    if (
-                      active.tokens?.access_token !== record.tokens?.access_token ||
-                      active.tokens?.refresh_token !== record.tokens?.refresh_token
-                    )
-                      return undefined;
-                    return { ...active, tokens: next, tokensIssuedAt: now() };
-                  }),
+                  updateIfCurrent(
+                    id,
+                    server,
+                    generation,
+                    (active) => {
+                      if (
+                        active.tokens?.access_token !== record.tokens?.access_token ||
+                        active.tokens?.refresh_token !== record.tokens?.refresh_token
+                      )
+                        return undefined;
+                      return { ...active, tokens: next, tokensIssuedAt: now() };
+                    },
+                    stateLease,
+                  ),
                 );
                 return saved ? next : undefined;
               } catch {
@@ -530,43 +587,55 @@ const make = (config: ProjectMcpOAuthConfig) =>
             },
             saveClientInformation: async (client, ctx) => {
               await Effect.runPromise(
-                updateIfCurrent(id, server, generation, (record) => {
-                  if (!matchesClientRegistration(client, server))
-                    throw new Error("OAuth client registration mismatch");
-                  return {
-                    ...record,
-                    client: ctx?.issuer ? { ...client, issuer: ctx.issuer } : client,
-                  };
-                }),
+                updateIfCurrent(
+                  id,
+                  server,
+                  generation,
+                  (record) => {
+                    if (!matchesClientRegistration(client, server))
+                      throw new Error("OAuth client registration mismatch");
+                    return {
+                      ...record,
+                      client: ctx?.issuer ? { ...client, issuer: ctx.issuer } : client,
+                    };
+                  },
+                  stateLease,
+                ),
               );
             },
             saveTokens: async (tokens, ctx) => {
               const completedGeneration = authorization === undefined ? undefined : random();
               const saved = await Effect.runPromise(
-                updateIfCurrent(id, server, generation, (record) => {
-                  if (authorization !== undefined && record.state !== authorization.state)
-                    return undefined;
-                  if (record.issuer && ctx?.issuer && record.issuer !== ctx.issuer)
-                    throw new Error("issuer mismatch");
-                  const updated = {
-                    ...record,
-                    ...((ctx?.issuer ?? record.issuer)
-                      ? { issuer: ctx?.issuer ?? record.issuer }
-                      : {}),
-                    tokens,
-                    tokensIssuedAt: now(),
-                  };
-                  if (completedGeneration === undefined) return updated;
-                  const {
-                    state: _state,
-                    codeVerifier: _codeVerifier,
-                    authorizationUrl: _authorizationUrl,
-                    scope: _scope,
-                    expiresAt: _expiresAt,
-                    ...completed
-                  } = updated;
-                  return { ...completed, generation: completedGeneration };
-                }),
+                updateIfCurrent(
+                  id,
+                  server,
+                  generation,
+                  (record) => {
+                    if (authorization !== undefined && record.state !== authorization.state)
+                      return undefined;
+                    if (record.issuer && ctx?.issuer && record.issuer !== ctx.issuer)
+                      throw new Error("issuer mismatch");
+                    const updated = {
+                      ...record,
+                      ...((ctx?.issuer ?? record.issuer)
+                        ? { issuer: ctx?.issuer ?? record.issuer }
+                        : {}),
+                      tokens,
+                      tokensIssuedAt: now(),
+                    };
+                    if (completedGeneration === undefined) return updated;
+                    const {
+                      state: _state,
+                      codeVerifier: _codeVerifier,
+                      authorizationUrl: _authorizationUrl,
+                      scope: _scope,
+                      expiresAt: _expiresAt,
+                      ...completed
+                    } = updated;
+                    return { ...completed, generation: completedGeneration };
+                  },
+                  stateLease,
+                ),
               );
               if (saved && completedGeneration !== undefined)
                 authorization?.onSaved(completedGeneration);
@@ -578,23 +647,35 @@ const make = (config: ProjectMcpOAuthConfig) =>
               if (!state) throw new Error("OAuth authorization URL did not include state");
               const scope = authorizationUrl.searchParams.get("scope") ?? undefined;
               const saved = await Effect.runPromise(
-                updateIfCurrent(id, server, generation, (record) => ({
-                  ...record,
-                  state,
-                  redirectUrl: String(provider.redirectUrl),
-                  expiresAt: now() + STATE_TTL_MS,
-                  authorizationUrl: authorizationUrl.toString(),
-                  ...(scope === undefined ? {} : { scope }),
-                })),
+                updateIfCurrent(
+                  id,
+                  server,
+                  generation,
+                  (record) => ({
+                    ...record,
+                    state,
+                    redirectUrl: String(provider.redirectUrl),
+                    expiresAt: now() + STATE_TTL_MS,
+                    authorizationUrl: authorizationUrl.toString(),
+                    ...(scope === undefined ? {} : { scope }),
+                  }),
+                  stateLease,
+                ),
               );
               if (!saved) throw new Error("OAuth authorization state is stale");
             },
             saveCodeVerifier: async (codeVerifier) => {
               await Effect.runPromise(
-                updateIfCurrent(id, server, generation, (record) => ({
-                  ...record,
-                  codeVerifier,
-                })),
+                updateIfCurrent(
+                  id,
+                  server,
+                  generation,
+                  (record) => ({
+                    ...record,
+                    codeVerifier,
+                  }),
+                  stateLease,
+                ),
               );
             },
             codeVerifier: async () => {
@@ -605,13 +686,19 @@ const make = (config: ProjectMcpOAuthConfig) =>
             state: () => random(),
             saveDiscoveryState: async (discovery) => {
               const saved = await Effect.runPromise(
-                updateIfCurrent(id, server, generation, (record) => ({
-                  ...record,
-                  discovery,
-                  ...(discovery.authorizationServerMetadata?.issuer
-                    ? { issuer: discovery.authorizationServerMetadata.issuer }
-                    : {}),
-                })),
+                updateIfCurrent(
+                  id,
+                  server,
+                  generation,
+                  (record) => ({
+                    ...record,
+                    discovery,
+                    ...(discovery.authorizationServerMetadata?.issuer
+                      ? { issuer: discovery.authorizationServerMetadata.issuer }
+                      : {}),
+                  }),
+                  stateLease,
+                ),
               );
               if (!saved) throw new Error("OAuth authorization requires reconnect.");
             },
@@ -623,39 +710,45 @@ const make = (config: ProjectMcpOAuthConfig) =>
             },
             invalidateCredentials: async (scope) => {
               await Effect.runPromise(
-                updateIfCurrent(id, server, generation, (record) => {
-                  if (scope === "all")
-                    return {
-                      kind: RECORD_NAME,
-                      serverId: id,
-                      resource: record.resource,
-                      generation,
-                    };
-                  if (scope === "tokens") {
-                    const { tokens: _tokens, tokensIssuedAt: _issued, ...retained } = record;
+                updateIfCurrent(
+                  id,
+                  server,
+                  generation,
+                  (record) => {
+                    if (scope === "all")
+                      return {
+                        kind: RECORD_NAME,
+                        serverId: id,
+                        resource: record.resource,
+                        generation,
+                      };
+                    if (scope === "tokens") {
+                      const { tokens: _tokens, tokensIssuedAt: _issued, ...retained } = record;
+                      return retained;
+                    }
+                    if (scope === "verifier") {
+                      const { codeVerifier: _verifier, ...retained } = record;
+                      return retained;
+                    }
+                    if (scope === "discovery") {
+                      const { discovery: _discovery, ...retained } = record;
+                      return retained;
+                    }
+                    const {
+                      client: _client,
+                      tokens: _tokens,
+                      tokensIssuedAt: _issued,
+                      state: _state,
+                      codeVerifier: _verifier,
+                      authorizationUrl: _url,
+                      scope: _scope,
+                      expiresAt: _expiry,
+                      ...retained
+                    } = record;
                     return retained;
-                  }
-                  if (scope === "verifier") {
-                    const { codeVerifier: _verifier, ...retained } = record;
-                    return retained;
-                  }
-                  if (scope === "discovery") {
-                    const { discovery: _discovery, ...retained } = record;
-                    return retained;
-                  }
-                  const {
-                    client: _client,
-                    tokens: _tokens,
-                    tokensIssuedAt: _issued,
-                    state: _state,
-                    codeVerifier: _verifier,
-                    authorizationUrl: _url,
-                    scope: _scope,
-                    expiresAt: _expiry,
-                    ...retained
-                  } = record;
-                  return retained;
-                }),
+                  },
+                  stateLease,
+                ),
               );
             },
           };
@@ -663,6 +756,9 @@ const make = (config: ProjectMcpOAuthConfig) =>
         },
         catch: (cause) => new ProjectMcpOAuthError({ operation: "create provider", cause }),
       });
+
+    const providerFor: ProjectMcpOAuthShape["providerFor"] = (id, supplied, stateLease) =>
+      providerForWithOptions(id, supplied, stateLease === undefined ? undefined : { stateLease });
 
     const begin: ProjectMcpOAuthShape["begin"] = (input) => {
       const redirectOrigin =
@@ -868,11 +964,13 @@ const make = (config: ProjectMcpOAuthConfig) =>
           catch: (cause) => new ProjectMcpOAuthError({ operation: "resolve callback", cause }),
         });
         let completedGeneration: string | undefined;
-        const provider = yield* providerFor(found.serverId, callbackServer, {
-          generation: record.generation ?? 0,
-          state,
-          onSaved: (generation) => {
-            completedGeneration = generation;
+        const provider = yield* providerForWithOptions(found.serverId, callbackServer, {
+          authorization: {
+            generation: record.generation ?? 0,
+            state,
+            onSaved: (generation) => {
+              completedGeneration = generation;
+            },
           },
         });
         yield* Effect.tryPromise({
@@ -929,15 +1027,13 @@ const make = (config: ProjectMcpOAuthConfig) =>
         mutex.withPermits(1)(
           Effect.gen(function* () {
             nextGeneration(id);
-            for (const record of yield* recordsFor(id)) {
-              yield* secrets
-                .removeAuxiliarySecret(id, record.id)
-                .pipe(
-                  Effect.mapError(
-                    (cause) => new ProjectMcpOAuthError({ operation: "disconnect", cause }),
-                  ),
-                );
-            }
+            yield* secrets
+              .revokeOAuthState(id)
+              .pipe(
+                Effect.mapError(
+                  (cause) => new ProjectMcpOAuthError({ operation: "disconnect", cause }),
+                ),
+              );
             forgetPendingStatesFor(id);
           }),
         ),

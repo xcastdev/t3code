@@ -1526,6 +1526,50 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
     }),
   );
 
+  it.effect("leases OAuth state for live sessions through catalog removal", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+      const secretFiles = yield* ServerSecretStore.ServerSecretStore;
+      const projectId = ProjectId.make("oauth-session-lease-project");
+      yield* createProject(projectId, "create-oauth-session-lease-project");
+      const server = yield* service.create({
+        projectId,
+        name: "OAuth state lease",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: {
+          type: "streamable-http",
+          url: "https://oauth-session.example.test/mcp",
+          headers: [],
+          authorization: { type: "oauth", registration: { type: "automatic" } },
+        },
+      });
+      const stateId = yield* secrets.createAuxiliarySecret(server.id, "oauth-session-state");
+      const firstScope = yield* Scope.make();
+      const first = yield* service
+        .acquireSessionLease(projectId, codexInstance)
+        .pipe(Effect.provideService(Scope.Scope, firstScope));
+      const stateLease = first.oauthStateLeases.get(server.id);
+      expect(stateLease).toBeDefined();
+      if (!stateLease) return yield* Effect.die("Expected an OAuth state lease");
+
+      yield* service.remove({ projectId, id: server.id });
+      const secondScope = yield* Scope.make();
+      const second = yield* service
+        .acquireSessionLease(projectId, codexInstance)
+        .pipe(Effect.provideService(Scope.Scope, secondScope));
+      expect(second.servers.some(({ id }) => id === server.id)).toBe(false);
+      expect(yield* stateLease.resolve(stateId)).toBe("oauth-session-state");
+
+      yield* Scope.close(firstScope, Exit.void);
+      expect(
+        Option.isNone(yield* secretFiles.get(ProjectMcpSecretStore.credentialSecretName(stateId))),
+      ).toBe(true);
+      yield* Scope.close(secondScope, Exit.void);
+    }),
+  );
+
   it.effect("serializes each server mutation through dispatch and secret commit", () =>
     Effect.gen(function* () {
       const service = yield* ProjectMcpService.ProjectMcpService;

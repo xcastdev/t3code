@@ -85,7 +85,7 @@ const makeProviderProjectContextTestLayer = (
   resolveForSession: ProjectMcpService.ProjectMcpServiceShape["resolveForSession"] = () =>
     Effect.succeed([]),
   acquireSessionLease: ProjectMcpService.ProjectMcpServiceShape["acquireSessionLease"] = () =>
-    Effect.succeed({ servers: [], resolveSecret: () => undefined }),
+    Effect.succeed({ servers: [], resolveSecret: () => undefined, oauthStateLeases: new Map() }),
 ) =>
   Layer.mergeAll(
     Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
@@ -378,6 +378,7 @@ function makeProviderServiceLayer(
       Effect.as({
         servers: [projectMcpServer],
         resolveSecret: () => undefined,
+        oauthStateLeases: new Map(),
       }),
     ),
   );
@@ -803,6 +804,7 @@ const makeMcpLifecycleHarness = Effect.fn("makeMcpLifecycleHarness")(function* (
         return {
           servers: [routing.projectMcpServer],
           resolveSecret: () => (lease.active ? "leased-secret" : undefined),
+          oauthStateLeases: new Map(),
         };
       }),
     ),
@@ -3038,6 +3040,7 @@ describe("agent browser access", () => {
             Effect.succeed({
               servers: [projectMcpServer],
               resolveSecret: () => undefined,
+              oauthStateLeases: new Map(),
             }),
         ),
       ).pipe(

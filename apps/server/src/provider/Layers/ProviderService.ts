@@ -314,6 +314,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     resolveProjectMcpSecret?: Parameters<
       typeof McpSessionRegistry.issueActiveMcpCredential
     >[0]["resolveProjectMcpSecret"],
+    oauthStateLeases: NonNullable<
+      Parameters<typeof McpSessionRegistry.issueActiveMcpCredential>[0]["oauthStateLeases"]
+    > = new Map(),
   ) =>
     Effect.gen(function* () {
       const includePreview = yield* agentBrowserAccessEnabled;
@@ -334,6 +337,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         ...(includePreview ? {} : { includePreview: false as const }),
         ...(projectMcpServers && projectMcpServers.length > 0 ? { projectMcpServers } : {}),
         ...(resolveProjectMcpSecret === undefined ? {} : { resolveProjectMcpSecret }),
+        ...(oauthStateLeases.size > 0 ? { oauthStateLeases } : {}),
       });
       yield* Effect.sync(() => {
         if (!includePreview) {
@@ -471,6 +475,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           input.providerInstanceId,
           projectMcpSession.servers,
           projectMcpSession.resolveSecret,
+          projectMcpSession.oauthStateLeases,
         );
         const issuedProjectMcpServers = credential?.config.projectServers;
         return yield* input.adapter.startSession({

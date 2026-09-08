@@ -58,6 +58,10 @@ export interface ProjectMcpProxySessionInput {
   readonly servers: ReadonlyArray<ResolvedProjectMcpServer>;
   /** Used by tests and by secret-store integrations that already own a lease. */
   readonly resolveSecret?: (serverId: McpServerId, credentialId: string) => string | undefined;
+  readonly oauthStateLeases?: ReadonlyMap<
+    McpServerId,
+    ProjectMcpSecretStore.ProjectMcpOAuthStateLease
+  >;
 }
 
 export type ProjectMcpProxyErrorCode =
@@ -101,6 +105,7 @@ export class ProjectMcpProxyUnknownEndpointError extends ProjectMcpProxyError {
 interface ConnectionRecord {
   readonly server: ResolvedProjectMcpServer;
   readonly resolveSecret?: ProjectMcpProxySessionInput["resolveSecret"];
+  readonly oauthStateLeases?: ProjectMcpProxySessionInput["oauthStateLeases"];
   readonly opening: Promise<ProjectMcpConnection>;
   modernBroker?: ProjectMcpBroker;
   modernBrokerOpening?: Promise<ProjectMcpBroker>;
@@ -122,6 +127,7 @@ interface SessionRecord {
   readonly endpoints: ReadonlyMap<string, ProjectMcpProxyEndpoint>;
   readonly connections: Map<string, ConnectionRecord>;
   readonly resolveSecret?: ProjectMcpProxySessionInput["resolveSecret"];
+  readonly oauthStateLeases?: ProjectMcpProxySessionInput["oauthStateLeases"];
   readonly revokedServerIds: Set<McpServerId>;
   revoked: boolean;
 }
@@ -497,6 +503,7 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
       endpoints: endpointMap,
       connections: new Map(),
       resolveSecret: input.resolveSecret,
+      oauthStateLeases: input.oauthStateLeases,
       revokedServerIds: new Set(),
       revoked: false,
     });
@@ -536,7 +543,15 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
           ? await Effect.runPromise(
               ProjectMcpOAuth.resolveServerBinding(server, (_serverId, credentialId) =>
                 Effect.succeed(secretValues.get(credentialId)),
-              ).pipe(Effect.flatMap((binding) => oauth.value.providerFor(server.id, binding))),
+              ).pipe(
+                Effect.flatMap((binding) =>
+                  oauth.value.providerFor(
+                    server.id,
+                    binding,
+                    session.oauthStateLeases?.get(server.id),
+                  ),
+                ),
+              ),
             )
           : undefined;
       return connect({
