@@ -7,6 +7,7 @@ import {
   WsProjectMcpCreateRpc,
   WsProjectMcpRemoveRpc,
   WsProjectMcpOAuthBeginRpc,
+  WsProjectMcpOAuthContinueRpc,
   WsProjectMcpOAuthDisconnectRpc,
   WsProjectMcpUpdateRpc,
   WsSubscribeServerConfigRpc,
@@ -17,6 +18,9 @@ const decodeSubscribeServerConfig = Schema.decodeUnknownSync(
 );
 const decodeOAuthBeginPayload = Schema.decodeUnknownSync(WsProjectMcpOAuthBeginRpc.payloadSchema);
 const decodeOAuthBeginSuccess = Schema.decodeUnknownSync(WsProjectMcpOAuthBeginRpc.successSchema);
+const decodeOAuthContinueSuccess = Schema.decodeUnknownSync(
+  WsProjectMcpOAuthContinueRpc.successSchema,
+);
 const decodeOAuthDisconnectSuccess = Schema.decodeUnknownSync(
   WsProjectMcpOAuthDisconnectRpc.successSchema,
 );
@@ -89,6 +93,20 @@ describe("project MCP OAuth RPC contracts", () => {
         oauthStatus: "not-connected",
       }),
     ).toMatchObject({ oauthStatus: "not-connected" });
+  });
+
+  it("keeps begin and continue success URLs bounded at the shared contract limit", () => {
+    const prefix = "https://issuer.example.test/authorize?padding=";
+    const authorizationUrlAtLimit = `${prefix}${"x".repeat(4_096 - prefix.length)}`;
+    const authorizationUrlOverLimit = `${authorizationUrlAtLimit}x`;
+    const expiresAt = "2026-09-08T00:00:00.000Z";
+    const successAtLimit = { authorizationUrl: authorizationUrlAtLimit, expiresAt };
+    const successOverLimit = { authorizationUrl: authorizationUrlOverLimit, expiresAt };
+
+    expect(decodeOAuthBeginSuccess(successAtLimit)).toEqual(successAtLimit);
+    expect(decodeOAuthContinueSuccess(successAtLimit)).toEqual(successAtLimit);
+    expect(() => decodeOAuthBeginSuccess(successOverLimit)).toThrow();
+    expect(() => decodeOAuthContinueSuccess(successOverLimit)).toThrow();
   });
 
   it("accepts committed cleanup-pending mutation errors", () => {

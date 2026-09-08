@@ -168,6 +168,13 @@ const decodeRecord = Schema.decodeUnknownSync(
 );
 const decodeObject = Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown));
 const formValue = (value: string) => new URLSearchParams({ value }).toString().slice(6);
+const oversizedAuthorizationUrl = (state = "oversized-state") => {
+  const url = new URL("https://issuer.example.test/authorize");
+  url.searchParams.set("state", state);
+  url.searchParams.set("padding", "x".repeat(4_096));
+  assert.isTrue(url.toString().length > 4_096);
+  return url;
+};
 
 it.effect("accepts loopback IPv6 and HTTPS browser callback origins", () =>
   Effect.gen(function* () {
@@ -455,6 +462,31 @@ for (const authorizationEndpoint of [
   );
 }
 
+it.effect("rejects an oversized discovered authorization endpoint before persisting", () =>
+  Effect.gen(function* () {
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    const authorizationEndpoint = new URL("https://issuer.example.test/authorize");
+    authorizationEndpoint.searchParams.set("padding", "x".repeat(4_096));
+    assert.isTrue(authorizationEndpoint.toString().length > 4_096);
+    const oauth = yield* prepareOAuth({
+      fetch: async (input, init) => {
+        const response = await fetchOAuthFixture(input, init);
+        if (String(input).endsWith("/.well-known/oauth-authorization-server")) {
+          return Response.json({
+            ...decodeObject(await response.json()),
+            authorization_endpoint: authorizationEndpoint.toString(),
+          });
+        }
+        return response;
+      },
+    });
+    const error = yield* Effect.flip(oauth.begin({ serverId }));
+    assert.instanceOf(error, ProjectMcpOAuth.ProjectMcpOAuthError);
+    assert.equal(error.operation, "begin");
+    assert.deepEqual(yield* secrets.listAuxiliarySecrets(serverId), []);
+  }).pipe(Effect.provide(secretLayer)),
+);
+
 it.effect("rejects an unsafe OAuth step-up URL without persisting it", () =>
   Effect.gen(function* () {
     const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
@@ -474,6 +506,31 @@ it.effect("rejects an unsafe OAuth step-up URL without persisting it", () =>
     const ids = yield* secrets.listAuxiliarySecrets(serverId);
     const record = decodePendingRecord(yield* secrets.resolve(serverId, ids.at(-1)!));
     assert.isUndefined(record.authorizationUrl);
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+it.effect("rejects an oversized OAuth step-up URL without persisting it", () =>
+  Effect.gen(function* () {
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    const oauth = yield* prepareOAuth();
+    const started = yield* oauth.begin({ serverId });
+    assert.equal(
+      (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+      200,
+    );
+    const provider = yield* oauth.providerFor(serverId);
+    const idsBefore = yield* secrets.listAuxiliarySecrets(serverId);
+    const before = decodePendingRecord(yield* secrets.resolve(serverId, idsBefore.at(-1)!));
+    const result = yield* Effect.exit(
+      Effect.promise(async () => {
+        await provider.redirectToAuthorization(oversizedAuthorizationUrl("step-up-oversized"));
+      }),
+    );
+    assert.isTrue(Exit.isFailure(result));
+    const idsAfter = yield* secrets.listAuxiliarySecrets(serverId);
+    assert.deepEqual(idsAfter, idsBefore);
+    const after = decodePendingRecord(yield* secrets.resolve(serverId, idsAfter.at(-1)!));
+    assert.deepEqual(after, before);
   }).pipe(Effect.provide(secretLayer)),
 );
 
@@ -501,6 +558,38 @@ it.effect("rejects an unsafe authorization URL in legacy pending state", () =>
     const error = yield* Effect.flip(oauth.continuePending(serverId));
     assert.instanceOf(error, ProjectMcpOAuth.ProjectMcpOAuthError);
     assert.equal(error.operation, "continue authorization");
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+it.effect("rejects an oversized authorization URL in legacy pending state", () =>
+  Effect.gen(function* () {
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    yield* prepareOAuth();
+    const authorizationUrl = oversizedAuthorizationUrl().toString();
+    assert.isTrue(authorizationUrl.length > 4_096);
+    yield* secrets.createAuxiliarySecret(
+      serverId,
+      encodeLegacyRecord({
+        kind: "project-mcp-oauth",
+        serverId,
+        resource,
+        registration: {},
+        state: "oversized-state",
+        authorizationUrl,
+        // @effect-diagnostics-next-line globalDateInEffect:off
+        expiresAt: Date.now() + 60_000,
+      }),
+    );
+    const pendingId = (yield* secrets.listAuxiliarySecrets(serverId)).at(-1)!;
+    const restarted = yield* ProjectMcpOAuth.__testing.make({
+      servers: [fixtureServer],
+      fetch: fetchOAuthFixture,
+    });
+    const error = yield* Effect.flip(restarted.continuePending(serverId));
+    assert.instanceOf(error, ProjectMcpOAuth.ProjectMcpOAuthError);
+    assert.equal(error.operation, "continue authorization");
+    const record = decodePendingRecord(yield* secrets.resolve(serverId, pendingId));
+    assert.equal(record.authorizationUrl, authorizationUrl);
   }).pipe(Effect.provide(secretLayer)),
 );
 

@@ -6,6 +6,7 @@ import { ProviderInstanceId } from "./providerInstance.ts";
 
 const PROJECT_MCP_NAME_MAX_LENGTH = 120;
 const PROJECT_MCP_URL_MAX_LENGTH = 2048;
+const PROJECT_MCP_OAUTH_AUTHORIZATION_URL_MAX_LENGTH = 4_096;
 
 export const McpServerId = TrimmedNonEmptyString.pipe(Schema.brand("McpServerId"));
 export type McpServerId = typeof McpServerId.Type;
@@ -38,6 +39,7 @@ export const ProjectMcpUrl = Schema.String.check(
 export type ProjectMcpUrl = typeof ProjectMcpUrl.Type;
 
 export const parseProjectMcpOAuthAuthorizationUrl = (value: string): string | undefined => {
+  if (value.length > PROJECT_MCP_OAUTH_AUTHORIZATION_URL_MAX_LENGTH) return undefined;
   try {
     const url = new URL(value);
     if (
@@ -47,7 +49,10 @@ export const parseProjectMcpOAuthAuthorizationUrl = (value: string): string | un
     ) {
       return undefined;
     }
-    return url.toString();
+    const canonical = url.toString();
+    return canonical.length <= PROJECT_MCP_OAUTH_AUTHORIZATION_URL_MAX_LENGTH
+      ? canonical
+      : undefined;
   } catch {
     return undefined;
   }
@@ -61,7 +66,6 @@ const PROJECT_MCP_HEADER_LIMIT = 64;
 const PROJECT_MCP_CREDENTIAL_NAME_MAX_LENGTH = 120;
 const PROJECT_MCP_CREDENTIAL_VALUE_MAX_LENGTH = 16 * 1024;
 const PROJECT_MCP_APPLICATION_REASON_MAX_LENGTH = 1_000;
-const PROJECT_MCP_OAUTH_AUTHORIZATION_URL_MAX_LENGTH = 4_096;
 
 export const ProjectMcpOAuthAuthorizationUrl = TrimmedNonEmptyString.check(
   Schema.isMaxLength(PROJECT_MCP_OAUTH_AUTHORIZATION_URL_MAX_LENGTH),

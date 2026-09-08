@@ -707,6 +707,39 @@ describe("Project MCP contract shapes", () => {
         }),
       ).toThrow();
     }
+
+    const authorizationUrlAtLimit = `https://issuer.example.test/authorize?padding=${"x".repeat(
+      4_096 - "https://issuer.example.test/authorize?padding=".length,
+    )}`;
+    const authorizationUrlOverLimit = `${authorizationUrlAtLimit}x`;
+    const rawUrlThatCanonicalizesOverLimit = `https://issuer.example.test/authorize?padding=${" ".repeat(1_366)}x`;
+    expect(authorizationUrlAtLimit.length).toBe(4_096);
+    expect(authorizationUrlOverLimit.length).toBe(4_097);
+    expect(rawUrlThatCanonicalizesOverLimit.length).toBeLessThanOrEqual(4_096);
+    expect(new URL(rawUrlThatCanonicalizesOverLimit).toString().length).toBeGreaterThan(4_096);
+
+    expect(parseProjectMcpOAuthAuthorizationUrl(authorizationUrlAtLimit)).toBe(
+      authorizationUrlAtLimit,
+    );
+    expect(decodeProjectMcpOAuthAuthorizationUrl(authorizationUrlAtLimit)).toBe(
+      authorizationUrlAtLimit,
+    );
+    expect(parseProjectMcpOAuthAuthorizationUrl(authorizationUrlOverLimit)).toBeUndefined();
+    expect(() => decodeProjectMcpOAuthAuthorizationUrl(authorizationUrlOverLimit)).toThrow();
+    expect(parseProjectMcpOAuthAuthorizationUrl(rawUrlThatCanonicalizesOverLimit)).toBeUndefined();
+    expect(() => decodeProjectMcpOAuthAuthorizationUrl(rawUrlThatCanonicalizesOverLimit)).toThrow();
+    expect(
+      decodeProjectMcpOAuthBeginResult({
+        authorizationUrl: authorizationUrlAtLimit,
+        expiresAt: "2026-09-08T00:00:00.000Z",
+      }),
+    ).toMatchObject({ authorizationUrl: authorizationUrlAtLimit });
+    expect(() =>
+      decodeProjectMcpOAuthBeginResult({
+        authorizationUrl: authorizationUrlOverLimit,
+        expiresAt: "2026-09-08T00:00:00.000Z",
+      }),
+    ).toThrow();
   });
 
   it("decodes an actionable case-folded name conflict error", () => {

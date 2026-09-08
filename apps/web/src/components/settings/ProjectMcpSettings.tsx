@@ -20,6 +20,7 @@ import {
 import type { ProjectMcpTransportDraft } from "@t3tools/contracts";
 import { PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
 import * as Cause from "effect/Cause";
+import { AsyncResult } from "effect/unstable/reactivity";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { isElectron } from "../../env";
@@ -570,10 +571,12 @@ function ScopedProjectMcpCatalogSettings({
           result.value.authorizationUrl,
         );
         if (authorizationUrl === undefined) {
-          reportFailure("Failed to connect MCP OAuth", {
-            _tag: "Failure",
-            cause: Cause.fail(new Error("OAuth returned an unsafe authorization URL.")),
-          });
+          reportFailure(
+            "Failed to connect MCP OAuth",
+            AsyncResult.failure<never, Error>(
+              Cause.fail(new Error("OAuth returned an unsafe authorization URL.")),
+            ),
+          );
           return;
         }
         catalog.refresh();
@@ -606,10 +609,12 @@ function ScopedProjectMcpCatalogSettings({
           result.value.authorizationUrl,
         );
         if (authorizationUrl === undefined) {
-          reportFailure("Failed to continue MCP OAuth", {
-            _tag: "Failure",
-            cause: Cause.fail(new Error("OAuth returned an unsafe authorization URL.")),
-          });
+          reportFailure(
+            "Failed to continue MCP OAuth",
+            AsyncResult.failure<never, Error>(
+              Cause.fail(new Error("OAuth returned an unsafe authorization URL.")),
+            ),
+          );
           return;
         }
         catalog.refresh();

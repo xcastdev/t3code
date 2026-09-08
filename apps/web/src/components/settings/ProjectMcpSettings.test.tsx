@@ -925,38 +925,45 @@ describe("ProjectMcpSettings", () => {
     open.mockRestore();
   });
 
-  it.each(["javascript:alert(1)", "data:text/html,hello", "file:///tmp/authorize"])(
-    "does not render an unsafe OAuth authorization URL: %s",
-    async (authorizationUrl) => {
-      query.data = decodeProjectMcpCatalog({
-        external: [
-          {
-            ...externalServer(),
-            transport: {
-              type: "streamable-http",
-              url: "https://mcp.example.com/endpoint",
-              headers: [],
-              authorization: { type: "oauth", registration: { type: "automatic" } },
-            },
-            url: undefined,
-            oauthStatus: "not-connected",
+  const oversizedAuthorizationUrl = `https://issuer.example.test/authorize?padding=${"x".repeat(4_096)}`;
+
+  it.each([
+    "javascript:alert(1)",
+    "data:text/html,hello",
+    "file:///tmp/authorize",
+    oversizedAuthorizationUrl,
+  ])("does not render an invalid OAuth authorization URL: %s", async (authorizationUrl) => {
+    if (authorizationUrl === oversizedAuthorizationUrl) {
+      expect(authorizationUrl.length).toBeGreaterThan(4_096);
+    }
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          transport: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/endpoint",
+            headers: [],
+            authorization: { type: "oauth", registration: { type: "automatic" } },
           },
-        ],
-        managed: [],
-        applications: [],
-      });
-      commands.oauthBegin.mockResolvedValueOnce({
-        _tag: "Success",
-        value: { authorizationUrl, expiresAt: "2026-09-02T00:00:00.000Z" },
-      });
-      await renderPanel();
-      await click(labelled<HTMLButtonElement>("Edit External"));
-      await click(button("Connect OAuth"));
-      await settle();
-      expect(document.querySelector('a[target="_blank"]')).toBeNull();
-      expect(query.refresh).not.toHaveBeenCalled();
-    },
-  );
+          url: undefined,
+          oauthStatus: "not-connected",
+        },
+      ],
+      managed: [],
+      applications: [],
+    });
+    commands.oauthBegin.mockResolvedValueOnce({
+      _tag: "Success",
+      value: { authorizationUrl, expiresAt: "2026-09-02T00:00:00.000Z" },
+    });
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await click(button("Connect OAuth"));
+    await settle();
+    expect(document.querySelector('a[target="_blank"]')).toBeNull();
+    expect(query.refresh).not.toHaveBeenCalled();
+  });
 
   it("renders a valid HTTP OAuth authorization URL", async () => {
     query.data = decodeProjectMcpCatalog({
@@ -1077,6 +1084,38 @@ describe("ProjectMcpSettings", () => {
       "https://auth.example.com/step-up",
     );
     open.mockRestore();
+  });
+
+  it("does not render or refresh for an oversized OAuth continuation URL", async () => {
+    const authorizationUrl = `https://issuer.example.test/authorize?padding=${"x".repeat(4_096)}`;
+    expect(authorizationUrl.length).toBeGreaterThan(4_096);
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          transport: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/endpoint",
+            headers: [],
+            authorization: { type: "oauth", registration: { type: "automatic" } },
+          },
+          url: undefined,
+          oauthStatus: "authorization-pending",
+        },
+      ],
+      managed: [],
+      applications: [],
+    });
+    commands.oauthContinue.mockResolvedValueOnce({
+      _tag: "Success",
+      value: { authorizationUrl, expiresAt: "2026-09-02T00:00:00.000Z" },
+    });
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await click(button("Continue authorization"));
+    await settle();
+    expect(document.querySelector('a[target="_blank"]')).toBeNull();
+    expect(query.refresh).not.toHaveBeenCalled();
   });
 
   it("shows and removes stale providers while editing", async () => {
