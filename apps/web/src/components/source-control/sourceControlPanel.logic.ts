@@ -147,6 +147,8 @@ export function sourceControlDiffRenderModel(diff: string): ReadonlyArray<Source
 export function canSubmitSourceControlCommit(input: {
   readonly workflowAvailable: boolean;
   readonly stagedCount: number;
+  readonly pendingMergeHeads?: readonly string[] | undefined;
+  readonly hasConflicts?: boolean;
   readonly message: string;
   readonly commitPending: boolean;
   readonly diffReviewReady: boolean;
@@ -155,7 +157,8 @@ export function canSubmitSourceControlCommit(input: {
 }): boolean {
   return (
     input.workflowAvailable &&
-    input.stagedCount > 0 &&
+    (input.stagedCount > 0 || (input.pendingMergeHeads?.length ?? 0) > 0) &&
+    !input.hasConflicts &&
     input.message.trim().length > 0 &&
     !input.commitPending &&
     input.diffReviewReady &&
@@ -177,6 +180,7 @@ export function buildSourceControlCommitInput(input: {
   readonly headCommit: string | null | undefined;
   readonly indexTree: string | undefined;
   readonly refName?: string | null;
+  readonly pendingMergeHeads?: readonly string[] | undefined;
   readonly confirmDefaultRef: boolean;
 }): GitCommitIndexInput {
   return {
@@ -188,6 +192,9 @@ export function buildSourceControlCommitInput(input: {
             expectedHeadCommit: input.headCommit,
             expectedIndexTree: input.indexTree,
             ...(input.refName === undefined ? {} : { expectedRefName: input.refName }),
+            ...(input.pendingMergeHeads === undefined
+              ? {}
+              : { expectedMergeHeads: input.pendingMergeHeads }),
           },
         }
       : {}),

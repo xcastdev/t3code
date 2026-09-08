@@ -252,6 +252,9 @@ function toLocalStatusPart(status: VcsStatusResult): VcsStatusLocalResult {
     ...(status.localRevision === undefined ? {} : { localRevision: status.localRevision }),
     ...(status.headCommit === undefined ? {} : { headCommit: status.headCommit }),
     ...(status.indexTree === undefined ? {} : { indexTree: status.indexTree }),
+    ...(status.pendingMergeHeads === undefined
+      ? {}
+      : { pendingMergeHeads: status.pendingMergeHeads }),
     ...(status.sourceControlProvider
       ? { sourceControlProvider: status.sourceControlProvider }
       : {}),

@@ -912,6 +912,9 @@ export const make = Effect.gen(function* () {
       ...(details.repositoryRoot ? { repositoryRoot: details.repositoryRoot } : {}),
       ...(details.headCommit !== undefined ? { headCommit: details.headCommit } : {}),
       ...(details.indexTree ? { indexTree: details.indexTree } : {}),
+      ...(details.pendingMergeHeads === undefined
+        ? {}
+        : { pendingMergeHeads: details.pendingMergeHeads }),
       ...(hostingProvider ? { sourceControlProvider: hostingProvider } : {}),
       hasPrimaryRemote: details.hasOriginRemote,
       isDefaultRef: details.isDefaultBranch,

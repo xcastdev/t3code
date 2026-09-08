@@ -1349,6 +1349,26 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("reports verified pending merge heads in the local status snapshot", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* git(cwd, ["checkout", "-b", "feature/pending-merge"]);
+        yield* writeTextFile(cwd, "feature.txt", "feature\n");
+        yield* git(cwd, ["add", "feature.txt"]);
+        yield* git(cwd, ["commit", "-m", "feature change"]);
+        const mergeHead = yield* git(cwd, ["rev-parse", "HEAD"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* git(cwd, ["merge", "--no-commit", "-s", "ours", "feature/pending-merge"]);
+
+        const status = yield* driver.statusDetailsLocal(cwd);
+
+        assert.deepStrictEqual(status.pendingMergeHeads, [mergeHead]);
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
     it.effect("reports and stages nested-cwd changes with one root-relative path", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -2266,6 +2286,71 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("diffs, stages, and unstages a tracked submodule gitlink", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const submoduleRepo = yield* makeTmpDir("git-vcs-driver-submodule-");
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        const fileProtocolEnv = { GIT_ALLOW_PROTOCOL: "file" };
+
+        yield* initRepoWithCommit(cwd);
+        yield* initRepoWithCommit(submoduleRepo);
+
+        yield* git(
+          cwd,
+          ["-c", "protocol.file.allow=always", "submodule", "add", submoduleRepo, "module"],
+          fileProtocolEnv,
+        );
+        yield* git(cwd, ["commit", "-m", "add submodule"]);
+        yield* writeTextFile(submoduleRepo, "README.md", "submodule change\n");
+        yield* git(submoduleRepo, ["add", "README.md"]);
+        yield* git(submoduleRepo, ["commit", "-m", "submodule change"]);
+        const changedSubmoduleCommit = yield* git(submoduleRepo, ["rev-parse", "HEAD"]);
+        yield* git(
+          pathService.join(cwd, "module"),
+          ["fetch", submoduleRepo, changedSubmoduleCommit],
+          fileProtocolEnv,
+        );
+        yield* git(pathService.join(cwd, "module"), ["checkout", changedSubmoduleCommit]);
+
+        const status = yield* driver.statusDetailsLocal(cwd);
+        assert.equal(
+          status.workingTree.files.find((file) => file.path === "module")?.path,
+          "module",
+        );
+
+        const diff = yield* driver.getWorkingTreeDiff({ cwd, path: "module", comparison: "head" });
+        assert.include(diff.diff, changedSubmoduleCommit.slice(0, 7));
+        yield* driver.stageFiles({ cwd, paths: ["module"] });
+        assert.include(
+          yield* git(cwd, ["diff", "--cached", "--submodule=short", "--", "module"]),
+          changedSubmoduleCommit.slice(0, 7),
+        );
+        yield* driver.unstageFiles({ cwd, paths: ["module"] });
+        assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only", "--", "module"]), "");
+
+        yield* git(cwd, ["rm", "--cached", "--", "module"]);
+        yield* driver.unstageFiles({ cwd, paths: ["module"] });
+        assert.include(yield* git(cwd, ["ls-files", "--stage", "--", "module"]), "160000");
+        assert.isTrue(yield* fileSystem.exists(pathService.join(cwd, "module")));
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
+    it.effect("continues to reject ordinary directories as index paths", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* initRepoWithCommit(cwd);
+        yield* writeTextFile(cwd, "nested/file.txt", "file\n");
+
+        const error = yield* driver.stageFiles({ cwd, paths: ["nested"] }).pipe(Effect.flip);
+
+        assert.include(error.message, "must identify a file");
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
     it.effect("renders a staged diff from the reviewed tree instead of the live index", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -2507,6 +2592,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           expectedHeadCommit: yield* git(cwd, ["rev-parse", "HEAD"]),
           expectedIndexTree: yield* git(cwd, ["write-tree"]),
           expectedRefName: initialBranch,
+          expectedMergeHeads: [oursCommit],
         };
 
         const committed = yield* driver.commitIndex({
@@ -2533,6 +2619,146 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         assert.isFalse(mergeHeadExists);
         assert.equal(yield* git(cwd, ["show", `${committed.commitSha}:README.md`]), "resolved");
       }),
+    );
+
+    it.effect("creates a two-parent commit for a tree-identical ours merge", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* git(cwd, ["checkout", "-b", "feature/ours-only"]);
+        yield* writeTextFile(cwd, "feature.txt", "feature\n");
+        yield* git(cwd, ["add", "feature.txt"]);
+        yield* git(cwd, ["commit", "-m", "feature change"]);
+        const mergeHead = yield* git(cwd, ["rev-parse", "HEAD"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* git(cwd, ["merge", "--no-commit", "-s", "ours", "feature/ours-only"]);
+
+        const precondition = {
+          expectedHeadCommit: yield* git(cwd, ["rev-parse", "HEAD"]),
+          expectedIndexTree: yield* git(cwd, ["write-tree"]),
+          expectedRefName: initialBranch,
+          expectedMergeHeads: [mergeHead],
+        };
+        const committed = yield* driver.commitIndex({
+          cwd,
+          message: "record ours merge",
+          precondition,
+          confirmDefaultRef: true,
+        });
+
+        const parents = (yield* git(cwd, [
+          "rev-list",
+          "--parents",
+          "-1",
+          committed.commitSha,
+        ])).split(" ");
+        const mergeHeadPath = yield* git(cwd, ["rev-parse", "--git-path", "MERGE_HEAD"]);
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+
+        assert.equal(parents.length, 3);
+        assert.equal(parents[1], precondition.expectedHeadCommit);
+        assert.equal(parents[2], mergeHead);
+        assert.isFalse(yield* fileSystem.exists(pathService.resolve(cwd, mergeHeadPath)));
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
+    it.effect("rejects a guarded commit when the reviewed merge state is cleared", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* git(cwd, ["checkout", "-b", "feature/merge-state"]);
+        yield* writeTextFile(cwd, "README.md", "ours\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "ours"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* writeTextFile(cwd, "README.md", "theirs\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "theirs"]);
+        const mergeResult = yield* driver.execute({
+          operation: "GitVcsDriver.test.merge-state",
+          cwd,
+          args: ["merge", "feature/merge-state"],
+          allowNonZeroExit: true,
+        });
+        assert.equal(mergeResult.exitCode, 1);
+        yield* writeTextFile(cwd, "README.md", "resolved\n");
+        yield* driver.stageFiles({ cwd, paths: ["README.md"] });
+        const precondition = {
+          expectedHeadCommit: yield* git(cwd, ["rev-parse", "HEAD"]),
+          expectedIndexTree: yield* git(cwd, ["write-tree"]),
+          expectedRefName: initialBranch,
+          expectedMergeHeads: [yield* git(cwd, ["rev-parse", "MERGE_HEAD"])],
+        };
+        const headBefore = precondition.expectedHeadCommit;
+        yield* git(cwd, ["merge", "--quit"]);
+
+        const error = yield* driver
+          .commitIndex({
+            cwd,
+            message: "must reject stale merge state",
+            precondition,
+            confirmDefaultRef: true,
+          })
+          .pipe(Effect.flip);
+
+        assert.equal(error.code, "stale_git_state");
+        assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), headBefore);
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
+    it.effect("rejects a guarded commit during a resolved cherry-pick", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* git(cwd, ["checkout", "-b", "feature/cherry-pick-source"]);
+        yield* writeTextFile(cwd, "README.md", "source\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "source change"]);
+        const sourceCommit = yield* git(cwd, ["rev-parse", "HEAD"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* writeTextFile(cwd, "README.md", "target\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "target change"]);
+        const headBefore = yield* git(cwd, ["rev-parse", "HEAD"]);
+        const cherryPick = yield* driver.execute({
+          operation: "GitVcsDriver.test.cherry-pick",
+          cwd,
+          args: ["cherry-pick", sourceCommit],
+          allowNonZeroExit: true,
+        });
+        assert.notEqual(cherryPick.exitCode, 0);
+        yield* writeTextFile(cwd, "README.md", "resolved cherry-pick\n");
+        yield* driver.stageFiles({ cwd, paths: ["README.md"] });
+        const cherryPickHeadPath = yield* git(cwd, ["rev-parse", "--git-path", "CHERRY_PICK_HEAD"]);
+        const precondition = {
+          expectedHeadCommit: headBefore,
+          expectedIndexTree: yield* git(cwd, ["write-tree"]),
+          expectedRefName: initialBranch,
+          expectedMergeHeads: [],
+        };
+
+        const error = yield* driver
+          .commitIndex({
+            cwd,
+            message: "must not finish cherry-pick through guarded commit",
+            precondition,
+            confirmDefaultRef: true,
+          })
+          .pipe(Effect.flip);
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+
+        assert.include(error.message.toLowerCase(), "cherry-pick");
+        assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), headBefore);
+        assert.isTrue(yield* fileSystem.exists(pathService.resolve(cwd, cherryPickHeadPath)));
+      }).pipe(Effect.provide(TestLayer)),
     );
 
     it.effect("uses the only configured remote when guarding its default branch", () =>

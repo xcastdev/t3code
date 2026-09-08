@@ -65,6 +65,7 @@ export interface GitStatusDetails {
   repositoryRoot?: string;
   headCommit?: string | null;
   indexTree?: string;
+  pendingMergeHeads?: ReadonlyArray<string>;
   sourceControlProvider?: VcsStatusResult["sourceControlProvider"];
   hasOriginRemote: boolean;
   isDefaultBranch: boolean;

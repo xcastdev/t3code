@@ -743,6 +743,41 @@ describe("VcsStatusBroadcaster", () => {
     }).pipe(Effect.provide(makeTestLayer(state)));
   });
 
+  it.effect("advances the local revision when only pending merge heads change", () => {
+    const state = {
+      currentLocalStatus: baseLocalStatus,
+      currentRemoteStatus: baseRemoteStatus,
+      localStatusCalls: 0,
+      remoteStatusCalls: 0,
+      localInvalidationCalls: 0,
+      remoteInvalidationCalls: 0,
+    };
+
+    return Effect.gen(function* () {
+      const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+      const snapshotDeferred = yield* Deferred.make<VcsStatusStreamEvent>();
+      const updateDeferred = yield* Deferred.make<VcsStatusStreamEvent>();
+      yield* Stream.runForEach(broadcaster.streamStatus({ cwd: "/repo" }), (event) => {
+        if (event._tag === "snapshot")
+          return Deferred.succeed(snapshotDeferred, event).pipe(Effect.ignore);
+        if (event._tag === "localUpdated")
+          return Deferred.succeed(updateDeferred, event).pipe(Effect.ignore);
+        return Effect.void;
+      }).pipe(Effect.forkScoped);
+
+      yield* Deferred.await(snapshotDeferred);
+      state.currentLocalStatus = { ...baseLocalStatus, pendingMergeHeads: ["merge-head-1"] };
+      const refreshed = yield* broadcaster.refreshLocalStatus("/repo");
+      const update = yield* Deferred.await(updateDeferred);
+
+      assert.equal(refreshed.localRevision, "2");
+      assert.equal(update._tag, "localUpdated");
+      if (update._tag === "localUpdated") {
+        assert.deepStrictEqual(update.local.pendingMergeHeads, ["merge-head-1"]);
+      }
+    }).pipe(Effect.provide(makeTestLayer(state)));
+  });
+
   it.effect("normalizes symlinked CWDs before cache lookup and workflow calls", () => {
     const seenCwds: string[] = [];
     const state = {

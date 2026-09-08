@@ -140,6 +140,7 @@ describe("applyGitStatusStreamEvent", () => {
       localRevision: "7",
       headCommit: "abc123",
       indexTree: "def456",
+      pendingMergeHeads: ["merge-head-1"],
       sourceControlProvider: {
         kind: "github",
         name: "GitHub",

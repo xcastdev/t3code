@@ -303,6 +303,7 @@ describe("Git index and diff contracts", () => {
       localRevision: "revision-1",
       headCommit: "0123456789abcdef",
       indexTree: "tree-1",
+      pendingMergeHeads: ["merge-head-1"],
       workingTree: { files: [], insertions: 0, deletions: 0 },
       hasUpstream: false,
       aheadCount: 0,
@@ -313,6 +314,7 @@ describe("Git index and diff contracts", () => {
     expect(parsed.localRevision).toBe("revision-1");
     expect(parsed.headCommit).toBe("0123456789abcdef");
     expect(parsed.indexTree).toBe("tree-1");
+    expect(parsed.pendingMergeHeads).toEqual(["merge-head-1"]);
   });
 
   it("accepts guarded commit and ref mutation requests", () => {
@@ -320,6 +322,7 @@ describe("Git index and diff contracts", () => {
       expectedHeadCommit: null,
       expectedIndexTree: "tree-1",
       expectedRefName: "main",
+      expectedMergeHeads: [],
     };
 
     expect(

@@ -68,6 +68,24 @@ describe("SourceControlPanel commit interaction", () => {
     ).not.toHaveProperty("confirmDefaultRef");
   });
 
+  it("includes an explicitly reviewed empty merge-head list for ordinary commits", () => {
+    expect(
+      buildSourceControlCommitInput({
+        cwd: "/repo",
+        message: "reviewed ordinary change",
+        headCommit: "head-1",
+        indexTree: "tree-1",
+        refName: "feature/reviewed",
+        pendingMergeHeads: [],
+        confirmDefaultRef: false,
+      }),
+    ).toMatchObject({
+      precondition: {
+        expectedMergeHeads: [],
+      },
+    });
+  });
+
   it("waits for the refreshed reviewed diff before sending a commit", async () => {
     const commit = vi.fn(async () => ({ _tag: "Success" as const, value: undefined }));
     const statusBeforeRefresh = { headCommit: "head-1", indexTree: "tree-1" };

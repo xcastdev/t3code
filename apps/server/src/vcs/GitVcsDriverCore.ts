@@ -1166,6 +1166,62 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const mergeHeadsEqual = (left: ReadonlyArray<string>, right: ReadonlyArray<string>): boolean =>
     left.length === right.length && left.every((head, index) => head === right[index]);
 
+  const readGuardedCommitCherryPickState = Effect.fn(
+    "GitVcsDriver.readGuardedCommitCherryPickState",
+  )(function* (cwd: string) {
+    const cherryPickHeadPathValue = yield* runGitStdout(
+      "GitVcsDriver.readGuardedCommitCherryPickState.path",
+      cwd,
+      ["rev-parse", "--git-path", "CHERRY_PICK_HEAD"],
+    ).pipe(Effect.map((value) => value.trim()));
+    const cherryPickHeadPath = path.isAbsolute(cherryPickHeadPathValue)
+      ? cherryPickHeadPathValue
+      : path.resolve(cwd, cherryPickHeadPathValue);
+    const cherryPickHeadContents = yield* fileSystem.readFileString(cherryPickHeadPath).pipe(
+      Effect.catchTags({
+        PlatformError: (cause) =>
+          cause.reason._tag === "NotFound"
+            ? Effect.succeed(null)
+            : Effect.fail(
+                new GitCommandError({
+                  ...gitCommandContext({
+                    operation: "GitVcsDriver.readGuardedCommitCherryPickState.read",
+                    cwd,
+                    args: ["rev-parse", "--git-path", "CHERRY_PICK_HEAD"],
+                  }),
+                  detail: "Could not read the repository cherry-pick state.",
+                  cause,
+                }),
+              ),
+      }),
+    );
+    if (cherryPickHeadContents === null) {
+      return { path: cherryPickHeadPath, head: null as string | null };
+    }
+
+    const cherryPickHeadLines = cherryPickHeadContents
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+    const cherryPickHead = cherryPickHeadLines[0];
+    if (cherryPickHeadLines.length !== 1 || cherryPickHead === undefined) {
+      return yield* new GitCommandError({
+        ...gitCommandContext({
+          operation: "GitVcsDriver.readGuardedCommitCherryPickState.parse",
+          cwd,
+          args: ["rev-parse", "--git-path", "CHERRY_PICK_HEAD"],
+        }),
+        detail: "The repository cherry-pick state is malformed.",
+      });
+    }
+    const verifiedHead = yield* runGitStdout(
+      "GitVcsDriver.readGuardedCommitCherryPickState.verify",
+      cwd,
+      ["rev-parse", "--verify", "--end-of-options", `${cherryPickHead}^{commit}`],
+    ).pipe(Effect.map((value) => value.trim()));
+    return { path: cherryPickHeadPath, head: verifiedHead };
+  });
+
   const guardedCommitHookNames = Effect.fn("GitVcsDriver.guardedCommitHookNames")(function* (
     cwd: string,
   ) {
@@ -1909,7 +1965,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }
 
       const statusCacheKey = repositoryPaths?.gitCommonDir;
-      const [headResult, indexTreeResult] = yield* Effect.all([
+      const [headResult, indexTreeResult, mergeState] = yield* Effect.all([
         executeGitWithStableDiagnostics(
           "GitVcsDriver.statusDetails.head",
           commandCwd,
@@ -1922,6 +1978,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           ["write-tree"],
           { allowNonZeroExit: true },
         ),
+        readGuardedCommitMergeState(commandCwd),
       ]);
       const headCommit = headResult.exitCode === 0 ? headResult.stdout.trim() : null;
       const indexTree = indexTreeResult.exitCode === 0 ? indexTreeResult.stdout.trim() : null;
@@ -2025,7 +2082,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         { concurrency: "unbounded" },
       );
 
-      const [finalHeadResult, finalIndexTreeResult] = yield* Effect.all([
+      const [finalHeadResult, finalIndexTreeResult, finalMergeState] = yield* Effect.all([
         executeGitWithStableDiagnostics(
           "GitVcsDriver.statusDetails.finalHead",
           commandCwd,
@@ -2038,11 +2095,16 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           ["write-tree"],
           { allowNonZeroExit: true },
         ),
+        readGuardedCommitMergeState(commandCwd),
       ]);
       const finalHead = finalHeadResult.exitCode === 0 ? finalHeadResult.stdout.trim() : null;
       const finalIndexTree =
         finalIndexTreeResult.exitCode === 0 ? finalIndexTreeResult.stdout.trim() : null;
-      if (finalHead !== headCommit || finalIndexTree !== indexTree) {
+      if (
+        finalHead !== headCommit ||
+        finalIndexTree !== indexTree ||
+        !mergeHeadsEqual(finalMergeState.heads, mergeState.heads)
+      ) {
         if (attempt < 2) continue;
         return yield* new GitCommandError({
           ...gitCommandContext({
@@ -2142,6 +2204,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         ...(repositoryPaths?.worktreeRoot ? { repositoryRoot: repositoryPaths.worktreeRoot } : {}),
         headCommit,
         ...(indexTree === null ? {} : { indexTree }),
+        pendingMergeHeads: mergeState.heads,
         hasOriginRemote: hasPrimaryRemote,
         isDefaultBranch,
         branch: refName,
@@ -2201,6 +2264,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         ...(details.repositoryRoot ? { repositoryRoot: details.repositoryRoot } : {}),
         ...(details.headCommit !== undefined ? { headCommit: details.headCommit } : {}),
         ...(details.indexTree ? { indexTree: details.indexTree } : {}),
+        ...(details.pendingMergeHeads === undefined
+          ? {}
+          : { pendingMergeHeads: details.pendingMergeHeads }),
         hasPrimaryRemote: details.hasOriginRemote,
         isDefaultRef: details.isDefaultBranch,
         refName: details.branch,
@@ -2787,6 +2853,34 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     }
   });
 
+  const isTrackedGitlinkPath = Effect.fn("GitVcsDriver.isTrackedGitlinkPath")(function* (
+    repositoryRoot: string,
+    relativePath: string,
+  ) {
+    const parseGitlinkEntries = (stdout: string): boolean =>
+      stdout.split("\0").some((record) => {
+        const tabIndex = record.indexOf("\t");
+        if (tabIndex < 0) return false;
+        const header = record.slice(0, tabIndex).split(" ");
+        return header[0] === "160000" && record.slice(tabIndex + 1) === relativePath;
+      });
+    const indexResult = yield* executeGit(
+      "GitVcsDriver.isTrackedGitlinkPath.index",
+      repositoryRoot,
+      ["--literal-pathspecs", "ls-files", "--stage", "-z", "--", relativePath],
+      { allowNonZeroExit: true },
+    );
+    if (indexResult.exitCode === 0 && parseGitlinkEntries(indexResult.stdout)) return true;
+
+    const headResult = yield* executeGit(
+      "GitVcsDriver.isTrackedGitlinkPath.head",
+      repositoryRoot,
+      ["--literal-pathspecs", "ls-tree", "-z", "HEAD", "--", relativePath],
+      { allowNonZeroExit: true },
+    );
+    return headResult.exitCode === 0 && parseGitlinkEntries(headResult.stdout);
+  });
+
   const validateIndexPaths = Effect.fn("GitVcsDriver.validateIndexPaths")(function* (
     operation: string,
     cwd: string,
@@ -2874,7 +2968,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           ),
         ),
       );
-      if (fileInfo?.type === "Directory") {
+      if (
+        fileInfo?.type === "Directory" &&
+        !(yield* isTrackedGitlinkPath(repositoryRoot, relativePath))
+      ) {
         return yield* indexPathError(
           operation,
           cwd,
@@ -3174,9 +3271,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
       const precondition = input.precondition;
       return yield* Effect.gen(function* () {
-        const [state, mergeState] = yield* Effect.all([
+        const [state, mergeState, cherryPickState] = yield* Effect.all([
           readMutationState(input.cwd),
           readGuardedCommitMergeState(input.cwd),
+          readGuardedCommitCherryPickState(input.cwd),
         ]);
         const expectedRefName = precondition.expectedRefName;
         if (
@@ -3193,6 +3291,31 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             "stale_git_state",
             "Repository state changed after the staged changes were reviewed.",
           );
+        }
+        if (
+          precondition.expectedMergeHeads === undefined
+            ? mergeState.heads.length > 0
+            : !mergeHeadsEqual(mergeState.heads, precondition.expectedMergeHeads)
+        ) {
+          return yield* mutationRejection(
+            "GitVcsDriver.commitIndex.mergePrecondition",
+            input.cwd,
+            "stale_git_state",
+            precondition.expectedMergeHeads === undefined
+              ? "Pending merge state was not reviewed by this client."
+              : "Repository merge state changed after the staged changes were reviewed.",
+          );
+        }
+        if (cherryPickState.head !== null) {
+          return yield* new GitCommandError({
+            ...gitCommandContext({
+              operation: "GitVcsDriver.commitIndex.cherryPick",
+              cwd: input.cwd,
+              args: ["commit-tree"],
+            }),
+            detail:
+              "Guarded commits cannot finish an active cherry-pick. Continue or abort it with Git.",
+          });
         }
 
         const fullRefName = yield* runGitStdout(
@@ -3249,7 +3372,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
                 "rev-parse",
                 `${state.headCommit}^{tree}`,
               ]).pipe(Effect.map((value) => value.trim()));
-        if (headTree === precondition.expectedIndexTree) {
+        if (headTree === precondition.expectedIndexTree && mergeState.heads.length === 0) {
           return yield* new GitCommandError({
             ...gitCommandContext({
               operation: "GitVcsDriver.commitIndex.empty",
@@ -3288,15 +3411,21 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         // commit-tree is deliberately based on the reviewed tree. Re-check
         // the checked-out branch and its tip before publishing so a checkout
         // or branch movement during object creation fails closed.
-        const [stateBeforePublication, mergeStateBeforePublication] = yield* Effect.all([
+        const [
+          stateBeforePublication,
+          mergeStateBeforePublication,
+          cherryPickStateBeforePublication,
+        ] = yield* Effect.all([
           readMutationState(input.cwd),
           readGuardedCommitMergeState(input.cwd),
+          readGuardedCommitCherryPickState(input.cwd),
         ]);
         if (
           stateBeforePublication.currentRef !== state.currentRef ||
           stateBeforePublication.headCommit !== state.headCommit ||
           stateBeforePublication.indexTree !== state.indexTree ||
-          !mergeHeadsEqual(mergeStateBeforePublication.heads, mergeState.heads)
+          !mergeHeadsEqual(mergeStateBeforePublication.heads, mergeState.heads) ||
+          cherryPickStateBeforePublication.head !== cherryPickState.head
         ) {
           return yield* mutationRejection(
             "GitVcsDriver.commitIndex.publicationPrecondition",

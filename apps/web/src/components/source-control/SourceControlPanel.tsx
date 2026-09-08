@@ -324,7 +324,11 @@ function ChangesView({
       return;
     }
     const staged = files.some(isFileStaged);
-    if (!staged || commitPending) return;
+    const hasConflicts = files.some((file) => file.indexStatus === "conflicted");
+    const pendingMergeHeads = status.pendingMergeHeads;
+    const hasMergeOnlyReview = staged === false && (pendingMergeHeads?.length ?? 0) > 0;
+    if ((!staged && !hasMergeOnlyReview) || hasConflicts) return;
+    if (commitPending) return;
     const confirmDefaultRef = async () => {
       const api = readLocalApi();
       if (!api) {
@@ -333,7 +337,9 @@ function ChangesView({
       }
       const branch = status.refName ?? "the default branch";
       return await api.dialogs.confirm(
-        `Commit staged changes on \"${branch}\"?\nThis commits only files already staged in the Git index.`,
+        hasMergeOnlyReview
+          ? `Create a merge commit on \"${branch}\"?\nThere are no file changes; this records the reviewed merge state.`
+          : `Commit staged changes on \"${branch}\"?\nThis commits only files already staged in the Git index.`,
       );
     };
     if (status.isDefaultRef && !(await confirmDefaultRef())) {
@@ -348,6 +354,7 @@ function ChangesView({
       headCommit: status.headCommit,
       indexTree: status.indexTree,
       refName: status.refName,
+      pendingMergeHeads,
       confirmDefaultRef: status.isDefaultRef,
     });
     const result = await submitSourceControlCommit({
@@ -424,11 +431,14 @@ function ChangesView({
   }
 
   const stagedCount = files.filter(isFileStaged).length;
+  const hasConflicts = files.some((file) => file.indexStatus === "conflicted");
   const diffReviewReady =
     selectedFile === null || diffState.kind === "ready" || diffState.kind === "empty";
   const canCommit = canSubmitSourceControlCommit({
     workflowAvailable,
     stagedCount,
+    pendingMergeHeads: status?.pendingMergeHeads,
+    hasConflicts,
     message: commitMessage,
     commitPending,
     diffReviewReady,
@@ -630,7 +640,9 @@ function ChangesView({
           <span className="text-[10px] text-muted-foreground">
             {stagedCount > 0
               ? `${stagedCount} file${stagedCount === 1 ? "" : "s"} staged`
-              : "Stage files to commit"}
+              : (status?.pendingMergeHeads?.length ?? 0) > 0
+                ? "Merge commit ready — no file changes to review."
+                : "Stage files to commit"}
           </span>
           <Button size="sm" disabled={!canCommit} onClick={() => void submitCommit()}>
             <GitCommitIcon className="size-3.5" aria-hidden />

@@ -75,6 +75,31 @@ describe("source control panel logic", () => {
     expect(canSubmitSourceControlCommit({ ...commitState, hasReviewedBranch: true })).toBe(true);
   });
 
+  it("allows a reviewed merge-only commit but not an unreviewed empty commit", () => {
+    const commitState = {
+      workflowAvailable: true,
+      stagedCount: 0,
+      message: "record merge",
+      commitPending: false,
+      diffReviewReady: true,
+      reviewedStateAvailable: true,
+      hasReviewedBranch: true,
+    };
+
+    expect(canSubmitSourceControlCommit(commitState)).toBe(false);
+    expect(
+      canSubmitSourceControlCommit({ ...commitState, pendingMergeHeads: ["merge-head-1"] }),
+    ).toBe(true);
+    expect(canSubmitSourceControlCommit({ ...commitState, pendingMergeHeads: [] })).toBe(false);
+    expect(
+      canSubmitSourceControlCommit({
+        ...commitState,
+        pendingMergeHeads: ["merge-head-1"],
+        hasConflicts: true,
+      }),
+    ).toBe(false);
+  });
+
   it("defaults commit-ready files to the index diff", () => {
     expect(defaultSourceControlDiffComparison({ indexStatus: "staged" })).toBe("index");
     expect(defaultSourceControlDiffComparison({ indexStatus: "both" })).toBe("index");
@@ -191,6 +216,22 @@ describe("source control panel logic", () => {
         confirmDefaultRef: true,
       }),
     ).toMatchObject({ confirmDefaultRef: true });
+
+    expect(
+      buildSourceControlCommitInput({
+        cwd: "/repo",
+        message: "record merge",
+        headCommit: "head-1",
+        indexTree: "tree-1",
+        refName: "feature/workflow",
+        pendingMergeHeads: ["merge-head-1"],
+        confirmDefaultRef: false,
+      }),
+    ).toMatchObject({
+      precondition: {
+        expectedMergeHeads: ["merge-head-1"],
+      },
+    });
   });
 
   it("recognizes typed Git mutation rejections without trusting message text", () => {
