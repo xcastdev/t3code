@@ -83,6 +83,7 @@ interface ProjectMcpCredentialDraft {
   readonly id?: ProjectMcpCredentialId;
   readonly name: string;
   readonly value: string;
+  readonly explicitEmpty?: boolean;
 }
 
 type ProjectMcpFieldErrors = Partial<Record<"name" | "url" | "command", string>>;
@@ -186,13 +187,15 @@ function CredentialFields({
   label,
   entries,
   onChange,
+  disabled,
 }: {
   readonly label: string;
   readonly entries: ReadonlyArray<ProjectMcpCredentialDraft>;
   readonly onChange: (entries: ReadonlyArray<ProjectMcpCredentialDraft>) => void;
+  readonly disabled: boolean;
 }) {
   return (
-    <fieldset className="grid gap-2">
+    <fieldset className="grid gap-2" disabled={disabled}>
       <legend className="text-sm font-medium">Credentials</legend>
       {entries.map((entry, index) => (
         <div key={entry.key} className="grid gap-1.5">
@@ -222,7 +225,22 @@ function CredentialFields({
             }
           />
           {entry.id ? (
-            <p className="text-xs text-muted-foreground">Configured; value hidden.</p>
+            <>
+              <p className="text-xs text-muted-foreground">Configured; value hidden.</p>
+              <Button
+                type="button"
+                variant="ghost"
+                onClick={() =>
+                  onChange(
+                    entries.map((current, i) =>
+                      i === index ? { key: current.key, name: current.name, value: "" } : current,
+                    ),
+                  )
+                }
+              >
+                Set empty value
+              </Button>
+            </>
           ) : null}
           <Button
             type="button"
@@ -291,6 +309,11 @@ function ScopedProjectMcpCatalogSettings({
   );
   const [editing, setEditing] = useState<ProjectMcpServer | null>(null);
   const [draft, setDraft] = useState<ProjectMcpDraft | null>(null);
+  const savedDraft = useRef<ProjectMcpDraft | null>(null);
+  const [authorizationLink, setAuthorizationLink] = useState<{
+    url: string;
+    draft: ProjectMcpDraft | null;
+  } | null>(null);
   const [fieldErrors, setFieldErrors] = useState<ProjectMcpFieldErrors>({});
   const [isSaving, setIsSaving] = useState(false);
   const [removalTarget, setRemovalTarget] = useState<ProjectMcpServer | null>(null);
@@ -300,14 +323,16 @@ function ScopedProjectMcpCatalogSettings({
   const nextArgumentKey = useRef(0);
 
   const openCreate = useCallback(() => {
+    setAuthorizationLink(null);
     setEditing(null);
     setDraft(EMPTY_DRAFT);
     setFieldErrors({});
   }, []);
   const openEdit = useCallback((entry: ProjectMcpServer) => {
+    setAuthorizationLink(null);
     setEditing(entry);
     const transport = entry.transport;
-    setDraft({
+    const initialDraft: ProjectMcpDraft = {
       name: entry.name,
       transportType: transport?.type ?? "legacy-url",
       url: entry.url ?? (transport?.type === "stdio" ? "" : (transport?.url ?? "")),
@@ -360,10 +385,13 @@ function ScopedProjectMcpCatalogSettings({
           : { ...credentialDraft(), name: "OAuth client secret" },
       enabled: entry.enabled,
       providerInstanceIds: entry.providerInstanceIds,
-    });
+    };
+    savedDraft.current = initialDraft;
+    setDraft(initialDraft);
     setFieldErrors({});
   }, []);
   const closeForm = useCallback(() => {
+    setAuthorizationLink(null);
     setDraft(null);
     setEditing(null);
     setFieldErrors({});
@@ -387,9 +415,7 @@ function ScopedProjectMcpCatalogSettings({
     const preserveLegacyUrl =
       draft.transportType === "legacy-url" &&
       draft.authorization === "none" &&
-      draft.headers.every(
-        (credential) => !credential.name.trim() || (credential.value === "" && !credential.id),
-      );
+      draft.headers.every((credential) => !credential.name.trim());
     const httpTransportType =
       draft.transportType === "legacy-url" ? "streamable-http" : draft.transportType;
     const errors: ProjectMcpFieldErrors = {
@@ -422,10 +448,7 @@ function ScopedProjectMcpCatalogSettings({
                     args: draft.args.map((argument) => argument.value),
                     ...(draft.cwd.trim() ? { cwd: draft.cwd.trim() } : {}),
                     env: draft.env
-                      .filter(
-                        (credential) =>
-                          credential.name.trim() && (credential.value !== "" || credential.id),
-                      )
+                      .filter((credential) => credential.name.trim())
                       .map((credential) => ({
                         name: ProjectMcpEnvironmentVariableName.make(credential.name.trim()),
                         credential: credentialInput(credential),
@@ -435,10 +458,7 @@ function ScopedProjectMcpCatalogSettings({
                     type: httpTransportType as "streamable-http" | "legacy-sse",
                     url,
                     headers: draft.headers
-                      .filter(
-                        (credential) =>
-                          credential.name.trim() && (credential.value !== "" || credential.id),
-                      )
+                      .filter((credential) => credential.name.trim())
                       .map((credential) => ({
                         name: ProjectMcpHeaderName.make(credential.name.trim()),
                         credential: credentialInput(credential),
@@ -453,7 +473,9 @@ function ScopedProjectMcpCatalogSettings({
                                 : {
                                     type: "pre-registered" as const,
                                     clientId: draft.oauthClientId.trim(),
-                                    ...(draft.oauthClientSecret.value || draft.oauthClientSecret.id
+                                    ...(draft.oauthClientSecret.value ||
+                                    draft.oauthClientSecret.id ||
+                                    draft.oauthClientSecret.explicitEmpty
                                       ? {
                                           clientSecret: credentialInput(draft.oauthClientSecret),
                                         }
@@ -530,15 +552,16 @@ function ScopedProjectMcpCatalogSettings({
       const result = await oauthBegin({ environmentId, input: { projectId, id: entry.id } });
       if (result._tag === "Success") {
         catalog.refresh();
-        window.open(result.value.authorizationUrl, "_blank", "noopener,noreferrer");
+        setAuthorizationLink({ url: result.value.authorizationUrl, draft });
       } else {
         reportFailure("Failed to connect MCP OAuth", result);
       }
     },
-    [catalog, environmentId, oauthBegin, projectId, reportFailure],
+    [catalog, draft, environmentId, oauthBegin, projectId, reportFailure],
   );
   const disconnectOAuth = useCallback(
     async (entry: ProjectMcpServer) => {
+      setAuthorizationLink(null);
       const result = await oauthDisconnect({ environmentId, input: { projectId, id: entry.id } });
       if (result._tag === "Success") catalog.refresh();
       else reportFailure("Failed to disconnect MCP OAuth", result);
@@ -550,12 +573,12 @@ function ScopedProjectMcpCatalogSettings({
       const result = await oauthContinue({ environmentId, input: { projectId, id: entry.id } });
       if (result._tag === "Success") {
         catalog.refresh();
-        window.open(result.value.authorizationUrl, "_blank", "noopener,noreferrer");
+        setAuthorizationLink({ url: result.value.authorizationUrl, draft });
       } else {
         reportFailure("Failed to continue MCP OAuth", result);
       }
     },
-    [catalog, environmentId, oauthContinue, projectId, reportFailure],
+    [catalog, draft, environmentId, oauthContinue, projectId, reportFailure],
   );
   const removeExisting = useCallback(
     async (entry: ProjectMcpServer) => {
@@ -590,6 +613,10 @@ function ScopedProjectMcpCatalogSettings({
     editing === null
       ? null
       : (catalog.data?.external.find((entry) => entry.id === editing.id) ?? editing);
+  const hasUnsavedChanges =
+    draft !== savedDraft.current ||
+    JSON.stringify(currentEditing?.transport ?? currentEditing?.url) !==
+      JSON.stringify(editing?.transport ?? editing?.url);
   const unavailableProviderIds =
     draft?.providerInstanceIds.filter(
       (providerInstanceId) => !providerNameById.has(providerInstanceId),
@@ -833,6 +860,7 @@ function ScopedProjectMcpCatalogSettings({
                       />
                     </label>
                     <CredentialFields
+                      disabled={!canMutate || isSaving}
                       label="Environment variable"
                       entries={draft.env}
                       onChange={(env) => setDraft({ ...draft, env })}
@@ -861,6 +889,7 @@ function ScopedProjectMcpCatalogSettings({
                       ) : null}
                     </label>
                     <CredentialFields
+                      disabled={!canMutate || isSaving}
                       label="HTTP header"
                       entries={draft.headers}
                       onChange={(headers) => setDraft({ ...draft, headers })}
@@ -930,10 +959,47 @@ function ScopedProjectMcpCatalogSettings({
                                 }
                                 disabled={!canMutate || isSaving}
                               />
-                              {draft.oauthClientSecret.id ? (
-                                <p className="text-xs text-muted-foreground">
-                                  A client secret is configured; its value is never displayed.
-                                </p>
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                disabled={!canMutate || isSaving}
+                                onClick={() =>
+                                  setDraft({
+                                    ...draft,
+                                    oauthClientSecret: {
+                                      ...credentialDraft(),
+                                      name: "OAuth client secret",
+                                      explicitEmpty: true,
+                                    },
+                                  })
+                                }
+                              >
+                                Set empty client secret
+                              </Button>
+                              {draft.oauthClientSecret.id ||
+                              draft.oauthClientSecret.explicitEmpty ||
+                              draft.oauthClientSecret.value ? (
+                                <>
+                                  <p className="text-xs text-muted-foreground">
+                                    A client secret is configured or will be saved.
+                                  </p>
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    disabled={!canMutate || isSaving}
+                                    onClick={() =>
+                                      setDraft({
+                                        ...draft,
+                                        oauthClientSecret: {
+                                          ...credentialDraft(),
+                                          name: "OAuth client secret",
+                                        },
+                                      })
+                                    }
+                                  >
+                                    Remove client secret
+                                  </Button>
+                                </>
                               ) : null}
                             </>
                           ) : null}
@@ -943,7 +1009,7 @@ function ScopedProjectMcpCatalogSettings({
                                 <Button
                                   type="button"
                                   variant="outline"
-                                  disabled={isSaving || !canMutate}
+                                  disabled={isSaving || !canMutate || hasUnsavedChanges}
                                   onClick={() => void connectOAuth(currentEditing)}
                                 >
                                   Reconnect OAuth
@@ -961,7 +1027,7 @@ function ScopedProjectMcpCatalogSettings({
                               <Button
                                 type="button"
                                 variant="outline"
-                                disabled={isSaving || !canMutate}
+                                disabled={isSaving || !canMutate || hasUnsavedChanges}
                                 onClick={() => void continueOAuth(currentEditing)}
                               >
                                 Continue authorization
@@ -970,12 +1036,28 @@ function ScopedProjectMcpCatalogSettings({
                               <Button
                                 type="button"
                                 variant="outline"
-                                disabled={isSaving || !canMutate}
+                                disabled={isSaving || !canMutate || hasUnsavedChanges}
                                 onClick={() => void connectOAuth(currentEditing)}
                               >
                                 Connect OAuth
                               </Button>
                             )
+                          ) : null}
+                          {hasUnsavedChanges ? (
+                            <p className="text-xs text-muted-foreground">
+                              Save changes before connecting OAuth.
+                            </p>
+                          ) : null}
+                          {authorizationLink &&
+                          authorizationLink.draft === draft &&
+                          !hasUnsavedChanges ? (
+                            <a
+                              href={authorizationLink.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              Open OAuth authorization
+                            </a>
                           ) : null}
                         </>
                       ) : null}

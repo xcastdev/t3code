@@ -46,13 +46,18 @@ those sessions stop.
 Header values, stdio environment values, and OAuth client secrets are write-only. An existing
 credential is shown as **Configured**; its value is never returned or placed in the page. Leave a
 retained credential blank to keep it, or choose **Remove credential** to delete it explicitly.
+For a named header or environment variable, an empty new value is saved as an empty string.
+Choose **Set empty value** to replace a retained value with an empty string. Choose
+**Remove client secret** to remove a saved OAuth client secret.
+Choose **Set empty client secret** if the OAuth client requires an explicit empty secret.
 
 For an OAuth server, select **OAuth** and choose automatic registration or a pre-registered client.
-Use **Connect OAuth** to start authorization and **Disconnect OAuth** to revoke T3's stored grant.
+Save your settings, reopen the server, and use **Connect OAuth**, then **Open OAuth authorization**
+to authorize in a new tab. Use **Disconnect OAuth** to revoke T3's stored grant.
 T3 stores tokens, PKCE verifiers, client details, and authorization state in the server secret
 store, not in the project catalog or event history.
 
-If the browser blocks the authorization window, allow pop-ups for the T3 page and try again. The
+The authorization link opens only when you select it. The
 callback must return to the T3 server that started authorization; a different browser origin or
 server address cannot complete that state.
 

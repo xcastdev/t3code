@@ -663,6 +663,175 @@ describe("ProjectMcpSettings", () => {
     });
   });
 
+  it("saves a named empty header instead of dropping it", async () => {
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await input(labelled<HTMLInputElement>("HTTP header name 1"), "X-Empty");
+    await click(button("Save changes"));
+    expect(commands.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          transport: expect.objectContaining({
+            headers: [{ name: "X-Empty", credential: { name: "X-Empty", value: "" } }],
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("prevents OAuth from using unsaved authorization settings", async () => {
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await act(async () => {
+      const select = labelled<HTMLSelectElement>("MCP authorization");
+      select.value = "oauth";
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    await click(button("Connect OAuth"));
+    expect(commands.oauthBegin).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("Save changes before connecting OAuth.");
+  });
+
+  it("removes a retained OAuth client secret from the saved transport", async () => {
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          url: undefined,
+          transport: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/endpoint",
+            headers: [],
+            authorization: {
+              type: "oauth",
+              registration: {
+                type: "pre-registered",
+                clientId: "client",
+                clientSecret: { id: "11111111-1111-4111-8111-111111111111", name: "secret" },
+              },
+            },
+          },
+        },
+      ],
+      managed: [],
+      applications: [],
+    });
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await click(button("Remove client secret"));
+    await click(button("Save changes"));
+    expect(commands.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          transport: expect.objectContaining({
+            authorization: {
+              type: "oauth",
+              registration: { type: "pre-registered", clientId: "client" },
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("can explicitly save an empty OAuth client secret", async () => {
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          url: undefined,
+          transport: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/endpoint",
+            headers: [],
+            authorization: {
+              type: "oauth",
+              registration: { type: "pre-registered", clientId: "client" },
+            },
+          },
+        },
+      ],
+      managed: [],
+      applications: [],
+    });
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await click(button("Set empty client secret"));
+    await click(button("Save changes"));
+    expect(commands.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          transport: expect.objectContaining({
+            authorization: {
+              type: "oauth",
+              registration: {
+                type: "pre-registered",
+                clientId: "client",
+                clientSecret: { name: "OAuth client secret", value: "" },
+              },
+            },
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("replaces a retained environment value with an explicit empty string", async () => {
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          url: undefined,
+          transport: {
+            type: "stdio",
+            command: "tool",
+            args: [],
+            env: [
+              {
+                name: "EMPTY",
+                credential: { id: "11111111-1111-4111-8111-111111111111", name: "EMPTY" },
+              },
+            ],
+          },
+        },
+      ],
+      managed: [],
+      applications: [],
+    });
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await click(button("Set empty value"));
+    await click(button("Save changes"));
+    expect(commands.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          transport: expect.objectContaining({
+            env: [{ name: "EMPTY", credential: { name: "EMPTY", value: "" } }],
+          }),
+        }),
+      }),
+    );
+  });
+
+  it("locks credentials while the save is pending", async () => {
+    let finishSave = () => {};
+    const pending = new Promise<{ _tag: "Success" }>((resolve) => {
+      finishSave = () => resolve({ _tag: "Success" });
+    });
+    commands.update.mockReturnValueOnce(pending);
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await input(labelled<HTMLInputElement>("HTTP header name 1"), "X-Empty");
+    await click(button("Save changes"));
+    expect(labelled<HTMLInputElement>("HTTP header name 1").closest("fieldset")?.disabled).toBe(
+      true,
+    );
+    await act(async () => {
+      finishSave();
+    });
+    expect(commands.update).toHaveBeenCalledTimes(1);
+  });
+
   it("offers OAuth connect and disconnect actions", async () => {
     const open = vi.spyOn(window, "open").mockImplementation(() => null);
     query.data = decodeProjectMcpCatalog({
@@ -691,7 +860,10 @@ describe("ProjectMcpSettings", () => {
       environmentId,
       input: { projectId, id: McpServerId.make("external") },
     });
-    expect(open).toHaveBeenCalledWith("https://auth.example.com", "_blank", "noopener,noreferrer");
+    expect(open).not.toHaveBeenCalled();
+    expect(document.querySelector<HTMLAnchorElement>('a[target="_blank"]')?.href).toBe(
+      "https://auth.example.com/",
+    );
     expect(query.refresh).toHaveBeenCalledTimes(1);
     open.mockRestore();
   });
@@ -776,10 +948,9 @@ describe("ProjectMcpSettings", () => {
       environmentId,
       input: { projectId, id: McpServerId.make("external") },
     });
-    expect(open).toHaveBeenCalledWith(
+    expect(open).not.toHaveBeenCalled();
+    expect(document.querySelector<HTMLAnchorElement>('a[target="_blank"]')?.href).toBe(
       "https://auth.example.com/step-up",
-      "_blank",
-      "noopener,noreferrer",
     );
     open.mockRestore();
   });

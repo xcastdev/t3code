@@ -133,16 +133,6 @@ const makeProjectMcpService = Effect.gen(function* () {
   const mcpSecrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
   const mcpOAuth = yield* Effect.serviceOption(ProjectMcpOAuth.ProjectMcpOAuth);
   const catalogMutationLock = yield* Semaphore.make(1);
-  const mutationLocks = new Map<McpServerId, Semaphore.Semaphore>();
-
-  const mutationLockFor = (serverId: McpServerId) =>
-    Effect.gen(function* () {
-      const existing = mutationLocks.get(serverId);
-      if (existing !== undefined) return existing;
-      const created = yield* Semaphore.make(1);
-      mutationLocks.set(serverId, created);
-      return created;
-    });
 
   const isDefiniteDispatchFailure = (cause: Cause.Cause<unknown>): boolean => {
     const error = Cause.squash(cause);
@@ -387,102 +377,88 @@ const makeProjectMcpService = Effect.gen(function* () {
 
   const update: ProjectMcpServiceShape["update"] = (input) =>
     catalogMutationLock.withPermits(1)(
-      mutationLockFor(input.id).pipe(
-        Effect.flatMap((lock) =>
-          lock.withPermits(1)(
-            Effect.gen(function* () {
-              if (input.patch !== "enabled") {
-                yield* validateTransport(input, "project.mcp-server.update");
-              }
-              const catalog = yield* list(input.projectId);
-              const existing = catalog.external.find((entry) => entry.id === input.id);
-              if (existing === undefined) {
-                return yield* new ProjectMcpServerNotFoundError({ id: input.id });
-              }
-              if (input.patch === "enabled") {
-                const server: ProjectMcpServer = {
-                  id: existing.id,
-                  name: existing.name,
-                  ...(existing.transport === undefined
-                    ? { url: existing.url! }
-                    : { transport: existing.transport }),
-                  enabled: input.enabled,
-                  providerInstanceIds: existing.providerInstanceIds,
-                };
-                yield* engine.dispatch({
-                  type: "project.mcp-server.update",
-                  commandId: CommandId.make(yield* crypto.randomUUIDv4),
-                  projectId: input.projectId,
-                  server,
-                  updatedAt: yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)),
-                });
-                return server;
-              }
-              yield* validateName(input.projectId, input.name, input.id);
-              yield* validateProviderIds(input.providerInstanceIds, existing.providerInstanceIds);
-              const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
-              const commandId = CommandId.make(yield* crypto.randomUUIDv4);
-              const prepared =
-                input.transport === undefined
-                  ? undefined
-                  : yield* mcpSecrets.prepareUpdate(
-                      input.id,
-                      getProjectMcpTransport(existing),
-                      input.transport,
-                    );
-              const server: ProjectMcpServer = {
-                id: input.id,
-                name: input.name,
-                ...(prepared === undefined
-                  ? { url: input.url! }
-                  : { transport: prepared.transport }),
-                enabled: input.enabled,
-                providerInstanceIds: input.providerInstanceIds,
-              };
-              yield* dispatchPrepared(
-                engine.dispatch({
-                  type: "project.mcp-server.update",
-                  commandId,
-                  projectId: input.projectId,
-                  server,
-                  updatedAt: now,
-                }),
-                prepared,
+      Effect.gen(function* () {
+        if (input.patch !== "enabled") {
+          yield* validateTransport(input, "project.mcp-server.update");
+        }
+        const catalog = yield* list(input.projectId);
+        const existing = catalog.external.find((entry) => entry.id === input.id);
+        if (existing === undefined) {
+          return yield* new ProjectMcpServerNotFoundError({ id: input.id });
+        }
+        if (input.patch === "enabled") {
+          const server: ProjectMcpServer = {
+            id: existing.id,
+            name: existing.name,
+            ...(existing.transport === undefined
+              ? { url: existing.url! }
+              : { transport: existing.transport }),
+            enabled: input.enabled,
+            providerInstanceIds: existing.providerInstanceIds,
+          };
+          yield* engine.dispatch({
+            type: "project.mcp-server.update",
+            commandId: CommandId.make(yield* crypto.randomUUIDv4),
+            projectId: input.projectId,
+            server,
+            updatedAt: yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)),
+          });
+          return server;
+        }
+        yield* validateName(input.projectId, input.name, input.id);
+        yield* validateProviderIds(input.providerInstanceIds, existing.providerInstanceIds);
+        const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+        const commandId = CommandId.make(yield* crypto.randomUUIDv4);
+        const prepared =
+          input.transport === undefined
+            ? undefined
+            : yield* mcpSecrets.prepareUpdate(
+                input.id,
+                getProjectMcpTransport(existing),
+                input.transport,
               );
-              if (prepared === undefined && existing.transport !== undefined) {
-                yield* mcpSecrets.retireTransport(input.id, existing.transport);
-              }
-              return server;
-            }),
-          ),
-        ),
-      ),
+        const server: ProjectMcpServer = {
+          id: input.id,
+          name: input.name,
+          ...(prepared === undefined ? { url: input.url! } : { transport: prepared.transport }),
+          enabled: input.enabled,
+          providerInstanceIds: input.providerInstanceIds,
+        };
+        yield* dispatchPrepared(
+          engine.dispatch({
+            type: "project.mcp-server.update",
+            commandId,
+            projectId: input.projectId,
+            server,
+            updatedAt: now,
+          }),
+          prepared,
+        );
+        if (prepared === undefined && existing.transport !== undefined) {
+          yield* mcpSecrets.retireTransport(input.id, existing.transport);
+        }
+        return server;
+      }),
     );
 
   const remove: ProjectMcpServiceShape["remove"] = (input) =>
     catalogMutationLock.withPermits(1)(
-      mutationLockFor(input.id).pipe(
-        Effect.flatMap((lock) =>
-          lock.withPermits(1)(
-            Effect.gen(function* () {
-              const catalog = yield* list(input.projectId);
-              if (!catalog.external.some((entry) => entry.id === input.id)) {
-                return yield* new ProjectMcpServerNotFoundError({ id: input.id });
-              }
-              const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
-              const commandId = CommandId.make(yield* crypto.randomUUIDv4);
-              yield* engine.dispatch({
-                type: "project.mcp-server.remove",
-                commandId,
-                projectId: input.projectId,
-                id: input.id,
-                removedAt: now,
-              });
-              yield* mcpSecrets.removeServer(input.id);
-            }),
-          ),
-        ),
-      ),
+      Effect.gen(function* () {
+        const catalog = yield* list(input.projectId);
+        if (!catalog.external.some((entry) => entry.id === input.id)) {
+          return yield* new ProjectMcpServerNotFoundError({ id: input.id });
+        }
+        const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+        const commandId = CommandId.make(yield* crypto.randomUUIDv4);
+        yield* engine.dispatch({
+          type: "project.mcp-server.remove",
+          commandId,
+          projectId: input.projectId,
+          id: input.id,
+          removedAt: now,
+        });
+        yield* mcpSecrets.removeServer(input.id);
+      }),
     );
 
   const resolveForSession: ProjectMcpServiceShape["resolveForSession"] = (
