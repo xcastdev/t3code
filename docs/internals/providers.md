@@ -81,10 +81,12 @@ an external reload or restart before T3 Code's next refresh sees them.
 
 The OpenCode adapter treats an external server as a separately owned process. Adapter shutdown,
 `stopAll`, and reconnect cleanup close T3 Code's event subscription without calling `session.abort`.
-OpenCode can therefore continue an active turn while T3 Code is offline. When a context replacement
-adopts the same upstream session, the old context is detached in the same way, so changing runtime
-mode or reconnecting does not abort the turn or settle its pending requests. A replacement that
-targets a different upstream session still terminates the old context.
+OpenCode can therefore continue an active turn while T3 Code is offline. A managed context that
+recovers the same upstream session is updated in place, preserving its process, event pump, and
+pending requests. An external context targeting the same upstream session is detached in the same
+way, so changing runtime mode or reconnecting does not abort the turn or settle its pending
+requests. A replacement that targets a different upstream session still terminates the old
+context.
 
 An explicit `stopSession` with an active turn calls `session.abort` and confirms the result before it
 closes the adapter context. A matching `session.error` with `MessageAbortedError`, or a

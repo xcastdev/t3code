@@ -1155,9 +1155,16 @@ const closeOpenCodeContext = Effect.fn("closeOpenCodeContext")(function* (
   return true;
 });
 
-const detachOpenCodeContext = Effect.fn("detachOpenCodeContext")(function* (
+const detachExternalOpenCodeContext = Effect.fn("detachExternalOpenCodeContext")(function* (
   context: OpenCodeSessionContext,
 ) {
+  if (!context.server.external) {
+    return yield* new ProviderAdapterRequestError({
+      provider: PROVIDER,
+      method: "session.detach",
+      detail: "Managed OpenCode sessions must be reused or terminated, not detached.",
+    });
+  }
   if (yield* Ref.getAndSet(context.stopped, true)) {
     return false;
   }
@@ -3902,6 +3909,99 @@ export function makeOpenCodeAdapter(
           }
         }
 
+        if (
+          existing &&
+          existing.server.external === false &&
+          resumeSessionId === existing.openCodeSessionId
+        ) {
+          const requestedDirectoryMatches = yield* sameDirectory(existing.directory, directory);
+          const isCurrentContext = () =>
+            Effect.gen(function* () {
+              return (
+                sessions.get(input.threadId) === existing && !(yield* Ref.get(existing.stopped))
+              );
+            });
+
+          if (requestedDirectoryMatches && (yield* isCurrentContext())) {
+            const inPlaceResult = yield* Effect.gen(function* () {
+              yield* runOpenCodeSdk("session.update", () =>
+                existing.client.session.update({
+                  sessionID: existing.openCodeSessionId,
+                  permission: buildOpenCodePermissionRules(input.runtimeMode),
+                }),
+              ).pipe(Effect.mapError(toRequestError));
+              if (!(yield* isCurrentContext())) {
+                return undefined;
+              }
+
+              const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+              const mcpReplacement = McpProviderSession.readMcpProviderSessionReplacement(
+                input.threadId,
+              );
+              if (mcpSession) {
+                const currentConfig = yield* runOpenCodeSdk("config.get", () =>
+                  existing.client.config.get(),
+                ).pipe(Effect.mapError(toRequestError));
+                previousManagedMcpConfig = currentConfig.data?.mcp?.["t3-code"];
+                managedMcpConfigWasRead = true;
+                if (!(yield* isCurrentContext())) {
+                  return undefined;
+                }
+                yield* runOpenCodeSdk("mcp.add", () =>
+                  existing.client.mcp.add({
+                    name: "t3-code",
+                    config: openCodeMcpConfig(mcpSession),
+                  }),
+                ).pipe(Effect.mapError(toRequestError));
+                if (!(yield* isCurrentContext())) {
+                  return undefined;
+                }
+              } else if (
+                mcpReplacement?.accessWasDisabled &&
+                mcpReplacement.previous !== undefined
+              ) {
+                yield* runOpenCodeSdk("mcp.disconnect", () =>
+                  existing.client.mcp.disconnect({ name: "t3-code" }),
+                ).pipe(Effect.mapError(toRequestError));
+                if (!(yield* isCurrentContext())) {
+                  return undefined;
+                }
+              }
+
+              const session = yield* updateProviderSession(existing, {
+                runtimeMode: input.runtimeMode,
+                ...(input.modelSelection ? { model: input.modelSelection.model } : {}),
+              });
+              if (!(yield* isCurrentContext())) {
+                return undefined;
+              }
+              if (input.recovery !== undefined) {
+                yield* schedulePendingRequestRecovery(existing, { maxRetries: 3 });
+              }
+              return session;
+            }).pipe(
+              Effect.onError(() => restoreMcpConfiguration(existing.client, existing.server)),
+            );
+
+            if (inPlaceResult !== undefined) {
+              return inPlaceResult;
+            }
+
+            yield* restoreMcpConfiguration(existing.client, existing.server);
+            const winner = sessions.get(input.threadId);
+            if (winner && winner !== existing && !(yield* Ref.get(winner.stopped))) {
+              return (yield* awaitOpenCodeContextReady(winner)).session;
+            }
+            if (yield* isCurrentContext()) {
+              return existing.session;
+            }
+            return yield* new ProviderAdapterSessionClosedError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+            });
+          }
+        }
+
         const started = yield* Effect.gen(function* () {
           const sessionScope = yield* Scope.make();
           const startedExit = yield* Effect.exit(
@@ -4169,7 +4269,7 @@ export function makeOpenCodeAdapter(
 
         if (existing && raceWinner === existing && !(yield* Ref.get(existing.stopped))) {
           const handoff = isSameOpenCodeUpstreamSession(existing, context)
-            ? detachOpenCodeContext(existing)
+            ? detachExternalOpenCodeContext(existing)
             : terminateOpenCodeContext(existing);
           const handoffExit = yield* Effect.exit(handoff);
           if (Exit.isFailure(handoffExit)) {
