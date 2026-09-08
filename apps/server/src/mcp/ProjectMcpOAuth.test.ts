@@ -233,6 +233,148 @@ it.effect("rejects unsafe browser callback origins before changing pending state
   }).pipe(Effect.provide(secretLayer)),
 );
 
+it.effect("rejects an unknown callback without scanning persisted OAuth records", () =>
+  Effect.gen(function* () {
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    const persistedServerIds = [
+      serverId,
+      McpServerId.make("oauth-test-server-other-a"),
+      McpServerId.make("oauth-test-server-other-b"),
+    ];
+    for (const persistedServerId of persistedServerIds) {
+      const prepared = yield* secrets.prepareCreate(persistedServerId, {
+        type: "streamable-http",
+        url: `https://${persistedServerId}.example.test/rpc`,
+        headers: [],
+        authorization: { type: "oauth", registration: { type: "automatic" } },
+      });
+      yield* prepared.commit;
+      yield* secrets.createAuxiliarySecret(
+        persistedServerId,
+        encodeLegacyRecord({
+          kind: "project-mcp-oauth",
+          serverId: persistedServerId,
+          resource: `https://${persistedServerId}.example.test/rpc`,
+          registration: {},
+          state: "known-state",
+          // @effect-diagnostics-next-line globalDateInEffect:off
+          expiresAt: Date.now() + 60_000,
+        }),
+      );
+    }
+
+    let listServerIdsReads = 0;
+    let auxiliaryReads = 0;
+    let valueReads = 0;
+    let tokenExchanges = 0;
+    const countedSecrets: ProjectMcpSecretStore.ProjectMcpSecretStoreShape = {
+      ...secrets,
+      listServerIds: () =>
+        Effect.gen(function* () {
+          listServerIdsReads++;
+          return yield* secrets.listServerIds();
+        }),
+      listAuxiliarySecrets: (id) =>
+        Effect.gen(function* () {
+          auxiliaryReads++;
+          return yield* secrets.listAuxiliarySecrets(id);
+        }),
+      resolve: (id, credentialId) =>
+        Effect.gen(function* () {
+          valueReads++;
+          return yield* secrets.resolve(id, credentialId);
+        }),
+    };
+    const oauth = yield* ProjectMcpOAuth.__testing
+      .make({
+        servers: [fixtureServer],
+        fetch: async (input, init) => {
+          if (String(input).endsWith("/token")) tokenExchanges++;
+          return fetchOAuthFixture(input, init);
+        },
+      })
+      .pipe(Effect.provideService(ProjectMcpSecretStore.ProjectMcpSecretStore, countedSecrets));
+
+    listServerIdsReads = 0;
+    auxiliaryReads = 0;
+    valueReads = 0;
+    tokenExchanges = 0;
+    const response = yield* oauth.completeCallback(
+      new Request("https://t3.example.test/oauth/project-mcp/callback?state=unknown&code=unknown"),
+    );
+
+    assert.equal(response.status, 400);
+    assert.equal(listServerIdsReads, 0);
+    assert.equal(auxiliaryReads, 0);
+    assert.equal(valueReads, 0);
+    assert.equal(tokenExchanges, 0);
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+it.effect("uses the hydrated owner index for a valid restarted callback", () =>
+  Effect.gen(function* () {
+    const oauth = yield* prepareOAuth();
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    const otherServerId = McpServerId.make("oauth-test-server-restart-other");
+    const otherPrepared = yield* secrets.prepareCreate(otherServerId, {
+      type: "streamable-http",
+      url: "https://oauth-test-server-restart-other.example.test/rpc",
+      headers: [],
+      authorization: { type: "oauth", registration: { type: "automatic" } },
+    });
+    yield* otherPrepared.commit;
+    yield* secrets.createAuxiliarySecret(
+      otherServerId,
+      encodeLegacyRecord({
+        kind: "project-mcp-oauth",
+        serverId: otherServerId,
+        resource: "https://oauth-test-server-restart-other.example.test/rpc",
+        registration: {},
+        state: "other-state",
+        // @effect-diagnostics-next-line globalDateInEffect:off
+        expiresAt: Date.now() + 60_000,
+      }),
+    );
+    const started = yield* oauth.begin({ serverId });
+
+    let listServerIdsReads = 0;
+    let tokenExchanges = 0;
+    const auxiliaryReadServerIds = new Set<McpServerId>();
+    const countedSecrets: ProjectMcpSecretStore.ProjectMcpSecretStoreShape = {
+      ...secrets,
+      listServerIds: () =>
+        Effect.gen(function* () {
+          listServerIdsReads++;
+          return yield* secrets.listServerIds();
+        }),
+      listAuxiliarySecrets: (id) =>
+        Effect.gen(function* () {
+          auxiliaryReadServerIds.add(id);
+          return yield* secrets.listAuxiliarySecrets(id);
+        }),
+    };
+    const restarted = yield* ProjectMcpOAuth.__testing
+      .make({
+        servers: [],
+        fetch: async (input, init) => {
+          if (String(input).endsWith("/token")) tokenExchanges++;
+          return fetchOAuthFixture(input, init);
+        },
+      })
+      .pipe(Effect.provideService(ProjectMcpSecretStore.ProjectMcpSecretStore, countedSecrets));
+
+    listServerIdsReads = 0;
+    auxiliaryReadServerIds.clear();
+    tokenExchanges = 0;
+    const response = yield* restarted.completeCallback(callbackRequest(started.authorizationUrl));
+
+    assert.equal(response.status, 200);
+    assert.equal(listServerIdsReads, 0);
+    assert.deepEqual([...auxiliaryReadServerIds], [serverId]);
+    assert.equal(tokenExchanges, 1);
+  }).pipe(Effect.provide(secretLayer)),
+);
+
 it.effect("requires reconnect for legacy grants without a registration binding", () =>
   Effect.gen(function* () {
     const oauth = yield* prepareOAuth();

@@ -235,12 +235,33 @@ const make = (config: ProjectMcpOAuthConfig) =>
   Effect.gen(function* () {
     const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
     const byId = new Map(config.servers.map((server) => [server.serverId, server]));
-    const pendingStates = new Map<string, McpServerId>();
+    const pendingStateOwners = new Map<string, Set<McpServerId>>();
     const generations = new Map<string, string | number>();
     const mutex = yield* Semaphore.make(1);
     let authorizedHandler: ProjectMcpOAuthAuthorizedHandler | undefined;
     const fetchFn = config.fetch ?? fetch;
     const now = config.now ?? Date.now;
+    const rememberPendingState = (state: string, serverId: McpServerId) => {
+      const owners = pendingStateOwners.get(state) ?? new Set<McpServerId>();
+      owners.add(serverId);
+      pendingStateOwners.set(state, owners);
+    };
+    const forgetPendingState = (state: string, serverId: McpServerId) => {
+      const owners = pendingStateOwners.get(state);
+      if (owners === undefined) return;
+      owners.delete(serverId);
+      if (owners.size === 0) pendingStateOwners.delete(state);
+    };
+    const forgetPendingStatesFor = (serverId: McpServerId) => {
+      for (const [state, owners] of pendingStateOwners) {
+        owners.delete(serverId);
+        if (owners.size === 0) pendingStateOwners.delete(state);
+      }
+    };
+    const isPendingStateRecord = (record: StoredRecord) =>
+      record.state !== undefined &&
+      record.registration !== undefined &&
+      (record.expiresAt ?? 0) >= now();
     const defaultRedirect = config.redirectOrigin
       ? new URL("/oauth/project-mcp/callback", config.redirectOrigin).toString()
       : "http://127.0.0.1/oauth/project-mcp/callback";
@@ -276,6 +297,27 @@ const make = (config: ProjectMcpOAuthConfig) =>
           (cause) => new ProjectMcpOAuthError({ operation: "read credentials", cause }),
         ),
       );
+    yield* mutex
+      .withPermits(1)(
+        Effect.gen(function* () {
+          const serverIds = [
+            ...new Set([
+              ...config.servers.map(({ serverId }) => serverId),
+              ...(yield* secrets.listServerIds()),
+            ]),
+          ];
+          for (const serverId of serverIds) {
+            for (const { record } of yield* recordsFor(serverId)) {
+              if (isPendingStateRecord(record)) rememberPendingState(record.state!, serverId);
+            }
+          }
+        }).pipe(
+          Effect.mapError(
+            (cause) => new ProjectMcpOAuthError({ operation: "read callback states", cause }),
+          ),
+        ),
+      )
+      .pipe(Effect.orDie);
     const currentUnlocked = (id: McpServerId, server?: ProjectMcpOAuthServer) =>
       recordsFor(id).pipe(
         Effect.map(
@@ -288,6 +330,12 @@ const make = (config: ProjectMcpOAuthConfig) =>
       );
     const current = (id: McpServerId, server?: ProjectMcpOAuthServer) =>
       mutex.withPermits(1)(currentUnlocked(id, server));
+    const recordForPendingState = (id: McpServerId, state: string) =>
+      mutex.withPermits(1)(
+        recordsFor(id).pipe(
+          Effect.map((records) => records.findLast(({ record }) => record.state === state)),
+        ),
+      );
     const save = (id: McpServerId, record: StoredRecord) =>
       Effect.gen(function* () {
         // @effect-diagnostics-next-line preferSchemaOverJson:off
@@ -295,8 +343,11 @@ const make = (config: ProjectMcpOAuthConfig) =>
         for (const old of yield* recordsFor(id)) {
           if (old.id !== replacementId && hasSameResource(old.record, record)) {
             yield* secrets.removeAuxiliarySecret(id, old.id);
+            if (old.record.state !== undefined) forgetPendingState(old.record.state, id);
           }
         }
+        if (isPendingStateRecord(record)) rememberPendingState(record.state!, id);
+        else if (record.state !== undefined) forgetPendingState(record.state, id);
       }).pipe(
         Effect.mapError(
           (cause) => new ProjectMcpOAuthError({ operation: "write credentials", cause }),
@@ -734,11 +785,7 @@ const make = (config: ProjectMcpOAuthConfig) =>
               ...(started.authorizationUrl.searchParams.get("scope") === null
                 ? {}
                 : { scope: started.authorizationUrl.searchParams.get("scope")! }),
-            }).pipe(
-              Effect.tap(() =>
-                Effect.sync(() => pendingStates.set(authorizationState, input.serverId)),
-              ),
-            );
+            });
           }),
         );
         return {
@@ -785,31 +832,11 @@ const make = (config: ProjectMcpOAuthConfig) =>
         const state = url.searchParams.get("state");
         const code = url.searchParams.get("code");
         if (!state || !code) return oauthErrorResponse("Invalid OAuth callback.");
-        const pendingServerId = pendingStates.get(state);
-        const serverIds = [
-          ...new Set([
-            ...config.servers.map(({ serverId }) => serverId),
-            ...(yield* secrets
-              .listServerIds()
-              .pipe(
-                Effect.mapError(
-                  (cause) => new ProjectMcpOAuthError({ operation: "read server IDs", cause }),
-                ),
-              )),
-          ]),
-        ];
-        const matches = yield* Effect.forEach(serverIds, (serverId) =>
-          current(serverId).pipe(Effect.map((record) => ({ serverId, record }))),
-        );
-        const persistedFound = matches.find(({ record }) => record?.state === state);
-        const pendingFound =
-          pendingServerId === undefined
-            ? undefined
-            : matches.find(
-                ({ serverId: candidateServerId, record }) =>
-                  candidateServerId === pendingServerId && record?.state === state,
-              );
-        const found = persistedFound ?? pendingFound;
+        const owners = pendingStateOwners.get(state);
+        if (owners?.size !== 1) return oauthErrorResponse("Invalid OAuth state.");
+        const serverId = [...owners][0]!;
+        const pendingRecord = yield* recordForPendingState(serverId, state);
+        const found = pendingRecord === undefined ? undefined : { serverId, ...pendingRecord };
         const record = found?.record;
         if (
           !found ||
@@ -858,7 +885,7 @@ const make = (config: ProjectMcpOAuthConfig) =>
             }),
           catch: (cause) => new ProjectMcpOAuthError({ operation: "callback", cause }),
         });
-        pendingStates.delete(state);
+        forgetPendingState(state, found.serverId);
         const after = yield* current(found.serverId);
         if (
           completedGeneration === undefined ||
@@ -911,6 +938,7 @@ const make = (config: ProjectMcpOAuthConfig) =>
                   ),
                 );
             }
+            forgetPendingStatesFor(id);
           }),
         ),
     });

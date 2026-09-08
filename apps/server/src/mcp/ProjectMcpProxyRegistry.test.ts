@@ -1,7 +1,7 @@
 import { McpServerId, ThreadId } from "@t3tools/contracts";
 import { expect, it, vi } from "@effect/vitest";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
-import { InMemoryTransport, Server } from "@modelcontextprotocol/server";
+import { InMemoryTransport, Server, type Notification } from "@modelcontextprotocol/server";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
@@ -340,6 +340,9 @@ it.effect("speaks the modern MCP protocol through the SDK client and HTTP route"
 it.effect("keeps modern subscription notifications alive across HTTP requests", () =>
   Effect.gen(function* () {
     let upstreamToolsChanged: ((notification: unknown) => void | Promise<void>) | undefined;
+    let upstreamFallbackNotificationHandler:
+      | ((notification: Notification) => Promise<void>)
+      | undefined;
     const discoverResult = {
       protocolVersion: "2026-07-28",
       supportedVersions: ["2026-07-28"],
@@ -421,6 +424,22 @@ it.effect("keeps modern subscription notifications alive across HTTP requests", 
     );
     expect(secondRequest.status).toBe(200);
     yield* Effect.promise(() => secondRequest.arrayBuffer());
+
+    upstreamFallbackNotificationHandler = (upstream as ProjectMcpClient)
+      .fallbackNotificationHandler;
+    if (upstreamFallbackNotificationHandler === undefined)
+      throw new Error("upstream fallback handler was not registered");
+    yield* Effect.promise(() =>
+      upstreamFallbackNotificationHandler!({
+        method: "com.fixture/catalog",
+        params: { marker: "custom" },
+      }),
+    );
+    const customNotification = yield* Effect.promise(() => reader.read());
+    const customNotificationText = new TextDecoder().decode(customNotification.value);
+    expect(customNotificationText).toContain("com.fixture/catalog");
+    expect(customNotificationText).toContain('"marker":"custom"');
+    expect(customNotificationText).toContain('"io.modelcontextprotocol/subscriptionId":"listen"');
 
     if (upstreamToolsChanged === undefined) throw new Error("upstream handler was not registered");
     yield* Effect.promise(async () => {

@@ -592,6 +592,8 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
             onToolsChanged: () => record.modernBus.publish({ kind: "tools_list_changed" }),
             onPromptsChanged: () => record.modernBus.publish({ kind: "prompts_list_changed" }),
             onResourcesChanged: () => record.modernBus.publish({ kind: "resources_list_changed" }),
+            onUpstreamNotification: (notification) =>
+              record.modernBus.publish({ kind: "notification", notification }),
           },
         });
         record.modernBroker = broker;
