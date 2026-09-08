@@ -29,6 +29,7 @@ import {
   type PreviewEvent,
   ProjectId,
   ProjectMcpCredentialId,
+  ProjectMcpCatalogCommittedCleanupPendingError,
   ProjectMcpHeaderName,
   ProjectMcpNameConflictError,
   ProjectMcpProviderNotFoundError,
@@ -150,6 +151,10 @@ import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
 import * as ProjectMcpService from "./project/ProjectMcpService.ts";
+
+const isProjectMcpCatalogCommittedCleanupPendingError = Schema.is(
+  ProjectMcpCatalogCommittedCleanupPendingError,
+);
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
@@ -5409,6 +5414,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const projectId = ProjectId.make("project-mcp-errors");
       const missingId = McpServerId.make("missing-server");
       const unknownProviderId = ProviderInstanceId.make("missing-provider");
+      const pendingId = McpServerId.make("pending-server");
       const project = {
         id: projectId,
         title: "MCP errors",
@@ -5445,6 +5451,14 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                   );
                 case "Conflict":
                   return Effect.fail(nameConflict);
+                case "Pending create":
+                  return Effect.fail(
+                    new ProjectMcpCatalogCommittedCleanupPendingError({
+                      id: pendingId,
+                      operation: "create",
+                      sequence: 41,
+                    }),
+                  );
                 default:
                   return Effect.fail(
                     new OrchestrationCommandInvariantError({
@@ -5455,8 +5469,26 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                   );
               }
             },
-            update: () => Effect.fail(new ProjectMcpServerNotFoundError({ id: missingId })),
-            remove: () => Effect.fail(new ProjectMcpServerNotFoundError({ id: missingId })),
+            update: (input) =>
+              input.id === pendingId
+                ? Effect.fail(
+                    new ProjectMcpCatalogCommittedCleanupPendingError({
+                      id: pendingId,
+                      operation: "update",
+                      sequence: 42,
+                    }),
+                  )
+                : Effect.fail(new ProjectMcpServerNotFoundError({ id: missingId })),
+            remove: (input) =>
+              input.id === pendingId
+                ? Effect.fail(
+                    new ProjectMcpCatalogCommittedCleanupPendingError({
+                      id: pendingId,
+                      operation: "remove",
+                      sequence: 43,
+                    }),
+                  )
+                : Effect.fail(new ProjectMcpServerNotFoundError({ id: missingId })),
           },
         },
       });
@@ -5512,6 +5544,26 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 providerInstanceIds: [],
               }),
             ),
+            Effect.flip(
+              client[WS_METHODS.projectMcpCreate]({
+                projectId,
+                name: "Pending create",
+                url: "https://pending.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [],
+              }),
+            ),
+            Effect.flip(
+              client[WS_METHODS.projectMcpUpdate]({
+                projectId,
+                id: pendingId,
+                name: "Pending update",
+                url: "https://pending.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [],
+              }),
+            ),
+            Effect.flip(client[WS_METHODS.projectMcpRemove]({ projectId, id: pendingId })),
           ]),
         ),
       );
@@ -5525,6 +5577,9 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           "ProjectMcpServerNotFoundError",
           "ProjectMcpNameConflictError",
           "ProjectMcpNameConflictError",
+          "ProjectMcpCatalogCommittedCleanupPendingError",
+          "ProjectMcpCatalogCommittedCleanupPendingError",
+          "ProjectMcpCatalogCommittedCleanupPendingError",
         ],
       );
       if (errors[0]?._tag === "ProjectMcpProviderNotFoundError") {
@@ -5539,6 +5594,39 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       if (errors[3]?._tag === "ProjectMcpServerNotFoundError") {
         assert.equal(errors[3].id, missingId);
       }
+      const pendingErrors = errors.slice(-3).map((error) => {
+        if (!isProjectMcpCatalogCommittedCleanupPendingError(error))
+          throw new Error("Expected a committed cleanup-pending error");
+        return error;
+      });
+      assert.deepEqual(
+        pendingErrors.map((error) => ({
+          tag: error._tag,
+          id: error.id,
+          operation: error.operation,
+          sequence: error.sequence,
+        })),
+        [
+          {
+            tag: "ProjectMcpCatalogCommittedCleanupPendingError",
+            id: pendingId,
+            operation: "create",
+            sequence: 41,
+          },
+          {
+            tag: "ProjectMcpCatalogCommittedCleanupPendingError",
+            id: pendingId,
+            operation: "update",
+            sequence: 42,
+          },
+          {
+            tag: "ProjectMcpCatalogCommittedCleanupPendingError",
+            id: pendingId,
+            operation: "remove",
+            sequence: 43,
+          },
+        ],
+      );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

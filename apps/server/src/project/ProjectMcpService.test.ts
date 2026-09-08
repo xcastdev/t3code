@@ -2,6 +2,7 @@ import {
   CommandId,
   McpServerId,
   ProjectId,
+  ProjectMcpCatalogCommittedCleanupPendingError,
   ProjectMcpEnvironmentVariableName,
   ProjectMcpHeaderName,
   ProviderDriverKind,
@@ -176,6 +177,9 @@ const makeTestLayer = (
   );
 
 const testLayer = makeTestLayer();
+const isProjectMcpCatalogCommittedCleanupPendingError = Schema.is(
+  ProjectMcpCatalogCommittedCleanupPendingError,
+);
 
 const makeRestartTestLayer = (
   persistenceLayer: ReturnType<typeof makeSqlitePersistenceLive>,
@@ -1652,6 +1656,7 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
     Effect.gen(function* () {
       const service = yield* ProjectMcpService.ProjectMcpService;
       const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+      const engine = yield* OrchestrationEngineService;
       const config = yield* ServerConfig.ServerConfig;
       const fileSystem = yield* FileSystem.FileSystem;
       const projectId = ProjectId.make("create-rollback-project");
@@ -1674,6 +1679,7 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
           authorization: { type: "none" },
         },
       });
+      yield* service.drainThrough(yield* engine.latestSequence);
       const activeTransport = active.transport!;
       if (activeTransport.type !== "streamable-http")
         return yield* Effect.die("Expected HTTP transport");
@@ -1714,6 +1720,310 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
         "rejected-rollback-sentinel",
       );
     }),
+  );
+
+  it.effect("reconciles a transient post-dispatch create failure before returning", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const engine = yield* OrchestrationEngineService;
+      const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+      const files = yield* ServerSecretStore.ServerSecretStore;
+      const projectId = ProjectId.make("post-dispatch-create-project");
+      const originalSet = files.set;
+      let failures = 1;
+      const set = vi.spyOn(files, "set").mockImplementation((name, value) =>
+        name === "project-mcp-secret-manifest" && failures > 0
+          ? Effect.suspend(() => {
+              failures--;
+              return Effect.fail(
+                new ServerSecretStore.SecretStorePersistError({
+                  resource: name,
+                  cause: "injected manifest failure",
+                }),
+              );
+            })
+          : originalSet(name, value),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(() => set.mockRestore()));
+      yield* createProject(projectId, "post-dispatch-create-project");
+      const server = yield* service.create({
+        projectId,
+        name: "Transient create",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: {
+          type: "streamable-http",
+          url: "https://transient-create.example.test/mcp",
+          headers: [
+            {
+              name: ProjectMcpHeaderName.make("X-Api-Key"),
+              credential: { name: "api key", value: "transient-create-secret" },
+            },
+          ],
+          authorization: { type: "none" },
+        },
+      });
+      const sequence = yield* engine.latestSequence;
+      yield* service.drainThrough(sequence);
+      expect(failures).toBe(0);
+      const transport = server.transport!;
+      if (transport.type !== "streamable-http")
+        return yield* Effect.die("Expected streamable HTTP transport");
+      expect(yield* secrets.resolve(server.id, transport.headers[0]!.credential.id)).toBe(
+        "transient-create-secret",
+      );
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("reconciles transient post-dispatch update and remove failures before returning", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+      const files = yield* ServerSecretStore.ServerSecretStore;
+      const projectId = ProjectId.make("post-dispatch-update-remove-project");
+      yield* createProject(projectId, "post-dispatch-update-remove-project");
+      const initial = yield* service.create({
+        projectId,
+        name: "Transient update/remove",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: {
+          type: "streamable-http",
+          url: "https://transient-initial.example.test/mcp",
+          headers: [
+            {
+              name: ProjectMcpHeaderName.make("X-Api-Key"),
+              credential: { name: "initial key", value: "transient-initial-secret" },
+            },
+          ],
+          authorization: { type: "none" },
+        },
+      });
+      const initialTransport = initial.transport;
+      if (initialTransport?.type !== "streamable-http")
+        return yield* Effect.die("Expected streamable HTTP transport");
+      const initialCredentialId = initialTransport.headers[0]!.credential.id;
+      const originalSet = files.set;
+      let failures = 2;
+      const set = vi.spyOn(files, "set").mockImplementation((name, value) =>
+        name === "project-mcp-secret-manifest" && failures > 0
+          ? Effect.suspend(() => {
+              failures--;
+              return Effect.fail(
+                new ServerSecretStore.SecretStorePersistError({
+                  resource: name,
+                  cause: "injected update/remove manifest failure",
+                }),
+              );
+            })
+          : originalSet(name, value),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(() => set.mockRestore()));
+
+      const updated = yield* service.update({
+        projectId,
+        id: initial.id,
+        name: "Transient update/remove",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: {
+          type: "streamable-http",
+          url: "https://transient-updated.example.test/mcp",
+          headers: [
+            {
+              name: ProjectMcpHeaderName.make("X-Api-Key"),
+              credential: { name: "updated key", value: "transient-updated-secret" },
+            },
+          ],
+          authorization: { type: "none" },
+        },
+      });
+      const updatedTransport = updated.transport;
+      if (updatedTransport?.type !== "streamable-http")
+        return yield* Effect.die("Expected streamable HTTP transport");
+      const updatedCredentialId = updatedTransport.headers[0]!.credential.id;
+      expect(yield* secrets.resolve(updated.id, updatedCredentialId)).toBe(
+        "transient-updated-secret",
+      );
+      expect(
+        Option.isNone(
+          yield* files.get(ProjectMcpSecretStore.credentialSecretName(initialCredentialId)),
+        ),
+      ).toBe(true);
+
+      yield* service.remove({ projectId, id: updated.id });
+      expect((yield* service.list(projectId)).external).toEqual([]);
+      expect(failures).toBe(0);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("reports a committed create and repairs it after a persistent manifest failure", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const engine = yield* OrchestrationEngineService;
+      const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+      const files = yield* ServerSecretStore.ServerSecretStore;
+      const projectId = ProjectId.make("persistent-create-project");
+      const originalSet = files.set;
+      const set = vi.spyOn(files, "set").mockImplementation((name, _value) =>
+        name === "project-mcp-secret-manifest"
+          ? Effect.fail(
+              new ServerSecretStore.SecretStorePersistError({
+                resource: name,
+                cause: "injected persistent manifest failure",
+              }),
+            )
+          : originalSet(name, _value),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(() => set.mockRestore()));
+      yield* createProject(projectId, "persistent-create-project");
+      const input = {
+        projectId,
+        name: "Persistent create",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: {
+          type: "streamable-http" as const,
+          url: "https://persistent-create.example.test/mcp",
+          headers: [
+            {
+              name: ProjectMcpHeaderName.make("X-Api-Key"),
+              credential: { name: "api key", value: "persistent-create-secret" },
+            },
+          ],
+          authorization: { type: "none" as const },
+        },
+      };
+      const error = yield* service.create(input).pipe(Effect.flip);
+      expect(error).toBeInstanceOf(ProjectMcpCatalogCommittedCleanupPendingError);
+      expect(error).toMatchObject({ operation: "create" });
+      if (!isProjectMcpCatalogCommittedCleanupPendingError(error))
+        return yield* Effect.die("Expected a committed cleanup-pending error");
+      expect((yield* service.list(projectId)).external).toHaveLength(1);
+      const id = error.id;
+      set.mockRestore();
+
+      const updated = yield* service.update({
+        ...input,
+        id,
+        name: "Persistent create repaired",
+      });
+      yield* service.drainThrough(yield* engine.latestSequence);
+      const transport = updated.transport!;
+      if (transport.type !== "streamable-http")
+        return yield* Effect.die("Expected streamable HTTP transport");
+      expect(yield* secrets.resolve(id, transport.headers[0]!.credential.id)).toBe(
+        "persistent-create-secret",
+      );
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("reports a committed remove and repairs it after a persistent cleanup failure", () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const engine = yield* OrchestrationEngineService;
+      const files = yield* ServerSecretStore.ServerSecretStore;
+      const originalSet = files.set;
+      const projectId = ProjectId.make("persistent-remove-project");
+      yield* createProject(projectId, "persistent-remove-project");
+      const removed = yield* createSecretServer(projectId, "persistent-remove");
+      yield* service.drainThrough(yield* engine.latestSequence);
+      const set = vi.spyOn(files, "set").mockImplementation((name, _value) =>
+        name === "project-mcp-secret-manifest"
+          ? Effect.fail(
+              new ServerSecretStore.SecretStorePersistError({
+                resource: name,
+                cause: "injected persistent removal failure",
+              }),
+            )
+          : originalSet(name, _value),
+      );
+      const error = yield* service.remove({ projectId, id: removed.server.id }).pipe(Effect.flip);
+      expect(error).toBeInstanceOf(ProjectMcpCatalogCommittedCleanupPendingError);
+      expect(error).toMatchObject({ operation: "remove", id: removed.server.id });
+      expect((yield* service.list(projectId)).external).toEqual([]);
+      set.mockRestore();
+
+      yield* createSecretServer(projectId, "persistent-remove-repaired");
+      yield* service.drainThrough(yield* engine.latestSequence);
+      expect(
+        Option.isNone(
+          yield* files.get(ProjectMcpSecretStore.credentialSecretName(removed.credentialId)),
+        ),
+      ).toBe(true);
+    }).pipe(Effect.provide(testLayer)),
+  );
+
+  it.effect("startup reconciliation repairs a committed MCP create after a failed recovery", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      const persistenceLayer = makeSqlitePersistenceLive(config.dbPath);
+      const projectId = ProjectId.make("mcp-create-recovery-restart-project");
+      const server = yield* Effect.gen(function* () {
+        const service = yield* ProjectMcpService.ProjectMcpService;
+        const files = yield* ServerSecretStore.ServerSecretStore;
+        const originalSet = files.set;
+        const set = vi.spyOn(files, "set").mockImplementation((name, _value) =>
+          name === "project-mcp-secret-manifest"
+            ? Effect.fail(
+                new ServerSecretStore.SecretStorePersistError({
+                  resource: name,
+                  cause: "injected restart manifest failure",
+                }),
+              )
+            : originalSet(name, _value),
+        );
+        yield* createProject(projectId, "mcp-create-recovery-restart");
+        const input = {
+          projectId,
+          name: "Restart recovery",
+          enabled: true,
+          providerInstanceIds: [codexInstance],
+          transport: {
+            type: "streamable-http" as const,
+            url: "https://restart-recovery.example.test/mcp",
+            headers: [
+              {
+                name: ProjectMcpHeaderName.make("X-Api-Key"),
+                credential: { name: "api key", value: "restart-recovery-secret" },
+              },
+            ],
+            authorization: { type: "none" as const },
+          },
+        };
+        const error = yield* service.create(input).pipe(Effect.flip);
+        expect(error).toBeInstanceOf(ProjectMcpCatalogCommittedCleanupPendingError);
+        expect(error).toMatchObject({ operation: "create" });
+        const catalog = yield* service.list(projectId);
+        expect(catalog.external).toHaveLength(1);
+        const created = catalog.external[0];
+        if (!created) return yield* Effect.die("Expected committed MCP server");
+        set.mockRestore();
+        return created;
+      }).pipe(Effect.provide(Layer.fresh(makeRestartTestLayer(persistenceLayer, config, false))));
+
+      const restored = yield* Effect.gen(function* () {
+        const service = yield* ProjectMcpService.ProjectMcpService;
+        const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+        const catalog = yield* service.list(projectId);
+        const transport = catalog.external[0]?.transport;
+        if (!transport || transport.type !== "streamable-http")
+          return yield* Effect.die("Expected restored streamable HTTP transport");
+        return {
+          catalog,
+          credential: yield* secrets.resolve(server.id, transport.headers[0]!.credential.id),
+        };
+      }).pipe(Effect.provide(Layer.fresh(makeRestartTestLayer(persistenceLayer, config))));
+
+      expect(restored.catalog.external).toEqual([server]);
+      expect(restored.credential).toBe("restart-recovery-secret");
+    }).pipe(
+      Effect.provide(
+        ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-create-recovery-restart-" }).pipe(
+          Layer.provideMerge(NodeServices.layer),
+        ),
+      ),
+    ),
   );
 
   it.effect("deletes an external entry without affecting another project", () =>

@@ -42,6 +42,7 @@ import {
   type ProjectId,
   type McpServerId,
   ProjectMcpCreateError,
+  ProjectMcpCatalogCommittedCleanupPendingError,
   type ProjectMcpMutationError,
   ProjectMcpRemoveError,
   ProjectMcpUpdateError,
@@ -163,6 +164,9 @@ const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvar
 const isProjectMcpCreateError = Schema.is(ProjectMcpCreateError);
 const isProjectMcpUpdateError = Schema.is(ProjectMcpUpdateError);
 const isProjectMcpRemoveError = Schema.is(ProjectMcpRemoveError);
+const isProjectMcpCatalogCommittedCleanupPendingError = Schema.is(
+  ProjectMcpCatalogCommittedCleanupPendingError,
+);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const CONFIG_DISCOVERY_TIMEOUT = Duration.seconds(5);
@@ -1335,12 +1339,14 @@ const makeWsRpcLayer = (
       const preserveProjectMcpMutationError = <A, E extends ProjectMcpMutationError, R>(
         operation: Effect.Effect<A, Error, R>,
         isExpected: (input: unknown) => input is E,
-      ): Effect.Effect<A, E, R> =>
+      ): Effect.Effect<A, E | ProjectMcpCatalogCommittedCleanupPendingError, R> =>
         operation.pipe(
           Effect.catch((error) =>
-            isExpected(error)
+            isExpected(error) || isProjectMcpCatalogCommittedCleanupPendingError(error)
               ? Effect.fail(error)
-              : isOrchestrationCommandInvariantError(error) && isExpected(error.cause)
+              : isOrchestrationCommandInvariantError(error) &&
+                  (isExpected(error.cause) ||
+                    isProjectMcpCatalogCommittedCleanupPendingError(error.cause))
                 ? Effect.fail(error.cause)
                 : Effect.die(error),
           ),

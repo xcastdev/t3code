@@ -2,6 +2,7 @@ import {
   CommandId,
   McpServerId,
   ProjectMcpNameConflictError,
+  ProjectMcpCatalogCommittedCleanupPendingError,
   ProjectMcpEnvironmentVariableNameConflictError,
   ProjectMcpProviderNotFoundError,
   ProjectMcpServer,
@@ -25,6 +26,7 @@ import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
@@ -52,6 +54,13 @@ const MANAGED_PREVIEW_MCP_ID = McpServerId.make("t3-code");
 const isCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
 const isCommandPreviouslyRejectedError = Schema.is(OrchestrationCommandPreviouslyRejectedError);
 const isCommandIdConflictError = Schema.is(OrchestrationCommandIdConflictError);
+
+const projectMcpCleanupEventTypes = new Set([
+  "project.deleted",
+  "project.mcp-server.created",
+  "project.mcp-server.updated",
+  "project.mcp-server.removed",
+]);
 
 const ProjectMcpProjectionRow = Schema.Struct({
   serverId: McpServerId,
@@ -131,6 +140,22 @@ export class ProjectMcpCleanupError extends Schema.TaggedErrorClass<ProjectMcpCl
   },
 ) {}
 
+type CatalogMutationOutcome<A, E extends Error> =
+  | {
+      readonly _tag: "Succeeded";
+      readonly id: McpServerId;
+      readonly value: A;
+      readonly sequence: number;
+    }
+  | { readonly _tag: "Rejected"; readonly id: McpServerId; readonly cause: Cause.Cause<E> }
+  | {
+      readonly _tag: "CommittedSecretFailure";
+      readonly id: McpServerId;
+      readonly value: A;
+      readonly sequence: number;
+      readonly cause: Cause.Cause<ProjectMcpSecretStore.ProjectMcpSecretError>;
+    };
+
 const makeProjectMcpService = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const engine = yield* OrchestrationEngineService;
@@ -151,22 +176,69 @@ const makeProjectMcpService = Effect.gen(function* () {
     );
   };
 
-  const dispatchPrepared = <A, E>(
-    dispatch: Effect.Effect<A, E>,
+  const dispatchPrepared = <A, E extends Error>(
+    dispatch: Effect.Effect<{ sequence: number }, E, never>,
+    id: McpServerId,
+    value: A,
     prepared: ProjectMcpSecretStore.PreparedProjectMcpSecrets | undefined,
-  ): Effect.Effect<A, E | ProjectMcpSecretStore.ProjectMcpSecretError> =>
-    prepared === undefined
-      ? dispatch
-      : Effect.uninterruptibleMask((restore) =>
-          restore(dispatch).pipe(
-            Effect.catchCause((cause) =>
-              isDefiniteDispatchFailure(cause)
-                ? prepared.rollback.pipe(Effect.andThen(Effect.failCause(cause)))
-                : Effect.failCause(cause),
-            ),
-            Effect.flatMap((result) => prepared.commit.pipe(Effect.as(result))),
-          ),
+    secretWork: Effect.Effect<
+      void,
+      ProjectMcpSecretStore.ProjectMcpSecretError,
+      never
+    > = Effect.void,
+  ): Effect.Effect<CatalogMutationOutcome<A, E>, E | ProjectMcpSecretStore.ProjectMcpSecretError> =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const dispatchExit = yield* restore(dispatch).pipe(Effect.exit);
+        if (Exit.isFailure(dispatchExit)) {
+          if (!isDefiniteDispatchFailure(dispatchExit.cause))
+            return yield* Effect.failCause(dispatchExit.cause);
+          yield* prepared?.rollback ?? Effect.void;
+          return {
+            _tag: "Rejected",
+            id,
+            cause: dispatchExit.cause,
+          } satisfies CatalogMutationOutcome<A, E>;
+        }
+
+        const sequence = dispatchExit.value.sequence;
+        const secretExit = yield* (prepared?.commit ?? Effect.void).pipe(
+          Effect.andThen(secretWork),
+          Effect.exit,
         );
+        if (Exit.isFailure(secretExit)) {
+          return {
+            _tag: "CommittedSecretFailure",
+            id,
+            value,
+            sequence,
+            cause: secretExit.cause,
+          } satisfies CatalogMutationOutcome<A, E>;
+        }
+        return { _tag: "Succeeded", id, value, sequence } satisfies CatalogMutationOutcome<A, E>;
+      }),
+    );
+
+  let recoverCommittedMutation: <A, E extends Error>(
+    operation: "create" | "update" | "remove",
+    id: McpServerId,
+    outcome: Extract<CatalogMutationOutcome<A, E>, { readonly _tag: "CommittedSecretFailure" }>,
+  ) => Effect.Effect<void, ProjectMcpCatalogCommittedCleanupPendingError>;
+
+  const finishCatalogMutation = <A, E extends Error>(
+    operation: "create" | "update" | "remove",
+    id: McpServerId,
+    outcome: CatalogMutationOutcome<A, E>,
+  ): Effect.Effect<A, E | ProjectMcpCatalogCommittedCleanupPendingError> => {
+    switch (outcome._tag) {
+      case "Succeeded":
+        return Effect.succeed(outcome.value);
+      case "Rejected":
+        return Effect.failCause(outcome.cause);
+      case "CommittedSecretFailure":
+        return recoverCommittedMutation(operation, id, outcome).pipe(Effect.as(outcome.value));
+    }
+  };
 
   const list: ProjectMcpServiceShape["list"] = (projectId) =>
     Effect.gen(function* () {
@@ -373,130 +445,151 @@ const makeProjectMcpService = Effect.gen(function* () {
     );
 
   const create: ProjectMcpServiceShape["create"] = (input) =>
-    catalogMutationLock.withPermits(1)(
-      Effect.gen(function* () {
-        yield* validateTransport(input, "project.mcp-server.create");
-        const catalog = yield* list(input.projectId);
-        if (catalog.external.length >= PROJECT_MCP_SERVER_LIMIT) {
-          return yield* new ProjectMcpServerLimitExceededError({
-            limit: PROJECT_MCP_SERVER_LIMIT,
-          });
-        }
-        yield* validateName(input.projectId, input.name, undefined);
-        yield* validateProviderIds(input.providerInstanceIds);
-        const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
-        const serverId = McpServerId.make(yield* crypto.randomUUIDv4);
-        const commandId = CommandId.make(yield* crypto.randomUUIDv4);
-        const prepared =
-          input.transport === undefined
-            ? undefined
-            : yield* mcpSecrets.prepareCreate(serverId, input.transport);
-        const server: ProjectMcpServer = {
-          id: serverId,
-          name: input.name,
-          ...(prepared === undefined ? { url: input.url! } : { transport: prepared.transport }),
-          enabled: input.enabled,
-          providerInstanceIds: input.providerInstanceIds,
-        };
-        yield* dispatchPrepared(
-          engine.dispatch({
-            type: "project.mcp-server.create",
-            commandId,
-            projectId: input.projectId,
+    Effect.gen(function* () {
+      const outcome = yield* catalogMutationLock.withPermits(1)(
+        Effect.gen(function* () {
+          yield* validateTransport(input, "project.mcp-server.create");
+          const catalog = yield* list(input.projectId);
+          if (catalog.external.length >= PROJECT_MCP_SERVER_LIMIT) {
+            return yield* new ProjectMcpServerLimitExceededError({
+              limit: PROJECT_MCP_SERVER_LIMIT,
+            });
+          }
+          yield* validateName(input.projectId, input.name, undefined);
+          yield* validateProviderIds(input.providerInstanceIds);
+          const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+          const serverId = McpServerId.make(yield* crypto.randomUUIDv4);
+          const commandId = CommandId.make(yield* crypto.randomUUIDv4);
+          const prepared =
+            input.transport === undefined
+              ? undefined
+              : yield* mcpSecrets.prepareCreate(serverId, input.transport);
+          const server: ProjectMcpServer = {
+            id: serverId,
+            name: input.name,
+            ...(prepared === undefined ? { url: input.url! } : { transport: prepared.transport }),
+            enabled: input.enabled,
+            providerInstanceIds: input.providerInstanceIds,
+          };
+          return yield* dispatchPrepared(
+            engine.dispatch({
+              type: "project.mcp-server.create",
+              commandId,
+              projectId: input.projectId,
+              server,
+              createdAt: now,
+            }),
+            serverId,
             server,
-            createdAt: now,
-          }),
-          prepared,
-        );
-        return server;
-      }),
-    );
+            prepared,
+          );
+        }),
+      );
+      return yield* finishCatalogMutation("create", outcome.id, outcome);
+    });
 
   const update: ProjectMcpServiceShape["update"] = (input) =>
-    catalogMutationLock.withPermits(1)(
-      Effect.gen(function* () {
-        if (input.patch !== "enabled") {
-          yield* validateTransport(input, "project.mcp-server.update");
-        }
-        const catalog = yield* list(input.projectId);
-        const existing = catalog.external.find((entry) => entry.id === input.id);
-        if (existing === undefined) {
-          return yield* new ProjectMcpServerNotFoundError({ id: input.id });
-        }
-        if (input.patch === "enabled") {
+    Effect.gen(function* () {
+      const outcome = yield* catalogMutationLock.withPermits(1)(
+        Effect.gen(function* () {
+          if (input.patch !== "enabled") {
+            yield* validateTransport(input, "project.mcp-server.update");
+          }
+          const catalog = yield* list(input.projectId);
+          const existing = catalog.external.find((entry) => entry.id === input.id);
+          if (existing === undefined) {
+            return yield* new ProjectMcpServerNotFoundError({ id: input.id });
+          }
+          if (input.patch === "enabled") {
+            const server: ProjectMcpServer = {
+              id: existing.id,
+              name: existing.name,
+              ...(existing.transport === undefined
+                ? { url: existing.url! }
+                : { transport: existing.transport }),
+              enabled: input.enabled,
+              providerInstanceIds: existing.providerInstanceIds,
+            };
+            const receipt = yield* engine.dispatch({
+              type: "project.mcp-server.update",
+              commandId: CommandId.make(yield* crypto.randomUUIDv4),
+              projectId: input.projectId,
+              server,
+              updatedAt: yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)),
+            });
+            return {
+              _tag: "Succeeded",
+              id: input.id,
+              value: server,
+              sequence: receipt.sequence,
+            } satisfies CatalogMutationOutcome<ProjectMcpServer, Error>;
+          }
+          yield* validateName(input.projectId, input.name, input.id);
+          yield* validateProviderIds(input.providerInstanceIds, existing.providerInstanceIds);
+          const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+          const commandId = CommandId.make(yield* crypto.randomUUIDv4);
+          const prepared =
+            input.transport === undefined
+              ? undefined
+              : yield* mcpSecrets.prepareUpdate(
+                  input.id,
+                  getProjectMcpTransport(existing),
+                  input.transport,
+                );
           const server: ProjectMcpServer = {
-            id: existing.id,
-            name: existing.name,
-            ...(existing.transport === undefined
-              ? { url: existing.url! }
-              : { transport: existing.transport }),
+            id: input.id,
+            name: input.name,
+            ...(prepared === undefined ? { url: input.url! } : { transport: prepared.transport }),
             enabled: input.enabled,
-            providerInstanceIds: existing.providerInstanceIds,
+            providerInstanceIds: input.providerInstanceIds,
           };
-          yield* engine.dispatch({
-            type: "project.mcp-server.update",
-            commandId: CommandId.make(yield* crypto.randomUUIDv4),
-            projectId: input.projectId,
+          return yield* dispatchPrepared(
+            engine.dispatch({
+              type: "project.mcp-server.update",
+              commandId,
+              projectId: input.projectId,
+              server,
+              updatedAt: now,
+            }),
+            input.id,
             server,
-            updatedAt: yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)),
-          });
-          return server;
-        }
-        yield* validateName(input.projectId, input.name, input.id);
-        yield* validateProviderIds(input.providerInstanceIds, existing.providerInstanceIds);
-        const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
-        const commandId = CommandId.make(yield* crypto.randomUUIDv4);
-        const prepared =
-          input.transport === undefined
-            ? undefined
-            : yield* mcpSecrets.prepareUpdate(
-                input.id,
-                getProjectMcpTransport(existing),
-                input.transport,
-              );
-        const server: ProjectMcpServer = {
-          id: input.id,
-          name: input.name,
-          ...(prepared === undefined ? { url: input.url! } : { transport: prepared.transport }),
-          enabled: input.enabled,
-          providerInstanceIds: input.providerInstanceIds,
-        };
-        yield* dispatchPrepared(
-          engine.dispatch({
-            type: "project.mcp-server.update",
-            commandId,
-            projectId: input.projectId,
-            server,
-            updatedAt: now,
-          }),
-          prepared,
-        );
-        if (prepared === undefined && existing.transport !== undefined) {
-          yield* mcpSecrets.retireTransport(input.id, existing.transport);
-        }
-        return server;
-      }),
-    );
+            prepared,
+            prepared === undefined && existing.transport !== undefined
+              ? mcpSecrets.retireTransport(input.id, existing.transport)
+              : Effect.void,
+          );
+        }),
+      );
+      return yield* finishCatalogMutation("update", input.id, outcome);
+    });
 
   const remove: ProjectMcpServiceShape["remove"] = (input) =>
-    catalogMutationLock.withPermits(1)(
-      Effect.gen(function* () {
-        const catalog = yield* list(input.projectId);
-        if (!catalog.external.some((entry) => entry.id === input.id)) {
-          return yield* new ProjectMcpServerNotFoundError({ id: input.id });
-        }
-        const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
-        const commandId = CommandId.make(yield* crypto.randomUUIDv4);
-        yield* engine.dispatch({
-          type: "project.mcp-server.remove",
-          commandId,
-          projectId: input.projectId,
-          id: input.id,
-          removedAt: now,
-        });
-        yield* mcpSecrets.removeServer(input.id);
-      }),
-    );
+    Effect.gen(function* () {
+      const outcome = yield* catalogMutationLock.withPermits(1)(
+        Effect.gen(function* () {
+          const catalog = yield* list(input.projectId);
+          if (!catalog.external.some((entry) => entry.id === input.id)) {
+            return yield* new ProjectMcpServerNotFoundError({ id: input.id });
+          }
+          const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+          const commandId = CommandId.make(yield* crypto.randomUUIDv4);
+          return yield* dispatchPrepared(
+            engine.dispatch({
+              type: "project.mcp-server.remove",
+              commandId,
+              projectId: input.projectId,
+              id: input.id,
+              removedAt: now,
+            }),
+            input.id,
+            undefined,
+            undefined,
+            mcpSecrets.removeServer(input.id),
+          );
+        }),
+      );
+      return yield* finishCatalogMutation("remove", input.id, outcome);
+    });
 
   const resolveForSession: ProjectMcpServiceShape["resolveForSession"] = (
     projectId,
@@ -662,6 +755,47 @@ const makeProjectMcpService = Effect.gen(function* () {
     if (failure) return yield* failure;
   });
 
+  recoverCommittedMutation = (operation, id, outcome) => {
+    const recovery =
+      cleanupWorker === undefined
+        ? reconcileCatalog.pipe(Effect.mapError((error) => error as Error))
+        : cleanupWorker
+            .enqueue(outcome.sequence)
+            .pipe(
+              Effect.andThen(noteSeen(outcome.sequence)),
+              Effect.andThen(drainThrough(outcome.sequence)),
+            );
+    return recovery.pipe(
+      Effect.matchCauseEffect({
+        onSuccess: () =>
+          Effect.logWarning("project MCP committed mutation recovered", {
+            operation,
+            id,
+            sequence: outcome.sequence,
+            originalCause: outcome.cause,
+          }),
+        onFailure: (recoveryCause) =>
+          Effect.logWarning("project MCP committed mutation cleanup pending", {
+            operation,
+            id,
+            sequence: outcome.sequence,
+            originalCause: outcome.cause,
+            recoveryCause,
+          }).pipe(
+            Effect.andThen(
+              Effect.fail(
+                new ProjectMcpCatalogCommittedCleanupPendingError({
+                  operation,
+                  id,
+                  sequence: outcome.sequence,
+                }),
+              ),
+            ),
+          ),
+      }),
+    );
+  };
+
   const startCleanup: ProjectMcpServiceShape["startCleanup"] = Effect.fn(
     "ProjectMcpService.startCleanup",
   )(function* () {
@@ -676,9 +810,10 @@ const makeProjectMcpService = Effect.gen(function* () {
     yield* noteSeen(sequence);
     yield* forkParked(
       Stream.runForEach(Stream.fromSubscription(subscription), (event) =>
-        (event.type === "project.deleted" ? worker.enqueue(event.sequence) : Effect.void).pipe(
-          Effect.andThen(noteSeen(event.sequence)),
-        ),
+        (projectMcpCleanupEventTypes.has(event.type)
+          ? worker.enqueue(event.sequence)
+          : Effect.void
+        ).pipe(Effect.andThen(noteSeen(event.sequence))),
       ),
     );
     yield* drainThrough(sequence);

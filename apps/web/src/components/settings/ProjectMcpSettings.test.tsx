@@ -925,6 +925,73 @@ describe("ProjectMcpSettings", () => {
     open.mockRestore();
   });
 
+  it.each(["javascript:alert(1)", "data:text/html,hello", "file:///tmp/authorize"])(
+    "does not render an unsafe OAuth authorization URL: %s",
+    async (authorizationUrl) => {
+      query.data = decodeProjectMcpCatalog({
+        external: [
+          {
+            ...externalServer(),
+            transport: {
+              type: "streamable-http",
+              url: "https://mcp.example.com/endpoint",
+              headers: [],
+              authorization: { type: "oauth", registration: { type: "automatic" } },
+            },
+            url: undefined,
+            oauthStatus: "not-connected",
+          },
+        ],
+        managed: [],
+        applications: [],
+      });
+      commands.oauthBegin.mockResolvedValueOnce({
+        _tag: "Success",
+        value: { authorizationUrl, expiresAt: "2026-09-02T00:00:00.000Z" },
+      });
+      await renderPanel();
+      await click(labelled<HTMLButtonElement>("Edit External"));
+      await click(button("Connect OAuth"));
+      await settle();
+      expect(document.querySelector('a[target="_blank"]')).toBeNull();
+      expect(query.refresh).not.toHaveBeenCalled();
+    },
+  );
+
+  it("renders a valid HTTP OAuth authorization URL", async () => {
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          transport: {
+            type: "streamable-http",
+            url: "https://mcp.example.com/endpoint",
+            headers: [],
+            authorization: { type: "oauth", registration: { type: "automatic" } },
+          },
+          url: undefined,
+          oauthStatus: "not-connected",
+        },
+      ],
+      managed: [],
+      applications: [],
+    });
+    commands.oauthBegin.mockResolvedValueOnce({
+      _tag: "Success",
+      value: {
+        authorizationUrl: "http://127.0.0.1:8787/authorize?state=test",
+        expiresAt: "2026-09-02T00:00:00.000Z",
+      },
+    });
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await click(button("Connect OAuth"));
+    await settle();
+    expect(document.querySelector<HTMLAnchorElement>('a[target="_blank"]')?.href).toBe(
+      "http://127.0.0.1:8787/authorize?state=test",
+    );
+  });
+
   it("refreshes OAuth status on focus and uses the current catalog entry in an open edit form", async () => {
     query.data = decodeProjectMcpCatalog({
       external: [

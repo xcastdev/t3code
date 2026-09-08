@@ -427,6 +427,83 @@ const prepareOAuth = Effect.fn(function* (
   });
 });
 
+for (const authorizationEndpoint of [
+  "javascript:alert(1)",
+  "data:text/html,hello",
+  "file:///tmp/authorize",
+] as const) {
+  it.effect(`rejects an unsafe discovered authorization endpoint: ${authorizationEndpoint}`, () =>
+    Effect.gen(function* () {
+      const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+      const oauth = yield* prepareOAuth({
+        fetch: async (input, init) => {
+          const response = await fetchOAuthFixture(input, init);
+          if (String(input).endsWith("/.well-known/oauth-authorization-server")) {
+            return Response.json({
+              ...decodeObject(await response.json()),
+              authorization_endpoint: authorizationEndpoint,
+            });
+          }
+          return response;
+        },
+      });
+      const error = yield* Effect.flip(oauth.begin({ serverId }));
+      assert.instanceOf(error, ProjectMcpOAuth.ProjectMcpOAuthError);
+      assert.isTrue(error.operation === "begin" || error.operation === "discover");
+      assert.deepEqual(yield* secrets.listAuxiliarySecrets(serverId), []);
+    }).pipe(Effect.provide(secretLayer)),
+  );
+}
+
+it.effect("rejects an unsafe OAuth step-up URL without persisting it", () =>
+  Effect.gen(function* () {
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    const oauth = yield* prepareOAuth();
+    const started = yield* oauth.begin({ serverId });
+    assert.equal(
+      (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+      200,
+    );
+    const provider = yield* oauth.providerFor(serverId);
+    const result = yield* Effect.exit(
+      Effect.promise(async () => {
+        await provider.redirectToAuthorization(new URL("javascript:alert(1)?state=step-up"));
+      }),
+    );
+    assert.isTrue(Exit.isFailure(result));
+    const ids = yield* secrets.listAuxiliarySecrets(serverId);
+    const record = decodePendingRecord(yield* secrets.resolve(serverId, ids.at(-1)!));
+    assert.isUndefined(record.authorizationUrl);
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+it.effect("rejects an unsafe authorization URL in legacy pending state", () =>
+  Effect.gen(function* () {
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    yield* prepareOAuth();
+    yield* secrets.createAuxiliarySecret(
+      serverId,
+      encodeLegacyRecord({
+        kind: "project-mcp-oauth",
+        serverId,
+        resource,
+        registration: {},
+        state: "unsafe-state",
+        authorizationUrl: "data:text/html,hello",
+        // @effect-diagnostics-next-line globalDateInEffect:off
+        expiresAt: Date.now() + 60_000,
+      }),
+    );
+    const oauth = yield* ProjectMcpOAuth.__testing.make({
+      servers: [fixtureServer],
+      fetch: fetchOAuthFixture,
+    });
+    const error = yield* Effect.flip(oauth.continuePending(serverId));
+    assert.instanceOf(error, ProjectMcpOAuth.ProjectMcpOAuthError);
+    assert.equal(error.operation, "continue authorization");
+  }).pipe(Effect.provide(secretLayer)),
+);
+
 it.effect("retains bearer and refresh access through catalog removal for a live provider", () =>
   Effect.gen(function* () {
     let clock = 1_800_000_000_000;

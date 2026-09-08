@@ -11,6 +11,8 @@ import {
   ProjectMcpListInput,
   ProjectMcpManagedServer,
   ProjectMcpNameConflictError,
+  ProjectMcpOAuthAuthorizationUrl,
+  ProjectMcpOAuthBeginResult,
   ProjectMcpRemoveInput,
   ProjectMcpServer,
   ProjectMcpTransport,
@@ -18,6 +20,7 @@ import {
   ProjectMcpServerNotFoundError,
   ProjectMcpUpdateInput,
   ProjectMcpUrl,
+  parseProjectMcpOAuthAuthorizationUrl,
   getProjectMcpTransport,
 } from "./projectMcp.ts";
 
@@ -41,6 +44,10 @@ const decodeProjectMcpUpdateInput = Schema.decodeUnknownSync(ProjectMcpUpdateInp
 const decodeProjectMcpRemoveInput = Schema.decodeUnknownSync(ProjectMcpRemoveInput);
 const decodeMcpServerId = Schema.decodeUnknownSync(McpServerId);
 const decodeProjectMcpUrl = Schema.decodeUnknownSync(ProjectMcpUrl);
+const decodeProjectMcpOAuthAuthorizationUrl = Schema.decodeUnknownSync(
+  ProjectMcpOAuthAuthorizationUrl,
+);
+const decodeProjectMcpOAuthBeginResult = Schema.decodeUnknownSync(ProjectMcpOAuthBeginResult);
 const decodeProjectMcpNameConflictError = Schema.decodeUnknownSync(ProjectMcpNameConflictError);
 const decodeProjectMcpEnvironmentVariableNameConflictError = Schema.decodeUnknownSync(
   ProjectMcpEnvironmentVariableNameConflictError,
@@ -667,6 +674,39 @@ describe("Project MCP contract shapes", () => {
   it("brands MCP server ids and keeps URL values bounded", () => {
     expect(decodeMcpServerId("mcp-1")).toBe("mcp-1");
     expect(decodeProjectMcpUrl("https://example.com/mcp")).toBe("https://example.com/mcp");
+  });
+
+  it("accepts only safe HTTP(S) OAuth authorization URLs", () => {
+    for (const value of [
+      "https://issuer.example.test/authorize?state=opaque",
+      "http://127.0.0.1:8787/authorize?state=opaque",
+    ]) {
+      expect(parseProjectMcpOAuthAuthorizationUrl(value)).toBe(new URL(value).toString());
+      expect(decodeProjectMcpOAuthAuthorizationUrl(value)).toBe(new URL(value).toString());
+      expect(
+        decodeProjectMcpOAuthBeginResult({
+          authorizationUrl: value,
+          expiresAt: "2026-09-08T00:00:00.000Z",
+        }),
+      ).toMatchObject({ authorizationUrl: new URL(value).toString() });
+    }
+
+    for (const value of [
+      "javascript:alert(1)",
+      "data:text/html,hello",
+      "file:///tmp/authorize",
+      "mailto:oauth@example.test",
+      "https://user:pass@issuer.example.test/authorize",
+      "not a url",
+    ]) {
+      expect(parseProjectMcpOAuthAuthorizationUrl(value)).toBeUndefined();
+      expect(() =>
+        decodeProjectMcpOAuthBeginResult({
+          authorizationUrl: value,
+          expiresAt: "2026-09-08T00:00:00.000Z",
+        }),
+      ).toThrow();
+    }
   });
 
   it("decodes an actionable case-folded name conflict error", () => {

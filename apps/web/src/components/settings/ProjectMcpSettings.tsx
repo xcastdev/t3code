@@ -15,9 +15,11 @@ import {
   ProjectMcpServer,
   ProviderInstanceId,
   ServerProvider,
+  parseProjectMcpOAuthAuthorizationUrl,
 } from "@t3tools/contracts";
 import type { ProjectMcpTransportDraft } from "@t3tools/contracts";
 import { PencilIcon, PlusIcon, Trash2Icon } from "lucide-react";
+import * as Cause from "effect/Cause";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { isElectron } from "../../env";
@@ -564,8 +566,18 @@ function ScopedProjectMcpCatalogSettings({
       const result = await oauthBegin({ environmentId, input: { projectId, id: entry.id } });
       if (operation !== oauthOperation.current) return;
       if (result._tag === "Success") {
+        const authorizationUrl = parseProjectMcpOAuthAuthorizationUrl(
+          result.value.authorizationUrl,
+        );
+        if (authorizationUrl === undefined) {
+          reportFailure("Failed to connect MCP OAuth", {
+            _tag: "Failure",
+            cause: Cause.fail(new Error("OAuth returned an unsafe authorization URL.")),
+          });
+          return;
+        }
         catalog.refresh();
-        setAuthorizationLink({ url: result.value.authorizationUrl, draft });
+        setAuthorizationLink({ url: authorizationUrl, draft });
       } else {
         reportFailure("Failed to connect MCP OAuth", result);
       }
@@ -590,8 +602,18 @@ function ScopedProjectMcpCatalogSettings({
       const result = await oauthContinue({ environmentId, input: { projectId, id: entry.id } });
       if (operation !== oauthOperation.current) return;
       if (result._tag === "Success") {
+        const authorizationUrl = parseProjectMcpOAuthAuthorizationUrl(
+          result.value.authorizationUrl,
+        );
+        if (authorizationUrl === undefined) {
+          reportFailure("Failed to continue MCP OAuth", {
+            _tag: "Failure",
+            cause: Cause.fail(new Error("OAuth returned an unsafe authorization URL.")),
+          });
+          return;
+        }
         catalog.refresh();
-        setAuthorizationLink({ url: result.value.authorizationUrl, draft });
+        setAuthorizationLink({ url: authorizationUrl, draft });
       } else {
         reportFailure("Failed to continue MCP OAuth", result);
       }

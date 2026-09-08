@@ -37,6 +37,22 @@ export const ProjectMcpUrl = Schema.String.check(
 );
 export type ProjectMcpUrl = typeof ProjectMcpUrl.Type;
 
+export const parseProjectMcpOAuthAuthorizationUrl = (value: string): string | undefined => {
+  try {
+    const url = new URL(value);
+    if (
+      (url.protocol !== "https:" && url.protocol !== "http:") ||
+      url.username !== "" ||
+      url.password !== ""
+    ) {
+      return undefined;
+    }
+    return url.toString();
+  } catch {
+    return undefined;
+  }
+};
+
 const PROJECT_MCP_STDIO_COMMAND_MAX_LENGTH = 1024;
 const PROJECT_MCP_STDIO_ARGUMENT_MAX_LENGTH = 4096;
 const PROJECT_MCP_STDIO_ARGUMENT_LIMIT = 128;
@@ -46,6 +62,14 @@ const PROJECT_MCP_CREDENTIAL_NAME_MAX_LENGTH = 120;
 const PROJECT_MCP_CREDENTIAL_VALUE_MAX_LENGTH = 16 * 1024;
 const PROJECT_MCP_APPLICATION_REASON_MAX_LENGTH = 1_000;
 const PROJECT_MCP_OAUTH_AUTHORIZATION_URL_MAX_LENGTH = 4_096;
+
+export const ProjectMcpOAuthAuthorizationUrl = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(PROJECT_MCP_OAUTH_AUTHORIZATION_URL_MAX_LENGTH),
+  Schema.makeFilter((value) => parseProjectMcpOAuthAuthorizationUrl(value) !== undefined, {
+    message: "Expected an HTTP or HTTPS OAuth authorization URL",
+  }),
+);
+export type ProjectMcpOAuthAuthorizationUrl = typeof ProjectMcpOAuthAuthorizationUrl.Type;
 
 export const ProjectMcpCredentialId = Schema.String.check(Schema.isUUID()).pipe(
   Schema.brand("ProjectMcpCredentialId"),
@@ -465,11 +489,21 @@ export class ProjectMcpOAuthActionError extends Schema.TaggedErrorClass<ProjectM
   }
 }
 
+export class ProjectMcpCatalogCommittedCleanupPendingError extends Schema.TaggedErrorClass<ProjectMcpCatalogCommittedCleanupPendingError>()(
+  "ProjectMcpCatalogCommittedCleanupPendingError",
+  {
+    id: McpServerId,
+    operation: Schema.Literals(["create", "update", "remove"]),
+    sequence: Schema.Int.check(Schema.isGreaterThan(0)),
+  },
+) {}
+
 export const ProjectMcpCreateError = Schema.Union([
   ProjectMcpNameConflictError,
   ProjectMcpEnvironmentVariableNameConflictError,
   ProjectMcpProviderNotFoundError,
   ProjectMcpServerLimitExceededError,
+  ProjectMcpCatalogCommittedCleanupPendingError,
 ]);
 export type ProjectMcpCreateError = typeof ProjectMcpCreateError.Type;
 
@@ -479,10 +513,14 @@ export const ProjectMcpUpdateError = Schema.Union([
   ProjectMcpProviderNotFoundError,
   ProjectMcpServerNotFoundError,
   ProjectMcpOAuthActionError,
+  ProjectMcpCatalogCommittedCleanupPendingError,
 ]);
 export type ProjectMcpUpdateError = typeof ProjectMcpUpdateError.Type;
 
-export const ProjectMcpRemoveError = ProjectMcpServerNotFoundError;
+export const ProjectMcpRemoveError = Schema.Union([
+  ProjectMcpServerNotFoundError,
+  ProjectMcpCatalogCommittedCleanupPendingError,
+]);
 export type ProjectMcpRemoveError = typeof ProjectMcpRemoveError.Type;
 
 export const ProjectMcpMutationError = Schema.Union([
@@ -492,6 +530,7 @@ export const ProjectMcpMutationError = Schema.Union([
   ProjectMcpServerLimitExceededError,
   ProjectMcpServerNotFoundError,
   ProjectMcpOAuthActionError,
+  ProjectMcpCatalogCommittedCleanupPendingError,
 ]);
 export type ProjectMcpMutationError = typeof ProjectMcpMutationError.Type;
 
@@ -555,9 +594,7 @@ export const ProjectMcpOAuthBeginInput = Schema.Struct({
 export type ProjectMcpOAuthBeginInput = typeof ProjectMcpOAuthBeginInput.Type;
 
 export const ProjectMcpOAuthBeginResult = Schema.Struct({
-  authorizationUrl: TrimmedNonEmptyString.check(
-    Schema.isMaxLength(PROJECT_MCP_OAUTH_AUTHORIZATION_URL_MAX_LENGTH),
-  ),
+  authorizationUrl: ProjectMcpOAuthAuthorizationUrl,
   expiresAt: IsoDateTime,
 });
 export type ProjectMcpOAuthBeginResult = typeof ProjectMcpOAuthBeginResult.Type;

@@ -1,5 +1,6 @@
 import {
   McpServerId,
+  parseProjectMcpOAuthAuthorizationUrl,
   type ProjectMcpCredentialId,
   type ProjectMcpOAuthBeginResult,
   type ResolvedProjectMcpServer,
@@ -641,11 +642,17 @@ const make = (config: ProjectMcpOAuthConfig) =>
                 authorization?.onSaved(completedGeneration);
             },
             redirectToAuthorization: async (authorizationUrl) => {
+              const canonicalAuthorizationUrl = parseProjectMcpOAuthAuthorizationUrl(
+                authorizationUrl.toString(),
+              );
+              if (canonicalAuthorizationUrl === undefined)
+                throw new Error("OAuth authorization server returned an unsafe authorization URL.");
+              const canonicalUrl = new URL(canonicalAuthorizationUrl);
               const record = await readRecord();
               if (record === undefined) throw new Error("OAuth authorization state is unavailable");
-              const state = authorizationUrl.searchParams.get("state");
+              const state = canonicalUrl.searchParams.get("state");
               if (!state) throw new Error("OAuth authorization URL did not include state");
-              const scope = authorizationUrl.searchParams.get("scope") ?? undefined;
+              const scope = canonicalUrl.searchParams.get("scope") ?? undefined;
               const saved = await Effect.runPromise(
                 updateIfCurrent(
                   id,
@@ -656,7 +663,7 @@ const make = (config: ProjectMcpOAuthConfig) =>
                     state,
                     redirectUrl: String(provider.redirectUrl),
                     expiresAt: now() + STATE_TTL_MS,
-                    authorizationUrl: authorizationUrl.toString(),
+                    authorizationUrl: canonicalAuthorizationUrl,
                     ...(scope === undefined ? {} : { scope }),
                   }),
                   stateLease,
@@ -847,7 +854,17 @@ const make = (config: ProjectMcpOAuthConfig) =>
             }),
           catch: (cause) => new ProjectMcpOAuthError({ operation: "begin", cause }),
         });
-        const authorizationState = new URL(started.authorizationUrl).searchParams.get("state");
+        const canonicalAuthorizationUrl = parseProjectMcpOAuthAuthorizationUrl(
+          started.authorizationUrl.toString(),
+        );
+        if (canonicalAuthorizationUrl === undefined) {
+          return yield* new ProjectMcpOAuthError({
+            operation: "begin",
+            cause: new Error("OAuth authorization server returned an unsafe authorization URL."),
+          });
+        }
+        const authorizationUrl = new URL(canonicalAuthorizationUrl);
+        const authorizationState = authorizationUrl.searchParams.get("state");
         if (!authorizationState) {
           return yield* new ProjectMcpOAuthError({
             operation: "begin",
@@ -877,15 +894,15 @@ const make = (config: ProjectMcpOAuthConfig) =>
               client: { ...client, issuer },
               discovery: info,
               generation,
-              authorizationUrl: started.authorizationUrl.toString(),
-              ...(started.authorizationUrl.searchParams.get("scope") === null
+              authorizationUrl: canonicalAuthorizationUrl,
+              ...(authorizationUrl.searchParams.get("scope") === null
                 ? {}
-                : { scope: started.authorizationUrl.searchParams.get("scope")! }),
+                : { scope: authorizationUrl.searchParams.get("scope")! }),
             });
           }),
         );
         return {
-          authorizationUrl: started.authorizationUrl.toString(),
+          authorizationUrl: canonicalAuthorizationUrl,
           // @effect-diagnostics-next-line globalDateInEffect:off
           expiresAt: new Date(now() + STATE_TTL_MS).toISOString(),
         };
@@ -901,8 +918,20 @@ const make = (config: ProjectMcpOAuthConfig) =>
     const continuePending: ProjectMcpOAuthShape["continuePending"] = (id, server) =>
       current(id, server).pipe(
         Effect.flatMap((record) => {
+          if (record === undefined) {
+            return Effect.fail(
+              new ProjectMcpOAuthError({
+                operation: "continue authorization",
+                cause: new Error("No pending OAuth authorization is available."),
+              }),
+            );
+          }
+          const authorizationUrl =
+            record.authorizationUrl === undefined
+              ? undefined
+              : parseProjectMcpOAuthAuthorizationUrl(record.authorizationUrl);
           if (
-            record?.authorizationUrl === undefined ||
+            authorizationUrl === undefined ||
             record.registration === undefined ||
             record.state === undefined ||
             record.expiresAt === undefined ||
@@ -916,7 +945,7 @@ const make = (config: ProjectMcpOAuthConfig) =>
             );
           }
           return Effect.succeed({
-            authorizationUrl: record.authorizationUrl,
+            authorizationUrl,
             expiresAt: DateTime.formatIso(DateTime.makeUnsafe(record.expiresAt)),
           });
         }),

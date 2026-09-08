@@ -4,8 +4,11 @@ import * as Schema from "effect/Schema";
 
 import {
   WS_METHODS,
+  WsProjectMcpCreateRpc,
+  WsProjectMcpRemoveRpc,
   WsProjectMcpOAuthBeginRpc,
   WsProjectMcpOAuthDisconnectRpc,
+  WsProjectMcpUpdateRpc,
   WsSubscribeServerConfigRpc,
 } from "./rpc.ts";
 
@@ -17,6 +20,9 @@ const decodeOAuthBeginSuccess = Schema.decodeUnknownSync(WsProjectMcpOAuthBeginR
 const decodeOAuthDisconnectSuccess = Schema.decodeUnknownSync(
   WsProjectMcpOAuthDisconnectRpc.successSchema,
 );
+const decodeCreateError = Schema.decodeUnknownSync(WsProjectMcpCreateRpc.errorSchema);
+const decodeUpdateError = Schema.decodeUnknownSync(WsProjectMcpUpdateRpc.errorSchema);
+const decodeRemoveError = Schema.decodeUnknownSync(WsProjectMcpRemoveRpc.errorSchema);
 
 /**
  * The client always sends `environmentThemes`, including to servers built
@@ -83,5 +89,24 @@ describe("project MCP OAuth RPC contracts", () => {
         oauthStatus: "not-connected",
       }),
     ).toMatchObject({ oauthStatus: "not-connected" });
+  });
+
+  it("accepts committed cleanup-pending mutation errors", () => {
+    const error = {
+      _tag: "ProjectMcpCatalogCommittedCleanupPendingError",
+      id: "mcp-1",
+      operation: "update",
+      sequence: 42,
+    };
+    expect(decodeCreateError({ ...error, operation: "create" })._tag).toBe(
+      "ProjectMcpCatalogCommittedCleanupPendingError",
+    );
+    expect(decodeUpdateError(error)).toMatchObject(error);
+    expect(decodeRemoveError({ ...error, operation: "remove" })).toMatchObject({
+      ...error,
+      operation: "remove",
+    });
+    expect(() => decodeUpdateError({ ...error, operation: "other" })).toThrow();
+    expect(() => decodeUpdateError({ ...error, sequence: 0 })).toThrow();
   });
 });
