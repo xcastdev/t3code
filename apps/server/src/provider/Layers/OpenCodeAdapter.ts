@@ -187,11 +187,6 @@ type OpenCodeSubscribedEvent =
     ? TEvent
     : never;
 
-type OpenCodeSessionStatusEvent = Extract<
-  OpenCodeSubscribedEvent,
-  { readonly type: "session.status" }
->;
-
 type OpenCodeToolStatus = Extract<Part, { readonly type: "tool" }>["state"]["status"];
 type OpenCodeSubtaskPart = Extract<Part, { readonly type: "subtask" }>;
 
@@ -289,11 +284,15 @@ const OpenCodeSessionStatusMap = Schema.Record(
 );
 const decodeOpenCodeSessionStatusMap = Schema.decodeUnknownOption(OpenCodeSessionStatusMap);
 
+const OPENCODE_ABORT_ATTEMPT_TIMEOUT = "2 seconds";
+const OPENCODE_ABORT_CONFIRM_TIMEOUT = "10 seconds";
+const OPENCODE_ABORT_RETRY_DELAYS = [0, 250, 1_000] as const;
+
+type OpenCodeContextCloseIntent = "detach" | "terminate";
+
 interface OpenCodeCancellation {
   readonly turnId: TurnId | undefined;
   readonly completion: Deferred.Deferred<void, ProviderAdapterRequestError>;
-  acknowledged?: boolean;
-  deferredIdleEvent?: OpenCodeSessionStatusEvent;
 }
 
 interface OpenCodeIdleReconciliation {
@@ -481,10 +480,11 @@ interface OpenCodeSessionContext {
   pendingRequestRecovery: OpenCodePendingRequestRecovery | undefined;
   promptGeneration: number;
   promptAdmission: OpenCodePromptAdmission | undefined;
+  closingIntent: OpenCodeContextCloseIntent | undefined;
   readonly promptSemaphore: Semaphore.Semaphore;
   readonly firstConnection: Deferred.Deferred<void, ProviderAdapterRequestError>;
   /**
-   * One-shot guard flipped by `stopOpenCodeContext` / `emitUnexpectedExit`.
+   * One-shot guard flipped by `closeOpenCodeContext` / `emitUnexpectedExit`.
    * The session lifecycle is owned by `sessionScope`; this Ref exists only
    * so concurrent callers can race the transition safely via `getAndSet`.
    */
@@ -1013,7 +1013,7 @@ const cancelPendingOpenCodePrompt = Effect.fn("cancelPendingOpenCodePrompt")(fun
 
 const closeStartingOpenCodeContext = Effect.fn("closeStartingOpenCodeContext")(function* (
   context: OpenCodeSessionContext,
-  abortRemote: boolean,
+  intent: OpenCodeContextCloseIntent,
   settlePendingRequests: (
     context: OpenCodeSessionContext,
   ) => Effect.Effect<void, ProviderAdapterRequestError>,
@@ -1032,18 +1032,20 @@ const closeStartingOpenCodeContext = Effect.fn("closeStartingOpenCodeContext")(f
   yield* cancelPendingOpenCodePrompt(context);
   yield* failPendingOpenCodeCancellation(context, "OpenCode session startup was cancelled.");
   context.promptAdmission = undefined;
-  if (abortRemote) {
+  if (intent === "terminate" || !context.server.external) {
     yield* abortOpenCodeSessionForTeardown(context);
   }
   yield* settlePendingRequests(context);
   yield* Scope.close(context.sessionScope, Exit.void).pipe(Effect.ignore);
 });
 
-const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
+const closeOpenCodeContext = Effect.fn("closeOpenCodeContext")(function* (
   context: OpenCodeSessionContext,
+  intent: OpenCodeContextCloseIntent,
   settlePendingRequests: (
     context: OpenCodeSessionContext,
   ) => Effect.Effect<void, ProviderAdapterRequestError>,
+  options?: { readonly remoteTerminationConfirmed?: boolean },
 ) {
   // Race-safe one-shot: first caller flips the flag, everyone else no-ops.
   if (yield* Ref.getAndSet(context.stopped, true)) {
@@ -1067,9 +1069,11 @@ const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
 
   // Scope close only tears down our local handles (the event pump and event
   // subscription). An externally configured OpenCode server owns its turn,
-  // so reconnecting T3 must not abort that work. Explicit user interrupts
-  // still call `session.abort` through `interruptTurn`.
-  if (!context.server.external) {
+  // so detaching T3 must not abort that work. Explicit termination runs the
+  // shared abort-and-confirm operation before this helper is called.
+  const remoteTerminationConfirmed =
+    intent === "terminate" && options?.remoteTerminationConfirmed === true;
+  if (!context.server.external && !remoteTerminationConfirmed) {
     yield* abortOpenCodeSessionForTeardown(context);
   }
   yield* settlePendingRequests(context);
@@ -1208,7 +1212,9 @@ export function makeOpenCodeAdapter(
         yield* Effect.forEach(
           contexts,
           (context) =>
-            Effect.ignoreCause(stopOpenCodeContext(context, settlePendingOpenCodeRequests)),
+            Effect.ignoreCause(
+              closeOpenCodeContext(context, "detach", settlePendingOpenCodeRequests),
+            ),
           { concurrency: "unbounded", discard: true },
         );
         // Close the logger AFTER session teardown so any final lifecycle
@@ -1974,6 +1980,106 @@ export function makeOpenCodeAdapter(
       }
     });
 
+    const abortAndConfirmOpenCodeTurn = Effect.fn("abortAndConfirmOpenCodeTurn")(function* (
+      context: OpenCodeSessionContext,
+      cancellation: OpenCodeCancellation,
+    ) {
+      const confirm = Effect.gen(function* () {
+        for (const delayMs of OPENCODE_ABORT_RETRY_DELAYS) {
+          if (delayMs > 0) {
+            yield* Effect.sleep(`${delayMs} millis`);
+          }
+
+          yield* Effect.exit(
+            runOpenCodeSdk("session.abort", (signal) =>
+              context.client.session.abort({ sessionID: context.openCodeSessionId }, { signal }),
+            ).pipe(
+              Effect.timeout(OPENCODE_ABORT_ATTEMPT_TIMEOUT),
+              Effect.catchTags({
+                OpenCodeRuntimeError: (cause) => Effect.fail(toRequestError(cause)),
+                TimeoutError: (cause) =>
+                  Effect.fail(
+                    new ProviderAdapterRequestError({
+                      provider: PROVIDER,
+                      method: "session.abort",
+                      detail: "OpenCode session abort attempt timed out.",
+                      cause,
+                    }),
+                  ),
+              }),
+            ),
+          ).pipe(Effect.asVoid);
+
+          const statusExit = yield* Effect.exit(
+            runOpenCodeSdk("session.status", (signal) =>
+              context.client.session.status(undefined, { signal }),
+            ).pipe(
+              Effect.timeout(OPENCODE_ABORT_ATTEMPT_TIMEOUT),
+              Effect.catchTags({
+                OpenCodeRuntimeError: (cause) => Effect.fail(toRequestError(cause)),
+                TimeoutError: (cause) =>
+                  Effect.fail(
+                    new ProviderAdapterRequestError({
+                      provider: PROVIDER,
+                      method: "session.status",
+                      detail: "OpenCode session status query timed out while confirming abort.",
+                      cause,
+                    }),
+                  ),
+              }),
+            ),
+          );
+          if (Exit.isFailure(statusExit)) {
+            continue;
+          }
+
+          const statusData = Option.getOrUndefined(
+            decodeOpenCodeSessionStatusMap(statusExit.value.data),
+          );
+          const status = statusData?.[context.openCodeSessionId];
+          const confirmed =
+            status === undefined || (status.type !== "busy" && status.type !== "retry");
+          if (!confirmed) {
+            continue;
+          }
+
+          if (context.cancellation === cancellation) {
+            if (cancellation.turnId !== undefined) {
+              yield* interruptOpenCodeTurn(context, cancellation.turnId);
+            } else {
+              context.cancellation = undefined;
+              context.reconcileIdleStatus = true;
+              yield* Deferred.succeed(cancellation.completion, undefined).pipe(Effect.ignore);
+            }
+          }
+          return;
+        }
+
+        // Keep the confirmation operation alive until the enclosing timeout.
+        // This gives a late matching session.error or session.status event a
+        // chance to confirm the abort after the bounded retry attempts.
+        return yield* Effect.never;
+      });
+
+      return yield* Effect.raceFirst(
+        Deferred.await(cancellation.completion).pipe(Effect.asVoid),
+        confirm,
+      ).pipe(
+        Effect.timeout(OPENCODE_ABORT_CONFIRM_TIMEOUT),
+        Effect.catchTags({
+          TimeoutError: (cause) =>
+            Effect.fail(
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "session.abort",
+                detail: "OpenCode session abort did not complete within 10 seconds.",
+                cause,
+              }),
+            ),
+        }),
+      );
+    });
+
     const emitUnexpectedExit = Effect.fn("emitUnexpectedExit")(function* (
       context: OpenCodeSessionContext,
       message: string,
@@ -2049,10 +2155,12 @@ export function makeOpenCodeAdapter(
         },
       }).pipe(Effect.ignore);
       yield* settlePendingOpenCodeRequests(context).pipe(Effect.ignore);
-      // Inline the teardown that `stopOpenCodeContext` would do; we can't
+      // Inline the teardown that `closeOpenCodeContext` would do; we can't
       // delegate to it because our `getAndSet` above already flipped the
       // one-shot guard, so the call would no-op.
-      yield* abortOpenCodeSessionForTeardown(context);
+      if (!context.server.external) {
+        yield* abortOpenCodeSessionForTeardown(context);
+      }
       yield* Scope.close(context.sessionScope, Exit.void);
     });
 
@@ -3449,7 +3557,6 @@ export function makeOpenCodeAdapter(
               break;
             }
             if (context.cancellation?.turnId === turnId) {
-              context.cancellation.deferredIdleEvent = event;
               break;
             }
             if (context.promptAdmission?.turnId === turnId) {
@@ -3524,7 +3631,6 @@ export function makeOpenCodeAdapter(
           const cancellation = context.cancellation;
           if (isOpenCodeAbortError(event.properties.error)) {
             if (cancellation !== undefined && cancellation.turnId === undefined) {
-              cancellation.acknowledged = true;
               context.cancellation = undefined;
               context.reconcileIdleStatus = true;
               yield* Deferred.succeed(cancellation.completion, undefined).pipe(Effect.ignore);
@@ -3665,7 +3771,7 @@ export function makeOpenCodeAdapter(
           if (existing.session.status === "connecting" && !(yield* Ref.get(existing.stopped))) {
             return (yield* awaitOpenCodeContextReady(existing)).session;
           }
-          yield* stopOpenCodeContext(existing, settlePendingOpenCodeRequests);
+          yield* closeOpenCodeContext(existing, "detach", settlePendingOpenCodeRequests);
           deleteContextIfCurrent(existing);
         }
 
@@ -3877,6 +3983,7 @@ export function makeOpenCodeAdapter(
           pendingRequestRecovery: undefined,
           promptGeneration: 0,
           promptAdmission: undefined,
+          closingIntent: undefined,
           promptSemaphore: Semaphore.makeUnsafe(1),
           firstConnection: Deferred.makeUnsafe<void, ProviderAdapterRequestError>(),
           stopped: yield* Ref.make(false),
@@ -3897,7 +4004,7 @@ export function makeOpenCodeAdapter(
           // belongs to this loser; a resumed session is shared upstream state.
           yield* closeStartingOpenCodeContext(
             context,
-            started.created,
+            started.created ? "terminate" : "detach",
             settlePendingOpenCodeRequests,
           );
           return (yield* awaitOpenCodeContextReady(raceWinner)).session;
@@ -3905,7 +4012,7 @@ export function makeOpenCodeAdapter(
         sessions.set(input.threadId, context);
         const cleanupStartingContext = closeStartingOpenCodeContext(
           context,
-          started.created,
+          started.created ? "terminate" : "detach",
           settlePendingOpenCodeRequests,
         ).pipe(Effect.ensuring(Effect.sync(() => deleteContextIfCurrent(context))));
         const connectionExit = yield* Effect.gen(function* () {
@@ -4006,14 +4113,22 @@ export function makeOpenCodeAdapter(
             const cancellationResult = yield* Deferred.await(pendingCancellation.completion).pipe(
               Effect.result,
             );
-            if ((yield* Ref.get(context.stopped)) || sessions.get(input.threadId) !== context) {
+            if (
+              (yield* Ref.get(context.stopped)) ||
+              context.closingIntent !== undefined ||
+              sessions.get(input.threadId) !== context
+            ) {
               return yield* Effect.interrupt;
             }
             if (cancellationResult._tag === "Failure") {
               return yield* cancellationResult.failure;
             }
           }
-          if (sessions.get(input.threadId) !== context || (yield* Ref.get(context.stopped))) {
+          if (
+            sessions.get(input.threadId) !== context ||
+            (yield* Ref.get(context.stopped)) ||
+            context.closingIntent !== undefined
+          ) {
             return yield* Effect.interrupt;
           }
           // A sendTurn while a turn is active is a steer. OpenCode queues the
@@ -4404,71 +4519,13 @@ export function makeOpenCodeAdapter(
           yield* Deferred.await(promptAdmission.submissionSettled);
         }
 
-        const abortOutcome = yield* Effect.raceFirst(
-          runOpenCodeSdk("session.abort", (signal) =>
-            context.client.session.abort({ sessionID: context.openCodeSessionId }, { signal }),
-          ).pipe(
-            Effect.timeout("10 seconds"),
-            Effect.catchTags({
-              OpenCodeRuntimeError: (cause) => Effect.fail(toRequestError(cause)),
-              TimeoutError: (cause) =>
-                Effect.fail(
-                  new ProviderAdapterRequestError({
-                    provider: PROVIDER,
-                    method: "session.abort",
-                    detail: "OpenCode session abort did not complete within 10 seconds.",
-                    cause,
-                  }),
-                ),
-            }),
-            Effect.exit,
-            Effect.map((exit) => ({ source: "request" as const, exit })),
-          ),
-          Deferred.await(cancellation.completion).pipe(
-            Effect.exit,
-            Effect.map((exit) => ({ source: "event" as const, exit })),
-          ),
-        );
-        if (abortOutcome.source === "event") {
-          return Exit.isFailure(abortOutcome.exit)
-            ? yield* Effect.failCause(abortOutcome.exit.cause)
-            : undefined;
-        }
-        const abortExit = abortOutcome.exit;
+        const abortExit = yield* Effect.exit(abortAndConfirmOpenCodeTurn(context, cancellation));
         if (Exit.isFailure(abortExit)) {
-          if (interruptedTurnId && context.interruptedTurnId === interruptedTurnId) {
-            yield* Deferred.succeed(cancellation.completion, undefined).pipe(Effect.ignore);
-            return;
-          }
-          if (cancellation.turnId === undefined && cancellation.acknowledged) {
-            if (context.cancellation === cancellation) {
-              context.cancellation = undefined;
-              context.reconcileIdleStatus = true;
-            }
-            yield* Deferred.succeed(cancellation.completion, undefined).pipe(Effect.ignore);
-            return;
-          }
           if (context.cancellation === cancellation) {
             context.cancellation = undefined;
-            if (cancellation.turnId !== undefined && cancellation.deferredIdleEvent) {
-              yield* scheduleIdleReconciliation(
-                context,
-                cancellation.turnId,
-                cancellation.deferredIdleEvent,
-              );
-            }
           }
           yield* Deferred.done(cancellation.completion, abortExit).pipe(Effect.ignore);
           return yield* Effect.failCause(abortExit.cause);
-        }
-
-        if (context.cancellation === cancellation) {
-          if (cancellation.turnId !== undefined) {
-            yield* interruptOpenCodeTurn(context, cancellation.turnId);
-          } else {
-            context.cancellation = undefined;
-            context.reconcileIdleStatus = true;
-          }
         }
         yield* Deferred.succeed(cancellation.completion, undefined).pipe(Effect.ignore);
       },
@@ -4524,7 +4581,21 @@ export function makeOpenCodeAdapter(
             threadId,
           });
         }
-        const stopped = yield* stopOpenCodeContext(context, settlePendingOpenCodeRequests);
+        context.closingIntent = "terminate";
+        const activeTurnId = context.activeTurnId;
+        if (activeTurnId !== undefined) {
+          const interruptExit = yield* Effect.exit(interruptTurn(threadId, activeTurnId));
+          if (Exit.isFailure(interruptExit)) {
+            context.closingIntent = undefined;
+            return yield* Effect.failCause(interruptExit.cause);
+          }
+        }
+        const stopped = yield* closeOpenCodeContext(
+          context,
+          "terminate",
+          settlePendingOpenCodeRequests,
+          { remoteTerminationConfirmed: activeTurnId !== undefined },
+        );
         deleteContextIfCurrent(context);
         if (!stopped) {
           return;
@@ -4602,14 +4673,16 @@ export function makeOpenCodeAdapter(
       Effect.gen(function* () {
         const contexts = [...sessions.values()];
         sessions.clear();
-        // `stopOpenCodeContext` is typed as never-failing — SDK aborts are
+        // `closeOpenCodeContext` is typed as never-failing — SDK aborts are
         // already `Effect.ignore`'d inside it. `ignoreCause` here also
         // swallows defects from throwing finalizers so one bad close can't
         // interrupt the sibling fibers. Same pattern as the layer finalizer.
         yield* Effect.forEach(
           contexts,
           (context) =>
-            Effect.ignoreCause(stopOpenCodeContext(context, settlePendingOpenCodeRequests)),
+            Effect.ignoreCause(
+              closeOpenCodeContext(context, "detach", settlePendingOpenCodeRequests),
+            ),
           { concurrency: "unbounded", discard: true },
         );
       });

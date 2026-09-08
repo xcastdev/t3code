@@ -77,6 +77,22 @@ update snapshot enrichment. Other providers retain their existing refresh policy
 T3 Code does not own an external OpenCode process. Native configuration changes there can require
 an external reload or restart before T3 Code's next refresh sees them.
 
+### External OpenCode lifecycle
+
+The OpenCode adapter treats an external server as a separately owned process. Adapter shutdown,
+`stopAll`, context replacement, and reconnect cleanup close T3 Code's event subscription without
+calling `session.abort`. OpenCode can therefore continue an active turn while T3 Code is offline.
+
+An explicit `stopSession` with an active turn calls `session.abort` and confirms the result before it
+closes the adapter context. A matching `session.error` with `MessageAbortedError`, or a
+`session.status` response that is idle or has no entry for the session, confirms the abort. HTTP
+success alone does not confirm that the turn stopped.
+
+The adapter retries an unconfirmed abort within a ten-second confirmation window. If confirmation
+still fails, it keeps the active turn, event pump, and session context available for another
+attempt. The orchestration reactor records the failure without changing the projected session to
+`stopped`.
+
 The shared server's idle shutdown does not clear the catalog. Failed discovery keeps the last
 known models, slash commands, and skills through the registry's existing merge rules. A successful
 empty inventory is authoritative. Existing threads keep their explicit model identifier and
