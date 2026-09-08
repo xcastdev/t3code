@@ -1166,61 +1166,90 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const mergeHeadsEqual = (left: ReadonlyArray<string>, right: ReadonlyArray<string>): boolean =>
     left.length === right.length && left.every((head, index) => head === right[index]);
 
+  const readGuardedCommitOperationHead = Effect.fn("GitVcsDriver.readGuardedCommitOperationHead")(
+    function* (
+      cwd: string,
+      options: {
+        readonly stateFile: "CHERRY_PICK_HEAD" | "REVERT_HEAD";
+        readonly operationLabel: "cherry-pick" | "revert";
+        readonly operationName: "CherryPick" | "Revert";
+      },
+    ) {
+      const operation = `GitVcsDriver.readGuardedCommit${options.operationName}State`;
+      const statePathValue = yield* runGitStdout(`${operation}.path`, cwd, [
+        "rev-parse",
+        "--git-path",
+        options.stateFile,
+      ]).pipe(Effect.map((value) => value.trim()));
+      const statePath = path.isAbsolute(statePathValue)
+        ? statePathValue
+        : path.resolve(cwd, statePathValue);
+      const stateContents = yield* fileSystem.readFileString(statePath).pipe(
+        Effect.catchTags({
+          PlatformError: (cause) =>
+            cause.reason._tag === "NotFound"
+              ? Effect.succeed(null)
+              : Effect.fail(
+                  new GitCommandError({
+                    ...gitCommandContext({
+                      operation: `${operation}.read`,
+                      cwd,
+                      args: ["rev-parse", "--git-path", options.stateFile],
+                    }),
+                    detail: `Could not read the repository ${options.operationLabel} state.`,
+                    cause,
+                  }),
+                ),
+        }),
+      );
+      if (stateContents === null) {
+        return { path: statePath, head: null as string | null };
+      }
+
+      const stateLines = stateContents
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter((line) => line.length > 0);
+      const stateHead = stateLines[0];
+      if (stateLines.length !== 1 || stateHead === undefined) {
+        return yield* new GitCommandError({
+          ...gitCommandContext({
+            operation: `${operation}.parse`,
+            cwd,
+            args: ["rev-parse", "--git-path", options.stateFile],
+          }),
+          detail: `The repository ${options.operationLabel} state is malformed.`,
+        });
+      }
+      const verifiedHead = yield* runGitStdout(`${operation}.verify`, cwd, [
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        `${stateHead}^{commit}`,
+      ]).pipe(Effect.map((value) => value.trim()));
+      return { path: statePath, head: verifiedHead };
+    },
+  );
+
   const readGuardedCommitCherryPickState = Effect.fn(
     "GitVcsDriver.readGuardedCommitCherryPickState",
   )(function* (cwd: string) {
-    const cherryPickHeadPathValue = yield* runGitStdout(
-      "GitVcsDriver.readGuardedCommitCherryPickState.path",
-      cwd,
-      ["rev-parse", "--git-path", "CHERRY_PICK_HEAD"],
-    ).pipe(Effect.map((value) => value.trim()));
-    const cherryPickHeadPath = path.isAbsolute(cherryPickHeadPathValue)
-      ? cherryPickHeadPathValue
-      : path.resolve(cwd, cherryPickHeadPathValue);
-    const cherryPickHeadContents = yield* fileSystem.readFileString(cherryPickHeadPath).pipe(
-      Effect.catchTags({
-        PlatformError: (cause) =>
-          cause.reason._tag === "NotFound"
-            ? Effect.succeed(null)
-            : Effect.fail(
-                new GitCommandError({
-                  ...gitCommandContext({
-                    operation: "GitVcsDriver.readGuardedCommitCherryPickState.read",
-                    cwd,
-                    args: ["rev-parse", "--git-path", "CHERRY_PICK_HEAD"],
-                  }),
-                  detail: "Could not read the repository cherry-pick state.",
-                  cause,
-                }),
-              ),
-      }),
-    );
-    if (cherryPickHeadContents === null) {
-      return { path: cherryPickHeadPath, head: null as string | null };
-    }
-
-    const cherryPickHeadLines = cherryPickHeadContents
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
-    const cherryPickHead = cherryPickHeadLines[0];
-    if (cherryPickHeadLines.length !== 1 || cherryPickHead === undefined) {
-      return yield* new GitCommandError({
-        ...gitCommandContext({
-          operation: "GitVcsDriver.readGuardedCommitCherryPickState.parse",
-          cwd,
-          args: ["rev-parse", "--git-path", "CHERRY_PICK_HEAD"],
-        }),
-        detail: "The repository cherry-pick state is malformed.",
-      });
-    }
-    const verifiedHead = yield* runGitStdout(
-      "GitVcsDriver.readGuardedCommitCherryPickState.verify",
-      cwd,
-      ["rev-parse", "--verify", "--end-of-options", `${cherryPickHead}^{commit}`],
-    ).pipe(Effect.map((value) => value.trim()));
-    return { path: cherryPickHeadPath, head: verifiedHead };
+    return yield* readGuardedCommitOperationHead(cwd, {
+      stateFile: "CHERRY_PICK_HEAD",
+      operationLabel: "cherry-pick",
+      operationName: "CherryPick",
+    });
   });
+
+  const readGuardedCommitRevertState = Effect.fn("GitVcsDriver.readGuardedCommitRevertState")(
+    function* (cwd: string) {
+      return yield* readGuardedCommitOperationHead(cwd, {
+        stateFile: "REVERT_HEAD",
+        operationLabel: "revert",
+        operationName: "Revert",
+      });
+    },
+  );
 
   const guardedCommitHookNames = Effect.fn("GitVcsDriver.guardedCommitHookNames")(function* (
     cwd: string,
@@ -3271,10 +3300,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
       const precondition = input.precondition;
       return yield* Effect.gen(function* () {
-        const [state, mergeState, cherryPickState] = yield* Effect.all([
+        const [state, mergeState, cherryPickState, revertState] = yield* Effect.all([
           readMutationState(input.cwd),
           readGuardedCommitMergeState(input.cwd),
           readGuardedCommitCherryPickState(input.cwd),
+          readGuardedCommitRevertState(input.cwd),
         ]);
         const expectedRefName = precondition.expectedRefName;
         if (
@@ -3315,6 +3345,17 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             }),
             detail:
               "Guarded commits cannot finish an active cherry-pick. Continue or abort it with Git.",
+          });
+        }
+        if (revertState.head !== null) {
+          return yield* new GitCommandError({
+            ...gitCommandContext({
+              operation: "GitVcsDriver.commitIndex.revert",
+              cwd: input.cwd,
+              args: ["commit-tree"],
+            }),
+            detail:
+              "Guarded commits cannot finish an active revert. Continue or abort it with Git.",
           });
         }
 
@@ -3415,17 +3456,20 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           stateBeforePublication,
           mergeStateBeforePublication,
           cherryPickStateBeforePublication,
+          revertStateBeforePublication,
         ] = yield* Effect.all([
           readMutationState(input.cwd),
           readGuardedCommitMergeState(input.cwd),
           readGuardedCommitCherryPickState(input.cwd),
+          readGuardedCommitRevertState(input.cwd),
         ]);
         if (
           stateBeforePublication.currentRef !== state.currentRef ||
           stateBeforePublication.headCommit !== state.headCommit ||
           stateBeforePublication.indexTree !== state.indexTree ||
           !mergeHeadsEqual(mergeStateBeforePublication.heads, mergeState.heads) ||
-          cherryPickStateBeforePublication.head !== cherryPickState.head
+          cherryPickStateBeforePublication.head !== cherryPickState.head ||
+          revertStateBeforePublication.head !== revertState.head
         ) {
           return yield* mutationRejection(
             "GitVcsDriver.commitIndex.publicationPrecondition",

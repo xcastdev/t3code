@@ -2761,6 +2761,72 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }).pipe(Effect.provide(TestLayer)),
     );
 
+    it.effect("rejects a guarded commit during a resolved revert", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* git(cwd, ["checkout", "-b", "feature/revert-source"]);
+        yield* writeTextFile(cwd, "README.md", "source\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "source change"]);
+        const sourceCommit = yield* git(cwd, ["rev-parse", "HEAD"]);
+        yield* git(cwd, ["checkout", initialBranch]);
+        yield* writeTextFile(cwd, "README.md", "target\n");
+        yield* git(cwd, ["add", "README.md"]);
+        yield* git(cwd, ["commit", "-m", "target change"]);
+        const headBefore = yield* git(cwd, ["rev-parse", "HEAD"]);
+        const revert = yield* driver.execute({
+          operation: "GitVcsDriver.test.revert",
+          cwd,
+          args: ["revert", sourceCommit],
+          allowNonZeroExit: true,
+        });
+        assert.notEqual(revert.exitCode, 0);
+        yield* writeTextFile(cwd, "README.md", "resolved revert\n");
+        yield* driver.stageFiles({ cwd, paths: ["README.md"] });
+        const revertHeadPath = yield* git(cwd, ["rev-parse", "--git-path", "REVERT_HEAD"]);
+        const precondition = {
+          expectedHeadCommit: headBefore,
+          expectedIndexTree: yield* git(cwd, ["write-tree"]),
+          expectedRefName: initialBranch,
+          expectedMergeHeads: [],
+        };
+
+        const error = yield* driver
+          .commitIndex({
+            cwd,
+            message: "must not finish revert through guarded commit",
+            precondition,
+            confirmDefaultRef: true,
+          })
+          .pipe(Effect.flip);
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+
+        assert.equal(error._tag, "GitCommandError");
+        assert.equal(error.operation, "GitVcsDriver.commitIndex.revert");
+        assert.equal(
+          error.detail,
+          "Guarded commits cannot finish an active revert. Continue or abort it with Git.",
+        );
+        assert.include(error.message.toLowerCase(), "revert");
+        assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), headBefore);
+        assert.isTrue(yield* fileSystem.exists(pathService.resolve(cwd, revertHeadPath)));
+
+        const continued = yield* driver.execute({
+          operation: "GitVcsDriver.test.revert-continue",
+          cwd,
+          args: ["revert", "--continue"],
+          env: { GIT_EDITOR: "true" },
+          allowNonZeroExit: true,
+        });
+        assert.equal(continued.exitCode, 0);
+        assert.isFalse(yield* fileSystem.exists(pathService.resolve(cwd, revertHeadPath)));
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
     it.effect("uses the only configured remote when guarding its default branch", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -2908,6 +2974,63 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           assert.equal(error.code, "stale_git_state");
           assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), competingCommit);
           assert.equal(yield* git(cwd, ["log", "-1", "--pretty=%s"]), "competing");
+        }),
+      ),
+    );
+
+    it.effect("rejects publication when a revert starts during commit creation", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const fileSystem = yield* FileSystem.FileSystem;
+          const pathService = yield* Path.Path;
+          const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
+          const initialBranch = "feature/reviewed-revert-state";
+          yield* git(cwd, ["checkout", "-b", initialBranch]);
+          const headBefore = yield* git(cwd, ["rev-parse", "HEAD"]);
+          const revertHeadPath = yield* git(cwd, ["rev-parse", "--git-path", "REVERT_HEAD"]);
+          let injectedRace = false;
+          const coordinator = ChildProcessSpawner.make((command) =>
+            Effect.gen(function* () {
+              if (!ChildProcess.isStandardCommand(command)) {
+                return yield* Effect.die("expected a standard Git command");
+              }
+              if (!injectedRace && command.args[0] === "commit-tree") {
+                injectedRace = true;
+                yield* fileSystem.writeFileString(
+                  pathService.resolve(cwd, revertHeadPath),
+                  `${headBefore}\n`,
+                );
+              }
+              return yield* delegate.spawn(command);
+            }),
+          );
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, coordinator),
+            Effect.provide(ServerConfigLayer),
+          );
+          yield* writeTextFile(cwd, "reviewed.txt", "reviewed\n");
+          yield* driver.stageFiles({ cwd, paths: ["reviewed.txt"] });
+          const precondition = {
+            expectedHeadCommit: headBefore,
+            expectedIndexTree: yield* git(cwd, ["write-tree"]),
+            expectedRefName: initialBranch,
+            expectedMergeHeads: [],
+          };
+
+          const error = yield* driver
+            .commitIndex({
+              cwd,
+              message: "must not publish after revert starts",
+              precondition,
+            })
+            .pipe(Effect.flip);
+
+          assert.equal(error.code, "stale_git_state");
+          assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), headBefore);
+          assert.equal(yield* git(cwd, ["rev-parse", `refs/heads/${initialBranch}`]), headBefore);
+          assert.isTrue(yield* fileSystem.exists(pathService.resolve(cwd, revertHeadPath)));
         }),
       ),
     );
