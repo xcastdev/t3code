@@ -54,6 +54,13 @@ const REVIEW_UNTRACKED_DIFF_MAX_OUTPUT_BYTES = 80_000;
 const REVIEW_DIFF_FILE_MAX_OUTPUT_BYTES = 1024 * 1024;
 const MAX_WORKING_TREE_DIFF_BYTES = 120_000;
 const MAX_WORKING_TREE_DIFF_LINES = 4_000;
+const GUARDED_COMMIT_HOOK_NAMES = [
+  "pre-commit",
+  "prepare-commit-msg",
+  "commit-msg",
+  "post-commit",
+] as const;
+const ZERO_OID = "0000000000000000000000000000000000000000";
 const WORKSPACE_FILES_MAX_OUTPUT_BYTES = 120_000;
 const STATUS_UPSTREAM_REFRESH_INTERVAL = Duration.seconds(15);
 const STATUS_UPSTREAM_REFRESH_TIMEOUT = Duration.seconds(5);
@@ -1102,6 +1109,43 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       indexTree: indexTree.trim(),
       porcelainStatus,
     };
+  });
+
+  const guardedCommitHookNames = Effect.fn("GitVcsDriver.guardedCommitHookNames")(function* (
+    cwd: string,
+  ) {
+    const hooksPath = yield* runGitStdout("GitVcsDriver.guardedCommitHooksPath", cwd, [
+      "rev-parse",
+      "--git-path",
+      "hooks",
+    ]).pipe(Effect.map((value) => value.trim()));
+    const hooksDirectory = path.isAbsolute(hooksPath) ? hooksPath : path.resolve(cwd, hooksPath);
+    const configuredHooks = yield* Effect.forEach(
+      GUARDED_COMMIT_HOOK_NAMES,
+      (hookName) =>
+        fileSystem.stat(path.join(hooksDirectory, hookName)).pipe(
+          Effect.map((info) =>
+            info.type === "File" && (info.mode & 0o111) !== 0 ? hookName : null,
+          ),
+          Effect.orElseSucceed(() => null),
+        ),
+      { concurrency: "unbounded" },
+    );
+    return configuredHooks.filter(
+      (hookName): hookName is (typeof GUARDED_COMMIT_HOOK_NAMES)[number] => hookName !== null,
+    );
+  });
+
+  const guardedCommitSigningArgs = Effect.fn("GitVcsDriver.guardedCommitSigningArgs")(function* (
+    cwd: string,
+  ) {
+    const signingEnabled = yield* runGitStdout(
+      "GitVcsDriver.guardedCommitSigningConfig",
+      cwd,
+      ["config", "--bool", "--get", "commit.gpgSign"],
+      true,
+    );
+    return signingEnabled.trim() === "true" ? (["-S"] as const) : ([] as const);
   });
 
   const mutationRejection = (
@@ -2916,14 +2960,47 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
 
   const commitIndex: GitVcsDriver.GitVcsDriver["Service"]["commitIndex"] = Effect.fn("commitIndex")(
     function* (input) {
-      if (input.precondition !== undefined || input.confirmDefaultRef !== undefined) {
+      const legacyCommit = Effect.gen(function* () {
+        if (input.confirmDefaultRef !== undefined) {
+          const state = yield* readMutationState(input.cwd);
+          const defaultRef = yield* resolveDefaultBranchName(input.cwd, "origin");
+          const isDefaultRef =
+            state.currentRef !== null &&
+            (state.currentRef === defaultRef ||
+              (defaultRef === null &&
+                (state.currentRef === "main" || state.currentRef === "master")));
+          if (isDefaultRef && input.confirmDefaultRef !== true) {
+            return yield* mutationRejection(
+              "GitVcsDriver.commitIndex.defaultRef",
+              input.cwd,
+              "default_ref_confirmation_required",
+              "Committing on the default ref requires confirmation.",
+            );
+          }
+        }
+        yield* runGit("GitVcsDriver.commitIndex", input.cwd, ["commit", "-m", input.message]);
+        const commitSha = yield* runGitStdout("GitVcsDriver.commitIndex.revParseHead", input.cwd, [
+          "rev-parse",
+          "HEAD",
+        ]);
+        return { commitSha: commitSha.trim() };
+      });
+
+      if (input.precondition === undefined) {
+        return yield* legacyCommit;
+      }
+
+      const precondition = input.precondition;
+      return yield* Effect.gen(function* () {
         const state = yield* readMutationState(input.cwd);
+        const expectedRefName = precondition.expectedRefName;
         if (
-          input.precondition !== undefined &&
-          (state.headCommit !== input.precondition.expectedHeadCommit ||
-            state.indexTree !== input.precondition.expectedIndexTree ||
-            (input.precondition.expectedRefName !== undefined &&
-              state.currentRef !== input.precondition.expectedRefName))
+          expectedRefName === undefined ||
+          expectedRefName === null ||
+          state.currentRef === null ||
+          state.currentRef !== expectedRefName ||
+          state.headCommit !== precondition.expectedHeadCommit ||
+          state.indexTree !== precondition.expectedIndexTree
         ) {
           return yield* mutationRejection(
             "GitVcsDriver.commitIndex.precondition",
@@ -2933,12 +3010,25 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           );
         }
 
+        const fullRefName = yield* runGitStdout(
+          "GitVcsDriver.commitIndex.currentRef",
+          input.cwd,
+          ["symbolic-ref", "-q", "HEAD"],
+          true,
+        ).pipe(Effect.map((value) => value.trim()));
+        if (fullRefName !== `refs/heads/${state.currentRef}`) {
+          return yield* mutationRejection(
+            "GitVcsDriver.commitIndex.currentRef",
+            input.cwd,
+            "stale_git_state",
+            "Guarded commits require the reviewed local branch to remain checked out.",
+          );
+        }
+
         const defaultRef = yield* resolveDefaultBranchName(input.cwd, "origin");
         const isDefaultRef =
-          state.currentRef !== null &&
-          (state.currentRef === defaultRef ||
-            (defaultRef === null &&
-              (state.currentRef === "main" || state.currentRef === "master")));
+          state.currentRef === defaultRef ||
+          (defaultRef === null && (state.currentRef === "main" || state.currentRef === "master"));
         if (isDefaultRef && input.confirmDefaultRef !== true) {
           return yield* mutationRejection(
             "GitVcsDriver.commitIndex.defaultRef",
@@ -2947,14 +3037,109 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             "Committing on the default ref requires confirmation.",
           );
         }
-      }
 
-      yield* runGit("GitVcsDriver.commitIndex", input.cwd, ["commit", "-m", input.message]);
-      const commitSha = yield* runGitStdout("GitVcsDriver.commitIndex.revParseHead", input.cwd, [
-        "rev-parse",
-        "HEAD",
-      ]);
-      return { commitSha: commitSha.trim() };
+        const hooks = yield* guardedCommitHookNames(input.cwd);
+        if (hooks.length > 0) {
+          return yield* new GitCommandError({
+            ...gitCommandContext({
+              operation: "GitVcsDriver.commitIndex.hooks",
+              cwd: input.cwd,
+              args: ["commit-tree"],
+            }),
+            detail: `Guarded commits cannot run configured Git hooks (${hooks.join(
+              ", ",
+            )}). Disable those hooks or use the regular Git commit flow.`,
+          });
+        }
+
+        const commitTreeArgs = [
+          "commit-tree",
+          precondition.expectedIndexTree,
+          ...(state.headCommit === null ? [] : ["-p", state.headCommit]),
+          ...(yield* guardedCommitSigningArgs(input.cwd)),
+          "-m",
+          input.message,
+        ];
+        const commitSha = yield* runGitStdout(
+          "GitVcsDriver.commitIndex.commitTree",
+          input.cwd,
+          commitTreeArgs,
+        ).pipe(Effect.map((value) => value.trim()));
+        if (commitSha.length === 0) {
+          return yield* new GitCommandError({
+            ...gitCommandContext({
+              operation: "GitVcsDriver.commitIndex.commitTree",
+              cwd: input.cwd,
+              args: commitTreeArgs,
+            }),
+            detail: "git commit-tree returned an empty commit oid.",
+          });
+        }
+
+        // commit-tree is deliberately based on the reviewed tree. Re-check
+        // the checked-out branch and its tip before publishing so a checkout
+        // or branch movement during object creation fails closed.
+        const stateBeforePublication = yield* readMutationState(input.cwd);
+        if (
+          stateBeforePublication.currentRef !== state.currentRef ||
+          stateBeforePublication.headCommit !== state.headCommit
+        ) {
+          return yield* mutationRejection(
+            "GitVcsDriver.commitIndex.publicationPrecondition",
+            input.cwd,
+            "stale_git_state",
+            "Repository state changed while creating the reviewed commit.",
+          );
+        }
+
+        const oldCommit = state.headCommit ?? ZERO_OID;
+        const refName = fullRefName;
+        const transaction = [
+          "start",
+          `update ${refName} ${commitSha} ${oldCommit}`,
+          "prepare",
+          "commit",
+          "",
+        ].join("\n");
+        const updateResult = yield* executeGit(
+          "GitVcsDriver.commitIndex.updateRef",
+          input.cwd,
+          ["update-ref", "--stdin"],
+          { stdin: transaction, allowNonZeroExit: true },
+        );
+        if (updateResult.exitCode !== 0) {
+          return yield* mutationRejection(
+            "GitVcsDriver.commitIndex.updateRef",
+            input.cwd,
+            "stale_git_state",
+            "Repository state changed while publishing the reviewed commit.",
+          );
+        }
+
+        const stateAfterPublication = yield* readMutationState(input.cwd);
+        if (
+          stateAfterPublication.currentRef !== state.currentRef ||
+          stateAfterPublication.headCommit !== commitSha
+        ) {
+          // Best-effort rollback is itself compare-and-swap guarded. If an
+          // external writer won the race, leave its ref untouched and still
+          // report the guarded operation as stale.
+          yield* executeGit(
+            "GitVcsDriver.commitIndex.rollbackRef",
+            input.cwd,
+            ["update-ref", refName, oldCommit, commitSha],
+            { allowNonZeroExit: true },
+          ).pipe(Effect.asVoid);
+          return yield* mutationRejection(
+            "GitVcsDriver.commitIndex.publicationPostcondition",
+            input.cwd,
+            "stale_git_state",
+            "The checked-out branch changed while publishing the reviewed commit.",
+          );
+        }
+
+        return { commitSha };
+      });
     },
   );
 

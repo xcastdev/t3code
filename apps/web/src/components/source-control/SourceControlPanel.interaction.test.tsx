@@ -29,6 +29,7 @@ describe("SourceControlPanel commit interaction", () => {
     const result = await submitSourceControlCommit({
       commit,
       commitInput,
+      confirmDefaultRef: async () => false,
       onStale: (failure) =>
         handleSourceControlCommitFailure(failure, {
           refreshStatus,
@@ -46,7 +47,7 @@ describe("SourceControlPanel commit interaction", () => {
         expectedRefName: "feature/reviewed",
       },
     });
-    expect(result._tag).toBe("Failure");
+    expect(result?._tag).toBe("Failure");
     expect(refreshStatus).toHaveBeenCalledTimes(1);
     expect(refreshDiff).toHaveBeenCalledTimes(1);
     expect(setError).toHaveBeenCalledWith(
@@ -94,6 +95,7 @@ describe("SourceControlPanel commit interaction", () => {
           refName: "feature/reviewed",
           confirmDefaultRef: false,
         }),
+        confirmDefaultRef: async () => false,
         onStale: () => undefined,
       });
     };

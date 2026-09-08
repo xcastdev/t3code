@@ -15,6 +15,7 @@ import {
   sourceControlDiffRenderModel,
   sourceControlDiffState,
   sourceControlDiffComparisons,
+  submitSourceControlCommit,
 } from "./sourceControlPanel.logic";
 
 describe("source control panel logic", () => {
@@ -201,6 +202,108 @@ describe("source control panel logic", () => {
     expect(setError).toHaveBeenCalledWith(
       "Repository changed; review the staged changes and try again.",
     );
+  });
+
+  it("confirms and retries when the server authoritatively requires a default-ref confirmation", async () => {
+    const confirmDefaultRef = vi.fn(async () => true);
+    const onStale = vi.fn();
+    const commitInput = buildSourceControlCommitInput({
+      cwd: "/repo",
+      message: "reviewed change",
+      headCommit: "head-1",
+      indexTree: "tree-1",
+      refName: "feature/reviewed",
+      confirmDefaultRef: false,
+    });
+    const commit = vi
+      .fn()
+      .mockResolvedValueOnce({
+        _tag: "Failure" as const,
+        cause: Cause.fail({ code: "default_ref_confirmation_required" }),
+      })
+      .mockResolvedValueOnce({ _tag: "Success" as const, value: undefined });
+
+    const result = await submitSourceControlCommit({
+      commit,
+      commitInput,
+      confirmDefaultRef,
+      onStale,
+    });
+
+    expect(result).toEqual({ _tag: "Success", value: undefined });
+    expect(confirmDefaultRef).toHaveBeenCalledTimes(1);
+    expect(commit).toHaveBeenNthCalledWith(1, commitInput);
+    expect(commit).toHaveBeenNthCalledWith(2, {
+      ...commitInput,
+      confirmDefaultRef: true,
+    });
+    expect(onStale).not.toHaveBeenCalled();
+  });
+
+  it("cancels an authoritative default-ref retry without sending another commit", async () => {
+    const confirmDefaultRef = vi.fn(async () => false);
+    const commit = vi.fn().mockResolvedValue({
+      _tag: "Failure" as const,
+      cause: Cause.fail({ code: "default_ref_confirmation_required" }),
+    });
+    const onStale = vi.fn();
+
+    const result = await submitSourceControlCommit({
+      commit,
+      commitInput: {
+        cwd: "/repo",
+        message: "keep draft",
+        precondition: {
+          expectedHeadCommit: "head-1",
+          expectedIndexTree: "tree-1",
+          expectedRefName: "feature/reviewed",
+        },
+      },
+      confirmDefaultRef,
+      onStale,
+    });
+
+    expect(result).toBeNull();
+    expect(commit).toHaveBeenCalledTimes(1);
+    expect(onStale).not.toHaveBeenCalled();
+  });
+
+  it("handles stale state from the single default-ref retry", async () => {
+    const confirmDefaultRef = vi.fn(async () => true);
+    const onStale = vi.fn();
+    const commitInput = {
+      cwd: "/repo",
+      message: "reviewed change",
+      precondition: {
+        expectedHeadCommit: "head-1",
+        expectedIndexTree: "tree-1",
+        expectedRefName: "feature/reviewed",
+      },
+    };
+    const staleResult = {
+      _tag: "Failure" as const,
+      cause: Cause.fail({ code: "stale_git_state" }),
+    };
+    const commit = vi
+      .fn()
+      .mockResolvedValueOnce({
+        _tag: "Failure" as const,
+        cause: Cause.fail({ code: "default_ref_confirmation_required" }),
+      })
+      .mockResolvedValueOnce(staleResult);
+
+    const result = await submitSourceControlCommit({
+      commit,
+      commitInput,
+      confirmDefaultRef,
+      onStale,
+    });
+
+    expect(result).toBe(staleResult);
+    expect(commit).toHaveBeenCalledTimes(2);
+    expect(commit).toHaveBeenLastCalledWith({ ...commitInput, confirmDefaultRef: true });
+    expect(onStale).toHaveBeenCalledTimes(1);
+    expect(onStale).toHaveBeenCalledWith(staleResult);
   });
 
   it("uses the server dirty-tree rejection as the single retry boundary", async () => {

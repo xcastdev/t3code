@@ -1117,6 +1117,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         const envKeys = [
           "GCM_INTERACTIVE",
           "GIT_ASKPASS",
+          "GIT_SSH_COMMAND",
           "GIT_SSH",
           "GIT_TERMINAL_PROMPT",
           "SSH_ASKPASS",
@@ -1151,6 +1152,7 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           process.env.SSH_ASKPASS = "ssh-askpass";
           process.env.SSH_ASKPASS_REQUIRE = "force";
           process.env.T3_TEST_SSH_ASKPASS_LOG = sshLogPath;
+          delete process.env.GIT_SSH_COMMAND;
 
           yield* (yield* GitVcsDriver.GitVcsDriver).statusDetails(cwd);
 
@@ -2204,9 +2206,11 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         const driver = yield* GitVcsDriver.GitVcsDriver;
         yield* writeTextFile(cwd, "staged.txt", "staged\n");
         yield* driver.stageFiles({ cwd, paths: ["staged.txt"] });
+        const expectedRefName = yield* git(cwd, ["branch", "--show-current"]);
         const precondition = {
           expectedHeadCommit: yield* git(cwd, ["rev-parse", "HEAD"]),
           expectedIndexTree: yield* git(cwd, ["write-tree"]),
+          expectedRefName,
         };
 
         const error = yield* driver
@@ -2222,6 +2226,262 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         });
         assert.match(committed.commitSha, /^[a-f0-9]{40}$/);
         assert.equal(yield* git(cwd, ["log", "-1", "--pretty=%s"]), "guarded commit");
+      }),
+    );
+
+    it.effect("commits the reviewed tree when another process stages during validation", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
+          const initialBranch = "feature/reviewed-tree";
+          yield* git(cwd, ["checkout", "-b", initialBranch]);
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(
+              ChildProcessSpawner.ChildProcessSpawner,
+              ChildProcessSpawner.make((command) =>
+                Effect.gen(function* () {
+                  if (!ChildProcess.isStandardCommand(command)) {
+                    return yield* Effect.die("expected a standard Git command");
+                  }
+                  if (command.args[0] === "commit-tree") {
+                    const handle = yield* delegate.spawn(
+                      ChildProcess.make("git", ["add", "--", "external.txt"], {
+                        cwd: command.options.cwd,
+                      }),
+                    );
+                    yield* handle.exitCode;
+                  }
+                  return yield* delegate.spawn(command);
+                }),
+              ),
+            ),
+            Effect.provide(ServerConfigLayer),
+          );
+          yield* writeTextFile(cwd, "reviewed.txt", "reviewed\n");
+          yield* driver.stageFiles({ cwd, paths: ["reviewed.txt"] });
+          const precondition = {
+            expectedHeadCommit: yield* git(cwd, ["rev-parse", "HEAD"]),
+            expectedIndexTree: yield* git(cwd, ["write-tree"]),
+            expectedRefName: initialBranch,
+          };
+          yield* writeTextFile(cwd, "external.txt", "external\n");
+
+          const commit = yield* driver.commitIndex({
+            cwd,
+            message: "commit reviewed tree",
+            precondition,
+          });
+
+          assert.equal(
+            yield* git(cwd, ["show", "--format=", "--name-only", commit.commitSha]),
+            "reviewed.txt",
+          );
+          assert.equal(yield* git(cwd, ["diff", "--cached", "--name-only"]), "external.txt");
+        }),
+      ),
+    );
+
+    it.effect("fails closed when the reviewed branch moves during publication", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
+          const initialBranch = "feature/reviewed-branch";
+          yield* git(cwd, ["checkout", "-b", initialBranch]);
+          const competingCommit = yield* git(cwd, [
+            "commit-tree",
+            "HEAD^{tree}",
+            "-p",
+            "HEAD",
+            "-m",
+            "competing",
+          ]);
+          const expectedHeadCommit = yield* git(cwd, ["rev-parse", "HEAD"]);
+          const coordinator = ChildProcessSpawner.make((command) =>
+            Effect.gen(function* () {
+              if (!ChildProcess.isStandardCommand(command)) {
+                return yield* Effect.die("expected a standard Git command");
+              }
+              if (command.args[0] === "update-ref" && command.args[1] === "--stdin") {
+                const handle = yield* delegate.spawn(
+                  ChildProcess.make(
+                    "git",
+                    [
+                      "update-ref",
+                      `refs/heads/${initialBranch}`,
+                      competingCommit,
+                      expectedHeadCommit,
+                    ],
+                    { cwd },
+                  ),
+                );
+                yield* handle.exitCode;
+              }
+              return yield* delegate.spawn(command);
+            }),
+          );
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, coordinator),
+            Effect.provide(ServerConfigLayer),
+          );
+          yield* writeTextFile(cwd, "reviewed.txt", "reviewed\n");
+          yield* driver.stageFiles({ cwd, paths: ["reviewed.txt"] });
+          const precondition = {
+            expectedHeadCommit,
+            expectedIndexTree: yield* git(cwd, ["write-tree"]),
+            expectedRefName: initialBranch,
+          };
+
+          const error = yield* driver
+            .commitIndex({ cwd, message: "must not publish", precondition })
+            .pipe(Effect.flip);
+
+          assert.equal(error.code, "stale_git_state");
+          assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), competingCommit);
+          assert.equal(yield* git(cwd, ["log", "-1", "--pretty=%s"]), "competing");
+        }),
+      ),
+    );
+
+    it.effect("creates a guarded initial commit from an unborn branch", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* driver.initRepo({ cwd });
+        yield* git(cwd, ["config", "user.email", "test@test.com"]);
+        yield* git(cwd, ["config", "user.name", "Test"]);
+        yield* git(cwd, ["branch", "-M", "feature/initial"]);
+        const expectedRefName = yield* git(cwd, ["branch", "--show-current"]);
+        yield* writeTextFile(cwd, "initial.txt", "initial\n");
+        yield* driver.stageFiles({ cwd, paths: ["initial.txt"] });
+        const precondition = {
+          expectedHeadCommit: null,
+          expectedIndexTree: yield* git(cwd, ["write-tree"]),
+          expectedRefName,
+        };
+
+        const commit = yield* driver.commitIndex({
+          cwd,
+          message: "initial guarded commit",
+          precondition,
+        });
+
+        assert.equal(
+          yield* git(cwd, ["rev-list", "--parents", "-1", commit.commitSha]),
+          commit.commitSha,
+        );
+        assert.equal(
+          yield* git(cwd, ["show", "--format=", "--name-only", commit.commitSha]),
+          "initial.txt",
+        );
+      }),
+    );
+
+    it.effect("fails closed when checkout changes during publication", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
+          const initialBranch = "feature/reviewed-checkout";
+          yield* git(cwd, ["checkout", "-b", initialBranch]);
+          const expectedHeadCommit = yield* git(cwd, ["rev-parse", "HEAD"]);
+          const coordinator = ChildProcessSpawner.make((command) =>
+            Effect.gen(function* () {
+              if (!ChildProcess.isStandardCommand(command)) {
+                return yield* Effect.die("expected a standard Git command");
+              }
+              if (command.args[0] === "update-ref" && command.args[1] === "--stdin") {
+                const handle = yield* delegate.spawn(
+                  ChildProcess.make("git", ["checkout", "-b", "competing-checkout"], { cwd }),
+                );
+                yield* handle.exitCode;
+              }
+              return yield* delegate.spawn(command);
+            }),
+          );
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, coordinator),
+            Effect.provide(ServerConfigLayer),
+          );
+          yield* writeTextFile(cwd, "reviewed.txt", "reviewed\n");
+          yield* driver.stageFiles({ cwd, paths: ["reviewed.txt"] });
+          const precondition = {
+            expectedHeadCommit,
+            expectedIndexTree: yield* git(cwd, ["write-tree"]),
+            expectedRefName: initialBranch,
+          };
+
+          const error = yield* driver
+            .commitIndex({ cwd, message: "must not publish after checkout", precondition })
+            .pipe(Effect.flip);
+
+          assert.equal(error.code, "stale_git_state");
+          assert.equal(yield* git(cwd, ["branch", "--show-current"]), "competing-checkout");
+          assert.equal(
+            yield* git(cwd, ["rev-parse", `refs/heads/${initialBranch}`]),
+            expectedHeadCommit,
+          );
+        }),
+      ),
+    );
+
+    it.effect("rejects guarded commits from detached HEAD", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* git(cwd, ["checkout", "--detach", "HEAD"]);
+        yield* writeTextFile(cwd, "detached.txt", "detached\n");
+        yield* driver.stageFiles({ cwd, paths: ["detached.txt"] });
+        const precondition = {
+          expectedHeadCommit: yield* git(cwd, ["rev-parse", "HEAD"]),
+          expectedIndexTree: yield* git(cwd, ["write-tree"]),
+          expectedRefName: null,
+        };
+
+        const error = yield* driver
+          .commitIndex({ cwd, message: "must not commit detached", precondition })
+          .pipe(Effect.flip);
+
+        assert.equal(error.code, "stale_git_state");
+      }),
+    );
+
+    it.effect("rejects guarded commits when native commit hooks are configured", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        const initialBranch = "feature/hooks";
+        yield* git(cwd, ["checkout", "-b", initialBranch]);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const fileSystem = yield* FileSystem.FileSystem;
+        const pathService = yield* Path.Path;
+        const hookPath = pathService.join(cwd, ".git", "hooks", "pre-commit");
+        yield* fileSystem.writeFileString(hookPath, "#!/bin/sh\nexit 1\n");
+        yield* fileSystem.chmod(hookPath, 0o755);
+        yield* writeTextFile(cwd, "hooked.txt", "hooked\n");
+        yield* driver.stageFiles({ cwd, paths: ["hooked.txt"] });
+        const headBefore = yield* git(cwd, ["rev-parse", "HEAD"]);
+
+        const error = yield* driver
+          .commitIndex({
+            cwd,
+            message: "must honor hooks",
+            precondition: {
+              expectedHeadCommit: headBefore,
+              expectedIndexTree: yield* git(cwd, ["write-tree"]),
+              expectedRefName: initialBranch,
+            },
+          })
+          .pipe(Effect.flip);
+
+        assert.isUndefined(error.code);
+        assert.include(error.detail, "pre-commit");
+        assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), headBefore);
       }),
     );
 

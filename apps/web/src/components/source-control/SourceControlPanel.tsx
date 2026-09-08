@@ -305,17 +305,19 @@ function ChangesView({
     }
     const staged = files.some(isFileStaged);
     if (!staged || commitPending) return;
-    if (status.isDefaultRef) {
+    const confirmDefaultRef = async () => {
       const api = readLocalApi();
       if (!api) {
         setActionError("Confirmation is unavailable in this client.");
-        return;
+        return false;
       }
       const branch = status.refName ?? "the default branch";
-      const confirmed = await api.dialogs.confirm(
+      return await api.dialogs.confirm(
         `Commit staged changes on \"${branch}\"?\nThis commits only files already staged in the Git index.`,
       );
-      if (!confirmed) return;
+    };
+    if (status.isDefaultRef && !(await confirmDefaultRef())) {
+      return;
     }
     setCommitPending(true);
     setActionError(null);
@@ -331,6 +333,7 @@ function ChangesView({
     const result = await submitSourceControlCommit({
       commit: (input) => commit({ environmentId, input }),
       commitInput,
+      confirmDefaultRef,
       onStale: (failure) => {
         staleStateHandled = handleSourceControlCommitFailure(failure, {
           refreshStatus,
@@ -340,6 +343,7 @@ function ChangesView({
       },
     });
     setCommitPending(false);
+    if (result === null) return;
     if (result._tag === "Failure") {
       if (!isAtomCommandInterrupted(result) && !staleStateHandled) {
         setActionError(commandError(result));

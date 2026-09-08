@@ -321,76 +321,27 @@ export const make = Effect.gen(function* () {
     },
   );
 
-  const updateCachedStatus = Effect.fn("VcsStatusBroadcaster.updateCachedStatus")(function* (
-    cwd: string,
-    local: VcsStatusLocalResult,
-    remote: VcsStatusRemoteResult | null,
-    options?: { publish?: boolean; preserveLocalRevisionIfUnchanged?: boolean },
-  ) {
-    const nextRemote = {
-      fingerprint: fingerprintStatusPart(remote),
-      value: remote,
-    } satisfies CachedValue<VcsStatusRemoteResult | null>;
-    const [nextLocal, shouldPublish] = yield* Ref.modify(cacheRef, (cache) => {
-      const previous = cache.get(cwd) ?? EMPTY_CACHED_VCS_STATUS;
-      const localUnchanged =
-        options?.preserveLocalRevisionIfUnchanged &&
-        previous.local !== null &&
-        fingerprintLocalStatus(previous.local.value) === fingerprintLocalStatus(local);
-      const localRevision = localUnchanged ? previous.localRevision : previous.localRevision + 1;
-      const value = {
-        ...local,
-        localRevision: String(localRevision),
-      };
-      const nextLocal = {
-        fingerprint: fingerprintStatusPart(value),
-        value,
-      } satisfies CachedValue<VcsStatusLocalResult>;
-      const nextCache = new Map(cache);
-      nextCache.set(cwd, {
-        localRevision,
-        local: nextLocal,
-        remote: nextRemote,
-      });
-      return [
-        [
-          nextLocal,
-          previous.local?.fingerprint !== nextLocal.fingerprint ||
-            previous.remote?.fingerprint !== nextRemote.fingerprint,
-        ] as const,
-        nextCache,
-      ] as const;
-    });
-
-    if (options?.publish && shouldPublish) {
-      yield* PubSub.publish(changesPubSub, {
-        cwd,
-        event: {
-          _tag: "snapshot",
-          local: nextLocal.value,
-          remote,
-        },
-      });
-    }
-
-    return mergeGitStatusParts(nextLocal.value, remote);
-  });
-
   const loadLocalStatus = Effect.fn("VcsStatusBroadcaster.loadLocalStatus")(function* (
     cwd: string,
   ) {
-    const local = yield* workflow.localStatus({ cwd });
-    const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
-    const cached = yield* getCachedStatus(canonicalCwd);
-    if (
-      cached?.local &&
-      fingerprintLocalStatus(cached.local.value) === fingerprintLocalStatus(local)
-    ) {
-      yield* removeStatusCacheAlias(cwd, canonicalCwd);
-      return cached.local.value;
-    }
-    yield* removeStatusCacheAlias(cwd, canonicalCwd);
-    return yield* updateCachedLocalStatus(canonicalCwd, local, { onlyIfChanged: true });
+    return yield* workflow.withRepositoryPermit(
+      "VcsStatusBroadcaster.loadLocalStatus",
+      cwd,
+      Effect.gen(function* () {
+        const local = yield* workflow.localStatus({ cwd });
+        const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
+        const cached = yield* getCachedStatus(canonicalCwd);
+        if (
+          cached?.local &&
+          fingerprintLocalStatus(cached.local.value) === fingerprintLocalStatus(local)
+        ) {
+          yield* removeStatusCacheAlias(cwd, canonicalCwd);
+          return cached.local.value;
+        }
+        yield* removeStatusCacheAlias(cwd, canonicalCwd);
+        return yield* updateCachedLocalStatus(canonicalCwd, local, { onlyIfChanged: true });
+      }),
+    );
   });
 
   const getOrLoadLocalStatus = Effect.fn("VcsStatusBroadcaster.getOrLoadLocalStatus")(function* (
@@ -434,19 +385,27 @@ export const make = Effect.gen(function* () {
       canonicalCached?.remote?.value ??
       cached?.remote?.value ??
       (yield* workflow.remoteStatus({ cwd }));
-    yield* removeStatusCacheAlias(cwd, canonicalCwd);
-    return yield* updateCachedStatus(canonicalCwd, local, remote, {
-      preserveLocalRevisionIfUnchanged: true,
-    });
+    const latestAtCwd = yield* getCachedStatus(cwd);
+    const latestLocal = latestAtCwd?.local?.value ?? local;
+    const latestCanonicalCwd = yield* statusCacheKeyForLocal(cwd, latestLocal);
+    yield* removeStatusCacheAlias(cwd, latestCanonicalCwd);
+    yield* updateCachedRemoteStatus(latestCanonicalCwd, remote);
+    const latestCached = yield* getCachedStatus(latestCanonicalCwd);
+    return mergeGitStatusParts(
+      latestCached?.local?.value ?? latestLocal,
+      latestCached?.remote?.value ?? remote,
+    );
   });
 
   const refreshLocalStatusCore = Effect.fn("VcsStatusBroadcaster.refreshLocalStatusCore")(
-    function* (cwd: string) {
+    function* (cwd: string, invalidation: "local" | "none" = "local") {
       return yield* workflow.withRepositoryPermit(
         "VcsStatusBroadcaster.refreshLocalStatus",
         cwd,
         Effect.gen(function* () {
-          yield* workflow.invalidateLocalStatus(cwd);
+          if (invalidation === "local") {
+            yield* workflow.invalidateLocalStatus(cwd);
+          }
           const local = yield* workflow.localStatus({ cwd });
           const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
           yield* removeStatusCacheAlias(cwd, canonicalCwd);
@@ -471,27 +430,39 @@ export const make = Effect.gen(function* () {
       yield* workflow.invalidateRemoteStatus(cwd);
     }
     const remote = yield* workflow.remoteStatus({ cwd }, options);
-    return yield* updateCachedRemoteStatus(cwd, remote, { publish: true });
+    const cached = yield* getCachedStatus(cwd);
+    const canonicalCwd = cached?.local
+      ? yield* statusCacheKeyForLocal(cwd, cached.local.value)
+      : cwd;
+    return yield* updateCachedRemoteStatus(canonicalCwd, remote, { publish: true });
   });
 
   const refreshStatus: VcsStatusBroadcaster["Service"]["refreshStatus"] = Effect.fn(
     "VcsStatusBroadcaster.refreshStatus",
   )(function* (rawCwd, options) {
     const cwd = yield* withFileSystem(normalizeCwd(rawCwd));
-    if (options?.refreshUpstream === false) {
-      yield* workflow.invalidateLocalStatus(cwd);
-    } else {
-      // invalidateStatus (not the two partial invalidations) so an explicit
-      // refresh also bypasses GitManager's slow PR-lookup cache.
+    const fullRefresh = options?.refreshUpstream !== false;
+    if (fullRefresh) {
+      // Invalidate before either branch starts so a remote read cannot win
+      // the race and return the pre-refresh cached upstream result. The local
+      // read and publication remain serialized by refreshLocalStatusCore.
       yield* workflow.invalidateStatus(cwd);
     }
     const [local, remote] = yield* Effect.all(
-      [workflow.localStatus({ cwd }), workflow.remoteStatus({ cwd }, options)],
+      [
+        refreshLocalStatusCore(cwd, fullRefresh ? "none" : "local"),
+        workflow.remoteStatus({ cwd }, options),
+      ],
       { concurrency: "unbounded" },
     );
     const canonicalCwd = yield* statusCacheKeyForLocal(cwd, local);
     yield* removeStatusCacheAlias(cwd, canonicalCwd);
-    return yield* updateCachedStatus(canonicalCwd, local, remote, { publish: true });
+    // The local branch has already been published under the permit. Publish
+    // remote state independently so a delayed full refresh cannot overwrite a
+    // newer local mutation with an old snapshot.
+    yield* updateCachedRemoteStatus(canonicalCwd, remote, { publish: true });
+    const latestCached = yield* getCachedStatus(canonicalCwd);
+    return mergeGitStatusParts(latestCached?.local?.value ?? local, remote);
   });
 
   const makeRemoteRefreshLoop = (

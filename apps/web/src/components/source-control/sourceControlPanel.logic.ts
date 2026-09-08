@@ -231,9 +231,17 @@ export async function submitSourceControlCommit<
 >(input: {
   readonly commit: (commitInput: GitCommitIndexInput) => Promise<R>;
   readonly commitInput: GitCommitIndexInput;
+  readonly confirmDefaultRef: () => Promise<boolean>;
   readonly onStale: (result: { readonly cause: Cause.Cause<E> }) => void;
-}): Promise<R> {
-  const result = await input.commit(input.commitInput);
+}): Promise<R | null> {
+  let result = await input.commit(input.commitInput);
+  if (
+    result._tag === "Failure" &&
+    getGitMutationRejectionCode(result) === "default_ref_confirmation_required"
+  ) {
+    if (!(await input.confirmDefaultRef())) return null;
+    result = await input.commit({ ...input.commitInput, confirmDefaultRef: true });
+  }
   if (result._tag === "Failure" && getGitMutationRejectionCode(result) === "stale_git_state") {
     input.onStale(result);
   }
