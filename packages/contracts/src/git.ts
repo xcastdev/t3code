@@ -143,6 +143,12 @@ export const VcsWorkingTreeDiffInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
   path: GitPath,
   comparison: Schema.Literals(["index", "head"]),
+  reviewedState: Schema.optional(
+    Schema.Struct({
+      headCommit: Schema.NullOr(Schema.String),
+      indexTree: Schema.String,
+    }),
+  ),
 });
 export type VcsWorkingTreeDiffInput = typeof VcsWorkingTreeDiffInput.Type;
 

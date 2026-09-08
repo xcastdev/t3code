@@ -46,6 +46,7 @@ describe("source control panel logic", () => {
       commitPending: false,
       diffReviewReady: false,
       reviewedStateAvailable: true,
+      hasReviewedBranch: true,
     };
 
     expect(canSubmitSourceControlCommit(commitState)).toBe(false);
@@ -57,6 +58,21 @@ describe("source control panel logic", () => {
         reviewedStateAvailable: false,
       }),
     ).toBe(false);
+  });
+
+  it("keeps commit unavailable for a detached reviewed HEAD", () => {
+    const commitState = {
+      workflowAvailable: true,
+      stagedCount: 1,
+      message: "reviewed change",
+      commitPending: false,
+      diffReviewReady: true,
+      reviewedStateAvailable: true,
+      hasReviewedBranch: false,
+    };
+
+    expect(canSubmitSourceControlCommit(commitState)).toBe(false);
+    expect(canSubmitSourceControlCommit({ ...commitState, hasReviewedBranch: true })).toBe(true);
   });
 
   it("defaults commit-ready files to the index diff", () => {
@@ -186,12 +202,12 @@ describe("source control panel logic", () => {
     ).toBeUndefined();
   });
 
-  it("refreshes the reviewed views and retains the draft after a stale commit", () => {
+  it("refreshes the reviewed views and retains the draft after a stale commit", async () => {
     const refreshStatus = vi.fn();
     const refreshDiff = vi.fn();
     const setError = vi.fn();
 
-    const handled = handleSourceControlCommitFailure(
+    const handled = await handleSourceControlCommitFailure(
       { cause: Cause.fail({ code: "stale_git_state" }) },
       { refreshStatus, refreshDiff, setError },
     );

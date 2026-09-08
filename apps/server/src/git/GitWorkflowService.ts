@@ -60,6 +60,11 @@ export class GitWorkflowService extends Context.Service<
       cwd: string,
       effect: Effect.Effect<A, E, R>,
     ) => Effect.Effect<A, E | GitCommandError, R>;
+    readonly withDetectedGitRepositoryPermit?: <A, E, R>(
+      operation: string,
+      cwd: string,
+      effect: Effect.Effect<A, E, R>,
+    ) => Effect.Effect<A | null, E | GitCommandError, R>;
     readonly stageFiles: (input: VcsStageFilesInput) => Effect.Effect<void, GitCommandError>;
     readonly unstageFiles: (input: VcsStageFilesInput) => Effect.Effect<void, GitCommandError>;
     readonly getWorkingTreeDiff: (
@@ -247,6 +252,37 @@ export const make = Effect.gen(function* () {
       ),
     );
 
+  const withDetectedGitRepositoryPermit = <A, E, R>(
+    operation: string,
+    cwd: string,
+    effect: Effect.Effect<A, E, R>,
+  ): Effect.Effect<A | null, E | GitCommandError, R> =>
+    Effect.gen(function* () {
+      const handle = yield* registry.detect({ cwd }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new GitCommandError({
+              operation,
+              command: "vcs-route",
+              cwd,
+              detail: "Failed to detect a VCS repository for this Git command.",
+              cause,
+            }),
+        ),
+      );
+      if (handle === null) return null;
+      if (handle.kind !== "git") {
+        return yield* new GitCommandError({
+          operation,
+          command: "vcs-route",
+          cwd,
+          detail: `The ${operation} command currently supports Git repositories only; detected ${handle.kind}.`,
+        });
+      }
+      const semaphore = yield* getMutationSemaphore(mutationKey(handle));
+      return yield* semaphore.withPermit(effect);
+    });
+
   const detectGitRepositoryForStatus = Effect.fn("GitWorkflowService.detectGitRepositoryForStatus")(
     function* (operation: string, cwd: string) {
       const handle = yield* registry.detect({ cwd }).pipe(
@@ -336,6 +372,7 @@ export const make = Effect.gen(function* () {
     invalidateRemoteStatus: gitManager.invalidateRemoteStatus,
     invalidateStatus: gitManager.invalidateStatus,
     withRepositoryPermit: serializedMutation,
+    withDetectedGitRepositoryPermit,
     stageFiles: (input) =>
       serializedMutation("GitWorkflowService.stageFiles", input.cwd, git.stageFiles(input)),
     unstageFiles: (input) =>

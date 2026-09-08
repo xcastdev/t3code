@@ -112,6 +112,7 @@ function makeTestLayer(
             state.remoteInvalidationCalls += 1;
           }),
         withRepositoryPermit: (_operation, _cwd, effect) => effect,
+        withDetectedGitRepositoryPermit: (_operation, _cwd, effect) => effect,
         ...workflowOverrides,
       }),
     ),
@@ -172,6 +173,33 @@ describe("VcsStatusBroadcaster", () => {
       assert.equal(state.remoteStatusCalls, 1);
       assert.equal(state.localInvalidationCalls, 0);
       assert.equal(state.remoteInvalidationCalls, 0);
+    }).pipe(Effect.provide(makeTestLayer(state)));
+  });
+
+  it.effect("does not request remote status for a non-repository", () => {
+    const state = {
+      currentLocalStatus: {
+        isRepo: false,
+        hasPrimaryRemote: false,
+        isDefaultRef: false,
+        refName: null,
+        hasWorkingTreeChanges: false,
+        workingTree: { files: [], insertions: 0, deletions: 0 },
+      } satisfies VcsStatusLocalResult,
+      currentRemoteStatus: baseRemoteStatus,
+      localStatusCalls: 0,
+      remoteStatusCalls: 0,
+      localInvalidationCalls: 0,
+      remoteInvalidationCalls: 0,
+    };
+
+    return Effect.gen(function* () {
+      const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+      const status = yield* broadcaster.getStatus({ cwd: "/not-a-repo" });
+
+      assert.equal(status.isRepo, false);
+      assert.equal(status.hasUpstream, false);
+      assert.equal(state.remoteStatusCalls, 0);
     }).pipe(Effect.provide(makeTestLayer(state)));
   });
 
@@ -329,6 +357,49 @@ describe("VcsStatusBroadcaster", () => {
     }).pipe(Effect.scoped);
   });
 
+  it.effect("does not let an older remote refresh overwrite a newer one", () => {
+    const state = {
+      currentLocalStatus: baseLocalStatus,
+      currentRemoteStatus: baseRemoteStatus,
+      localStatusCalls: 0,
+      remoteStatusCalls: 0,
+      localInvalidationCalls: 0,
+      remoteInvalidationCalls: 0,
+    };
+
+    return Effect.gen(function* () {
+      const olderRefreshStarted = yield* Deferred.make<void>();
+      const releaseOlderRefresh = yield* Deferred.make<void>();
+      const layer = makeTestLayer(state, {
+        remoteStatus: () =>
+          Effect.gen(function* () {
+            state.remoteStatusCalls += 1;
+            if (state.remoteStatusCalls === 2) {
+              yield* Deferred.succeed(olderRefreshStarted, undefined);
+              yield* Deferred.await(releaseOlderRefresh);
+              return { ...baseRemoteStatus, aheadCount: 1 };
+            }
+            if (state.remoteStatusCalls === 3) {
+              return { ...baseRemoteStatus, aheadCount: 2 };
+            }
+            return state.currentRemoteStatus;
+          }),
+      });
+      const broadcaster = yield* Effect.provide(VcsStatusBroadcaster.VcsStatusBroadcaster, layer);
+      yield* broadcaster.getStatus({ cwd: "/repo" });
+
+      const older = yield* broadcaster.refreshStatus("/repo").pipe(Effect.forkScoped);
+      yield* Deferred.await(olderRefreshStarted);
+      const newer = yield* broadcaster.refreshStatus("/repo");
+      yield* Deferred.succeed(releaseOlderRefresh, undefined);
+      yield* Fiber.join(older);
+
+      const cached = yield* broadcaster.getStatus({ cwd: "/repo" });
+      assert.equal(newer.aheadCount, 2);
+      assert.equal(cached.aheadCount, 2);
+    }).pipe(Effect.scoped);
+  });
+
   it.effect(
     "refreshStatus forwards no-fetch options and publishes local and remote separately",
     () => {
@@ -445,6 +516,7 @@ describe("VcsStatusBroadcaster", () => {
               state.remoteInvalidationCalls += 1;
             }),
           withRepositoryPermit: (_operation, _cwd, effect) => effect,
+          withDetectedGitRepositoryPermit: (_operation, _cwd, effect) => effect,
         }),
       ),
     );
@@ -618,6 +690,7 @@ describe("VcsStatusBroadcaster", () => {
               state.remoteInvalidationCalls += 1;
             }),
           withRepositoryPermit: (_operation, _cwd, effect) => effect,
+          withDetectedGitRepositoryPermit: (_operation, _cwd, effect) => effect,
         } satisfies Partial<GitWorkflowService.GitWorkflowService["Service"]>),
       ),
     );
@@ -955,6 +1028,7 @@ describe("VcsStatusBroadcaster", () => {
               state.remoteInvalidationCalls += 1;
             }),
           withRepositoryPermit: (_operation, _cwd, effect) => effect,
+          withDetectedGitRepositoryPermit: (_operation, _cwd, effect) => effect,
         }),
       ),
     );
@@ -1139,6 +1213,7 @@ describe("VcsStatusBroadcaster", () => {
               state.remoteInvalidationCalls += 1;
             }),
           withRepositoryPermit: (_operation, _cwd, effect) => effect,
+          withDetectedGitRepositoryPermit: (_operation, _cwd, effect) => effect,
         } satisfies Partial<GitWorkflowService.GitWorkflowService["Service"]>),
       ),
     );
@@ -1204,6 +1279,7 @@ describe("VcsStatusBroadcaster", () => {
               state.remoteInvalidationCalls += 1;
             }),
           withRepositoryPermit: (_operation, _cwd, effect) => effect,
+          withDetectedGitRepositoryPermit: (_operation, _cwd, effect) => effect,
         } satisfies Partial<GitWorkflowService.GitWorkflowService["Service"]>),
       ),
     );

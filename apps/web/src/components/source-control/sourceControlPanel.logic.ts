@@ -151,6 +151,7 @@ export function canSubmitSourceControlCommit(input: {
   readonly commitPending: boolean;
   readonly diffReviewReady: boolean;
   readonly reviewedStateAvailable: boolean;
+  readonly hasReviewedBranch: boolean;
 }): boolean {
   return (
     input.workflowAvailable &&
@@ -158,7 +159,8 @@ export function canSubmitSourceControlCommit(input: {
     input.message.trim().length > 0 &&
     !input.commitPending &&
     input.diffReviewReady &&
-    input.reviewedStateAvailable
+    input.reviewedStateAvailable &&
+    input.hasReviewedBranch
   );
 }
 
@@ -209,17 +211,17 @@ export function getGitMutationRejectionCode<E>(input: {
   }
 }
 
-export function handleSourceControlCommitFailure<E>(
+export async function handleSourceControlCommitFailure<E>(
   result: { readonly cause: Cause.Cause<E> },
   callbacks: {
-    readonly refreshStatus: () => void;
-    readonly refreshDiff: () => void;
+    readonly refreshStatus: () => void | Promise<void>;
+    readonly refreshDiff: () => void | Promise<void>;
     readonly setError: (message: string) => void;
   },
-): boolean {
+): Promise<boolean> {
   if (getGitMutationRejectionCode(result) !== "stale_git_state") return false;
-  callbacks.refreshStatus();
-  callbacks.refreshDiff();
+  await callbacks.refreshStatus();
+  await callbacks.refreshDiff();
   callbacks.setError(SOURCE_CONTROL_STALE_STATE_MESSAGE);
   return true;
 }
@@ -232,7 +234,7 @@ export async function submitSourceControlCommit<
   readonly commit: (commitInput: GitCommitIndexInput) => Promise<R>;
   readonly commitInput: GitCommitIndexInput;
   readonly confirmDefaultRef: () => Promise<boolean>;
-  readonly onStale: (result: { readonly cause: Cause.Cause<E> }) => void;
+  readonly onStale: (result: { readonly cause: Cause.Cause<E> }) => void | Promise<void>;
 }): Promise<R | null> {
   let result = await input.commit(input.commitInput);
   if (
@@ -243,7 +245,7 @@ export async function submitSourceControlCommit<
     result = await input.commit({ ...input.commitInput, confirmDefaultRef: true });
   }
   if (result._tag === "Failure" && getGitMutationRejectionCode(result) === "stale_git_state") {
-    input.onStale(result);
+    await input.onStale(result);
   }
   return result;
 }

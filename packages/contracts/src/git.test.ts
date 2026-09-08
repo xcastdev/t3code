@@ -265,6 +265,20 @@ describe("Git index and diff contracts", () => {
     expect(result.truncated).toBe(false);
   });
 
+  it("decodes an immutable reviewed state for staged diff requests", () => {
+    const input = decodeVcsWorkingTreeDiffInput({
+      cwd: "/repo",
+      path: "src/a.ts",
+      comparison: "index",
+      reviewedState: {
+        headCommit: null,
+        indexTree: "tree-1",
+      },
+    });
+
+    expect(input.reviewedState).toEqual({ headCommit: null, indexTree: "tree-1" });
+  });
+
   it("decodes an index-only commit request", () => {
     const parsed = decodeGitCommitIndexInput({ cwd: "/repo", message: "fix: stage it" });
 

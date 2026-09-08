@@ -248,6 +248,14 @@ function ChangesView({
             cwd,
             path: selectedFile.path,
             comparison: diffComparison,
+            ...(status?.headCommit !== undefined && status.indexTree !== undefined
+              ? {
+                  reviewedState: {
+                    headCommit: status.headCommit,
+                    indexTree: status.indexTree,
+                  },
+                }
+              : {}),
             ...(status?.localRevision === undefined ? {} : { localRevision: status.localRevision }),
           },
         })
@@ -261,8 +269,20 @@ function ChangesView({
     diff: diffQuery.data?.diff ?? null,
     truncated: diffQuery.data?.truncated ?? false,
   });
-  const refreshStatus = statusQuery.refresh;
+  const refreshStatusCommand = useAtomCommand(vcsEnvironment.refreshStatus, {
+    reportFailure: false,
+  });
   const refreshDiff = diffQuery.refresh;
+  const refreshStatus = useCallback(async () => {
+    if (cwd === null) return;
+    const result = await refreshStatusCommand({ environmentId, input: { cwd } });
+    if (result._tag === "Failure") {
+      if (!isAtomCommandInterrupted(result)) setActionError(commandError(result));
+      return;
+    }
+    statusQuery.refresh();
+    refreshDiff();
+  }, [cwd, environmentId, refreshDiff, refreshStatusCommand, statusQuery]);
   const stage = useAtomCommand(vcsEnvironment.stageFiles, { reportFailure: false });
   const unstage = useAtomCommand(vcsEnvironment.unstageFiles, { reportFailure: false });
   const commit = useAtomCommand(vcsEnvironment.commitIndex, { reportFailure: false });
@@ -334,8 +354,8 @@ function ChangesView({
       commit: (input) => commit({ environmentId, input }),
       commitInput,
       confirmDefaultRef,
-      onStale: (failure) => {
-        staleStateHandled = handleSourceControlCommitFailure(failure, {
+      onStale: async (failure) => {
+        staleStateHandled = await handleSourceControlCommitFailure(failure, {
           refreshStatus,
           refreshDiff,
           setError: setActionError,
@@ -360,6 +380,7 @@ function ChangesView({
     files,
     refreshDiff,
     refreshStatus,
+    refreshStatusCommand,
     status,
     workflowAvailable,
   ]);
@@ -374,7 +395,7 @@ function ChangesView({
         <p className="text-xs text-destructive" role="alert">
           {statusQuery.error}
         </p>
-        <Button size="sm" variant="outline" onClick={() => statusQuery.refresh()}>
+        <Button size="sm" variant="outline" onClick={() => void refreshStatus()}>
           Retry
         </Button>
       </div>
@@ -412,6 +433,7 @@ function ChangesView({
     commitPending,
     diffReviewReady,
     reviewedStateAvailable: status?.headCommit !== undefined && status?.indexTree !== undefined,
+    hasReviewedBranch: status?.refName !== null && status?.refName !== undefined,
   });
 
   return (
@@ -433,7 +455,7 @@ function ChangesView({
             aria-label="Refresh source control"
             size="icon-xs"
             variant="ghost"
-            onClick={() => statusQuery.refresh()}
+            onClick={() => void refreshStatus()}
           >
             <RefreshCwIcon className="size-3.5" aria-hidden />
           </Button>
@@ -615,6 +637,11 @@ function ChangesView({
             {commitPending ? "Committing..." : "Commit"}
           </Button>
         </div>
+        {status?.refName === null ? (
+          <p className="mt-1 text-[10px] text-muted-foreground">
+            Commit is unavailable while HEAD is detached. Switch to a branch to commit.
+          </p>
+        ) : null}
       </div>
     </div>
   );

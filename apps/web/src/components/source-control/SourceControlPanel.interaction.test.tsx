@@ -30,12 +30,13 @@ describe("SourceControlPanel commit interaction", () => {
       commit,
       commitInput,
       confirmDefaultRef: async () => false,
-      onStale: (failure) =>
-        handleSourceControlCommitFailure(failure, {
+      onStale: async (failure) => {
+        await handleSourceControlCommitFailure(failure, {
           refreshStatus,
           refreshDiff,
           setError,
-        }),
+        });
+      },
     });
 
     expect(commit).toHaveBeenCalledWith({
@@ -82,6 +83,7 @@ describe("SourceControlPanel commit interaction", () => {
           commitPending: false,
           diffReviewReady,
           reviewedStateAvailable: status.headCommit !== undefined && status.indexTree !== undefined,
+          hasReviewedBranch: true,
         })
       ) {
         return;

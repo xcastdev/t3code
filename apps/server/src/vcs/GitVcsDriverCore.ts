@@ -60,7 +60,6 @@ const GUARDED_COMMIT_HOOK_NAMES = [
   "commit-msg",
   "post-commit",
 ] as const;
-const ZERO_OID = "0000000000000000000000000000000000000000";
 const WORKSPACE_FILES_MAX_OUTPUT_BYTES = 120_000;
 const STATUS_UPSTREAM_REFRESH_INTERVAL = Duration.seconds(15);
 const STATUS_UPSTREAM_REFRESH_TIMEOUT = Duration.seconds(5);
@@ -1580,6 +1579,13 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     });
   });
 
+  const resolvePrimaryDefaultBranchName = Effect.fn("resolvePrimaryDefaultBranchName")(function* (
+    cwd: string,
+  ) {
+    const remoteName = yield* resolvePrimaryRemoteName(cwd).pipe(Effect.orElseSucceed(() => null));
+    return remoteName === null ? null : yield* resolveDefaultBranchName(cwd, remoteName);
+  });
+
   const resolvePushRemoteName = Effect.fn("resolvePushRemoteName")(function* (
     cwd: string,
     refName: string,
@@ -1816,117 +1822,38 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       Effect.catchTags({ GitCommandError: () => Effect.succeed(null) }),
     );
     const commandCwd = repositoryPaths?.worktreeRoot ?? cwd;
-    const statusResult = yield* executeGitWithStableDiagnostics(
-      "GitVcsDriver.statusDetails.status",
-      commandCwd,
-      ["status", "--porcelain=2", "--branch", "-z"],
-      {
-        allowNonZeroExit: true,
-      },
-    ).pipe(
-      Effect.catchTags({
-        GitCommandError: (error) =>
-          isMissingGitCwdError(error) ? Effect.succeed(null) : Effect.fail(error),
-      }),
-    );
 
-    if (statusResult === null) {
-      return NON_REPOSITORY_STATUS_DETAILS;
-    }
-
-    if (statusResult.exitCode !== 0) {
-      if (isNonRepositoryGitStderr(statusResult.stderr)) {
-        return NON_REPOSITORY_STATUS_DETAILS;
-      }
-      return yield* new GitCommandError({
-        ...gitCommandContext({
-          operation: "GitVcsDriver.statusDetails.status",
-          cwd,
-          args: ["status", "--porcelain=2", "--branch", "-z"],
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const statusResult = yield* executeGitWithStableDiagnostics(
+        "GitVcsDriver.statusDetails.status",
+        commandCwd,
+        ["status", "--porcelain=2", "--branch", "-z"],
+        { allowNonZeroExit: true },
+      ).pipe(
+        Effect.catchTags({
+          GitCommandError: (error) =>
+            isMissingGitCwdError(error) ? Effect.succeed(null) : Effect.fail(error),
         }),
-        detail: "Git status failed.",
-        exitCode: statusResult.exitCode,
-        stdoutLength: statusResult.stdout.length,
-        stderrLength: statusResult.stderr.length,
-      });
-    }
+      );
 
-    const statusCacheKey = repositoryPaths?.gitCommonDir;
-    const [
-      numstatEntries,
-      defaultBranch,
-      hasPrimaryRemote,
-      headResult,
-      indexTreeResult,
-      stagedPathsResult,
-      unstagedPathsResult,
-      untrackedPathsResult,
-      conflictedPathsResult,
-    ] = yield* Effect.all(
-      [
-        executeGitWithStableDiagnostics(
-          "GitVcsDriver.statusDetails.numstat",
-          commandCwd,
-          ["diff", "HEAD", "--numstat", "-z", "--"],
-          { allowNonZeroExit: true },
-        ).pipe(
-          Effect.flatMap((result) => {
-            if (result.exitCode === 0) {
-              return Effect.succeed(parseNumstatEntries(result.stdout));
-            }
-            if (isUnbornHeadStderr(result.stderr)) {
-              return Effect.map(
-                Effect.all([
-                  runGitStdout("GitVcsDriver.statusDetails.numstat.unborn", commandCwd, [
-                    "diff",
-                    "--numstat",
-                    "-z",
-                  ]),
-                  runGitStdout("GitVcsDriver.statusDetails.numstat.unborn.staged", commandCwd, [
-                    "diff",
-                    "--cached",
-                    "--numstat",
-                    "-z",
-                  ]),
-                ]),
-                ([unstagedStdout, stagedStdout]) => {
-                  const staged = parseNumstatEntries(stagedStdout);
-                  const unstaged = parseNumstatEntries(unstagedStdout);
-                  const map = new Map<string, { insertions: number; deletions: number }>();
-                  for (const entry of [...staged, ...unstaged]) {
-                    const existing = map.get(entry.path) ?? {
-                      insertions: 0,
-                      deletions: 0,
-                    };
-                    existing.insertions += entry.insertions;
-                    existing.deletions += entry.deletions;
-                    map.set(entry.path, existing);
-                  }
-                  return Array.from(map.entries()).map(([path, stat]) => ({ path, ...stat }));
-                },
-              );
-            }
-            return Effect.fail(
-              new GitCommandError({
-                ...gitCommandContext({
-                  operation: "GitVcsDriver.statusDetails.numstat",
-                  cwd,
-                  args: ["diff", "HEAD", "--numstat", "-z", "--"],
-                }),
-                detail: "git diff HEAD --numstat failed.",
-                exitCode: result.exitCode,
-                stdoutLength: result.stdout.length,
-                stderrLength: result.stderr.length,
-              }),
-            );
+      if (statusResult === null) return NON_REPOSITORY_STATUS_DETAILS;
+      if (statusResult.exitCode !== 0) {
+        if (isNonRepositoryGitStderr(statusResult.stderr)) return NON_REPOSITORY_STATUS_DETAILS;
+        return yield* new GitCommandError({
+          ...gitCommandContext({
+            operation: "GitVcsDriver.statusDetails.status",
+            cwd,
+            args: ["status", "--porcelain=2", "--branch", "-z"],
           }),
-        ),
-        statusCacheKey
-          ? Cache.get(defaultBranchCache, statusCacheKey).pipe(Effect.orElseSucceed(() => null))
-          : resolveDefaultBranchName(cwd, "origin").pipe(Effect.orElseSucceed(() => null)),
-        statusCacheKey
-          ? Cache.get(originExistsCache, statusCacheKey).pipe(Effect.orElseSucceed(() => false))
-          : originRemoteExists(cwd).pipe(Effect.orElseSucceed(() => false)),
+          detail: "Git status failed.",
+          exitCode: statusResult.exitCode,
+          stdoutLength: statusResult.stdout.length,
+          stderrLength: statusResult.stderr.length,
+        });
+      }
+
+      const statusCacheKey = repositoryPaths?.gitCommonDir;
+      const [headResult, indexTreeResult] = yield* Effect.all([
         executeGitWithStableDiagnostics(
           "GitVcsDriver.statusDetails.head",
           commandCwd,
@@ -1939,123 +1866,243 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           ["write-tree"],
           { allowNonZeroExit: true },
         ),
-        executeGitWithStableDiagnostics(
-          "GitVcsDriver.statusDetails.stagedPaths",
-          commandCwd,
-          ["diff", "--cached", "--name-only", "-z", "--"],
-          { allowNonZeroExit: true },
-        ),
-        executeGitWithStableDiagnostics(
-          "GitVcsDriver.statusDetails.unstagedPaths",
-          commandCwd,
-          ["diff", "--name-only", "-z", "--"],
-          { allowNonZeroExit: true },
-        ),
-        executeGitWithStableDiagnostics(
-          "GitVcsDriver.statusDetails.untrackedPaths",
-          commandCwd,
-          ["--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z"],
-          { allowNonZeroExit: true },
-        ),
-        executeGitWithStableDiagnostics(
-          "GitVcsDriver.statusDetails.conflictedPaths",
-          commandCwd,
-          ["diff", "--name-only", "--diff-filter=U", "-z", "--"],
-          { allowNonZeroExit: true },
-        ),
-      ],
-      { concurrency: "unbounded" },
-    );
-    const parsedStatus = parsePorcelainV2Status(statusResult.stdout);
-    let { aheadCount, behindCount } = parsedStatus;
-    const { refName, upstreamRef, hasWorkingTreeChanges } = parsedStatus;
-    let aheadOfDefaultCount = 0;
+      ]);
+      const headCommit = headResult.exitCode === 0 ? headResult.stdout.trim() : null;
+      const indexTree = indexTreeResult.exitCode === 0 ? indexTreeResult.stdout.trim() : null;
 
-    const fallbackAheadCount =
-      !upstreamRef && refName
-        ? yield* computeAheadCountAgainstBase(cwd, refName).pipe(Effect.orElseSucceed(() => 0))
-        : null;
+      const baseTree =
+        headCommit ??
+        (yield* runGitStdoutWithOptions(
+          "GitVcsDriver.statusDetails.emptyTree",
+          commandCwd,
+          ["hash-object", "-t", "tree", "--stdin"],
+          { stdin: "" },
+        ).pipe(Effect.map((value) => value.trim())));
+      const [
+        stagedPathsResult,
+        stagedNumstatResult,
+        unstagedNumstatResult,
+        unstagedPathsResult,
+        untrackedPathsResult,
+        conflictedPathsResult,
+      ] = yield* Effect.all(
+        [
+          indexTree === null
+            ? executeGitWithStableDiagnostics(
+                "GitVcsDriver.statusDetails.stagedPaths",
+                commandCwd,
+                ["diff", "--cached", "--name-only", "-z", "--"],
+                { allowNonZeroExit: true },
+              )
+            : executeGitWithStableDiagnostics(
+                "GitVcsDriver.statusDetails.stagedPaths.reviewed",
+                commandCwd,
+                [
+                  "--literal-pathspecs",
+                  "diff",
+                  "--no-ext-diff",
+                  "--no-textconv",
+                  "--name-only",
+                  "-z",
+                  baseTree,
+                  indexTree,
+                  "--",
+                ],
+                { allowNonZeroExit: true },
+              ),
+          indexTree === null
+            ? executeGitWithStableDiagnostics(
+                "GitVcsDriver.statusDetails.stagedNumstat",
+                commandCwd,
+                ["diff", "--cached", "--numstat", "-z", "--"],
+                { allowNonZeroExit: true },
+              )
+            : executeGitWithStableDiagnostics(
+                "GitVcsDriver.statusDetails.stagedNumstat.reviewed",
+                commandCwd,
+                [
+                  "--literal-pathspecs",
+                  "diff",
+                  "--no-ext-diff",
+                  "--no-textconv",
+                  "--numstat",
+                  "-z",
+                  baseTree,
+                  indexTree,
+                  "--",
+                ],
+                { allowNonZeroExit: true },
+              ),
+          executeGitWithStableDiagnostics(
+            "GitVcsDriver.statusDetails.unstagedNumstat",
+            commandCwd,
+            [
+              "--literal-pathspecs",
+              "diff",
+              "--no-ext-diff",
+              "--no-textconv",
+              "--numstat",
+              "-z",
+              "--",
+            ],
+            { allowNonZeroExit: true },
+          ),
+          executeGitWithStableDiagnostics(
+            "GitVcsDriver.statusDetails.unstagedPaths",
+            commandCwd,
+            ["--literal-pathspecs", "diff", "--name-only", "-z", "--"],
+            { allowNonZeroExit: true },
+          ),
+          executeGitWithStableDiagnostics(
+            "GitVcsDriver.statusDetails.untrackedPaths",
+            commandCwd,
+            ["--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "-z"],
+            { allowNonZeroExit: true },
+          ),
+          executeGitWithStableDiagnostics(
+            "GitVcsDriver.statusDetails.conflictedPaths",
+            commandCwd,
+            ["diff", "--name-only", "--diff-filter=U", "-z", "--"],
+            { allowNonZeroExit: true },
+          ),
+        ],
+        { concurrency: "unbounded" },
+      );
 
-    if (fallbackAheadCount !== null) {
-      aheadCount = fallbackAheadCount;
-      behindCount = 0;
+      const [finalHeadResult, finalIndexTreeResult] = yield* Effect.all([
+        executeGitWithStableDiagnostics(
+          "GitVcsDriver.statusDetails.finalHead",
+          commandCwd,
+          ["rev-parse", "--verify", "HEAD"],
+          { allowNonZeroExit: true },
+        ),
+        executeGitWithStableDiagnostics(
+          "GitVcsDriver.statusDetails.finalIndexTree",
+          commandCwd,
+          ["write-tree"],
+          { allowNonZeroExit: true },
+        ),
+      ]);
+      const finalHead = finalHeadResult.exitCode === 0 ? finalHeadResult.stdout.trim() : null;
+      const finalIndexTree =
+        finalIndexTreeResult.exitCode === 0 ? finalIndexTreeResult.stdout.trim() : null;
+      if (finalHead !== headCommit || finalIndexTree !== indexTree) {
+        if (attempt < 2) continue;
+        return yield* new GitCommandError({
+          ...gitCommandContext({
+            operation: "GitVcsDriver.statusDetails.coherence",
+            cwd,
+            args: ["rev-parse", "--verify", "HEAD", "write-tree"],
+          }),
+          detail: "Git changed while the review snapshot was being read; try again.",
+        });
+      }
+
+      const parsedStatus = parsePorcelainV2Status(statusResult.stdout);
+      let { aheadCount, behindCount } = parsedStatus;
+      const { refName, upstreamRef, hasWorkingTreeChanges } = parsedStatus;
+      let aheadOfDefaultCount = 0;
+      const [defaultBranch, hasPrimaryRemote] = yield* Effect.all([
+        statusCacheKey
+          ? Cache.get(defaultBranchCache, statusCacheKey).pipe(Effect.orElseSucceed(() => null))
+          : resolveDefaultBranchName(cwd, "origin").pipe(Effect.orElseSucceed(() => null)),
+        statusCacheKey
+          ? Cache.get(originExistsCache, statusCacheKey).pipe(Effect.orElseSucceed(() => false))
+          : originRemoteExists(cwd).pipe(Effect.orElseSucceed(() => false)),
+      ]);
+
+      const fallbackAheadCount =
+        !upstreamRef && refName
+          ? yield* computeAheadCountAgainstBase(cwd, refName).pipe(Effect.orElseSucceed(() => 0))
+          : null;
+      if (fallbackAheadCount !== null) {
+        aheadCount = fallbackAheadCount;
+        behindCount = 0;
+      }
+
+      const isDefaultBranch =
+        refName !== null &&
+        (refName === defaultBranch ||
+          (defaultBranch === null && (refName === "main" || refName === "master")));
+      if (refName && !isDefaultBranch) {
+        aheadOfDefaultCount =
+          fallbackAheadCount !== null
+            ? fallbackAheadCount
+            : yield* computeAheadCountAgainstBase(cwd, refName).pipe(Effect.orElseSucceed(() => 0));
+      }
+
+      const stagedPaths = new Set(splitNullSeparatedGitStdoutPaths(stagedPathsResult));
+      const unstagedPaths = new Set(splitNullSeparatedGitStdoutPaths(unstagedPathsResult));
+      const untrackedPaths = new Set(splitNullSeparatedGitStdoutPaths(untrackedPathsResult));
+      const conflictedPaths = new Set(splitNullSeparatedGitStdoutPaths(conflictedPathsResult));
+      const fileStatMap = new Map<string, { insertions: number; deletions: number }>();
+      for (const entry of [
+        ...parseNumstatEntries(stagedNumstatResult.stdout),
+        ...parseNumstatEntries(unstagedNumstatResult.stdout),
+      ]) {
+        const existing = fileStatMap.get(entry.path) ?? { insertions: 0, deletions: 0 };
+        existing.insertions += entry.insertions;
+        existing.deletions += entry.deletions;
+        fileStatMap.set(entry.path, existing);
+      }
+
+      let insertions = 0;
+      let deletions = 0;
+      const filePaths = new Set([
+        ...fileStatMap.keys(),
+        ...parsedStatus.changedTrackedPaths,
+        ...stagedPaths,
+        ...unstagedPaths,
+        ...untrackedPaths,
+        ...conflictedPaths,
+      ]);
+      const files = Array.from(filePaths)
+        .map((filePath) => {
+          const stat = fileStatMap.get(filePath) ?? { insertions: 0, deletions: 0 };
+          insertions += stat.insertions;
+          deletions += stat.deletions;
+          const indexStatus = conflictedPaths.has(filePath)
+            ? ("conflicted" as const)
+            : untrackedPaths.has(filePath)
+              ? ("untracked" as const)
+              : stagedPaths.has(filePath) && unstagedPaths.has(filePath)
+                ? ("both" as const)
+                : stagedPaths.has(filePath)
+                  ? ("staged" as const)
+                  : unstagedPaths.has(filePath)
+                    ? ("unstaged" as const)
+                    : undefined;
+          return {
+            path: filePath,
+            insertions: stat.insertions,
+            deletions: stat.deletions,
+            ...(indexStatus === undefined ? {} : { indexStatus }),
+          };
+        })
+        .toSorted((a, b) => a.path.localeCompare(b.path));
+
+      return {
+        isRepo: true,
+        ...(repositoryPaths?.worktreeRoot ? { repositoryRoot: repositoryPaths.worktreeRoot } : {}),
+        headCommit,
+        ...(indexTree === null ? {} : { indexTree }),
+        hasOriginRemote: hasPrimaryRemote,
+        isDefaultBranch,
+        branch: refName,
+        upstreamRef,
+        hasWorkingTreeChanges,
+        workingTree: { files, insertions, deletions },
+        hasUpstream: upstreamRef !== null,
+        aheadCount,
+        behindCount,
+        aheadOfDefaultCount,
+      };
     }
 
-    const isDefaultBranch =
-      refName !== null &&
-      (refName === defaultBranch ||
-        (defaultBranch === null && (refName === "main" || refName === "master")));
-    if (refName && !isDefaultBranch) {
-      aheadOfDefaultCount =
-        fallbackAheadCount !== null
-          ? fallbackAheadCount
-          : yield* computeAheadCountAgainstBase(cwd, refName).pipe(Effect.orElseSucceed(() => 0));
-    }
-
-    const stagedPaths = new Set(splitNullSeparatedGitStdoutPaths(stagedPathsResult));
-    const unstagedPaths = new Set(splitNullSeparatedGitStdoutPaths(unstagedPathsResult));
-    const untrackedPaths = new Set(splitNullSeparatedGitStdoutPaths(untrackedPathsResult));
-    const conflictedPaths = new Set(splitNullSeparatedGitStdoutPaths(conflictedPathsResult));
-    const fileStatMap = new Map<string, { insertions: number; deletions: number }>();
-    for (const entry of numstatEntries) {
-      fileStatMap.set(entry.path, { insertions: entry.insertions, deletions: entry.deletions });
-    }
-
-    let insertions = 0;
-    let deletions = 0;
-    const filePaths = new Set([
-      ...fileStatMap.keys(),
-      ...parsedStatus.changedTrackedPaths,
-      ...stagedPaths,
-      ...unstagedPaths,
-      ...untrackedPaths,
-      ...conflictedPaths,
-    ]);
-    const files = Array.from(filePaths)
-      .map((filePath) => {
-        const stat = fileStatMap.get(filePath) ?? { insertions: 0, deletions: 0 };
-        insertions += stat.insertions;
-        deletions += stat.deletions;
-        const indexStatus = conflictedPaths.has(filePath)
-          ? ("conflicted" as const)
-          : untrackedPaths.has(filePath)
-            ? ("untracked" as const)
-            : stagedPaths.has(filePath) && unstagedPaths.has(filePath)
-              ? ("both" as const)
-              : stagedPaths.has(filePath)
-                ? ("staged" as const)
-                : unstagedPaths.has(filePath)
-                  ? ("unstaged" as const)
-                  : undefined;
-        return {
-          path: filePath,
-          insertions: stat.insertions,
-          deletions: stat.deletions,
-          ...(indexStatus === undefined ? {} : { indexStatus }),
-        };
-      })
-      .toSorted((a, b) => a.path.localeCompare(b.path));
-
-    return {
-      isRepo: true,
-      ...(repositoryPaths?.worktreeRoot ? { repositoryRoot: repositoryPaths.worktreeRoot } : {}),
-      headCommit: headResult.exitCode === 0 ? headResult.stdout.trim() : null,
-      ...(indexTreeResult.exitCode === 0 ? { indexTree: indexTreeResult.stdout.trim() } : {}),
-      hasOriginRemote: hasPrimaryRemote,
-      isDefaultBranch,
-      branch: refName,
-      upstreamRef,
-      hasWorkingTreeChanges,
-      workingTree: {
-        files,
-        insertions,
-        deletions,
-      },
-      hasUpstream: upstreamRef !== null,
-      aheadCount,
-      behindCount,
-      aheadOfDefaultCount,
-    };
+    return yield* new GitCommandError({
+      ...gitCommandContext({ operation: "GitVcsDriver.statusDetails.coherence", cwd, args: [] }),
+      detail: "Git review status could not be read consistently; try again.",
+    });
   });
 
   const statusDetailsLocal: GitVcsDriver.GitVcsDriver["Service"]["statusDetailsLocal"] = Effect.fn(
@@ -2878,6 +2925,85 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       );
     }
 
+    if (input.comparison === "index" && input.reviewedState !== undefined) {
+      const reviewedState = input.reviewedState;
+      const resolveReviewedObject = Effect.fn(
+        "GitVcsDriver.getWorkingTreeDiff.resolveReviewedObject",
+      )(function* (revision: string, objectKind: "commit" | "tree") {
+        const result = yield* executeGit(
+          "GitVcsDriver.getWorkingTreeDiff.validateReviewedObject",
+          validated.repositoryRoot,
+          ["rev-parse", "--verify", "--end-of-options", `${revision}^{${objectKind}}`],
+          { allowNonZeroExit: true },
+        );
+        if (result.exitCode !== 0) {
+          return yield* new GitCommandError({
+            ...gitCommandContext({
+              operation: "GitVcsDriver.getWorkingTreeDiff.validateReviewedObject",
+              cwd: input.cwd,
+              args: ["rev-parse", "--verify", "--end-of-options", `${revision}^{${objectKind}}`],
+            }),
+            detail: `The reviewed ${objectKind} is no longer available.`,
+            exitCode: result.exitCode,
+            stdoutLength: result.stdout.length,
+            stderrLength: result.stderr.length,
+          });
+        }
+        return result.stdout.trim();
+      });
+
+      const indexTree = yield* resolveReviewedObject(reviewedState.indexTree, "tree");
+      const reviewedHeadCommit = reviewedState.headCommit;
+      const baseTree =
+        reviewedHeadCommit === null
+          ? yield* runGitStdoutWithOptions(
+              "GitVcsDriver.getWorkingTreeDiff.emptyTree",
+              validated.repositoryRoot,
+              ["hash-object", "-t", "tree", "--stdin"],
+              { stdin: "" },
+            ).pipe(Effect.map((value) => value.trim()))
+          : yield* Effect.gen(function* () {
+              const headCommit = yield* resolveReviewedObject(reviewedHeadCommit, "commit");
+              return yield* resolveReviewedObject(headCommit, "tree");
+            });
+      const diffArgs = [
+        "--literal-pathspecs",
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--patch",
+        "--minimal",
+        baseTree,
+        indexTree,
+        "--",
+        relativePath,
+      ];
+      const result = yield* executeGit(
+        "GitVcsDriver.getWorkingTreeDiff.reviewedState",
+        validated.repositoryRoot,
+        diffArgs,
+        {
+          allowNonZeroExit: true,
+          maxOutputBytes: MAX_WORKING_TREE_DIFF_BYTES,
+          appendTruncationMarker: true,
+        },
+      );
+      if (result.exitCode !== 0) {
+        return yield* new GitCommandError({
+          ...gitCommandContext({
+            operation: "GitVcsDriver.getWorkingTreeDiff",
+            cwd: input.cwd,
+            args: diffArgs,
+          }),
+          detail: "Git reviewed staged diff failed.",
+          exitCode: result.exitCode,
+          stdoutLength: result.stdout.length,
+          stderrLength: result.stderr.length,
+        });
+      }
+      return truncateWorkingTreeDiff(result.stdout, result.stdoutTruncated);
+    }
+
     const [headResult, untrackedResult] = yield* Effect.all([
       executeGit(
         "GitVcsDriver.getWorkingTreeDiff.head",
@@ -2963,7 +3089,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       const legacyCommit = Effect.gen(function* () {
         if (input.confirmDefaultRef !== undefined) {
           const state = yield* readMutationState(input.cwd);
-          const defaultRef = yield* resolveDefaultBranchName(input.cwd, "origin");
+          const defaultRef = yield* resolvePrimaryDefaultBranchName(input.cwd);
           const isDefaultRef =
             state.currentRef !== null &&
             (state.currentRef === defaultRef ||
@@ -3025,7 +3151,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           );
         }
 
-        const defaultRef = yield* resolveDefaultBranchName(input.cwd, "origin");
+        const defaultRef = yield* resolvePrimaryDefaultBranchName(input.cwd);
         const isDefaultRef =
           state.currentRef === defaultRef ||
           (defaultRef === null && (state.currentRef === "main" || state.currentRef === "master"));
@@ -3092,7 +3218,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
           );
         }
 
-        const oldCommit = state.headCommit ?? ZERO_OID;
+        const oldCommit = state.headCommit ?? "0".repeat(state.indexTree.length);
         const refName = fullRefName;
         const transaction = [
           "start",
@@ -3971,6 +4097,10 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
               ? ["checkout", localTrackingBranch]
               : ["checkout", input.refName];
 
+      // The initial check protects the confirmation decision while we resolve
+      // the target. Re-check at the checkout boundary so preparatory reads do
+      // not turn a newly dirty worktree into an unconfirmed switch.
+      yield* guardDirtyWorkingTree("GitVcsDriver.switchRef.final", input);
       yield* executeGit("GitVcsDriver.switchRef.checkout", input.cwd, checkoutArgs, {
         timeoutMs: 10_000,
         fallbackErrorDetail: "git checkout failed",
@@ -3999,7 +4129,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         yield* switchRef({
           cwd: input.cwd,
           refName: input.refName,
-          confirmDirtyWorkingTree: true,
+          confirmDirtyWorkingTree: input.confirmDirtyWorkingTree,
         });
       }
 

@@ -301,6 +301,7 @@ export function createVcsEnvironmentAtoms<R, E>(
         cwd: input.cwd,
         path: input.path,
         comparison: input.comparison,
+        ...(input.reviewedState === undefined ? {} : { reviewedState: input.reviewedState }),
       }),
   });
   const mountedWorkingTreeDiffsByScope = new Map<string, Set<WeakRef<Atom.Atom<unknown>>>>();
@@ -321,6 +322,7 @@ export function createVcsEnvironmentAtoms<R, E>(
           cwd: input.cwd,
           path: input.path,
           comparison: input.comparison,
+          ...(input.reviewedState === undefined ? {} : { reviewedState: input.reviewedState }),
           ...(localRevision === undefined ? {} : { localRevision }),
         },
       });

@@ -2114,6 +2114,34 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect("renders a staged diff from the reviewed tree instead of the live index", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        yield* initRepoWithCommit(cwd);
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+
+        yield* writeTextFile(cwd, "reviewed.txt", "reviewed\n");
+        yield* driver.stageFiles({ cwd, paths: ["reviewed.txt"] });
+        const reviewedState = {
+          headCommit: yield* git(cwd, ["rev-parse", "HEAD"]),
+          indexTree: yield* git(cwd, ["write-tree"]),
+        };
+
+        yield* writeTextFile(cwd, "reviewed.txt", "external index\n");
+        yield* driver.stageFiles({ cwd, paths: ["reviewed.txt"] });
+
+        const result = yield* driver.getWorkingTreeDiff({
+          cwd,
+          path: "reviewed.txt",
+          comparison: "index",
+          reviewedState,
+        });
+
+        assert.include(result.diff, "+reviewed");
+        assert.notInclude(result.diff, "+external index");
+      }).pipe(Effect.provide(TestLayer)),
+    );
+
     it.effect("rejects an index commit when HEAD differs from the reviewed precondition", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -2226,6 +2254,38 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
         });
         assert.match(committed.commitSha, /^[a-f0-9]{40}$/);
         assert.equal(yield* git(cwd, ["log", "-1", "--pretty=%s"]), "guarded commit");
+      }),
+    );
+
+    it.effect("uses the only configured remote when guarding its default branch", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const remote = yield* makeTmpDir("git-vcs-driver-primary-remote-");
+        yield* initRepoWithCommit(cwd);
+        yield* git(remote, ["init", "--bare"]);
+        yield* git(cwd, ["branch", "-M", "release"]);
+        yield* git(cwd, ["remote", "add", "upstream", remote]);
+        yield* git(cwd, ["push", "-u", "upstream", "release"]);
+        yield* git(remote, ["symbolic-ref", "HEAD", "refs/heads/release"]);
+        yield* git(cwd, [
+          "symbolic-ref",
+          "refs/remotes/upstream/HEAD",
+          "refs/remotes/upstream/release",
+        ]);
+
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* writeTextFile(cwd, "release.txt", "release\n");
+        yield* driver.stageFiles({ cwd, paths: ["release.txt"] });
+        const precondition = {
+          expectedHeadCommit: yield* git(cwd, ["rev-parse", "HEAD"]),
+          expectedIndexTree: yield* git(cwd, ["write-tree"]),
+          expectedRefName: "release",
+        };
+
+        const error = yield* driver
+          .commitIndex({ cwd, message: "guarded release", precondition })
+          .pipe(Effect.flip);
+        assert.equal(error.code, "default_ref_confirmation_required");
       }),
     );
 
@@ -2377,6 +2437,33 @@ it.layer(TestLayer)("GitVcsDriver core integration", (it) => {
           yield* git(cwd, ["show", "--format=", "--name-only", commit.commitSha]),
           "initial.txt",
         );
+      }),
+    );
+
+    it.effect("uses the repository object-id width for an unborn guarded commit", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        yield* git(cwd, ["init", "--object-format=sha256"]);
+        yield* git(cwd, ["config", "user.email", "test@test.com"]);
+        yield* git(cwd, ["config", "user.name", "Test"]);
+        yield* git(cwd, ["branch", "-M", "feature/sha256-initial"]);
+        yield* writeTextFile(cwd, "initial.txt", "initial\n");
+        yield* driver.stageFiles({ cwd, paths: ["initial.txt"] });
+        const precondition = {
+          expectedHeadCommit: null,
+          expectedIndexTree: yield* git(cwd, ["write-tree"]),
+          expectedRefName: "feature/sha256-initial",
+        };
+
+        const commit = yield* driver.commitIndex({
+          cwd,
+          message: "initial sha256 guarded commit",
+          precondition,
+        });
+
+        assert.match(commit.commitSha, /^[a-f0-9]{64}$/);
+        assert.equal(yield* git(cwd, ["rev-parse", "HEAD"]), commit.commitSha);
       }),
     );
 
