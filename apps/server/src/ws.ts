@@ -1358,26 +1358,18 @@ const makeWsRpcLayer = (
           const entry = catalog.external.find((server) => server.id === id);
           if (!entry) return yield* new ProjectMcpServerNotFoundError({ id });
           const transport = getProjectMcpTransport(entry);
-          if (transport.type === "stdio" || transport.authorization.type !== "oauth") {
+          const binding = yield* ProjectMcpOAuth.resolveServerBinding(
+            { id: entry.id, transport },
+            projectMcpSecrets.resolve,
+          );
+          if (binding === undefined) {
             return yield* new ProjectMcpOAuthActionError({
               id,
               reason: "This MCP server does not use OAuth authorization.",
             });
           }
-          const registration = transport.authorization.registration;
-          const clientSecret =
-            registration.type === "pre-registered" && registration.clientSecret !== undefined
-              ? yield* projectMcpSecrets.resolve(entry.id, registration.clientSecret.id)
-              : undefined;
           return {
-            serverId: entry.id,
-            resource: transport.url,
-            ...(registration.type === "pre-registered"
-              ? {
-                  clientId: registration.clientId,
-                  ...(clientSecret === undefined ? {} : { clientSecret }),
-                }
-              : {}),
+            ...binding,
             ...(requestOrigin === undefined
               ? {}
               : {

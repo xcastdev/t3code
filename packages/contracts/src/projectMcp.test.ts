@@ -210,6 +210,28 @@ describe("ProjectMcpServer", () => {
 });
 
 describe("Project MCP contract shapes", () => {
+  it("accepts enabled-only patches without accepting replacement fields", () => {
+    const patch = { projectId: "project-1", id: "mcp-1", enabled: false, patch: "enabled" };
+    expect(decodeProjectMcpUpdateInput(patch)).toEqual(patch);
+    for (const replacement of [
+      { name: "Replacement" },
+      { url: "https://replacement.example.test/mcp" },
+      { transport: { type: "stdio" } },
+      { providerInstanceIds: [] },
+    ]) {
+      expect(() => decodeProjectMcpUpdateInput({ ...patch, ...replacement })).toThrow();
+    }
+    expect(() => decodeProjectMcpUpdateInput({ ...patch, patch: undefined })).toThrow();
+    expect(() =>
+      decodeProjectMcpUpdateInput({
+        ...patch,
+        name: "Replacement",
+        url: "https://replacement.example.test/mcp",
+        providerInstanceIds: [],
+      }),
+    ).toThrow();
+  });
+
   it("returns credential references without secret values from catalog servers", () => {
     const server = decodeProjectMcpServer({
       id: "mcp-credentials",

@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import * as NodeCrypto from "node:crypto";
 import type {
   McpServerId,
   ProjectMcpCredentialId,
@@ -18,7 +18,11 @@ import {
   type ServerContext,
   type ServerNotifier,
 } from "@modelcontextprotocol/server";
-import { JSONObjectSchema, JSONValueSchema } from "@modelcontextprotocol/core";
+import {
+  JSONObjectSchema,
+  JSONValueSchema,
+  SubscriptionFilterSchema,
+} from "@modelcontextprotocol/core";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -26,12 +30,15 @@ import * as Layer from "effect/Layer";
 import { HttpServer } from "effect/unstable/http";
 
 import type { ConnectProjectMcpServerInput, ProjectMcpConnection } from "./ProjectMcpConnection.ts";
-import { connectProjectMcpServer } from "./ProjectMcpConnection.ts";
+import {
+  connectProjectMcpServer,
+  projectMcpConnectionCoordinator,
+} from "./ProjectMcpConnection.ts";
 import { ProjectMcpBroker } from "./ProjectMcpBroker.ts";
 import * as ProjectMcpOAuth from "./ProjectMcpOAuth.ts";
 import * as ProjectMcpSecretStore from "./ProjectMcpSecretStore.ts";
 
-const randomEndpointHandle = randomUUID;
+const randomEndpointHandle = NodeCrypto.randomUUID;
 
 export type ProjectMcpProxyConnect = (
   input: ConnectProjectMcpServerInput,
@@ -174,29 +181,6 @@ const credentialIds = (server: ResolvedProjectMcpServer): ReadonlyArray<ProjectM
   ];
 };
 
-const oauthServerFor = (
-  server: ResolvedProjectMcpServer,
-  secretValues: ReadonlyMap<string, string>,
-): ProjectMcpOAuth.ProjectMcpOAuthServer | undefined => {
-  if (server.transport.type === "stdio" || server.transport.authorization.type !== "oauth")
-    return undefined;
-  const registration = server.transport.authorization.registration;
-  const clientSecret =
-    registration.type === "pre-registered" && registration.clientSecret !== undefined
-      ? secretValues.get(registration.clientSecret.id)
-      : undefined;
-  return {
-    serverId: server.id,
-    resource: server.transport.url,
-    ...(registration.type === "pre-registered"
-      ? {
-          clientId: registration.clientId,
-          ...(clientSecret === undefined ? {} : { clientSecret }),
-        }
-      : {}),
-  };
-};
-
 const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server => {
   const discovered = broker.discoverResult;
   const discoveredInfo: unknown = discovered?.serverInfo ?? broker.serverVersion;
@@ -216,9 +200,11 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
   const requestOptions = (context: ServerContext): RequestOptions => ({
     signal: context.mcpReq.signal,
     onprogress: (progress: Progress) => {
+      const progressToken = context.mcpReq._meta?.progressToken;
+      if (progressToken === undefined) return;
       void context.mcpReq.notify({
         method: "notifications/progress",
-        params: progress,
+        params: { ...progress, progressToken },
       } satisfies Notification);
     },
   });
@@ -293,33 +279,32 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
       broker.setLoggingLevel(request.params.level, requestOptions(context)),
     );
   }
-  broker.setHandlers({
-    onToolsChanged: () =>
-      broker.protocolEra === "modern" && notifier
-        ? notifier.toolsChanged()
-        : server.sendToolListChanged(),
-    onPromptsChanged: () =>
-      broker.protocolEra === "modern" && notifier
-        ? notifier.promptsChanged()
-        : server.sendPromptListChanged(),
-    onResourcesChanged: () =>
-      broker.protocolEra === "modern" && notifier
-        ? notifier.resourcesChanged()
-        : server.sendResourceListChanged(),
-    onResourceUpdated: (uri) =>
-      broker.protocolEra === "modern" && notifier
-        ? notifier.resourceUpdated(uri)
-        : server.sendResourceUpdated({ uri }),
+  const disposeHandlers = broker.setHandlers({
+    ...(notifier
+      ? {}
+      : {
+          onToolsChanged: () => server.sendToolListChanged(),
+          onPromptsChanged: () => server.sendPromptListChanged(),
+          onResourcesChanged: () => server.sendResourceListChanged(),
+          onResourceUpdated: (uri: string) => server.sendResourceUpdated({ uri }),
+        }),
     onLoggingMessage: (notification) => server.notification(notification),
-    onProgress: (progress) =>
-      server.notification({
-        method: "notifications/progress",
-        params: progress,
-      } satisfies Notification),
-    onRootsRequest: (request) => forwardServerRequest(server, "roots/list", request),
-    onSamplingRequest: (request) => forwardServerRequest(server, "sampling/createMessage", request),
-    onElicitationRequest: (request) => forwardServerRequest(server, "elicitation/create", request),
+    onRootsRequest: (request, context) =>
+      forwardServerRequest(server, "roots/list", request, context?.mcpReq.signal),
+    onSamplingRequest: (request, context) =>
+      forwardServerRequest(server, "sampling/createMessage", request, context?.mcpReq.signal),
+    onElicitationRequest: (request, context) =>
+      forwardServerRequest(server, "elicitation/create", request, context?.mcpReq.signal),
   });
+  // MCP Protocol exposes a callback property, not EventTarget.addEventListener.
+  // eslint-disable-next-line unicorn/prefer-add-event-listener
+  server.onclose = () => {
+    disposeHandlers();
+    if (!notifier)
+      void broker.dispose().catch((error: unknown) => {
+        server.onerror?.(error instanceof Error ? error : new Error(String(error)));
+      });
+  };
   return server;
 };
 
@@ -337,9 +322,13 @@ const forwardServerRequest = (
   server: Server,
   method: "roots/list" | "sampling/createMessage" | "elicitation/create",
   request: unknown,
+  signal?: AbortSignal,
 ) => {
   const params = requestParams(request);
-  return params === undefined ? server.request({ method }) : server.request({ method, params });
+  return server.request(
+    { method, ...(params === undefined ? {} : { params }) },
+    signal ? { signal } : {},
+  );
 };
 
 const requestMethod = async (request: Request): Promise<string | undefined> => {
@@ -411,6 +400,12 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
 
   const closeConnection = async (entry: ConnectionRecord): Promise<void> => {
     let firstError: unknown;
+    // Release suspended tool permits before facade resource teardown can queue behind them.
+    try {
+      await entry.opening.then((connection) => projectMcpConnectionCoordinator(connection).close());
+    } catch (cause) {
+      firstError = cause;
+    }
     const handlerResults = await Promise.allSettled(
       [...entry.modernHandlers].map((handler) => handler.close()),
     );
@@ -516,7 +511,9 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
         server.transport.authorization.type === "oauth" &&
         oauth._tag === "Some"
           ? await Effect.runPromise(
-              oauth.value.providerFor(server.id, oauthServerFor(server, secretValues)),
+              ProjectMcpOAuth.resolveServerBinding(server, (_serverId, credentialId) =>
+                Effect.succeed(secretValues.get(credentialId)),
+              ).pipe(Effect.flatMap((binding) => oauth.value.providerFor(server.id, binding))),
             )
           : undefined;
       return connect({
@@ -551,11 +548,28 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
       if (record.modernBroker) return record.modernBroker;
       if (record.modernBrokerOpening) return record.modernBrokerOpening;
       record.modernBrokerOpening = record.opening.then((connection) => {
+        // Modern stream owners live in the event bus, which applies each stream's URI filter.
+        projectMcpConnectionCoordinator(connection).addListener((notification) => {
+          if (
+            notification.method === "notifications/resources/updated" &&
+            typeof notification.params?.uri === "string"
+          ) {
+            return record.modernBus.publish({
+              kind: "resource_updated",
+              uri: notification.params.uri,
+            });
+          }
+        });
         const broker = new ProjectMcpBroker({
           connection,
           serverId: record.server.id,
           providerSessionId,
           downstreamProtocolEra,
+          handlers: {
+            onToolsChanged: () => record.modernBus.publish({ kind: "tools_list_changed" }),
+            onPromptsChanged: () => record.modernBus.publish({ kind: "prompts_list_changed" }),
+            onResourcesChanged: () => record.modernBus.publish({ kind: "resources_list_changed" }),
+          },
         });
         record.modernBroker = broker;
         return broker;
@@ -586,7 +600,27 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
       responseMode: "auto",
     });
     record.modernHandlers.add(handler);
+    const coordinator = projectMcpConnectionCoordinator(await record.opening);
+    const resourceUris: string[] = [];
+    const close = handler.close.bind(handler);
+    handler.close = async () => {
+      await close();
+      await Promise.all(
+        resourceUris.splice(0).map((uri) => coordinator.unsubscribeResource(uri, handler)),
+      );
+    };
     try {
+      if ((await requestMethod(request)) === "subscriptions/listen") {
+        const body: unknown = await request.clone().json();
+        const params = requestParams(body);
+        const filter = await SubscriptionFilterSchema["~standard"].validate(params?.notifications);
+        if (!filter.issues) {
+          for (const uri of new Set(filter.value.resourceSubscriptions ?? [])) {
+            await coordinator.subscribeResource(uri, handler, { signal: request.signal });
+            resourceUris.push(uri);
+          }
+        }
+      }
       const response = await handler.fetch(request);
       return trackModernResponse(response, handler, () => record.modernHandlers.delete(handler));
     } catch (cause) {
@@ -618,8 +652,9 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
       onsessioninitialized: (initializedSessionId) => {
         if (legacy) record.legacySessions.set(initializedSessionId, legacy);
       },
-      onsessionclosed: (closedSessionId) => {
+      onsessionclosed: async (closedSessionId) => {
         record.legacySessions.delete(closedSessionId);
+        await broker.dispose();
       },
     });
     legacy = { broker, server, transport };
@@ -647,7 +682,7 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
     if (!server || session.revokedServerIds.has(server.id)) {
       return yield* Effect.fail<ProjectMcpProxyError>(new ProjectMcpProxyUnknownEndpointError());
     }
-    const connection = yield* Effect.tryPromise({
+    yield* Effect.tryPromise({
       try: () => getConnection(session, endpointHandle),
       catch: (cause) =>
         new ProjectMcpProxyError(

@@ -3719,8 +3719,8 @@ describe("ProviderRuntimeIngestion", () => {
         activity.payload !== null &&
         (activity.payload as Record<string, unknown>).requestId === "req-approval-aborted",
     );
-    expect((cancelledQuestion?.payload as Record<string, unknown>).resolution).toBe("cancelled");
-    expect((cancelledApproval?.payload as Record<string, unknown>).decision).toBe("cancel");
+    expect((cancelledQuestion?.payload as Record<string, unknown>)?.resolution).toBe("cancelled");
+    expect((cancelledApproval?.payload as Record<string, unknown>)?.decision).toBe("cancel");
   });
 
   it("continues processing runtime events after a single event handler failure", async () => {

@@ -172,6 +172,35 @@ it("rejects tampered input state before contacting the upstream server", async (
   expect(calls).toBe(0);
 });
 
+it("rejects unassociated upstream push requests with a typed unsupported-operation error", async () => {
+  let requestRoots: ((request: unknown) => unknown) | undefined;
+  const broker = new ProjectMcpBroker({
+    connection: connection(
+      makeClient({
+        setRequestHandler: ((method: string, handler: (request: unknown) => unknown) => {
+          if (method === "roots/list") requestRoots = handler;
+        }) as NonNullable<ProjectMcpClient["setRequestHandler"]>,
+      }),
+      "legacy",
+    ),
+    serverId,
+    providerSessionId: "fixture",
+    downstreamProtocolEra: "modern",
+    handlers: {
+      onRootsRequest: () => {
+        throw new Error("must not forward");
+      },
+    },
+  });
+  try {
+    expect(() => requestRoots?.({ method: "roots/list" })).toThrow(
+      expect.objectContaining({ code: -32601 }),
+    );
+  } finally {
+    await broker.close();
+  }
+});
+
 it("allows a validated custom request only when both sides use the same era", async () => {
   const seen: unknown[] = [];
   const broker = new ProjectMcpBroker({
@@ -244,7 +273,7 @@ it("does not treat standard protocol methods as extensions", async () => {
 
 it("relays list-change notifications through the semantic handler surface", async () => {
   let toolsChanged: unknown;
-  let registered: (() => void | Promise<void>) | undefined;
+  let registered: ((notification: unknown) => void | Promise<void>) | undefined;
   const broker = new ProjectMcpBroker({
     connection: connection(
       makeClient({
@@ -267,7 +296,7 @@ it("relays list-change notifications through the semantic handler surface", asyn
   });
 
   void broker;
-  await registered?.();
+  await registered?.({ method: "notifications/tools/list_changed" });
   expect(toolsChanged).toEqual({
     tools: [{ name: "new-tool", inputSchema: { type: "object" } }],
   });

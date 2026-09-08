@@ -95,6 +95,7 @@ const ServerSecrets = Schema.Struct({
   credentials: Schema.Array(ProjectMcpCredentialId),
   retired: Schema.Array(ProjectMcpCredentialId),
   auxiliary: Schema.Array(ProjectMcpCredentialId),
+  removed: Schema.optional(Schema.Boolean),
 });
 type ServerSecrets = typeof ServerSecrets.Type;
 
@@ -346,7 +347,14 @@ const make = Effect.gen(function* () {
     if (server === undefined) return;
     const leaseCounts = yield* Ref.get(leases);
     const deletable = server.retired.filter((id) => (leaseCounts.get(id) ?? 0) === 0);
-    if (deletable.length === 0) return;
+    if (
+      deletable.length === 0 &&
+      (server.removed !== true ||
+        server.credentials.length > 0 ||
+        server.retired.length > 0 ||
+        server.auxiliary.length > 0)
+    )
+      return;
     yield* Effect.forEach(deletable, removeCredential, { discard: true }).pipe(
       Effect.mapError((cause) => new ProjectMcpSecretCleanupError({ serverId, cause })),
     );
@@ -358,7 +366,8 @@ const make = Effect.gen(function* () {
       retired: removeIds(currentServer.retired, deletable),
     } satisfies ServerSecrets;
     yield* persistManifest(
-      updated.credentials.length === 0 &&
+      updated.removed === true &&
+        updated.credentials.length === 0 &&
         updated.retired.length === 0 &&
         updated.auxiliary.length === 0
         ? withoutServer(current, serverId)
@@ -386,6 +395,7 @@ const make = Effect.gen(function* () {
     const manifest = yield* Ref.get(manifests);
     const server = manifest.servers[operation.serverId] ?? noServerSecrets();
     const next = {
+      removed: false,
       credentials:
         operation.kind === "catalog" ? unique(operation.nextCredentialIds) : server.credentials,
       retired:
@@ -600,6 +610,7 @@ const make = Effect.gen(function* () {
         const retiring = credentialIds(transport).filter((id) => hasCredential(server, id));
         yield* persistManifest(
           serverSecretsWith(manifest, serverId, {
+            ...server,
             credentials: removeIds(server.credentials, retiring),
             retired: unique([...server.retired, ...retiring]),
             auxiliary: server.auxiliary,
@@ -616,7 +627,10 @@ const make = Effect.gen(function* () {
     mutex.withPermits(1)(
       Effect.gen(function* () {
         const manifest = yield* Ref.get(manifests);
-        if (manifest.servers[serverId] === undefined) {
+        if (
+          manifest.servers[serverId] === undefined ||
+          manifest.servers[serverId].removed === true
+        ) {
           return yield* new ProjectMcpSecretDraftError({
             message: `Cannot add an auxiliary secret to unknown MCP server '${serverId}'.`,
           });
@@ -663,6 +677,7 @@ const make = Effect.gen(function* () {
         if (server === undefined) return;
         yield* persistManifest(
           serverSecretsWith(manifest, serverId, {
+            removed: true,
             credentials: [],
             retired: unique([...server.credentials, ...server.retired, ...server.auxiliary]),
             auxiliary: [],
@@ -699,6 +714,7 @@ const make = Effect.gen(function* () {
           // delete can then be retried by this call or by reconciliation.
           yield* persistManifest(
             serverSecretsWith(manifest, serverId, {
+              ...server,
               credentials: server.credentials,
               retired: unique([...server.retired, credentialId]),
               auxiliary: removeIds(server.auxiliary, [credentialId]),
@@ -805,6 +821,7 @@ const make = Effect.gen(function* () {
             ...(current === undefined ? server.auxiliary : []),
           ]);
           const next = {
+            removed: current === undefined,
             credentials: currentIds.filter((id) => hasCredential(server, id)),
             retired,
             auxiliary: current === undefined ? [] : server.auxiliary,

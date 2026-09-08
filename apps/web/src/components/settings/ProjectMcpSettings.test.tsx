@@ -328,8 +328,15 @@ async function click(element: HTMLElement): Promise<void> {
   });
 }
 
-async function input(element: HTMLInputElement, value: string): Promise<void> {
-  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+async function input(
+  element: HTMLInputElement | HTMLTextAreaElement,
+  value: string,
+): Promise<void> {
+  const prototype =
+    element instanceof HTMLTextAreaElement
+      ? HTMLTextAreaElement.prototype
+      : HTMLInputElement.prototype;
+  const setter = Object.getOwnPropertyDescriptor(prototype, "value")?.set;
   setter?.call(element, value);
   await act(async () => {
     element.dispatchEvent(new Event("input", { bubbles: true }));
@@ -379,6 +386,131 @@ describe("ProjectMcpSettings", () => {
 
   it("labels next-session support honestly", () => {
     expect(applicationLabel("next-session")).toBe("Applies to new sessions");
+  });
+
+  it("toggles only enabled without resending the displayed configuration", async () => {
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Enable External"));
+    expect(commands.update).toHaveBeenCalledWith({
+      environmentId,
+      input: { projectId, id: externalServer().id, enabled: false, patch: "enabled" },
+    });
+  });
+
+  it("preserves empty and multiline stdio arguments when renaming", async () => {
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          url: undefined,
+          transport: {
+            type: "stdio",
+            command: "node",
+            args: ["--label", "", "line1\nline2"],
+            env: [],
+          },
+        },
+      ],
+      managed: [],
+      applications: [],
+    });
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await input(labelled<HTMLInputElement>("MCP server name"), "Renamed");
+    await click(button("Save changes"));
+    expect(commands.update).toHaveBeenCalledWith({
+      environmentId,
+      input: {
+        projectId,
+        id: externalServer().id,
+        name: "Renamed",
+        enabled: true,
+        providerInstanceIds: [codexId],
+        transport: {
+          type: "stdio",
+          command: "node",
+          args: ["--label", "", "line1\nline2"],
+          env: [],
+        },
+      },
+    });
+  });
+
+  it.each([false, true])(
+    "distinguishes zero arguments from one empty argument: %s",
+    async (addEmpty) => {
+      query.data = decodeProjectMcpCatalog({
+        external: [
+          {
+            ...externalServer(),
+            url: undefined,
+            transport: {
+              type: "stdio",
+              command: "node",
+              args: [],
+              env: [],
+            },
+          },
+        ],
+        managed: [],
+        applications: [],
+      });
+      await renderPanel();
+      await click(labelled<HTMLButtonElement>("Edit External"));
+      if (addEmpty) await click(button("Add argument"));
+      await click(button("Save changes"));
+      expect(commands.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          input: expect.objectContaining({
+            transport: {
+              type: "stdio",
+              command: "node",
+              args: addEmpty ? [""] : [],
+              env: [],
+            },
+          }),
+        }),
+      );
+    },
+  );
+
+  it("adds and removes arguments without remounting or changing surviving values", async () => {
+    query.data = decodeProjectMcpCatalog({
+      external: [
+        {
+          ...externalServer(),
+          url: undefined,
+          transport: {
+            type: "stdio",
+            command: "node",
+            args: ["remove", "keep"],
+            env: [],
+          },
+        },
+      ],
+      managed: [],
+      applications: [],
+    });
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    const survivor = labelled<HTMLTextAreaElement>("MCP server argument 2");
+    await click(labelled<HTMLButtonElement>("Remove argument 1"));
+    expect(labelled<HTMLTextAreaElement>("MCP server argument 1")).toBe(survivor);
+    await input(survivor, "  line1\nline2  ");
+    await click(button("Add argument"));
+    await click(button("Save changes"));
+    expect(commands.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          transport: {
+            type: "stdio",
+            command: "node",
+            args: ["  line1\nline2  ", ""],
+            env: [],
+          },
+        }),
+      }),
+    );
   });
 
   it("renders managed entries without mutation controls and disables mutations without operate access", async () => {
@@ -469,6 +601,38 @@ describe("ProjectMcpSettings", () => {
       }),
     );
     expect(document.body.textContent).not.toContain("secret-value");
+  });
+
+  it("keeps credential inputs mounted while editing and removing another row", async () => {
+    await renderPanel();
+    await click(labelled<HTMLButtonElement>("Edit External"));
+    await click(button("Add credential"));
+    const name = labelled<HTMLInputElement>("HTTP header name 2");
+    const value = labelled<HTMLInputElement>("HTTP header value 2");
+    name.focus();
+    await input(name, "X-API-Key");
+    expect(labelled<HTMLInputElement>("HTTP header name 2")).toBe(name);
+    expect(document.activeElement).toBe(name);
+    value.focus();
+    await input(value, "secret-value");
+    expect(labelled<HTMLInputElement>("HTTP header value 2")).toBe(value);
+    expect(document.activeElement).toBe(value);
+    await click(button("Remove credential"));
+    expect(labelled<HTMLInputElement>("HTTP header name 1")).toBe(name);
+    expect(labelled<HTMLInputElement>("HTTP header value 1")).toBe(value);
+    expect(document.activeElement).toBe(value);
+    await click(button("Save changes"));
+    expect(commands.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        input: expect.objectContaining({
+          transport: expect.objectContaining({
+            headers: [
+              { name: "X-API-Key", credential: { name: "X-API-Key", value: "secret-value" } },
+            ],
+          }),
+        }),
+      }),
+    );
   });
 
   it("normalizes a legacy URL entry to streamable HTTP when adding authentication", async () => {

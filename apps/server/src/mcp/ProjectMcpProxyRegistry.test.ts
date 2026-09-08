@@ -1,10 +1,6 @@
 import { McpServerId, ThreadId } from "@t3tools/contracts";
 import { expect, it, vi } from "@effect/vitest";
-import {
-  Client,
-  StreamableHTTPClientTransport,
-  type FetchLike,
-} from "@modelcontextprotocol/client";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { InMemoryTransport, Server } from "@modelcontextprotocol/server";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
@@ -15,6 +11,7 @@ import * as McpSessionRegistry from "./McpSessionRegistry.ts";
 import type { ProjectMcpClient, ProjectMcpConnection } from "./ProjectMcpConnection.ts";
 import * as ProjectMcpProxyHttpServer from "./ProjectMcpProxyHttpServer.ts";
 import * as ProjectMcpProxyRegistry from "./ProjectMcpProxyRegistry.ts";
+import { makeScopedFetch } from "./ProjectMcpProxyRegistry.fetch.fixture.ts";
 
 const serverId = McpServerId.make("server/with-untrusted-path");
 const transport = {
@@ -218,18 +215,14 @@ it.effect("speaks the modern MCP protocol through the SDK client and HTTP route"
       servers: [server],
     });
     const sessions = fixtureSessionRegistry();
-    const fetchFn: FetchLike = async (input, init) => {
-      const request = new Request(String(input), init);
+    const fetchFn = yield* makeScopedFetch((request) => {
       const effectRequest = HttpServerRequest.fromWeb(request);
-      const response = await Effect.runPromise(
-        ProjectMcpProxyHttpServer.handleProjectMcpProxyRequest(effectRequest).pipe(
-          Effect.provideService(McpSessionRegistry.McpSessionRegistry, sessions),
-          Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, registry),
-        ),
+      return ProjectMcpProxyHttpServer.handleProjectMcpProxyRequest(effectRequest).pipe(
+        Effect.provideService(McpSessionRegistry.McpSessionRegistry, sessions),
+        Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, registry),
+        Effect.map(HttpServerResponse.toWeb),
       );
-      const result = HttpServerResponse.toWeb(response);
-      return result;
-    };
+    });
     const client = new Client({ name: "sdk-fixture", version: "1" });
     const sdkTransport = new StreamableHTTPClientTransport(issued!.endpoint, {
       authProvider: { token: async () => "provider-token" },
@@ -335,7 +328,7 @@ it.effect("keeps modern subscription notifications alive across HTTP requests", 
 
     if (upstreamToolsChanged === undefined) throw new Error("upstream handler was not registered");
     yield* Effect.promise(async () => {
-      await upstreamToolsChanged!({});
+      await upstreamToolsChanged!({ method: "notifications/tools/list_changed" });
     });
     const notification = yield* Effect.promise(() => reader.read());
     const notificationText = new TextDecoder().decode(notification.value);
@@ -370,17 +363,14 @@ it.effect("accepts a legacy streamable HTTP client through a stateful session", 
       servers: [server],
     });
     const sessions = fixtureSessionRegistry();
-    const fetchFn: FetchLike = async (input, init) => {
-      const request = new Request(String(input), init);
+    const fetchFn = yield* makeScopedFetch((request) => {
       const effectRequest = HttpServerRequest.fromWeb(request);
-      const response = await Effect.runPromise(
-        ProjectMcpProxyHttpServer.handleProjectMcpProxyRequest(effectRequest).pipe(
-          Effect.provideService(McpSessionRegistry.McpSessionRegistry, sessions),
-          Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, registry),
-        ),
+      return ProjectMcpProxyHttpServer.handleProjectMcpProxyRequest(effectRequest).pipe(
+        Effect.provideService(McpSessionRegistry.McpSessionRegistry, sessions),
+        Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, registry),
+        Effect.map(HttpServerResponse.toWeb),
       );
-      return HttpServerResponse.toWeb(response);
-    };
+    });
     const client = new Client(
       { name: "legacy-sdk-fixture", version: "1" },
       { versionNegotiation: { mode: "legacy" } },
@@ -482,17 +472,14 @@ it.effect("bridges legacy upstream server requests to a modern downstream client
       servers: [server],
     });
     const sessions = fixtureSessionRegistry();
-    const fetchFn: FetchLike = async (input, init) => {
-      const request = new Request(String(input), init);
+    const fetchFn = yield* makeScopedFetch((request) => {
       const effectRequest = HttpServerRequest.fromWeb(request);
-      const response = await Effect.runPromise(
-        ProjectMcpProxyHttpServer.handleProjectMcpProxyRequest(effectRequest).pipe(
-          Effect.provideService(McpSessionRegistry.McpSessionRegistry, sessions),
-          Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, registry),
-        ),
+      return ProjectMcpProxyHttpServer.handleProjectMcpProxyRequest(effectRequest).pipe(
+        Effect.provideService(McpSessionRegistry.McpSessionRegistry, sessions),
+        Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, registry),
+        Effect.map(HttpServerResponse.toWeb),
       );
-      return HttpServerResponse.toWeb(response);
-    };
+    });
     const downstreamClient = new Client(
       { name: "modern-downstream-client", version: "1" },
       {

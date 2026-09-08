@@ -641,6 +641,63 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("an old runtime exit cannot mark its replacement stopped", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime: previous } = yield* startLifecycleRuntime();
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        runtimeMode: "full-access",
+      });
+      const current = lifecycleRuntimeFactory.lastRuntime;
+      NodeAssert.ok(current);
+      const forwarded = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      yield* previous.emit({
+        id: asEventId("old-runtime-exit"),
+        kind: "session",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-09-07T00:00:00.000Z",
+        method: "session/exited",
+      });
+      yield* current.emit({
+        id: asEventId("current-runtime-started"),
+        kind: "session",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-09-07T00:00:00.000Z",
+        method: "session/started",
+      });
+      NodeAssert.equal(
+        Option.getOrUndefined(yield* Fiber.join(forwarded))?.type,
+        "session.started",
+      );
+      NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-1")), true);
+      NodeAssert.equal(previous.closeImpl.mock.calls.length, 1);
+    }),
+  );
+
+  it.effect.each(["session/exited", "session/closed"])(
+    "marks the actual adapter terminal before forwarding %s without native IDs",
+    (method) =>
+      Effect.gen(function* () {
+        const { adapter, runtime } = yield* startLifecycleRuntime();
+        const forwarded = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+        yield* runtime.emit({
+          id: asEventId(`terminal-${method}`),
+          kind: "session",
+          provider: ProviderDriverKind.make("codex"),
+          threadId: asThreadId("thread-1"),
+          createdAt: "2026-09-07T00:00:00.000Z",
+          method,
+        });
+        const event = yield* Fiber.join(forwarded);
+        NodeAssert.equal(Option.getOrUndefined(event)?.type, "session.exited");
+        NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-1")), false);
+        NodeAssert.deepEqual(yield* adapter.listSessions(), []);
+      }),
+  );
+
   it.effect("carries child model metadata through every task event", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();

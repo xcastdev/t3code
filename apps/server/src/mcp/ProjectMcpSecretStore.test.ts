@@ -385,7 +385,7 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
         headers: [],
         authorization: { type: "none" },
       };
-      const removedBeforeDispatch = yield* Effect.gen(function* () {
+      yield* Effect.gen(function* () {
         const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
         return yield* secrets.prepareUpdate(serverA, replacing.transport, removalDraft);
       }).pipe(Effect.provide(Layer.fresh(makeSecretLayer(config))));

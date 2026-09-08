@@ -411,7 +411,7 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
       }).pipe(Effect.provide(snapshotLayer));
 
       assert.deepEqual(
-        servers.map(({ id, transport }) => ({
+        servers.map(({ id }) => ({
           id,
           transport: readModel.projectMcpServers?.find((entry) => entry.server.id === id)?.server
             .transport,

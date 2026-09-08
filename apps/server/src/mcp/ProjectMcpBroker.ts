@@ -1,10 +1,10 @@
-import { AsyncLocalStorage } from "node:async_hooks";
-import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import * as NodeCrypto from "node:crypto";
 import type { McpServerId } from "@t3tools/contracts";
 import type {
   CallToolRequestParams,
   CallToolResult,
   Client,
+  ClientContext,
   CompleteRequestParams,
   CompleteResult,
   DiscoverResult,
@@ -12,19 +12,14 @@ import type {
   GetPromptResult,
   InputRequiredResult,
   InputRequest,
-  ListPromptsRequest,
   ListPromptsResult,
-  ListResourceTemplatesRequest,
   ListResourceTemplatesResult,
-  ListResourcesRequest,
   ListResourcesResult,
-  ListToolsRequest,
   ListToolsResult,
   McpSubscription,
   Notification,
   NotificationOptions,
   ProtocolEra,
-  Progress,
   RequestOptions,
   StandardSchemaV1,
   SubscriptionFilter,
@@ -36,6 +31,10 @@ import {
 } from "@modelcontextprotocol/client";
 
 import type { ProjectMcpClient, ProjectMcpConnection } from "./ProjectMcpConnection.ts";
+import {
+  projectMcpConnectionCoordinator,
+  type ProjectMcpConnectionCoordinator,
+} from "./ProjectMcpConnection.ts";
 
 const INPUT_STATE_TTL_MS = 10 * 60 * 1000;
 const MAX_INPUT_ROUNDS = 10;
@@ -72,10 +71,18 @@ export interface ProjectMcpBrokerHandlers {
   readonly onResourcesChanged?: (result: ListResourcesResult) => void | Promise<void>;
   readonly onResourceUpdated?: (uri: string) => void | Promise<void>;
   readonly onLoggingMessage?: (notification: Notification) => void | Promise<void>;
-  readonly onProgress?: (progress: Progress) => void | Promise<void>;
-  readonly onRootsRequest?: (request: unknown) => unknown | Promise<unknown>;
-  readonly onSamplingRequest?: (request: unknown) => unknown | Promise<unknown>;
-  readonly onElicitationRequest?: (request: unknown) => unknown | Promise<unknown>;
+  readonly onRootsRequest?: (
+    request: unknown,
+    context?: ClientContext,
+  ) => unknown | Promise<unknown>;
+  readonly onSamplingRequest?: (
+    request: unknown,
+    context?: ClientContext,
+  ) => unknown | Promise<unknown>;
+  readonly onElicitationRequest?: (
+    request: unknown,
+    context?: ClientContext,
+  ) => unknown | Promise<unknown>;
 }
 
 export interface ProjectMcpExtensionSchemas {
@@ -121,45 +128,37 @@ interface InputState {
   readonly method: "tools/call";
   readonly paramsHash: string;
   readonly upstreamRequestState?: string;
-  readonly legacyInput?: {
-    readonly key: string;
-    readonly method: LegacyServerRequestMethod;
-  };
   readonly round: number;
   readonly expiresAt: number;
+  readonly operationId?: string;
+  readonly nonce?: string;
 }
 
 type LegacyServerRequestMethod = "roots/list" | "sampling/createMessage" | "elicitation/create";
 
-interface LegacyInputContext {
-  readonly inputResponses?: Record<string, unknown>;
-  readonly inputKey?: string;
-  readonly inputMethod?: LegacyServerRequestMethod;
+interface PendingInput {
+  key: string;
+  request: InputRequest;
+  resolve: (value: unknown) => void;
+  reject: (error: unknown) => void;
 }
 
-interface LegacyInputRequiredData {
-  readonly t3LegacyInputRequired: true;
-  readonly key?: string;
-  readonly request: InputRequest;
+interface LegacyOperation {
+  id: string;
+  paramsHash: string;
+  expiresAt: number;
+  controller: AbortController;
+  round: number;
+  nonce?: string | undefined;
+  inputs: PendingInput[];
+  waiter?:
+    | { resolve: (result: ProjectMcpCallToolResult) => void; reject: (error: unknown) => void }
+    | undefined;
+  options?: ProjectMcpRequestOptions;
+  detach?: () => void;
+  timer?: ReturnType<typeof setTimeout>;
+  release: () => void;
 }
-
-const LEGACY_INPUT_REQUIRED_MARKER = "t3LegacyInputRequired";
-
-const isLegacyServerRequestMethod = (value: unknown): value is LegacyServerRequestMethod =>
-  value === "roots/list" || value === "sampling/createMessage" || value === "elicitation/create";
-
-const legacyInputRequiredData = (error: unknown): LegacyInputRequiredData | undefined => {
-  if (!(error instanceof ProtocolError) || !isRecord(error.data)) return undefined;
-  if (error.data[LEGACY_INPUT_REQUIRED_MARKER] !== true) return undefined;
-  const request = error.data.request;
-  if (!isRecord(request) || !isLegacyServerRequestMethod(request.method)) return undefined;
-  const key = error.data.key;
-  return {
-    t3LegacyInputRequired: true,
-    ...(typeof key === "string" ? { key } : {}),
-    request: request as unknown as InputRequest,
-  };
-};
 
 const canonicalJson = (value: unknown): string => {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
@@ -173,8 +172,15 @@ const canonicalJson = (value: unknown): string => {
 };
 
 const paramsForHash = (params: Record<string, unknown>): Record<string, unknown> => {
-  const { inputResponses: _inputResponses, requestState: _requestState, ...original } = params;
-  return original;
+  const {
+    inputResponses: _inputResponses,
+    requestState: _requestState,
+    _meta,
+    ...original
+  } = params;
+  if (!isRecord(_meta)) return original;
+  const { progressToken: _progressToken, ...metadata } = _meta;
+  return Object.keys(metadata).length ? { ...original, _meta: metadata } : original;
 };
 
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -215,10 +221,21 @@ export class ProjectMcpBroker {
   private readonly requestStateSecret: string | Uint8Array;
   private readonly now: () => number;
   private readonly extensionAdapters: ReadonlyMap<string, ProjectMcpExtensionAdapter>;
-  private readonly legacyInputContext = new AsyncLocalStorage<LegacyInputContext>();
+  private active: LegacyOperation | undefined;
+  private readonly coordinator: ProjectMcpConnectionCoordinator;
+  private readonly handlers = new Set<ProjectMcpBrokerHandlers>();
+  private readonly handlerDisposers = new Set<() => void>();
+  private disposing: Promise<void> | undefined;
+  private readonly onConnectionClose = () => {
+    if (this.active) this.failOperation(this.active, new Error("MCP connection closed"));
+  };
 
   constructor(options: ProjectMcpBrokerOptions) {
     this.connection = options.connection;
+    this.coordinator = projectMcpConnectionCoordinator(options.connection);
+    this.coordinator.controller.signal.addEventListener("abort", this.onConnectionClose, {
+      once: true,
+    });
     this.serverId = options.serverId;
     this.providerSessionId = options.providerSessionId;
     this.protocolEra = options.connection.protocolEra;
@@ -228,14 +245,23 @@ export class ProjectMcpBroker {
     this.serverVersion = options.connection.serverVersion;
     this.downstreamProtocolEra =
       options.downstreamProtocolEra ?? options.connection.protocolEra ?? "legacy";
-    this.requestStateSecret = options.requestStateSecret ?? randomBytes(32);
+    this.requestStateSecret = options.requestStateSecret ?? NodeCrypto.randomBytes(32);
     this.now = options.now ?? Date.now;
     this.extensionAdapters = options.extensionAdapters ?? new Map();
     this.setHandlers(options.handlers);
   }
 
   async close(): Promise<void> {
+    await this.coordinator.close();
     await this.connection.close();
+  }
+
+  dispose(): Promise<void> {
+    if (this.disposing) return this.disposing;
+    this.coordinator.controller.signal.removeEventListener("abort", this.onConnectionClose);
+    if (this.active) this.failOperation(this.active, new Error("MCP facade disposed"));
+    for (const dispose of this.handlerDisposers) dispose();
+    return (this.disposing = this.coordinator.releaseResourceOwner(this));
   }
 
   async ping(options?: RequestOptions) {
@@ -265,59 +291,20 @@ export class ProjectMcpBroker {
     params: ProjectMcpCallToolParams,
     options?: ProjectMcpRequestOptions,
   ): Promise<ProjectMcpCallToolResult> {
+    if (this.active && this.active.expiresAt <= this.now()) {
+      this.failOperation(this.active, new ProjectMcpBrokerError("invalid_request_state"));
+    }
     const input = params as Record<string, unknown>;
     const state =
       typeof input.requestState === "string"
         ? this.verifyInputState(input.requestState, input)
         : undefined;
+    if (this.shouldBridgeLegacyServerRequests()) return this.callLegacyTool(params, state, options);
     const outbound = state ? this.retryParams(input, state) : params;
-    let result: ProjectMcpCallToolResult;
-    const invoke = () =>
-      this.method("callTool")(outbound as ProjectMcpCallToolParams, {
-        ...options,
-        allowInputRequired: true,
-      }) as Promise<ProjectMcpCallToolResult>;
-    try {
-      result = this.shouldBridgeLegacyServerRequests()
-        ? await this.legacyInputContext.run(
-            {
-              ...(isRecord(input.inputResponses) && !Array.isArray(input.inputResponses)
-                ? { inputResponses: input.inputResponses }
-                : {}),
-              ...(state?.legacyInput?.key === undefined ? {} : { inputKey: state.legacyInput.key }),
-              ...(state?.legacyInput?.method === undefined
-                ? {}
-                : { inputMethod: state.legacyInput.method }),
-            },
-            invoke,
-          )
-        : await invoke();
-    } catch (error) {
-      const pending = this.shouldBridgeLegacyServerRequests()
-        ? legacyInputRequiredData(error)
-        : undefined;
-      if (pending === undefined) throw error;
-      const key = pending.key ?? `legacy-input-${state?.round ?? 0}`;
-      result = {
-        resultType: "input_required",
-        inputRequests: { [key]: pending.request },
-      };
-      const round = state ? state.round + 1 : 0;
-      if (round > MAX_INPUT_ROUNDS) throw new ProjectMcpBrokerError("input_round_limit");
-      return {
-        ...result,
-        requestState: this.signInputState({
-          version: 1,
-          serverId: String(this.serverId),
-          providerSessionId: this.providerSessionId,
-          method: "tools/call",
-          paramsHash: canonicalJson(paramsForHash(input)),
-          legacyInput: { key, method: pending.request.method as LegacyServerRequestMethod },
-          round,
-          expiresAt: this.now() + INPUT_STATE_TTL_MS,
-        }),
-      };
-    }
+    const result = (await this.method("callTool")(outbound as ProjectMcpCallToolParams, {
+      ...options,
+      allowInputRequired: true,
+    })) as ProjectMcpCallToolResult;
     if (!isInputRequiredResult(result)) return result;
     const round = state ? state.round + 1 : 0;
     if (round > MAX_INPUT_ROUNDS) throw new ProjectMcpBrokerError("input_round_limit");
@@ -361,14 +348,17 @@ export class ProjectMcpBroker {
     params: Parameters<Client["subscribeResource"]>[0],
     options?: RequestOptions,
   ) {
-    return this.method("subscribeResource")(params, options);
+    await this.coordinator.subscribeResource(params.uri, this, options);
+    return {};
   }
 
   async unsubscribeResource(
     params: Parameters<Client["unsubscribeResource"]>[0],
     options?: RequestOptions,
   ) {
-    return this.method("unsubscribeResource")(params, options);
+    options?.signal?.throwIfAborted();
+    await this.coordinator.unsubscribeResource(params.uri, this);
+    return {};
   }
 
   async listen(filter: SubscriptionFilter, options?: RequestOptions): Promise<McpSubscription> {
@@ -431,12 +421,202 @@ export class ProjectMcpBroker {
   private method<K extends keyof ProjectMcpClient>(key: K): NonNullable<ProjectMcpClient[K]> {
     const value = this.connection.client[key];
     if (typeof value !== "function") throw new ProjectMcpBrokerError("missing_client_operation");
-    return value.bind(this.connection.client) as NonNullable<ProjectMcpClient[K]>;
+    const bound = value.bind(this.connection.client);
+    if (
+      this.protocolEra !== "legacy" ||
+      (key === "callTool" && this.shouldBridgeLegacyServerRequests()) ||
+      key === "notification"
+    ) {
+      return bound as NonNullable<ProjectMcpClient[K]>;
+    }
+    return (async (...args: unknown[]) => {
+      const options = args.at(-1);
+      const signal =
+        isRecord(options) && options.signal instanceof AbortSignal ? options.signal : undefined;
+      const release = await this.acquire(signal);
+      try {
+        return await Reflect.apply(bound, undefined, args);
+      } finally {
+        release();
+      }
+    }) as NonNullable<ProjectMcpClient[K]>;
+  }
+
+  private acquire(signal?: AbortSignal): Promise<() => void> {
+    return this.coordinator.acquire((method, request, context) => {
+      if (
+        method !== "roots/list" &&
+        method !== "sampling/createMessage" &&
+        method !== "elicitation/create"
+      ) {
+        throw new ProtocolError(ProtocolErrorCode.MethodNotFound, "Unsupported MCP server request");
+      }
+      const key =
+        method === "roots/list"
+          ? "onRootsRequest"
+          : method === "sampling/createMessage"
+            ? "onSamplingRequest"
+            : "onElicitationRequest";
+      const handlers = [...this.handlers].flatMap((handlers) =>
+        handlers[key] ? [handlers[key]] : [],
+      );
+      return this.handleUpstreamServerRequest(
+        method,
+        request,
+        (request, context) => {
+          if (handlers.length !== 1)
+            throw new ProtocolError(
+              ProtocolErrorCode.MethodNotFound,
+              "Unassociated MCP server request is unsupported",
+            );
+          return handlers[0]!(request, context);
+        },
+        context,
+      );
+    }, signal);
+  }
+
+  private finishOperation(operation: LegacyOperation): void {
+    operation.detach?.();
+    clearTimeout(operation.timer);
+    if (this.active === operation) this.active = undefined;
+    operation.release();
+  }
+
+  private failOperation(operation: LegacyOperation, error: unknown): void {
+    if (this.active !== operation) return;
+    operation.controller.abort(error);
+    for (const input of operation.inputs.splice(0)) input.reject(error);
+    operation.waiter?.reject(error);
+    operation.waiter = undefined;
+    this.finishOperation(operation);
+  }
+
+  private waitForOperation(
+    operation: LegacyOperation,
+    options?: ProjectMcpRequestOptions,
+  ): Promise<ProjectMcpCallToolResult> {
+    operation.options = options;
+    return new Promise((resolve, reject) => {
+      operation.waiter = { resolve, reject };
+      const abort = () =>
+        this.failOperation(
+          operation,
+          options?.signal?.reason ?? new Error("MCP request cancelled"),
+        );
+      operation.detach = () => options?.signal?.removeEventListener("abort", abort);
+      if (options?.signal?.aborted) abort();
+      else options?.signal?.addEventListener("abort", abort, { once: true });
+    });
+  }
+
+  private publishInput(operation: LegacyOperation): void {
+    const input = operation.inputs[0];
+    if (!input || !operation.waiter) return;
+    if (operation.round >= MAX_INPUT_ROUNDS) {
+      this.failOperation(operation, new ProjectMcpBrokerError("input_round_limit"));
+      return;
+    }
+    operation.nonce = NodeCrypto.randomUUID();
+    const waiter = operation.waiter;
+    operation.waiter = undefined;
+    operation.detach?.();
+    operation.options = undefined;
+    waiter.resolve({
+      resultType: "input_required",
+      inputRequests: { [input.key]: input.request },
+      requestState: this.signInputState({
+        version: 1,
+        serverId: String(this.serverId),
+        providerSessionId: this.providerSessionId,
+        method: "tools/call",
+        paramsHash: operation.paramsHash,
+        operationId: operation.id,
+        nonce: operation.nonce,
+        round: operation.round++,
+        expiresAt: operation.expiresAt,
+      }),
+    });
+  }
+
+  private async callLegacyTool(
+    params: ProjectMcpCallToolParams,
+    state: InputState | undefined,
+    options?: ProjectMcpRequestOptions,
+  ): Promise<ProjectMcpCallToolResult> {
+    if (state) {
+      const operation = this.active;
+      const pending = operation?.inputs[0];
+      if (
+        !operation ||
+        !pending ||
+        operation.id !== state.operationId ||
+        !operation.nonce ||
+        operation.nonce !== state.nonce ||
+        !params.inputResponses ||
+        !Object.hasOwn(params.inputResponses, pending.key) ||
+        Object.keys(params.inputResponses).length !== 1
+      ) {
+        throw new ProjectMcpBrokerError("invalid_request_state");
+      }
+      // Claim before the first await so concurrent resumes cannot consume the same round.
+      operation.nonce = undefined;
+      const result = this.waitForOperation(operation, options);
+      if (this.active === operation) {
+        operation.inputs.shift();
+        pending.resolve(params.inputResponses[pending.key]);
+        this.publishInput(operation);
+      }
+      return result;
+    }
+    if (params.inputResponses) throw new ProjectMcpBrokerError("invalid_request_state");
+    const release = await this.acquire(options?.signal);
+    const operation: LegacyOperation = {
+      id: NodeCrypto.randomUUID(),
+      paramsHash: canonicalJson(paramsForHash(params)),
+      expiresAt: this.now() + INPUT_STATE_TTL_MS,
+      controller: new AbortController(),
+      round: 0,
+      inputs: [],
+      release,
+    };
+    this.active = operation;
+    // The Promise-based SDK invocation owns this deadline, outside an Effect runtime.
+    // @effect-diagnostics-next-line globalTimers:off
+    operation.timer = setTimeout(
+      () => this.failOperation(operation, new ProjectMcpBrokerError("invalid_request_state")),
+      INPUT_STATE_TTL_MS,
+    );
+    operation.timer.unref?.();
+    const result = this.waitForOperation(operation, options);
+    if (this.active !== operation) return result;
+    void Promise.resolve()
+      .then(() =>
+        this.method("callTool")(params, {
+          ...options,
+          signal: operation.controller.signal,
+          timeout: INPUT_STATE_TTL_MS,
+          maxTotalTimeout: INPUT_STATE_TTL_MS,
+          resetTimeoutOnProgress: false,
+          onprogress: (progress) => operation.options?.onprogress?.(progress),
+        }),
+      )
+      .then(
+        (completed) => {
+          if (this.active !== operation) return;
+          operation.waiter?.resolve(completed);
+          for (const pending of operation.inputs.splice(0))
+            pending.reject(new Error("MCP invocation completed"));
+          this.finishOperation(operation);
+        },
+        (error: unknown) => this.failOperation(operation, error),
+      );
+    return result;
   }
 
   private signInputState(state: InputState): string {
     const payload = Buffer.from(JSON.stringify(state)).toString("base64url");
-    const signature = createHmac("sha256", this.requestStateSecret)
+    const signature = NodeCrypto.createHmac("sha256", this.requestStateSecret)
       .update(payload)
       .digest("base64url");
     return `${payload}.${signature}`;
@@ -450,14 +630,16 @@ export class ProjectMcpBroker {
     if (payload === undefined || signature === undefined) {
       throw new ProjectMcpBrokerError("invalid_request_state");
     }
-    const expected = createHmac("sha256", this.requestStateSecret).update(payload).digest();
+    const expected = NodeCrypto.createHmac("sha256", this.requestStateSecret)
+      .update(payload)
+      .digest();
     let received: Buffer;
     try {
       received = Buffer.from(signature, "base64url");
     } catch {
       throw new ProjectMcpBrokerError("invalid_request_state");
     }
-    if (received.length !== expected.length || !timingSafeEqual(received, expected)) {
+    if (received.length !== expected.length || !NodeCrypto.timingSafeEqual(received, expected)) {
       throw new ProjectMcpBrokerError("invalid_request_state");
     }
     let decoded: unknown;
@@ -503,107 +685,90 @@ export class ProjectMcpBroker {
   private handleUpstreamServerRequest(
     method: LegacyServerRequestMethod,
     request: unknown,
-    handler: (request: unknown) => unknown | Promise<unknown>,
+    handler: (request: unknown, context?: ClientContext) => unknown | Promise<unknown>,
+    context?: ClientContext,
   ): unknown | Promise<unknown> {
-    if (!this.shouldBridgeLegacyServerRequests()) return handler(request);
-    const context = this.legacyInputContext.getStore();
-    if (!context) return handler(request);
-    const key = context.inputMethod === method ? context.inputKey : undefined;
-    if (
-      key !== undefined &&
-      context.inputResponses !== undefined &&
-      key in context.inputResponses
-    ) {
-      return context.inputResponses[key];
-    }
+    if (!this.shouldBridgeLegacyServerRequests()) return handler(request, context);
+    const operation = this.active;
+    if (!operation)
+      throw new ProtocolError(
+        ProtocolErrorCode.MethodNotFound,
+        "Unassociated MCP server request is unsupported",
+      );
     const params =
       isRecord(request) && isRecord(request.params) ? { params: request.params } : undefined;
     const inputRequest = {
       method,
-      ...(params ?? {}),
+      ...params,
     } as InputRequest;
-    throw new ProtocolError(
-      ProtocolErrorCode.InternalError,
-      "The MCP proxy needs downstream input.",
-      {
-        [LEGACY_INPUT_REQUIRED_MARKER]: true,
-        ...(key === undefined ? {} : { key }),
+    return new Promise((resolve, reject) => {
+      const signal = context?.mcpReq.signal;
+      const abort = () =>
+        this.failOperation(operation, signal?.reason ?? new Error("MCP input cancelled"));
+      if (signal?.aborted) {
+        abort();
+        reject(signal.reason);
+        return;
+      }
+      signal?.addEventListener("abort", abort, { once: true });
+      operation.inputs.push({
+        key: `legacy-input-${operation.round + operation.inputs.length}`,
         request: inputRequest,
-      },
-    );
+        resolve: (value) => {
+          signal?.removeEventListener("abort", abort);
+          resolve(value);
+        },
+        reject: (error) => {
+          signal?.removeEventListener("abort", abort);
+          reject(error);
+        },
+      });
+      this.publishInput(operation);
+    });
   }
 
-  setHandlers(handlers: ProjectMcpBrokerHandlers | undefined): void {
-    if (!handlers) return;
-    const client = this.connection.client;
-    if (typeof client.setNotificationHandler === "function") {
-      const setNotificationHandler = client.setNotificationHandler.bind(client) as unknown as (
-        method: string,
-        handler: (notification: Notification) => void | Promise<void>,
-      ) => void;
-      if (handlers.onToolsChanged) {
-        setNotificationHandler("notifications/tools/list_changed", async () => {
-          await handlers.onToolsChanged!(await this.listTools(undefined, { cacheMode: "refresh" }));
-        });
+  setHandlers(handlers: ProjectMcpBrokerHandlers | undefined): () => void {
+    if (!handlers) return () => undefined;
+    this.handlers.add(handlers);
+    const dispose = this.coordinator.addListener(async (notification) => {
+      if (notification.method === "notifications/tools/list_changed" && handlers.onToolsChanged) {
+        await handlers.onToolsChanged!(await this.listTools(undefined, { cacheMode: "refresh" }));
       }
-      if (handlers.onPromptsChanged) {
-        setNotificationHandler("notifications/prompts/list_changed", async () => {
-          await handlers.onPromptsChanged!(
-            await this.listPrompts(undefined, { cacheMode: "refresh" }),
-          );
-        });
-      }
-      if (handlers.onResourcesChanged) {
-        setNotificationHandler("notifications/resources/list_changed", async () => {
-          await handlers.onResourcesChanged!(
-            await this.listResources(undefined, { cacheMode: "refresh" }),
-          );
-        });
-      }
-      if (handlers.onResourceUpdated) {
-        setNotificationHandler("notifications/resources/updated", async (notification) => {
-          const params =
-            isRecord(notification.params) && typeof notification.params.uri === "string"
-              ? notification.params.uri
-              : undefined;
-          if (params) await handlers.onResourceUpdated!(params);
-        });
-      }
-      if (handlers.onLoggingMessage) {
-        setNotificationHandler("notifications/message", handlers.onLoggingMessage);
-      }
-      if (handlers.onProgress) {
-        setNotificationHandler("notifications/progress", async (notification) => {
-          await handlers.onProgress!(notification.params as unknown as Progress);
-        });
-      }
-    }
-    if (typeof client.setRequestHandler === "function") {
-      const setRequestHandler = client.setRequestHandler.bind(client) as unknown as (
-        method: string,
-        handler: (request: unknown) => unknown | Promise<unknown>,
-      ) => void;
-      if (handlers.onRootsRequest)
-        setRequestHandler("roots/list", (request) =>
-          this.handleUpstreamServerRequest("roots/list", request, handlers.onRootsRequest!),
+      if (
+        notification.method === "notifications/prompts/list_changed" &&
+        handlers.onPromptsChanged
+      ) {
+        await handlers.onPromptsChanged!(
+          await this.listPrompts(undefined, { cacheMode: "refresh" }),
         );
-      if (handlers.onSamplingRequest)
-        setRequestHandler("sampling/createMessage", (request) =>
-          this.handleUpstreamServerRequest(
-            "sampling/createMessage",
-            request,
-            handlers.onSamplingRequest!,
-          ),
+      }
+      if (
+        notification.method === "notifications/resources/list_changed" &&
+        handlers.onResourcesChanged
+      ) {
+        await handlers.onResourcesChanged!(
+          await this.listResources(undefined, { cacheMode: "refresh" }),
         );
-      if (handlers.onElicitationRequest)
-        setRequestHandler("elicitation/create", (request) =>
-          this.handleUpstreamServerRequest(
-            "elicitation/create",
-            request,
-            handlers.onElicitationRequest!,
-          ),
-        );
-    }
+      }
+      if (notification.method === "notifications/resources/updated" && handlers.onResourceUpdated) {
+        const params =
+          isRecord(notification.params) && typeof notification.params.uri === "string"
+            ? notification.params.uri
+            : undefined;
+        if (params && this.coordinator.ownsResource(params, this))
+          await handlers.onResourceUpdated!(params);
+      }
+      if (notification.method === "notifications/message" && handlers.onLoggingMessage) {
+        await handlers.onLoggingMessage(notification);
+      }
+    });
+    const disposeHandlers = () => {
+      this.handlers.delete(handlers);
+      dispose();
+      this.handlerDisposers.delete(disposeHandlers);
+    };
+    this.handlerDisposers.add(disposeHandlers);
+    return disposeHandlers;
   }
 }
 

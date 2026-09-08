@@ -14,6 +14,7 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import {
   ApprovalRequestId,
@@ -97,6 +98,126 @@ const grokAdapterTestLayer = ServerConfig.layerTest(process.cwd(), {
 
 const makeTestAdapter = (binaryPath: string, options?: Parameters<typeof makeGrokAdapter>[1]) =>
   makeGrokAdapter(decodeGrokSettings({ binaryPath }), options).pipe(Effect.orDie);
+
+it.effect("removes an idle Grok session before publishing unexpected process exit", () =>
+  Effect.gen(function* () {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const spawned: ChildProcessSpawner.ChildProcessHandle[] = [];
+    const wrapper = yield* Effect.acquireRelease(
+      Effect.promise(() => makeMockGrokWrapper()),
+      (path) => Effect.promise(() => NodeFSP.rm(NodePath.dirname(path), { recursive: true })),
+    );
+    const adapter = yield* makeTestAdapter(wrapper).pipe(
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make((command) =>
+          spawner
+            .spawn(command)
+            .pipe(Effect.tap((handle) => Effect.sync(() => spawned.push(handle)))),
+        ),
+      ),
+    );
+    const threadId = ThreadId.make("grok-idle-process-exit");
+    const exited = yield* adapter.streamEvents.pipe(
+      Stream.filter((event) => event.type === "session.exited"),
+      Stream.take(1),
+      Stream.mapEffect((event) =>
+        Effect.gen(function* () {
+          assert.isFalse(yield* adapter.hasSession(threadId));
+          assert.deepEqual(yield* adapter.listSessions(), []);
+          return event;
+        }),
+      ),
+      Stream.runCollect,
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+    const child = spawned.at(-1)!;
+    assert.isTrue(yield* child.isRunning);
+    yield* child.kill({ killSignal: "SIGKILL" });
+    const events = yield* Fiber.join(exited);
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.payload.exitKind, "error");
+  }).pipe(Effect.provide(grokAdapterTestLayer)),
+);
+
+for (const delayedExit of [true, false]) {
+  it.effect(
+    `Grok replacement ignores an old ${delayedExit ? "delayed" : "interrupted"} exit observer`,
+    () =>
+      Effect.gen(function* () {
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const processes: Array<{
+          observer: Deferred.Deferred<Fiber.Fiber<unknown, unknown>>;
+          release: Deferred.Deferred<void>;
+        }> = [];
+        const wrapper = yield* Effect.acquireRelease(
+          Effect.promise(() => makeMockGrokWrapper()),
+          (path) => Effect.promise(() => NodeFSP.rm(NodePath.dirname(path), { recursive: true })),
+        );
+        const adapter = yield* makeTestAdapter(wrapper).pipe(
+          Effect.provideService(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make((command) =>
+              Effect.gen(function* () {
+                const handle = yield* spawner.spawn(command);
+                const observer = yield* Deferred.make<Fiber.Fiber<unknown, unknown>>();
+                const release = yield* Deferred.make<void>();
+                processes.push({ observer, release });
+                let claimed = false;
+                return ChildProcessSpawner.makeHandle({
+                  ...handle,
+                  exitCode: Effect.withFiber((fiber) => {
+                    if (claimed) return handle.exitCode;
+                    claimed = true;
+                    return Deferred.succeed(observer, fiber).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                      Effect.andThen(handle.exitCode),
+                    );
+                  }),
+                });
+              }),
+            ),
+          ),
+        );
+        const threadId = ThreadId.make("grok-exit-replacement");
+        const barrierThreadId = ThreadId.make("grok-exit-barrier");
+        const events = yield* adapter.streamEvents.pipe(
+          Stream.takeUntil(
+            (event) => event.type === "thread.started" && event.threadId === barrierThreadId,
+          ),
+          Stream.runCollect,
+          Effect.forkScoped({ startImmediately: true }),
+        );
+        const start = { threadId, cwd: process.cwd(), runtimeMode: "full-access" as const };
+        yield* adapter.startSession(start);
+        const old = processes.at(-1)!;
+        const oldObserver = yield* Deferred.await(old.observer);
+        yield* adapter.sendTurn({ threadId, input: "normal completed prompt" });
+        assert.isTrue(yield* adapter.hasSession(threadId));
+        if (!delayedExit) yield* Fiber.interrupt(oldObserver);
+        yield* adapter.startSession(start);
+        const current = processes.at(-1)!;
+        const currentObserver = yield* Deferred.await(current.observer);
+        yield* Deferred.succeed(old.release, undefined);
+        yield* Fiber.await(oldObserver);
+        assert.isTrue(yield* adapter.hasSession(threadId));
+        assert.equal((yield* adapter.listSessions()).length, 1);
+        yield* adapter.stopSession(threadId);
+        yield* Deferred.succeed(current.release, undefined);
+        yield* Fiber.await(currentObserver);
+        assert.isFalse(yield* adapter.hasSession(threadId));
+        yield* adapter.startSession({ ...start, threadId: barrierThreadId });
+        const observed = yield* Fiber.join(events);
+        const exits = observed.filter((event) => event.type === "session.exited");
+        assert.equal(exits.length, 2);
+        assert.deepEqual(
+          exits.map((event) => event.payload.exitKind),
+          ["graceful", "graceful"],
+        );
+      }).pipe(Effect.provide(grokAdapterTestLayer)),
+  );
+}
 
 it("detects enter_plan_mode tool calls from title and rawInput", () => {
   assert.isTrue(

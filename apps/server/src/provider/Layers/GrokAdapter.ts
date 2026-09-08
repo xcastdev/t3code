@@ -332,6 +332,7 @@ export function grokPromptSettlementBelongsToContext(input: {
 
 export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapterLiveOptions) {
   return Effect.gen(function* () {
+    const adapterScope = yield* Scope.Scope;
     const boundInstanceId = options?.instanceId ?? ProviderInstanceId.make("grok");
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
@@ -916,25 +917,28 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       return Effect.succeed(ctx);
     };
 
-    const stopSessionInternal = (ctx: GrokSessionContext) =>
+    const stopSessionInternal = (
+      ctx: GrokSessionContext,
+      exitKind: "graceful" | "error" = "graceful",
+    ) =>
       Effect.gen(function* () {
-        if (ctx.stopped) return;
+        if (ctx.stopped || sessions.get(ctx.threadId) !== ctx) return;
         ctx.stopped = true;
+        sessions.delete(ctx.threadId);
         yield* settlePendingApprovalsAsCancelled(ctx.pendingApprovals);
         yield* settlePendingUserInputsAsCancelled(ctx.pendingUserInputs);
         if (ctx.notificationFiber) {
           yield* Fiber.interrupt(ctx.notificationFiber);
         }
         yield* Effect.ignore(Scope.close(ctx.scope, Exit.void));
-        sessions.delete(ctx.threadId);
         yield* offerRuntimeEvent({
           type: "session.exited",
           ...(yield* makeEventStamp()),
           provider: PROVIDER,
           threadId: ctx.threadId,
-          payload: { exitKind: "graceful" },
+          payload: { exitKind },
         });
-      });
+      }).pipe(Effect.uninterruptible);
 
     const startSession: GrokAdapterShape["startSession"] = (input) =>
       withThreadLock(
@@ -1473,6 +1477,21 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             payload: { providerThreadId: started.sessionId },
           });
 
+          // The observer must outlive the session scope that terminal cleanup closes.
+          yield* acp.awaitExit.pipe(
+            Effect.matchEffect({
+              onFailure: () => withThreadLock(ctx.threadId, stopSessionInternal(ctx, "error")),
+              onSuccess: (code) =>
+                withThreadLock(
+                  ctx.threadId,
+                  stopSessionInternal(ctx, code === 0 ? "graceful" : "error"),
+                ),
+            }),
+            Effect.catch((cause) =>
+              Effect.logError("Failed to publish Grok process exit.", { cause }),
+            ),
+            Effect.forkIn(adapterScope),
+          );
           return session;
         }).pipe(Effect.scoped),
       );
@@ -2032,7 +2051,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       });
 
     const stopAll: GrokAdapterShape["stopAll"] = () =>
-      Effect.forEach(Array.from(sessions.values()), stopSessionInternal, { discard: true });
+      Effect.forEach(Array.from(sessions.values()), (ctx) => stopSessionInternal(ctx), {
+        discard: true,
+      });
 
     yield* Effect.addFinalizer(() =>
       Effect.ignore(stopAll()).pipe(

@@ -30,6 +30,17 @@ working directory, headers, or environment values.
 Catalog changes apply to new provider sessions. Existing sessions keep their issued endpoints and
 configuration until they stop.
 
+For stdio, each argument has its own text field. Choose **Add argument** to append an argument or
+**Remove argument** to delete one. An empty field passes one empty argument; remove all fields to
+pass no arguments. Spaces and line breaks within each field are preserved when you save, including
+when you edit another setting.
+
+Enabling or disabling a server preserves configuration changes saved from another device.
+
+When a provider session exits, T3 revokes its proxy endpoints and releases its credentials. Deleting
+a project removes its unused MCP credentials. Credentials still in use remain available until
+those sessions stop.
+
 ## Credentials and OAuth
 
 Header values, stdio environment values, and OAuth client secrets are write-only. An existing
@@ -85,6 +96,14 @@ executable is installed there, that the selected working directory exists, and t
 environment variables are configured. The inherited environment, including `PATH`, is retained.
 
 ### OAuth does not reconnect
+
+Some older OAuth connections require authorization again after an upgrade. If **Connect OAuth**
+appears for a previously connected server, select it to reconnect. Older grants lack the registration
+details needed to verify that the saved credentials belong to the current configuration.
+
+Changing the server URL, OAuth registration mode, client ID, or client secret requires a matching
+authorization. A grant for the previous configuration does not appear as connected. If T3 cannot
+read the authorization status, the server shows an OAuth error.
 
 Confirm that the OAuth callback returned to the same T3 server and that the authorization popup
 was not blocked. If the client secret or grant was replaced, disconnect the old grant, connect

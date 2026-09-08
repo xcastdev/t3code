@@ -1,12 +1,15 @@
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import type { FetchLike } from "@modelcontextprotocol/client";
+import { auth, type FetchLike } from "@modelcontextprotocol/client";
 import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as NodeCrypto from "node:crypto";
 import * as Schema from "effect/Schema";
-import { McpServerId } from "@t3tools/contracts";
+import { McpServerId, ProjectMcpCredentialId } from "@t3tools/contracts";
 import * as ServerConfig from "../config.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ProjectMcpOAuth from "./ProjectMcpOAuth.ts";
@@ -14,6 +17,64 @@ import * as ProjectMcpSecretStore from "./ProjectMcpSecretStore.ts";
 
 const serverId = McpServerId.make("oauth-test-server");
 const resource = "https://mcp.example.test/rpc";
+
+for (const clientSecret of ["leased-client-secret", undefined]) {
+  it.effect(
+    `resolves a pre-registered binding with cached secret ${clientSecret !== undefined}`,
+    () =>
+      Effect.gen(function* () {
+        const credentialId = ProjectMcpCredentialId.make("018f6d7a-8b9c-7def-8123-456789abcdef");
+        const resolved = yield* ProjectMcpOAuth.resolveServerBinding(
+          {
+            id: serverId,
+            transport: {
+              type: "streamable-http",
+              url: resource,
+              headers: [],
+              authorization: {
+                type: "oauth",
+                registration: {
+                  type: "pre-registered",
+                  clientId: "registered-client",
+                  clientSecret: { id: credentialId, name: "client secret" },
+                },
+              },
+            },
+          },
+          (owner, credential) => {
+            assert.equal(owner, serverId);
+            assert.equal(credential, credentialId);
+            return Effect.succeed(clientSecret);
+          },
+        );
+        assert.deepEqual(resolved, {
+          serverId,
+          resource,
+          clientId: "registered-client",
+          ...(clientSecret === undefined ? {} : { clientSecret }),
+        });
+      }),
+  );
+}
+
+it.effect("resolves automatic registration without reading a client secret", () =>
+  Effect.gen(function* () {
+    const resolved = yield* ProjectMcpOAuth.resolveServerBinding(
+      {
+        id: serverId,
+        transport: {
+          type: "legacy-sse",
+          url: resource,
+          headers: [],
+          authorization: { type: "oauth", registration: { type: "automatic" } },
+        },
+      },
+      () => Effect.die("Automatic registration must not resolve a client secret"),
+    );
+    assert.deepEqual(resolved, { serverId, resource });
+  }),
+);
+
 const fetchOAuthFixture: FetchLike = async (input: string | Request | URL, init?: RequestInit) => {
   const url = String(input);
   if (url.endsWith("/.well-known/oauth-protected-resource")) {
@@ -44,6 +105,27 @@ const fetchOAuthFixture: FetchLike = async (input: string | Request | URL, init?
   }
   return new Response(null, { status: 404 });
 };
+const fetchRegistrationFixture: FetchLike = async (input, init) => {
+  const url = String(input);
+  if (url.endsWith("/.well-known/oauth-authorization-server")) {
+    return Response.json({
+      issuer: "https://issuer.example.test",
+      authorization_endpoint: "https://issuer.example.test/authorize",
+      token_endpoint: "https://issuer.example.test/token",
+      registration_endpoint: "https://issuer.example.test/register",
+      response_types_supported: ["code"],
+      grant_types_supported: ["authorization_code", "refresh_token"],
+      token_endpoint_auth_methods_supported: ["none", "client_secret_post"],
+      code_challenge_methods_supported: ["S256"],
+    });
+  }
+  if (url.endsWith("/register"))
+    return Response.json({
+      client_id: "dynamic-client",
+      redirect_uris: ["http://127.0.0.1/oauth/project-mcp/callback"],
+    });
+  return fetchOAuthFixture(input, init);
+};
 const cryptoLayer = Layer.succeed(
   Crypto.Crypto,
   Crypto.make({
@@ -72,6 +154,891 @@ const decodePendingRecord = Schema.decodeUnknownSync(
       state: Schema.optional(Schema.String),
     }),
   ),
+);
+
+const fixtureServer = {
+  serverId,
+  resource,
+  clientId: "registered-client",
+};
+const encodeLegacyRecord = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeRecord = Schema.decodeUnknownSync(
+  Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
+);
+const decodeObject = Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown));
+
+it.effect("requires reconnect for legacy grants without a registration binding", () =>
+  Effect.gen(function* () {
+    const oauth = yield* prepareOAuth();
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    yield* secrets.createAuxiliarySecret(
+      serverId,
+      encodeLegacyRecord({
+        kind: "project-mcp-oauth",
+        serverId,
+        resource,
+        issuer: "https://issuer.example.test",
+        client: { client_id: "registered-client", issuer: "https://issuer.example.test" },
+        tokens: {
+          access_token: "legacy-token",
+          token_type: "Bearer",
+          issuer: "https://issuer.example.test",
+        },
+        generation: 1,
+      }),
+    );
+    assert.equal(yield* oauth.status(serverId), "not-connected");
+    for (const server of [fixtureServer, { serverId, resource }]) {
+      const provider = yield* oauth.providerFor(serverId, server);
+      assert.isUndefined(yield* Effect.promise(async () => provider.tokens()));
+    }
+    const started = yield* oauth.begin({ serverId });
+    assert.equal(
+      (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+      200,
+    );
+    assert.equal(yield* oauth.status(serverId), "connected");
+  }).pipe(Effect.provide(secretLayer)),
+);
+const prepareOAuth = Effect.fn(function* (
+  config: Partial<ProjectMcpOAuth.ProjectMcpOAuthConfig> = {},
+) {
+  const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+  const prepared = yield* secrets.prepareCreate(serverId, {
+    type: "streamable-http",
+    url: resource,
+    headers: [],
+    authorization: { type: "oauth", registration: { type: "automatic" } },
+  });
+  yield* prepared.commit;
+  return yield* ProjectMcpOAuth.__testing.make({
+    servers: [fixtureServer],
+    fetch: fetchOAuthFixture,
+    ...config,
+  });
+});
+
+const callbackRequest = (authorizationUrl: string) => {
+  const url = new URL("https://t3.example.test/oauth/project-mcp/callback");
+  url.searchParams.set("state", new URL(authorizationUrl).searchParams.get("state")!);
+  url.searchParams.set("code", "one-time-code");
+  url.searchParams.set("iss", "https://issuer.example.test");
+  return new Request(url.toString());
+};
+
+for (const reader of ["status", "provider"] as const) {
+  for (const replacement of ["tokens", "verifier"] as const) {
+    it.effect(
+      `coherent ${reader} reads serialize secret resolution with ${replacement} replacement`,
+      () =>
+        Effect.gen(function* () {
+          yield* prepareOAuth();
+          const store = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+          const listed = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          const writeStarted = Promise.withResolvers<void>();
+          let gateRead = false;
+          let readSuspended = false;
+          let writerEnteredStore = false;
+          const oauth = yield* ProjectMcpOAuth.__testing.make({ servers: [fixtureServer] }).pipe(
+            Effect.provideService(ProjectMcpSecretStore.ProjectMcpSecretStore, {
+              ...store,
+              listAuxiliarySecrets: (id) =>
+                Effect.gen(function* () {
+                  if (readSuspended) writerEnteredStore = true;
+                  const ids = yield* store.listAuxiliarySecrets(id);
+                  if (gateRead) {
+                    gateRead = false;
+                    readSuspended = true;
+                    yield* Deferred.succeed(listed, undefined);
+                    yield* Deferred.await(release);
+                  }
+                  return ids;
+                }),
+            }),
+          );
+          const provider = yield* oauth.providerFor(serverId);
+          yield* Effect.promise(async () => {
+            await provider.saveTokens({ access_token: "first", token_type: "Bearer" });
+            await provider.saveCodeVerifier("first-verifier");
+          });
+          gateRead = true;
+          const read = yield* Effect.forkScoped(
+            Effect.exit(
+              Effect.gen(function* () {
+                if (reader === "status") assert.equal(yield* oauth.status(serverId), "connected");
+                else
+                  assert.equal(
+                    (yield* Effect.tryPromise(async () => provider.tokens()))?.access_token,
+                    "first",
+                  );
+              }),
+            ),
+          );
+          yield* Deferred.await(listed);
+          const write = yield* Effect.forkScoped(
+            Effect.promise(async () => {
+              const saving =
+                replacement === "tokens"
+                  ? provider.saveTokens({ access_token: "replacement", token_type: "Bearer" })
+                  : provider.saveCodeVerifier("replacement-verifier");
+              writeStarted.resolve();
+              return saving;
+            }),
+          );
+          yield* Effect.promise(() => writeStarted.promise);
+          // If the writer bypassed the read lock, finish revoking the listed IDs
+          // before resolving them. With the lock, release the reader to admit it.
+          if (writerEnteredStore) yield* Fiber.join(write);
+          readSuspended = false;
+          yield* Deferred.succeed(release, undefined);
+          const result = yield* Fiber.join(read);
+          yield* Fiber.join(write);
+          assert.deepEqual(result, Exit.succeed(undefined));
+          assert.equal(
+            (yield* Effect.promise(async () => provider.tokens()))?.access_token,
+            replacement === "tokens" ? "replacement" : "first",
+          );
+          assert.equal(
+            yield* Effect.promise(async () => provider.codeVerifier()),
+            replacement === "verifier" ? "replacement-verifier" : "first-verifier",
+          );
+          yield* oauth.disconnect(serverId);
+          assert.isUndefined(yield* Effect.promise(async () => provider.tokens()));
+        }).pipe(Effect.scoped, Effect.provide(secretLayer)),
+    );
+  }
+}
+
+it.effect("automatic registration uses the HTTPS origin client metadata document", () =>
+  Effect.gen(function* () {
+    let registrations = 0;
+    const oauth = yield* prepareOAuth({
+      fetch: async (input, init) => {
+        if (String(input).endsWith("/register")) registrations++;
+        const response = await fetchOAuthFixture(input, init);
+        if (String(input).endsWith("/.well-known/oauth-authorization-server")) {
+          return Response.json({
+            ...decodeObject(await response.json()),
+            client_id_metadata_document_supported: true,
+          });
+        }
+        return response;
+      },
+    });
+    const started = yield* oauth.begin({
+      serverId,
+      server: { serverId, resource },
+      redirectOrigin: "https://remote.example.test",
+    });
+    const url = new URL(started.authorizationUrl);
+    assert.equal(
+      url.searchParams.get("client_id"),
+      "https://remote.example.test/oauth/project-mcp/client-metadata",
+    );
+    assert.equal(
+      url.searchParams.get("redirect_uri"),
+      "https://remote.example.test/oauth/project-mcp/callback",
+    );
+    assert.equal(registrations, 0);
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+const invalidationCases = [
+  { scope: "tokens", removed: ["tokens", "tokensIssuedAt"] },
+  { scope: "verifier", removed: ["codeVerifier"] },
+  {
+    scope: "client",
+    removed: [
+      "client",
+      "tokens",
+      "tokensIssuedAt",
+      "state",
+      "codeVerifier",
+      "authorizationUrl",
+      "scope",
+      "expiresAt",
+    ],
+  },
+  { scope: "discovery", removed: ["discovery"] },
+  {
+    scope: "all",
+    removed: [
+      "client",
+      "tokens",
+      "tokensIssuedAt",
+      "state",
+      "codeVerifier",
+      "authorizationUrl",
+      "scope",
+      "expiresAt",
+      "discovery",
+      "issuer",
+      "redirectUrl",
+    ],
+  },
+] as const;
+
+it.effect("credential read failures remain errors rather than disconnected status", () =>
+  Effect.gen(function* () {
+    yield* prepareOAuth();
+    const store = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    let failReads = false;
+    const oauth = yield* ProjectMcpOAuth.__testing.make({ servers: [fixtureServer] }).pipe(
+      Effect.provideService(ProjectMcpSecretStore.ProjectMcpSecretStore, {
+        ...store,
+        resolve: (id, credential) =>
+          failReads
+            ? Effect.fail(
+                new ProjectMcpSecretStore.ProjectMcpSecretStoreError({
+                  operation: "read",
+                  cause: new Error("fixture storage failure"),
+                }),
+              )
+            : store.resolve(id, credential),
+      }),
+    );
+    const provider = yield* oauth.providerFor(serverId);
+    yield* Effect.promise(async () =>
+      provider.saveTokens({ access_token: "token", token_type: "Bearer" }),
+    );
+    failReads = true;
+    assert.isTrue(Exit.isFailure(yield* Effect.exit(oauth.status(serverId))));
+    assert.isTrue(
+      Exit.isFailure(yield* Effect.exit(Effect.tryPromise(async () => provider.tokens()))),
+    );
+    failReads = false;
+    assert.equal(yield* oauth.status(serverId), "connected");
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+it.effect("invalidation cannot cross a replacement registration binding", () =>
+  Effect.gen(function* () {
+    const oauth = yield* prepareOAuth();
+    yield* oauth.begin({ serverId });
+    const previous = yield* oauth.providerFor(serverId);
+    const replacement = { ...fixtureServer, clientId: "replacement-client" };
+    const started = yield* oauth.begin({ serverId, server: replacement });
+    const provider = yield* oauth.providerFor(serverId, replacement);
+    const verifier = yield* Effect.promise(async () => provider.codeVerifier());
+    for (const { scope } of invalidationCases) {
+      yield* Effect.promise(async () => previous.invalidateCredentials!(scope));
+      assert.equal(yield* Effect.promise(async () => provider.codeVerifier()), verifier);
+      assert.equal(
+        (yield* oauth.continuePending(serverId, replacement)).authorizationUrl,
+        started.authorizationUrl,
+      );
+    }
+    assert.equal(
+      (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+      200,
+    );
+    assert.equal(yield* oauth.status(serverId, replacement), "connected");
+    assert.equal(yield* oauth.status(serverId, fixtureServer), "not-connected");
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+for (const { scope, removed } of invalidationCases) {
+  it.effect(`SDK ${scope} invalidation removes only its owned state`, () =>
+    Effect.gen(function* () {
+      const oauth = yield* prepareOAuth();
+      const store = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+      const started = yield* oauth.begin({
+        serverId,
+        scope: "mcp:read",
+        redirectOrigin: "https://remote.example.test",
+      });
+      const provider = yield* oauth.providerFor(serverId);
+      yield* Effect.promise(async () =>
+        provider.saveTokens({ access_token: "old-token", token_type: "Bearer" }),
+      );
+      const beforeIds = yield* store.listAuxiliarySecrets(serverId);
+      const before = decodeRecord(yield* store.resolve(serverId, beforeIds[0]!));
+      yield* Effect.promise(async () => provider.invalidateCredentials!(scope));
+      const afterIds = yield* store.listAuxiliarySecrets(serverId);
+      const after = decodeRecord(yield* store.resolve(serverId, afterIds[0]!));
+      for (const [key, value] of Object.entries(before)) {
+        if ((removed as readonly string[]).includes(key)) assert.notProperty(after, key);
+        else assert.deepEqual(after[key], value, `${scope} must preserve ${key}`);
+      }
+      assert.equal(after.generation, before.generation);
+      assert.deepEqual(after.registration, { clientId: "registered-client" });
+      if (scope === "tokens") {
+        assert.isUndefined(yield* Effect.promise(async () => provider.tokens()));
+        assert.equal(
+          (yield* oauth.continuePending(serverId)).authorizationUrl,
+          started.authorizationUrl,
+        );
+        assert.equal(
+          (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+          200,
+        );
+      }
+      if (scope === "discovery") {
+        assert.isUndefined(yield* Effect.promise(async () => provider.discoveryState!()));
+        assert.equal(
+          (yield* Effect.promise(async () => provider.tokens()))?.access_token,
+          "old-token",
+        );
+        assert.equal(
+          yield* Effect.promise(() =>
+            auth(provider, {
+              serverUrl: resource,
+              fetchFn: fetchOAuthFixture,
+              forceReauthorization: true,
+            }),
+          ),
+          "REDIRECT",
+        );
+        assert.isDefined(yield* Effect.promise(async () => provider.discoveryState!()));
+      }
+    }).pipe(Effect.provide(secretLayer)),
+  );
+
+  it.effect(`stale providers cannot invalidate ${scope} in a replacement generation`, () =>
+    Effect.gen(function* () {
+      const oauth = yield* prepareOAuth();
+      yield* oauth.begin({ serverId });
+      const stale = yield* oauth.providerFor(serverId);
+      const started = yield* oauth.begin({ serverId });
+      const active = yield* oauth.providerFor(serverId);
+      const verifier = yield* Effect.promise(async () => active.codeVerifier());
+      yield* Effect.promise(async () => stale.invalidateCredentials!(scope));
+      assert.equal(yield* Effect.promise(async () => active.codeVerifier()), verifier);
+      assert.equal(
+        (yield* oauth.continuePending(serverId)).authorizationUrl,
+        started.authorizationUrl,
+      );
+      assert.equal(
+        (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+        200,
+      );
+    }).pipe(Effect.provide(secretLayer)),
+  );
+}
+
+it.effect(
+  "SDK authorization uses the configured pre-registered client without dynamic registration",
+  () =>
+    Effect.gen(function* () {
+      let registrations = 0;
+      const fetchRegistered: FetchLike = async (input, init) => {
+        if (String(input).endsWith("/register")) registrations++;
+        if (String(input).endsWith("/token")) {
+          const body = new URLSearchParams(init?.body as string);
+          assert.equal(body.get("client_id"), "registered-client");
+          assert.equal(body.get("client_secret"), "fixture-secret");
+        }
+        return fetchRegistrationFixture(input, init);
+      };
+      const oauth = yield* prepareOAuth({ fetch: fetchRegistered });
+      const runtime = yield* oauth.providerFor(serverId, {
+        ...fixtureServer,
+        clientSecret: "fixture-secret",
+      });
+      assert.equal(
+        yield* Effect.promise(() =>
+          auth(runtime, { serverUrl: resource, fetchFn: fetchRegistered }),
+        ),
+        "REDIRECT",
+      );
+      const pending = yield* oauth.continuePending(serverId);
+      assert.equal(
+        new URL(pending.authorizationUrl).searchParams.get("client_id"),
+        "registered-client",
+      );
+      assert.equal(registrations, 0);
+      assert.equal(
+        (yield* oauth.completeCallback(callbackRequest(pending.authorizationUrl))).status,
+        200,
+      );
+    }).pipe(Effect.provide(secretLayer)),
+);
+
+for (const previous of ["legacy", "different registration", "mismatched client"] as const) {
+  it.effect(`SDK authorization cannot replace a ${previous} grant without explicit reconnect`, () =>
+    Effect.gen(function* () {
+      let registrations = 0;
+      const fetchRegistered: FetchLike = async (input, init) => {
+        if (String(input).endsWith("/register")) registrations++;
+        return fetchRegistrationFixture(input, init);
+      };
+      yield* prepareOAuth({ fetch: fetchRegistered });
+      const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+      yield* secrets.createAuxiliarySecret(
+        serverId,
+        encodeLegacyRecord({
+          kind: "project-mcp-oauth",
+          serverId,
+          resource,
+          ...(previous === "legacy"
+            ? {}
+            : {
+                registration: {
+                  clientId: previous === "mismatched client" ? "registered-client" : "other-client",
+                },
+              }),
+          client: { client_id: "other-client", issuer: "https://issuer.example.test" },
+          tokens: {
+            access_token: "previous-token",
+            token_type: "Bearer",
+            issuer: "https://issuer.example.test",
+          },
+          generation: 1,
+        }),
+      );
+      const ids = yield* secrets.listAuxiliarySecrets(serverId);
+      const restarted = yield* ProjectMcpOAuth.__testing.make({
+        servers: [],
+        fetch: fetchRegistered,
+      });
+      const runtime = yield* restarted.providerFor(serverId, fixtureServer);
+      const result = yield* Effect.exit(
+        Effect.tryPromise({
+          try: () => auth(runtime, { serverUrl: resource, fetchFn: fetchRegistered }),
+          catch: (cause) =>
+            new ProjectMcpOAuth.ProjectMcpOAuthError({ operation: "SDK authorization", cause }),
+        }),
+      );
+      assert.isTrue(Exit.isFailure(result));
+      assert.equal(registrations, 0);
+      assert.deepEqual(yield* secrets.listAuxiliarySecrets(serverId), ids);
+      const next = yield* restarted.begin({ serverId, server: fixtureServer });
+      assert.equal(
+        (yield* restarted.completeCallback(callbackRequest(next.authorizationUrl))).status,
+        200,
+      );
+    }).pipe(Effect.provide(secretLayer)),
+  );
+}
+
+it.effect("rejects SDK attempts to save a client inconsistent with pre-registration", () =>
+  Effect.gen(function* () {
+    const oauth = yield* prepareOAuth();
+    yield* oauth.begin({ serverId });
+    const runtime = yield* oauth.providerFor(serverId);
+    const result = yield* Effect.exit(
+      Effect.tryPromise({
+        try: async () => runtime.saveClientInformation!({ client_id: "wrong-client" }),
+        catch: (cause) =>
+          new ProjectMcpOAuth.ProjectMcpOAuthError({ operation: "SDK client update", cause }),
+      }),
+    );
+    assert.isTrue(Exit.isFailure(result));
+    assert.equal(
+      (yield* Effect.promise(async () => runtime.clientInformation()))?.client_id,
+      "registered-client",
+    );
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+for (const action of ["disconnect", "reconnect"] as const) {
+  it.effect(`an outstanding Connect cannot supersede a later ${action}`, () =>
+    Effect.gen(function* () {
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let pauseDiscovery = true;
+      const oauth = yield* prepareOAuth({
+        fetch: async (input, init) => {
+          if (pauseDiscovery && String(input).endsWith("/.well-known/oauth-protected-resource")) {
+            pauseDiscovery = false;
+            entered.resolve();
+            await release.promise;
+          }
+          return fetchOAuthFixture(input, init);
+        },
+      });
+      const first = yield* Effect.forkScoped(Effect.exit(oauth.begin({ serverId })));
+      const next = yield* Effect.gen(function* () {
+        yield* Effect.promise(() => entered.promise);
+        if (action === "disconnect") {
+          yield* oauth.disconnect(serverId);
+          return undefined;
+        }
+        return yield* oauth.begin({ serverId });
+      }).pipe(Effect.ensuring(Effect.sync(() => release.resolve())));
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(first)));
+      if (next === undefined) {
+        assert.equal(yield* oauth.status(serverId), "not-connected");
+      } else {
+        assert.equal(
+          (yield* oauth.continuePending(serverId)).authorizationUrl,
+          next.authorizationUrl,
+        );
+        assert.equal(
+          (yield* oauth.completeCallback(callbackRequest(next.authorizationUrl))).status,
+          200,
+        );
+      }
+    }).pipe(Effect.scoped, Effect.provide(secretLayer)),
+  );
+}
+
+it.effect("runtime step-up uses the saved remote callback after restart", () =>
+  Effect.gen(function* () {
+    const oauth = yield* prepareOAuth();
+    const started = yield* oauth.begin({ serverId, redirectOrigin: "https://t3.example.test" });
+    assert.equal(
+      (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+      200,
+    );
+    const restarted = yield* ProjectMcpOAuth.__testing.make({
+      servers: [],
+      fetch: fetchOAuthFixture,
+    });
+    const runtime = yield* restarted.providerFor(serverId, fixtureServer);
+    assert.equal(
+      yield* Effect.promise(() =>
+        auth(runtime, {
+          serverUrl: resource,
+          scope: "mcp:read mcp:write",
+          forceReauthorization: true,
+          fetchFn: fetchOAuthFixture,
+        }),
+      ),
+      "REDIRECT",
+    );
+    const continued = yield* restarted.continuePending(serverId, fixtureServer);
+    assert.equal(
+      new URL(continued.authorizationUrl).searchParams.get("redirect_uri"),
+      "https://t3.example.test/oauth/project-mcp/callback",
+    );
+    assert.equal(
+      (yield* restarted.completeCallback(callbackRequest(continued.authorizationUrl))).status,
+      200,
+    );
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+it.effect("a completed callback keeps fresh tokens until their own expiry", () =>
+  Effect.gen(function* () {
+    let clock = 1_800_000_000_000;
+    let refreshes = 0;
+    const fetchTokens: FetchLike = async (input, init) => {
+      if (!String(input).endsWith("/token")) return fetchOAuthFixture(input, init);
+      const refresh =
+        new URLSearchParams(init?.body as string).get("grant_type") === "refresh_token";
+      if (refresh) refreshes++;
+      return Response.json({
+        access_token: refresh ? "refreshed-token" : "fresh-token",
+        token_type: "Bearer",
+        expires_in: 3600,
+        refresh_token: "refresh-token",
+      });
+    };
+    const oauth = yield* prepareOAuth({ fetch: fetchTokens, now: () => clock });
+    const started = yield* oauth.begin({ serverId });
+    assert.equal(
+      (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+      200,
+    );
+    const restarted = yield* ProjectMcpOAuth.__testing.make({
+      servers: [],
+      fetch: fetchTokens,
+      now: () => clock,
+    });
+    const runtime = yield* restarted.providerFor(serverId, fixtureServer);
+    clock += 3_599_000;
+    assert.equal(
+      (yield* Effect.promise(async () => runtime.tokens()))?.access_token,
+      "fresh-token",
+    );
+    assert.equal(refreshes, 0);
+    clock += 1_001;
+    assert.equal(
+      (yield* Effect.promise(async () => runtime.tokens()))?.access_token,
+      "refreshed-token",
+    );
+    assert.equal(refreshes, 1);
+    assert.equal(
+      (yield* Effect.promise(async () => runtime.tokens()))?.access_token,
+      "refreshed-token",
+    );
+    assert.equal(refreshes, 1);
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+for (const overlap of ["pending authorization", "completed authorization"] as const) {
+  it.effect(`a refresh preserves a newer ${overlap}`, () =>
+    Effect.gen(function* () {
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      let clock = 1_800_000_000_000;
+      let grants = 0;
+      const oauth = yield* prepareOAuth({
+        now: () => clock,
+        fetch: async (input, init) => {
+          if (!String(input).endsWith("/token")) return fetchOAuthFixture(input, init);
+          const refresh =
+            new URLSearchParams(init?.body as string).get("grant_type") === "refresh_token";
+          if (refresh) {
+            entered.resolve();
+            await release.promise;
+          } else {
+            grants++;
+          }
+          return Response.json({
+            access_token: refresh ? "refreshed-token" : `grant-${grants}`,
+            token_type: "Bearer",
+            expires_in: 1,
+            refresh_token: refresh ? "rotated-refresh" : `refresh-${grants}`,
+          });
+        },
+      });
+      const started = yield* oauth.begin({ serverId });
+      assert.equal(
+        (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+        200,
+      );
+      const provider = yield* oauth.providerFor(serverId);
+      clock += 2_000;
+      const authorizationUrl =
+        "https://issuer.example.test/authorize?state=step-up&scope=mcp%3Aread+mcp%3Awrite";
+      const startStepUp = Effect.promise(async () => {
+        await provider.saveCodeVerifier("v".repeat(48));
+        await provider.redirectToAuthorization(new URL(authorizationUrl));
+      });
+      if (overlap === "completed authorization") yield* startStepUp;
+      const refresh = yield* Effect.forkScoped(Effect.promise(async () => provider.tokens()));
+      yield* Effect.gen(function* () {
+        yield* Effect.promise(() => entered.promise);
+        if (overlap === "pending authorization") yield* startStepUp;
+        else
+          assert.equal(
+            (yield* oauth.completeCallback(callbackRequest(authorizationUrl))).status,
+            200,
+          );
+      }).pipe(Effect.ensuring(Effect.sync(() => release.resolve())));
+      yield* Fiber.join(refresh);
+      if (overlap === "pending authorization") {
+        assert.equal(yield* oauth.status(serverId), "authorization-pending");
+        assert.equal((yield* oauth.continuePending(serverId)).authorizationUrl, authorizationUrl);
+        assert.equal(
+          (yield* oauth.completeCallback(callbackRequest(authorizationUrl))).status,
+          200,
+        );
+      } else {
+        assert.equal(yield* oauth.status(serverId), "connected");
+        assert.isUndefined(yield* Effect.promise(async () => provider.tokens()));
+        const active = yield* oauth.providerFor(serverId);
+        assert.equal((yield* Effect.promise(async () => active.tokens()))?.access_token, "grant-2");
+      }
+    }).pipe(Effect.scoped, Effect.provide(secretLayer)),
+  );
+}
+
+it.effect("an SDK-driven refresh cannot replace a completed callback grant", () =>
+  Effect.gen(function* () {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let grants = 0;
+    const fetchTokens: FetchLike = async (input, init) => {
+      if (!String(input).endsWith("/token")) return fetchOAuthFixture(input, init);
+      const refresh =
+        new URLSearchParams(init?.body as string).get("grant_type") === "refresh_token";
+      if (refresh) {
+        entered.resolve();
+        await release.promise;
+      } else grants++;
+      return Response.json({
+        access_token: refresh ? "stale-sdk-refresh" : `grant-${grants}`,
+        token_type: "Bearer",
+        expires_in: 3600,
+        refresh_token: `refresh-${grants}`,
+      });
+    };
+    const oauth = yield* prepareOAuth({ fetch: fetchTokens });
+    const started = yield* oauth.begin({ serverId });
+    assert.equal(
+      (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+      200,
+    );
+    const runtime = yield* oauth.providerFor(serverId);
+    yield* Effect.promise(async () => {
+      await runtime.saveCodeVerifier("v".repeat(48));
+      await runtime.redirectToAuthorization(
+        new URL("https://issuer.example.test/authorize?state=step-up"),
+      );
+    });
+    const refresh = yield* Effect.forkScoped(
+      Effect.promise(() =>
+        auth(runtime, {
+          serverUrl: resource,
+          fetchFn: fetchTokens,
+        }),
+      ),
+    );
+    yield* Effect.gen(function* () {
+      yield* Effect.promise(() => entered.promise);
+      assert.equal(
+        (yield* oauth.completeCallback(
+          callbackRequest("https://issuer.example.test/authorize?state=step-up"),
+        )).status,
+        200,
+      );
+    }).pipe(Effect.ensuring(Effect.sync(() => release.resolve())));
+    yield* Fiber.join(refresh);
+    const active = yield* oauth.providerFor(serverId);
+    assert.equal((yield* Effect.promise(async () => active.tokens()))?.access_token, "grant-2");
+  }).pipe(Effect.scoped, Effect.provide(secretLayer)),
+);
+
+for (const [name, replacement] of [
+  ["client ID", { clientId: "other-client", clientSecret: "original-secret" }],
+  ["client secret", { clientId: "registered-client", clientSecret: "rotated-secret" }],
+  ["registration mode", {}],
+] as const) {
+  it.effect(`does not reuse credentials after changing ${name}`, () =>
+    Effect.gen(function* () {
+      const oauth = yield* prepareOAuth();
+      const original = { ...fixtureServer, clientSecret: "original-secret" };
+      const started = yield* oauth.begin({ serverId, server: original });
+      assert.equal(
+        (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+        200,
+      );
+      const provider = yield* oauth.providerFor(serverId, { serverId, resource, ...replacement });
+      assert.isUndefined(yield* Effect.promise(async () => provider.tokens()));
+      assert.isUndefined(yield* Effect.promise(async () => provider.clientInformation()));
+      const unchanged = yield* oauth.providerFor(serverId, original);
+      assert.equal(
+        (yield* Effect.promise(async () => unchanged.tokens()))?.access_token,
+        "opaque-access-token",
+      );
+    }).pipe(Effect.provide(secretLayer)),
+  );
+}
+
+it.effect("keeps automatic registration bound to automatic mode across restart", () =>
+  Effect.gen(function* () {
+    const fetchAutomatic: FetchLike = async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/.well-known/oauth-authorization-server")) {
+        return Response.json({
+          issuer: "https://issuer.example.test",
+          authorization_endpoint: "https://issuer.example.test/authorize",
+          token_endpoint: "https://issuer.example.test/token",
+          registration_endpoint: "https://issuer.example.test/register",
+          response_types_supported: ["code"],
+          grant_types_supported: ["authorization_code", "refresh_token"],
+          token_endpoint_auth_methods_supported: ["none"],
+          code_challenge_methods_supported: ["S256"],
+        });
+      }
+      if (url.endsWith("/register"))
+        return Response.json({
+          client_id: "dynamic-client",
+          redirect_uris: ["http://127.0.0.1/oauth/project-mcp/callback"],
+        });
+      return fetchOAuthFixture(input, init);
+    };
+    const oauth = yield* prepareOAuth({ fetch: fetchAutomatic });
+    const started = yield* oauth.begin({ serverId, server: { serverId, resource } });
+    assert.equal(
+      (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+      200,
+    );
+    const restarted = yield* ProjectMcpOAuth.__testing.make({ servers: [], fetch: fetchAutomatic });
+    const automatic = yield* restarted.providerFor(serverId, { serverId, resource });
+    assert.equal(
+      (yield* Effect.promise(async () => automatic.tokens()))?.access_token,
+      "opaque-access-token",
+    );
+    const explicit = yield* restarted.providerFor(serverId, {
+      serverId,
+      resource,
+      clientId: "dynamic-client",
+    });
+    assert.isUndefined(yield* Effect.promise(async () => explicit.tokens()));
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+it.effect("an old provider cannot write credentials into a reconnected authorization", () =>
+  Effect.gen(function* () {
+    const oauth = yield* prepareOAuth();
+    yield* oauth.begin({ serverId });
+    const old = yield* oauth.providerFor(serverId);
+    yield* oauth.disconnect(serverId);
+    const next = yield* oauth.begin({ serverId });
+    yield* Effect.promise(async () => {
+      await old.saveTokens({ access_token: "stale-token", token_type: "Bearer" });
+      await old.saveCodeVerifier("stale-verifier");
+      assert.isDefined(old.saveClientInformation);
+      await old.saveClientInformation!({ client_id: "stale-client" });
+    });
+    const active = yield* oauth.providerFor(serverId);
+    assert.isUndefined(yield* Effect.promise(async () => active.tokens()));
+    assert.equal(
+      (yield* Effect.promise(async () => active.clientInformation()))?.client_id,
+      "registered-client",
+    );
+    assert.equal(
+      (yield* oauth.completeCallback(callbackRequest(next.authorizationUrl))).status,
+      200,
+    );
+    assert.isUndefined(yield* Effect.promise(async () => old.tokens()));
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+it.effect("disconnect preserves reconnect access until the catalog server is removed", () =>
+  Effect.gen(function* () {
+    const oauth = yield* prepareOAuth();
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    yield* oauth.begin({ serverId });
+    yield* oauth.disconnect(serverId);
+    yield* Effect.scoped(secrets.acquireLease(serverId, []));
+    assert.deepEqual(yield* secrets.listAuxiliarySecrets(serverId), []);
+    assert.include(yield* secrets.listServerIds(), serverId);
+    yield* secrets.removeServer(serverId);
+    assert.notInclude(yield* secrets.listServerIds(), serverId);
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+it.effect("a callback finishing after reconnect cannot authorize the replacement grant", () =>
+  Effect.gen(function* () {
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const oauth = yield* prepareOAuth({
+      fetch: async (input, init) => {
+        if (String(input).endsWith("/token")) {
+          entered.resolve();
+          await release.promise;
+        }
+        return fetchOAuthFixture(input, init);
+      },
+    });
+    const started = yield* oauth.begin({ serverId });
+    const callback = yield* Effect.forkScoped(
+      oauth.completeCallback(callbackRequest(started.authorizationUrl)),
+    );
+    yield* Effect.gen(function* () {
+      yield* Effect.promise(() => entered.promise);
+      yield* oauth.disconnect(serverId);
+      yield* oauth.begin({ serverId });
+    }).pipe(Effect.ensuring(Effect.sync(() => release.resolve())));
+    assert.equal((yield* Fiber.join(callback)).status, 400);
+    const provider = yield* oauth.providerFor(serverId);
+    assert.isUndefined(yield* Effect.promise(async () => provider.tokens()));
+    assert.equal(yield* oauth.status(serverId), "authorization-pending");
+  }).pipe(Effect.scoped, Effect.provide(secretLayer)),
+);
+
+it.effect("a restarted service does not reuse the previous authorization generation", () =>
+  Effect.gen(function* () {
+    const oauth = yield* prepareOAuth();
+    yield* oauth.begin({ serverId });
+    const restarted = yield* ProjectMcpOAuth.__testing.make({
+      servers: [fixtureServer],
+      fetch: fetchOAuthFixture,
+    });
+    const old = yield* restarted.providerFor(serverId);
+    yield* restarted.begin({ serverId });
+    yield* Effect.promise(async () =>
+      old.saveTokens({ access_token: "stale-token", token_type: "Bearer" }),
+    );
+    const active = yield* restarted.providerFor(serverId);
+    assert.isUndefined(yield* Effect.promise(async () => active.tokens()));
+  }).pipe(Effect.provide(secretLayer)),
 );
 
 it.effect("begins and completes an authorization-code flow with an in-process authority", () =>

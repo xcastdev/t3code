@@ -16,6 +16,7 @@ import {
   type ResolvedProjectMcpServer,
   ProviderInstanceId,
 } from "@t3tools/contracts";
+import { makeDrainableWorker, type DrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
@@ -25,6 +26,9 @@ import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
+import * as Ref from "effect/Ref";
+import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import { HttpServer } from "effect/unstable/http";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -38,9 +42,13 @@ import {
 } from "../orchestration/Errors.ts";
 import { OrchestrationEngineService } from "../orchestration/Services/OrchestrationEngine.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
+import { forkParked } from "../serverActivation.ts";
 
 const PROJECT_MCP_SERVER_LIMIT = 50;
 const MANAGED_PREVIEW_MCP_ID = McpServerId.make("t3-code");
+const isCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
+const isCommandPreviouslyRejectedError = Schema.is(OrchestrationCommandPreviouslyRejectedError);
+const isCommandIdConflictError = Schema.is(OrchestrationCommandIdConflictError);
 
 const ProjectMcpProjectionRow = Schema.Struct({
   serverId: McpServerId,
@@ -86,6 +94,10 @@ export interface AcquiredProjectMcpSessionServers {
 }
 
 export interface ProjectMcpServiceShape {
+  /** Subscribe and reconcile before accepting normal operations; owns scoped cleanup fibers. */
+  readonly startCleanup: () => Effect.Effect<void, Error, Scope.Scope>;
+  /** Wait for events through this sequence and cleanup, reporting unresolved cleanup failures. */
+  readonly drainThrough: (sequence: number) => Effect.Effect<void, Error>;
   readonly list: (projectId: ProjectId) => Effect.Effect<ProjectMcpCatalog, Error>;
   readonly create: (input: ProjectMcpCreateInput) => Effect.Effect<ProjectMcpServer, Error>;
   readonly update: (input: ProjectMcpUpdateInput) => Effect.Effect<ProjectMcpServer, Error>;
@@ -102,6 +114,14 @@ export interface ProjectMcpServiceShape {
 
 export class ProjectMcpService extends Context.Service<ProjectMcpService, ProjectMcpServiceShape>()(
   "t3/project/ProjectMcpService",
+) {}
+
+export class ProjectMcpCleanupError extends Schema.TaggedErrorClass<ProjectMcpCleanupError>()(
+  "ProjectMcpCleanupError",
+  {
+    message: Schema.String,
+    cause: Schema.optional(Schema.Defect()),
+  },
 ) {}
 
 const makeProjectMcpService = Effect.gen(function* () {
@@ -127,9 +147,9 @@ const makeProjectMcpService = Effect.gen(function* () {
   const isDefiniteDispatchFailure = (cause: Cause.Cause<unknown>): boolean => {
     const error = Cause.squash(cause);
     return (
-      Schema.is(OrchestrationCommandInvariantError)(error) ||
-      Schema.is(OrchestrationCommandPreviouslyRejectedError)(error) ||
-      Schema.is(OrchestrationCommandIdConflictError)(error)
+      isCommandInvariantError(error) ||
+      isCommandPreviouslyRejectedError(error) ||
+      isCommandIdConflictError(error)
     );
   };
 
@@ -228,9 +248,13 @@ const makeProjectMcpService = Effect.gen(function* () {
           return Effect.succeed(entry);
         }
         return mcpOAuth._tag === "Some"
-          ? mcpOAuth.value.status(entry.id).pipe(
+          ? ProjectMcpOAuth.resolveServerBinding(
+              { id: entry.id, transport },
+              mcpSecrets.resolve,
+            ).pipe(
+              Effect.flatMap((server) => mcpOAuth.value.status(entry.id, server)),
               Effect.map((oauthStatus) => ({ ...entry, oauthStatus })),
-              Effect.orElseSucceed(() => entry),
+              Effect.orElseSucceed(() => ({ ...entry, oauthStatus: "error" as const })),
             )
           : Effect.succeed(entry);
       });
@@ -367,11 +391,32 @@ const makeProjectMcpService = Effect.gen(function* () {
         Effect.flatMap((lock) =>
           lock.withPermits(1)(
             Effect.gen(function* () {
-              yield* validateTransport(input, "project.mcp-server.update");
+              if (input.patch !== "enabled") {
+                yield* validateTransport(input, "project.mcp-server.update");
+              }
               const catalog = yield* list(input.projectId);
               const existing = catalog.external.find((entry) => entry.id === input.id);
               if (existing === undefined) {
                 return yield* new ProjectMcpServerNotFoundError({ id: input.id });
+              }
+              if (input.patch === "enabled") {
+                const server: ProjectMcpServer = {
+                  id: existing.id,
+                  name: existing.name,
+                  ...(existing.transport === undefined
+                    ? { url: existing.url! }
+                    : { transport: existing.transport }),
+                  enabled: input.enabled,
+                  providerInstanceIds: existing.providerInstanceIds,
+                };
+                yield* engine.dispatch({
+                  type: "project.mcp-server.update",
+                  commandId: CommandId.make(yield* crypto.randomUUIDv4),
+                  projectId: input.projectId,
+                  server,
+                  updatedAt: yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)),
+                });
+                return server;
               }
               yield* validateName(input.projectId, input.name, input.id);
               yield* validateProviderIds(input.providerInstanceIds, existing.providerInstanceIds);
@@ -510,7 +555,7 @@ const makeProjectMcpService = Effect.gen(function* () {
       ),
     );
 
-  const persistedServers = yield* sql<Schema.Schema.Type<typeof ProjectMcpProjectionRow>>`
+  const loadCompleteCatalog = sql<Schema.Schema.Type<typeof ProjectMcpProjectionRow>>`
     SELECT
       server_id AS "serverId",
       name,
@@ -541,9 +586,78 @@ const makeProjectMcpService = Effect.gen(function* () {
       ),
     ),
   );
-  yield* mcpSecrets.reconcile(persistedServers);
+  const reconcileCatalog = catalogMutationLock.withPermits(1)(
+    loadCompleteCatalog.pipe(Effect.flatMap(mcpSecrets.reconcile)),
+  );
+  const cleanupFailure = yield* Ref.make<ProjectMcpCleanupError | undefined>(undefined);
+  const seenSequence = yield* SubscriptionRef.make(0);
+  const noteSeen = (sequence: number) =>
+    SubscriptionRef.update(seenSequence, (seen) => Math.max(seen, sequence));
+  const cleanupStartLock = yield* Semaphore.make(1);
+  let cleanupWorker: DrainableWorker<number> | undefined;
+
+  const processCleanup = Effect.fn("ProjectMcpService.processCleanup")(function* (
+    sequence: number,
+  ) {
+    yield* reconcileCatalog.pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterrupts(cause) ? Effect.failCause(cause) : reconcileCatalog,
+      ),
+      Effect.matchCauseEffect({
+        onSuccess: () => Ref.set(cleanupFailure, undefined),
+        onFailure: (cause) => {
+          if (Cause.hasInterrupts(cause)) return Effect.failCause(cause);
+          const error = new ProjectMcpCleanupError({
+            message: "Project MCP secret cleanup failed.",
+            cause: Cause.squash(cause),
+          });
+          return Ref.set(cleanupFailure, error).pipe(
+            Effect.andThen(Effect.logWarning("project MCP cleanup failed", { sequence, cause })),
+          );
+        },
+      }),
+    );
+  });
+
+  const drainThrough: ProjectMcpServiceShape["drainThrough"] = Effect.fn(
+    "ProjectMcpService.drainThrough",
+  )(function* (sequence) {
+    if (!cleanupWorker)
+      return yield* new ProjectMcpCleanupError({ message: "Project MCP cleanup has not started." });
+    yield* SubscriptionRef.changes(seenSequence).pipe(
+      Stream.filter((seen) => seen >= sequence),
+      Stream.runHead,
+    );
+    yield* cleanupWorker.drain;
+    const failure = yield* Ref.get(cleanupFailure);
+    if (failure) return yield* failure;
+  });
+
+  const startCleanup: ProjectMcpServiceShape["startCleanup"] = Effect.fn(
+    "ProjectMcpService.startCleanup",
+  )(function* () {
+    if (cleanupWorker) return yield* drainThrough(yield* engine.latestSequence);
+    // Acquire the subscription before either the head read or reconciliation.
+    // Events committed during startup stay buffered until the subscriber runs.
+    const subscription = yield* engine.subscribeDomainEvents;
+    const worker = yield* makeDrainableWorker(processCleanup);
+    cleanupWorker = worker;
+    const sequence = yield* engine.latestSequence;
+    yield* worker.enqueue(sequence);
+    yield* noteSeen(sequence);
+    yield* forkParked(
+      Stream.runForEach(Stream.fromSubscription(subscription), (event) =>
+        (event.type === "project.deleted" ? worker.enqueue(event.sequence) : Effect.void).pipe(
+          Effect.andThen(noteSeen(event.sequence)),
+        ),
+      ),
+    );
+    yield* drainThrough(sequence);
+  }, cleanupStartLock.withPermits(1));
 
   return ProjectMcpService.of({
+    startCleanup,
+    drainThrough,
     list,
     create,
     update,

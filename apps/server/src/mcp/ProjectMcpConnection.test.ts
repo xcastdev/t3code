@@ -29,7 +29,7 @@ it("falls back from modern Streamable HTTP to legacy SSE only when the endpoint 
   let closedClients = 0;
   const clients: ProjectMcpClient[] = [];
   const dependencies: ProjectMcpConnectionDependencies = {
-    createClient: (options) => {
+    createClient: (_options) => {
       const client: ProjectMcpClient = {
         connect: async (transport) => {
           connected.push(String((transport as { kind: string }).kind));

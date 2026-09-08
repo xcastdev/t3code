@@ -1676,7 +1676,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         }
 
         const existing = sessions.get(input.threadId);
-        if (existing && !existing.stopped) {
+        if (existing) {
           yield* Effect.suspend(() => stopSessionInternal(existing));
         }
 
@@ -1770,9 +1770,18 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         // this a child of `startSession`, and Effect interrupts a fiber's
         // children when it completes, so the consumer died on return and every
         // runtime event the session emitted afterwards was dropped.
+        let stopped = false;
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
             yield* writeNativeEvent(event);
+            if (
+              event.threadId === input.threadId &&
+              (event.method === "session/exited" || event.method === "session/closed")
+            ) {
+              stopped = true;
+              const current = sessions.get(input.threadId);
+              if (current?.runtime === runtime) current.stopped = true;
+            }
             const runtimeEvents = mapToRuntimeEvents(event, event.threadId);
             if (runtimeEvents.length === 0) {
               yield* Effect.logDebug("ignoring unhandled Codex provider event", {
@@ -1811,7 +1820,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           scope: sessionScope,
           runtime,
           eventFiber,
-          stopped: false,
+          stopped,
         });
         sessionScopeTransferred = true;
 
@@ -1993,11 +2002,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const stopSessionInternal = Effect.fn("stopSessionInternal")(function* (
     session: CodexAdapterSessionContext,
   ) {
-    if (session.stopped) {
-      return;
-    }
     session.stopped = true;
-    sessions.delete(session.threadId);
+    if (sessions.get(session.threadId) === session) sessions.delete(session.threadId);
     yield* session.runtime.close.pipe(Effect.ignore);
     yield* Effect.ignore(Scope.close(session.scope, Exit.void));
     yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);

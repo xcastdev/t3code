@@ -164,6 +164,8 @@ it("starts a noisy stdio child without retaining its stderr", async () => {
     resolveSecret,
   }) as StdioClientTransport;
   const ready = new Promise<void>((resolve) => {
+    // The SDK transport exposes a callback slot, not an EventTarget.
+    // oxlint-disable-next-line unicorn/prefer-add-event-listener
     transport.onmessage = (message) => {
       if ("method" in message && message.method === "ready") resolve();
     };

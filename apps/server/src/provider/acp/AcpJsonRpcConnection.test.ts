@@ -7,6 +7,8 @@ import * as NodeFS from "node:fs";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as TestClock from "effect/testing/TestClock";
@@ -22,6 +24,41 @@ const mockAgentCommand = "node";
 const mockAgentArgs = [mockAgentPath];
 
 describe("AcpSessionRuntime", () => {
+  for (const code of [0, 7]) {
+    it.effect(`exposes subprocess exit code ${code} without an active request`, () =>
+      Effect.gen(function* () {
+        const runtime = yield* AcpSessionRuntime.make({
+          spawn: { command: process.execPath, args: ["-e", `process.exit(${code})`] },
+          cwd: process.cwd(),
+          clientInfo: { name: "t3-test", version: "0.0.0" },
+          authMethodId: "test",
+        });
+        expect(yield* runtime.awaitExit).toBe(code);
+      }).pipe(Effect.provide(NodeServices.layer)),
+    );
+  }
+
+  it.effect("interrupting an exit observer leaves the ACP subprocess usable", () =>
+    Effect.gen(function* () {
+      const runtime = yield* AcpSessionRuntime.make({
+        spawn: { command: mockAgentCommand, args: mockAgentArgs },
+        cwd: process.cwd(),
+        clientInfo: { name: "t3-test", version: "0.0.0" },
+        authMethodId: "test",
+      });
+      yield* runtime.start();
+      const observer = yield* runtime.awaitExit.pipe(Effect.forkScoped({ startImmediately: true }));
+      yield* Fiber.interrupt(observer);
+      const result = yield* Fiber.await(observer);
+      expect(Exit.isFailure(result) && Cause.hasInterruptsOnly(result.cause)).toBe(true);
+      expect(
+        yield* runtime.prompt({ prompt: [{ type: "text", text: "still running" }] }),
+      ).toMatchObject({
+        stopReason: "end_turn",
+      });
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("merges custom initialize client capabilities into the ACP handshake", () => {
     const requestEvents: Array<AcpSessionRuntime.AcpSessionRequestLogEvent> = [];
     return Effect.gen(function* () {

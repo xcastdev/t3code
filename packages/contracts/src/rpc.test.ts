@@ -9,6 +9,15 @@ import {
   WsSubscribeServerConfigRpc,
 } from "./rpc.ts";
 
+const decodeSubscribeServerConfig = Schema.decodeUnknownSync(
+  WsSubscribeServerConfigRpc.payloadSchema,
+);
+const decodeOAuthBeginPayload = Schema.decodeUnknownSync(WsProjectMcpOAuthBeginRpc.payloadSchema);
+const decodeOAuthBeginSuccess = Schema.decodeUnknownSync(WsProjectMcpOAuthBeginRpc.successSchema);
+const decodeOAuthDisconnectSuccess = Schema.decodeUnknownSync(
+  WsProjectMcpOAuthDisconnectRpc.successSchema,
+);
+
 /**
  * The client always sends `environmentThemes`, including to servers built
  * before the field existed, whose payload schema was an empty struct. What
@@ -23,14 +32,14 @@ describe("subscribeServerConfig payload compatibility", () => {
   });
 
   it("is carried by a server that declares it", () => {
-    const decoded = Schema.decodeUnknownSync(WsSubscribeServerConfigRpc.payloadSchema)({
+    const decoded = decodeSubscribeServerConfig({
       environmentThemes: true,
     });
     expect(decoded).toEqual({ environmentThemes: true });
   });
 
   it("stays optional, so a client that never sends it still subscribes", () => {
-    const decoded = Schema.decodeUnknownSync(WsSubscribeServerConfigRpc.payloadSchema)({});
+    const decoded = decodeSubscribeServerConfig({});
     expect(decoded).toEqual({});
   });
 });
@@ -43,20 +52,20 @@ describe("project MCP OAuth RPC contracts", () => {
     });
 
     expect(
-      Schema.decodeUnknownSync(WsProjectMcpOAuthBeginRpc.payloadSchema)({
+      decodeOAuthBeginPayload({
         projectId: "project-1",
         id: "mcp-1",
       }),
     ).toEqual({ projectId: "project-1", id: "mcp-1" });
     expect(() =>
-      Schema.decodeUnknownSync(WsProjectMcpOAuthBeginRpc.payloadSchema)({
+      decodeOAuthBeginPayload({
         projectId: "project-1",
         id: "mcp-1",
         redirectUrl: "https://attacker.example/callback",
       }),
     ).toThrow();
     expect(
-      Schema.decodeUnknownSync(WsProjectMcpOAuthBeginRpc.successSchema)({
+      decodeOAuthBeginSuccess({
         authorizationUrl: "https://issuer.example/authorize?state=opaque",
         expiresAt: "2026-09-04T12:00:00.000Z",
       }),
@@ -65,7 +74,7 @@ describe("project MCP OAuth RPC contracts", () => {
       expiresAt: "2026-09-04T12:00:00.000Z",
     });
     expect(
-      Schema.decodeUnknownSync(WsProjectMcpOAuthDisconnectRpc.successSchema)({
+      decodeOAuthDisconnectSuccess({
         id: "mcp-1",
         name: "OAuth docs",
         url: "https://example.com/mcp",

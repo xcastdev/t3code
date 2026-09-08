@@ -1,0 +1,42 @@
+diff --git a/dist/src-CX2iR2pK.mjs b/dist/src-CX2iR2pK.mjs
+--- a/dist/src-CX2iR2pK.mjs
++++ b/dist/src-CX2iR2pK.mjs
+@@ -6247,7 +6247,7 @@ var Protocol = class {
+ 		return this._requestHandlers.get(method);
+ 	}
+ 	async _oncancel(notification) {
+-		if (!notification.params.requestId) return;
++		if (notification.params.requestId === void 0) return;
+ 		this._requestHandlerAbortControllers.get(notification.params.requestId)?.abort(notification.params.reason);
+ 	}
+ 	_setupTimeout(messageId, timeout, maxTotalTimeout, onTimeout, resetTimeoutOnProgress = false) {
+@@ -6512,7 +6512,7 @@ var Protocol = class {
+ 		}
+ 		this._responseHandlers.delete(messageId);
+ 		this._cleanupTimeout(messageId);
+-		this._progressHandlers.delete(messageId);
++		queueMicrotask(() => this._progressHandlers.delete(messageId));
+ 		if (isJSONRPCResultResponse(response)) handler(response);
+ 		else handler(ProtocolError.fromError(response.error.code, response.error.message, response.error.data));
+ 	}
+diff --git a/dist/src-STyD_Vvf.cjs b/dist/src-STyD_Vvf.cjs
+--- a/dist/src-STyD_Vvf.cjs
++++ b/dist/src-STyD_Vvf.cjs
+@@ -6248,7 +6248,7 @@ var Protocol = class {
+ 		return this._requestHandlers.get(method);
+ 	}
+ 	async _oncancel(notification) {
+-		if (!notification.params.requestId) return;
++		if (notification.params.requestId === void 0) return;
+ 		this._requestHandlerAbortControllers.get(notification.params.requestId)?.abort(notification.params.reason);
+ 	}
+ 	_setupTimeout(messageId, timeout, maxTotalTimeout, onTimeout, resetTimeoutOnProgress = false) {
+@@ -6513,7 +6513,7 @@ var Protocol = class {
+ 		}
+ 		this._responseHandlers.delete(messageId);
+ 		this._cleanupTimeout(messageId);
+-		this._progressHandlers.delete(messageId);
++		queueMicrotask(() => this._progressHandlers.delete(messageId));
+ 		if (isJSONRPCResultResponse(response)) handler(response);
+ 		else handler(ProtocolError.fromError(response.error.code, response.error.message, response.error.data));
+ 	}

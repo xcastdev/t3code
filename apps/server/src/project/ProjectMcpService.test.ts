@@ -7,9 +7,10 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ServerProvider,
+  type ProjectMcpTransportDraft,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { expect, it } from "@effect/vitest";
+import { expect, it, vi } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -18,7 +19,8 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
-import * as Stream from "effect/Stream";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import { HttpServer } from "effect/unstable/http";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
@@ -138,10 +140,22 @@ const providerInstanceRegistry = Layer.succeed(ProviderInstanceRegistry, {
   subscribeChanges: Effect.die("Unused in ProjectMcpService tests"),
 } as never);
 
-const makeTestLayer = (engineLayer = OrchestrationEngineLive) =>
-  ProjectMcpService.layer.pipe(
+const startedServiceLayer = Layer.effectDiscard(
+  Effect.flatMap(ProjectMcpService.ProjectMcpService, (service) => service.startCleanup()),
+).pipe(Layer.provideMerge(ProjectMcpService.layer));
+
+const makeTestLayer = (
+  engineLayer = OrchestrationEngineLive,
+  oauthLayer: Layer.Layer<
+    ProjectMcpOAuth.ProjectMcpOAuth,
+    never,
+    ProjectMcpSecretStore.ProjectMcpSecretStore
+  > = projectMcpOAuthTestLayer,
+  startCleanup = true,
+) =>
+  (startCleanup ? startedServiceLayer : ProjectMcpService.layer).pipe(
+    Layer.provideMerge(oauthLayer),
     Layer.provideMerge(ProjectMcpSecretStore.layer),
-    Layer.provideMerge(projectMcpOAuthTestLayer),
     Layer.provideMerge(ServerSecretStore.layer),
     Layer.provideMerge(engineLayer),
     Layer.provideMerge(OrchestrationProjectionSnapshotQueryLive),
@@ -163,8 +177,9 @@ const testLayer = makeTestLayer();
 const makeRestartTestLayer = (
   persistenceLayer: ReturnType<typeof makeSqlitePersistenceLive>,
   config: ServerConfig.ServerConfig["Service"],
+  startCleanup = true,
 ) =>
-  ProjectMcpService.layer.pipe(
+  (startCleanup ? startedServiceLayer : ProjectMcpService.layer).pipe(
     Layer.provideMerge(ProjectMcpSecretStore.layer),
     Layer.provideMerge(projectMcpOAuthTestLayer),
     Layer.provideMerge(ServerSecretStore.layer),
@@ -197,6 +212,629 @@ const createProject = (projectId: ProjectId, commandId: string) =>
   });
 
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+
+const createSecretServer = Effect.fn("createSecretServer")(function* (
+  projectId: ProjectId,
+  name: string,
+) {
+  const service = yield* ProjectMcpService.ProjectMcpService;
+  const server = yield* service.create({
+    projectId,
+    name,
+    enabled: true,
+    providerInstanceIds: [codexInstance],
+    transport: {
+      type: "stdio",
+      command: "node",
+      args: [],
+      env: [
+        {
+          name: ProjectMcpEnvironmentVariableName.make("TOKEN"),
+          credential: { name: "token", value: `${name}-secret` },
+        },
+      ],
+    },
+  });
+  const transport = server.transport;
+  if (transport?.type !== "stdio") return yield* Effect.die("Expected stdio transport");
+  return { server, credentialId: transport.env[0]!.credential.id };
+});
+
+it.effect(
+  "cleans deleted projects after durable dispatch while retaining other projects and leased credentials",
+  () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const engine = yield* OrchestrationEngineService;
+      const files = yield* ServerSecretStore.ServerSecretStore;
+      yield* service.startCleanup();
+      yield* createProject(projectA, "cleanup-project-a");
+      yield* createProject(projectB, "cleanup-project-b");
+      const leased = yield* createSecretServer(projectA, "leased");
+      const scope = yield* Scope.make();
+      yield* Effect.addFinalizer(() => Scope.close(scope, Exit.void));
+      const session = yield* service
+        .acquireSessionLease(projectA, codexInstance)
+        .pipe(Scope.provide(scope));
+      const unleased = yield* createSecretServer(projectA, "unleased");
+      const retained = yield* createSecretServer(projectB, "retained");
+      const deletion = yield* engine.dispatch({
+        type: "project.delete",
+        commandId: CommandId.make("cleanup-delete-a"),
+        projectId: projectA,
+      });
+      yield* service.drainThrough(deletion.sequence);
+      expect(
+        Option.isNone(
+          yield* files.get(ProjectMcpSecretStore.credentialSecretName(unleased.credentialId)),
+        ),
+      ).toBe(true);
+      expect(
+        Option.isSome(
+          yield* files.get(ProjectMcpSecretStore.credentialSecretName(retained.credentialId)),
+        ),
+      ).toBe(true);
+      expect(
+        Option.isSome(
+          yield* files.get(ProjectMcpSecretStore.credentialSecretName(leased.credentialId)),
+        ),
+      ).toBe(true);
+      expect(session.resolveSecret(leased.server.id, leased.credentialId)).toBe("leased-secret");
+      yield* Scope.close(scope, Exit.void);
+      expect(
+        Option.isNone(
+          yield* files.get(ProjectMcpSecretStore.credentialSecretName(leased.credentialId)),
+        ),
+      ).toBe(true);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect.each([1, 2])(
+  "retries project cleanup and exposes %s storage failures without losing the subscriber",
+  (failures) =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const engine = yield* OrchestrationEngineService;
+      const files = yield* ServerSecretStore.ServerSecretStore;
+      yield* createProject(projectA, "failure-project-a");
+      yield* createProject(projectB, "failure-project-b");
+      const removed = yield* createSecretServer(projectA, "cleanup-failure");
+      const secretName = ProjectMcpSecretStore.credentialSecretName(removed.credentialId);
+      const originalRemove = files.remove;
+      let remaining = failures;
+      const remove = vi.spyOn(files, "remove").mockImplementation((name) =>
+        Effect.suspend(() => {
+          if (name === secretName && remaining > 0) {
+            remaining -= 1;
+            return Effect.fail(
+              new ServerSecretStore.SecretStoreRemoveError({
+                resource: name,
+                cause: "injected cleanup failure",
+              }),
+            );
+          }
+          return originalRemove(name);
+        }),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(() => remove.mockRestore()));
+      const deletion = yield* engine.dispatch({
+        type: "project.delete",
+        commandId: CommandId.make("failure-delete-a"),
+        projectId: projectA,
+      });
+      const drained = yield* service.drainThrough(deletion.sequence).pipe(Effect.exit);
+      expect(Exit.isFailure(drained)).toBe(failures === 2);
+      expect(remaining).toBe(0);
+      if (failures === 2) {
+        expect(Option.isSome(yield* files.get(secretName))).toBe(true);
+        expect(
+          Exit.isFailure(yield* service.drainThrough(deletion.sequence).pipe(Effect.exit)),
+        ).toBe(true);
+        const nextDeletion = yield* engine.dispatch({
+          type: "project.delete",
+          commandId: CommandId.make("failure-delete-b"),
+          projectId: projectB,
+        });
+        yield* service.drainThrough(nextDeletion.sequence);
+      }
+      expect(Option.isNone(yield* files.get(secretName))).toBe(true);
+    }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect(
+  "subscribes before taking the startup cleanup watermark",
+  () =>
+    Effect.gen(function* () {
+      let injectDeletion = false;
+      let deletionSequence = 0;
+      const engineLayer = Layer.effect(
+        OrchestrationEngineService,
+        Effect.gen(function* () {
+          const engine = yield* OrchestrationEngineService;
+          return {
+            ...engine,
+            latestSequence: Effect.gen(function* () {
+              const head = yield* engine.latestSequence;
+              if (injectDeletion) {
+                injectDeletion = false;
+                deletionSequence = (yield* engine
+                  .dispatch({
+                    type: "project.delete",
+                    commandId: CommandId.make("startup-race-delete"),
+                    projectId: projectA,
+                  })
+                  .pipe(Effect.orDie)).sequence;
+              }
+              return head;
+            }),
+          };
+        }),
+      ).pipe(Layer.provide(OrchestrationEngineLive));
+      yield* Effect.gen(function* () {
+        const service = yield* ProjectMcpService.ProjectMcpService;
+        const files = yield* ServerSecretStore.ServerSecretStore;
+        yield* createProject(projectA, "startup-race-project");
+        const removed = yield* createSecretServer(projectA, "startup-race");
+        injectDeletion = true;
+        yield* service.startCleanup();
+        expect(deletionSequence).toBeGreaterThan(0);
+        yield* service.drainThrough(deletionSequence);
+        expect(
+          Option.isNone(
+            yield* files.get(ProjectMcpSecretStore.credentialSecretName(removed.credentialId)),
+          ),
+        ).toBe(true);
+      }).pipe(Effect.provide(makeTestLayer(engineLayer, projectMcpOAuthTestLayer, false)));
+    }),
+  { timeout: 3000 },
+);
+
+it.effect("startup cleanup recovers a deletion committed while cleanup was offline", () =>
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const persistenceLayer = makeSqlitePersistenceLive(config.dbPath);
+    const removed = yield* Effect.gen(function* () {
+      const engine = yield* OrchestrationEngineService;
+      yield* createProject(projectA, "offline-project-a");
+      yield* createProject(projectB, "offline-project-b");
+      const removed = yield* createSecretServer(projectA, "offline-removed");
+      const retained = yield* createSecretServer(projectB, "offline-retained");
+      yield* engine.dispatch({
+        type: "project.delete",
+        commandId: CommandId.make("offline-delete"),
+        projectId: projectA,
+      });
+      return { removed, retained };
+    }).pipe(Effect.provide(Layer.fresh(makeRestartTestLayer(persistenceLayer, config, false))));
+    yield* Effect.gen(function* () {
+      const files = yield* ServerSecretStore.ServerSecretStore;
+      expect(
+        Option.isNone(
+          yield* files.get(
+            ProjectMcpSecretStore.credentialSecretName(removed.removed.credentialId),
+          ),
+        ),
+      ).toBe(true);
+      expect(
+        Option.isSome(
+          yield* files.get(
+            ProjectMcpSecretStore.credentialSecretName(removed.retained.credentialId),
+          ),
+        ),
+      ).toBe(true);
+    }).pipe(Effect.provide(Layer.fresh(makeRestartTestLayer(persistenceLayer, config))));
+  }).pipe(
+    Effect.provide(
+      ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-cleanup-restart-" }).pipe(
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    ),
+  ),
+);
+
+it.effect(
+  "buffers deletion during startup reconciliation and serializes catalog writes with cleanup",
+  () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const engine = yield* OrchestrationEngineService;
+      const files = yield* ServerSecretStore.ServerSecretStore;
+      const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+      yield* createProject(projectA, "reconciliation-project-a");
+      yield* createProject(projectB, "reconciliation-project-b");
+      const orphan = yield* createSecretServer(projectA, "reconciliation-orphan");
+      const removedDuringStart = yield* createSecretServer(projectB, "reconciliation-deleted");
+      const projectC = ProjectId.make("reconciliation-project-c");
+      yield* createProject(projectC, "reconciliation-project-c");
+      yield* engine.dispatch({
+        type: "project.delete",
+        commandId: CommandId.make("reconciliation-delete-a"),
+        projectId: projectA,
+      });
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const originalRemove = files.remove;
+      const remove = vi
+        .spyOn(files, "remove")
+        .mockImplementation((name) =>
+          name === ProjectMcpSecretStore.credentialSecretName(orphan.credentialId)
+            ? Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.andThen(originalRemove(name)),
+              )
+            : originalRemove(name),
+        );
+      yield* Effect.addFinalizer(() => Effect.sync(() => remove.mockRestore()));
+      const starting = yield* service.startCleanup().pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      const deletion = yield* engine.dispatch({
+        type: "project.delete",
+        commandId: CommandId.make("reconciliation-delete-b"),
+        projectId: projectB,
+      });
+      const creating = yield* createSecretServer(projectC, "reconciliation-created").pipe(
+        Effect.forkChild({ startImmediately: true }),
+      );
+      expect(creating.pollUnsafe()).toBeUndefined();
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(starting);
+      const created = yield* Fiber.join(creating);
+      yield* service.drainThrough(deletion.sequence);
+      expect(
+        Option.isNone(
+          yield* files.get(
+            ProjectMcpSecretStore.credentialSecretName(removedDuringStart.credentialId),
+          ),
+        ),
+      ).toBe(true);
+      expect(yield* secrets.resolve(created.server.id, created.credentialId)).toBe(
+        "reconciliation-created-secret",
+      );
+      expect((yield* service.list(projectC)).external.map((server) => server.id)).toEqual([
+        created.server.id,
+      ]);
+    }).pipe(
+      Effect.provide(makeTestLayer(OrchestrationEngineLive, projectMcpOAuthTestLayer, false)),
+    ),
+);
+
+it.effect("startup retries durable retirement intent left by repeated cleanup failures", () =>
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const persistence = makeSqlitePersistenceLive(config.dbPath);
+    const removed = yield* Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const engine = yield* OrchestrationEngineService;
+      const files = yield* ServerSecretStore.ServerSecretStore;
+      yield* createProject(projectA, "retirement-restart-a");
+      const removed = yield* createSecretServer(projectA, "retirement-restart");
+      const secretName = ProjectMcpSecretStore.credentialSecretName(removed.credentialId);
+      const originalRemove = files.remove;
+      const remove = vi.spyOn(files, "remove").mockImplementation((name) =>
+        name === secretName
+          ? Effect.fail(
+              new ServerSecretStore.SecretStoreRemoveError({
+                resource: name,
+                cause: "injected persistent failure",
+              }),
+            )
+          : originalRemove(name),
+      );
+      const deletion = yield* engine.dispatch({
+        type: "project.delete",
+        commandId: CommandId.make("retirement-restart-delete"),
+        projectId: projectA,
+      });
+      const drained = yield* service
+        .drainThrough(deletion.sequence)
+        .pipe(Effect.exit, Effect.ensuring(Effect.sync(() => remove.mockRestore())));
+      expect(Exit.isFailure(drained)).toBe(true);
+      expect(Option.isSome(yield* files.get(secretName))).toBe(true);
+      return removed;
+    }).pipe(Effect.provide(Layer.fresh(makeRestartTestLayer(persistence, config))));
+    yield* Effect.gen(function* () {
+      const files = yield* ServerSecretStore.ServerSecretStore;
+      expect(
+        Option.isNone(
+          yield* files.get(ProjectMcpSecretStore.credentialSecretName(removed.credentialId)),
+        ),
+      ).toBe(true);
+    }).pipe(Effect.provide(Layer.fresh(makeRestartTestLayer(persistence, config))));
+  }).pipe(
+    Effect.provide(
+      ServerConfig.layerTest(process.cwd(), { prefix: "t3-mcp-retirement-restart-" }).pipe(
+        Layer.provideMerge(NodeServices.layer),
+      ),
+    ),
+  ),
+);
+
+for (const failure of ["client-secret resolution", "status read"] as const) {
+  it.effect(`catalog reports OAuth error after failing ${failure}`, () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+      yield* createProject(projectA, `oauth-error-${failure}`);
+      const entry = yield* service.create({
+        projectId: projectA,
+        name: "OAuth error",
+        enabled: true,
+        providerInstanceIds: [],
+        transport: {
+          type: "streamable-http",
+          url: "https://oauth.example.test/mcp",
+          headers: [],
+          authorization: {
+            type: "oauth",
+            registration: {
+              type: "pre-registered",
+              clientId: "client",
+              clientSecret: { name: "client secret", value: "secret" },
+            },
+          },
+        },
+      });
+      if (failure === "client-secret resolution") yield* secrets.removeServer(entry.id);
+      expect((yield* service.list(projectA)).external).toEqual([
+        { ...entry, oauthStatus: "error" },
+      ]);
+    }).pipe(
+      Effect.provide(
+        makeTestLayer(
+          OrchestrationEngineLive,
+          Layer.succeed(
+            ProjectMcpOAuth.ProjectMcpOAuth,
+            ProjectMcpOAuth.ProjectMcpOAuth.of({
+              status: () =>
+                failure === "status read"
+                  ? Effect.fail(
+                      new ProjectMcpOAuth.ProjectMcpOAuthError({
+                        operation: "status",
+                        cause: "status read failed",
+                      }),
+                    )
+                  : Effect.succeed("not-connected"),
+              providerFor: () => Effect.die("unused"),
+              begin: () => Effect.die("unused"),
+              continuePending: () => Effect.die("unused"),
+              completeCallback: () => Effect.die("unused"),
+              disconnect: () => Effect.die("unused"),
+            }),
+          ),
+        ),
+      ),
+    ),
+  );
+}
+
+it.effect("enabled patches preserve another client's replacement and retained credentials", () =>
+  Effect.gen(function* () {
+    const service = yield* ProjectMcpService.ProjectMcpService;
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    yield* createProject(projectA, "patch-create-project-a");
+    const displayedByA = yield* service.create({ projectId: projectA, ...codexInput });
+    const replacementByB = yield* service.update({
+      projectId: projectA,
+      id: displayedByA.id,
+      name: "Replacement",
+      enabled: true,
+      providerInstanceIds: [openCodeInstance],
+      transport: {
+        type: "streamable-http",
+        url: "https://replacement.example.test/mcp",
+        headers: [
+          {
+            name: ProjectMcpHeaderName.make("X-Key"),
+            credential: { name: "key", value: "patch-retained-secret" },
+          },
+        ],
+        authorization: { type: "none" },
+      },
+    });
+    for (const enabled of [false, true]) {
+      const patched = yield* service.update({
+        projectId: projectA,
+        id: displayedByA.id,
+        enabled,
+        patch: "enabled",
+      });
+      expect(patched).toEqual({ ...replacementByB, enabled });
+      expect((yield* service.list(projectA)).external[0]).toMatchObject({
+        ...replacementByB,
+        enabled,
+      });
+      const transport = patched.transport;
+      if (transport?.type !== "streamable-http") return yield* Effect.die("Expected HTTP");
+      expect(yield* secrets.resolve(patched.id, transport.headers[0]!.credential.id)).toBe(
+        "patch-retained-secret",
+      );
+    }
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("enabled patches reject foreign-project and missing targets", () =>
+  Effect.gen(function* () {
+    const service = yield* ProjectMcpService.ProjectMcpService;
+    yield* createProject(projectA, "patch-owner-project");
+    yield* createProject(projectB, "patch-foreign-project");
+    const entry = yield* service.create({ projectId: projectA, ...codexInput });
+    for (const id of [entry.id, McpServerId.make("missing-patch-target")]) {
+      const error = yield* service
+        .update({
+          projectId: projectB,
+          id,
+          enabled: false,
+          patch: "enabled",
+        })
+        .pipe(Effect.flip);
+      expect(error).toMatchObject({ _tag: "ProjectMcpServerNotFoundError", id });
+    }
+    expect((yield* service.list(projectA)).external[0]).toMatchObject(entry);
+  }).pipe(Effect.provide(testLayer)),
+);
+
+it.effect("enabled patches preserve legacy URLs, SSE, and lossless stdio transports", () =>
+  Effect.gen(function* () {
+    const service = yield* ProjectMcpService.ProjectMcpService;
+    yield* createProject(projectA, "patch-transport-project");
+    const transports: ReadonlyArray<ProjectMcpTransportDraft> = [
+      {
+        type: "legacy-sse",
+        url: "https://legacy.example.test/sse",
+        headers: [],
+        authorization: { type: "none" },
+      },
+      {
+        type: "stdio",
+        command: "node",
+        args: ["--label", "", "line1\nline2"],
+        cwd: "/tmp",
+        env: [],
+      },
+    ];
+    const entries = [yield* service.create({ projectId: projectA, ...codexInput })];
+    for (const transport of transports) {
+      entries.push(
+        yield* service.create({
+          projectId: projectA,
+          name: transport.type,
+          enabled: true,
+          providerInstanceIds: [],
+          transport,
+        }),
+      );
+    }
+    for (const entry of entries) {
+      yield* service.update({
+        projectId: projectA,
+        id: entry.id,
+        enabled: false,
+        patch: "enabled",
+      });
+      expect(
+        (yield* service.list(projectA)).external.find((server) => server.id === entry.id),
+      ).toMatchObject({ ...entry, enabled: false });
+    }
+  }).pipe(Effect.provide(testLayer)),
+);
+
+for (const change of [
+  "unchanged",
+  "client ID",
+  "secret",
+  "automatic",
+  "explicit",
+  "resource",
+  "legacy",
+] as const) {
+  it.effect(`catalog OAuth status follows the current ${change} binding`, () =>
+    Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      const oauth = yield* ProjectMcpOAuth.ProjectMcpOAuth;
+      const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+      const projectId = ProjectId.make(`oauth-binding-${change}`);
+      yield* createProject(projectId, `create-${projectId}`);
+      const resource = "https://oauth.example.test/mcp";
+      const transport: ProjectMcpTransportDraft = {
+        type: "streamable-http",
+        url: resource,
+        headers: [],
+        authorization: {
+          type: "oauth",
+          registration:
+            change === "explicit"
+              ? { type: "automatic" }
+              : {
+                  type: "pre-registered",
+                  clientId: "registered-client",
+                  clientSecret: { name: "client secret", value: "original-secret" },
+                },
+        },
+      };
+      const entry = yield* service.create({
+        projectId,
+        name: "OAuth binding",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport,
+      });
+      const originalBinding = {
+        serverId: entry.id,
+        resource,
+        ...(change === "explicit"
+          ? {}
+          : { clientId: "registered-client", clientSecret: "original-secret" }),
+      };
+      if (change === "legacy") {
+        yield* secrets.createAuxiliarySecret(
+          entry.id,
+          encodeUnknownJson({
+            kind: "project-mcp-oauth",
+            serverId: entry.id,
+            resource,
+            tokens: { access_token: "legacy-token", token_type: "Bearer" },
+          }),
+        );
+        expect((yield* service.list(projectId)).external[0]?.oauthStatus).toBe("not-connected");
+        const provider = yield* oauth.providerFor(entry.id, originalBinding);
+        expect(yield* Effect.promise(async () => provider.tokens())).toBeUndefined();
+        return;
+      }
+      const original = yield* oauth.providerFor(entry.id, originalBinding);
+      yield* Effect.promise(async () =>
+        original.saveTokens({ access_token: "grant-token", token_type: "Bearer" }),
+      );
+      expect((yield* service.list(projectId)).external[0]?.oauthStatus).toBe("connected");
+
+      const nextResource =
+        change === "resource" ? "https://replacement.example.test/mcp" : resource;
+      const nextClient = change === "client ID" ? "replacement-client" : "registered-client";
+      const nextSecret = change === "secret" ? "replacement-secret" : "original-secret";
+      yield* service.update({
+        projectId,
+        id: entry.id,
+        name: entry.name,
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: {
+          type: "streamable-http",
+          url: nextResource,
+          headers: [],
+          authorization: {
+            type: "oauth",
+            registration:
+              change === "automatic"
+                ? { type: "automatic" }
+                : {
+                    type: "pre-registered",
+                    clientId: nextClient,
+                    clientSecret: { name: "client secret", value: nextSecret },
+                  },
+          },
+        },
+      });
+      const catalog = yield* service.list(projectId);
+      expect(catalog.external[0]?.oauthStatus).toBe(
+        change === "unchanged" ? "connected" : "not-connected",
+      );
+      const current = yield* oauth.providerFor(entry.id, {
+        serverId: entry.id,
+        resource: nextResource,
+        ...(change === "automatic" ? {} : { clientId: nextClient, clientSecret: nextSecret }),
+      });
+      expect((yield* Effect.promise(async () => current.tokens()))?.access_token).toBe(
+        change === "unchanged" ? "grant-token" : undefined,
+      );
+      expect(encodeUnknownJson(catalog)).not.toContain("original-secret");
+      expect(encodeUnknownJson(catalog)).not.toContain("replacement-secret");
+      expect(encodeUnknownJson(catalog)).not.toContain("grant-token");
+    }).pipe(
+      Effect.provide(
+        makeTestLayer(OrchestrationEngineLive, ProjectMcpOAuth.layer({ servers: [] })),
+      ),
+    ),
+  );
+}
 
 it.effect("restores explicit MCP transports after the service restarts", () =>
   Effect.gen(function* () {

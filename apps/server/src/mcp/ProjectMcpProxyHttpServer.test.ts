@@ -1,7 +1,7 @@
 import { EnvironmentId, McpServerId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { expect, it, vi } from "@effect/vitest";
 import * as Effect from "effect/Effect";
-import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http";
+import { HttpServerRequest } from "effect/unstable/http";
 
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as ProjectMcpProxyHttpServer from "./ProjectMcpProxyHttpServer.ts";

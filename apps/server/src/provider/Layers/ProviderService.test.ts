@@ -37,11 +37,13 @@ import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { HttpServer } from "effect/unstable/http";
 
 import {
   ProviderAdapterRequestError,
@@ -69,6 +71,9 @@ import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProjectMcpService from "../../project/ProjectMcpService.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import * as ProjectMcpProxyRegistry from "../../mcp/ProjectMcpProxyRegistry.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
@@ -123,6 +128,7 @@ type LegacyProviderRuntimeEvent = {
 function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+  const subscribed = Deferred.makeUnsafe<void>();
 
   const startSession = vi.fn((input: ProviderSessionStartInput) =>
     Effect.sync(() => {
@@ -262,7 +268,13 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     ...(provider === CODEX_DRIVER ? { uploadFeedback } : {}),
     stopAll,
     get streamEvents() {
-      return Stream.fromPubSub(runtimeEventPubSub);
+      return Stream.unwrap(
+        Effect.gen(function* () {
+          const subscription = yield* PubSub.subscribe(runtimeEventPubSub);
+          yield* Deferred.succeed(subscribed, undefined);
+          return Stream.fromSubscription(subscription);
+        }),
+      );
     },
   };
 
@@ -283,6 +295,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
 
   return {
     adapter,
+    subscribed: Deferred.await(subscribed),
     emit,
     updateSession,
     startSession,
@@ -702,6 +715,371 @@ const routing = makeProviderServiceLayer((request) =>
   }),
 );
 
+const makeMcpLifecycleHarness = Effect.fn("makeMcpLifecycleHarness")(function* (
+  leaseGate: Effect.Effect<void> = Effect.void,
+) {
+  const original = makeFakeCodexAdapter();
+  let current: ReturnType<typeof makeFakeCodexAdapter> | undefined = original;
+  const changes = yield* PubSub.unbounded<void>();
+  const forwarded = yield* Queue.unbounded<ProviderRuntimeEvent>();
+  let reconcileBarrier: { remaining: number; done: Deferred.Deferred<void> } | undefined;
+  const base = makeAdapterRegistryMock({ [CODEX_DRIVER]: original.adapter });
+  const registry: ProviderAdapterRegistry.ProviderAdapterRegistryShape = {
+    ...base,
+    getByInstance: () =>
+      current
+        ? Effect.succeed(current.adapter)
+        : Effect.fail(new ProviderUnsupportedError({ provider: CODEX_DRIVER })),
+    listInstances: () =>
+      Effect.gen(function* () {
+        if (reconcileBarrier && --reconcileBarrier.remaining === 0) {
+          yield* Deferred.succeed(reconcileBarrier.done, undefined);
+        }
+        return current ? [codexInstanceId] : [];
+      }),
+    subscribeChanges: PubSub.subscribe(changes),
+    streamChanges: Stream.fromPubSub(changes),
+  };
+  const proxy = yield* ProjectMcpProxyRegistry.__testing.make({
+    endpointBase: "http://127.0.0.1:43123/mcp",
+  });
+  yield* Effect.addFinalizer(() => proxy.revokeAll);
+  const credentials = yield* McpSessionRegistry.__testing.make().pipe(
+    Effect.provideService(HttpServer.HttpServer, {
+      address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: 43123 },
+      serve: () => Effect.void,
+    }),
+    Effect.provideService(ServerEnvironment.ServerEnvironment, {
+      getEnvironmentId: Effect.succeed(EnvironmentId.make("lifecycle-test")),
+      getDescriptor: Effect.die("unused"),
+    }),
+    Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, proxy),
+  );
+  yield* Effect.addFinalizer(() => credentials.revokeAll);
+  const leases: Array<{ active: boolean }> = [];
+  const issued: McpSessionRegistry.McpIssuedCredential[] = [];
+  let revokeFailures = 0;
+  let revokeAttempts = 0;
+  const providerLayer = makeTestProviderServiceLive(
+    {
+      issueMcpCredential: (request) =>
+        credentials.revokeThread(request.threadId).pipe(
+          Effect.andThen(credentials.issue(request)),
+          Effect.tap((credential) =>
+            Effect.sync(() => {
+              issued.push(credential);
+            }),
+          ),
+        ),
+      revokeMcpCredential: (threadId) =>
+        Effect.suspend(() => {
+          revokeAttempts += 1;
+          if (revokeFailures > 0) {
+            revokeFailures -= 1;
+            return Effect.die("injected proxy revocation failure");
+          }
+          return credentials.revokeThread(threadId);
+        }),
+      canonicalEventLogger: {
+        filePath: "memory://mcp-lifecycle",
+        write: (event) => Queue.offer(forwarded, event as ProviderRuntimeEvent).pipe(Effect.asVoid),
+        close: () => Effect.void,
+      },
+    },
+    makeProviderProjectContextTestLayer(undefined, () =>
+      Effect.gen(function* () {
+        const lease = yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            const lease = { active: true };
+            leases.push(lease);
+            return lease;
+          }),
+          (lease) =>
+            Effect.sync(() => {
+              lease.active = false;
+            }),
+        );
+        yield* leaseGate;
+        return {
+          servers: [routing.projectMcpServer],
+          resolveSecret: () => (lease.active ? "leased-secret" : undefined),
+        };
+      }),
+    ),
+  ).pipe(
+    Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+    Layer.provide(
+      ProviderSessionDirectoryLive.pipe(
+        Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+      ),
+    ),
+    Layer.provide(defaultServerSettingsLayer),
+    Layer.provide(serverConfigTestLayer),
+    Layer.provide(AnalyticsService.layerTest),
+    Layer.provide(
+      Layer.succeed(
+        ProviderEventLoggers.ProviderEventLoggers,
+        ProviderEventLoggers.NoOpProviderEventLoggers,
+      ),
+    ),
+  );
+  const providerScope = yield* Scope.make();
+  const closeProvider = Scope.close(providerScope, Exit.void);
+  yield* Effect.addFinalizer(() => closeProvider);
+  const context = yield* Layer.build(providerLayer).pipe(Scope.provide(providerScope));
+  const provider = yield* ProviderService.ProviderService.pipe(Effect.provide(context));
+  yield* original.subscribed;
+  const changeInstance = Effect.fn("changeInstance")(function* (next: typeof current) {
+    const done = yield* Deferred.make<void>();
+    reconcileBarrier = { remaining: 2, done };
+    current = next;
+    yield* PubSub.publish(changes, undefined);
+    yield* PubSub.publish(changes, undefined);
+    yield* Deferred.await(done);
+    if (next) yield* next.subscribed;
+  });
+  const exit = Effect.fn("emitExit")(function* (
+    adapter: typeof original,
+    threadId: ThreadId,
+    sessionId?: string,
+  ) {
+    adapter.emit({
+      type: "session.exited",
+      eventId: asEventId("lifecycle-exit"),
+      provider: CODEX_DRIVER,
+      threadId,
+      createdAt: "2026-09-07T00:00:00.000Z",
+      payload: {},
+      ...(sessionId ? { raw: { source: "notification", payload: { sessionId } } } : {}),
+    });
+    return yield* Queue.take(forwarded);
+  });
+  const credentialAlive = Effect.fn("credentialAlive")(function* (index: number) {
+    const config = issued[index]?.config;
+    assert.isDefined(config);
+    const endpoint = config!.projectServers?.[0]?.endpoint;
+    assert.isDefined(endpoint);
+    const handle = endpoint!.pathname.split("/").at(-1)!;
+    return {
+      credential:
+        (yield* credentials.resolve(config!.authorizationHeader.replace(/^Bearer\s+/, ""))) !==
+        undefined,
+      proxy: (yield* proxy.resolve(config!.providerSessionId, handle)) !== undefined,
+      lease: leases[index]?.active,
+    };
+  });
+  return {
+    provider,
+    original,
+    changeInstance,
+    exit,
+    credentialAlive,
+    closeProvider,
+    leases,
+    get issuedCount() {
+      return issued.length;
+    },
+    failRevokes: (count: number) => {
+      revokeFailures = count;
+    },
+    get revokeAttempts() {
+      return revokeAttempts;
+    },
+  };
+});
+
+it.effect.each(["removed", "replaced"])(
+  "rejects a start whose instance is %s during lease acquisition",
+  (mode) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const h = yield* makeMcpLifecycleHarness(
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      );
+      const threadId = asThreadId(`lease-race-${mode}`);
+      const starting = yield* h.provider
+        .startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.exit, Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* h.changeInstance(mode === "replaced" ? makeFakeCodexAdapter() : undefined);
+      yield* Deferred.succeed(release, undefined);
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(starting)));
+      assert.equal(h.issuedCount, 0);
+      assert.deepEqual(h.leases, [{ active: false }]);
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each(["removed", "replaced"])(
+  "cleans MCP resources when a provider instance is %s",
+  (mode) =>
+    Effect.gen(function* () {
+      const h = yield* makeMcpLifecycleHarness();
+      const threadId = asThreadId(`instance-${mode}`);
+      const input = {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access" as const,
+      };
+      yield* h.provider.startSession(threadId, input);
+      assert.deepEqual(yield* h.credentialAlive(0), { credential: true, proxy: true, lease: true });
+      const replacement = mode === "replaced" ? makeFakeCodexAdapter() : undefined;
+      yield* h.changeInstance(replacement);
+      assert.deepEqual(yield* h.credentialAlive(0), {
+        credential: false,
+        proxy: false,
+        lease: false,
+      });
+      if (replacement) {
+        yield* h.provider.startSession(threadId, input);
+        yield* h.exit(h.original, threadId);
+        assert.deepEqual(yield* h.credentialAlive(1), {
+          credential: true,
+          proxy: true,
+          lease: true,
+        });
+        yield* replacement.stopSession(threadId);
+        yield* h.exit(replacement, threadId);
+        assert.deepEqual(yield* h.credentialAlive(1), {
+          credential: false,
+          proxy: false,
+          lease: false,
+        });
+      }
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "retries transient exit cleanup before forwarding and keeps repeated failures retryable",
+  () =>
+    Effect.gen(function* () {
+      const h = yield* makeMcpLifecycleHarness();
+      const threadId = asThreadId("exit-cleanup-failure");
+      const input = {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access" as const,
+      };
+      yield* h.provider.startSession(threadId, input);
+      yield* h.original.stopSession(threadId);
+      h.failRevokes(1);
+      yield* h.exit(h.original, threadId);
+      assert.equal(h.revokeAttempts, 2);
+      assert.deepEqual(yield* h.credentialAlive(0), {
+        credential: false,
+        proxy: false,
+        lease: false,
+      });
+      yield* h.provider.startSession(threadId, input);
+      yield* h.original.stopSession(threadId);
+      h.failRevokes(2);
+      yield* h.exit(h.original, threadId);
+      assert.deepEqual(yield* h.credentialAlive(1), { credential: true, proxy: true, lease: true });
+      yield* h.exit(h.original, threadId);
+      assert.deepEqual(yield* h.credentialAlive(1), {
+        credential: false,
+        proxy: false,
+        lease: false,
+      });
+    }).pipe(Effect.provide(NodeServices.layer)),
+  { timeout: 3000 },
+);
+
+it.effect(
+  "keeps instance cleanup subscribed after repeated revocation failures",
+  () =>
+    Effect.gen(function* () {
+      const h = yield* makeMcpLifecycleHarness();
+      const threadId = asThreadId("instance-cleanup-failure");
+      yield* h.provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      h.failRevokes(2);
+      yield* h.changeInstance(undefined);
+      yield* h.changeInstance(undefined);
+      assert.deepEqual(yield* h.credentialAlive(0), {
+        credential: false,
+        proxy: false,
+        lease: false,
+      });
+    }).pipe(Effect.provide(NodeServices.layer)),
+  { timeout: 3000 },
+);
+
+it.effect.each(["start", "stop", "stopAll"])(
+  "revokes real MCP endpoints after a failed adapter %s",
+  (operation) =>
+    Effect.gen(function* () {
+      const h = yield* makeMcpLifecycleHarness();
+      const threadId = asThreadId(`failed-${operation}`);
+      const input = {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access" as const,
+      };
+      const failure = new ProviderAdapterRequestError({
+        provider: CODEX_DRIVER,
+        method: operation,
+        detail: "injected lifecycle failure",
+      });
+      if (operation !== "start") yield* h.provider.startSession(threadId, input);
+      const method =
+        operation === "start" ? "startSession" : operation === "stop" ? "stopSession" : "stopAll";
+      const spy = vi
+        .spyOn(h.original.adapter, method)
+        .mockImplementationOnce(() => Effect.fail(failure));
+      const result = yield* (
+        operation === "start"
+          ? h.provider.startSession(threadId, input)
+          : operation === "stop"
+            ? h.provider.stopSession({ threadId })
+            : h.closeProvider
+      ).pipe(Effect.exit, Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+      assert.equal(Exit.isFailure(result), operation !== "stopAll");
+      assert.deepEqual(yield* h.credentialAlive(0), {
+        credential: false,
+        proxy: false,
+        lease: false,
+      });
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("matches native exits and preserves a newer native session on the same adapter", () =>
+  Effect.gen(function* () {
+    const h = yield* makeMcpLifecycleHarness();
+    const threadId = asThreadId("native-exit");
+    const input = {
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      threadId,
+      runtimeMode: "full-access" as const,
+    };
+    yield* h.provider.startSession(threadId, { ...input, resumeCursor: { sessionId: "first" } });
+    yield* h.provider.startSession(threadId, { ...input, resumeCursor: { sessionId: "second" } });
+    yield* h.exit(h.original, threadId, "first");
+    assert.deepEqual(yield* h.credentialAlive(1), { credential: true, proxy: true, lease: true });
+    yield* h.exit(h.original, threadId);
+    assert.deepEqual(yield* h.credentialAlive(1), { credential: true, proxy: true, lease: true });
+    yield* h.exit(h.original, threadId, "second");
+    assert.deepEqual(yield* h.credentialAlive(1), {
+      credential: false,
+      proxy: false,
+      lease: false,
+    });
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.effect(
   "ProviderServiceLive uploads feedback through the adapter that recovered the session",
   () =>
@@ -1024,6 +1402,149 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
+  it.effect("releases the MCP lease when an adapter stop fails", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-mcp-failed-stop");
+      const releasedBefore = routing.releasedSessionLeases;
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const stop = vi.spyOn(routing.codex.adapter, "stopSession").mockImplementationOnce(() =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: CODEX_DRIVER,
+            method: "stopSession",
+            detail: "injected stop failure",
+          }),
+        ),
+      );
+      const stopped = yield* provider
+        .stopSession({ threadId })
+        .pipe(Effect.exit, Effect.ensuring(Effect.sync(() => stop.mockRestore())));
+      assert.isTrue(Exit.isFailure(stopped));
+      assert.equal(routing.releasedSessionLeases, releasedBefore + 1);
+      assert.isUndefined(McpProviderSession.readMcpProviderSession(threadId));
+      yield* routing.codex.stopSession(threadId);
+    }),
+  );
+
+  it.effect("cleans an exit received while the adapter is still starting", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-mcp-exit-during-start");
+      const releasedBefore = routing.releasedSessionLeases;
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const originalStart = routing.codex.adapter.startSession;
+      const start = vi
+        .spyOn(routing.codex.adapter, "startSession")
+        .mockImplementationOnce((input) =>
+          originalStart(input).pipe(
+            Effect.tap(() => Deferred.succeed(entered, undefined)),
+            Effect.tap(() => Deferred.await(finish)),
+          ),
+        );
+      yield* routing.codex.subscribed;
+      const events = yield* Stream.toPull(provider.streamEvents);
+      const forwarded = yield* events.pipe(Effect.forkChild({ startImmediately: true }));
+      const starting = yield* provider
+        .startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* routing.codex.stopSession(threadId);
+      routing.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("during-start"),
+        provider: CODEX_DRIVER,
+        threadId,
+        createdAt: "2026-09-07T00:00:00.000Z",
+        payload: {},
+      });
+      yield* Deferred.succeed(finish, undefined);
+      yield* Fiber.join(starting).pipe(Effect.ensuring(Effect.sync(() => start.mockRestore())));
+      yield* Fiber.join(forwarded);
+      assert.equal(routing.releasedSessionLeases, releasedBefore + 1);
+      assert.isUndefined(McpProviderSession.readMcpProviderSession(threadId));
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect.each(["old adapter", "old native session", "missing native ID with live replacement"])(
+    "keeps replacement MCP credentials after an exit from %s",
+    (scenario) =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const threadId = asThreadId(`thread-mcp-${scenario}`);
+        const releasedBefore = routing.releasedSessionLeases;
+        yield* provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          resumeCursor: { sessionId: "replacement-native" },
+          runtimeMode: "full-access",
+        });
+        const source = scenario === "old adapter" ? routing.claude : routing.codex;
+        yield* source.subscribed;
+        if (scenario !== "missing native ID with live replacement") {
+          yield* routing.codex.stopSession(threadId);
+        }
+        const events = yield* Stream.toPull(provider.streamEvents);
+        const forwarded = yield* events.pipe(Effect.forkChild({ startImmediately: true }));
+        source.emit({
+          type: "session.exited",
+          eventId: asEventId(`exit-${scenario}`),
+          provider: source.adapter.provider,
+          threadId,
+          createdAt: "2026-09-07T00:00:00.000Z",
+          payload: {},
+          ...(scenario === "old native session"
+            ? { raw: { source: "notification", payload: { sessionId: "old-native" } } }
+            : {}),
+        });
+        yield* Fiber.join(forwarded);
+        assert.equal(routing.releasedSessionLeases, releasedBefore);
+        assert.isDefined(McpProviderSession.readMcpProviderSession(threadId));
+        yield* provider.stopSession({ threadId });
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("releases MCP credentials before forwarding an unexpected session exit", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-mcp-unexpected-exit");
+      const releasedBefore = routing.releasedSessionLeases;
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const events = yield* Stream.toPull(provider.streamEvents);
+      const forwarded = yield* events.pipe(Effect.forkChild({ startImmediately: true }));
+      yield* routing.codex.subscribed;
+      yield* routing.codex.stopSession(threadId);
+      routing.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("unexpected-exit"),
+        provider: CODEX_DRIVER,
+        threadId,
+        createdAt: "2026-09-07T00:00:00.000Z",
+        payload: {},
+      });
+      yield* Fiber.join(forwarded);
+      assert.equal(routing.releasedSessionLeases, releasedBefore + 1);
+      assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("resolves project MCP servers for normal starts and internal recovery", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -1044,7 +1565,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       ]);
       assert.deepEqual(
         (routing.codex.startSession.mock.calls[0]?.[0] as { projectMcpServers?: unknown })
-          .projectMcpServers,
+          ?.projectMcpServers,
         [routing.issuedProjectMcpServer],
       );
 
@@ -1058,7 +1579,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       ]);
       assert.deepEqual(
         (routing.codex.startSession.mock.calls[0]?.[0] as { projectMcpServers?: unknown })
-          .projectMcpServers,
+          ?.projectMcpServers,
         [routing.issuedProjectMcpServer],
       );
       yield* provider.stopSession({ threadId });
@@ -2452,7 +2973,7 @@ describe("agent browser access", () => {
       // Clearing the in-memory map is not enough: a token issued before the
       // toggle flipped stays valid against `/mcp` for its whole liveness
       // window, and later turns refresh it.
-      assert.deepEqual(revokedThreads, [threadId]);
+      assert.deepEqual([...new Set(revokedThreads)], [threadId]);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
@@ -2555,7 +3076,7 @@ describe("agent browser access", () => {
       assert.deepEqual(request.projectMcpServers, [projectMcpServer]);
       assert.deepEqual(
         (codex.startSession.mock.calls[0]?.[0] as { projectMcpServers?: unknown })
-          .projectMcpServers,
+          ?.projectMcpServers,
         [
           {
             id: projectMcpServer.id,

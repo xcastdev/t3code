@@ -337,11 +337,6 @@ const ProjectMcpServerDraftFields = Schema.Struct({
   enabled: Schema.Boolean,
   providerInstanceIds: Schema.Array(ProviderInstanceId),
 });
-const ProjectMcpServerDraft = ProjectMcpServerDraftFields.check(
-  Schema.makeFilter(hasProjectMcpTransport, {
-    message: "Expected either a legacy URL or an explicit MCP transport",
-  }),
-);
 
 const hasCredentialValues = (transport: ProjectMcpTransportDraft | undefined): boolean => {
   if (transport === undefined) return true;
@@ -498,7 +493,8 @@ export const ProjectMcpCreateInput = Schema.Struct({
 );
 export type ProjectMcpCreateInput = typeof ProjectMcpCreateInput.Type;
 
-export const ProjectMcpUpdateInput = Schema.Struct({
+const ProjectMcpFullUpdateInput = Schema.Struct({
+  patch: Schema.optional(Schema.Never),
   projectId: ProjectId,
   id: McpServerId,
   ...ProjectMcpServerDraftFields.fields,
@@ -507,6 +503,19 @@ export const ProjectMcpUpdateInput = Schema.Struct({
     message: "Expected either a legacy URL or an explicit MCP transport",
   }),
 );
+export const ProjectMcpUpdateInput = Schema.Union([
+  ProjectMcpFullUpdateInput,
+  Schema.Struct({
+    projectId: ProjectId,
+    id: McpServerId,
+    enabled: Schema.Boolean,
+    patch: Schema.Literal("enabled"),
+    name: Schema.optional(Schema.Never),
+    url: Schema.optional(Schema.Never),
+    transport: Schema.optional(Schema.Never),
+    providerInstanceIds: Schema.optional(Schema.Never),
+  }),
+]);
 export type ProjectMcpUpdateInput = typeof ProjectMcpUpdateInput.Type;
 
 export const ProjectMcpListInput = Schema.Struct({ projectId: ProjectId });

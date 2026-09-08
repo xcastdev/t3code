@@ -66,7 +66,7 @@ interface ProjectMcpDraft {
   readonly transportType: "streamable-http" | "legacy-sse" | "stdio" | "legacy-url";
   readonly url: string;
   readonly command: string;
-  readonly args: string;
+  readonly args: ReadonlyArray<{ readonly key: number; readonly value: string }>;
   readonly cwd: string;
   readonly headers: ReadonlyArray<ProjectMcpCredentialDraft>;
   readonly env: ReadonlyArray<ProjectMcpCredentialDraft>;
@@ -79,6 +79,7 @@ interface ProjectMcpDraft {
 }
 
 interface ProjectMcpCredentialDraft {
+  readonly key: number;
   readonly id?: ProjectMcpCredentialId;
   readonly name: string;
   readonly value: string;
@@ -86,29 +87,33 @@ interface ProjectMcpCredentialDraft {
 
 type ProjectMcpFieldErrors = Partial<Record<"name" | "url" | "command", string>>;
 
+let nextCredentialKey = 0;
+
 const EMPTY_DRAFT: ProjectMcpDraft = {
   name: "",
   transportType: "streamable-http",
   url: "",
   command: "",
-  args: "",
+  args: [],
   cwd: "",
-  headers: [{ name: "", value: "" }],
-  env: [{ name: "", value: "" }],
+  headers: [credentialDraft()],
+  env: [credentialDraft()],
   authorization: "none",
   oauthRegistration: "automatic",
   oauthClientId: "",
-  oauthClientSecret: { name: "OAuth client secret", value: "" },
+  oauthClientSecret: { ...credentialDraft(), name: "OAuth client secret" },
   enabled: true,
   providerInstanceIds: [],
 };
 
-function credentialDraft(
-  credential: { readonly id: ProjectMcpCredentialId; readonly name: string } | undefined,
-): ProjectMcpCredentialDraft {
+function credentialDraft(credential?: {
+  readonly id: ProjectMcpCredentialId;
+  readonly name: string;
+}): ProjectMcpCredentialDraft {
+  const key = nextCredentialKey++;
   return credential
-    ? { id: credential.id, name: credential.name, value: "" }
-    : { name: "", value: "" };
+    ? { key, id: credential.id, name: credential.name, value: "" }
+    : { key, name: "", value: "" };
 }
 
 function credentialInput(credential: ProjectMcpCredentialDraft): {
@@ -190,7 +195,7 @@ function CredentialFields({
     <fieldset className="grid gap-2">
       <legend className="text-sm font-medium">Credentials</legend>
       {entries.map((entry, index) => (
-        <div key={`${entry.id ?? "new"}-${index}`} className="grid gap-1.5">
+        <div key={entry.key} className="grid gap-1.5">
           <Input
             aria-label={`${label} name ${index + 1}`}
             placeholder={`${label} name`}
@@ -234,7 +239,7 @@ function CredentialFields({
         type="button"
         size="xs"
         variant="outline"
-        onClick={() => onChange([...entries, { name: "", value: "" }])}
+        onClick={() => onChange([...entries, credentialDraft()])}
       >
         Add credential
       </Button>
@@ -292,6 +297,7 @@ function ScopedProjectMcpCatalogSettings({
   const nameInputRef = useRef<HTMLInputElement>(null);
   const urlInputRef = useRef<HTMLInputElement>(null);
   const commandInputRef = useRef<HTMLInputElement>(null);
+  const nextArgumentKey = useRef(0);
 
   const openCreate = useCallback(() => {
     setEditing(null);
@@ -306,7 +312,10 @@ function ScopedProjectMcpCatalogSettings({
       transportType: transport?.type ?? "legacy-url",
       url: entry.url ?? (transport?.type === "stdio" ? "" : (transport?.url ?? "")),
       command: transport?.type === "stdio" ? transport.command : "",
-      args: transport?.type === "stdio" ? transport.args.join("\n") : "",
+      args:
+        transport?.type === "stdio"
+          ? transport.args.map((value) => ({ key: nextArgumentKey.current++, value }))
+          : [],
       cwd: transport?.type === "stdio" ? (transport.cwd ?? "") : "",
       headers:
         transport?.type === "streamable-http" || transport?.type === "legacy-sse"
@@ -314,14 +323,14 @@ function ScopedProjectMcpCatalogSettings({
               ...credentialDraft(header.credential),
               name: header.name,
             }))
-          : [{ name: "", value: "" }],
+          : [credentialDraft()],
       env:
         transport?.type === "stdio"
           ? transport.env.map((variable) => ({
               ...credentialDraft(variable.credential),
               name: variable.name,
             }))
-          : [{ name: "", value: "" }],
+          : [credentialDraft()],
       authorization:
         transport?.type === "streamable-http" || transport?.type === "legacy-sse"
           ? transport.authorization.type
@@ -347,8 +356,8 @@ function ScopedProjectMcpCatalogSettings({
                 ...credentialDraft(transport.authorization.registration.clientSecret),
                 name: "OAuth client secret",
               }
-            : { name: "OAuth client secret", value: "" }
-          : { name: "OAuth client secret", value: "" },
+            : { ...credentialDraft(), name: "OAuth client secret" }
+          : { ...credentialDraft(), name: "OAuth client secret" },
       enabled: entry.enabled,
       providerInstanceIds: entry.providerInstanceIds,
     });
@@ -410,7 +419,7 @@ function ScopedProjectMcpCatalogSettings({
                 ? {
                     type: "stdio" as const,
                     command: draft.command.trim(),
-                    args: draft.args.split("\n").filter(Boolean),
+                    args: draft.args.map((argument) => argument.value),
                     ...(draft.cwd.trim() ? { cwd: draft.cwd.trim() } : {}),
                     env: draft.env
                       .filter(
@@ -492,7 +501,7 @@ function ScopedProjectMcpCatalogSettings({
     updateEntry,
   ]);
   const updateExisting = useCallback(
-    async (entry: ProjectMcpServer, changes: Partial<ProjectMcpDraft>) => {
+    async (entry: ProjectMcpServer, enabled: boolean) => {
       if (isSaving || !canMutate) return;
       setIsSaving(true);
       try {
@@ -501,10 +510,8 @@ function ScopedProjectMcpCatalogSettings({
           input: {
             projectId,
             id: entry.id,
-            name: entry.name,
-            ...(entry.transport ? { transport: entry.transport } : { url: entry.url }),
-            enabled: changes.enabled ?? entry.enabled,
-            providerInstanceIds: changes.providerInstanceIds ?? entry.providerInstanceIds,
+            patch: "enabled",
+            enabled,
           },
         });
         if (result._tag === "Success") {
@@ -651,7 +658,7 @@ function ScopedProjectMcpCatalogSettings({
                     checked={entry.enabled}
                     disabled={isSaving || !canMutate}
                     aria-label={`Enable ${entry.name}`}
-                    onCheckedChange={(enabled) => void updateExisting(entry, { enabled })}
+                    onCheckedChange={(enabled) => void updateExisting(entry, enabled)}
                   />
                   <Button
                     size="icon-xs"
@@ -769,15 +776,53 @@ function ScopedProjectMcpCatalogSettings({
                       />
                       {fieldErrors.command ? <p role="alert">{fieldErrors.command}</p> : null}
                     </label>
-                    <label className="grid gap-1.5 text-sm font-medium">
-                      Arguments{" "}
-                      <textarea
-                        aria-label="MCP server arguments"
-                        value={draft.args}
-                        onChange={(event) => setDraft({ ...draft, args: event.target.value })}
+                    <div className="grid gap-1.5 text-sm font-medium">
+                      <span>Arguments</span>
+                      {draft.args.map((argument, index) => (
+                        <div key={argument.key} className="flex items-start gap-2">
+                          <textarea
+                            aria-label={`MCP server argument ${index + 1}`}
+                            value={argument.value}
+                            onChange={(event) =>
+                              setDraft({
+                                ...draft,
+                                args: draft.args.map((item) =>
+                                  item.key === argument.key
+                                    ? { ...item, value: event.target.value }
+                                    : item,
+                                ),
+                              })
+                            }
+                            disabled={!canMutate || isSaving}
+                          />
+                          <Button
+                            type="button"
+                            aria-label={`Remove argument ${index + 1}`}
+                            disabled={!canMutate || isSaving}
+                            onClick={() =>
+                              setDraft({
+                                ...draft,
+                                args: draft.args.filter((item) => item.key !== argument.key),
+                              })
+                            }
+                          >
+                            <Trash2Icon className="size-4" />
+                          </Button>
+                        </div>
+                      ))}
+                      <Button
+                        type="button"
                         disabled={!canMutate || isSaving}
-                      />
-                    </label>
+                        onClick={() =>
+                          setDraft({
+                            ...draft,
+                            args: [...draft.args, { key: nextArgumentKey.current++, value: "" }],
+                          })
+                        }
+                      >
+                        Add argument
+                      </Button>
+                    </div>
                     <label className="grid gap-1.5 text-sm font-medium">
                       Working directory{" "}
                       <Input
