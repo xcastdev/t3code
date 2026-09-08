@@ -1,8 +1,13 @@
 import * as NodeURL from "node:url";
 import { expect, it } from "@effect/vitest";
 import { McpServerId } from "@t3tools/contracts";
-import { connectProjectMcpServer } from "./ProjectMcpConnection.ts";
+import {
+  connectProjectMcpServer,
+  projectMcpConnectionCoordinator,
+} from "./ProjectMcpConnection.ts";
+import type { ProjectMcpConnection } from "./ProjectMcpConnection.ts";
 import { ProjectMcpBroker } from "./ProjectMcpBroker.ts";
+import { ProtocolErrorCode } from "@modelcontextprotocol/client";
 
 it("owns modern subscriptions once and delivers updates until unsubscribe or close", async ({
   onTestFinished,
@@ -81,4 +86,53 @@ it("owns modern subscriptions once and delivers updates until unsubscribe or clo
   } finally {
     await connection.close();
   }
+});
+
+it("releases roots ownership on replacement and connection close", async () => {
+  let rootsRequest:
+    | ((request: unknown, context: unknown) => unknown | Promise<unknown>)
+    | undefined;
+  const client = {
+    connect: async () => undefined,
+    close: async () => undefined,
+    setRequestHandler: (
+      method: string,
+      handler: (request: unknown, context: unknown) => unknown,
+    ) => {
+      if (method === "roots/list") rootsRequest = handler;
+    },
+  };
+  const connection = {
+    client,
+    transport: { type: "stdio", command: "fixture", args: [], env: [] } as const,
+    protocolEra: "legacy" as const,
+    negotiatedProtocolVersion: "2025-11-25",
+    discoverResult: undefined,
+    close: async () => undefined,
+  };
+  const coordinator = projectMcpConnectionCoordinator(
+    connection as unknown as ProjectMcpConnection,
+  );
+  if (!rootsRequest) throw new Error("roots request handler was not registered");
+  const first = {};
+  const second = {};
+  coordinator.setRootsOwner(first, () => ({ roots: [{ uri: "file:///first" }] }));
+  coordinator.setRootsOwner(second, () => ({ roots: [{ uri: "file:///second" }] }));
+  const context = { mcpReq: { signal: new AbortController().signal } };
+  expect(await rootsRequest({ method: "roots/list" }, context)).toEqual({
+    roots: [{ uri: "file:///second" }],
+  });
+  coordinator.releaseRootsOwner(first);
+  expect(await rootsRequest({ method: "roots/list" }, context)).toEqual({
+    roots: [{ uri: "file:///second" }],
+  });
+  coordinator.releaseRootsOwner(second);
+  await expect(
+    Promise.resolve().then(() => rootsRequest!({ method: "roots/list" }, context)),
+  ).rejects.toMatchObject({ code: ProtocolErrorCode.MethodNotFound });
+  coordinator.setRootsOwner(first, () => ({ roots: [{ uri: "file:///first" }] }));
+  await coordinator.close();
+  await expect(
+    Promise.resolve().then(() => rootsRequest!({ method: "roots/list" }, context)),
+  ).rejects.toMatchObject({ code: ProtocolErrorCode.MethodNotFound });
 });

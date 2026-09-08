@@ -20,6 +20,8 @@ import type {
   Notification,
   NotificationOptions,
   ProtocolEra,
+  ReadResourceRequestParams,
+  ReadResourceResult,
   RequestOptions,
   StandardSchemaV1,
   SubscriptionFilter,
@@ -85,6 +87,8 @@ export interface ProjectMcpBrokerHandlers {
   ) => unknown | Promise<unknown>;
 }
 
+type RootsRequestHandler = NonNullable<ProjectMcpBrokerHandlers["onRootsRequest"]>;
+
 export interface ProjectMcpExtensionSchemas {
   readonly params: StandardSchemaV1;
   readonly result: StandardSchemaV1;
@@ -107,10 +111,19 @@ export interface ProjectMcpBrokerOptions {
 }
 
 export type ProjectMcpCallToolResult = CallToolResult | InputRequiredResult;
-export type ProjectMcpCallToolParams = CallToolRequestParams & {
+type ProjectMcpContinuationMethod = "tools/call" | "prompts/get" | "resources/read";
+type ProjectMcpContinuationParams = Record<string, unknown> & {
   readonly inputResponses?: Record<string, unknown>;
   readonly requestState?: string;
 };
+export type ProjectMcpCallToolParams = CallToolRequestParams & ProjectMcpContinuationParams;
+export type ProjectMcpGetPromptParams = GetPromptRequestParams & ProjectMcpContinuationParams;
+export type ProjectMcpReadResourceParams = ReadResourceRequestParams & ProjectMcpContinuationParams;
+export type ProjectMcpContinuationResult =
+  | CallToolResult
+  | GetPromptResult
+  | ReadResourceResult
+  | InputRequiredResult;
 export type ProjectMcpRequestOptions = Parameters<Client["callTool"]>[1];
 export type ProjectMcpListToolsParams = Parameters<Client["listTools"]>[0];
 export type ProjectMcpListToolsOptions = Parameters<Client["listTools"]>[1];
@@ -125,7 +138,7 @@ interface InputState {
   readonly version: 1;
   readonly serverId: string;
   readonly providerSessionId: string;
-  readonly method: "tools/call";
+  readonly method: ProjectMcpContinuationMethod;
   readonly paramsHash: string;
   readonly upstreamRequestState?: string;
   readonly round: number;
@@ -261,6 +274,7 @@ export class ProjectMcpBroker {
     this.coordinator.controller.signal.removeEventListener("abort", this.onConnectionClose);
     if (this.active) this.failOperation(this.active, new Error("MCP facade disposed"));
     for (const dispose of this.handlerDisposers) dispose();
+    this.releaseRootsOwner(this);
     return (this.disposing = this.coordinator.releaseResourceOwner(this));
   }
 
@@ -297,30 +311,10 @@ export class ProjectMcpBroker {
     const input = params as Record<string, unknown>;
     const state =
       typeof input.requestState === "string"
-        ? this.verifyInputState(input.requestState, input)
+        ? this.verifyInputState(input.requestState, "tools/call", input)
         : undefined;
     if (this.shouldBridgeLegacyServerRequests()) return this.callLegacyTool(params, state, options);
-    const outbound = state ? this.retryParams(input, state) : params;
-    const result = (await this.method("callTool")(outbound as ProjectMcpCallToolParams, {
-      ...options,
-      allowInputRequired: true,
-    })) as ProjectMcpCallToolResult;
-    if (!isInputRequiredResult(result)) return result;
-    const round = state ? state.round + 1 : 0;
-    if (round > MAX_INPUT_ROUNDS) throw new ProjectMcpBrokerError("input_round_limit");
-    return {
-      ...result,
-      requestState: this.signInputState({
-        version: 1,
-        serverId: String(this.serverId),
-        providerSessionId: this.providerSessionId,
-        method: "tools/call",
-        paramsHash: canonicalJson(paramsForHash(input)),
-        ...(result.requestState !== undefined ? { upstreamRequestState: result.requestState } : {}),
-        round,
-        expiresAt: this.now() + INPUT_STATE_TTL_MS,
-      }),
-    };
+    return this.callWithInputRequired("tools/call", params, options, state);
   }
 
   async listResources(
@@ -338,10 +332,15 @@ export class ProjectMcpBroker {
   }
 
   async readResource(
-    params: Parameters<Client["readResource"]>[0],
+    params: ProjectMcpReadResourceParams,
     options?: Parameters<Client["readResource"]>[1],
-  ) {
-    return this.method("readResource")(params, options);
+  ): Promise<ReadResourceResult | InputRequiredResult> {
+    const input = params as Record<string, unknown>;
+    const state =
+      typeof input.requestState === "string"
+        ? this.verifyInputState(input.requestState, "resources/read", input)
+        : undefined;
+    return this.callWithInputRequired("resources/read", params, options, state);
   }
 
   async subscribeResource(
@@ -373,14 +372,45 @@ export class ProjectMcpBroker {
   }
 
   async getPrompt(
-    params: GetPromptRequestParams,
+    params: ProjectMcpGetPromptParams,
     options?: RequestOptions,
-  ): Promise<GetPromptResult> {
-    return this.method("getPrompt")(params, options);
+  ): Promise<GetPromptResult | InputRequiredResult> {
+    const input = params as Record<string, unknown>;
+    const state =
+      typeof input.requestState === "string"
+        ? this.verifyInputState(input.requestState, "prompts/get", input)
+        : undefined;
+    return this.callWithInputRequired("prompts/get", params, options, state);
   }
 
   async notify(notification: Notification, options?: NotificationOptions): Promise<void> {
     return this.method("notification")(notification, options);
+  }
+
+  async notifyRootsListChanged(options?: NotificationOptions): Promise<void> {
+    return this.notifyRootsListChangedFor(
+      this,
+      (request, context) =>
+        this.handleUpstreamServerRequestFromCoordinator("roots/list", request, context),
+      options,
+    );
+  }
+
+  async notifyRootsListChangedFor(
+    owner: object,
+    handler: RootsRequestHandler,
+    options?: NotificationOptions,
+  ): Promise<void> {
+    this.coordinator.setRootsOwner(owner, (method, request, context) => {
+      if (method !== "roots/list")
+        throw new ProtocolError(ProtocolErrorCode.MethodNotFound, "Unsupported MCP server request");
+      return handler(request, context);
+    });
+    await this.method("notification")({ method: "notifications/roots/list_changed" }, options);
+  }
+
+  releaseRootsOwner(owner: object): void {
+    this.coordinator.releaseRootsOwner(owner);
   }
 
   async requestExtension<T>(
@@ -443,44 +473,103 @@ export class ProjectMcpBroker {
   }
 
   private acquire(signal?: AbortSignal): Promise<() => void> {
-    return this.coordinator.acquire((method, request, context) => {
-      if (
-        method !== "roots/list" &&
-        method !== "sampling/createMessage" &&
-        method !== "elicitation/create"
-      ) {
-        throw new ProtocolError(ProtocolErrorCode.MethodNotFound, "Unsupported MCP server request");
-      }
-      const key =
-        method === "roots/list"
-          ? "onRootsRequest"
-          : method === "sampling/createMessage"
-            ? "onSamplingRequest"
-            : "onElicitationRequest";
-      const handlers = [...this.handlers].flatMap((handlers) =>
-        handlers[key] ? [handlers[key]] : [],
-      );
-      return this.handleUpstreamServerRequest(
-        method,
-        request,
-        (request, context) => {
-          if (handlers.length !== 1)
-            throw new ProtocolError(
-              ProtocolErrorCode.MethodNotFound,
-              "Unassociated MCP server request is unsupported",
-            );
-          return handlers[0]!(request, context);
-        },
-        context,
-      );
-    }, signal);
+    return this.coordinator.acquire(this.handleUpstreamServerRequestFromCoordinator, signal);
   }
+
+  private readonly handleUpstreamServerRequestFromCoordinator = (
+    method: string,
+    request: unknown,
+    context?: ClientContext,
+  ): unknown | Promise<unknown> => {
+    if (
+      method !== "roots/list" &&
+      method !== "sampling/createMessage" &&
+      method !== "elicitation/create"
+    ) {
+      throw new ProtocolError(ProtocolErrorCode.MethodNotFound, "Unsupported MCP server request");
+    }
+    const key =
+      method === "roots/list"
+        ? "onRootsRequest"
+        : method === "sampling/createMessage"
+          ? "onSamplingRequest"
+          : "onElicitationRequest";
+    const handlers = [...this.handlers].flatMap((handlers) =>
+      handlers[key] ? [handlers[key]] : [],
+    );
+    return this.handleUpstreamServerRequest(
+      method,
+      request,
+      (request, context) => {
+        if (handlers.length !== 1)
+          throw new ProtocolError(
+            ProtocolErrorCode.MethodNotFound,
+            "Unassociated MCP server request is unsupported",
+          );
+        return handlers[0]!(request, context);
+      },
+      context,
+    );
+  };
 
   private finishOperation(operation: LegacyOperation): void {
     operation.detach?.();
     clearTimeout(operation.timer);
     if (this.active === operation) this.active = undefined;
     operation.release();
+  }
+
+  private async callWithInputRequired(
+    method: "tools/call",
+    params: ProjectMcpContinuationParams,
+    options: RequestOptions | undefined,
+    state: InputState | undefined,
+  ): Promise<ProjectMcpCallToolResult>;
+  private async callWithInputRequired(
+    method: "prompts/get",
+    params: ProjectMcpContinuationParams,
+    options: RequestOptions | undefined,
+    state: InputState | undefined,
+  ): Promise<GetPromptResult | InputRequiredResult>;
+  private async callWithInputRequired(
+    method: "resources/read",
+    params: ProjectMcpContinuationParams,
+    options: RequestOptions | undefined,
+    state: InputState | undefined,
+  ): Promise<ReadResourceResult | InputRequiredResult>;
+  private async callWithInputRequired(
+    method: ProjectMcpContinuationMethod,
+    params: ProjectMcpContinuationParams,
+    options: RequestOptions | undefined,
+    state: InputState | undefined,
+  ): Promise<ProjectMcpContinuationResult> {
+    const outbound = state ? this.retryParams(params, state) : params;
+    const clientMethod =
+      method === "tools/call"
+        ? "callTool"
+        : method === "prompts/get"
+          ? "getPrompt"
+          : "readResource";
+    const result = (await this.method(clientMethod)(outbound as never, {
+      ...options,
+      allowInputRequired: true,
+    })) as ProjectMcpContinuationResult;
+    if (!isInputRequiredResult(result)) return result;
+    const round = state ? state.round + 1 : 0;
+    if (round > MAX_INPUT_ROUNDS) throw new ProjectMcpBrokerError("input_round_limit");
+    return {
+      ...result,
+      requestState: this.signInputState({
+        version: 1,
+        serverId: String(this.serverId),
+        providerSessionId: this.providerSessionId,
+        method,
+        paramsHash: canonicalJson(paramsForHash(params)),
+        ...(result.requestState !== undefined ? { upstreamRequestState: result.requestState } : {}),
+        round,
+        expiresAt: this.now() + INPUT_STATE_TTL_MS,
+      }),
+    };
   }
 
   private failOperation(operation: LegacyOperation, error: unknown): void {
@@ -622,7 +711,11 @@ export class ProjectMcpBroker {
     return `${payload}.${signature}`;
   }
 
-  private verifyInputState(encoded: string, params: Record<string, unknown>): InputState {
+  private verifyInputState(
+    encoded: string,
+    method: ProjectMcpContinuationMethod,
+    params: Record<string, unknown>,
+  ): InputState {
     const parts = encoded.split(".");
     if (parts.length !== 2) throw new ProjectMcpBrokerError("invalid_request_state");
     const payload = parts[0];
@@ -653,7 +746,7 @@ export class ProjectMcpBroker {
       decoded.version !== 1 ||
       decoded.serverId !== String(this.serverId) ||
       decoded.providerSessionId !== this.providerSessionId ||
-      decoded.method !== "tools/call" ||
+      decoded.method !== method ||
       typeof decoded.paramsHash !== "string" ||
       typeof decoded.round !== "number" ||
       !Number.isInteger(decoded.round) ||
@@ -690,11 +783,14 @@ export class ProjectMcpBroker {
   ): unknown | Promise<unknown> {
     if (!this.shouldBridgeLegacyServerRequests()) return handler(request, context);
     const operation = this.active;
-    if (!operation)
+    if (!operation) {
+      if (method === "roots/list" && this.coordinator.ownsRootsOwner(this))
+        return handler(request, context);
       throw new ProtocolError(
         ProtocolErrorCode.MethodNotFound,
         "Unassociated MCP server request is unsupported",
       );
+    }
     const params =
       isRecord(request) && isRecord(request.params) ? { params: request.params } : undefined;
     const inputRequest = {

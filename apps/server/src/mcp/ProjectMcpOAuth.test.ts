@@ -168,6 +168,71 @@ const decodeRecord = Schema.decodeUnknownSync(
 const decodeObject = Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown));
 const formValue = (value: string) => new URLSearchParams({ value }).toString().slice(6);
 
+it.effect("accepts loopback IPv6 and HTTPS browser callback origins", () =>
+  Effect.gen(function* () {
+    const oauth = yield* prepareOAuth();
+    for (const [origin, expected] of [
+      ["http://[::1]:43210", "http://[::1]:43210/oauth/project-mcp/callback"],
+      ["http://127.0.0.1:43210", "http://127.0.0.1:43210/oauth/project-mcp/callback"],
+      ["http://localhost:43210", "http://localhost:43210/oauth/project-mcp/callback"],
+    ] as const) {
+      const started = yield* oauth.begin({ serverId, redirectOrigin: origin });
+      assert.equal(new URL(started.authorizationUrl).searchParams.get("redirect_uri"), expected);
+    }
+
+    const automatic = yield* ProjectMcpOAuth.__testing.make({
+      servers: [],
+      fetch: async (input, init) => {
+        const response = await fetchOAuthFixture(input, init);
+        if (String(input).endsWith("/.well-known/oauth-authorization-server")) {
+          return Response.json({
+            ...decodeObject(await response.json()),
+            client_id_metadata_document_supported: true,
+          });
+        }
+        return response;
+      },
+    });
+    const started = yield* automatic.begin({
+      serverId,
+      server: { serverId, resource },
+      redirectOrigin: "https://tunnel.example.test",
+    });
+    assert.equal(
+      new URL(started.authorizationUrl).searchParams.get("redirect_uri"),
+      "https://tunnel.example.test/oauth/project-mcp/callback",
+    );
+    assert.equal(
+      new URL(started.authorizationUrl).searchParams.get("client_id"),
+      "https://tunnel.example.test/oauth/project-mcp/client-metadata",
+    );
+  }).pipe(Effect.provide(secretLayer)),
+);
+
+it.effect("rejects unsafe browser callback origins before changing pending state", () =>
+  Effect.gen(function* () {
+    const oauth = yield* prepareOAuth();
+    const started = yield* oauth.begin({
+      serverId,
+      redirectOrigin: "https://correct.example.test",
+    });
+    for (const redirectOrigin of [
+      "http://192.168.1.50:3773",
+      "https://correct.example.test/callback",
+      "https://user:pass@correct.example.test",
+      "https://correct.example.test?unsafe=1",
+      "not a URL",
+    ]) {
+      const error = yield* Effect.flip(oauth.begin({ serverId, redirectOrigin }));
+      assert.equal(error.operation, "resolve redirect");
+      assert.equal(
+        (yield* oauth.continuePending(serverId)).authorizationUrl,
+        started.authorizationUrl,
+      );
+    }
+  }).pipe(Effect.provide(secretLayer)),
+);
+
 it.effect("requires reconnect for legacy grants without a registration binding", () =>
   Effect.gen(function* () {
     const oauth = yield* prepareOAuth();
@@ -414,12 +479,75 @@ it.effect(
 );
 
 const callbackRequest = (authorizationUrl: string) => {
-  const url = new URL("https://t3.example.test/oauth/project-mcp/callback");
-  url.searchParams.set("state", new URL(authorizationUrl).searchParams.get("state")!);
+  const authorization = new URL(authorizationUrl);
+  const url = new URL(
+    authorization.searchParams.get("redirect_uri") ?? "http://127.0.0.1/oauth/project-mcp/callback",
+  );
+  url.searchParams.set("state", authorization.searchParams.get("state")!);
   url.searchParams.set("code", "one-time-code");
   url.searchParams.set("iss", "https://issuer.example.test");
   return new Request(url.toString());
 };
+
+const callbackRequestAt = (authorizationUrl: string, callbackUrl: string) => {
+  const url = new URL(callbackUrl);
+  const authorization = new URL(authorizationUrl);
+  url.searchParams.set("state", authorization.searchParams.get("state")!);
+  url.searchParams.set("code", "one-time-code");
+  url.searchParams.set("iss", "https://issuer.example.test");
+  return new Request(url.toString());
+};
+
+it.effect("binds callback completion to the saved origin and path", () =>
+  Effect.gen(function* () {
+    let exchanges = 0;
+    const oauth = yield* prepareOAuth({
+      fetch: async (input, init) => {
+        if (String(input).endsWith("/token")) exchanges++;
+        return fetchOAuthFixture(input, init);
+      },
+    });
+    const started = yield* oauth.begin({
+      serverId,
+      redirectOrigin: "https://correct.example.test",
+    });
+    const wrongCallbacks = [
+      "https://different.example.test/oauth/project-mcp/callback",
+      "https://correct.example.test/not-the-callback",
+      "http://correct.example.test/oauth/project-mcp/callback",
+    ];
+    for (const callbackUrl of wrongCallbacks) {
+      const response = yield* oauth.completeCallback(
+        callbackRequestAt(started.authorizationUrl, callbackUrl),
+      );
+      assert.equal(response.status, 400);
+      assert.equal(response.headers.get("cache-control"), "no-store");
+      assert.equal(exchanges, 0);
+      assert.equal(yield* oauth.status(serverId), "authorization-pending");
+      assert.equal(
+        (yield* oauth.continuePending(serverId)).authorizationUrl,
+        started.authorizationUrl,
+      );
+    }
+
+    const restarted = yield* ProjectMcpOAuth.__testing.make({
+      servers: [],
+      fetch: async (input, init) => {
+        if (String(input).endsWith("/token")) exchanges++;
+        return fetchOAuthFixture(input, init);
+      },
+    });
+    const valid = yield* restarted.completeCallback(
+      callbackRequestAt(
+        started.authorizationUrl,
+        "https://correct.example.test/oauth/project-mcp/callback?code=ignored&state=ignored",
+      ),
+    );
+    assert.equal(valid.status, 200);
+    assert.equal(exchanges, 1);
+    assert.equal(yield* restarted.status(serverId), "connected");
+  }).pipe(Effect.provide(secretLayer)),
+);
 
 for (const reader of ["status", "provider"] as const) {
   for (const replacement of ["tokens", "verifier"] as const) {
@@ -1265,7 +1393,9 @@ it.effect("begins and completes an authorization-code flow with an in-process au
       servers: [],
       fetch: fetchOAuthFixture,
     });
-    const callbackUrl = new URL("https://t3.example.test/oauth/project-mcp/callback");
+    const callbackUrl = new URL(
+      new URL(superseding.authorizationUrl).searchParams.get("redirect_uri")!,
+    );
     callbackUrl.searchParams.set(
       "state",
       new URL(superseding.authorizationUrl).searchParams.get("state")!,
@@ -1391,7 +1521,7 @@ it.effect("persists headless step-up authorization for callback recovery", () =>
     yield* prepared.commit;
     const oauth = yield* ProjectMcpOAuth.ProjectMcpOAuth;
     const started = yield* oauth.begin({ serverId });
-    const initialCallbackUrl = new URL("https://t3.example.test/oauth/project-mcp/callback");
+    const initialCallbackUrl = new URL("http://127.0.0.1/oauth/project-mcp/callback");
     initialCallbackUrl.searchParams.set(
       "state",
       new URL(started.authorizationUrl).searchParams.get("state")!,
@@ -1430,7 +1560,7 @@ it.effect("persists headless step-up authorization for callback recovery", () =>
     const restartedContinuation = yield* restarted.continuePending(serverId);
     assert.equal(restartedContinuation.authorizationUrl, stepUpAuthorizationUrl.toString());
     assert.isTrue(restartedContinuation.expiresAt.length > 0);
-    const stepUpCallbackUrl = new URL("https://t3.example.test/oauth/project-mcp/callback");
+    const stepUpCallbackUrl = new URL("http://127.0.0.1/oauth/project-mcp/callback");
     stepUpCallbackUrl.searchParams.set("state", "step-up-state");
     stepUpCallbackUrl.searchParams.set("code", "step-up-code");
     stepUpCallbackUrl.searchParams.set("iss", "https://issuer.example.test");

@@ -144,11 +144,17 @@ type PushHandler = (
   context?: ClientContext,
 ) => unknown | Promise<unknown>;
 
+interface RootsOwner {
+  readonly owner: object;
+  readonly handler: PushHandler;
+}
+
 /** One owner at a time on legacy transports, which carry no parent request correlation. */
 export class ProjectMcpConnectionCoordinator {
   readonly controller = new AbortController();
   private busy = false;
   private owner: PushHandler | undefined;
+  private rootsOwner: RootsOwner | undefined;
   private readonly queue: Array<() => void> = [];
   private readonly listeners = new Set<(notification: Notification) => void | Promise<void>>();
   private readonly subscriptions = new Map<string, Promise<McpSubscription>>();
@@ -185,12 +191,14 @@ export class ProjectMcpConnectionCoordinator {
       | undefined;
     for (const method of ["roots/list", "sampling/createMessage", "elicitation/create"] as const) {
       setRequestHandler?.(method, (request: unknown, context: ClientContext) => {
-        if (!this.owner)
+        const handler =
+          this.owner ?? (method === "roots/list" ? this.rootsOwner?.handler : undefined);
+        if (!handler)
           throw new ProtocolError(
             ProtocolErrorCode.MethodNotFound,
             "Unassociated MCP server request is unsupported",
           );
-        return this.owner(method, request, context);
+        return handler(method, request, context);
       });
     }
   }
@@ -289,6 +297,19 @@ export class ProjectMcpConnectionCoordinator {
       .filter(([, owners]) => owners.has(owner))
       .map(([uri]) => uri);
     await Promise.all(uris.map((uri) => this.unsubscribeResource(uri, owner)));
+  }
+
+  setRootsOwner(owner: object, handler: PushHandler): void {
+    if (this.controller.signal.aborted) return;
+    this.rootsOwner = { owner, handler };
+  }
+
+  ownsRootsOwner(owner: object): boolean {
+    return this.rootsOwner?.owner === owner;
+  }
+
+  releaseRootsOwner(owner: object): void {
+    if (this.rootsOwner?.owner === owner) this.rootsOwner = undefined;
   }
 
   private resourceTransition(
@@ -398,6 +419,8 @@ export class ProjectMcpConnectionCoordinator {
   async close(): Promise<void> {
     if (this.controller.signal.aborted) return;
     this.controller.abort(new Error("MCP connection closed"));
+    this.owner = undefined;
+    this.rootsOwner = undefined;
     for (const next of this.queue.splice(0)) next();
     this.listeners.clear();
     const subscriptions = [...this.subscriptions.values()];

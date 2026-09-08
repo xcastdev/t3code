@@ -23,6 +23,7 @@ import {
   JSONValueSchema,
   SubscriptionFilterSchema,
 } from "@modelcontextprotocol/core";
+import type { ClientContext } from "@modelcontextprotocol/client";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -195,6 +196,7 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
         }
       : { name: "T3 Code MCP proxy", version: "1" };
   const server = new Server(serverInfo);
+  const rootsOwner = {};
   const capabilities = discovered?.capabilities ?? broker.serverCapabilities ?? {};
   server.registerCapabilities(capabilities);
   const requestOptions = (context: ServerContext): RequestOptions => ({
@@ -207,6 +209,15 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
         params: { ...progress, progressToken },
       } satisfies Notification);
     },
+  });
+  const continuationParams = (params: object, context: ServerContext): Record<string, unknown> => ({
+    ...(params as Record<string, unknown>),
+    ...(context.mcpReq.inputResponses === undefined
+      ? {}
+      : { inputResponses: context.mcpReq.inputResponses }),
+    ...(typeof context.mcpReq.requestState() !== "string"
+      ? {}
+      : { requestState: context.mcpReq.requestState() }),
   });
   server.setRequestHandler("ping", (_request, context) => broker.ping(requestOptions(context)));
   (
@@ -231,15 +242,7 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
     );
     server.setRequestHandler("tools/call", (request, context) =>
       broker.callTool(
-        {
-          ...request.params,
-          ...(context.mcpReq.inputResponses === undefined
-            ? {}
-            : { inputResponses: context.mcpReq.inputResponses }),
-          ...(typeof context.mcpReq.requestState() !== "string"
-            ? {}
-            : { requestState: context.mcpReq.requestState() }),
-        } as Parameters<ProjectMcpBroker["callTool"]>[0],
+        continuationParams(request.params, context) as Parameters<ProjectMcpBroker["callTool"]>[0],
         requestOptions(context),
       ),
     );
@@ -252,7 +255,12 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
       broker.listResourceTemplates(request.params, requestOptions(context)),
     );
     server.setRequestHandler("resources/read", (request, context) =>
-      broker.readResource(request.params, requestOptions(context)),
+      broker.readResource(
+        continuationParams(request.params, context) as Parameters<
+          ProjectMcpBroker["readResource"]
+        >[0],
+        requestOptions(context),
+      ),
     );
     server.setRequestHandler("resources/subscribe", (request, context) =>
       broker.subscribeResource(request.params, requestOptions(context)),
@@ -266,7 +274,10 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
       broker.listPrompts(request.params, requestOptions(context)),
     );
     server.setRequestHandler("prompts/get", (request, context) =>
-      broker.getPrompt(request.params, requestOptions(context)),
+      broker.getPrompt(
+        continuationParams(request.params, context) as Parameters<ProjectMcpBroker["getPrompt"]>[0],
+        requestOptions(context),
+      ),
     );
   }
   if (capabilities.completions) {
@@ -279,6 +290,11 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
       broker.setLoggingLevel(request.params.level, requestOptions(context)),
     );
   }
+  const forwardRootsRequest = (request: unknown, context?: ClientContext) =>
+    forwardServerRequest(server, "roots/list", request, context?.mcpReq.signal);
+  server.setNotificationHandler("notifications/roots/list_changed", () =>
+    broker.notifyRootsListChangedFor(rootsOwner, forwardRootsRequest),
+  );
   const disposeHandlers = broker.setHandlers({
     ...(notifier
       ? {}
@@ -289,8 +305,7 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
           onResourceUpdated: (uri: string) => server.sendResourceUpdated({ uri }),
         }),
     onLoggingMessage: (notification) => server.notification(notification),
-    onRootsRequest: (request, context) =>
-      forwardServerRequest(server, "roots/list", request, context?.mcpReq.signal),
+    onRootsRequest: forwardRootsRequest,
     onSamplingRequest: (request, context) =>
       forwardServerRequest(server, "sampling/createMessage", request, context?.mcpReq.signal),
     onElicitationRequest: (request, context) =>
@@ -299,6 +314,7 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
   // MCP Protocol exposes a callback property, not EventTarget.addEventListener.
   // eslint-disable-next-line unicorn/prefer-add-event-listener
   server.onclose = () => {
+    broker.releaseRootsOwner(rootsOwner);
     disposeHandlers();
     if (!notifier)
       void broker.dispose().catch((error: unknown) => {

@@ -8,6 +8,7 @@ import { HttpServer } from "effect/unstable/http";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as McpSessionRegistry from "./McpSessionRegistry.ts";
+import * as ProjectMcpProxyRegistry from "./ProjectMcpProxyRegistry.ts";
 
 const environmentId = EnvironmentId.make("environment-1");
 const makeFakeHttpServer = (hostname: string, port = 43123) =>
@@ -191,5 +192,75 @@ it.effect("does not keep credentials of other threads alive", () =>
     timestamp += 2;
 
     expect(yield* registry.resolve(token)).toBeUndefined();
+  }),
+);
+
+it.effect("cleans project sessions pruned by unrelated liveness activity", () =>
+  Effect.gen(function* () {
+    let timestamp = 1_000;
+    let closed = 0;
+    const serverId = "pruned-project-server" as never;
+    const transport = {
+      type: "streamable-http" as const,
+      url: "https://fixture.example.test/mcp",
+      headers: [],
+      authorization: { type: "none" as const },
+    };
+    const proxy = yield* ProjectMcpProxyRegistry.__testing.make({
+      endpointBase: "http://127.0.0.1:43123/mcp",
+      connect: async () => ({
+        client: {
+          connect: async () => undefined,
+          close: async () => undefined,
+          ping: async () => ({}),
+        },
+        transport,
+        protocolEra: "modern" as const,
+        negotiatedProtocolVersion: "2026-07-28",
+        discoverResult: {
+          protocolVersion: "2026-07-28",
+          supportedVersions: ["2026-07-28"],
+          capabilities: {},
+          serverInfo: { name: "fixture", version: "1" },
+        },
+        close: async () => {
+          closed += 1;
+        },
+      }),
+    });
+    const registry = yield* makeRegistry(() => timestamp).pipe(
+      Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, proxy),
+    );
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("thread-pruned"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      projectMcpServers: [
+        {
+          id: serverId,
+          name: "fixture",
+          transport,
+        },
+      ],
+    });
+    const endpoint = issued.config.projectServers?.[0];
+    if (!endpoint) throw new Error("expected a project MCP endpoint");
+    const endpointHandle = endpoint.endpoint.pathname.split("/").at(-1);
+    if (!endpointHandle) throw new Error("expected an endpoint handle");
+    const response = yield* proxy.handle(
+      issued.config.providerSessionId,
+      endpointHandle,
+      new Request(String(endpoint.endpoint)),
+    );
+    yield* Effect.promise(() => response.text());
+
+    timestamp += 101;
+    yield* registry.touch(ThreadId.make("unrelated-thread"));
+    yield* registry.revokeAll;
+
+    expect(closed).toBe(1);
+    expect(yield* proxy.resolve(issued.config.providerSessionId, endpointHandle)).toBeUndefined();
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    expect(yield* registry.resolve(token)).toBeUndefined();
+    yield* proxy.revokeAll;
   }),
 );

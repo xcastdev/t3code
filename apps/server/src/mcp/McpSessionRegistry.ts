@@ -70,6 +70,11 @@ interface RegistryState {
   readonly records: ReadonlyMap<string, CredentialRecord>;
 }
 
+interface PrunedRecords {
+  readonly records: ReadonlyMap<string, CredentialRecord>;
+  readonly expiredProviderSessionIds: ReadonlyArray<string>;
+}
+
 export interface McpSessionRegistryOptions {
   readonly livenessWindowMs?: number;
   readonly now?: () => number;
@@ -122,6 +127,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const projectProxy = yield* Effect.serviceOption(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry);
   const state = yield* SynchronizedRef.make<RegistryState>({ records: new Map() });
   const expiryFibers = new Map<string, Fiber.Fiber<void, never>>();
+  const expiryTokens = new Map<string, symbol>();
   const currentTimeMillis = options.now ? Effect.sync(options.now) : Clock.currentTimeMillis;
   const livenessWindowMs = options.livenessWindowMs ?? DEFAULT_LIVENESS_WINDOW_MS;
   const endpoint = getMcpEndpoint(httpServer);
@@ -131,13 +137,20 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       .digest("SHA-256", new TextEncoder().encode(token))
       .pipe(Effect.map(bytesToHex), Effect.orDie);
 
-  const pruneDead = (records: ReadonlyMap<string, CredentialRecord>, timestamp: number) => {
-    const next = new Map(
-      Array.from(records).filter(
-        ([, record]) => timestamp - record.lastAliveAt <= livenessWindowMs,
-      ),
-    );
-    return next.size === records.size ? records : next;
+  const pruneDead = (
+    records: ReadonlyMap<string, CredentialRecord>,
+    timestamp: number,
+  ): PrunedRecords => {
+    const next = new Map<string, CredentialRecord>();
+    const expiredProviderSessionIds: string[] = [];
+    for (const [tokenHash, record] of records) {
+      if (timestamp - record.lastAliveAt <= livenessWindowMs) next.set(tokenHash, record);
+      else expiredProviderSessionIds.push(record.scope.providerSessionId);
+    }
+    return {
+      records: next.size === records.size ? records : next,
+      expiredProviderSessionIds,
+    };
   };
 
   const issue: McpSessionRegistryShape["issue"] = Effect.fn("McpSessionRegistry.issue")(
@@ -170,11 +183,16 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         ]),
         issuedAt,
       };
-      yield* SynchronizedRef.update(state, ({ records }) => {
-        const next = new Map(pruneDead(records, issuedAt));
-        next.set(tokenHash, { tokenHash, scope, lastAliveAt: issuedAt });
-        return { records: next };
-      });
+      const expiredProviderSessionIds = yield* SynchronizedRef.modify(
+        state,
+        ({ records }): readonly [ReadonlyArray<string>, RegistryState] => {
+          const pruned = pruneDead(records, issuedAt);
+          const next = new Map(pruned.records);
+          next.set(tokenHash, { tokenHash, scope, lastAliveAt: issuedAt });
+          return [pruned.expiredProviderSessionIds, { records: next }] as const;
+        },
+      );
+      yield* cleanupExpiredProjectSessions(expiredProviderSessionIds);
       yield* scheduleExpiry(providerSessionId);
       return {
         config: {
@@ -211,28 +229,20 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         }): readonly [
           {
             readonly scope: McpInvocationContext.McpInvocationScope | undefined;
-            readonly expired: string[];
+            readonly expired: ReadonlyArray<string>;
           },
           RegistryState,
         ] => {
-          const current = pruneDead(records, timestamp);
-          const record = current.get(tokenHash);
-          const expired = Array.from(records.values())
-            .filter((candidate) => !current.has(candidate.tokenHash))
-            .map((candidate) => candidate.scope.providerSessionId);
-          if (!record) return [{ scope: undefined, expired }, { records: current }] as const;
-          const next = new Map(current);
+          const pruned = pruneDead(records, timestamp);
+          const record = pruned.records.get(tokenHash);
+          const expired = pruned.expiredProviderSessionIds;
+          if (!record) return [{ scope: undefined, expired }, { records: pruned.records }] as const;
+          const next = new Map(pruned.records);
           next.set(tokenHash, { ...record, lastAliveAt: timestamp });
           return [{ scope: record.scope, expired }, { records: next }] as const;
         },
       );
-      if (projectProxy._tag === "Some") {
-        yield* Effect.forEach(
-          resolved.expired,
-          (providerSessionId) => projectProxy.value.revokeProviderSession(providerSessionId),
-          { discard: true },
-        );
-      }
+      yield* cleanupExpiredProjectSessions(resolved.expired);
       if (resolved.scope !== undefined) {
         yield* scheduleExpiry(resolved.scope.providerSessionId);
       }
@@ -243,19 +253,29 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const touch: McpSessionRegistryShape["touch"] = Effect.fn("McpSessionRegistry.touch")(
     function* (threadId) {
       const timestamp = yield* currentTimeMillis;
-      const touchedProviderSessionIds = yield* SynchronizedRef.modify(state, ({ records }) => {
-        const current = pruneDead(records, timestamp);
-        const next = new Map(current);
+      const result = yield* SynchronizedRef.modify(state, ({ records }) => {
+        const pruned = pruneDead(records, timestamp);
+        const next = new Map(pruned.records);
         const touched = new Set<string>();
-        for (const [tokenHash, record] of current) {
+        for (const [tokenHash, record] of pruned.records) {
           if (record.scope.threadId === threadId) {
             next.set(tokenHash, { ...record, lastAliveAt: timestamp });
             touched.add(record.scope.providerSessionId);
           }
         }
-        return [touched, { records: next }] as const;
+        return [
+          {
+            touchedProviderSessionIds: touched,
+            expiredProviderSessionIds: pruned.expiredProviderSessionIds,
+          },
+          { records: next },
+        ] as const;
       });
-      yield* Effect.forEach(touchedProviderSessionIds, scheduleExpiry, { discard: true });
+      const expiredProviderSessionIds = new Set(result.expiredProviderSessionIds);
+      yield* cleanupExpiredProjectSessions([...expiredProviderSessionIds]);
+      yield* Effect.forEach(new Set(result.touchedProviderSessionIds), scheduleExpiry, {
+        discard: true,
+      });
     },
   );
 
@@ -273,6 +293,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const cancelExpiry = (providerSessionId: string) => {
     const fiber = expiryFibers.get(providerSessionId);
     expiryFibers.delete(providerSessionId);
+    expiryTokens.delete(providerSessionId);
     return fiber === undefined ? Effect.void : Fiber.interrupt(fiber).pipe(Effect.asVoid);
   };
 
@@ -283,6 +304,11 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         })
       : Effect.void;
 
+  const cleanupExpiredProjectSessions = (providerSessionIds: ReadonlyArray<string>) =>
+    Effect.forEach(new Set(providerSessionIds), cancelExpiry, { discard: true }).pipe(
+      Effect.andThen(cleanupProjectSessions(providerSessionIds)),
+    );
+
   const revokeAndCleanup = (predicate: (record: CredentialRecord) => boolean) =>
     revokeWhere(predicate).pipe(
       Effect.flatMap((providerSessionIds) =>
@@ -292,12 +318,19 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       ),
     );
 
-  const expireProviderSession = (providerSessionId: string) =>
-    revokeWhere((record) => record.scope.providerSessionId === providerSessionId).pipe(
-      Effect.flatMap(cleanupProjectSessions),
+  const expireProviderSession = (providerSessionId: string, token: symbol) =>
+    Effect.gen(function* () {
+      if (expiryTokens.get(providerSessionId) !== token) return;
+      yield* revokeWhere((record) => record.scope.providerSessionId === providerSessionId);
+      if (expiryTokens.get(providerSessionId) === token)
+        yield* cleanupProjectSessions([providerSessionId]);
+    }).pipe(
       Effect.ensuring(
         Effect.sync(() => {
-          expiryFibers.delete(providerSessionId);
+          if (expiryTokens.get(providerSessionId) === token) {
+            expiryTokens.delete(providerSessionId);
+            expiryFibers.delete(providerSessionId);
+          }
         }),
       ),
       Effect.ignore,
@@ -305,14 +338,17 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
 
   const scheduleExpiry = (providerSessionId: string) =>
     Effect.gen(function* () {
+      const token = Symbol();
+      const previous = expiryFibers.get(providerSessionId);
+      expiryTokens.set(providerSessionId, token);
       const fiber = yield* Effect.forkDetach(
         Effect.sleep(Duration.millis(livenessWindowMs)).pipe(
-          Effect.andThen(expireProviderSession(providerSessionId)),
+          Effect.andThen(expireProviderSession(providerSessionId, token)),
         ),
       );
-      const previous = expiryFibers.get(providerSessionId);
-      expiryFibers.set(providerSessionId, fiber);
-      if (previous !== undefined) yield* Fiber.interrupt(previous);
+      if (expiryTokens.get(providerSessionId) === token) expiryFibers.set(providerSessionId, fiber);
+      else yield* Fiber.interrupt(fiber);
+      if (previous !== undefined && previous !== fiber) yield* Fiber.interrupt(previous);
     });
 
   return McpSessionRegistry.of({

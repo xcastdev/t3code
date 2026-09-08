@@ -15,7 +15,35 @@ serveStdio(
     });
     server.setRequestHandler("tools/list", () => ({ tools: [] }));
     server.setRequestHandler("prompts/list", () => ({ prompts: [] }));
+    server.setRequestHandler("prompts/get", (request, context) => {
+      if (context.mcpReq.requestState() === "upstream-state")
+        return { description: "prompt approved", messages: [] };
+      return {
+        resultType: "input_required",
+        inputRequests: {
+          approval: {
+            method: "elicitation/create",
+            params: { mode: "form", message: "Approve?", requestedSchema: {} },
+          },
+        },
+        requestState: "upstream-state",
+      };
+    });
     server.setRequestHandler("resources/list", () => ({ resources: [] }));
+    server.setRequestHandler("resources/read", (request, context) => {
+      if (context.mcpReq.requestState() === "upstream-state")
+        return { contents: [{ uri: request.params.uri, text: "resource approved" }] };
+      return {
+        resultType: "input_required",
+        inputRequests: {
+          approval: {
+            method: "elicitation/create",
+            params: { mode: "form", message: "Approve?", requestedSchema: {} },
+          },
+        },
+        requestState: "upstream-state",
+      };
+    });
     server.setRequestHandler("tools/call", async (request) => {
       if (request.params.name === "subscriptions")
         return {

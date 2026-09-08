@@ -89,6 +89,236 @@ it("signs input-required state and restores the upstream request state on retry"
   });
 });
 
+it.each([
+  ["getPrompt", { name: "approval", arguments: { subject: "one" } }],
+  ["readResource", { uri: "file:///workspace/one" }],
+] as const)("supports signed input-required continuation for %s", async (method, params) => {
+  const calls: Array<{ params: Record<string, unknown>; options: Record<string, unknown> }> = [];
+  const client = makeClient({
+    getPrompt: (async (request, options) => {
+      calls.push({ params: request as Record<string, unknown>, options: options ?? {} });
+      if (options?.allowInputRequired !== true)
+        throw new Error("manual input-required mode was not enabled");
+      return calls.length === 1
+        ? ({
+            resultType: "input_required",
+            inputRequests: {
+              approval: {
+                method: "elicitation/create",
+                params: { mode: "form", message: "Approve?", requestedSchema: {} },
+              },
+            },
+            requestState: "upstream-state",
+          } as never)
+        : ({ description: "approved", messages: [] } as never);
+    }) as NonNullable<ProjectMcpClient["getPrompt"]>,
+    readResource: (async (request, options) => {
+      calls.push({ params: request as Record<string, unknown>, options: options ?? {} });
+      if (options?.allowInputRequired !== true)
+        throw new Error("manual input-required mode was not enabled");
+      return calls.length === 1
+        ? ({
+            resultType: "input_required",
+            inputRequests: {
+              approval: {
+                method: "elicitation/create",
+                params: { mode: "form", message: "Approve?", requestedSchema: {} },
+              },
+            },
+            requestState: "upstream-state",
+          } as never)
+        : ({ contents: [{ uri: request.uri, text: "approved" }] } as never);
+    }) as NonNullable<ProjectMcpClient["readResource"]>,
+  });
+  const broker = new ProjectMcpBroker({
+    connection: connection(client),
+    serverId,
+    providerSessionId: "provider-session",
+    requestStateSecret: "broker-secret",
+  });
+
+  const first = (method === "getPrompt"
+    ? await broker.getPrompt(params as never)
+    : await broker.readResource(params as never)) as unknown as InputRequiredResult;
+  expect(first.resultType).toBe("input_required");
+  expect(first.requestState).toBeTypeOf("string");
+  if (typeof first.requestState !== "string") throw new Error("expected signed request state");
+
+  const retry = {
+    ...params,
+    inputResponses: { approval: { action: "accept", content: {} } },
+    requestState: first.requestState,
+  };
+  const complete =
+    method === "getPrompt"
+      ? await broker.getPrompt(retry as never)
+      : await broker.readResource(retry as never);
+  expect(complete).toEqual(
+    method === "getPrompt"
+      ? { description: "approved", messages: [] }
+      : { contents: [{ uri: "file:///workspace/one", text: "approved" }] },
+  );
+  expect(calls[1]?.params).toEqual({
+    ...params,
+    inputResponses: { approval: { action: "accept", content: {} } },
+    requestState: "upstream-state",
+  });
+  expect(calls[1]?.options.allowInputRequired).toBe(true);
+});
+
+it("does not let continuation state cross methods or original parameters", async () => {
+  let promptCalls = 0;
+  let resourceCalls = 0;
+  const client = makeClient({
+    getPrompt: (async () => {
+      promptCalls += 1;
+      return {
+        resultType: "input_required",
+        inputRequests: {
+          approval: {
+            method: "elicitation/create",
+            params: { mode: "form", message: "Approve?", requestedSchema: {} },
+          },
+        },
+        requestState: "prompt-state",
+      } as never;
+    }) as NonNullable<ProjectMcpClient["getPrompt"]>,
+    readResource: (async () => {
+      resourceCalls += 1;
+      return { contents: [{ uri: "file:///other", text: "unexpected" }] } as never;
+    }) as NonNullable<ProjectMcpClient["readResource"]>,
+  });
+  const broker = new ProjectMcpBroker({
+    connection: connection(client),
+    serverId,
+    providerSessionId: "provider-session",
+    requestStateSecret: "broker-secret",
+  });
+  const first = (await broker.getPrompt({ name: "approval" })) as unknown as InputRequiredResult;
+  if (typeof first.requestState !== "string") throw new Error("expected signed request state");
+
+  await expect(
+    broker.readResource({
+      uri: "file:///other",
+      requestState: first.requestState,
+      inputResponses: { approval: {} },
+    } as never),
+  ).rejects.toMatchObject({ code: "invalid_request_state" });
+  await expect(
+    broker.getPrompt({
+      name: "changed",
+      requestState: first.requestState,
+      inputResponses: { approval: {} },
+    } as never),
+  ).rejects.toMatchObject({ code: "invalid_request_state" });
+  expect(promptCalls).toBe(1);
+  expect(resourceCalls).toBe(0);
+});
+
+it("rejects expired continuation state before contacting the upstream method", async () => {
+  let timestamp = 1_000;
+  let calls = 0;
+  const broker = new ProjectMcpBroker({
+    connection: connection(
+      makeClient({
+        getPrompt: (async () => {
+          calls += 1;
+          return {
+            resultType: "input_required",
+            inputRequests: {
+              approval: {
+                method: "elicitation/create",
+                params: { mode: "form", message: "Approve?", requestedSchema: {} },
+              },
+            },
+          } as never;
+        }) as NonNullable<ProjectMcpClient["getPrompt"]>,
+      }),
+    ),
+    serverId,
+    providerSessionId: "provider-session",
+    requestStateSecret: "broker-secret",
+    now: () => timestamp,
+  });
+  const first = (await broker.getPrompt({ name: "approval" })) as unknown as InputRequiredResult;
+  if (typeof first.requestState !== "string") throw new Error("expected signed request state");
+  timestamp += 10 * 60 * 1000 + 1;
+
+  await expect(
+    broker.getPrompt({
+      name: "approval",
+      requestState: first.requestState,
+      inputResponses: { approval: {} },
+    } as never),
+  ).rejects.toMatchObject({ code: "invalid_request_state" });
+  expect(calls).toBe(1);
+});
+
+it("rejects a continuation beyond the maximum input round", async () => {
+  const broker = new ProjectMcpBroker({
+    connection: connection(
+      makeClient({
+        getPrompt: (async () =>
+          ({
+            resultType: "input_required",
+            inputRequests: {
+              approval: {
+                method: "elicitation/create",
+                params: { mode: "form", message: "Approve?", requestedSchema: {} },
+              },
+            },
+          }) as never) as NonNullable<ProjectMcpClient["getPrompt"]>,
+      }),
+    ),
+    serverId,
+    providerSessionId: "provider-session",
+    requestStateSecret: "broker-secret",
+  });
+  let state: string | undefined;
+  for (let round = 0; round <= 10; round += 1) {
+    const result = (await broker.getPrompt({
+      name: "approval",
+      ...(state === undefined ? {} : { requestState: state, inputResponses: { approval: {} } }),
+    } as never)) as unknown as InputRequiredResult;
+    if (typeof result.requestState !== "string") throw new Error("expected signed request state");
+    state = result.requestState;
+  }
+
+  await expect(
+    broker.getPrompt({
+      name: "approval",
+      requestState: state,
+      inputResponses: { approval: {} },
+    } as never),
+  ).rejects.toMatchObject({ code: "input_round_limit" });
+});
+
+it("passes prompt cancellation through to the upstream method", async () => {
+  const entered = Promise.withResolvers<AbortSignal>();
+  const client = makeClient({
+    getPrompt: (async (_params, options) => {
+      if (!options?.signal) throw new Error("missing cancellation signal");
+      entered.resolve(options.signal);
+      await new Promise<void>((_resolve, reject) => {
+        options.signal!.addEventListener("abort", () => reject(options.signal!.reason), {
+          once: true,
+        });
+      });
+      return { messages: [] } as never;
+    }) as NonNullable<ProjectMcpClient["getPrompt"]>,
+  });
+  const broker = new ProjectMcpBroker({
+    connection: connection(client),
+    serverId,
+    providerSessionId: "provider-session",
+  });
+  const abort = new AbortController();
+  const pending = broker.getPrompt({ name: "approval" }, { signal: abort.signal });
+  expect(await entered.promise).toBe(abort.signal);
+  abort.abort(new Error("cancelled"));
+  await expect(pending).rejects.toThrow("cancelled");
+});
+
 it("bridges legacy upstream server requests through modern input-required rounds", async () => {
   let rootsHandler: ((request: unknown) => unknown | Promise<unknown>) | undefined;
   const roots = { roots: [{ uri: "file:///workspace", name: "workspace" }] };
@@ -300,4 +530,63 @@ it("relays list-change notifications through the semantic handler surface", asyn
   expect(toolsChanged).toEqual({
     tools: [{ name: "new-tool", inputSchema: { type: "object" } }],
   });
+});
+
+it("associates unsolicited legacy roots requests with the notifying facade", async () => {
+  let rootsRequest:
+    | ((request: unknown, context: unknown) => unknown | Promise<unknown>)
+    | undefined;
+  const forwarded: unknown[] = [];
+  const client = makeClient({
+    notification: (notification) => {
+      forwarded.push(notification);
+      return Promise.resolve();
+    },
+    setRequestHandler: ((
+      method: string,
+      handler: (request: unknown, context: unknown) => unknown,
+    ) => {
+      if (method === "roots/list") rootsRequest = handler;
+    }) as NonNullable<ProjectMcpClient["setRequestHandler"]>,
+  });
+  const shared = connection(client, "legacy");
+  const rootsA = { roots: [{ uri: "file:///a" }] };
+  const rootsB = { roots: [{ uri: "file:///b" }] };
+  const first = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "first",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => rootsA },
+  });
+  const second = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "second",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => rootsB },
+  });
+  const notify = (first as unknown as { notifyRootsListChanged?: () => Promise<void> })
+    .notifyRootsListChanged;
+  expect(notify).toBeTypeOf("function");
+  if (notify === undefined || rootsRequest === undefined) throw new Error("missing roots seam");
+  const request = rootsRequest;
+  await notify.call(first);
+  expect(forwarded).toEqual([{ method: "notifications/roots/list_changed" }]);
+
+  const context = { mcpReq: { signal: new AbortController().signal } };
+  expect(await request({ method: "roots/list" }, context)).toEqual(rootsA);
+  await first.dispose();
+  await expect(
+    Promise.resolve().then(() => request({ method: "roots/list" }, context)),
+  ).rejects.toMatchObject({
+    code: -32601,
+    message: "Unassociated MCP server request is unsupported",
+  });
+
+  const notifySecond = (second as unknown as { notifyRootsListChanged: () => Promise<void> })
+    .notifyRootsListChanged;
+  await notifySecond.call(second);
+  expect(await request({ method: "roots/list" }, context)).toEqual(rootsB);
+  await second.close();
 });

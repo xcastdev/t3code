@@ -1045,27 +1045,40 @@ const buildAppUnderTest = (options?: {
 
 const parseSessionCookieFromWsUrl = (
   wsUrl: string,
-): { readonly cookie: string | null; readonly url: string } => {
+): {
+  readonly cookie: string | null;
+  readonly requestHost: string | null;
+  readonly url: string;
+} => {
   const next = new URL(wsUrl);
-  const cookie = next.hash.startsWith("#cookie=")
-    ? decodeURIComponent(next.hash.slice("#cookie=".length))
-    : null;
+  const hashParams = new URLSearchParams(next.hash.slice(1));
+  const cookieValue = hashParams.get("cookie");
+  const requestHost = hashParams.get("host");
+  const cookie = cookieValue;
   next.hash = "";
   return {
     cookie,
+    requestHost,
     url: next.toString(),
   };
 };
 
 const wsRpcProtocolLayer = (wsUrl: string) => {
-  const { cookie, url } = parseSessionCookieFromWsUrl(wsUrl);
+  const { cookie, requestHost, url } = parseSessionCookieFromWsUrl(wsUrl);
   const webSocketConstructorLayer = Layer.succeed(
     Socket.WebSocketConstructor,
     (socketUrl, protocols) =>
       new NodeSocket.NodeWS.WebSocket(
         socketUrl,
         protocols,
-        cookie ? { headers: { cookie } } : undefined,
+        cookie || requestHost
+          ? {
+              headers: {
+                ...(cookie ? { cookie } : {}),
+                ...(requestHost ? { host: requestHost } : {}),
+              },
+            }
+          : undefined,
       ) as unknown as globalThis.WebSocket,
   );
 
@@ -1084,10 +1097,17 @@ const withWsRpcClient = <A, E, R>(
   f: (client: WsRpcClient) => Effect.Effect<A, E, R>,
 ) => makeWsRpcClient.pipe(Effect.flatMap(f), Effect.provide(wsRpcProtocolLayer(wsUrl)));
 
-const appendSessionCookieToWsUrl = (url: string, sessionCookieHeader: string) => {
+const appendSessionCookieToWsUrl = (
+  url: string,
+  sessionCookieHeader: string,
+  requestHost?: string,
+) => {
   const isAbsoluteUrl = /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(url);
   const next = new URL(url, "http://localhost");
-  next.hash = `cookie=${encodeURIComponent(sessionCookieHeader)}`;
+  next.hash = [
+    `cookie=${encodeURIComponent(sessionCookieHeader)}`,
+    ...(requestHost === undefined ? [] : [`host=${encodeURIComponent(requestHost)}`]),
+  ].join("&");
   return isAbsoluteUrl ? next.toString() : `${next.pathname}${next.search}${next.hash}`;
 };
 
@@ -1450,18 +1470,25 @@ const crossOriginClientOrigin = "http://remote-client.test:3773";
 
 const getWsServerUrl = (
   pathname = "",
-  options?: { authenticated?: boolean; credential?: string },
+  options?: {
+    authenticated?: boolean;
+    credential?: string;
+    requestHost?: string;
+  },
 ) =>
   Effect.gen(function* () {
     const server = yield* HttpServer.HttpServer;
     const address = server.address as HttpServer.TcpAddress;
     const baseUrl = `ws://127.0.0.1:${address.port}${pathname}`;
     if (options?.authenticated === false) {
-      return baseUrl;
+      return options.requestHost === undefined
+        ? baseUrl
+        : `${baseUrl}#host=${encodeURIComponent(`${options.requestHost}:${address.port}`)}`;
     }
     return appendSessionCookieToWsUrl(
       baseUrl,
       yield* getAuthenticatedSessionCookieHeader(options?.credential),
+      options?.requestHost === undefined ? undefined : `${options.requestHost}:${address.port}`,
     );
   });
 
@@ -5286,6 +5313,52 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.deepEqual(results[2], server);
       assert.notInclude(encodeUnknownJson(results), "rpc-secret-sentinel");
       assert.deepEqual(calls, ["list", "create", "update", "remove"]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("requires a safe browser origin before starting project MCP OAuth", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-mcp-oauth-origin");
+      const serverId = McpServerId.make("mcp-oauth-origin");
+      let listCalls = 0;
+      const project = {
+        id: projectId,
+        title: "OAuth origin",
+        workspaceRoot: "/tmp/project-mcp-oauth-origin",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: "2026-09-02T00:00:00.000Z",
+        updatedAt: "2026-09-02T00:00:00.000Z",
+      } as const;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectMcpService: {
+            list: () =>
+              Effect.sync(() => {
+                listCalls++;
+                return { external: [], managed: [], applications: [] };
+              }),
+          },
+          projectionSnapshotQuery: {
+            getProjectShellById: () => Effect.succeed(Option.some(project)),
+          },
+        },
+      });
+
+      const unsafeUrl = yield* getWsServerUrl("/ws", {
+        requestHost: "192.168.1.50",
+      });
+      const unsafe = yield* Effect.scoped(
+        withWsRpcClient(unsafeUrl, (client) =>
+          Effect.flip(client[WS_METHODS.projectMcpOauthBegin]({ projectId, id: serverId })),
+        ),
+      );
+      assert.equal(unsafe._tag, "ProjectMcpOAuthActionError");
+      if (unsafe._tag === "ProjectMcpOAuthActionError") {
+        assert.include(unsafe.reason, "HTTPS");
+      }
+      assert.equal(listCalls, 0);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

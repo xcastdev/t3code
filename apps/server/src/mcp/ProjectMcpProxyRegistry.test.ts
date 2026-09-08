@@ -94,6 +94,10 @@ const fixtureSessionRegistry = (): McpSessionRegistry.McpSessionRegistryShape =>
   revokeAll: Effect.void,
 });
 
+const sendRootsListChanged = async (client: Client): Promise<void> => {
+  await client.notification({ method: "notifications/roots/list_changed" });
+};
+
 it.effect("issues opaque immutable endpoints and isolates sessions", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry(async () => connection(async () => undefined));
@@ -385,6 +389,144 @@ it.effect("accepts a legacy streamable HTTP client through a stateful session", 
     yield* Effect.promise(() => client.close());
 
     expect(tools.tools.map((tool) => tool.name)).toEqual(["echo"]);
+  }),
+);
+
+it.effect("releases roots ownership when legacy proxy facades share a connection", () =>
+  Effect.gen(function* () {
+    const forwarded: unknown[] = [];
+    const forwardedReceipts: Array<{ readonly resolve: () => void }> = [];
+    let upstreamRootsRequest:
+      | ((request: unknown, context: unknown) => unknown | Promise<unknown>)
+      | undefined;
+    const upstreamClient = {
+      ...clientForFixture(),
+      notification: async (notification: unknown) => {
+        forwarded.push(notification);
+        forwardedReceipts.shift()?.resolve();
+      },
+      setRequestHandler: ((
+        method: string,
+        handler: (request: unknown, context: unknown) => unknown,
+      ) => {
+        if (method === "roots/list") upstreamRootsRequest = handler;
+      }) as NonNullable<ProjectMcpClient["setRequestHandler"]>,
+      getProtocolEra: () => "legacy" as const,
+      getNegotiatedProtocolVersion: () => "2025-11-25",
+      getDiscoverResult: () => undefined,
+      getServerCapabilities: () => ({ tools: {} }),
+      getServerVersion: () => ({ name: "legacy-fixture", version: "1" }),
+    } satisfies ProjectMcpClient;
+    const registry = yield* makeRegistry(async () => ({
+      client: upstreamClient,
+      transport,
+      protocolEra: "legacy" as const,
+      negotiatedProtocolVersion: "2025-11-25",
+      discoverResult: undefined,
+      serverCapabilities: { tools: {} },
+      serverVersion: { name: "legacy-fixture", version: "1" },
+      close: async () => undefined,
+    }));
+    const [issued] = yield* registry.registerSession({
+      providerSessionId: "provider-a",
+      threadId: ThreadId.make("thread-a"),
+      servers: [server],
+    });
+    const fetchFn = yield* makeScopedFetch((request) =>
+      registry.handle("provider-a", issued!.endpointHandle, request),
+    );
+    const downstreamClientA = new Client(
+      { name: "legacy-downstream-a", version: "1" },
+      {
+        versionNegotiation: { mode: "legacy" },
+        capabilities: { roots: { listChanged: true } },
+      },
+    );
+    const downstreamClientB = new Client(
+      { name: "legacy-downstream-b", version: "1" },
+      {
+        versionNegotiation: { mode: "legacy" },
+        capabilities: { roots: { listChanged: true } },
+      },
+    );
+    const rootsA = { roots: [{ uri: "file:///downstream-a" }] };
+    const rootsB = { roots: [{ uri: "file:///downstream-b" }] };
+    let bCanAnswerRoots = false;
+    downstreamClientA.setRequestHandler("roots/list", async () => rootsA);
+    downstreamClientB.setRequestHandler("roots/list", async () => {
+      if (!bCanAnswerRoots) throw new Error("B received roots/list before its notification");
+      return rootsB;
+    });
+    const downstreamTransportA = new StreamableHTTPClientTransport(issued!.endpoint, {
+      authProvider: { token: async () => "provider-token" },
+      fetch: fetchFn,
+    });
+    const downstreamTransportB = new StreamableHTTPClientTransport(issued!.endpoint, {
+      authProvider: { token: async () => "provider-token" },
+      fetch: fetchFn,
+    });
+    yield* Effect.promise(() => downstreamClientA.connect(downstreamTransportA));
+    yield* Effect.promise(() => downstreamClientB.connect(downstreamTransportB));
+    const firstForwarded = Promise.withResolvers<void>();
+    forwardedReceipts.push(firstForwarded);
+    yield* Effect.promise(() => sendRootsListChanged(downstreamClientA));
+    yield* Effect.promise(() => firstForwarded.promise);
+    expect(forwarded).toEqual([{ method: "notifications/roots/list_changed" }]);
+    if (!upstreamRootsRequest) throw new Error("upstream roots request handler was not registered");
+    const rootsRequest = upstreamRootsRequest;
+    expect(
+      yield* Effect.promise(() =>
+        Promise.resolve(
+          rootsRequest(
+            { method: "roots/list" },
+            {
+              mcpReq: { signal: new AbortController().signal },
+            },
+          ),
+        ),
+      ),
+    ).toEqual(rootsA);
+    yield* Effect.promise(() => downstreamTransportA.terminateSession());
+    yield* Effect.promise(() => downstreamClientA.close());
+    yield* Effect.promise(() =>
+      expect(
+        Promise.resolve().then(() =>
+          rootsRequest(
+            { method: "roots/list" },
+            {
+              mcpReq: { signal: new AbortController().signal },
+            },
+          ),
+        ),
+      ).rejects.toMatchObject({
+        code: -32601,
+        message: "Unassociated MCP server request is unsupported",
+      }),
+    );
+    bCanAnswerRoots = true;
+    const secondForwarded = Promise.withResolvers<void>();
+    forwardedReceipts.push(secondForwarded);
+    yield* Effect.promise(() => sendRootsListChanged(downstreamClientB));
+    yield* Effect.promise(() => secondForwarded.promise);
+    expect(forwarded).toEqual([
+      { method: "notifications/roots/list_changed" },
+      { method: "notifications/roots/list_changed" },
+    ]);
+    expect(
+      yield* Effect.promise(() =>
+        Promise.resolve(
+          rootsRequest(
+            { method: "roots/list" },
+            {
+              mcpReq: { signal: new AbortController().signal },
+            },
+          ),
+        ),
+      ),
+    ).toEqual(rootsB);
+    yield* Effect.promise(() => downstreamTransportB.terminateSession());
+    yield* Effect.promise(() => downstreamClientB.close());
+    yield* registry.revokeProviderSession("provider-a");
   }),
 );
 

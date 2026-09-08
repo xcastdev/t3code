@@ -62,6 +62,10 @@ store, not in the project catalog or event history.
 The authorization link opens only when you select it. The
 callback must return to the T3 server that started authorization; a different browser origin or
 server address cannot complete that state.
+Local HTTP callbacks are supported only when you open T3 through a loopback address. An HTTP LAN
+or tailnet address cannot host the callback; open T3 through T3 Connect or an HTTPS reverse proxy
+and complete authorization at that exact HTTPS address. T3 reports an error instead of falling
+back to a misleading localhost callback when it cannot form a safe browser origin.
 
 Completing OAuth or disconnecting OAuth closes active upstream connections for that server. Rotating
 a header, environment value, or pre-registered client secret applies to new provider sessions;

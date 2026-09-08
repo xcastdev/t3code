@@ -38,6 +38,37 @@ const oauthErrorResponse = (message: string): Response =>
     headers: { "cache-control": "no-store" },
   });
 
+export const parseProjectMcpOAuthOrigin = (origin: string): string | undefined => {
+  try {
+    const url = new URL(origin);
+    const hostname = url.hostname.replace(/^\[|\]$/g, "").toLowerCase();
+    const loopback = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+    if (
+      url.username !== "" ||
+      url.password !== "" ||
+      url.search !== "" ||
+      url.hash !== "" ||
+      url.pathname !== "/" ||
+      (url.protocol !== "https:" && !(url.protocol === "http:" && loopback))
+    ) {
+      return undefined;
+    }
+    return url.origin;
+  } catch {
+    return undefined;
+  }
+};
+
+export const callbackMatchesRedirect = (requestUrl: string, savedRedirectUrl: string): boolean => {
+  try {
+    const request = new URL(requestUrl);
+    const saved = new URL(savedRedirectUrl);
+    return request.origin === saved.origin && request.pathname === saved.pathname;
+  } catch {
+    return false;
+  }
+};
+
 export class ProjectMcpOAuthError extends Schema.TaggedErrorClass<ProjectMcpOAuthError>()(
   "ProjectMcpOAuthError",
   { operation: Schema.String, cause: Schema.Defect() },
@@ -582,8 +613,20 @@ const make = (config: ProjectMcpOAuthConfig) =>
         catch: (cause) => new ProjectMcpOAuthError({ operation: "create provider", cause }),
       });
 
-    const begin: ProjectMcpOAuthShape["begin"] = (input) =>
-      Effect.gen(function* () {
+    const begin: ProjectMcpOAuthShape["begin"] = (input) => {
+      const redirectOrigin =
+        input.redirectOrigin === undefined
+          ? undefined
+          : parseProjectMcpOAuthOrigin(input.redirectOrigin);
+      if (input.redirectOrigin !== undefined && redirectOrigin === undefined) {
+        return Effect.fail(
+          new ProjectMcpOAuthError({
+            operation: "resolve redirect",
+            cause: new Error("OAuth redirects require HTTPS or loopback HTTP."),
+          }),
+        );
+      }
+      return Effect.gen(function* () {
         const generation = yield* mutex.withPermits(1)(
           Effect.sync(() => nextGeneration(input.serverId)),
         );
@@ -592,35 +635,15 @@ const make = (config: ProjectMcpOAuthConfig) =>
           catch: (cause) => new ProjectMcpOAuthError({ operation: "resolve server", cause }),
         });
         let providerServer = server;
-        if (input.redirectOrigin !== undefined) {
-          let redirectOrigin: URL;
-          try {
-            redirectOrigin = new URL(input.redirectOrigin);
-          } catch (cause) {
-            return yield* new ProjectMcpOAuthError({ operation: "resolve redirect", cause });
-          }
-          const loopback = new Set(["localhost", "127.0.0.1", "::1"]);
-          if (
-            redirectOrigin.username !== "" ||
-            redirectOrigin.password !== "" ||
-            redirectOrigin.search !== "" ||
-            redirectOrigin.hash !== "" ||
-            (redirectOrigin.protocol !== "https:" &&
-              !(redirectOrigin.protocol === "http:" && loopback.has(redirectOrigin.hostname)))
-          ) {
-            return yield* new ProjectMcpOAuthError({
-              operation: "resolve redirect",
-              cause: new Error("OAuth redirects require HTTPS or loopback HTTP."),
-            });
-          }
+        if (redirectOrigin !== undefined) {
           providerServer = {
             ...server,
-            redirectUrl: new URL("/oauth/project-mcp/callback", redirectOrigin.origin).toString(),
-            ...(redirectOrigin.protocol === "https:"
+            redirectUrl: new URL("/oauth/project-mcp/callback", redirectOrigin).toString(),
+            ...(new URL(redirectOrigin).protocol === "https:"
               ? {
                   clientMetadataUrl: new URL(
                     "/oauth/project-mcp/client-metadata",
-                    redirectOrigin.origin,
+                    redirectOrigin,
                   ).toString(),
                 }
               : {}),
@@ -730,6 +753,7 @@ const make = (config: ProjectMcpOAuthConfig) =>
             : Effect.fail(new ProjectMcpOAuthError({ operation: "begin", cause })),
         ),
       );
+    };
 
     const continuePending: ProjectMcpOAuthShape["continuePending"] = (id, server) =>
       current(id, server).pipe(
@@ -796,6 +820,11 @@ const make = (config: ProjectMcpOAuthConfig) =>
           return oauthErrorResponse("Invalid OAuth state.");
         if (url.searchParams.get("iss") !== null && url.searchParams.get("iss") !== record.issuer)
           return oauthErrorResponse("Invalid OAuth issuer.");
+        if (
+          record.redirectUrl === undefined ||
+          !callbackMatchesRedirect(request.url, record.redirectUrl)
+        )
+          return oauthErrorResponse("Invalid OAuth callback.");
         const callbackServer = yield* Effect.tryPromise({
           try: async () => {
             const configured = await serverFor(found.serverId).catch(() => undefined);

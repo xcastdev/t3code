@@ -43,6 +43,7 @@ const makeProxy = Effect.fn(function* (modern = false, legacyUpstream = false) {
     { name: "downstream", version: "1" },
     {
       versionNegotiation: { mode: modern ? "auto" : "legacy" },
+      inputRequired: { autoFulfill: false },
       capabilities: { roots: {}, sampling: {}, elicitation: { form: {} } },
     },
   );
@@ -103,6 +104,49 @@ it.effect("revokes a connection with both a suspended tool and resource subscrip
     expect(pending.resultType).toBe("input_required");
     yield* registry.revokeProviderSession("fixture");
     expect(yield* registry.resolve("fixture", endpoint.endpointHandle)).toBeUndefined();
+  }),
+);
+
+it.effect("continues prompt and resource input-required results through the HTTP proxy", () =>
+  Effect.gen(function* () {
+    const { client } = yield* makeProxy(true);
+    const prompt = (yield* Effect.promise(() =>
+      client.getPrompt({ name: "needs-input" }, { allowInputRequired: true }),
+    )) as unknown as { resultType?: string; requestState?: string };
+    expect(prompt.resultType).toBe("input_required");
+    expect(prompt.requestState).toBeTypeOf("string");
+    if (typeof prompt.requestState !== "string") throw new Error("expected prompt state");
+    const completedPrompt = yield* Effect.promise(() =>
+      client.getPrompt(
+        {
+          name: "needs-input",
+          requestState: prompt.requestState,
+          inputResponses: { approval: { action: "accept", content: {} } },
+        } as never,
+        { allowInputRequired: true },
+      ),
+    );
+    expect(completedPrompt).toMatchObject({ description: "prompt approved", messages: [] });
+
+    const resource = (yield* Effect.promise(() =>
+      client.readResource({ uri: "file:///needs-input" }, { allowInputRequired: true }),
+    )) as unknown as { resultType?: string; requestState?: string };
+    expect(resource.resultType).toBe("input_required");
+    expect(resource.requestState).toBeTypeOf("string");
+    if (typeof resource.requestState !== "string") throw new Error("expected resource state");
+    const completedResource = yield* Effect.promise(() =>
+      client.readResource(
+        {
+          uri: "file:///needs-input",
+          requestState: resource.requestState,
+          inputResponses: { approval: { action: "accept", content: {} } },
+        } as never,
+        { allowInputRequired: true },
+      ),
+    );
+    expect(completedResource).toMatchObject({
+      contents: [{ uri: "file:///needs-input", text: "resource approved" }],
+    });
   }),
 );
 

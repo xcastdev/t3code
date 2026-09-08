@@ -430,13 +430,7 @@ function readTrustedRequestOrigin(
 ): string | undefined {
   const url = HttpServerRequest.toURL(request);
   if (Option.isNone(url)) return undefined;
-  const origin = url.value.origin;
-  const parsed = new URL(origin);
-  const loopback = new Set(["localhost", "127.0.0.1", "::1"]);
-  return parsed.protocol === "https:" ||
-    (parsed.protocol === "http:" && loopback.has(parsed.hostname))
-    ? origin
-    : undefined;
+  return ProjectMcpOAuth.parseProjectMcpOAuthOrigin(url.value.origin);
 }
 
 // Client telemetry stays in this socket's RPC layer. It must not become a
@@ -1868,22 +1862,30 @@ const makeWsRpcLayer = (
             runProjectMcpOperation(
               WS_METHODS.projectMcpOauthBegin,
               input.projectId,
-              oauthServerFor(input.projectId, input.id).pipe(
-                Effect.flatMap((server) =>
-                  projectMcpOAuth.begin({
-                    serverId: input.id,
-                    server,
-                    ...(requestOrigin === undefined ? {} : { redirectOrigin: requestOrigin }),
-                  }),
-                ),
-                Effect.mapError(
-                  () =>
+              requestOrigin === undefined
+                ? Effect.fail(
                     new ProjectMcpOAuthActionError({
                       id: input.id,
-                      reason: "The authorization server could not start authorization.",
+                      reason:
+                        "OAuth needs this T3 server at an HTTPS address. Open it through T3 Connect or another HTTPS reverse proxy, then try again.",
                     }),
-                ),
-              ),
+                  )
+                : oauthServerFor(input.projectId, input.id).pipe(
+                    Effect.flatMap((server) =>
+                      projectMcpOAuth.begin({
+                        serverId: input.id,
+                        server,
+                        redirectOrigin: requestOrigin,
+                      }),
+                    ),
+                    Effect.mapError(
+                      () =>
+                        new ProjectMcpOAuthActionError({
+                          id: input.id,
+                          reason: "The authorization server could not start authorization.",
+                        }),
+                    ),
+                  ),
             ),
             { "rpc.aggregate": "project-mcp" },
           ),
