@@ -1,5 +1,8 @@
 import {
   CommandId,
+  McpCatalogDefinition,
+  McpCatalogOverride,
+  McpCatalogSnapshot,
   McpServerId,
   ProjectMcpNameConflictError,
   ProjectMcpCatalogCommittedCleanupPendingError,
@@ -60,6 +63,18 @@ const projectMcpCleanupEventTypes = new Set([
   "project.mcp-server.created",
   "project.mcp-server.updated",
   "project.mcp-server.removed",
+  "project.mcp-definition.created",
+  "project.mcp-definition.updated",
+  "project.mcp-definition.removed",
+  "environment.mcp-definition.created",
+  "environment.mcp-definition.updated",
+  "environment.mcp-definition.removed",
+  "project.mcp-override.upserted",
+  "project.mcp-override.removed",
+  "thread.mcp-catalog.initialized",
+  "thread.mcp-catalog.updated",
+  "thread.mcp-catalog.reset",
+  "thread.mcp-catalog.disposed",
 ]);
 
 const ProjectMcpProjectionRow = Schema.Struct({
@@ -70,6 +85,18 @@ const ProjectMcpProjectionRow = Schema.Struct({
   enabled: Schema.Number,
   providerInstanceIds: Schema.String,
 });
+const McpCatalogDefinitionProjectionRow = Schema.Struct({
+  serverId: McpServerId,
+  transportJson: Schema.String,
+});
+const McpCatalogOverrideProjectionRow = Schema.Struct({
+  serverId: McpServerId,
+  patchJson: Schema.String,
+});
+const McpCatalogSessionProjectionRow = Schema.Struct({
+  baselineJson: Schema.String,
+  desiredJson: Schema.String,
+});
 
 const decodeProjectMcpServer = Schema.decodeUnknownEffect(ProjectMcpServer);
 const decodeProjectMcpTransportJson = Schema.decodeUnknownEffect(
@@ -77,6 +104,11 @@ const decodeProjectMcpTransportJson = Schema.decodeUnknownEffect(
 );
 const decodeProviderInstanceIds = Schema.decodeUnknownEffect(
   Schema.fromJsonString(Schema.Array(ProviderInstanceId)),
+);
+const decodeMcpCatalogDefinition = Schema.decodeUnknownEffect(McpCatalogDefinition);
+const decodeMcpCatalogOverride = Schema.decodeUnknownEffect(McpCatalogOverride);
+const decodeMcpCatalogDefinitionsJson = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(Schema.Array(McpCatalogDefinition)),
 );
 
 const foldName = (name: string): string => name.toLocaleLowerCase();
@@ -125,6 +157,10 @@ export interface ProjectMcpServiceShape {
   readonly acquireSessionLease: (
     projectId: ProjectId,
     providerInstanceId: ProviderInstanceId,
+  ) => Effect.Effect<AcquiredProjectMcpSessionServers, Error, Scope.Scope>;
+  /** Acquire a lease for a durable catalog resolution chosen by the caller. */
+  readonly acquireResolvedSessionLease: (
+    servers: ReadonlyArray<ResolvedProjectMcpServer>,
   ) => Effect.Effect<AcquiredProjectMcpSessionServers, Error, Scope.Scope>;
 }
 
@@ -232,7 +268,23 @@ const makeProjectMcpService = Effect.gen(function* () {
   ): Effect.Effect<A, E | ProjectMcpCatalogCommittedCleanupPendingError> => {
     switch (outcome._tag) {
       case "Succeeded":
-        return Effect.succeed(outcome.value);
+        // The orchestration receipt is emitted after its SQL projection has
+        // been written, so reconcile synchronously against every durable
+        // catalog reference before returning. This preserves a session's old
+        // credential while it is still in baseline/desired state, while also
+        // keeping the legacy project mutation path's immediate cleanup
+        // guarantee.
+        return reconcileCatalog.pipe(
+          Effect.map(() => outcome.value),
+          Effect.mapError(
+            () =>
+              new ProjectMcpCatalogCommittedCleanupPendingError({
+                operation,
+                id,
+                sequence: outcome.sequence,
+              }),
+          ),
+        );
       case "Rejected":
         return Effect.failCause(outcome.cause);
       case "CommittedSecretFailure":
@@ -619,61 +671,65 @@ const makeProjectMcpService = Effect.gen(function* () {
       ),
     );
 
+  const acquireResolvedSessionLeaseUnsafe = (servers: ReadonlyArray<ResolvedProjectMcpServer>) =>
+    Effect.forEach(
+      servers,
+      (server) => {
+        const oauthStateLease =
+          server.transport.type !== "stdio" && server.transport.authorization.type === "oauth"
+            ? mcpSecrets.acquireOAuthStateLease(server.id)
+            : Effect.succeed(undefined);
+        return Effect.flatMap(oauthStateLease, (stateLease) =>
+          Effect.flatMap(
+            mcpSecrets.acquireLease(
+              server.id,
+              ProjectMcpSecretStore.credentialIdsForTransport(server.transport),
+            ),
+            (lease) =>
+              Effect.map(
+                Effect.forEach(
+                  ProjectMcpSecretStore.credentialIdsForTransport(server.transport),
+                  (credentialId) =>
+                    lease
+                      .resolve(credentialId)
+                      .pipe(Effect.map((value) => [credentialId, value] as const)),
+                ),
+                (credentials) => ({ server, credentials, oauthStateLease: stateLease }),
+              ),
+          ),
+        );
+      },
+      { concurrency: 1 },
+    ).pipe(
+      Effect.map((leased) => {
+        const secretValues = new Map<string, string>();
+        const oauthStateLeases = new Map<
+          McpServerId,
+          ProjectMcpSecretStore.ProjectMcpOAuthStateLease
+        >();
+        for (const { credentials, oauthStateLease, server } of leased) {
+          for (const [credentialId, value] of credentials) secretValues.set(credentialId, value);
+          if (oauthStateLease !== undefined) oauthStateLeases.set(server.id, oauthStateLease);
+        }
+        return {
+          servers: leased.map(({ server }) => server),
+          resolveSecret: (_serverId, credentialId) => secretValues.get(credentialId),
+          oauthStateLeases,
+        } satisfies AcquiredProjectMcpSessionServers;
+      }),
+    );
+
+  const acquireResolvedSessionLease: ProjectMcpServiceShape["acquireResolvedSessionLease"] = (
+    servers,
+  ) => catalogMutationLock.withPermits(1)(acquireResolvedSessionLeaseUnsafe(servers));
+
   const acquireSessionLease: ProjectMcpServiceShape["acquireSessionLease"] = (
     projectId,
     providerInstanceId,
   ) =>
     catalogMutationLock.withPermits(1)(
       resolveForSession(projectId, providerInstanceId).pipe(
-        Effect.flatMap((servers) =>
-          Effect.forEach(
-            servers,
-            (server) => {
-              const oauthStateLease =
-                server.transport.type !== "stdio" && server.transport.authorization.type === "oauth"
-                  ? mcpSecrets.acquireOAuthStateLease(server.id)
-                  : Effect.succeed(undefined);
-              return Effect.flatMap(oauthStateLease, (stateLease) =>
-                Effect.flatMap(
-                  mcpSecrets.acquireLease(
-                    server.id,
-                    ProjectMcpSecretStore.credentialIdsForTransport(server.transport),
-                  ),
-                  (lease) =>
-                    Effect.map(
-                      Effect.forEach(
-                        ProjectMcpSecretStore.credentialIdsForTransport(server.transport),
-                        (credentialId) =>
-                          lease
-                            .resolve(credentialId)
-                            .pipe(Effect.map((value) => [credentialId, value] as const)),
-                      ),
-                      (credentials) => ({ server, credentials, oauthStateLease: stateLease }),
-                    ),
-                ),
-              );
-            },
-            { concurrency: 1 },
-          ).pipe(
-            Effect.map((leased) => {
-              const secretValues = new Map<string, string>();
-              const oauthStateLeases = new Map<
-                McpServerId,
-                ProjectMcpSecretStore.ProjectMcpOAuthStateLease
-              >();
-              for (const { credentials, oauthStateLease, server } of leased) {
-                for (const [credentialId, value] of credentials)
-                  secretValues.set(credentialId, value);
-                if (oauthStateLease !== undefined) oauthStateLeases.set(server.id, oauthStateLease);
-              }
-              return {
-                servers: leased.map(({ server }) => server),
-                resolveSecret: (_serverId, credentialId) => secretValues.get(credentialId),
-                oauthStateLeases,
-              } satisfies AcquiredProjectMcpSessionServers;
-            }),
-          ),
-        ),
+        Effect.flatMap(acquireResolvedSessionLeaseUnsafe),
       ),
     );
 
@@ -686,30 +742,73 @@ const makeProjectMcpService = Effect.gen(function* () {
       enabled,
       provider_instance_ids_json AS "providerInstanceIds"
     FROM projection_project_mcp_servers
-  `.pipe(
-    Effect.flatMap((rows) =>
-      Effect.forEach(rows, (row) =>
-        Effect.all([
-          decodeProviderInstanceIds(row.providerInstanceIds),
-          row.transportJson === null
-            ? Effect.void
-            : decodeProjectMcpTransportJson(row.transportJson),
-        ]).pipe(
-          Effect.flatMap(([providerInstanceIds, transport]) =>
-            decodeProjectMcpServer({
-              id: row.serverId,
-              name: row.name,
-              ...(transport === undefined ? { url: row.url } : { transport }),
-              enabled: row.enabled === 1,
-              providerInstanceIds,
-            }),
+  `;
+  const loadDurableCatalogReferences = Effect.gen(function* () {
+    const legacyRows = yield* loadCompleteCatalog.pipe(
+      Effect.flatMap((rows) =>
+        Effect.forEach(rows, (row) =>
+          Effect.all([
+            decodeProviderInstanceIds(row.providerInstanceIds),
+            row.transportJson === null
+              ? Effect.void
+              : decodeProjectMcpTransportJson(row.transportJson),
+          ]).pipe(
+            Effect.flatMap(([providerInstanceIds, transport]) =>
+              decodeProjectMcpServer({
+                id: row.serverId,
+                name: row.name,
+                ...(transport === undefined ? { url: row.url } : { transport }),
+                enabled: row.enabled === 1,
+                providerInstanceIds,
+              }),
+            ),
           ),
         ),
       ),
-    ),
-  );
+    );
+    const definitions = yield* sql<Schema.Schema.Type<typeof McpCatalogDefinitionProjectionRow>>`
+      SELECT logical_server_id AS "serverId", transport_json AS "transportJson"
+      FROM projection_mcp_definitions
+    `;
+    const overrides = yield* sql<Schema.Schema.Type<typeof McpCatalogOverrideProjectionRow>>`
+      SELECT target_logical_server_id AS "serverId", patch_json AS "patchJson"
+      FROM projection_mcp_overrides
+      WHERE scope_type = 'project'
+    `;
+    const sessions = yield* sql<Schema.Schema.Type<typeof McpCatalogSessionProjectionRow>>`
+      SELECT baseline_json AS "baselineJson", desired_catalog_json AS "desiredJson"
+      FROM projection_mcp_catalog_sessions
+    `;
+    const references: Array<{
+      readonly id: McpServerId;
+      readonly transport?: ProjectMcpTransport;
+    }> = legacyRows.map((server) => ({ id: server.id, transport: getProjectMcpTransport(server) }));
+    for (const row of definitions) {
+      references.push({
+        id: row.serverId,
+        transport: yield* decodeProjectMcpTransportJson(row.transportJson),
+      });
+    }
+    for (const row of overrides) {
+      const override = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(McpCatalogOverride))(
+        row.patchJson,
+      );
+      if (override.transport !== undefined) {
+        references.push({ id: row.serverId, transport: override.transport });
+      }
+    }
+    for (const row of sessions) {
+      for (const json of [row.baselineJson, row.desiredJson]) {
+        const definitions = yield* decodeMcpCatalogDefinitionsJson(json);
+        for (const definition of definitions) {
+          references.push({ id: definition.logicalServerId, transport: definition.transport });
+        }
+      }
+    }
+    return references;
+  });
   const reconcileCatalog = catalogMutationLock.withPermits(1)(
-    loadCompleteCatalog.pipe(Effect.flatMap(mcpSecrets.reconcile)),
+    loadDurableCatalogReferences.pipe(Effect.flatMap(mcpSecrets.reconcile)),
   );
   const cleanupFailure = yield* Ref.make<ProjectMcpCleanupError | undefined>(undefined);
   const seenSequence = yield* SubscriptionRef.make(0);
@@ -828,6 +927,7 @@ const makeProjectMcpService = Effect.gen(function* () {
     remove,
     resolveForSession,
     acquireSessionLease,
+    acquireResolvedSessionLease,
   });
 });
 

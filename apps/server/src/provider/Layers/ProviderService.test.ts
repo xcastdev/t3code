@@ -5,6 +5,7 @@ import * as NodePath from "node:path";
 
 import type {
   ProviderApprovalDecision,
+  OrchestrationCommand,
   ProviderRuntimeEvent,
   ProviderSendTurnInput,
   ProviderSession,
@@ -13,9 +14,11 @@ import type {
   ProviderUploadFeedbackResult,
 } from "@t3tools/contracts";
 import {
+  CommandId,
   EnvironmentId,
   ApprovalRequestId,
   EventId,
+  McpCatalogSessionId,
   McpServerId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -69,6 +72,7 @@ import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as OrchestrationEngine from "../../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectMcpService from "../../project/ProjectMcpService.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
@@ -86,14 +90,34 @@ const makeProviderProjectContextTestLayer = (
     Effect.succeed([]),
   acquireSessionLease: ProjectMcpService.ProjectMcpServiceShape["acquireSessionLease"] = () =>
     Effect.succeed({ servers: [], resolveSecret: () => undefined, oauthStateLeases: new Map() }),
+  commandReadModel?: unknown,
+  acquireResolvedSessionLease: ProjectMcpService.ProjectMcpServiceShape["acquireResolvedSessionLease"] = (
+    servers,
+  ) => Effect.succeed({ servers, resolveSecret: () => undefined, oauthStateLeases: new Map() }),
 ) =>
   Layer.mergeAll(
     Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
-      getThreadShellById: () => Effect.succeed(Option.some({ projectId: defaultProjectId })),
+      getThreadShellById: () =>
+        Effect.succeed(
+          Option.some(
+            commandReadModel === undefined
+              ? { projectId: defaultProjectId }
+              : {
+                  projectId: (commandReadModel as { threads: Array<{ projectId: ProjectId }> })
+                    .threads[0]!.projectId,
+                  session: (commandReadModel as { threads: Array<{ session?: unknown }> })
+                    .threads[0]?.session,
+                },
+          ),
+        ),
+      ...(commandReadModel === undefined
+        ? {}
+        : { getCommandReadModel: () => Effect.succeed(commandReadModel) }),
     } as never),
     Layer.succeed(ProjectMcpService.ProjectMcpService, {
       resolveForSession,
       acquireSessionLease,
+      acquireResolvedSessionLease,
     } as never),
   );
 
@@ -422,6 +446,152 @@ function makeProviderServiceLayer(
     layer,
   };
 }
+
+it.effect("starts providers from the durable catalog and persists application", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("thread-durable-catalog");
+    const sessionId = McpCatalogSessionId.make("catalog-session-durable");
+    const projectId = ProjectId.make("project-durable-catalog");
+    const logicalServerId = McpServerId.make("durable-server");
+    const definition = {
+      definitionId: "definition-durable",
+      logicalServerId,
+      scope: "global" as const,
+      scopeId: "environment-durable",
+      name: "Durable server",
+      transport: {
+        type: "streamable-http" as const,
+        url: "https://durable.example.test/mcp",
+        headers: [
+          {
+            name: "X-Api-Key",
+            credential: { id: "11111111-1111-4111-8111-111111111111", name: "api-key" },
+          },
+        ],
+        authorization: { type: "none" as const },
+      },
+      enabled: true,
+      providerInstanceIds: [codexInstanceId],
+      revision: 1,
+    };
+    const snapshot = {
+      catalogSessionId: sessionId,
+      threadId,
+      providerInstanceId: codexInstanceId,
+      baseline: [definition],
+      desired: [definition],
+      desiredRevision: 1,
+      appliedRevision: 0,
+    };
+    const readModel = {
+      threads: [
+        {
+          id: threadId,
+          projectId,
+          session: { mcpCatalogSessionId: sessionId },
+        },
+      ],
+      mcpCatalog: {
+        environmentId: "environment-durable",
+        globalRevision: 1,
+        globalDefinitions: [definition],
+        projectRevisions: [],
+        projectDefinitions: [],
+        projectOverrides: [],
+        sessions: [snapshot],
+      },
+    };
+    const acquired = vi.fn((servers: ReadonlyArray<ResolvedProjectMcpServer>) =>
+      Effect.succeed({ servers, resolveSecret: () => undefined, oauthStateLeases: new Map() }),
+    );
+    const issued = vi.fn(
+      (request: Parameters<typeof McpSessionRegistry.issueActiveMcpCredential>[0]) =>
+        Effect.succeed({
+          config: {
+            environmentId: EnvironmentId.make("environment-durable"),
+            threadId: request.threadId,
+            providerSessionId: "provider-session-durable",
+            providerInstanceId: request.providerInstanceId,
+            endpoint: "http://127.0.0.1:43123/mcp",
+            authorizationHeader: "Bearer durable-token",
+            projectServers: (request.projectMcpServers ?? []).map((server) => ({
+              id: server.id,
+              name: server.name,
+              endpoint: new URL("http://127.0.0.1:43123/mcp/project/durable"),
+              authorizationHeader: "Bearer durable-token",
+            })),
+          },
+        }),
+    );
+    const applied = vi.fn((_command: OrchestrationCommand) => Effect.succeed({ sequence: 2 }));
+    const adapter = makeFakeCodexAdapter();
+    const providerLayer = makeTestProviderServiceLive(
+      { issueMcpCredential: issued },
+      makeProviderProjectContextTestLayer(
+        undefined,
+        () => Effect.die("legacy lease should not be used"),
+        readModel,
+        acquired,
+      ),
+    ).pipe(
+      Layer.provide(
+        Layer.succeed(
+          ProviderAdapterRegistry.ProviderAdapterRegistry,
+          makeAdapterRegistryMock({ [CODEX_DRIVER]: adapter.adapter }),
+        ),
+      ),
+      Layer.provide(
+        ProviderSessionDirectoryLive.pipe(
+          Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+        ),
+      ),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(serverConfigTestLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+      Layer.provide(
+        Layer.succeed(OrchestrationEngine.OrchestrationEngineService, {
+          dispatch: applied,
+        } as never),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      assert.equal(acquired.mock.calls.length, 1);
+      assert.deepEqual(
+        acquired.mock.calls[0]?.[0].map(({ id, name }) => ({ id, name })),
+        [{ id: logicalServerId, name: "Durable server" }],
+      );
+      assert.equal(issued.mock.calls.length, 1);
+      assert.deepEqual(
+        issued.mock.calls[0]?.[0].projectMcpServers?.map(({ id, name }) => ({ id, name })),
+        [{ id: logicalServerId, name: "Durable server" }],
+      );
+      assert.deepEqual(applied.mock.calls[0]?.[0], {
+        type: "thread.mcp-catalog.applied",
+        commandId: CommandId.make(
+          "server:mcp-catalog-applied:thread-durable-catalog:catalog-session-durable:1",
+        ),
+        threadId,
+        mcpCatalogSessionId: sessionId,
+        revision: 1,
+        appliedAt: "1970-01-01T00:00:00.000Z",
+      });
+    }).pipe(Effect.provide(providerLayer));
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
 
 it.effect("ProviderServiceLive catches stopAll failures during shutdown", () =>
   Effect.gen(function* () {

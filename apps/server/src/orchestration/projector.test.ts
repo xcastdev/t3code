@@ -1,6 +1,8 @@
 import {
   CommandId,
+  EnvironmentId,
   EventId,
+  McpDefinitionId,
   ProjectId,
   ProviderDriverKind,
   ThreadId,
@@ -26,9 +28,11 @@ function makeEvent(input: {
     type: input.type,
     aggregateKind: input.aggregateKind,
     aggregateId:
-      input.aggregateKind === "project"
-        ? ProjectId.make(input.aggregateId)
-        : ThreadId.make(input.aggregateId),
+      input.aggregateKind === "environment"
+        ? EnvironmentId.make(input.aggregateId)
+        : input.aggregateKind === "project"
+          ? ProjectId.make(input.aggregateId)
+          : ThreadId.make(input.aggregateId),
     occurredAt: input.occurredAt,
     commandId: input.commandId === null ? null : CommandId.make(input.commandId),
     causationEventId: null,
@@ -39,6 +43,143 @@ function makeEvent(input: {
 }
 
 describe("orchestration projector", () => {
+  it("keeps catalog replacement and final-deletion revisions in the pure read model", async () => {
+    const first = {
+      definitionId: McpDefinitionId.make("definition-global-1"),
+      logicalServerId: "global-server",
+      scope: "global",
+      scopeId: "environment-1",
+      name: "Global server",
+      transport: {
+        type: "streamable-http",
+        url: "https://global.example/mcp",
+        headers: [],
+        authorization: { type: "none" },
+      },
+      enabled: true,
+      providerInstanceIds: ["codex"],
+      revision: 1,
+    };
+    const replacement = {
+      ...first,
+      definitionId: McpDefinitionId.make("definition-global-2"),
+      name: "Global replacement",
+      revision: 2,
+    };
+    const projectDefinition = {
+      definitionId: McpDefinitionId.make("definition-project-1"),
+      logicalServerId: "project-server",
+      scope: "project",
+      scopeId: "project-1",
+      name: "Project server",
+      transport: {
+        type: "stdio",
+        command: "server",
+        args: [],
+        env: [],
+      },
+      enabled: true,
+      providerInstanceIds: ["codex"],
+      revision: 1,
+    };
+    const projectReplacement = {
+      ...projectDefinition,
+      definitionId: McpDefinitionId.make("definition-project-2"),
+      name: "Project replacement",
+      revision: 2,
+    };
+    const at = (sequence: number, type: OrchestrationEvent["type"], payload: unknown) =>
+      makeEvent({
+        sequence,
+        type,
+        occurredAt: `2026-01-01T00:00:0${sequence}.000Z`,
+        aggregateKind: type.startsWith("environment.") ? "environment" : "project",
+        aggregateId: type.startsWith("environment.") ? "environment-1" : "project-1",
+        commandId: `catalog-${sequence}`,
+        payload,
+      });
+
+    let model = createEmptyReadModel("2026-01-01T00:00:00.000Z");
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        at(1, "environment.mcp-definition.created", {
+          environmentId: "environment-1",
+          definition: first,
+          revision: 1,
+          createdAt: "2026-01-01T00:00:01.000Z",
+        }),
+      ),
+    );
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        at(2, "environment.mcp-definition.updated", {
+          environmentId: "environment-1",
+          definition: replacement,
+          revision: 2,
+          updatedAt: "2026-01-01T00:00:02.000Z",
+        }),
+      ),
+    );
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        at(3, "environment.mcp-definition.removed", {
+          environmentId: "environment-1",
+          logicalServerId: "global-server",
+          definitionId: replacement.definitionId,
+          revision: 3,
+          removedAt: "2026-01-01T00:00:03.000Z",
+        }),
+      ),
+    );
+    expect(model.mcpCatalog).toMatchObject({
+      environmentId: "environment-1",
+      globalRevision: 3,
+      globalDefinitions: [],
+    });
+
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        at(4, "project.mcp-definition.created", {
+          projectId: "project-1",
+          definition: projectDefinition,
+          revision: 1,
+          createdAt: "2026-01-01T00:00:04.000Z",
+        }),
+      ),
+    );
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        at(5, "project.mcp-definition.updated", {
+          projectId: "project-1",
+          definition: projectReplacement,
+          revision: 2,
+          updatedAt: "2026-01-01T00:00:05.000Z",
+        }),
+      ),
+    );
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        at(6, "project.mcp-definition.removed", {
+          projectId: "project-1",
+          logicalServerId: "project-server",
+          definitionId: projectReplacement.definitionId,
+          revision: 3,
+          removedAt: "2026-01-01T00:00:06.000Z",
+        }),
+      ),
+    );
+    expect(model.mcpCatalog).toMatchObject({
+      projectDefinitions: [],
+      projectRevisions: [{ projectId: "project-1", revision: 3 }],
+    });
+  });
+
   it("applies thread.created events", async () => {
     const now = "2026-01-01T00:00:00.000Z";
     const model = createEmptyReadModel(now);

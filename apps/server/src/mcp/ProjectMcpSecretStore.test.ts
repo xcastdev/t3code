@@ -166,6 +166,41 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
     ),
   );
 
+  it.effect("reconciles every durable reference for a server, including a session baseline", () =>
+    Effect.gen(function* () {
+      const config = yield* ServerConfig.ServerConfig;
+      yield* Effect.gen(function* () {
+        const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+        const first = yield* secrets.prepareCreate(serverA, httpDraft("baseline-sentinel"));
+        yield* first.commit;
+        const rotated = yield* secrets.prepareUpdate(
+          serverA,
+          first.transport,
+          httpDraft("current-sentinel"),
+        );
+        yield* rotated.commit;
+
+        yield* secrets.reconcile([
+          { id: serverA, transport: rotated.transport },
+          { id: serverA, transport: first.transport },
+        ]);
+
+        assert.equal(
+          yield* secrets.resolve(serverA, credentialId(first.transport)),
+          "baseline-sentinel",
+        );
+        assert.equal(
+          yield* secrets.resolve(serverA, credentialId(rotated.transport)),
+          "current-sentinel",
+        );
+      }).pipe(Effect.provide(makeSecretLayer(config)));
+    }).pipe(
+      Effect.provide(
+        ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-secret-store-refs-" }),
+      ),
+    ),
+  );
+
   it.effect("rolls back a prepared replacement and leaves its active value usable", () =>
     Effect.gen(function* () {
       const config = yield* ServerConfig.ServerConfig;

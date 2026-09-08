@@ -10,6 +10,7 @@
  * @module ProviderServiceLive
  */
 import {
+  CommandId,
   ModelSelection,
   NonNegativeInt,
   ThreadId,
@@ -24,6 +25,8 @@ import {
   type ProviderDriverKind,
   type ProviderRuntimeEvent,
   type ProviderSession,
+  type McpCatalogSnapshot,
+  type ResolvedProjectMcpServer,
 } from "@t3tools/contracts";
 import { causeErrorTag } from "@t3tools/shared/observability";
 import * as DateTime from "effect/DateTime";
@@ -42,8 +45,10 @@ import * as Semaphore from "effect/Semaphore";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import * as ServerConfig from "../../config.ts";
+import * as OrchestrationEngine from "../../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as ProjectMcpService from "../../project/ProjectMcpService.ts";
+import { resolveSessionCatalog } from "../../mcp/McpCatalogResolver.ts";
 import {
   increment,
   providerMetricAttributes,
@@ -255,10 +260,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
   const projectMcpService = yield* ProjectMcpService.ProjectMcpService;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
+  const mcpSessionRegistry = yield* Effect.serviceOption(McpSessionRegistry.McpSessionRegistry);
+  const orchestrationEngine = yield* Effect.serviceOption(
+    OrchestrationEngine.OrchestrationEngineService,
+  );
   const issueMcpCredential =
-    options?.issueMcpCredential ?? McpSessionRegistry.issueActiveMcpCredential;
+    options?.issueMcpCredential ??
+    (Option.isSome(mcpSessionRegistry)
+      ? mcpSessionRegistry.value.issue
+      : McpSessionRegistry.issueActiveMcpCredential);
   const revokeMcpCredential =
-    options?.revokeMcpCredential ?? McpSessionRegistry.revokeActiveMcpThread;
+    options?.revokeMcpCredential ??
+    (Option.isSome(mcpSessionRegistry)
+      ? mcpSessionRegistry.value.revokeThread
+      : McpSessionRegistry.revokeActiveMcpThread);
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   const projectMcpLeaseScopes = yield* Ref.make(new Map<ThreadId, ProjectMcpLeaseOwner>());
   let startGeneration = 0;
@@ -424,20 +439,74 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           `Cannot start thread '${input.sessionInput.threadId}' because it is not in the durable read model.`,
         );
       }
+      const durableCatalogSnapshot: McpCatalogSnapshot | undefined =
+        typeof projectionSnapshotQuery.getCommandReadModel !== "function"
+          ? undefined
+          : yield* projectionSnapshotQuery.getCommandReadModel().pipe(
+              Effect.mapError((cause) =>
+                toValidationError(
+                  input.operation,
+                  "Could not read the durable MCP catalog session.",
+                  cause,
+                ),
+              ),
+              Effect.map((readModel) => {
+                const sessionId = thread.value.session?.mcpCatalogSessionId;
+                if (sessionId === undefined || readModel.mcpCatalog === undefined) return undefined;
+                const snapshot = readModel.mcpCatalog.sessions.find(
+                  (entry) => entry.catalogSessionId === sessionId,
+                );
+                return snapshot?.threadId === input.sessionInput.threadId &&
+                  snapshot.providerInstanceId === input.providerInstanceId
+                  ? snapshot
+                  : undefined;
+              }),
+            );
+      const durableCatalogServers: ReadonlyArray<ResolvedProjectMcpServer> | undefined =
+        durableCatalogSnapshot === undefined
+          ? undefined
+          : yield* Effect.try({
+              try: () =>
+                resolveSessionCatalog({
+                  baseline: durableCatalogSnapshot.baseline,
+                  sessionDefinitions: durableCatalogSnapshot.desired.filter(
+                    (definition) =>
+                      definition.scope === "session" &&
+                      definition.scopeId === String(durableCatalogSnapshot.catalogSessionId),
+                  ),
+                  sessionOverrides: [],
+                  providerInstanceId: input.providerInstanceId,
+                  // Current adapters consume MCP configuration at process
+                  // start. A later catalog revision is applied on restart.
+                  providerCapability: "restart-required",
+                }).map((entry) => ({
+                  id: entry.logicalServerId,
+                  name: entry.name,
+                  transport: entry.transport,
+                })),
+              catch: (cause) =>
+                toValidationError(
+                  input.operation,
+                  "Could not resolve the durable MCP catalog session.",
+                  cause,
+                ),
+            });
       const sessionScope = yield* Scope.make("sequential");
-      const projectMcpSession = yield* projectMcpService
-        .acquireSessionLease(thread.value.projectId, input.providerInstanceId)
-        .pipe(
-          Effect.mapError((cause) =>
-            toValidationError(
-              input.operation,
-              "Could not resolve and lease project MCP servers.",
-              cause,
-            ),
+      const projectMcpSession = yield* (
+        durableCatalogServers === undefined
+          ? projectMcpService.acquireSessionLease(thread.value.projectId, input.providerInstanceId)
+          : projectMcpService.acquireResolvedSessionLease(durableCatalogServers)
+      ).pipe(
+        Effect.mapError((cause) =>
+          toValidationError(
+            input.operation,
+            "Could not resolve and lease project MCP servers.",
+            cause,
           ),
-          Effect.provideService(Scope.Scope, sessionScope),
-          Effect.onError(() => closeProjectMcpLeaseScope(sessionScope)),
-        );
+        ),
+        Effect.provideService(Scope.Scope, sessionScope),
+        Effect.onError(() => closeProjectMcpLeaseScope(sessionScope)),
+      );
       const owner: ProjectMcpLeaseOwner = {
         scope: sessionScope,
         adapter: input.adapter,
@@ -489,6 +558,24 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           Exit.isSuccess(exit) ? Effect.void : cleanupOwner(input.sessionInput.threadId, owner),
         ),
       );
+      if (
+        durableCatalogSnapshot !== undefined &&
+        durableCatalogSnapshot.desiredRevision > durableCatalogSnapshot.appliedRevision &&
+        Option.isSome(orchestrationEngine)
+      ) {
+        yield* orchestrationEngine.value
+          .dispatch({
+            type: "thread.mcp-catalog.applied",
+            commandId: CommandId.make(
+              `server:mcp-catalog-applied:${input.sessionInput.threadId}:${durableCatalogSnapshot.catalogSessionId}:${durableCatalogSnapshot.desiredRevision}`,
+            ),
+            threadId: input.sessionInput.threadId,
+            mcpCatalogSessionId: durableCatalogSnapshot.catalogSessionId,
+            revision: durableCatalogSnapshot.desiredRevision,
+            appliedAt: yield* nowIso,
+          })
+          .pipe(Effect.ignoreCause({ log: true }));
+      }
       owner.nativeSessionId = nativeSessionId(started.resumeCursor);
       return started;
     },

@@ -165,6 +165,90 @@ it.effect("hydrates saved definitions and sessions once across websocket clients
         sessions: [],
       },
     });
-    expect((yield* service.listGlobal()).map((item) => item.name)).toEqual(["Weather", "Search"]);
+    expect((yield* service.listGlobal()).map((item) => item.name)).toEqual(["Weather"]);
+  }).pipe(Effect.provide(serviceLayer)),
+);
+
+it.effect("materialization is idempotent and generated session definition ids are unique", () =>
+  Effect.gen(function* () {
+    const service = yield* McpCatalogService.McpCatalogService;
+    const catalogSessionId = McpCatalogSessionId.make("catalog-session-1");
+    const first = yield* service.materializeSession({
+      threadId: ThreadId.make("thread-1"),
+      projectId: "project-1",
+      providerInstanceId: provider,
+      mcpCatalogSessionId: catalogSessionId,
+    });
+    const added = yield* service.addSession({
+      scope: "session",
+      scopeId: String(catalogSessionId),
+      expectedRevision: 0,
+      mcpCatalogSessionId: catalogSessionId,
+      threadId: ThreadId.make("thread-1"),
+      definition: {
+        name: "Weather",
+        transport,
+        enabled: true,
+        providerInstanceIds: [provider],
+      },
+    });
+    const second = yield* service.addSession({
+      scope: "session",
+      scopeId: String(catalogSessionId),
+      expectedRevision: 1,
+      mcpCatalogSessionId: catalogSessionId,
+      threadId: ThreadId.make("thread-1"),
+      definition: {
+        name: "Search",
+        transport,
+        enabled: true,
+        providerInstanceIds: [provider],
+      },
+    });
+    expect(first.desired).toHaveLength(0);
+    expect(new Set(second.desired.map((entry) => entry.definitionId)).size).toBe(2);
+    expect(new Set(second.desired.map((entry) => entry.logicalServerId)).size).toBe(2);
+
+    const rematerialized = yield* service.materializeSession({
+      threadId: ThreadId.make("thread-1"),
+      projectId: "project-1",
+      providerInstanceId: provider,
+      mcpCatalogSessionId: catalogSessionId,
+    });
+    expect(rematerialized.desired.map((entry) => entry.name)).toEqual(["Weather", "Search"]);
+    expect(rematerialized.desiredRevision).toBe(2);
+    expect(added.desired[0]?.definitionId).not.toBe(second.desired[1]?.definitionId);
+  }).pipe(Effect.provide(serviceLayer)),
+);
+
+it.effect("disposed sessions reject later mutations", () =>
+  Effect.gen(function* () {
+    const service = yield* McpCatalogService.McpCatalogService;
+    const snapshot = yield* service.materializeSession({
+      threadId: ThreadId.make("thread-1"),
+      projectId: "project-1",
+      providerInstanceId: provider,
+      mcpCatalogSessionId: McpCatalogSessionId.make("catalog-session-1"),
+    });
+    yield* service.disposeSession({
+      threadId: ThreadId.make("thread-1"),
+      mcpCatalogSessionId: snapshot.catalogSessionId,
+    });
+    const error = yield* service
+      .addSession({
+        scope: "session",
+        scopeId: String(snapshot.catalogSessionId),
+        expectedRevision: 0,
+        mcpCatalogSessionId: snapshot.catalogSessionId,
+        threadId: ThreadId.make("thread-1"),
+        definition: {
+          name: "Weather",
+          transport,
+          enabled: true,
+          providerInstanceIds: [provider],
+        },
+      })
+      .pipe(Effect.flip);
+    expect(error).toBeInstanceOf(McpCatalogStaleSessionError);
   }).pipe(Effect.provide(serviceLayer)),
 );

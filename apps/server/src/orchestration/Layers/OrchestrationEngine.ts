@@ -75,6 +75,9 @@ function commandToAggregateRef(command: OrchestrationCommand): {
       };
     case "project.mcp-override.upsert":
     case "project.mcp-override.remove":
+    case "project.mcp-definition.create":
+    case "project.mcp-definition.update":
+    case "project.mcp-definition.remove":
     case "project.create":
     case "project.meta.update":
     case "project.delete":

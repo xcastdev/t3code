@@ -443,7 +443,13 @@ const make = Effect.gen(function* () {
           : server.auxiliary,
     } satisfies ServerSecrets;
     yield* persistManifest(serverSecretsWith(manifest, operation.serverId, next));
-    yield* cleanupRetired(operation.serverId);
+    // Catalog replacements may still be referenced by a durable session
+    // baseline/desired snapshot. The catalog reconciliation pass owns
+    // retirement once it has seen every reference; auxiliary operations have
+    // no catalog replacement and can be cleaned immediately.
+    if (operation.kind === "auxiliary") {
+      yield* cleanupRetired(operation.serverId);
+    }
     const { [operationId]: _removed, ...operations } = (yield* Ref.get(journals)).operations;
     yield* persistJournal({ version: 1, operations });
   });
@@ -958,13 +964,28 @@ const make = Effect.gen(function* () {
   const reconcile: ProjectMcpSecretStoreShape["reconcile"] = (catalog) =>
     mutex.withPermits(1)(
       Effect.gen(function* () {
-        const currentByServer = new Map(catalog.map((server) => [server.id, server] as const));
+        const currentByServer = new Map<McpServerId, ReadonlyArray<ProjectMcpTransport>>();
+        for (const server of catalog) {
+          if (server.transport !== undefined) {
+            currentByServer.set(server.id, [
+              ...(currentByServer.get(server.id) ?? []),
+              server.transport,
+            ]);
+          } else if (!currentByServer.has(server.id)) {
+            currentByServer.set(server.id, []);
+          }
+        }
+        const currentCredentialIds = (
+          serverId: McpServerId,
+        ): ReadonlyArray<ProjectMcpCredentialIdType> =>
+          unique(
+            (currentByServer.get(serverId) ?? []).flatMap((transport) => credentialIds(transport)),
+          );
         for (const [operationId, operation] of Object.entries(
           (yield* Ref.get(journals)).operations,
         )) {
           const current = currentByServer.get(operation.serverId);
-          const currentIds =
-            current?.transport === undefined ? [] : credentialIds(current.transport);
+          const currentIds = currentCredentialIds(operation.serverId);
           if (
             operation.kind === "auxiliary"
               ? current !== undefined
@@ -979,8 +1000,7 @@ const make = Effect.gen(function* () {
         for (const [serverId, server] of Object.entries((yield* Ref.get(manifests)).servers)) {
           const typedServerId = McpServerId.make(serverId);
           const current = currentByServer.get(typedServerId);
-          const currentIds =
-            current?.transport === undefined ? [] : credentialIds(current.transport);
+          const currentIds = currentCredentialIds(typedServerId);
           const retired = unique([
             ...server.retired,
             ...server.credentials.filter((id) => !currentIds.includes(id)),
@@ -988,7 +1008,7 @@ const make = Effect.gen(function* () {
             ((yield* Ref.get(oauthStateLeaseCounts)).get(typedServerId) ?? 0) === 0
               ? server.auxiliary
               : []),
-          ]);
+          ]).filter((id) => !currentIds.includes(id));
           const retainedOAuthState =
             current === undefined &&
             ((yield* Ref.get(oauthStateLeaseCounts)).get(typedServerId) ?? 0) > 0;

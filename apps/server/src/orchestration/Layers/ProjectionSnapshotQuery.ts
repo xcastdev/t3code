@@ -208,6 +208,11 @@ const ProjectionMcpCatalogOverrideDbRowSchema = Schema.Struct({
   override: Schema.fromJsonString(McpCatalogOverride),
   revision: NonNegativeInt,
 });
+const ProjectionMcpCatalogRevisionDbRowSchema = Schema.Struct({
+  scopeType: McpCatalogScope,
+  scopeId: Schema.String,
+  revision: NonNegativeInt,
+});
 const ProjectionMcpCatalogSessionDbRowSchema = Schema.Struct({
   catalogSessionId: McpCatalogSessionId,
   threadId: ThreadId,
@@ -217,6 +222,10 @@ const ProjectionMcpCatalogSessionDbRowSchema = Schema.Struct({
   desiredRevision: NonNegativeInt,
   appliedRevision: NonNegativeInt,
   applicationError: Schema.NullOr(Schema.String),
+  applicationStatus: Schema.NullOr(Schema.Literals(["applied", "failed"])),
+  applicationRevision: Schema.NullOr(NonNegativeInt),
+  applicationAppliedAt: Schema.NullOr(IsoDateTime),
+  applicationFailedAt: Schema.NullOr(IsoDateTime),
   disposedAt: Schema.NullOr(IsoDateTime),
 });
 const ProjectionThreadIdLookupRowSchema = Schema.Struct({
@@ -751,9 +760,27 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           desired_revision AS "desiredRevision",
           applied_revision AS "appliedRevision",
           application_error AS "applicationError",
+          application_status AS "applicationStatus",
+          application_revision AS "applicationRevision",
+          application_applied_at AS "applicationAppliedAt",
+          application_failed_at AS "applicationFailedAt",
           disposed_at AS "disposedAt"
         FROM projection_mcp_catalog_sessions
         ORDER BY thread_id ASC, catalog_session_id ASC
+      `,
+  });
+
+  const listMcpCatalogRevisionRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionMcpCatalogRevisionDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          scope_type AS "scopeType",
+          scope_id AS "scopeId",
+          revision
+        FROM projection_mcp_catalog_revisions
+        ORDER BY scope_type ASC, scope_id ASC
       `,
   });
 
@@ -1945,6 +1972,14 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
+          listMcpCatalogRevisionRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogRevisions:query",
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogRevisions:decodeRows",
+              ),
+            ),
+          ),
           listThreadRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
@@ -1995,6 +2030,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             mcpCatalogDefinitionRows,
             mcpCatalogOverrideRows,
             mcpCatalogSessionRows,
+            mcpCatalogRevisionRows,
             threadRows,
             proposedPlanRows,
             sessionRows,
@@ -2038,6 +2074,11 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   },
                 }));
               const projectRevisions = new Map<string, number>();
+              for (const row of mcpCatalogRevisionRows) {
+                if (row.scopeType === "project") {
+                  projectRevisions.set(row.scopeId, row.revision);
+                }
+              }
               for (const row of mcpCatalogDefinitionRows) {
                 if (row.scopeType === "project") {
                   projectRevisions.set(
@@ -2060,6 +2101,29 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 desired: row.desired,
                 desiredRevision: row.desiredRevision,
                 appliedRevision: row.appliedRevision,
+                ...(row.applicationStatus === "applied" &&
+                row.applicationRevision !== null &&
+                row.applicationAppliedAt !== null
+                  ? {
+                      application: {
+                        status: "applied" as const,
+                        revision: row.applicationRevision,
+                        appliedAt: row.applicationAppliedAt,
+                      },
+                    }
+                  : row.applicationStatus === "failed" &&
+                      row.applicationRevision !== null &&
+                      row.applicationFailedAt !== null &&
+                      row.applicationError !== null
+                    ? {
+                        application: {
+                          status: "failed" as const,
+                          revision: row.applicationRevision,
+                          failedAt: row.applicationFailedAt,
+                          reason: row.applicationError,
+                        },
+                      }
+                    : {}),
                 ...(row.disposedAt === null ? {} : { disposedAt: row.disposedAt }),
               }));
 
@@ -2198,17 +2262,24 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 projectMcpServers,
                 ...(mcpCatalogDefinitionRows.length === 0 &&
                 mcpCatalogOverrideRows.length === 0 &&
-                mcpCatalogSessionRows.length === 0
+                mcpCatalogSessionRows.length === 0 &&
+                mcpCatalogRevisionRows.length === 0
                   ? {}
                   : {
                       mcpCatalog: {
                         environmentId: EnvironmentId.make(
-                          globalDefinitions[0]?.scopeId ?? "unknown",
+                          mcpCatalogRevisionRows.find((row) => row.scopeType === "global")
+                            ?.scopeId ??
+                            globalDefinitions[0]?.scopeId ??
+                            "unknown",
                         ),
-                        globalRevision: globalDefinitions.reduce(
-                          (revision, definition) => Math.max(revision, definition.revision),
-                          0,
-                        ),
+                        globalRevision:
+                          mcpCatalogRevisionRows.find((row) => row.scopeType === "global")
+                            ?.revision ??
+                          globalDefinitions.reduce(
+                            (revision, definition) => Math.max(revision, definition.revision),
+                            0,
+                          ),
                         globalDefinitions,
                         projectRevisions: [...projectRevisions].map(([projectId, revision]) => ({
                           projectId: ProjectId.make(projectId),

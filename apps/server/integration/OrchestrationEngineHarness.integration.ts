@@ -303,6 +303,12 @@ export const makeOrchestrationIntegrationHarness = (
           resolveSecret: () => undefined,
           oauthStateLeases: new Map(),
         }),
+      acquireResolvedSessionLease: () =>
+        Effect.succeed({
+          servers: [],
+          resolveSecret: () => undefined,
+          oauthStateLeases: new Map(),
+        }),
     });
     const providerLayer = useRealCodex
       ? makeProviderServiceLive().pipe(

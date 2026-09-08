@@ -4,6 +4,7 @@ import {
   McpCatalogOverride,
   McpCatalogSessionId,
   McpCatalogSnapshot,
+  McpCatalogOperationError,
   McpCatalogStaleRevisionError,
   McpCatalogStaleSessionError,
   McpDefinitionId,
@@ -24,6 +25,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 
 import {
   applyMcpCatalogOverrides,
@@ -64,11 +66,7 @@ type McpCatalogHydrationReadModel = {
 };
 
 export interface McpCatalogServiceShape {
-  /**
-   * Seeds the process-local mutation cache from the durable projection. The
-   * service is deliberately hydrated once: subsequent calls are no-ops so a
-   * second websocket cannot overwrite mutations made by the first client.
-   */
+  /** Refreshes the process-local read cache from the durable projection. */
   readonly hydrate: (readModel: McpCatalogHydrationReadModel) => Effect.Effect<void>;
   readonly listGlobal: () => Effect.Effect<ReadonlyArray<CatalogDefinition>>;
   readonly listProject: (
@@ -132,6 +130,8 @@ export class McpCatalogService extends Context.Service<McpCatalogService, McpCat
   "t3/mcp/McpCatalogService",
 ) {}
 
+const decodePersistedTransport = Schema.decodeUnknownEffect(ProjectMcpTransport);
+
 const makeDefinition = (
   draft: McpCatalogDefinitionDraft,
   scope: CatalogDefinition["scope"],
@@ -139,19 +139,27 @@ const makeDefinition = (
   logicalServerId: McpServerId,
   definitionId: McpDefinitionId,
   revision: number,
-): CatalogDefinition => ({
-  definitionId,
-  logicalServerId,
-  scope,
-  scopeId,
-  name: draft.name,
-  // The catalog service accepts already-prepared transports. Secret-store
-  // preparation deliberately remains a boundary above this pure state layer.
-  transport: draft.transport as ProjectMcpTransport,
-  enabled: draft.enabled,
-  providerInstanceIds: draft.providerInstanceIds,
-  revision,
-});
+): Effect.Effect<CatalogDefinition, McpCatalogOperationError> =>
+  decodePersistedTransport(draft.transport).pipe(
+    Effect.mapError(
+      () =>
+        new McpCatalogOperationError({
+          message:
+            "MCP credential drafts must be prepared by the secret store before entering the catalog.",
+        }),
+    ),
+    Effect.map((transport) => ({
+      definitionId,
+      logicalServerId,
+      scope,
+      scopeId,
+      name: draft.name,
+      transport,
+      enabled: draft.enabled,
+      providerInstanceIds: draft.providerInstanceIds,
+      revision,
+    })),
+  );
 
 const nextId = (state: CatalogState, prefix: string): [string, CatalogState] => [
   `${prefix}-${state.nextId}`,
@@ -196,11 +204,15 @@ const makeCatalogService = Effect.gen(function* () {
 
   const hydrate: McpCatalogServiceShape["hydrate"] = (readModel) =>
     update((state) => {
-      if (state.hydrated || readModel.mcpCatalog === undefined) {
-        return [undefined, { ...state, hydrated: true }] as const;
-      }
-
-      const catalog = readModel.mcpCatalog;
+      const catalog = readModel.mcpCatalog ?? {
+        environmentId: "unknown",
+        globalRevision: 0,
+        globalDefinitions: [],
+        projectRevisions: [],
+        projectDefinitions: [],
+        projectOverrides: [],
+        sessions: [],
+      };
       const projectDefinitions = new Map<string, ReadonlyArray<CatalogDefinition>>();
       for (const entry of catalog.projectDefinitions) {
         projectDefinitions.set(entry.projectId, [
@@ -289,7 +301,7 @@ const makeCatalogService = Effect.gen(function* () {
       const revision = yield* withRevision(state, "global", input.scopeId, input.expectedRevision);
       const [logicalId, afterId] = nextId(state, "mcp-server");
       const [definitionId, afterDefinitionId] = nextId(afterId, "mcp-definition");
-      const definition = makeDefinition(
+      const definition = yield* makeDefinition(
         input.definition,
         "global",
         input.scopeId,
@@ -318,7 +330,7 @@ const makeCatalogService = Effect.gen(function* () {
       if (existing === undefined)
         return yield* Effect.die(new Error("Global MCP definition not found"));
       const [definitionId, afterId] = nextId(state, "mcp-definition");
-      const definition = makeDefinition(
+      const definition = yield* makeDefinition(
         input.definition,
         "global",
         input.scopeId,
@@ -361,7 +373,7 @@ const makeCatalogService = Effect.gen(function* () {
       const revision = yield* withRevision(state, "project", input.scopeId, input.expectedRevision);
       const [logicalId, afterId] = nextId(state, "mcp-server");
       const [definitionId, afterDefinitionId] = nextId(afterId, "mcp-definition");
-      const definition = makeDefinition(
+      const definition = yield* makeDefinition(
         input.definition,
         "project",
         input.scopeId,
@@ -391,7 +403,7 @@ const makeCatalogService = Effect.gen(function* () {
       if (existing === undefined)
         return yield* Effect.die(new Error("Project MCP definition not found"));
       const [definitionId, afterId] = nextId(state, "mcp-definition");
-      const definition = makeDefinition(
+      const definition = yield* makeDefinition(
         input.definition,
         "project",
         input.scopeId,
@@ -476,6 +488,23 @@ const makeCatalogService = Effect.gen(function* () {
   const materializeSession: McpCatalogServiceShape["materializeSession"] = (input) =>
     Effect.gen(function* () {
       const state = yield* read;
+      const requestedSessionId = input.mcpCatalogSessionId;
+      if (requestedSessionId !== undefined) {
+        const existing = state.sessions.get(String(requestedSessionId));
+        if (existing !== undefined) {
+          if (
+            existing.snapshot.threadId !== input.threadId ||
+            existing.snapshot.disposedAt !== undefined
+          ) {
+            return yield* new McpCatalogStaleSessionError({
+              threadId: input.threadId as never,
+              requestedSessionId,
+              activeSessionId: existing.snapshot.catalogSessionId,
+            });
+          }
+          return existing.snapshot;
+        }
+      }
       const projectId = input.projectId;
       const baseline = [
         ...applyMcpCatalogOverrides(
@@ -485,7 +514,7 @@ const makeCatalogService = Effect.gen(function* () {
         ...(state.projectDefinitions.get(projectId) ?? []),
       ];
       const sessionId =
-        input.mcpCatalogSessionId ?? McpCatalogSessionId.make(`catalog-session-${state.nextId}`);
+        requestedSessionId ?? McpCatalogSessionId.make(`catalog-session-${state.nextId}`);
       const snapshot: McpCatalogSnapshot = {
         catalogSessionId: sessionId,
         threadId: input.threadId as never,
@@ -519,7 +548,8 @@ const makeCatalogService = Effect.gen(function* () {
     const session = state.sessions.get(String(sessionId));
     if (
       session === undefined ||
-      (threadId !== undefined && session.snapshot.threadId !== threadId)
+      (threadId !== undefined && session.snapshot.threadId !== threadId) ||
+      session?.snapshot.disposedAt !== undefined
     ) {
       return Effect.fail(
         new McpCatalogStaleSessionError({
@@ -540,7 +570,10 @@ const makeCatalogService = Effect.gen(function* () {
 
   const mutateSession = (
     input: McpCatalogSessionMutationInput,
-    mutate: (session: SessionState, state: CatalogState) => SessionState,
+    mutate: (
+      session: SessionState,
+      state: CatalogState,
+    ) => Effect.Effect<readonly [SessionState, CatalogState], McpCatalogOperationError>,
   ) =>
     Effect.gen(function* () {
       const state = yield* read;
@@ -552,7 +585,7 @@ const makeCatalogService = Effect.gen(function* () {
           expectedRevision: input.expectedRevision,
           actualRevision: session.snapshot.desiredRevision,
         });
-      const next = mutate(session, state);
+      const [next, allocatedState] = yield* mutate(session, state);
       const nextSnapshot = {
         ...next.snapshot,
         desiredRevision: session.snapshot.desiredRevision + 1,
@@ -562,70 +595,88 @@ const makeCatalogService = Effect.gen(function* () {
       yield* update((current) => [
         nextSnapshot,
         {
-          ...current,
-          sessions: new Map(current.sessions).set(String(input.mcpCatalogSessionId), nextSession),
+          ...allocatedState,
+          sessions: new Map(allocatedState.sessions).set(
+            String(input.mcpCatalogSessionId),
+            nextSession,
+          ),
         },
       ]);
       return nextSnapshot;
     });
 
   const addSession: McpCatalogServiceShape["addSession"] = (input) =>
-    mutateSession(input, (session, state) => {
-      const [logicalId, afterId] = nextId(state, "mcp-server");
-      const [definitionId] = nextId(afterId, "mcp-definition");
-      const definition = makeDefinition(
-        input.definition,
-        "session",
-        String(input.mcpCatalogSessionId),
-        input.logicalServerId ?? McpServerId.make(logicalId),
-        McpDefinitionId.make(definitionId),
-        session.snapshot.desiredRevision + 1,
-      );
-      return {
-        ...session,
-        sessionDefinitions: [...session.sessionDefinitions, definition],
-        snapshot: { ...session.snapshot, desired: [...session.snapshot.desired, definition] },
-      };
-    });
+    mutateSession(input, (session, state) =>
+      Effect.gen(function* () {
+        const [logicalId, afterId] = nextId(state, "mcp-server");
+        const [definitionId, allocatedState] = nextId(afterId, "mcp-definition");
+        const definition = yield* makeDefinition(
+          input.definition,
+          "session",
+          String(input.mcpCatalogSessionId),
+          input.logicalServerId ?? McpServerId.make(logicalId),
+          McpDefinitionId.make(definitionId),
+          session.snapshot.desiredRevision + 1,
+        );
+        return [
+          {
+            ...session,
+            sessionDefinitions: [...session.sessionDefinitions, definition],
+            snapshot: { ...session.snapshot, desired: [...session.snapshot.desired, definition] },
+          },
+          allocatedState,
+        ] as const;
+      }),
+    );
 
   const updateSession: McpCatalogServiceShape["updateSession"] = (input) =>
-    mutateSession(input, (session) => {
-      const existing = session.snapshot.desired.find(
-        (item) => item.logicalServerId === input.logicalServerId,
-      );
-      if (existing === undefined) return session;
-      const definition = makeDefinition(
-        input.definition,
-        existing.scope === "session" ? "session" : existing.scope,
-        existing.scopeId,
-        existing.logicalServerId,
-        existing.definitionId,
-        existing.revision + 1,
-      );
-      return {
-        ...session,
-        snapshot: {
-          ...session.snapshot,
-          desired: session.snapshot.desired.map((item) =>
-            item.logicalServerId === definition.logicalServerId ? definition : item,
-          ),
-        },
-      };
-    });
+    mutateSession(input, (session, state) =>
+      Effect.gen(function* () {
+        const existing = session.snapshot.desired.find(
+          (item) => item.logicalServerId === input.logicalServerId,
+        );
+        if (existing === undefined) return [session, state] as const;
+        const definition = yield* makeDefinition(
+          input.definition,
+          existing.scope === "session" ? "session" : existing.scope,
+          existing.scopeId,
+          existing.logicalServerId,
+          existing.definitionId,
+          existing.revision + 1,
+        );
+        return [
+          {
+            ...session,
+            snapshot: {
+              ...session.snapshot,
+              desired: session.snapshot.desired.map((item) =>
+                item.logicalServerId === definition.logicalServerId ? definition : item,
+              ),
+            },
+          },
+          state,
+        ] as const;
+      }),
+    );
 
   const removeSession: McpCatalogServiceShape["removeSession"] = (input) =>
-    mutateSession(input, (session) => ({
-      ...session,
-      sessionDefinitions: session.sessionDefinitions.filter(
-        (item) => item.logicalServerId !== input.logicalServerId,
-      ),
-      snapshot: {
-        ...session.snapshot,
-        desired: session.snapshot.desired.filter(
-          (item) => item.logicalServerId !== input.logicalServerId,
-        ),
-      },
-    }));
+    mutateSession(input, (session, state) =>
+      Effect.succeed([
+        {
+          ...session,
+          sessionDefinitions: session.sessionDefinitions.filter(
+            (item) => item.logicalServerId !== input.logicalServerId,
+          ),
+          snapshot: {
+            ...session.snapshot,
+            desired: session.snapshot.desired.filter(
+              (item) => item.logicalServerId !== input.logicalServerId,
+            ),
+          },
+        },
+        state,
+      ] as const),
+    );
 
   const resetSession: McpCatalogServiceShape["resetSession"] = (input) =>
     Effect.gen(function* () {

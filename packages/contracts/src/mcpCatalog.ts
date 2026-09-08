@@ -191,6 +191,11 @@ export class McpCatalogUnsupportedProviderError extends Schema.TaggedErrorClass<
   },
 ) {}
 
+export class McpCatalogOperationError extends Schema.TaggedErrorClass<McpCatalogOperationError>()(
+  "McpCatalogOperationError",
+  { message: Schema.String },
+) {}
+
 export const McpCatalogListInput = Schema.Struct({
   scope: McpCatalogScope,
   scopeId: TrimmedNonEmptyString,
@@ -272,6 +277,7 @@ export const McpCatalogMutationError = Schema.Union([
   McpCatalogStaleRevisionError,
   McpCatalogStaleSessionError,
   McpCatalogUnsupportedProviderError,
+  McpCatalogOperationError,
 ]);
 export type McpCatalogMutationError = typeof McpCatalogMutationError.Type;
 

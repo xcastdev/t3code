@@ -2,8 +2,10 @@ import {
   CheckpointRef,
   CommandId,
   CorrelationId,
+  EnvironmentId,
   EventId,
   MessageId,
+  McpDefinitionId,
   McpServerId,
   ProjectId,
   ThreadId,
@@ -18,6 +20,7 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
+import * as PubSub from "effect/PubSub";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
@@ -3105,6 +3108,154 @@ engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
         WHERE projector = 'projection.projects'
       `;
       assert.deepEqual(projectorRows, [{ lastAppliedSequence: 1 }]);
+    }),
+  );
+
+  it.effect("reconstructs replacement and deletion-only revisions for two subscribers", () =>
+    Effect.gen(function* () {
+      const engine = yield* OrchestrationEngineService;
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      const environmentId = EnvironmentId.make("environment-catalog-parity");
+      const projectId = ProjectId.make("project-catalog-parity");
+      const logicalServerId = McpServerId.make("server-catalog-parity");
+      const firstDefinition = {
+        definitionId: McpDefinitionId.make("definition-catalog-parity-1"),
+        logicalServerId,
+        scope: "global" as const,
+        scopeId: environmentId,
+        name: "Catalog server",
+        transport: {
+          type: "streamable-http" as const,
+          url: "https://catalog-parity.example/mcp",
+          headers: [],
+          authorization: { type: "none" as const },
+        },
+        enabled: true,
+        providerInstanceIds: [ProviderInstanceId.make("codex")],
+        revision: 1,
+      };
+      const replacementDefinition = {
+        ...firstDefinition,
+        definitionId: McpDefinitionId.make("definition-catalog-parity-2"),
+        name: "Catalog replacement",
+        revision: 2,
+      };
+      const projectLogicalServerId = McpServerId.make("project-server-catalog-parity");
+      const projectDefinition = {
+        ...firstDefinition,
+        definitionId: McpDefinitionId.make("definition-project-catalog-parity-1"),
+        logicalServerId: projectLogicalServerId,
+        scope: "project" as const,
+        scopeId: projectId,
+        name: "Project catalog server",
+        revision: 1,
+      };
+      const projectReplacementDefinition = {
+        ...projectDefinition,
+        definitionId: McpDefinitionId.make("definition-project-catalog-parity-2"),
+        name: "Project catalog replacement",
+        revision: 2,
+      };
+      const firstSubscriber = yield* engine.subscribeDomainEvents;
+      const secondSubscriber = yield* engine.subscribeDomainEvents;
+
+      yield* engine.dispatch({
+        type: "environment.mcp-definition.create",
+        commandId: CommandId.make("cmd-catalog-parity-create"),
+        environmentId,
+        definition: firstDefinition,
+        expectedRevision: 0,
+        createdAt: "2026-01-01T00:00:01.000Z",
+      });
+      const [firstEvent, secondEvent] = yield* Effect.all([
+        PubSub.take(firstSubscriber),
+        PubSub.take(secondSubscriber),
+      ]);
+      assert.equal(firstEvent.type, "environment.mcp-definition.created");
+      assert.equal(secondEvent.type, "environment.mcp-definition.created");
+
+      yield* engine.dispatch({
+        type: "environment.mcp-definition.update",
+        commandId: CommandId.make("cmd-catalog-parity-update"),
+        environmentId,
+        definition: replacementDefinition,
+        expectedRevision: 1,
+        updatedAt: "2026-01-01T00:00:02.000Z",
+      });
+      yield* engine.dispatch({
+        type: "environment.mcp-definition.remove",
+        commandId: CommandId.make("cmd-catalog-parity-remove"),
+        environmentId,
+        logicalServerId,
+        expectedRevision: 2,
+        removedAt: "2026-01-01T00:00:03.000Z",
+      });
+
+      yield* engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("cmd-project-catalog-parity"),
+        projectId,
+        title: "Catalog parity",
+        workspaceRoot: "/tmp/project-catalog-parity",
+        defaultModelSelection: {
+          instanceId: ProviderInstanceId.make("codex"),
+          model: "gpt-5-codex",
+        },
+        createdAt: "2026-01-01T00:00:04.000Z",
+      });
+      yield* engine.dispatch({
+        type: "project.mcp-definition.create",
+        commandId: CommandId.make("cmd-project-catalog-definition-create"),
+        projectId,
+        definition: projectDefinition,
+        expectedRevision: 0,
+        createdAt: "2026-01-01T00:00:05.000Z",
+      });
+      yield* engine.dispatch({
+        type: "project.mcp-definition.update",
+        commandId: CommandId.make("cmd-project-catalog-definition-update"),
+        projectId,
+        definition: projectReplacementDefinition,
+        expectedRevision: 1,
+        updatedAt: "2026-01-01T00:00:06.000Z",
+      });
+      yield* engine.dispatch({
+        type: "project.mcp-definition.remove",
+        commandId: CommandId.make("cmd-project-catalog-definition-remove"),
+        projectId,
+        logicalServerId: projectLogicalServerId,
+        expectedRevision: 2,
+        removedAt: "2026-01-01T00:00:07.000Z",
+      });
+
+      const readModel = yield* snapshotQuery.getCommandReadModel();
+      assert.deepEqual(readModel.mcpCatalog, {
+        environmentId,
+        globalRevision: 3,
+        globalDefinitions: [],
+        projectRevisions: [{ projectId, revision: 3 }],
+        projectDefinitions: [],
+        projectOverrides: [],
+        sessions: [],
+      });
+      const revisionRows = yield* sql<{
+        readonly scopeType: string;
+        readonly scopeId: string;
+        readonly revision: number;
+      }>`
+        SELECT
+          scope_type AS "scopeType",
+          scope_id AS "scopeId",
+          revision
+        FROM projection_mcp_catalog_revisions
+        WHERE (scope_type = 'global' AND scope_id = ${environmentId})
+           OR (scope_type = 'project' AND scope_id = ${projectId})
+      `;
+      assert.deepEqual(revisionRows, [
+        { scopeType: "global", scopeId: environmentId, revision: 3 },
+        { scopeType: "project", scopeId: projectId, revision: 3 },
+      ]);
     }),
   );
 

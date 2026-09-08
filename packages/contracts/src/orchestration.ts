@@ -818,6 +818,33 @@ const EnvironmentMcpDefinitionRemoveCommand = Schema.Struct({
   removedAt: IsoDateTime,
 });
 
+const ProjectMcpDefinitionCreateCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-definition.create"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  definition: McpCatalogDefinition,
+  expectedRevision: NonNegativeInt,
+  createdAt: IsoDateTime,
+});
+
+const ProjectMcpDefinitionUpdateCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-definition.update"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  definition: McpCatalogDefinition,
+  expectedRevision: NonNegativeInt,
+  updatedAt: IsoDateTime,
+});
+
+const ProjectMcpDefinitionRemoveCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-definition.remove"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  logicalServerId: McpServerId,
+  expectedRevision: NonNegativeInt,
+  removedAt: IsoDateTime,
+});
+
 const ProjectMcpOverrideUpsertCommand = Schema.Struct({
   type: Schema.Literal("project.mcp-override.upsert"),
   commandId: CommandId,
@@ -869,6 +896,7 @@ const ThreadMcpCatalogDisposeCommand = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
   mcpCatalogSessionId: McpCatalogSessionId,
+  revision: NonNegativeInt,
   disposedAt: IsoDateTime,
 });
 
@@ -1271,6 +1299,9 @@ const InternalOrchestrationCommand = Schema.Union([
   EnvironmentMcpDefinitionCreateCommand,
   EnvironmentMcpDefinitionUpdateCommand,
   EnvironmentMcpDefinitionRemoveCommand,
+  ProjectMcpDefinitionCreateCommand,
+  ProjectMcpDefinitionUpdateCommand,
+  ProjectMcpDefinitionRemoveCommand,
   ProjectMcpOverrideUpsertCommand,
   ProjectMcpOverrideRemoveCommand,
   ThreadMcpCatalogInitializeCommand,
@@ -1309,6 +1340,9 @@ export const OrchestrationEventType = Schema.Literals([
   "environment.mcp-definition.created",
   "environment.mcp-definition.updated",
   "environment.mcp-definition.removed",
+  "project.mcp-definition.created",
+  "project.mcp-definition.updated",
+  "project.mcp-definition.removed",
   "project.mcp-override.upserted",
   "project.mcp-override.removed",
   "thread.created",
@@ -1420,6 +1454,28 @@ export const EnvironmentMcpDefinitionRemovedPayload = Schema.Struct({
   removedAt: IsoDateTime,
 });
 
+export const ProjectMcpDefinitionCreatedPayload = Schema.Struct({
+  projectId: ProjectId,
+  definition: McpCatalogDefinition,
+  revision: NonNegativeInt,
+  createdAt: IsoDateTime,
+});
+
+export const ProjectMcpDefinitionUpdatedPayload = Schema.Struct({
+  projectId: ProjectId,
+  definition: McpCatalogDefinition,
+  revision: NonNegativeInt,
+  updatedAt: IsoDateTime,
+});
+
+export const ProjectMcpDefinitionRemovedPayload = Schema.Struct({
+  projectId: ProjectId,
+  logicalServerId: McpServerId,
+  definitionId: Schema.optional(McpDefinitionId),
+  revision: NonNegativeInt,
+  removedAt: IsoDateTime,
+});
+
 export const ProjectMcpOverrideUpsertedPayload = Schema.Struct({
   projectId: ProjectId,
   override: McpCatalogOverride,
@@ -1456,6 +1512,7 @@ export const ThreadMcpCatalogResetPayload = Schema.Struct({
 export const ThreadMcpCatalogDisposedPayload = Schema.Struct({
   threadId: ThreadId,
   mcpCatalogSessionId: McpCatalogSessionId,
+  revision: NonNegativeInt,
   disposedAt: IsoDateTime,
 });
 
@@ -1752,6 +1809,21 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("environment.mcp-definition.removed"),
     payload: EnvironmentMcpDefinitionRemovedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-definition.created"),
+    payload: ProjectMcpDefinitionCreatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-definition.updated"),
+    payload: ProjectMcpDefinitionUpdatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-definition.removed"),
+    payload: ProjectMcpDefinitionRemovedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,
