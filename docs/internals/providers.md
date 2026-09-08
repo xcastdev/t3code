@@ -85,8 +85,15 @@ OpenCode can therefore continue an active turn while T3 Code is offline. A manag
 recovers the same upstream session is updated in place, preserving its process, event pump, and
 pending requests. An external context targeting the same upstream session is detached in the same
 way, so changing runtime mode or reconnecting does not abort the turn or settle its pending
-requests. A replacement that targets a different upstream session still terminates the old
-context.
+requests. External recovery waits until the candidate connects before reasserting permissions. If
+that update fails, the candidate is cleaned up and the incumbent remains attached. T3 Code does not
+roll back an ambiguous external permission update because another external owner may have changed
+the rules concurrently. A replacement that targets a different upstream session still terminates
+the old context.
+
+An unpublished replacement that fails before handoff still closes its own resources, but it does not
+emit runtime or session lifecycle events for the incumbent thread. Initial startup and failures from
+published contexts retain their terminal events.
 
 An explicit `stopSession` with an active turn calls `session.abort` and confirms the result before it
 closes the adapter context. A matching `session.error` with `MessageAbortedError`, or a

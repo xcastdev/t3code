@@ -2192,6 +2192,8 @@ export function makeOpenCodeAdapter(
       if (yield* Ref.getAndSet(context.stopped, true)) {
         return;
       }
+      const isUnpublishedReplacement =
+        context.unpublished && sessions.get(context.session.threadId) !== context;
       yield* Deferred.fail(
         context.firstConnection,
         new ProviderAdapterRequestError({
@@ -2206,7 +2208,7 @@ export function makeOpenCodeAdapter(
       );
       context.promptAdmission = undefined;
       const turnId = context.activeTurnId;
-      if (turnId !== undefined && context.recovery !== undefined) {
+      if (!isUnpublishedReplacement && turnId !== undefined && context.recovery !== undefined) {
         context.activeTurnId = undefined;
         context.activeAgent = undefined;
         context.activeVariant = undefined;
@@ -2228,6 +2230,16 @@ export function makeOpenCodeAdapter(
         }).pipe(Effect.ignore);
       }
       deleteContextIfCurrent(context);
+      if (isUnpublishedReplacement) {
+        yield* settlePendingOpenCodeRequests(context).pipe(Effect.ignore);
+        // A replacement that never became current must not publish lifecycle
+        // events for the incumbent thread. It still owns its own cleanup.
+        if (!context.server.external) {
+          yield* abortOpenCodeSessionForTeardown(context);
+        }
+        yield* Scope.close(context.sessionScope, Exit.void);
+        return;
+      }
       // Emit lifecycle events BEFORE tearing down the scope. Both call sites
       // run this inside a fiber forked via `Effect.forkIn(context.sessionScope)`;
       // closing that scope triggers the fiber-interrupt finalizer, so any
@@ -4082,16 +4094,15 @@ export function makeOpenCodeAdapter(
                     : undefined;
 
                 if (reusable) {
-                  // Resume skips `session.create`, so re-assert the ruleset —
-                  // a runtime-mode change would otherwise leave the session on
-                  // its original permissions.
-                  yield* runOpenCodeSdk("session.update", () =>
-                    client.session.update({
-                      sessionID: reusable.id,
-                      permission: buildOpenCodePermissionRules(input.runtimeMode),
-                    }),
-                  );
-                  return { openCodeSession: reusable, created: false, adopted: true };
+                  // Resume skips `session.create`. External sessions defer
+                  // the permission reassertion until the event stream proves
+                  // this candidate is ready to win the handoff.
+                  return {
+                    openCodeSession: reusable,
+                    created: false,
+                    adopted: true,
+                    permissionReassertionRequired: true,
+                  };
                 }
 
                 if (input.recovery) {
@@ -4132,7 +4143,12 @@ export function makeOpenCodeAdapter(
                       permission: buildOpenCodePermissionRules(input.runtimeMode),
                     }),
                   );
-                  return { openCodeSession: forked, created: true, adopted: false };
+                  return {
+                    openCodeSession: forked,
+                    created: true,
+                    adopted: false,
+                    permissionReassertionRequired: false,
+                  };
                 }
 
                 if (resumeSessionId) {
@@ -4152,7 +4168,12 @@ export function makeOpenCodeAdapter(
                     detail: "OpenCode session.create returned no session payload.",
                   });
                 }
-                return { openCodeSession: createdSession.data, created: true, adopted: false };
+                return {
+                  openCodeSession: createdSession.data,
+                  created: true,
+                  adopted: false,
+                  permissionReassertionRequired: false,
+                };
               }).pipe(Effect.onError(() => restoreMcpConfiguration(client, server)));
 
               return {
@@ -4162,6 +4183,7 @@ export function makeOpenCodeAdapter(
                 openCodeSession: resolved.openCodeSession,
                 created: resolved.created,
                 adopted: resolved.adopted,
+                permissionReassertionRequired: resolved.permissionReassertionRequired,
               };
             }).pipe(Effect.provideService(Scope.Scope, sessionScope)),
           );
@@ -4291,7 +4313,71 @@ export function makeOpenCodeAdapter(
           return (yield* awaitOpenCodeContextReady(raceWinner)).session;
         }
 
-        if (existing && raceWinner === existing && !(yield* Ref.get(existing.stopped))) {
+        if (started.permissionReassertionRequired) {
+          const currentOwner = sessions.get(input.threadId);
+          const candidateStopped = yield* Ref.get(context.stopped);
+          const existingStopped = existing ? yield* Ref.get(existing.stopped) : false;
+          const canReassertPermissions =
+            (!candidateStopped && existing === undefined && currentOwner === context) ||
+            (!candidateStopped &&
+              existing !== undefined &&
+              existing.server.external &&
+              isSameOpenCodeUpstreamSession(existing, context) &&
+              ((currentOwner === existing && !existingStopped) ||
+                (currentOwner === undefined && existingStopped)));
+
+          if (!canReassertPermissions) {
+            yield* cleanupStartingContext;
+            const winner = sessions.get(input.threadId);
+            if (winner && winner !== context) {
+              return (yield* awaitOpenCodeContextReady(winner)).session;
+            }
+            return yield* new ProviderAdapterSessionClosedError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+            });
+          }
+
+          yield* runOpenCodeSdk("session.update", () =>
+            context.client.session.update({
+              sessionID: context.openCodeSessionId,
+              permission: buildOpenCodePermissionRules(input.runtimeMode),
+            }),
+          ).pipe(
+            Effect.mapError(toRequestError),
+            Effect.onError(() => cleanupStartingContext.pipe(Effect.ignoreCause)),
+          );
+        }
+
+        if (yield* Ref.get(context.stopped)) {
+          yield* cleanupStartingContext;
+          const winner = sessions.get(input.threadId);
+          if (winner && winner !== context) {
+            return (yield* awaitOpenCodeContextReady(winner)).session;
+          }
+          return yield* new ProviderAdapterSessionClosedError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+          });
+        }
+
+        const handoffWinner = sessions.get(input.threadId);
+        if (existing === undefined && handoffWinner !== context) {
+          yield* cleanupStartingContext;
+          if (handoffWinner) {
+            return (yield* awaitOpenCodeContextReady(handoffWinner)).session;
+          }
+          return yield* new ProviderAdapterSessionClosedError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+          });
+        }
+        if (handoffWinner && handoffWinner !== existing && handoffWinner !== context) {
+          yield* cleanupStartingContext;
+          return (yield* awaitOpenCodeContextReady(handoffWinner)).session;
+        }
+
+        if (existing && handoffWinner === existing && !(yield* Ref.get(existing.stopped))) {
           const handoff = isSameOpenCodeUpstreamSession(existing, context)
             ? detachExternalOpenCodeContext(existing)
             : terminateOpenCodeContext(existing);
@@ -4300,7 +4386,7 @@ export function makeOpenCodeAdapter(
             yield* cleanupStartingContext;
             return yield* Effect.failCause(handoffExit.cause);
           }
-        } else if (existing && raceWinner === existing) {
+        } else if (existing && handoffWinner === existing) {
           deleteContextIfCurrent(existing);
         }
 
