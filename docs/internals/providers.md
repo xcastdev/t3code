@@ -105,6 +105,14 @@ still fails, it keeps the active turn, event pump, and session context available
 attempt. The orchestration reactor records the failure without changing the projected session to
 `stopped`.
 
+`ProviderService` places a per-thread stop barrier before it waits for MCP replacement work. Recovery,
+explicit starts, and turn operations that began before that barrier cannot commit credentials, publish
+an active binding, admit a turn, or write `running`. The stop holds the existing short MCP transaction
+lock while it routes without recovery, shuts down the adapter session, clears credentials, and writes
+the `stopped` binding. If any stop step fails before that binding is written, the service clears the
+pending barrier so the still-live session remains usable. A later send may recover a stopped binding as
+before; only work fenced by the failed stop is rejected.
+
 The shared server's idle shutdown does not clear the catalog. Failed discovery keeps the last
 known models, slash commands, and skills through the registry's existing merge rules. A successful
 empty inventory is authoritative. Existing threads keep their explicit model identifier and

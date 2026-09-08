@@ -748,6 +748,242 @@ describe("MCP replacement transactions", () => {
       }).pipe(Effect.provide(providerLayer));
     }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
   );
+
+  it.effect("fences recovery when stop arrives before candidate publication", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-stop-during-recovery");
+      const codex = makeFakeCodexAdapter();
+      const issuedProviderSessions: string[] = [];
+      const revokedProviderSessions: string[] = [];
+      const recoveryStartEntered = yield* Deferred.make<void>();
+      const releaseRecoveryStart = yield* Deferred.make<void>();
+      const issueMcpCredential = (request: McpSessionRegistry.McpCredentialRequest) =>
+        Effect.sync(() => {
+          const providerSessionId = ["initial", "candidate"][issuedProviderSessions.length];
+          if (providerSessionId === undefined) {
+            throw new Error("test credential sequence exhausted");
+          }
+          issuedProviderSessions.push(providerSessionId);
+          return makeTestMcpCredential(request.threadId, providerSessionId);
+        });
+      const providerLayer = makeMcpTransactionTestLayer({
+        codex,
+        issueMcpCredential,
+        revokeMcpProviderCredential: (providerSessionId) =>
+          Effect.sync(() => void revokedProviderSessions.push(providerSessionId)),
+      });
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
+        yield* codex.stopSession(threadId);
+
+        codex.startSession.mockImplementationOnce((input) =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(recoveryStartEntered, undefined);
+            yield* Deferred.await(releaseRecoveryStart);
+            return yield* codex.createSession(input);
+          }),
+        );
+        const recovery = yield* provider
+          .sendTurn(sendInput(threadId))
+          .pipe(Effect.exit, Effect.forkChild);
+        yield* Deferred.await(recoveryStartEntered);
+        const stop = yield* provider.stopSession({ threadId }).pipe(Effect.exit, Effect.forkChild);
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseRecoveryStart, undefined);
+
+        const recoveryExit = yield* Fiber.join(recovery);
+        const stopExit = yield* Fiber.join(stop);
+        assert.equal(Exit.isFailure(recoveryExit), true);
+        assert.equal(Exit.isSuccess(stopExit), true);
+        assert.equal(codex.sendTurn.mock.calls.length, 0);
+        assert.deepEqual(revokedProviderSessions, ["candidate"]);
+        assert.equal(yield* codex.hasSession(threadId), false);
+
+        const persisted = yield* runtimeRepository.getByThreadId({ threadId });
+        assert.equal(Option.isSome(persisted), true);
+        if (Option.isSome(persisted)) {
+          assert.equal(persisted.value.status, "stopped");
+        }
+        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
+      }).pipe(Effect.provide(providerLayer));
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
+  );
+
+  it.effect("clears the stop fence when stopping the live session fails", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-stop-failure");
+      const codex = makeFakeCodexAdapter();
+      const providerLayer = makeMcpTransactionTestLayer({
+        codex,
+        issueMcpCredential: (request) =>
+          Effect.succeed(makeTestMcpCredential(request.threadId, "stop-failure")),
+      });
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
+        codex.stopSession.mockImplementationOnce(() =>
+          Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: String(CODEX_DRIVER),
+              method: "stopSession",
+              detail: "simulated stop failure",
+            }),
+          ),
+        );
+
+        const stopExit = yield* provider.stopSession({ threadId }).pipe(Effect.exit);
+        assert.equal(Exit.isFailure(stopExit), true);
+
+        yield* provider.sendTurn(sendInput(threadId));
+        assert.equal(codex.sendTurn.mock.calls.length, 1);
+      }).pipe(Effect.provide(providerLayer));
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
+  );
+
+  it.effect("does not persist running after a send is overtaken by stop", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-send-stop-race");
+      const codex = makeFakeCodexAdapter();
+      const sendEntered = yield* Deferred.make<void>();
+      const releaseSend = yield* Deferred.make<void>();
+      const providerLayer = makeMcpTransactionTestLayer({
+        codex,
+        issueMcpCredential: (request) =>
+          Effect.succeed(makeTestMcpCredential(request.threadId, "send-stop-race")),
+      });
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
+        codex.sendTurn.mockImplementationOnce((input) =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(sendEntered, undefined);
+            yield* Deferred.await(releaseSend);
+            return {
+              threadId: input.threadId,
+              turnId: asTurnId("turn-send-stop-race"),
+            };
+          }),
+        );
+
+        const send = yield* provider
+          .sendTurn(sendInput(threadId))
+          .pipe(Effect.exit, Effect.forkChild);
+        yield* Deferred.await(sendEntered);
+        const stop = yield* provider.stopSession({ threadId }).pipe(Effect.exit, Effect.forkChild);
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseSend, undefined);
+
+        const sendExit = yield* Fiber.join(send);
+        const stopExit = yield* Fiber.join(stop);
+        assert.equal(Exit.isFailure(sendExit), true);
+        assert.equal(Exit.isSuccess(stopExit), true);
+        const persisted = yield* runtimeRepository.getByThreadId({ threadId });
+        assert.equal(Option.isSome(persisted), true);
+        if (Option.isSome(persisted)) {
+          assert.equal(persisted.value.status, "stopped");
+        }
+      }).pipe(Effect.provide(providerLayer));
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
+  );
+
+  it.effect("allows an explicit restart after a completed stop", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-explicit-restart");
+      const codex = makeFakeCodexAdapter();
+      const issuedProviderSessions: string[] = [];
+      const providerLayer = makeMcpTransactionTestLayer({
+        codex,
+        issueMcpCredential: (request) =>
+          Effect.sync(() => {
+            const providerSessionId = ["initial", "restart"][issuedProviderSessions.length];
+            if (providerSessionId === undefined) {
+              throw new Error("test credential sequence exhausted");
+            }
+            issuedProviderSessions.push(providerSessionId);
+            return makeTestMcpCredential(request.threadId, providerSessionId);
+          }),
+      });
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
+        yield* provider.stopSession({ threadId });
+
+        const restarted = yield* provider.startSession(
+          threadId,
+          startInput(threadId, "approval-required"),
+        );
+        assert.equal(restarted.runtimeMode, "approval-required");
+        assert.deepEqual(issuedProviderSessions, ["initial", "restart"]);
+        assert.equal(
+          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
+          "restart",
+        );
+      }).pipe(Effect.provide(providerLayer));
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
+  );
+
+  it.effect("keeps a failed explicit restart recoverable after stop", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-failed-explicit-restart");
+      const codex = makeFakeCodexAdapter();
+      const issuedProviderSessions: string[] = [];
+      const revokedProviderSessions: string[] = [];
+      const providerLayer = makeMcpTransactionTestLayer({
+        codex,
+        issueMcpCredential: (request) =>
+          Effect.sync(() => {
+            const providerSessionId = ["initial", "failed", "recovery"][
+              issuedProviderSessions.length
+            ];
+            if (providerSessionId === undefined) {
+              throw new Error("test credential sequence exhausted");
+            }
+            issuedProviderSessions.push(providerSessionId);
+            return makeTestMcpCredential(request.threadId, providerSessionId);
+          }),
+        revokeMcpProviderCredential: (providerSessionId) =>
+          Effect.sync(() => void revokedProviderSessions.push(providerSessionId)),
+      });
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
+        yield* provider.stopSession({ threadId });
+        codex.startSession.mockImplementationOnce(() =>
+          Effect.fail(
+            new ProviderAdapterRequestError({
+              provider: String(CODEX_DRIVER),
+              method: "startSession",
+              detail: "simulated restart failure",
+            }),
+          ),
+        );
+
+        const restartExit = yield* provider
+          .startSession(threadId, startInput(threadId, "approval-required"))
+          .pipe(Effect.exit);
+        assert.equal(Exit.isFailure(restartExit), true);
+        assert.deepEqual(revokedProviderSessions, ["failed"]);
+
+        const persisted = yield* runtimeRepository.getByThreadId({ threadId });
+        assert.equal(Option.isSome(persisted), true);
+        if (Option.isSome(persisted)) {
+          assert.equal(persisted.value.status, "stopped");
+        }
+
+        yield* provider.sendTurn(sendInput(threadId));
+        assert.deepEqual(issuedProviderSessions, ["initial", "failed", "recovery"]);
+      }).pipe(Effect.provide(providerLayer));
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
+  );
 });
 
 it.effect("ProviderServiceLive rejects new sessions for disabled providers", () =>
