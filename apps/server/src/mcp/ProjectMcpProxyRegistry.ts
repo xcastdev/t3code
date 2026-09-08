@@ -311,6 +311,7 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
           onResourceUpdated: (uri: string) => server.sendResourceUpdated({ uri }),
         }),
     onLoggingMessage: (notification) => server.notification(notification),
+    onUpstreamNotification: (notification) => server.notification(notification),
     onRootsRequest: forwardRootsRequest,
     onSamplingRequest: (request, context) =>
       forwardServerRequest(server, "sampling/createMessage", request, context?.mcpReq.signal),

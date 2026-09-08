@@ -5,12 +5,14 @@ import {
   SdkErrorCode,
   SdkHttpError,
   type ClientOptions,
+  type Notification,
   type Transport,
 } from "@modelcontextprotocol/client";
 import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 
 import {
   connectProjectMcpServer,
+  projectMcpConnectionCoordinator,
   type ProjectMcpClient,
   type ProjectMcpConnectionDependencies,
 } from "./ProjectMcpConnection.ts";
@@ -21,6 +23,50 @@ const modern: ProjectMcpTransport = {
   headers: [],
   authorization: { type: "none" },
 };
+
+it("delivers fallback notifications alongside dedicated notification handlers", async () => {
+  let fallbackNotificationHandler: ((notification: Notification) => Promise<void>) | undefined;
+  let listChangedHandler: ((notification: Notification) => Promise<void>) | undefined;
+  const client = {
+    connect: async () => undefined,
+    close: async () => undefined,
+    setNotificationHandler: ((method: string, handler: unknown) => {
+      if (method === "notifications/tools/list_changed")
+        listChangedHandler = handler as typeof listChangedHandler;
+    }) as NonNullable<ProjectMcpClient["setNotificationHandler"]>,
+  } as ProjectMcpClient & {
+    fallbackNotificationHandler?: (notification: Notification) => Promise<void>;
+  };
+  const dependencies: ProjectMcpConnectionDependencies = {
+    createClient: () => client,
+    createTransport: () => ({ close: async () => undefined }),
+  };
+  const connection = await connectProjectMcpServer({
+    serverId: McpServerId.make("mcp-fallback"),
+    transport: modern,
+    resolveSecret: () => undefined,
+    dependencies,
+  });
+  const received: Notification[] = [];
+  const removeListener = projectMcpConnectionCoordinator(connection).addListener((notification) => {
+    received.push(notification);
+  });
+
+  try {
+    fallbackNotificationHandler = client.fallbackNotificationHandler;
+    if (!fallbackNotificationHandler || !listChangedHandler)
+      throw new Error("coordinator did not install the notification handlers");
+    await fallbackNotificationHandler({ method: "com.fixture/catalog", params: { value: 1 } });
+    await listChangedHandler({ method: "notifications/tools/list_changed" });
+    expect(received).toEqual([
+      { method: "com.fixture/catalog", params: { value: 1 } },
+      { method: "notifications/tools/list_changed" },
+    ]);
+  } finally {
+    removeListener();
+    await connection.close();
+  }
+});
 
 it("falls back from modern Streamable HTTP to legacy SSE only when the endpoint rejects it", async () => {
   const connected: string[] = [];

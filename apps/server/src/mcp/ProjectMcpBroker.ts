@@ -68,11 +68,12 @@ export class ProjectMcpBrokerError extends Error {
 }
 
 export interface ProjectMcpBrokerHandlers {
-  readonly onToolsChanged?: (result: ListToolsResult) => void | Promise<void>;
-  readonly onPromptsChanged?: (result: ListPromptsResult) => void | Promise<void>;
-  readonly onResourcesChanged?: (result: ListResourcesResult) => void | Promise<void>;
+  readonly onToolsChanged?: () => void | Promise<void>;
+  readonly onPromptsChanged?: () => void | Promise<void>;
+  readonly onResourcesChanged?: () => void | Promise<void>;
   readonly onResourceUpdated?: (uri: string) => void | Promise<void>;
   readonly onLoggingMessage?: (notification: Notification) => void | Promise<void>;
+  readonly onUpstreamNotification?: (notification: Notification) => void | Promise<void>;
   readonly onRootsRequest?: (
     request: unknown,
     context?: ClientContext,
@@ -240,6 +241,11 @@ const standardNotificationMethods = new Set([
   "notifications/prompts/list_changed",
   "notifications/elicitation/complete",
   "notifications/subscriptions/acknowledged",
+]);
+
+const legacyForwardableUpstreamNotificationMethods = new Set([
+  "notifications/tasks/status",
+  "notifications/elicitation/complete",
 ]);
 
 export class ProjectMcpBroker {
@@ -438,6 +444,16 @@ export class ProjectMcpBroker {
     return this.method("notification")(
       { method, ...(params === undefined ? {} : { params }) } as Notification,
       options,
+    );
+  }
+
+  private isSafeUpstreamNotification(notification: Notification): boolean {
+    if (!standardNotificationMethods.has(notification.method))
+      return this.protocolEra === this.downstreamProtocolEra;
+    return (
+      this.protocolEra === "legacy" &&
+      this.downstreamProtocolEra === "legacy" &&
+      legacyForwardableUpstreamNotificationMethods.has(notification.method)
     );
   }
 
@@ -939,23 +955,31 @@ export class ProjectMcpBroker {
     this.handlers.add(handlers);
     const dispose = this.coordinator.addListener(async (notification) => {
       if (notification.method === "notifications/tools/list_changed" && handlers.onToolsChanged) {
-        await handlers.onToolsChanged!(await this.listTools(undefined, { cacheMode: "refresh" }));
+        const refreshed = this.listTools(undefined, { cacheMode: "refresh" }).catch(
+          () => undefined,
+        );
+        await handlers.onToolsChanged();
+        await refreshed;
       }
       if (
         notification.method === "notifications/prompts/list_changed" &&
         handlers.onPromptsChanged
       ) {
-        await handlers.onPromptsChanged!(
-          await this.listPrompts(undefined, { cacheMode: "refresh" }),
+        const refreshed = this.listPrompts(undefined, { cacheMode: "refresh" }).catch(
+          () => undefined,
         );
+        await handlers.onPromptsChanged();
+        await refreshed;
       }
       if (
         notification.method === "notifications/resources/list_changed" &&
         handlers.onResourcesChanged
       ) {
-        await handlers.onResourcesChanged!(
-          await this.listResources(undefined, { cacheMode: "refresh" }),
+        const refreshed = this.listResources(undefined, { cacheMode: "refresh" }).catch(
+          () => undefined,
         );
+        await handlers.onResourcesChanged();
+        await refreshed;
       }
       if (notification.method === "notifications/resources/updated" && handlers.onResourceUpdated) {
         const params =
@@ -967,6 +991,9 @@ export class ProjectMcpBroker {
       }
       if (notification.method === "notifications/message" && handlers.onLoggingMessage) {
         await handlers.onLoggingMessage(notification);
+      }
+      if (handlers.onUpstreamNotification && this.isSafeUpstreamNotification(notification)) {
+        await handlers.onUpstreamNotification(notification);
       }
     });
     const disposeHandlers = () => {

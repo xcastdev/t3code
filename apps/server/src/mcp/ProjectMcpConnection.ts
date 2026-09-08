@@ -42,6 +42,7 @@ export interface ProjectMcpClient {
   readonly getPrompt?: Client["getPrompt"];
   readonly setRequestHandler?: Client["setRequestHandler"];
   readonly setNotificationHandler?: Client["setNotificationHandler"];
+  fallbackNotificationHandler?: (notification: Notification) => Promise<void>;
   readonly terminateSession?: () => Promise<void>;
   readonly getProtocolEra?: () => ProtocolEra | undefined;
   readonly getNegotiatedProtocolVersion?: () => string | undefined;
@@ -189,6 +190,7 @@ export class ProjectMcpConnectionCoordinator {
       Promise.allSettled(
         [...this.listeners].map((listener) => Promise.resolve().then(() => listener(notification))),
       ).then(() => undefined);
+    client.fallbackNotificationHandler = notify;
     for (const method of [
       "notifications/tools/list_changed",
       "notifications/prompts/list_changed",

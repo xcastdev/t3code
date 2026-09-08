@@ -1,13 +1,13 @@
 import { McpServerId } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import { JSONObjectSchema, JSONValueSchema } from "@modelcontextprotocol/core";
-import type { Client, InputRequiredResult } from "@modelcontextprotocol/client";
+import type { Client, InputRequiredResult, Notification } from "@modelcontextprotocol/client";
 import {
   projectMcpConnectionCoordinator,
   type ProjectMcpClient,
   type ProjectMcpConnectionCoordinator,
 } from "./ProjectMcpConnection.ts";
-import type { ProjectMcpCallToolParams } from "./ProjectMcpBroker.ts";
+import type { ProjectMcpBrokerHandlers, ProjectMcpCallToolParams } from "./ProjectMcpBroker.ts";
 
 import { ProjectMcpBroker, ProjectMcpBrokerError } from "./ProjectMcpBroker.ts";
 
@@ -1148,15 +1148,120 @@ it("does not treat standard protocol notifications as extensions", async () => {
   }
 });
 
-it("relays list-change notifications through the semantic handler surface", async () => {
-  let toolsChanged: unknown;
+type TestFallbackClient = ProjectMcpClient & {
+  fallbackNotificationHandler?: (notification: Notification) => Promise<void>;
+};
+
+it.each([
+  ["modern", "modern", "com.fixture/catalog", true],
+  ["legacy", "legacy", "com.fixture/catalog", true],
+  ["modern", "legacy", "com.fixture/catalog", false],
+  ["legacy", "modern", "com.fixture/catalog", false],
+  ["legacy", "legacy", "notifications/tasks/status", true],
+  ["legacy", "legacy", "notifications/elicitation/complete", true],
+  ["modern", "modern", "notifications/tasks/status", false],
+  ["modern", "modern", "notifications/elicitation/complete", false],
+  ["legacy", "legacy", "notifications/subscriptions/acknowledged", false],
+  ["modern", "modern", "notifications/cancelled", false],
+  ["modern", "modern", "notifications/progress", false],
+  ["modern", "modern", "notifications/roots/list_changed", false],
+  ["modern", "modern", "notifications/tools/list_changed", false],
+] as const)(
+  "classifies upstream notification %s -> %s for %s",
+  async (upstreamEra, downstreamEra, method, expected) => {
+    const seen: Notification[] = [];
+    const client = makeClient() as TestFallbackClient;
+    const broker = new ProjectMcpBroker({
+      connection: connection(client, upstreamEra),
+      serverId,
+      providerSessionId: "provider-session",
+      downstreamProtocolEra: downstreamEra,
+      handlers: {
+        onUpstreamNotification: (notification) => {
+          seen.push(notification);
+        },
+      },
+    });
+
+    try {
+      const fallback = client.fallbackNotificationHandler;
+      if (!fallback) throw new Error("coordinator did not install fallback notification handler");
+      await fallback({ method, params: { enabled: true } });
+      expect(seen).toEqual(expected ? [{ method, params: { enabled: true } }] : []);
+    } finally {
+      await broker.dispose();
+    }
+  },
+);
+
+it.each(["tools", "prompts", "resources"] as const)(
+  "invalidates %s even when its eager refresh rejects",
+  async (kind) => {
+    let refreshes = 0;
+    let invalidations = 0;
+    let registered: ((notification: unknown) => void | Promise<void>) | undefined;
+    const overrides: {
+      setNotificationHandler?: NonNullable<ProjectMcpClient["setNotificationHandler"]>;
+      listTools?: NonNullable<ProjectMcpClient["listTools"]>;
+      listPrompts?: NonNullable<ProjectMcpClient["listPrompts"]>;
+      listResources?: NonNullable<ProjectMcpClient["listResources"]>;
+    } = {
+      setNotificationHandler: ((method: string, handler: unknown) => {
+        if (method === `notifications/${kind}/list_changed`)
+          registered = handler as typeof registered;
+      }) as NonNullable<ProjectMcpClient["setNotificationHandler"]>,
+    };
+    if (kind === "tools") {
+      overrides.listTools = (async () => {
+        refreshes += 1;
+        throw new Error("injected refresh failure");
+      }) as NonNullable<ProjectMcpClient["listTools"]>;
+    } else if (kind === "prompts") {
+      overrides.listPrompts = (async () => {
+        refreshes += 1;
+        throw new Error("injected refresh failure");
+      }) as NonNullable<ProjectMcpClient["listPrompts"]>;
+    } else {
+      overrides.listResources = (async () => {
+        refreshes += 1;
+        throw new Error("injected refresh failure");
+      }) as NonNullable<ProjectMcpClient["listResources"]>;
+    }
+    const handlers: ProjectMcpBrokerHandlers =
+      kind === "tools"
+        ? { onToolsChanged: () => void (invalidations += 1) }
+        : kind === "prompts"
+          ? { onPromptsChanged: () => void (invalidations += 1) }
+          : { onResourcesChanged: () => void (invalidations += 1) };
+    const broker = new ProjectMcpBroker({
+      connection: connection(makeClient(overrides)),
+      serverId,
+      providerSessionId: "provider-session",
+      handlers,
+    });
+
+    try {
+      if (!registered) throw new Error("list-change handler was not registered");
+      await registered({ method: `notifications/${kind}/list_changed` });
+      expect(refreshes).toBe(1);
+      expect(invalidations).toBe(1);
+    } finally {
+      await broker.dispose();
+    }
+  },
+);
+
+it("retains eager refresh on a successful list-change notification", async () => {
+  let refreshes = 0;
+  let invalidations = 0;
   let registered: ((notification: unknown) => void | Promise<void>) | undefined;
   const broker = new ProjectMcpBroker({
     connection: connection(
       makeClient({
-        listTools: async () => ({
-          tools: [{ name: "new-tool", inputSchema: { type: "object" as const } }],
-        }),
+        listTools: async () => {
+          refreshes += 1;
+          return { tools: [{ name: "new-tool", inputSchema: { type: "object" as const } }] };
+        },
         setNotificationHandler: ((method: string, handler: unknown) => {
           if (method === "notifications/tools/list_changed")
             registered = handler as typeof registered;
@@ -1165,18 +1270,17 @@ it("relays list-change notifications through the semantic handler surface", asyn
     ),
     serverId,
     providerSessionId: "provider-session",
-    handlers: {
-      onToolsChanged: (tools) => {
-        toolsChanged = tools;
-      },
-    },
+    handlers: { onToolsChanged: () => void (invalidations += 1) },
   });
 
-  void broker;
-  await registered?.({ method: "notifications/tools/list_changed" });
-  expect(toolsChanged).toEqual({
-    tools: [{ name: "new-tool", inputSchema: { type: "object" } }],
-  });
+  try {
+    if (!registered) throw new Error("list-change handler was not registered");
+    await registered({ method: "notifications/tools/list_changed" });
+    expect(refreshes).toBe(1);
+    expect(invalidations).toBe(1);
+  } finally {
+    await broker.dispose();
+  }
 });
 
 it("associates unsolicited legacy roots requests with the notifying facade", async () => {

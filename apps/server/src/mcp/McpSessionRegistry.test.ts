@@ -1,8 +1,10 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
-import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, McpServerId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
+import * as Fiber from "effect/Fiber";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpServer } from "effect/unstable/http";
 
@@ -21,6 +23,18 @@ const fakeEnvironment = ServerEnvironment.ServerEnvironment.of({
   getEnvironmentId: Effect.succeed(environmentId),
   getDescriptor: Effect.die("unused"),
 });
+
+const projectTransport = {
+  type: "streamable-http" as const,
+  url: "https://fixture.example.test/mcp",
+  headers: [],
+  authorization: { type: "none" as const },
+};
+const projectServer = {
+  id: McpServerId.make("mcp-rollback-fixture"),
+  name: "rollback fixture",
+  transport: projectTransport,
+};
 
 const makeRegistry = (now: () => number, httpServer = fakeHttpServer) =>
   McpSessionRegistry.__testing
@@ -262,5 +276,107 @@ it.effect("cleans project sessions pruned by unrelated liveness activity", () =>
     const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
     expect(yield* registry.resolve(token)).toBeUndefined();
     yield* proxy.revokeAll;
+  }),
+);
+
+it.effect("rolls back a proxy session when issuance is interrupted after registration", () =>
+  Effect.gen(function* () {
+    const realProxy = yield* ProjectMcpProxyRegistry.__testing.make({
+      endpointBase: "http://127.0.0.1:43123/mcp",
+      connect: async () => ({
+        client: {
+          connect: async () => undefined,
+          close: async () => undefined,
+          ping: async () => ({}),
+        },
+        transport: projectTransport,
+        protocolEra: "modern" as const,
+        negotiatedProtocolVersion: "2026-07-28",
+        discoverResult: {
+          protocolVersion: "2026-07-28",
+          supportedVersions: ["2026-07-28"],
+          capabilities: {},
+          serverInfo: { name: "fixture", version: "1" },
+        },
+        close: async () => undefined,
+      }),
+    });
+    const registered = yield* Deferred.make<void>();
+    let capturedProviderSessionId: string | undefined;
+    let capturedEndpointHandle: string | undefined;
+    const blockingProxy = ProjectMcpProxyRegistry.ProjectMcpProxyRegistry.of({
+      ...realProxy,
+      registerSession: (input) =>
+        realProxy.registerSession(input).pipe(
+          Effect.tap((endpoints) =>
+            Effect.sync(() => {
+              capturedProviderSessionId = input.providerSessionId;
+              capturedEndpointHandle = endpoints[0]!.endpointHandle;
+            }).pipe(Effect.andThen(Deferred.succeed(registered, undefined))),
+          ),
+          Effect.andThen(Effect.never),
+        ),
+    });
+    const registry = yield* makeRegistry(() => 1_000).pipe(
+      Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, blockingProxy),
+    );
+    const issueFiber = yield* Effect.forkChild(
+      registry.issue({
+        threadId: ThreadId.make("thread-interrupted"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        projectMcpServers: [projectServer],
+        resolveProjectMcpSecret: () => "synthetic-secret",
+      }),
+    );
+    yield* Deferred.await(registered);
+    yield* Fiber.interrupt(issueFiber);
+
+    if (!capturedProviderSessionId || !capturedEndpointHandle)
+      throw new Error("proxy registration was not captured");
+    expect(
+      yield* realProxy.resolve(capturedProviderSessionId, capturedEndpointHandle),
+    ).toBeUndefined();
+    yield* realProxy.revokeAll;
+  }),
+);
+
+it.effect("keeps a successful project issuance until its provider session is revoked", () =>
+  Effect.gen(function* () {
+    const proxy = yield* ProjectMcpProxyRegistry.__testing.make({
+      endpointBase: "http://127.0.0.1:43123/mcp",
+      connect: async () => ({
+        client: {
+          connect: async () => undefined,
+          close: async () => undefined,
+          ping: async () => ({}),
+        },
+        transport: projectTransport,
+        protocolEra: "modern" as const,
+        negotiatedProtocolVersion: "2026-07-28",
+        discoverResult: {
+          protocolVersion: "2026-07-28",
+          supportedVersions: ["2026-07-28"],
+          capabilities: {},
+          serverInfo: { name: "fixture", version: "1" },
+        },
+        close: async () => undefined,
+      }),
+    });
+    const registry = yield* makeRegistry(() => 1_000).pipe(
+      Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, proxy),
+    );
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("thread-success"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      projectMcpServers: [projectServer],
+    });
+    const endpoint = issued.config.projectServers?.[0];
+    if (!endpoint) throw new Error("expected a project endpoint");
+    const endpointHandle = endpoint.endpoint.pathname.split("/").at(-1);
+    if (!endpointHandle) throw new Error("expected an endpoint handle");
+    expect(yield* proxy.resolve(issued.config.providerSessionId, endpointHandle)).toBeDefined();
+
+    yield* registry.revokeProviderSession(issued.config.providerSessionId);
+    expect(yield* proxy.resolve(issued.config.providerSessionId, endpointHandle)).toBeUndefined();
   }),
 );

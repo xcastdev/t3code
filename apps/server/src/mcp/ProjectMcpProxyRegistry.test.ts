@@ -434,6 +434,132 @@ it.effect("keeps modern subscription notifications alive across HTTP requests", 
   }),
 );
 
+it.effect("delivers legacy upstream notifications to the owning legacy facade", () =>
+  Effect.gen(function* () {
+    const [upstreamClientTransport, upstreamServerTransport] = InMemoryTransport.createLinkedPair();
+    const upstreamServer = new Server({ name: "legacy-upstream", version: "1" });
+    const upstreamClient = new Client(
+      { name: "legacy-upstream-client", version: "1" },
+      {
+        capabilities: {
+          roots: { listChanged: true },
+          sampling: {},
+          elicitation: { form: {}, url: {} },
+        },
+        versionNegotiation: { mode: "legacy" },
+      },
+    );
+    yield* Effect.promise(() => upstreamServer.connect(upstreamServerTransport));
+    yield* Effect.promise(() => upstreamClient.connect(upstreamClientTransport));
+
+    const registry = yield* makeRegistry(async () => ({
+      client: upstreamClient as unknown as ProjectMcpClient,
+      transport,
+      protocolEra: "legacy" as const,
+      negotiatedProtocolVersion: "2025-11-25",
+      discoverResult: undefined,
+      serverCapabilities: {},
+      serverVersion: { name: "legacy-upstream", version: "1" },
+      close: async () => undefined,
+    }));
+    const [issued] = yield* registry.registerSession({
+      providerSessionId: "provider-a",
+      threadId: ThreadId.make("thread-a"),
+      servers: [server],
+    });
+    const sessions = fixtureSessionRegistry();
+    const downstreamStream = Promise.withResolvers<ReadableStream<Uint8Array>>();
+    const fetchFn = yield* makeScopedFetch((request) => {
+      const effectRequest = HttpServerRequest.fromWeb(request);
+      return ProjectMcpProxyHttpServer.handleProjectMcpProxyRequest(effectRequest).pipe(
+        Effect.provideService(McpSessionRegistry.McpSessionRegistry, sessions),
+        Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, registry),
+        Effect.map(HttpServerResponse.toWeb),
+        Effect.map((response) => {
+          if (request.method !== "GET" || !response.body) return response;
+          const [clientBody, testBody] = response.body.tee();
+          downstreamStream.resolve(testBody);
+          return new Response(clientBody, {
+            status: response.status,
+            statusText: response.statusText,
+            headers: response.headers,
+          });
+        }),
+      );
+    });
+    const downstreamClient = new Client(
+      { name: "legacy-downstream-client", version: "1" },
+      {
+        capabilities: { elicitation: { form: {}, url: {} } },
+        versionNegotiation: { mode: "legacy" },
+      },
+    );
+    const downstreamTransport = new StreamableHTTPClientTransport(issued!.endpoint, {
+      authProvider: { token: async () => "provider-token" },
+      fetch: fetchFn,
+    });
+
+    try {
+      yield* Effect.promise(() => downstreamClient.connect(downstreamTransport));
+      const stream = yield* Effect.promise(() => downstreamStream.promise);
+      const reader = stream.pipeThrough(new TextDecoderStream()).getReader();
+      let buffered = "";
+      const readNotification = async () => {
+        for (;;) {
+          const boundary = buffered.indexOf("\n\n");
+          if (boundary >= 0) {
+            const event = buffered.slice(0, boundary);
+            buffered = buffered.slice(boundary + 2);
+            const data = event
+              .split("\n")
+              .find((line) => line.startsWith("data: "))
+              ?.slice("data: ".length);
+            if (data !== undefined) return JSON.parse(data) as unknown;
+          }
+          const chunk = await reader.read();
+          if (chunk.done) throw new Error("The legacy notification stream closed unexpectedly");
+          buffered += chunk.value;
+        }
+      };
+      yield* Effect.promise(() =>
+        upstreamServer.notification({
+          method: "notifications/tasks/status",
+          params: { taskId: "task-1", status: "working" },
+        } as never),
+      );
+      expect(yield* Effect.promise(readNotification)).toEqual({
+        jsonrpc: "2.0",
+        method: "notifications/tasks/status",
+        params: { taskId: "task-1", status: "working" },
+      });
+      const completion = upstreamServer.createElicitationCompletionNotifier("elicitation-1");
+      yield* Effect.promise(completion);
+      expect(yield* Effect.promise(readNotification)).toEqual({
+        jsonrpc: "2.0",
+        method: "notifications/elicitation/complete",
+        params: { elicitationId: "elicitation-1" },
+      });
+      yield* Effect.promise(() =>
+        upstreamServer.notification({
+          method: "com.fixture/catalog",
+          params: { enabled: true },
+        } as never),
+      );
+      expect(yield* Effect.promise(readNotification)).toEqual({
+        jsonrpc: "2.0",
+        method: "com.fixture/catalog",
+        params: { enabled: true },
+      });
+      yield* Effect.promise(() => reader.cancel());
+    } finally {
+      yield* Effect.promise(() => downstreamClient.close().catch(() => undefined));
+      yield* registry.revokeProviderSession("provider-a");
+      yield* Effect.promise(() => upstreamClient.close().catch(() => undefined));
+      yield* Effect.promise(() => upstreamServer.close().catch(() => undefined));
+    }
+  }),
+);
+
 it.effect("accepts a legacy streamable HTTP client through a stateful session", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry(async () => ({

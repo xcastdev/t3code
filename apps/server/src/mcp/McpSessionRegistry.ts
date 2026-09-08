@@ -153,70 +153,6 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     };
   };
 
-  const issue: McpSessionRegistryShape["issue"] = Effect.fn("McpSessionRegistry.issue")(
-    function* (request) {
-      const issuedAt = yield* currentTimeMillis;
-      const providerSessionId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
-      const rawToken = yield* crypto.randomBytes(32).pipe(Effect.map(tokenFromBytes), Effect.orDie);
-      const tokenHash = yield* hashToken(rawToken);
-      const projectEndpoints =
-        request.projectMcpServers &&
-        request.projectMcpServers.length > 0 &&
-        projectProxy._tag === "Some"
-          ? yield* projectProxy.value.registerSession({
-              providerSessionId,
-              threadId: request.threadId,
-              servers: request.projectMcpServers,
-              ...(request.resolveProjectMcpSecret === undefined
-                ? {}
-                : { resolveSecret: request.resolveProjectMcpSecret }),
-            })
-          : [];
-      const scope: McpInvocationContext.McpInvocationScope = {
-        environmentId,
-        threadId: ThreadId.make(request.threadId),
-        providerSessionId,
-        providerInstanceId: ProviderInstanceId.make(request.providerInstanceId),
-        capabilities: new Set<McpInvocationContext.McpCapability>([
-          ...(request.includePreview === false ? [] : ["preview" as const]),
-          ...(projectEndpoints.length > 0 ? ["project" as const] : []),
-        ]),
-        issuedAt,
-      };
-      const expiredProviderSessionIds = yield* SynchronizedRef.modify(
-        state,
-        ({ records }): readonly [ReadonlyArray<string>, RegistryState] => {
-          const pruned = pruneDead(records, issuedAt);
-          const next = new Map(pruned.records);
-          next.set(tokenHash, { tokenHash, scope, lastAliveAt: issuedAt });
-          return [pruned.expiredProviderSessionIds, { records: next }] as const;
-        },
-      );
-      yield* cleanupExpiredProjectSessions(expiredProviderSessionIds);
-      yield* scheduleExpiry(providerSessionId);
-      return {
-        config: {
-          environmentId,
-          threadId: scope.threadId,
-          providerSessionId,
-          providerInstanceId: scope.providerInstanceId,
-          endpoint,
-          authorizationHeader: `Bearer ${rawToken}`,
-          ...(projectEndpoints.length > 0
-            ? {
-                projectServers: projectEndpoints.map((projectEndpoint) => ({
-                  id: projectEndpoint.id,
-                  name: projectEndpoint.name,
-                  endpoint: projectEndpoint.endpoint,
-                  authorizationHeader: `Bearer ${rawToken}`,
-                })),
-              }
-            : {}),
-        },
-      };
-    },
-  );
-
   const resolve: McpSessionRegistryShape["resolve"] = Effect.fn("McpSessionRegistry.resolve")(
     function* (rawToken) {
       if (rawToken.length === 0) return undefined;
@@ -350,6 +286,97 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       else yield* Fiber.interrupt(fiber);
       if (previous !== undefined && previous !== fiber) yield* Fiber.interrupt(previous);
     });
+
+  const rollbackIssue = (tokenHash: string, providerSessionId: string) =>
+    Effect.gen(function* () {
+      yield* SynchronizedRef.modify(state, ({ records }) => {
+        const next = new Map(records);
+        next.delete(tokenHash);
+        return [undefined, { records: next }] as const;
+      });
+      yield* cancelExpiry(providerSessionId);
+      if (projectProxy._tag === "Some")
+        yield* projectProxy.value.revokeProviderSession(providerSessionId).pipe(Effect.ignore);
+    });
+
+  const issue: McpSessionRegistryShape["issue"] = Effect.fn("McpSessionRegistry.issue")(
+    function* (request) {
+      const issuedAt = yield* currentTimeMillis;
+      const providerSessionId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+      const rawToken = yield* crypto.randomBytes(32).pipe(Effect.map(tokenFromBytes), Effect.orDie);
+      const tokenHash = yield* hashToken(rawToken);
+
+      return yield* Effect.uninterruptibleMask((restore) => {
+        let completed = false;
+        return Effect.gen(function* () {
+          const projectEndpoints =
+            request.projectMcpServers &&
+            request.projectMcpServers.length > 0 &&
+            projectProxy._tag === "Some"
+              ? yield* restore(
+                  projectProxy.value.registerSession({
+                    providerSessionId,
+                    threadId: request.threadId,
+                    servers: request.projectMcpServers,
+                    ...(request.resolveProjectMcpSecret === undefined
+                      ? {}
+                      : { resolveSecret: request.resolveProjectMcpSecret }),
+                  }),
+                )
+              : [];
+          const scope: McpInvocationContext.McpInvocationScope = {
+            environmentId,
+            threadId: ThreadId.make(request.threadId),
+            providerSessionId,
+            providerInstanceId: ProviderInstanceId.make(request.providerInstanceId),
+            capabilities: new Set<McpInvocationContext.McpCapability>([
+              ...(request.includePreview === false ? [] : ["preview" as const]),
+              ...(projectEndpoints.length > 0 ? ["project" as const] : []),
+            ]),
+            issuedAt,
+          };
+          const expiredProviderSessionIds = yield* SynchronizedRef.modify(
+            state,
+            ({ records }): readonly [ReadonlyArray<string>, RegistryState] => {
+              const pruned = pruneDead(records, issuedAt);
+              const next = new Map(pruned.records);
+              next.set(tokenHash, { tokenHash, scope, lastAliveAt: issuedAt });
+              return [pruned.expiredProviderSessionIds, { records: next }] as const;
+            },
+          );
+          yield* cleanupExpiredProjectSessions(expiredProviderSessionIds);
+          yield* scheduleExpiry(providerSessionId);
+          completed = true;
+          return {
+            config: {
+              environmentId,
+              threadId: scope.threadId,
+              providerSessionId,
+              providerInstanceId: scope.providerInstanceId,
+              endpoint,
+              authorizationHeader: `Bearer ${rawToken}`,
+              ...(projectEndpoints.length > 0
+                ? {
+                    projectServers: projectEndpoints.map((projectEndpoint) => ({
+                      id: projectEndpoint.id,
+                      name: projectEndpoint.name,
+                      endpoint: projectEndpoint.endpoint,
+                      authorizationHeader: `Bearer ${rawToken}`,
+                    })),
+                  }
+                : {}),
+            },
+          };
+        }).pipe(
+          Effect.ensuring(
+            Effect.suspend(() =>
+              completed ? Effect.void : rollbackIssue(tokenHash, providerSessionId),
+            ),
+          ),
+        );
+      });
+    },
+  );
 
   return McpSessionRegistry.of({
     issue,
