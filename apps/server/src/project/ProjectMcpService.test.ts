@@ -43,6 +43,7 @@ import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSna
 import * as ThreadBackgroundLiveness from "../orchestration/ThreadBackgroundLiveness.ts";
 import * as ThreadPlanProgress from "../orchestration/ThreadPlanProgress.ts";
 import { ProviderInstanceRegistry } from "../provider/Services/ProviderInstanceRegistry.ts";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as RepositoryIdentityResolver from "./RepositoryIdentityResolver.ts";
 
 import * as ProjectMcpService from "./ProjectMcpService.ts";
@@ -152,6 +153,7 @@ const makeTestLayer = (
     ProjectMcpSecretStore.ProjectMcpSecretStore
   > = projectMcpOAuthTestLayer,
   startCleanup = true,
+  platform: NodeJS.Platform = "linux",
 ) =>
   (startCleanup ? startedServiceLayer : ProjectMcpService.layer).pipe(
     Layer.provideMerge(oauthLayer),
@@ -170,6 +172,7 @@ const makeTestLayer = (
     Layer.provideMerge(SqlitePersistenceMemory),
     Layer.provideMerge(ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-test-" })),
     Layer.provideMerge(NodeServices.layer),
+    Layer.provideMerge(Layer.succeed(HostProcessPlatform, platform)),
   );
 
 const testLayer = makeTestLayer();
@@ -178,6 +181,7 @@ const makeRestartTestLayer = (
   persistenceLayer: ReturnType<typeof makeSqlitePersistenceLive>,
   config: ServerConfig.ServerConfig["Service"],
   startCleanup = true,
+  platform: NodeJS.Platform = "linux",
 ) =>
   (startCleanup ? startedServiceLayer : ProjectMcpService.layer).pipe(
     Layer.provideMerge(ProjectMcpSecretStore.layer),
@@ -196,6 +200,7 @@ const makeRestartTestLayer = (
     Layer.provideMerge(persistenceLayer),
     Layer.provideMerge(Layer.succeed(ServerConfig.ServerConfig, config)),
     Layer.provideMerge(NodeServices.layer),
+    Layer.provideMerge(Layer.succeed(HostProcessPlatform, platform)),
   );
 
 const createProject = (projectId: ProjectId, commandId: string) =>
@@ -238,6 +243,22 @@ const createSecretServer = Effect.fn("createSecretServer")(function* (
   const transport = server.transport;
   if (transport?.type !== "stdio") return yield* Effect.die("Expected stdio transport");
   return { server, credentialId: transport.env[0]!.credential.id };
+});
+
+const caseDistinctStdio = (upperValue: string, lowerValue: string) => ({
+  type: "stdio" as const,
+  command: "node",
+  args: [],
+  env: [
+    {
+      name: ProjectMcpEnvironmentVariableName.make("HTTP_PROXY"),
+      credential: { name: "upper", value: upperValue },
+    },
+    {
+      name: ProjectMcpEnvironmentVariableName.make("http_proxy"),
+      credential: { name: "lower", value: lowerValue },
+    },
+  ],
 });
 
 it.effect(
@@ -901,6 +922,177 @@ it.effect("restores explicit MCP transports after the service restarts", () =>
         ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-restart-" }),
         NodeServices.layer,
       ),
+    ),
+  ),
+);
+
+it.effect("accepts case-distinct stdio environment names on a Unix-like host", () =>
+  Effect.gen(function* () {
+    const service = yield* ProjectMcpService.ProjectMcpService;
+    const projectId = ProjectId.make("case-distinct-unix-project");
+    yield* createProject(projectId, "case-distinct-unix-project");
+
+    const server = yield* service.create({
+      projectId,
+      name: "Case-distinct variables",
+      enabled: true,
+      providerInstanceIds: [codexInstance],
+      transport: caseDistinctStdio("upper", "lower"),
+    });
+    const resolved = yield* service.resolveForSession(projectId, codexInstance);
+    const transport = resolved[0]?.transport;
+    expect(transport?.type).toBe("stdio");
+    if (transport?.type === "stdio")
+      expect(transport.env.map(({ name }) => name)).toEqual(["HTTP_PROXY", "http_proxy"]);
+    expect(server.transport?.type).toBe("stdio");
+  }).pipe(Effect.provide(makeTestLayer(OrchestrationEngineLive, projectMcpOAuthTestLayer, false))),
+);
+
+it.effect("rejects case-distinct stdio environment names on Windows before persistence", () =>
+  Effect.gen(function* () {
+    const service = yield* ProjectMcpService.ProjectMcpService;
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    const sql = yield* SqlClient.SqlClient;
+    const projectId = ProjectId.make("case-distinct-windows-project");
+    yield* createProject(projectId, "case-distinct-windows-project");
+
+    const error = yield* service
+      .create({
+        projectId,
+        name: "Case-distinct variables",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: caseDistinctStdio("upper", "lower"),
+      })
+      .pipe(Effect.flip);
+
+    expect(error).toMatchObject({
+      _tag: "ProjectMcpEnvironmentVariableNameConflictError",
+      name: "http_proxy",
+    });
+    expect(error.message).toContain("conflicts with another name on Windows");
+    expect(yield* secrets.listServerIds()).toEqual([]);
+    expect(
+      yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count
+        FROM orchestration_events
+        WHERE event_type = 'project.mcp-server.created'
+          AND json_extract(payload_json, '$.projectId') = ${projectId}
+      `,
+    ).toEqual([{ count: 0 }]);
+  }).pipe(
+    Effect.provide(
+      makeTestLayer(OrchestrationEngineLive, projectMcpOAuthTestLayer, false, "win32"),
+    ),
+  ),
+);
+
+it.effect("rejects a restored case-colliding stdio catalog on Windows before session startup", () =>
+  Effect.gen(function* () {
+    const config = yield* ServerConfig.ServerConfig;
+    const persistenceLayer = makeSqlitePersistenceLive(config.dbPath);
+    const projectId = ProjectId.make("restored-case-collision-project");
+    const firstServiceLayer = Layer.fresh(
+      makeRestartTestLayer(persistenceLayer, config, false, "linux"),
+    );
+    const secondServiceLayer = Layer.fresh(
+      makeRestartTestLayer(persistenceLayer, config, false, "win32"),
+    );
+
+    yield* Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      yield* createProject(projectId, "restored-case-collision-project");
+      yield* service.create({
+        projectId,
+        name: "Restored case collision",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: caseDistinctStdio("upper", "lower"),
+      });
+    }).pipe(Effect.provide(firstServiceLayer));
+
+    const error = yield* Effect.gen(function* () {
+      const service = yield* ProjectMcpService.ProjectMcpService;
+      return yield* service.resolveForSession(projectId, codexInstance).pipe(Effect.flip);
+    }).pipe(Effect.provide(secondServiceLayer));
+
+    expect(error).toMatchObject({
+      _tag: "ProjectMcpEnvironmentVariableNameConflictError",
+      name: "http_proxy",
+    });
+  }).pipe(
+    Effect.provide(
+      Layer.provideMerge(
+        ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-case-restart-" }),
+        NodeServices.layer,
+      ),
+    ),
+  ),
+);
+
+it.effect("rejects a Windows full update before dispatching or preparing new credentials", () =>
+  Effect.gen(function* () {
+    const service = yield* ProjectMcpService.ProjectMcpService;
+    const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+    const fileSystem = yield* FileSystem.FileSystem;
+    const config = yield* ServerConfig.ServerConfig;
+    const sql = yield* SqlClient.SqlClient;
+    const projectId = ProjectId.make("case-distinct-update-project");
+    yield* createProject(projectId, "case-distinct-update-project");
+    const initial = yield* service.create({
+      projectId,
+      name: "Safe variables",
+      enabled: true,
+      providerInstanceIds: [codexInstance],
+      transport: {
+        type: "stdio",
+        command: "node",
+        args: [],
+        env: [
+          {
+            name: ProjectMcpEnvironmentVariableName.make("SAFE_TOKEN"),
+            credential: { name: "safe", value: "before" },
+          },
+        ],
+      },
+    });
+    const initialTransport = initial.transport;
+    if (initialTransport?.type !== "stdio") return yield* Effect.die("Expected stdio transport");
+    const initialCredentialIds = ProjectMcpSecretStore.credentialIdsForTransport(initialTransport);
+    const secretFilesBefore = yield* fileSystem.readDirectory(config.secretsDir);
+
+    const error = yield* service
+      .update({
+        projectId,
+        id: initial.id,
+        name: "Safe variables",
+        enabled: true,
+        providerInstanceIds: [codexInstance],
+        transport: caseDistinctStdio("new-upper", "new-lower"),
+      })
+      .pipe(Effect.flip);
+
+    expect(error).toMatchObject({
+      _tag: "ProjectMcpEnvironmentVariableNameConflictError",
+      name: "http_proxy",
+    });
+    expect((yield* service.list(projectId)).external).toEqual([initial]);
+    const current = (yield* service.list(projectId)).external[0]?.transport;
+    if (current?.type !== "stdio") return yield* Effect.die("Expected stdio transport");
+    expect(ProjectMcpSecretStore.credentialIdsForTransport(current)).toEqual(initialCredentialIds);
+    expect(yield* secrets.listAuxiliarySecrets(initial.id)).toEqual([]);
+    expect(yield* fileSystem.readDirectory(config.secretsDir)).toEqual(secretFilesBefore);
+    expect(
+      yield* sql<{ readonly count: number }>`
+        SELECT COUNT(*) AS count
+        FROM orchestration_events
+        WHERE event_type = 'project.mcp-server.updated'
+          AND json_extract(payload_json, '$.server.id') = ${initial.id}
+      `,
+    ).toEqual([{ count: 0 }]);
+  }).pipe(
+    Effect.provide(
+      makeTestLayer(OrchestrationEngineLive, projectMcpOAuthTestLayer, false, "win32"),
     ),
   ),
 );

@@ -2,6 +2,7 @@ import {
   CommandId,
   McpServerId,
   ProjectMcpNameConflictError,
+  ProjectMcpEnvironmentVariableNameConflictError,
   ProjectMcpProviderNotFoundError,
   ProjectMcpServer,
   ProjectMcpServerLimitExceededError,
@@ -12,11 +13,13 @@ import {
   type ProjectMcpCatalog,
   type ProjectMcpCreateInput,
   type ProjectMcpRemoveInput,
+  type ProjectMcpTransportDraft,
   type ProjectMcpUpdateInput,
   type ResolvedProjectMcpServer,
   ProviderInstanceId,
 } from "@t3tools/contracts";
 import { makeDrainableWorker, type DrainableWorker } from "@t3tools/shared/DrainableWorker";
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Context from "effect/Context";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
@@ -132,6 +135,7 @@ const makeProjectMcpService = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const mcpSecrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
   const mcpOAuth = yield* Effect.serviceOption(ProjectMcpOAuth.ProjectMcpOAuth);
+  const hostPlatform = yield* HostProcessPlatform;
   const catalogMutationLock = yield* Semaphore.make(1);
 
   const isDefiniteDispatchFailure = (cause: Cause.Cause<unknown>): boolean => {
@@ -289,13 +293,42 @@ const makeProjectMcpService = Effect.gen(function* () {
           }),
         );
 
+  const duplicateWindowsEnvironmentName = (
+    transport: ProjectMcpTransport | ProjectMcpTransportDraft,
+  ) =>
+    transport.type !== "stdio" || hostPlatform !== "win32"
+      ? undefined
+      : transport.env.find(
+          ({ name }, index, entries) =>
+            entries.findIndex(
+              ({ name: candidate }) => candidate.toLowerCase() === name.toLowerCase(),
+            ) !== index,
+        )?.name;
+
   const validateTransport = (
     input: Pick<ProjectMcpCreateInput | ProjectMcpUpdateInput, "url" | "transport">,
     commandType: string,
-  ) => {
+  ): Effect.Effect<
+    void,
+    OrchestrationCommandInvariantError | ProjectMcpEnvironmentVariableNameConflictError
+  > => {
     const transport = input.transport;
-    if (transport === undefined) return validateUrl(input.url!, commandType);
-    return transport.type === "stdio" ? Effect.void : validateUrl(transport.url, commandType);
+    const urlValidation =
+      transport === undefined
+        ? validateUrl(input.url!, commandType)
+        : transport.type === "stdio"
+          ? Effect.void
+          : validateUrl(transport.url, commandType);
+    const duplicate =
+      transport === undefined ? undefined : duplicateWindowsEnvironmentName(transport);
+    return duplicate === undefined
+      ? urlValidation
+      : Effect.fail(
+          new ProjectMcpEnvironmentVariableNameConflictError({
+            name: duplicate,
+            message: `Stdio environment variable '${duplicate}' conflicts with another name on Windows.`,
+          }),
+        );
   };
 
   const validateProviderIds = (
@@ -466,9 +499,9 @@ const makeProjectMcpService = Effect.gen(function* () {
     providerInstanceId,
   ) =>
     list(projectId).pipe(
-      Effect.map((catalog) =>
-        catalog.external
-          .filter(
+      Effect.flatMap((catalog) =>
+        Effect.forEach(
+          catalog.external.filter(
             (entry) =>
               entry.enabled &&
               entry.providerInstanceIds.includes(providerInstanceId) &&
@@ -478,12 +511,14 @@ const makeProjectMcpService = Effect.gen(function* () {
                   application.providerInstanceId === providerInstanceId &&
                   application.mode !== "unsupported",
               ),
-          )
-          .map((server) => ({
-            id: server.id,
-            name: server.name,
-            transport: getProjectMcpTransport(server),
-          })),
+          ),
+          (server) => {
+            const transport = getProjectMcpTransport(server);
+            return validateTransport({ transport }, "project.mcp-server.resolve").pipe(
+              Effect.as({ id: server.id, name: server.name, transport }),
+            );
+          },
+        ),
       ),
     );
 

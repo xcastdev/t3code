@@ -166,6 +166,7 @@ const decodeRecord = Schema.decodeUnknownSync(
   Schema.fromJsonString(Schema.Record(Schema.String, Schema.Unknown)),
 );
 const decodeObject = Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.Unknown));
+const formValue = (value: string) => new URLSearchParams({ value }).toString().slice(6);
 
 it.effect("requires reconnect for legacy grants without a registration binding", () =>
   Effect.gen(function* () {
@@ -290,6 +291,127 @@ for (const method of ["client_secret_post", "client_secret_basic"] as const) {
     );
   }
 }
+
+for (const [clientId, clientSecret] of [
+  ["client:segment", "secret+value"],
+  ["客户端", "秘密 + value"],
+] as const) {
+  it.effect(
+    `form-encodes nonempty pre-registered Basic credentials for ${clientId} through authorization and refresh`,
+    () =>
+      Effect.gen(function* () {
+        const server = { ...fixtureServer, clientId, clientSecret };
+        let exchanges = 0;
+        let clock = 1_800_000_000_000;
+        const fetchBasic: FetchLike = async (input, init) => {
+          if (String(input).endsWith("/.well-known/oauth-authorization-server")) {
+            const response = await fetchRegistrationFixture(input, init);
+            return Response.json({
+              ...decodeObject(await response.json()),
+              token_endpoint_auth_methods_supported: ["client_secret_basic"],
+            });
+          }
+          if (String(input).endsWith("/token")) {
+            assert.equal(
+              new Headers(init?.headers).get("authorization"),
+              `Basic ${btoa(`${formValue(clientId)}:${formValue(clientSecret)}`)}`,
+            );
+            exchanges++;
+            return Response.json({
+              access_token: `token-${exchanges}`,
+              token_type: "Bearer",
+              expires_in: 1,
+              refresh_token: "refresh",
+            });
+          }
+          return fetchRegistrationFixture(input, init);
+        };
+        const oauth = yield* prepareOAuth({
+          servers: [server],
+          fetch: fetchBasic,
+          now: () => clock,
+        });
+        const started = yield* oauth.begin({ serverId });
+        assert.equal(
+          (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+          200,
+        );
+        assert.equal(exchanges, 1);
+        clock += 2000;
+        const connected = yield* oauth.providerFor(serverId, server);
+        assert.equal(
+          (yield* Effect.promise(async () => connected.tokens()))?.access_token,
+          "token-2",
+        );
+        assert.equal(exchanges, 2);
+      }).pipe(Effect.provide(secretLayer)),
+  );
+}
+
+it.effect(
+  "form-encodes dynamically registered Basic credentials through authorization and refresh",
+  () =>
+    Effect.gen(function* () {
+      const dynamicClientId = "dynamic:客户端";
+      const dynamicClientSecret = "dynamic+秘密";
+      let exchanges = 0;
+      let clock = 1_800_000_000_000;
+      const fetchDynamicBasic: FetchLike = async (input, init) => {
+        const url = String(input);
+        if (url.endsWith("/.well-known/oauth-authorization-server")) {
+          return Response.json({
+            issuer: "https://issuer.example.test",
+            authorization_endpoint: "https://issuer.example.test/authorize",
+            token_endpoint: "https://issuer.example.test/token",
+            registration_endpoint: "https://issuer.example.test/register",
+            response_types_supported: ["code"],
+            grant_types_supported: ["authorization_code", "refresh_token"],
+            token_endpoint_auth_methods_supported: ["client_secret_basic"],
+            code_challenge_methods_supported: ["S256"],
+          });
+        }
+        if (url.endsWith("/register"))
+          return Response.json({
+            client_id: dynamicClientId,
+            client_secret: dynamicClientSecret,
+            redirect_uris: ["http://127.0.0.1/oauth/project-mcp/callback"],
+          });
+        if (url.endsWith("/token")) {
+          assert.equal(
+            new Headers(init?.headers).get("authorization"),
+            `Basic ${btoa(`${formValue(dynamicClientId)}:${formValue(dynamicClientSecret)}`)}`,
+          );
+          exchanges++;
+          return Response.json({
+            access_token: `dynamic-token-${exchanges}`,
+            token_type: "Bearer",
+            expires_in: 1,
+            refresh_token: "dynamic-refresh",
+          });
+        }
+        return fetchOAuthFixture(input, init);
+      };
+      const oauth = yield* prepareOAuth({
+        servers: [],
+        fetch: fetchDynamicBasic,
+        now: () => clock,
+      });
+      const automaticServer = { serverId, resource };
+      const started = yield* oauth.begin({ serverId, server: automaticServer });
+      assert.equal(
+        (yield* oauth.completeCallback(callbackRequest(started.authorizationUrl))).status,
+        200,
+      );
+      assert.equal(exchanges, 1);
+      clock += 2000;
+      const connected = yield* oauth.providerFor(serverId, automaticServer);
+      assert.equal(
+        (yield* Effect.promise(async () => connected.tokens()))?.access_token,
+        "dynamic-token-2",
+      );
+      assert.equal(exchanges, 2);
+    }).pipe(Effect.provide(secretLayer)),
+);
 
 const callbackRequest = (authorizationUrl: string) => {
   const url = new URL("https://t3.example.test/oauth/project-mcp/callback");

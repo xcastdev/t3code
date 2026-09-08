@@ -326,27 +326,40 @@ const make = (config: ProjectMcpOAuthConfig) =>
             const record = await Effect.runPromise(current(id, server));
             return (record?.generation ?? 0) === generation ? record : undefined;
           };
+          const clientAuthentication: OAuthClientProvider["addClientAuthentication"] = async (
+            headers,
+            params,
+            _url,
+            metadata,
+          ) => {
+            const storedClient = (await readRecord())?.client;
+            const clientId = storedClient?.client_id ?? server.clientId;
+            const clientSecret = storedClient?.client_secret ?? server.clientSecret;
+            if (clientId === undefined) return;
+
+            const method = selectClientAuthMethod(
+              {
+                client_id: clientId,
+                ...(clientSecret === undefined ? {} : { client_secret: clientSecret }),
+              },
+              metadata?.token_endpoint_auth_methods_supported ?? [],
+            );
+            if (method === "client_secret_basic") {
+              const formValue = (value: string) =>
+                new URLSearchParams({ value }).toString().slice(6);
+              headers.set(
+                "Authorization",
+                `Basic ${btoa(`${formValue(clientId)}:${formValue(clientSecret ?? "")}`)}`,
+              );
+              return;
+            }
+            params.set("client_id", clientId);
+            if (method === "client_secret_post" && clientSecret !== undefined)
+              params.set("client_secret", clientSecret);
+          };
           const provider: OAuthClientProvider = {
-            // SDK 2.0's default token helper treats an empty secret as absent.
-            ...(server.clientSecret === "" && server.clientId !== undefined
-              ? ({
-                  addClientAuthentication: (headers, params, _url, metadata) => {
-                    const clientId = server.clientId!;
-                    const method = selectClientAuthMethod(
-                      { client_id: clientId, client_secret: "" },
-                      metadata?.token_endpoint_auth_methods_supported ?? [],
-                    );
-                    if (method === "client_secret_basic") {
-                      const encodedClientId = new URLSearchParams({ id: clientId })
-                        .toString()
-                        .slice(3);
-                      headers.set("Authorization", `Basic ${btoa(`${encodedClientId}:`)}`);
-                    } else {
-                      params.set("client_id", clientId);
-                      if (method === "client_secret_post") params.set("client_secret", "");
-                    }
-                  },
-                } satisfies Pick<OAuthClientProvider, "addClientAuthentication">)
+            ...(server.clientId !== undefined || initial?.client?.client_id !== undefined
+              ? { addClientAuthentication: clientAuthentication }
               : {}),
             get redirectUrl() {
               return server.redirectUrl ?? initial?.redirectUrl ?? defaultRedirect;

@@ -6,6 +6,7 @@ import {
   ProjectMcpApplicationMode,
   ProjectMcpCatalog,
   ProjectMcpCreateInput,
+  ProjectMcpEnvironmentVariableNameConflictError,
   ProjectMcpProviderNotFoundError,
   ProjectMcpListInput,
   ProjectMcpManagedServer,
@@ -41,6 +42,9 @@ const decodeProjectMcpRemoveInput = Schema.decodeUnknownSync(ProjectMcpRemoveInp
 const decodeMcpServerId = Schema.decodeUnknownSync(McpServerId);
 const decodeProjectMcpUrl = Schema.decodeUnknownSync(ProjectMcpUrl);
 const decodeProjectMcpNameConflictError = Schema.decodeUnknownSync(ProjectMcpNameConflictError);
+const decodeProjectMcpEnvironmentVariableNameConflictError = Schema.decodeUnknownSync(
+  ProjectMcpEnvironmentVariableNameConflictError,
+);
 const encodeProjectMcpServer = Schema.encodeSync(ProjectMcpServer);
 
 describe("ProjectMcpServer", () => {
@@ -177,6 +181,76 @@ describe("ProjectMcpServer", () => {
       name: "Filesystem",
       transport: { type: "stdio", command: "npx" },
     });
+  });
+
+  it("keeps HTTP header names case-insensitive while allowing case-distinct stdio names", () => {
+    expect(() =>
+      decodeProjectMcpTransport({
+        type: "streamable-http",
+        url: "https://example.com/mcp",
+        headers: [
+          {
+            name: "X-Token",
+            credential: {
+              id: "f6caec74-f44d-4fe3-babb-1d5f1c3bb2bc",
+              name: "Upper token",
+            },
+          },
+          {
+            name: "x-token",
+            credential: {
+              id: "ad949dba-339d-48d5-8a15-b230711f50e3",
+              name: "Lower token",
+            },
+          },
+        ],
+      }),
+    ).toThrow();
+
+    const persisted = decodeProjectMcpTransport({
+      type: "stdio",
+      command: "node",
+      args: [],
+      env: [
+        {
+          name: "HTTP_PROXY",
+          credential: {
+            id: "f6caec74-f44d-4fe3-babb-1d5f1c3bb2bc",
+            name: "Upper proxy",
+          },
+        },
+        {
+          name: "http_proxy",
+          credential: {
+            id: "ad949dba-339d-48d5-8a15-b230711f50e3",
+            name: "Lower proxy",
+          },
+        },
+      ],
+    });
+    expect(persisted.type).toBe("stdio");
+    if (persisted.type === "stdio")
+      expect(persisted.env.map(({ name }) => name)).toEqual(["HTTP_PROXY", "http_proxy"]);
+
+    const created = decodeProjectMcpCreateInput({
+      projectId: "project-1",
+      name: "Proxy-aware command",
+      enabled: true,
+      providerInstanceIds: [],
+      transport: {
+        type: "stdio",
+        command: "node",
+        args: [],
+        env: [
+          { name: "HTTP_PROXY", credential: { name: "Upper proxy", value: "upper" } },
+          { name: "http_proxy", credential: { name: "Lower proxy", value: "lower" } },
+        ],
+      },
+    });
+    const createdTransport = created.transport;
+    expect(createdTransport?.type).toBe("stdio");
+    if (createdTransport?.type === "stdio")
+      expect(createdTransport.env.map(({ name }) => name)).toEqual(["HTTP_PROXY", "http_proxy"]);
   });
 
   it.each([
@@ -385,7 +459,7 @@ describe("Project MCP contract shapes", () => {
           args: [],
           env: [
             { name: "API_TOKEN", credential: { name: "One", value: "one" } },
-            { name: "api_token", credential: { name: "Two", value: "two" } },
+            { name: "API_TOKEN", credential: { name: "Two", value: "two" } },
           ],
         },
       }),
@@ -620,9 +694,15 @@ describe("Project MCP contract shapes", () => {
       _tag: "ProjectMcpServerNotFoundError",
       id: "missing-server",
     });
+    const environmentConflict = decodeProjectMcpEnvironmentVariableNameConflictError({
+      _tag: "ProjectMcpEnvironmentVariableNameConflictError",
+      name: "HTTP_PROXY",
+      message: "Stdio environment variable 'HTTP_PROXY' conflicts with another name on Windows.",
+    });
 
     expect(unknownProvider.message).toContain("missing-provider");
     expect(limit.message).toContain("50");
     expect(missingServer.message).toContain("missing-server");
+    expect(environmentConflict.message).toContain("conflicts with another name on Windows");
   });
 });

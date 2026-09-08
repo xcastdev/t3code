@@ -14,6 +14,8 @@ T3 Code supports these upstream MCP transports:
 For HTTP transports, use an HTTPS URL or an HTTP URL on a loopback host. URLs cannot contain
 embedded usernames, passwords, or query strings. For stdio, provide the executable command,
 optional arguments, working directory, and environment variables.
+On macOS and Linux, `HTTP_PROXY` and `http_proxy` are separate variables. Windows treats those
+names as the same variable, so T3 rejects that pair before it starts the command.
 
 ## Add or edit a server
 
@@ -99,6 +101,7 @@ fallback.
 The command runs on the T3 environment machine, not on the browser or phone. Check that the
 executable is installed there, that the selected working directory exists, and that required
 environment variables are configured. The inherited environment, including `PATH`, is retained.
+On Windows, rename one of two environment variables whose names differ only by case.
 
 ### OAuth does not reconnect
 

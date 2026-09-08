@@ -164,8 +164,12 @@ const ProjectMcpHttpAuthorizationDraftWithDefault = ProjectMcpHttpAuthorizationD
   Schema.withDecodingDefault(ProjectMcpHttpAuthorizationDefault),
 );
 
-const hasDistinctNames = (values: ReadonlyArray<{ readonly name: string }>): boolean =>
+const hasDistinctHeaderNames = (values: ReadonlyArray<{ readonly name: string }>): boolean =>
   new Set(values.map(({ name }) => name.toLowerCase())).size === values.length;
+
+const hasDistinctEnvironmentVariableNames = (
+  values: ReadonlyArray<{ readonly name: string }>,
+): boolean => new Set(values.map(({ name }) => name)).size === values.length;
 
 const hasNoOAuthAuthorizationHeader = (input: {
   readonly authorization: { readonly type: "none" | "oauth" };
@@ -183,7 +187,7 @@ const ProjectMcpHttpTransport = Schema.Union([
   }).check(
     Schema.makeFilter(
       (transport) =>
-        hasDistinctNames(transport.headers) && hasNoOAuthAuthorizationHeader(transport),
+        hasDistinctHeaderNames(transport.headers) && hasNoOAuthAuthorizationHeader(transport),
       { message: "Expected distinct headers and no Authorization header with OAuth" },
     ),
   ),
@@ -195,7 +199,7 @@ const ProjectMcpHttpTransport = Schema.Union([
   }).check(
     Schema.makeFilter(
       (transport) =>
-        hasDistinctNames(transport.headers) && hasNoOAuthAuthorizationHeader(transport),
+        hasDistinctHeaderNames(transport.headers) && hasNoOAuthAuthorizationHeader(transport),
       { message: "Expected distinct headers and no Authorization header with OAuth" },
     ),
   ),
@@ -212,7 +216,7 @@ const ProjectMcpHttpTransportDraft = Schema.Union([
   }).check(
     Schema.makeFilter(
       (transport) =>
-        hasDistinctNames(transport.headers) && hasNoOAuthAuthorizationHeader(transport),
+        hasDistinctHeaderNames(transport.headers) && hasNoOAuthAuthorizationHeader(transport),
       { message: "Expected distinct headers and no Authorization header with OAuth" },
     ),
   ),
@@ -226,7 +230,7 @@ const ProjectMcpHttpTransportDraft = Schema.Union([
   }).check(
     Schema.makeFilter(
       (transport) =>
-        hasDistinctNames(transport.headers) && hasNoOAuthAuthorizationHeader(transport),
+        hasDistinctHeaderNames(transport.headers) && hasNoOAuthAuthorizationHeader(transport),
       { message: "Expected distinct headers and no Authorization header with OAuth" },
     ),
   ),
@@ -244,7 +248,7 @@ const ProjectMcpStdioTransport = Schema.Struct({
   ),
   authorization: Schema.optional(Schema.Never),
 }).check(
-  Schema.makeFilter((transport) => hasDistinctNames(transport.env), {
+  Schema.makeFilter((transport) => hasDistinctEnvironmentVariableNames(transport.env), {
     message: "Expected distinct environment variable names",
   }),
 );
@@ -261,7 +265,7 @@ const ProjectMcpStdioTransportDraft = Schema.Struct({
   ),
   authorization: Schema.optional(Schema.Never),
 }).check(
-  Schema.makeFilter((transport) => hasDistinctNames(transport.env), {
+  Schema.makeFilter((transport) => hasDistinctEnvironmentVariableNames(transport.env), {
     message: "Expected distinct environment variable names",
   }),
 );
@@ -414,6 +418,14 @@ export class ProjectMcpNameConflictError extends Schema.TaggedErrorClass<Project
   },
 ) {}
 
+export class ProjectMcpEnvironmentVariableNameConflictError extends Schema.TaggedErrorClass<ProjectMcpEnvironmentVariableNameConflictError>()(
+  "ProjectMcpEnvironmentVariableNameConflictError",
+  {
+    name: ProjectMcpEnvironmentVariableName,
+    message: TrimmedNonEmptyString,
+  },
+) {}
+
 export class ProjectMcpProviderNotFoundError extends Schema.TaggedErrorClass<ProjectMcpProviderNotFoundError>()(
   "ProjectMcpProviderNotFoundError",
   { providerInstanceId: ProviderInstanceId },
@@ -455,6 +467,7 @@ export class ProjectMcpOAuthActionError extends Schema.TaggedErrorClass<ProjectM
 
 export const ProjectMcpCreateError = Schema.Union([
   ProjectMcpNameConflictError,
+  ProjectMcpEnvironmentVariableNameConflictError,
   ProjectMcpProviderNotFoundError,
   ProjectMcpServerLimitExceededError,
 ]);
@@ -462,6 +475,7 @@ export type ProjectMcpCreateError = typeof ProjectMcpCreateError.Type;
 
 export const ProjectMcpUpdateError = Schema.Union([
   ProjectMcpNameConflictError,
+  ProjectMcpEnvironmentVariableNameConflictError,
   ProjectMcpProviderNotFoundError,
   ProjectMcpServerNotFoundError,
   ProjectMcpOAuthActionError,
@@ -473,6 +487,7 @@ export type ProjectMcpRemoveError = typeof ProjectMcpRemoveError.Type;
 
 export const ProjectMcpMutationError = Schema.Union([
   ProjectMcpNameConflictError,
+  ProjectMcpEnvironmentVariableNameConflictError,
   ProjectMcpProviderNotFoundError,
   ProjectMcpServerLimitExceededError,
   ProjectMcpServerNotFoundError,
