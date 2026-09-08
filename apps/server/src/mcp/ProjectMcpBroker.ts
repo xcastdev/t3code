@@ -99,6 +99,10 @@ export interface ProjectMcpExtensionAdapter extends ProjectMcpExtensionSchemas {
   readonly decodeResult?: (result: unknown) => unknown;
 }
 
+export interface ProjectMcpNotificationAdapter {
+  readonly encodeParams?: (params: unknown) => unknown;
+}
+
 export interface ProjectMcpBrokerOptions {
   readonly connection: ProjectMcpConnection;
   readonly serverId: McpServerId;
@@ -108,6 +112,7 @@ export interface ProjectMcpBrokerOptions {
   readonly now?: () => number;
   readonly handlers?: ProjectMcpBrokerHandlers;
   readonly extensionAdapters?: ReadonlyMap<string, ProjectMcpExtensionAdapter>;
+  readonly notificationExtensionAdapters?: ReadonlyMap<string, ProjectMcpNotificationAdapter>;
 }
 
 export type ProjectMcpCallToolResult = CallToolResult | InputRequiredResult;
@@ -221,6 +226,22 @@ const methodNames = new Set([
   "subscriptions/listen",
 ]);
 
+// Keep protocol-owned notifications out of the custom-extension fallback path.
+const standardNotificationMethods = new Set([
+  "notifications/cancelled",
+  "notifications/progress",
+  "notifications/initialized",
+  "notifications/roots/list_changed",
+  "notifications/tasks/status",
+  "notifications/message",
+  "notifications/resources/updated",
+  "notifications/resources/list_changed",
+  "notifications/tools/list_changed",
+  "notifications/prompts/list_changed",
+  "notifications/elicitation/complete",
+  "notifications/subscriptions/acknowledged",
+]);
+
 export class ProjectMcpBroker {
   readonly protocolEra: ProtocolEra | undefined;
   readonly negotiatedProtocolVersion: string | undefined;
@@ -235,6 +256,10 @@ export class ProjectMcpBroker {
   private readonly requestStateSecret: string | Uint8Array;
   private readonly now: () => number;
   private readonly extensionAdapters: ReadonlyMap<string, ProjectMcpExtensionAdapter>;
+  private readonly notificationExtensionAdapters: ReadonlyMap<
+    string,
+    ProjectMcpNotificationAdapter
+  >;
   private active: LegacyOperation | undefined;
   private readonly disposeController = new AbortController();
   private readonly coordinator: ProjectMcpConnectionCoordinator;
@@ -263,6 +288,7 @@ export class ProjectMcpBroker {
     this.requestStateSecret = options.requestStateSecret ?? NodeCrypto.randomBytes(32);
     this.now = options.now ?? Date.now;
     this.extensionAdapters = options.extensionAdapters ?? new Map();
+    this.notificationExtensionAdapters = options.notificationExtensionAdapters ?? new Map();
     this.setHandlers(options.handlers);
   }
 
@@ -394,6 +420,25 @@ export class ProjectMcpBroker {
 
   async notify(notification: Notification, options?: NotificationOptions): Promise<void> {
     return this.method("notification")(notification, options);
+  }
+
+  async notifyExtension(
+    method: string,
+    params: unknown,
+    options?: NotificationOptions,
+  ): Promise<void> {
+    if (!method || standardNotificationMethods.has(method))
+      throw new ProjectMcpBrokerError("invalid_extension_params");
+    if (this.protocolEra !== this.downstreamProtocolEra) {
+      const adapter = this.notificationExtensionAdapters.get(method);
+      if (adapter === undefined)
+        throw new ProjectMcpBrokerError("unsupported_extension_across_protocol_eras");
+      params = adapter.encodeParams ? adapter.encodeParams(params) : params;
+    }
+    return this.method("notification")(
+      { method, ...(params === undefined ? {} : { params }) } as Notification,
+      options,
+    );
   }
 
   async notifyRootsListChanged(options?: NotificationOptions): Promise<void> {

@@ -1024,6 +1024,130 @@ it("does not treat standard protocol methods as extensions", async () => {
   }
 });
 
+it("forwards a custom notification unchanged when both sides use the same era", async () => {
+  const seen: unknown[] = [];
+  const broker = new ProjectMcpBroker({
+    connection: connection(
+      makeClient({ notification: async (value) => void seen.push(value) }),
+      "modern",
+    ),
+    serverId,
+    providerSessionId: "provider-session",
+    downstreamProtocolEra: "modern",
+  });
+  const params = { values: [0, false, null, "é"], _meta: { vendor: "astra" } };
+
+  try {
+    await broker.notifyExtension("com.astra/ack", params);
+    expect(seen).toEqual([{ method: "com.astra/ack", params }]);
+  } finally {
+    await broker.close();
+  }
+});
+
+it.each([
+  ["modern", "legacy"],
+  ["legacy", "modern"],
+] as const)(
+  "rejects custom notifications across %s upstream and %s downstream eras",
+  async (upstreamEra, downstreamEra) => {
+    const seen: unknown[] = [];
+    const broker = new ProjectMcpBroker({
+      connection: connection(
+        makeClient({ notification: async (value) => void seen.push(value) }),
+        upstreamEra,
+      ),
+      serverId,
+      providerSessionId: "provider-session",
+      downstreamProtocolEra: downstreamEra,
+      extensionAdapters: new Map([
+        [
+          "com.astra/ack",
+          {
+            params: JSONObjectSchema,
+            result: JSONValueSchema,
+            encodeParams: () => ({ encoded: true }),
+          },
+        ],
+      ]),
+    });
+
+    try {
+      await expect(broker.notifyExtension("com.astra/ack", { value: true })).rejects.toMatchObject({
+        code: "unsupported_extension_across_protocol_eras",
+      });
+      expect(seen).toEqual([]);
+    } finally {
+      await broker.close();
+    }
+  },
+);
+
+it("uses a separate notification adapter for cross-era custom notifications", async () => {
+  const seen: unknown[] = [];
+  const broker = new ProjectMcpBroker({
+    connection: connection(
+      makeClient({ notification: async (value) => void seen.push(value) }),
+      "modern",
+    ),
+    serverId,
+    providerSessionId: "provider-session",
+    downstreamProtocolEra: "legacy",
+    notificationExtensionAdapters: new Map([
+      [
+        "com.astra/ack",
+        {
+          encodeParams: (params: unknown) => ({ encoded: params }),
+        },
+      ],
+    ]),
+  });
+
+  try {
+    await broker.notifyExtension("com.astra/ack", { value: true });
+    expect(seen).toEqual([{ method: "com.astra/ack", params: { encoded: { value: true } } }]);
+  } finally {
+    await broker.close();
+  }
+});
+
+it("does not treat standard protocol notifications as extensions", async () => {
+  const seen: unknown[] = [];
+  const broker = new ProjectMcpBroker({
+    connection: connection(
+      makeClient({ notification: async (value) => void seen.push(value) }),
+      "modern",
+    ),
+    serverId,
+    providerSessionId: "provider-session",
+    downstreamProtocolEra: "modern",
+  });
+
+  try {
+    for (const method of [
+      "notifications/roots/list_changed",
+      "notifications/initialized",
+      "notifications/cancelled",
+      "notifications/progress",
+      "notifications/tasks/status",
+      "notifications/message",
+      "notifications/resources/updated",
+      "notifications/resources/list_changed",
+      "notifications/tools/list_changed",
+      "notifications/prompts/list_changed",
+      "notifications/elicitation/complete",
+      "notifications/subscriptions/acknowledged",
+    ]) {
+      await expect(broker.notifyExtension(method, {})).rejects.toMatchObject({
+        code: "invalid_extension_params",
+      });
+    }
+    expect(seen).toEqual([]);
+  } finally {
+    await broker.close();
+  }
+});
+
 it("relays list-change notifications through the semantic handler surface", async () => {
   let toolsChanged: unknown;
   let registered: ((notification: unknown) => void | Promise<void>) | undefined;

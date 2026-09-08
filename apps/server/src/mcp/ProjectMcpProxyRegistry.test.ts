@@ -98,6 +98,98 @@ const sendRootsListChanged = async (client: Client): Promise<void> => {
   await client.notification({ method: "notifications/roots/list_changed" });
 };
 
+type Era = "modern" | "legacy";
+
+const runExtensionNotificationScenario = ({
+  upstreamEra,
+  downstreamEra,
+}: {
+  upstreamEra: Era;
+  downstreamEra: Era;
+}) =>
+  Effect.gen(function* () {
+    const forwarded: unknown[] = [];
+    const forwardedReceipts: Array<{ readonly resolve: () => void }> = [];
+    const discoverResult =
+      upstreamEra === "modern"
+        ? {
+            protocolVersion: "2026-07-28",
+            supportedVersions: ["2026-07-28"],
+            capabilities: {},
+            serverInfo: { name: "modern-upstream", version: "1" },
+          }
+        : undefined;
+    const upstreamClient = {
+      ...clientForFixture(),
+      notification: async (notification: unknown) => {
+        forwarded.push(notification);
+        forwardedReceipts.shift()?.resolve();
+      },
+      getProtocolEra: () => upstreamEra,
+      getNegotiatedProtocolVersion: () => (upstreamEra === "modern" ? "2026-07-28" : "2025-11-25"),
+      getDiscoverResult: () => discoverResult,
+      getServerCapabilities: () => ({}),
+      getServerVersion: () => ({ name: `${upstreamEra}-upstream`, version: "1" }),
+    } satisfies ProjectMcpClient;
+    const registry = yield* makeRegistry(async () => ({
+      client: upstreamClient,
+      transport,
+      protocolEra: upstreamEra,
+      negotiatedProtocolVersion: upstreamEra === "modern" ? "2026-07-28" : "2025-11-25",
+      discoverResult,
+      serverCapabilities: {},
+      serverVersion: { name: `${upstreamEra}-upstream`, version: "1" },
+      close: async () => undefined,
+    }));
+    const [issued] = yield* registry.registerSession({
+      providerSessionId: "provider-a",
+      threadId: ThreadId.make("thread-a"),
+      servers: [server],
+    });
+    const sessions = fixtureSessionRegistry();
+    const fetchFn = yield* makeScopedFetch((request) => {
+      const effectRequest = HttpServerRequest.fromWeb(request);
+      return ProjectMcpProxyHttpServer.handleProjectMcpProxyRequest(effectRequest).pipe(
+        Effect.provideService(McpSessionRegistry.McpSessionRegistry, sessions),
+        Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, registry),
+        Effect.map(HttpServerResponse.toWeb),
+      );
+    });
+    const client =
+      downstreamEra === "modern"
+        ? new Client(
+            { name: "modern-downstream", version: "1" },
+            { versionNegotiation: { mode: { pin: "2026-07-28" } } },
+          )
+        : new Client(
+            { name: "legacy-downstream", version: "1" },
+            { versionNegotiation: { mode: "legacy" } },
+          );
+    const sdkTransport = new StreamableHTTPClientTransport(issued!.endpoint, {
+      authProvider: { token: async () => "provider-token" },
+      fetch: fetchFn,
+    });
+
+    yield* Effect.promise(() => client.connect(sdkTransport));
+    expect(client.getProtocolEra()).toBe(downstreamEra);
+    for (const notification of [
+      {
+        method: "com.astra/ack",
+        params: { values: [0, false, null, "é"], _meta: { vendor: "astra" } },
+      },
+      { method: "notifications/com.astra/control", params: {} },
+      { method: "com.astra/noParams" },
+    ]) {
+      const receipt = Promise.withResolvers<void>();
+      if (upstreamEra === downstreamEra) forwardedReceipts.push(receipt);
+      yield* Effect.promise(() => client.notification(notification as never));
+      if (upstreamEra === downstreamEra) yield* Effect.promise(() => receipt.promise);
+    }
+    yield* Effect.promise(() => client.close());
+    yield* registry.revokeProviderSession("provider-a");
+    return forwarded;
+  });
+
 it.effect("issues opaque immutable endpoints and isolates sessions", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry(async () => connection(async () => undefined));
@@ -389,6 +481,64 @@ it.effect("accepts a legacy streamable HTTP client through a stateful session", 
     yield* Effect.promise(() => client.close());
 
     expect(tools.tools.map((tool) => tool.name)).toEqual(["echo"]);
+  }),
+);
+
+it.effect("forwards custom notifications between modern peers", () =>
+  Effect.gen(function* () {
+    const forwarded = yield* runExtensionNotificationScenario({
+      upstreamEra: "modern",
+      downstreamEra: "modern",
+    });
+
+    expect(forwarded).toEqual([
+      {
+        method: "com.astra/ack",
+        params: { values: [0, false, null, "é"], _meta: { vendor: "astra" } },
+      },
+      { method: "notifications/com.astra/control", params: {} },
+      { method: "com.astra/noParams", params: {} },
+    ]);
+  }),
+);
+
+it.effect("forwards custom notifications between legacy peers", () =>
+  Effect.gen(function* () {
+    const forwarded = yield* runExtensionNotificationScenario({
+      upstreamEra: "legacy",
+      downstreamEra: "legacy",
+    });
+
+    expect(forwarded).toEqual([
+      {
+        method: "com.astra/ack",
+        params: { values: [0, false, null, "é"], _meta: { vendor: "astra" } },
+      },
+      { method: "notifications/com.astra/control", params: {} },
+      { method: "com.astra/noParams" },
+    ]);
+  }),
+);
+
+it.effect("does not forward custom notifications from modern to legacy peers", () =>
+  Effect.gen(function* () {
+    const forwarded = yield* runExtensionNotificationScenario({
+      upstreamEra: "legacy",
+      downstreamEra: "modern",
+    });
+
+    expect(forwarded).toEqual([]);
+  }),
+);
+
+it.effect("does not forward custom notifications from legacy to modern peers", () =>
+  Effect.gen(function* () {
+    const forwarded = yield* runExtensionNotificationScenario({
+      upstreamEra: "modern",
+      downstreamEra: "legacy",
+    });
+
+    expect(forwarded).toEqual([]);
   }),
 );
 

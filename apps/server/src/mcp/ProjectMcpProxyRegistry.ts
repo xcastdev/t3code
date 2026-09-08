@@ -236,6 +236,12 @@ const makeServer = (broker: ProjectMcpBroker, notifier?: ServerNotifier): Server
       requestOptions(context),
     );
   };
+  (
+    server as unknown as {
+      fallbackNotificationHandler: (notification: Notification) => Promise<void>;
+    }
+  ).fallbackNotificationHandler = (notification) =>
+    broker.notifyExtension(notification.method, notification.params);
   if (capabilities.tools) {
     server.setRequestHandler("tools/list", (request, context) =>
       broker.listTools(request.params, requestOptions(context)),
