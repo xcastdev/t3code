@@ -8,9 +8,30 @@ const server = new Server(
     supportedProtocolVersions: ["2025-11-25"],
   },
 );
-server.registerCapabilities({ tools: {}, resources: { subscribe: true, listChanged: true } });
+server.registerCapabilities({
+  tools: {},
+  prompts: {},
+  resources: { subscribe: true, listChanged: true },
+});
 const resources = new Set();
 server.setRequestHandler("resources/list", () => ({ resources: [] }));
+server.setRequestHandler("prompts/list", () => ({ prompts: [] }));
+server.setRequestHandler("prompts/get", async (request, context) => {
+  if (request.params.name !== "needs-roots-prompt") return { messages: [] };
+  const result = await context.mcpReq.send(
+    { method: "roots/list" },
+    { signal: context.mcpReq.signal },
+  );
+  return { description: result.roots[0].uri, messages: [] };
+});
+server.setRequestHandler("resources/read", async (request, context) => {
+  if (request.params.uri !== "file:///needs-roots-resource") return { contents: [] };
+  const result = await context.mcpReq.send(
+    { method: "roots/list" },
+    { signal: context.mcpReq.signal },
+  );
+  return { contents: [{ uri: request.params.uri, text: result.roots[0].uri }] };
+});
 server.setRequestHandler("resources/subscribe", (request) => {
   resources.add(request.params.uri);
   return {};

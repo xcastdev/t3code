@@ -157,6 +157,7 @@ interface PendingInput {
 }
 
 interface LegacyOperation {
+  method: ProjectMcpContinuationMethod;
   id: string;
   paramsHash: string;
   expiresAt: number;
@@ -165,7 +166,7 @@ interface LegacyOperation {
   nonce?: string | undefined;
   inputs: PendingInput[];
   waiter?:
-    | { resolve: (result: ProjectMcpCallToolResult) => void; reject: (error: unknown) => void }
+    | { resolve: (result: ProjectMcpContinuationResult) => void; reject: (error: unknown) => void }
     | undefined;
   options?: ProjectMcpRequestOptions;
   detach?: () => void;
@@ -313,7 +314,8 @@ export class ProjectMcpBroker {
       typeof input.requestState === "string"
         ? this.verifyInputState(input.requestState, "tools/call", input)
         : undefined;
-    if (this.shouldBridgeLegacyServerRequests()) return this.callLegacyTool(params, state, options);
+    if (this.shouldBridgeLegacyServerRequests())
+      return this.callLegacyOperation("tools/call", params, state, options);
     return this.callWithInputRequired("tools/call", params, options, state);
   }
 
@@ -340,6 +342,8 @@ export class ProjectMcpBroker {
       typeof input.requestState === "string"
         ? this.verifyInputState(input.requestState, "resources/read", input)
         : undefined;
+    if (this.shouldBridgeLegacyServerRequests())
+      return this.callLegacyOperation("resources/read", params, state, options);
     return this.callWithInputRequired("resources/read", params, options, state);
   }
 
@@ -380,6 +384,8 @@ export class ProjectMcpBroker {
       typeof input.requestState === "string"
         ? this.verifyInputState(input.requestState, "prompts/get", input)
         : undefined;
+    if (this.shouldBridgeLegacyServerRequests())
+      return this.callLegacyOperation("prompts/get", params, state, options);
     return this.callWithInputRequired("prompts/get", params, options, state);
   }
 
@@ -401,12 +407,17 @@ export class ProjectMcpBroker {
     handler: RootsRequestHandler,
     options?: NotificationOptions,
   ): Promise<void> {
-    this.coordinator.setRootsOwner(owner, (method, request, context) => {
+    const replacement = this.coordinator.replaceRootsOwner(owner, (method, request, context) => {
       if (method !== "roots/list")
         throw new ProtocolError(ProtocolErrorCode.MethodNotFound, "Unsupported MCP server request");
       return handler(request, context);
     });
-    await this.method("notification")({ method: "notifications/roots/list_changed" }, options);
+    try {
+      await this.method("notification")({ method: "notifications/roots/list_changed" }, options);
+    } catch (error) {
+      if (replacement !== undefined) this.coordinator.rollbackRootsOwner(replacement);
+      throw error;
+    }
   }
 
   releaseRootsOwner(owner: object): void {
@@ -454,7 +465,8 @@ export class ProjectMcpBroker {
     const bound = value.bind(this.connection.client);
     if (
       this.protocolEra !== "legacy" ||
-      (key === "callTool" && this.shouldBridgeLegacyServerRequests()) ||
+      ((key === "callTool" || key === "getPrompt" || key === "readResource") &&
+        this.shouldBridgeLegacyServerRequests()) ||
       key === "notification"
     ) {
       return bound as NonNullable<ProjectMcpClient[K]>;
@@ -584,7 +596,7 @@ export class ProjectMcpBroker {
   private waitForOperation(
     operation: LegacyOperation,
     options?: ProjectMcpRequestOptions,
-  ): Promise<ProjectMcpCallToolResult> {
+  ): Promise<ProjectMcpContinuationResult> {
     operation.options = options;
     return new Promise((resolve, reject) => {
       operation.waiter = { resolve, reject };
@@ -618,7 +630,7 @@ export class ProjectMcpBroker {
         version: 1,
         serverId: String(this.serverId),
         providerSessionId: this.providerSessionId,
-        method: "tools/call",
+        method: operation.method,
         paramsHash: operation.paramsHash,
         operationId: operation.id,
         nonce: operation.nonce,
@@ -628,16 +640,36 @@ export class ProjectMcpBroker {
     });
   }
 
-  private async callLegacyTool(
+  private callLegacyOperation(
+    method: "tools/call",
     params: ProjectMcpCallToolParams,
     state: InputState | undefined,
     options?: ProjectMcpRequestOptions,
-  ): Promise<ProjectMcpCallToolResult> {
+  ): Promise<ProjectMcpCallToolResult>;
+  private callLegacyOperation(
+    method: "prompts/get",
+    params: ProjectMcpGetPromptParams,
+    state: InputState | undefined,
+    options?: ProjectMcpRequestOptions,
+  ): Promise<GetPromptResult | InputRequiredResult>;
+  private callLegacyOperation(
+    method: "resources/read",
+    params: ProjectMcpReadResourceParams,
+    state: InputState | undefined,
+    options?: ProjectMcpRequestOptions,
+  ): Promise<ReadResourceResult | InputRequiredResult>;
+  private async callLegacyOperation(
+    method: ProjectMcpContinuationMethod,
+    params: ProjectMcpContinuationParams,
+    state: InputState | undefined,
+    options?: ProjectMcpRequestOptions,
+  ): Promise<ProjectMcpContinuationResult> {
     if (state) {
       const operation = this.active;
       const pending = operation?.inputs[0];
       if (
         !operation ||
+        operation.method !== method ||
         !pending ||
         operation.id !== state.operationId ||
         !operation.nonce ||
@@ -661,6 +693,7 @@ export class ProjectMcpBroker {
     if (params.inputResponses) throw new ProjectMcpBrokerError("invalid_request_state");
     const release = await this.acquire(options?.signal);
     const operation: LegacyOperation = {
+      method,
       id: NodeCrypto.randomUUID(),
       paramsHash: canonicalJson(paramsForHash(params)),
       expiresAt: this.now() + INPUT_STATE_TTL_MS,
@@ -680,16 +713,26 @@ export class ProjectMcpBroker {
     const result = this.waitForOperation(operation, options);
     if (this.active !== operation) return result;
     void Promise.resolve()
-      .then(() =>
-        this.method("callTool")(params, {
+      .then(() => {
+        const clientMethod =
+          method === "tools/call"
+            ? "callTool"
+            : method === "prompts/get"
+              ? "getPrompt"
+              : "readResource";
+        const invoke = this.method(clientMethod) as unknown as (
+          params: ProjectMcpContinuationParams,
+          options: ProjectMcpRequestOptions,
+        ) => Promise<ProjectMcpContinuationResult>;
+        return invoke(params, {
           ...options,
           signal: operation.controller.signal,
           timeout: INPUT_STATE_TTL_MS,
           maxTotalTimeout: INPUT_STATE_TTL_MS,
           resetTimeoutOnProgress: false,
           onprogress: (progress) => operation.options?.onprogress?.(progress),
-        }),
-      )
+        });
+      })
       .then(
         (completed) => {
           if (this.active !== operation) return;

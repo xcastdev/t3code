@@ -147,6 +147,13 @@ type PushHandler = (
 interface RootsOwner {
   readonly owner: object;
   readonly handler: PushHandler;
+  readonly generation: number;
+}
+
+interface RootsOwnerReplacement {
+  readonly owner: object;
+  readonly generation: number;
+  readonly previous: RootsOwner | undefined;
 }
 
 /** One owner at a time on legacy transports, which carry no parent request correlation. */
@@ -155,6 +162,8 @@ export class ProjectMcpConnectionCoordinator {
   private busy = false;
   private owner: PushHandler | undefined;
   private rootsOwner: RootsOwner | undefined;
+  private rootsOwnerGeneration = 0;
+  private readonly releasedRootsOwners = new WeakSet<object>();
   private readonly queue: Array<() => void> = [];
   private readonly listeners = new Set<(notification: Notification) => void | Promise<void>>();
   private readonly subscriptions = new Map<string, Promise<McpSubscription>>();
@@ -299,16 +308,32 @@ export class ProjectMcpConnectionCoordinator {
     await Promise.all(uris.map((uri) => this.unsubscribeResource(uri, owner)));
   }
 
-  setRootsOwner(owner: object, handler: PushHandler): void {
-    if (this.controller.signal.aborted) return;
-    this.rootsOwner = { owner, handler };
+  replaceRootsOwner(owner: object, handler: PushHandler): RootsOwnerReplacement | undefined {
+    if (this.controller.signal.aborted || this.releasedRootsOwners.has(owner)) return undefined;
+    const previous = this.rootsOwner;
+    const generation = ++this.rootsOwnerGeneration;
+    this.rootsOwner = { owner, handler, generation };
+    return { owner, generation, previous };
+  }
+
+  rollbackRootsOwner(replacement: RootsOwnerReplacement): void {
+    const current = this.rootsOwner;
+    if (current?.owner !== replacement.owner || current.generation !== replacement.generation) {
+      return;
+    }
+    const previous = replacement.previous;
+    this.rootsOwner =
+      previous !== undefined && !this.releasedRootsOwners.has(previous.owner)
+        ? previous
+        : undefined;
   }
 
   ownsRootsOwner(owner: object): boolean {
-    return this.rootsOwner?.owner === owner;
+    return this.rootsOwner?.owner === owner && !this.releasedRootsOwners.has(owner);
   }
 
   releaseRootsOwner(owner: object): void {
+    this.releasedRootsOwners.add(owner);
     if (this.rootsOwner?.owner === owner) this.rootsOwner = undefined;
   }
 

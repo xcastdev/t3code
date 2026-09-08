@@ -151,6 +151,61 @@ it.effect("continues prompt and resource input-required results through the HTTP
 );
 
 it.effect(
+  "bridges legacy stdio prompt and resource requests through HTTP input-required rounds",
+  () =>
+    Effect.gen(function* () {
+      const { client } = yield* makeProxy(true, true);
+      const roots = { roots: [{ uri: "file:///workspace", name: "workspace" }] };
+      client.setRequestHandler("roots/list", () => roots);
+
+      const prompt = (yield* Effect.promise(() =>
+        client.getPrompt(
+          { name: "needs-roots-prompt", arguments: {} },
+          { allowInputRequired: true },
+        ),
+      )) as unknown as { resultType?: string; requestState?: string };
+      expect(prompt.resultType).toBe("input_required");
+      expect(prompt.requestState).toBeTypeOf("string");
+      if (typeof prompt.requestState !== "string") throw new Error("expected prompt state");
+      const completedPrompt = yield* Effect.promise(() =>
+        client.getPrompt(
+          {
+            name: "needs-roots-prompt",
+            arguments: {},
+            requestState: prompt.requestState,
+            inputResponses: { "legacy-input-0": roots },
+          } as never,
+          { allowInputRequired: true },
+        ),
+      );
+      expect(completedPrompt).toMatchObject({
+        description: "file:///workspace",
+        messages: [],
+      });
+
+      const resource = (yield* Effect.promise(() =>
+        client.readResource({ uri: "file:///needs-roots-resource" }, { allowInputRequired: true }),
+      )) as unknown as { resultType?: string; requestState?: string };
+      expect(resource.resultType).toBe("input_required");
+      expect(resource.requestState).toBeTypeOf("string");
+      if (typeof resource.requestState !== "string") throw new Error("expected resource state");
+      const completedResource = yield* Effect.promise(() =>
+        client.readResource(
+          {
+            uri: "file:///needs-roots-resource",
+            requestState: resource.requestState,
+            inputResponses: { "legacy-input-0": roots },
+          } as never,
+          { allowInputRequired: true },
+        ),
+      );
+      expect(completedResource).toMatchObject({
+        contents: [{ uri: "file:///needs-roots-resource", text: "file:///workspace" }],
+      });
+    }),
+);
+
+it.effect(
   "opens modern upstream resource filters and releases them with downstream subscriptions",
   () =>
     Effect.gen(function* () {

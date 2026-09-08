@@ -116,8 +116,8 @@ it("releases roots ownership on replacement and connection close", async () => {
   if (!rootsRequest) throw new Error("roots request handler was not registered");
   const first = {};
   const second = {};
-  coordinator.setRootsOwner(first, () => ({ roots: [{ uri: "file:///first" }] }));
-  coordinator.setRootsOwner(second, () => ({ roots: [{ uri: "file:///second" }] }));
+  coordinator.replaceRootsOwner(first, () => ({ roots: [{ uri: "file:///first" }] }));
+  coordinator.replaceRootsOwner(second, () => ({ roots: [{ uri: "file:///second" }] }));
   const context = { mcpReq: { signal: new AbortController().signal } };
   expect(await rootsRequest({ method: "roots/list" }, context)).toEqual({
     roots: [{ uri: "file:///second" }],
@@ -130,7 +130,9 @@ it("releases roots ownership on replacement and connection close", async () => {
   await expect(
     Promise.resolve().then(() => rootsRequest!({ method: "roots/list" }, context)),
   ).rejects.toMatchObject({ code: ProtocolErrorCode.MethodNotFound });
-  coordinator.setRootsOwner(first, () => ({ roots: [{ uri: "file:///first" }] }));
+  expect(
+    coordinator.replaceRootsOwner(first, () => ({ roots: [{ uri: "file:///first" }] })),
+  ).toBeUndefined();
   await coordinator.close();
   await expect(
     Promise.resolve().then(() => rootsRequest!({ method: "roots/list" }, context)),

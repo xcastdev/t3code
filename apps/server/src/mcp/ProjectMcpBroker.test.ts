@@ -375,6 +375,219 @@ it("bridges legacy upstream server requests through modern input-required rounds
   expect(forwarded).toBe(0);
 });
 
+it.each([
+  ["getPrompt", "roots/list"],
+  ["getPrompt", "sampling/createMessage"],
+  ["getPrompt", "elicitation/create"],
+  ["readResource", "roots/list"],
+  ["readResource", "sampling/createMessage"],
+  ["readResource", "elicitation/create"],
+] as const)("bridges legacy %s server requests for %s", async (operationMethod, pushMethod) => {
+  let pushHandler: ((request: unknown, context: unknown) => unknown | Promise<unknown>) | undefined;
+  let response: unknown;
+  const expectedResponse =
+    pushMethod === "roots/list"
+      ? { roots: [{ uri: "file:///workspace" }] }
+      : pushMethod === "sampling/createMessage"
+        ? { model: "fixture", role: "assistant", content: { type: "text", text: "ok" } }
+        : { action: "accept", content: {} };
+  let calls = 0;
+  const client = makeClient({
+    setRequestHandler: ((
+      method: string,
+      handler: (request: unknown, context: unknown) => unknown,
+    ) => {
+      if (method === pushMethod) pushHandler = handler;
+    }) as NonNullable<ProjectMcpClient["setRequestHandler"]>,
+    ...(operationMethod === "getPrompt"
+      ? {
+          getPrompt: (async (params, options) => {
+            calls += 1;
+            if (!pushHandler) throw new Error("push handler was not installed");
+            response = await pushHandler(
+              { jsonrpc: "2.0", id: calls, method: pushMethod, params: {} },
+              { mcpReq: { signal: options?.signal ?? new AbortController().signal } },
+            );
+            return {
+              description: JSON.stringify({ params, response }),
+              messages: [],
+            };
+          }) as NonNullable<ProjectMcpClient["getPrompt"]>,
+        }
+      : {
+          readResource: (async (params, options) => {
+            calls += 1;
+            if (!pushHandler) throw new Error("push handler was not installed");
+            response = await pushHandler(
+              { jsonrpc: "2.0", id: calls, method: pushMethod, params: {} },
+              { mcpReq: { signal: options?.signal ?? new AbortController().signal } },
+            );
+            return {
+              contents: [{ uri: params.uri, text: JSON.stringify({ params, response }) }],
+            };
+          }) as NonNullable<ProjectMcpClient["readResource"]>,
+        }),
+  });
+  const broker = new ProjectMcpBroker({
+    connection: connection(client, "legacy"),
+    serverId,
+    providerSessionId: `${operationMethod}-${pushMethod}`,
+    downstreamProtocolEra: "modern",
+    requestStateSecret: "broker-secret",
+    handlers: {
+      onRootsRequest: () => expectedResponse,
+      onSamplingRequest: () => ({
+        model: "fixture",
+        role: "assistant",
+        content: { type: "text", text: "ok" },
+      }),
+      onElicitationRequest: () => ({ action: "accept", content: {} }),
+    },
+  });
+  const params =
+    operationMethod === "getPrompt"
+      ? { name: "needs-input", arguments: { subject: "workspace" } }
+      : { uri: "file:///needs-input" };
+
+  const first = (
+    operationMethod === "getPrompt"
+      ? await broker.getPrompt(params as never)
+      : await broker.readResource(params as never)
+  ) as InputRequiredResult;
+  expect(first).toMatchObject({
+    resultType: "input_required",
+    inputRequests: { "legacy-input-0": { method: pushMethod } },
+  });
+  expect(first.requestState).toBeTypeOf("string");
+  if (typeof first.requestState !== "string") throw new Error("expected signed request state");
+
+  const completedParams = {
+    ...params,
+    inputResponses: { "legacy-input-0": expectedResponse },
+    requestState: first.requestState,
+  } as never;
+  const completed =
+    operationMethod === "getPrompt"
+      ? await broker.getPrompt(completedParams)
+      : await broker.readResource(completedParams);
+  expect(completed).toMatchObject(
+    operationMethod === "getPrompt"
+      ? { description: expect.stringContaining('"response"') }
+      : { contents: [{ uri: "file:///needs-input", text: expect.stringContaining('"response"') }] },
+  );
+  expect(response).toEqual(expectedResponse);
+  expect(calls).toBe(1);
+});
+
+it("rejects a legacy prompt continuation through the resource method", async () => {
+  let rootsHandler:
+    | ((request: unknown, context: unknown) => unknown | Promise<unknown>)
+    | undefined;
+  let promptCalls = 0;
+  let resourceCalls = 0;
+  const client = makeClient({
+    setRequestHandler: ((
+      method: string,
+      handler: (request: unknown, context: unknown) => unknown,
+    ) => {
+      if (method === "roots/list") rootsHandler = handler;
+    }) as NonNullable<ProjectMcpClient["setRequestHandler"]>,
+    getPrompt: (async () => {
+      promptCalls += 1;
+      if (!rootsHandler) throw new Error("roots handler was not installed");
+      await rootsHandler(
+        { method: "roots/list" },
+        { mcpReq: { signal: new AbortController().signal } },
+      );
+      return { messages: [] };
+    }) as NonNullable<ProjectMcpClient["getPrompt"]>,
+    readResource: (async () => {
+      resourceCalls += 1;
+      return { contents: [] };
+    }) as NonNullable<ProjectMcpClient["readResource"]>,
+  });
+  const broker = new ProjectMcpBroker({
+    connection: connection(client, "legacy"),
+    serverId,
+    providerSessionId: "legacy-method-binding",
+    downstreamProtocolEra: "modern",
+    requestStateSecret: "broker-secret",
+    handlers: { onRootsRequest: () => ({ roots: [] }) },
+  });
+  const first = (await broker.getPrompt({ name: "needs-input" })) as InputRequiredResult;
+  if (typeof first.requestState !== "string") throw new Error("expected signed request state");
+  await expect(
+    broker.readResource({
+      uri: "file:///wrong-method",
+      inputResponses: { "legacy-input-0": { roots: [] } },
+      requestState: first.requestState,
+    }),
+  ).rejects.toMatchObject({ code: "invalid_request_state" });
+  expect(promptCalls).toBe(1);
+  expect(resourceCalls).toBe(0);
+  await broker.close();
+});
+
+it("cancels a suspended legacy resource operation and cannot revive it", async () => {
+  let rootsHandler:
+    | ((request: unknown, context: unknown) => unknown | Promise<unknown>)
+    | undefined;
+  const entered = Promise.withResolvers<void>();
+  const client = makeClient({
+    setRequestHandler: ((
+      method: string,
+      handler: (request: unknown, context: unknown) => unknown,
+    ) => {
+      if (method === "roots/list") rootsHandler = handler;
+    }) as NonNullable<ProjectMcpClient["setRequestHandler"]>,
+    readResource: (async (_params, options) => {
+      if (!rootsHandler) throw new Error("roots handler was not installed");
+      await rootsHandler(
+        { method: "roots/list" },
+        { mcpReq: { signal: options?.signal ?? new AbortController().signal } },
+      );
+      if (!options?.signal) throw new Error("missing cancellation signal");
+      entered.resolve();
+      await new Promise<never>((_resolve, reject) => {
+        options.signal!.addEventListener("abort", () => reject(options.signal!.reason), {
+          once: true,
+        });
+      });
+      return { contents: [] };
+    }) as NonNullable<ProjectMcpClient["readResource"]>,
+  });
+  const broker = new ProjectMcpBroker({
+    connection: connection(client, "legacy"),
+    serverId,
+    providerSessionId: "legacy-cancellation",
+    downstreamProtocolEra: "modern",
+    requestStateSecret: "broker-secret",
+    handlers: { onRootsRequest: () => ({ roots: [] }) },
+  });
+  const first = (await broker.readResource({ uri: "file:///needs-input" })) as InputRequiredResult;
+  if (typeof first.requestState !== "string") throw new Error("expected signed request state");
+  const abort = new AbortController();
+  const pending = broker.readResource(
+    {
+      uri: "file:///needs-input",
+      inputResponses: { "legacy-input-0": { roots: [] } },
+      requestState: first.requestState,
+    },
+    { signal: abort.signal },
+  );
+  await entered.promise;
+  abort.abort(new Error("cancelled"));
+  await expect(pending).rejects.toThrow("cancelled");
+  await expect(
+    broker.readResource({
+      uri: "file:///needs-input",
+      inputResponses: { "legacy-input-0": { roots: [] } },
+      requestState: first.requestState,
+    }),
+  ).rejects.toMatchObject({ code: "invalid_request_state" });
+  await broker.close();
+});
+
 it("rejects tampered input state before contacting the upstream server", async () => {
   let calls = 0;
   const broker = new ProjectMcpBroker({
@@ -589,4 +802,161 @@ it("associates unsolicited legacy roots requests with the notifying facade", asy
   await notifySecond.call(second);
   expect(await request({ method: "roots/list" }, context)).toEqual(rootsB);
   await second.close();
+});
+
+it("rolls back a failed roots notification to the healthy owner", async () => {
+  let rootsRequest:
+    | ((request: unknown, context: unknown) => unknown | Promise<unknown>)
+    | undefined;
+  let notificationCount = 0;
+  const failure = new Error("notification failed");
+  const client = makeClient({
+    notification: async () => {
+      notificationCount += 1;
+      if (notificationCount === 2) throw failure;
+    },
+    setRequestHandler: ((
+      method: string,
+      handler: (request: unknown, context: unknown) => unknown,
+    ) => {
+      if (method === "roots/list") rootsRequest = handler;
+    }) as NonNullable<ProjectMcpClient["setRequestHandler"]>,
+  });
+  const shared = connection(client, "legacy");
+  const first = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "roots-healthy",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => ({ roots: [{ uri: "file:///healthy" }] }) },
+  });
+  const second = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "roots-failed",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => ({ roots: [{ uri: "file:///failed" }] }) },
+  });
+  if (!rootsRequest) throw new Error("roots handler was not installed");
+  await first.notifyRootsListChanged();
+  await expect(second.notifyRootsListChanged()).rejects.toBe(failure);
+  expect(await rootsRequest({}, { mcpReq: { signal: new AbortController().signal } })).toEqual({
+    roots: [{ uri: "file:///healthy" }],
+  });
+  await first.dispose();
+  await second.dispose();
+});
+
+it("does not let a stale failed roots notification erase a newer owner", async () => {
+  let rootsRequest:
+    | ((request: unknown, context: unknown) => unknown | Promise<unknown>)
+    | undefined;
+  const notifications: Array<PromiseWithResolvers<void>> = [];
+  const entered = Promise.withResolvers<void>();
+  const failure = new Error("stale notification failed");
+  const client = makeClient({
+    notification: () => {
+      const pending = Promise.withResolvers<void>();
+      notifications.push(pending);
+      entered.resolve();
+      return pending.promise;
+    },
+    setRequestHandler: ((
+      method: string,
+      handler: (request: unknown, context: unknown) => unknown,
+    ) => {
+      if (method === "roots/list") rootsRequest = handler;
+    }) as NonNullable<ProjectMcpClient["setRequestHandler"]>,
+  });
+  const shared = connection(client, "legacy");
+  const first = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "roots-stale-a",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => ({ roots: [{ uri: "file:///a" }] }) },
+  });
+  const second = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "roots-stale-b",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => ({ roots: [{ uri: "file:///b" }] }) },
+  });
+  const third = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "roots-stale-c",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => ({ roots: [{ uri: "file:///c" }] }) },
+  });
+  if (!rootsRequest) throw new Error("roots handler was not installed");
+  const pendingSecond = second.notifyRootsListChanged();
+  await entered.promise;
+  const pendingThird = third.notifyRootsListChanged();
+  while (notifications.length < 2) await Promise.resolve();
+  notifications[1]!.resolve();
+  await pendingThird;
+  notifications[0]!.reject(failure);
+  await expect(pendingSecond).rejects.toBe(failure);
+  expect(await rootsRequest({}, { mcpReq: { signal: new AbortController().signal } })).toEqual({
+    roots: [{ uri: "file:///c" }],
+  });
+  await first.dispose();
+  await second.dispose();
+  await third.dispose();
+});
+
+it("does not restore a released roots owner after a failed replacement", async () => {
+  let rootsRequest:
+    | ((request: unknown, context: unknown) => unknown | Promise<unknown>)
+    | undefined;
+  const notifications: Array<PromiseWithResolvers<void>> = [];
+  const entered = Promise.withResolvers<void>();
+  const failure = new Error("replacement failed");
+  const client = makeClient({
+    notification: () => {
+      const pending = Promise.withResolvers<void>();
+      notifications.push(pending);
+      entered.resolve();
+      return pending.promise;
+    },
+    setRequestHandler: ((
+      method: string,
+      handler: (request: unknown, context: unknown) => unknown,
+    ) => {
+      if (method === "roots/list") rootsRequest = handler;
+    }) as NonNullable<ProjectMcpClient["setRequestHandler"]>,
+  });
+  const shared = connection(client, "legacy");
+  const first = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "roots-released-a",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => ({ roots: [{ uri: "file:///released" }] }) },
+  });
+  const second = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "roots-released-b",
+    downstreamProtocolEra: "modern",
+    handlers: { onRootsRequest: () => ({ roots: [{ uri: "file:///failed" }] }) },
+  });
+  if (!rootsRequest) throw new Error("roots handler was not installed");
+  const firstNotification = first.notifyRootsListChanged();
+  await entered.promise;
+  notifications[0]!.resolve();
+  await firstNotification;
+  const failed = second.notifyRootsListChanged();
+  while (notifications.length < 2) await Promise.resolve();
+  await first.dispose();
+  notifications[1]!.reject(failure);
+  await expect(failed).rejects.toBe(failure);
+  await expect(
+    Promise.resolve().then(() =>
+      rootsRequest!({}, { mcpReq: { signal: new AbortController().signal } }),
+    ),
+  ).rejects.toMatchObject({ code: -32601 });
+  await second.dispose();
 });
