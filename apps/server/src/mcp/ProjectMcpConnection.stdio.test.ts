@@ -219,6 +219,128 @@ it("tracks roots owner generations through failure, release, and close", async (
   }
 
   {
+    const { coordinator, rootsList } = makeCoordinator();
+    const stalled = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///stalled" }],
+    }))!;
+    for (let index = 0; index < 128; index += 1) {
+      const replacement = coordinator.replaceRootsOwner({}, () => ({
+        roots: [{ uri: `file:///success-${index}` }],
+      }))!;
+      coordinator.commitRootsOwner(replacement);
+    }
+    expect(retainedRootsGenerations(coordinator)).toBeLessThanOrEqual(3);
+    await expect(rootsList()).resolves.toEqual({
+      roots: [{ uri: "file:///success-127" }],
+    });
+    coordinator.commitRootsOwner(stalled);
+    expect(retainedRootsGenerations(coordinator)).toBe(1);
+    await expect(rootsList()).resolves.toEqual({
+      roots: [{ uri: "file:///success-127" }],
+    });
+  }
+
+  {
+    const { coordinator, rootsList } = makeCoordinator();
+    const stalled = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///stalled" }],
+    }))!;
+    for (let index = 0; index < 128; index += 1) {
+      const replacement = coordinator.replaceRootsOwner({}, () => ({
+        roots: [{ uri: `file:///success-${index}` }],
+      }))!;
+      coordinator.commitRootsOwner(replacement);
+    }
+    coordinator.rollbackRootsOwner(stalled);
+    expect(retainedRootsGenerations(coordinator)).toBe(1);
+    await expect(rootsList()).resolves.toEqual({
+      roots: [{ uri: "file:///success-127" }],
+    });
+  }
+
+  {
+    // H committed; A pending; B pending; B fails, then A fails.
+    const { coordinator, rootsList } = makeCoordinator();
+    const healthy = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///healthy" }],
+    }))!;
+    coordinator.commitRootsOwner(healthy);
+    const first = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///a" }],
+    }))!;
+    const second = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///b" }],
+    }))!;
+    coordinator.rollbackRootsOwner(second);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///a" }] });
+    coordinator.rollbackRootsOwner(first);
+    await expect(rootsList()).resolves.toEqual({ roots: [{ uri: "file:///healthy" }] });
+  }
+
+  {
+    // A stalled owner must not prevent retaining the latest viable fallback.
+    const { coordinator, rootsList } = makeCoordinator();
+    const stalled = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///stalled" }],
+    }))!;
+    for (let index = 0; index < 128; index += 1) {
+      const replacement = coordinator.replaceRootsOwner({}, () => ({
+        roots: [{ uri: `file:///success-${index}` }],
+      }))!;
+      coordinator.commitRootsOwner(replacement);
+    }
+    const pending = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///pending" }],
+    }))!;
+    coordinator.rollbackRootsOwner(pending);
+    await expect(rootsList()).resolves.toEqual({
+      roots: [{ uri: "file:///success-127" }],
+    });
+    coordinator.rollbackRootsOwner(stalled);
+  }
+
+  {
+    // A released stalled owner cannot be restored by late settlement.
+    const { coordinator, rootsList } = makeCoordinator();
+    const stalledOwner = {};
+    const stalled = coordinator.replaceRootsOwner(stalledOwner, () => ({
+      roots: [{ uri: "file:///stalled" }],
+    }))!;
+    for (let index = 0; index < 128; index += 1) {
+      const replacement = coordinator.replaceRootsOwner({}, () => ({
+        roots: [{ uri: `file:///success-${index}` }],
+      }))!;
+      coordinator.commitRootsOwner(replacement);
+    }
+    coordinator.releaseRootsOwner(stalledOwner);
+    expect(retainedRootsGenerations(coordinator)).toBeLessThanOrEqual(3);
+    coordinator.commitRootsOwner(stalled);
+    expect(retainedRootsGenerations(coordinator)).toBe(1);
+    await expect(rootsList()).resolves.toEqual({
+      roots: [{ uri: "file:///success-127" }],
+    });
+  }
+
+  {
+    // Closing clears routing permanently, including late settlements.
+    const { coordinator, rootsList } = makeCoordinator();
+    const stalled = coordinator.replaceRootsOwner({}, () => ({
+      roots: [{ uri: "file:///stalled" }],
+    }))!;
+    for (let index = 0; index < 128; index += 1) {
+      const replacement = coordinator.replaceRootsOwner({}, () => ({
+        roots: [{ uri: `file:///success-${index}` }],
+      }))!;
+      coordinator.commitRootsOwner(replacement);
+    }
+    await coordinator.close();
+    coordinator.commitRootsOwner(stalled);
+    coordinator.rollbackRootsOwner(stalled);
+    expect(retainedRootsGenerations(coordinator)).toBe(0);
+    await expectNoRootsOwner(rootsList);
+  }
+
+  {
     // H committed; A and B pending; A commits; release A; B fails.
     const { coordinator, rootsList } = makeCoordinator();
     const healthy = coordinator.replaceRootsOwner({}, () => ({

@@ -2,7 +2,11 @@ import { McpServerId } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import { JSONObjectSchema, JSONValueSchema } from "@modelcontextprotocol/core";
 import type { Client, InputRequiredResult } from "@modelcontextprotocol/client";
-import type { ProjectMcpClient } from "./ProjectMcpConnection.ts";
+import {
+  projectMcpConnectionCoordinator,
+  type ProjectMcpClient,
+  type ProjectMcpConnectionCoordinator,
+} from "./ProjectMcpConnection.ts";
 import type { ProjectMcpCallToolParams } from "./ProjectMcpBroker.ts";
 
 import { ProjectMcpBroker, ProjectMcpBrokerError } from "./ProjectMcpBroker.ts";
@@ -586,6 +590,151 @@ it("cancels a suspended legacy resource operation and cannot revive it", async (
     }),
   ).rejects.toMatchObject({ code: "invalid_request_state" });
   await broker.close();
+});
+
+it.each([
+  ["legacy", "callTool", { name: "queued" }],
+  ["legacy", "getPrompt", { name: "queued" }],
+  ["legacy", "readResource", { uri: "file:///queued" }],
+  ["modern", "callTool", { name: "queued" }],
+  ["modern", "getPrompt", { name: "queued" }],
+  ["modern", "readResource", { uri: "file:///queued" }],
+] as const)(
+  "does not invoke a queued %s operation after %s facade disposal",
+  async (downstreamProtocolEra, operationMethod, queuedParams) => {
+    const calls: string[] = [];
+    const hold = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    const resultFor = () =>
+      operationMethod === "callTool"
+        ? { content: [], isError: false }
+        : operationMethod === "getPrompt"
+          ? { messages: [] }
+          : { contents: [] };
+    const identifier = (params: Record<string, unknown>) =>
+      typeof params.name === "string"
+        ? params.name
+        : params.uri === "file:///hold"
+          ? "hold"
+          : "queued";
+    const invoke = async (broker: ProjectMcpBroker, params: Record<string, unknown>) => {
+      if (operationMethod === "callTool") return broker.callTool(params as never);
+      if (operationMethod === "getPrompt") return broker.getPrompt(params as never);
+      return broker.readResource(params as never);
+    };
+    const client = makeClient({
+      callTool: (async (params) => {
+        const name = identifier(params as Record<string, unknown>);
+        calls.push(name);
+        if (name === "hold") {
+          entered.resolve();
+          await hold.promise;
+        }
+        return resultFor() as never;
+      }) as NonNullable<ProjectMcpClient["callTool"]>,
+      getPrompt: (async (params) => {
+        const name = identifier(params as Record<string, unknown>);
+        calls.push(name);
+        if (name === "hold") {
+          entered.resolve();
+          await hold.promise;
+        }
+        return resultFor() as never;
+      }) as NonNullable<ProjectMcpClient["getPrompt"]>,
+      readResource: (async (params) => {
+        const name = identifier(params as Record<string, unknown>);
+        calls.push(name);
+        if (name === "hold") {
+          entered.resolve();
+          await hold.promise;
+        }
+        return resultFor() as never;
+      }) as NonNullable<ProjectMcpClient["readResource"]>,
+    });
+    const shared = connection(client, "legacy");
+    const first = new ProjectMcpBroker({
+      connection: shared,
+      serverId,
+      providerSessionId: `${downstreamProtocolEra}-hold`,
+      downstreamProtocolEra,
+    });
+    const second = new ProjectMcpBroker({
+      connection: shared,
+      serverId,
+      providerSessionId: `${downstreamProtocolEra}-queued`,
+      downstreamProtocolEra,
+    });
+    const holdParams =
+      operationMethod === "readResource" ? { uri: "file:///hold" } : { name: "hold" };
+    try {
+      const firstRequest = invoke(first, holdParams);
+      await entered.promise;
+      const queuedRequest = invoke(second, queuedParams);
+      const coordinator = projectMcpConnectionCoordinator(shared);
+      expect((coordinator as unknown as { queue: unknown[] }).queue).toHaveLength(1);
+      const queuedRejected = expect(queuedRequest).rejects.toThrow("MCP facade disposed");
+      await second.dispose();
+      expect(calls).toEqual(["hold"]);
+      hold.resolve();
+      await expect(firstRequest).resolves.toEqual(resultFor());
+      await queuedRejected;
+    } finally {
+      hold.resolve();
+      await first.close();
+      await second.dispose();
+    }
+  },
+);
+
+it("checks facade disposal after a legacy-to-modern acquire resolves", async () => {
+  const calls: string[] = [];
+  const client = makeClient({
+    callTool: (async (params) => {
+      calls.push(params.name);
+      return { content: [], isError: false };
+    }) as NonNullable<ProjectMcpClient["callTool"]>,
+  });
+  const shared = connection(client, "legacy");
+  const second = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "acquire-race-second",
+    downstreamProtocolEra: "modern",
+  });
+  const third = new ProjectMcpBroker({
+    connection: shared,
+    serverId,
+    providerSessionId: "acquire-race-third",
+    downstreamProtocolEra: "modern",
+  });
+  const coordinator = projectMcpConnectionCoordinator(shared);
+  const originalAcquire = coordinator.acquire.bind(coordinator);
+  const mutableCoordinator = coordinator as unknown as {
+    acquire: ProjectMcpConnectionCoordinator["acquire"];
+  };
+  let disposeStarted = false;
+  mutableCoordinator.acquire = ((handler, signal) => {
+    const permit = originalAcquire(handler, signal);
+    if (disposeStarted) return permit;
+    disposeStarted = true;
+    return permit.then((release) => {
+      void second.dispose();
+      return release;
+    });
+  }) as ProjectMcpConnectionCoordinator["acquire"];
+  try {
+    await expect(second.callTool({ name: "disposed" })).rejects.toThrow("MCP facade disposed");
+    expect(calls).toEqual([]);
+    await expect(third.callTool({ name: "third" })).resolves.toEqual({
+      content: [],
+      isError: false,
+    });
+    expect(calls).toEqual(["third"]);
+  } finally {
+    mutableCoordinator.acquire = originalAcquire;
+    await second.dispose();
+    await third.close();
+  }
 });
 
 it("rejects tampered input state before contacting the upstream server", async () => {

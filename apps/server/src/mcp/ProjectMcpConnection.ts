@@ -357,8 +357,31 @@ export class ProjectMcpConnectionCoordinator {
   }
 
   private compactRootsOwnerHistory(): void {
-    if (this.pendingRootsOwnerCount !== 0) return;
-    if (this.rootsOwner !== undefined) this.rootsOwner.previous = undefined;
+    const current = this.rootsOwner;
+    if (!current) return;
+
+    const required = new Set<RootsOwner>([current]);
+    for (let record: RootsOwner | undefined = current; record; record = record.previous) {
+      if (record.state !== "pending") continue;
+      required.add(record);
+      const fallback = this.nearestViableRootsOwner(record.previous);
+      if (fallback) {
+        required.add(fallback);
+        const fallbackPredecessor = this.nearestViableRootsOwner(fallback.previous);
+        if (fallbackPredecessor) required.add(fallbackPredecessor);
+      }
+    }
+
+    const retained: RootsOwner[] = [];
+    for (let record: RootsOwner | undefined = current; record; ) {
+      const next: RootsOwner | undefined = record.previous;
+      if (required.has(record)) retained.push(record);
+      else record.previous = undefined;
+      record = next;
+    }
+    for (let index = 0; index < retained.length; index += 1) {
+      retained[index]!.previous = retained[index + 1];
+    }
   }
 
   private isViableRootsOwner(record: RootsOwner | undefined): boolean {

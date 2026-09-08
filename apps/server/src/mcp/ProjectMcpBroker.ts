@@ -236,6 +236,7 @@ export class ProjectMcpBroker {
   private readonly now: () => number;
   private readonly extensionAdapters: ReadonlyMap<string, ProjectMcpExtensionAdapter>;
   private active: LegacyOperation | undefined;
+  private readonly disposeController = new AbortController();
   private readonly coordinator: ProjectMcpConnectionCoordinator;
   private readonly handlers = new Set<ProjectMcpBrokerHandlers>();
   private readonly handlerDisposers = new Set<() => void>();
@@ -272,8 +273,10 @@ export class ProjectMcpBroker {
 
   dispose(): Promise<void> {
     if (this.disposing) return this.disposing;
+    const disposeError = new Error("MCP facade disposed");
+    this.disposeController.abort(disposeError);
     this.coordinator.controller.signal.removeEventListener("abort", this.onConnectionClose);
-    if (this.active) this.failOperation(this.active, new Error("MCP facade disposed"));
+    if (this.active) this.failOperation(this.active, disposeError);
     for (const dispose of this.handlerDisposers) dispose();
     this.releaseRootsOwner(this);
     return (this.disposing = this.coordinator.releaseResourceOwner(this));
@@ -474,10 +477,12 @@ export class ProjectMcpBroker {
     }
     return (async (...args: unknown[]) => {
       const options = args.at(-1);
-      const signal =
+      const callerSignal =
         isRecord(options) && options.signal instanceof AbortSignal ? options.signal : undefined;
+      const signal = this.lifecycleSignal(callerSignal);
       const release = await this.acquire(signal);
       try {
+        signal.throwIfAborted();
         return await Reflect.apply(bound, undefined, args);
       } finally {
         release();
@@ -487,6 +492,12 @@ export class ProjectMcpBroker {
 
   private acquire(signal?: AbortSignal): Promise<() => void> {
     return this.coordinator.acquire(this.handleUpstreamServerRequestFromCoordinator, signal);
+  }
+
+  private lifecycleSignal(signal?: AbortSignal): AbortSignal {
+    return signal
+      ? AbortSignal.any([signal, this.disposeController.signal])
+      : this.disposeController.signal;
   }
 
   private readonly handleUpstreamServerRequestFromCoordinator = (
@@ -692,7 +703,14 @@ export class ProjectMcpBroker {
       return result;
     }
     if (params.inputResponses) throw new ProjectMcpBrokerError("invalid_request_state");
-    const release = await this.acquire(options?.signal);
+    const signal = this.lifecycleSignal(options?.signal);
+    const release = await this.acquire(signal);
+    try {
+      signal.throwIfAborted();
+    } catch (error) {
+      release();
+      throw error;
+    }
     const operation: LegacyOperation = {
       method,
       id: NodeCrypto.randomUUID(),
