@@ -9,7 +9,14 @@ export interface McpProviderSessionConfig {
   readonly authorizationHeader: string;
 }
 
+export interface McpProviderSessionReplacement {
+  readonly previous: McpProviderSessionConfig | undefined;
+  readonly candidate: McpProviderSessionConfig | undefined;
+  readonly accessWasDisabled: boolean;
+}
+
 const sessionsByThread = new Map<ThreadId, McpProviderSessionConfig>();
+const replacementsByThread = new Map<ThreadId, McpProviderSessionReplacement>();
 
 export function setMcpProviderSession(config: McpProviderSessionConfig): void {
   sessionsByThread.set(config.threadId, config);
@@ -23,6 +30,37 @@ export function clearMcpProviderSession(threadId: ThreadId): void {
   sessionsByThread.delete(threadId);
 }
 
+export function beginMcpProviderSessionReplacement(
+  threadId: ThreadId,
+  replacement: McpProviderSessionReplacement,
+): void {
+  replacementsByThread.set(threadId, replacement);
+}
+
+export function readMcpProviderSessionReplacement(
+  threadId: ThreadId,
+): McpProviderSessionReplacement | undefined {
+  return replacementsByThread.get(threadId);
+}
+
+export function commitMcpProviderSessionReplacement(threadId: ThreadId): void {
+  replacementsByThread.delete(threadId);
+}
+
+export function rollbackMcpProviderSessionReplacement(threadId: ThreadId): void {
+  const replacement = replacementsByThread.get(threadId);
+  if (!replacement) {
+    return;
+  }
+  if (replacement.accessWasDisabled || replacement.previous === undefined) {
+    sessionsByThread.delete(threadId);
+  } else {
+    sessionsByThread.set(threadId, replacement.previous);
+  }
+  replacementsByThread.delete(threadId);
+}
+
 export function clearAllMcpProviderSessions(): void {
   sessionsByThread.clear();
+  replacementsByThread.clear();
 }

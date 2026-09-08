@@ -25,10 +25,12 @@ stopped only after OpenCode confirms the abort through an event or an idle sessi
 If T3 Code cannot confirm the abort, it reports the failure and keeps the session active so you can
 try again. A successful HTTP request alone does not mean that OpenCode stopped the turn.
 
-Restarting T3 Code, reconnecting a client, stopping all sessions, or changing the provider
-connection detaches T3 Code from an external OpenCode server. It does not stop work on that server.
-When you start the thread again, T3 Code reattaches to the saved OpenCode session and can continue
-or stop the existing turn.
+Restarting T3 Code, reconnecting a client, or stopping all sessions detaches T3 Code from an
+external OpenCode server. It does not stop work on that server. When you start the thread again,
+T3 Code reattaches to the saved OpenCode session and can continue or stop the existing turn.
+Changing runtime mode while the same saved session is being recovered also keeps the upstream turn
+and pending question or permission request alive. A provider connection change that targets a
+different OpenCode session stops the old turn before switching.
 
 ## Refresh the model list
 

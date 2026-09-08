@@ -866,7 +866,7 @@ const make = Effect.gen(function* () {
       });
       yield* bindSessionToThread(
         restartedSession,
-        supportsSessionRecovery(resolvedDriverKind) ? recovery?.turnId : undefined,
+        recovery !== undefined ? restartedSession.activeTurnId : undefined,
       );
       return restartedSession.threadId;
     }

@@ -502,6 +502,11 @@ interface OpenCodeSessionContext {
   readonly sessionScope: Scope.Closeable;
 }
 
+const isSameOpenCodeUpstreamSession = (
+  existing: OpenCodeSessionContext,
+  candidate: OpenCodeSessionContext,
+): boolean => existing.openCodeSessionId === candidate.openCodeSessionId;
+
 export interface OpenCodeAdapterLiveOptions {
   readonly instanceId?: ProviderInstanceId;
   readonly environment?: NodeJS.ProcessEnv;
@@ -999,6 +1004,66 @@ const abortOpenCodeSessionForTeardown = (context: OpenCodeSessionContext) =>
     context.client.session.abort({ sessionID: context.openCodeSessionId }, { signal }),
   ).pipe(Effect.timeout("1 second"), Effect.ignore({ log: true }));
 
+const openCodeMcpConfig = (config: McpProviderSession.McpProviderSessionConfig) => ({
+  type: "remote" as const,
+  url: config.endpoint,
+  headers: { Authorization: config.authorizationHeader },
+  oauth: false as const,
+});
+
+type OpenCodeMcpConfig = NonNullable<
+  NonNullable<Parameters<OpencodeClient["mcp"]["add"]>[0]>["config"]
+>;
+type OpenCodeMcpEntry = OpenCodeMcpConfig | { readonly enabled: boolean };
+
+const restoreManagedOpenCodeMcpConfiguration = (
+  client: OpencodeClient,
+  server: OpenCodeServerConnection,
+  previousConfig: OpenCodeMcpEntry | undefined,
+  configWasRead: boolean,
+) => {
+  if (server.external || !configWasRead) {
+    return Effect.void;
+  }
+  if (previousConfig !== undefined) {
+    if ("enabled" in previousConfig) {
+      return runOpenCodeSdk("config.update", () =>
+        client.config.update({ config: { mcp: { "t3-code": previousConfig } } }),
+      ).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("OpenCode MCP configuration rollback failed", { cause }),
+        ),
+        Effect.asVoid,
+      );
+    }
+    return runOpenCodeSdk("mcp.add", () =>
+      client.mcp.add({ name: "t3-code", config: previousConfig }),
+    ).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("OpenCode MCP configuration rollback failed", { cause }),
+      ),
+      Effect.asVoid,
+    );
+  }
+  return runOpenCodeSdk("config.get", () => client.config.get()).pipe(
+    Effect.flatMap((response) => {
+      const currentConfig = response.data;
+      const currentMcp = currentConfig?.mcp;
+      if (!currentMcp || !Object.hasOwn(currentMcp, "t3-code")) {
+        return Effect.void;
+      }
+      const { ["t3-code"]: _removed, ...remainingMcp } = currentMcp;
+      return runOpenCodeSdk("config.update", () =>
+        client.config.update({ config: { ...currentConfig, mcp: remainingMcp } }),
+      ).pipe(Effect.asVoid);
+    }),
+    Effect.catchCause((cause) =>
+      Effect.logWarning("OpenCode MCP configuration rollback failed", { cause }),
+    ),
+    Effect.asVoid,
+  );
+};
+
 const cancelPendingOpenCodePrompt = Effect.fn("cancelPendingOpenCodePrompt")(function* (
   context: OpenCodeSessionContext,
 ) {
@@ -1019,6 +1084,7 @@ const closeStartingOpenCodeContext = Effect.fn("closeStartingOpenCodeContext")(f
   settlePendingRequests: (
     context: OpenCodeSessionContext,
   ) => Effect.Effect<void, ProviderAdapterRequestError>,
+  restoreMcpConfiguration: Effect.Effect<void> = Effect.void,
 ) {
   if (yield* Ref.getAndSet(context.stopped, true)) {
     return;
@@ -1031,10 +1097,11 @@ const closeStartingOpenCodeContext = Effect.fn("closeStartingOpenCodeContext")(f
       detail: "OpenCode session startup ended before the event stream connected.",
     }),
   ).pipe(Effect.ignore);
+  yield* restoreMcpConfiguration;
   yield* cancelPendingOpenCodePrompt(context);
   yield* failPendingOpenCodeCancellation(context, "OpenCode session startup was cancelled.");
   context.promptAdmission = undefined;
-  if (intent === "terminate" || !context.server.external) {
+  if (intent === "terminate") {
     yield* abortOpenCodeSessionForTeardown(context);
   }
   yield* settlePendingRequests(context);
@@ -1085,6 +1152,29 @@ const closeOpenCodeContext = Effect.fn("closeOpenCodeContext")(function* (
   // runs each finalizer we registered — the `AbortController.abort()` call,
   // the child-process termination, etc.
   yield* Scope.close(context.sessionScope, Exit.void);
+  return true;
+});
+
+const detachOpenCodeContext = Effect.fn("detachOpenCodeContext")(function* (
+  context: OpenCodeSessionContext,
+) {
+  if (yield* Ref.getAndSet(context.stopped, true)) {
+    return false;
+  }
+  yield* Deferred.fail(
+    context.firstConnection,
+    new ProviderAdapterRequestError({
+      provider: PROVIDER,
+      method: "event.subscribe",
+      detail: "OpenCode session detached before the event stream connected.",
+    }),
+  ).pipe(Effect.ignore);
+
+  // A same-upstream handoff only gives the new local context ownership of the
+  // subscription. The remote session remains live, so do not interrupt local
+  // prompt/cancellation state or settle requests that the candidate will
+  // recover from OpenCode.
+  yield* Scope.close(context.sessionScope, Exit.void).pipe(Effect.ignoreCause);
   return true;
 });
 
@@ -3791,6 +3881,18 @@ export function makeOpenCodeAdapter(
         const directory = input.cwd ?? serverConfig.cwd;
         const resumeSessionId = parseOpenCodeResume(input.resumeCursor)?.sessionId;
         const existing = sessions.get(input.threadId);
+        let previousManagedMcpConfig: OpenCodeMcpEntry | undefined;
+        let managedMcpConfigWasRead = false;
+        const restoreMcpConfiguration = (
+          client: OpencodeClient,
+          server: OpenCodeServerConnection,
+        ) =>
+          restoreManagedOpenCodeMcpConfiguration(
+            client,
+            server,
+            previousManagedMcpConfig,
+            managedMcpConfigWasRead,
+          );
         if (existing) {
           if (existing.session.status === "connecting" && !(yield* Ref.get(existing.stopped))) {
             return (yield* awaitOpenCodeContextReady(existing)).session;
@@ -3821,18 +3923,13 @@ export function makeOpenCodeAdapter(
               });
               const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
               if (mcpSession && !server.external) {
+                const currentConfig = yield* runOpenCodeSdk("config.get", () =>
+                  client.config.get(),
+                );
+                previousManagedMcpConfig = currentConfig.data?.mcp?.["t3-code"];
+                managedMcpConfigWasRead = true;
                 yield* runOpenCodeSdk("mcp.add", () =>
-                  client.mcp.add({
-                    name: "t3-code",
-                    config: {
-                      type: "remote",
-                      url: mcpSession.endpoint,
-                      headers: {
-                        Authorization: mcpSession.authorizationHeader,
-                      },
-                      oauth: false,
-                    },
-                  }),
+                  client.mcp.add({ name: "t3-code", config: openCodeMcpConfig(mcpSession) }),
                 );
               }
               // Resume: re-adopt the session named by the durable cursor —
@@ -3932,7 +4029,7 @@ export function makeOpenCodeAdapter(
                   });
                 }
                 return { openCodeSession: createdSession.data, created: true, adopted: false };
-              });
+              }).pipe(Effect.onError(() => restoreMcpConfiguration(client, server)));
 
               return {
                 sessionScope,
@@ -4025,10 +4122,15 @@ export function makeOpenCodeAdapter(
             ),
           );
         }
+        const restoreMcpConfigurationForContext = restoreMcpConfiguration(
+          context.client,
+          context.server,
+        );
         const cleanupStartingContext = closeStartingOpenCodeContext(
           context,
           started.created ? "terminate" : "detach",
           settlePendingOpenCodeRequests,
+          restoreMcpConfigurationForContext,
         ).pipe(Effect.ensuring(Effect.sync(() => deleteContextIfCurrent(context))));
         if (existing === undefined) {
           sessions.set(input.threadId, context);
@@ -4066,10 +4168,13 @@ export function makeOpenCodeAdapter(
         }
 
         if (existing && raceWinner === existing && !(yield* Ref.get(existing.stopped))) {
-          const terminated = yield* Effect.exit(terminateOpenCodeContext(existing));
-          if (Exit.isFailure(terminated)) {
+          const handoff = isSameOpenCodeUpstreamSession(existing, context)
+            ? detachOpenCodeContext(existing)
+            : terminateOpenCodeContext(existing);
+          const handoffExit = yield* Effect.exit(handoff);
+          if (Exit.isFailure(handoffExit)) {
             yield* cleanupStartingContext;
-            return yield* Effect.failCause(terminated.cause);
+            return yield* Effect.failCause(handoffExit.cause);
           }
         } else if (existing && raceWinner === existing) {
           deleteContextIfCurrent(existing);
@@ -4081,6 +4186,12 @@ export function makeOpenCodeAdapter(
         if (context.recoveryReconciliationDeferred) {
           context.recoveryReconciliationDeferred = false;
           yield* reconcileRecoveredOpenCodeSession(context);
+          if (
+            (yield* Ref.get(context.stopped)) ||
+            sessions.get(context.session.threadId) !== context
+          ) {
+            yield* restoreMcpConfigurationForContext;
+          }
           // Reconciliation can fail the candidate and remove it from the
           // session map. Do not publish lifecycle events for that failed
           // startup.

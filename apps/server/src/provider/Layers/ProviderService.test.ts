@@ -14,6 +14,7 @@ import type {
 } from "@t3tools/contracts";
 import {
   ApprovalRequestId,
+  EnvironmentId,
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -63,6 +64,7 @@ import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
 const serverConfigTestLayer = ServerConfig.layerTest(process.cwd(), process.cwd()).pipe(
@@ -96,27 +98,28 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
 
-  const startSession = vi.fn((input: ProviderSessionStartInput) =>
-    Effect.sync(() => {
-      const now = "2026-01-01T00:00:00.000Z";
-      const session: ProviderSession = {
-        provider,
-        ...(input.providerInstanceId !== undefined
-          ? { providerInstanceId: input.providerInstanceId }
-          : {}),
-        status: "ready",
-        runtimeMode: input.runtimeMode,
-        threadId: input.threadId,
-        resumeCursor: input.resumeCursor ?? {
-          opaque: `resume-${String(input.threadId)}`,
-        },
-        cwd: input.cwd ?? process.cwd(),
-        createdAt: now,
-        updatedAt: now,
-      };
-      sessions.set(session.threadId, session);
-      return session;
-    }),
+  const startSession = vi.fn(
+    (input: ProviderSessionStartInput): Effect.Effect<ProviderSession, ProviderAdapterError> =>
+      Effect.sync(() => {
+        const now = "2026-01-01T00:00:00.000Z";
+        const session: ProviderSession = {
+          provider,
+          ...(input.providerInstanceId !== undefined
+            ? { providerInstanceId: input.providerInstanceId }
+            : {}),
+          status: "ready",
+          runtimeMode: input.runtimeMode,
+          threadId: input.threadId,
+          resumeCursor: input.resumeCursor ?? {
+            opaque: `resume-${String(input.threadId)}`,
+          },
+          cwd: input.cwd ?? process.cwd(),
+          createdAt: now,
+          updatedAt: now,
+        };
+        sessions.set(session.threadId, session);
+        return session;
+      }),
   );
 
   const sendTurn = vi.fn(
@@ -2292,5 +2295,106 @@ describe("agent browser access", () => {
 
       assert.deepEqual(issued, [threadId]);
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("restores the previous MCP session when a replacement fails", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-browser-replacement-failure");
+      const codex = makeFakeCodexAdapter();
+      const revokedProviderSessions: Array<string> = [];
+      const issuedConfigs = [
+        {
+          environmentId: EnvironmentId.make("environment-1"),
+          threadId,
+          providerSessionId: "candidate-initial",
+          providerInstanceId: codexInstanceId,
+          endpoint: "http://127.0.0.1:43123/mcp",
+          authorizationHeader: "Bearer initial-token",
+        },
+        {
+          environmentId: EnvironmentId.make("environment-1"),
+          threadId,
+          providerSessionId: "candidate-replacement",
+          providerInstanceId: codexInstanceId,
+          endpoint: "http://127.0.0.1:43123/mcp",
+          authorizationHeader: "Bearer replacement-token",
+        },
+      ] as const;
+      let issuedIndex = 0;
+      const providerAdapterLayer = Layer.succeed(
+        ProviderAdapterRegistry.ProviderAdapterRegistry,
+        makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter }),
+      );
+      const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
+        Layer.provide(SqlitePersistenceMemory),
+      );
+      const directoryLayer = ProviderSessionDirectoryLive.pipe(
+        Layer.provide(runtimeRepositoryLayer),
+      );
+      const providerLayer = makeProviderServiceLive({
+        issueMcpCredential: () =>
+          Effect.succeed({ config: issuedConfigs[issuedIndex++] }) as Effect.Effect<{
+            config: (typeof issuedConfigs)[number];
+          }>,
+        revokeMcpProviderCredential: (providerSessionId) =>
+          Effect.sync(() => void revokedProviderSessions.push(providerSessionId)),
+      }).pipe(
+        Layer.provide(providerAdapterLayer),
+        Layer.provide(directoryLayer),
+        Layer.provide(
+          ServerSettings.ServerSettingsService.layerTest({ enableAgentBrowserAccess: true }),
+        ),
+        Layer.provide(serverConfigTestLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        yield* provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+        const previous = {
+          ...issuedConfigs[0],
+          providerSessionId: "previous-session",
+          authorizationHeader: "Bearer previous-token",
+        };
+        McpProviderSession.setMcpProviderSession(previous);
+        codex.startSession.mockImplementationOnce(
+          (): Effect.Effect<ProviderSession, ProviderAdapterError> =>
+            Effect.fail(
+              new ProviderAdapterRequestError({
+                provider: String(CODEX_DRIVER),
+                method: "startSession",
+                detail: "candidate failed",
+              }),
+            ),
+        );
+
+        const result = yield* provider
+          .startSession(threadId, {
+            provider: CODEX_DRIVER,
+            providerInstanceId: codexInstanceId,
+            threadId,
+            runtimeMode: "approval-required",
+          })
+          .pipe(Effect.result);
+
+        assert.equal(result._tag, "Failure");
+        assert.deepEqual(McpProviderSession.readMcpProviderSession(threadId), previous);
+        assert.deepEqual(revokedProviderSessions, ["candidate-replacement"]);
+      }).pipe(Effect.provide(providerLayer));
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions())),
+      Effect.provide(NodeServices.layer),
+    ),
   );
 });
