@@ -617,6 +617,143 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("reports the resolved model and effort on turn.started", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 4).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-sonnet-4-6",
+          [{ id: "effort", value: "max" }],
+        ),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "hello",
+        attachments: [],
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-sonnet-4-6",
+          [{ id: "effort", value: "max" }],
+        ),
+      });
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const turnStarted = runtimeEvents.find((event) => event.type === "turn.started");
+      assert.equal(turnStarted?.type, "turn.started");
+      if (turnStarted?.type === "turn.started") {
+        assert.equal(turnStarted.payload.model, "claude-sonnet-4-6");
+        // Sonnet 4.6 does not support `max`; the resolved effort is `high`.
+        assert.equal(turnStarted.payload.effort, "high");
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("omits effort on turn.started for a model without an effort concept", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 4).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-haiku-4-5",
+          [{ id: "effort", value: "high" }],
+        ),
+        runtimeMode: "full-access",
+      });
+
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "hello",
+        attachments: [],
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-haiku-4-5",
+          [{ id: "effort", value: "high" }],
+        ),
+      });
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const turnStarted = runtimeEvents.find((event) => event.type === "turn.started");
+      assert.equal(turnStarted?.type, "turn.started");
+      if (turnStarted?.type === "turn.started") {
+        assert.equal(turnStarted.payload.model, "claude-haiku-4-5");
+        assert.equal("effort" in turnStarted.payload, false);
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("reports the resolved model and effort on a synthetic turn.started", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+
+      const runtimeEventsFiber = yield* Stream.take(adapter.streamEvents, 5).pipe(
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("claudeAgent"),
+          "claude-sonnet-4-6",
+          [{ id: "effort", value: "max" }],
+        ),
+        runtimeMode: "full-access",
+      });
+
+      // An assistant message with no active turn auto-starts a synthetic turn.
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session-synthetic",
+        uuid: "assistant-synthetic-1",
+        parent_tool_use_id: null,
+        message: {
+          id: "assistant-message-synthetic-1",
+          content: [{ type: "text", text: "Background work." }],
+        },
+      } as unknown as SDKMessage);
+
+      const runtimeEvents = Array.from(yield* Fiber.join(runtimeEventsFiber));
+      const turnStarted = runtimeEvents.find((event) => event.type === "turn.started");
+      assert.equal(turnStarted?.type, "turn.started");
+      if (turnStarted?.type === "turn.started") {
+        assert.equal(turnStarted.payload.model, "claude-sonnet-4-6");
+        assert.equal(turnStarted.payload.effort, "high");
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("forwards Claude thinking toggle into SDK settings for Haiku 4.5", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {

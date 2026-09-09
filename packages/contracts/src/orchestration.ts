@@ -420,6 +420,37 @@ export const OrchestrationLatestTurn = Schema.Struct({
 });
 export type OrchestrationLatestTurn = typeof OrchestrationLatestTurn.Type;
 
+/**
+ * Work a turn performed, stamped when the turn settles. Counts are authoritative
+ * history: resolving them later against retained activities would under-report
+ * any turn whose rows have aged out.
+ */
+export const OrchestrationTurnCounts = Schema.Struct({
+  commandCount: NonNegativeInt,
+  toolCallCount: NonNegativeInt,
+  subagentCount: NonNegativeInt,
+  changedFileCount: NonNegativeInt,
+});
+export type OrchestrationTurnCounts = typeof OrchestrationTurnCounts.Type;
+
+/**
+ * One turn's record: what ran it and what it did. `model`, `effort`, and
+ * `counts` are optional because turns that settled before per-turn provenance
+ * existed carry none of them, and are never backfilled.
+ */
+export const OrchestrationTurnSummary = Schema.Struct({
+  turnId: TurnId,
+  state: OrchestrationLatestTurnState,
+  requestedAt: IsoDateTime,
+  startedAt: Schema.NullOr(IsoDateTime),
+  completedAt: Schema.NullOr(IsoDateTime),
+  assistantMessageId: Schema.NullOr(MessageId),
+  model: Schema.optional(TrimmedNonEmptyString),
+  effort: Schema.optional(TrimmedNonEmptyString),
+  counts: Schema.optional(OrchestrationTurnCounts),
+});
+export type OrchestrationTurnSummary = typeof OrchestrationTurnSummary.Type;
+
 export const ThreadTitleRegeneration = Schema.Struct({
   requestId: CommandId,
   startedAt: IsoDateTime,
@@ -483,6 +514,21 @@ export const OrchestrationThread = Schema.Struct({
   ),
   activities: Schema.Array(OrchestrationThreadActivity),
   checkpoints: Schema.Array(OrchestrationCheckpointSummary),
+  // Per-turn history. Optional so payloads from pre-provenance servers, and
+  // snapshots cached before this change, still decode.
+  turns: Schema.optional(Schema.Array(OrchestrationTurnSummary)),
+  /**
+   * Turns whose activity rows were cut by the retention window, so only part of
+   * their work is in `activities`. A client counting the rows it holds would
+   * undercount these, and reports nothing instead.
+   *
+   * Turn ids rather than a timestamp: the client drops, merges and reorders
+   * activity rows on the way to the screen, so no `createdAt` survives that
+   * trip intact, while a turn id rides along untouched. Optional so payloads
+   * from older servers, and snapshots cached before this field existed, decode
+   * unchanged — absent means nothing was cut.
+   */
+  partialTurnIds: Schema.optional(Schema.Array(TurnId)),
   session: Schema.NullOr(OrchestrationSession),
 });
 export type OrchestrationThread = typeof OrchestrationThread.Type;
@@ -691,6 +737,36 @@ export const OrchestrationThreadDetailPage = Schema.Struct({
   threadSequence: Schema.optionalKey(NonNegativeInt),
 });
 export type OrchestrationThreadDetailPage = typeof OrchestrationThreadDetailPage.Type;
+
+/**
+ * Rows a single thread-detail read returns per thread. A client seeing this
+ * many activities cannot tell a full thread from a trimmed one on size alone,
+ * which is why the server names the turns it cut; the number is shared so an
+ * older host that names none can still be treated conservatively.
+ */
+export const THREAD_ACTIVITY_WINDOW_LIMIT = 500;
+
+/**
+ * Whether a client must treat every unstamped turn as possibly undercounted.
+ *
+ * A server that names the turns it cut is authoritative, and its silence means
+ * nothing was cut. Only a host too old to send `turns` at all leaves the window
+ * size as the last hint — and there a full window is reason enough to stay
+ * silent rather than publish a count derived from a partial thread.
+ *
+ * Shared by web and mobile: the older-host semantics are subtle enough that two
+ * copies would drift.
+ */
+export function resolveActivityWindowMayBeTruncated(input: {
+  hasTurnRecords: boolean;
+  activityCount: number;
+  windowLimit?: number;
+}): boolean {
+  if (input.hasTurnRecords) {
+    return false;
+  }
+  return input.activityCount >= (input.windowLimit ?? THREAD_ACTIVITY_WINDOW_LIMIT);
+}
 
 export const OrchestrationThreadDetailSnapshot = Schema.Struct({
   snapshotSequence: NonNegativeInt,
@@ -1035,11 +1111,24 @@ export const ClientOrchestrationCommand = Schema.Union([
 ]);
 export type ClientOrchestrationCommand = typeof ClientOrchestrationCommand.Type;
 
+/**
+ * Provenance for the turn a session set is opening. Carried alongside the
+ * session rather than inside it: the session is current state and is
+ * overwritten on every status change, while this describes one turn's history.
+ */
+export const OrchestrationTurnProvenance = Schema.Struct({
+  turnId: TurnId,
+  model: Schema.optional(TrimmedNonEmptyString),
+  effort: Schema.optional(TrimmedNonEmptyString),
+});
+export type OrchestrationTurnProvenance = typeof OrchestrationTurnProvenance.Type;
+
 const ThreadSessionSetCommand = Schema.Struct({
   type: Schema.Literal("thread.session.set"),
   commandId: CommandId,
   threadId: ThreadId,
   session: OrchestrationSession,
+  turnProvenance: Schema.optional(OrchestrationTurnProvenance),
   createdAt: IsoDateTime,
 });
 
@@ -1369,6 +1458,10 @@ export const ThreadSessionStopRequestedPayload = Schema.Struct({
 export const ThreadSessionSetPayload = Schema.Struct({
   threadId: ThreadId,
   session: OrchestrationSession,
+  // Present only on the session set that opens a turn, and only when the
+  // provider reported it. Stored events written before this field existed
+  // decode unchanged.
+  turnProvenance: Schema.optional(OrchestrationTurnProvenance),
 });
 
 export const ThreadProposedPlanUpsertedPayload = Schema.Struct({

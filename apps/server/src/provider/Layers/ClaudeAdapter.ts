@@ -388,6 +388,24 @@ function getEffectiveClaudeAgentEffort(
   return normalized ? (normalized as ClaudeSdkEffort) : null;
 }
 
+/**
+ * `turn.started` payload describing what actually governs the run. `effort` is
+ * the resolved value (`context.currentEffort`), not the raw selection, and is
+ * omitted entirely for models with no effort concept so the payload never
+ * carries an empty string.
+ */
+function turnStartedPayload(
+  context: ClaudeSessionContext,
+  model: string | null | undefined,
+): { model?: string; effort?: string } {
+  const resolvedModel = model?.trim() || context.session.model?.trim();
+  const resolvedEffort = context.currentEffort?.trim();
+  return {
+    ...(resolvedModel ? { model: resolvedModel } : {}),
+    ...(resolvedEffort ? { effort: resolvedEffort } : {}),
+  };
+}
+
 function isClaudeInterruptedMessage(message: string): boolean {
   const normalized = message.toLowerCase();
   return (
@@ -2934,7 +2952,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         createdAt: turnStartedStamp.createdAt,
         threadId: context.session.threadId,
         turnId,
-        payload: {},
+        payload: turnStartedPayload(context, context.session.model),
         providerRefs: {
           ...nativeProviderRefs(context),
           providerTurnId: turnId,
@@ -4580,7 +4598,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         createdAt: turnStartedStamp.createdAt,
         threadId: context.session.threadId,
         turnId,
-        payload: modelSelection?.model ? { model: modelSelection.model } : {},
+        payload: turnStartedPayload(context, modelSelection?.model),
         providerRefs: {},
       });
     }

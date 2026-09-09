@@ -5,14 +5,17 @@ import {
   ProviderRequestKind,
 } from "@t3tools/contracts";
 import type {
+  OrchestrationCheckpointSummary,
   OrchestrationLatestTurn,
   OrchestrationThread,
   OrchestrationThreadActivity,
+  OrchestrationTurnSummary,
   ToolLifecycleItemType,
   TurnId,
   UserInputQuestion,
 } from "@t3tools/contracts";
 import { formatDuration } from "@t3tools/shared/orchestrationTiming";
+import { countTurnWork, type TurnWorkActivity } from "@t3tools/shared/turnWorkCounts";
 import {
   normalizeCompactToolLabel,
   omitSupersededLifecycleMarkers,
@@ -1233,6 +1236,87 @@ function deriveUnsettledTurnId(latestTurn: ThreadFeedLatestTurn | null): TurnId 
   return settled ? null : latestTurn.turnId;
 }
 
+function pluralizeWorkSegment(count: number, singular: string, plural: string): string | null {
+  if (count <= 0) {
+    return null;
+  }
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+/**
+ * The shared count vocabulary, in a fixed order. Wording and order match web
+ * exactly: the same turn must not read differently on the two surfaces.
+ */
+function workCountSegments(counts: {
+  readonly commandCount: number;
+  readonly toolCallCount: number;
+  readonly subagentCount: number;
+}): string[] {
+  return [
+    pluralizeWorkSegment(counts.commandCount, "Command", "Commands"),
+    pluralizeWorkSegment(counts.toolCallCount, "Tool Call", "Tool Calls"),
+    pluralizeWorkSegment(counts.subagentCount, "Subagent", "Subagents"),
+  ].filter((segment): segment is string => segment !== null);
+}
+
+/**
+ * Changed files read from the turn's checkpoint. The `+N/−M` diff is suppressed
+ * unless the checkpoint is `ready`, because a pending or missing checkpoint has
+ * no trustworthy line counts — but the file count still describes the turn.
+ */
+function changedFileSegment(
+  changedFileCount: number,
+  diff: { additions: number; deletions: number } | null,
+): string | null {
+  const fileSegment = pluralizeWorkSegment(changedFileCount, "Changed File", "Changed Files");
+  if (fileSegment === null) {
+    return null;
+  }
+  return diff === null ? fileSegment : `${fileSegment} +${diff.additions}/−${diff.deletions}`;
+}
+
+/**
+ * Work rows as the counter wants them, flattened across every activity group of
+ * the turn in feed order.
+ *
+ * Flattening matters: mobile splits a turn's activities into a new group at each
+ * message boundary, and counting per group would restart `toolCallId` dedupe and
+ * the id-less run fold at every split, inflating the total above web's.
+ */
+function collectTurnWorkActivities(entries: ReadonlyArray<ThreadFeedEntry>): TurnWorkActivity[] {
+  const activities: TurnWorkActivity[] = [];
+  for (const entry of entries) {
+    if (entry.type !== "activity-group") {
+      continue;
+    }
+    for (const activity of entry.activities) {
+      const workEntry = activity.workEntry;
+      activities.push({
+        tone: workEntry.tone,
+        itemType: workEntry.itemType ?? null,
+        toolCallId: workEntry.toolCallId ?? null,
+        kind: workEntry.sourceActivityKind ?? null,
+        summary: workEntry.toolTitle ?? workEntry.label,
+        detail: workEntry.detail ?? null,
+      });
+    }
+  }
+  return activities;
+}
+
+/**
+ * Per-turn inputs the fold label needs beyond the feed itself. All optional: a
+ * thread delivered without them renders the duration-only label it always did.
+ */
+export interface ThreadFeedTurnFoldInputs {
+  readonly turns?: ReadonlyArray<OrchestrationTurnSummary> | undefined;
+  /** Turns the server had to cut activity rows from; counting what survived undercounts them. */
+  readonly partialTurnIds?: ReadonlySet<TurnId> | undefined;
+  /** Set only for a host too old to name the turns it cut. */
+  readonly activityWindowMayBeTruncated?: boolean | undefined;
+  readonly checkpointsByTurnId?: ReadonlyMap<TurnId, OrchestrationCheckpointSummary> | undefined;
+}
+
 interface ThreadFeedTurnFold {
   readonly turnId: TurnId;
   readonly createdAt: string;
@@ -1243,7 +1327,12 @@ interface ThreadFeedTurnFold {
 function deriveThreadFeedTurnFolds(
   feed: ReadonlyArray<ThreadFeedEntry>,
   latestTurn: ThreadFeedLatestTurn | null,
+  foldInputs: ThreadFeedTurnFoldInputs = {},
 ): ReadonlyMap<string, ThreadFeedTurnFold> {
+  const turnSummaryById = new Map<TurnId, OrchestrationTurnSummary>();
+  for (const summary of foldInputs.turns ?? []) {
+    turnSummaryById.set(summary.turnId, summary);
+  }
   const firstAssistantMessageIdByTurn = new Map<TurnId, string>();
   const terminalAssistantMessageIdByTurn = new Map<TurnId, string>();
   for (const entry of feed) {
@@ -1335,14 +1424,64 @@ function deriveThreadFeedTurnFolds(
             ) ?? lastEntryEnd,
           );
     const duration = elapsedMs === null ? null : formatDuration(elapsedMs);
-    const interrupted = latestTurnMatches && latestTurn.state === "interrupted";
-    const label = interrupted
+    const turnSummary = turnSummaryById.get(turnId);
+    // Per-turn state, so a turn that was interrupted keeps its wording once it
+    // is no longer the latest turn. `latestTurn` is the fallback for threads
+    // delivered without a `turns[]` record.
+    const interrupted =
+      turnSummary !== undefined
+        ? turnSummary.state === "interrupted"
+        : latestTurnMatches && latestTurn.state === "interrupted";
+    const durationPhrase = interrupted
       ? duration
         ? `You stopped after ${duration}`
         : "You stopped this response"
       : duration
         ? `Worked for ${duration}`
         : "Worked";
+
+    // Stamped counts win for a settled turn: they were computed when every
+    // activity row still existed. Without a stamp the client may only derive
+    // counts for a turn whose rows it holds in full — the server names the
+    // turns it cut, and counting the survivors of one would undercount it.
+    const stampedCounts = turnSummary?.counts;
+    const activitiesMayHaveAgedOut =
+      foldInputs.partialTurnIds === undefined
+        ? foldInputs.activityWindowMayBeTruncated === true
+        : foldInputs.partialTurnIds.has(turnId);
+    const counts =
+      stampedCounts ??
+      (activitiesMayHaveAgedOut ? null : countTurnWork(collectTurnWorkActivities(entries)));
+
+    const checkpoint = foldInputs.checkpointsByTurnId?.get(turnId);
+    // A turn can settle before its checkpoint is captured, stamping a file
+    // count of zero. A ready checkpoint is the later, better answer, so it
+    // wins over a zero stamp rather than being skipped by a nullish check.
+    const stampedChangedFileCount = stampedCounts?.changedFileCount;
+    const changedFileCount =
+      stampedChangedFileCount !== undefined && stampedChangedFileCount > 0
+        ? stampedChangedFileCount
+        : (checkpoint?.files.length ?? stampedChangedFileCount ?? 0);
+    // Line counts are only trustworthy once the checkpoint is ready; the file
+    // count still stands either way.
+    const diff =
+      checkpoint?.status === "ready"
+        ? checkpoint.files.reduce(
+            (totals, file) => ({
+              additions: totals.additions + file.additions,
+              deletions: totals.deletions + file.deletions,
+            }),
+            { additions: 0, deletions: 0 },
+          )
+        : null;
+
+    const label = [
+      durationPhrase,
+      ...(counts === null ? [] : workCountSegments(counts)),
+      ...(counts === null ? [] : [changedFileSegment(changedFileCount, diff)]),
+    ]
+      .filter((segment): segment is string => segment != null && segment.length > 0)
+      .join(" · ");
 
     foldsByAnchorId.set(firstHiddenEntry.id, {
       turnId,
@@ -1360,6 +1499,10 @@ export function deriveThreadFeedPresentation(
   expandedTurnIds: ReadonlySet<TurnId>,
   expandedWorkGroupIds: ReadonlySet<string> = new Set(),
   activeWorkStartedAt: string | null = null,
+  // An options object rather than more positional params: the fold inputs are
+  // all optional and arrive together, and five positional args is already the
+  // limit of what reads.
+  foldInputs: ThreadFeedTurnFoldInputs = {},
 ): ThreadFeedEntry[] {
   const sourceFeed = feed.filter(
     (entry) => entry.type !== "turn-fold" && entry.type !== "work-toggle",
@@ -1367,7 +1510,7 @@ export function deriveThreadFeedPresentation(
   const activeTailGroup = sourceFeed.findLast(
     (entry) => entry.type !== "message" || !isEmptyMessage(entry),
   );
-  const foldsByAnchorId = deriveThreadFeedTurnFolds(sourceFeed, latestTurn);
+  const foldsByAnchorId = deriveThreadFeedTurnFolds(sourceFeed, latestTurn, foldInputs);
   const unsettledTurnId = deriveUnsettledTurnId(latestTurn);
   const isWorking = activeWorkStartedAt !== null;
   const collapsedEntryIds = new Set<string>();

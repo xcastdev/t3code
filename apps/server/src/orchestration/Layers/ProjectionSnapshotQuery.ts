@@ -15,6 +15,7 @@ import {
   TurnId,
   type OrchestrationCheckpointSummary,
   type OrchestrationLatestTurn,
+  type OrchestrationTurnSummary,
   type OrchestrationMessage,
   type OrchestrationProjectShell,
   type OrchestrationProposedPlan,
@@ -25,6 +26,7 @@ import {
   ModelSelection,
   ProjectId,
   ThreadLinkedPullRequest,
+  THREAD_ACTIVITY_WINDOW_LIMIT,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Arr from "effect/Array";
@@ -73,7 +75,14 @@ const decodeThread = Schema.decodeUnknownEffect(OrchestrationThread);
 // Keep detail reads consistent with the in-memory projector's retained
 // activity window. Applying the limit in SQL avoids decoding an unbounded
 // payload_json set before the projector can enforce that invariant.
-const THREAD_DETAIL_ACTIVITY_LIMIT = 500;
+const THREAD_DETAIL_ACTIVITY_LIMIT = THREAD_ACTIVITY_WINDOW_LIMIT;
+// One row past the window. A bare LIMIT cannot say whether a full page means
+// "exactly this many rows exist" or "more were cut"; reading one extra row and
+// discarding it turns that ambiguity into a fact.
+const THREAD_DETAIL_ACTIVITY_PROBE_LIMIT = THREAD_DETAIL_ACTIVITY_LIMIT + 1;
+// Same window as activities, for the same reason: bound the decode cost of a
+// long-lived thread. Turns are far cheaper than activities, so this is generous.
+const THREAD_TURN_LIMIT = 500;
 const ProjectionProjectDbRowSchema = ProjectionProject.mapFields(
   Struct.assign({
     defaultModelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
@@ -115,6 +124,21 @@ const ProjectionLatestTurnDbRowSchema = Schema.Struct({
   assistantMessageId: Schema.NullOr(MessageId),
   sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
   sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
+});
+const ProjectionTurnSummaryDbRowSchema = Schema.Struct({
+  threadId: ProjectionThread.fields.threadId,
+  turnId: TurnId,
+  state: Schema.String,
+  requestedAt: IsoDateTime,
+  startedAt: Schema.NullOr(IsoDateTime),
+  completedAt: Schema.NullOr(IsoDateTime),
+  assistantMessageId: Schema.NullOr(MessageId),
+  model: Schema.NullOr(Schema.String),
+  effort: Schema.NullOr(Schema.String),
+  commandCount: Schema.NullOr(Schema.Number),
+  toolCallCount: Schema.NullOr(Schema.Number),
+  subagentCount: Schema.NullOr(Schema.Number),
+  changedFileCount: Schema.NullOr(Schema.Number),
 });
 const ProjectionStateDbRowSchema = ProjectionState;
 const ProjectionCountsRowSchema = Schema.Struct({
@@ -285,6 +309,48 @@ function mapLatestTurn(
           },
         }
       : {}),
+  };
+}
+
+/**
+ * Turns that settled before per-turn provenance existed carry NULL columns, and
+ * those map to omitted optional fields rather than nulls so a client can tell
+ * "not recorded" from "recorded as zero".
+ */
+function mapTurnSummary(
+  row: Schema.Schema.Type<typeof ProjectionTurnSummaryDbRowSchema>,
+): OrchestrationTurnSummary {
+  const counts =
+    row.commandCount !== null &&
+    row.toolCallCount !== null &&
+    row.subagentCount !== null &&
+    row.changedFileCount !== null
+      ? {
+          counts: {
+            commandCount: row.commandCount,
+            toolCallCount: row.toolCallCount,
+            subagentCount: row.subagentCount,
+            changedFileCount: row.changedFileCount,
+          },
+        }
+      : {};
+  return {
+    turnId: row.turnId,
+    state:
+      row.state === "error"
+        ? "error"
+        : row.state === "interrupted"
+          ? "interrupted"
+          : row.state === "completed"
+            ? "completed"
+            : "running",
+    requestedAt: row.requestedAt,
+    startedAt: row.startedAt,
+    completedAt: row.completedAt,
+    assistantMessageId: row.assistantMessageId,
+    ...(row.model === null ? {} : { model: row.model }),
+    ...(row.effort === null ? {} : { effort: row.effort }),
+    ...counts,
   };
 }
 
@@ -682,6 +748,54 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       `,
   });
 
+  // Per-thread capped turn history for the full snapshot. The window is applied
+  // per thread so one busy thread cannot starve the others.
+  const listTurnRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionTurnSummaryDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          "threadId",
+          "turnId",
+          state,
+          "requestedAt",
+          "startedAt",
+          "completedAt",
+          "assistantMessageId",
+          model,
+          effort,
+          "commandCount",
+          "toolCallCount",
+          "subagentCount",
+          "changedFileCount"
+        FROM (
+          SELECT
+            thread_id AS "threadId",
+            turn_id AS "turnId",
+            state,
+            requested_at AS "requestedAt",
+            started_at AS "startedAt",
+            completed_at AS "completedAt",
+            assistant_message_id AS "assistantMessageId",
+            model,
+            effort,
+            command_count AS "commandCount",
+            tool_call_count AS "toolCallCount",
+            subagent_count AS "subagentCount",
+            changed_file_count AS "changedFileCount",
+            ROW_NUMBER() OVER (
+              PARTITION BY thread_id
+              ORDER BY requested_at DESC, turn_id DESC
+            ) AS "recencyRank"
+          FROM projection_turns
+          WHERE turn_id IS NOT NULL
+        ) AS ranked_turns
+        WHERE "recencyRank" <= ${THREAD_TURN_LIMIT}
+        ORDER BY "threadId" ASC, "requestedAt" ASC, "turnId" ASC
+      `,
+  });
+
   const listLatestTurnRows = SqlSchema.findAll({
     Request: Schema.Void,
     Result: ProjectionLatestTurnDbRowSchema,
@@ -1046,7 +1160,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             sequence DESC,
             created_at DESC,
             activity_id DESC
-          LIMIT ${THREAD_DETAIL_ACTIVITY_LIMIT}
+          LIMIT ${THREAD_DETAIL_ACTIVITY_PROBE_LIMIT}
         ) AS recent_activities
         ORDER BY
           sequence ASC,
@@ -1098,6 +1212,62 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           AND threads.deleted_at IS NULL
           AND threads.archived_at IS NULL
         LIMIT 1
+      `,
+  });
+
+  // Most recent THREAD_TURN_LIMIT turns for one thread, returned ascending.
+  // The cap mirrors the activity window: a thread with thousands of turns must
+  // not decode all of them to render a timeline.
+  // Total rows a thread holds per turn, for the turns a truncated window kept.
+  // Position cannot answer this: `sequence` is never populated, so rows order by
+  // time, and a provider completing an earlier turn after a later one has begun
+  // interleaves them. Comparing a turn's total against what the window retained
+  // is the only way to know it was cut.
+  const countActivityRowsByTurn = SqlSchema.findAll({
+    Request: ThreadIdLookupInput,
+    Result: Schema.Struct({
+      turnId: TurnId,
+      activityCount: Schema.Number,
+    }),
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          turn_id AS "turnId",
+          COUNT(*) AS "activityCount"
+        FROM projection_thread_activities
+        WHERE thread_id = ${threadId}
+          AND turn_id IS NOT NULL
+        GROUP BY turn_id
+      `,
+  });
+
+  const listTurnRowsByThread = SqlSchema.findAll({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionTurnSummaryDbRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT * FROM (
+          SELECT
+            thread_id AS "threadId",
+            turn_id AS "turnId",
+            state,
+            requested_at AS "requestedAt",
+            started_at AS "startedAt",
+            completed_at AS "completedAt",
+            assistant_message_id AS "assistantMessageId",
+            model,
+            effort,
+            command_count AS "commandCount",
+            tool_call_count AS "toolCallCount",
+            subagent_count AS "subagentCount",
+            changed_file_count AS "changedFileCount"
+          FROM projection_turns
+          WHERE thread_id = ${threadId}
+            AND turn_id IS NOT NULL
+          ORDER BY requested_at DESC, turn_id DESC
+          LIMIT ${THREAD_TURN_LIMIT}
+        ) AS recent_turns
+        ORDER BY "requestedAt" ASC, "turnId" ASC
       `,
   });
 
@@ -1410,7 +1580,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             sequence DESC,
             created_at DESC,
             activity_id DESC
-          LIMIT ${THREAD_DETAIL_ACTIVITY_LIMIT}
+          LIMIT ${THREAD_DETAIL_ACTIVITY_PROBE_LIMIT}
         ) AS recent_activities
         ORDER BY
           sequence ASC,
@@ -1519,6 +1689,14 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
+          listTurnRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getSnapshot:listTurns:query",
+                "ProjectionSnapshotQuery.getSnapshot:listTurns:decodeRows",
+              ),
+            ),
+          ),
           listProjectionStateRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
@@ -1540,6 +1718,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             sessionRows,
             checkpointRows,
             latestTurnRows,
+            turnRows,
             stateRows,
           ]) =>
             Effect.gen(function* () {
@@ -1549,6 +1728,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               const checkpointsByThread = new Map<string, Array<OrchestrationCheckpointSummary>>();
               const sessionsByThread = new Map<string, OrchestrationSession>();
               const latestTurnByThread = new Map<string, OrchestrationLatestTurn>();
+              const turnsByThread = new Map<string, Array<OrchestrationTurnSummary>>();
 
               let updatedAt: string | null = null;
 
@@ -1622,6 +1802,12 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   completedAt: row.completedAt,
                 });
                 checkpointsByThread.set(row.threadId, threadCheckpoints);
+              }
+
+              for (const row of turnRows) {
+                const threadTurns = turnsByThread.get(row.threadId) ?? [];
+                threadTurns.push(mapTurnSummary(row));
+                turnsByThread.set(row.threadId, threadTurns);
               }
 
               for (const row of latestTurnRows) {
@@ -1724,6 +1910,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 proposedPlans: proposedPlansByThread.get(row.threadId) ?? [],
                 activities: activitiesByThread.get(row.threadId) ?? [],
                 checkpoints: checkpointsByThread.get(row.threadId) ?? [],
+                turns: turnsByThread.get(row.threadId) ?? [],
                 session: sessionsByThread.get(row.threadId) ?? null,
               }));
 
@@ -2533,6 +2720,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         activityRows,
         pinnedActivityRows,
         checkpointRows,
+        turnRows,
         latestTurnRow,
         sessionRow,
       ] = yield* Effect.all([
@@ -2590,6 +2778,14 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             ),
           ),
         ),
+        listTurnRowsByThread({ threadId }).pipe(
+          Effect.mapError(
+            toPersistenceSqlOrDecodeError(
+              "ProjectionSnapshotQuery.getThreadDetailById:listTurns:query",
+              "ProjectionSnapshotQuery.getThreadDetailById:listTurns:decodeRows",
+            ),
+          ),
+        ),
         getLatestTurnRowByThread({ threadId }).pipe(
           Effect.mapError(
             toPersistenceSqlOrDecodeError(
@@ -2612,9 +2808,49 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         return Option.none<OrchestrationThread>();
       }
 
+      // The query reads one row past the window, so an over-full result is
+      // proof that older rows were cut. Which turns lost rows is then a
+      // counting question, not a positional one: `sequence` is never written,
+      // so rows order by time, and a provider finishing an earlier turn after
+      // a later one has begun interleaves the two. Compare each retained turn's
+      // total against what survived — anything short of its total is partial.
+      const activityWindowTruncated = activityRows.length > THREAD_DETAIL_ACTIVITY_LIMIT;
+      const retainedActivityRows = activityWindowTruncated
+        ? activityRows.slice(activityRows.length - THREAD_DETAIL_ACTIVITY_LIMIT)
+        : activityRows;
+      const retainedCountsByTurnId = new Map<string, number>();
+      if (activityWindowTruncated) {
+        for (const row of retainedActivityRows) {
+          if (row.turnId !== null) {
+            retainedCountsByTurnId.set(
+              row.turnId,
+              (retainedCountsByTurnId.get(row.turnId) ?? 0) + 1,
+            );
+          }
+        }
+      }
+      const turnActivityTotals = activityWindowTruncated
+        ? yield* countActivityRowsByTurn({ threadId }).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getThreadDetailById:countActivitiesByTurn:query",
+                "ProjectionSnapshotQuery.getThreadDetailById:countActivitiesByTurn:decodeRows",
+              ),
+            ),
+          )
+        : [];
+      const partialTurnIds = turnActivityTotals
+        // A turn the window cut down to nothing is partial too, and is the case
+        // that matters most: with no rows left, a client counting what it holds
+        // would report zero work as fact rather than staying silent.
+        .filter((row) => (retainedCountsByTurnId.get(row.turnId) ?? 0) < row.activityCount)
+        .map((row) => row.turnId);
+
       const selectedActivityRows = [
         ...new Map(
-          [...activityRows, ...pinnedActivityRows].map((row) => [row.activityId, row] as const),
+          [...retainedActivityRows, ...pinnedActivityRows].map(
+            (row) => [row.activityId, row] as const,
+          ),
         ).values(),
       ].toSorted(
         (left, right) =>
@@ -2688,6 +2924,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           assistantMessageId: row.assistantMessageId,
           completedAt: row.completedAt,
         })),
+        turns: turnRows.map(mapTurnSummary),
+        // Omitted when nothing was cut, so the field reads as "no turn is
+        // partial" rather than as an empty answer to a question never asked.
+        ...(partialTurnIds.length === 0 ? {} : { partialTurnIds }),
         session: Option.isSome(sessionRow) ? mapSessionRow(sessionRow.value) : null,
       };
 

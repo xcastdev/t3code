@@ -68,6 +68,7 @@ import type {
   PendingUserInput,
   PendingUserInputDraftAnswer,
   ThreadFeedEntry,
+  ThreadFeedTurnFoldInputs,
 } from "../../lib/threadActivity";
 import { PendingApprovalCard } from "./PendingApprovalCard";
 import { PendingUserInputCard } from "./PendingUserInputCard";
@@ -100,6 +101,7 @@ export interface ThreadDetailScreenProps {
   readonly connectionError: string | null;
   readonly environmentLabel: string | null;
   readonly selectedThreadFeed: ReadonlyArray<ThreadFeedEntry>;
+  readonly selectedThreadFoldInputs?: ThreadFeedTurnFoldInputs;
   readonly activeWorkStartedAt: string | null;
   readonly activePendingApproval: PendingApproval | null;
   readonly respondingApprovalId: ApprovalRequestId | null;
@@ -718,6 +720,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
             contentPresentation={props.contentPresentation}
             agentLabel={agentLabel}
             latestTurn={props.selectedThread.latestTurn}
+            foldInputs={props.selectedThreadFoldInputs}
             activeWorkStartedAt={props.activeWorkStartedAt}
             listRef={listRef}
             freeze={freeze}

@@ -12,6 +12,7 @@ import {
   OrchestrationDispatchCommandError,
   OrchestrationEvent,
   OrchestrationGetFullThreadDiffInput,
+  resolveActivityWindowMayBeTruncated,
   OrchestrationGetTurnDiffInput,
   OrchestrationLatestTurn,
   ProjectCreatedPayload,
@@ -20,6 +21,7 @@ import {
   OrchestrationSession,
   OrchestrationThread,
   OrchestrationThreadShell,
+  OrchestrationTurnSummary,
   ProjectCreateCommand,
   OrchestrationMessage,
   ThreadMessageSentPayload,
@@ -47,6 +49,7 @@ const decodeThreadTurnStartRequestedPayload = Schema.decodeUnknownEffect(
   ThreadTurnStartRequestedPayload,
 );
 const decodeOrchestrationLatestTurn = Schema.decodeUnknownEffect(OrchestrationLatestTurn);
+const decodeOrchestrationTurnSummary = Schema.decodeUnknownEffect(OrchestrationTurnSummary);
 const decodeOrchestrationProposedPlan = Schema.decodeUnknownEffect(OrchestrationProposedPlan);
 const decodeOrchestrationSession = Schema.decodeUnknownEffect(OrchestrationSession);
 const decodeOrchestrationThread = Schema.decodeUnknownEffect(OrchestrationThread);
@@ -1109,4 +1112,145 @@ it("isProviderSendTurnSupportedImageMimeType accepts raster formats and rejects 
   assert.strictEqual(isProviderSendTurnSupportedImageMimeType("image/png"), true);
   assert.strictEqual(isProviderSendTurnSupportedImageMimeType("IMAGE/JPEG"), true);
   assert.strictEqual(isProviderSendTurnSupportedImageMimeType("image/svg+xml"), false);
+});
+
+const HISTORICAL_THREAD_FIXTURE = {
+  id: "thread-1",
+  projectId: "project-1",
+  title: "Provenance thread",
+  modelSelection: { provider: "codex", model: "gpt-5.4" },
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: null,
+  worktreePath: null,
+  latestTurn: null,
+  createdAt: "2026-01-01T00:00:00.000Z",
+  updatedAt: "2026-01-01T00:00:00.000Z",
+  archivedAt: null,
+  session: null,
+  deletedAt: null,
+  messages: [],
+  proposedPlans: [],
+  activities: [],
+  checkpoints: [],
+} as const;
+
+it.effect("decodes a turn summary carrying model, effort, and work counts", () =>
+  Effect.gen(function* () {
+    const turn = yield* decodeOrchestrationTurnSummary({
+      turnId: "turn-1",
+      state: "completed",
+      requestedAt: "2026-01-01T00:00:00.000Z",
+      startedAt: "2026-01-01T00:00:01.000Z",
+      completedAt: "2026-01-01T00:01:13.000Z",
+      assistantMessageId: "message-1",
+      model: "claude-opus-4-5",
+      effort: "high",
+      counts: {
+        commandCount: 5,
+        toolCallCount: 7,
+        subagentCount: 2,
+        changedFileCount: 3,
+      },
+    });
+
+    assert.strictEqual(turn.model, "claude-opus-4-5");
+    assert.strictEqual(turn.effort, "high");
+    assert.strictEqual(turn.counts?.commandCount, 5);
+    assert.strictEqual(turn.counts?.subagentCount, 2);
+  }),
+);
+
+it.effect("decodes a pre-stamp turn summary with no provenance", () =>
+  Effect.gen(function* () {
+    // Turns that settled before the migration carry no model, effort, or
+    // counts. They must still decode so history keeps rendering.
+    const turn = yield* decodeOrchestrationTurnSummary({
+      turnId: "turn-legacy",
+      state: "interrupted",
+      requestedAt: "2026-01-01T00:00:00.000Z",
+      startedAt: null,
+      completedAt: null,
+      assistantMessageId: null,
+    });
+
+    assert.strictEqual(turn.model, undefined);
+    assert.strictEqual(turn.effort, undefined);
+    assert.strictEqual(turn.counts, undefined);
+  }),
+);
+
+it.effect("rejects a turn summary with a negative work count", () =>
+  Effect.gen(function* () {
+    const failure = yield* decodeOrchestrationTurnSummary({
+      turnId: "turn-1",
+      state: "completed",
+      requestedAt: "2026-01-01T00:00:00.000Z",
+      startedAt: null,
+      completedAt: null,
+      assistantMessageId: null,
+      counts: {
+        commandCount: -1,
+        toolCallCount: 0,
+        subagentCount: 0,
+        changedFileCount: 0,
+      },
+    }).pipe(Effect.flip);
+
+    assert.ok(failure);
+  }),
+);
+
+it.effect("decodes a thread payload from a server that does not send turns", () =>
+  Effect.gen(function* () {
+    // `turns` is optional so an older server's payload, and any snapshot cached
+    // before this change, still decode.
+    const thread = yield* decodeOrchestrationThread(HISTORICAL_THREAD_FIXTURE);
+
+    assert.strictEqual(thread.turns, undefined);
+  }),
+);
+
+it.effect("decodes a thread payload carrying per-turn history", () =>
+  Effect.gen(function* () {
+    const thread = yield* decodeOrchestrationThread({
+      ...HISTORICAL_THREAD_FIXTURE,
+      turns: [
+        {
+          turnId: "turn-1",
+          state: "completed",
+          requestedAt: "2026-01-01T00:00:00.000Z",
+          startedAt: "2026-01-01T00:00:01.000Z",
+          completedAt: "2026-01-01T00:01:13.000Z",
+          assistantMessageId: "message-1",
+          model: "claude-opus-4-5",
+          effort: "high",
+          counts: {
+            commandCount: 5,
+            toolCallCount: 7,
+            subagentCount: 2,
+            changedFileCount: 3,
+          },
+        },
+      ],
+    });
+
+    assert.strictEqual(thread.turns?.length, 1);
+    assert.strictEqual(thread.turns?.[0]?.effort, "high");
+  }),
+);
+
+it("trusts a server that sends turn records, however many activities it sent", () => {
+  // A modern server omits `partialTurnIds` when it cut nothing, so a full
+  // window is not evidence of truncation. Threads cross the window through
+  // pagination and ordinary live growth; treating that as a cut would blank
+  // the counts on every turn the server has not stamped.
+  assert.isFalse(resolveActivityWindowMayBeTruncated({ hasTurnRecords: true, activityCount: 900 }));
+});
+
+it("falls back to window size only for a host too old to send turn records", () => {
+  assert.isTrue(resolveActivityWindowMayBeTruncated({ hasTurnRecords: false, activityCount: 500 }));
+  assert.isFalse(
+    resolveActivityWindowMayBeTruncated({ hasTurnRecords: false, activityCount: 499 }),
+  );
 });

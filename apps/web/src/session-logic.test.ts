@@ -2286,3 +2286,40 @@ describe("session activity performance", () => {
     });
   });
 });
+
+describe("work log entry start time retention", () => {
+  it("retains the original lifecycle start across a collapse merge", () => {
+    const activities: OrchestrationThreadActivity[] = [
+      makeActivity({
+        id: "tool-start",
+        createdAt: "2026-02-23T00:00:01.000Z",
+        turnId: "turn-1",
+        kind: "tool.updated",
+        summary: "Ran a command",
+        payload: {
+          itemType: "command_execution",
+          toolCallId: "call-a",
+          status: "inProgress",
+        },
+      }),
+      makeActivity({
+        id: "tool-end",
+        createdAt: "2026-02-23T00:00:09.000Z",
+        turnId: "turn-1",
+        kind: "tool.completed",
+        summary: "Ran a command",
+        payload: {
+          itemType: "command_execution",
+          toolCallId: "call-a",
+        },
+      }),
+    ];
+
+    const [entry] = deriveWorkLogEntries(activities);
+
+    // The merged row reports the completion timestamp, so the start must be
+    // retained separately for a duration to be derivable at all.
+    expect(entry?.startedAt).toBe("2026-02-23T00:00:01.000Z");
+    expect(entry?.createdAt).toBe("2026-02-23T00:00:09.000Z");
+  });
+});

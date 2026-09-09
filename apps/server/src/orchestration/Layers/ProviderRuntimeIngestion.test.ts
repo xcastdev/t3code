@@ -369,6 +369,52 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBe("turn failed");
   });
 
+  it("carries turn.started model and effort through to the turn record", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-provenance"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: now,
+      turnId: asTurnId("turn-provenance"),
+      payload: { model: "gpt-5-codex", effort: "high" },
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      (entry.turns ?? []).some((turn) => turn.turnId === "turn-provenance"),
+    );
+    const turn = (thread.turns ?? []).find((entry) => entry.turnId === "turn-provenance");
+    expect(turn?.model).toBe("gpt-5-codex");
+    expect(turn?.effort).toBe("high");
+    // The turn-scoped carrier must not leak into session state.
+    expect(thread.session?.activeTurnId).toBe("turn-provenance");
+    expect(thread.session?.status).toBe("running");
+  });
+
+  it("leaves turn model and effort absent when turn.started omits them", async () => {
+    const harness = await createHarness();
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-no-provenance"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId("thread-1"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      turnId: asTurnId("turn-no-provenance"),
+    });
+
+    const thread = await waitForThread(harness.readModel, (entry) =>
+      (entry.turns ?? []).some((turn) => turn.turnId === "turn-no-provenance"),
+    );
+    const turn = (thread.turns ?? []).find((entry) => entry.turnId === "turn-no-provenance");
+    expect(turn?.model).toBeUndefined();
+    expect(turn?.effort).toBeUndefined();
+    expect(thread.session?.status).toBe("running");
+  });
+
   it("clears an active turn when the provider aborts it", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
@@ -3023,7 +3069,9 @@ describe("ProviderRuntimeIngestion", () => {
       (entry: ProviderRuntimeTestCheckpoint) => entry.turnId === "turn-p1",
     );
     expect(checkpoint?.status).toBe("missing");
-    expect(checkpoint?.assistantMessageId).toBe("assistant:item-p1-assistant");
+    // A diff update names no assistant message: it is turn-scoped, and the id
+    // it used to synthesise matched no message that would ever exist.
+    expect(checkpoint?.assistantMessageId).toBeNull();
     expect(checkpoint?.checkpointRef).toBe("provider-diff:evt-turn-diff-updated");
   });
 

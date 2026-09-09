@@ -4,7 +4,9 @@ import {
   type OrchestrationEvent,
   type OrchestrationSessionStatus,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
+import { countTurnWork } from "@t3tools/shared/turnWorkCounts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -1221,6 +1223,110 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
       });
     });
 
+    /**
+     * Counts the work a turn performed, for stamping onto the turn as it
+     * settles. `itemType` and `toolCallId` live inside the activity payload
+     * rather than in columns, so the rows are parsed here and handed to the
+     * shared classifier the client also uses.
+     */
+    const countWorkForTurn = Effect.fn("countWorkForTurn")(function* (
+      threadId: ThreadId,
+      turnId: TurnId,
+    ) {
+      const rows = yield* sql<{
+        readonly tone: string;
+        readonly kind: string;
+        readonly summary: string;
+        readonly payloadJson: string | null;
+      }>`
+        SELECT tone, kind, summary, payload_json AS "payloadJson"
+        FROM projection_thread_activities
+        WHERE thread_id = ${threadId}
+          AND turn_id = ${turnId}
+        ORDER BY
+          CASE WHEN sequence IS NULL THEN 0 ELSE 1 END ASC,
+          sequence ASC,
+          created_at ASC,
+          activity_id ASC
+      `.pipe(Effect.mapError(toPersistenceSqlError("ProjectionPipeline.countWorkForTurn:query")));
+
+      return countTurnWork(
+        rows.map((row) => {
+          if (row.payloadJson === null) {
+            return { tone: row.tone, kind: row.kind, summary: row.summary };
+          }
+          const payload: unknown = JSON.parse(row.payloadJson);
+          if (typeof payload !== "object" || payload === null) {
+            return { tone: row.tone, kind: row.kind, summary: row.summary };
+          }
+          const record = payload as {
+            readonly itemType?: unknown;
+            readonly toolCallId?: unknown;
+            readonly agentId?: unknown;
+            readonly detail?: unknown;
+          };
+          return {
+            tone: row.tone,
+            // Ordered rows plus the lifecycle kind let the shared counter fold
+            // id-less rows into runs the same way the work log does.
+            kind: row.kind,
+            summary: row.summary,
+            itemType: typeof record.itemType === "string" ? record.itemType : null,
+            toolCallId: typeof record.toolCallId === "string" ? record.toolCallId : null,
+            // Carried so the stamp skips the same rows the timeline hides;
+            // without them the settled fold outruns its own subfolds.
+            agentId: typeof record.agentId === "string" ? record.agentId : null,
+            detail: typeof record.detail === "string" ? record.detail : null,
+          };
+        }),
+      );
+    });
+
+    /**
+     * Turns the session-end signal still has to finish.
+     *
+     * A running turn is the ordinary case. An interrupted turn is included only
+     * while it is unstamped: interrupt is a *request*, and the provider keeps
+     * emitting until it lands, so the counts belong to the terminal session
+     * event rather than the request. Its "interrupted" state is preserved.
+     */
+    const needsSettling = (turn: {
+      readonly state: string;
+      readonly commandCount: number | null;
+    }) => turn.state === "running" || (turn.state === "interrupted" && turn.commandCount === null);
+
+    /**
+     * Builds the count columns for a turn that is settling. Already-stamped
+     * turns keep their original numbers: counts are turn history, and a later
+     * event must not recount them against activities that have since aged out
+     * or been appended.
+     */
+    const settleCountsFor = Effect.fn("settleCountsFor")(function* (turn: {
+      readonly threadId: ThreadId;
+      readonly turnId: TurnId;
+      readonly commandCount: number | null;
+      readonly checkpointFiles: ReadonlyArray<{ readonly path: string }>;
+      /**
+       * Whether the file list is real. A placeholder checkpoint reports none,
+       * and the capture that would replace it may never land, so its count is
+       * left unstamped instead of frozen at zero.
+       */
+      readonly countsChangedFiles?: boolean;
+    }) {
+      if (turn.commandCount !== null) {
+        return {};
+      }
+      const counts = yield* countWorkForTurn(turn.threadId, turn.turnId);
+      return {
+        commandCount: counts.commandCount,
+        toolCallCount: counts.toolCallCount,
+        subagentCount: counts.subagentCount,
+        ...(turn.countsChangedFiles === false
+          ? {}
+          : { changedFileCount: new Set(turn.checkpointFiles.map((file) => file.path)).size }),
+      };
+    });
+
     const applyThreadTurnsProjection: ProjectorDefinition["apply"] = Effect.fn(
       "applyThreadTurnsProjection",
     )(function* (event, _attachmentSideEffects) {
@@ -1265,19 +1371,34 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               threadId: event.payload.threadId,
             });
             yield* Effect.forEach(
-              existingTurns.filter((turn) => turn.turnId !== null && turn.state === "running"),
-              (turn) =>
-                turn.turnId === null
-                  ? Effect.void
-                  : projectionTurnRepository.upsertByTurnId({
-                      ...turn,
-                      turnId: turn.turnId,
-                      state: settledTurnState,
-                      // A running turn's completedAt can only hold a mid-turn
-                      // placeholder checkpoint timestamp — the session leaving
-                      // "running" is the authoritative turn end.
-                      completedAt: event.payload.session.updatedAt,
-                    }),
+              existingTurns.filter((turn) => turn.turnId !== null && needsSettling(turn)),
+              Effect.fn("settleRunningTurn")(function* (turn) {
+                if (turn.turnId === null) {
+                  return;
+                }
+                const counts = yield* settleCountsFor({
+                  threadId: turn.threadId,
+                  turnId: turn.turnId,
+                  commandCount: turn.commandCount,
+                  checkpointFiles: turn.checkpointFiles,
+                });
+                yield* projectionTurnRepository.upsertByTurnId({
+                  ...turn,
+                  turnId: turn.turnId,
+                  // An interrupted turn is only here to be stamped; the user
+                  // stopping it is the more specific truth about how it ended,
+                  // and the interrupt already recorded when that happened.
+                  state: turn.state === "interrupted" ? "interrupted" : settledTurnState,
+                  // A running turn's completedAt can only hold a mid-turn
+                  // placeholder checkpoint timestamp — the session leaving
+                  // "running" is the authoritative turn end.
+                  completedAt:
+                    turn.state === "interrupted"
+                      ? (turn.completedAt ?? event.payload.session.updatedAt)
+                      : event.payload.session.updatedAt,
+                  ...counts,
+                });
+              }),
               { concurrency: 1 },
             );
             return;
@@ -1291,19 +1412,52 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           });
           yield* Effect.forEach(
             otherRunningTurns.filter(
-              (turn) => turn.turnId !== null && turn.turnId !== turnId && turn.state === "running",
+              (turn) => turn.turnId !== null && turn.turnId !== turnId && needsSettling(turn),
             ),
             (turn) =>
               turn.turnId === null
                 ? Effect.void
-                : projectionTurnRepository.upsertByTurnId({
-                    ...turn,
-                    turnId: turn.turnId,
-                    state: "completed",
-                    completedAt: event.payload.session.updatedAt,
+                : Effect.gen(function* () {
+                    const turnId = turn.turnId;
+                    if (turnId === null) {
+                      return;
+                    }
+                    // Steering settles this turn just as truly as the provider
+                    // completing it would, so stamp its work here too —
+                    // nothing backfills a turn that settles unstamped.
+                    const counts = yield* settleCountsFor({
+                      threadId: turn.threadId,
+                      turnId,
+                      commandCount: turn.commandCount,
+                      checkpointFiles: turn.checkpointFiles,
+                    });
+                    yield* projectionTurnRepository.upsertByTurnId({
+                      ...turn,
+                      turnId,
+                      state: turn.state === "interrupted" ? "interrupted" : "completed",
+                      completedAt:
+                        turn.state === "interrupted"
+                          ? (turn.completedAt ?? event.payload.session.updatedAt)
+                          : event.payload.session.updatedAt,
+                      ...counts,
+                    });
                   }),
             { concurrency: 1 },
           );
+
+          // Only the session set that opened this turn carries provenance;
+          // later writes for the same turn must not blank what it recorded.
+          const turnProvenance =
+            event.payload.turnProvenance?.turnId === turnId
+              ? event.payload.turnProvenance
+              : undefined;
+          const turnProvenanceColumns =
+            turnProvenance === undefined
+              ? {}
+              : {
+                  ...(turnProvenance.model === undefined ? {} : { model: turnProvenance.model }),
+                  ...(turnProvenance.effort === undefined ? {} : { effort: turnProvenance.effort }),
+                };
 
           const existingTurn = yield* projectionTurnRepository.getByTurnId({
             threadId: event.payload.threadId,
@@ -1333,6 +1487,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
                 (Option.isSome(pendingTurnStart)
                   ? pendingTurnStart.value.sourceProposedPlanId
                   : null),
+              ...turnProvenanceColumns,
               startedAt:
                 existingTurn.value.startedAt ??
                 (Option.isSome(pendingTurnStart)
@@ -1370,6 +1525,13 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               checkpointRef: null,
               checkpointStatus: null,
               checkpointFiles: [],
+              model: null,
+              effort: null,
+              commandCount: null,
+              toolCallCount: null,
+              subagentCount: null,
+              changedFileCount: null,
+              ...turnProvenanceColumns,
             });
           }
 
@@ -1401,9 +1563,18 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             turnId: event.payload.turnId,
           });
           if (Option.isSome(existingTurn)) {
+            const counts = settlesTurn
+              ? yield* settleCountsFor({
+                  threadId: event.payload.threadId,
+                  turnId: event.payload.turnId,
+                  commandCount: existingTurn.value.commandCount,
+                  checkpointFiles: existingTurn.value.checkpointFiles,
+                })
+              : {};
             yield* projectionTurnRepository.upsertByTurnId({
               ...existingTurn.value,
               assistantMessageId: event.payload.messageId,
+              ...counts,
               state: settlesTurn
                 ? existingTurn.value.state === "interrupted"
                   ? "interrupted"
@@ -1434,6 +1605,12 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             checkpointRef: null,
             checkpointStatus: null,
             checkpointFiles: [],
+            model: null,
+            effort: null,
+            commandCount: null,
+            toolCallCount: null,
+            subagentCount: null,
+            changedFileCount: null,
           });
           return;
         }
@@ -1447,6 +1624,10 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             turnId: event.payload.turnId,
           });
           if (Option.isSome(existingTurn)) {
+            // Counts are deliberately not stamped here. An interrupt is a
+            // request the provider has not seen yet, so work started in the
+            // meantime would be counted out. The terminal session event settles
+            // this turn's counts; only the state and timestamps land now.
             yield* projectionTurnRepository.upsertByTurnId({
               ...existingTurn.value,
               state: "interrupted",
@@ -1471,6 +1652,12 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             checkpointRef: null,
             checkpointStatus: null,
             checkpointFiles: [],
+            model: null,
+            effort: null,
+            commandCount: null,
+            toolCallCount: null,
+            subagentCount: null,
+            changedFileCount: null,
           });
           return;
         }
@@ -1497,10 +1684,33 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           });
 
           if (Option.isSome(existingTurn)) {
+            // This event settles the turn whenever its session has already
+            // moved on, and on every rebuild — each projector replays the whole
+            // log independently, so the sessions projector is at its final
+            // state before this one replays. A settle here is the turn's last
+            // chance to be counted: the terminal session set that would
+            // otherwise stamp it skips turns that are no longer running.
+            const settledCounts = turnStillRunning
+              ? {}
+              : yield* settleCountsFor({
+                  threadId: event.payload.threadId,
+                  turnId: event.payload.turnId,
+                  commandCount: existingTurn.value.commandCount,
+                  checkpointFiles: event.payload.files,
+                  // A placeholder carries no files, and the real capture may
+                  // never arrive to restamp it. Leave the file count unstamped
+                  // rather than freezing a zero the reader would trust.
+                  countsChangedFiles: event.payload.status !== "missing",
+                });
             yield* projectionTurnRepository.upsertByTurnId({
               ...existingTurn.value,
-              assistantMessageId: event.payload.assistantMessageId,
+              // A diff that names no message must not erase the one the turn
+              // already found: a placeholder capture carries no item, and
+              // blanking here left the turn pointing at nothing.
+              assistantMessageId:
+                event.payload.assistantMessageId ?? existingTurn.value.assistantMessageId,
               state: turnStillRunning ? existingTurn.value.state : nextState,
+              ...settledCounts,
               checkpointTurnCount: event.payload.checkpointTurnCount,
               checkpointRef: event.payload.checkpointRef,
               checkpointStatus: event.payload.status,
@@ -1508,6 +1718,18 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               startedAt: existingTurn.value.startedAt ?? event.payload.completedAt,
               requestedAt: existingTurn.value.requestedAt ?? event.payload.completedAt,
               completedAt: event.payload.completedAt,
+              // The checkpoint is captured asynchronously, so a turn that
+              // settled first stamped its file count from an empty (or
+              // mid-turn placeholder) file list. This is where the real diff
+              // finally lands, so restamp the count the settle path guessed.
+              // Only for a turn that was actually stamped: a file count on an
+              // otherwise unstamped row is a partial the reader discards
+              // wholesale, which would lose the client's derived counts too.
+              ...(turnStillRunning || existingTurn.value.commandCount === null
+                ? {}
+                : {
+                    changedFileCount: new Set(event.payload.files.map((file) => file.path)).size,
+                  }),
             });
             return;
           }
@@ -1526,6 +1748,12 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             checkpointRef: event.payload.checkpointRef,
             checkpointStatus: event.payload.status,
             checkpointFiles: event.payload.files,
+            model: null,
+            effort: null,
+            commandCount: null,
+            toolCallCount: null,
+            subagentCount: null,
+            changedFileCount: null,
           });
           return;
         }
