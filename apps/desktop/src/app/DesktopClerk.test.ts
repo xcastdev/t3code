@@ -1,5 +1,6 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { beforeEach, vi } from "vite-plus/test";
@@ -36,6 +37,7 @@ import * as ElectronTheme from "../electron/ElectronTheme.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopClerk from "./DesktopClerk.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopLaunchIntent from "./DesktopLaunchIntent.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
 
 const makeDesktopClerkLayer = (isDevelopment = true, events: string[] = []) => {
@@ -68,6 +70,7 @@ const makeDesktopClerkLayer = (isDevelopment = true, events: string[] = []) => {
 
 const makeDesktopClerkEventContextLayer = (
   electronDialog: ElectronDialog.ElectronDialog["Service"] = {} as ElectronDialog.ElectronDialog["Service"],
+  launchIntent: Layer.Layer<DesktopLaunchIntent.DesktopLaunchIntent> = DesktopLaunchIntent.layer,
 ) =>
   Layer.mergeAll(
     Layer.succeed(
@@ -79,6 +82,7 @@ const makeDesktopClerkEventContextLayer = (
     Layer.succeed(DesktopWindow.DesktopWindow, {} as DesktopWindow.DesktopWindow["Service"]),
     Layer.succeed(ElectronTheme.ElectronTheme, {} as ElectronTheme.ElectronTheme["Service"]),
     Layer.succeed(ElectronDialog.ElectronDialog, electronDialog),
+    launchIntent,
   );
 
 describe("DesktopClerk", () => {
@@ -454,6 +458,7 @@ describe("DesktopClerk", () => {
     return Effect.gen(function* () {
       const clerk = yield* DesktopClerk.DesktopClerk;
       yield* Effect.scoped(clerk.configure);
+      assert.isTrue(DesktopLaunchIntent.capturePreReadyDesktopLaunchIntent(attachUrl));
       handlers.get("open-url")?.({ preventDefault }, attachUrl);
       yield* Deferred.await(warningShown);
 
@@ -463,6 +468,65 @@ describe("DesktopClerk", () => {
     }).pipe(
       Effect.provide(
         Layer.mergeAll(makeDesktopClerkLayer(), makeDesktopClerkEventContextLayer(dialog)),
+      ),
+      Effect.provideService(ElectronApp.ElectronApp, electronApp),
+      Effect.provideService(ElectronWindow.ElectronWindow, electronWindow),
+      Effect.provideService(DesktopAttachedBackend.DesktopAttachedBackend, attachedBackend),
+      Effect.provideService(DesktopLifecycle.DesktopLifecycle, lifecycle),
+    );
+  });
+
+  it.effect("claims a pre-ready intent before bootstrap can consume the same URL", () => {
+    storageMock.mockReturnValue(storageAdapter);
+    createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: true });
+    const handlers = new Map<string, (...args: Array<unknown>) => void>();
+    const attachComplete = Effect.runSync(Deferred.make<void>());
+    const pairingUrl = "http://127.0.0.1:3773/pair#token=owner-token";
+    const attachUrl = `t3code://attach-primary?pairingUrl=${encodeURIComponent(pairingUrl)}`;
+    const prebuiltContext = Effect.runSync(Effect.scoped(Layer.build(DesktopLaunchIntent.layer)));
+    const launchIntent = Context.get(prebuiltContext, DesktopLaunchIntent.DesktopLaunchIntent);
+    Effect.runSync(launchIntent.consume);
+    assert.isTrue(DesktopLaunchIntent.capturePreReadyDesktopLaunchIntent(attachUrl));
+
+    const electronApp = {
+      quit: Effect.void,
+      on: (eventName: string, listener: (...args: Array<unknown>) => void) =>
+        Effect.sync(() => {
+          handlers.set(eventName, listener);
+        }),
+    } as unknown as ElectronApp.ElectronApp["Service"];
+    const electronWindow = {} as ElectronWindow.ElectronWindow["Service"];
+    const attach = vi.fn((value: string) =>
+      Effect.gen(function* () {
+        assert.equal(value, pairingUrl);
+        yield* Deferred.succeed(attachComplete, undefined);
+        return { mode: "attached" as const };
+      }),
+    );
+    const attachedBackend = {
+      attach,
+    } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"];
+    const lifecycle = {
+      relaunch: () => Effect.void,
+    } as unknown as DesktopLifecycle.DesktopLifecycle["Service"];
+
+    return Effect.gen(function* () {
+      const clerk = yield* DesktopClerk.DesktopClerk;
+      yield* Effect.scoped(clerk.configure);
+      handlers.get("open-url")?.({ preventDefault: vi.fn() }, attachUrl);
+      yield* Deferred.await(attachComplete);
+
+      assert.equal(attach.mock.calls.length, 1);
+      assert.isTrue(Option.isNone(yield* launchIntent.consume));
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          makeDesktopClerkLayer(),
+          makeDesktopClerkEventContextLayer(
+            undefined,
+            Layer.succeed(DesktopLaunchIntent.DesktopLaunchIntent, launchIntent),
+          ),
+        ),
       ),
       Effect.provideService(ElectronApp.ElectronApp, electronApp),
       Effect.provideService(ElectronWindow.ElectronWindow, electronWindow),

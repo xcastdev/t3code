@@ -1,7 +1,10 @@
 import { assert, describe, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import { vi } from "vite-plus/test";
 
 import { EnvironmentId } from "@t3tools/contracts";
 
@@ -16,6 +19,7 @@ import * as DesktopWindow from "../../window/DesktopWindow.ts";
 import {
   attachPrimaryBackend,
   getPrimaryBackendState,
+  refreshAttachedPrimaryCredential,
   useManagedPrimaryBackend,
 } from "./primaryBackend.ts";
 
@@ -85,6 +89,49 @@ describe("primary backend IPC", () => {
       );
       yield* useManagedPrimaryBackend.handler(undefined).pipe(Effect.provide(layer));
       assert.deepEqual(relaunchReasons, ["primary-backend-attached", "primary-backend-managed"]);
+    }),
+  );
+
+  it.effect("refreshes once without relaunching and preserves typed failures", () =>
+    Effect.gen(function* () {
+      const refreshCredential = vi.fn(
+        (
+          _credential: string,
+        ): Effect.Effect<void, DesktopAttachedBackend.DesktopAttachedBackendError> =>
+          Effect.fail(
+            new DesktopAttachedBackend.DesktopAttachAdministrativeScopeError({
+              missingScopes: ["access:write"],
+            }),
+          ),
+      );
+      const attachedBackend = DesktopAttachedBackend.DesktopAttachedBackend.of({
+        getState: Effect.succeed(attachedState),
+        attach: () => Effect.succeed(attachedState),
+        refreshCredential,
+        getBearerToken: Effect.succeed("decrypted-bearer"),
+        probe: Effect.succeed({} as never),
+        useManagedBackend: Effect.void,
+      });
+      const result = yield* Effect.exit(
+        refreshAttachedPrimaryCredential
+          .handler("replacement-owner-token")
+          .pipe(
+            Effect.provideService(DesktopAttachedBackend.DesktopAttachedBackend, attachedBackend),
+          ),
+      );
+
+      assert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        const failure = Cause.findErrorOption(result.cause);
+        assert.isTrue(Option.isSome(failure));
+        if (Option.isSome(failure)) {
+          assert.instanceOf(
+            failure.value,
+            DesktopAttachedBackend.DesktopAttachAdministrativeScopeError,
+          );
+        }
+      }
+      assert.deepEqual(refreshCredential.mock.calls, [["replacement-owner-token"]]);
     }),
   );
 });

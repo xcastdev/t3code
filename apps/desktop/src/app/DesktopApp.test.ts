@@ -1,13 +1,17 @@
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import { assert, describe, it } from "@effect/vitest";
+import { PRIMARY_LOCAL_ENVIRONMENT_ID } from "@t3tools/contracts";
 import { vi } from "vite-plus/test";
+import type { DesktopPrimaryBackendState } from "@t3tools/contracts";
 
 import * as DesktopApp from "./DesktopApp.ts";
 import * as DesktopAttachedBackend from "../backend/DesktopAttachedBackend.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopLifecycle from "./DesktopLifecycle.ts";
+import * as DesktopLaunchIntent from "./DesktopLaunchIntent.ts";
 import * as DesktopShutdown from "./DesktopShutdown.ts";
 import * as DesktopState from "./DesktopState.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
@@ -16,6 +20,10 @@ import * as ElectronTheme from "../electron/ElectronTheme.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
 
 const pairingUrl = "http://127.0.0.1:3773/pair#token=owner-token";
+const primaryEnvironmentId = PRIMARY_LOCAL_ENVIRONMENT_ID as Extract<
+  DesktopPrimaryBackendState,
+  { readonly mode: "attached" }
+>["environmentId"];
 type TestAttachFailure = { readonly _tag: "TestAttachFailure" };
 
 type RecoveryInput = {
@@ -92,14 +100,14 @@ function makeHarness(responses: number[] = []): Effect.Effect<RecoveryHarness> {
   });
 }
 
-type RecoveryEffect = Effect.Effect<
-  boolean,
+type RecoveryError =
   | DesktopAttachedBackend.DesktopAttachedBackendError
-  | ElectronDialog.ElectronDialogShowMessageBoxError,
-  DesktopLifecycle.DesktopLifecycleRuntimeServices
->;
+  | ElectronDialog.ElectronDialogShowMessageBoxError;
 
-function runRecovery(effect: RecoveryEffect, input: RecoveryInput) {
+function runRecovery<A>(
+  effect: Effect.Effect<A, RecoveryError, DesktopLifecycle.DesktopLifecycleRuntimeServices>,
+  input: RecoveryInput,
+) {
   return effect.pipe(
     Effect.provide(
       Layer.mergeAll(
@@ -243,6 +251,183 @@ describe("DesktopApp attached startup recovery", () => {
       assert.equal(harness.quit.mock.calls.length, 1);
       assert.isTrue(yield* Ref.get(harness.quitting));
       assert.equal(managedStart.mock.calls.length, 0);
+    }),
+  );
+
+  it.effect("selects attached startup after one pending attach and one probe", () =>
+    Effect.gen(function* () {
+      const pairingUrl = "http://127.0.0.1:3773/pair#token=owner-token";
+      const operations = {
+        portScan: 0,
+        exposureConfigure: 0,
+        primaryStart: 0,
+        wslReconcile: 0,
+      };
+      let state: DesktopPrimaryBackendState = { mode: "managed" };
+      const attachedState = {
+        mode: "attached" as const,
+        httpBaseUrl: "http://127.0.0.1:3773/",
+        environmentId: primaryEnvironmentId,
+        label: "Workstation",
+        bearerExpiresAt: "2026-10-08T12:00:00.000Z",
+      } satisfies Extract<DesktopPrimaryBackendState, { readonly mode: "attached" }>;
+      const attach = vi.fn(() =>
+        Effect.sync(() => {
+          state = attachedState;
+        }),
+      );
+      const probe = vi.fn(() => Effect.succeed({}));
+      const attachedBackend = {
+        getState: Effect.sync(() => state),
+        attach,
+        probe: Effect.suspend(() => probe()),
+        useManagedBackend: Effect.void,
+      } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"];
+      const launchIntent = DesktopLaunchIntent.DesktopLaunchIntent.of({
+        capture: () => Effect.succeed(false),
+        captureArgv: () => Effect.succeed(false),
+        consume: Effect.succeed(Option.some(pairingUrl)),
+      });
+      const harness = yield* makeHarness();
+      const selection = yield* runRecovery(
+        DesktopApp.selectDesktopPrimaryBackend({
+          ...harness.input,
+          attachedBackend,
+          launchIntent,
+        }),
+        harness.input,
+      );
+      if (selection._tag === "Managed") {
+        operations.portScan += 1;
+        operations.exposureConfigure += 1;
+        operations.primaryStart += 1;
+        operations.wslReconcile += 1;
+      }
+
+      assert.deepEqual(selection, {
+        _tag: "Attached",
+        state: attachedState,
+      });
+      assert.equal(attach.mock.calls.length, 1);
+      assert.equal(probe.mock.calls.length, 1);
+      assert.deepEqual(operations, {
+        portScan: 0,
+        exposureConfigure: 0,
+        primaryStart: 0,
+        wslReconcile: 0,
+      });
+    }),
+  );
+
+  it.effect("selects stored attached startup with probe-only recovery", () =>
+    Effect.gen(function* () {
+      const operations = {
+        portScan: 0,
+        exposureConfigure: 0,
+        primaryStart: 0,
+        wslReconcile: 0,
+      };
+      const storedState = {
+        mode: "attached" as const,
+        httpBaseUrl: "http://127.0.0.1:3773/",
+        environmentId: primaryEnvironmentId,
+        label: "Workstation",
+        bearerExpiresAt: "2026-10-08T12:00:00.000Z",
+      };
+      const harness = yield* makeHarness();
+      const attach = vi.fn(() => Effect.die("stored attachment must not attach"));
+      const probe = vi.fn(() => Effect.succeed({}));
+      const attachedBackend = {
+        getState: Effect.succeed(storedState),
+        attach,
+        probe: Effect.suspend(() => probe()),
+        useManagedBackend: Effect.void,
+      } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"];
+      const launchIntent = DesktopLaunchIntent.DesktopLaunchIntent.of({
+        capture: () => Effect.succeed(false),
+        captureArgv: () => Effect.succeed(false),
+        consume: Effect.succeed(Option.none()),
+      });
+
+      const selection = yield* runRecovery(
+        DesktopApp.selectDesktopPrimaryBackend({
+          ...harness.input,
+          attachedBackend,
+          launchIntent,
+        }),
+        harness.input,
+      );
+      if (selection._tag === "Managed") {
+        operations.portScan += 1;
+        operations.exposureConfigure += 1;
+        operations.primaryStart += 1;
+        operations.wslReconcile += 1;
+      }
+
+      assert.deepEqual(selection, { _tag: "Attached", state: storedState });
+      assert.equal(attach.mock.calls.length, 0);
+      assert.equal(probe.mock.calls.length, 1);
+      assert.deepEqual(operations, {
+        portScan: 0,
+        exposureConfigure: 0,
+        primaryStart: 0,
+        wslReconcile: 0,
+      });
+    }),
+  );
+
+  it.effect("aborts attached startup after probe failure without falling back to managed", () =>
+    Effect.gen(function* () {
+      const operations = {
+        portScan: 0,
+        exposureConfigure: 0,
+        primaryStart: 0,
+        wslReconcile: 0,
+      };
+      const storedState = {
+        mode: "attached" as const,
+        httpBaseUrl: "http://127.0.0.1:3773/",
+        environmentId: primaryEnvironmentId,
+        label: "Workstation",
+        bearerExpiresAt: "2026-10-08T12:00:00.000Z",
+      };
+      const harness = yield* makeHarness([2]);
+      const probe = vi.fn(() => Effect.fail({ _tag: "TestAttachFailure" }));
+      const attachedBackend = {
+        getState: Effect.succeed(storedState),
+        attach: vi.fn(() => Effect.die("stored attachment must not attach")),
+        probe: Effect.suspend(() => probe()),
+        useManagedBackend: Effect.void,
+      } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"];
+      const launchIntent = DesktopLaunchIntent.DesktopLaunchIntent.of({
+        capture: () => Effect.succeed(false),
+        captureArgv: () => Effect.succeed(false),
+        consume: Effect.succeed(Option.none()),
+      });
+
+      const selection = yield* runRecovery(
+        DesktopApp.selectDesktopPrimaryBackend({
+          ...harness.input,
+          attachedBackend,
+          launchIntent,
+        }),
+        harness.input,
+      );
+      if (selection._tag === "Managed") {
+        operations.portScan += 1;
+        operations.exposureConfigure += 1;
+        operations.primaryStart += 1;
+        operations.wslReconcile += 1;
+      }
+
+      assert.deepEqual(selection, { _tag: "Aborted" });
+      assert.equal(probe.mock.calls.length, 1);
+      assert.deepEqual(operations, {
+        portScan: 0,
+        exposureConfigure: 0,
+        primaryStart: 0,
+        wslReconcile: 0,
+      });
     }),
   );
 });

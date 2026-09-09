@@ -357,6 +357,12 @@ export const make = Effect.gen(function* () {
     if (preference.mode !== "attached") {
       return yield* new DesktopAttachedCredentialUnavailableError();
     }
+    // The descriptor is public and unauthenticated; these checks reduce
+    // endpoint substitution risk but do not authenticate a capable local impersonator.
+    const precheckDescriptor = yield* fetchDescriptor(preference.httpBaseUrl);
+    if (precheckDescriptor.environmentId !== preference.environmentId) {
+      return yield* new DesktopAttachedIdentityMismatchError();
+    }
     const session = yield* exchangeCredential({
       httpBaseUrl: preference.httpBaseUrl,
       credential: pairingCredential,
@@ -365,12 +371,12 @@ export const make = Effect.gen(function* () {
     if (missingScopes.length > 0) {
       return yield* new DesktopAttachAdministrativeScopeError({ missingScopes });
     }
-    const descriptor = yield* fetchDescriptor(preference.httpBaseUrl);
-    if (descriptor.environmentId !== preference.environmentId) {
+    const postcheckDescriptor = yield* fetchDescriptor(preference.httpBaseUrl);
+    if (postcheckDescriptor.environmentId !== preference.environmentId) {
       return yield* new DesktopAttachedIdentityMismatchError();
     }
     yield* persistAttached({
-      descriptor,
+      descriptor: postcheckDescriptor,
       httpBaseUrl: preference.httpBaseUrl,
       wsBaseUrl: preference.wsBaseUrl,
       accessToken: session.access_token,

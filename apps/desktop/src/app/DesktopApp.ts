@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import type { DesktopPrimaryBackendState } from "@t3tools/contracts";
 
 import * as NetService from "@t3tools/shared/Net";
 import * as Crypto from "effect/Crypto";
@@ -199,6 +200,54 @@ export const awaitAttachedBackend = Effect.fn("desktop.startup.awaitAttachedBack
   },
 );
 
+type AttachedDesktopPrimaryBackendState = Extract<
+  DesktopPrimaryBackendState,
+  { readonly mode: "attached" }
+>;
+
+export type DesktopPrimaryBackendSelection =
+  | { readonly _tag: "Attached"; readonly state: AttachedDesktopPrimaryBackendState }
+  | { readonly _tag: "Managed" }
+  | { readonly _tag: "Aborted" };
+
+export const selectDesktopPrimaryBackend = Effect.fn("desktop.startup.selectDesktopPrimaryBackend")(
+  function* (input: {
+    readonly attachedBackend: DesktopAttachedBackend.DesktopAttachedBackend["Service"];
+    readonly launchIntent: DesktopLaunchIntent.DesktopLaunchIntent["Service"];
+    readonly dialog: ElectronDialog.ElectronDialog["Service"];
+    readonly lifecycle: DesktopLifecycle.DesktopLifecycle["Service"];
+    readonly shutdown: DesktopShutdown.DesktopShutdown["Service"];
+    readonly electronApp: ElectronApp.ElectronApp["Service"];
+    readonly state: DesktopState.DesktopState["Service"];
+  }) {
+    const pendingLaunchIntent = yield* input.launchIntent.consume;
+    const initialPrimaryBackendState = yield* input.attachedBackend.getState;
+    const pendingPairingUrl = Option.getOrUndefined(pendingLaunchIntent);
+    const needsAttachedRecovery =
+      pendingPairingUrl !== undefined ||
+      initialPrimaryBackendState.mode === "invalid-attached" ||
+      initialPrimaryBackendState.mode === "attached";
+
+    if (needsAttachedRecovery) {
+      const canContinue = yield* awaitAttachedBackend({
+        attachedBackend: input.attachedBackend,
+        dialog: input.dialog,
+        lifecycle: input.lifecycle,
+        shutdown: input.shutdown,
+        electronApp: input.electronApp,
+        state: input.state,
+        ...(pendingPairingUrl === undefined ? {} : { pairingUrl: pendingPairingUrl }),
+      });
+      if (!canContinue) return { _tag: "Aborted" };
+    }
+
+    const primaryBackendState = yield* input.attachedBackend.getState;
+    return primaryBackendState.mode === "attached"
+      ? { _tag: "Attached", state: primaryBackendState }
+      : { _tag: "Managed" };
+  },
+);
+
 const bootstrap = Effect.gen(function* () {
   const pool = yield* DesktopBackendPool.DesktopBackendPool;
   const primaryBackend = yield* pool.primary;
@@ -214,43 +263,20 @@ const bootstrap = Effect.gen(function* () {
   const dialog = yield* ElectronDialog.ElectronDialog;
   yield* logBootstrapInfo("bootstrap start");
 
-  const pendingLaunchIntent = yield* launchIntent.consume;
+  const primaryBackendSelection = yield* selectDesktopPrimaryBackend({
+    attachedBackend,
+    launchIntent,
+    dialog,
+    lifecycle,
+    shutdown: yield* DesktopShutdown.DesktopShutdown,
+    electronApp: yield* ElectronApp.ElectronApp,
+    state,
+  });
+  if (primaryBackendSelection._tag === "Aborted") return;
+
   const settings = yield* desktopSettings.get;
-  const initialPrimaryBackendState = yield* attachedBackend.getState;
-  const pendingPairingUrl = Option.getOrUndefined(pendingLaunchIntent);
-  const recoveredBeforeBackendSelection =
-    pendingPairingUrl !== undefined ||
-    initialPrimaryBackendState.mode === "invalid-attached" ||
-    initialPrimaryBackendState.mode === "attached";
-  if (recoveredBeforeBackendSelection) {
-    const canContinue = yield* awaitAttachedBackend({
-      attachedBackend,
-      dialog,
-      lifecycle,
-      shutdown: yield* DesktopShutdown.DesktopShutdown,
-      electronApp: yield* ElectronApp.ElectronApp,
-      state,
-      ...(pendingPairingUrl === undefined ? {} : { pairingUrl: pendingPairingUrl }),
-    });
-    if (!canContinue) return;
-  }
-
-  const primaryBackendState = yield* attachedBackend.getState;
-  if (primaryBackendState.mode === "attached") {
-    if (!recoveredBeforeBackendSelection) {
-      const canContinue = yield* awaitAttachedBackend({
-        attachedBackend,
-        dialog,
-        lifecycle,
-        shutdown: yield* DesktopShutdown.DesktopShutdown,
-        electronApp: yield* ElectronApp.ElectronApp,
-        state,
-      });
-      if (!canContinue) return;
-    }
-
-    const attachedState = yield* attachedBackend.getState;
-    if (attachedState.mode !== "attached") return;
+  if (primaryBackendSelection._tag === "Attached") {
+    const attachedState = primaryBackendSelection.state as AttachedDesktopPrimaryBackendState;
     const electronProtocol = yield* ElectronProtocol.ElectronProtocol;
     yield* electronProtocol.registerDesktopProtocol({
       scheme: ElectronProtocol.getDesktopScheme(environment.isDevelopment),

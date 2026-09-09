@@ -111,9 +111,12 @@ Open the printed **Desktop attach URL** while the desktop app is closed. The des
 bundled web client and sends API and WebSocket traffic to the existing server. It does not start
 another backend.
 
-The desktop attach URL is printed when the server uses an unspecified host, `localhost`, a
-`127.0.0.0/8` address, or `[::1]`. The desktop app and server must share a filesystem namespace.
-Native file actions, terminals, previews, and editor actions use that shared filesystem.
+The desktop attach URL is printed when the listener host is unspecified or empty, `localhost`, a
+valid address in `127.0.0.0/8`, `::1` or `[::1]`, or a wildcard listener (`0.0.0.0`, `::`, or
+`[::]`). Wildcards only make the listener eligible for the attach URL; the generated Desktop
+attach URL always targets `127.0.0.1` and uses the server's actual listening port. The desktop app
+and server must share a filesystem namespace. Native file actions, terminals, previews, and editor
+actions use that shared filesystem.
 
 To attach an already-open desktop app, open **Settings** → **Connections** → **Backend process** and
 paste the full owner pairing URL. The desktop app relaunches after it saves the attachment.

@@ -2,7 +2,6 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
-import * as Ref from "effect/Ref";
 
 import {
   DESKTOP_DEVELOPMENT_SCHEME,
@@ -11,7 +10,7 @@ import {
 
 export const DESKTOP_ATTACH_HOST = "attach-primary";
 
-let preReadyPairingUrl = findDesktopLaunchIntentInArgv(process.argv);
+let pendingPairingUrl = findDesktopLaunchIntentInArgv(process.argv);
 
 export function buildDesktopAttachUrl(
   pairingUrl: string,
@@ -61,8 +60,20 @@ export function stripDesktopLaunchIntentsFromArgv(argv: readonly string[]): Arra
 export function capturePreReadyDesktopLaunchIntent(raw: string): boolean {
   const pairingUrl = parseDesktopLaunchIntent(raw);
   if (pairingUrl === null) return false;
-  preReadyPairingUrl = pairingUrl;
+  pendingPairingUrl = pairingUrl;
   return true;
+}
+
+/** Claims an intent captured by the process-level pre-ready listener. */
+export function claimDesktopLaunchIntent(pairingUrl: string): boolean {
+  if (pendingPairingUrl !== pairingUrl) return false;
+  pendingPairingUrl = null;
+  return true;
+}
+
+/** Discards a stale startup intent before handling a newer second-instance request. */
+export function clearDesktopLaunchIntent(): void {
+  pendingPairingUrl = null;
 }
 
 export class DesktopLaunchIntent extends Context.Service<
@@ -77,26 +88,28 @@ export class DesktopLaunchIntent extends Context.Service<
 export const layer = Layer.effect(
   DesktopLaunchIntent,
   Effect.gen(function* () {
-    const pending = yield* Ref.make(Option.fromNullishOr(preReadyPairingUrl));
-    preReadyPairingUrl = null;
     const capture = (raw: string) =>
-      Effect.gen(function* () {
+      Effect.sync(() => {
         const pairingUrl = parseDesktopLaunchIntent(raw);
         if (pairingUrl === null) return false;
-        yield* Ref.set(pending, Option.some(pairingUrl));
+        pendingPairingUrl = pairingUrl;
         return true;
       });
     const captureArgv = (argv: readonly string[]) =>
-      Effect.gen(function* () {
+      Effect.sync(() => {
         const pairingUrl = findDesktopLaunchIntentInArgv(argv);
         if (pairingUrl === null) return false;
-        yield* Ref.set(pending, Option.some(pairingUrl));
+        pendingPairingUrl = pairingUrl;
         return true;
       });
     return DesktopLaunchIntent.of({
       capture,
       captureArgv,
-      consume: Ref.getAndSet(pending, Option.none()),
+      consume: Effect.sync(() => {
+        const pairingUrl = pendingPairingUrl;
+        pendingPairingUrl = null;
+        return Option.fromNullishOr(pairingUrl);
+      }),
     });
   }),
 );

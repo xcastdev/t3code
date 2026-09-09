@@ -16,7 +16,12 @@ import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopLifecycle from "./DesktopLifecycle.ts";
-import { findDesktopLaunchIntentInArgv, parseDesktopLaunchIntent } from "./DesktopLaunchIntent.ts";
+import {
+  claimDesktopLaunchIntent,
+  clearDesktopLaunchIntent,
+  findDesktopLaunchIntentInArgv,
+  parseDesktopLaunchIntent,
+} from "./DesktopLaunchIntent.ts";
 
 declare const __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: string | undefined;
 
@@ -187,6 +192,7 @@ export const make = Effect.gen(function* () {
           : [];
         const pairingUrl = findDesktopLaunchIntentInArgv(argv);
         if (pairingUrl !== null) {
+          clearDesktopLaunchIntent();
           handleAttachIntent(pairingUrl);
           return;
         }
@@ -205,7 +211,9 @@ export const make = Effect.gen(function* () {
         if (parseDesktopLaunchIntent(url) === null) return;
         electronEvent.preventDefault?.();
         const pairingUrl = parseDesktopLaunchIntent(url);
-        if (pairingUrl !== null) handleAttachIntent(pairingUrl);
+        if (pairingUrl !== null && claimDesktopLaunchIntent(pairingUrl)) {
+          handleAttachIntent(pairingUrl);
+        }
       });
     }).pipe(Effect.withSpan("desktop.clerk.configure")),
   });
