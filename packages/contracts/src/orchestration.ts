@@ -746,6 +746,28 @@ export type OrchestrationThreadDetailPage = typeof OrchestrationThreadDetailPage
  */
 export const THREAD_ACTIVITY_WINDOW_LIMIT = 500;
 
+/**
+ * Whether a client must treat every unstamped turn as possibly undercounted.
+ *
+ * A server that names the turns it cut is authoritative, and its silence means
+ * nothing was cut. Only a host too old to send `turns` at all leaves the window
+ * size as the last hint — and there a full window is reason enough to stay
+ * silent rather than publish a count derived from a partial thread.
+ *
+ * Shared by web and mobile: the older-host semantics are subtle enough that two
+ * copies would drift.
+ */
+export function resolveActivityWindowMayBeTruncated(input: {
+  hasTurnRecords: boolean;
+  activityCount: number;
+  windowLimit?: number;
+}): boolean {
+  if (input.hasTurnRecords) {
+    return false;
+  }
+  return input.activityCount >= (input.windowLimit ?? THREAD_ACTIVITY_WINDOW_LIMIT);
+}
+
 export const OrchestrationThreadDetailSnapshot = Schema.Struct({
   snapshotSequence: NonNegativeInt,
   thread: OrchestrationThread,

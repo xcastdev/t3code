@@ -174,12 +174,35 @@ pill) is unchanged.
 Mobile has its own independent anchoring implementation in `ThreadFeed` and shares only the generic
 helper in `packages/shared/src/chatList.ts`, which is why the web removal left it untouched.
 
+## Mobile
+
+Mobile renders the same fold label as web — duration, work counts, and the changed-file segment —
+through the same `countTurnWork` in `packages/shared/src/turnWorkCounts.ts`, so a turn never reads
+differently on the two surfaces. The count precedence is identical: stamped server counts win, a
+turn the server named as partial reports none, and an older host that names none suppresses counts
+once the activity window is full (`resolveActivityWindowMayBeTruncated` in `packages/contracts`).
+
+Two mechanical differences are worth knowing:
+
+- Mobile groups a turn's activities into `activity-group` entries and starts a new group at every
+  message boundary. `collectTurnWorkActivities` flattens all of a turn's groups into one array
+  before counting, which is what keeps an id-less run contiguous across a split. In practice
+  `collapseDerivedWorkLogEntries` has already merged lifecycle rows by `toolCallId` before grouping,
+  so per-group counting would agree on most threads; it diverges on a run of id-less rows that
+  straddles a message, where the fold key would restart and count the run twice.
+- The screens below `use-thread-composer-state` receive an `OrchestrationThreadShell`, which carries
+  no `turns`, `checkpoints`, or `activities`. The fold inputs are therefore derived where the full
+  thread detail lives and passed down as one `ThreadFeedTurnFoldInputs` object.
+
+The model/effort footer and the per-tool-row duration column remain web-only: both attach to
+surfaces mobile renders differently (its assistant footer is a copy button and timestamp), and
+mobile's `WorkLogEntry` carries no `startedAt`, which the duration column needs.
+
 ## Not covered here
 
 Per-turn tokens and cost are not plumbed from adapters. Reasoning is emitted by Claude, OpenCode,
 and Codex but dropped at ingestion, which filters to `assistant_text`; when it is picked up, the
-fold label absorbs it without redesign. Mobile's parallel timeline still renders the old
-fold label — the additive contract keeps it working unchanged.
+fold label absorbs it without redesign.
 
 A steer that changes the model mid-turn is not re-stamped. Claude, Cursor, and Grok all gate
 `turn.started` on there being no steering turn, so the run switches model while the turn keeps the

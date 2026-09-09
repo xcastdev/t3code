@@ -12,6 +12,7 @@ import {
   OrchestrationDispatchCommandError,
   OrchestrationEvent,
   OrchestrationGetFullThreadDiffInput,
+  resolveActivityWindowMayBeTruncated,
   OrchestrationGetTurnDiffInput,
   OrchestrationLatestTurn,
   ProjectCreatedPayload,
@@ -1238,3 +1239,18 @@ it.effect("decodes a thread payload carrying per-turn history", () =>
     assert.strictEqual(thread.turns?.[0]?.effort, "high");
   }),
 );
+
+it("trusts a server that sends turn records, however many activities it sent", () => {
+  // A modern server omits `partialTurnIds` when it cut nothing, so a full
+  // window is not evidence of truncation. Threads cross the window through
+  // pagination and ordinary live growth; treating that as a cut would blank
+  // the counts on every turn the server has not stamped.
+  assert.isFalse(resolveActivityWindowMayBeTruncated({ hasTurnRecords: true, activityCount: 900 }));
+});
+
+it("falls back to window size only for a host too old to send turn records", () => {
+  assert.isTrue(resolveActivityWindowMayBeTruncated({ hasTurnRecords: false, activityCount: 500 }));
+  assert.isFalse(
+    resolveActivityWindowMayBeTruncated({ hasTurnRecords: false, activityCount: 499 }),
+  );
+});

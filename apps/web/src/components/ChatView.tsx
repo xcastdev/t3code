@@ -2,7 +2,7 @@ import {
   type ApprovalRequestId,
   type ChatFileAttachment,
   DEFAULT_MODEL,
-  THREAD_ACTIVITY_WINDOW_LIMIT,
+  resolveActivityWindowMayBeTruncated,
   defaultInstanceIdForDriver,
   type EnvironmentId,
   type MessageId,
@@ -390,7 +390,6 @@ import {
   isVideoPreviewRequestCurrent,
   reconcileMountedTerminalThreadIds,
   resolveBackgroundDraftWorkspaceOptions,
-  resolveActivityWindowMayBeTruncated,
   resolveDraftHeroState,
   resolveTimelineScrollModeForSend,
   resolveThreadMetadataUpdateForNextTurn,
@@ -2241,7 +2240,6 @@ function ChatViewContent(props: ChatViewProps) {
   const activityWindowMayBeTruncated = resolveActivityWindowMayBeTruncated({
     hasTurnRecords: activeThread?.turns !== undefined,
     activityCount: threadActivities.length,
-    windowLimit: THREAD_ACTIVITY_WINDOW_LIMIT,
   });
   // Native subagent fold: memoized by activity-list identity, shared by the
   // Agents surface, live strip, and workflow cards. v2Projection is null

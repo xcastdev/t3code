@@ -2,12 +2,14 @@ import { describe, expect, it } from "vite-plus/test";
 import { codexFeedbackMessage } from "@t3tools/client-runtime/state/threads";
 
 import {
+  CheckpointRef,
   EventId,
   MessageId,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
   TurnId,
+  type OrchestrationCheckpointSummary,
   type OrchestrationThread,
   type OrchestrationThreadActivity,
 } from "@t3tools/contracts";
@@ -652,6 +654,235 @@ describe("buildThreadFeed", () => {
     ]);
   });
 
+  describe("turn fold work counts", () => {
+    const turnId = TurnId.make("turn-1");
+
+    const makeCountedThread = (extra: Record<string, unknown> = {}) =>
+      makeThread({
+        id: ThreadId.make("thread-counted"),
+        projectId: ProjectId.make("project-1"),
+        title: "Counted work",
+        latestTurn: {
+          turnId,
+          state: "completed",
+          requestedAt: "2026-04-01T00:00:00.000Z",
+          startedAt: "2026-04-01T00:00:00.000Z",
+          completedAt: "2026-04-01T00:00:12.000Z",
+          assistantMessageId: MessageId.make("assistant-final"),
+        },
+        messages: [
+          {
+            id: MessageId.make("assistant-first"),
+            role: "assistant",
+            text: "Starting.",
+            turnId,
+            streaming: false,
+            createdAt: "2026-04-01T00:00:01.000Z",
+            updatedAt: "2026-04-01T00:00:01.000Z",
+          },
+          {
+            id: MessageId.make("assistant-final"),
+            role: "assistant",
+            text: "Done.",
+            turnId,
+            streaming: false,
+            createdAt: "2026-04-01T00:00:12.000Z",
+            updatedAt: "2026-04-01T00:00:12.000Z",
+          },
+        ],
+        activities: [
+          makeActivity({
+            id: EventId.make("work-1"),
+            kind: "tool.completed",
+            tone: "tool",
+            summary: "Ran command",
+            createdAt: "2026-04-01T00:00:02.000Z",
+            turnId,
+            payload: {
+              title: "Ran command",
+              itemType: "command_execution",
+              toolCallId: "call-1",
+              status: "completed",
+            },
+          }),
+          // After the mid-turn message, so it lands in a second activity group.
+          // Counting per group would restart dedupe and double this row.
+          makeActivity({
+            id: EventId.make("work-2"),
+            kind: "tool.completed",
+            tone: "tool",
+            summary: "Edited file",
+            createdAt: "2026-04-01T00:00:11.000Z",
+            turnId,
+            payload: {
+              title: "Edited file",
+              itemType: "file_change",
+              toolCallId: "call-2",
+              status: "completed",
+            },
+          }),
+        ],
+        ...extra,
+      });
+
+    const foldLabel = (
+      thread: ReturnType<typeof makeCountedThread>,
+      foldInputs?: Parameters<typeof deriveThreadFeedPresentation>[5],
+    ) => {
+      const rows = deriveThreadFeedPresentation(
+        buildThreadFeed(thread),
+        thread.latestTurn,
+        new Set(),
+        new Set(),
+        null,
+        foldInputs,
+      );
+      const fold = rows.find((entry) => entry.type === "turn-fold");
+      return fold?.type === "turn-fold" ? fold.label : null;
+    };
+
+    it("counts work across every activity group of the turn", () => {
+      // Both rows belong to one turn but sit either side of a message, so they
+      // land in separate groups. The fold must still read them as one run.
+      expect(foldLabel(makeCountedThread())).toBe("Worked for 12s · 1 Command · 1 Tool Call");
+    });
+
+    it("prefers the server's stamped counts over what the client can see", () => {
+      // Stamped when every row still existed, so they outrank a local count
+      // taken from whatever survived the retention window.
+      expect(
+        foldLabel(makeCountedThread(), {
+          turns: [
+            {
+              turnId,
+              state: "completed",
+              requestedAt: "2026-04-01T00:00:00.000Z",
+              startedAt: "2026-04-01T00:00:00.000Z",
+              completedAt: "2026-04-01T00:00:12.000Z",
+              assistantMessageId: MessageId.make("assistant-final"),
+              counts: {
+                commandCount: 9,
+                toolCallCount: 4,
+                subagentCount: 2,
+                changedFileCount: 3,
+              },
+            },
+          ],
+        }),
+      ).toBe("Worked for 12s · 9 Commands · 4 Tool Calls · 2 Subagents · 3 Changed Files");
+    });
+
+    it("reports no counts for a turn the server had to cut rows from", () => {
+      // Counting the survivors would undercount, so the label says nothing
+      // about work rather than stating a number it cannot back up.
+      expect(foldLabel(makeCountedThread(), { partialTurnIds: new Set([turnId]) })).toBe(
+        "Worked for 12s",
+      );
+    });
+
+    it("reports no counts against a host too old to name the turns it cut", () => {
+      expect(foldLabel(makeCountedThread(), { activityWindowMayBeTruncated: true })).toBe(
+        "Worked for 12s",
+      );
+    });
+
+    it("adds the line diff only once the checkpoint is ready", () => {
+      const readyCheckpoint: OrchestrationCheckpointSummary = {
+        turnId,
+        checkpointTurnCount: 1,
+        checkpointRef: CheckpointRef.make("ref-1"),
+        status: "ready",
+        assistantMessageId: MessageId.make("assistant-final"),
+        completedAt: "2026-04-01T00:00:12.000Z",
+        files: [{ path: "a.ts", kind: "modified", additions: 10, deletions: 2 }],
+      };
+      const checkpointsByTurnId = new Map<TurnId, OrchestrationCheckpointSummary>([
+        [turnId, readyCheckpoint],
+      ]);
+      expect(foldLabel(makeCountedThread(), { checkpointsByTurnId })).toBe(
+        "Worked for 12s · 1 Command · 1 Tool Call · 1 Changed File +10/−2",
+      );
+
+      const pending = new Map<TurnId, OrchestrationCheckpointSummary>([
+        [turnId, { ...readyCheckpoint, status: "missing" }],
+      ]);
+      // A checkpoint that never captured has no trustworthy line counts, but
+      // its file list still describes the turn.
+      expect(foldLabel(makeCountedThread(), { checkpointsByTurnId: pending })).toBe(
+        "Worked for 12s · 1 Command · 1 Tool Call · 1 Changed File",
+      );
+    });
+
+    it("lets a ready checkpoint replace a stamped file count of zero", () => {
+      // A turn can settle before its checkpoint is captured, stamping zero
+      // files. The checkpoint is the later, better answer.
+      const checkpointsByTurnId = new Map<TurnId, OrchestrationCheckpointSummary>([
+        [
+          turnId,
+          {
+            turnId,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("ref-1"),
+            status: "ready",
+            assistantMessageId: MessageId.make("assistant-final"),
+            completedAt: "2026-04-01T00:00:12.000Z",
+            files: [{ path: "a.ts", kind: "modified", additions: 4, deletions: 1 }],
+          },
+        ],
+      ]);
+      expect(
+        foldLabel(makeCountedThread(), {
+          checkpointsByTurnId,
+          turns: [
+            {
+              turnId,
+              state: "completed",
+              requestedAt: "2026-04-01T00:00:00.000Z",
+              startedAt: "2026-04-01T00:00:00.000Z",
+              completedAt: "2026-04-01T00:00:12.000Z",
+              assistantMessageId: MessageId.make("assistant-final"),
+              counts: {
+                commandCount: 1,
+                toolCallCount: 1,
+                subagentCount: 0,
+                changedFileCount: 0,
+              },
+            },
+          ],
+        }),
+      ).toBe("Worked for 12s · 1 Command · 1 Tool Call · 1 Changed File +4/−1");
+    });
+
+    it("keeps interrupted wording once the turn is no longer the latest", () => {
+      const thread = makeCountedThread({
+        latestTurn: {
+          turnId: TurnId.make("turn-2"),
+          state: "running",
+          requestedAt: "2026-04-01T00:00:20.000Z",
+          startedAt: "2026-04-01T00:00:20.000Z",
+          completedAt: null,
+          assistantMessageId: null,
+        },
+      });
+      expect(
+        foldLabel(thread, {
+          turns: [
+            {
+              turnId,
+              state: "interrupted",
+              requestedAt: "2026-04-01T00:00:00.000Z",
+              startedAt: "2026-04-01T00:00:00.000Z",
+              completedAt: "2026-04-01T00:00:12.000Z",
+              assistantMessageId: MessageId.make("assistant-final"),
+            },
+          ],
+        }),
+        // 11s, not 12s: with the turn no longer latest, the elapsed time is
+        // measured from its own first entry rather than `latestTurn.startedAt`.
+      ).toBe("You stopped after 11s · 1 Command · 1 Tool Call");
+    });
+  });
+
   it("measures a steer-superseded turn from its user boundary through trailing work", () => {
     const firstTurnId = TurnId.make("turn-1");
     const secondTurnId = TurnId.make("turn-2");
@@ -726,7 +957,7 @@ describe("buildThreadFeed", () => {
     const collapsed = deriveThreadFeedPresentation(feed, thread.latestTurn, new Set());
     expect(collapsed.find((entry) => entry.type === "turn-fold")).toMatchObject({
       turnId: firstTurnId,
-      label: "Worked for 12s",
+      label: "Worked for 12s · 1 Command",
     });
   });
 

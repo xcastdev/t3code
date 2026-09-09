@@ -77,25 +77,6 @@ export function resolveTimelineScrollModeForSend(_input: {
   return "following-end";
 }
 
-/**
- * Whether the timeline must treat every unstamped turn as possibly undercounted.
- *
- * A server that names the turns it cut is authoritative, and its silence means
- * nothing was cut. Only a host too old to send `turns` at all leaves the window
- * size as the last hint — and there a full window is reason enough to stay
- * silent rather than publish a count derived from a partial thread.
- */
-export function resolveActivityWindowMayBeTruncated(input: {
-  hasTurnRecords: boolean;
-  activityCount: number;
-  windowLimit: number;
-}): boolean {
-  if (input.hasTurnRecords) {
-    return false;
-  }
-  return input.activityCount >= input.windowLimit;
-}
-
 export function resolveDraftHeroState(input: {
   isLocalDraftThread: boolean;
   hasTimelineEntries: boolean;
