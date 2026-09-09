@@ -8,11 +8,14 @@ import {
   expandOpenCodeCommandTemplate,
   MessageId,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
+  resolveActivityWindowMayBeTruncated,
   type EnvironmentId,
   type ModelSelection,
+  type OrchestrationCheckpointSummary,
   type ProviderInteractionMode,
   type RuntimeMode,
   type ThreadId,
+  type TurnId,
 } from "@t3tools/contracts";
 import { mergeServerProviderCatalogs } from "@t3tools/client-runtime/providerCatalog";
 import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
@@ -35,7 +38,7 @@ import {
 import type { DraftComposerImageAttachment } from "../lib/composerImages";
 import { scopedThreadKey } from "../lib/scopedEntities";
 import { copyTextWithHaptic } from "../lib/copyTextWithHaptic";
-import { buildThreadFeed } from "../lib/threadActivity";
+import { buildThreadFeed, type ThreadFeedTurnFoldInputs } from "../lib/threadActivity";
 import { appAtomRegistry } from "../state/atom-registry";
 import {
   appendComposerDraftAttachments,
@@ -137,6 +140,30 @@ export function useThreadComposerState() {
       ),
     });
   }, [feedbackSubmissionsByThreadKey, selectedThreadDetail, selectedThreadKey]);
+
+  // Per-turn inputs for the fold label. Derived here because this is where the
+  // full thread detail lives — the screens below only receive the shell, which
+  // carries no turns, checkpoints, or activities.
+  const selectedThreadFoldInputs = useMemo((): ThreadFeedTurnFoldInputs => {
+    if (!selectedThreadDetail) {
+      return {};
+    }
+    const checkpointsByTurnId = new Map<TurnId, OrchestrationCheckpointSummary>();
+    for (const checkpoint of selectedThreadDetail.checkpoints) {
+      checkpointsByTurnId.set(checkpoint.turnId, checkpoint);
+    }
+    return {
+      turns: selectedThreadDetail.turns,
+      ...(selectedThreadDetail.partialTurnIds === undefined
+        ? {}
+        : { partialTurnIds: new Set(selectedThreadDetail.partialTurnIds) }),
+      activityWindowMayBeTruncated: resolveActivityWindowMayBeTruncated({
+        hasTurnRecords: selectedThreadDetail.turns !== undefined,
+        activityCount: selectedThreadDetail.activities.length,
+      }),
+      checkpointsByTurnId,
+    };
+  }, [selectedThreadDetail]);
 
   const selectedDraft = selectedThreadKey ? composerDrafts[selectedThreadKey] : null;
   const draftMessage = selectedDraft?.text ?? "";
@@ -485,6 +512,7 @@ export function useThreadComposerState() {
 
   return {
     selectedThreadFeed,
+    selectedThreadFoldInputs,
     selectedThreadQueueCount,
     activeWorkStartedAt,
     draftMessage,

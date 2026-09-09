@@ -8,11 +8,11 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("047 MCP catalog revisions", (it) => {
+layer("048 MCP catalog revisions", (it) => {
   it.effect("backfills deterministic identities, revisions, and application state", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 46 });
+      yield* runMigrations({ toMigrationInclusive: 47 });
 
       const transport =
         '{"type":"streamable-http","url":"https://catalog.example/mcp","headers":[],"authorization":{"type":"none"}}';
@@ -44,7 +44,7 @@ layer("047 MCP catalog revisions", (it) => {
         )
       `;
 
-      yield* runMigrations({ toMigrationInclusive: 47 });
+      yield* runMigrations({ toMigrationInclusive: 48 });
 
       const definitions = yield* sql<{
         readonly definitionId: string;

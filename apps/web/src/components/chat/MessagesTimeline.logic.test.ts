@@ -1,11 +1,20 @@
-import { describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import type { WorkLogEntry } from "~/session-logic";
 import {
   computeStableMessagesTimelineRows,
   computeMessageDurationStart,
+  createWorkingStatusDwell,
   deriveMessagesTimelineRows,
+  durationTickSubscriberCount,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
   shouldPreserveAssistantLineBreaks,
+  stableFallbackPhrase,
+  subscribeToDurationTick,
+  WORKING_FALLBACK_PHRASES,
+  WORKING_STATUS_DWELL_MS,
+  workingStatusIsLive,
+  workingStatusPhrase,
 } from "./MessagesTimeline.logic";
 
 describe("shouldPreserveAssistantLineBreaks", () => {
@@ -1698,5 +1707,828 @@ describe("computeStableMessagesTimelineRows", () => {
 
     expect(reordered).not.toBe(initial);
     expect(reordered.result).toEqual([initial.result[1], initial.result[0]]);
+  });
+});
+
+describe("deriveTurnFolds work summaries", () => {
+  const userEntry = (createdAt: string, id = "user-1") =>
+    ({
+      id: `entry-${id}`,
+      kind: "message" as const,
+      createdAt,
+      message: {
+        id: id as never,
+        role: "user" as const,
+        text: "Do the thing",
+        turnId: null,
+        createdAt,
+        updatedAt: createdAt,
+        streaming: false,
+      },
+    }) as never;
+
+  const assistantEntry = (
+    id: string,
+    turnId: string,
+    createdAt: string,
+    updatedAt: string,
+    text = "Response",
+  ) =>
+    ({
+      id: `entry-${id}`,
+      kind: "message" as const,
+      createdAt,
+      message: {
+        id: id as never,
+        role: "assistant" as const,
+        text,
+        turnId: turnId as never,
+        createdAt,
+        updatedAt,
+        streaming: false,
+      },
+    }) as never;
+
+  const workEntry = (
+    id: string,
+    turnId: string,
+    createdAt: string,
+    itemType: string,
+    toolCallId: string,
+    tone = "tool",
+  ) =>
+    ({
+      id: `entry-${id}`,
+      kind: "work" as const,
+      createdAt,
+      entry: {
+        id,
+        createdAt,
+        turnId: turnId as never,
+        label: "Did work",
+        tone,
+        itemType,
+        toolCallId,
+      },
+    }) as never;
+
+  const foldRowOf = (rows: ReadonlyArray<unknown>, turnId: string) =>
+    rows.find(
+      (row): row is { kind: "turn-fold"; turnId: string; label: string } =>
+        (row as { kind?: string }).kind === "turn-fold" &&
+        (row as { turnId?: string }).turnId === turnId,
+    );
+
+  it("renders every count segment after the duration, omitting zero segments", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        userEntry("2026-01-01T00:00:00Z"),
+        workEntry("w1", "turn-1", "2026-01-01T00:00:02Z", "command_execution", "c1"),
+        workEntry("w2", "turn-1", "2026-01-01T00:00:03Z", "command_execution", "c2"),
+        workEntry("w3", "turn-1", "2026-01-01T00:00:04Z", "file_change", "t1"),
+        workEntry("w4", "turn-1", "2026-01-01T00:00:05Z", "collab_agent_tool_call", "s1"),
+        assistantEntry("a1", "turn-1", "2026-01-01T00:01:10Z", "2026-01-01T00:01:12Z"),
+      ],
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:01:12Z",
+      },
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    const fold = foldRowOf(rows, "turn-1");
+    expect(fold?.label).toBe("Worked for 1m 12s · 2 Commands · 1 Tool Call · 1 Subagent");
+  });
+
+  it("uses singular nouns for single items", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        userEntry("2026-01-01T00:00:00Z"),
+        workEntry("w1", "turn-1", "2026-01-01T00:00:02Z", "command_execution", "c1"),
+        assistantEntry("a1", "turn-1", "2026-01-01T00:00:10Z", "2026-01-01T00:00:10Z"),
+      ],
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:00:10Z",
+      },
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(foldRowOf(rows, "turn-1")?.label).toBe("Worked for 10s · 1 Command");
+  });
+
+  it("prefers stamped counts over client-derived ones for a settled turn", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        userEntry("2026-01-01T00:00:00Z"),
+        workEntry("w1", "turn-1", "2026-01-01T00:00:02Z", "command_execution", "c1"),
+        assistantEntry("a1", "turn-1", "2026-01-01T00:00:10Z", "2026-01-01T00:00:10Z"),
+      ],
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:00:10Z",
+      },
+      turns: [
+        {
+          turnId: "turn-1" as never,
+          state: "completed",
+          requestedAt: "2026-01-01T00:00:00Z",
+          startedAt: "2026-01-01T00:00:00Z",
+          completedAt: "2026-01-01T00:00:10Z",
+          assistantMessageId: "a1" as never,
+          counts: {
+            commandCount: 9,
+            toolCallCount: 4,
+            subagentCount: 0,
+            changedFileCount: 0,
+          },
+        },
+      ] as never,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(foldRowOf(rows, "turn-1")?.label).toBe("Worked for 10s · 9 Commands · 4 Tool Calls");
+  });
+
+  it("falls back to the bare duration when the server cut the turn's rows", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        userEntry("2026-01-01T00:00:00Z"),
+        // Retained activity begins well after the turn started: rows aged out.
+        workEntry("w1", "turn-1", "2026-01-01T00:05:00Z", "command_execution", "c1"),
+        assistantEntry("a1", "turn-1", "2026-01-01T00:05:10Z", "2026-01-01T00:05:10Z"),
+        userEntry("2026-01-01T00:06:00Z", "user-2"),
+        workEntry("w2", "turn-2", "2026-01-01T00:06:02Z", "command_execution", "c2"),
+        assistantEntry("a2", "turn-2", "2026-01-01T00:06:10Z", "2026-01-01T00:06:10Z"),
+      ],
+      partialTurnIds: new Set(["turn-1"]) as never,
+      latestTurn: {
+        turnId: "turn-2" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:06:00Z",
+        completedAt: "2026-01-01T00:06:10Z",
+      },
+      turns: [
+        {
+          turnId: "turn-1" as never,
+          state: "completed",
+          requestedAt: "2026-01-01T00:00:00Z",
+          startedAt: "2026-01-01T00:00:00Z",
+          completedAt: "2026-01-01T00:05:10Z",
+          assistantMessageId: "a1" as never,
+        },
+      ] as never,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    // No stamp and the server named this turn as cut: never a partial count.
+    expect(foldRowOf(rows, "turn-1")?.label).toBe("Worked for 5m 10s");
+  });
+
+  it("shows no derived counts when an older host names no cut turns", () => {
+    // A host too old to send `partialTurnIds` leaves the field undefined. That
+    // must read as "unknown", not "nothing was cut" — otherwise every turn in a
+    // trimmed thread publishes a count built from the rows that survived.
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        userEntry("2026-01-01T00:00:00Z"),
+        workEntry("w1", "turn-1", "2026-01-01T00:05:00Z", "command_execution", "c1"),
+        assistantEntry("a1", "turn-1", "2026-01-01T00:05:10Z", "2026-01-01T00:05:10Z"),
+      ],
+      // No partialTurnIds: the host never sent one.
+      activityWindowMayBeTruncated: true,
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:05:10Z",
+      },
+      turns: [
+        {
+          turnId: "turn-1" as never,
+          state: "completed",
+          requestedAt: "2026-01-01T00:00:00Z",
+          startedAt: "2026-01-01T00:00:00Z",
+          completedAt: "2026-01-01T00:05:10Z",
+          assistantMessageId: "a1" as never,
+        },
+      ] as never,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(foldRowOf(rows, "turn-1")?.label).toBe("Worked for 5m 10s");
+  });
+
+  it("counts turns when an older host's window was not full", () => {
+    // The same older host, but the thread is small enough that nothing could
+    // have been trimmed: derive and show the counts.
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        userEntry("2026-01-01T00:00:00Z"),
+        workEntry("w1", "turn-1", "2026-01-01T00:05:00Z", "command_execution", "c1"),
+        assistantEntry("a1", "turn-1", "2026-01-01T00:05:10Z", "2026-01-01T00:05:10Z"),
+      ],
+      activityWindowMayBeTruncated: false,
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:05:10Z",
+      },
+      turns: [
+        {
+          turnId: "turn-1" as never,
+          state: "completed",
+          requestedAt: "2026-01-01T00:00:00Z",
+          startedAt: "2026-01-01T00:00:00Z",
+          completedAt: "2026-01-01T00:05:10Z",
+          assistantMessageId: "a1" as never,
+        },
+      ] as never,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(foldRowOf(rows, "turn-1")?.label).toBe("Worked for 5m 10s · 1 Command");
+  });
+
+  it("counts an unstamped turn the server did not cut", () => {
+    // Same fixture, minus the truncation signal. A dropped tool.started and a
+    // collapsed updated/completed pair are present on purpose: a guard keyed on
+    // a row timestamp would lose them and wrongly fall back to a bare duration.
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        userEntry("2026-01-01T00:00:00Z"),
+        workEntry("w1", "turn-1", "2026-01-01T00:05:00Z", "command_execution", "c1"),
+        assistantEntry("a1", "turn-1", "2026-01-01T00:05:10Z", "2026-01-01T00:05:10Z"),
+        userEntry("2026-01-01T00:06:00Z", "user-2"),
+        workEntry("w2", "turn-2", "2026-01-01T00:06:02Z", "command_execution", "c2"),
+        assistantEntry("a2", "turn-2", "2026-01-01T00:06:10Z", "2026-01-01T00:06:10Z"),
+      ],
+      latestTurn: {
+        turnId: "turn-2" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:06:00Z",
+        completedAt: "2026-01-01T00:06:10Z",
+      },
+      turns: [
+        {
+          turnId: "turn-1" as never,
+          state: "completed",
+          requestedAt: "2026-01-01T00:00:00Z",
+          startedAt: "2026-01-01T00:00:00Z",
+          completedAt: "2026-01-01T00:05:10Z",
+          assistantMessageId: "a1" as never,
+        },
+      ] as never,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(foldRowOf(rows, "turn-1")?.label).toBe("Worked for 5m 10s · 1 Command");
+  });
+
+  it("suppresses the diff but keeps the changed-file count when the checkpoint is not ready", () => {
+    const timelineEntries = [
+      userEntry("2026-01-01T00:00:00Z"),
+      workEntry("w1", "turn-1", "2026-01-01T00:00:02Z", "command_execution", "c1"),
+      assistantEntry("a1", "turn-1", "2026-01-01T00:00:10Z", "2026-01-01T00:00:10Z"),
+    ];
+    const latestTurn = {
+      turnId: "turn-1" as never,
+      state: "completed" as const,
+      startedAt: "2026-01-01T00:00:00Z",
+      completedAt: "2026-01-01T00:00:10Z",
+    };
+    const checkpoint = (status: string) =>
+      new Map([
+        [
+          "a1" as never,
+          {
+            turnId: "turn-1" as never,
+            checkpointTurnCount: 1,
+            checkpointRef: "ref-1" as never,
+            status,
+            files: [
+              { path: "a.ts", kind: "modified", additions: 8, deletions: 0 },
+              { path: "b.ts", kind: "modified", additions: 3, deletions: 2 },
+            ],
+            assistantMessageId: "a1" as never,
+            completedAt: "2026-01-01T00:00:10Z",
+          },
+        ],
+      ]) as never;
+
+    const readyRows = deriveMessagesTimelineRows({
+      timelineEntries,
+      latestTurn,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: checkpoint("ready"),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+    expect(foldRowOf(readyRows, "turn-1")?.label).toBe(
+      "Worked for 10s · 1 Command · 2 Changed Files +11/−2",
+    );
+
+    const pendingRows = deriveMessagesTimelineRows({
+      timelineEntries,
+      latestTurn,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: checkpoint("missing"),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+    expect(foldRowOf(pendingRows, "turn-1")?.label).toBe(
+      "Worked for 10s · 1 Command · 2 Changed Files",
+    );
+  });
+
+  it("labels a historical interrupted turn as stopped, not worked", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        userEntry("2026-01-01T00:00:00Z"),
+        workEntry("w1", "turn-1", "2026-01-01T00:00:02Z", "command_execution", "c1"),
+        assistantEntry("a1", "turn-1", "2026-01-01T00:00:10Z", "2026-01-01T00:00:10Z"),
+        userEntry("2026-01-01T00:01:00Z", "user-2"),
+        workEntry("w2", "turn-2", "2026-01-01T00:01:02Z", "command_execution", "c2"),
+        assistantEntry("a2", "turn-2", "2026-01-01T00:01:10Z", "2026-01-01T00:01:10Z"),
+      ],
+      // turn-2 is the latest; turn-1 is history and was interrupted.
+      latestTurn: {
+        turnId: "turn-2" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:01:00Z",
+        completedAt: "2026-01-01T00:01:10Z",
+      },
+      turns: [
+        {
+          turnId: "turn-1" as never,
+          state: "interrupted",
+          requestedAt: "2026-01-01T00:00:00Z",
+          startedAt: "2026-01-01T00:00:00Z",
+          completedAt: "2026-01-01T00:00:10Z",
+          assistantMessageId: "a1" as never,
+          counts: {
+            commandCount: 1,
+            toolCallCount: 0,
+            subagentCount: 0,
+            changedFileCount: 0,
+          },
+        },
+      ] as never,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(foldRowOf(rows, "turn-1")?.label).toBe("You stopped after 10s · 1 Command");
+  });
+
+  it("totals work across runs split by assistant messages", () => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        userEntry("2026-01-01T00:00:00Z"),
+        workEntry("w1", "turn-1", "2026-01-01T00:00:02Z", "command_execution", "c1"),
+        workEntry("w2", "turn-1", "2026-01-01T00:00:03Z", "command_execution", "c2"),
+        workEntry("w3", "turn-1", "2026-01-01T00:00:04Z", "command_execution", "c3"),
+        assistantEntry("a1", "turn-1", "2026-01-01T00:00:05Z", "2026-01-01T00:00:05Z", "Mid"),
+        workEntry("w4", "turn-1", "2026-01-01T00:00:06Z", "file_change", "t1"),
+        workEntry("w5", "turn-1", "2026-01-01T00:00:07Z", "file_change", "t2"),
+        workEntry("w6", "turn-1", "2026-01-01T00:00:08Z", "collab_agent_tool_call", "s1"),
+        assistantEntry("a2", "turn-1", "2026-01-01T00:00:20Z", "2026-01-01T00:00:20Z", "Final"),
+      ],
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:00:20Z",
+      },
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    const fold = foldRowOf(rows, "turn-1");
+    expect(fold?.label).toBe("Worked for 20s · 3 Commands · 2 Tool Calls · 1 Subagent");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC-12 — tool-aware working status
+// ---------------------------------------------------------------------------
+
+describe("workingStatusPhrase", () => {
+  const entry = (over: Partial<WorkLogEntry>): WorkLogEntry =>
+    ({
+      id: "w1",
+      createdAt: "2026-01-01T00:00:00Z",
+      label: "l",
+      tone: "tool",
+      ...over,
+    }) as WorkLogEntry;
+
+  it("names the running tool for each item type", () => {
+    expect(workingStatusPhrase(entry({ itemType: "command_execution" }))).toBe("Running command");
+    expect(workingStatusPhrase(entry({ itemType: "file_change" }))).toBe("Editing file");
+    expect(workingStatusPhrase(entry({ itemType: "web_search" }))).toBe("Searching the web");
+    expect(workingStatusPhrase(entry({ itemType: "image_view" }))).toBe("Viewing image");
+    expect(workingStatusPhrase(entry({ itemType: "mcp_tool_call" }))).toBe("Running MCP tool");
+    expect(workingStatusPhrase(entry({ itemType: "collab_agent_tool_call" }))).toBe(
+      "Delegating to subagent",
+    );
+  });
+
+  it("reads file work that arrives as a dynamic Read File tool call", () => {
+    // There is no `file_read` item type; read work arrives this way.
+    expect(
+      workingStatusPhrase(entry({ itemType: "dynamic_tool_call", toolTitle: "Read File" })),
+    ).toBe("Reading file");
+  });
+
+  it("reads file work that arrives as a file-read request kind", () => {
+    expect(workingStatusPhrase(entry({ itemType: "file_change", requestKind: "file-read" }))).toBe(
+      "Reading file",
+    );
+  });
+
+  it("returns null when no tool is identifiable", () => {
+    expect(workingStatusPhrase(entry({ tone: "thinking" }))).toBeNull();
+    expect(workingStatusPhrase(null)).toBeNull();
+  });
+});
+
+describe("stableFallbackPhrase", () => {
+  it("is deterministic for the same message key", () => {
+    const first = stableFallbackPhrase("msg-abc");
+    for (let i = 0; i < 50; i += 1) {
+      expect(stableFallbackPhrase("msg-abc")).toBe(first);
+    }
+  });
+
+  it("spreads different keys across more than one phrase", () => {
+    const seen = new Set(Array.from({ length: 200 }, (_, i) => stableFallbackPhrase(`msg-${i}`)));
+    expect(seen.size).toBeGreaterThan(1);
+  });
+
+  it("only ever returns a phrase from the fallback set", () => {
+    for (let i = 0; i < 200; i += 1) {
+      expect(WORKING_FALLBACK_PHRASES).toContain(stableFallbackPhrase(`k-${i}`));
+    }
+  });
+});
+
+describe("createWorkingStatusDwell", () => {
+  it("holds the first label for the dwell window before showing the next", () => {
+    const dwell = createWorkingStatusDwell("Thinking", 0);
+    expect(dwell.label).toBe("Thinking");
+
+    dwell.push("Running command", 100);
+    // Still inside the dwell window: the first label must stay readable.
+    expect(dwell.label).toBe("Thinking");
+
+    dwell.push("Running command", WORKING_STATUS_DWELL_MS + 1);
+    expect(dwell.label).toBe("Running command");
+  });
+
+  it("holds the current label through rapid generic churn", () => {
+    const dwell = createWorkingStatusDwell("Running command", 0);
+    // Distinct generic phrases arriving far faster than the dwell window.
+    dwell.push("Thinking", 50);
+    dwell.push("Working", 100);
+    dwell.push("Considering the options", 150);
+    expect(dwell.label).toBe("Running command");
+    // Each generic transition was dropped rather than queued behind the others.
+    expect(dwell.droppedCount).toBe(3);
+
+    // Only the newest generic phrase survives; the intermediate ones never show.
+    dwell.push("Considering the options", WORKING_STATUS_DWELL_MS + 1);
+    expect(dwell.label).toBe("Considering the options");
+  });
+
+  it("never lets generic churn displace a queued real tool change", () => {
+    const dwell = createWorkingStatusDwell("Running command", 0);
+    dwell.push("Reading file", 50);
+    // Generic churn arrives after a real tool change is already pending.
+    dwell.push("Thinking", 100);
+    dwell.push("Working", 150);
+    expect(dwell.label).toBe("Running command");
+
+    // The real tool change wins the slot; the generic phrases are dropped.
+    dwell.push("Working", WORKING_STATUS_DWELL_MS + 1);
+    expect(dwell.label).toBe("Reading file");
+  });
+
+  it("abandons the previous turn's queued tool when reset for a new turn", () => {
+    const dwell = createWorkingStatusDwell("Running command", 0);
+    // A tool change queues behind the shown label, still inside the window.
+    dwell.push("Reading file", 300);
+    expect(dwell.label).toBe("Running command");
+
+    // The turn is steered. Everything queued describes work that is over, so
+    // the new turn's status shows at once instead of waiting behind it.
+    dwell.reset("Thinking", 400);
+    expect(dwell.label).toBe("Thinking");
+
+    // The abandoned tool must never surface once the old window elapses.
+    dwell.push("Thinking", WORKING_STATUS_DWELL_MS + 1);
+    expect(dwell.label).toBe("Thinking");
+  });
+
+  it("drops queued labels when the status reverts to what is already shown", () => {
+    const dwell = createWorkingStatusDwell("Reading file", 0);
+    // A tool starts and finishes inside the dwell window, so the status falls
+    // back to the label already on screen.
+    dwell.push("Editing file", 100);
+    dwell.push("Reading file", 200);
+    expect(dwell.label).toBe("Reading file");
+
+    // "Editing file" is long finished. A later transition must show the tool
+    // that is actually running, not resurrect the dead one.
+    dwell.push("Running command", WORKING_STATUS_DWELL_MS + 1);
+    expect(dwell.label).toBe("Running command");
+  });
+
+  it("shows genuine tool changes in order once the dwell elapses", () => {
+    const dwell = createWorkingStatusDwell("Running command", 0);
+    dwell.push("Reading file", 100);
+    dwell.push("Editing file", 200);
+    expect(dwell.label).toBe("Running command");
+
+    dwell.push("Editing file", WORKING_STATUS_DWELL_MS + 1);
+    expect(dwell.label).toBe("Reading file");
+
+    dwell.push("Editing file", WORKING_STATUS_DWELL_MS * 2 + 2);
+    expect(dwell.label).toBe("Editing file");
+  });
+
+  it("does not re-arm the dwell window for an unchanged label", () => {
+    const dwell = createWorkingStatusDwell("Running command", 0);
+    dwell.push("Running command", 100);
+    dwell.push("Reading file", 200);
+    dwell.push("Reading file", WORKING_STATUS_DWELL_MS + 1);
+    expect(dwell.label).toBe("Reading file");
+  });
+});
+
+describe("workingStatusIsLive", () => {
+  it("is live while the turn phase is running", () => {
+    expect(workingStatusIsLive({ isWorking: true, toolLifecycleStatus: "inProgress" })).toBe(true);
+  });
+
+  it("is not live for a settled part even when a timestamp is absent", () => {
+    // Live-ness must come from phase, never from a missing completedAt.
+    expect(workingStatusIsLive({ isWorking: false, toolLifecycleStatus: undefined })).toBe(false);
+    expect(workingStatusIsLive({ isWorking: true, toolLifecycleStatus: "completed" })).toBe(false);
+    expect(workingStatusIsLive({ isWorking: true, toolLifecycleStatus: "failed" })).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// AC-11 — one shared duration ticker
+// ---------------------------------------------------------------------------
+
+describe("subscribeToDurationTick", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("runs exactly one interval for N subscribers", () => {
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+
+    const ticks = [0, 0, 0, 0, 0];
+    const unsubscribes = ticks.map((_, index) =>
+      subscribeToDurationTick(() => {
+        ticks[index] = (ticks[index] ?? 0) + 1;
+      }),
+    );
+
+    // Five live rows, one interval.
+    expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+    expect(durationTickSubscriberCount()).toBe(5);
+
+    vi.advanceTimersByTime(1000);
+    expect(ticks).toEqual([1, 1, 1, 1, 1]);
+
+    vi.advanceTimersByTime(2000);
+    expect(ticks).toEqual([3, 3, 3, 3, 3]);
+    // Still one interval after ticking.
+    expect(setIntervalSpy).toHaveBeenCalledTimes(1);
+
+    for (const unsubscribe of unsubscribes.slice(0, 4)) unsubscribe();
+    expect(durationTickSubscriberCount()).toBe(1);
+    expect(clearIntervalSpy).not.toHaveBeenCalled();
+
+    unsubscribes[4]!();
+    expect(durationTickSubscriberCount()).toBe(0);
+    expect(clearIntervalSpy).toHaveBeenCalledTimes(1);
+
+    // No interval may run with zero subscribers.
+    vi.advanceTimersByTime(5000);
+    expect(ticks).toEqual([3, 3, 3, 3, 3]);
+  });
+
+  it("restarts a single interval when a subscriber returns after the last one left", () => {
+    const setIntervalSpy = vi.spyOn(globalThis, "setInterval");
+    const unsubscribe = subscribeToDurationTick(() => {});
+    unsubscribe();
+    expect(durationTickSubscriberCount()).toBe(0);
+
+    const second = subscribeToDurationTick(() => {});
+    expect(setIntervalSpy).toHaveBeenCalledTimes(2);
+    expect(durationTickSubscriberCount()).toBe(1);
+    second();
+    expect(durationTickSubscriberCount()).toBe(0);
+  });
+
+  it("is idempotent when the same unsubscribe runs twice", () => {
+    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+    const a = subscribeToDurationTick(() => {});
+    const b = subscribeToDurationTick(() => {});
+    a();
+    a();
+    expect(durationTickSubscriberCount()).toBe(1);
+    expect(clearIntervalSpy).not.toHaveBeenCalled();
+    b();
+    expect(durationTickSubscriberCount()).toBe(0);
+    expect(clearIntervalSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps ticking the remaining subscribers when one throws", () => {
+    const ticked: string[] = [];
+    const unsubA = subscribeToDurationTick(() => {
+      throw new Error("boom");
+    });
+    const unsubB = subscribeToDurationTick(() => {
+      ticked.push("b");
+    });
+    vi.advanceTimersByTime(1000);
+    expect(ticked).toEqual(["b"]);
+    unsubA();
+    unsubB();
+  });
+});
+
+describe("working row status label", () => {
+  const workingRowFor = (
+    entry: Partial<WorkLogEntry> | null,
+    turnId = "turn-status",
+  ): Extract<ReturnType<typeof deriveMessagesTimelineRows>[number], { kind: "working" }> => {
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        {
+          id: "user-entry",
+          kind: "message",
+          createdAt: "2026-01-01T00:00:00Z",
+          message: {
+            id: "user-1" as never,
+            role: "user",
+            text: "go",
+            turnId: null,
+            createdAt: "2026-01-01T00:00:00Z",
+            updatedAt: "2026-01-01T00:00:00Z",
+            streaming: false,
+          },
+        },
+        ...(entry
+          ? [
+              {
+                id: "work-entry",
+                kind: "work" as const,
+                createdAt: "2026-01-01T00:00:01Z",
+                entry: {
+                  id: "w-1",
+                  createdAt: "2026-01-01T00:00:01Z",
+                  turnId: turnId as never,
+                  toolCallId: "call-1",
+                  label: "work",
+                  tone: "tool",
+                  toolLifecycleStatus: "inProgress",
+                  ...entry,
+                } as WorkLogEntry,
+              },
+            ]
+          : []),
+      ],
+      isWorking: true,
+      activeTurnStartedAt: "2026-01-01T00:00:00Z",
+      runningTurnId: turnId as never,
+      latestTurn: {
+        turnId: turnId as never,
+        state: "running",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: null,
+      },
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+    const workingRow = rows.find((row) => row.kind === "working");
+    if (!workingRow || workingRow.kind !== "working") throw new Error("no working row");
+    return workingRow;
+  };
+
+  it("names the running command instead of a generic label", () => {
+    expect(workingRowFor({ itemType: "command_execution" }).statusLabel).toBe("Running command");
+  });
+
+  it("names subagent delegation", () => {
+    expect(workingRowFor({ itemType: "collab_agent_tool_call" }).statusLabel).toBe(
+      "Delegating to subagent",
+    );
+  });
+
+  it("falls back to a stable per-turn phrase when no tool is running", () => {
+    const label = workingRowFor(null, "turn-abc").statusLabel;
+    expect(WORKING_FALLBACK_PHRASES).toContain(label);
+    // Deterministic across independent derivations of the same turn.
+    expect(workingRowFor(null, "turn-abc").statusLabel).toBe(label);
+  });
+
+  it("keeps the fallback phrase stable while the turn is unchanged but differs by turn", () => {
+    const labels = new Set(
+      Array.from({ length: 60 }, (_, i) => workingRowFor(null, `turn-${i}`).statusLabel),
+    );
+    expect(labels.size).toBeGreaterThan(1);
+  });
+
+  it("treats a changed status label as a new row so the label never goes stale", () => {
+    const rowWith = (statusLabel: string) =>
+      ({
+        kind: "working" as const,
+        id: "working-indicator-row",
+        createdAt: "2026-01-01T00:00:00Z",
+        showThinking: true,
+        statusLabel,
+      }) as never;
+
+    const initial = computeStableMessagesTimelineRows([rowWith("Thinking")], {
+      byId: new Map(),
+      result: [],
+    });
+    const updated = computeStableMessagesTimelineRows([rowWith("Running command")], initial);
+    expect(updated.result[0]).not.toBe(initial.result[0]);
+  });
+});
+
+describe("shared ticker mid-tick unsubscribe", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("survives a subscriber that unsubscribes during its own tick", () => {
+    const ticked: string[] = [];
+    let unsubA = () => {};
+    unsubA = subscribeToDurationTick(() => {
+      ticked.push("a");
+      // A row unmounting on the same tick it fires must not corrupt iteration.
+      unsubA();
+    });
+    const unsubB = subscribeToDurationTick(() => {
+      ticked.push("b");
+    });
+
+    vi.advanceTimersByTime(1000);
+    expect(ticked).toEqual(["a", "b"]);
+    expect(durationTickSubscriberCount()).toBe(1);
+
+    vi.advanceTimersByTime(1000);
+    expect(ticked).toEqual(["a", "b", "b"]);
+
+    unsubB();
+    expect(durationTickSubscriberCount()).toBe(0);
   });
 });

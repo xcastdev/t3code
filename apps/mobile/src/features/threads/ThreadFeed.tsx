@@ -119,6 +119,7 @@ import {
   deriveThreadFeedPresentation,
   type ThreadFeedEntry,
   type ThreadFeedLatestTurn,
+  type ThreadFeedTurnFoldInputs,
 } from "../../lib/threadActivity";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import {
@@ -184,6 +185,8 @@ export interface ThreadFeedProps {
   readonly contentPresentation: ThreadContentPresentation;
   readonly agentLabel: string;
   readonly latestTurn: ThreadFeedLatestTurn | null;
+  /** Per-turn records backing the fold label's work counts. */
+  readonly foldInputs?: ThreadFeedTurnFoldInputs;
   readonly activeWorkStartedAt: string | null;
   readonly listRef: RefObject<LegendListRef | null>;
   readonly freeze: SharedValue<boolean>;
@@ -2015,12 +2018,14 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         expandedTurnIds,
         expandedWorkGroupIds,
         props.activeWorkStartedAt,
+        props.foldInputs,
       ),
     [
       expandedTurnIds,
       expandedWorkGroupIds,
       props.activeWorkStartedAt,
       props.feed,
+      props.foldInputs,
       props.latestTurn,
     ],
   );

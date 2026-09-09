@@ -9,7 +9,17 @@ import {
   type WorkLogEntry,
 } from "../../session-logic";
 import { type ChatMessage, type ProposedPlan, type TurnDiffSummary } from "../../types";
-import { type MessageId, type OrchestrationLatestTurn, type TurnId } from "@t3tools/contracts";
+import {
+  type MessageId,
+  type OrchestrationLatestTurn,
+  type OrchestrationTurnSummary,
+  type TurnId,
+} from "@t3tools/contracts";
+import {
+  countTurnWork,
+  type TurnWorkActivity,
+  type TurnWorkCounts,
+} from "@t3tools/shared/turnWorkCounts";
 
 export const TIMELINE_MINIMAP_ITEM_SPACING = 8;
 export const TIMELINE_MINIMAP_MIN_ITEMS = 2;
@@ -176,6 +186,18 @@ export type TimelineLatestTurn = Pick<
   "turnId" | "state" | "startedAt" | "completedAt"
 >;
 
+/**
+ * A settled turn's own record. Counts are stamped by the server when the turn
+ * settles, so they stay correct after the activity rows behind them age out.
+ */
+export type TimelineTurnSummary = Pick<
+  OrchestrationTurnSummary,
+  "turnId" | "state" | "startedAt" | "completedAt" | "counts"
+> &
+  // The turn footer reads provenance straight off the record, matched to its
+  // terminal assistant message.
+  Partial<Pick<OrchestrationTurnSummary, "assistantMessageId" | "model" | "effort">>;
+
 export type MessagesTimelineRow =
   | {
       kind: "work";
@@ -236,6 +258,17 @@ export type MessagesTimelineRow =
       id: string;
       createdAt: string | null;
       showThinking: boolean;
+      /**
+       * Names the tool currently running, or a stable per-turn fallback phrase
+       * when nothing specific is identifiable. Only rendered when `showThinking`.
+       */
+      statusLabel: string;
+      /**
+       * The turn the label describes. The working row keeps one id across a
+       * steer, so this is what tells the renderer the label now belongs to a
+       * different turn and any label still held for the old one is stale.
+       */
+      statusTurnId: TurnId | null;
     };
 
 export interface StableMessagesTimelineRowsState {
@@ -474,6 +507,64 @@ interface TurnFold {
   label: string;
 }
 
+function pluralizeWorkSegment(count: number, singular: string, plural: string): string | null {
+  if (count <= 0) {
+    return null;
+  }
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+/**
+ * The shared count vocabulary, in a fixed order so a turn label and its
+ * subfolds always read the same way.
+ */
+function workCountSegments(counts: TurnWorkCounts): string[] {
+  return [
+    pluralizeWorkSegment(counts.commandCount, "Command", "Commands"),
+    pluralizeWorkSegment(counts.toolCallCount, "Tool Call", "Tool Calls"),
+    pluralizeWorkSegment(counts.subagentCount, "Subagent", "Subagents"),
+  ].filter((segment): segment is string => segment !== null);
+}
+
+/**
+ * Changed files read from the turn's checkpoint. The `+N/−M` diff is suppressed
+ * unless the checkpoint is `ready`, because a pending or missing checkpoint has
+ * no trustworthy line counts — but the file count still describes the turn.
+ */
+function changedFileSegment(
+  changedFileCount: number,
+  diff: { additions: number; deletions: number } | null,
+): string | null {
+  const fileSegment = pluralizeWorkSegment(changedFileCount, "Changed File", "Changed Files");
+  if (fileSegment === null) {
+    return null;
+  }
+  return diff === null ? fileSegment : `${fileSegment} +${diff.additions}/−${diff.deletions}`;
+}
+
+/**
+ * Work rows as the counter wants them. The fold fields are carried too: these
+ * entries are already collapsed, so an id-less row here stands for one call,
+ * and passing what the server passes keeps both sides folding alike.
+ */
+function collectTurnWorkActivities(entries: ReadonlyArray<TimelineEntry>): TurnWorkActivity[] {
+  const activities: TurnWorkActivity[] = [];
+  for (const entry of entries) {
+    if (entry.kind !== "work") {
+      continue;
+    }
+    activities.push({
+      tone: entry.entry.tone,
+      itemType: entry.entry.itemType ?? null,
+      toolCallId: entry.entry.toolCallId ?? null,
+      kind: entry.entry.sourceActivityKind ?? null,
+      summary: entry.entry.toolTitle ?? entry.entry.label,
+      detail: entry.entry.detail ?? null,
+    });
+  }
+  return activities;
+}
+
 /**
  * The session's running turn is authoritative when latestTurn briefly lags or
  * regresses behind it. Otherwise, the latest turn counts as unsettled while it
@@ -522,7 +613,21 @@ function deriveTurnFolds(input: {
   terminalAssistantMessageIds: ReadonlySet<string>;
   latestTurn: TimelineLatestTurn | null;
   unsettledTurnId: TurnId | null;
+  turns?: ReadonlyArray<TimelineTurnSummary> | undefined;
+  partialTurnIds?: ReadonlySet<TurnId> | undefined;
+  /**
+   * True when the thread's activity list may be missing older rows and the
+   * server said nothing about which turns lost them — an older host that does
+   * not send `partialTurnIds`. Without it the guard would read "no turn was
+   * cut" and publish an undercount as fact.
+   */
+  activityWindowMayBeTruncated?: boolean | undefined;
+  checkpointsByTurnId?: ReadonlyMap<TurnId, TurnDiffSummary> | undefined;
 }): ReadonlyMap<string, TurnFold> {
+  const turnSummaryById = new Map<TurnId, TimelineTurnSummary>();
+  for (const summary of input.turns ?? []) {
+    turnSummaryById.set(summary.turnId, summary);
+  }
   interface TurnGroup {
     entries: Array<TimelineEntry>;
     terminalEntry: Extract<TimelineEntry, { kind: "message" }> | null;
@@ -609,8 +714,14 @@ function deriveTurnFolds(input: {
       continue;
     }
 
-    const isLatestInterruptedTurn =
-      input.latestTurn?.turnId === turnId && input.latestTurn.state === "interrupted";
+    const turnSummary = turnSummaryById.get(turnId);
+    // Per-turn state, so a turn that was interrupted keeps its styling once it
+    // is no longer the latest turn. `latestTurn` is the fallback for threads
+    // delivered without a `turns[]` record.
+    const isInterruptedTurn =
+      turnSummary !== undefined
+        ? turnSummary.state === "interrupted"
+        : input.latestTurn?.turnId === turnId && input.latestTurn.state === "interrupted";
     // A turn cut short by a steer leaves trailing work entries behind its
     // terminal message — take whichever ended last.
     const lastEntryEnd =
@@ -626,13 +737,59 @@ function deriveTurnFolds(input: {
               lastEntryEnd,
           );
     const duration = elapsedMs !== null ? formatDuration(elapsedMs) : null;
-    const label = isLatestInterruptedTurn
+    const durationPhrase = isInterruptedTurn
       ? duration
         ? `You stopped after ${duration}`
         : "You stopped this response"
       : duration
         ? `Worked for ${duration}`
         : "Worked";
+
+    // Stamped counts win for a settled turn: they were computed when every
+    // activity row still existed. Without a stamp the client may only derive
+    // counts for a turn whose rows it holds in full — the server names the
+    // turns it cut, and counting the survivors of one would undercount it.
+    const stampedCounts = turnSummary?.counts;
+    const activitiesMayHaveAgedOut =
+      input.partialTurnIds === undefined
+        ? // An older host names no turns, so the window's own size is the only
+          // signal left: at the cap, treat every turn as possibly cut.
+          input.activityWindowMayBeTruncated === true
+        : input.partialTurnIds.has(turnId);
+
+    const derivedCounts = countTurnWork(collectTurnWorkActivities(group.entries));
+    const counts: TurnWorkCounts | null =
+      stampedCounts ?? (activitiesMayHaveAgedOut ? null : derivedCounts);
+
+    const checkpoint = input.checkpointsByTurnId?.get(turnId);
+    // A turn can settle before its checkpoint is captured, stamping a file
+    // count of zero. A ready checkpoint is the later, better answer, so it
+    // wins over a zero stamp rather than being skipped by a nullish check.
+    const stampedChangedFileCount = stampedCounts?.changedFileCount;
+    const changedFileCount =
+      stampedChangedFileCount !== undefined && stampedChangedFileCount > 0
+        ? stampedChangedFileCount
+        : (checkpoint?.files.length ?? stampedChangedFileCount ?? 0);
+    // Line counts are only trustworthy once the checkpoint is ready; the file
+    // count still stands either way.
+    const diff =
+      checkpoint?.status === "ready"
+        ? checkpoint.files.reduce(
+            (totals, file) => ({
+              additions: totals.additions + file.additions,
+              deletions: totals.deletions + file.deletions,
+            }),
+            { additions: 0, deletions: 0 },
+          )
+        : null;
+
+    const label = [
+      durationPhrase,
+      ...(counts === null ? [] : workCountSegments(counts)),
+      ...(counts === null ? [] : [changedFileSegment(changedFileCount, diff)]),
+    ]
+      .filter((segment): segment is string => segment != null && segment.length > 0)
+      .join(" · ");
 
     foldsByAnchorEntryId.set(firstHiddenEntry.id, {
       turnId,
@@ -648,6 +805,13 @@ function deriveTurnFolds(input: {
 export function deriveMessagesTimelineRows(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
   latestTurn?: TimelineLatestTurn | null;
+  turns?: ReadonlyArray<TimelineTurnSummary> | null;
+  /**
+   * Timestamp of the oldest activity row the thread still retains. Turns that
+   * began before it cannot be counted client-side without undercounting.
+   */
+  partialTurnIds?: ReadonlySet<TurnId> | undefined;
+  activityWindowMayBeTruncated?: boolean | undefined;
   runningTurnId?: TurnId | null;
   expandedTurnIds?: ReadonlySet<TurnId>;
   expandedWorkGroupIds?: ReadonlySet<string>;
@@ -665,11 +829,22 @@ export function deriveMessagesTimelineRows(input: {
     input.latestTurn ?? null,
     input.runningTurnId ?? null,
   );
+  // Checkpoints arrive keyed by assistant message but carry their own turn id.
+  const checkpointsByTurnId = new Map<TurnId, TurnDiffSummary>();
+  for (const summary of input.turnDiffSummaryByAssistantMessageId.values()) {
+    checkpointsByTurnId.set(summary.turnId, summary);
+  }
   const foldsByAnchorEntryId = deriveTurnFolds({
     timelineEntries: input.timelineEntries,
     terminalAssistantMessageIds,
     latestTurn: input.latestTurn ?? null,
     unsettledTurnId,
+    turns: input.turns ?? undefined,
+    ...(input.partialTurnIds === undefined ? {} : { partialTurnIds: input.partialTurnIds }),
+    ...(input.activityWindowMayBeTruncated === undefined
+      ? {}
+      : { activityWindowMayBeTruncated: input.activityWindowMayBeTruncated }),
+    checkpointsByTurnId,
   });
   const collapsedEntryIds = new Set<string>();
   for (const fold of foldsByAnchorEntryId.values()) {
@@ -757,11 +932,21 @@ export function deriveMessagesTimelineRows(input: {
         })()
       : null;
   const appendWorkingRow = () => {
+    // Name the tool actually running. The newest active tool entry is used even
+    // when it has no visible row of its own, which is exactly the case the old
+    // generic "Thinking" label covered up.
+    const runningToolPhrase = workingStatusPhrase(activeToolEntries.at(-1)?.entry ?? null);
     nextRows.push({
       kind: "working",
       id: "working-indicator-row",
       createdAt: input.activeTurnStartedAt,
       showThinking: activeWorkRow === null && !activeTurnHasVisibleContent,
+      // Falls back to a phrase hashed from the turn so a given turn always shows
+      // the same phrase instead of reshuffling across re-renders.
+      statusLabel:
+        runningToolPhrase ??
+        stableFallbackPhrase(unsettledTurnId ?? input.activeTurnStartedAt ?? "working"),
+      statusTurnId: unsettledTurnId,
     });
   };
   const appendActiveWorkRows = () => {
@@ -997,7 +1182,10 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
   switch (a.kind) {
     case "working":
       return (
-        a.createdAt === (b as typeof a).createdAt && a.showThinking === (b as typeof a).showThinking
+        a.createdAt === (b as typeof a).createdAt &&
+        a.showThinking === (b as typeof a).showThinking &&
+        a.statusLabel === (b as typeof a).statusLabel &&
+        a.statusTurnId === (b as typeof a).statusTurnId
       );
 
     case "turn-fold": {
@@ -1054,4 +1242,236 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
       );
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// AC-12 — tool-aware working status
+//
+// The busy row used to say "Thinking" no matter what the agent was doing. These
+// helpers name the running tool instead. They are pure so the dwell window and
+// the fallback hash are testable without rendering.
+// ---------------------------------------------------------------------------
+
+/**
+ * Phrases used when no specific tool is identifiable. Picked by a stable hash of
+ * a per-message key so a given message always shows the same one.
+ */
+export const WORKING_FALLBACK_PHRASES = [
+  "Thinking",
+  "Working",
+  "Figuring things out",
+  "Piecing it together",
+  "Considering the options",
+  "Working through it",
+] as const;
+
+/**
+ * Minimum time a working label stays on screen. Below roughly this window the
+ * label reads as a flicker rather than as status.
+ */
+export const WORKING_STATUS_DWELL_MS = 1200;
+
+/**
+ * Names the tool a work entry is running, or `null` when nothing specific is
+ * identifiable and the caller should fall back to a stable generic phrase.
+ *
+ * Keyed on `itemType`. There is no `file_read` item type: read work arrives as a
+ * `file-read` request kind or as a dynamic `Read File` tool call, so both are
+ * mapped to the read phrase before the `file_change` default of "Editing file".
+ */
+export function workingStatusPhrase(entry: WorkLogEntry | null | undefined): string | null {
+  if (!entry) return null;
+
+  if (entry.requestKind === "file-read") return "Reading file";
+
+  switch (entry.itemType) {
+    case "command_execution":
+      return "Running command";
+    case "file_change":
+      return "Editing file";
+    case "web_search":
+      return workLogEntryIsLocalCodeSearch(entry) ? "Searching code" : "Searching the web";
+    case "image_view":
+      return "Viewing image";
+    case "mcp_tool_call":
+      return "Running MCP tool";
+    case "collab_agent_tool_call":
+      return "Delegating to subagent";
+    case "dynamic_tool_call":
+      return entry.toolTitle === "Read File" ? "Reading file" : "Running tool";
+    default:
+      return null;
+  }
+}
+
+/**
+ * Deterministic fallback phrase for a message. The same key always yields the
+ * same phrase so re-renders never reshuffle the label.
+ */
+export function stableFallbackPhrase(messageKey: string): string {
+  // FNV-1a: small, stable across runs, and good enough to spread short keys.
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < messageKey.length; index += 1) {
+    hash ^= messageKey.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return WORKING_FALLBACK_PHRASES[hash % WORKING_FALLBACK_PHRASES.length]!;
+}
+
+/**
+ * Live-ness comes from the stream phase, never from an absent timestamp: a
+ * settled part has no live indicator even when it carries no completion time.
+ */
+export function workingStatusIsLive(input: {
+  isWorking: boolean;
+  toolLifecycleStatus?: WorkLogEntry["toolLifecycleStatus"];
+}): boolean {
+  if (!input.isWorking) return false;
+  return input.toolLifecycleStatus === undefined || input.toolLifecycleStatus === "inProgress";
+}
+
+export interface WorkingStatusDwell {
+  /** The label that should currently render. */
+  readonly label: string;
+  /** Number of transitions dropped because they arrived inside a dwell window. */
+  readonly droppedCount: number;
+  /** Offers the newest desired label at `now`; returns the label to render. */
+  push: (nextLabel: string, now: number) => string;
+  /**
+   * Drops everything pending and shows `nextLabel` immediately, re-arming the
+   * window. For when the labels queued so far describe work that is over — a
+   * new turn's status must not wait behind the previous turn's tools.
+   */
+  reset: (nextLabel: string, now: number) => void;
+}
+
+/**
+ * Holds a working label for {@link WORKING_STATUS_DWELL_MS} so fast-changing work
+ * does not flicker.
+ *
+ * A transition offered inside the window is queued rather than applied, and only
+ * the most recent queued label survives — intermediate churn is dropped. Once the
+ * window elapses the queued label is promoted and the window re-arms, so genuine
+ * tool changes still appear in order at dwell cadence.
+ */
+export function createWorkingStatusDwell(initialLabel: string, now = 0): WorkingStatusDwell {
+  let label = initialLabel;
+  let shownAt = now;
+  const queue: string[] = [];
+  let droppedCount = 0;
+
+  const isGeneric = (value: string): boolean =>
+    (WORKING_FALLBACK_PHRASES as ReadonlyArray<string>).includes(value);
+
+  /** Queues a transition, collapsing runs of generic churn into nothing. */
+  const enqueue = (nextLabel: string) => {
+    if (queue.at(-1) === nextLabel) {
+      // Same pending label offered again: not a transition, not a drop.
+      return;
+    }
+    if (isGeneric(nextLabel)) {
+      // Generic churn never earns a slot of its own while work is in flight;
+      // a real tool name already queued outranks it.
+      droppedCount += 1;
+      if (queue.length === 0) queue.push(nextLabel);
+      else if (isGeneric(queue.at(-1)!)) queue[queue.length - 1] = nextLabel;
+      return;
+    }
+    // A genuine tool change keeps its place in order. It supersedes a trailing
+    // generic entry rather than queueing behind it.
+    if (queue.length > 0 && isGeneric(queue.at(-1)!)) queue[queue.length - 1] = nextLabel;
+    else queue.push(nextLabel);
+  };
+
+  /** Promotes the oldest pending label once the window has elapsed. */
+  const drain = (at: number) => {
+    while (queue.length > 0 && at - shownAt >= WORKING_STATUS_DWELL_MS) {
+      const next = queue.shift()!;
+      if (next === label) continue;
+      label = next;
+      shownAt = at;
+    }
+  };
+
+  return {
+    get label() {
+      return label;
+    },
+    get droppedCount() {
+      return droppedCount;
+    },
+    reset(nextLabel: string, at: number) {
+      queue.length = 0;
+      label = nextLabel;
+      shownAt = at;
+    },
+    push(nextLabel: string, at: number) {
+      if (nextLabel === label) {
+        // Reverting to the shown label makes everything queued behind it dead
+        // work: the caller stops re-offering once shown matches, so those
+        // entries would sit until some later transition promoted a tool that
+        // finished seconds ago.
+        queue.length = 0;
+        return label;
+      }
+      enqueue(nextLabel);
+      drain(at);
+      return label;
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// AC-11 — one shared duration ticker
+//
+// Every live duration label used to own a `setInterval`, so N streaming rows ran
+// N timers. They now share one module-level interval with a subscriber set: the
+// interval starts with the first subscriber and is cleared with the last, so no
+// timer ever runs with zero subscribers.
+// ---------------------------------------------------------------------------
+
+type DurationTickSubscriber = () => void;
+
+const durationTickSubscribers = new Set<DurationTickSubscriber>();
+let durationTickIntervalId: ReturnType<typeof setInterval> | null = null;
+
+/** Test seam: proves the subscriber set drains and the interval is released. */
+export function durationTickSubscriberCount(): number {
+  return durationTickSubscribers.size;
+}
+
+/**
+ * Registers `onTick` on the shared one-second ticker and returns an idempotent
+ * unsubscribe. Subscribers write their own text nodes; the ticker deliberately
+ * causes no React commit.
+ */
+export function subscribeToDurationTick(onTick: DurationTickSubscriber): () => void {
+  durationTickSubscribers.add(onTick);
+
+  if (durationTickIntervalId === null) {
+    durationTickIntervalId = setInterval(() => {
+      // Snapshot: a subscriber may unsubscribe (unmount) during its own tick,
+      // which would otherwise mutate the set mid-iteration.
+      // eslint-disable-next-line unicorn/no-useless-spread
+      for (const subscriber of [...durationTickSubscribers]) {
+        // One faulty row must not stop every other live duration.
+        try {
+          subscriber();
+        } catch {
+          // ignored
+        }
+      }
+    }, 1000);
+  }
+
+  let unsubscribed = false;
+  return () => {
+    if (unsubscribed) return;
+    unsubscribed = true;
+    durationTickSubscribers.delete(onTick);
+    if (durationTickSubscribers.size === 0 && durationTickIntervalId !== null) {
+      clearInterval(durationTickIntervalId);
+      durationTickIntervalId = null;
+    }
+  };
 }

@@ -14,6 +14,7 @@ import {
   ProviderDriverKind,
   type ProviderEvent,
   ProviderInstanceId,
+  type ModelSelection,
   type ProviderRuntimeEvent,
   type ProviderRequestKind,
   type ThreadTokenUsageSnapshot,
@@ -87,6 +88,14 @@ export interface CodexAdapterLiveOptions {
   >;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  /**
+   * Resolves a model slug to its catalog `defaultReasoningEffort`. The adapter
+   * holds no model catalog — capabilities arrive over the `model/list` RPC and
+   * live on the provider snapshot — so the driver injects this lookup to let
+   * `turn.started` report the effort Codex will actually run at when the user
+   * has not chosen one explicitly.
+   */
+  readonly resolveDefaultReasoningEffort?: (model: string) => string | undefined;
 }
 
 interface CodexAdapterSessionContext {
@@ -95,6 +104,13 @@ interface CodexAdapterSessionContext {
   readonly runtime: CodexSessionRuntimeShape;
   readonly eventFiber: Fiber.Fiber<void, never>;
   stopped: boolean;
+  /**
+   * Model and effort resolved for the most recent turn. Codex's `turn/started`
+   * wire event carries neither, so the adapter records what it sent and the
+   * event pump reads it back when mapping the notification.
+   */
+  turnModel: string | undefined;
+  turnEffort: string | undefined;
 }
 
 function mapCodexRuntimeError(
@@ -771,6 +787,10 @@ function mapCollabAgentEvent(
 function mapToRuntimeEvents(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
+  turnProvenance?: {
+    readonly model: string | undefined;
+    readonly effort: string | undefined;
+  },
 ): ReadonlyArray<ProviderRuntimeEvent> {
   if (event.kind === "notification" && event.method.startsWith("collabAgent/")) {
     return mapCollabAgentEvent(event, canonicalThreadId);
@@ -1047,12 +1067,17 @@ function mapToRuntimeEvents(
     if (!turnId) {
       return [];
     }
+    const model = trimText(turnProvenance?.model);
+    const effort = trimText(turnProvenance?.effort);
     return [
       {
         ...runtimeEventBase(event, canonicalThreadId),
         turnId,
         type: "turn.started",
-        payload: {},
+        payload: {
+          ...(model ? { model } : {}),
+          ...(effort ? { effort } : {}),
+        },
       },
     ];
   }
@@ -1664,6 +1689,26 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
 
+  /**
+   * Model and effort a turn will actually run at. Effort is the explicit
+   * `reasoningEffort` selection when present, otherwise the model's catalog
+   * default. Every level here comes from the model's own
+   * `supportedReasoningEfforts`, so any value that arrives is a real level and
+   * is reported as-is.
+   */
+  const resolveTurnProvenance = (modelSelection: ModelSelection | null | undefined) => {
+    const selection = modelSelection?.instanceId === boundInstanceId ? modelSelection : undefined;
+    const model = trimText(selection?.model);
+    const explicitEffort = selection
+      ? getModelSelectionStringOptionValue(selection, "reasoningEffort")
+      : undefined;
+    const defaultEffort = model ? options?.resolveDefaultReasoningEffort?.(model) : undefined;
+    return {
+      model,
+      effort: trimText(explicitEffort) ?? trimText(defaultEffort),
+    };
+  };
+
   const startSession: CodexAdapterShape["startSession"] = (input) =>
     Effect.scoped(
       Effect.gen(function* () {
@@ -1770,7 +1815,13 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         // this a child of `startSession`, and Effect interrupts a fiber's
         // children when it completes, so the consumer died on return and every
         // runtime event the session emitted afterwards was dropped.
+        // Seeded from the session's own selection so a `turn/started` that
+        // arrives before any `sendTurn` still reports the session model. Each
+        // `sendTurn` overwrites it with that turn's resolved values.
+        const turnProvenance = resolveTurnProvenance(input.modelSelection);
+        let sessionContext: CodexAdapterSessionContext | undefined;
         let stopped = false;
+
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
             yield* writeNativeEvent(event);
@@ -1782,7 +1833,10 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               const current = sessions.get(input.threadId);
               if (current?.runtime === runtime) current.stopped = true;
             }
-            const runtimeEvents = mapToRuntimeEvents(event, event.threadId);
+            const runtimeEvents = mapToRuntimeEvents(event, event.threadId, {
+              model: sessionContext?.turnModel ?? turnProvenance.model,
+              effort: sessionContext?.turnEffort ?? turnProvenance.effort,
+            });
             if (runtimeEvents.length === 0) {
               yield* Effect.logDebug("ignoring unhandled Codex provider event", {
                 method: event.method,
@@ -1815,13 +1869,16 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ),
         );
 
-        sessions.set(input.threadId, {
+        sessionContext = {
           threadId: input.threadId,
           scope: sessionScope,
           runtime,
           eventFiber,
           stopped,
-        });
+          turnModel: turnProvenance.model,
+          turnEffort: turnProvenance.effort,
+        };
+        sessions.set(input.threadId, sessionContext);
         sessionScopeTransferred = true;
 
         return started;
@@ -1879,6 +1936,20 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       input.modelSelection?.instanceId === boundInstanceId
         ? getCodexServiceTierOptionValue(input.modelSelection)
         : undefined;
+
+    // Stamp the session before the turn starts: Codex's `turn/started`
+    // notification carries neither model nor effort, so the event pump reads
+    // these back when it maps the notification.
+    const turnProvenance = resolveTurnProvenance(input.modelSelection);
+    // Model and effort are resolved together, so they fall back together.
+    // Keying effort on the model alone would let an unresolved selection
+    // report the *previous* turn's effort as this turn's, and provenance is
+    // never backfilled once stamped.
+    if (turnProvenance.model !== undefined) {
+      session.turnModel = turnProvenance.model;
+      session.turnEffort = turnProvenance.effort;
+    }
+
     return yield* session.runtime
       .sendTurn({
         ...(input.input !== undefined ? { input: input.input } : {}),

@@ -158,9 +158,25 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       // here; the registry only has to worry about snapshot-build and
       // spawner-availability failures surfaced from `checkCodexProviderStatus`
       // below.
+      // The adapter is constructed before the snapshot exists, and it needs
+      // model capabilities to report the effort a turn runs at when the user
+      // picked none. Cache the latest published snapshot here so the adapter's
+      // resolver stays a synchronous lookup, and refresh the cache whenever a
+      // new snapshot lands.
+      let latestModels: ServerProvider["models"] = [];
+      const resolveDefaultReasoningEffort = (model: string): string | undefined => {
+        const capabilities = latestModels.find((entry) => entry.slug === model)?.capabilities;
+        const descriptor = capabilities?.optionDescriptors?.find(
+          (option) => option.id === "reasoningEffort",
+        );
+        if (!descriptor || descriptor.type !== "select") return undefined;
+        return descriptor.options.find((option) => option.isDefault)?.id;
+      };
+
       const adapter = yield* makeCodexAdapter(effectiveConfig, {
         instanceId,
         environment: processEnv,
+        resolveDefaultReasoningEffort,
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
       });
       const textGeneration = yield* makeCodexTextGeneration(effectiveConfig, processEnv);
@@ -172,13 +188,19 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       // Kick the TTL-gated manifest refresh in the background and classify
       // with the in-memory manifest, so a slow or hung fetch never delays the
       // provider check. A refresh that lands mid-probe applies on the next one.
+      const rememberModels = (snapshot: ServerProvider): ServerProvider => {
+        latestModels = snapshot.models;
+        return snapshot;
+      };
       const checkProvider = modelManifest.refreshInBackground.pipe(
         Effect.andThen(
           Effect.zipWith(
             checkCodexProviderStatus(effectiveConfig, undefined, processEnv),
             modelManifest.current,
             (draft, manifest) =>
-              stampIdentity(ModelManifest.applyModelManifest(draft, manifest, DRIVER_KIND)),
+              rememberModels(
+                stampIdentity(ModelManifest.applyModelManifest(draft, manifest, DRIVER_KIND)),
+              ),
             { concurrent: true },
           ),
         ),
@@ -195,7 +217,9 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
             makePendingCodexProvider(settings.provider),
             modelManifest.current,
             (draft, manifest) =>
-              stampIdentity(ModelManifest.applyModelManifest(draft, manifest, DRIVER_KIND)),
+              rememberModels(
+                stampIdentity(ModelManifest.applyModelManifest(draft, manifest, DRIVER_KIND)),
+              ),
           ),
         checkProvider,
         enrichSnapshot: ({ settings, snapshot, publishSnapshot }) =>
