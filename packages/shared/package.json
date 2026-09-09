@@ -199,6 +199,10 @@
       "types": "./src/filePreview.ts",
       "import": "./src/filePreview.ts"
     },
+    "./turnWorkCounts": {
+      "types": "./src/turnWorkCounts.ts",
+      "import": "./src/turnWorkCounts.ts"
+    },
     "./chatList": {
       "types": "./src/chatList.ts",
       "import": "./src/chatList.ts"

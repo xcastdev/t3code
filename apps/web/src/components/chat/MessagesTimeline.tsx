@@ -19,7 +19,6 @@ const EMPTY_AGENT_PANEL_MODEL = emptyAgentPanelModel();
 const NOOP_OPEN_AGENTS = () => {};
 const NOOP_USE_ARTIFACT_TEMPLATE = () => {};
 const NOOP_OPEN_ATTACHMENT = (_attachment: ChatFileAttachment) => {};
-import { resolveChatListAnchoredEndSpace } from "@t3tools/shared/chatList";
 import {
   createContext,
   Fragment,
@@ -88,6 +87,7 @@ import { keepTimelineEndVisibleAfterOverlayGrowth } from "./timelineScrollAnchor
 import { MessageCopyButton } from "./MessageCopyButton";
 import {
   computeStableMessagesTimelineRows,
+  createWorkingStatusDwell,
   deriveMessagesTimelineRows,
   normalizeCompactToolLabel,
   resolveAssistantMessageCopyState,
@@ -99,12 +99,16 @@ import {
   resolveTimelineMinimapInteractiveWidth,
   resolveTimelineMinimapTopPercent,
   shouldPreserveAssistantLineBreaks,
+  subscribeToDurationTick,
   toolGroupAction,
   workEntryIsVisibleInGroup,
+  WORKING_STATUS_DWELL_MS,
   type StableMessagesTimelineRowsState,
   type MessagesTimelineRow,
   TIMELINE_MINIMAP_MIN_ITEMS,
   type TimelineLatestTurn,
+  type TimelineTurnSummary,
+  type WorkingStatusDwell,
 } from "./MessagesTimeline.logic";
 import { TerminalContextInlineChip } from "./TerminalContextInlineChip";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
@@ -165,6 +169,11 @@ interface TimelineRowSharedState {
   onToggleWorkGroup: (groupId: string, anchorKey: string) => void;
   agentPanelModel: AgentPanelModel;
   onOpenAgents: () => void;
+  /**
+   * Settled turn records keyed by their terminal assistant message, so the
+   * turn footer can read provenance without pushing it into the row shape.
+   */
+  turnSummaryByAssistantMessageId: ReadonlyMap<MessageId, TimelineTurnSummary>;
 }
 
 interface TimelineRowActivityState {
@@ -229,6 +238,21 @@ interface MessagesTimelineProps {
   listRef: React.RefObject<LegendListRef | null>;
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
   latestTurn: TimelineLatestTurn | null;
+  /**
+   * Every settled turn's own record. Counts are stamped server-side when a
+   * turn settles, so they stay correct after the activity rows behind them
+   * age out of the retained window.
+   */
+  turns?: ReadonlyArray<TimelineTurnSummary> | null;
+  /**
+   * Timestamp of the oldest activity row the thread still retains. Turns that
+   * began before it cannot be counted client-side without undercounting.
+   */
+  oldestRetainedActivityAt?: string | null;
+  /** Turn folds to render expanded on mount. Test seam and deep links. */
+  initialExpandedTurnIds?: ReadonlySet<TurnId>;
+  /** Tool groups to render expanded on mount. Test seam and deep links. */
+  initialExpandedWorkGroupIds?: ReadonlySet<string>;
   runningTurnId: TurnId | null;
   turnDiffSummaryByAssistantMessageId: Map<MessageId, TurnDiffSummary>;
   routeThreadKey: string;
@@ -246,8 +270,6 @@ interface MessagesTimelineProps {
   timestampFormat: TimestampFormat;
   workspaceRoot: string | undefined;
   skills?: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
-  anchorMessageId: MessageId | null;
-  onAnchorReady: (messageId: MessageId, anchorIndex: number) => void;
   contentInsetEndAdjustment: number;
   /**
    * Whether the timeline should keep pinning to the live edge as content
@@ -276,6 +298,10 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   listRef,
   timelineEntries,
   latestTurn,
+  turns = null,
+  oldestRetainedActivityAt = null,
+  initialExpandedTurnIds,
+  initialExpandedWorkGroupIds,
   runningTurnId,
   turnDiffSummaryByAssistantMessageId,
   routeThreadKey,
@@ -293,8 +319,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   timestampFormat,
   workspaceRoot,
   skills = EMPTY_TIMELINE_SKILLS,
-  anchorMessageId,
-  onAnchorReady,
   contentInsetEndAdjustment,
   liveFollowEnabled,
   onIsAtEndChange,
@@ -303,8 +327,12 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   topFadeEnabled = false,
   loadEarlier = null,
 }: MessagesTimelineProps) {
-  const [expandedTurnIds, setExpandedTurnIds] = useState<ReadonlySet<TurnId>>(new Set());
-  const [expandedWorkGroupIds, setExpandedWorkGroupIds] = useState<ReadonlySet<string>>(new Set());
+  const [expandedTurnIds, setExpandedTurnIds] = useState<ReadonlySet<TurnId>>(
+    () => initialExpandedTurnIds ?? new Set(),
+  );
+  const [expandedWorkGroupIds, setExpandedWorkGroupIds] = useState<ReadonlySet<string>>(
+    () => initialExpandedWorkGroupIds ?? new Set(),
+  );
   const [disclosureToggleSettling, setDisclosureToggleSettling] = useState(false);
   const [minimapStripMap] = useState(() => new Map<string, HTMLSpanElement>());
   const disclosureAnchorKeyRef = useRef<string | null>(null);
@@ -317,10 +345,10 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       timeline: listRef.current,
       previousOverlayHeight: previousContentInsetEndAdjustmentRef.current,
       overlayHeight: contentInsetEndAdjustment,
-      followingEnd: liveFollowEnabled && anchorMessageId === null,
+      followingEnd: liveFollowEnabled,
     });
     previousContentInsetEndAdjustmentRef.current = contentInsetEndAdjustment;
-  }, [anchorMessageId, contentInsetEndAdjustment, listRef, liveFollowEnabled]);
+  }, [contentInsetEndAdjustment, listRef, liveFollowEnabled]);
 
   useEffect(() => {
     return () => {
@@ -431,6 +459,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       deriveMessagesTimelineRows({
         timelineEntries,
         latestTurn,
+        turns,
+        oldestRetainedActivityAt,
         runningTurnId,
         expandedTurnIds,
         expandedWorkGroupIds,
@@ -442,6 +472,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     [
       timelineEntries,
       latestTurn,
+      turns,
+      oldestRetainedActivityAt,
       runningTurnId,
       expandedTurnIds,
       expandedWorkGroupIds,
@@ -451,6 +483,18 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       revertTurnCountByUserMessageId,
     ],
   );
+  // The footer keys off the turn's own terminal assistant message, so a turn
+  // whose record predates provenance stamping simply has no entry here and
+  // falls back to the plain timestamp footer.
+  const turnSummaryByAssistantMessageId = useMemo(() => {
+    const byAssistantMessageId = new Map<MessageId, TimelineTurnSummary>();
+    for (const turn of turns ?? []) {
+      if (turn.assistantMessageId) {
+        byAssistantMessageId.set(turn.assistantMessageId, turn);
+      }
+    }
+    return byAssistantMessageId;
+  }, [turns]);
   const rows = useStableRows(rawRows);
   const minimapItems = useMemo(() => deriveTimelineMinimapItems(rows), [rows]);
   const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(
@@ -458,21 +502,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   );
   const [minimapHasPersistentGutter, setMinimapHasPersistentGutter] = useState(false);
   const [minimapHitStripWidth, setMinimapHitStripWidth] = useState(0);
-  const handleAnchorReady = useCallback(
-    (info: { anchorIndex: number | undefined }) => {
-      if (anchorMessageId !== null && info.anchorIndex !== undefined) {
-        onAnchorReady(anchorMessageId, info.anchorIndex);
-      }
-    },
-    [anchorMessageId, onAnchorReady],
-  );
-  const anchoredEndSpace = useMemo(() => {
-    const config = resolveChatListAnchoredEndSpace(rows, anchorMessageId, (row) =>
-      row.kind === "message" && row.message.role === "user" ? row.message.id : null,
-    );
-    return config ? { ...config, onReady: handleAnchorReady } : undefined;
-  }, [anchorMessageId, handleAnchorReady, rows]);
-
   const handleScroll = useCallback(() => {
     const state = listRef.current?.getState?.();
     const isAtEnd = resolveTimelineIsAtEnd(state, contentInsetEndAdjustment);
@@ -553,8 +582,10 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onToggleWorkGroup,
       agentPanelModel,
       onOpenAgents,
+      turnSummaryByAssistantMessageId,
     }),
     [
+      turnSummaryByAssistantMessageId,
       timestampFormat,
       routeThreadKey,
       markdownCwd,
@@ -617,10 +648,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
             renderItem={renderItem}
             estimatedItemSize={90}
             initialScrollAtEnd
-            {...(anchoredEndSpace ? { anchoredEndSpace } : {})}
             contentInsetEndAdjustment={contentInsetEndAdjustment}
             maintainScrollAtEnd={
-              anchoredEndSpace || !liveFollowEnabled || disclosureToggleSettling
+              !liveFollowEnabled || disclosureToggleSettling
                 ? false
                 : TIMELINE_MAINTAIN_SCROLL_AT_END
             }
@@ -1218,6 +1248,20 @@ function RevertUserMessageButton({ messageId }: { messageId: MessageId }) {
   );
 }
 
+/**
+ * Subfold labels are positional summaries, so two runs of the same shape share
+ * text. Disambiguating repeats by occurrence keeps each list item's key stable
+ * as long as the fold's shape is.
+ */
+function subfoldKeys(turnId: TurnId, labels: ReadonlyArray<string>) {
+  const seen = new Map<string, number>();
+  return labels.map((label) => {
+    const occurrence = seen.get(label) ?? 0;
+    seen.set(label, occurrence + 1);
+    return { key: `${turnId}:${label}:${occurrence}`, label };
+  });
+}
+
 function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-fold" }> }) {
   const ctx = use(TimelineRowCtx);
   const Icon = row.expanded ? ChevronDownIcon : ChevronRightIcon;
@@ -1234,6 +1278,20 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
         <span>{row.label}</span>
         <Icon className="size-3.5" />
       </button>
+      {row.expanded && row.subfoldLabels.length > 0 ? (
+        <ul className="mt-0.5 ms-1 flex flex-col gap-0.5">
+          {subfoldKeys(row.turnId, row.subfoldLabels).map(({ key, label }) => (
+            <li
+              key={key}
+              data-timeline-subfold
+              className="flex items-center gap-1 px-1 text-xs leading-relaxed text-muted-foreground tabular-nums"
+            >
+              <ChevronRightIcon className="size-3 shrink-0 text-icon-muted" aria-hidden />
+              <span className="min-w-0 truncate">{label}</span>
+            </li>
+          ))}
+        </ul>
+      ) : null}
     </div>
   );
 }
@@ -1262,8 +1320,9 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
           onOpenTurnDiff={ctx.onOpenTurnDiff}
         />
         {row.showAssistantMeta ? (
-          <div className="mt-1.5 flex items-center gap-2 text-xs tabular-nums opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover/assistant:opacity-100">
+          <div className="@container/turn-footer mt-1.5 flex items-center gap-2 text-xs tabular-nums opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover/assistant:opacity-100">
             <AssistantCopyButton row={row} />
+            <TurnFooterProvenance row={row} />
             {!row.message.streaming && (
               <Tooltip>
                 <TooltipTrigger
@@ -1297,6 +1356,55 @@ function AssistantCopyButton({ row }: { row: Extract<TimelineRow, { kind: "messa
   return <MessageCopyButton text={assistantCopyState.text ?? ""} variant="ghost" />;
 }
 
+/**
+ * Codex reports "default" when the user never chose an effort. The adapter
+ * already maps that sentinel away, so this is the render-side guarantee that
+ * a stray one never reaches a user: absent means absent, with no fallback.
+ */
+const EFFORT_SENTINEL = "default";
+
+/**
+ * Which model and effort produced this turn, and how long it took. Reads the
+ * turn's own settled record — a turn with no record (or no model) renders
+ * nothing and leaves today's timestamp-only footer untouched.
+ */
+function TurnFooterProvenance({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
+  const ctx = use(TimelineRowCtx);
+  const turn = ctx.turnSummaryByAssistantMessageId.get(row.message.id);
+  const model = turn?.model?.trim();
+  if (!turn || !model || row.message.streaming) {
+    return null;
+  }
+
+  const rawEffort = turn.effort?.trim();
+  const effort = rawEffort && rawEffort.toLowerCase() !== EFFORT_SENTINEL ? rawEffort : undefined;
+  const duration =
+    turn.startedAt && turn.completedAt
+      ? formatWorkingTimer(turn.startedAt, turn.completedAt)
+      : null;
+
+  return (
+    <span className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
+      <span className="flex min-w-0 items-center gap-1" data-turn-footer-model>
+        <BotIcon className="size-3 shrink-0" aria-hidden />
+        {/* Labels drop out on a narrow footer; the icons still carry meaning. */}
+        <span className="hidden min-w-0 truncate @[16rem]/turn-footer:inline">{model}</span>
+      </span>
+      {effort ? (
+        <span className="flex shrink-0 items-center gap-1" data-turn-footer-effort>
+          <ZapIcon className="size-3 shrink-0" aria-hidden />
+          <span className="hidden @[16rem]/turn-footer:inline">{effort}</span>
+        </span>
+      ) : null}
+      {duration ? (
+        <span className="shrink-0" data-turn-footer-duration>
+          {duration}
+        </span>
+      ) : null}
+    </span>
+  );
+}
+
 function ProposedPlanTimelineRow({
   row,
 }: {
@@ -1321,7 +1429,7 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
   return (
     <div>
       <div className="border-b border-border/60 pb-2 pt-1">
-        <div className="flex min-w-0 items-baseline px-1 text-sm leading-relaxed text-muted-foreground tabular-nums">
+        <div className="flex min-w-0 items-baseline gap-1.5 px-1 text-sm leading-relaxed text-muted-foreground tabular-nums">
           <span className="shrink-0 whitespace-nowrap">
             {row.createdAt ? (
               <>
@@ -1331,15 +1439,43 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
               "Working..."
             )}
           </span>
+          <WorkingStatusLabel statusLabel={row.statusLabel} />
         </div>
       </div>
       {row.showThinking ? (
         <div className="mt-1">
-          <ThinkingActivityRow />
+          <LiveActivityRow label={row.statusLabel} />
         </div>
       ) : null}
     </div>
   );
+}
+
+/**
+ * Names the work currently running, held for the dwell window so fast-changing
+ * tools read as status rather than as a flicker.
+ */
+function WorkingStatusLabel({ statusLabel }: { statusLabel: string }) {
+  const dwellRef = useRef<WorkingStatusDwell | null>(null);
+  dwellRef.current ??= createWorkingStatusDwell(statusLabel, Date.now());
+  const dwell = dwellRef.current;
+
+  const [displayLabel, setDisplayLabel] = useState(dwell.label);
+
+  useEffect(() => {
+    const shown = dwell.push(statusLabel, Date.now());
+    setDisplayLabel(shown);
+    if (shown === statusLabel) return;
+
+    // The shown label is still inside its dwell window; re-offer the pending
+    // transition once the window elapses so it is not stranded.
+    const id = setTimeout(() => {
+      setDisplayLabel(dwell.push(statusLabel, Date.now()));
+    }, WORKING_STATUS_DWELL_MS);
+    return () => clearTimeout(id);
+  }, [dwell, statusLabel]);
+
+  return <span className="min-w-0 truncate text-secondary-label">{displayLabel}</span>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1359,8 +1495,9 @@ function WorkingTimer({ createdAt }: { createdAt: string }) {
       }
     };
     updateText();
-    const id = setInterval(updateText, 1000);
-    return () => clearInterval(id);
+    // One module-level interval backs every live duration: N streaming rows
+    // share a single timer instead of each owning one.
+    return subscribeToDurationTick(updateText);
   }, [createdAt]);
 
   return (
@@ -1441,10 +1578,6 @@ function LiveActivityRow({
       </div>
     </div>
   );
-}
-
-function ThinkingActivityRow() {
-  return <LiveActivityRow label="Thinking" />;
 }
 
 function LiveActivityContent({
@@ -2077,6 +2210,24 @@ function formatWorkingTimer(startIso: string, endIso: string): string | null {
   return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
 }
 
+/**
+ * Tool-row durations. Sub-minute work reads with one decimal (`0.1s`, `2.0s`)
+ * because whole seconds round most tool calls to a flat `0s`; anything longer
+ * falls back to the turn-level `1m 12s` vocabulary.
+ */
+function formatWorkingTimerSeconds(startIso: string, endIso: string): string | null {
+  const startedAtMs = Date.parse(startIso);
+  const endedAtMs = Date.parse(endIso);
+  if (!Number.isFinite(startedAtMs) || !Number.isFinite(endedAtMs)) {
+    return null;
+  }
+  const elapsedMs = Math.max(0, endedAtMs - startedAtMs);
+  if (elapsedMs < 60_000) {
+    return `${(elapsedMs / 1000).toFixed(1)}s`;
+  }
+  return formatWorkingTimer(startIso, endIso);
+}
+
 function formatWorkingTimerNow(startIso: string): string {
   return formatWorkingTimer(startIso, new Date().toISOString()) ?? "0s";
 }
@@ -2396,7 +2547,22 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
   const showFailedIndicator = workEntryDisplayIndicatesToolFailure(workEntry);
   const entryIconName =
     showWarningIndicator || showFailedIndicator ? "circle-alert" : workEntryIconName(workEntry);
-  const displayText = workEntryPreview(workEntry, workspaceRoot) ?? toolWorkEntryHeading(workEntry);
+  // Three columns: the tool's own name, what it acted on, and how long it took.
+  // The description is what truncates first; the duration keeps the right edge
+  // a column even when a row has none.
+  const rowName = toolWorkEntryHeading(workEntry);
+  const rowDescription = workEntryPreview(workEntry, workspaceRoot);
+  // Commands read as commands: their description is the literal argv, so it
+  // gets monospace where a file path or tool argument does not.
+  const isCommandRow =
+    workEntry.itemType === "command_execution" || Boolean(workEntry.command?.trim());
+  const displayText = rowDescription ?? rowName;
+  // Settled rows only. Live durations are a separate concern (shared ticker),
+  // and a ticking text node here would repaint the whole list.
+  const rowDuration =
+    workEntry.toolLifecycleStatus === "inProgress" || !workEntry.startedAt
+      ? null
+      : formatWorkingTimerSeconds(workEntry.startedAt, workEntry.createdAt);
   const expandedBody = buildToolCallExpandedBody(workEntry, workspaceRoot);
   const canExpand = expandedBody !== null;
   const showDestructiveRowStyle =
@@ -2466,7 +2632,37 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
         <div className="flex min-w-0 flex-1 items-center gap-1.5">
           <div className="min-w-0 flex-1 overflow-hidden">
             <p className="flex min-w-0 w-full items-baseline gap-1.5 text-sm leading-relaxed">
-              <span className={cn("min-w-0 flex-1 truncate", headingClass)}>{displayText}</span>
+              {rowDescription === null ? (
+                <span className={cn("min-w-0 flex-1 truncate", headingClass)} data-tool-row-name>
+                  {rowName}
+                </span>
+              ) : (
+                <>
+                  <span
+                    className={cn("shrink-0 whitespace-nowrap", headingClass)}
+                    data-tool-row-name
+                  >
+                    {rowName}
+                  </span>
+                  {/* Flexes and truncates before the name or the duration. */}
+                  <span
+                    className={cn(
+                      "min-w-0 flex-1 truncate text-secondary-label",
+                      isCommandRow && "font-mono text-xs",
+                    )}
+                    data-tool-row-description
+                  >
+                    {rowDescription}
+                  </span>
+                </>
+              )}
+              {/* Kept even when empty so the right edge stays a column. */}
+              <span
+                className="shrink-0 whitespace-nowrap text-xs text-icon-muted tabular-nums"
+                data-tool-row-duration
+              >
+                {rowDuration ?? ""}
+              </span>
             </p>
           </div>
           <span

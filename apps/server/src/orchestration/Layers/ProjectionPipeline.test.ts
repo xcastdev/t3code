@@ -3218,3 +3218,429 @@ engineLayer("OrchestrationProjectionPipeline via engine dispatch", (it) => {
     }),
   );
 });
+
+it.layer(makeProjectionPipelinePrefixedTestLayer("t3-turn-provenance-test-"))(
+  "OrchestrationProjectionPipeline turn provenance",
+  (it) => {
+    const projectId = ProjectId.make("project-provenance");
+
+    const appendThreadCreated = (threadId: ThreadId, suffix: string) =>
+      Effect.gen(function* () {
+        const eventStore = yield* OrchestrationEventStore;
+        yield* eventStore.append({
+          type: "thread.created",
+          eventId: EventId.make(`evt-created-${suffix}`),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-03-01T00:00:00.000Z",
+          commandId: CommandId.make(`cmd-created-${suffix}`),
+          causationEventId: null,
+          correlationId: CorrelationId.make(`cmd-created-${suffix}`),
+          metadata: {},
+          payload: {
+            threadId,
+            projectId,
+            title: "Provenance",
+            modelSelection: {
+              instanceId: ProviderInstanceId.make("claude"),
+              model: "claude-opus",
+            },
+            runtimeMode: "full-access",
+            branch: null,
+            worktreePath: null,
+            createdAt: "2026-03-01T00:00:00.000Z",
+            updatedAt: "2026-03-01T00:00:00.000Z",
+          },
+        });
+      });
+
+    const appendSessionSet = (input: {
+      readonly threadId: ThreadId;
+      readonly suffix: string;
+      readonly status: "running" | "ready";
+      readonly activeTurnId: TurnId | null;
+      readonly at: string;
+      readonly turnProvenance?: {
+        readonly turnId: TurnId;
+        readonly model?: string;
+        readonly effort?: string;
+      };
+    }) =>
+      Effect.gen(function* () {
+        const eventStore = yield* OrchestrationEventStore;
+        yield* eventStore.append({
+          type: "thread.session-set",
+          eventId: EventId.make(`evt-session-${input.suffix}`),
+          aggregateKind: "thread",
+          aggregateId: input.threadId,
+          occurredAt: input.at,
+          commandId: CommandId.make(`cmd-session-${input.suffix}`),
+          causationEventId: null,
+          correlationId: CorrelationId.make(`cmd-session-${input.suffix}`),
+          metadata: {},
+          payload: {
+            threadId: input.threadId,
+            session: {
+              threadId: input.threadId,
+              status: input.status,
+              providerName: "claude",
+              runtimeMode: "full-access",
+              activeTurnId: input.activeTurnId,
+              lastError: null,
+              updatedAt: input.at,
+            },
+            ...(input.turnProvenance === undefined ? {} : { turnProvenance: input.turnProvenance }),
+          },
+        });
+      });
+
+    const appendActivity = (input: {
+      readonly threadId: ThreadId;
+      readonly turnId: TurnId;
+      readonly suffix: string;
+      readonly tone: "approval" | "error" | "info" | "tool";
+      readonly itemType?: string;
+      readonly toolCallId?: string;
+      readonly at: string;
+    }) =>
+      Effect.gen(function* () {
+        const eventStore = yield* OrchestrationEventStore;
+        yield* eventStore.append({
+          type: "thread.activity-appended",
+          eventId: EventId.make(`evt-activity-${input.suffix}`),
+          aggregateKind: "thread",
+          aggregateId: input.threadId,
+          occurredAt: input.at,
+          commandId: CommandId.make(`cmd-activity-${input.suffix}`),
+          causationEventId: null,
+          correlationId: CorrelationId.make(`cmd-activity-${input.suffix}`),
+          metadata: {},
+          payload: {
+            threadId: input.threadId,
+            activity: {
+              id: EventId.make(`activity-${input.suffix}`),
+              tone: input.tone,
+              kind: "tool.updated",
+              summary: `Activity ${input.suffix}`,
+              payload: {
+                ...(input.itemType === undefined ? {} : { itemType: input.itemType }),
+                ...(input.toolCallId === undefined ? {} : { toolCallId: input.toolCallId }),
+              },
+              turnId: input.turnId,
+              createdAt: input.at,
+            },
+          },
+        });
+      });
+
+    interface ProvenanceRow {
+      readonly state: string;
+      readonly model: string | null;
+      readonly effort: string | null;
+      readonly commandCount: number | null;
+      readonly toolCallCount: number | null;
+      readonly subagentCount: number | null;
+      readonly changedFileCount: number | null;
+    }
+
+    const readProvenance = (threadId: ThreadId, turnId: TurnId) =>
+      Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        return yield* sql<ProvenanceRow>`
+          SELECT
+            state,
+            model,
+            effort,
+            command_count AS "commandCount",
+            tool_call_count AS "toolCallCount",
+            subagent_count AS "subagentCount",
+            changed_file_count AS "changedFileCount"
+          FROM projection_turns
+          WHERE thread_id = ${threadId} AND turn_id = ${turnId}
+        `;
+      });
+
+    it.effect("persists model and effort carried by the turn-start session set", () =>
+      Effect.gen(function* () {
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const threadId = ThreadId.make("thread-prov-model");
+        const turnId = TurnId.make("turn-prov-model");
+
+        yield* appendThreadCreated(threadId, "prov-model");
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-model-start",
+          status: "running",
+          activeTurnId: turnId,
+          at: "2026-03-01T00:00:01.000Z",
+          turnProvenance: { turnId, model: "claude-opus-4", effort: "high" },
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const rows = yield* readProvenance(threadId, turnId);
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0]?.model, "claude-opus-4");
+        assert.strictEqual(rows[0]?.effort, "high");
+
+        // Session semantics are untouched by the turn-scoped carrier.
+        const sql = yield* SqlClient.SqlClient;
+        const sessionRows = yield* sql<{
+          readonly status: string;
+          readonly activeTurnId: string | null;
+        }>`
+          SELECT status, active_turn_id AS "activeTurnId"
+          FROM projection_thread_sessions
+          WHERE thread_id = ${threadId}
+        `;
+        assert.deepEqual(sessionRows, [{ status: "running", activeTurnId: turnId }]);
+      }),
+    );
+
+    it.effect("leaves model and effort NULL when the session set carries no provenance", () =>
+      Effect.gen(function* () {
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const threadId = ThreadId.make("thread-prov-absent");
+        const turnId = TurnId.make("turn-prov-absent");
+
+        yield* appendThreadCreated(threadId, "prov-absent");
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-absent-start",
+          status: "running",
+          activeTurnId: turnId,
+          at: "2026-03-01T00:00:01.000Z",
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const rows = yield* readProvenance(threadId, turnId);
+        assert.strictEqual(rows.length, 1);
+        assert.isNull(rows[0]?.model ?? null);
+        assert.isNull(rows[0]?.effort ?? null);
+
+        const sql = yield* SqlClient.SqlClient;
+        const sessionRows = yield* sql<{ readonly status: string }>`
+          SELECT status FROM projection_thread_sessions WHERE thread_id = ${threadId}
+        `;
+        assert.deepEqual(sessionRows, [{ status: "running" }]);
+      }),
+    );
+
+    it.effect("stamps deduped work counts when a turn settles", () =>
+      Effect.gen(function* () {
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const threadId = ThreadId.make("thread-prov-counts");
+        const turnId = TurnId.make("turn-prov-counts");
+
+        yield* appendThreadCreated(threadId, "prov-counts");
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-counts-start",
+          status: "running",
+          activeTurnId: turnId,
+          at: "2026-03-01T00:00:01.000Z",
+        });
+
+        // One command call emitting three lifecycle rows must count once.
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "c1a",
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: "call-1",
+          at: "2026-03-01T00:00:02.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "c1b",
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: "call-1",
+          at: "2026-03-01T00:00:03.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "c1c",
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: "call-1",
+          at: "2026-03-01T00:00:04.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "t1",
+          tone: "tool",
+          itemType: "mcp_tool_call",
+          toolCallId: "call-2",
+          at: "2026-03-01T00:00:05.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "s1",
+          tone: "tool",
+          itemType: "collab_agent_tool_call",
+          toolCallId: "call-3",
+          at: "2026-03-01T00:00:06.000Z",
+        });
+        // Info-tone rows narrate and must be excluded.
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "i1",
+          tone: "info",
+          itemType: "command_execution",
+          toolCallId: "call-4",
+          at: "2026-03-01T00:00:07.000Z",
+        });
+
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-counts-end",
+          status: "ready",
+          activeTurnId: null,
+          at: "2026-03-01T00:01:00.000Z",
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const rows = yield* readProvenance(threadId, turnId);
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0]?.state, "completed");
+        assert.strictEqual(rows[0]?.commandCount, 1);
+        assert.strictEqual(rows[0]?.toolCallCount, 1);
+        assert.strictEqual(rows[0]?.subagentCount, 1);
+        assert.strictEqual(rows[0]?.changedFileCount, 0);
+      }),
+    );
+
+    it.effect("stamps work counts on an interrupted turn", () =>
+      Effect.gen(function* () {
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const eventStore = yield* OrchestrationEventStore;
+        const threadId = ThreadId.make("thread-prov-interrupt");
+        const turnId = TurnId.make("turn-prov-interrupt");
+
+        yield* appendThreadCreated(threadId, "prov-interrupt");
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-interrupt-start",
+          status: "running",
+          activeTurnId: turnId,
+          at: "2026-03-01T00:00:01.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "int-c1",
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: "int-call-1",
+          at: "2026-03-01T00:00:02.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "int-t1",
+          tone: "tool",
+          itemType: "file_change",
+          toolCallId: "int-call-2",
+          at: "2026-03-01T00:00:03.000Z",
+        });
+
+        yield* eventStore.append({
+          type: "thread.turn-interrupt-requested",
+          eventId: EventId.make("evt-prov-interrupt"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-03-01T00:00:10.000Z",
+          commandId: CommandId.make("cmd-prov-interrupt"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-prov-interrupt"),
+          metadata: {},
+          payload: {
+            threadId,
+            turnId,
+            createdAt: "2026-03-01T00:00:10.000Z",
+          },
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const rows = yield* readProvenance(threadId, turnId);
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0]?.state, "interrupted");
+        assert.strictEqual(rows[0]?.commandCount, 1);
+        assert.strictEqual(rows[0]?.toolCallCount, 1);
+        assert.strictEqual(rows[0]?.subagentCount, 0);
+      }),
+    );
+
+    it.effect("does not recount a settled turn when later events arrive", () =>
+      Effect.gen(function* () {
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const threadId = ThreadId.make("thread-prov-once");
+        const turnId = TurnId.make("turn-prov-once");
+
+        yield* appendThreadCreated(threadId, "prov-once");
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-once-start",
+          status: "running",
+          activeTurnId: turnId,
+          at: "2026-03-01T00:00:01.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "once-c1",
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: "once-call-1",
+          at: "2026-03-01T00:00:02.000Z",
+        });
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-once-end",
+          status: "ready",
+          activeTurnId: null,
+          at: "2026-03-01T00:01:00.000Z",
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const afterSettle = yield* readProvenance(threadId, turnId);
+        assert.strictEqual(afterSettle[0]?.commandCount, 1);
+
+        // A second settle-shaped event for the same turn must not double the
+        // stamp, and must not recount against activities appended later.
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "once-c2",
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: "once-call-2",
+          at: "2026-03-01T00:02:00.000Z",
+        });
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-once-end-2",
+          status: "ready",
+          activeTurnId: null,
+          at: "2026-03-01T00:03:00.000Z",
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const afterSecond = yield* readProvenance(threadId, turnId);
+        assert.strictEqual(afterSecond[0]?.commandCount, 1);
+      }),
+    );
+  },
+);

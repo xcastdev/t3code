@@ -15,6 +15,7 @@ import {
   TurnId,
   type OrchestrationCheckpointSummary,
   type OrchestrationLatestTurn,
+  type OrchestrationTurnSummary,
   type OrchestrationMessage,
   type OrchestrationProjectShell,
   type OrchestrationProposedPlan,
@@ -74,6 +75,9 @@ const decodeThread = Schema.decodeUnknownEffect(OrchestrationThread);
 // activity window. Applying the limit in SQL avoids decoding an unbounded
 // payload_json set before the projector can enforce that invariant.
 const THREAD_DETAIL_ACTIVITY_LIMIT = 500;
+// Same window as activities, for the same reason: bound the decode cost of a
+// long-lived thread. Turns are far cheaper than activities, so this is generous.
+const THREAD_TURN_LIMIT = 500;
 const ProjectionProjectDbRowSchema = ProjectionProject.mapFields(
   Struct.assign({
     defaultModelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
@@ -115,6 +119,21 @@ const ProjectionLatestTurnDbRowSchema = Schema.Struct({
   assistantMessageId: Schema.NullOr(MessageId),
   sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
   sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
+});
+const ProjectionTurnSummaryDbRowSchema = Schema.Struct({
+  threadId: ProjectionThread.fields.threadId,
+  turnId: TurnId,
+  state: Schema.String,
+  requestedAt: IsoDateTime,
+  startedAt: Schema.NullOr(IsoDateTime),
+  completedAt: Schema.NullOr(IsoDateTime),
+  assistantMessageId: Schema.NullOr(MessageId),
+  model: Schema.NullOr(Schema.String),
+  effort: Schema.NullOr(Schema.String),
+  commandCount: Schema.NullOr(Schema.Number),
+  toolCallCount: Schema.NullOr(Schema.Number),
+  subagentCount: Schema.NullOr(Schema.Number),
+  changedFileCount: Schema.NullOr(Schema.Number),
 });
 const ProjectionStateDbRowSchema = ProjectionState;
 const ProjectionCountsRowSchema = Schema.Struct({
@@ -285,6 +304,48 @@ function mapLatestTurn(
           },
         }
       : {}),
+  };
+}
+
+/**
+ * Turns that settled before per-turn provenance existed carry NULL columns, and
+ * those map to omitted optional fields rather than nulls so a client can tell
+ * "not recorded" from "recorded as zero".
+ */
+function mapTurnSummary(
+  row: Schema.Schema.Type<typeof ProjectionTurnSummaryDbRowSchema>,
+): OrchestrationTurnSummary {
+  const counts =
+    row.commandCount !== null &&
+    row.toolCallCount !== null &&
+    row.subagentCount !== null &&
+    row.changedFileCount !== null
+      ? {
+          counts: {
+            commandCount: row.commandCount,
+            toolCallCount: row.toolCallCount,
+            subagentCount: row.subagentCount,
+            changedFileCount: row.changedFileCount,
+          },
+        }
+      : {};
+  return {
+    turnId: row.turnId,
+    state:
+      row.state === "error"
+        ? "error"
+        : row.state === "interrupted"
+          ? "interrupted"
+          : row.state === "completed"
+            ? "completed"
+            : "running",
+    requestedAt: row.requestedAt,
+    startedAt: row.startedAt,
+    completedAt: row.completedAt,
+    assistantMessageId: row.assistantMessageId,
+    ...(row.model === null ? {} : { model: row.model }),
+    ...(row.effort === null ? {} : { effort: row.effort }),
+    ...counts,
   };
 }
 
@@ -679,6 +740,54 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         FROM projection_turns
         WHERE checkpoint_turn_count IS NOT NULL
         ORDER BY thread_id ASC, checkpoint_turn_count ASC
+      `,
+  });
+
+  // Per-thread capped turn history for the full snapshot. The window is applied
+  // per thread so one busy thread cannot starve the others.
+  const listTurnRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionTurnSummaryDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          "threadId",
+          "turnId",
+          state,
+          "requestedAt",
+          "startedAt",
+          "completedAt",
+          "assistantMessageId",
+          model,
+          effort,
+          "commandCount",
+          "toolCallCount",
+          "subagentCount",
+          "changedFileCount"
+        FROM (
+          SELECT
+            thread_id AS "threadId",
+            turn_id AS "turnId",
+            state,
+            requested_at AS "requestedAt",
+            started_at AS "startedAt",
+            completed_at AS "completedAt",
+            assistant_message_id AS "assistantMessageId",
+            model,
+            effort,
+            command_count AS "commandCount",
+            tool_call_count AS "toolCallCount",
+            subagent_count AS "subagentCount",
+            changed_file_count AS "changedFileCount",
+            ROW_NUMBER() OVER (
+              PARTITION BY thread_id
+              ORDER BY requested_at DESC, turn_id DESC
+            ) AS "recencyRank"
+          FROM projection_turns
+          WHERE turn_id IS NOT NULL
+        ) AS ranked_turns
+        WHERE "recencyRank" <= ${THREAD_TURN_LIMIT}
+        ORDER BY "threadId" ASC, "requestedAt" ASC, "turnId" ASC
       `,
   });
 
@@ -1101,6 +1210,39 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       `,
   });
 
+  // Most recent THREAD_TURN_LIMIT turns for one thread, returned ascending.
+  // The cap mirrors the activity window: a thread with thousands of turns must
+  // not decode all of them to render a timeline.
+  const listTurnRowsByThread = SqlSchema.findAll({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionTurnSummaryDbRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT * FROM (
+          SELECT
+            thread_id AS "threadId",
+            turn_id AS "turnId",
+            state,
+            requested_at AS "requestedAt",
+            started_at AS "startedAt",
+            completed_at AS "completedAt",
+            assistant_message_id AS "assistantMessageId",
+            model,
+            effort,
+            command_count AS "commandCount",
+            tool_call_count AS "toolCallCount",
+            subagent_count AS "subagentCount",
+            changed_file_count AS "changedFileCount"
+          FROM projection_turns
+          WHERE thread_id = ${threadId}
+            AND turn_id IS NOT NULL
+          ORDER BY requested_at DESC, turn_id DESC
+          LIMIT ${THREAD_TURN_LIMIT}
+        ) AS recent_turns
+        ORDER BY "requestedAt" ASC, "turnId" ASC
+      `,
+  });
+
   const listCheckpointRowsByThread = SqlSchema.findAll({
     Request: ThreadIdLookupInput,
     Result: ProjectionCheckpointDbRowSchema,
@@ -1519,6 +1661,14 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               ),
             ),
           ),
+          listTurnRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getSnapshot:listTurns:query",
+                "ProjectionSnapshotQuery.getSnapshot:listTurns:decodeRows",
+              ),
+            ),
+          ),
           listProjectionStateRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
@@ -1540,6 +1690,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             sessionRows,
             checkpointRows,
             latestTurnRows,
+            turnRows,
             stateRows,
           ]) =>
             Effect.gen(function* () {
@@ -1549,6 +1700,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
               const checkpointsByThread = new Map<string, Array<OrchestrationCheckpointSummary>>();
               const sessionsByThread = new Map<string, OrchestrationSession>();
               const latestTurnByThread = new Map<string, OrchestrationLatestTurn>();
+              const turnsByThread = new Map<string, Array<OrchestrationTurnSummary>>();
 
               let updatedAt: string | null = null;
 
@@ -1622,6 +1774,12 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                   completedAt: row.completedAt,
                 });
                 checkpointsByThread.set(row.threadId, threadCheckpoints);
+              }
+
+              for (const row of turnRows) {
+                const threadTurns = turnsByThread.get(row.threadId) ?? [];
+                threadTurns.push(mapTurnSummary(row));
+                turnsByThread.set(row.threadId, threadTurns);
               }
 
               for (const row of latestTurnRows) {
@@ -1724,6 +1882,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 proposedPlans: proposedPlansByThread.get(row.threadId) ?? [],
                 activities: activitiesByThread.get(row.threadId) ?? [],
                 checkpoints: checkpointsByThread.get(row.threadId) ?? [],
+                turns: turnsByThread.get(row.threadId) ?? [],
                 session: sessionsByThread.get(row.threadId) ?? null,
               }));
 
@@ -2533,6 +2692,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         activityRows,
         pinnedActivityRows,
         checkpointRows,
+        turnRows,
         latestTurnRow,
         sessionRow,
       ] = yield* Effect.all([
@@ -2587,6 +2747,14 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             toPersistenceSqlOrDecodeError(
               "ProjectionSnapshotQuery.getThreadDetailById:listCheckpoints:query",
               "ProjectionSnapshotQuery.getThreadDetailById:listCheckpoints:decodeRows",
+            ),
+          ),
+        ),
+        listTurnRowsByThread({ threadId }).pipe(
+          Effect.mapError(
+            toPersistenceSqlOrDecodeError(
+              "ProjectionSnapshotQuery.getThreadDetailById:listTurns:query",
+              "ProjectionSnapshotQuery.getThreadDetailById:listTurns:decodeRows",
             ),
           ),
         ),
@@ -2688,6 +2856,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           assistantMessageId: row.assistantMessageId,
           completedAt: row.completedAt,
         })),
+        turns: turnRows.map(mapTurnSummary),
         session: Option.isSome(sessionRow) ? mapSessionRow(sessionRow.value) : null,
       };
 

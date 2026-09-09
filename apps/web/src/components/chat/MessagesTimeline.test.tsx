@@ -14,12 +14,6 @@ vi.mock("@legendapp/list/react", async () => {
     renderItem: (args: { item: { id: string } }) => ReactNode;
     ListHeaderComponent?: ReactNode;
     ListFooterComponent?: ReactNode;
-    anchoredEndSpace?: {
-      anchorIndex: number;
-      anchorMaxSize?: number;
-      anchorOffset?: number;
-      onReady?: (info: { anchorIndex: number }) => void;
-    };
     contentInsetEndAdjustment?: number;
     className?: string;
     maintainScrollAtEnd?:
@@ -41,16 +35,9 @@ vi.mock("@legendapp/list/react", async () => {
         };
     ref?: Ref<LegendListRef>;
   }) => {
-    if (props.anchoredEndSpace) {
-      props.anchoredEndSpace.onReady?.({ anchorIndex: props.anchoredEndSpace.anchorIndex });
-    }
     return (
       <div
         data-testid={legendListTestId}
-        data-anchor-index={props.anchoredEndSpace?.anchorIndex}
-        data-anchor-max-size={props.anchoredEndSpace?.anchorMaxSize}
-        data-anchor-offset={props.anchoredEndSpace?.anchorOffset}
-        data-anchor-on-ready={Boolean(props.anchoredEndSpace?.onReady)}
         data-content-inset-end={props.contentInsetEndAdjustment}
         data-class-name={props.className}
         data-maintain-scroll-at-end={props.maintainScrollAtEnd ? "enabled" : undefined}
@@ -194,8 +181,6 @@ function buildProps() {
     resolvedTheme: "light" as const,
     timestampFormat: "locale" as const,
     workspaceRoot: undefined,
-    anchorMessageId: null,
-    onAnchorReady: () => {},
     contentInsetEndAdjustment: 0,
     liveFollowEnabled: true,
     onIsAtEndChange: () => {},
@@ -491,74 +476,6 @@ describe("MessagesTimeline", () => {
     expect(resolveTimelineMinimapInteractiveWidth(40, true)).toBe("22rem");
   });
 
-  it("anchors the first user message using its measured height", () => {
-    const onAnchorReady = vi.fn();
-    const firstEntry = {
-      ...buildUserTimelineEntry("First prompt."),
-      message: {
-        ...buildUserTimelineEntry("First prompt.").message,
-        attachments: [
-          {
-            type: "image" as const,
-            id: "attachment-1",
-            name: "screenshot.png",
-            mimeType: "image/png",
-            sizeBytes: 1,
-            previewUrl: "data:image/png;base64,iVBORw0KGgo=",
-          },
-        ],
-      },
-    };
-    const markup = renderToStaticMarkup(
-      <MessagesTimeline
-        {...buildProps()}
-        anchorMessageId={firstEntry.message.id}
-        onAnchorReady={onAnchorReady}
-        contentInsetEndAdjustment={144}
-        timelineEntries={[firstEntry]}
-      />,
-    );
-
-    expect(markup).toContain('data-anchor-index="0"');
-    expect(markup).toContain('data-anchor-offset="16"');
-    expect(markup).toContain('data-anchor-on-ready="true"');
-    expect(markup).not.toContain("data-anchor-max-size=");
-    expect(markup).toContain('data-content-inset-end="144"');
-    expect(markup).toContain("[overflow-anchor:none]");
-    expect(markup).not.toContain('data-maintain-scroll-at-end="enabled"');
-    expect(markup).toContain('data-maintain-visible-content-position="object"');
-    expect(markup).toContain('data-maintain-visible-content-position-data="true"');
-    expect(markup).toContain('data-maintain-visible-content-position-size="true"');
-    expect(markup).toContain('data-maintain-visible-content-position-restore="true"');
-    expect(onAnchorReady).toHaveBeenCalledOnce();
-    expect(onAnchorReady).toHaveBeenCalledWith(firstEntry.message.id, 0);
-  });
-
-  it("does not reserve end space for a follow-up user message", () => {
-    const onAnchorReady = vi.fn();
-    const firstEntry = buildUserTimelineEntry("First prompt.");
-    const secondEntry = {
-      ...buildUserTimelineEntry("Newest prompt."),
-      id: "entry-2",
-      message: {
-        ...buildUserTimelineEntry("Newest prompt.").message,
-        id: MessageId.make("message-2"),
-      },
-    };
-    const markup = renderToStaticMarkup(
-      <MessagesTimeline
-        {...buildProps()}
-        anchorMessageId={secondEntry.message.id}
-        onAnchorReady={onAnchorReady}
-        timelineEntries={[firstEntry, secondEntry]}
-      />,
-    );
-
-    expect(markup).not.toContain("data-anchor-index=");
-    expect(markup).toContain('data-maintain-scroll-at-end="enabled"');
-    expect(onAnchorReady).not.toHaveBeenCalled();
-  });
-
   it("renders generic attachments as download links instead of image previews", () => {
     const entry = {
       ...buildUserTimelineEntry("Read the report."),
@@ -706,50 +623,7 @@ describe("MessagesTimeline", () => {
     expect(markup).not.toContain("href=");
   });
 
-  it("keeps reserved end space when tool work starts while reading history", () => {
-    const turnId = TurnId.make("turn-with-active-tool");
-    const firstEntry = buildUserTimelineEntry("Run the command.");
-    const markup = renderToStaticMarkup(
-      <MessagesTimeline
-        {...buildProps()}
-        isWorking
-        activeTurnStartedAt={MESSAGE_CREATED_AT}
-        latestTurn={{
-          turnId,
-          state: "running",
-          startedAt: MESSAGE_CREATED_AT,
-          completedAt: null,
-        }}
-        runningTurnId={turnId}
-        anchorMessageId={firstEntry.message.id}
-        liveFollowEnabled={false}
-        timelineEntries={[
-          firstEntry,
-          {
-            id: "entry-active-tool",
-            kind: "work",
-            createdAt: MESSAGE_CREATED_AT,
-            entry: {
-              id: "work-active-tool",
-              createdAt: MESSAGE_CREATED_AT,
-              turnId,
-              toolCallId: "call-active-tool",
-              label: "Run command",
-              tone: "tool",
-              itemType: "command_execution",
-              command: "git status",
-              toolLifecycleStatus: "inProgress",
-            },
-          },
-        ]}
-      />,
-    );
-
-    expect(markup).toContain('data-anchor-index="0"');
-    expect(markup).not.toContain('data-maintain-scroll-at-end="enabled"');
-  });
-
-  it("hands end-following back to the list once the send anchor is released", () => {
+  it("lets live follow alone decide whether the list pins to the end", () => {
     const firstEntry = buildUserTimelineEntry("First prompt.");
     const secondEntry = {
       ...buildUserTimelineEntry("Newest prompt."),
@@ -761,37 +635,19 @@ describe("MessagesTimeline", () => {
     };
     const timelineEntries = [firstEntry, secondEntry];
 
-    // While the send anchor holds the end space open, ChatView owns streaming
-    // scrolls and LegendList must not re-pin behind it.
+    // Sending follows the newest line straight away: nothing holds end space
+    // open any more, so LegendList owns end-following from the first token.
     expect(
       renderToStaticMarkup(
-        <MessagesTimeline
-          {...buildProps()}
-          anchorMessageId={firstEntry.message.id}
-          timelineEntries={timelineEntries}
-        />,
-      ),
-    ).not.toContain('data-maintain-scroll-at-end="enabled"');
-
-    // Dropping the anchor is what actually gives end-following back, so
-    // returning to the live edge has to release it — re-enabling live follow
-    // alone leaves nothing pinned to the stream.
-    expect(
-      renderToStaticMarkup(
-        <MessagesTimeline
-          {...buildProps()}
-          anchorMessageId={null}
-          timelineEntries={timelineEntries}
-        />,
+        <MessagesTimeline {...buildProps()} timelineEntries={timelineEntries} />,
       ),
     ).toContain('data-maintain-scroll-at-end="enabled"');
 
-    // Reading history still wins over both.
+    // Reading history still wins.
     expect(
       renderToStaticMarkup(
         <MessagesTimeline
           {...buildProps()}
-          anchorMessageId={null}
           liveFollowEnabled={false}
           timelineEntries={timelineEntries}
         />,
@@ -1496,5 +1352,605 @@ describe("MessagesTimeline", () => {
 
     expect(markup).toContain("lucide-circle-alert");
     expect(markup).toContain("text-destructive");
+  });
+
+  // -------------------------------------------------------------------------
+  // Stamped turn records reaching the derivation (AC-05 / AC-07 / AC-09)
+  // -------------------------------------------------------------------------
+
+  describe("stamped turn records", () => {
+    const STAMPED_TURN_ID = TurnId.make("turn-stamped");
+
+    /**
+     * A turn whose activity rows have aged out of the retained window. Only a
+     * server stamp can describe its work; anything derived from the two
+     * surviving entries would undercount.
+     */
+    function buildAgedOutTurnEntries() {
+      const assistantEntry = buildAssistantTimelineEntry("All done.");
+      return [
+        {
+          id: "aged-work-entry",
+          kind: "work" as const,
+          createdAt: "2026-03-17T19:12:22.000Z",
+          entry: {
+            id: "aged-work",
+            createdAt: "2026-03-17T19:12:22.000Z",
+            turnId: STAMPED_TURN_ID,
+            label: "Ran command",
+            tone: "tool" as const,
+            // Countable on purpose: without it the aged-out assertion below
+            // would pass whether or not the retention gate is wired.
+            itemType: "command_execution" as const,
+            toolLifecycleStatus: "completed" as const,
+          },
+        },
+        {
+          ...assistantEntry,
+          message: { ...assistantEntry.message, turnId: STAMPED_TURN_ID },
+        },
+      ];
+    }
+
+    it("renders server-stamped counts for a turn whose activities aged out", () => {
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          latestTurn={{
+            turnId: STAMPED_TURN_ID,
+            state: "completed",
+            startedAt: "2026-03-17T19:12:20.000Z",
+            completedAt: "2026-03-17T19:12:28.000Z",
+          }}
+          turns={[
+            {
+              turnId: STAMPED_TURN_ID,
+              state: "completed",
+              startedAt: "2026-03-17T19:12:20.000Z",
+              completedAt: "2026-03-17T19:12:28.000Z",
+              counts: {
+                commandCount: 7,
+                toolCallCount: 4,
+                subagentCount: 2,
+                changedFileCount: 3,
+              },
+            },
+          ]}
+          oldestRetainedActivityAt="2026-03-17T19:12:21.000Z"
+          timelineEntries={buildAgedOutTurnEntries()}
+        />,
+      );
+
+      // Stamped totals, not the single surviving activity row.
+      expect(markup).toContain("7 Commands");
+      expect(markup).toContain("4 Tool Calls");
+      expect(markup).toContain("2 Subagents");
+    });
+
+    it("omits counts for an aged-out turn that carries no stamp", () => {
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          latestTurn={{
+            turnId: STAMPED_TURN_ID,
+            state: "completed",
+            startedAt: "2026-03-17T19:12:20.000Z",
+            completedAt: "2026-03-17T19:12:28.000Z",
+          }}
+          // A record without counts: the turn settled before per-turn
+          // provenance existed, so nothing was ever stamped for it.
+          turns={[
+            {
+              turnId: STAMPED_TURN_ID,
+              state: "completed",
+              startedAt: "2026-03-17T19:12:20.000Z",
+              completedAt: "2026-03-17T19:12:28.000Z",
+            },
+          ]}
+          // The turn began before the oldest row the thread still retains.
+          oldestRetainedActivityAt="2026-03-17T19:12:21.000Z"
+          timelineEntries={buildAgedOutTurnEntries()}
+        />,
+      );
+
+      // Undercounting is worse than silence.
+      expect(markup).toContain("Worked for 8.0s");
+      expect(markup).not.toContain("Command");
+    });
+
+    it("styles a turn as interrupted from its own record, not the latest turn", () => {
+      const olderTurnId = TurnId.make("turn-older-interrupted");
+      const assistantEntry = buildAssistantTimelineEntry("Stopped there.");
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          latestTurn={{
+            turnId: TurnId.make("turn-newer"),
+            state: "completed",
+            startedAt: "2026-03-17T19:13:20.000Z",
+            completedAt: "2026-03-17T19:13:28.000Z",
+          }}
+          turns={[
+            {
+              turnId: olderTurnId,
+              state: "interrupted",
+              startedAt: "2026-03-17T19:12:20.000Z",
+              completedAt: "2026-03-17T19:12:28.000Z",
+            },
+          ]}
+          timelineEntries={[
+            {
+              id: "older-work-entry",
+              kind: "work",
+              createdAt: "2026-03-17T19:12:22.000Z",
+              entry: {
+                id: "older-work",
+                createdAt: "2026-03-17T19:12:22.000Z",
+                turnId: olderTurnId,
+                label: "Ran command",
+                tone: "tool",
+                toolLifecycleStatus: "completed",
+              },
+            },
+            {
+              ...assistantEntry,
+              message: {
+                ...assistantEntry.message,
+                turnId: olderTurnId,
+                updatedAt: "2026-03-17T19:12:28.000Z",
+              },
+            },
+          ]}
+        />,
+      );
+
+      expect(markup).toContain("You stopped after");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // AC-07 — subfold labels inside an expanded turn fold
+  // -------------------------------------------------------------------------
+
+  describe("turn fold subfolds", () => {
+    it("renders subfold labels once the turn fold is expanded", async () => {
+      const { deriveMessagesTimelineRows } = await import("./MessagesTimeline.logic");
+      const turnId = TurnId.make("turn-subfolds");
+      const assistantEntry = buildAssistantTimelineEntry("Finished.");
+
+      const timelineEntries = [
+        {
+          id: "sub-work-1",
+          kind: "work" as const,
+          createdAt: "2026-03-17T19:12:21.000Z",
+          entry: {
+            id: "sub-work-entry-1",
+            createdAt: "2026-03-17T19:12:21.000Z",
+            turnId,
+            label: "Ran command",
+            tone: "tool" as const,
+            itemType: "command_execution" as const,
+            toolLifecycleStatus: "completed" as const,
+          },
+        },
+        {
+          id: "sub-assistant-mid",
+          kind: "message" as const,
+          createdAt: "2026-03-17T19:12:22.000Z",
+          message: {
+            ...assistantEntry.message,
+            id: MessageId.make("message-mid"),
+            turnId,
+            text: "Thinking out loud.",
+          },
+        },
+        {
+          id: "sub-work-2",
+          kind: "work" as const,
+          createdAt: "2026-03-17T19:12:23.000Z",
+          entry: {
+            id: "sub-work-entry-2",
+            createdAt: "2026-03-17T19:12:23.000Z",
+            turnId,
+            label: "Read file",
+            tone: "tool" as const,
+            itemType: "file_change" as const,
+            toolLifecycleStatus: "completed" as const,
+          },
+        },
+        {
+          ...assistantEntry,
+          message: {
+            ...assistantEntry.message,
+            turnId,
+            updatedAt: "2026-03-17T19:12:28.000Z",
+          },
+        },
+      ];
+
+      const rows = deriveMessagesTimelineRows({
+        timelineEntries,
+        latestTurn: {
+          turnId,
+          state: "completed",
+          startedAt: "2026-03-17T19:12:20.000Z",
+          completedAt: "2026-03-17T19:12:28.000Z",
+        },
+        expandedTurnIds: new Set([turnId]),
+        isWorking: false,
+        activeTurnStartedAt: null,
+        turnDiffSummaryByAssistantMessageId: new Map(),
+        revertTurnCountByUserMessageId: new Map(),
+      });
+
+      const fold = rows.find((row) => row.kind === "turn-fold");
+      // Guard the fixture: without subfold labels the render assertion below
+      // would pass vacuously.
+      expect(fold?.kind === "turn-fold" && fold.subfoldLabels.length).toBeGreaterThan(0);
+      const expectedLabels =
+        fold?.kind === "turn-fold" ? fold.subfoldLabels : ([] as ReadonlyArray<string>);
+
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          latestTurn={{
+            turnId,
+            state: "completed",
+            startedAt: "2026-03-17T19:12:20.000Z",
+            completedAt: "2026-03-17T19:12:28.000Z",
+          }}
+          initialExpandedTurnIds={new Set([turnId])}
+          timelineEntries={timelineEntries}
+        />,
+      );
+
+      for (const label of expectedLabels) {
+        expect(markup).toContain(label);
+      }
+      expect(markup).toContain("data-timeline-subfold");
+    });
+
+    it("hides subfold labels while the turn fold is collapsed", () => {
+      const turnId = TurnId.make("turn-subfolds-collapsed");
+      const assistantEntry = buildAssistantTimelineEntry("Finished.");
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          latestTurn={{
+            turnId,
+            state: "completed",
+            startedAt: "2026-03-17T19:12:20.000Z",
+            completedAt: "2026-03-17T19:12:28.000Z",
+          }}
+          timelineEntries={[
+            {
+              id: "collapsed-work-1",
+              kind: "work",
+              createdAt: "2026-03-17T19:12:21.000Z",
+              entry: {
+                id: "collapsed-work-entry-1",
+                createdAt: "2026-03-17T19:12:21.000Z",
+                turnId,
+                label: "Ran command",
+                tone: "tool",
+                itemType: "command_execution",
+                toolLifecycleStatus: "completed",
+              },
+            },
+            {
+              ...assistantEntry,
+              message: {
+                ...assistantEntry.message,
+                turnId,
+                updatedAt: "2026-03-17T19:12:28.000Z",
+              },
+            },
+          ]}
+        />,
+      );
+
+      expect(markup).not.toContain("data-timeline-subfold");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // AC-10 — three-column tool rows
+  // -------------------------------------------------------------------------
+
+  describe("tool row columns", () => {
+    it("renders the tool name and its description as separate columns", () => {
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          initialExpandedWorkGroupIds={new Set(["work-group:entry-shell"])}
+          timelineEntries={[
+            {
+              id: "entry-shell",
+              kind: "work",
+              createdAt: "2026-03-17T19:12:28.000Z",
+              entry: {
+                id: "work-shell",
+                createdAt: "2026-03-17T19:12:28.000Z",
+                startedAt: "2026-03-17T19:12:27.900Z",
+                label: "Shell command",
+                toolTitle: "Shell command",
+                tone: "tool",
+                itemType: "command_execution",
+                toolLifecycleStatus: "completed",
+                command: "git status --short && git log -5",
+              },
+            },
+          ]}
+        />,
+      );
+
+      // The heading must survive alongside the description rather than being
+      // replaced by it.
+      expect(markup).toContain("Shell command");
+      expect(markup).toContain("git status --short &amp;&amp; git log -5");
+      expect(markup).toContain("data-tool-row-name");
+      expect(markup).toContain("data-tool-row-description");
+    });
+
+    it("right-aligns a settled tool duration in its own column", () => {
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          initialExpandedWorkGroupIds={new Set(["work-group:entry-timed"])}
+          timelineEntries={[
+            {
+              id: "entry-timed",
+              kind: "work",
+              createdAt: "2026-03-17T19:12:30.000Z",
+              entry: {
+                id: "work-timed",
+                createdAt: "2026-03-17T19:12:30.000Z",
+                startedAt: "2026-03-17T19:12:28.000Z",
+                label: "Read file",
+                toolTitle: "Read file",
+                tone: "tool",
+                itemType: "file_change",
+                toolLifecycleStatus: "completed",
+                detail: "/tmp/opencode/pkg/package.json",
+              },
+            },
+          ]}
+        />,
+      );
+
+      const durationMatch = markup.match(
+        /<span class="([^"]*)" data-tool-row-duration="[^"]*">([^<]*)</,
+      );
+      expect(durationMatch).not.toBeNull();
+      // Its own column: never shrinks, so the description truncates first.
+      expect(durationMatch?.[1]).toContain("shrink-0");
+      expect(durationMatch?.[2]).toBe("2.0s");
+    });
+
+    it("keeps an empty duration column for a tool row without a duration", () => {
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          initialExpandedWorkGroupIds={new Set(["work-group:entry-untimed"])}
+          timelineEntries={[
+            {
+              id: "entry-untimed",
+              kind: "work",
+              createdAt: "2026-03-17T19:12:30.000Z",
+              entry: {
+                id: "work-untimed",
+                createdAt: "2026-03-17T19:12:30.000Z",
+                label: "Read file",
+                toolTitle: "Read file",
+                tone: "tool",
+                itemType: "file_change",
+                toolLifecycleStatus: "completed",
+                detail: "/tmp/opencode/pkg/package.json",
+              },
+            },
+          ]}
+        />,
+      );
+
+      // The column stays so the right edge remains a column.
+      const durationMatch = markup.match(
+        /<span class="([^"]*)" data-tool-row-duration="[^"]*">([^<]*)</,
+      );
+      expect(markup).toContain("data-tool-row-duration");
+      expect(durationMatch?.[1]).toContain("shrink-0");
+      expect(durationMatch?.[2] ?? "").toBe("");
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // AC-08 — terminal assistant turn footer
+  // -------------------------------------------------------------------------
+
+  describe("assistant turn footer", () => {
+    const FOOTER_TURN_ID = TurnId.make("turn-footer");
+
+    function buildTerminalAssistantEntries() {
+      const assistantEntry = buildAssistantTimelineEntry("Here is the answer.");
+      return [
+        {
+          ...assistantEntry,
+          message: {
+            ...assistantEntry.message,
+            turnId: FOOTER_TURN_ID,
+            updatedAt: "2026-03-17T19:13:40.000Z",
+          },
+        },
+      ];
+    }
+
+    const settledLatestTurn = {
+      turnId: FOOTER_TURN_ID,
+      state: "completed" as const,
+      startedAt: "2026-03-17T19:12:28.000Z",
+      completedAt: "2026-03-17T19:13:40.000Z",
+    };
+
+    it("renders model, effort, duration and timestamp for a stamped turn", () => {
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          latestTurn={settledLatestTurn}
+          turns={[
+            {
+              ...settledLatestTurn,
+              assistantMessageId: MessageId.make("message-1"),
+              model: "Claude Opus 4.5",
+              effort: "high",
+            },
+          ]}
+          timelineEntries={buildTerminalAssistantEntries()}
+        />,
+      );
+
+      expect(markup).toContain("Claude Opus 4.5");
+      expect(markup).toContain("high");
+      expect(markup).toContain("1m 12s");
+    });
+
+    it("omits effort entirely when the turn records none", () => {
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          latestTurn={settledLatestTurn}
+          turns={[
+            {
+              ...settledLatestTurn,
+              assistantMessageId: MessageId.make("message-1"),
+              model: "GPT-5 Codex",
+            },
+          ]}
+          timelineEntries={buildTerminalAssistantEntries()}
+        />,
+      );
+
+      expect(markup).toContain("GPT-5 Codex");
+      expect(markup).not.toContain("data-turn-footer-effort");
+    });
+
+    it("never renders the literal effort sentinel 'default'", () => {
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          latestTurn={settledLatestTurn}
+          turns={[
+            {
+              ...settledLatestTurn,
+              assistantMessageId: MessageId.make("message-1"),
+              model: "GPT-5 Codex",
+              effort: "default",
+            },
+          ]}
+          timelineEntries={buildTerminalAssistantEntries()}
+        />,
+      );
+
+      const footerMatch = markup.match(/data-turn-footer-effort[^>]*>([^<]*)</);
+      expect(footerMatch).toBeNull();
+      expect(markup).not.toContain(">default<");
+    });
+
+    it("falls back to the plain timestamp footer for a pre-stamp turn", () => {
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          latestTurn={settledLatestTurn}
+          turns={[]}
+          timelineEntries={buildTerminalAssistantEntries()}
+        />,
+      );
+
+      expect(markup).not.toContain("data-turn-footer-model");
+      expect(markup).not.toContain("data-turn-footer-duration");
+      // Today's footer still renders its timestamp.
+      expect(markup).toContain("group-hover/assistant:opacity-100");
+    });
+  });
+});
+
+describe("working status legibility", () => {
+  const runningTurn = (turnId: TurnId) => ({
+    turnId,
+    state: "running" as const,
+    startedAt: MESSAGE_CREATED_AT,
+    completedAt: null,
+  });
+
+  it("names the running tool rather than a generic Thinking label", () => {
+    const turnId = TurnId.make("turn-status");
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        isWorking
+        activeTurnStartedAt={MESSAGE_CREATED_AT}
+        latestTurn={runningTurn(turnId)}
+        runningTurnId={turnId}
+        timelineEntries={[
+          {
+            id: "entry-mcp",
+            kind: "work",
+            createdAt: MESSAGE_CREATED_AT,
+            entry: {
+              id: "work-mcp",
+              createdAt: MESSAGE_CREATED_AT,
+              turnId,
+              toolCallId: "call-mcp",
+              label: "Query",
+              tone: "info",
+              itemType: "mcp_tool_call",
+              toolLifecycleStatus: "inProgress",
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).toContain("Running MCP tool");
+    expect(markup).not.toContain(">Thinking<");
+  });
+
+  it("renders no live indicator once the turn has settled", () => {
+    const turnId = TurnId.make("turn-settled");
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        isWorking={false}
+        activeTurnStartedAt={null}
+        latestTurn={{
+          turnId,
+          state: "completed",
+          startedAt: MESSAGE_CREATED_AT,
+          completedAt: MESSAGE_CREATED_AT,
+        }}
+        runningTurnId={null}
+        timelineEntries={[
+          {
+            id: "entry-settled",
+            kind: "work",
+            createdAt: MESSAGE_CREATED_AT,
+            entry: {
+              id: "work-settled",
+              createdAt: MESSAGE_CREATED_AT,
+              turnId,
+              toolCallId: "call-settled",
+              label: "Run tests",
+              tone: "tool",
+              itemType: "command_execution",
+              command: "pnpm test",
+              // A settled part carrying no lifecycle status and no completion
+              // timestamp: live-ness must come from the turn phase, not from the
+              // absent timestamp.
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).not.toContain("live-activity-focus");
+    expect(markup).not.toContain("Working for");
   });
 });

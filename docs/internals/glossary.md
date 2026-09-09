@@ -43,6 +43,18 @@ A single user-to-assistant work cycle inside a thread. It starts with user input
 
 A user-visible log item attached to a thread. In [the contracts][1], activities cover important non-message events like approvals, tool actions, and failures. They are projected into thread state in [projector.ts][4].
 
+#### Turn provenance
+
+What ran a turn: the resolved model and reasoning effort, captured from `turn.started` when the turn begins and stored on the turn rather than the thread. Thread-level `modelSelection` is overwritten every turn, so reading it at render time would relabel history. See [turn-provenance.md](./turn-provenance.md).
+
+#### Turn work counts
+
+Commands, tool calls, subagents, and changed files performed by a turn, computed once when the turn settles and stored with it. Stamped rather than derived because activities are capped per thread, so an older turn can no longer be counted accurately. Classification is shared between server and client by `packages/shared/src/turnWorkCounts.ts`. See [turn-provenance.md](./turn-provenance.md).
+
+#### Turn fold
+
+The collapsed summary row standing in for a settled turn's intermediate work, labelled with the duration and the turn's work counts. Contiguous work between assistant messages inside an expanded fold groups into subfolds, whose counts sum to the turn total.
+
 ### Orchestration
 
 Orchestration is the server-side domain layer that turns runtime activity into stable app state. The main entry point is [OrchestrationEngine.ts][7], with core logic in [decider.ts][8] and [projector.ts][4].

@@ -67,6 +67,12 @@ export type WorkLogToolLifecycleStatus =
 export interface WorkLogEntry {
   id: string;
   createdAt: string;
+  /**
+   * When the tool's lifecycle first appeared. `createdAt` drifts to the latest
+   * lifecycle row as updates collapse into one entry, so the original start is
+   * kept separately to leave a per-tool duration derivable.
+   */
+  startedAt?: string;
   turnId?: TurnId | null;
   /** Stable provider identity across in-progress and completed lifecycle updates. */
   toolCallId?: string;
@@ -1163,9 +1169,13 @@ function mergeDerivedWorkLogEntries(
   const toolCallId = next.toolCallId ?? previous.toolCallId;
   const toolLifecycleStatus = next.toolLifecycleStatus ?? previous.toolLifecycleStatus;
   const toolData = next.toolData ?? previous.toolData;
+  // `...next` moves createdAt to the newest lifecycle row, so the first row's
+  // timestamp is the only record of when the tool actually started.
+  const startedAt = previous.startedAt ?? previous.createdAt;
   return {
     ...previous,
     ...next,
+    startedAt,
     ...(detail ? { detail } : {}),
     ...(command ? { command } : {}),
     ...(rawCommand ? { rawCommand } : {}),

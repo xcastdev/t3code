@@ -420,6 +420,37 @@ export const OrchestrationLatestTurn = Schema.Struct({
 });
 export type OrchestrationLatestTurn = typeof OrchestrationLatestTurn.Type;
 
+/**
+ * Work a turn performed, stamped when the turn settles. Counts are authoritative
+ * history: resolving them later against retained activities would under-report
+ * any turn whose rows have aged out.
+ */
+export const OrchestrationTurnCounts = Schema.Struct({
+  commandCount: NonNegativeInt,
+  toolCallCount: NonNegativeInt,
+  subagentCount: NonNegativeInt,
+  changedFileCount: NonNegativeInt,
+});
+export type OrchestrationTurnCounts = typeof OrchestrationTurnCounts.Type;
+
+/**
+ * One turn's record: what ran it and what it did. `model`, `effort`, and
+ * `counts` are optional because turns that settled before per-turn provenance
+ * existed carry none of them, and are never backfilled.
+ */
+export const OrchestrationTurnSummary = Schema.Struct({
+  turnId: TurnId,
+  state: OrchestrationLatestTurnState,
+  requestedAt: IsoDateTime,
+  startedAt: Schema.NullOr(IsoDateTime),
+  completedAt: Schema.NullOr(IsoDateTime),
+  assistantMessageId: Schema.NullOr(MessageId),
+  model: Schema.optional(TrimmedNonEmptyString),
+  effort: Schema.optional(TrimmedNonEmptyString),
+  counts: Schema.optional(OrchestrationTurnCounts),
+});
+export type OrchestrationTurnSummary = typeof OrchestrationTurnSummary.Type;
+
 export const ThreadTitleRegeneration = Schema.Struct({
   requestId: CommandId,
   startedAt: IsoDateTime,
@@ -483,6 +514,9 @@ export const OrchestrationThread = Schema.Struct({
   ),
   activities: Schema.Array(OrchestrationThreadActivity),
   checkpoints: Schema.Array(OrchestrationCheckpointSummary),
+  // Per-turn history. Optional so payloads from pre-provenance servers, and
+  // snapshots cached before this change, still decode.
+  turns: Schema.optional(Schema.Array(OrchestrationTurnSummary)),
   session: Schema.NullOr(OrchestrationSession),
 });
 export type OrchestrationThread = typeof OrchestrationThread.Type;
@@ -1035,11 +1069,24 @@ export const ClientOrchestrationCommand = Schema.Union([
 ]);
 export type ClientOrchestrationCommand = typeof ClientOrchestrationCommand.Type;
 
+/**
+ * Provenance for the turn a session set is opening. Carried alongside the
+ * session rather than inside it: the session is current state and is
+ * overwritten on every status change, while this describes one turn's history.
+ */
+export const OrchestrationTurnProvenance = Schema.Struct({
+  turnId: TurnId,
+  model: Schema.optional(TrimmedNonEmptyString),
+  effort: Schema.optional(TrimmedNonEmptyString),
+});
+export type OrchestrationTurnProvenance = typeof OrchestrationTurnProvenance.Type;
+
 const ThreadSessionSetCommand = Schema.Struct({
   type: Schema.Literal("thread.session.set"),
   commandId: CommandId,
   threadId: ThreadId,
   session: OrchestrationSession,
+  turnProvenance: Schema.optional(OrchestrationTurnProvenance),
   createdAt: IsoDateTime,
 });
 
@@ -1369,6 +1416,10 @@ export const ThreadSessionStopRequestedPayload = Schema.Struct({
 export const ThreadSessionSetPayload = Schema.Struct({
   threadId: ThreadId,
   session: OrchestrationSession,
+  // Present only on the session set that opens a turn, and only when the
+  // provider reported it. Stored events written before this field existed
+  // decode unchanged.
+  turnProvenance: Schema.optional(OrchestrationTurnProvenance),
 });
 
 export const ThreadProposedPlanUpsertedPayload = Schema.Struct({

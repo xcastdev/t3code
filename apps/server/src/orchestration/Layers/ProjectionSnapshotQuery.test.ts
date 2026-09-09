@@ -380,6 +380,16 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
               completedAt: "2026-02-24T00:00:08.000Z",
             },
           ],
+          turns: [
+            {
+              turnId: asTurnId("turn-1"),
+              state: "completed",
+              requestedAt: "2026-02-24T00:00:08.000Z",
+              startedAt: "2026-02-24T00:00:08.000Z",
+              completedAt: "2026-02-24T00:00:08.000Z",
+              assistantMessageId: asMessageId("message-1"),
+            },
+          ],
           session: {
             threadId: ThreadId.make("thread-1"),
             status: "running",
@@ -2473,6 +2483,239 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
         assert.equal(snapshot.value.page?.hasMore, false);
         assert.equal(snapshot.value.page?.beforeCursor, null);
       }
+    }),
+  );
+});
+
+projectionSnapshotLayer("ProjectionSnapshotQuery turns", (it) => {
+  const seedThread = (threadId: string) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`DELETE FROM projection_projects`;
+      yield* sql`DELETE FROM projection_threads`;
+      yield* sql`DELETE FROM projection_turns`;
+      yield* sql`DELETE FROM projection_state`;
+
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id, title, workspace_root, default_model_selection_json,
+          scripts_json, created_at, updated_at, deleted_at
+        )
+        VALUES (
+          'project-turns', 'Turns project', '/tmp/turns', NULL, '[]',
+          '2026-03-01T00:00:00.000Z', '2026-03-01T00:00:00.000Z', NULL
+        )
+      `;
+
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id, project_id, title, model_selection_json, runtime_mode,
+          interaction_mode, branch, worktree_path, linked_pull_request_json,
+          latest_turn_id, latest_user_message_at, pending_approval_count,
+          pending_user_input_count, has_actionable_proposed_plan, pinned_at,
+          pin_order_key, created_at, updated_at, deleted_at
+        )
+        VALUES (
+          ${threadId}, 'project-turns', 'Turns thread',
+          '{"provider":"codex","model":"gpt-5-codex"}', 'full-access',
+          'default', NULL, NULL, NULL, NULL, NULL, 0, 0, 0, NULL, NULL,
+          '2026-03-01T00:00:00.000Z', '2026-03-01T00:00:00.000Z', NULL
+        )
+      `;
+
+      let sequence = 1;
+      for (const projector of Object.values(ORCHESTRATION_PROJECTOR_NAMES)) {
+        yield* sql`
+          INSERT INTO projection_state (projector, last_applied_sequence, updated_at)
+          VALUES (${projector}, ${sequence}, '2026-03-01T00:00:00.000Z')
+        `;
+        sequence += 1;
+      }
+    });
+
+  const insertTurn = (input: {
+    readonly threadId: string;
+    readonly turnId: string;
+    readonly requestedAt: string;
+    readonly state?: string;
+    readonly model?: string | null;
+    readonly effort?: string | null;
+    readonly counts?: {
+      readonly commandCount: number;
+      readonly toolCallCount: number;
+      readonly subagentCount: number;
+      readonly changedFileCount: number;
+    } | null;
+  }) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const counts = input.counts ?? null;
+      yield* sql`
+        INSERT INTO projection_turns (
+          thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id,
+          source_proposed_plan_id, assistant_message_id, state, requested_at,
+          started_at, completed_at, checkpoint_turn_count, checkpoint_ref,
+          checkpoint_status, checkpoint_files_json, model, effort,
+          command_count, tool_call_count, subagent_count, changed_file_count
+        )
+        VALUES (
+          ${input.threadId}, ${input.turnId}, NULL, NULL, NULL, NULL,
+          ${input.state ?? "completed"}, ${input.requestedAt}, ${input.requestedAt},
+          ${input.requestedAt}, NULL, NULL, NULL, '[]',
+          ${input.model ?? null}, ${input.effort ?? null},
+          ${counts === null ? null : counts.commandCount},
+          ${counts === null ? null : counts.toolCallCount},
+          ${counts === null ? null : counts.subagentCount},
+          ${counts === null ? null : counts.changedFileCount}
+        )
+      `;
+    });
+
+  it.effect("returns per-turn rows with provenance and omits it for pre-stamp turns", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const threadId = "thread-turns-provenance";
+
+      yield* seedThread(threadId);
+      yield* insertTurn({
+        threadId,
+        turnId: "turn-old",
+        requestedAt: "2026-03-01T00:00:01.000Z",
+      });
+      yield* insertTurn({
+        threadId,
+        turnId: "turn-new",
+        requestedAt: "2026-03-01T00:00:02.000Z",
+        model: "claude-opus-4",
+        effort: "high",
+        counts: {
+          commandCount: 3,
+          toolCallCount: 4,
+          subagentCount: 1,
+          changedFileCount: 2,
+        },
+      });
+
+      const detail = yield* snapshotQuery.getThreadDetailById(ThreadId.make(threadId));
+      assert.equal(detail._tag, "Some");
+      if (detail._tag !== "Some") {
+        return;
+      }
+      const turns = detail.value.turns ?? [];
+      assert.deepEqual(
+        turns.map((turn) => turn.turnId),
+        ["turn-old", "turn-new"],
+      );
+
+      // Absent, not present-and-undefined: the contract field is optional, and
+      // an explicit undefined would survive the schema but change the wire shape.
+      const preStamp = turns[0];
+      assert.isFalse(Object.hasOwn(preStamp ?? {}, "model"));
+      assert.isFalse(Object.hasOwn(preStamp ?? {}, "effort"));
+      assert.isFalse(Object.hasOwn(preStamp ?? {}, "counts"));
+
+      const stamped = turns[1];
+      assert.strictEqual(stamped?.model, "claude-opus-4");
+      assert.strictEqual(stamped?.effort, "high");
+      assert.deepEqual(stamped?.counts, {
+        commandCount: 3,
+        toolCallCount: 4,
+        subagentCount: 1,
+        changedFileCount: 2,
+      });
+    }),
+  );
+
+  it.effect("exposes turns on the full snapshot as well as thread detail", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const threadId = "thread-turns-snapshot";
+
+      yield* seedThread(threadId);
+      yield* insertTurn({
+        threadId,
+        turnId: "turn-snap-1",
+        requestedAt: "2026-03-01T00:00:01.000Z",
+        model: "gpt-5-codex",
+      });
+
+      const readModel = yield* snapshotQuery.getSnapshot();
+      const thread = readModel.threads.find((candidate) => candidate.id === threadId);
+      assert.isDefined(thread);
+      assert.deepEqual(
+        (thread?.turns ?? []).map((turn) => turn.turnId),
+        ["turn-snap-1"],
+      );
+      assert.strictEqual(thread?.turns?.[0]?.model, "gpt-5-codex");
+    }),
+  );
+
+  it.effect("caps turns at the most recent 500 and returns them ascending", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const threadId = "thread-turns-cap";
+
+      yield* seedThread(threadId);
+      // 520 turns, requested one second apart, inserted newest-first so the
+      // result order cannot come from insertion order.
+      const total = 520;
+      for (let index = total - 1; index >= 0; index -= 1) {
+        yield* insertTurn({
+          threadId,
+          turnId: `turn-cap-${String(index).padStart(4, "0")}`,
+          requestedAt: `2026-03-01T00:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`,
+        });
+      }
+
+      const detail = yield* snapshotQuery.getThreadDetailById(ThreadId.make(threadId));
+      assert.equal(detail._tag, "Some");
+      if (detail._tag !== "Some") {
+        return;
+      }
+      const turns = detail.value.turns ?? [];
+      assert.strictEqual(turns.length, 500);
+      // The oldest 20 are dropped, and the retained window reads ascending.
+      assert.strictEqual(turns[0]?.turnId, "turn-cap-0020");
+      assert.strictEqual(turns.at(-1)?.turnId, "turn-cap-0519");
+      const requestedAts = turns.map((turn) => turn.requestedAt);
+      assert.deepEqual(requestedAts, [...requestedAts].toSorted());
+    }),
+  );
+
+  it.effect("excludes pending placeholder rows that have no turn id", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = "thread-turns-pending";
+
+      yield* seedThread(threadId);
+      yield* insertTurn({
+        threadId,
+        turnId: "turn-real",
+        requestedAt: "2026-03-01T00:00:02.000Z",
+      });
+      yield* sql`
+        INSERT INTO projection_turns (
+          thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id,
+          source_proposed_plan_id, assistant_message_id, state, requested_at,
+          started_at, completed_at, checkpoint_turn_count, checkpoint_ref,
+          checkpoint_status, checkpoint_files_json
+        )
+        VALUES (
+          ${threadId}, NULL, 'message-pending', NULL, NULL, NULL, 'pending',
+          '2026-03-01T00:00:03.000Z', NULL, NULL, NULL, NULL, NULL, '[]'
+        )
+      `;
+
+      const detail = yield* snapshotQuery.getThreadDetailById(ThreadId.make(threadId));
+      assert.equal(detail._tag, "Some");
+      if (detail._tag !== "Some") {
+        return;
+      }
+      assert.deepEqual(
+        (detail.value.turns ?? []).map((turn) => turn.turnId),
+        ["turn-real"],
+      );
     }),
   );
 });

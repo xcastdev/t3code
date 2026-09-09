@@ -1718,10 +1718,23 @@ const make = Effect.gen(function* () {
             );
           }
 
+          // `turn.started` is the only event carrying what ran the turn, and
+          // the session is current state rather than history — so the model and
+          // effort ride alongside it as turn-scoped provenance.
+          const turnProvenance =
+            event.type === "turn.started" && nextActiveTurnId !== null
+              ? {
+                  turnId: nextActiveTurnId,
+                  ...(event.payload?.model === undefined ? {} : { model: event.payload.model }),
+                  ...(event.payload?.effort === undefined ? {} : { effort: event.payload.effort }),
+                }
+              : undefined;
+
           yield* orchestrationEngine.dispatch({
             type: "thread.session.set",
             commandId: yield* providerCommandId(event, "thread-session-set"),
             threadId: thread.id,
+            ...(turnProvenance === undefined ? {} : { turnProvenance }),
             session: {
               threadId: thread.id,
               status,

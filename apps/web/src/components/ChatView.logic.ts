@@ -2,7 +2,6 @@ import {
   type EnvironmentId,
   isProviderDriverKind,
   ProjectId,
-  type MessageId,
   type ModelSelection,
   type ProviderInteractionMode,
   type ProviderDriverKind,
@@ -35,7 +34,7 @@ import {
 } from "../lib/terminalContext";
 import type { DraftThreadEnvMode } from "../composerDraftStore";
 import type { ComposerSubmissionIntent } from "../composer-logic";
-import type { TimelineEntry } from "../session-logic";
+import type { TimelineScrollMode } from "./chat/timelineScrollAnchoring";
 
 export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "t3code:last-invoked-script-by-project";
 export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
@@ -65,29 +64,17 @@ export function shouldDockDraftHeroForSubmission(input: {
   );
 }
 
-export function shouldReleaseTimelineAnchorForToolActivity(input: {
-  anchorMessageId: MessageId | null;
-  liveFollowEnabled: boolean;
-  runningTurnId: TurnId | null;
-  timelineEntries: ReadonlyArray<TimelineEntry>;
-}): boolean {
-  if (input.anchorMessageId === null || !input.liveFollowEnabled || input.runningTurnId === null) {
-    return false;
-  }
-
-  return input.timelineEntries.some((timelineEntry) => {
-    if (timelineEntry.kind !== "work" || timelineEntry.entry.turnId !== input.runningTurnId) {
-      return false;
-    }
-
-    const entry = timelineEntry.entry;
-    return (
-      entry.tone === "tool" ||
-      entry.itemType !== undefined ||
-      entry.requestKind !== undefined ||
-      (entry.command?.trim().length ?? 0) > 0
-    );
-  });
+/**
+ * The timeline follows the newest line from the moment a message is sent, for
+ * both the first message of a thread and every follow-up. T3 previously pinned
+ * a freshly sent message near the top with reserved space below it, but tool
+ * output pushed past that framing almost immediately, so the terminal model is
+ * what the product actually wants.
+ */
+export function resolveTimelineScrollModeForSend(_input: {
+  isFirstMessageInThread: boolean;
+}): TimelineScrollMode {
+  return "following-end";
 }
 
 export function resolveDraftHeroState(input: {

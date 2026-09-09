@@ -1682,3 +1682,137 @@ it.effect("flushes managed native logs when the adapter layer shuts down", () =>
     }
   }),
 );
+
+// AC-01: `turn.started` reports the resolved model and effort. Effort resolves
+// as explicit `reasoningEffort` first, then the selected model's catalog
+// `defaultReasoningEffort` supplied by the driver, and is omitted when neither
+// produces a value.
+const turnStartedRuntimeFactory = makeRuntimeFactory();
+const MODEL_DEFAULT_EFFORTS: Record<string, string> = {
+  "gpt-5.6-sol": "medium",
+  "gpt-5.3-codex": "high",
+};
+const turnStartedLayer = it.layer(
+  Layer.effect(
+    CodexAdapter,
+    Effect.gen(function* () {
+      const codexConfig = decodeCodexSettings({});
+      return yield* makeCodexAdapter(codexConfig, {
+        makeRuntime: turnStartedRuntimeFactory.factory,
+        resolveDefaultReasoningEffort: (model) => MODEL_DEFAULT_EFFORTS[model],
+      });
+    }),
+  ).pipe(
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  ),
+);
+
+/**
+ * Starts a session, optionally sends a turn, then emits `turn/started` and
+ * returns the resulting `turn.started` payload. The collector is forked before
+ * the emit so the assertion waits on the event itself rather than a timer.
+ */
+function collectTurnStartedPayload(input: {
+  readonly threadId: string;
+  readonly startSelection?: ReturnType<typeof createModelSelection>;
+  readonly sendSelection?: ReturnType<typeof createModelSelection>;
+  readonly sendTurn: boolean;
+}) {
+  return Effect.gen(function* () {
+    const adapter = yield* CodexAdapter;
+    yield* adapter.startSession({
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId(input.threadId),
+      ...(input.startSelection ? { modelSelection: input.startSelection } : {}),
+      runtimeMode: "full-access",
+    });
+    const runtime = turnStartedRuntimeFactory.lastRuntime;
+    NodeAssert.ok(runtime);
+
+    if (input.sendTurn) {
+      yield* adapter.sendTurn({
+        threadId: asThreadId(input.threadId),
+        input: "hello",
+        ...(input.sendSelection ? { modelSelection: input.sendSelection } : {}),
+      });
+    }
+
+    const eventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+    yield* runtime.emit({
+      id: asEventId(`evt-turn-started-${input.threadId}`),
+      kind: "notification",
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      method: "turn/started",
+      threadId: asThreadId(input.threadId),
+      turnId: asTurnId("turn-1"),
+    } satisfies ProviderEvent);
+
+    const event = Option.getOrUndefined(yield* Fiber.join(eventFiber));
+    NodeAssert.ok(event);
+    NodeAssert.equal(event.type, "turn.started");
+    return event.payload as Record<string, unknown>;
+  });
+}
+
+turnStartedLayer("CodexAdapterLive turn.started model/effort", (it) => {
+  it.effect("reports the explicit reasoning effort selected for the turn", () =>
+    Effect.gen(function* () {
+      const payload = yield* collectTurnStartedPayload({
+        threadId: "thread-effort-explicit",
+        sendTurn: true,
+        sendSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.6-sol", [
+          { id: "reasoningEffort", value: "xhigh" },
+        ]),
+      });
+
+      NodeAssert.equal(payload.model, "gpt-5.6-sol");
+      NodeAssert.equal(payload.effort, "xhigh");
+    }),
+  );
+
+  it.effect("falls back to the model's default reasoning effort when none is selected", () =>
+    Effect.gen(function* () {
+      const payload = yield* collectTurnStartedPayload({
+        threadId: "thread-effort-default",
+        sendTurn: true,
+        sendSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.3-codex"),
+      });
+
+      NodeAssert.equal(payload.model, "gpt-5.3-codex");
+      NodeAssert.equal(payload.effort, "high");
+    }),
+  );
+
+  it.effect("omits effort entirely when neither explicit nor default resolves", () =>
+    Effect.gen(function* () {
+      const payload = yield* collectTurnStartedPayload({
+        threadId: "thread-effort-absent",
+        sendTurn: true,
+        sendSelection: createModelSelection(
+          ProviderInstanceId.make("codex"),
+          "model-without-efforts",
+        ),
+      });
+
+      NodeAssert.equal(payload.model, "model-without-efforts");
+      NodeAssert.equal("effort" in payload, false);
+    }),
+  );
+
+  it.effect("reports the session model when a turn has not overridden it", () =>
+    Effect.gen(function* () {
+      const payload = yield* collectTurnStartedPayload({
+        threadId: "thread-model-from-session",
+        sendTurn: false,
+        startSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.6-sol"),
+      });
+
+      NodeAssert.equal(payload.model, "gpt-5.6-sol");
+      NodeAssert.equal(payload.effort, "medium");
+    }),
+  );
+});
