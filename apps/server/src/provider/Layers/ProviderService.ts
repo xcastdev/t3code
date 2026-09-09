@@ -62,7 +62,10 @@ import {
   withMetrics,
 } from "../../observability/Metrics.ts";
 import { type ProviderAdapterError, ProviderValidationError } from "../Errors.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type {
+  ProviderAdapterCapabilities,
+  ProviderAdapterShape,
+} from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
@@ -326,6 +329,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const prepareMcpSession = (
     threadId: ThreadId,
     providerInstanceId: ProviderInstanceId,
+    capabilities: ProviderAdapterCapabilities,
     projectMcpServers: Parameters<
       typeof McpSessionRegistry.issueActiveMcpCredential
     >[0]["projectMcpServers"],
@@ -337,8 +341,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     > = new Map(),
   ) =>
     Effect.gen(function* () {
-      const includePreview = yield* agentBrowserAccessEnabled;
-      if (!includePreview && (!projectMcpServers || projectMcpServers.length === 0)) {
+      const includePreview =
+        capabilities.managedPreviewMcp !== "unsupported" && (yield* agentBrowserAccessEnabled);
+      const managedProjectServers =
+        capabilities.projectMcpProxy === "unsupported" ? undefined : projectMcpServers;
+      if (!includePreview && (!managedProjectServers || managedProjectServers.length === 0)) {
         // Revoke as well as clear. Every other prepare path reaches
         // `issueActiveMcpCredential`, which revokes the thread first, so
         // skipping it here would leave a previously issued bearer token valid
@@ -353,7 +360,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         threadId,
         providerInstanceId,
         ...(includePreview ? {} : { includePreview: false as const }),
-        ...(projectMcpServers && projectMcpServers.length > 0 ? { projectMcpServers } : {}),
+        ...(managedProjectServers && managedProjectServers.length > 0
+          ? { projectMcpServers: managedProjectServers }
+          : {}),
         ...(resolveProjectMcpSecret === undefined ? {} : { resolveProjectMcpSecret }),
         ...(oauthStateLeases.size > 0 ? { oauthStateLeases } : {}),
       });
@@ -370,9 +379,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       return credential;
     });
   const clearMcpSession = (threadId: ThreadId) =>
-    revokeMcpCredential(threadId).pipe(
-      Effect.tap(() => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
-    );
+    Effect.gen(function* () {
+      yield* Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId));
+      yield* revokeMcpCredential(threadId);
+    });
 
   const closeProjectMcpLeaseScope = (scope: Scope.Scope) =>
     Effect.uninterruptible(Scope.close(scope, Exit.void));
@@ -395,6 +405,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     function* (threadId: ThreadId, owner: ProjectMcpLeaseOwner) {
       if ((yield* Ref.get(projectMcpLeaseScopes)).get(threadId) !== owner) return;
       yield* clearMcpSession(threadId);
+      if (owner.adapter.cleanupSessionMcp !== undefined) {
+        yield* owner.adapter.cleanupSessionMcp(threadId).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.mcp.adapter-cleanup-failed", {
+              threadId,
+              providerInstanceId: owner.instanceId,
+              cause,
+            }),
+          ),
+        );
+      }
       yield* releaseProjectMcpLease(threadId);
     },
     (effect) =>
@@ -600,21 +621,29 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const durableCatalogCapability =
         input.adapter.capabilities.sessionMcpCatalog ?? "restart-required";
       const sessionScope = yield* Scope.make("sequential");
-      const projectMcpSession = yield* (
-        durableCatalogServers === undefined
-          ? projectMcpService.acquireSessionLease(thread.value.projectId, input.providerInstanceId)
-          : projectMcpService.acquireResolvedSessionLease(durableCatalogServers)
-      ).pipe(
-        Effect.mapError((cause) =>
-          toValidationError(
-            input.operation,
-            "Could not resolve and lease project MCP servers.",
-            cause,
-          ),
-        ),
-        Effect.provideService(Scope.Scope, sessionScope),
-        Effect.onError(() => closeProjectMcpLeaseScope(sessionScope)),
-      );
+      const projectMcpSession = yield* input.adapter.capabilities.projectMcpProxy === "unsupported"
+        ? Effect.succeed({
+            servers: [],
+            resolveSecret: () => undefined,
+            oauthStateLeases: new Map(),
+          } satisfies ProjectMcpService.AcquiredProjectMcpSessionServers)
+        : (durableCatalogServers === undefined
+            ? projectMcpService.acquireSessionLease(
+                thread.value.projectId,
+                input.providerInstanceId,
+              )
+            : projectMcpService.acquireResolvedSessionLease(durableCatalogServers)
+          ).pipe(
+            Effect.mapError((cause) =>
+              toValidationError(
+                input.operation,
+                "Could not resolve and lease project MCP servers.",
+                cause,
+              ),
+            ),
+            Effect.provideService(Scope.Scope, sessionScope),
+            Effect.onError(() => closeProjectMcpLeaseScope(sessionScope)),
+          );
       const owner: ProjectMcpLeaseOwner = {
         scope: sessionScope,
         adapter: input.adapter,
@@ -650,6 +679,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         const credential = yield* prepareMcpSession(
           input.sessionInput.threadId,
           input.providerInstanceId,
+          input.adapter.capabilities,
           projectMcpSession.servers,
           projectMcpSession.resolveSecret,
           projectMcpSession.oauthStateLeases,
@@ -1463,15 +1493,12 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           input.threadId,
           Effect.gen(function* () {
             const owner = (yield* Ref.get(projectMcpLeaseScopes)).get(input.threadId);
-            yield* (
-              routed.isActive ? routed.adapter.stopSession(routed.threadId) : Effect.void
-            ).pipe(
-              Effect.ensuring(
-                owner?.adapter === routed.adapter
-                  ? cleanupOwner(input.threadId, owner)
-                  : Effect.void,
-              ),
-            );
+            if (owner?.adapter === routed.adapter) {
+              yield* cleanupOwner(input.threadId, owner);
+            }
+            if (routed.isActive) {
+              yield* routed.adapter.stopSession(routed.threadId);
+            }
           }),
         );
         yield* directory.upsert({
@@ -1694,10 +1721,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }),
       ),
     ).pipe(Effect.asVoid);
-    yield* Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll()).pipe(
-      Effect.asVoid,
-      Effect.ensuring(releaseAllProjectMcpLeases),
-    );
+    yield* releaseAllProjectMcpLeases;
+    yield* Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll()).pipe(Effect.asVoid);
     yield* McpSessionRegistry.revokeAllActiveMcpCredentials();
     McpProviderSession.clearAllMcpProviderSessions();
     const bindings = yield* directory.listBindings().pipe(Effect.orElseSucceed(() => []));

@@ -153,7 +153,10 @@ type LegacyProviderRuntimeEvent = {
   readonly [key: string]: unknown;
 };
 
-function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
+function makeFakeCodexAdapter(
+  provider: ProviderDriverKind = CODEX_DRIVER,
+  lifecycleEvents?: Array<string>,
+) {
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
   const subscribed = Deferred.makeUnsafe<void>();
@@ -229,6 +232,13 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
       }),
   );
 
+  const cleanupSessionMcp = vi.fn(
+    (_threadId: ThreadId): Effect.Effect<void, ProviderAdapterError> =>
+      Effect.sync(() => {
+        lifecycleEvents?.push("adapter.cleanup");
+      }),
+  );
+
   const listSessions = vi.fn(
     (): Effect.Effect<ReadonlyArray<ProviderSession>> =>
       Effect.sync(() => Array.from(sessions.values())),
@@ -289,6 +299,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     respondToRequest,
     respondToUserInput,
     stopSession,
+    cleanupSessionMcp,
     listSessions,
     hasSession,
     readThread,
@@ -332,6 +343,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     respondToRequest,
     respondToUserInput,
     stopSession,
+    cleanupSessionMcp,
     listSessions,
     hasSession,
     readThread,
@@ -994,8 +1006,9 @@ const routing = makeProviderServiceLayer((request) =>
 
 const makeMcpLifecycleHarness = Effect.fn("makeMcpLifecycleHarness")(function* (
   leaseGate: Effect.Effect<void> = Effect.void,
+  lifecycleEvents?: Array<string>,
 ) {
-  const original = makeFakeCodexAdapter();
+  const original = makeFakeCodexAdapter(CODEX_DRIVER, lifecycleEvents);
   let current: ReturnType<typeof makeFakeCodexAdapter> | undefined = original;
   const changes = yield* PubSub.unbounded<void>();
   const forwarded = yield* Queue.unbounded<ProviderRuntimeEvent>();
@@ -1051,6 +1064,7 @@ const makeMcpLifecycleHarness = Effect.fn("makeMcpLifecycleHarness")(function* (
       revokeMcpCredential: (threadId) =>
         Effect.suspend(() => {
           revokeAttempts += 1;
+          lifecycleEvents?.push("credential.revoke");
           if (revokeFailures > 0) {
             revokeFailures -= 1;
             return Effect.die("injected proxy revocation failure");
@@ -1074,6 +1088,7 @@ const makeMcpLifecycleHarness = Effect.fn("makeMcpLifecycleHarness")(function* (
           (lease) =>
             Effect.sync(() => {
               lease.active = false;
+              lifecycleEvents?.push("project.release");
             }),
         );
         yield* leaseGate;
@@ -1165,6 +1180,24 @@ const makeMcpLifecycleHarness = Effect.fn("makeMcpLifecycleHarness")(function* (
     },
   };
 });
+
+it.effect("orders credential revocation before adapter MCP cleanup and project lease release", () =>
+  Effect.gen(function* () {
+    const lifecycleEvents: Array<string> = [];
+    const h = yield* makeMcpLifecycleHarness(Effect.void, lifecycleEvents);
+    const threadId = asThreadId("ordered-provider-cleanup");
+
+    yield* h.provider.startSession(threadId, {
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      threadId,
+      runtimeMode: "full-access",
+    });
+    yield* h.provider.stopSession({ threadId });
+
+    assert.deepEqual(lifecycleEvents, ["credential.revoke", "adapter.cleanup", "project.release"]);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
 
 it.effect.each(["removed", "replaced"])(
   "rejects a start whose instance is %s during lease acquisition",

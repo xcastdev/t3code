@@ -133,6 +133,12 @@ export interface ProviderAdapterShape<TError> {
   readonly stopSession: (threadId: ThreadId) => Effect.Effect<void, TError>;
 
   /**
+   * Release provider-owned MCP configuration before the native session stops.
+   * Providers that do not manage external MCP servers omit this hook.
+   */
+  readonly cleanupSessionMcp?: (threadId: ThreadId) => Effect.Effect<void, TError>;
+
+  /**
    * List currently active provider sessions for this adapter.
    */
   readonly listSessions: () => Effect.Effect<ReadonlyArray<ProviderSession>>;

@@ -93,9 +93,17 @@ Each selected provider has an application status:
 - **Not supported by this provider** means the provider cannot receive the server.
 - **Provider unavailable** means that provider instance is not currently available.
 
-External OpenCode instances are explicitly unsupported because T3 cannot safely configure an
-OpenCode server managed outside T3. T3-managed OpenCode instances use the same authenticated
-proxy endpoint as the other supported providers.
+External OpenCode instances are unsupported by default because T3 does not change a server it
+does not manage. To opt in, enable **Manage MCP servers on external OpenCode** in the OpenCode
+provider settings. Use **T3 MCP public origin** when OpenCode and T3 run on different machines;
+that origin must use HTTPS. Loopback HTTP is available only when both services share a machine.
+T3 validates ownership markers and connection status for each managed entry. T3-managed OpenCode
+instances use the same authenticated proxy endpoint as the other supported providers.
+
+An opted-in external OpenCode server is limited to one MCP-enabled T3 session per URL and exact
+directory within one T3 server process. This does not lock a second T3 process or a native
+OpenCode client. Disconnected dynamic entries remain in OpenCode as disabled configuration because
+OpenCode 1.15.13 has no remove endpoint.
 
 If no providers are selected, the server is saved but is not attached to a provider session.
 

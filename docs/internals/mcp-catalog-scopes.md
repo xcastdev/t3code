@@ -67,11 +67,16 @@ adds one tool, changes its description, and removes it while the same MCP
 client connection remains open. This proves the notification/list contract,
 not provider-specific refresh behavior.
 
-As of 2026-09-08, no real provider integration case has been run in this
-worktree. Therefore all managed adapters remain `restart-required` and external
-OpenCode remains `unsupported` until a provider-specific test observes add,
-update, and remove without a runtime restart. Provider versions and observed
-behaviors must be appended here when those cases are run.
+The external OpenCode integration fixture observes the v2 SDK's config/status/add/disconnect
+sequence and invokes a real MCP tool through the registered client. OpenCode 1.15.13 reports
+`connected` only after the remote MCP initialization succeeds, and disconnect leaves the dynamic
+entry disabled because the API has no remove operation. This test covers registration and cleanup,
+not live catalog refresh: external OpenCode's session catalog remains `restart-required`.
+
+External OpenCode is `unsupported` until the provider setting explicitly opts into management. The
+opt-in is still limited to one URL-and-exact-directory lease per T3 process. The coordinator uses
+environment ownership markers and generation-specific names for crash recovery, but cannot lock a
+separate T3 process or a native OpenCode client.
 
 ## Compatibility
 

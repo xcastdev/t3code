@@ -75,9 +75,31 @@ environment replace the instance and start a new discovery. Changes to unrelated
 update snapshot enrichment. Other providers retain their existing refresh policy.
 
 T3 Code does not own an external OpenCode process. Native configuration changes there can require
-an external reload or restart before T3 Code's next refresh sees them.
-T3 Code therefore reports managed preview MCP as unsupported for external OpenCode instances;
-disabled provider instances remain unavailable.
+an external reload or restart before T3 Code's next refresh sees them. External OpenCode MCP
+management is opt-in. When enabled, the OpenCode adapter reports preview and project proxy
+support for the next session, while the session catalog remains restart-required. When disabled,
+all external MCP capabilities are unsupported and no preview credential or project MCP lease is
+issued.
+
+The server provides one `OpenCodeExternalMcpCoordinator` to every OpenCode driver. It leases a
+canonical external URL plus the exact directory string, and gives the lease a process nonce and
+monotonic generation. The adapter names entries with the environment hash and generation, and
+adds `X-T3-MCP-Owner` and `X-T3-MCP-Generation` headers. Before each add it reads OpenCode config
+and status, disconnects stale entries owned by the current environment, rejects foreign or
+unmarked name collisions, and requires both the add response and follow-up status to be
+`connected`.
+
+The public MCP origin is an HTTPS root, or loopback HTTP for same-machine use. Rebasing preserves
+the issued endpoint path and query. Empty origin plus a loopback issued endpoint is rejected for
+a non-loopback OpenCode server because it would send a bearer URL that the server cannot reach
+safely. Separate T3 processes and native OpenCode clients are outside the coordinator's lock.
+
+Normal provider cleanup clears and revokes the T3 credential, asks the adapter to disconnect all
+attempted generation names, releases the external coordinator lease, closes the project MCP
+lease, and only then stops the native provider session. Disconnect attempts are individually
+bounded and logged. An adapter-scope fallback protects abnormal shutdown; full lease identity
+checks prevent delayed cleanup from releasing or disconnecting a replacement generation.
+OpenCode's dynamic API has no remove operation, so disconnected entries remain as disabled config.
 
 The shared server's idle shutdown does not clear the catalog. Failed discovery keeps the last
 known models, slash commands, and skills through the registry's existing merge rules. A successful

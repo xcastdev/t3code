@@ -561,13 +561,34 @@ export const OpenCodeSettings = makeProviderSettingsSchema(
         },
       }),
     ),
+    manageExternalMcp: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Manage MCP servers on external OpenCode",
+        description:
+          "T3 changes directory-scoped MCP entries on the configured OpenCode server while a T3 session runs.",
+        providerSettingsForm: { control: "switch", clearWhenEmpty: "omit" },
+      }),
+    ),
+    externalMcpBaseUrl: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "T3 MCP public origin",
+        description:
+          "Set an origin such as https://t3.example.com when OpenCode must reach T3 from another machine. Leave empty only when both run on the same machine.",
+        providerSettingsForm: {
+          placeholder: "https://t3.example.com",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
     customModels: Schema.Array(Schema.String).pipe(
       Schema.withDecodingDefault(Effect.succeed([])),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
   {
-    order: ["binaryPath", "serverUrl", "serverPassword"],
+    order: ["binaryPath", "serverUrl", "serverPassword", "manageExternalMcp", "externalMcpBaseUrl"],
   },
 );
 export type OpenCodeSettings = typeof OpenCodeSettings.Type;
@@ -911,6 +932,8 @@ const OpenCodeSettingsPatch = Schema.Struct({
   binaryPath: Schema.optionalKey(TrimmedString),
   serverUrl: Schema.optionalKey(TrimmedString),
   serverPassword: Schema.optionalKey(TrimmedString),
+  manageExternalMcp: Schema.optionalKey(Schema.Boolean),
+  externalMcpBaseUrl: Schema.optionalKey(TrimmedString),
   customModels: Schema.optionalKey(Schema.Array(Schema.String)),
 });
 

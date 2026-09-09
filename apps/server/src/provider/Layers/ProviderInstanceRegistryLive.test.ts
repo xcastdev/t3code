@@ -29,6 +29,7 @@ import {
   type CodexSettings,
   type CursorSettings,
   type GrokSettings,
+  EnvironmentId,
   type OpenCodeSettings,
   ProviderDriverKind,
   type ProviderInstanceConfigMap,
@@ -43,6 +44,7 @@ import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import type { BuiltInDriversEnv } from "../builtInDrivers.ts";
 import { ServerConfig } from "../../config.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ClaudeDriver } from "../Drivers/ClaudeDriver.ts";
 import { CodexDriver } from "../Drivers/CodexDriver.ts";
@@ -51,6 +53,7 @@ import { GrokDriver } from "../Drivers/GrokDriver.ts";
 import { OpenCodeDriver } from "../Drivers/OpenCodeDriver.ts";
 import * as ModelManifest from "../ModelManifest.ts";
 import { OpenCodeRuntimeLive } from "../opencodeRuntime.ts";
+import * as OpenCodeExternalMcpCoordinator from "../OpenCodeExternalMcpCoordinator.ts";
 import { NoOpProviderEventLoggers, ProviderEventLoggers } from "./ProviderEventLoggers.ts";
 import { makeProviderInstanceRegistry } from "./ProviderInstanceRegistryLive.ts";
 
@@ -132,6 +135,8 @@ const makeOpenCodeConfig = (overrides: Partial<OpenCodeSettings>): OpenCodeSetti
   binaryPath: "opencode",
   serverUrl: "",
   serverPassword: "",
+  manageExternalMcp: false,
+  externalMcpBaseUrl: "",
   customModels: [],
   ...overrides,
 });
@@ -307,7 +312,19 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
   // provides `OpenCodeRuntimeLive`'s deps while keeping its own outputs
   // surfaced; that merged layer then provides `ServerConfig.layerTest`'s
   // `FileSystem` dep while keeping everything else surfaced to the test.
-  const infraLayer = OpenCodeRuntimeLive.pipe(Layer.provideMerge(NodeServices.layer));
+  const testServerEnvironmentLayer = Layer.succeed(
+    ServerEnvironment.ServerEnvironment,
+    ServerEnvironment.ServerEnvironment.of({
+      getEnvironmentId: Effect.succeed(EnvironmentId.make("environment-test")),
+      getDescriptor: Effect.die("descriptor is not used by this registry slice"),
+    }),
+  );
+  const infraLayer = OpenCodeRuntimeLive.pipe(
+    Layer.provideMerge(NodeServices.layer),
+    Layer.provideMerge(OpenCodeExternalMcpCoordinator.layer),
+    Layer.provideMerge(testServerEnvironmentLayer),
+    Layer.provideMerge(NodeServices.layer),
+  );
   const testLayer = ServerConfig.layerTest(process.cwd(), {
     prefix: "provider-instance-registry-all-drivers-test",
   }).pipe(
