@@ -3822,6 +3822,73 @@ it.layer(makeProjectionPipelinePrefixedTestLayer("t3-turn-provenance-test-"))(
       }),
     );
 
+    it.effect("leaves the file count unstamped when only a placeholder diff settles", () =>
+      Effect.gen(function* () {
+        // A placeholder reports no files and the real capture may never land,
+        // so a zero here would be indistinguishable from a turn that changed
+        // nothing. Work counts still stamp; the file count stays null.
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const threadId = ThreadId.make("thread-prov-placeholder");
+        const turnId = TurnId.make("turn-prov-placeholder");
+
+        yield* appendThreadCreated(threadId, "prov-placeholder");
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-placeholder-start",
+          status: "running",
+          activeTurnId: turnId,
+          at: "2026-03-01T00:00:01.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "ph1",
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: "call-ph-1",
+          at: "2026-03-01T00:00:02.000Z",
+        });
+
+        const eventStore = yield* OrchestrationEventStore;
+        yield* eventStore.append({
+          type: "thread.turn-diff-completed",
+          eventId: EventId.make("evt-prov-placeholder"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-03-01T00:00:10.000Z",
+          commandId: CommandId.make("cmd-prov-placeholder"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-prov-placeholder"),
+          metadata: {},
+          payload: {
+            threadId,
+            turnId,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("provider-diff:evt-prov-placeholder"),
+            status: "missing",
+            files: [],
+            assistantMessageId: MessageId.make("message-prov-placeholder"),
+            completedAt: "2026-03-01T00:00:10.000Z",
+          },
+        });
+
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-placeholder-end",
+          status: "ready",
+          activeTurnId: null,
+          at: "2026-03-01T00:00:11.000Z",
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const rows = yield* readProvenance(threadId, turnId);
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0]?.commandCount, 1);
+        assert.strictEqual(rows[0]?.changedFileCount, null);
+      }),
+    );
+
     it.effect("stamps work counts on an interrupted turn", () =>
       Effect.gen(function* () {
         const projectionPipeline = yield* OrchestrationProjectionPipeline;

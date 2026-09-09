@@ -149,11 +149,104 @@ describe("countTurnWork", () => {
     // than the turn's own subfolds can account for.
     expect(
       countTurnWork([
-        { tone: "tool", itemType: "file_change", toolCallId: null, detail: "Read File: a.ts" },
-        { tone: "tool", itemType: "file_change", toolCallId: null, detail: "Read File: a.ts" },
-        { tone: "tool", itemType: "file_change", toolCallId: null, detail: "Read File: a.ts" },
+        {
+          tone: "tool",
+          itemType: "file_change",
+          toolCallId: null,
+          kind: "tool.updated",
+          summary: "Read",
+          detail: "Read File: a.ts",
+        },
+        {
+          tone: "tool",
+          itemType: "file_change",
+          toolCallId: null,
+          kind: "tool.updated",
+          summary: "Read",
+          detail: "Read File: a.ts",
+        },
+        {
+          tone: "tool",
+          itemType: "file_change",
+          toolCallId: null,
+          kind: "tool.completed",
+          summary: "Read",
+          detail: "Read File: a.ts",
+        },
       ]),
     ).toEqual({ commandCount: 0, toolCallCount: 1, subagentCount: 0 });
+  });
+
+  it("counts the same id-less command run twice as two", () => {
+    // The work log starts a new row once a call completes, so an identical
+    // call after it is new work rather than another update of the finished one.
+    expect(
+      countTurnWork([
+        {
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: null,
+          kind: "tool.updated",
+          summary: "Bash",
+          detail: "Bash: pnpm test",
+        },
+        {
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: null,
+          kind: "tool.completed",
+          summary: "Bash",
+          detail: "Bash: pnpm test",
+        },
+        {
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: null,
+          kind: "tool.updated",
+          summary: "Bash",
+          detail: "Bash: pnpm test",
+        },
+        {
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: null,
+          kind: "tool.completed",
+          summary: "Bash",
+          detail: "Bash: pnpm test",
+        },
+      ]),
+    ).toEqual({ commandCount: 2, toolCallCount: 0, subagentCount: 0 });
+  });
+
+  it("does not fold id-less rows separated by other work", () => {
+    expect(
+      countTurnWork([
+        {
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: null,
+          kind: "tool.updated",
+          summary: "Bash",
+          detail: "Bash: ls",
+        },
+        {
+          tone: "tool",
+          itemType: "file_change",
+          toolCallId: null,
+          kind: "tool.updated",
+          summary: "Edit",
+          detail: "Edit: a.ts",
+        },
+        {
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: null,
+          kind: "tool.updated",
+          summary: "Bash",
+          detail: "Bash: ls",
+        },
+      ]),
+    ).toEqual({ commandCount: 2, toolCallCount: 1, subagentCount: 0 });
   });
 
   it("keeps id-less rows apart when they describe different work", () => {

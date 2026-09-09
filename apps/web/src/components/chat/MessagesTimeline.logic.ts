@@ -15,7 +15,11 @@ import {
   type OrchestrationTurnSummary,
   type TurnId,
 } from "@t3tools/contracts";
-import { countTurnWork, type TurnWorkCounts } from "@t3tools/shared/turnWorkCounts";
+import {
+  countTurnWork,
+  type TurnWorkActivity,
+  type TurnWorkCounts,
+} from "@t3tools/shared/turnWorkCounts";
 
 export const TIMELINE_MINIMAP_ITEM_SPACING = 8;
 export const TIMELINE_MINIMAP_MIN_ITEMS = 2;
@@ -540,11 +544,13 @@ function changedFileSegment(
   return diff === null ? fileSegment : `${fileSegment} +${diff.additions}/−${diff.deletions}`;
 }
 
-function collectTurnWorkActivities(
-  entries: ReadonlyArray<TimelineEntry>,
-): Array<{ tone: string; itemType?: string | null; toolCallId?: string | null }> {
-  const activities: Array<{ tone: string; itemType?: string | null; toolCallId?: string | null }> =
-    [];
+/**
+ * Work rows as the counter wants them. The fold fields are carried too: these
+ * entries are already collapsed, so an id-less row here stands for one call,
+ * and passing what the server passes keeps both sides folding alike.
+ */
+function collectTurnWorkActivities(entries: ReadonlyArray<TimelineEntry>): TurnWorkActivity[] {
+  const activities: TurnWorkActivity[] = [];
   for (const entry of entries) {
     if (entry.kind !== "work") {
       continue;
@@ -553,6 +559,9 @@ function collectTurnWorkActivities(
       tone: entry.entry.tone,
       itemType: entry.entry.itemType ?? null,
       toolCallId: entry.entry.toolCallId ?? null,
+      kind: entry.entry.sourceActivityKind ?? null,
+      summary: entry.entry.toolTitle ?? entry.entry.label,
+      detail: entry.entry.detail ?? null,
     });
   }
   return activities;

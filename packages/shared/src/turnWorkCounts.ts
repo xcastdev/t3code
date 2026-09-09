@@ -31,6 +31,14 @@ export interface TurnWorkActivity {
   readonly agentId?: string | null | undefined;
   /** Tool request summary; carries the tool name for rows the timeline hides. */
   readonly detail?: string | null | undefined;
+  /**
+   * Activity kind, e.g. `tool.updated` or `tool.completed`. Only used to fold
+   * id-less rows the way the work log does: a completed row ends a run, so an
+   * identical row after it is new work rather than another update of the old.
+   */
+  readonly kind?: string | null | undefined;
+  /** Row title. Part of the id-less fold key, as it is in the work log. */
+  readonly summary?: string | null | undefined;
 }
 
 type WorkCategory = "command" | "tool" | "subagent";
@@ -73,18 +81,34 @@ function isHiddenFromTimeline(activity: TurnWorkActivity): boolean {
 }
 
 /**
+ * Fold key for a row with no tool call id, mirroring the work log's key so the
+ * two sides agree on what counts as one call. Returns null when the row
+ * carries nothing to fold on, which keeps such rows distinct.
+ */
+function foldKeyFor(activity: TurnWorkActivity): string | null {
+  const detail = activity.detail?.trim() ?? "";
+  const summary = activity.summary?.trim() ?? "";
+  if (detail.length === 0 && summary.length === 0) {
+    return null;
+  }
+  return `${activity.itemType ?? ""}\u001f${summary}\u001f${detail}`;
+}
+
+/**
  * Counts the distinct work a turn performed.
  *
  * Rows are deduped by `toolCallId` because one call emits several lifecycle
  * rows, and `info`-tone rows are excluded because they narrate rather than
- * report work. Rows without a `toolCallId` fall back to deduping by content,
- * matching how the client's work log folds them. Rows the timeline hides are
- * skipped, so a fold's total always reconciles with the rows a user can
- * actually expand.
+ * report work. A row with no `toolCallId` folds only into the row directly
+ * before it, and only while that run is still open — the same adjacency the
+ * work log uses, so repeating a command counts twice rather than collapsing
+ * into the earlier identical one. Rows the timeline hides are skipped, so a
+ * fold's total always reconciles with the rows a user can actually expand.
  */
 export function countTurnWork(activities: Iterable<TurnWorkActivity>): TurnWorkCounts {
   const seenToolCallIds = new Set<string>();
-  const seenContentKeys = new Set<string>();
+  // The open id-less run: its fold key, or null once a run has ended.
+  let openContentKey: string | null = null;
   let commandCount = 0;
   let toolCallCount = 0;
   let subagentCount = 0;
@@ -105,20 +129,18 @@ export function countTurnWork(activities: Iterable<TurnWorkActivity>): TurnWorkC
         continue;
       }
       seenToolCallIds.add(toolCallId);
+      openContentKey = null;
     } else {
       // A provider that omits the call id leaves lifecycle rows with nothing
-      // to dedupe on, so the client's work log folds them together by content
-      // instead. Count them the same way here, or a settled turn would report
-      // more work than the rows the user can actually expand. A row carrying
-      // no detail has nothing to fold on, and the client keeps those separate
-      // too, so each one stays its own unit of work.
-      const detail = activity.detail?.trim() ?? "";
-      if (detail.length > 0) {
-        const contentKey = `${activity.itemType ?? ""}\u001f${detail}`;
-        if (seenContentKeys.has(contentKey)) {
-          continue;
-        }
-        seenContentKeys.add(contentKey);
+      // to dedupe on, so the work log folds each run of them into the row
+      // before it and starts a new row once that run completes. Mirror that:
+      // fold only into the open run, and close the run on a terminal row, so
+      // the same command run twice still counts twice.
+      const contentKey = foldKeyFor(activity);
+      const foldsIntoOpenRun = contentKey !== null && contentKey === openContentKey;
+      openContentKey = activity.kind === "tool.completed" ? null : contentKey;
+      if (foldsIntoOpenRun) {
+        continue;
       }
     }
 

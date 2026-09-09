@@ -1235,22 +1235,29 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
     ) {
       const rows = yield* sql<{
         readonly tone: string;
+        readonly kind: string;
+        readonly summary: string;
         readonly payloadJson: string | null;
       }>`
-        SELECT tone, payload_json AS "payloadJson"
+        SELECT tone, kind, summary, payload_json AS "payloadJson"
         FROM projection_thread_activities
         WHERE thread_id = ${threadId}
           AND turn_id = ${turnId}
+        ORDER BY
+          CASE WHEN sequence IS NULL THEN 0 ELSE 1 END ASC,
+          sequence ASC,
+          created_at ASC,
+          activity_id ASC
       `.pipe(Effect.mapError(toPersistenceSqlError("ProjectionPipeline.countWorkForTurn:query")));
 
       return countTurnWork(
         rows.map((row) => {
           if (row.payloadJson === null) {
-            return { tone: row.tone };
+            return { tone: row.tone, kind: row.kind, summary: row.summary };
           }
           const payload: unknown = JSON.parse(row.payloadJson);
           if (typeof payload !== "object" || payload === null) {
-            return { tone: row.tone };
+            return { tone: row.tone, kind: row.kind, summary: row.summary };
           }
           const record = payload as {
             readonly itemType?: unknown;
@@ -1260,6 +1267,10 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           };
           return {
             tone: row.tone,
+            // Ordered rows plus the lifecycle kind let the shared counter fold
+            // id-less rows into runs the same way the work log does.
+            kind: row.kind,
+            summary: row.summary,
             itemType: typeof record.itemType === "string" ? record.itemType : null,
             toolCallId: typeof record.toolCallId === "string" ? record.toolCallId : null,
             // Carried so the stamp skips the same rows the timeline hides;
@@ -1295,6 +1306,12 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
       readonly turnId: TurnId;
       readonly commandCount: number | null;
       readonly checkpointFiles: ReadonlyArray<{ readonly path: string }>;
+      /**
+       * Whether the file list is real. A placeholder checkpoint reports none,
+       * and the capture that would replace it may never land, so its count is
+       * left unstamped instead of frozen at zero.
+       */
+      readonly countsChangedFiles?: boolean;
     }) {
       if (turn.commandCount !== null) {
         return {};
@@ -1304,7 +1321,9 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         commandCount: counts.commandCount,
         toolCallCount: counts.toolCallCount,
         subagentCount: counts.subagentCount,
-        changedFileCount: new Set(turn.checkpointFiles.map((file) => file.path)).size,
+        ...(turn.countsChangedFiles === false
+          ? {}
+          : { changedFileCount: new Set(turn.checkpointFiles.map((file) => file.path)).size }),
       };
     });
 
@@ -1678,6 +1697,10 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
                   turnId: event.payload.turnId,
                   commandCount: existingTurn.value.commandCount,
                   checkpointFiles: event.payload.files,
+                  // A placeholder carries no files, and the real capture may
+                  // never arrive to restamp it. Leave the file count unstamped
+                  // rather than freezing a zero the reader would trust.
+                  countsChangedFiles: event.payload.status !== "missing",
                 });
             yield* projectionTurnRepository.upsertByTurnId({
               ...existingTurn.value,
