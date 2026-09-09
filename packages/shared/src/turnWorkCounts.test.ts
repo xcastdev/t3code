@@ -99,4 +99,47 @@ describe("countTurnWork", () => {
       ]),
     ).toEqual({ commandCount: 0, toolCallCount: 3, subagentCount: 0 });
   });
+
+  it("skips a subagent's own tool calls while still counting the delegation", () => {
+    // The timeline re-homes agent-attributed rows out of the turn, so counting
+    // them would make a settled fold outrun the subfolds a user can expand.
+    // The delegation itself still counts, via the parent's own collab row.
+    expect(
+      countTurnWork([
+        { tone: "tool", itemType: "command_execution", toolCallId: "call-1" },
+        { tone: "tool", itemType: "collab_agent_tool_call", toolCallId: "call-2" },
+        {
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: "call-3",
+          agentId: "agent-1",
+        },
+        { tone: "tool", itemType: "file_change", toolCallId: "call-4", agentId: "agent-1" },
+      ]),
+    ).toEqual({ commandCount: 1, toolCallCount: 0, subagentCount: 1 });
+  });
+
+  it("counts a row whose agent id is blank", () => {
+    // Only a real attribution re-homes a row; an empty stamp is not one.
+    expect(
+      countTurnWork([
+        { tone: "tool", itemType: "command_execution", toolCallId: "call-1", agentId: "   " },
+        { tone: "tool", itemType: "command_execution", toolCallId: "call-2", agentId: null },
+      ]),
+    ).toEqual({ commandCount: 2, toolCallCount: 0, subagentCount: 0 });
+  });
+
+  it("skips the plan-mode boundary tool the timeline renders as its own row", () => {
+    expect(
+      countTurnWork([
+        {
+          tone: "tool",
+          itemType: "dynamic_tool_call",
+          toolCallId: "call-1",
+          detail: "ExitPlanMode: {}",
+        },
+        { tone: "tool", itemType: "dynamic_tool_call", toolCallId: "call-2", detail: "Read: a.ts" },
+      ]),
+    ).toEqual({ commandCount: 0, toolCallCount: 1, subagentCount: 0 });
+  });
 });

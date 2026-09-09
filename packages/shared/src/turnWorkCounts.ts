@@ -27,6 +27,10 @@ export interface TurnWorkActivity {
   readonly tone: string;
   readonly itemType?: ToolLifecycleItemType | string | null | undefined;
   readonly toolCallId?: string | null | undefined;
+  /** Set when the row is a subagent's own tool call rather than the agent's. */
+  readonly agentId?: string | null | undefined;
+  /** Tool request summary; carries the tool name for rows the timeline hides. */
+  readonly detail?: string | null | undefined;
 }
 
 type WorkCategory = "command" | "tool" | "subagent";
@@ -53,12 +57,29 @@ function classifyWorkCategory(
 }
 
 /**
+ * A row the timeline hides, and so must not be counted.
+ *
+ * A subagent's own tool calls (`agentId`) are re-homed out of the main timeline
+ * and belong to the subagent, not to this turn — the delegation itself is still
+ * counted, through the parent's own un-attributed `collab_agent_tool_call` row.
+ * Plan-mode boundaries are hidden as well: the plan is rendered as its own row,
+ * so counting the tool that produced it would double-report it.
+ */
+function isHiddenFromTimeline(activity: TurnWorkActivity): boolean {
+  if (activity.agentId?.trim()) {
+    return true;
+  }
+  return activity.detail?.startsWith("ExitPlanMode:") === true;
+}
+
+/**
  * Counts the distinct work a turn performed.
  *
  * Rows are deduped by `toolCallId` because one call emits several lifecycle
  * rows, and `info`-tone rows are excluded because they narrate rather than
  * report work. Rows without a `toolCallId` cannot be deduped against each
- * other, so each counts once.
+ * other, so each counts once. Rows the timeline hides are skipped, so a fold's
+ * total always reconciles with the rows a user can actually expand.
  */
 export function countTurnWork(activities: Iterable<TurnWorkActivity>): TurnWorkCounts {
   const seenToolCallIds = new Set<string>();
@@ -67,7 +88,7 @@ export function countTurnWork(activities: Iterable<TurnWorkActivity>): TurnWorkC
   let subagentCount = 0;
 
   for (const activity of activities) {
-    if (activity.tone === "info") {
+    if (activity.tone === "info" || isHiddenFromTimeline(activity)) {
       continue;
     }
 

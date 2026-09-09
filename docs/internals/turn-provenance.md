@@ -37,8 +37,9 @@ Codex from the explicit `reasoningEffort` selection falling back to the model's 
 
 Codex's catalog default is not reachable from the adapter — it arrives over the `model/list` RPC and
 is mapped in the provider layer — so `CodexDriver` injects a `resolveDefaultReasoningEffort` lookup
-at construction. Codex's own `"default"` sentinel is mapped to `undefined` there, which is why no
-part of the render path needs a `default` special case.
+at construction. Effort levels come from the model's own `supportedReasoningEfforts`, so every value
+that reaches the adapter is a real level — there is no sentinel to filter, and no part of the render
+path needs a special case. (`"default"` is a **serviceTier** id, not a reasoning-effort one.)
 
 **Provenance rides beside the session, not inside it.** `OrchestrationTurnProvenance` is a separate
 optional field on `ThreadSessionSetCommand` and `ThreadSessionSetPayload`. The session is current
@@ -60,14 +61,25 @@ The reason is retention: activities are capped at 500 per thread, so a turn old 
 rows can no longer be counted accurately. A stamp taken at settle is complete; a count derived
 afterwards silently undercounts.
 
-Settle has three paths, and all three stamp:
+Settle has two paths, and both stamp:
 
 - `thread.session-set`, where the session leaves `running`
 - `thread.message-sent`, on assistant completion
-- `thread.turn-interrupt-requested`
 
 `settleCountsFor` returns `{}` when a count is already present, which is what makes the write
 happen exactly once.
+
+`thread.turn-interrupt-requested` deliberately does **not** stamp. An interrupt is a request the
+provider has not seen yet — it keeps emitting until the stop lands, and Codex first tears down
+children on bounded timeouts — so stamping at request time counts out any work that starts inside
+that window, permanently. The interrupt records the state and `completedAt`; the terminal
+`thread.session-set` stamps the counts. To let it, the settle filters match a turn that is
+`running`, or `interrupted` and still unstamped; an interrupted turn keeps its state and its own
+end timestamp when that later settle lands.
+
+The `changed_file_count` restamp on a late `thread.turn-diff-completed` applies only to a turn that
+was already stamped. A file count written onto an otherwise-NULL row is a partial, and the reader
+discards partials wholesale — which would also throw away the counts the client can still derive.
 
 ### Classification
 
@@ -80,9 +92,19 @@ and subfolds) so the two can never disagree about what a command is.
 - `collab_agent_tool_call` counts as a subagent, not a tool call.
 - `info`-tone rows are excluded; `error` and `approval` are counted, because a failed command still
   ran.
+- Rows the timeline hides are excluded, so a fold's total always reconciles with the rows a user can
+  expand under it:
+  - **`agentId` rows** are a subagent's own tool calls. Claude and OpenCode stamp them and file them
+    under the _parent's_ turn, so counting them would attribute a delegate's work to this turn. The
+    delegation still counts, through the parent's own un-attributed `collab_agent_tool_call` row.
+  - **`detail` starting `ExitPlanMode:`** is the plan-mode boundary, already rendered as its own row.
 
-`itemType` and `toolCallId` are fields inside `payload_json`, not columns. The activity table stores
-`tone` and `kind`.
+`itemType`, `toolCallId`, `agentId`, and `detail` are fields inside `payload_json`, not columns. The
+activity table stores `tone` and `kind`.
+
+> Turns stamped before this filter existed keep their inflated counts: `settleCountsFor` skips an
+> already-stamped turn, and nothing backfills. Only turns settling from now on reconcile with their
+> subfolds.
 
 ## The client refuses to guess
 

@@ -1691,8 +1691,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   /**
    * Model and effort a turn will actually run at. Effort is the explicit
    * `reasoningEffort` selection when present, otherwise the model's catalog
-   * default. Codex's own `"default"` sentinel is never a real level, so it is
-   * dropped rather than reported as one.
+   * default. Every level here comes from the model's own
+   * `supportedReasoningEfforts`, so any value that arrives is a real level and
+   * is reported as-is.
    */
   const resolveTurnProvenance = (modelSelection: ModelSelection | null | undefined) => {
     const selection = modelSelection?.instanceId === boundInstanceId ? modelSelection : undefined;
@@ -1701,10 +1702,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       ? getModelSelectionStringOptionValue(selection, "reasoningEffort")
       : undefined;
     const defaultEffort = model ? options?.resolveDefaultReasoningEffort?.(model) : undefined;
-    const effort = trimText(explicitEffort) ?? trimText(defaultEffort);
     return {
       model,
-      effort: effort === "default" ? undefined : effort,
+      effort: trimText(explicitEffort) ?? trimText(defaultEffort),
     };
   };
 

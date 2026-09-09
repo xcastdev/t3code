@@ -3301,6 +3301,8 @@ it.layer(makeProjectionPipelinePrefixedTestLayer("t3-turn-provenance-test-"))(
       readonly tone: "approval" | "error" | "info" | "tool";
       readonly itemType?: string;
       readonly toolCallId?: string;
+      readonly agentId?: string;
+      readonly detail?: string;
       readonly at: string;
     }) =>
       Effect.gen(function* () {
@@ -3325,6 +3327,8 @@ it.layer(makeProjectionPipelinePrefixedTestLayer("t3-turn-provenance-test-"))(
               payload: {
                 ...(input.itemType === undefined ? {} : { itemType: input.itemType }),
                 ...(input.toolCallId === undefined ? {} : { toolCallId: input.toolCallId }),
+                ...(input.agentId === undefined ? {} : { agentId: input.agentId }),
+                ...(input.detail === undefined ? {} : { detail: input.detail }),
               },
               turnId: input.turnId,
               createdAt: input.at,
@@ -3335,6 +3339,7 @@ it.layer(makeProjectionPipelinePrefixedTestLayer("t3-turn-provenance-test-"))(
 
     interface ProvenanceRow {
       readonly state: string;
+      readonly completedAt: string | null;
       readonly model: string | null;
       readonly effort: string | null;
       readonly commandCount: number | null;
@@ -3349,6 +3354,7 @@ it.layer(makeProjectionPipelinePrefixedTestLayer("t3-turn-provenance-test-"))(
         return yield* sql<ProvenanceRow>`
           SELECT
             state,
+            completed_at AS "completedAt",
             model,
             effort,
             command_count AS "commandCount",
@@ -3517,6 +3523,96 @@ it.layer(makeProjectionPipelinePrefixedTestLayer("t3-turn-provenance-test-"))(
         assert.strictEqual(rows[0]?.subagentCount, 1);
         assert.strictEqual(rows[0]?.changedFileCount, 0);
       }),
+    );
+
+    it.effect(
+      "stamps only the work the timeline shows, skipping subagent-owned and plan-boundary rows",
+      () =>
+        Effect.gen(function* () {
+          // The client derives the live turn's counts from timeline entries,
+          // which exclude agent-attributed and plan-boundary rows. Counting
+          // them here would make the numbers jump the moment a turn settles.
+          const projectionPipeline = yield* OrchestrationProjectionPipeline;
+          const threadId = ThreadId.make("thread-prov-hidden");
+          const turnId = TurnId.make("turn-prov-hidden");
+
+          yield* appendThreadCreated(threadId, "prov-hidden");
+          yield* appendSessionSet({
+            threadId,
+            suffix: "hidden-start",
+            status: "running",
+            activeTurnId: turnId,
+            at: "2026-03-01T00:00:01.000Z",
+          });
+
+          yield* appendActivity({
+            threadId,
+            turnId,
+            suffix: "h-own",
+            tone: "tool",
+            itemType: "command_execution",
+            toolCallId: "call-1",
+            at: "2026-03-01T00:00:02.000Z",
+          });
+          // The delegation itself: the parent's own row, with no agent stamp.
+          yield* appendActivity({
+            threadId,
+            turnId,
+            suffix: "h-collab",
+            tone: "tool",
+            itemType: "collab_agent_tool_call",
+            toolCallId: "call-2",
+            at: "2026-03-01T00:00:03.000Z",
+          });
+          // The subagent's own work rides the parent turn but belongs to the
+          // subagent, so it must not inflate this turn's totals.
+          yield* appendActivity({
+            threadId,
+            turnId,
+            suffix: "h-sub-cmd",
+            tone: "tool",
+            itemType: "command_execution",
+            toolCallId: "call-3",
+            agentId: "agent-1",
+            at: "2026-03-01T00:00:04.000Z",
+          });
+          yield* appendActivity({
+            threadId,
+            turnId,
+            suffix: "h-sub-file",
+            tone: "tool",
+            itemType: "file_change",
+            toolCallId: "call-4",
+            agentId: "agent-1",
+            at: "2026-03-01T00:00:05.000Z",
+          });
+          yield* appendActivity({
+            threadId,
+            turnId,
+            suffix: "h-plan",
+            tone: "tool",
+            itemType: "dynamic_tool_call",
+            toolCallId: "call-5",
+            detail: "ExitPlanMode: {}",
+            at: "2026-03-01T00:00:06.000Z",
+          });
+
+          yield* appendSessionSet({
+            threadId,
+            suffix: "hidden-end",
+            status: "ready",
+            activeTurnId: null,
+            at: "2026-03-01T00:01:00.000Z",
+          });
+
+          yield* projectionPipeline.bootstrap;
+
+          const rows = yield* readProvenance(threadId, turnId);
+          assert.strictEqual(rows.length, 1);
+          assert.strictEqual(rows[0]?.commandCount, 1);
+          assert.strictEqual(rows[0]?.toolCallCount, 0);
+          assert.strictEqual(rows[0]?.subagentCount, 1);
+        }),
     );
 
     it.effect("restamps the changed file count when the real diff lands late", () =>
@@ -3697,13 +3793,37 @@ it.layer(makeProjectionPipelinePrefixedTestLayer("t3-turn-provenance-test-"))(
           },
         });
 
+        // An interrupt is only a request: the provider keeps working until it
+        // lands, so this row is real work belonging to the interrupted turn.
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "int-t2",
+          tone: "tool",
+          itemType: "mcp_tool_call",
+          toolCallId: "int-call-3",
+          at: "2026-03-01T00:00:11.000Z",
+        });
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-interrupt-end",
+          status: "ready",
+          activeTurnId: null,
+          at: "2026-03-01T00:00:12.000Z",
+        });
+
         yield* projectionPipeline.bootstrap;
 
         const rows = yield* readProvenance(threadId, turnId);
         assert.strictEqual(rows.length, 1);
+        // The user stopping the turn stays the truth about how it ended, and
+        // the interrupt's own timestamp stays its end.
         assert.strictEqual(rows[0]?.state, "interrupted");
+        assert.strictEqual(rows[0]?.completedAt, "2026-03-01T00:00:10.000Z");
         assert.strictEqual(rows[0]?.commandCount, 1);
-        assert.strictEqual(rows[0]?.toolCallCount, 1);
+        // Counts settle at the terminal session event, so the tool call that
+        // started inside the interrupt window is counted rather than lost.
+        assert.strictEqual(rows[0]?.toolCallCount, 2);
         assert.strictEqual(rows[0]?.subagentCount, 0);
       }),
     );
