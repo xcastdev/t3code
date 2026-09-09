@@ -1,5 +1,6 @@
 import {
   defaultInstanceIdForDriver,
+  McpServerId,
   ProviderDriverKind,
   type ServerProvider,
 } from "@t3tools/contracts";
@@ -20,6 +21,7 @@ import type { ProviderInstance } from "../ProviderDriver.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import type * as TextGeneration from "../../textGeneration/TextGeneration.ts";
 import * as ProviderAdapterRegistryLayer from "./ProviderAdapterRegistry.ts";
+import { projectMcpNativeKey, projectMcpTokenEnvironmentKey } from "../Services/ProviderAdapter.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
@@ -29,7 +31,11 @@ const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
 
 const fakeCodexAdapter: CodexAdapter.CodexAdapterShape = {
   provider: CODEX_DRIVER,
-  capabilities: { sessionModelSwitch: "in-session" },
+  capabilities: {
+    sessionModelSwitch: "in-session",
+    remoteHttpMcp: "next-session",
+    managedPreviewMcp: "next-session",
+  },
   startSession: vi.fn(),
   sendTurn: vi.fn(),
   interruptTurn: vi.fn(),
@@ -47,7 +53,11 @@ const fakeCodexAdapter: CodexAdapter.CodexAdapterShape = {
 
 const fakeClaudeAdapter: ClaudeAdapter.ClaudeAdapterShape = {
   provider: CLAUDE_AGENT_DRIVER,
-  capabilities: { sessionModelSwitch: "in-session" },
+  capabilities: {
+    sessionModelSwitch: "in-session",
+    remoteHttpMcp: "next-session",
+    managedPreviewMcp: "next-session",
+  },
   startSession: vi.fn(),
   sendTurn: vi.fn(),
   interruptTurn: vi.fn(),
@@ -64,7 +74,11 @@ const fakeClaudeAdapter: ClaudeAdapter.ClaudeAdapterShape = {
 
 const fakeOpenCodeAdapter: OpenCodeAdapter.OpenCodeAdapterShape = {
   provider: OPENCODE_DRIVER,
-  capabilities: { sessionModelSwitch: "in-session" },
+  capabilities: {
+    sessionModelSwitch: "in-session",
+    remoteHttpMcp: "unsupported",
+    managedPreviewMcp: "next-session",
+  },
   startSession: vi.fn(),
   sendTurn: vi.fn(),
   interruptTurn: vi.fn(),
@@ -81,7 +95,11 @@ const fakeOpenCodeAdapter: OpenCodeAdapter.OpenCodeAdapterShape = {
 
 const fakeCursorAdapter: CursorAdapter.CursorAdapterShape = {
   provider: CURSOR_DRIVER,
-  capabilities: { sessionModelSwitch: "in-session" },
+  capabilities: {
+    sessionModelSwitch: "in-session",
+    remoteHttpMcp: "next-session",
+    managedPreviewMcp: "next-session",
+  },
   startSession: vi.fn(),
   sendTurn: vi.fn(),
   interruptTurn: vi.fn(),
@@ -154,6 +172,21 @@ const layer = Layer.mergeAll(
   ),
   NodeServices.layer,
 );
+
+it("derives safe, collision-resistant project MCP provider identifiers", () => {
+  const slashId = { id: McpServerId.make("mcp/docs") } as const;
+  const escapedId = { id: McpServerId.make("mcp_2F_docs") } as const;
+  const caseVariantId = { id: McpServerId.make("MCP/DOCS") } as const;
+
+  assert.notInclude(projectMcpNativeKey(slashId), "/");
+  assert.notInclude(projectMcpTokenEnvironmentKey(slashId), "/");
+  assert.notEqual(projectMcpNativeKey(slashId), projectMcpNativeKey(escapedId));
+  assert.notEqual(projectMcpTokenEnvironmentKey(slashId), projectMcpTokenEnvironmentKey(escapedId));
+  assert.notEqual(
+    projectMcpTokenEnvironmentKey(slashId),
+    projectMcpTokenEnvironmentKey(caseVariantId),
+  );
+});
 
 it.layer(layer)("ProviderAdapterRegistryLive", (it) => {
   it("resolves adapters and routing metadata from provider instances", () =>

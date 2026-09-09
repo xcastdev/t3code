@@ -1,0 +1,150 @@
+diff --git a/dist/createMcpHandler-CLhGwQTn.d.mts b/dist/createMcpHandler-CLhGwQTn.d.mts
+index 0f86d3f6b6a48501db9011c7328a0eadd54d7d10..e3908a7d3cbaa281b855178d729400b8b7b5fbf5 100644
+--- a/dist/createMcpHandler-CLhGwQTn.d.mts
++++ b/dist/createMcpHandler-CLhGwQTn.d.mts
+@@ -3686,6 +3686,7 @@ declare class PerRequestHTTPServerTransport implements Transport {
+  * - `prompts_list_changed` → `notifications/prompts/list_changed`
+  * - `resources_list_changed` → `notifications/resources/list_changed`
+  * - `resource_updated` → `notifications/resources/updated` (carries the URI)
++ * - `notification` → an already-authorized notification (not filter-gated)
+  *
+  * The bus carries the EVENT, not the wire shape — the entry's listen router
+  * owns subscription-id stamping and per-stream filtering.
+@@ -3699,6 +3700,9 @@ type ServerEvent = {
+ } | {
+   kind: 'resource_updated';
+   uri: string;
++} | {
++  kind: 'notification';
++  notification: Notification;
+ };
+ /**
+  * The server-side change-event seam for `subscriptions/listen`.
+diff --git a/dist/createMcpHandler-dBHMsxwf.d.cts b/dist/createMcpHandler-dBHMsxwf.d.cts
+index 1c8d54f4dff316317e01b405eb5e18ed60470f5d..385274a8e283501243fd4b09004cdf2f3522961a 100644
+--- a/dist/createMcpHandler-dBHMsxwf.d.cts
++++ b/dist/createMcpHandler-dBHMsxwf.d.cts
+@@ -3688,6 +3688,7 @@ declare class PerRequestHTTPServerTransport implements Transport {
+  * - `prompts_list_changed` → `notifications/prompts/list_changed`
+  * - `resources_list_changed` → `notifications/resources/list_changed`
+  * - `resource_updated` → `notifications/resources/updated` (carries the URI)
++ * - `notification` → an already-authorized notification (not filter-gated)
+  *
+  * The bus carries the EVENT, not the wire shape — the entry's listen router
+  * owns subscription-id stamping and per-stream filtering.
+@@ -3701,6 +3702,9 @@ type ServerEvent = {
+ } | {
+   kind: 'resource_updated';
+   uri: string;
++} | {
++  kind: 'notification';
++  notification: Notification;
+ };
+ /**
+  * The server-side change-event seam for `subscriptions/listen`.
+diff --git a/dist/mcp-D7GmuPnv.cjs b/dist/mcp-D7GmuPnv.cjs
+index 275f8337354523bb679eea70d0b7cfbff8eb7e99..0b68f0a4cf19e9e6adac9c5470cfd33e21b2532b 100644
+--- a/dist/mcp-D7GmuPnv.cjs
++++ b/dist/mcp-D7GmuPnv.cjs
+@@ -127,8 +127,8 @@ function createServerNotifier(bus) {
+ * Whether a `subscriptions/listen` filter accepts a given change event.
+ *
+ * Pure: no I/O, no mutation. The filter governs ONLY the four
+-* subscription-gated change types — non-gated notifications never reach the
+-* bus and are not modeled here.
++* subscription-gated change types. Already-authorized passthrough notifications
++* are accepted without applying the change-event filter.
+ *
+ * `resource_updated` matches only when `resourceSubscriptions` is present and
+ * contains the event's URI exactly (per the spec: "for these resource URIs").
+@@ -139,6 +139,7 @@ function listenFilterAccepts(filter, event) {
+ 		case "prompts_list_changed": return filter.promptsListChanged === true;
+ 		case "resources_list_changed": return filter.resourcesListChanged === true;
+ 		case "resource_updated": return filter.resourceSubscriptions !== void 0 && filter.resourceSubscriptions.includes(event.uri);
++		case "notification": return true;
+ 	}
+ }
+ /**
+@@ -178,6 +179,7 @@ function serverEventToNotification(event) {
+ 			method: "notifications/resources/updated",
+ 			params: { uri: event.uri }
+ 		};
++		case "notification": return event.notification;
+ 	}
+ }
+ 
+diff --git a/dist/mcp-DXXb3Vv3.mjs b/dist/mcp-DXXb3Vv3.mjs
+index 49d5128ad085cc2339925155bf3130109c3b0ff4..40e01aa7b4503cf28cf9b9b4b5c45aabbcd4b71a 100644
+--- a/dist/mcp-DXXb3Vv3.mjs
++++ b/dist/mcp-DXXb3Vv3.mjs
+@@ -125,8 +125,8 @@ function createServerNotifier(bus) {
+ * Whether a `subscriptions/listen` filter accepts a given change event.
+ *
+ * Pure: no I/O, no mutation. The filter governs ONLY the four
+-* subscription-gated change types — non-gated notifications never reach the
+-* bus and are not modeled here.
++* subscription-gated change types. Already-authorized passthrough notifications
++* are accepted without applying the change-event filter.
+ *
+ * `resource_updated` matches only when `resourceSubscriptions` is present and
+ * contains the event's URI exactly (per the spec: "for these resource URIs").
+@@ -137,6 +137,7 @@ function listenFilterAccepts(filter, event) {
+ 		case "prompts_list_changed": return filter.promptsListChanged === true;
+ 		case "resources_list_changed": return filter.resourcesListChanged === true;
+ 		case "resource_updated": return filter.resourceSubscriptions !== void 0 && filter.resourceSubscriptions.includes(event.uri);
++		case "notification": return true;
+ 	}
+ }
+ /**
+@@ -176,6 +177,7 @@ function serverEventToNotification(event) {
+ 			method: "notifications/resources/updated",
+ 			params: { uri: event.uri }
+ 		};
++		case "notification": return event.notification;
+ 	}
+ }
+ 
+diff --git a/dist/src-CX2iR2pK.mjs b/dist/src-CX2iR2pK.mjs
+index a84104122fd3fdc6ae8865c10c65221c76f71ee3..ecbf677946a4f642f0b60669ef6006ec80733696 100644
+--- a/dist/src-CX2iR2pK.mjs
++++ b/dist/src-CX2iR2pK.mjs
+@@ -6247,7 +6247,7 @@ var Protocol = class {
+ 		return this._requestHandlers.get(method);
+ 	}
+ 	async _oncancel(notification) {
+-		if (!notification.params.requestId) return;
++		if (notification.params.requestId === void 0) return;
+ 		this._requestHandlerAbortControllers.get(notification.params.requestId)?.abort(notification.params.reason);
+ 	}
+ 	_setupTimeout(messageId, timeout, maxTotalTimeout, onTimeout, resetTimeoutOnProgress = false) {
+@@ -6512,7 +6512,7 @@ var Protocol = class {
+ 		}
+ 		this._responseHandlers.delete(messageId);
+ 		this._cleanupTimeout(messageId);
+-		this._progressHandlers.delete(messageId);
++		queueMicrotask(() => this._progressHandlers.delete(messageId));
+ 		if (isJSONRPCResultResponse(response)) handler(response);
+ 		else handler(ProtocolError.fromError(response.error.code, response.error.message, response.error.data));
+ 	}
+diff --git a/dist/src-STyD_Vvf.cjs b/dist/src-STyD_Vvf.cjs
+index cf5cbacc42becea62c32f3aa83a5748aebcb33c0..ef9888cc894607e3823ee993fe0a16af3eae33b9 100644
+--- a/dist/src-STyD_Vvf.cjs
++++ b/dist/src-STyD_Vvf.cjs
+@@ -6248,7 +6248,7 @@ var Protocol = class {
+ 		return this._requestHandlers.get(method);
+ 	}
+ 	async _oncancel(notification) {
+-		if (!notification.params.requestId) return;
++		if (notification.params.requestId === void 0) return;
+ 		this._requestHandlerAbortControllers.get(notification.params.requestId)?.abort(notification.params.reason);
+ 	}
+ 	_setupTimeout(messageId, timeout, maxTotalTimeout, onTimeout, resetTimeoutOnProgress = false) {
+@@ -6513,7 +6513,7 @@ var Protocol = class {
+ 		}
+ 		this._responseHandlers.delete(messageId);
+ 		this._cleanupTimeout(messageId);
+-		this._progressHandlers.delete(messageId);
++		queueMicrotask(() => this._progressHandlers.delete(messageId));
+ 		if (isJSONRPCResultResponse(response)) handler(response);
+ 		else handler(ProtocolError.fromError(response.error.code, response.error.message, response.error.data));
+ 	}

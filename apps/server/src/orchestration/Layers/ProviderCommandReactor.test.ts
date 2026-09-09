@@ -17,6 +17,7 @@ import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   EventId,
   MessageId,
+  McpCatalogSessionId,
   ProjectId,
   ThreadId,
   TurnId,
@@ -343,6 +344,8 @@ describe("ProviderCommandReactor", () => {
       getCapabilities: (_provider) =>
         Effect.succeed({
           sessionModelSwitch: input?.sessionModelSwitch ?? "in-session",
+          remoteHttpMcp: "next-session",
+          managedPreviewMcp: "next-session",
         }),
       getInstanceInfo: (instanceId) => {
         const raw = String(instanceId);
@@ -393,6 +396,7 @@ describe("ProviderCommandReactor", () => {
         const engine = yield* OrchestrationEngineService;
         return {
           readEvents: engine.readEvents,
+          subscribeDomainEvents: engine.subscribeDomainEvents,
           dispatch: (command) => {
             if (command.type === "thread.title.regeneration.complete") {
               titleRegenerationCompletionDispatchAttempts += 1;
@@ -3661,4 +3665,52 @@ describe("ProviderCommandReactor", () => {
       ).toBe(false);
     }),
   );
+
+  it("preserves the catalog link for a conditional settle cleanup stop", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const catalogSessionId = McpCatalogSessionId.make("catalog-session-stop");
+
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("cmd-session-set-for-settle-stop"),
+        threadId: ThreadId.make("thread-1"),
+        session: {
+          threadId: ThreadId.make("thread-1"),
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "full-access",
+          mcpCatalogSessionId: catalogSessionId,
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.settle",
+        commandId: CommandId.make("cmd-settle-before-stop"),
+        threadId: ThreadId.make("thread-1"),
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.session.stop",
+        commandId: CommandId.make("cmd-conditional-session-stop"),
+        threadId: ThreadId.make("thread-1"),
+        createdAt: now,
+        onlyIfSettled: true,
+      }),
+    );
+
+    await waitFor(() => harness.stopSession.mock.calls.length === 1);
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.session?.status).toBe("stopped");
+    expect(thread?.session?.mcpCatalogSessionId).toBe(catalogSessionId);
+  });
 });

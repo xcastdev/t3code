@@ -71,11 +71,40 @@ but its native configuration files can remain cached for the lifetime of the hel
 helper closes 30 seconds after its last inventory or text-generation borrower releases it. A
 refresh after that idle period starts a new helper and reads file changes. Repeated refreshes and
 active text-generation work can extend process reuse. Changes to the provider configuration or
-environment replace the instance and start a new discovery. Changes to unrelated settings only
-update snapshot enrichment. Other providers retain their existing refresh policy.
+environment publish a new instance generation and start a new discovery. OpenCode generations
+owned by active sessions drain after those sessions release their exact generation handles, so
+existing sessions keep their original adapter and MCP connection while new sessions use the new
+settings. Other providers retain their immediate replacement policy.
 
 T3 Code does not own an external OpenCode process. Native configuration changes there can require
-an external reload or restart before T3 Code's next refresh sees them.
+an external reload or restart before T3 Code's next refresh sees them. External OpenCode MCP
+management is opt-in. When enabled, the OpenCode adapter reports preview and project proxy
+support for the next session, while the session catalog remains restart-required. When disabled,
+all external MCP capabilities are unsupported and no preview credential or project MCP lease is
+issued.
+
+The server provides one `OpenCodeExternalMcpCoordinator` to every OpenCode driver. It leases a
+canonical external URL plus the exact directory string, and gives the lease a process nonce and
+monotonic generation. The adapter names entries with the environment hash and generation, and
+adds `X-T3-MCP-Owner` and `X-T3-MCP-Generation` headers. Before each add it reads OpenCode config
+and status, disconnects stale entries owned by the current environment, rejects foreign or
+unmarked name collisions, and requires both the add response and follow-up status to be
+`connected`.
+
+The public MCP origin is an HTTPS root, or loopback HTTP for same-machine use. Rebasing preserves
+the issued endpoint path and query. Empty origin plus a loopback issued endpoint is rejected for
+a non-loopback OpenCode server because it would send a bearer URL that the server cannot reach
+safely. Separate T3 processes and native OpenCode clients are outside the coordinator's lock.
+
+Normal provider cleanup clears and revokes the T3 credential, asks the adapter to disconnect all
+attempted generation names, releases the external coordinator lease, closes the project MCP
+lease, and only then stops the native provider session. Each disconnect and its follow-up config
+and status verification share one bound and are logged on failure. An adapter-scope fallback
+protects abnormal shutdown; full lease identity checks prevent delayed cleanup from releasing or
+disconnecting a replacement generation. OpenCode replacement generations drain explicitly;
+removed or disabled instances, and all other providers, retain immediate teardown unless an
+active session owns the generation.
+OpenCode's dynamic API has no remove operation, so disconnected entries remain as disabled config.
 
 ### External OpenCode lifecycle
 

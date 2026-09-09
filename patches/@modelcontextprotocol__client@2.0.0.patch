@@ -1,0 +1,42 @@
+diff --git a/dist/src-D_zzAWoS.mjs b/dist/src-D_zzAWoS.mjs
+--- a/dist/src-D_zzAWoS.mjs
++++ b/dist/src-D_zzAWoS.mjs
+@@ -5697,7 +5697,7 @@ var Protocol = class {
+ 		return this._requestHandlers.get(method);
+ 	}
+ 	async _oncancel(notification) {
+-		if (!notification.params.requestId) return;
++		if (notification.params.requestId === void 0) return;
+ 		this._requestHandlerAbortControllers.get(notification.params.requestId)?.abort(notification.params.reason);
+ 	}
+ 	_setupTimeout(messageId, timeout, maxTotalTimeout, onTimeout, resetTimeoutOnProgress = false) {
+@@ -5962,7 +5962,7 @@ var Protocol = class {
+ 		}
+ 		this._responseHandlers.delete(messageId);
+ 		this._cleanupTimeout(messageId);
+-		this._progressHandlers.delete(messageId);
++		queueMicrotask(() => this._progressHandlers.delete(messageId));
+ 		if (isJSONRPCResultResponse(response)) handler(response);
+ 		else handler(ProtocolError.fromError(response.error.code, response.error.message, response.error.data));
+ 	}
+diff --git a/dist/src-NAgB4Mp8.cjs b/dist/src-NAgB4Mp8.cjs
+--- a/dist/src-NAgB4Mp8.cjs
++++ b/dist/src-NAgB4Mp8.cjs
+@@ -5698,7 +5698,7 @@ var Protocol = class {
+ 		return this._requestHandlers.get(method);
+ 	}
+ 	async _oncancel(notification) {
+-		if (!notification.params.requestId) return;
++		if (notification.params.requestId === void 0) return;
+ 		this._requestHandlerAbortControllers.get(notification.params.requestId)?.abort(notification.params.reason);
+ 	}
+ 	_setupTimeout(messageId, timeout, maxTotalTimeout, onTimeout, resetTimeoutOnProgress = false) {
+@@ -5963,7 +5963,7 @@ var Protocol = class {
+ 		}
+ 		this._responseHandlers.delete(messageId);
+ 		this._cleanupTimeout(messageId);
+-		this._progressHandlers.delete(messageId);
++		queueMicrotask(() => this._progressHandlers.delete(messageId));
+ 		if (isJSONRPCResultResponse(response)) handler(response);
+ 		else handler(ProtocolError.fromError(response.error.code, response.error.message, response.error.data));
+ 	}

@@ -1,11 +1,12 @@
 import type { ProviderRuntimeEvent } from "@t3tools/contracts";
-import { ProviderDriverKind, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import { ProjectId, ProviderDriverKind, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import { DEFAULT_SERVER_SETTINGS } from "@t3tools/contracts/settings";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, assert } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
@@ -28,6 +29,8 @@ import { ServerSettingsService } from "../src/serverSettings.ts";
 import { AnalyticsService } from "../src/telemetry/Services/AnalyticsService.ts";
 import { SqlitePersistenceMemory } from "../src/persistence/Layers/Sqlite.ts";
 import * as ProviderSessionRuntime from "../src/persistence/ProviderSessionRuntime.ts";
+import * as ProjectionSnapshotQuery from "../src/orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ProjectMcpService from "../src/project/ProjectMcpService.ts";
 
 import {
   makeTestProviderAdapterHarness,
@@ -41,6 +44,7 @@ import {
 } from "./fixtures/providerRuntime.ts";
 
 const codexInstanceId = ProviderInstanceId.make("codex");
+const integrationProjectId = ProjectId.make("provider-service-integration");
 
 const makeWorkspaceDirectory = Effect.gen(function* () {
   const fs = yield* FileSystem.FileSystem;
@@ -98,6 +102,13 @@ const makeIntegrationFixture = (options?: { readonly analytics?: Layer.Layer<Ana
       ServerSettingsService.layerTest(DEFAULT_SERVER_SETTINGS),
       options?.analytics ?? AnalyticsService.layerTest,
       Layer.succeed(ProviderEventLoggers, NoOpProviderEventLoggers),
+      Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+        getThreadShellById: () => Effect.succeed(Option.some({ projectId: integrationProjectId })),
+      } as never),
+      Layer.succeed(ProjectMcpService.ProjectMcpService, {
+        resolveForSession: () => Effect.succeed([]),
+        acquireSessionLease: () => Effect.succeed({ servers: [], resolveSecret: () => undefined }),
+      } as never),
     ).pipe(Layer.provide(SqlitePersistenceMemory));
 
     const layer = makeProviderServiceLive().pipe(Layer.provide(shared));

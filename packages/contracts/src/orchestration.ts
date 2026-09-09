@@ -10,6 +10,7 @@ import {
   CheckpointRef,
   ClientSurface,
   CommandId,
+  EnvironmentId,
   EventId,
   IsoDateTime,
   MessageId,
@@ -23,6 +24,14 @@ import {
   TurnId,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
+import { McpServerId, ProjectMcpServer } from "./projectMcp.ts";
+import {
+  McpCatalogDefinition,
+  McpCatalogOverride,
+  McpCatalogSessionId,
+  McpCatalogSnapshot,
+  McpDefinitionId,
+} from "./mcpCatalog.ts";
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
@@ -354,6 +363,8 @@ export const OrchestrationSession = Schema.Struct({
   providerInstanceId: Schema.optional(ProviderInstanceId),
   runtimeMode: RuntimeMode.pipe(Schema.withDecodingDefault(Effect.succeed(DEFAULT_RUNTIME_MODE))),
   activeTurnId: Schema.NullOr(TurnId),
+  /** Stable logical MCP catalog identity across recoverable provider restarts. */
+  mcpCatalogSessionId: Schema.optional(McpCatalogSessionId),
   lastError: Schema.NullOr(TrimmedNonEmptyString),
   updatedAt: IsoDateTime,
 });
@@ -490,6 +501,30 @@ export type OrchestrationThread = typeof OrchestrationThread.Type;
 export const OrchestrationReadModel = Schema.Struct({
   snapshotSequence: NonNegativeInt,
   projects: Schema.Array(OrchestrationProject),
+  projectMcpServers: Schema.Array(
+    Schema.Struct({
+      projectId: ProjectId,
+      server: ProjectMcpServer,
+    }),
+  ).pipe(Schema.optional),
+  /** Optional so read models written before scoped catalogs still decode. */
+  mcpCatalog: Schema.optional(
+    Schema.Struct({
+      environmentId: EnvironmentId,
+      globalRevision: NonNegativeInt,
+      globalDefinitions: Schema.Array(McpCatalogDefinition),
+      projectRevisions: Schema.Array(
+        Schema.Struct({ projectId: ProjectId, revision: NonNegativeInt }),
+      ),
+      projectDefinitions: Schema.Array(
+        Schema.Struct({ projectId: ProjectId, definition: McpCatalogDefinition }),
+      ),
+      projectOverrides: Schema.Array(
+        Schema.Struct({ projectId: ProjectId, override: McpCatalogOverride }),
+      ),
+      sessions: Schema.Array(McpCatalogSnapshot),
+    }),
+  ),
   threads: Schema.Array(OrchestrationThread),
   updatedAt: IsoDateTime,
 });
@@ -730,6 +765,159 @@ const ProjectDeleteCommand = Schema.Struct({
   commandId: CommandId,
   projectId: ProjectId,
   force: Schema.optional(Schema.Boolean),
+});
+
+const ProjectMcpServerCreateCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-server.create"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  server: ProjectMcpServer,
+  createdAt: IsoDateTime,
+});
+
+const ProjectMcpServerUpdateCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-server.update"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  server: ProjectMcpServer,
+  updatedAt: IsoDateTime,
+});
+
+const ProjectMcpServerRemoveCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-server.remove"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  id: McpServerId,
+  removedAt: IsoDateTime,
+});
+
+const EnvironmentMcpDefinitionCreateCommand = Schema.Struct({
+  type: Schema.Literal("environment.mcp-definition.create"),
+  commandId: CommandId,
+  environmentId: EnvironmentId,
+  definition: McpCatalogDefinition,
+  expectedRevision: NonNegativeInt,
+  createdAt: IsoDateTime,
+});
+
+const EnvironmentMcpDefinitionUpdateCommand = Schema.Struct({
+  type: Schema.Literal("environment.mcp-definition.update"),
+  commandId: CommandId,
+  environmentId: EnvironmentId,
+  definition: McpCatalogDefinition,
+  expectedRevision: NonNegativeInt,
+  updatedAt: IsoDateTime,
+});
+
+const EnvironmentMcpDefinitionRemoveCommand = Schema.Struct({
+  type: Schema.Literal("environment.mcp-definition.remove"),
+  commandId: CommandId,
+  environmentId: EnvironmentId,
+  logicalServerId: McpServerId,
+  expectedRevision: NonNegativeInt,
+  removedAt: IsoDateTime,
+});
+
+const ProjectMcpDefinitionCreateCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-definition.create"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  definition: McpCatalogDefinition,
+  expectedRevision: NonNegativeInt,
+  createdAt: IsoDateTime,
+});
+
+const ProjectMcpDefinitionUpdateCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-definition.update"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  definition: McpCatalogDefinition,
+  expectedRevision: NonNegativeInt,
+  updatedAt: IsoDateTime,
+});
+
+const ProjectMcpDefinitionRemoveCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-definition.remove"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  logicalServerId: McpServerId,
+  expectedRevision: NonNegativeInt,
+  removedAt: IsoDateTime,
+});
+
+const ProjectMcpOverrideUpsertCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-override.upsert"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  override: McpCatalogOverride,
+  expectedRevision: NonNegativeInt,
+  updatedAt: IsoDateTime,
+});
+
+const ProjectMcpOverrideRemoveCommand = Schema.Struct({
+  type: Schema.Literal("project.mcp-override.remove"),
+  commandId: CommandId,
+  projectId: ProjectId,
+  overrideId: Schema.String,
+  expectedRevision: NonNegativeInt,
+  removedAt: IsoDateTime,
+});
+
+const ThreadMcpCatalogInitializeCommand = Schema.Struct({
+  type: Schema.Literal("thread.mcp-catalog.initialize"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  snapshot: McpCatalogSnapshot,
+  createdAt: IsoDateTime,
+});
+
+const ThreadMcpCatalogUpdateCommand = Schema.Struct({
+  type: Schema.Literal("thread.mcp-catalog.update"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  mcpCatalogSessionId: McpCatalogSessionId,
+  desiredCatalog: Schema.Array(McpCatalogDefinition),
+  expectedRevision: NonNegativeInt,
+  updatedAt: IsoDateTime,
+});
+
+const ThreadMcpCatalogResetCommand = Schema.Struct({
+  type: Schema.Literal("thread.mcp-catalog.reset"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  mcpCatalogSessionId: McpCatalogSessionId,
+  baseline: Schema.Array(McpCatalogDefinition),
+  expectedRevision: NonNegativeInt,
+  updatedAt: IsoDateTime,
+});
+
+const ThreadMcpCatalogDisposeCommand = Schema.Struct({
+  type: Schema.Literal("thread.mcp-catalog.dispose"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  mcpCatalogSessionId: McpCatalogSessionId,
+  revision: NonNegativeInt,
+  disposedAt: IsoDateTime,
+});
+
+const ThreadMcpCatalogAppliedCommand = Schema.Struct({
+  type: Schema.Literal("thread.mcp-catalog.applied"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  mcpCatalogSessionId: McpCatalogSessionId,
+  revision: NonNegativeInt,
+  appliedCatalog: Schema.optional(Schema.Array(McpCatalogDefinition)),
+  appliedAt: IsoDateTime,
+});
+
+const ThreadMcpCatalogApplyFailedCommand = Schema.Struct({
+  type: Schema.Literal("thread.mcp-catalog.apply-failed"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  mcpCatalogSessionId: McpCatalogSessionId,
+  revision: NonNegativeInt,
+  reason: TrimmedNonEmptyString,
+  failedAt: IsoDateTime,
 });
 
 const ThreadCreateCommand = Schema.Struct({
@@ -1109,6 +1297,23 @@ const ThreadTitleRegenerationCompleteCommand = Schema.Struct({
 });
 
 const InternalOrchestrationCommand = Schema.Union([
+  EnvironmentMcpDefinitionCreateCommand,
+  EnvironmentMcpDefinitionUpdateCommand,
+  EnvironmentMcpDefinitionRemoveCommand,
+  ProjectMcpDefinitionCreateCommand,
+  ProjectMcpDefinitionUpdateCommand,
+  ProjectMcpDefinitionRemoveCommand,
+  ProjectMcpOverrideUpsertCommand,
+  ProjectMcpOverrideRemoveCommand,
+  ThreadMcpCatalogInitializeCommand,
+  ThreadMcpCatalogUpdateCommand,
+  ThreadMcpCatalogResetCommand,
+  ThreadMcpCatalogDisposeCommand,
+  ThreadMcpCatalogAppliedCommand,
+  ThreadMcpCatalogApplyFailedCommand,
+  ProjectMcpServerCreateCommand,
+  ProjectMcpServerUpdateCommand,
+  ProjectMcpServerRemoveCommand,
   ThreadSessionSetCommand,
   ThreadMessageAssistantDeltaCommand,
   ThreadMessageAssistantCompleteCommand,
@@ -1130,6 +1335,17 @@ export const OrchestrationEventType = Schema.Literals([
   "project.created",
   "project.meta-updated",
   "project.deleted",
+  "project.mcp-server.created",
+  "project.mcp-server.updated",
+  "project.mcp-server.removed",
+  "environment.mcp-definition.created",
+  "environment.mcp-definition.updated",
+  "environment.mcp-definition.removed",
+  "project.mcp-definition.created",
+  "project.mcp-definition.updated",
+  "project.mcp-definition.removed",
+  "project.mcp-override.upserted",
+  "project.mcp-override.removed",
   "thread.created",
   "thread.deleted",
   "thread.archived",
@@ -1153,13 +1369,19 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.reverted",
   "thread.session-stop-requested",
   "thread.session-set",
+  "thread.mcp-catalog.initialized",
+  "thread.mcp-catalog.updated",
+  "thread.mcp-catalog.reset",
+  "thread.mcp-catalog.disposed",
+  "thread.mcp-catalog.applied",
+  "thread.mcp-catalog.apply-failed",
   "thread.proposed-plan-upserted",
   "thread.turn-diff-completed",
   "thread.activity-appended",
 ]);
 export type OrchestrationEventType = typeof OrchestrationEventType.Type;
 
-export const OrchestrationAggregateKind = Schema.Literals(["project", "thread"]);
+export const OrchestrationAggregateKind = Schema.Literals(["environment", "project", "thread"]);
 export type OrchestrationAggregateKind = typeof OrchestrationAggregateKind.Type;
 export const OrchestrationActorKind = Schema.Literals(["client", "server", "provider"]);
 
@@ -1191,6 +1413,124 @@ export const ProjectMetaUpdatedPayload = Schema.Struct({
 export const ProjectDeletedPayload = Schema.Struct({
   projectId: ProjectId,
   deletedAt: IsoDateTime,
+});
+
+export const ProjectMcpServerCreatedPayload = Schema.Struct({
+  projectId: ProjectId,
+  server: ProjectMcpServer,
+  createdAt: IsoDateTime,
+});
+
+export const ProjectMcpServerUpdatedPayload = Schema.Struct({
+  projectId: ProjectId,
+  server: ProjectMcpServer,
+  updatedAt: IsoDateTime,
+});
+
+export const ProjectMcpServerRemovedPayload = Schema.Struct({
+  projectId: ProjectId,
+  id: McpServerId,
+  removedAt: IsoDateTime,
+});
+
+export const EnvironmentMcpDefinitionCreatedPayload = Schema.Struct({
+  environmentId: EnvironmentId,
+  definition: McpCatalogDefinition,
+  revision: NonNegativeInt,
+  createdAt: IsoDateTime,
+});
+
+export const EnvironmentMcpDefinitionUpdatedPayload = Schema.Struct({
+  environmentId: EnvironmentId,
+  definition: McpCatalogDefinition,
+  revision: NonNegativeInt,
+  updatedAt: IsoDateTime,
+});
+
+export const EnvironmentMcpDefinitionRemovedPayload = Schema.Struct({
+  environmentId: EnvironmentId,
+  logicalServerId: McpServerId,
+  definitionId: Schema.optional(McpDefinitionId),
+  revision: NonNegativeInt,
+  removedAt: IsoDateTime,
+});
+
+export const ProjectMcpDefinitionCreatedPayload = Schema.Struct({
+  projectId: ProjectId,
+  definition: McpCatalogDefinition,
+  revision: NonNegativeInt,
+  createdAt: IsoDateTime,
+});
+
+export const ProjectMcpDefinitionUpdatedPayload = Schema.Struct({
+  projectId: ProjectId,
+  definition: McpCatalogDefinition,
+  revision: NonNegativeInt,
+  updatedAt: IsoDateTime,
+});
+
+export const ProjectMcpDefinitionRemovedPayload = Schema.Struct({
+  projectId: ProjectId,
+  logicalServerId: McpServerId,
+  definitionId: Schema.optional(McpDefinitionId),
+  revision: NonNegativeInt,
+  removedAt: IsoDateTime,
+});
+
+export const ProjectMcpOverrideUpsertedPayload = Schema.Struct({
+  projectId: ProjectId,
+  override: McpCatalogOverride,
+  revision: NonNegativeInt,
+  updatedAt: IsoDateTime,
+});
+
+export const ProjectMcpOverrideRemovedPayload = Schema.Struct({
+  projectId: ProjectId,
+  overrideId: Schema.String,
+  revision: NonNegativeInt,
+  removedAt: IsoDateTime,
+});
+
+export const ThreadMcpCatalogInitializedPayload = Schema.Struct({
+  threadId: ThreadId,
+  snapshot: McpCatalogSnapshot,
+});
+
+export const ThreadMcpCatalogUpdatedPayload = Schema.Struct({
+  threadId: ThreadId,
+  mcpCatalogSessionId: McpCatalogSessionId,
+  desiredCatalog: Schema.Array(McpCatalogDefinition),
+  desiredRevision: NonNegativeInt,
+});
+
+export const ThreadMcpCatalogResetPayload = Schema.Struct({
+  threadId: ThreadId,
+  mcpCatalogSessionId: McpCatalogSessionId,
+  baseline: Schema.Array(McpCatalogDefinition),
+  desiredRevision: NonNegativeInt,
+});
+
+export const ThreadMcpCatalogDisposedPayload = Schema.Struct({
+  threadId: ThreadId,
+  mcpCatalogSessionId: McpCatalogSessionId,
+  revision: NonNegativeInt,
+  disposedAt: IsoDateTime,
+});
+
+export const ThreadMcpCatalogAppliedPayload = Schema.Struct({
+  threadId: ThreadId,
+  mcpCatalogSessionId: McpCatalogSessionId,
+  revision: NonNegativeInt,
+  appliedCatalog: Schema.optional(Schema.Array(McpCatalogDefinition)),
+  appliedAt: IsoDateTime,
+});
+
+export const ThreadMcpCatalogApplyFailedPayload = Schema.Struct({
+  threadId: ThreadId,
+  mcpCatalogSessionId: McpCatalogSessionId,
+  revision: NonNegativeInt,
+  reason: TrimmedNonEmptyString,
+  failedAt: IsoDateTime,
 });
 
 export const ThreadCreatedPayload = Schema.Struct({
@@ -1364,6 +1704,10 @@ export const ThreadRevertedPayload = Schema.Struct({
 export const ThreadSessionStopRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   createdAt: IsoDateTime,
+  // Cleanup stops are conditional so the provider reactor can preserve the
+  // catalog link for a later restart. Explicit stops leave this absent (or
+  // false) and are allowed to clear the link after disposal.
+  onlyIfSettled: Schema.optional(Schema.Boolean),
 });
 
 export const ThreadSessionSetPayload = Schema.Struct({
@@ -1418,7 +1762,7 @@ const EventBaseFields = {
   sequence: NonNegativeInt,
   eventId: EventId,
   aggregateKind: OrchestrationAggregateKind,
-  aggregateId: Schema.Union([ProjectId, ThreadId]),
+  aggregateId: Schema.Union([EnvironmentId, ProjectId, ThreadId]),
   occurredAt: IsoDateTime,
   commandId: Schema.NullOr(CommandId),
   causationEventId: Schema.NullOr(EventId),
@@ -1441,6 +1785,61 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("project.deleted"),
     payload: ProjectDeletedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-server.created"),
+    payload: ProjectMcpServerCreatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-server.updated"),
+    payload: ProjectMcpServerUpdatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-server.removed"),
+    payload: ProjectMcpServerRemovedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("environment.mcp-definition.created"),
+    payload: EnvironmentMcpDefinitionCreatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("environment.mcp-definition.updated"),
+    payload: EnvironmentMcpDefinitionUpdatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("environment.mcp-definition.removed"),
+    payload: EnvironmentMcpDefinitionRemovedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-definition.created"),
+    payload: ProjectMcpDefinitionCreatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-definition.updated"),
+    payload: ProjectMcpDefinitionUpdatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-definition.removed"),
+    payload: ProjectMcpDefinitionRemovedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-override.upserted"),
+    payload: ProjectMcpOverrideUpsertedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("project.mcp-override.removed"),
+    payload: ProjectMcpOverrideRemovedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,
@@ -1556,6 +1955,36 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.session-set"),
     payload: ThreadSessionSetPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.mcp-catalog.initialized"),
+    payload: ThreadMcpCatalogInitializedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.mcp-catalog.updated"),
+    payload: ThreadMcpCatalogUpdatedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.mcp-catalog.reset"),
+    payload: ThreadMcpCatalogResetPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.mcp-catalog.disposed"),
+    payload: ThreadMcpCatalogDisposedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.mcp-catalog.applied"),
+    payload: ThreadMcpCatalogAppliedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.mcp-catalog.apply-failed"),
+    payload: ThreadMcpCatalogApplyFailedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

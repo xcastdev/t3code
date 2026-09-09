@@ -51,6 +51,11 @@ export interface ProviderDriverMetadata {
    * rejects multi-instance configurations with a clear error.
    */
   readonly supportsMultipleInstances?: boolean;
+  /**
+   * Whether a settings replacement may keep an existing instance alive for
+   * retained sessions. Drivers default to immediate scope teardown.
+   */
+  readonly replacementPolicy?: "immediate" | "drain";
 }
 
 /**

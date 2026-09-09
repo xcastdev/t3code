@@ -5,6 +5,7 @@ import * as NodePath from "node:path";
 
 import type {
   ProviderApprovalDecision,
+  OrchestrationCommand,
   ProviderRuntimeEvent,
   ProviderSendTurnInput,
   ProviderSession,
@@ -13,13 +14,20 @@ import type {
   ProviderUploadFeedbackResult,
 } from "@t3tools/contracts";
 import {
-  ApprovalRequestId,
+  CommandId,
   EnvironmentId,
+  ApprovalRequestId,
   EventId,
+  McpCatalogSessionId,
+  McpCatalogDefinition,
+  McpDefinitionId,
+  McpServerId,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProjectId,
   ProviderSessionStartInput,
   ThreadId,
+  type ResolvedProjectMcpServer,
   TurnId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
@@ -34,11 +42,14 @@ import * as Layer from "effect/Layer";
 import * as Metric from "effect/Metric";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { HttpServer } from "effect/unstable/http";
 
 import {
   ProviderAdapterRequestError,
@@ -51,7 +62,7 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
-import { makeProviderServiceLive } from "./ProviderService.ts";
+import { makeProviderServiceLive, type ProviderServiceLiveOptions } from "./ProviderService.ts";
 import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -63,14 +74,61 @@ import {
 import * as ServerConfig from "../../config.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
-import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
+import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as OrchestrationEngine from "../../orchestration/Services/OrchestrationEngine.ts";
+import * as ProjectMcpService from "../../project/ProjectMcpService.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import * as ProjectMcpProxyRegistry from "../../mcp/ProjectMcpProxyRegistry.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
+import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
 const serverConfigTestLayer = ServerConfig.layerTest(process.cwd(), process.cwd()).pipe(
   Layer.provide(NodeServices.layer),
 );
+const defaultProjectId = ProjectId.make("provider-service-project");
+const makeProviderProjectContextTestLayer = (
+  resolveForSession: ProjectMcpService.ProjectMcpServiceShape["resolveForSession"] = () =>
+    Effect.succeed([]),
+  acquireSessionLease: ProjectMcpService.ProjectMcpServiceShape["acquireSessionLease"] = () =>
+    Effect.succeed({ servers: [], resolveSecret: () => undefined, oauthStateLeases: new Map() }),
+  commandReadModel?: unknown,
+  acquireResolvedSessionLease: ProjectMcpService.ProjectMcpServiceShape["acquireResolvedSessionLease"] = (
+    servers,
+  ) => Effect.succeed({ servers, resolveSecret: () => undefined, oauthStateLeases: new Map() }),
+) =>
+  Layer.mergeAll(
+    Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+      getThreadShellById: () =>
+        Effect.succeed(
+          Option.some(
+            commandReadModel === undefined
+              ? { projectId: defaultProjectId }
+              : {
+                  projectId: (commandReadModel as { threads: Array<{ projectId: ProjectId }> })
+                    .threads[0]!.projectId,
+                  session: (commandReadModel as { threads: Array<{ session?: unknown }> })
+                    .threads[0]?.session,
+                },
+          ),
+        ),
+      ...(commandReadModel === undefined
+        ? {}
+        : { getCommandReadModel: () => Effect.succeed(commandReadModel) }),
+    } as never),
+    Layer.succeed(ProjectMcpService.ProjectMcpService, {
+      resolveForSession,
+      acquireSessionLease,
+      acquireResolvedSessionLease,
+      withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+    } as never),
+  );
+
+const makeTestProviderServiceLive = (
+  options?: Parameters<typeof makeProviderServiceLive>[0],
+  projectContextLayer = makeProviderProjectContextTestLayer(),
+) => makeProviderServiceLive(options).pipe(Layer.provide(projectContextLayer));
 
 const asRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
 const asEventId = (value: string): EventId => EventId.make(value);
@@ -81,6 +139,7 @@ const claudeAgentInstanceId = ProviderInstanceId.make("claudeAgent");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
+const OPENCODE_DRIVER = ProviderDriverKind.make("opencode");
 
 type LegacyProviderRuntimeEvent = {
   readonly type: string;
@@ -95,11 +154,15 @@ type LegacyProviderRuntimeEvent = {
   readonly [key: string]: unknown;
 };
 
-function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
+function makeFakeCodexAdapter(
+  provider: ProviderDriverKind = CODEX_DRIVER,
+  lifecycleEvents?: Array<string>,
+) {
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
+  const subscribed = Deferred.makeUnsafe<void>();
 
-  const createSession = (input: ProviderSessionStartInput): Effect.Effect<ProviderSession, never> =>
+  const startSession = vi.fn((input: ProviderSessionStartInput) =>
     Effect.sync(() => {
       const now = "2026-01-01T00:00:00.000Z";
       const session: ProviderSession = {
@@ -119,11 +182,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
       };
       sessions.set(session.threadId, session);
       return session;
-    });
-
-  const startSession = vi.fn(
-    (input: ProviderSessionStartInput): Effect.Effect<ProviderSession, ProviderAdapterError> =>
-      createSession(input),
+    }),
   );
 
   const sendTurn = vi.fn(
@@ -171,6 +230,13 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     (threadId: ThreadId): Effect.Effect<void, ProviderAdapterError> =>
       Effect.sync(() => {
         sessions.delete(threadId);
+      }),
+  );
+
+  const cleanupSessionMcp = vi.fn(
+    (_threadId: ThreadId): Effect.Effect<void, ProviderAdapterError> =>
+      Effect.sync(() => {
+        lifecycleEvents?.push("adapter.cleanup");
       }),
   );
 
@@ -225,6 +291,8 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     provider,
     capabilities: {
       sessionModelSwitch: "in-session",
+      remoteHttpMcp: "next-session",
+      managedPreviewMcp: "next-session",
     },
     startSession,
     sendTurn,
@@ -232,6 +300,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     respondToRequest,
     respondToUserInput,
     stopSession,
+    cleanupSessionMcp,
     listSessions,
     hasSession,
     readThread,
@@ -239,7 +308,13 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     ...(provider === CODEX_DRIVER ? { uploadFeedback } : {}),
     stopAll,
     get streamEvents() {
-      return Stream.fromPubSub(runtimeEventPubSub);
+      return Stream.unwrap(
+        Effect.gen(function* () {
+          const subscription = yield* PubSub.subscribe(runtimeEventPubSub);
+          yield* Deferred.succeed(subscribed, undefined);
+          return Stream.fromSubscription(subscription);
+        }),
+      );
     },
   };
 
@@ -260,7 +335,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
 
   return {
     adapter,
-    createSession,
+    subscribed: Deferred.await(subscribed),
     emit,
     updateSession,
     startSession,
@@ -269,6 +344,7 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     respondToRequest,
     respondToUserInput,
     stopSession,
+    cleanupSessionMcp,
     listSessions,
     hasSession,
     readThread,
@@ -276,57 +352,6 @@ function makeFakeCodexAdapter(provider: ProviderDriverKind = CODEX_DRIVER) {
     uploadFeedback,
     stopAll,
   };
-}
-
-const makeTestMcpCredential = (
-  threadId: ThreadId,
-  providerSessionId: string,
-): McpSessionRegistry.McpIssuedCredential => ({
-  config: {
-    environmentId: EnvironmentId.make("environment-1"),
-    threadId,
-    providerSessionId,
-    providerInstanceId: codexInstanceId,
-    endpoint: "http://127.0.0.1:43123/mcp",
-    authorizationHeader: `Bearer ${providerSessionId}-token`,
-  },
-});
-
-function makeMcpTransactionTestLayer(input: {
-  readonly codex: ReturnType<typeof makeFakeCodexAdapter>;
-  readonly issueMcpCredential: (
-    request: McpSessionRegistry.McpCredentialRequest,
-  ) => Effect.Effect<McpSessionRegistry.McpIssuedCredential | undefined>;
-  readonly revokeMcpProviderCredential?: (providerSessionId: string) => Effect.Effect<void>;
-}) {
-  const providerAdapterLayer = Layer.succeed(
-    ProviderAdapterRegistry.ProviderAdapterRegistry,
-    makeAdapterRegistryMock({ [CODEX_DRIVER]: input.codex.adapter }),
-  );
-  const runtimeRepositoryLayer = ProviderSessionRuntime.layer.pipe(
-    Layer.provide(SqlitePersistenceMemory),
-  );
-  const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
-  const providerLayer = makeProviderServiceLive({
-    issueMcpCredential: input.issueMcpCredential,
-    ...(input.revokeMcpProviderCredential
-      ? { revokeMcpProviderCredential: input.revokeMcpProviderCredential }
-      : {}),
-  }).pipe(
-    Layer.provide(providerAdapterLayer),
-    Layer.provide(directoryLayer),
-    Layer.provide(defaultServerSettingsLayer),
-    Layer.provide(serverConfigTestLayer),
-    Layer.provide(AnalyticsService.layerTest),
-    Layer.provide(
-      Layer.succeed(
-        ProviderEventLoggers.ProviderEventLoggers,
-        ProviderEventLoggers.NoOpProviderEventLoggers,
-      ),
-    ),
-  );
-
-  return Layer.mergeAll(providerLayer, directoryLayer, runtimeRepositoryLayer, NodeServices.layer);
 }
 
 const advanceTestClock = (ms: number) =>
@@ -343,14 +368,12 @@ const hasMetricSnapshot = (
       Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value),
   );
 
-function makeProviderServiceLayer() {
+function makeProviderServiceLayer(
+  issueMcpCredential?: ProviderServiceLiveOptions["issueMcpCredential"],
+) {
   const codex = makeFakeCodexAdapter();
   const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
-  const analyticsRecords: Array<{
-    readonly event: string;
-    readonly properties?: Readonly<Record<string, unknown>>;
-  }> = [];
   const registry = makeAdapterRegistryMock({
     [ProviderDriverKind.make("codex")]: codex.adapter,
     [ProviderDriverKind.make("claudeAgent")]: claude.adapter,
@@ -365,50 +388,329 @@ function makeProviderServiceLayer() {
     Layer.provide(SqlitePersistenceMemory),
   );
   const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
-  const analyticsLayer = Layer.succeed(
-    AnalyticsService.AnalyticsService,
-    AnalyticsService.AnalyticsService.of({
-      record: (event, properties) =>
-        Effect.sync(() => {
-          analyticsRecords.push({
-            event,
-            ...(properties !== undefined ? { properties } : {}),
-          });
-        }),
-      flush: Effect.void,
-    }),
+  const projectMcpServer = {
+    id: McpServerId.make("mcp-docs"),
+    name: "t3-code",
+    transport: {
+      type: "streamable-http",
+      url: "https://docs.example.test/mcp",
+      headers: [],
+      authorization: { type: "none" },
+    },
+  } as const;
+  const issuedProjectMcpServer = {
+    id: projectMcpServer.id,
+    name: projectMcpServer.name,
+    endpoint: new URL("http://127.0.0.1:43123/mcp/project/project-endpoint"),
+    authorizationHeader: "Bearer project-token",
+  } as const;
+  const resolveProjectMcp = vi.fn<ProjectMcpService.ProjectMcpServiceShape["resolveForSession"]>(
+    () => Effect.succeed([projectMcpServer]),
+  );
+  let releasedSessionLeases = 0;
+  const acquireProjectMcpLease = vi.fn<
+    ProjectMcpService.ProjectMcpServiceShape["acquireSessionLease"]
+  >(() =>
+    Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        releasedSessionLeases += 1;
+      }),
+    ).pipe(
+      Effect.as({
+        servers: [projectMcpServer],
+        resolveSecret: () => undefined,
+        oauthStateLeases: new Map(),
+      }),
+    ),
   );
 
-  const rawLayer = Layer.mergeAll(
-    makeProviderServiceLive().pipe(
-      Layer.provide(providerAdapterLayer),
-      Layer.provide(directoryLayer),
+  const layer = it.layer(
+    Layer.mergeAll(
+      makeTestProviderServiceLive(
+        issueMcpCredential === undefined ? undefined : { issueMcpCredential },
+        makeProviderProjectContextTestLayer(resolveProjectMcp, acquireProjectMcpLease),
+      ).pipe(
+        Layer.provide(providerAdapterLayer),
+        Layer.provide(directoryLayer),
+        Layer.provide(defaultServerSettingsLayer),
+        Layer.provide(serverConfigTestLayer),
+        Layer.provideMerge(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      ),
+      directoryLayer,
+
+      runtimeRepositoryLayer,
+      NodeServices.layer,
+    ),
+  );
+
+  return {
+    codex,
+    claude,
+    cursor,
+    projectMcpServer,
+    issuedProjectMcpServer,
+    resolveProjectMcp,
+    acquireProjectMcpLease,
+    get releasedSessionLeases() {
+      return releasedSessionLeases;
+    },
+    layer,
+  };
+}
+
+it.effect("starts providers from the durable catalog and persists application", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("thread-durable-catalog");
+    const sessionId = McpCatalogSessionId.make("catalog-session-durable");
+    const projectId = ProjectId.make("project-durable-catalog");
+    const logicalServerId = McpServerId.make("durable-server");
+    const definition = yield* Schema.decodeUnknownEffect(McpCatalogDefinition)({
+      definitionId: McpDefinitionId.make("definition-durable"),
+      logicalServerId,
+      scope: "global",
+      scopeId: "environment-durable",
+      name: "Durable server",
+      transport: {
+        type: "streamable-http",
+        url: "https://durable.example.test/mcp",
+        headers: [
+          {
+            name: "X-Api-Key",
+            credential: { id: "11111111-1111-4111-8111-111111111111", name: "api-key" },
+          },
+        ],
+        authorization: { type: "none" },
+      },
+      enabled: true,
+      providerInstanceIds: [codexInstanceId],
+      revision: 1,
+    });
+    const snapshot = {
+      catalogSessionId: sessionId,
+      threadId,
+      providerInstanceId: codexInstanceId,
+      baseline: [definition],
+      desired: [definition],
+      applied: [],
+      desiredRevision: 1,
+      appliedRevision: 0,
+    };
+    const readModel = {
+      threads: [
+        {
+          id: threadId,
+          projectId,
+          session: { mcpCatalogSessionId: sessionId },
+        },
+      ],
+      mcpCatalog: {
+        environmentId: "environment-durable",
+        globalRevision: 1,
+        globalDefinitions: [definition],
+        projectRevisions: [],
+        projectDefinitions: [],
+        projectOverrides: [],
+        sessions: [snapshot],
+      },
+    };
+    const acquired = vi.fn((servers: ReadonlyArray<ResolvedProjectMcpServer>) =>
+      Effect.succeed({ servers, resolveSecret: () => undefined, oauthStateLeases: new Map() }),
+    );
+    const issued = vi.fn(
+      (request: Parameters<typeof McpSessionRegistry.issueActiveMcpCredential>[0]) =>
+        Effect.succeed({
+          config: {
+            environmentId: EnvironmentId.make("environment-durable"),
+            threadId: request.threadId,
+            providerSessionId: "provider-session-durable",
+            providerInstanceId: request.providerInstanceId,
+            endpoint: "http://127.0.0.1:43123/mcp",
+            authorizationHeader: "Bearer durable-token",
+            projectServers: (request.projectMcpServers ?? []).map((server) => ({
+              id: server.id,
+              name: server.name,
+              endpoint: new URL("http://127.0.0.1:43123/mcp/project/durable"),
+              authorizationHeader: "Bearer durable-token",
+            })),
+          },
+        }),
+    );
+    const applied = vi.fn((_command: OrchestrationCommand) => Effect.succeed({ sequence: 2 }));
+    const adapter = makeFakeCodexAdapter();
+    const providerLayer = makeTestProviderServiceLive(
+      { issueMcpCredential: issued },
+      makeProviderProjectContextTestLayer(
+        undefined,
+        () => Effect.die("legacy lease should not be used"),
+        readModel,
+        acquired,
+      ),
+    ).pipe(
+      Layer.provide(
+        Layer.succeed(
+          ProviderAdapterRegistry.ProviderAdapterRegistry,
+          makeAdapterRegistryMock({ [CODEX_DRIVER]: adapter.adapter }),
+        ),
+      ),
+      Layer.provide(
+        ProviderSessionDirectoryLive.pipe(
+          Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+        ),
+      ),
       Layer.provide(defaultServerSettingsLayer),
       Layer.provide(serverConfigTestLayer),
-      Layer.provideMerge(analyticsLayer),
+      Layer.provide(AnalyticsService.layerTest),
       Layer.provide(
         Layer.succeed(
           ProviderEventLoggers.ProviderEventLoggers,
           ProviderEventLoggers.NoOpProviderEventLoggers,
         ),
       ),
-    ),
-    directoryLayer,
+      Layer.provide(
+        Layer.succeed(OrchestrationEngine.OrchestrationEngineService, {
+          dispatch: applied,
+        } as never),
+      ),
+    );
 
-    runtimeRepositoryLayer,
-    NodeServices.layer,
-  );
-  const layer = it.layer(rawLayer);
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      assert.equal(acquired.mock.calls.length, 1);
+      assert.deepEqual(
+        acquired.mock.calls[0]?.[0].map(({ id, name }) => ({ id, name })),
+        [{ id: logicalServerId, name: "Durable server" }],
+      );
+      assert.equal(issued.mock.calls.length, 1);
+      assert.deepEqual(
+        issued.mock.calls[0]?.[0].projectMcpServers?.map(({ id, name }) => ({ id, name })),
+        [{ id: logicalServerId, name: "Durable server" }],
+      );
+      assert.deepEqual(applied.mock.calls[0]?.[0], {
+        type: "thread.mcp-catalog.applied",
+        commandId: CommandId.make(
+          "server:mcp-catalog-applied:thread-durable-catalog:catalog-session-durable:1",
+        ),
+        threadId,
+        mcpCatalogSessionId: sessionId,
+        revision: 1,
+        appliedCatalog: [definition],
+        appliedAt: "1970-01-01T00:00:00.000Z",
+      });
+    }).pipe(Effect.provide(providerLayer));
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
 
-  return {
-    codex,
-    claude,
-    cursor,
-    analyticsRecords,
-    rawLayer,
-    layer,
-  };
-}
+it.effect("initializes the durable catalog from global definitions on first provider start", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("thread-first-catalog-start");
+    const projectId = ProjectId.make("project-first-catalog-start");
+    const definition = {
+      definitionId: McpDefinitionId.make("definition-first-catalog"),
+      logicalServerId: McpServerId.make("first-catalog-server"),
+      scope: "global" as const,
+      scopeId: "environment-first-catalog",
+      name: "First catalog server",
+      transport: {
+        type: "streamable-http" as const,
+        url: "https://first-catalog.example.test/mcp",
+        headers: [],
+        authorization: { type: "none" as const },
+      },
+      enabled: true,
+      providerInstanceIds: [codexInstanceId],
+      revision: 1,
+    };
+    const readModel = {
+      threads: [{ id: threadId, projectId, session: null }],
+      mcpCatalog: {
+        environmentId: "environment-first-catalog",
+        globalRevision: 1,
+        globalDefinitions: [definition],
+        projectRevisions: [],
+        projectDefinitions: [],
+        projectOverrides: [],
+        sessions: [],
+      },
+    };
+    const acquired = vi.fn((servers: ReadonlyArray<ResolvedProjectMcpServer>) =>
+      Effect.succeed({ servers, resolveSecret: () => undefined, oauthStateLeases: new Map() }),
+    );
+    const dispatch = vi.fn((_command: OrchestrationCommand) => Effect.succeed({ sequence: 1 }));
+    const adapter = makeFakeCodexAdapter();
+    const providerLayer = makeTestProviderServiceLive(
+      {},
+      makeProviderProjectContextTestLayer(
+        undefined,
+        () => Effect.die("legacy lease should not be used"),
+        readModel,
+        acquired,
+      ),
+    ).pipe(
+      Layer.provide(
+        Layer.succeed(
+          ProviderAdapterRegistry.ProviderAdapterRegistry,
+          makeAdapterRegistryMock({ [CODEX_DRIVER]: adapter.adapter }),
+        ),
+      ),
+      Layer.provide(
+        ProviderSessionDirectoryLive.pipe(
+          Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+        ),
+      ),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(serverConfigTestLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+      Layer.provide(
+        Layer.succeed(OrchestrationEngine.OrchestrationEngineService, { dispatch } as never),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      assert.equal(acquired.mock.calls.length, 1);
+      assert.deepEqual(
+        acquired.mock.calls[0]?.[0].map(({ id }) => id),
+        [definition.logicalServerId],
+      );
+      assert.equal(dispatch.mock.calls.length, 2);
+      assert.equal(dispatch.mock.calls[0]?.[0].type, "thread.mcp-catalog.initialize");
+      assert.equal(
+        (
+          dispatch.mock.calls[0]?.[0] as Extract<
+            OrchestrationCommand,
+            { type: "thread.mcp-catalog.initialize" }
+          >
+        ).snapshot.baseline[0]?.logicalServerId,
+        definition.logicalServerId,
+      );
+      assert.equal(dispatch.mock.calls[1]?.[0].type, "thread.mcp-catalog.applied");
+    }).pipe(Effect.provide(providerLayer));
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
 
 it.effect("ProviderServiceLive catches stopAll failures during shutdown", () =>
   Effect.gen(function* () {
@@ -434,7 +736,7 @@ it.effect("ProviderServiceLive catches stopAll failures during shutdown", () =>
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
     const providerLayer = Layer.mergeAll(
-      makeProviderServiceLive().pipe(
+      makeTestProviderServiceLive().pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(defaultServerSettingsLayer),
@@ -461,759 +763,6 @@ it.effect("ProviderServiceLive catches stopAll failures during shutdown", () =>
     assert.equal(codex.stopAll.mock.calls.length, 1);
   }),
 );
-
-describe("MCP replacement transactions", () => {
-  const startInput = (threadId: ThreadId, runtimeMode: "approval-required" | "full-access") => ({
-    provider: CODEX_DRIVER,
-    providerInstanceId: codexInstanceId,
-    threadId,
-    runtimeMode,
-  });
-
-  const sendInput = (threadId: ThreadId) => ({
-    threadId,
-    input: "hello",
-    attachments: [],
-  });
-
-  it.effect("stops a bound session even when the adapter hides it from routing", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-stop-hidden-session");
-      const codex = makeFakeCodexAdapter();
-      const providerLayer = makeMcpTransactionTestLayer({
-        codex,
-        issueMcpCredential: (request) =>
-          Effect.succeed(makeTestMcpCredential(request.threadId, "hidden-session")),
-      });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
-        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
-        codex.stopSession.mockClear();
-        codex.hasSession.mockImplementation(() => Effect.succeed(false));
-
-        yield* provider.stopSession({ threadId });
-
-        assert.deepEqual(codex.stopSession.mock.calls, [[threadId]]);
-        assert.deepEqual(yield* codex.listSessions(), []);
-        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
-        const persisted = yield* runtimeRepository.getByThreadId({ threadId });
-        assert.equal(Option.isSome(persisted), true);
-        if (Option.isSome(persisted)) {
-          assert.equal(persisted.value.status, "stopped");
-        }
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("keeps explicit stop idempotent for an adapter that reports not found", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-stop-not-found");
-      const codex = makeFakeCodexAdapter();
-      const providerLayer = makeMcpTransactionTestLayer({
-        codex,
-        issueMcpCredential: (request) =>
-          Effect.succeed(makeTestMcpCredential(request.threadId, "not-found-session")),
-      });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
-        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
-        codex.stopSession.mockClear();
-        codex.hasSession.mockImplementation(() => Effect.succeed(false));
-        codex.stopSession.mockImplementation(() =>
-          Effect.fail(
-            new ProviderAdapterSessionNotFoundError({
-              provider: String(CODEX_DRIVER),
-              threadId,
-            }),
-          ),
-        );
-
-        yield* provider.stopSession({ threadId });
-
-        assert.deepEqual(codex.stopSession.mock.calls, [[threadId]]);
-        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
-        const persisted = yield* runtimeRepository.getByThreadId({ threadId });
-        assert.equal(Option.isSome(persisted), true);
-        if (Option.isSome(persisted)) {
-          assert.equal(persisted.value.status, "stopped");
-        }
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("preserves state when a hidden session cannot be stopped", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-stop-hidden-failure");
-      const codex = makeFakeCodexAdapter();
-      const stopError = new ProviderAdapterRequestError({
-        provider: String(CODEX_DRIVER),
-        method: "stopSession",
-        detail: "hidden session termination failed",
-      });
-      const providerLayer = makeMcpTransactionTestLayer({
-        codex,
-        issueMcpCredential: (request) =>
-          Effect.succeed(makeTestMcpCredential(request.threadId, "hidden-failure-session")),
-      });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
-        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
-        const persistedBefore = yield* runtimeRepository.getByThreadId({ threadId });
-        codex.hasSession.mockImplementation(() => Effect.succeed(false));
-        codex.stopSession.mockImplementation(() => Effect.fail(stopError));
-
-        const failure = yield* provider.stopSession({ threadId }).pipe(Effect.flip);
-
-        assert.equal(failure, stopError);
-        assert.deepEqual(
-          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
-          "hidden-failure-session",
-        );
-        const persistedAfterFailure = yield* runtimeRepository.getByThreadId({ threadId });
-        assert.deepEqual(persistedAfterFailure, persistedBefore);
-
-        codex.stopSession.mockImplementation(() => Effect.void);
-        yield* provider.stopSession({ threadId });
-        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("serializes overlapping recovery rollbacks before the next recovery prepares", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-overlapping-recovery");
-      const codex = makeFakeCodexAdapter();
-      const issued = ["initial", "candidate-a", "candidate-b"];
-      const issuedProviderSessions: string[] = [];
-      const revokedProviderSessions: string[] = [];
-      const firstStartEntered = yield* Deferred.make<void>();
-      const releaseFirstStart = yield* Deferred.make<void>();
-      const issueMcpCredential = (request: McpSessionRegistry.McpCredentialRequest) =>
-        Effect.sync(() => {
-          const providerSessionId = issued[issuedProviderSessions.length];
-          if (providerSessionId === undefined) {
-            throw new Error("test credential sequence exhausted");
-          }
-          issuedProviderSessions.push(providerSessionId);
-          return makeTestMcpCredential(request.threadId, providerSessionId);
-        });
-      const providerLayer = makeMcpTransactionTestLayer({
-        codex,
-        issueMcpCredential,
-        revokeMcpProviderCredential: (providerSessionId) =>
-          Effect.sync(() => void revokedProviderSessions.push(providerSessionId)),
-      });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
-        yield* codex.stopSession(threadId);
-
-        codex.startSession.mockImplementationOnce(() =>
-          Effect.gen(function* () {
-            yield* Deferred.succeed(firstStartEntered, undefined);
-            yield* Deferred.await(releaseFirstStart);
-            return yield* Effect.fail(
-              new ProviderAdapterRequestError({
-                provider: String(CODEX_DRIVER),
-                method: "startSession",
-                detail: "first recovery failed",
-              }),
-            );
-          }),
-        );
-
-        const firstRecovery = yield* provider
-          .sendTurn(sendInput(threadId))
-          .pipe(Effect.exit, Effect.forkChild);
-        yield* Deferred.await(firstStartEntered);
-        const secondRecovery = yield* provider
-          .sendTurn(sendInput(threadId))
-          .pipe(Effect.exit, Effect.forkChild);
-        yield* Effect.yieldNow;
-
-        assert.deepEqual(issuedProviderSessions, ["initial", "candidate-a"]);
-        yield* Deferred.succeed(releaseFirstStart, undefined);
-
-        const firstExit = yield* Fiber.join(firstRecovery);
-        const secondExit = yield* Fiber.join(secondRecovery);
-        assert.equal(Exit.isFailure(firstExit), true);
-        assert.equal(Exit.isSuccess(secondExit), true);
-        assert.deepEqual(issuedProviderSessions, ["initial", "candidate-a", "candidate-b"]);
-        assert.deepEqual(revokedProviderSessions, ["candidate-a", "initial"]);
-        assert.equal(
-          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
-          "candidate-b",
-        );
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("adopts a successful earlier recovery without issuing another credential", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-recovery-adoption");
-      const codex = makeFakeCodexAdapter();
-      const issuedProviderSessions: string[] = [];
-      const firstStartEntered = yield* Deferred.make<void>();
-      const releaseFirstStart = yield* Deferred.make<void>();
-      const secondTurnCompleted = yield* Deferred.make<void>();
-      const issueMcpCredential = (request: McpSessionRegistry.McpCredentialRequest) =>
-        Effect.sync(() => {
-          const providerSessionId = ["initial", "candidate-a"][issuedProviderSessions.length];
-          if (providerSessionId === undefined) {
-            throw new Error("test credential sequence exhausted");
-          }
-          issuedProviderSessions.push(providerSessionId);
-          return makeTestMcpCredential(request.threadId, providerSessionId);
-        });
-      const providerLayer = makeMcpTransactionTestLayer({ codex, issueMcpCredential });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
-        yield* codex.stopSession(threadId);
-
-        codex.startSession.mockImplementationOnce((input) =>
-          Effect.gen(function* () {
-            yield* Deferred.succeed(firstStartEntered, undefined);
-            yield* Deferred.await(releaseFirstStart);
-            return yield* codex.createSession(input);
-          }),
-        );
-
-        const firstRecovery = yield* provider.sendTurn(sendInput(threadId)).pipe(Effect.forkChild);
-        yield* Deferred.await(firstStartEntered);
-        const secondRecovery = yield* provider.sendTurn(sendInput(threadId)).pipe(
-          Effect.tap(() => Deferred.succeed(secondTurnCompleted, undefined)),
-          Effect.forkChild,
-        );
-        yield* Effect.yieldNow;
-
-        assert.deepEqual(issuedProviderSessions, ["initial", "candidate-a"]);
-        yield* Deferred.succeed(releaseFirstStart, undefined);
-        yield* Fiber.join(firstRecovery);
-        yield* Deferred.await(secondTurnCompleted);
-        yield* Fiber.join(secondRecovery);
-
-        assert.deepEqual(issuedProviderSessions, ["initial", "candidate-a"]);
-        assert.equal(codex.startSession.mock.calls.length, 2);
-        assert.equal(codex.sendTurn.mock.calls.length, 2);
-        assert.equal(
-          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
-          "candidate-a",
-        );
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("rolls back an interrupted recovery before allowing the next recovery", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-interrupted-recovery");
-      const codex = makeFakeCodexAdapter();
-      const issuedProviderSessions: string[] = [];
-      const revokedProviderSessions: string[] = [];
-      const firstStartEntered = yield* Deferred.make<void>();
-      const releaseFirstStart = yield* Deferred.make<void>();
-      const issueMcpCredential = (request: McpSessionRegistry.McpCredentialRequest) =>
-        Effect.sync(() => {
-          const providerSessionId = ["initial", "candidate-a", "candidate-b"][
-            issuedProviderSessions.length
-          ];
-          if (providerSessionId === undefined) {
-            throw new Error("test credential sequence exhausted");
-          }
-          issuedProviderSessions.push(providerSessionId);
-          return makeTestMcpCredential(request.threadId, providerSessionId);
-        });
-      const providerLayer = makeMcpTransactionTestLayer({
-        codex,
-        issueMcpCredential,
-        revokeMcpProviderCredential: (providerSessionId) =>
-          Effect.sync(() => void revokedProviderSessions.push(providerSessionId)),
-      });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
-        yield* codex.stopSession(threadId);
-
-        codex.startSession.mockImplementationOnce((input) =>
-          Effect.gen(function* () {
-            yield* Deferred.succeed(firstStartEntered, undefined);
-            yield* Deferred.await(releaseFirstStart);
-            return yield* codex.createSession(input);
-          }),
-        );
-
-        const firstRecovery = yield* provider.sendTurn(sendInput(threadId)).pipe(Effect.forkChild);
-        yield* Deferred.await(firstStartEntered);
-        yield* Fiber.interrupt(firstRecovery);
-        yield* Deferred.succeed(releaseFirstStart, undefined);
-
-        const secondExit = yield* provider.sendTurn(sendInput(threadId)).pipe(Effect.exit);
-        assert.equal(Exit.isSuccess(secondExit), true);
-        assert.deepEqual(issuedProviderSessions, ["initial", "candidate-a", "candidate-b"]);
-        assert.deepEqual(revokedProviderSessions, ["candidate-a", "initial"]);
-        assert.equal(
-          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
-          "candidate-b",
-        );
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("serializes concurrent explicit starts for one thread", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-explicit-starts");
-      const codex = makeFakeCodexAdapter();
-      const issuedProviderSessions: string[] = [];
-      const firstStartEntered = yield* Deferred.make<void>();
-      const releaseFirstStart = yield* Deferred.make<void>();
-      const issueMcpCredential = (request: McpSessionRegistry.McpCredentialRequest) =>
-        Effect.sync(() => {
-          const providerSessionId = ["candidate-a", "candidate-b"][issuedProviderSessions.length];
-          if (providerSessionId === undefined) {
-            throw new Error("test credential sequence exhausted");
-          }
-          issuedProviderSessions.push(providerSessionId);
-          return makeTestMcpCredential(request.threadId, providerSessionId);
-        });
-      const providerLayer = makeMcpTransactionTestLayer({ codex, issueMcpCredential });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        codex.startSession.mockImplementationOnce(() =>
-          Effect.gen(function* () {
-            yield* Deferred.succeed(firstStartEntered, undefined);
-            yield* Deferred.await(releaseFirstStart);
-            return yield* Effect.fail(
-              new ProviderAdapterRequestError({
-                provider: String(CODEX_DRIVER),
-                method: "startSession",
-                detail: "first explicit start failed",
-              }),
-            );
-          }),
-        );
-
-        const firstStart = yield* provider
-          .startSession(threadId, startInput(threadId, "full-access"))
-          .pipe(Effect.exit, Effect.forkChild);
-        yield* Deferred.await(firstStartEntered);
-        const secondStart = yield* provider
-          .startSession(threadId, startInput(threadId, "approval-required"))
-          .pipe(Effect.exit, Effect.forkChild);
-        yield* Effect.yieldNow;
-
-        assert.deepEqual(issuedProviderSessions, ["candidate-a"]);
-        yield* Deferred.succeed(releaseFirstStart, undefined);
-        const firstExit = yield* Fiber.join(firstStart);
-        const secondExit = yield* Fiber.join(secondStart);
-        assert.equal(Exit.isFailure(firstExit), true);
-        assert.equal(Exit.isSuccess(secondExit), true);
-        assert.deepEqual(issuedProviderSessions, ["candidate-a", "candidate-b"]);
-        assert.equal(
-          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
-          "candidate-b",
-        );
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("keeps different-thread explicit starts concurrent", () =>
-    Effect.gen(function* () {
-      const firstThreadId = asThreadId("thread-mcp-concurrency-a");
-      const secondThreadId = asThreadId("thread-mcp-concurrency-b");
-      const codex = makeFakeCodexAdapter();
-      const issuedProviderSessions: string[] = [];
-      const firstStartEntered = yield* Deferred.make<void>();
-      const releaseFirstStart = yield* Deferred.make<void>();
-      const secondStartCompleted = yield* Deferred.make<void>();
-      const issueMcpCredential = (request: McpSessionRegistry.McpCredentialRequest) =>
-        Effect.sync(() => {
-          const providerSessionId = `candidate-${issuedProviderSessions.length + 1}`;
-          issuedProviderSessions.push(`${String(request.threadId)}:${providerSessionId}`);
-          return makeTestMcpCredential(request.threadId, providerSessionId);
-        });
-      const providerLayer = makeMcpTransactionTestLayer({ codex, issueMcpCredential });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        codex.startSession.mockImplementationOnce((input) =>
-          Effect.gen(function* () {
-            yield* Deferred.succeed(firstStartEntered, undefined);
-            yield* Deferred.await(releaseFirstStart);
-            return yield* codex.createSession(input);
-          }),
-        );
-
-        const firstStart = yield* provider
-          .startSession(firstThreadId, startInput(firstThreadId, "full-access"))
-          .pipe(Effect.forkChild);
-        yield* Deferred.await(firstStartEntered);
-        const secondStart = yield* provider
-          .startSession(secondThreadId, startInput(secondThreadId, "full-access"))
-          .pipe(
-            Effect.tap(() => Deferred.succeed(secondStartCompleted, undefined)),
-            Effect.forkChild,
-          );
-
-        yield* Deferred.await(secondStartCompleted);
-        assert.deepEqual(issuedProviderSessions, [
-          `${String(firstThreadId)}:candidate-1`,
-          `${String(secondThreadId)}:candidate-2`,
-        ]);
-        yield* Fiber.join(secondStart);
-        yield* Deferred.succeed(releaseFirstStart, undefined);
-        yield* Fiber.join(firstStart);
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("fences recovery when stop arrives before candidate publication", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-stop-during-recovery");
-      const codex = makeFakeCodexAdapter();
-      const issuedProviderSessions: string[] = [];
-      const revokedProviderSessions: string[] = [];
-      const recoveryStartEntered = yield* Deferred.make<void>();
-      const releaseRecoveryStart = yield* Deferred.make<void>();
-      const issueMcpCredential = (request: McpSessionRegistry.McpCredentialRequest) =>
-        Effect.sync(() => {
-          const providerSessionId = ["initial", "candidate"][issuedProviderSessions.length];
-          if (providerSessionId === undefined) {
-            throw new Error("test credential sequence exhausted");
-          }
-          issuedProviderSessions.push(providerSessionId);
-          return makeTestMcpCredential(request.threadId, providerSessionId);
-        });
-      const providerLayer = makeMcpTransactionTestLayer({
-        codex,
-        issueMcpCredential,
-        revokeMcpProviderCredential: (providerSessionId) =>
-          Effect.sync(() => void revokedProviderSessions.push(providerSessionId)),
-      });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
-        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
-        yield* codex.stopSession(threadId);
-
-        codex.startSession.mockImplementationOnce((input) =>
-          Effect.gen(function* () {
-            yield* Deferred.succeed(recoveryStartEntered, undefined);
-            yield* Deferred.await(releaseRecoveryStart);
-            return yield* codex.createSession(input);
-          }),
-        );
-        const recovery = yield* provider
-          .sendTurn(sendInput(threadId))
-          .pipe(Effect.exit, Effect.forkChild);
-        yield* Deferred.await(recoveryStartEntered);
-        const stop = yield* provider.stopSession({ threadId }).pipe(Effect.exit, Effect.forkChild);
-        yield* Effect.yieldNow;
-        yield* Deferred.succeed(releaseRecoveryStart, undefined);
-
-        const recoveryExit = yield* Fiber.join(recovery);
-        const stopExit = yield* Fiber.join(stop);
-        assert.equal(Exit.isFailure(recoveryExit), true);
-        assert.equal(Exit.isSuccess(stopExit), true);
-        assert.equal(codex.sendTurn.mock.calls.length, 0);
-        assert.deepEqual(revokedProviderSessions, ["candidate"]);
-        assert.equal(yield* codex.hasSession(threadId), false);
-
-        const persisted = yield* runtimeRepository.getByThreadId({ threadId });
-        assert.equal(Option.isSome(persisted), true);
-        if (Option.isSome(persisted)) {
-          assert.equal(persisted.value.status, "stopped");
-        }
-        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("restores a rejected replacement before a failed stop can preserve it", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-stop-during-mutated-replacement");
-      const codex = makeFakeCodexAdapter();
-      const issuedProviderSessions: string[] = [];
-      const revokedProviderSessions: string[] = [];
-      const replacementStartEntered = yield* Deferred.make<void>();
-      const releaseReplacementStart = yield* Deferred.make<void>();
-      let nativeRuntimeMode: ProviderSession["runtimeMode"] = "approval-required";
-      let nativeMcpToken = "initial-token";
-      const issueMcpCredential = (request: McpSessionRegistry.McpCredentialRequest) =>
-        Effect.sync(() => {
-          const providerSessionId = ["initial", "candidate"][issuedProviderSessions.length];
-          if (providerSessionId === undefined) {
-            throw new Error("test credential sequence exhausted");
-          }
-          issuedProviderSessions.push(providerSessionId);
-          return makeTestMcpCredential(request.threadId, providerSessionId);
-        });
-      const stopError = new ProviderAdapterRequestError({
-        provider: String(CODEX_DRIVER),
-        method: "stopSession",
-        detail: "simulated termination confirmation failure",
-      });
-      const providerLayer = makeMcpTransactionTestLayer({
-        codex,
-        issueMcpCredential,
-        revokeMcpProviderCredential: (providerSessionId) =>
-          Effect.sync(() => void revokedProviderSessions.push(providerSessionId)),
-      });
-
-      Object.assign(codex.adapter, {
-        settleStartedSession: ({
-          threadId: settledThreadId,
-          session,
-          outcome,
-        }: {
-          readonly threadId: ThreadId;
-          readonly session: ProviderSession;
-          readonly outcome: "commit" | "rollback";
-        }) =>
-          Effect.sync(() => {
-            if (outcome !== "rollback") return;
-            nativeRuntimeMode = "approval-required";
-            nativeMcpToken = "initial-token";
-            codex.updateSession(settledThreadId, (current) => ({
-              ...current,
-              runtimeMode:
-                session.runtimeMode === "full-access" ? "approval-required" : current.runtimeMode,
-            }));
-          }),
-      });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        yield* provider.startSession(threadId, startInput(threadId, "approval-required"));
-        nativeRuntimeMode = "approval-required";
-        nativeMcpToken = "initial-token";
-        yield* codex.stopSession(threadId);
-
-        codex.startSession.mockImplementationOnce((input) =>
-          Effect.gen(function* () {
-            nativeRuntimeMode = input.runtimeMode;
-            nativeMcpToken = "candidate-token";
-            yield* Deferred.succeed(replacementStartEntered, undefined);
-            yield* Deferred.await(releaseReplacementStart);
-            return yield* codex.createSession(input);
-          }),
-        );
-        codex.stopSession.mockImplementation(() => Effect.fail(stopError));
-
-        const replacement = yield* provider
-          .startSession(threadId, startInput(threadId, "full-access"))
-          .pipe(Effect.exit, Effect.forkChild);
-        yield* Deferred.await(replacementStartEntered);
-        const stop = yield* provider.stopSession({ threadId }).pipe(Effect.exit, Effect.forkChild);
-        yield* Effect.yieldNow;
-        yield* Deferred.succeed(releaseReplacementStart, undefined);
-
-        const replacementExit = yield* Fiber.join(replacement);
-        const stopExit = yield* Fiber.join(stop);
-        assert.equal(Exit.isFailure(replacementExit), true);
-        assert.equal(Exit.isFailure(stopExit), true);
-        assert.equal(nativeRuntimeMode, "approval-required");
-        assert.equal(nativeMcpToken, "initial-token");
-        assert.equal((yield* codex.listSessions())[0]?.runtimeMode, "approval-required");
-        assert.deepEqual(issuedProviderSessions, ["initial", "candidate"]);
-        assert.deepEqual(revokedProviderSessions, ["candidate"]);
-        assert.equal(
-          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
-          "initial",
-        );
-
-        yield* provider.sendTurn(sendInput(threadId));
-        assert.equal(codex.sendTurn.mock.calls.length, 1);
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("clears the stop fence when stopping the live session fails", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-stop-failure");
-      const codex = makeFakeCodexAdapter();
-      const providerLayer = makeMcpTransactionTestLayer({
-        codex,
-        issueMcpCredential: (request) =>
-          Effect.succeed(makeTestMcpCredential(request.threadId, "stop-failure")),
-      });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
-        codex.stopSession.mockImplementationOnce(() =>
-          Effect.fail(
-            new ProviderAdapterRequestError({
-              provider: String(CODEX_DRIVER),
-              method: "stopSession",
-              detail: "simulated stop failure",
-            }),
-          ),
-        );
-
-        const stopExit = yield* provider.stopSession({ threadId }).pipe(Effect.exit);
-        assert.equal(Exit.isFailure(stopExit), true);
-
-        yield* provider.sendTurn(sendInput(threadId));
-        assert.equal(codex.sendTurn.mock.calls.length, 1);
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("does not persist running after a send is overtaken by stop", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-send-stop-race");
-      const codex = makeFakeCodexAdapter();
-      const sendEntered = yield* Deferred.make<void>();
-      const releaseSend = yield* Deferred.make<void>();
-      const providerLayer = makeMcpTransactionTestLayer({
-        codex,
-        issueMcpCredential: (request) =>
-          Effect.succeed(makeTestMcpCredential(request.threadId, "send-stop-race")),
-      });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
-        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
-        codex.sendTurn.mockImplementationOnce((input) =>
-          Effect.gen(function* () {
-            yield* Deferred.succeed(sendEntered, undefined);
-            yield* Deferred.await(releaseSend);
-            return {
-              threadId: input.threadId,
-              turnId: asTurnId("turn-send-stop-race"),
-            };
-          }),
-        );
-
-        const send = yield* provider
-          .sendTurn(sendInput(threadId))
-          .pipe(Effect.exit, Effect.forkChild);
-        yield* Deferred.await(sendEntered);
-        const stop = yield* provider.stopSession({ threadId }).pipe(Effect.exit, Effect.forkChild);
-        yield* Effect.yieldNow;
-        yield* Deferred.succeed(releaseSend, undefined);
-
-        const sendExit = yield* Fiber.join(send);
-        const stopExit = yield* Fiber.join(stop);
-        assert.equal(Exit.isFailure(sendExit), true);
-        assert.equal(Exit.isSuccess(stopExit), true);
-        const persisted = yield* runtimeRepository.getByThreadId({ threadId });
-        assert.equal(Option.isSome(persisted), true);
-        if (Option.isSome(persisted)) {
-          assert.equal(persisted.value.status, "stopped");
-        }
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("allows an explicit restart after a completed stop", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-explicit-restart");
-      const codex = makeFakeCodexAdapter();
-      const issuedProviderSessions: string[] = [];
-      const providerLayer = makeMcpTransactionTestLayer({
-        codex,
-        issueMcpCredential: (request) =>
-          Effect.sync(() => {
-            const providerSessionId = ["initial", "restart"][issuedProviderSessions.length];
-            if (providerSessionId === undefined) {
-              throw new Error("test credential sequence exhausted");
-            }
-            issuedProviderSessions.push(providerSessionId);
-            return makeTestMcpCredential(request.threadId, providerSessionId);
-          }),
-      });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
-        yield* provider.stopSession({ threadId });
-
-        const restarted = yield* provider.startSession(
-          threadId,
-          startInput(threadId, "approval-required"),
-        );
-        assert.equal(restarted.runtimeMode, "approval-required");
-        assert.deepEqual(issuedProviderSessions, ["initial", "restart"]);
-        assert.equal(
-          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
-          "restart",
-        );
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-
-  it.effect("keeps a failed explicit restart recoverable after stop", () =>
-    Effect.gen(function* () {
-      const threadId = asThreadId("thread-mcp-failed-explicit-restart");
-      const codex = makeFakeCodexAdapter();
-      const issuedProviderSessions: string[] = [];
-      const revokedProviderSessions: string[] = [];
-      const providerLayer = makeMcpTransactionTestLayer({
-        codex,
-        issueMcpCredential: (request) =>
-          Effect.sync(() => {
-            const providerSessionId = ["initial", "failed", "recovery"][
-              issuedProviderSessions.length
-            ];
-            if (providerSessionId === undefined) {
-              throw new Error("test credential sequence exhausted");
-            }
-            issuedProviderSessions.push(providerSessionId);
-            return makeTestMcpCredential(request.threadId, providerSessionId);
-          }),
-        revokeMcpProviderCredential: (providerSessionId) =>
-          Effect.sync(() => void revokedProviderSessions.push(providerSessionId)),
-      });
-
-      yield* Effect.gen(function* () {
-        const provider = yield* ProviderService.ProviderService;
-        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
-        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
-        yield* provider.stopSession({ threadId });
-        codex.hasSession.mockImplementation(() => Effect.succeed(false));
-        codex.stopSession.mockClear();
-        codex.startSession.mockImplementationOnce(() =>
-          Effect.fail(
-            new ProviderAdapterRequestError({
-              provider: String(CODEX_DRIVER),
-              method: "startSession",
-              detail: "simulated restart failure",
-            }),
-          ),
-        );
-
-        const restartExit = yield* provider
-          .startSession(threadId, startInput(threadId, "approval-required"))
-          .pipe(Effect.exit);
-        assert.equal(Exit.isFailure(restartExit), true);
-        assert.deepEqual(revokedProviderSessions, ["failed"]);
-        assert.deepEqual(codex.stopSession.mock.calls, [[threadId]]);
-
-        const persisted = yield* runtimeRepository.getByThreadId({ threadId });
-        assert.equal(Option.isSome(persisted), true);
-        if (Option.isSome(persisted)) {
-          assert.equal(persisted.value.status, "stopped");
-        }
-
-        yield* provider.sendTurn(sendInput(threadId));
-        assert.deepEqual(issuedProviderSessions, ["initial", "failed", "recovery"]);
-      }).pipe(Effect.provide(providerLayer));
-    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
-  );
-});
 
 it.effect("ProviderServiceLive rejects new sessions for disabled providers", () =>
   Effect.gen(function* () {
@@ -1247,7 +796,7 @@ it.effect("ProviderServiceLive rejects new sessions for disabled providers", () 
       Layer.provide(SqlitePersistenceMemory),
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
-    const providerLayer = makeProviderServiceLive().pipe(
+    const providerLayer = makeTestProviderServiceLive().pipe(
       Layer.provide(providerAdapterLayer),
       Layer.provide(directoryLayer),
       Layer.provide(defaultServerSettingsLayer),
@@ -1332,7 +881,7 @@ it.effect(
       const directoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const providerLayer = makeProviderServiceLive().pipe(
+      const providerLayer = makeTestProviderServiceLive().pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(serverSettingsLayer),
@@ -1403,7 +952,7 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
       Layer.provide(SqlitePersistenceMemory),
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
-    const providerLayer = makeProviderServiceLive().pipe(
+    const providerLayer = makeTestProviderServiceLive().pipe(
       Layer.provide(providerAdapterLayer),
       Layer.provide(directoryLayer),
       Layer.provide(defaultServerSettingsLayer),
@@ -1435,48 +984,570 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
-const routing = makeProviderServiceLayer();
-const hiddenStaleRouting = makeProviderServiceLayer();
+const routing = makeProviderServiceLayer((request) =>
+  Effect.succeed({
+    config: {
+      environmentId: EnvironmentId.make("provider-service-environment"),
+      threadId: request.threadId,
+      providerSessionId: `provider-session-${request.threadId}`,
+      providerInstanceId: request.providerInstanceId,
+      endpoint: "http://127.0.0.1:43123/mcp",
+      authorizationHeader: "Bearer preview-token",
+      projectServers: [
+        {
+          id: McpServerId.make("mcp-docs"),
+          name: "t3-code",
+          endpoint: new URL("http://127.0.0.1:43123/mcp/project/project-endpoint"),
+          authorizationHeader: "Bearer project-token",
+        },
+      ],
+    },
+  }),
+);
 
-it.effect("stops hidden stale sessions without recording a stop for an absent session", () =>
+const makeMcpLifecycleHarness = Effect.fn("makeMcpLifecycleHarness")(function* (
+  leaseGate: Effect.Effect<void> = Effect.void,
+  lifecycleEvents?: Array<string>,
+  generationFactory?: (
+    adapter: ReturnType<typeof makeFakeCodexAdapter>,
+  ) => ProviderAdapterRegistry.ProviderAdapterGenerationHandle,
+) {
+  const original = makeFakeCodexAdapter(CODEX_DRIVER, lifecycleEvents);
+  let current: ReturnType<typeof makeFakeCodexAdapter> | undefined = original;
+  const changes = yield* PubSub.unbounded<void>();
+  const forwarded = yield* Queue.unbounded<ProviderRuntimeEvent>();
+  let reconcileBarrier: { remaining: number; done: Deferred.Deferred<void> } | undefined;
+  const base = makeAdapterRegistryMock({ [CODEX_DRIVER]: original.adapter });
+  const providerGeneration = generationFactory?.(original);
+  const registry: ProviderAdapterRegistry.ProviderAdapterRegistryShape = {
+    ...base,
+    getByInstance: () =>
+      current
+        ? Effect.succeed(current.adapter)
+        : Effect.fail(new ProviderUnsupportedError({ provider: CODEX_DRIVER })),
+    listInstances: () =>
+      Effect.gen(function* () {
+        if (reconcileBarrier && --reconcileBarrier.remaining === 0) {
+          yield* Deferred.succeed(reconcileBarrier.done, undefined);
+        }
+        return current ? [codexInstanceId] : [];
+      }),
+    subscribeChanges: PubSub.subscribe(changes),
+    streamChanges: Stream.fromPubSub(changes),
+    ...(providerGeneration === undefined
+      ? {}
+      : { acquireInstance: () => Effect.succeed(providerGeneration) }),
+  };
+  const proxy = yield* ProjectMcpProxyRegistry.__testing.make({
+    endpointBase: "http://127.0.0.1:43123/mcp",
+  });
+  yield* Effect.addFinalizer(() => proxy.revokeAll);
+  const credentials = yield* McpSessionRegistry.__testing.make().pipe(
+    Effect.provideService(HttpServer.HttpServer, {
+      address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: 43123 },
+      serve: () => Effect.void,
+    }),
+    Effect.provideService(ServerEnvironment.ServerEnvironment, {
+      getEnvironmentId: Effect.succeed(EnvironmentId.make("lifecycle-test")),
+      getDescriptor: Effect.die("unused"),
+    }),
+    Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, proxy),
+  );
+  yield* Effect.addFinalizer(() => credentials.revokeAll);
+  const leases: Array<{ active: boolean }> = [];
+  const issued: McpSessionRegistry.McpIssuedCredential[] = [];
+  let revokeFailures = 0;
+  let revokeAttempts = 0;
+  const providerLayer = makeTestProviderServiceLive(
+    {
+      issueMcpCredential: (request) =>
+        credentials.revokeThread(request.threadId).pipe(
+          Effect.andThen(credentials.issue(request)),
+          Effect.tap((credential) =>
+            Effect.sync(() => {
+              issued.push(credential);
+            }),
+          ),
+        ),
+      revokeMcpCredential: (threadId) =>
+        Effect.suspend(() => {
+          revokeAttempts += 1;
+          lifecycleEvents?.push("credential.revoke");
+          if (revokeFailures > 0) {
+            revokeFailures -= 1;
+            return Effect.die("injected proxy revocation failure");
+          }
+          return credentials.revokeThread(threadId);
+        }),
+      canonicalEventLogger: {
+        filePath: "memory://mcp-lifecycle",
+        write: (event) => Queue.offer(forwarded, event as ProviderRuntimeEvent).pipe(Effect.asVoid),
+        close: () => Effect.void,
+      },
+    },
+    makeProviderProjectContextTestLayer(undefined, () =>
+      Effect.gen(function* () {
+        const lease = yield* Effect.acquireRelease(
+          Effect.sync(() => {
+            const lease = { active: true };
+            leases.push(lease);
+            return lease;
+          }),
+          (lease) =>
+            Effect.sync(() => {
+              lease.active = false;
+              lifecycleEvents?.push("project.release");
+            }),
+        );
+        yield* leaseGate;
+        return {
+          servers: [routing.projectMcpServer],
+          resolveSecret: () => (lease.active ? "leased-secret" : undefined),
+          oauthStateLeases: new Map(),
+        };
+      }),
+    ),
+  ).pipe(
+    Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+    Layer.provide(
+      ProviderSessionDirectoryLive.pipe(
+        Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+      ),
+    ),
+    Layer.provide(defaultServerSettingsLayer),
+    Layer.provide(serverConfigTestLayer),
+    Layer.provide(AnalyticsService.layerTest),
+    Layer.provide(
+      Layer.succeed(
+        ProviderEventLoggers.ProviderEventLoggers,
+        ProviderEventLoggers.NoOpProviderEventLoggers,
+      ),
+    ),
+  );
+  const providerScope = yield* Scope.make();
+  const closeProvider = Scope.close(providerScope, Exit.void);
+  yield* Effect.addFinalizer(() => closeProvider);
+  const context = yield* Layer.build(providerLayer).pipe(Scope.provide(providerScope));
+  const provider = yield* ProviderService.ProviderService.pipe(Effect.provide(context));
+  yield* original.subscribed;
+  const changeInstance = Effect.fn("changeInstance")(function* (next: typeof current) {
+    const done = yield* Deferred.make<void>();
+    reconcileBarrier = { remaining: 2, done };
+    current = next;
+    yield* PubSub.publish(changes, undefined);
+    yield* PubSub.publish(changes, undefined);
+    yield* Deferred.await(done);
+    if (next) yield* next.subscribed;
+  });
+  const exit = Effect.fn("emitExit")(function* (
+    adapter: typeof original,
+    threadId: ThreadId,
+    sessionId?: string,
+  ) {
+    adapter.emit({
+      type: "session.exited",
+      eventId: asEventId("lifecycle-exit"),
+      provider: CODEX_DRIVER,
+      threadId,
+      createdAt: "2026-09-07T00:00:00.000Z",
+      payload: {},
+      ...(sessionId ? { raw: { source: "notification", payload: { sessionId } } } : {}),
+    });
+    return yield* Queue.take(forwarded);
+  });
+  const credentialAlive = Effect.fn("credentialAlive")(function* (index: number) {
+    const config = issued[index]?.config;
+    assert.isDefined(config);
+    const endpoint = config!.projectServers?.[0]?.endpoint;
+    assert.isDefined(endpoint);
+    const handle = endpoint!.pathname.split("/").at(-1)!;
+    return {
+      credential:
+        (yield* credentials.resolve(config!.authorizationHeader.replace(/^Bearer\s+/, ""))) !==
+        undefined,
+      proxy: (yield* proxy.resolve(config!.providerSessionId, handle)) !== undefined,
+      lease: leases[index]?.active,
+    };
+  });
+  return {
+    provider,
+    original,
+    changeInstance,
+    exit,
+    credentialAlive,
+    closeProvider,
+    leases,
+    get issuedCount() {
+      return issued.length;
+    },
+    failRevokes: (count: number) => {
+      revokeFailures = count;
+    },
+    get revokeAttempts() {
+      return revokeAttempts;
+    },
+  };
+});
+
+it.effect("orders credential revocation before adapter MCP cleanup and project lease release", () =>
   Effect.gen(function* () {
-    const provider = yield* ProviderService.ProviderService;
-    const threadId = asThreadId("thread-hidden-stale-session");
+    const lifecycleEvents: Array<string> = [];
+    const h = yield* makeMcpLifecycleHarness(Effect.void, lifecycleEvents);
+    const threadId = asThreadId("ordered-provider-cleanup");
 
-    yield* provider.startSession(threadId, {
+    yield* h.provider.startSession(threadId, {
       provider: CODEX_DRIVER,
       providerInstanceId: codexInstanceId,
       threadId,
       runtimeMode: "full-access",
     });
-    hiddenStaleRouting.codex.stopSession.mockClear();
-    hiddenStaleRouting.codex.hasSession.mockImplementation(() => Effect.succeed(false));
-    hiddenStaleRouting.codex.stopSession.mockImplementation(() =>
-      Effect.fail(
-        new ProviderAdapterSessionNotFoundError({
-          provider: String(CODEX_DRIVER),
-          threadId,
+    yield* h.provider.stopSession({ threadId });
+
+    assert.deepEqual(lifecycleEvents, ["credential.revoke", "adapter.cleanup", "project.release"]);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("releases an acquired generation when project lease acquisition is interrupted", () =>
+  Effect.gen(function* () {
+    const leaseEntered = yield* Deferred.make<void>();
+    const releaseLease = yield* Deferred.make<void>();
+    let generationReleases = 0;
+    const h = yield* makeMcpLifecycleHarness(
+      Deferred.succeed(leaseEntered, undefined).pipe(Effect.andThen(Deferred.await(releaseLease))),
+      undefined,
+      (adapter) => ({
+        instanceId: codexInstanceId,
+        generation: 1,
+        enabled: true,
+        adapter: adapter.adapter,
+        release: Effect.sync(() => {
+          generationReleases += 1;
         }),
+      }),
+    );
+    const threadId = asThreadId("interrupted-provider-generation");
+    const starting = yield* h.provider
+      .startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      })
+      .pipe(Effect.exit, Effect.forkChild);
+
+    yield* Deferred.await(leaseEntered);
+    yield* Fiber.interrupt(starting);
+
+    assert.equal(generationReleases, 1);
+    assert.equal(h.issuedCount, 0);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("keeps an active OpenCode session on its generation when settings disable it", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("opencode-generation-preservation");
+    const instanceId = ProviderInstanceId.make("opencode");
+    const original = makeFakeCodexAdapter(OPENCODE_DRIVER);
+    const disabled = makeFakeCodexAdapter(OPENCODE_DRIVER);
+    const changes = yield* PubSub.unbounded<void>();
+    const disabledReconciled = yield* Deferred.make<void>();
+    let current = original;
+    let enabled = true;
+    let originalReleased = 0;
+    let disabledReleased = 0;
+
+    const makeGeneration = (
+      adapter: ReturnType<typeof makeFakeCodexAdapter>,
+      generation: number,
+      isEnabled: boolean,
+      onRelease: () => void,
+    ): ProviderAdapterRegistry.ProviderAdapterGenerationHandle => ({
+      instanceId,
+      generation,
+      enabled: isEnabled,
+      adapter: adapter.adapter,
+      release: Effect.sync(onRelease),
+    });
+    const registry = {
+      ...makeAdapterRegistryMock({ [OPENCODE_DRIVER]: original.adapter }),
+      getByInstance: () => Effect.succeed(current.adapter),
+      getInstanceInfo: () =>
+        Effect.succeed({
+          instanceId,
+          driverKind: OPENCODE_DRIVER,
+          displayName: undefined,
+          enabled: true,
+          continuationIdentity: {
+            driverKind: OPENCODE_DRIVER,
+            continuationKey: `opencode:instance:${instanceId}`,
+          },
+        }),
+      acquireInstance: () =>
+        Effect.succeed(
+          makeGeneration(
+            current,
+            enabled ? 1 : 2,
+            enabled,
+            enabled ? () => (originalReleased += 1) : () => (disabledReleased += 1),
+          ),
+        ),
+      listInstances: () =>
+        Effect.succeed([instanceId]).pipe(
+          Effect.tap(() =>
+            enabled ? Effect.void : Deferred.succeed(disabledReconciled, undefined),
+          ),
+        ),
+      subscribeChanges: PubSub.subscribe(changes),
+      streamChanges: Stream.fromPubSub(changes),
+    } satisfies ProviderAdapterRegistry.ProviderAdapterRegistryShape;
+    const providerLayer = makeTestProviderServiceLive().pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(
+        ProviderSessionDirectoryLive.pipe(
+          Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+        ),
+      ),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(serverConfigTestLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
       ),
     );
 
-    yield* provider.startSession(threadId, {
-      provider: CLAUDE_AGENT_DRIVER,
-      providerInstanceId: claudeAgentInstanceId,
-      threadId,
-      runtimeMode: "full-access",
-    });
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        provider: OPENCODE_DRIVER,
+        providerInstanceId: instanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
 
-    assert.deepEqual(hiddenStaleRouting.codex.stopSession.mock.calls, [[threadId]]);
-    assert.equal(
-      hiddenStaleRouting.analyticsRecords.filter(
-        (record) =>
-          record.event === "provider.session.stopped" &&
-          record.properties?.provider === String(CODEX_DRIVER),
-      ).length,
-      0,
-    );
-  }).pipe(Effect.provide(hiddenStaleRouting.rawLayer)),
+      current = disabled;
+      enabled = false;
+      yield* PubSub.publish(changes, undefined);
+      yield* Deferred.await(disabledReconciled);
+
+      const sessions = yield* provider.listSessions();
+      assert.equal(sessions.find((session) => session.threadId === threadId)?.provider, "opencode");
+      yield* provider.sendTurn({ threadId, input: "still active", attachments: [] });
+      assert.equal(original.sendTurn.mock.calls.length, 1);
+      assert.equal(disabled.sendTurn.mock.calls.length, 0);
+      assert.equal(originalReleased, 0);
+
+      const newThreadId = asThreadId("opencode-disabled-generation");
+      const newStart = yield* provider
+        .startSession(newThreadId, {
+          provider: OPENCODE_DRIVER,
+          providerInstanceId: instanceId,
+          threadId: newThreadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(newStart));
+      assert.equal(disabled.startSession.mock.calls.length, 0);
+      assert.equal(disabledReleased, 1);
+
+      yield* provider.stopSession({ threadId });
+      assert.equal(originalReleased, 1);
+    }).pipe(Effect.provide(providerLayer));
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each(["removed", "replaced"])(
+  "rejects a start whose instance is %s during lease acquisition",
+  (mode) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const h = yield* makeMcpLifecycleHarness(
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      );
+      const threadId = asThreadId(`lease-race-${mode}`);
+      const starting = yield* h.provider
+        .startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.exit, Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* h.changeInstance(mode === "replaced" ? makeFakeCodexAdapter() : undefined);
+      yield* Deferred.succeed(release, undefined);
+      assert.isTrue(Exit.isFailure(yield* Fiber.join(starting)));
+      assert.equal(h.issuedCount, 0);
+      assert.deepEqual(h.leases, [{ active: false }]);
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect.each(["removed", "replaced"])(
+  "cleans MCP resources when a provider instance is %s",
+  (mode) =>
+    Effect.gen(function* () {
+      const h = yield* makeMcpLifecycleHarness();
+      const threadId = asThreadId(`instance-${mode}`);
+      const input = {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access" as const,
+      };
+      yield* h.provider.startSession(threadId, input);
+      assert.deepEqual(yield* h.credentialAlive(0), { credential: true, proxy: true, lease: true });
+      const replacement = mode === "replaced" ? makeFakeCodexAdapter() : undefined;
+      yield* h.changeInstance(replacement);
+      assert.deepEqual(yield* h.credentialAlive(0), {
+        credential: false,
+        proxy: false,
+        lease: false,
+      });
+      if (replacement) {
+        yield* h.provider.startSession(threadId, input);
+        yield* h.exit(h.original, threadId);
+        assert.deepEqual(yield* h.credentialAlive(1), {
+          credential: true,
+          proxy: true,
+          lease: true,
+        });
+        yield* replacement.stopSession(threadId);
+        yield* h.exit(replacement, threadId);
+        assert.deepEqual(yield* h.credentialAlive(1), {
+          credential: false,
+          proxy: false,
+          lease: false,
+        });
+      }
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect(
+  "retries transient exit cleanup before forwarding and keeps repeated failures retryable",
+  () =>
+    Effect.gen(function* () {
+      const h = yield* makeMcpLifecycleHarness();
+      const threadId = asThreadId("exit-cleanup-failure");
+      const input = {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access" as const,
+      };
+      yield* h.provider.startSession(threadId, input);
+      yield* h.original.stopSession(threadId);
+      h.failRevokes(1);
+      yield* h.exit(h.original, threadId);
+      assert.equal(h.revokeAttempts, 2);
+      assert.deepEqual(yield* h.credentialAlive(0), {
+        credential: false,
+        proxy: false,
+        lease: false,
+      });
+      yield* h.provider.startSession(threadId, input);
+      yield* h.original.stopSession(threadId);
+      h.failRevokes(2);
+      yield* h.exit(h.original, threadId);
+      assert.deepEqual(yield* h.credentialAlive(1), { credential: true, proxy: true, lease: true });
+      yield* h.exit(h.original, threadId);
+      assert.deepEqual(yield* h.credentialAlive(1), {
+        credential: false,
+        proxy: false,
+        lease: false,
+      });
+    }).pipe(Effect.provide(NodeServices.layer)),
+  { timeout: 3000 },
+);
+
+it.effect(
+  "keeps instance cleanup subscribed after repeated revocation failures",
+  () =>
+    Effect.gen(function* () {
+      const h = yield* makeMcpLifecycleHarness();
+      const threadId = asThreadId("instance-cleanup-failure");
+      yield* h.provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      h.failRevokes(2);
+      yield* h.changeInstance(undefined);
+      yield* h.changeInstance(undefined);
+      assert.deepEqual(yield* h.credentialAlive(0), {
+        credential: false,
+        proxy: false,
+        lease: false,
+      });
+    }).pipe(Effect.provide(NodeServices.layer)),
+  { timeout: 3000 },
+);
+
+it.effect.each(["start", "stop", "stopAll"])(
+  "revokes real MCP endpoints after a failed adapter %s",
+  (operation) =>
+    Effect.gen(function* () {
+      const h = yield* makeMcpLifecycleHarness();
+      const threadId = asThreadId(`failed-${operation}`);
+      const input = {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access" as const,
+      };
+      const failure = new ProviderAdapterRequestError({
+        provider: CODEX_DRIVER,
+        method: operation,
+        detail: "injected lifecycle failure",
+      });
+      if (operation !== "start") yield* h.provider.startSession(threadId, input);
+      const method =
+        operation === "start" ? "startSession" : operation === "stop" ? "stopSession" : "stopAll";
+      const spy = vi
+        .spyOn(h.original.adapter, method)
+        .mockImplementationOnce(() => Effect.fail(failure));
+      const result = yield* (
+        operation === "start"
+          ? h.provider.startSession(threadId, input)
+          : operation === "stop"
+            ? h.provider.stopSession({ threadId })
+            : h.closeProvider
+      ).pipe(Effect.exit, Effect.ensuring(Effect.sync(() => spy.mockRestore())));
+      assert.equal(Exit.isFailure(result), operation !== "stopAll");
+      assert.deepEqual(yield* h.credentialAlive(0), {
+        credential: false,
+        proxy: false,
+        lease: false,
+      });
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("matches native exits and preserves a newer native session on the same adapter", () =>
+  Effect.gen(function* () {
+    const h = yield* makeMcpLifecycleHarness();
+    const threadId = asThreadId("native-exit");
+    const input = {
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      threadId,
+      runtimeMode: "full-access" as const,
+    };
+    yield* h.provider.startSession(threadId, { ...input, resumeCursor: { sessionId: "first" } });
+    yield* h.provider.startSession(threadId, { ...input, resumeCursor: { sessionId: "second" } });
+    yield* h.exit(h.original, threadId, "first");
+    assert.deepEqual(yield* h.credentialAlive(1), { credential: true, proxy: true, lease: true });
+    yield* h.exit(h.original, threadId);
+    assert.deepEqual(yield* h.credentialAlive(1), { credential: true, proxy: true, lease: true });
+    yield* h.exit(h.original, threadId, "second");
+    assert.deepEqual(yield* h.credentialAlive(1), {
+      credential: false,
+      proxy: false,
+      lease: false,
+    });
+  }).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.effect(
@@ -1504,7 +1575,7 @@ it.effect(
       const directoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const providerLayer = makeProviderServiceLive().pipe(
+      const providerLayer = makeTestProviderServiceLive().pipe(
         Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
         Layer.provide(directoryLayer),
         Layer.provide(defaultServerSettingsLayer),
@@ -1553,7 +1624,7 @@ it.effect("ProviderServiceLive writes canonical events to the emitting thread se
       Layer.provide(SqlitePersistenceMemory),
     );
     const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
-    const providerLayer = makeProviderServiceLive({
+    const providerLayer = makeTestProviderServiceLive({
       canonicalEventLogger: {
         filePath: "memory://provider-canonical-events",
         write: (event, threadId) => {
@@ -1624,7 +1695,7 @@ it.effect("ProviderServiceLive keeps persisted resumable sessions on startup", (
       });
     }).pipe(Effect.provide(directoryLayer));
 
-    const providerLayer = makeProviderServiceLive().pipe(
+    const providerLayer = makeTestProviderServiceLive().pipe(
       Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
       Layer.provide(directoryLayer),
       Layer.provide(defaultServerSettingsLayer),
@@ -1689,7 +1760,7 @@ it.effect(
       const firstDirectoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const firstProviderLayer = makeProviderServiceLive().pipe(
+      const firstProviderLayer = makeTestProviderServiceLive().pipe(
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
         ),
@@ -1749,7 +1820,7 @@ it.effect(
       const secondDirectoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const secondProviderLayer = makeProviderServiceLive().pipe(
+      const secondProviderLayer = makeTestProviderServiceLive().pipe(
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
         ),
@@ -1801,6 +1872,215 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
+  it.effect("releases the MCP lease when an adapter stop fails", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-mcp-failed-stop");
+      const releasedBefore = routing.releasedSessionLeases;
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const stop = vi.spyOn(routing.codex.adapter, "stopSession").mockImplementationOnce(() =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: CODEX_DRIVER,
+            method: "stopSession",
+            detail: "injected stop failure",
+          }),
+        ),
+      );
+      const stopped = yield* provider
+        .stopSession({ threadId })
+        .pipe(Effect.exit, Effect.ensuring(Effect.sync(() => stop.mockRestore())));
+      assert.isTrue(Exit.isFailure(stopped));
+      assert.equal(routing.releasedSessionLeases, releasedBefore + 1);
+      assert.isUndefined(McpProviderSession.readMcpProviderSession(threadId));
+      yield* routing.codex.stopSession(threadId);
+    }),
+  );
+
+  it.effect("cleans an exit received while the adapter is still starting", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-mcp-exit-during-start");
+      const releasedBefore = routing.releasedSessionLeases;
+      const entered = yield* Deferred.make<void>();
+      const finish = yield* Deferred.make<void>();
+      const originalStart = routing.codex.adapter.startSession;
+      const start = vi
+        .spyOn(routing.codex.adapter, "startSession")
+        .mockImplementationOnce((input) =>
+          originalStart(input).pipe(
+            Effect.tap(() => Deferred.succeed(entered, undefined)),
+            Effect.tap(() => Deferred.await(finish)),
+          ),
+        );
+      yield* routing.codex.subscribed;
+      const events = yield* Stream.toPull(provider.streamEvents);
+      const forwarded = yield* events.pipe(Effect.forkChild({ startImmediately: true }));
+      const starting = yield* provider
+        .startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      yield* routing.codex.stopSession(threadId);
+      routing.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("during-start"),
+        provider: CODEX_DRIVER,
+        threadId,
+        createdAt: "2026-09-07T00:00:00.000Z",
+        payload: {},
+      });
+      yield* Deferred.succeed(finish, undefined);
+      yield* Fiber.join(starting).pipe(Effect.ensuring(Effect.sync(() => start.mockRestore())));
+      yield* Fiber.join(forwarded);
+      assert.equal(routing.releasedSessionLeases, releasedBefore + 1);
+      assert.isUndefined(McpProviderSession.readMcpProviderSession(threadId));
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect.each(["old adapter", "old native session", "missing native ID with live replacement"])(
+    "keeps replacement MCP credentials after an exit from %s",
+    (scenario) =>
+      Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const threadId = asThreadId(`thread-mcp-${scenario}`);
+        const releasedBefore = routing.releasedSessionLeases;
+        yield* provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          resumeCursor: { sessionId: "replacement-native" },
+          runtimeMode: "full-access",
+        });
+        const source = scenario === "old adapter" ? routing.claude : routing.codex;
+        yield* source.subscribed;
+        if (scenario !== "missing native ID with live replacement") {
+          yield* routing.codex.stopSession(threadId);
+        }
+        const events = yield* Stream.toPull(provider.streamEvents);
+        const forwarded = yield* events.pipe(Effect.forkChild({ startImmediately: true }));
+        source.emit({
+          type: "session.exited",
+          eventId: asEventId(`exit-${scenario}`),
+          provider: source.adapter.provider,
+          threadId,
+          createdAt: "2026-09-07T00:00:00.000Z",
+          payload: {},
+          ...(scenario === "old native session"
+            ? { raw: { source: "notification", payload: { sessionId: "old-native" } } }
+            : {}),
+        });
+        yield* Fiber.join(forwarded);
+        assert.equal(routing.releasedSessionLeases, releasedBefore);
+        assert.isDefined(McpProviderSession.readMcpProviderSession(threadId));
+        yield* provider.stopSession({ threadId });
+      }).pipe(Effect.scoped),
+  );
+
+  it.effect("releases MCP credentials before forwarding an unexpected session exit", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-mcp-unexpected-exit");
+      const releasedBefore = routing.releasedSessionLeases;
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const events = yield* Stream.toPull(provider.streamEvents);
+      const forwarded = yield* events.pipe(Effect.forkChild({ startImmediately: true }));
+      yield* routing.codex.subscribed;
+      yield* routing.codex.stopSession(threadId);
+      routing.codex.emit({
+        type: "session.exited",
+        eventId: asEventId("unexpected-exit"),
+        provider: CODEX_DRIVER,
+        threadId,
+        createdAt: "2026-09-07T00:00:00.000Z",
+        payload: {},
+      });
+      yield* Fiber.join(forwarded);
+      assert.equal(routing.releasedSessionLeases, releasedBefore + 1);
+      assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("resolves project MCP servers for normal starts and internal recovery", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-project-mcp");
+      routing.acquireProjectMcpLease.mockClear();
+      routing.codex.startSession.mockClear();
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        cwd: "/tmp/project-mcp",
+        runtimeMode: "full-access",
+      });
+
+      assert.deepEqual(routing.acquireProjectMcpLease.mock.calls, [
+        [defaultProjectId, codexInstanceId],
+      ]);
+      assert.deepEqual(
+        (routing.codex.startSession.mock.calls[0]?.[0] as { projectMcpServers?: unknown })
+          ?.projectMcpServers,
+        [routing.issuedProjectMcpServer],
+      );
+
+      yield* routing.codex.stopSession(threadId);
+      routing.codex.startSession.mockClear();
+      yield* provider.sendTurn({ threadId, input: "recover", attachments: [] });
+
+      assert.deepEqual(routing.acquireProjectMcpLease.mock.calls, [
+        [defaultProjectId, codexInstanceId],
+        [defaultProjectId, codexInstanceId],
+      ]);
+      assert.deepEqual(
+        (routing.codex.startSession.mock.calls[0]?.[0] as { projectMcpServers?: unknown })
+          ?.projectMcpServers,
+        [routing.issuedProjectMcpServer],
+      );
+      yield* provider.stopSession({ threadId });
+      routing.codex.startSession.mockClear();
+      routing.codex.sendTurn.mockClear();
+      routing.codex.stopSession.mockClear();
+    }),
+  );
+
+  it.effect("owns the project MCP lease for the provider session lifetime", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-project-mcp-lease");
+      const releasedBefore = routing.releasedSessionLeases;
+      routing.acquireProjectMcpLease.mockClear();
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      assert.equal(routing.acquireProjectMcpLease.mock.calls.length, 1);
+      assert.equal(routing.releasedSessionLeases, releasedBefore);
+
+      yield* provider.stopSession({ threadId });
+      assert.equal(routing.releasedSessionLeases, releasedBefore + 1);
+    }),
+  );
+
   it.effect("routes provider operations and rollback conversation", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -2216,6 +2496,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       });
 
       routing.codex.stopSession.mockClear();
+      routing.claude.stopSession.mockClear();
 
       const claudeSession = yield* provider.startSession(threadId, {
         provider: ProviderDriverKind.make("claudeAgent"),
@@ -2228,6 +2509,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.equal(codexSession.provider, "codex");
       assert.equal(claudeSession.provider, "claudeAgent");
       assert.deepEqual(routing.codex.stopSession.mock.calls, [[threadId]]);
+      assert.equal(routing.claude.stopSession.mock.calls.length, 0);
 
       const sessions = yield* provider.listSessions();
       assert.deepEqual(
@@ -2482,7 +2764,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       const firstDirectoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const firstProviderLayer = makeProviderServiceLive().pipe(
+      const firstProviderLayer = makeTestProviderServiceLive().pipe(
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
         ),
@@ -2521,7 +2803,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
       const secondDirectoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const secondProviderLayer = makeProviderServiceLive().pipe(
+      const secondProviderLayer = makeTestProviderServiceLive().pipe(
         Layer.provide(
           Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
         ),
@@ -2590,7 +2872,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         const firstDirectoryLayer = ProviderSessionDirectoryLive.pipe(
           Layer.provide(runtimeRepositoryLayer),
         );
-        const firstProviderLayer = makeProviderServiceLive().pipe(
+        const firstProviderLayer = makeTestProviderServiceLive().pipe(
           Layer.provide(
             Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, firstRegistry),
           ),
@@ -2624,7 +2906,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
         const secondDirectoryLayer = ProviderSessionDirectoryLive.pipe(
           Layer.provide(runtimeRepositoryLayer),
         );
-        const secondProviderLayer = makeProviderServiceLive().pipe(
+        const secondProviderLayer = makeTestProviderServiceLive().pipe(
           Layer.provide(
             Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, secondRegistry),
           ),
@@ -3081,6 +3363,17 @@ validation.layer("ProviderServiceLive validation", (it) => {
 describe("agent browser access", () => {
   const revokedThreads: Array<ThreadId> = [];
 
+  const projectMcpServer = {
+    id: McpServerId.make("project-mcp-server"),
+    name: "Project MCP",
+    transport: {
+      type: "streamable-http",
+      url: "https://project-mcp.example.test/mcp",
+      headers: [],
+      authorization: { type: "none" },
+    },
+  } satisfies ResolvedProjectMcpServer;
+
   const startSessionWith = (enableAgentBrowserAccess: boolean, threadId: ThreadId) =>
     Effect.gen(function* () {
       const issued: Array<ThreadId> = [];
@@ -3095,7 +3388,7 @@ describe("agent browser access", () => {
       const directoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const providerLayer = makeProviderServiceLive({
+      const providerLayer = makeTestProviderServiceLive({
         issueMcpCredential: (request) =>
           Effect.sync(() => {
             issued.push(request.threadId);
@@ -3150,7 +3443,7 @@ describe("agent browser access", () => {
       // Clearing the in-memory map is not enough: a token issued before the
       // toggle flipped stays valid against `/mcp` for its whole liveness
       // window, and later turns refresh it.
-      assert.deepEqual(revokedThreads, [threadId]);
+      assert.deepEqual([...new Set(revokedThreads)], [threadId]);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
@@ -3164,30 +3457,16 @@ describe("agent browser access", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("restores the previous MCP session when a replacement fails", () =>
+  it.effect("keeps project MCP when browser preview access is off", () =>
     Effect.gen(function* () {
-      const threadId = asThreadId("thread-browser-replacement-failure");
+      const threadId = asThreadId("thread-project-mcp-browser-off");
+      const requests: Array<{
+        readonly threadId: ThreadId;
+        readonly providerInstanceId: ProviderInstanceId;
+        readonly includePreview?: boolean;
+        readonly projectMcpServers?: ReadonlyArray<ResolvedProjectMcpServer>;
+      }> = [];
       const codex = makeFakeCodexAdapter();
-      const revokedProviderSessions: Array<string> = [];
-      const issuedConfigs = [
-        {
-          environmentId: EnvironmentId.make("environment-1"),
-          threadId,
-          providerSessionId: "candidate-initial",
-          providerInstanceId: codexInstanceId,
-          endpoint: "http://127.0.0.1:43123/mcp",
-          authorizationHeader: "Bearer initial-token",
-        },
-        {
-          environmentId: EnvironmentId.make("environment-1"),
-          threadId,
-          providerSessionId: "candidate-replacement",
-          providerInstanceId: codexInstanceId,
-          endpoint: "http://127.0.0.1:43123/mcp",
-          authorizationHeader: "Bearer replacement-token",
-        },
-      ] as const;
-      let issuedIndex = 0;
       const providerAdapterLayer = Layer.succeed(
         ProviderAdapterRegistry.ProviderAdapterRegistry,
         makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter }),
@@ -3198,18 +3477,45 @@ describe("agent browser access", () => {
       const directoryLayer = ProviderSessionDirectoryLive.pipe(
         Layer.provide(runtimeRepositoryLayer),
       );
-      const providerLayer = makeProviderServiceLive({
-        issueMcpCredential: () =>
-          Effect.succeed({ config: issuedConfigs[issuedIndex++] }) as Effect.Effect<{
-            config: (typeof issuedConfigs)[number];
-          }>,
-        revokeMcpProviderCredential: (providerSessionId) =>
-          Effect.sync(() => void revokedProviderSessions.push(providerSessionId)),
-      }).pipe(
+      const providerLayer = makeTestProviderServiceLive(
+        {
+          issueMcpCredential: (request) =>
+            Effect.sync(() => {
+              requests.push(request);
+              return {
+                config: {
+                  environmentId: EnvironmentId.make("provider-service-environment"),
+                  threadId: request.threadId,
+                  providerSessionId: "project-only-provider-session",
+                  providerInstanceId: request.providerInstanceId,
+                  endpoint: "http://127.0.0.1:43123/mcp",
+                  authorizationHeader: "Bearer preview-token",
+                  projectServers: [
+                    {
+                      id: projectMcpServer.id,
+                      name: projectMcpServer.name,
+                      endpoint: new URL("http://127.0.0.1:43123/mcp/project/project-only"),
+                      authorizationHeader: "Bearer project-token",
+                    },
+                  ],
+                },
+              };
+            }),
+        },
+        makeProviderProjectContextTestLayer(
+          () => Effect.succeed([]),
+          () =>
+            Effect.succeed({
+              servers: [projectMcpServer],
+              resolveSecret: () => undefined,
+              oauthStateLeases: new Map(),
+            }),
+        ),
+      ).pipe(
         Layer.provide(providerAdapterLayer),
         Layer.provide(directoryLayer),
         Layer.provide(
-          ServerSettings.ServerSettingsService.layerTest({ enableAgentBrowserAccess: true }),
+          ServerSettings.ServerSettingsService.layerTest({ enableAgentBrowserAccess: false }),
         ),
         Layer.provide(serverConfigTestLayer),
         Layer.provide(AnalyticsService.layerTest),
@@ -3229,39 +3535,28 @@ describe("agent browser access", () => {
           threadId,
           runtimeMode: "full-access",
         });
-        const previous = {
-          ...issuedConfigs[0],
-          providerSessionId: "previous-session",
-          authorizationHeader: "Bearer previous-token",
-        };
-        McpProviderSession.setMcpProviderSession(previous);
-        codex.startSession.mockImplementationOnce(
-          (): Effect.Effect<ProviderSession, ProviderAdapterError> =>
-            Effect.fail(
-              new ProviderAdapterRequestError({
-                provider: String(CODEX_DRIVER),
-                method: "startSession",
-                detail: "candidate failed",
-              }),
-            ),
-        );
 
-        const result = yield* provider
-          .startSession(threadId, {
-            provider: CODEX_DRIVER,
-            providerInstanceId: codexInstanceId,
-            threadId,
-            runtimeMode: "approval-required",
-          })
-          .pipe(Effect.result);
-
-        assert.equal(result._tag, "Failure");
-        assert.deepEqual(McpProviderSession.readMcpProviderSession(threadId), previous);
-        assert.deepEqual(revokedProviderSessions, ["candidate-replacement"]);
+        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
       }).pipe(Effect.provide(providerLayer));
-    }).pipe(
-      Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions())),
-      Effect.provide(NodeServices.layer),
-    ),
+
+      assert.equal(requests.length, 1);
+      const request = requests[0]!;
+      assert.equal(request.threadId, threadId);
+      assert.equal(request.providerInstanceId, codexInstanceId);
+      assert.equal(request.includePreview, false);
+      assert.deepEqual(request.projectMcpServers, [projectMcpServer]);
+      assert.deepEqual(
+        (codex.startSession.mock.calls[0]?.[0] as { projectMcpServers?: unknown })
+          ?.projectMcpServers,
+        [
+          {
+            id: projectMcpServer.id,
+            name: projectMcpServer.name,
+            endpoint: new URL("http://127.0.0.1:43123/mcp/project/project-only"),
+            authorizationHeader: "Bearer project-token",
+          },
+        ],
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

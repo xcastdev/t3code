@@ -1,5 +1,17 @@
-import type { OrchestrationEvent, OrchestrationReadModel, ThreadId } from "@t3tools/contracts";
+import type {
+  McpCatalogDefinition,
+  McpCatalogSnapshot,
+  OrchestrationEvent,
+  OrchestrationReadModel,
+  ProjectId,
+  ThreadId,
+} from "@t3tools/contracts";
 import {
+  getProjectMcpTransport,
+  McpDefinitionId,
+  McpServerId,
+  type ProjectMcpServer,
+  EnvironmentId,
   OrchestrationCheckpointSummary,
   OrchestrationMessage,
   OrchestrationSession,
@@ -13,7 +25,18 @@ import {
   MessageSentPayloadSchema,
   ProjectCreatedPayload,
   ProjectDeletedPayload,
+  ProjectMcpServerCreatedPayload,
+  ProjectMcpServerRemovedPayload,
+  ProjectMcpServerUpdatedPayload,
   ProjectMetaUpdatedPayload,
+  EnvironmentMcpDefinitionCreatedPayload,
+  EnvironmentMcpDefinitionUpdatedPayload,
+  EnvironmentMcpDefinitionRemovedPayload,
+  ProjectMcpDefinitionCreatedPayload,
+  ProjectMcpDefinitionUpdatedPayload,
+  ProjectMcpDefinitionRemovedPayload,
+  ProjectMcpOverrideUpsertedPayload,
+  ProjectMcpOverrideRemovedPayload,
   ThreadActivityAppendedPayload,
   ThreadArchivedPayload,
   ThreadCreatedPayload,
@@ -33,6 +56,12 @@ import {
   ThreadRevertedPayload,
   ThreadSessionSetPayload,
   ThreadTurnDiffCompletedPayload,
+  ThreadMcpCatalogInitializedPayload,
+  ThreadMcpCatalogUpdatedPayload,
+  ThreadMcpCatalogResetPayload,
+  ThreadMcpCatalogDisposedPayload,
+  ThreadMcpCatalogAppliedPayload,
+  ThreadMcpCatalogApplyFailedPayload,
 } from "./Schemas.ts";
 
 type ThreadPatch = Partial<Omit<OrchestrationThread, "id" | "projectId">>;
@@ -185,10 +214,141 @@ function compareThreadActivities(
   return left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id);
 }
 
+type McpCatalogReadModel = NonNullable<OrchestrationReadModel["mcpCatalog"]>;
+
+function ensureMcpCatalog(
+  model: OrchestrationReadModel,
+  environmentId: McpCatalogReadModel["environmentId"],
+): McpCatalogReadModel {
+  return (
+    model.mcpCatalog ?? {
+      environmentId,
+      globalRevision: 0,
+      globalDefinitions: [],
+      projectRevisions: [],
+      projectDefinitions: [],
+      projectOverrides: [],
+      sessions: [],
+    }
+  );
+}
+
+function replaceCatalogSession(
+  sessions: ReadonlyArray<McpCatalogSnapshot>,
+  snapshot: McpCatalogSnapshot,
+): McpCatalogSnapshot[] {
+  return [
+    ...sessions.filter((entry) => entry.catalogSessionId !== snapshot.catalogSessionId),
+    snapshot,
+  ];
+}
+
+function withProjectCatalogRevision(
+  catalog: McpCatalogReadModel,
+  projectId: string,
+  revision: number,
+): McpCatalogReadModel {
+  return {
+    ...catalog,
+    projectRevisions: [
+      ...catalog.projectRevisions.filter((entry) => entry.projectId !== projectId),
+      { projectId: projectId as ProjectId, revision },
+    ],
+  };
+}
+
+function upsertProjectCatalogDefinition(
+  model: OrchestrationReadModel,
+  projectId: string,
+  definition: McpCatalogDefinition,
+  revision: number,
+): OrchestrationReadModel {
+  const catalog = withProjectCatalogRevision(
+    ensureMcpCatalog(model, model.mcpCatalog?.environmentId ?? EnvironmentId.make("unknown")),
+    projectId,
+    revision,
+  );
+  const server: ProjectMcpServer = {
+    id: definition.logicalServerId,
+    name: definition.name,
+    transport: definition.transport,
+    enabled: definition.enabled,
+    providerInstanceIds: definition.providerInstanceIds,
+  };
+  return {
+    ...model,
+    projectMcpServers: [
+      ...(model.projectMcpServers ?? []).filter(
+        (entry) =>
+          !(entry.projectId === projectId && entry.server.id === definition.logicalServerId),
+      ),
+      { projectId: projectId as ProjectId, server },
+    ],
+    mcpCatalog: {
+      ...catalog,
+      projectDefinitions: [
+        ...catalog.projectDefinitions.filter(
+          (entry) =>
+            !(
+              entry.projectId === projectId &&
+              entry.definition.logicalServerId === definition.logicalServerId
+            ),
+        ),
+        { projectId: projectId as ProjectId, definition },
+      ],
+    },
+  };
+}
+
+function removeProjectCatalogDefinition(
+  model: OrchestrationReadModel,
+  projectId: string,
+  logicalServerId: McpServerId,
+  revision: number,
+): OrchestrationReadModel {
+  const catalog = withProjectCatalogRevision(
+    ensureMcpCatalog(model, model.mcpCatalog?.environmentId ?? EnvironmentId.make("unknown")),
+    projectId,
+    revision,
+  );
+  return {
+    ...model,
+    projectMcpServers: (model.projectMcpServers ?? []).filter(
+      (entry) => !(entry.projectId === projectId && entry.server.id === logicalServerId),
+    ),
+    mcpCatalog: {
+      ...catalog,
+      projectDefinitions: catalog.projectDefinitions.filter(
+        (entry) =>
+          !(entry.projectId === projectId && entry.definition.logicalServerId === logicalServerId),
+      ),
+    },
+  };
+}
+
+function legacyCatalogDefinition(
+  server: ProjectMcpServer,
+  projectId: string,
+  revision: number,
+): McpCatalogDefinition {
+  return {
+    definitionId: McpDefinitionId.make(`legacy-project-mcp-${server.id}`),
+    logicalServerId: server.id,
+    scope: "project",
+    scopeId: projectId,
+    name: server.name as never,
+    transport: getProjectMcpTransport(server),
+    enabled: server.enabled,
+    providerInstanceIds: server.providerInstanceIds,
+    revision,
+  };
+}
+
 export function createEmptyReadModel(nowIso: string): OrchestrationReadModel {
   return {
     snapshotSequence: 0,
     projects: [],
+    projectMcpServers: [],
     threads: [],
     updatedAt: nowIso,
   };
@@ -264,18 +424,329 @@ export function projectEvent(
 
     case "project.deleted":
       return decodeForEvent(ProjectDeletedPayload, event.payload, event.type, "payload").pipe(
-        Effect.map((payload) => ({
-          ...nextBase,
-          projects: nextBase.projects.map((project) =>
-            project.id === payload.projectId
-              ? {
-                  ...project,
-                  deletedAt: payload.deletedAt,
-                  updatedAt: payload.deletedAt,
-                }
-              : project,
+        Effect.map((payload) => {
+          const catalog = nextBase.mcpCatalog;
+          return {
+            ...nextBase,
+            projects: nextBase.projects.map((project) =>
+              project.id === payload.projectId
+                ? {
+                    ...project,
+                    deletedAt: payload.deletedAt,
+                    updatedAt: payload.deletedAt,
+                  }
+                : project,
+            ),
+            projectMcpServers: (nextBase.projectMcpServers ?? []).filter(
+              (entry) => entry.projectId !== payload.projectId,
+            ),
+            ...(catalog === undefined
+              ? {}
+              : {
+                  mcpCatalog: {
+                    ...catalog,
+                    projectDefinitions: catalog.projectDefinitions.filter(
+                      (entry) => entry.projectId !== payload.projectId,
+                    ),
+                    projectOverrides: catalog.projectOverrides.filter(
+                      (entry) => entry.projectId !== payload.projectId,
+                    ),
+                  },
+                }),
+          };
+        }),
+      );
+
+    case "project.mcp-server.created":
+      return decodeForEvent(
+        ProjectMcpServerCreatedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const base = {
+            ...nextBase,
+            projectMcpServers: [
+              ...(nextBase.projectMcpServers ?? []).filter(
+                (entry) => entry.server.id !== payload.server.id,
+              ),
+              { projectId: payload.projectId, server: payload.server },
+            ],
+          };
+          const currentRevision =
+            base.mcpCatalog?.projectRevisions.find((entry) => entry.projectId === payload.projectId)
+              ?.revision ?? 0;
+          return upsertProjectCatalogDefinition(
+            base,
+            payload.projectId,
+            legacyCatalogDefinition(payload.server, payload.projectId, currentRevision + 1),
+            currentRevision + 1,
+          );
+        }),
+      );
+
+    case "project.mcp-server.updated":
+      return decodeForEvent(
+        ProjectMcpServerUpdatedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const base = {
+            ...nextBase,
+            projectMcpServers: (nextBase.projectMcpServers ?? []).map((entry) =>
+              entry.projectId === payload.projectId && entry.server.id === payload.server.id
+                ? { projectId: payload.projectId, server: payload.server }
+                : entry,
+            ),
+          };
+          const currentRevision =
+            base.mcpCatalog?.projectRevisions.find((entry) => entry.projectId === payload.projectId)
+              ?.revision ?? 0;
+          return upsertProjectCatalogDefinition(
+            base,
+            payload.projectId,
+            legacyCatalogDefinition(payload.server, payload.projectId, currentRevision + 1),
+            currentRevision + 1,
+          );
+        }),
+      );
+
+    case "project.mcp-server.removed":
+      return decodeForEvent(
+        ProjectMcpServerRemovedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const base = {
+            ...nextBase,
+            projectMcpServers: (nextBase.projectMcpServers ?? []).filter(
+              (entry) => !(entry.projectId === payload.projectId && entry.server.id === payload.id),
+            ),
+          };
+          const currentRevision =
+            base.mcpCatalog?.projectRevisions.find((entry) => entry.projectId === payload.projectId)
+              ?.revision ?? 0;
+          return removeProjectCatalogDefinition(
+            base,
+            payload.projectId,
+            payload.id,
+            currentRevision + 1,
+          );
+        }),
+      );
+
+    case "environment.mcp-definition.created":
+      return decodeForEvent(
+        EnvironmentMcpDefinitionCreatedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const catalog = ensureMcpCatalog(nextBase, payload.environmentId);
+          return {
+            ...nextBase,
+            mcpCatalog: {
+              ...catalog,
+              environmentId: payload.environmentId,
+              globalRevision: payload.revision,
+              globalDefinitions: [
+                ...catalog.globalDefinitions.filter(
+                  (entry) => entry.logicalServerId !== payload.definition.logicalServerId,
+                ),
+                payload.definition,
+              ],
+            },
+          };
+        }),
+      );
+
+    case "environment.mcp-definition.updated":
+      return decodeForEvent(
+        EnvironmentMcpDefinitionUpdatedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const catalog = ensureMcpCatalog(nextBase, payload.environmentId);
+          return {
+            ...nextBase,
+            mcpCatalog: {
+              ...catalog,
+              environmentId: payload.environmentId,
+              globalRevision: payload.revision,
+              globalDefinitions: [
+                ...catalog.globalDefinitions.filter(
+                  (entry) => entry.logicalServerId !== payload.definition.logicalServerId,
+                ),
+                payload.definition,
+              ],
+            },
+          };
+        }),
+      );
+
+    case "environment.mcp-definition.removed":
+      return decodeForEvent(
+        EnvironmentMcpDefinitionRemovedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const catalog = ensureMcpCatalog(nextBase, payload.environmentId);
+          return {
+            ...nextBase,
+            mcpCatalog: {
+              ...catalog,
+              environmentId: payload.environmentId,
+              globalRevision: payload.revision,
+              globalDefinitions: catalog.globalDefinitions.filter(
+                (entry) => entry.logicalServerId !== payload.logicalServerId,
+              ),
+            },
+          };
+        }),
+      );
+
+    case "project.mcp-definition.created":
+      return decodeForEvent(
+        ProjectMcpDefinitionCreatedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) =>
+          upsertProjectCatalogDefinition(
+            nextBase,
+            payload.projectId,
+            payload.definition,
+            payload.revision,
           ),
-        })),
+        ),
+      );
+
+    case "project.mcp-definition.updated":
+      return decodeForEvent(
+        ProjectMcpDefinitionUpdatedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) =>
+          upsertProjectCatalogDefinition(
+            nextBase,
+            payload.projectId,
+            payload.definition,
+            payload.revision,
+          ),
+        ),
+      );
+
+    case "project.mcp-definition.removed":
+      return decodeForEvent(
+        ProjectMcpDefinitionRemovedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) =>
+          removeProjectCatalogDefinition(
+            nextBase,
+            payload.projectId,
+            payload.logicalServerId,
+            payload.revision,
+          ),
+        ),
+      );
+
+    case "project.mcp-override.upserted":
+      return decodeForEvent(
+        ProjectMcpOverrideUpsertedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          if (
+            payload.override.scope !== "project" ||
+            String(payload.override.scopeId) !== String(payload.projectId)
+          ) {
+            return nextBase;
+          }
+          const catalog = ensureMcpCatalog(
+            nextBase,
+            nextBase.mcpCatalog?.environmentId ?? EnvironmentId.make("unknown"),
+          );
+          const ownedByAnotherProject = catalog.projectOverrides.some(
+            (entry) =>
+              entry.override.id === payload.override.id && entry.projectId !== payload.projectId,
+          );
+          return {
+            ...nextBase,
+            mcpCatalog: {
+              ...catalog,
+              projectRevisions: [
+                ...catalog.projectRevisions.filter(
+                  (entry) => entry.projectId !== payload.projectId,
+                ),
+                { projectId: payload.projectId, revision: payload.revision },
+              ],
+              projectOverrides: [
+                ...catalog.projectOverrides.filter(
+                  (entry) =>
+                    !(
+                      entry.projectId === payload.projectId &&
+                      entry.override.id === payload.override.id
+                    ),
+                ),
+                ...(ownedByAnotherProject
+                  ? []
+                  : [{ projectId: payload.projectId, override: payload.override }]),
+              ],
+            },
+          };
+        }),
+      );
+
+    case "project.mcp-override.removed":
+      return decodeForEvent(
+        ProjectMcpOverrideRemovedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const catalog = ensureMcpCatalog(
+            nextBase,
+            nextBase.mcpCatalog?.environmentId ?? EnvironmentId.make("unknown"),
+          );
+          return {
+            ...nextBase,
+            mcpCatalog: {
+              ...catalog,
+              projectRevisions: [
+                ...catalog.projectRevisions.filter(
+                  (entry) => entry.projectId !== payload.projectId,
+                ),
+                { projectId: payload.projectId, revision: payload.revision },
+              ],
+              projectOverrides: catalog.projectOverrides.filter(
+                (entry) =>
+                  !(
+                    entry.projectId === payload.projectId &&
+                    entry.override.id === payload.overrideId
+                  ),
+              ),
+            },
+          };
+        }),
       );
 
     case "thread.created":
@@ -626,6 +1097,221 @@ export function projectEvent(
           }),
         };
       });
+
+    case "thread.mcp-catalog.initialized":
+      return decodeForEvent(
+        ThreadMcpCatalogInitializedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const catalog = ensureMcpCatalog(
+            nextBase,
+            nextBase.mcpCatalog?.environmentId ?? EnvironmentId.make("unknown"),
+          );
+          if (
+            catalog.sessions.some(
+              (entry) => entry.catalogSessionId === payload.snapshot.catalogSessionId,
+            )
+          ) {
+            return nextBase;
+          }
+          return {
+            ...nextBase,
+            mcpCatalog: {
+              ...catalog,
+              sessions: replaceCatalogSession(catalog.sessions, payload.snapshot),
+            },
+          };
+        }),
+      );
+
+    case "thread.mcp-catalog.updated":
+      return decodeForEvent(
+        ThreadMcpCatalogUpdatedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const catalog = ensureMcpCatalog(
+            nextBase,
+            nextBase.mcpCatalog?.environmentId ?? EnvironmentId.make("unknown"),
+          );
+          const existing = catalog.sessions.find(
+            (entry) => entry.catalogSessionId === payload.mcpCatalogSessionId,
+          );
+          if (
+            existing === undefined ||
+            existing.disposedAt !== undefined ||
+            payload.desiredRevision <= existing.desiredRevision
+          )
+            return nextBase;
+          const snapshot: McpCatalogSnapshot = {
+            ...existing,
+            desired: payload.desiredCatalog,
+            desiredRevision: payload.desiredRevision,
+            application: undefined,
+          };
+          return {
+            ...nextBase,
+            mcpCatalog: {
+              ...catalog,
+              sessions: replaceCatalogSession(catalog.sessions, snapshot),
+            },
+          };
+        }),
+      );
+
+    case "thread.mcp-catalog.reset":
+      return decodeForEvent(
+        ThreadMcpCatalogResetPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const catalog = ensureMcpCatalog(
+            nextBase,
+            nextBase.mcpCatalog?.environmentId ?? EnvironmentId.make("unknown"),
+          );
+          const existing = catalog.sessions.find(
+            (entry) => entry.catalogSessionId === payload.mcpCatalogSessionId,
+          );
+          if (
+            existing === undefined ||
+            existing.disposedAt !== undefined ||
+            payload.desiredRevision <= existing.desiredRevision
+          )
+            return nextBase;
+          const snapshot: McpCatalogSnapshot = {
+            ...existing,
+            baseline: payload.baseline,
+            desired: payload.baseline,
+            desiredRevision: payload.desiredRevision,
+            application: undefined,
+          };
+          return {
+            ...nextBase,
+            mcpCatalog: {
+              ...catalog,
+              sessions: replaceCatalogSession(catalog.sessions, snapshot),
+            },
+          };
+        }),
+      );
+
+    case "thread.mcp-catalog.disposed":
+      return decodeForEvent(
+        ThreadMcpCatalogDisposedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const catalog = ensureMcpCatalog(
+            nextBase,
+            nextBase.mcpCatalog?.environmentId ?? EnvironmentId.make("unknown"),
+          );
+          return {
+            ...nextBase,
+            mcpCatalog: {
+              ...catalog,
+              sessions: catalog.sessions.map((entry) =>
+                entry.catalogSessionId === payload.mcpCatalogSessionId
+                  ? entry.disposedAt === undefined && payload.revision >= entry.desiredRevision
+                    ? { ...entry, disposedAt: payload.disposedAt }
+                    : entry
+                  : entry,
+              ),
+            },
+          };
+        }),
+      );
+
+    case "thread.mcp-catalog.applied":
+      return decodeForEvent(
+        ThreadMcpCatalogAppliedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const catalog = ensureMcpCatalog(
+            nextBase,
+            nextBase.mcpCatalog?.environmentId ?? EnvironmentId.make("unknown"),
+          );
+          return {
+            ...nextBase,
+            mcpCatalog: {
+              ...catalog,
+              sessions: catalog.sessions.map((entry) =>
+                entry.catalogSessionId === payload.mcpCatalogSessionId
+                  ? {
+                      ...entry,
+                      ...(entry.disposedAt === undefined &&
+                      payload.revision <= entry.desiredRevision &&
+                      (payload.revision > entry.appliedRevision ||
+                        (payload.revision === 0 && entry.application === undefined))
+                        ? {
+                            appliedRevision: payload.revision,
+                            applied: payload.appliedCatalog ?? entry.desired,
+                            application: {
+                              status: "applied" as const,
+                              revision: payload.revision,
+                              appliedAt: payload.appliedAt,
+                            },
+                          }
+                        : {}),
+                    }
+                  : entry,
+              ),
+            },
+          };
+        }),
+      );
+
+    case "thread.mcp-catalog.apply-failed":
+      return decodeForEvent(
+        ThreadMcpCatalogApplyFailedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(
+        Effect.map((payload) => {
+          const catalog = ensureMcpCatalog(
+            nextBase,
+            nextBase.mcpCatalog?.environmentId ?? EnvironmentId.make("unknown"),
+          );
+          return {
+            ...nextBase,
+            mcpCatalog: {
+              ...catalog,
+              sessions: catalog.sessions.map((entry) =>
+                entry.catalogSessionId === payload.mcpCatalogSessionId
+                  ? {
+                      ...entry,
+                      ...(entry.disposedAt === undefined &&
+                      payload.revision <= entry.desiredRevision &&
+                      (payload.revision > entry.appliedRevision ||
+                        (payload.revision === 0 && entry.application === undefined))
+                        ? {
+                            application: {
+                              status: "failed" as const,
+                              revision: payload.revision,
+                              failedAt: payload.failedAt,
+                              reason: payload.reason,
+                            },
+                          }
+                        : {}),
+                    }
+                  : entry,
+              ),
+            },
+          };
+        }),
+      );
 
     case "thread.proposed-plan-upserted":
       return Effect.gen(function* () {

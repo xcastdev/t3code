@@ -1,0 +1,99 @@
+# Scoped MCP catalogs
+
+This document records the scope and lifetime rules for the MCP catalog. It is
+also the durable evidence ledger for provider catalog refresh support.
+
+## Scope and identity
+
+The environment owns global MCP definitions. A project inherits those
+definitions, can apply metadata or complete-transport overrides, and can add
+project-local definitions. A logical catalog session captures the effective
+global/project catalog when a provider session starts. Session overrides and
+session-local definitions are applied to that captured baseline only.
+
+Every entry has a stable logical server id and a definition id. The logical id
+is the target for overrides. The definition id owns one complete transport and
+its credentials. Direct global, project, and session updates retain the
+definition id when they change only metadata (`name`, `enabled`, provider
+assignments, or credential display names). Replacing a transport, changing
+ordered transport fields, changing credential references, or supplying a
+credential value creates a new definition id. Identity comparison is
+conservative and order-sensitive, including HTTP header/environment names and
+OAuth registration details; the server never compares secret contents.
+
+Resolution order is global definitions, project overrides, project-local
+definitions, session baseline, session overrides, and session-local definitions.
+The result is then filtered by enabled state, provider assignment, and provider
+capability before name-conflict and 50-entry-limit validation.
+
+Global/project changes affect future logical sessions. An active logical
+session changes only through a session mutation or **Reset to current defaults**.
+The logical session id survives recoverable provider-process restarts while the
+short-lived provider session id changes. Explicit stop, provider change, thread
+deletion, and unrecoverable expiry dispose the logical session.
+
+## Revisions and secrets
+
+Each logical session tracks desired and applied revisions. Mutations increment
+the desired revision; the runtime reactor records an applied or failed result.
+An unreachable upstream does not make a saved revision fail because upstream
+connections are lazy. Invocation reports the connection failure instead.
+
+Snapshots retain complete transports and definition ids so old credentials can
+be leased during recovery after a saved definition rotates. Secret values,
+OAuth state, and upstream proxy details never enter events, projections, or
+RPC responses. Explicit OAuth disconnect revokes the grant even when a retained
+session snapshot still references the old definition.
+
+## Gateway contract
+
+The catalog gateway is one stable MCP endpoint for a live-capable provider. It
+starts with an empty catalog, atomically swaps to each applied revision, and
+publishes the corresponding MCP list-change notification. Clients do not need
+to reconnect to observe additions, updates, or removals. Per-server proxy
+endpoints remain the compatibility path for restart-required providers.
+
+Names use the deterministic form `mcp_<logical-id-without-dashes>__<upstream-name>`.
+Resource URIs use `t3-mcp://<logical-id>/<base64url(upstream-uri)>` and are
+rewritten back to the owning upstream on read or completion. A provider whose
+name restrictions reject this reversible mapping remains restart-required until
+the mapping has an explicit design and tests.
+
+## Provider refresh evidence
+
+The gateway protocol fixture in
+`apps/server/src/mcp/McpCatalogGateway.contract.test.ts` starts with no tools,
+adds one tool, changes its description, and removes it while the same MCP
+client connection remains open. This proves the notification/list contract,
+not provider-specific refresh behavior.
+
+The external OpenCode integration fixture observes the v2 SDK's config/status/add/disconnect
+sequence and invokes a real MCP tool through the registered client. OpenCode 1.15.13 reports
+`connected` only after the remote MCP initialization succeeds, and disconnect leaves the dynamic
+entry disabled because the API has no remove operation. This test covers registration and cleanup,
+not live catalog refresh: external OpenCode's session catalog remains `restart-required`.
+
+External OpenCode is `unsupported` until the provider setting explicitly opts into management. The
+opt-in is still limited to one URL-and-exact-directory lease per T3 process. The coordinator uses
+environment ownership markers and generation-specific names for crash recovery, but cannot lock a
+separate T3 process or a native OpenCode client.
+
+## Compatibility
+
+The old `projectMcp.*` RPCs continue to expose only project-local definitions.
+The versioned `mcpCatalog.project.state.list` RPC exposes raw project state,
+including disabled definitions, overrides, and source-removed tombstones, with
+global and project revisions. New clients gate global, project-override, and
+session RPCs independently on the environment capability flags
+`globalMcpCatalog`, `projectMcpOverrides`, and `sessionMcpCatalog`.
+
+The effective `mcpCatalog.project.list` view is provider-specific and requires
+`providerInstanceId`. The separate `mcpCatalog.project.state.list` view is the
+provider-independent raw editor state and accepts only the project scope and
+project id.
+
+The scoped catalog editor is not yet exposed in the web or desktop clients;
+desktop shares the web surface. Mobile can consume configured catalogs and view
+thread state but does not edit catalogs. The legacy project panel remains the
+only client editor during this compatibility window. Catalog subscriptions are
+opt-in and carry only scope id and revision notices.

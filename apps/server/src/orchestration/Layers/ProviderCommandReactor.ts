@@ -1,4 +1,5 @@
 import {
+  McpCatalogSessionId,
   type ChatAttachment,
   CommandId,
   EventId,
@@ -441,6 +442,12 @@ const make = Effect.gen(function* () {
       ),
     );
 
+  const catalogSessionIdForThread = (thread: {
+    readonly id: ThreadId;
+    readonly session: OrchestrationSession | null;
+  }) =>
+    thread.session?.mcpCatalogSessionId ?? McpCatalogSessionId.make(`catalog-session:${thread.id}`);
+
   const setThreadSessionErrorOnTurnStartFailure = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
     readonly detail: string;
@@ -465,6 +472,7 @@ const make = Effect.gen(function* () {
           providerName: null,
           providerInstanceId: thread.modelSelection.instanceId,
           runtimeMode: thread.runtimeMode,
+          mcpCatalogSessionId: McpCatalogSessionId.make(`catalog-session:${thread.id}`),
         }),
         status: preserveAttachedSession
           ? session.status
@@ -659,6 +667,7 @@ const make = Effect.gen(function* () {
           providerInstanceId: activeSession?.providerInstanceId ?? desiredInstanceId,
           runtimeMode: desiredRuntimeMode,
           activeTurnId: null,
+          mcpCatalogSessionId: catalogSessionIdForThread(thread),
           lastError: null,
           updatedAt: createdAt,
         },
@@ -769,6 +778,12 @@ const make = Effect.gen(function* () {
             detail: `Provider session '${session.threadId}' started without a provider instance id.`,
           });
         }
+        // The provider start can initialize or replace the durable catalog
+        // while this reactor still holds the shell that triggered the start.
+        // Read the latest thread before binding so an old captured session
+        // cannot overwrite the newer catalog-session link.
+        const latestThread = yield* resolveThread(threadId);
+        const catalogSessionId = catalogSessionIdForThread(latestThread ?? thread);
         yield* setThreadSession({
           threadId,
           session: {
@@ -780,6 +795,7 @@ const make = Effect.gen(function* () {
             providerName: session.provider,
             providerInstanceId: session.providerInstanceId,
             runtimeMode: desiredRuntimeMode,
+            mcpCatalogSessionId: catalogSessionId,
             // Provider turn ids are not orchestration turn ids.
             activeTurnId: recoveryTurnId ?? null,
             lastError: session.lastError ?? null,
@@ -1521,6 +1537,10 @@ const make = Effect.gen(function* () {
         activeTurnId: null,
         lastError: thread.session?.lastError ?? null,
         updatedAt: now,
+        ...(event.payload.onlyIfSettled === true &&
+        thread.session?.mcpCatalogSessionId !== undefined
+          ? { mcpCatalogSessionId: thread.session.mcpCatalogSessionId }
+          : {}),
       },
       createdAt: now,
     });

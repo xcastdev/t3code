@@ -181,6 +181,55 @@ it.effect("decodes project.create with createWorkspaceRootIfMissing enabled", ()
   }),
 );
 
+it.effect("rejects MCP mutations from the client orchestration command schema", () =>
+  Effect.gen(function* () {
+    const commands = [
+      {
+        type: "project.mcp-server.create",
+        commandId: "cmd-mcp-create",
+        projectId: "project-1",
+        server: {
+          id: "mcp-1",
+          name: "Docs",
+          url: "https://docs.example.test/mcp",
+          enabled: true,
+          providerInstanceIds: ["codex"],
+        },
+        createdAt: "2026-01-01T00:00:00.000Z",
+      },
+      {
+        type: "project.mcp-server.update",
+        commandId: "cmd-mcp-update",
+        projectId: "project-1",
+        server: {
+          id: "mcp-1",
+          name: "Docs",
+          url: "https://docs.example.test/mcp",
+          enabled: true,
+          providerInstanceIds: ["codex"],
+        },
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      },
+      {
+        type: "project.mcp-server.remove",
+        commandId: "cmd-mcp-remove",
+        projectId: "project-1",
+        id: "mcp-1",
+        removedAt: "2026-01-01T00:00:00.000Z",
+      },
+    ];
+
+    const exits = yield* Effect.forEach(commands, (command) =>
+      Effect.exit(decodeClientOrchestrationCommand(command)),
+    );
+
+    assert.deepStrictEqual(
+      exits.map((exit) => exit._tag),
+      ["Failure", "Failure", "Failure"],
+    );
+  }),
+);
+
 it.effect("decodes historical project.created payloads with a default provider", () =>
   Effect.gen(function* () {
     const parsed = yield* decodeProjectCreatedPayload({

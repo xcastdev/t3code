@@ -889,6 +889,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         binaryPath: "/opt/homebrew/bin/opencode",
         serverUrl: "http://127.0.0.1:4096",
         serverPassword: "secret-password",
+        manageExternalMcp: false,
+        externalMcpBaseUrl: "",
         customModels: [],
       });
     }).pipe(Effect.provide(makeServerSettingsLayer())),
@@ -911,6 +913,24 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         otlpTracesUrl: "http://localhost:4318/v1/traces",
         otlpMetricsUrl: "http://localhost:4318/v1/metrics",
       });
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
+  it.effect("persists external OpenCode MCP settings", () =>
+    Effect.gen(function* () {
+      const serverSettings = yield* ServerSettingsModule.ServerSettingsService;
+
+      const next = yield* serverSettings.updateSettings({
+        providers: {
+          opencode: {
+            manageExternalMcp: true,
+            externalMcpBaseUrl: "  https://t3.example.test  ",
+          },
+        },
+      });
+
+      assert.equal(next.providers.opencode.manageExternalMcp, true);
+      assert.equal(next.providers.opencode.externalMcpBaseUrl, "https://t3.example.test");
     }).pipe(Effect.provide(makeServerSettingsLayer())),
   );
 

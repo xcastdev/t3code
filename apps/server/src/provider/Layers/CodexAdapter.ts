@@ -52,6 +52,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
+import { projectMcpNativeKey, projectMcpTokenEnvironmentKey } from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
@@ -1675,7 +1676,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         }
 
         const existing = sessions.get(input.threadId);
-        if (existing && !existing.stopped) {
+        if (existing) {
           yield* Effect.suspend(() => stopSessionInternal(existing));
         }
 
@@ -1684,6 +1685,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const projectMcpServers = input.projectMcpServers ?? [];
+        const projectMcpArgs = projectMcpServers.flatMap((server) => {
+          const nativeKey = projectMcpNativeKey(server);
+          const tokenEnvironmentKey = projectMcpTokenEnvironmentKey(server);
+          return [
+            "-c",
+            `mcp_servers.${nativeKey}.url=${JSON.stringify(server.endpoint.toString())}`,
+            "-c",
+            `mcp_servers.${nativeKey}.bearer_token_env_var=${JSON.stringify(tokenEnvironmentKey)}`,
+          ];
+        });
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
           providerInstanceId: boundInstanceId,
@@ -1700,17 +1712,35 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? { model: input.modelSelection.model }
             : {}),
           ...(serviceTier ? { serviceTier } : {}),
-          ...(mcpSession
+          ...(projectMcpArgs.length > 0 || mcpSession
             ? {
                 environment: {
                   ...(options?.environment ?? process.env),
-                  T3_MCP_BEARER_TOKEN: mcpSession.authorizationHeader.replace(/^Bearer\s+/, ""),
+                  ...Object.fromEntries(
+                    projectMcpServers.map((server) => [
+                      projectMcpTokenEnvironmentKey(server),
+                      server.authorizationHeader.replace(/^Bearer\s+/i, ""),
+                    ]),
+                  ),
+                  ...(mcpSession
+                    ? {
+                        T3_MCP_BEARER_TOKEN: mcpSession.authorizationHeader.replace(
+                          /^Bearer\s+/,
+                          "",
+                        ),
+                      }
+                    : {}),
                 },
                 appServerArgs: [
-                  "-c",
-                  `mcp_servers.t3-code.url=${mcpSession.endpoint}`,
-                  "-c",
-                  'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
+                  ...projectMcpArgs,
+                  ...(mcpSession
+                    ? [
+                        "-c",
+                        `mcp_servers.t3-code.url=${mcpSession.endpoint}`,
+                        "-c",
+                        'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
+                      ]
+                    : []),
                 ],
               }
             : {}),
@@ -1740,9 +1770,18 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         // this a child of `startSession`, and Effect interrupts a fiber's
         // children when it completes, so the consumer died on return and every
         // runtime event the session emitted afterwards was dropped.
+        let stopped = false;
         const eventFiber = yield* Stream.runForEach(runtime.events, (event) =>
           Effect.gen(function* () {
             yield* writeNativeEvent(event);
+            if (
+              event.threadId === input.threadId &&
+              (event.method === "session/exited" || event.method === "session/closed")
+            ) {
+              stopped = true;
+              const current = sessions.get(input.threadId);
+              if (current?.runtime === runtime) current.stopped = true;
+            }
             const runtimeEvents = mapToRuntimeEvents(event, event.threadId);
             if (runtimeEvents.length === 0) {
               yield* Effect.logDebug("ignoring unhandled Codex provider event", {
@@ -1781,7 +1820,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           scope: sessionScope,
           runtime,
           eventFiber,
-          stopped: false,
+          stopped,
         });
         sessionScopeTransferred = true;
 
@@ -1963,11 +2002,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   const stopSessionInternal = Effect.fn("stopSessionInternal")(function* (
     session: CodexAdapterSessionContext,
   ) {
-    if (session.stopped) {
-      return;
-    }
     session.stopped = true;
-    sessions.delete(session.threadId);
+    if (sessions.get(session.threadId) === session) sessions.delete(session.threadId);
     yield* session.runtime.close.pipe(Effect.ignore);
     yield* Effect.ignore(Scope.close(session.scope, Exit.void));
     yield* Fiber.interrupt(session.eventFiber).pipe(Effect.ignore);
@@ -2010,6 +2046,10 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     provider: PROVIDER,
     capabilities: {
       sessionModelSwitch: "in-session",
+      remoteHttpMcp: "next-session",
+      projectMcpProxy: "next-session",
+      managedPreviewMcp: "next-session",
+      sessionMcpCatalog: "restart-required",
     },
     startSession,
     sendTurn,

@@ -39,6 +39,7 @@ import * as ProviderSessionDirectory from "./provider/Services/ProviderSessionDi
 import * as ProviderSessionReaper from "./provider/Services/ProviderSessionReaper.ts";
 import { forkParked } from "./serverActivation.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
+import * as ProjectMcpService from "./project/ProjectMcpService.ts";
 import {
   formatHeadlessServeOutput,
   formatHostForUrl,
@@ -581,6 +582,7 @@ export const make = (options?: StartupOptions) =>
     const serverConfig = yield* ServerConfig.ServerConfig;
     const keybindings = yield* Keybindings.Keybindings;
     const orchestrationReactor = yield* OrchestrationReactor.OrchestrationReactor;
+    const projectMcpService = yield* ProjectMcpService.ProjectMcpService;
     const providerSessionReaper = yield* ProviderSessionReaper.ProviderSessionReaper;
     const lifecycleEvents = yield* ServerLifecycleEvents.ServerLifecycleEvents;
     const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -626,6 +628,10 @@ export const make = (options?: StartupOptions) =>
       );
 
       yield* Effect.logDebug("startup phase: parking orchestration roots at activation");
+      yield* runStartupPhase(
+        "project-mcp.cleanup",
+        projectMcpService.startCleanup().pipe(Scope.provide(reactorScope)),
+      );
       yield* runStartupPhase(
         "reactors.start",
         Effect.gen(function* () {

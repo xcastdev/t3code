@@ -1,6 +1,8 @@
 import {
   CommandId,
   EventId,
+  EnvironmentId,
+  McpCatalogSessionId,
   MessageId,
   ProjectId,
   ProviderInstanceId,
@@ -8,6 +10,7 @@ import {
   type OrchestrationEvent,
   type OrchestrationReadModel,
   type OrchestrationSession,
+  type McpCatalogSnapshot,
   type OrchestrationThread,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -682,6 +685,91 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
       expect(unconditionalEvents.map((event) => event.type)).toEqual([
         "thread.session-stop-requested",
       ]);
+
+      const linkedSnapshot: McpCatalogSnapshot = {
+        catalogSessionId: McpCatalogSessionId.make("catalog-stop"),
+        threadId: ThreadId.make("thread-1"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        baseline: [],
+        desired: [],
+        applied: [],
+        desiredRevision: 3,
+        appliedRevision: 3,
+      };
+      const readModelWithLinkedCatalog = (
+        settledOverride: OrchestrationThread["settledOverride"],
+      ) => ({
+        ...makeReadModel(null, null, {
+          ...makeSession("ready"),
+          mcpCatalogSessionId: McpCatalogSessionId.make("catalog-stop"),
+        }),
+        threads: makeReadModel(settledOverride, null, {
+          ...makeSession("ready"),
+          mcpCatalogSessionId: McpCatalogSessionId.make("catalog-stop"),
+        }).threads,
+        mcpCatalog: {
+          environmentId: EnvironmentId.make("environment-1"),
+          globalRevision: 0,
+          globalDefinitions: [],
+          projectRevisions: [],
+          projectDefinitions: [],
+          projectOverrides: [],
+          sessions: [linkedSnapshot],
+        },
+      });
+      const conditionalStop = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.session.stop",
+          commandId: CommandId.make("cmd-stop-preserve-catalog"),
+          threadId: ThreadId.make("thread-1"),
+          createdAt: NOW,
+          onlyIfSettled: true,
+        },
+        readModel: readModelWithLinkedCatalog("settled"),
+      });
+      expect(conditionalStop).toMatchObject({
+        type: "thread.session-stop-requested",
+        payload: { onlyIfSettled: true },
+      });
+      const explicitStop = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.session.stop",
+          commandId: CommandId.make("cmd-stop-dispose-catalog"),
+          threadId: ThreadId.make("thread-1"),
+          createdAt: NOW,
+        },
+        readModel: readModelWithLinkedCatalog(null),
+      });
+      const explicitStopEvents = Array.isArray(explicitStop) ? explicitStop : [explicitStop];
+      expect(explicitStopEvents.map((event) => event.type)).toEqual([
+        "thread.session-stop-requested",
+        "thread.mcp-catalog.disposed",
+      ]);
+      const disposal = explicitStopEvents[1];
+      if (disposal?.type === "thread.mcp-catalog.disposed") {
+        expect(disposal.payload).toMatchObject({
+          mcpCatalogSessionId: "catalog-stop",
+          revision: 3,
+        });
+      }
+      const explicitFalse = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.session.stop",
+          commandId: CommandId.make("cmd-stop-false-dispose-catalog"),
+          threadId: ThreadId.make("thread-1"),
+          createdAt: NOW,
+          onlyIfSettled: false,
+        },
+        readModel: readModelWithLinkedCatalog(null),
+      });
+      const explicitFalseEvents = Array.isArray(explicitFalse) ? explicitFalse : [explicitFalse];
+      expect(explicitFalseEvents.map((event) => event.type)).toEqual([
+        "thread.session-stop-requested",
+        "thread.mcp-catalog.disposed",
+      ]);
+      expect(explicitFalseEvents[0]).toMatchObject({
+        payload: { onlyIfSettled: false },
+      });
     }),
   );
 });

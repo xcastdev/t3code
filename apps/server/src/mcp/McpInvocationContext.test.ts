@@ -36,3 +36,21 @@ it.effect("reports the scoped credential context when preview capability is unav
     expect(error.message).toBe("MCP credential does not grant the preview capability.");
   });
 });
+
+it.effect("allows a project proxy invocation with the project capability", () =>
+  Effect.gen(function* () {
+    const invocation: McpInvocationContext.McpInvocationScope = {
+      environmentId: EnvironmentId.make("environment-1"),
+      threadId: ThreadId.make("thread-project"),
+      providerSessionId: "provider-project",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      capabilities: new Set(["project"]),
+      issuedAt: 1,
+    };
+
+    const resolved = yield* McpInvocationContext.requireMcpCapability("project").pipe(
+      Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+    );
+    expect(resolved).toBe(invocation);
+  }),
+);

@@ -6,7 +6,9 @@ import * as NodePath from "node:path";
 import {
   ApprovalRequestId,
   CodexSettings,
+  EnvironmentId,
   EventId,
+  McpServerId,
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderItemId,
@@ -36,6 +38,7 @@ import * as TestClock from "effect/testing/TestClock";
 import * as CodexErrors from "effect-codex-app-server/errors";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
@@ -436,6 +439,87 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
     }).pipe(Effect.provide(layer));
   });
 
+  it.effect("attaches project MCP servers with immutable ID-derived keys", () => {
+    const runtimeFactory = makeRuntimeFactory();
+    const layer = Layer.effect(
+      CodexAdapter,
+      Effect.gen(function* () {
+        return yield* makeCodexAdapter(decodeCodexSettings({}), {
+          makeRuntime: runtimeFactory.factory,
+        });
+      }),
+    ).pipe(
+      Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+      Layer.provideMerge(ServerSettingsService.layerTest()),
+      Layer.provideMerge(providerSessionDirectoryTestLayer),
+      Layer.provideMerge(NodeServices.layer),
+    );
+
+    return Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      const threadId = asThreadId("sess-project-mcp");
+      yield* Effect.sync(() =>
+        McpProviderSession.setMcpProviderSession({
+          environmentId: EnvironmentId.make("environment-test"),
+          threadId,
+          providerSessionId: "preview-session",
+          providerInstanceId: ProviderInstanceId.make("codex-primary"),
+          endpoint: "http://127.0.0.1:4310/mcp",
+          authorizationHeader: "Bearer preview-token",
+        }),
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        runtimeMode: "full-access",
+        projectMcpServers: [
+          {
+            id: McpServerId.make("mcp-docs"),
+            name: "Docs",
+            endpoint: new URL("http://127.0.0.1:4311/mcp/project/docs-endpoint"),
+            authorizationHeader: "Bearer project-token",
+          },
+          {
+            id: McpServerId.make("mcp-calendar"),
+            name: "Calendar",
+            endpoint: new URL("http://127.0.0.1:4311/mcp/project/calendar-endpoint"),
+            authorizationHeader: "Bearer calendar-token",
+          },
+        ],
+      });
+
+      const runtime = runtimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+      NodeAssert.deepEqual(runtime.options.appServerArgs, [
+        "-c",
+        'mcp_servers.t3-project-mcp-docs.url="http://127.0.0.1:4311/mcp/project/docs-endpoint"',
+        "-c",
+        'mcp_servers.t3-project-mcp-docs.bearer_token_env_var="T3_PROJECT_MCP_mcp_2D_docs"',
+        "-c",
+        'mcp_servers.t3-project-mcp-calendar.url="http://127.0.0.1:4311/mcp/project/calendar-endpoint"',
+        "-c",
+        'mcp_servers.t3-project-mcp-calendar.bearer_token_env_var="T3_PROJECT_MCP_mcp_2D_calendar"',
+        "-c",
+        "mcp_servers.t3-code.url=http://127.0.0.1:4310/mcp",
+        "-c",
+        'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
+      ]);
+      NodeAssert.equal(runtime.options.environment?.T3_MCP_BEARER_TOKEN, "preview-token");
+      NodeAssert.equal(runtime.options.environment?.T3_PROJECT_MCP_mcp_2D_docs, "project-token");
+      NodeAssert.equal(
+        runtime.options.environment?.T3_PROJECT_MCP_mcp_2D_calendar,
+        "calendar-token",
+      );
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(asThreadId("sess-project-mcp")),
+        ),
+      ),
+      Effect.provide(layer),
+    );
+  });
+
   it.effect("uses T3CODE_CODEX_LAUNCH_ARGS for the session runtime", () => {
     const runtimeFactory = makeRuntimeFactory();
     const layer = Layer.effect(
@@ -557,6 +641,63 @@ function startLifecycleRuntime() {
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("an old runtime exit cannot mark its replacement stopped", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime: previous } = yield* startLifecycleRuntime();
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        runtimeMode: "full-access",
+      });
+      const current = lifecycleRuntimeFactory.lastRuntime;
+      NodeAssert.ok(current);
+      const forwarded = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      yield* previous.emit({
+        id: asEventId("old-runtime-exit"),
+        kind: "session",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-09-07T00:00:00.000Z",
+        method: "session/exited",
+      });
+      yield* current.emit({
+        id: asEventId("current-runtime-started"),
+        kind: "session",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-09-07T00:00:00.000Z",
+        method: "session/started",
+      });
+      NodeAssert.equal(
+        Option.getOrUndefined(yield* Fiber.join(forwarded))?.type,
+        "session.started",
+      );
+      NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-1")), true);
+      NodeAssert.equal(previous.closeImpl.mock.calls.length, 1);
+    }),
+  );
+
+  it.effect.each(["session/exited", "session/closed"])(
+    "marks the actual adapter terminal before forwarding %s without native IDs",
+    (method) =>
+      Effect.gen(function* () {
+        const { adapter, runtime } = yield* startLifecycleRuntime();
+        const forwarded = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+        yield* runtime.emit({
+          id: asEventId(`terminal-${method}`),
+          kind: "session",
+          provider: ProviderDriverKind.make("codex"),
+          threadId: asThreadId("thread-1"),
+          createdAt: "2026-09-07T00:00:00.000Z",
+          method,
+        });
+        const event = yield* Fiber.join(forwarded);
+        NodeAssert.equal(Option.getOrUndefined(event)?.type, "session.exited");
+        NodeAssert.equal(yield* adapter.hasSession(asThreadId("thread-1")), false);
+        NodeAssert.deepEqual(yield* adapter.listSessions(), []);
+      }),
+  );
+
   it.effect("carries child model metadata through every task event", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();

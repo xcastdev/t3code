@@ -61,6 +61,14 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   pullRequests: Schema.optionalKey(Schema.Boolean),
   /** Server exposes per-file stage, unstage, bounded diff, and index-only commit RPCs. */
   gitIndexWorkflow: Schema.optionalKey(Schema.Boolean),
+  /** Server exposes project-scoped remote HTTP MCP catalog RPCs. */
+  projectMcpCatalog: Schema.optionalKey(Schema.Boolean),
+  /** Server exposes environment-global MCP definition RPCs. */
+  globalMcpCatalog: Schema.optionalKey(Schema.Boolean),
+  /** Server exposes project inheritance and override RPCs. */
+  projectMcpOverrides: Schema.optionalKey(Schema.Boolean),
+  /** Server exposes active logical-session MCP catalog RPCs. */
+  sessionMcpCatalog: Schema.optionalKey(Schema.Boolean),
   /** Server understands thread.settle / thread.unsettle commands. Absent on
       pre-settlement servers, so clients treat missing as unsupported and
       never send the commands under version skew. */

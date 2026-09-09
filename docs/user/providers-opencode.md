@@ -17,6 +17,30 @@ With a server URL, T3 Code connects to that external server and uses only the pa
 provider settings. It does not send a local `OPENCODE_SERVER_PASSWORD` to an external server.
 OpenCode uses this password for HTTP Basic authentication.
 
+## Manage MCP on an external server
+
+External OpenCode MCP management is off by default. To opt in, open **Settings > Providers**,
+select OpenCode, enable **Manage MCP servers on external OpenCode**, and start a new session.
+The setting applies when the next session starts. Existing sessions continue using the OpenCode
+connection and MCP generation they started with until they stop; changing the setting does not
+interrupt them.
+
+When T3 Code and OpenCode run on different machines, set **T3 MCP public origin** to the HTTPS
+origin that the OpenCode machine can reach, such as `https://t3.example.com`. T3 Code preserves
+the path and query of each issued MCP endpoint when it rebases it onto this origin. Leave the
+origin empty only when both services share a machine and can use loopback HTTP. HTTPS is required
+across machines; non-loopback HTTP is rejected.
+
+T3 Code manages the preview, project, and session MCP entries for an opted-in external server.
+It checks OpenCode's configuration and connection status before and after each change. If a name
+is already used without T3 Code's ownership markers, the session fails with instructions to
+rename that entry. Provider status and unrelated OpenCode use remain available.
+
+One T3 server process allows one MCP-enabled session for each external OpenCode URL and exact
+directory. This lock does not coordinate another T3 server process or a native OpenCode client.
+When a session ends, T3 Code disconnects its entries. OpenCode 1.15.13 keeps those entries as
+disabled configuration because it does not provide a dynamic remove operation.
+
 ## Stop and reconnect
 
 When you stop an active OpenCode turn, T3 Code asks OpenCode to abort it. T3 Code marks the turn
@@ -51,7 +75,9 @@ model-list or text-generation work. Refresh after that idle period to start a ne
 the file changes. Repeated refreshes or active helper work can extend this wait.
 
 T3 Code does not own an external OpenCode server. Native configuration changes on that server can
-require its own reload or restart before a refresh returns the new list.
+require its own reload or restart before a refresh returns the new list. Without the MCP opt-in,
+T3 Code does not manage MCP entries on the external server. Disabled provider instances are shown
+as unavailable.
 
 If a refresh fails, T3 Code keeps the last known models, slash commands, and skills. Fix the
 connection, then refresh again. A successful refresh can remove entries that OpenCode no longer

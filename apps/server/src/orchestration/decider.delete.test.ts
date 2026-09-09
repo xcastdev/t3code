@@ -2,6 +2,8 @@ import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   EventId,
+  McpDefinitionId,
+  McpServerId,
   ProjectId,
   ThreadId,
   type OrchestrationCommand,
@@ -212,6 +214,81 @@ it.layer(NodeServices.layer)("decider deletion flows", (it) => {
       }
 
       expect(normalizeDeleteEvent(forcedResult)).toEqual(normalizeDeleteEvent(sequentialEvents));
+    }),
+  );
+
+  it.effect("rejects a project catalog logical ID owned by another project", () =>
+    Effect.gen(function* () {
+      const initial = yield* seedReadModel;
+      const projectA = asProjectId("project-a");
+      const projectB = asProjectId("project-b");
+      const logicalServerId = McpServerId.make("shared-logical-id");
+      const readModel = {
+        ...initial,
+        projects: [
+          ...initial.projects,
+          { id: projectA, deletedAt: null } as never,
+          { id: projectB, deletedAt: null } as never,
+        ],
+        mcpCatalog: {
+          environmentId: "environment-1",
+          globalRevision: 0,
+          globalDefinitions: [],
+          projectRevisions: [],
+          projectDefinitions: [
+            {
+              projectId: projectA,
+              definition: {
+                definitionId: McpDefinitionId.make("definition-shared"),
+                logicalServerId,
+                scope: "project" as const,
+                scopeId: projectA,
+                name: "Shared",
+                transport: {
+                  type: "streamable-http" as const,
+                  url: "https://shared.example.test/mcp",
+                  headers: [],
+                  authorization: { type: "none" as const },
+                },
+                enabled: true,
+                providerInstanceIds: [ProviderInstanceId.make("codex")],
+                revision: 1,
+              },
+            },
+          ],
+          projectOverrides: [],
+          sessions: [],
+        },
+      };
+      const error = yield* Effect.flip(
+        decideOrchestrationCommand({
+          command: {
+            type: "project.mcp-definition.create",
+            commandId: asCommandId("cmd-shared-project-id"),
+            projectId: projectB,
+            definition: {
+              definitionId: McpDefinitionId.make("definition-other"),
+              logicalServerId,
+              scope: "project",
+              scopeId: projectB,
+              name: "Other",
+              transport: {
+                type: "streamable-http",
+                url: "https://other.example.test/mcp",
+                headers: [],
+                authorization: { type: "none" },
+              },
+              enabled: true,
+              providerInstanceIds: [ProviderInstanceId.make("codex")],
+              revision: 1,
+            },
+            expectedRevision: 0,
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+          readModel: readModel as never,
+        }),
+      );
+      expect(error.message).toContain("already owned");
     }),
   );
 });

@@ -113,6 +113,7 @@ import {
   canPickExternalProjectFavicon,
   ProjectFaviconPickerDialog,
 } from "./ProjectFaviconPickerDialog";
+import { ProjectMcpSettings } from "./ProjectMcpSettings";
 import { projectGroupTitleNeedsUpdate } from "./ProjectSettingsPanel.logic";
 
 export const PROJECT_GROUPING_MODE_LABELS: Record<SidebarProjectGroupingMode, string> = {
@@ -1163,6 +1164,11 @@ function ProjectDetail({ group }: { group: SidebarProjectSnapshot }) {
             />
           ) : null}
         </SettingsSection>
+
+        <ProjectMcpSettings
+          environmentId={selectedCheckout.environmentId}
+          projectId={selectedCheckout.id}
+        />
 
         <SettingsSection title="Danger">
           <SettingsRow

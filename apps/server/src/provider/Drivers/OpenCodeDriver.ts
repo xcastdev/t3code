@@ -30,6 +30,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { makeOpenCodeTextGeneration } from "../../textGeneration/OpenCodeTextGeneration.ts";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
+import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeOpenCodeAdapter } from "../Layers/OpenCodeAdapter.ts";
@@ -42,6 +43,7 @@ import { ProviderEventLoggers } from "../Layers/ProviderEventLoggers.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import { OpenCodeRuntime } from "../opencodeRuntime.ts";
 import * as OpenCodeServerOwner from "../OpenCodeServerOwner.ts";
+import * as OpenCodeExternalMcpCoordinator from "../OpenCodeExternalMcpCoordinator.ts";
 import {
   defaultProviderContinuationIdentity,
   type ProviderDriver,
@@ -91,9 +93,11 @@ export type OpenCodeDriverEnv =
   | FileSystem.FileSystem
   | HttpClient.HttpClient
   | OpenCodeRuntime
+  | OpenCodeExternalMcpCoordinator.OpenCodeExternalMcpCoordinator
   | Path.Path
   | ProviderEventLoggers
   | ServerConfig
+  | ServerEnvironment.ServerEnvironment
   | ServerSettingsService;
 
 const withInstanceIdentity =
@@ -117,6 +121,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
   metadata: {
     displayName: "OpenCode",
     supportsMultipleInstances: true,
+    replacementPolicy: "drain",
   },
   configSchema: OpenCodeSettings,
   defaultConfig: (): OpenCodeSettings => decodeOpenCodeSettings({}),
@@ -124,6 +129,10 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
     Effect.gen(function* () {
       const openCodeRuntime = yield* OpenCodeRuntime;
       const serverConfig = yield* ServerConfig;
+      const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+      const environmentId = yield* serverEnvironment.getEnvironmentId;
+      const externalMcpCoordinator =
+        yield* OpenCodeExternalMcpCoordinator.OpenCodeExternalMcpCoordinator;
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
@@ -150,6 +159,8 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
 
       const adapter = yield* makeOpenCodeAdapter(effectiveConfig, {
         instanceId,
+        environmentId,
+        externalMcpCoordinator,
         environment: processEnv,
         commandCatalog: (directory) => commandCatalogByDirectory.get(directory) ?? [],
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),

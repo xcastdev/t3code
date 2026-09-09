@@ -22,17 +22,56 @@ import type {
   ProviderTurnStartResult,
   TurnId,
 } from "@t3tools/contracts";
+import type { McpIssuedProjectServer } from "../../mcp/McpProviderSession.ts";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
+export type ProviderRemoteHttpMcpMode = "active-session" | "next-session" | "unsupported";
+export type ProviderSessionMcpCatalogMode = "live" | "restart-required" | "unsupported";
 
 export interface ProviderAdapterCapabilities {
   /**
    * Declares whether changing the model on an existing session is supported.
    */
   readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
+  /** Application timing for user-configured remote HTTP MCP servers. */
+  readonly remoteHttpMcp: ProviderRemoteHttpMcpMode;
+  /** Application timing for the T3-scoped project MCP proxy. */
+  readonly projectMcpProxy?: ProviderRemoteHttpMcpMode;
+  /** Human-readable reason when project MCP is unavailable for this adapter. */
+  readonly projectMcpUnsupportedReason?: string;
+  /** Application timing for the T3-managed preview MCP server. */
+  readonly managedPreviewMcp: ProviderRemoteHttpMcpMode;
+  /** Whether the resolved user catalog can change in the active session. */
+  readonly sessionMcpCatalog?: ProviderSessionMcpCatalogMode;
 }
+
+export type ProviderAdapterSessionStartInput = ProviderSessionStartInput & {
+  /** T3-issued proxy records only; upstream transport details never cross this seam. */
+  readonly projectMcpServers?: ReadonlyArray<McpIssuedProjectServer>;
+};
+
+const encodeProjectMcpId = (id: Pick<McpIssuedProjectServer, "id">["id"]): string =>
+  Array.from(String(id), (character) =>
+    /^[A-Za-z0-9-]$/.test(character)
+      ? character
+      : `_${character.codePointAt(0)?.toString(16).toUpperCase() ?? "00"}_`,
+  ).join("");
+
+export const projectMcpNativeKey = (server: Pick<McpIssuedProjectServer, "id">): string =>
+  `t3-project-${encodeProjectMcpId(server.id)}`;
+
+export const projectMcpTokenEnvironmentKey = (
+  server: Pick<McpIssuedProjectServer, "id">,
+): string => {
+  const suffix = Array.from(String(server.id), (character) =>
+    /^[A-Za-z0-9]$/.test(character)
+      ? character
+      : `_${character.codePointAt(0)?.toString(16).toUpperCase() ?? "00"}_`,
+  ).join("");
+  return `T3_PROJECT_MCP_${suffix}`;
+};
 
 export interface ProviderThreadTurnSnapshot {
   readonly id: TurnId;
@@ -61,7 +100,7 @@ export interface ProviderAdapterShape<TError> {
    * Start a provider-backed session.
    */
   readonly startSession: (
-    input: ProviderSessionStartInput,
+    input: ProviderAdapterSessionStartInput,
   ) => Effect.Effect<ProviderSession, TError>;
 
   /**
@@ -107,6 +146,12 @@ export interface ProviderAdapterShape<TError> {
    * Stop one provider session.
    */
   readonly stopSession: (threadId: ThreadId) => Effect.Effect<void, TError>;
+
+  /**
+   * Release provider-owned MCP configuration before the native session stops.
+   * Providers that do not manage external MCP servers omit this hook.
+   */
+  readonly cleanupSessionMcp?: (threadId: ThreadId) => Effect.Effect<void, TError>;
 
   /**
    * List currently active provider sessions for this adapter.

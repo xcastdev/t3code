@@ -2,6 +2,7 @@ import type {
   OrchestrationClientOrigin,
   OrchestrationEvent,
   OrchestrationReadModel,
+  EnvironmentId,
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
@@ -61,13 +62,28 @@ interface CommandEnvelope {
 }
 
 function commandToAggregateRef(command: OrchestrationCommand): {
-  readonly aggregateKind: "project" | "thread";
-  readonly aggregateId: ProjectId | ThreadId;
+  readonly aggregateKind: "environment" | "project" | "thread";
+  readonly aggregateId: EnvironmentId | ProjectId | ThreadId;
 } {
   switch (command.type) {
+    case "environment.mcp-definition.create":
+    case "environment.mcp-definition.update":
+    case "environment.mcp-definition.remove":
+      return {
+        aggregateKind: "environment",
+        aggregateId: command.environmentId,
+      };
+    case "project.mcp-override.upsert":
+    case "project.mcp-override.remove":
+    case "project.mcp-definition.create":
+    case "project.mcp-definition.update":
+    case "project.mcp-definition.remove":
     case "project.create":
     case "project.meta.update":
     case "project.delete":
+    case "project.mcp-server.create":
+    case "project.mcp-server.update":
+    case "project.mcp-server.remove":
       return {
         aggregateKind: "project",
         aggregateId: command.projectId,
@@ -355,6 +371,7 @@ const makeOrchestrationEngine = Effect.gen(function* () {
   return {
     readEvents,
     dispatch,
+    subscribeDomainEvents: PubSub.subscribe(eventPubSub),
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (wsServer, ProviderRuntimeIngestion, CheckpointReactor, etc.)
     // each independently receive all domain events.

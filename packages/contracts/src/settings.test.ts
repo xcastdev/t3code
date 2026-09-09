@@ -7,6 +7,7 @@ import {
   ClientSettingsPatch,
   ClaudeSettings,
   DEFAULT_SERVER_SETTINGS,
+  OpenCodeSettings,
   defaultEnabledForDriver,
   resolveProviderInstanceEnabled,
   ServerSettings,
@@ -20,6 +21,7 @@ const decodeServerSettings = Schema.decodeUnknownSync(ServerSettings);
 const decodeServerSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
+const decodeOpenCodeSettings = Schema.decodeUnknownSync(OpenCodeSettings);
 
 describe("ClaudeSettings auto-compaction", () => {
   it("uses Claude's default threshold when no override is configured", () => {
@@ -47,6 +49,44 @@ describe("ClaudeSettings auto-compaction", () => {
     expect(
       decodeServerSettingsPatch({ providers: { claudeAgent: { autoCompactWindow: "300000" } } }),
     ).toBeDefined();
+  });
+});
+
+describe("OpenCode external MCP settings", () => {
+  it("defaults external MCP management off with no public origin", () => {
+    expect(decodeOpenCodeSettings({})).toMatchObject({
+      manageExternalMcp: false,
+      externalMcpBaseUrl: "",
+    });
+  });
+
+  it("accepts the opt-in and public origin settings", () => {
+    expect(
+      decodeOpenCodeSettings({
+        manageExternalMcp: true,
+        externalMcpBaseUrl: "https://t3.example.test",
+      }),
+    ).toMatchObject({
+      manageExternalMcp: true,
+      externalMcpBaseUrl: "https://t3.example.test",
+    });
+    expect(
+      decodeServerSettingsPatch({
+        providers: {
+          opencode: {
+            manageExternalMcp: true,
+            externalMcpBaseUrl: "https://t3.example.test",
+          },
+        },
+      }).providers?.opencode,
+    ).toMatchObject({
+      manageExternalMcp: true,
+      externalMcpBaseUrl: "https://t3.example.test",
+    });
+  });
+
+  it("rejects a non-boolean opt-in", () => {
+    expect(() => decodeOpenCodeSettings({ manageExternalMcp: "yes" })).toThrow();
   });
 });
 

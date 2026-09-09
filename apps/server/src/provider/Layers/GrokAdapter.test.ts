@@ -14,10 +14,13 @@ import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 
 import {
   ApprovalRequestId,
+  EnvironmentId,
   GrokSettings,
+  McpServerId,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
@@ -26,6 +29,7 @@ import {
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   grokPromptSettlementBelongsToContext,
   isGrokEnterPlanModeToolCall,
@@ -94,6 +98,126 @@ const grokAdapterTestLayer = ServerConfig.layerTest(process.cwd(), {
 
 const makeTestAdapter = (binaryPath: string, options?: Parameters<typeof makeGrokAdapter>[1]) =>
   makeGrokAdapter(decodeGrokSettings({ binaryPath }), options).pipe(Effect.orDie);
+
+it.effect("removes an idle Grok session before publishing unexpected process exit", () =>
+  Effect.gen(function* () {
+    const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+    const spawned: ChildProcessSpawner.ChildProcessHandle[] = [];
+    const wrapper = yield* Effect.acquireRelease(
+      Effect.promise(() => makeMockGrokWrapper()),
+      (path) => Effect.promise(() => NodeFSP.rm(NodePath.dirname(path), { recursive: true })),
+    );
+    const adapter = yield* makeTestAdapter(wrapper).pipe(
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make((command) =>
+          spawner
+            .spawn(command)
+            .pipe(Effect.tap((handle) => Effect.sync(() => spawned.push(handle)))),
+        ),
+      ),
+    );
+    const threadId = ThreadId.make("grok-idle-process-exit");
+    const exited = yield* adapter.streamEvents.pipe(
+      Stream.filter((event) => event.type === "session.exited"),
+      Stream.take(1),
+      Stream.mapEffect((event) =>
+        Effect.gen(function* () {
+          assert.isFalse(yield* adapter.hasSession(threadId));
+          assert.deepEqual(yield* adapter.listSessions(), []);
+          return event;
+        }),
+      ),
+      Stream.runCollect,
+      Effect.forkScoped({ startImmediately: true }),
+    );
+    yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+    const child = spawned.at(-1)!;
+    assert.isTrue(yield* child.isRunning);
+    yield* child.kill({ killSignal: "SIGKILL" });
+    const events = yield* Fiber.join(exited);
+    assert.equal(events.length, 1);
+    assert.equal(events[0]?.payload.exitKind, "error");
+  }).pipe(Effect.provide(grokAdapterTestLayer)),
+);
+
+for (const delayedExit of [true, false]) {
+  it.effect(
+    `Grok replacement ignores an old ${delayedExit ? "delayed" : "interrupted"} exit observer`,
+    () =>
+      Effect.gen(function* () {
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const processes: Array<{
+          observer: Deferred.Deferred<Fiber.Fiber<unknown, unknown>>;
+          release: Deferred.Deferred<void>;
+        }> = [];
+        const wrapper = yield* Effect.acquireRelease(
+          Effect.promise(() => makeMockGrokWrapper()),
+          (path) => Effect.promise(() => NodeFSP.rm(NodePath.dirname(path), { recursive: true })),
+        );
+        const adapter = yield* makeTestAdapter(wrapper).pipe(
+          Effect.provideService(
+            ChildProcessSpawner.ChildProcessSpawner,
+            ChildProcessSpawner.make((command) =>
+              Effect.gen(function* () {
+                const handle = yield* spawner.spawn(command);
+                const observer = yield* Deferred.make<Fiber.Fiber<unknown, unknown>>();
+                const release = yield* Deferred.make<void>();
+                processes.push({ observer, release });
+                let claimed = false;
+                return ChildProcessSpawner.makeHandle({
+                  ...handle,
+                  exitCode: Effect.withFiber((fiber) => {
+                    if (claimed) return handle.exitCode;
+                    claimed = true;
+                    return Deferred.succeed(observer, fiber).pipe(
+                      Effect.andThen(Deferred.await(release)),
+                      Effect.andThen(handle.exitCode),
+                    );
+                  }),
+                });
+              }),
+            ),
+          ),
+        );
+        const threadId = ThreadId.make("grok-exit-replacement");
+        const barrierThreadId = ThreadId.make("grok-exit-barrier");
+        const events = yield* adapter.streamEvents.pipe(
+          Stream.takeUntil(
+            (event) => event.type === "thread.started" && event.threadId === barrierThreadId,
+          ),
+          Stream.runCollect,
+          Effect.forkScoped({ startImmediately: true }),
+        );
+        const start = { threadId, cwd: process.cwd(), runtimeMode: "full-access" as const };
+        yield* adapter.startSession(start);
+        const old = processes.at(-1)!;
+        const oldObserver = yield* Deferred.await(old.observer);
+        yield* adapter.sendTurn({ threadId, input: "normal completed prompt" });
+        assert.isTrue(yield* adapter.hasSession(threadId));
+        if (!delayedExit) yield* Fiber.interrupt(oldObserver);
+        yield* adapter.startSession(start);
+        const current = processes.at(-1)!;
+        const currentObserver = yield* Deferred.await(current.observer);
+        yield* Deferred.succeed(old.release, undefined);
+        yield* Fiber.await(oldObserver);
+        assert.isTrue(yield* adapter.hasSession(threadId));
+        assert.equal((yield* adapter.listSessions()).length, 1);
+        yield* adapter.stopSession(threadId);
+        yield* Deferred.succeed(current.release, undefined);
+        yield* Fiber.await(currentObserver);
+        assert.isFalse(yield* adapter.hasSession(threadId));
+        yield* adapter.startSession({ ...start, threadId: barrierThreadId });
+        const observed = yield* Fiber.join(events);
+        const exits = observed.filter((event) => event.type === "session.exited");
+        assert.equal(exits.length, 2);
+        assert.deepEqual(
+          exits.map((event) => event.payload.exitKind),
+          ["graceful", "graceful"],
+        );
+      }).pipe(Effect.provide(grokAdapterTestLayer)),
+  );
+}
 
 it("detects enter_plan_mode tool calls from title and rawInput", () => {
   assert.isTrue(
@@ -213,6 +337,81 @@ it("requires a settlement to match the live Grok turn", () => {
 });
 
 it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
+  it.effect("passes project MCP servers to ACP with immutable ID-derived names", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-project-mcp");
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-acp-mcp-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_REQUEST_LOG_PATH: requestLogPath }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      yield* Effect.sync(() =>
+        McpProviderSession.setMcpProviderSession({
+          environmentId: EnvironmentId.make("environment-test"),
+          threadId,
+          providerSessionId: "preview-session",
+          providerInstanceId: ProviderInstanceId.make("grok-primary"),
+          endpoint: "http://127.0.0.1:4310/mcp",
+          authorizationHeader: "Bearer preview-token",
+        }),
+      );
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("grok"),
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        projectMcpServers: [
+          {
+            id: McpServerId.make("mcp-docs"),
+            name: "Docs",
+            endpoint: new URL("http://127.0.0.1:4311/mcp/project/docs-endpoint"),
+            authorizationHeader: "Bearer project-token",
+          },
+          {
+            id: McpServerId.make("mcp-calendar"),
+            name: "Calendar",
+            endpoint: new URL("http://127.0.0.1:4311/mcp/project/calendar-endpoint"),
+            authorizationHeader: "Bearer calendar-token",
+          },
+        ],
+      });
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const sessionNew = requests.find((entry) => entry.method === "session/new");
+      assert.deepEqual((sessionNew?.params as { mcpServers?: unknown })?.mcpServers, [
+        {
+          type: "http",
+          name: "t3-project-mcp-docs",
+          url: "http://127.0.0.1:4311/mcp/project/docs-endpoint",
+          headers: [{ name: "Authorization", value: "Bearer project-token" }],
+        },
+        {
+          type: "http",
+          name: "t3-project-mcp-calendar",
+          url: "http://127.0.0.1:4311/mcp/project/calendar-endpoint",
+          headers: [{ name: "Authorization", value: "Bearer calendar-token" }],
+        },
+        {
+          type: "http",
+          name: "t3-code",
+          url: "http://127.0.0.1:4310/mcp",
+          headers: [{ name: "Authorization", value: "Bearer preview-token" }],
+        },
+      ]);
+      yield* adapter.stopSession(threadId);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(ThreadId.make("grok-project-mcp")),
+        ),
+      ),
+    ),
+  );
+
   it.effect("starts a session and maps mock ACP prompt flow to runtime events", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-mock-thread");

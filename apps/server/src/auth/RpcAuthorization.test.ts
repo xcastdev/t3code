@@ -46,6 +46,23 @@ describe("RPC authorization scopes", () => {
     );
   });
 
+  it("reads the project MCP catalog with read scope and mutates it with operate scope", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.projectMcpList)).toBe(AuthOrchestrationReadScope);
+    for (const method of [
+      WS_METHODS.projectMcpCreate,
+      WS_METHODS.projectMcpUpdate,
+      WS_METHODS.projectMcpRemove,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthOrchestrationOperateScope);
+    }
+  });
+
+  it("reads global scoped MCP state with the environment read scope", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.mcpCatalogGlobalStateList)).toBe(
+      AuthOrchestrationReadScope,
+    );
+  });
+
   it("reads the reviewer menu under the same scope as the pull request it belongs to", () => {
     // The candidate list is a read like the detail beside it, and asking somebody for a review is
     // a write like every other pull request operation.

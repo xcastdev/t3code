@@ -16,17 +16,33 @@ import {
   ExternalNotificationError,
   GitCommandError,
   KeybindingRule,
+  McpServerId,
+  McpCatalogOverrideId,
+  McpCatalogSessionId,
+  McpDefinitionId,
+  type McpCatalogDefinition,
+  type McpCatalogSnapshot,
   MessageId,
   ExternalLauncherCommandNotFoundError,
   OrchestrationThreadDetailSnapshot,
   type OrchestrationThreadStreamItem,
   type OrchestrationThreadShell,
+  type OrchestrationReadModel,
   TerminalNotRunningError,
   type OrchestrationCommand,
   type OrchestrationEvent,
+  type ProjectMcpTransportDraft,
   ORCHESTRATION_WS_METHODS,
   type PreviewEvent,
   ProjectId,
+  ProjectMcpCredentialId,
+  ProjectMcpEnvironmentVariableName,
+  ProjectMcpCatalogCommittedCleanupPendingError,
+  ProjectMcpHeaderName,
+  ProjectMcpNameConflictError,
+  ProjectMcpProviderNotFoundError,
+  ProjectMcpServerLimitExceededError,
+  ProjectMcpServerNotFoundError,
   ProviderDriverKind,
   ProviderInstanceId,
   ResolvedKeybindingRule,
@@ -81,6 +97,7 @@ const TEST_EPOCH = DateTime.makeUnsafe("1970-01-01T00:00:00.000Z");
 const decodeTransferThreadSnapshot = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationThreadDetailSnapshot),
 );
+const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 
 const collectQueueUntil = Effect.fn("TransferBudget.collectQueueUntil")(function* <A>(
   queue: Queue.Queue<A>,
@@ -107,6 +124,7 @@ import * as ServerConfig from "./config.ts";
 import { makeRoutesLayer } from "./server.ts";
 import {
   isThreadDetailEvent,
+  findScopedMcpCatalogDefinition,
   resolveAvailableEditorsForConfig,
   resolveFileManagerRevealKindForConfig,
 } from "./ws.ts";
@@ -117,7 +135,10 @@ import * as Keybindings from "./keybindings.ts";
 import * as ExternalLauncher from "./process/externalLauncher.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as OrchestrationEngine from "./orchestration/Services/OrchestrationEngine.ts";
-import { OrchestrationListenerCallbackError } from "./orchestration/Errors.ts";
+import {
+  OrchestrationCommandInvariantError,
+  OrchestrationListenerCallbackError,
+} from "./orchestration/Errors.ts";
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
 import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
@@ -138,6 +159,11 @@ import * as BrowserTraceCollector from "./observability/BrowserTraceCollector.ts
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
 import * as T3ProjectFileLoader from "./project/T3ProjectFileLoader.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
+import * as ProjectMcpService from "./project/ProjectMcpService.ts";
+
+const isProjectMcpCatalogCommittedCleanupPendingError = Schema.is(
+  ProjectMcpCatalogCommittedCleanupPendingError,
+);
 import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolver.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
@@ -416,6 +442,7 @@ const buildAppUnderTest = (options?: {
     projectSetupScriptRunner?: Partial<
       ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"]
     >;
+    projectMcpService?: Partial<ProjectMcpService.ProjectMcpService["Service"]>;
     terminalManager?: Partial<TerminalManager.TerminalManager["Service"]>;
     orchestrationEngine?: Partial<OrchestrationEngine.OrchestrationEngineService["Service"]>;
     threadDeletionReactor?: Partial<ThreadDeletionReactor["Service"]>;
@@ -626,6 +653,30 @@ const buildAppUnderTest = (options?: {
     const serviceLauncherClientLayer = ServiceLauncherClient.layer.pipe(
       Layer.provide(Layer.succeed(HostProcessEnvironment, {})),
     );
+    const projectSetupScriptRunnerLayer = Layer.mock(
+      ProjectSetupScriptRunner.ProjectSetupScriptRunner,
+    )({
+      runForThread: () => Effect.succeed({ status: "no-script" as const }),
+      ...options?.layers?.projectSetupScriptRunner,
+    });
+    const projectMcpServiceLayer = Layer.mock(ProjectMcpService.ProjectMcpService)({
+      list: () => Effect.succeed({ external: [], managed: [], applications: [] }),
+      create: () => Effect.die("Project MCP create is not stubbed in this test"),
+      update: () => Effect.die("Project MCP update is not stubbed in this test"),
+      remove: () => Effect.die("Project MCP remove is not stubbed in this test"),
+      resolveForSession: () => Effect.succeed([]),
+      acquireSessionLease: () =>
+        Effect.succeed({
+          servers: [],
+          resolveSecret: () => undefined,
+          oauthStateLeases: new Map(),
+        }),
+      ...options?.layers?.projectMcpService,
+    });
+    const projectServicesLayer = Layer.mergeAll(
+      projectSetupScriptRunnerLayer,
+      projectMcpServiceLayer,
+    );
 
     const servedRoutesLayer = HttpRouter.serve(
       makeRoutesLayer.pipe(Layer.provide(serviceLauncherClientLayer)),
@@ -773,12 +824,7 @@ const buildAppUnderTest = (options?: {
         }),
       ),
       Layer.provideMerge(vcsStatusBroadcasterLayer),
-      Layer.provide(
-        Layer.mock(ProjectSetupScriptRunner.ProjectSetupScriptRunner)({
-          runForThread: () => Effect.succeed({ status: "no-script" as const }),
-          ...options?.layers?.projectSetupScriptRunner,
-        }),
-      ),
+      Layer.provide(projectServicesLayer),
       Layer.provide(
         Layer.mock(TerminalManager.TerminalManager)({
           ...options?.layers?.terminalManager,
@@ -1018,27 +1064,40 @@ const buildAppUnderTest = (options?: {
 
 const parseSessionCookieFromWsUrl = (
   wsUrl: string,
-): { readonly cookie: string | null; readonly url: string } => {
+): {
+  readonly cookie: string | null;
+  readonly requestHost: string | null;
+  readonly url: string;
+} => {
   const next = new URL(wsUrl);
-  const cookie = next.hash.startsWith("#cookie=")
-    ? decodeURIComponent(next.hash.slice("#cookie=".length))
-    : null;
+  const hashParams = new URLSearchParams(next.hash.slice(1));
+  const cookieValue = hashParams.get("cookie");
+  const requestHost = hashParams.get("host");
+  const cookie = cookieValue;
   next.hash = "";
   return {
     cookie,
+    requestHost,
     url: next.toString(),
   };
 };
 
 const wsRpcProtocolLayer = (wsUrl: string) => {
-  const { cookie, url } = parseSessionCookieFromWsUrl(wsUrl);
+  const { cookie, requestHost, url } = parseSessionCookieFromWsUrl(wsUrl);
   const webSocketConstructorLayer = Layer.succeed(
     Socket.WebSocketConstructor,
     (socketUrl, protocols) =>
       new NodeSocket.NodeWS.WebSocket(
         socketUrl,
         protocols,
-        cookie ? { headers: { cookie } } : undefined,
+        cookie || requestHost
+          ? {
+              headers: {
+                ...(cookie ? { cookie } : {}),
+                ...(requestHost ? { host: requestHost } : {}),
+              },
+            }
+          : undefined,
       ) as unknown as globalThis.WebSocket,
   );
 
@@ -1057,10 +1116,17 @@ const withWsRpcClient = <A, E, R>(
   f: (client: WsRpcClient) => Effect.Effect<A, E, R>,
 ) => makeWsRpcClient.pipe(Effect.flatMap(f), Effect.provide(wsRpcProtocolLayer(wsUrl)));
 
-const appendSessionCookieToWsUrl = (url: string, sessionCookieHeader: string) => {
+const appendSessionCookieToWsUrl = (
+  url: string,
+  sessionCookieHeader: string,
+  requestHost?: string,
+) => {
   const isAbsoluteUrl = /^[a-zA-Z][a-zA-Z\d+.-]*:/.test(url);
   const next = new URL(url, "http://localhost");
-  next.hash = `cookie=${encodeURIComponent(sessionCookieHeader)}`;
+  next.hash = [
+    `cookie=${encodeURIComponent(sessionCookieHeader)}`,
+    ...(requestHost === undefined ? [] : [`host=${encodeURIComponent(requestHost)}`]),
+  ].join("&");
   return isAbsoluteUrl ? next.toString() : `${next.pathname}${next.search}${next.hash}`;
 };
 
@@ -1423,18 +1489,25 @@ const crossOriginClientOrigin = "http://remote-client.test:3773";
 
 const getWsServerUrl = (
   pathname = "",
-  options?: { authenticated?: boolean; credential?: string },
+  options?: {
+    authenticated?: boolean;
+    credential?: string;
+    requestHost?: string;
+  },
 ) =>
   Effect.gen(function* () {
     const server = yield* HttpServer.HttpServer;
     const address = server.address as HttpServer.TcpAddress;
     const baseUrl = `ws://127.0.0.1:${address.port}${pathname}`;
     if (options?.authenticated === false) {
-      return baseUrl;
+      return options.requestHost === undefined
+        ? baseUrl
+        : `${baseUrl}#host=${encodeURIComponent(`${options.requestHost}:${address.port}`)}`;
     }
     return appendSessionCookieToWsUrl(
       baseUrl,
       yield* getAuthenticatedSessionCookieHeader(options?.credential),
+      options?.requestHost === undefined ? undefined : `${options.requestHost}:${address.port}`,
     );
   });
 
@@ -1461,6 +1534,279 @@ const NodeHttpServerTestWithWsDeflate = HttpServer.layerTestClient.pipe(
 );
 
 it.layer(NodeServices.layer)("server router seam", (it) => {
+  it("prefers the applied session catalog for OAuth disconnect targets", () => {
+    const makeDefinition = (definitionId: string, name: string): McpCatalogDefinition => ({
+      definitionId: McpDefinitionId.make(definitionId),
+      logicalServerId: McpServerId.make("session-oauth-server"),
+      scope: "session",
+      scopeId: "catalog-session-oauth",
+      name,
+      transport: {
+        type: "streamable-http",
+        url: `https://${definitionId}.example.test/mcp`,
+        headers: [],
+        authorization: { type: "oauth", registration: { type: "automatic" } },
+      },
+      enabled: true,
+      providerInstanceIds: [ProviderInstanceId.make("codex-primary")],
+      revision: 1,
+    });
+    const applied = makeDefinition("definition-applied-oauth", "Applied OAuth");
+    const desired = makeDefinition("definition-desired-oauth", "Desired OAuth");
+    const snapshot: McpCatalogSnapshot = {
+      catalogSessionId: McpCatalogSessionId.make("catalog-session-oauth"),
+      threadId: ThreadId.make("thread-oauth"),
+      providerInstanceId: ProviderInstanceId.make("codex-primary"),
+      baseline: [applied],
+      desired: [desired],
+      applied: [applied],
+      desiredRevision: 1,
+      appliedRevision: 0,
+    };
+
+    assert.equal(
+      findScopedMcpCatalogDefinition({
+        snapshot,
+        target: {
+          logicalServerId: applied.logicalServerId,
+          transportDefinitionId: applied.definitionId,
+        },
+        preferApplied: true,
+      }),
+      applied,
+    );
+    assert.equal(
+      findScopedMcpCatalogDefinition({
+        snapshot,
+        target: {
+          logicalServerId: desired.logicalServerId,
+          transportDefinitionId: desired.definitionId,
+        },
+      }),
+      desired,
+    );
+  });
+
+  it.effect("retains definition identity across metadata-only catalog updates", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("catalog-identity-project");
+      const threadId = ThreadId.make("catalog-identity-thread");
+      const catalogSessionId = McpCatalogSessionId.make("catalog-identity-session");
+      const providerInstanceId = ProviderInstanceId.make("codex-primary");
+      const project = {
+        id: projectId,
+        title: "Catalog identity project",
+        workspaceRoot: "/tmp/catalog-identity-project",
+        defaultModelSelection: defaultModelSelection,
+        scripts: [],
+        createdAt: "2026-09-09T00:00:00.000Z",
+        updatedAt: "2026-09-09T00:00:00.000Z",
+      } as const;
+      const transport = {
+        type: "streamable-http" as const,
+        url: "https://catalog-identity.example.test/mcp",
+        headers: [],
+        authorization: { type: "none" as const },
+      };
+      const definition = (
+        scope: "global" | "project" | "session",
+        scopeId: string,
+        logicalServerId: string,
+        definitionId: string,
+      ): McpCatalogDefinition => ({
+        definitionId: McpDefinitionId.make(definitionId),
+        logicalServerId: McpServerId.make(logicalServerId),
+        scope,
+        scopeId,
+        name: `${scope} original`,
+        transport,
+        enabled: true,
+        providerInstanceIds: [providerInstanceId],
+        revision: 1,
+      });
+      const global = definition(
+        "global",
+        String(testEnvironmentDescriptor.environmentId),
+        "catalog-global-server",
+        "catalog-global-definition",
+      );
+      const projectDefinition = definition(
+        "project",
+        String(projectId),
+        "catalog-project-server",
+        "catalog-project-definition",
+      );
+      const session = definition(
+        "session",
+        String(catalogSessionId),
+        "catalog-session-server",
+        "catalog-session-definition",
+      );
+      const baseReadModel = makeDefaultOrchestrationReadModel();
+      const readModel = {
+        ...baseReadModel,
+        projects: [{ ...project, deletedAt: null }],
+        threads: [
+          {
+            ...baseReadModel.threads[0]!,
+            id: threadId,
+            projectId,
+            session: {
+              threadId,
+              status: "ready" as const,
+              providerName: "codex",
+              providerInstanceId,
+              runtimeMode: "full-access" as const,
+              activeTurnId: null,
+              mcpCatalogSessionId: catalogSessionId,
+              lastError: null,
+              updatedAt: "2026-09-09T00:00:00.000Z",
+            },
+          },
+        ],
+        mcpCatalog: {
+          environmentId: testEnvironmentDescriptor.environmentId,
+          globalRevision: 1,
+          globalDefinitions: [global],
+          projectRevisions: [{ projectId, revision: 1 }],
+          projectDefinitions: [{ projectId, definition: projectDefinition }],
+          projectOverrides: [],
+          sessions: [
+            {
+              catalogSessionId,
+              threadId,
+              providerInstanceId,
+              baseline: [session],
+              desired: [session],
+              applied: [session],
+              desiredRevision: 1,
+              appliedRevision: 1,
+            },
+          ],
+        },
+      } satisfies OrchestrationReadModel;
+      const dispatched: Array<OrchestrationCommand> = [];
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command);
+                return { sequence: dispatched.length };
+              }),
+          },
+          projectionSnapshotQuery: {
+            getCommandReadModel: () => Effect.succeed(readModel),
+            getProjectShellById: (requestedProjectId) =>
+              Effect.succeed(
+                requestedProjectId === projectId ? Option.some(project) : Option.none(),
+              ),
+          },
+          projectMcpService: {
+            withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const effectiveProjectCatalog = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.mcpCatalogProjectList]({
+            scope: "project",
+            scopeId: projectId,
+            providerInstanceId,
+          }),
+        ),
+      );
+      assert.deepEqual(
+        effectiveProjectCatalog.map((entry) => entry.logicalServerId),
+        [global.logicalServerId, projectDefinition.logicalServerId],
+      );
+      const rawProjectState = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.mcpCatalogProjectStateList]({
+            scope: "project",
+            scopeId: projectId,
+          }),
+        ),
+      );
+      assert.deepEqual(
+        rawProjectState.projectDefinitions.map((entry) => entry.logicalServerId),
+        [projectDefinition.logicalServerId],
+      );
+      const results = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.all([
+            client[WS_METHODS.mcpCatalogGlobalUpdate]({
+              scope: "global",
+              scopeId: testEnvironmentDescriptor.environmentId,
+              expectedRevision: 1,
+              logicalServerId: global.logicalServerId,
+              definition: {
+                name: "Global renamed",
+                transport,
+                enabled: false,
+                providerInstanceIds: [providerInstanceId],
+              },
+            }),
+            client[WS_METHODS.mcpCatalogProjectUpdate]({
+              scope: "project",
+              scopeId: projectId,
+              expectedRevision: 1,
+              logicalServerId: projectDefinition.logicalServerId,
+              definition: {
+                name: "Project renamed",
+                transport,
+                enabled: false,
+                providerInstanceIds: [providerInstanceId],
+              },
+            }),
+            client[WS_METHODS.mcpCatalogSessionUpdate]({
+              scope: "session",
+              scopeId: catalogSessionId,
+              threadId,
+              mcpCatalogSessionId: catalogSessionId,
+              expectedRevision: 1,
+              logicalServerId: session.logicalServerId,
+              definition: {
+                name: "Session renamed",
+                transport,
+                enabled: false,
+                providerInstanceIds: [providerInstanceId],
+              },
+            }),
+          ]),
+        ),
+      );
+
+      assert.deepEqual(
+        [
+          results[0].definitionId,
+          results[1].definitionId,
+          results[2].desired.find((entry) => entry.logicalServerId === session.logicalServerId)
+            ?.definitionId,
+        ],
+        [global.definitionId, projectDefinition.definitionId, session.definitionId],
+      );
+      assert.deepEqual(
+        dispatched
+          .map((command) =>
+            command.type === "environment.mcp-definition.update" ||
+            command.type === "project.mcp-definition.update"
+              ? command.definition.definitionId
+              : command.type === "thread.mcp-catalog.update"
+                ? command.desiredCatalog.find(
+                    (entry) => entry.logicalServerId === session.logicalServerId,
+                  )?.definitionId
+                : undefined,
+          )
+          .sort(),
+        [global.definitionId, projectDefinition.definitionId, session.definitionId].sort(),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("parks HTTP ingress until command readiness", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -5122,6 +5468,924 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.equal(
         draftResult.providers[0]?.skills[0]?.path,
         "/tmp/catalog-project/.opencode/skills/project-skill/SKILL.md",
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("routes project MCP catalog operations after validating project ownership", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-mcp-catalog");
+      const serverId = McpServerId.make("mcp-docs");
+      const credentialId = ProjectMcpCredentialId.make("2aef2447-b6f4-4c4f-b35e-89b59a0841ef");
+      const providerInstanceId = ProviderInstanceId.make("codex-primary");
+      const server = {
+        id: serverId,
+        name: "t3-code",
+        transport: {
+          type: "streamable-http" as const,
+          url: "https://docs.example.test/mcp",
+          headers: [
+            {
+              name: ProjectMcpHeaderName.make("X-Api-Key"),
+              credential: { id: credentialId, name: "Docs API key" },
+            },
+          ],
+          authorization: { type: "none" as const },
+        },
+        enabled: true,
+        providerInstanceIds: [providerInstanceId],
+      } as const;
+      const calls: Array<string> = [];
+      const project = {
+        id: projectId,
+        title: "MCP Catalog",
+        workspaceRoot: "/tmp/project-mcp-catalog",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: "2026-09-02T00:00:00.000Z",
+        updatedAt: "2026-09-02T00:00:00.000Z",
+      } as const;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getProjectShellById: (requestedProjectId) =>
+              Effect.succeed(
+                requestedProjectId === projectId ? Option.some(project) : Option.none(),
+              ),
+          },
+          projectMcpService: {
+            list: () =>
+              Effect.sync(() => {
+                calls.push("list");
+                return {
+                  external: [server],
+                  managed: [
+                    {
+                      id: McpServerId.make("t3-code"),
+                      name: "t3-code",
+                      url: "http://127.0.0.1:43123/mcp",
+                      providerInstanceIds: [providerInstanceId],
+                    },
+                  ],
+                  applications: [
+                    { serverId, providerInstanceId, mode: "next-session" as const },
+                    {
+                      serverId: McpServerId.make("t3-code"),
+                      providerInstanceId,
+                      mode: "next-session" as const,
+                    },
+                  ],
+                };
+              }),
+            create: () =>
+              Effect.sync(() => {
+                calls.push("create");
+                return server;
+              }),
+            update: () =>
+              Effect.sync(() => {
+                calls.push("update");
+                return server;
+              }),
+            remove: () =>
+              Effect.sync(() => {
+                calls.push("remove");
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const results = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.all([
+            client[WS_METHODS.projectMcpList]({ projectId }),
+            client[WS_METHODS.projectMcpCreate]({
+              projectId,
+              name: server.name,
+              enabled: server.enabled,
+              providerInstanceIds: server.providerInstanceIds,
+              transport: {
+                type: "streamable-http",
+                url: "https://docs.example.test/mcp",
+                headers: [
+                  {
+                    name: ProjectMcpHeaderName.make("X-Api-Key"),
+                    credential: { name: "Docs API key", value: "rpc-secret-sentinel" },
+                  },
+                ],
+                authorization: { type: "none" },
+              },
+            }),
+            client[WS_METHODS.projectMcpUpdate]({ projectId, ...server }),
+            client[WS_METHODS.projectMcpRemove]({ projectId, id: serverId }),
+          ]),
+        ),
+      );
+
+      assert.deepEqual(results[0].external, [server]);
+      assert.deepEqual(results[0].applications, [
+        { serverId, providerInstanceId, mode: "next-session" },
+        {
+          serverId: McpServerId.make("t3-code"),
+          providerInstanceId,
+          mode: "next-session",
+        },
+      ]);
+      assert.deepEqual(results[0].managed, [
+        {
+          id: McpServerId.make("t3-code"),
+          name: "t3-code",
+          url: "http://127.0.0.1:43123/mcp",
+          providerInstanceIds: [providerInstanceId],
+        },
+      ]);
+      assert.deepEqual(results[1], server);
+      assert.deepEqual(results[2], server);
+      assert.notInclude(encodeUnknownJson(results), "rpc-secret-sentinel");
+      assert.deepEqual(calls, ["list", "create", "update", "remove"]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("prepares project catalog override credentials before dispatch", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-mcp-override-preparation");
+      const serverId = McpServerId.make("mcp-override-target");
+      const providerInstanceId = ProviderInstanceId.make("codex-primary");
+      const project = {
+        id: projectId,
+        title: "MCP override preparation",
+        workspaceRoot: "/tmp/project-mcp-override-preparation",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: "2026-09-02T00:00:00.000Z",
+        updatedAt: "2026-09-02T00:00:00.000Z",
+      } as const;
+      const globalDefinition = {
+        definitionId: McpDefinitionId.make("mcp-override-global-definition"),
+        logicalServerId: serverId,
+        scope: "global" as const,
+        scopeId: testEnvironmentDescriptor.environmentId,
+        name: "Override target",
+        transport: {
+          type: "streamable-http" as const,
+          url: "https://override-target.example.test/mcp",
+          headers: [],
+          authorization: { type: "none" as const },
+        },
+        enabled: true,
+        providerInstanceIds: [providerInstanceId],
+        revision: 1,
+      };
+      const readModel = {
+        ...makeDefaultOrchestrationReadModel(),
+        projects: [{ ...project, deletedAt: null }],
+        mcpCatalog: {
+          environmentId: testEnvironmentDescriptor.environmentId,
+          globalRevision: 1,
+          globalDefinitions: [globalDefinition],
+          projectRevisions: [],
+          projectDefinitions: [],
+          projectOverrides: [],
+          sessions: [],
+        },
+      } satisfies OrchestrationReadModel;
+      const dispatched: Array<OrchestrationCommand> = [];
+      const foreignCredentialId = ProjectMcpCredentialId.make(
+        "2aef2447-b6f4-4c4f-b35e-89b59a0841ef",
+      );
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command);
+                return { sequence: dispatched.length };
+              }),
+          },
+          projectionSnapshotQuery: {
+            getCommandReadModel: () => Effect.succeed(readModel),
+            getProjectShellById: (requestedProjectId) =>
+              Effect.succeed(
+                requestedProjectId === projectId ? Option.some(project) : Option.none(),
+              ),
+          },
+          projectMcpService: {
+            withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const foreignError = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.mcpCatalogProjectOverride]({
+              scope: "project",
+              scopeId: projectId,
+              expectedRevision: 0,
+              override: {
+                id: McpCatalogOverrideId.make("override-foreign"),
+                scope: "project",
+                scopeId: projectId,
+                targetId: serverId,
+                transport: {
+                  type: "streamable-http",
+                  url: globalDefinition.transport.url,
+                  headers: [
+                    {
+                      name: ProjectMcpHeaderName.make("Authorization"),
+                      credential: { id: foreignCredentialId, name: "foreign credential" },
+                    },
+                  ],
+                  authorization: { type: "none" },
+                },
+              },
+            }),
+          ),
+        ),
+      );
+      assert.equal(foreignError._tag, "McpCatalogOperationError");
+      assert.equal(dispatched.length, 0);
+
+      const drafts: ReadonlyArray<{
+        readonly id: string;
+        readonly transport: ProjectMcpTransportDraft;
+      }> = [
+        {
+          id: "override-header",
+          transport: {
+            type: "streamable-http" as const,
+            url: "https://override-header.example.test/mcp",
+            headers: [
+              {
+                name: ProjectMcpHeaderName.make("Authorization"),
+                credential: { name: "header", value: "override-header-sentinel" },
+              },
+            ],
+            authorization: { type: "none" as const },
+          },
+        },
+        {
+          id: "override-stdio",
+          transport: {
+            type: "stdio" as const,
+            command: "node",
+            args: ["server.mjs"],
+            env: [
+              {
+                name: ProjectMcpEnvironmentVariableName.make("TOKEN"),
+                credential: { name: "stdio", value: "override-stdio-sentinel" },
+              },
+            ],
+          },
+        },
+        {
+          id: "override-oauth",
+          transport: {
+            type: "streamable-http" as const,
+            url: "https://override-oauth.example.test/mcp",
+            headers: [],
+            authorization: {
+              type: "oauth" as const,
+              registration: {
+                type: "pre-registered" as const,
+                clientId: "override-client",
+                clientSecret: { name: "client secret", value: "override-oauth-sentinel" },
+              },
+            },
+          },
+        },
+      ];
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.forEach(drafts, (draft) =>
+            client[WS_METHODS.mcpCatalogProjectOverride]({
+              scope: "project",
+              scopeId: projectId,
+              expectedRevision: 0,
+              override: {
+                id: McpCatalogOverrideId.make(draft.id),
+                scope: "project",
+                scopeId: projectId,
+                targetId: serverId,
+                transport: draft.transport,
+              },
+            }),
+          ),
+        ),
+      );
+
+      assert.equal(dispatched.length, 3);
+      assert.notInclude(encodeUnknownJson(dispatched), "override-header-sentinel");
+      assert.notInclude(encodeUnknownJson(dispatched), "override-stdio-sentinel");
+      assert.notInclude(encodeUnknownJson(dispatched), "override-oauth-sentinel");
+      for (const command of dispatched) {
+        if (command.type !== "project.mcp-override.upsert") continue;
+        assert.isDefined(command.override.transportDefinitionId);
+        assert.isDefined(command.override.transport);
+      }
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "rejects a global conflict masked by every existing project before preparing secrets",
+    () =>
+      Effect.gen(function* () {
+        const projectId = ProjectId.make("project-mcp-masked-global-1");
+        const otherProjectId = ProjectId.make("project-mcp-masked-global-2");
+        const serverA = McpServerId.make("masked-global-a");
+        const serverB = McpServerId.make("masked-global-b");
+        const providerInstanceId = ProviderInstanceId.make("codex-primary");
+        const project = (id: ProjectId) => ({
+          id,
+          title: String(id),
+          workspaceRoot: `/tmp/${id}`,
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: "2026-09-02T00:00:00.000Z",
+          updatedAt: "2026-09-02T00:00:00.000Z",
+        });
+        const definition = (
+          logicalServerId: McpServerId,
+          definitionId: McpDefinitionId,
+          name: string,
+        ): McpCatalogDefinition => ({
+          definitionId,
+          logicalServerId,
+          scope: "global",
+          scopeId: testEnvironmentDescriptor.environmentId,
+          name,
+          transport: {
+            type: "streamable-http",
+            url: "https://masked-global.example.test/mcp",
+            headers: [],
+            authorization: { type: "none" },
+          },
+          enabled: true,
+          providerInstanceIds: [providerInstanceId],
+          revision: 1,
+        });
+        const globalA = definition(
+          serverA,
+          McpDefinitionId.make("masked-global-definition-a"),
+          "A",
+        );
+        const globalB = definition(
+          serverB,
+          McpDefinitionId.make("masked-global-definition-b"),
+          "B",
+        );
+        const readModel = {
+          ...makeDefaultOrchestrationReadModel(),
+          projects: [project(projectId), project(otherProjectId)].map((entry) => ({
+            ...entry,
+            deletedAt: null,
+          })),
+          mcpCatalog: {
+            environmentId: testEnvironmentDescriptor.environmentId,
+            globalRevision: 1,
+            globalDefinitions: [globalA, globalB],
+            projectRevisions: [],
+            projectDefinitions: [],
+            projectOverrides: [projectId, otherProjectId].map((scopeId, index) => ({
+              projectId: scopeId,
+              revision: 1,
+              override: {
+                id: McpCatalogOverrideId.make(`masked-global-override-${index}`),
+                scope: "project" as const,
+                scopeId,
+                targetId: serverB,
+                enabled: false,
+              },
+            })),
+            sessions: [],
+          },
+        } satisfies OrchestrationReadModel;
+        const dispatched: Array<OrchestrationCommand> = [];
+
+        yield* buildAppUnderTest({
+          layers: {
+            orchestrationEngine: {
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  dispatched.push(command);
+                  return { sequence: dispatched.length };
+                }),
+            },
+            projectionSnapshotQuery: {
+              getCommandReadModel: () => Effect.succeed(readModel),
+              getProjectShellById: (requestedProjectId) =>
+                Effect.succeed(
+                  requestedProjectId === projectId || requestedProjectId === otherProjectId
+                    ? Option.some(project(requestedProjectId))
+                    : Option.none(),
+                ),
+            },
+            projectMcpService: {
+              withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+            },
+          },
+        });
+
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const error = yield* Effect.flip(
+          Effect.scoped(
+            withWsRpcClient(wsUrl, (client) =>
+              client[WS_METHODS.mcpCatalogGlobalUpdate]({
+                scope: "global",
+                scopeId: testEnvironmentDescriptor.environmentId,
+                expectedRevision: 1,
+                logicalServerId: serverB,
+                definition: {
+                  name: "A",
+                  transport: globalB.transport,
+                  enabled: true,
+                  providerInstanceIds: [providerInstanceId],
+                },
+              }),
+            ),
+          ),
+        );
+        assert.equal(error._tag, "McpCatalogNameConflictError");
+        assert.deepEqual(dispatched, []);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "rejects a masked global catalog over the provider limit before preparing secrets",
+    () =>
+      Effect.gen(function* () {
+        const projectIds = [
+          ProjectId.make("project-mcp-masked-limit-1"),
+          ProjectId.make("project-mcp-masked-limit-2"),
+        ];
+        const providerInstanceId = ProviderInstanceId.make("codex-primary");
+        const globalDefinitions = Array.from(
+          { length: 51 },
+          (_, index): McpCatalogDefinition => ({
+            definitionId: McpDefinitionId.make(`masked-limit-definition-${index}`),
+            logicalServerId: McpServerId.make(`masked-limit-server-${index}`),
+            scope: "global",
+            scopeId: testEnvironmentDescriptor.environmentId,
+            name: `Global ${index}`,
+            transport: {
+              type: "streamable-http",
+              url: "https://masked-limit.example.test/mcp",
+              headers: [],
+              authorization: { type: "none" },
+            },
+            enabled: true,
+            providerInstanceIds: [providerInstanceId],
+            revision: 1,
+          }),
+        );
+        const masked = globalDefinitions.slice(-2);
+        const project = (id: ProjectId) => ({
+          id,
+          title: String(id),
+          workspaceRoot: `/tmp/${id}`,
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: "2026-09-02T00:00:00.000Z",
+          updatedAt: "2026-09-02T00:00:00.000Z",
+        });
+        const readModel = {
+          ...makeDefaultOrchestrationReadModel(),
+          projects: projectIds.map((id) => ({ ...project(id), deletedAt: null })),
+          mcpCatalog: {
+            environmentId: testEnvironmentDescriptor.environmentId,
+            globalRevision: 51,
+            globalDefinitions,
+            projectRevisions: [],
+            projectDefinitions: [],
+            projectOverrides: projectIds.flatMap((scopeId, projectIndex) =>
+              masked.map((definition, index) => ({
+                projectId: scopeId,
+                revision: 1,
+                override: {
+                  id: McpCatalogOverrideId.make(`masked-limit-override-${projectIndex}-${index}`),
+                  scope: "project" as const,
+                  scopeId,
+                  targetId: definition.logicalServerId,
+                  enabled: false,
+                },
+              })),
+            ),
+            sessions: [],
+          },
+        } satisfies OrchestrationReadModel;
+        const dispatched: Array<OrchestrationCommand> = [];
+
+        yield* buildAppUnderTest({
+          layers: {
+            providerRegistry: {
+              getProviders: Effect.succeed([
+                {
+                  instanceId: providerInstanceId,
+                  driver: ProviderDriverKind.make("codex"),
+                  enabled: true,
+                  installed: true,
+                  version: "1.0.0",
+                  status: "ready" as const,
+                  auth: { status: "authenticated" as const },
+                  checkedAt: "2026-09-02T00:00:00.000Z",
+                  models: [],
+                  slashCommands: [],
+                  skills: [],
+                },
+              ]),
+            },
+            orchestrationEngine: {
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  dispatched.push(command);
+                  return { sequence: dispatched.length };
+                }),
+            },
+            projectionSnapshotQuery: {
+              getCommandReadModel: () => Effect.succeed(readModel),
+              getProjectShellById: (requestedProjectId) =>
+                Effect.succeed(
+                  projectIds.includes(requestedProjectId)
+                    ? Option.some(project(requestedProjectId))
+                    : Option.none(),
+                ),
+            },
+            projectMcpService: {
+              withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+            },
+          },
+        });
+
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const error = yield* Effect.flip(
+          Effect.scoped(
+            withWsRpcClient(wsUrl, (client) =>
+              client[WS_METHODS.mcpCatalogGlobalCreate]({
+                scope: "global",
+                scopeId: testEnvironmentDescriptor.environmentId,
+                expectedRevision: 51,
+                definition: {
+                  name: "New global",
+                  transport: globalDefinitions[0]!.transport,
+                  enabled: true,
+                  providerInstanceIds: [providerInstanceId],
+                },
+              }),
+            ),
+          ),
+        );
+        assert.equal(error._tag, "McpCatalogProviderLimitExceededError");
+        assert.deepEqual(dispatched, []);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects a global catalog request for another environment before dispatch", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Ref.make(0);
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: () =>
+              Ref.update(dispatched, (count) => count + 1).pipe(Effect.as({ sequence: 1 })),
+          },
+          projectMcpService: {
+            withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const error = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.mcpCatalogGlobalCreate]({
+              scope: "global",
+              scopeId: EnvironmentId.make("another-environment"),
+              expectedRevision: 0,
+              definition: {
+                name: "Foreign",
+                transport: {
+                  type: "streamable-http",
+                  url: "https://foreign.example.test/mcp",
+                  headers: [],
+                  authorization: { type: "none" },
+                },
+                enabled: true,
+                providerInstanceIds: [ProviderInstanceId.make("codex-primary")],
+              },
+            }),
+          ),
+        ),
+      );
+      assert.equal(error._tag, "EnvironmentAuthorizationError");
+      assert.equal(yield* Ref.get(dispatched), 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("requires a safe browser origin before starting project MCP OAuth", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-mcp-oauth-origin");
+      const serverId = McpServerId.make("mcp-oauth-origin");
+      let listCalls = 0;
+      const project = {
+        id: projectId,
+        title: "OAuth origin",
+        workspaceRoot: "/tmp/project-mcp-oauth-origin",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: "2026-09-02T00:00:00.000Z",
+        updatedAt: "2026-09-02T00:00:00.000Z",
+      } as const;
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectMcpService: {
+            list: () =>
+              Effect.sync(() => {
+                listCalls++;
+                return { external: [], managed: [], applications: [] };
+              }),
+          },
+          projectionSnapshotQuery: {
+            getProjectShellById: () => Effect.succeed(Option.some(project)),
+          },
+        },
+      });
+
+      const unsafeUrl = yield* getWsServerUrl("/ws", {
+        requestHost: "192.168.1.50",
+      });
+      const unsafe = yield* Effect.scoped(
+        withWsRpcClient(unsafeUrl, (client) =>
+          Effect.flip(client[WS_METHODS.projectMcpOauthBegin]({ projectId, id: serverId })),
+        ),
+      );
+      assert.equal(unsafe._tag, "ProjectMcpOAuthActionError");
+      if (unsafe._tag === "ProjectMcpOAuthActionError") {
+        assert.include(unsafe.reason, "HTTPS");
+      }
+      assert.equal(listCalls, 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects project MCP catalog operations for projects outside the environment", () =>
+    Effect.gen(function* () {
+      const listCalls = yield* Ref.make(0);
+      const projectId = ProjectId.make("project-not-owned");
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getProjectShellById: () => Effect.succeed(Option.none()),
+          },
+          projectMcpService: {
+            list: () =>
+              Ref.update(listCalls, (count) => count + 1).pipe(
+                Effect.as({
+                  external: [],
+                  managed: [],
+                  applications: [],
+                }),
+              ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const rpcError = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) => client[WS_METHODS.projectMcpList]({ projectId })),
+        ),
+      );
+
+      assert.equal(rpcError._tag, "EnvironmentAuthorizationError");
+      if (rpcError._tag === "EnvironmentAuthorizationError") {
+        assert.equal(rpcError.requiredScope, "orchestration:read");
+      }
+      assert.equal(yield* Ref.get(listCalls), 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("returns actionable project MCP mutation failures over RPC", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-mcp-errors");
+      const missingId = McpServerId.make("missing-server");
+      const unknownProviderId = ProviderInstanceId.make("missing-provider");
+      const pendingId = McpServerId.make("pending-server");
+      const project = {
+        id: projectId,
+        title: "MCP errors",
+        workspaceRoot: "/tmp/project-mcp-errors",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: "2026-09-02T00:00:00.000Z",
+        updatedAt: "2026-09-02T00:00:00.000Z",
+      } as const;
+      const nameConflict = new ProjectMcpNameConflictError({
+        name: "Conflict",
+        message: "Project already contains an MCP server named 'Conflict'.",
+      });
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getProjectShellById: () => Effect.succeed(Option.some(project)),
+          },
+          projectMcpService: {
+            create: (input) => {
+              switch (input.name) {
+                case "Unknown provider":
+                  return Effect.fail(
+                    new ProjectMcpProviderNotFoundError({
+                      providerInstanceId: unknownProviderId,
+                    }),
+                  );
+                case "Overflow":
+                  return Effect.fail(
+                    new ProjectMcpServerLimitExceededError({
+                      limit: 50,
+                    }),
+                  );
+                case "Conflict":
+                  return Effect.fail(nameConflict);
+                case "Pending create":
+                  return Effect.fail(
+                    new ProjectMcpCatalogCommittedCleanupPendingError({
+                      id: pendingId,
+                      operation: "create",
+                      sequence: 41,
+                    }),
+                  );
+                default:
+                  return Effect.fail(
+                    new OrchestrationCommandInvariantError({
+                      commandType: "project.mcp-server.create",
+                      detail: nameConflict.message,
+                      cause: nameConflict,
+                    }),
+                  );
+              }
+            },
+            update: (input) =>
+              input.id === pendingId
+                ? Effect.fail(
+                    new ProjectMcpCatalogCommittedCleanupPendingError({
+                      id: pendingId,
+                      operation: "update",
+                      sequence: 42,
+                    }),
+                  )
+                : Effect.fail(new ProjectMcpServerNotFoundError({ id: missingId })),
+            remove: (input) =>
+              input.id === pendingId
+                ? Effect.fail(
+                    new ProjectMcpCatalogCommittedCleanupPendingError({
+                      id: pendingId,
+                      operation: "remove",
+                      sequence: 43,
+                    }),
+                  )
+                : Effect.fail(new ProjectMcpServerNotFoundError({ id: missingId })),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const errors = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.all([
+            Effect.flip(
+              client[WS_METHODS.projectMcpCreate]({
+                projectId,
+                name: "Unknown provider",
+                url: "https://unknown.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [unknownProviderId],
+              }),
+            ),
+            Effect.flip(
+              client[WS_METHODS.projectMcpCreate]({
+                projectId,
+                name: "Overflow",
+                url: "https://overflow.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [],
+              }),
+            ),
+            Effect.flip(
+              client[WS_METHODS.projectMcpUpdate]({
+                projectId,
+                id: missingId,
+                name: "Missing",
+                url: "https://missing.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [],
+              }),
+            ),
+            Effect.flip(client[WS_METHODS.projectMcpRemove]({ projectId, id: missingId })),
+            Effect.flip(
+              client[WS_METHODS.projectMcpCreate]({
+                projectId,
+                name: "Conflict",
+                url: "https://conflict.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [],
+              }),
+            ),
+            Effect.flip(
+              client[WS_METHODS.projectMcpCreate]({
+                projectId,
+                name: "Race conflict",
+                url: "https://race.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [],
+              }),
+            ),
+            Effect.flip(
+              client[WS_METHODS.projectMcpCreate]({
+                projectId,
+                name: "Pending create",
+                url: "https://pending.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [],
+              }),
+            ),
+            Effect.flip(
+              client[WS_METHODS.projectMcpUpdate]({
+                projectId,
+                id: pendingId,
+                name: "Pending update",
+                url: "https://pending.example.test/mcp",
+                enabled: true,
+                providerInstanceIds: [],
+              }),
+            ),
+            Effect.flip(client[WS_METHODS.projectMcpRemove]({ projectId, id: pendingId })),
+          ]),
+        ),
+      );
+
+      assert.deepEqual(
+        errors.map((error) => error._tag),
+        [
+          "ProjectMcpProviderNotFoundError",
+          "ProjectMcpServerLimitExceededError",
+          "ProjectMcpServerNotFoundError",
+          "ProjectMcpServerNotFoundError",
+          "ProjectMcpNameConflictError",
+          "ProjectMcpNameConflictError",
+          "ProjectMcpCatalogCommittedCleanupPendingError",
+          "ProjectMcpCatalogCommittedCleanupPendingError",
+          "ProjectMcpCatalogCommittedCleanupPendingError",
+        ],
+      );
+      if (errors[0]?._tag === "ProjectMcpProviderNotFoundError") {
+        assert.equal(errors[0].providerInstanceId, unknownProviderId);
+      }
+      if (errors[1]?._tag === "ProjectMcpServerLimitExceededError") {
+        assert.equal(errors[1].limit, 50);
+      }
+      if (errors[2]?._tag === "ProjectMcpServerNotFoundError") {
+        assert.equal(errors[2].id, missingId);
+      }
+      if (errors[3]?._tag === "ProjectMcpServerNotFoundError") {
+        assert.equal(errors[3].id, missingId);
+      }
+      const pendingErrors = errors.slice(-3).map((error) => {
+        if (!isProjectMcpCatalogCommittedCleanupPendingError(error))
+          throw new Error("Expected a committed cleanup-pending error");
+        return error;
+      });
+      assert.deepEqual(
+        pendingErrors.map((error) => ({
+          tag: error._tag,
+          id: error.id,
+          operation: error.operation,
+          sequence: error.sequence,
+        })),
+        [
+          {
+            tag: "ProjectMcpCatalogCommittedCleanupPendingError",
+            id: pendingId,
+            operation: "create",
+            sequence: 41,
+          },
+          {
+            tag: "ProjectMcpCatalogCommittedCleanupPendingError",
+            id: pendingId,
+            operation: "update",
+            sequence: 42,
+          },
+          {
+            tag: "ProjectMcpCatalogCommittedCleanupPendingError",
+            id: pendingId,
+            operation: "remove",
+            sequence: 43,
+          },
+        ],
       );
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );

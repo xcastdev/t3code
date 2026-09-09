@@ -3,9 +3,9 @@
  *
  * Owns a `Map<ProviderInstanceId, ProviderInstance>` produced by running
  * registered driver factories against `ServerSettings.providerInstances`.
- * The registry watches settings; when an instance's config changes (or
- * the entry disappears), the registry tears down the affected instance's
- * scope and rebuilds — that's the entire hot-reload story.
+ * The registry watches settings and rebuilds changed instances. A driver may
+ * opt into retaining an old generation while sessions still own it; the
+ * generation handle makes that transition explicit and idempotent.
  *
  * What rest-of-server reads from here:
  *   - `getInstance(instanceId)` — for routing turn/session calls.
@@ -35,6 +35,14 @@ export interface ProviderInstanceRegistryShape {
   readonly getInstance: (
     instanceId: ProviderInstanceId,
   ) => Effect.Effect<ProviderInstance | undefined>;
+  /**
+   * Retain the exact active generation for a new session. A retained handle
+   * keeps a draining replacement alive until its idempotent release effect
+   * runs.
+   */
+  readonly acquireInstance?: (
+    instanceId: ProviderInstanceId,
+  ) => Effect.Effect<ProviderInstanceGenerationHandle | undefined>;
   /**
    * Every available (driver-registered, successfully created) instance,
    * in stable settings-author order.
@@ -79,6 +87,12 @@ export interface ProviderInstanceRegistryShape {
    * between "fiber scheduled" and "fiber starts running".
    */
   readonly subscribeChanges: Effect.Effect<PubSub.Subscription<void>, never, Scope.Scope>;
+}
+
+export interface ProviderInstanceGenerationHandle {
+  readonly instance: ProviderInstance;
+  readonly generation: number;
+  readonly release: Effect.Effect<void>;
 }
 
 export class ProviderInstanceRegistry extends Context.Service<

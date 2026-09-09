@@ -94,6 +94,10 @@ it.layer(NodeServices.layer)("ServerEnvironmentLive", (it) => {
       expect(second.capabilities.fileAttachments).toEqual({ maxUploadBytes: 50 * 1024 * 1024 });
       expect(second.capabilities.pullRequests).toBe(true);
       expect(second.capabilities.gitIndexWorkflow).toBe(true);
+      expect(second.capabilities.projectMcpCatalog).toBe(true);
+      expect(second.capabilities.globalMcpCatalog).toBe(true);
+      expect(second.capabilities.projectMcpOverrides).toBe(true);
+      expect(second.capabilities.sessionMcpCatalog).toBe(true);
       expect(second.capabilities.threadTitleRegeneration).toBe(true);
       expect(second.capabilities.threadPullRequestLinking).toBe(true);
       expect(second.capabilities.agentActivityPublishing).toBe(false);
