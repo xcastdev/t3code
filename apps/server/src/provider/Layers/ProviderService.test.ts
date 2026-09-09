@@ -1080,7 +1080,15 @@ const makeMcpLifecycleHarness = Effect.fn("makeMcpLifecycleHarness")(function* (
           return credentials.revokeThread(threadId);
         }),
       revokeMcpProviderCredential: (providerSessionId) =>
-        credentials.revokeProviderSession(providerSessionId),
+        Effect.suspend(() => {
+          revokeAttempts += 1;
+          lifecycleEvents?.push("credential.revoke");
+          if (revokeFailures > 0) {
+            revokeFailures -= 1;
+            return Effect.die("injected proxy revocation failure");
+          }
+          return credentials.revokeProviderSession(providerSessionId);
+        }),
       canonicalEventLogger: {
         filePath: "memory://mcp-lifecycle",
         write: (event) => Queue.offer(forwarded, event as ProviderRuntimeEvent).pipe(Effect.asVoid),

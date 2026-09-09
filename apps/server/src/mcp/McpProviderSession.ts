@@ -38,6 +38,12 @@ export function clearMcpProviderSession(threadId: ThreadId): void {
   sessionsByThread.delete(threadId);
 }
 
+export function clearMcpProviderSessionIf(threadId: ThreadId, providerSessionId: string): void {
+  if (sessionsByThread.get(threadId)?.providerSessionId === providerSessionId) {
+    sessionsByThread.delete(threadId);
+  }
+}
+
 export function beginMcpProviderSessionReplacement(
   threadId: ThreadId,
   replacement: McpProviderSessionReplacement,
@@ -60,10 +66,18 @@ export function rollbackMcpProviderSessionReplacement(threadId: ThreadId): void 
   if (!replacement) {
     return;
   }
-  if (replacement.accessWasDisabled || replacement.previous === undefined) {
-    sessionsByThread.delete(threadId);
-  } else {
-    sessionsByThread.set(threadId, replacement.previous);
+  const current = sessionsByThread.get(threadId);
+  const candidateId = replacement.candidate?.providerSessionId;
+  if (
+    candidateId === undefined ||
+    current === undefined ||
+    current.providerSessionId === candidateId
+  ) {
+    if (replacement.accessWasDisabled || replacement.previous === undefined) {
+      sessionsByThread.delete(threadId);
+    } else {
+      sessionsByThread.set(threadId, replacement.previous);
+    }
   }
   replacementsByThread.delete(threadId);
 }

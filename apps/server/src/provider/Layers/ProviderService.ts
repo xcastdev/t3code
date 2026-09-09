@@ -803,7 +803,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       readonly providerGeneration?: ProviderAdapterGenerationHandle;
       readonly beforeCommit?: (
         session: ProviderSession,
-      ) => Effect.Effect<void, ProviderSessionDirectory.ProviderSessionDirectoryWriteError>;
+      ) => Effect.Effect<
+        void,
+        ProviderValidationError | ProviderSessionDirectory.ProviderSessionDirectoryWriteError
+      >;
       readonly sessionInput: Omit<
         Parameters<ProviderAdapterShape<ProviderAdapterError>["startSession"]>[0],
         "projectMcpServers"
