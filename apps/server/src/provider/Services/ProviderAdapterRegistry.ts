@@ -39,6 +39,14 @@ export interface ProviderInstanceRoutingInfo {
   readonly continuationIdentity: ProviderContinuationIdentity;
 }
 
+export interface ProviderAdapterGenerationHandle {
+  readonly instanceId: ProviderInstanceId;
+  readonly generation: number;
+  readonly enabled: boolean;
+  readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+  readonly release: Effect.Effect<void>;
+}
+
 /**
  * ProviderAdapterRegistryShape - Service API for adapter lookup.
  */
@@ -53,6 +61,11 @@ export interface ProviderAdapterRegistryShape {
   readonly getByInstance: (
     instanceId: ProviderInstanceId,
   ) => Effect.Effect<ProviderAdapterShape<ProviderAdapterError>, ProviderUnsupportedError>;
+
+  /** Retain one exact provider generation for the lifetime of a session. */
+  readonly acquireInstance?: (
+    instanceId: ProviderInstanceId,
+  ) => Effect.Effect<ProviderAdapterGenerationHandle | undefined>;
 
   readonly getInstanceInfo: (
     instanceId: ProviderInstanceId,

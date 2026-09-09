@@ -50,6 +50,7 @@ import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 
 import { buildUnavailableProviderSnapshot } from "../unavailableProviderSnapshot.ts";
@@ -72,6 +73,9 @@ interface LiveEntry {
   readonly instance: ProviderInstance;
   readonly scope: Scope.Closeable;
   readonly entry: ProviderInstanceConfig;
+  readonly generation: number;
+  readonly replacementPolicy: "immediate" | "drain";
+  readonly retainCount: number;
 }
 
 /**
@@ -80,8 +84,10 @@ interface LiveEntry {
  */
 interface RegistryState {
   readonly entries: Ref.Ref<ReadonlyMap<ProviderInstanceId, LiveEntry>>;
+  readonly draining: Ref.Ref<ReadonlyArray<LiveEntry>>;
   readonly unavailable: Ref.Ref<ReadonlyMap<ProviderInstanceId, ServerProvider>>;
   readonly changes: PubSub.PubSub<void>;
+  readonly mutex: Semaphore.Semaphore;
 }
 
 /**
@@ -121,6 +127,7 @@ const buildEntry = <R>(input: {
   readonly instanceId: ProviderInstanceId;
   readonly rawInstanceId: string;
   readonly entry: ProviderInstanceConfig;
+  readonly generation: number;
 }): Effect.Effect<
   | { readonly kind: "live"; readonly live: LiveEntry }
   | { readonly kind: "unavailable"; readonly snapshot: ServerProvider },
@@ -128,7 +135,7 @@ const buildEntry = <R>(input: {
   R
 > =>
   Effect.gen(function* () {
-    const { driversById, parentScope, instanceId, rawInstanceId, entry } = input;
+    const { driversById, parentScope, instanceId, rawInstanceId, entry, generation } = input;
     const driver = driversById.get(entry.driver);
     if (!driver) {
       return {
@@ -209,6 +216,9 @@ const buildEntry = <R>(input: {
         instance: createResult.success,
         scope: childScope,
         entry,
+        generation,
+        replacementPolicy: driver.metadata.replacementPolicy ?? "immediate",
+        retainCount: 0,
       },
     };
   });
@@ -223,101 +233,114 @@ const makeReconcile = <R>(input: {
   readonly parentScope: Scope.Scope;
 }): ((configMap: ProviderInstanceConfigMap) => Effect.Effect<void, never, R>) => {
   const { state, driversById, parentScope } = input;
+  let nextGeneration = 0;
   return (configMap: ProviderInstanceConfigMap) =>
-    Effect.gen(function* () {
-      const previousEntries = yield* Ref.get(state.entries);
-      const previousUnavailable = yield* Ref.get(state.unavailable);
-      const nextRaw = Object.entries(configMap);
-      const nextKeys = new Set<ProviderInstanceId>(
-        nextRaw.map(([raw]) => ProviderInstanceId.make(raw)),
-      );
+    state.mutex.withPermits(1)(
+      Effect.gen(function* () {
+        const previousEntries = yield* Ref.get(state.entries);
+        const previousUnavailable = yield* Ref.get(state.unavailable);
+        const nextRaw = Object.entries(configMap);
+        const nextKeys = new Set<ProviderInstanceId>(
+          nextRaw.map(([raw]) => ProviderInstanceId.make(raw)),
+        );
 
-      // 1. Close scopes for instances that disappeared or whose config
-      //    changed. Do this BEFORE creating replacements so ids map 1-to-1
-      //    to live scopes at all times.
-      const removedIds: Array<ProviderInstanceId> = [];
-      const replacedIds = new Set<ProviderInstanceId>();
-      for (const [instanceId, live] of previousEntries) {
-        if (!nextKeys.has(instanceId)) {
-          removedIds.push(instanceId);
-          continue;
-        }
-        const nextEntry = configMap[instanceId];
-        if (nextEntry !== undefined && !entryEqual(live.entry, nextEntry)) {
-          replacedIds.add(instanceId);
-        }
-      }
-      for (const id of [...removedIds, ...replacedIds]) {
-        const live = previousEntries.get(id);
-        if (live) {
-          yield* Scope.close(live.scope, Exit.void).pipe(Effect.ignore);
-        }
-      }
-
-      // 2. Build additions and replacements. Walk `nextRaw` so the final
-      //    entry order follows settings-author order.
-      const builtEntries = new Map<ProviderInstanceId, LiveEntry>();
-      const builtUnavailable = new Map<ProviderInstanceId, ServerProvider>();
-      let orderChanged = false;
-      const previousOrder = [...previousEntries.keys()];
-      const nextOrder: Array<ProviderInstanceId> = [];
-
-      for (const [rawInstanceId, entry] of nextRaw) {
-        const instanceId = ProviderInstanceId.make(rawInstanceId);
-        nextOrder.push(instanceId);
-
-        const existing = previousEntries.get(instanceId);
-        if (existing !== undefined && !replacedIds.has(instanceId)) {
-          // No-op update: keep the existing live entry and scope.
-          builtEntries.set(instanceId, existing);
-          continue;
-        }
-
-        const result = yield* buildEntry({
-          driversById,
-          parentScope,
-          instanceId,
-          rawInstanceId,
-          entry,
-        });
-        if (result.kind === "live") {
-          builtEntries.set(instanceId, result.live);
-        } else {
-          builtUnavailable.set(instanceId, result.snapshot);
-        }
-      }
-
-      if (previousOrder.length === nextOrder.length) {
-        for (let i = 0; i < previousOrder.length; i++) {
-          if (previousOrder[i] !== nextOrder[i]) {
-            orderChanged = true;
-            break;
+        const removedIds: Array<ProviderInstanceId> = [];
+        const replacedIds = new Set<ProviderInstanceId>();
+        for (const [instanceId, live] of previousEntries) {
+          if (!nextKeys.has(instanceId)) {
+            removedIds.push(instanceId);
+            continue;
+          }
+          const nextEntry = configMap[instanceId];
+          if (nextEntry !== undefined && !entryEqual(live.entry, nextEntry)) {
+            replacedIds.add(instanceId);
           }
         }
-      } else {
-        orderChanged = true;
-      }
 
-      const entriesChanged =
-        orderChanged ||
-        removedIds.length > 0 ||
-        replacedIds.size > 0 ||
-        builtEntries.size !== previousEntries.size;
-      const unavailableChanged =
-        builtUnavailable.size !== previousUnavailable.size ||
-        [...builtUnavailable].some(([id, snapshot]) => {
-          const prev = previousUnavailable.get(id);
-          return prev === undefined || !Equal.equals(prev, snapshot);
-        }) ||
-        [...previousUnavailable].some(([id]) => !builtUnavailable.has(id));
+        // Build replacements while the old entries are still active. A
+        // failed replacement therefore leaves the old generation usable.
+        const builtEntries = new Map<ProviderInstanceId, LiveEntry>();
+        const builtUnavailable = new Map<ProviderInstanceId, ServerProvider>();
+        let orderChanged = false;
+        const previousOrder = [...previousEntries.keys()];
+        const nextOrder: Array<ProviderInstanceId> = [];
 
-      yield* Ref.set(state.entries, builtEntries);
-      yield* Ref.set(state.unavailable, builtUnavailable);
+        for (const [rawInstanceId, entry] of nextRaw) {
+          const instanceId = ProviderInstanceId.make(rawInstanceId);
+          nextOrder.push(instanceId);
 
-      if (entriesChanged || unavailableChanged) {
-        yield* PubSub.publish(state.changes, undefined);
-      }
-    });
+          const existing = previousEntries.get(instanceId);
+          if (existing !== undefined && !replacedIds.has(instanceId)) {
+            builtEntries.set(instanceId, existing);
+            continue;
+          }
+
+          const result = yield* buildEntry({
+            driversById,
+            parentScope,
+            instanceId,
+            rawInstanceId,
+            entry,
+            generation: ++nextGeneration,
+          });
+          if (result.kind === "live") {
+            builtEntries.set(instanceId, result.live);
+          } else {
+            builtUnavailable.set(instanceId, result.snapshot);
+          }
+        }
+
+        if (previousOrder.length === nextOrder.length) {
+          for (let i = 0; i < previousOrder.length; i++) {
+            if (previousOrder[i] !== nextOrder[i]) {
+              orderChanged = true;
+              break;
+            }
+          }
+        } else {
+          orderChanged = true;
+        }
+
+        const retiredIds = [...removedIds, ...replacedIds];
+        const previousDraining = yield* Ref.get(state.draining);
+        const nextDraining = [...previousDraining];
+        const closeImmediately: Array<LiveEntry> = [];
+        for (const id of retiredIds) {
+          const live = previousEntries.get(id);
+          if (!live) continue;
+          if (live.replacementPolicy === "drain" && live.retainCount > 0) {
+            nextDraining.push(live);
+          } else {
+            closeImmediately.push(live);
+          }
+        }
+
+        const entriesChanged =
+          orderChanged ||
+          removedIds.length > 0 ||
+          replacedIds.size > 0 ||
+          builtEntries.size !== previousEntries.size;
+        const unavailableChanged =
+          builtUnavailable.size !== previousUnavailable.size ||
+          [...builtUnavailable].some(([id, snapshot]) => {
+            const prev = previousUnavailable.get(id);
+            return prev === undefined || !Equal.equals(prev, snapshot);
+          }) ||
+          [...previousUnavailable].some(([id]) => !builtUnavailable.has(id));
+
+        yield* Ref.set(state.entries, builtEntries);
+        yield* Ref.set(state.draining, nextDraining);
+        yield* Ref.set(state.unavailable, builtUnavailable);
+
+        for (const live of closeImmediately) {
+          yield* Scope.close(live.scope, Exit.void).pipe(Effect.ignore);
+        }
+
+        if (entriesChanged || unavailableChanged) {
+          yield* PubSub.publish(state.changes, undefined);
+        }
+      }),
+    );
 };
 
 /**
@@ -365,14 +388,79 @@ export const makeProviderInstanceRegistry = <R>(input: {
     const driverContext = yield* Effect.context<R>();
 
     const entries = yield* Ref.make<ReadonlyMap<ProviderInstanceId, LiveEntry>>(new Map());
+    const draining = yield* Ref.make<ReadonlyArray<LiveEntry>>([]);
     const unavailable = yield* Ref.make<ReadonlyMap<ProviderInstanceId, ServerProvider>>(new Map());
     const changes = yield* PubSub.unbounded<void>();
+    const mutex = yield* Semaphore.make(1);
     yield* Effect.addFinalizer(() => PubSub.shutdown(changes));
 
-    const state: RegistryState = { entries, unavailable, changes };
+    const state: RegistryState = { entries, draining, unavailable, changes, mutex };
     const reconcileWithR = makeReconcile({ state, driversById, parentScope });
     const reconcile: ProviderInstanceRegistryMutatorShape["reconcile"] = (configMap) =>
       reconcileWithR(configMap).pipe(Effect.provideContext(driverContext));
+
+    const releaseEntry = (entry: LiveEntry, released: Ref.Ref<boolean>) =>
+      state.mutex.withPermits(1)(
+        Effect.gen(function* () {
+          const wasReleased = yield* Ref.modify(released, (current) => [current, true] as const);
+          if (wasReleased) return;
+
+          const current = yield* Ref.get(state.entries);
+          const active = current.get(entry.instance.instanceId);
+          if (
+            active !== undefined &&
+            active.instance === entry.instance &&
+            active.generation === entry.generation
+          ) {
+            const next = new Map(current);
+            next.set(active.instance.instanceId, {
+              ...active,
+              retainCount: Math.max(0, active.retainCount - 1),
+            });
+            yield* Ref.set(state.entries, next);
+            return;
+          }
+
+          const currentDraining = yield* Ref.get(state.draining);
+          const index = currentDraining.findIndex(
+            (candidate) =>
+              candidate.instance === entry.instance && candidate.generation === entry.generation,
+          );
+          if (index < 0) return;
+          const currentEntry = currentDraining[index]!;
+          if (currentEntry.retainCount > 1) {
+            const next = [...currentDraining];
+            next[index] = { ...currentEntry, retainCount: currentEntry.retainCount - 1 };
+            yield* Ref.set(state.draining, next);
+            return;
+          }
+
+          yield* Ref.set(
+            state.draining,
+            currentDraining.filter((candidate) => candidate !== currentEntry),
+          );
+          yield* Scope.close(entry.scope, Exit.void).pipe(Effect.ignore);
+        }),
+      );
+
+    const acquireInstance: ProviderInstanceRegistryShape["acquireInstance"] = (instanceId) =>
+      state.mutex.withPermits(1)(
+        Effect.gen(function* () {
+          const current = yield* Ref.get(state.entries);
+          const entry = current.get(instanceId);
+          if (entry === undefined) return undefined;
+          const retained = { ...entry, retainCount: entry.retainCount + 1 };
+          const next = new Map(current);
+          next.set(instanceId, retained);
+          yield* Ref.set(state.entries, next);
+          const released = yield* Ref.make(false);
+          return {
+            instance: retained.instance,
+            generation: retained.generation,
+            release: releaseEntry(retained, released),
+          };
+        }),
+      );
 
     // Hydrate the initial configMap synchronously so callers can read
     // `listInstances` immediately after this effect completes.
@@ -380,6 +468,7 @@ export const makeProviderInstanceRegistry = <R>(input: {
 
     const registry: ProviderInstanceRegistryShape = {
       getInstance: (id) => Ref.get(entries).pipe(Effect.map((map) => map.get(id)?.instance)),
+      acquireInstance,
       listInstances: Ref.get(entries).pipe(
         Effect.map(
           (map) =>

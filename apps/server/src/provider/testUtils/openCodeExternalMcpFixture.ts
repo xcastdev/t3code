@@ -23,6 +23,10 @@ export interface OpenCodeExternalMcpFixture {
   readonly status: Readonly<Record<string, { readonly status: string }>>;
   readonly registeredClients: ReadonlyMap<string, RegisteredMcpClient>;
   readonly invokeRegisteredTool: (name: string) => Promise<unknown>;
+  readonly setTokenValidator: (validator: (token: string) => Promise<boolean>) => void;
+  readonly setDisconnectObserver: (
+    observer: (name: string, token: string | undefined) => Promise<void>,
+  ) => void;
   readonly revokeToken: () => void;
   readonly probeWithRevokedToken: () => Promise<Response>;
   readonly close: () => Promise<void>;
@@ -63,12 +67,18 @@ const listen = (server: NodeHttp.Server): Promise<number> =>
 const closeServer = (server: NodeHttp.Server): Promise<void> =>
   new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 
-const createMcpHandler = (token: string) => {
+const createMcpHandler = (isAuthorized: (token: string) => Promise<boolean>) => {
   const transports = new Map<string, WebStandardStreamableHTTPServerTransport>();
   const servers = new Set<McpServer>();
 
   const handle = async (request: Request): Promise<Response> => {
-    if (request.headers.get("authorization") !== `Bearer ${token}`) {
+    const authorization = request.headers.get("authorization");
+    const token = authorization?.replace(/^Bearer\s+/, "") ?? "";
+    if (
+      authorization === null ||
+      !authorization.startsWith("Bearer ") ||
+      !(await isAuthorized(token))
+    ) {
       return new Response("Unauthorized", { status: 401 });
     }
 
@@ -160,8 +170,13 @@ export const startOpenCodeExternalMcpFixture = async (): Promise<OpenCodeExterna
   const config: Record<string, unknown> = {};
   const status: Record<string, { status: string }> = {};
   const registeredClients = new Map<string, RegisteredMcpClient>();
+  let tokenValidator: ((token: string) => Promise<boolean>) | undefined;
+  let disconnectObserver: ((name: string, token: string | undefined) => Promise<void>) | undefined;
 
-  const mcpHandler = createMcpHandler(token);
+  const mcpHandler = createMcpHandler(
+    async (candidate) =>
+      candidate === token || (tokenValidator !== undefined && (await tokenValidator(candidate))),
+  );
   const mcpServer = NodeHttp.createServer(async (request, response) => {
     if (!tokenActive) {
       writeJson(response, 401, { error: "revoked" });
@@ -228,6 +243,18 @@ export const startOpenCodeExternalMcpFixture = async (): Promise<OpenCodeExterna
         const name = decodeURIComponent(disconnectMatch[1]!);
         const registered = registeredClients.get(name);
         registeredClients.delete(name);
+        const headers =
+          config[name] && typeof config[name] === "object" && config[name] !== null
+            ? (config[name] as JsonRecord).headers
+            : undefined;
+        const authorization =
+          headers && typeof headers === "object" && headers !== null
+            ? (headers as JsonRecord).Authorization
+            : undefined;
+        await disconnectObserver?.(
+          name,
+          typeof authorization === "string" ? authorization.replace(/^Bearer\s+/, "") : undefined,
+        );
         if (registered !== undefined) {
           await registered.client.close().catch(() => undefined);
           await registered.transport.close().catch(() => undefined);
@@ -279,6 +306,12 @@ export const startOpenCodeExternalMcpFixture = async (): Promise<OpenCodeExterna
     config,
     status,
     registeredClients,
+    setTokenValidator: (validator) => {
+      tokenValidator = validator;
+    },
+    setDisconnectObserver: (observer) => {
+      disconnectObserver = observer;
+    },
     invokeRegisteredTool: async (name) => {
       const registered = registeredClients.get(name);
       if (registered === undefined) throw new Error(`No registered MCP client named ${name}.`);

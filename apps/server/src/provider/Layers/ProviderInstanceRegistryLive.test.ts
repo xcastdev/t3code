@@ -38,6 +38,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 
@@ -56,6 +57,7 @@ import { OpenCodeRuntimeLive } from "../opencodeRuntime.ts";
 import * as OpenCodeExternalMcpCoordinator from "../OpenCodeExternalMcpCoordinator.ts";
 import { NoOpProviderEventLoggers, ProviderEventLoggers } from "./ProviderEventLoggers.ts";
 import { makeProviderInstanceRegistry } from "./ProviderInstanceRegistryLive.ts";
+import type { ProviderDriver, ProviderInstance } from "../ProviderDriver.ts";
 
 const TestHttpClientLive = Layer.succeed(
   HttpClient.HttpClient,
@@ -491,5 +493,149 @@ describe("ProviderInstanceRegistryLive — all drivers slice", () => {
         `${openCodeDriverKind}:instance:${openCodeId}`,
       );
     }).pipe(Effect.provide(testLayer)),
+  );
+});
+
+describe("ProviderInstanceRegistryLive — retained OpenCode generations", () => {
+  it.live("keeps a replaced OpenCode generation alive until its handle releases", () =>
+    Effect.gen(function* () {
+      const finalizers: string[] = [];
+      const instanceId = ProviderInstanceId.make("opencode_retained");
+      const driver: ProviderDriver<{ value: string }> = {
+        driverKind: ProviderDriverKind.make("opencode"),
+        metadata: {
+          displayName: "OpenCode",
+          replacementPolicy: "drain",
+        },
+        configSchema: Schema.Struct({ value: Schema.String }),
+        defaultConfig: () => ({ value: "default" }),
+        create: (input) =>
+          Effect.gen(function* () {
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => finalizers.push(input.config.value)),
+            );
+            return {
+              instanceId: input.instanceId,
+              driverKind: ProviderDriverKind.make("opencode"),
+              continuationIdentity: {
+                driverKind: ProviderDriverKind.make("opencode"),
+                continuationKey: `opencode:${input.config.value}`,
+              },
+              displayName: input.displayName,
+              enabled: input.enabled,
+              snapshot: {} as ProviderInstance["snapshot"],
+              adapter: {} as ProviderInstance["adapter"],
+              textGeneration: {} as ProviderInstance["textGeneration"],
+            } satisfies ProviderInstance;
+          }),
+      };
+      const { registry, mutator } = yield* makeProviderInstanceRegistry({
+        drivers: [driver],
+        configMap: {
+          [instanceId]: {
+            driver: ProviderDriverKind.make("opencode"),
+            enabled: true,
+            config: { value: "a" },
+          },
+        },
+      });
+
+      const acquireInstance = registry.acquireInstance;
+      expect(acquireInstance).toBeDefined();
+      if (acquireInstance === undefined) throw new Error("acquireInstance is not available");
+      const old = yield* acquireInstance(instanceId);
+      expect(old).toBeDefined();
+      yield* mutator.reconcile({
+        [instanceId]: {
+          driver: ProviderDriverKind.make("opencode"),
+          enabled: true,
+          config: { value: "b" },
+        },
+      });
+
+      const current = yield* registry.getInstance(instanceId);
+      expect(current?.continuationIdentity.continuationKey).toBe("opencode:b");
+      expect(finalizers).toEqual([]);
+
+      const middle = yield* acquireInstance(instanceId);
+      expect(middle?.generation).toBeGreaterThan(old!.generation);
+      yield* mutator.reconcile({
+        [instanceId]: {
+          driver: ProviderDriverKind.make("opencode"),
+          enabled: true,
+          config: { value: "c" },
+        },
+      });
+      expect((yield* registry.getInstance(instanceId))?.continuationIdentity.continuationKey).toBe(
+        "opencode:c",
+      );
+      expect(finalizers).toEqual([]);
+
+      yield* old!.release;
+      expect(finalizers).toEqual(["a"]);
+      yield* old!.release;
+      expect(finalizers).toEqual(["a"]);
+      yield* middle!.release;
+      expect(finalizers).toEqual(["a", "b"]);
+      yield* middle!.release;
+      expect(finalizers).toEqual(["a", "b"]);
+    }),
+  );
+
+  it.live("keeps immediate teardown for providers without a drain policy", () =>
+    Effect.gen(function* () {
+      const finalizers: string[] = [];
+      const instanceId = ProviderInstanceId.make("codex_immediate");
+      const driver: ProviderDriver<{ value: string }> = {
+        driverKind: ProviderDriverKind.make("codex"),
+        metadata: { displayName: "Codex" },
+        configSchema: Schema.Struct({ value: Schema.String }),
+        defaultConfig: () => ({ value: "default" }),
+        create: (input) =>
+          Effect.gen(function* () {
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => finalizers.push(input.config.value)),
+            );
+            return {
+              instanceId: input.instanceId,
+              driverKind: ProviderDriverKind.make("codex"),
+              continuationIdentity: {
+                driverKind: ProviderDriverKind.make("codex"),
+                continuationKey: `codex:${input.config.value}`,
+              },
+              displayName: input.displayName,
+              enabled: input.enabled,
+              snapshot: {} as ProviderInstance["snapshot"],
+              adapter: {} as ProviderInstance["adapter"],
+              textGeneration: {} as ProviderInstance["textGeneration"],
+            } satisfies ProviderInstance;
+          }),
+      };
+      const { registry, mutator } = yield* makeProviderInstanceRegistry({
+        drivers: [driver],
+        configMap: {
+          [instanceId]: {
+            driver: ProviderDriverKind.make("codex"),
+            enabled: true,
+            config: { value: "a" },
+          },
+        },
+      });
+      const acquireInstance = registry.acquireInstance;
+      expect(acquireInstance).toBeDefined();
+      if (acquireInstance === undefined) throw new Error("acquireInstance is not available");
+      const retained = yield* acquireInstance(instanceId);
+      yield* mutator.reconcile({
+        [instanceId]: {
+          driver: ProviderDriverKind.make("codex"),
+          enabled: true,
+          config: { value: "b" },
+        },
+      });
+
+      expect(finalizers).toEqual(["a"]);
+      yield* retained!.release;
+      expect(finalizers).toEqual(["a"]);
+    }),
   );
 });

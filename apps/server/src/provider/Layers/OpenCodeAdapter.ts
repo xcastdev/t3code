@@ -1250,12 +1250,28 @@ export function makeOpenCodeAdapter(
       name: string,
     ) {
       const result = yield* Effect.exit(
-        runOpenCodeSdk("mcp.disconnect", (signal) =>
-          state.client.mcp.disconnect({ name, directory: state.directory }, { signal }),
-        ).pipe(Effect.timeout("2 seconds")),
+        Effect.gen(function* () {
+          yield* runOpenCodeSdk("mcp.disconnect", (signal) =>
+            state.client.mcp.disconnect({ name, directory: state.directory }, { signal }),
+          ).pipe(Effect.catchIf(isOpenCodeNotFound, () => Effect.void));
+          const after = yield* readExternalMcpState(state.client, state.directory);
+          const status = after.status[name];
+          if (
+            status !== undefined &&
+            typeof status === "object" &&
+            status !== null &&
+            (status as { readonly status?: unknown }).status === "connected"
+          ) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "mcp.disconnect",
+              detail: `OpenCode kept MCP server '${name}' connected after cleanup.`,
+            });
+          }
+        }).pipe(Effect.timeout("2 seconds")),
       );
       if (Exit.isFailure(result)) {
-        yield* Effect.logWarning("OpenCode external MCP disconnect failed", {
+        yield* Effect.logWarning("OpenCode external MCP cleanup verification failed", {
           name,
           directory: state.directory,
           cause: Cause.squash(result.cause),
@@ -3974,7 +3990,10 @@ export function makeOpenCodeAdapter(
         const serverPassword = openCodeSettings.serverPassword;
         const directory = input.cwd ?? serverConfig.cwd;
         const resumeSessionId = parseOpenCodeResume(input.resumeCursor)?.sessionId;
-        if (serverUrl && openCodeSettings.manageExternalMcp) {
+        const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const hasExternalMcpWork =
+          mcpSession !== undefined || (input.projectMcpServers?.length ?? 0) > 0;
+        if (serverUrl && openCodeSettings.manageExternalMcp && hasExternalMcpWork) {
           yield* Effect.try({
             try: () => {
               validateExternalOpenCodeUrl(serverUrl);
@@ -4011,9 +4030,8 @@ export function makeOpenCodeAdapter(
                 directory,
                 ...(server.serverPassword ? { serverPassword: server.serverPassword } : {}),
               });
-              const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
               let externalMcp: OpenCodeExternalMcpState | undefined;
-              if (server.external && openCodeSettings.manageExternalMcp) {
+              if (server.external && openCodeSettings.manageExternalMcp && hasExternalMcpWork) {
                 if (externalMcpCoordinator === undefined || externalEnvironmentId === undefined) {
                   return yield* new ProviderAdapterRequestError({
                     provider: PROVIDER,

@@ -21,8 +21,9 @@ OpenCode uses this password for HTTP Basic authentication.
 
 External OpenCode MCP management is off by default. To opt in, open **Settings > Providers**,
 select OpenCode, enable **Manage MCP servers on external OpenCode**, and start a new session.
-The setting applies when the next session starts; changing it does not interrupt the active
-session.
+The setting applies when the next session starts. Existing sessions continue using the OpenCode
+connection and MCP generation they started with until they stop; changing the setting does not
+interrupt them.
 
 When T3 Code and OpenCode run on different machines, set **T3 MCP public origin** to the HTTPS
 origin that the OpenCode machine can reach, such as `https://t3.example.com`. T3 Code preserves

@@ -62,6 +62,26 @@ describe("rebaseExternalMcpUrl", () => {
     ).toBe("https://t3.example.test/mcp/session?token=abc");
   });
 
+  it("rebases a non-loopback HTTP endpoint before validating final transport", () => {
+    expect(
+      rebaseExternalMcpUrl({
+        issuedEndpoint: "http://100.64.0.2:4310/mcp/session?token=abc%2Fdef",
+        externalMcpBaseUrl: "https://t3.example.test",
+        serverUrl: "https://opencode.example.test",
+      }),
+    ).toBe("https://t3.example.test/mcp/session?token=abc%2Fdef");
+  });
+
+  it("rejects a non-loopback HTTP endpoint when it is transmitted directly", () => {
+    expect(() =>
+      rebaseExternalMcpUrl({
+        issuedEndpoint: "http://100.64.0.2:4310/mcp/session",
+        externalMcpBaseUrl: "",
+        serverUrl: "https://opencode.example.test",
+      }),
+    ).toThrow(/HTTP is allowed only/);
+  });
+
   it("rejects a loopback issued endpoint when OpenCode is remote and no origin is set", () => {
     expect(() =>
       rebaseExternalMcpUrl({

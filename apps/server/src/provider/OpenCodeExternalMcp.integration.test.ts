@@ -3,6 +3,7 @@ import { describe, expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import {
   EnvironmentId,
@@ -10,13 +11,27 @@ import {
   OpenCodeSettings,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
 
 import * as McpProviderSession from "../mcp/McpProviderSession.ts";
+import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import * as ServerConfig from "../config.ts";
+import * as AnalyticsService from "../telemetry/AnalyticsService.ts";
 import * as OpenCodeExternalMcpCoordinator from "./OpenCodeExternalMcpCoordinator.ts";
 import { makeOpenCodeAdapter } from "./Layers/OpenCodeAdapter.ts";
+import * as ProviderAdapterRegistry from "./Services/ProviderAdapterRegistry.ts";
+import * as ProviderEventLoggers from "./Layers/ProviderEventLoggers.ts";
+import * as ProviderService from "./Layers/ProviderService.ts";
+import * as ProviderServiceService from "./Services/ProviderService.ts";
+import * as ProviderSessionDirectory from "./Services/ProviderSessionDirectory.ts";
+import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ProjectMcpService from "../project/ProjectMcpService.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as ServerSettings from "../serverSettings.ts";
+import { HttpServer } from "effect/unstable/http";
+import { makeAdapterRegistryMock } from "./testUtils/providerAdapterRegistryMock.ts";
 import { OpenCodeRuntime, type OpenCodeRuntimeShape } from "./opencodeRuntime.ts";
 import { startOpenCodeExternalMcpFixture } from "./testUtils/openCodeExternalMcpFixture.ts";
 
@@ -162,6 +177,178 @@ describe("external OpenCode MCP integration", () => {
         ),
         Effect.gen(function* () {
           yield* Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId));
+          yield* Effect.promise(fixture.close);
+        }),
+      );
+    });
+  });
+
+  it.effect("revokes the real credential before ProviderService disconnects MCP", () => {
+    const threadId = ThreadId.make("integration-provider-service-ordering");
+    const environmentId = EnvironmentId.make("integration-provider-environment");
+    const providerInstanceId = ProviderInstanceId.make("opencode");
+
+    return Effect.gen(function* () {
+      const fixture = yield* Effect.tryPromise({
+        try: startOpenCodeExternalMcpFixture,
+        catch: (cause) => new OpenCodeExternalMcpFixtureError(cause),
+      });
+      const fixturePort = Number(new URL(fixture.mcpUrl).port);
+      const credentials = yield* McpSessionRegistry.__testing.make().pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            NodeServices.layer,
+            Layer.succeed(HttpServer.HttpServer, {
+              address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: fixturePort },
+              serve: () => Effect.void,
+            }),
+            Layer.succeed(ServerEnvironment.ServerEnvironment, {
+              getEnvironmentId: Effect.succeed(environmentId),
+              getDescriptor: Effect.die("descriptor is not used by this test"),
+            }),
+          ),
+        ),
+      );
+      const activeTokens = new Set<string>();
+      const issueCredential: typeof credentials.issue = (request) =>
+        credentials.issue(request).pipe(
+          Effect.tap(({ config }) =>
+            Effect.sync(() => {
+              const token = config.authorizationHeader.replace(/^Bearer\s+/, "");
+              activeTokens.add(token);
+            }),
+          ),
+        );
+      let observedToken: string | undefined;
+      fixture.setTokenValidator(async (token) => {
+        observedToken = token;
+        return activeTokens.has(token);
+      });
+      let tokenActiveWhenDisconnectStarted: boolean | undefined;
+      fixture.setDisconnectObserver(async (_name, token) => {
+        tokenActiveWhenDisconnectStarted =
+          token === undefined ? undefined : activeTokens.has(token);
+      });
+
+      yield* Effect.ensuring(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const coordinator =
+              yield* OpenCodeExternalMcpCoordinator.OpenCodeExternalMcpCoordinator;
+            const adapter = yield* makeOpenCodeAdapter(settingsFor(fixture.openCodeUrl), {
+              environmentId,
+              instanceId: providerInstanceId,
+              externalMcpCoordinator: coordinator,
+            }).pipe(Effect.provide(makeAdapterDependencies()));
+            const registry = makeAdapterRegistryMock({
+              [ProviderDriverKind.make("opencode")]: adapter,
+            });
+            const projectLayer = Layer.mergeAll(
+              Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, {
+                getThreadShellById: () =>
+                  Effect.succeed(Option.some({ projectId: ProjectId.make("fixture-project") })),
+              } as never),
+              Layer.succeed(ProjectMcpService.ProjectMcpService, {
+                resolveForSession: () => Effect.succeed([]),
+                acquireSessionLease: () =>
+                  Effect.succeed({
+                    servers: [],
+                    resolveSecret: () => undefined,
+                    oauthStateLeases: new Map(),
+                  }),
+                acquireResolvedSessionLease: (servers: ReadonlyArray<unknown>) =>
+                  Effect.succeed({
+                    servers,
+                    resolveSecret: () => undefined,
+                    oauthStateLeases: new Map(),
+                  }),
+                withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+              } as never),
+            );
+            const bindings = new Map<ThreadId, ProviderSessionDirectory.ProviderRuntimeBinding>();
+            const directoryLayer = Layer.succeed(
+              ProviderSessionDirectory.ProviderSessionDirectory,
+              {
+                upsert: (binding) =>
+                  Effect.sync(() => {
+                    bindings.set(binding.threadId, binding);
+                  }),
+                getProvider: (id) => {
+                  const binding = bindings.get(id);
+                  return binding === undefined
+                    ? Effect.die(`No provider binding for '${id}'.`)
+                    : Effect.succeed(binding.provider);
+                },
+                getBinding: (id) => {
+                  const binding = bindings.get(id);
+                  return Effect.succeed(
+                    binding === undefined ? Option.none() : Option.some(binding),
+                  );
+                },
+                listThreadIds: () => Effect.succeed([...bindings.keys()]),
+                listBindings: () =>
+                  Effect.succeed(
+                    [...bindings.values()].map((binding) => ({
+                      ...binding,
+                      lastSeenAt: "2026-01-01T00:00:00.000Z",
+                    })),
+                  ),
+              },
+            );
+            const providerLayer = ProviderService.makeProviderServiceLive({
+              issueMcpCredential: issueCredential,
+              revokeMcpCredential: (id) =>
+                credentials
+                  .revokeThread(id)
+                  .pipe(Effect.tap(() => Effect.sync(() => activeTokens.clear()))),
+            }).pipe(
+              Layer.provide(projectLayer),
+              Layer.provide(
+                Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry),
+              ),
+              Layer.provide(directoryLayer),
+              Layer.provide(ServerSettings.ServerSettingsService.layerTest()),
+              Layer.provide(
+                ServerConfig.layerTest(process.cwd(), process.cwd()).pipe(
+                  Layer.provide(NodeServices.layer),
+                ),
+              ),
+              Layer.provide(AnalyticsService.layerTest),
+              Layer.provide(
+                Layer.succeed(
+                  ProviderEventLoggers.ProviderEventLoggers,
+                  ProviderEventLoggers.NoOpProviderEventLoggers,
+                ),
+              ),
+            );
+            const provider = yield* ProviderServiceService.ProviderService.pipe(
+              Effect.provide(providerLayer),
+            );
+            const started = yield* provider.startSession(threadId, {
+              provider: ProviderDriverKind.make("opencode"),
+              providerInstanceId,
+              threadId,
+              runtimeMode: "full-access",
+              cwd: "/fixture/workspace",
+            });
+            expect(started.provider).toBe("opencode");
+            expect(observedToken).toBeDefined();
+            expect(yield* credentials.resolve(observedToken!)).toBeDefined();
+            const previewName = findPreviewName(fixture);
+            expect(previewName).toBeDefined();
+            const result = (yield* Effect.promise(() =>
+              fixture.invokeRegisteredTool(previewName!),
+            )) as { content?: ReadonlyArray<{ readonly text?: string }> };
+            expect(result.content?.[0]?.text).toBe("external-mcp-sentinel");
+
+            yield* provider.stopSession({ threadId });
+
+            expect(tokenActiveWhenDisconnectStarted).toBe(false);
+            expect(Object.values(fixture.status)).toEqual([{ status: "disabled" }]);
+          }).pipe(Effect.provide(integrationServices)),
+        ),
+        Effect.gen(function* () {
+          yield* credentials.revokeAll;
           yield* Effect.promise(fixture.close);
         }),
       );

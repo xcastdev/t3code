@@ -112,11 +112,17 @@ export const validateExternalMcpBaseUrl = (value: string): string => {
   return url.origin;
 };
 
-const validateIssuedEndpoint = (value: string | URL): URL => {
+const validateIssuedEndpointStructure = (value: string | URL): URL => {
   const raw = typeof value === "string" ? value : value.toString();
   const url = parseAbsoluteUrl(raw, "mcp-endpoint");
   assertNoCredentialsOrFragment(url, "mcp-endpoint", raw);
-  assertSafeTransport(url, "mcp-endpoint", raw);
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new OpenCodeExternalMcpUrlError(
+      "mcp-endpoint",
+      raw,
+      "Use an absolute HTTP or HTTPS MCP endpoint.",
+    );
+  }
   return url;
 };
 
@@ -145,7 +151,7 @@ export function rebaseExternalMcpUrl(
           externalMcpBaseUrl: externalMcpBaseUrl ?? "",
           serverUrl: serverUrl ?? "",
         };
-  const issued = validateIssuedEndpoint(input.issuedEndpoint);
+  const issued = validateIssuedEndpointStructure(input.issuedEndpoint);
   const base = validateExternalMcpBaseUrl(input.externalMcpBaseUrl);
   const externalServerUrl = validateExternalOpenCodeUrl(input.serverUrl);
   const finalUrl =

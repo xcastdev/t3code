@@ -46,6 +46,24 @@ const makeProviderAdapterRegistry = Effect.fn("makeProviderAdapterRegistry")(fun
       ),
     );
 
+  const acquireGeneration = registry.acquireInstance;
+  const acquireInstance: ProviderAdapterRegistryShape["acquireInstance"] =
+    acquireGeneration === undefined
+      ? undefined
+      : (instanceId) =>
+          acquireGeneration(instanceId).pipe(
+            Effect.map((handle) => {
+              if (handle === undefined) return undefined;
+              return {
+                instanceId,
+                generation: handle.generation,
+                enabled: handle.instance.enabled,
+                adapter: handle.instance.adapter,
+                release: handle.release,
+              };
+            }),
+          );
+
   const getInstanceInfo: ProviderAdapterRegistryShape["getInstanceInfo"] = (instanceId) =>
     registry.getInstance(instanceId).pipe(
       Effect.flatMap((instance) =>
@@ -90,6 +108,7 @@ const makeProviderAdapterRegistry = Effect.fn("makeProviderAdapterRegistry")(fun
 
   return {
     getByInstance,
+    ...(acquireInstance === undefined ? {} : { acquireInstance }),
     getInstanceInfo,
     listInstances,
     listProviders,

@@ -139,6 +139,7 @@ const claudeAgentInstanceId = ProviderInstanceId.make("claudeAgent");
 const CODEX_DRIVER = ProviderDriverKind.make("codex");
 const CLAUDE_AGENT_DRIVER = ProviderDriverKind.make("claudeAgent");
 const CURSOR_DRIVER = ProviderDriverKind.make("cursor");
+const OPENCODE_DRIVER = ProviderDriverKind.make("opencode");
 
 type LegacyProviderRuntimeEvent = {
   readonly type: string;
@@ -1196,6 +1197,119 @@ it.effect("orders credential revocation before adapter MCP cleanup and project l
     yield* h.provider.stopSession({ threadId });
 
     assert.deepEqual(lifecycleEvents, ["credential.revoke", "adapter.cleanup", "project.release"]);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.effect("keeps an active OpenCode session on its generation when settings disable it", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("opencode-generation-preservation");
+    const instanceId = ProviderInstanceId.make("opencode");
+    const original = makeFakeCodexAdapter(OPENCODE_DRIVER);
+    const disabled = makeFakeCodexAdapter(OPENCODE_DRIVER);
+    const changes = yield* PubSub.unbounded<void>();
+    const disabledReconciled = yield* Deferred.make<void>();
+    let current = original;
+    let enabled = true;
+    let originalReleased = 0;
+
+    const makeGeneration = (
+      adapter: ReturnType<typeof makeFakeCodexAdapter>,
+      generation: number,
+      isEnabled: boolean,
+      onRelease: () => void,
+    ): ProviderAdapterRegistry.ProviderAdapterGenerationHandle => ({
+      instanceId,
+      generation,
+      enabled: isEnabled,
+      adapter: adapter.adapter,
+      release: Effect.sync(onRelease),
+    });
+    const registry = {
+      ...makeAdapterRegistryMock({ [OPENCODE_DRIVER]: original.adapter }),
+      getByInstance: () => Effect.succeed(current.adapter),
+      getInstanceInfo: () =>
+        Effect.succeed({
+          instanceId,
+          driverKind: OPENCODE_DRIVER,
+          displayName: undefined,
+          enabled,
+          continuationIdentity: {
+            driverKind: OPENCODE_DRIVER,
+            continuationKey: `opencode:instance:${instanceId}`,
+          },
+        }),
+      acquireInstance: () =>
+        Effect.succeed(
+          makeGeneration(
+            current,
+            enabled ? 1 : 2,
+            enabled,
+            enabled ? () => (originalReleased += 1) : () => undefined,
+          ),
+        ),
+      listInstances: () =>
+        Effect.succeed([instanceId]).pipe(
+          Effect.tap(() =>
+            enabled ? Effect.void : Deferred.succeed(disabledReconciled, undefined),
+          ),
+        ),
+      subscribeChanges: PubSub.subscribe(changes),
+      streamChanges: Stream.fromPubSub(changes),
+    } satisfies ProviderAdapterRegistry.ProviderAdapterRegistryShape;
+    const providerLayer = makeTestProviderServiceLive().pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(
+        ProviderSessionDirectoryLive.pipe(
+          Layer.provide(ProviderSessionRuntime.layer.pipe(Layer.provide(SqlitePersistenceMemory))),
+        ),
+      ),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(serverConfigTestLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* provider.startSession(threadId, {
+        provider: OPENCODE_DRIVER,
+        providerInstanceId: instanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      current = disabled;
+      enabled = false;
+      yield* PubSub.publish(changes, undefined);
+      yield* Deferred.await(disabledReconciled);
+
+      const sessions = yield* provider.listSessions();
+      assert.equal(sessions.find((session) => session.threadId === threadId)?.provider, "opencode");
+      yield* provider.sendTurn({ threadId, input: "still active", attachments: [] });
+      assert.equal(original.sendTurn.mock.calls.length, 1);
+      assert.equal(disabled.sendTurn.mock.calls.length, 0);
+      assert.equal(originalReleased, 0);
+
+      const newThreadId = asThreadId("opencode-disabled-generation");
+      const newStart = yield* provider
+        .startSession(newThreadId, {
+          provider: OPENCODE_DRIVER,
+          providerInstanceId: instanceId,
+          threadId: newThreadId,
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.exit);
+      assert.isTrue(Exit.isFailure(newStart));
+      assert.equal(disabled.startSession.mock.calls.length, 0);
+
+      yield* provider.stopSession({ threadId });
+      assert.equal(originalReleased, 1);
+    }).pipe(Effect.provide(providerLayer));
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 

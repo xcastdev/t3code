@@ -121,6 +121,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
   metadata: {
     displayName: "OpenCode",
     supportsMultipleInstances: true,
+    replacementPolicy: "drain",
   },
   configSchema: OpenCodeSettings,
   defaultConfig: (): OpenCodeSettings => decodeOpenCodeSettings({}),
