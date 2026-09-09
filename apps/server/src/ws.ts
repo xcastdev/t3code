@@ -160,6 +160,7 @@ import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as ProjectMcpProxyRegistry from "./mcp/ProjectMcpProxyRegistry.ts";
 import * as ProjectMcpOAuth from "./mcp/ProjectMcpOAuth.ts";
 import * as ProjectMcpSecretStore from "./mcp/ProjectMcpSecretStore.ts";
+import { hasCatalogTransportIdentityChange } from "./mcp/McpCatalogDefinitionIdentity.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
@@ -2422,7 +2423,12 @@ const makeWsRpcLayer = (
                       override: validationOverride(entry.override),
                     })) ?? [],
                 });
-                const definitionId = McpDefinitionId.make(yield* crypto.randomUUIDv4);
+                const definitionId = hasCatalogTransportIdentityChange(
+                  existing.transport,
+                  input.definition.transport,
+                )
+                  ? McpDefinitionId.make(yield* crypto.randomUUIDv4)
+                  : existing.definitionId;
                 const prepared = yield* projectMcpSecrets.prepareUpdate(
                   existing.logicalServerId,
                   existing.transport,
@@ -2520,8 +2526,7 @@ const makeWsRpcLayer = (
                             readModel.mcpCatalog?.projectOverrides
                               .filter((entry) => entry.projectId === input.scopeId)
                               .map((entry) => entry.override) ?? [],
-                          providerInstanceId:
-                            input.providerInstanceId ?? ProviderInstanceId.make("default"),
+                          providerInstanceId: input.providerInstanceId,
                           providerCapability: "restart-required",
                         }),
                       catch: (error) => toCatalogMutationError(error),
@@ -2727,7 +2732,12 @@ const makeWsRpcLayer = (
                       })) ?? [],
                     projectId,
                   });
-                  const definitionId = McpDefinitionId.make(yield* crypto.randomUUIDv4);
+                  const definitionId = hasCatalogTransportIdentityChange(
+                    existing.transport,
+                    input.definition.transport,
+                  )
+                    ? McpDefinitionId.make(yield* crypto.randomUUIDv4)
+                    : existing.definitionId;
                   const prepared = yield* projectMcpSecrets.prepareUpdate(
                     existing.logicalServerId,
                     existing.transport,
@@ -3231,7 +3241,12 @@ const makeWsRpcLayer = (
                   ),
                   [snapshot.providerInstanceId],
                 );
-                const definitionId = McpDefinitionId.make(yield* crypto.randomUUIDv4);
+                const definitionId = hasCatalogTransportIdentityChange(
+                  existing.transport,
+                  input.definition.transport,
+                )
+                  ? McpDefinitionId.make(yield* crypto.randomUUIDv4)
+                  : existing.definitionId;
                 const prepared = yield* projectMcpSecrets.prepareUpdate(
                   existing.logicalServerId,
                   existing.transport,

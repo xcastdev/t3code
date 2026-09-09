@@ -37,6 +37,8 @@ the file changes. Repeated refreshes or active helper work can extend this wait.
 
 T3 Code does not own an external OpenCode server. Native configuration changes on that server can
 require its own reload or restart before a refresh returns the new list.
+T3 Code does not manage the preview MCP connection on an external OpenCode server, so that
+integration is shown as unsupported. Disabled provider instances are shown as unavailable.
 
 If a refresh fails, T3 Code keeps the last known models, slash commands, and skills. Fix the
 connection, then refresh again. A successful refresh can remove entries that OpenCode no longer

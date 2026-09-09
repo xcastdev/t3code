@@ -558,7 +558,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         adapter.capabilities.projectMcpUnsupportedReason,
         "T3 cannot configure externally managed OpenCode servers.",
       );
-      NodeAssert.equal(adapter.capabilities.managedPreviewMcp, "next-session");
+      NodeAssert.equal(adapter.capabilities.managedPreviewMcp, "unsupported");
     }),
   );
 
@@ -592,6 +592,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const adapter = yield* makeOpenCodeAdapter(localOpenCodeAdapterTestSettings);
       NodeAssert.equal(adapter.capabilities.remoteHttpMcp, "next-session");
       NodeAssert.equal(adapter.capabilities.projectMcpProxy, "next-session");
+      NodeAssert.equal(adapter.capabilities.managedPreviewMcp, "next-session");
       yield* Effect.sync(() =>
         McpProviderSession.setMcpProviderSession({
           environmentId: EnvironmentId.make("environment-test"),

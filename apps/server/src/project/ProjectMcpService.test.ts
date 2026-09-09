@@ -126,7 +126,7 @@ const providerInstanceRegistry = Layer.succeed(ProviderInstanceRegistry, {
       instanceId: openCodeInstance,
       enabled: true,
       adapter: {
-        capabilities: { remoteHttpMcp: "unsupported", managedPreviewMcp: "next-session" },
+        capabilities: { remoteHttpMcp: "unsupported", managedPreviewMcp: "unsupported" },
       },
     },
     {
@@ -1136,7 +1136,7 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
         {
           serverId: McpServerId.make("t3-code"),
           providerInstanceId: openCodeInstance,
-          mode: "next-session",
+          mode: "unsupported",
         },
         {
           serverId: McpServerId.make("t3-code"),
@@ -1182,7 +1182,7 @@ it.layer(testLayer)("ProjectMcpService", (it) => {
         {
           serverId: McpServerId.make("t3-code"),
           providerInstanceId: openCodeInstance,
-          mode: "next-session",
+          mode: "unsupported",
         },
         {
           serverId: McpServerId.make("t3-code"),

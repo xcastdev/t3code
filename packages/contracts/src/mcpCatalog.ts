@@ -279,9 +279,14 @@ export type McpCatalogGlobalListInput = typeof McpCatalogGlobalListInput.Type;
 
 export const McpCatalogProjectListInput = Schema.Struct({
   ...McpCatalogProjectScope.fields,
-  providerInstanceId: Schema.optional(ProviderInstanceId),
+  providerInstanceId: ProviderInstanceId,
 });
 export type McpCatalogProjectListInput = typeof McpCatalogProjectListInput.Type;
+
+export const McpCatalogProjectStateListInput = Schema.Struct({
+  ...McpCatalogProjectScope.fields,
+});
+export type McpCatalogProjectStateListInput = typeof McpCatalogProjectStateListInput.Type;
 
 export const McpCatalogGlobalCreateInput = Schema.Struct({
   ...McpCatalogGlobalScope.fields,

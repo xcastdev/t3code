@@ -4653,7 +4653,7 @@ export function makeOpenCodeAdapter(
                 "T3 cannot configure externally managed OpenCode servers.",
             }
           : {}),
-        managedPreviewMcp: "next-session",
+        managedPreviewMcp: openCodeSettings.serverUrl ? "unsupported" : "next-session",
       },
       startSession,
       sendTurn,

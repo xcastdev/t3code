@@ -13,8 +13,13 @@ session-local definitions are applied to that captured baseline only.
 
 Every entry has a stable logical server id and a definition id. The logical id
 is the target for overrides. The definition id owns one complete transport and
-its credentials. Replacing a transport therefore creates a new definition id;
-metadata-only changes retain the inherited definition id.
+its credentials. Direct global, project, and session updates retain the
+definition id when they change only metadata (`name`, `enabled`, provider
+assignments, or credential display names). Replacing a transport, changing
+ordered transport fields, changing credential references, or supplying a
+credential value creates a new definition id. Identity comparison is
+conservative and order-sensitive, including HTTP header/environment names and
+OAuth registration details; the server never compares secret contents.
 
 Resolution order is global definitions, project overrides, project-local
 definitions, session baseline, session overrides, and session-local definitions.
@@ -76,6 +81,11 @@ including disabled definitions, overrides, and source-removed tombstones, with
 global and project revisions. New clients gate global, project-override, and
 session RPCs independently on the environment capability flags
 `globalMcpCatalog`, `projectMcpOverrides`, and `sessionMcpCatalog`.
+
+The effective `mcpCatalog.project.list` view is provider-specific and requires
+`providerInstanceId`. The separate `mcpCatalog.project.state.list` view is the
+provider-independent raw editor state and accepts only the project scope and
+project id.
 
 The scoped catalog editor is not yet exposed in the web or desktop clients;
 desktop shares the web surface. Mobile can consume configured catalogs and view

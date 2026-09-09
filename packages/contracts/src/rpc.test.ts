@@ -6,6 +6,8 @@ import {
   WS_METHODS,
   WsMcpCatalogGlobalStateListRpc,
   WsMcpCatalogGlobalCreateRpc,
+  WsMcpCatalogProjectListRpc,
+  WsMcpCatalogProjectStateListRpc,
   WsMcpCatalogProjectCreateRpc,
   WsMcpCatalogSessionCreateRpc,
   WsProjectMcpCreateRpc,
@@ -188,6 +190,25 @@ describe("scoped MCP catalog payload identities", () => {
         definition,
       }),
     ).toThrow();
+  });
+
+  it("requires a provider for effective project lists", () => {
+    const decode = Schema.decodeUnknownSync(WsMcpCatalogProjectListRpc.payloadSchema);
+    expect(() => decode({ scope: "project", scopeId: "project-1" })).toThrow();
+    expect(
+      decode({ scope: "project", scopeId: "project-1", providerInstanceId: "codex" }),
+    ).toMatchObject({ providerInstanceId: "codex" });
+  });
+
+  it("keeps raw project state provider-independent", () => {
+    const decode = Schema.decodeUnknownSync(WsMcpCatalogProjectStateListRpc.payloadSchema);
+    expect(decode({ scope: "project", scopeId: "project-1" })).toEqual({
+      scope: "project",
+      scopeId: "project-1",
+    });
+    expect(decode({ scope: "project", scopeId: "project-1", providerInstanceId: "codex" })).toEqual(
+      { scope: "project", scopeId: "project-1" },
+    );
   });
 
   it("requires session scope id to match the session identity", () => {

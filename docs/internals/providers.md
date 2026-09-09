@@ -76,6 +76,8 @@ update snapshot enrichment. Other providers retain their existing refresh policy
 
 T3 Code does not own an external OpenCode process. Native configuration changes there can require
 an external reload or restart before T3 Code's next refresh sees them.
+T3 Code therefore reports managed preview MCP as unsupported for external OpenCode instances;
+disabled provider instances remain unavailable.
 
 The shared server's idle shutdown does not clear the catalog. Failed discovery keeps the last
 known models, slash commands, and skills through the registry's existing merge rules. A successful

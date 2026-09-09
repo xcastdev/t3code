@@ -1587,6 +1587,226 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     );
   });
 
+  it.effect("retains definition identity across metadata-only catalog updates", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("catalog-identity-project");
+      const threadId = ThreadId.make("catalog-identity-thread");
+      const catalogSessionId = McpCatalogSessionId.make("catalog-identity-session");
+      const providerInstanceId = ProviderInstanceId.make("codex-primary");
+      const project = {
+        id: projectId,
+        title: "Catalog identity project",
+        workspaceRoot: "/tmp/catalog-identity-project",
+        defaultModelSelection: defaultModelSelection,
+        scripts: [],
+        createdAt: "2026-09-09T00:00:00.000Z",
+        updatedAt: "2026-09-09T00:00:00.000Z",
+      } as const;
+      const transport = {
+        type: "streamable-http" as const,
+        url: "https://catalog-identity.example.test/mcp",
+        headers: [],
+        authorization: { type: "none" as const },
+      };
+      const definition = (
+        scope: "global" | "project" | "session",
+        scopeId: string,
+        logicalServerId: string,
+        definitionId: string,
+      ): McpCatalogDefinition => ({
+        definitionId: McpDefinitionId.make(definitionId),
+        logicalServerId: McpServerId.make(logicalServerId),
+        scope,
+        scopeId,
+        name: `${scope} original`,
+        transport,
+        enabled: true,
+        providerInstanceIds: [providerInstanceId],
+        revision: 1,
+      });
+      const global = definition(
+        "global",
+        String(testEnvironmentDescriptor.environmentId),
+        "catalog-global-server",
+        "catalog-global-definition",
+      );
+      const projectDefinition = definition(
+        "project",
+        String(projectId),
+        "catalog-project-server",
+        "catalog-project-definition",
+      );
+      const session = definition(
+        "session",
+        String(catalogSessionId),
+        "catalog-session-server",
+        "catalog-session-definition",
+      );
+      const baseReadModel = makeDefaultOrchestrationReadModel();
+      const readModel = {
+        ...baseReadModel,
+        projects: [{ ...project, deletedAt: null }],
+        threads: [
+          {
+            ...baseReadModel.threads[0]!,
+            id: threadId,
+            projectId,
+            session: {
+              threadId,
+              status: "ready" as const,
+              providerName: "codex",
+              providerInstanceId,
+              runtimeMode: "full-access" as const,
+              activeTurnId: null,
+              mcpCatalogSessionId: catalogSessionId,
+              lastError: null,
+              updatedAt: "2026-09-09T00:00:00.000Z",
+            },
+          },
+        ],
+        mcpCatalog: {
+          environmentId: testEnvironmentDescriptor.environmentId,
+          globalRevision: 1,
+          globalDefinitions: [global],
+          projectRevisions: [{ projectId, revision: 1 }],
+          projectDefinitions: [{ projectId, definition: projectDefinition }],
+          projectOverrides: [],
+          sessions: [
+            {
+              catalogSessionId,
+              threadId,
+              providerInstanceId,
+              baseline: [session],
+              desired: [session],
+              applied: [session],
+              desiredRevision: 1,
+              appliedRevision: 1,
+            },
+          ],
+        },
+      } satisfies OrchestrationReadModel;
+      const dispatched: Array<OrchestrationCommand> = [];
+
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command);
+                return { sequence: dispatched.length };
+              }),
+          },
+          projectionSnapshotQuery: {
+            getCommandReadModel: () => Effect.succeed(readModel),
+            getProjectShellById: (requestedProjectId) =>
+              Effect.succeed(
+                requestedProjectId === projectId ? Option.some(project) : Option.none(),
+              ),
+          },
+          projectMcpService: {
+            withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const effectiveProjectCatalog = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.mcpCatalogProjectList]({
+            scope: "project",
+            scopeId: projectId,
+            providerInstanceId,
+          }),
+        ),
+      );
+      assert.deepEqual(
+        effectiveProjectCatalog.map((entry) => entry.logicalServerId),
+        [global.logicalServerId, projectDefinition.logicalServerId],
+      );
+      const rawProjectState = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.mcpCatalogProjectStateList]({
+            scope: "project",
+            scopeId: projectId,
+          }),
+        ),
+      );
+      assert.deepEqual(
+        rawProjectState.projectDefinitions.map((entry) => entry.logicalServerId),
+        [projectDefinition.logicalServerId],
+      );
+      const results = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.all([
+            client[WS_METHODS.mcpCatalogGlobalUpdate]({
+              scope: "global",
+              scopeId: testEnvironmentDescriptor.environmentId,
+              expectedRevision: 1,
+              logicalServerId: global.logicalServerId,
+              definition: {
+                name: "Global renamed",
+                transport,
+                enabled: false,
+                providerInstanceIds: [providerInstanceId],
+              },
+            }),
+            client[WS_METHODS.mcpCatalogProjectUpdate]({
+              scope: "project",
+              scopeId: projectId,
+              expectedRevision: 1,
+              logicalServerId: projectDefinition.logicalServerId,
+              definition: {
+                name: "Project renamed",
+                transport,
+                enabled: false,
+                providerInstanceIds: [providerInstanceId],
+              },
+            }),
+            client[WS_METHODS.mcpCatalogSessionUpdate]({
+              scope: "session",
+              scopeId: catalogSessionId,
+              threadId,
+              mcpCatalogSessionId: catalogSessionId,
+              expectedRevision: 1,
+              logicalServerId: session.logicalServerId,
+              definition: {
+                name: "Session renamed",
+                transport,
+                enabled: false,
+                providerInstanceIds: [providerInstanceId],
+              },
+            }),
+          ]),
+        ),
+      );
+
+      assert.deepEqual(
+        [
+          results[0].definitionId,
+          results[1].definitionId,
+          results[2].desired.find((entry) => entry.logicalServerId === session.logicalServerId)
+            ?.definitionId,
+        ],
+        [global.definitionId, projectDefinition.definitionId, session.definitionId],
+      );
+      assert.deepEqual(
+        dispatched
+          .map((command) =>
+            command.type === "environment.mcp-definition.update" ||
+            command.type === "project.mcp-definition.update"
+              ? command.definition.definitionId
+              : command.type === "thread.mcp-catalog.update"
+                ? command.desiredCatalog.find(
+                    (entry) => entry.logicalServerId === session.logicalServerId,
+                  )?.definitionId
+                : undefined,
+          )
+          .sort(),
+        [global.definitionId, projectDefinition.definitionId, session.definitionId].sort(),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("parks HTTP ingress until command readiness", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;

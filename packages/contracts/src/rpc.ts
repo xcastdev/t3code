@@ -241,6 +241,7 @@ import {
   McpCatalogOAuthDisconnectInput,
   McpCatalogProjectState,
   McpCatalogProjectListInput,
+  McpCatalogProjectStateListInput,
   McpCatalogProjectCreateInput,
   McpCatalogProjectUpdateInput,
   McpCatalogProjectRemoveInput,
@@ -851,7 +852,7 @@ export const WsMcpCatalogProjectListRpc = Rpc.make(WS_METHODS.mcpCatalogProjectL
 });
 
 export const WsMcpCatalogProjectStateListRpc = Rpc.make(WS_METHODS.mcpCatalogProjectStateList, {
-  payload: McpCatalogProjectListInput,
+  payload: McpCatalogProjectStateListInput,
   success: McpCatalogProjectState,
   error: mcpCatalogMutationError,
 });
