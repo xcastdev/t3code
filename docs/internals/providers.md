@@ -77,6 +77,42 @@ update snapshot enrichment. Other providers retain their existing refresh policy
 T3 Code does not own an external OpenCode process. Native configuration changes there can require
 an external reload or restart before T3 Code's next refresh sees them.
 
+### External OpenCode lifecycle
+
+The OpenCode adapter treats an external server as a separately owned process. Adapter shutdown,
+`stopAll`, and reconnect cleanup close T3 Code's event subscription without calling `session.abort`.
+OpenCode can therefore continue an active turn while T3 Code is offline. A managed context that
+recovers the same upstream session is updated in place, preserving its process, event pump, and
+pending requests. An external context targeting the same upstream session is detached in the same
+way, so changing runtime mode or reconnecting does not abort the turn or settle its pending
+requests. External recovery waits until the candidate connects before reasserting permissions. If
+that update fails, the candidate is cleaned up and the incumbent remains attached. T3 Code does not
+roll back an ambiguous external permission update because another external owner may have changed
+the rules concurrently. A replacement that targets a different upstream session still terminates
+the old context.
+
+An unpublished replacement that fails before handoff still closes its own resources, but it does not
+emit runtime or session lifecycle events for the incumbent thread. Initial startup and failures from
+published contexts retain their terminal events.
+
+An explicit `stopSession` with an active turn calls `session.abort` and confirms the result before it
+closes the adapter context. A matching `session.error` with `MessageAbortedError`, or a
+`session.status` response that is idle or has no entry for the session, confirms the abort. HTTP
+success alone does not confirm that the turn stopped.
+
+The adapter retries an unconfirmed abort within a ten-second confirmation window. If confirmation
+still fails, it keeps the active turn, event pump, and session context available for another
+attempt. The orchestration reactor records the failure without changing the projected session to
+`stopped`.
+
+`ProviderService` places a per-thread stop barrier before it waits for MCP replacement work. Recovery,
+explicit starts, and turn operations that began before that barrier cannot commit credentials, publish
+an active binding, admit a turn, or write `running`. The stop holds the existing short MCP transaction
+lock while it routes without recovery, shuts down the adapter session, clears credentials, and writes
+the `stopped` binding. If any stop step fails before that binding is written, the service clears the
+pending barrier so the still-live session remains usable. A later send may recover a stopped binding as
+before; only work fenced by the failed stop is rejected.
+
 The shared server's idle shutdown does not clear the catalog. Failed discovery keeps the last
 known models, slash commands, and skills through the registry's existing merge rules. A successful
 empty inventory is authoritative. Existing threads keep their explicit model identifier and
