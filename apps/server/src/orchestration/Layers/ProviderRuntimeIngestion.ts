@@ -2030,8 +2030,14 @@ const make = Effect.gen(function* () {
           if (hasCheckpointForTurn(checkpointContext.checkpoints, turnId)) {
             // Already tracked; no-op.
           } else {
-            const assistantMessageId = MessageId.make(
-              `assistant:${event.itemId ?? event.turnId ?? event.eventId}`,
+            // A diff update is turn-scoped and carries no item, so the only
+            // assistant message it may name is the one the turn already opened.
+            // Synthesising an id from the turn id instead produced an id no
+            // message ever has, which the projection then stamped over the
+            // turn's real one, leaving the turn pointing at nothing.
+            const activeAssistantMessageId = yield* getActiveAssistantMessageIdForTurn(
+              thread.id,
+              turnId,
             );
             yield* orchestrationEngine.dispatch({
               type: "thread.turn.diff.complete",
@@ -2042,7 +2048,9 @@ const make = Effect.gen(function* () {
               checkpointRef: CheckpointRef.make(`provider-diff:${event.eventId}`),
               status: "missing",
               files: [],
-              assistantMessageId,
+              ...(Option.isSome(activeAssistantMessageId)
+                ? { assistantMessageId: activeAssistantMessageId.value }
+                : {}),
               checkpointTurnCount: maxCheckpointTurnCount(checkpointContext.checkpoints) + 1,
               createdAt: now,
             });

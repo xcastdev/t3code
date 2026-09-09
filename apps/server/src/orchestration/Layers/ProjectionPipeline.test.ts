@@ -3742,6 +3742,84 @@ it.layer(makeProjectionPipelinePrefixedTestLayer("t3-turn-provenance-test-"))(
       }),
     );
 
+    it.effect("keeps the turn's assistant message when a diff names none", () =>
+      Effect.gen(function* () {
+        // A placeholder capture is turn-scoped and carries no item, so it names
+        // no message. Overwriting with that absence used to strand the turn on
+        // a message id nothing would ever have.
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const threadId = ThreadId.make("thread-prov-keep-asst");
+        const turnId = TurnId.make("turn-prov-keep-asst");
+        const messageId = MessageId.make("assistant:prt_real_message");
+
+        yield* appendThreadCreated(threadId, "prov-keep-asst");
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-keep-asst-start",
+          status: "running",
+          activeTurnId: turnId,
+          at: "2026-03-01T00:00:01.000Z",
+        });
+
+        const eventStore = yield* OrchestrationEventStore;
+        yield* eventStore.append({
+          type: "thread.message-sent",
+          eventId: EventId.make("evt-prov-keep-asst-msg"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-03-01T00:00:05.000Z",
+          commandId: CommandId.make("cmd-prov-keep-asst-msg"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-prov-keep-asst-msg"),
+          metadata: {},
+          payload: {
+            threadId,
+            messageId,
+            role: "assistant",
+            text: "Done.",
+            attachments: [],
+            turnId,
+            streaming: false,
+            createdAt: "2026-03-01T00:00:05.000Z",
+            updatedAt: "2026-03-01T00:00:05.000Z",
+          },
+        });
+
+        yield* eventStore.append({
+          type: "thread.turn-diff-completed",
+          eventId: EventId.make("evt-prov-keep-asst-diff"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-03-01T00:00:06.000Z",
+          commandId: CommandId.make("cmd-prov-keep-asst-diff"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-prov-keep-asst-diff"),
+          metadata: {},
+          payload: {
+            threadId,
+            turnId,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("provider-diff:evt-prov-keep-asst-diff"),
+            status: "missing",
+            files: [],
+            assistantMessageId: null,
+            completedAt: "2026-03-01T00:00:06.000Z",
+          },
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const sql = yield* SqlClient.SqlClient;
+        const rows = yield* sql<{ readonly assistantMessageId: string | null }>`
+          SELECT assistant_message_id AS "assistantMessageId"
+          FROM projection_turns
+          WHERE thread_id = ${threadId} AND turn_id = ${turnId}
+        `;
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0]?.assistantMessageId, messageId);
+      }),
+    );
+
     it.effect("stamps work counts on a turn settled by its diff", () =>
       Effect.gen(function* () {
         // On a rebuild every projector replays the whole log on its own, so the

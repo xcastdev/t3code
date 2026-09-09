@@ -3069,7 +3069,9 @@ describe("ProviderRuntimeIngestion", () => {
       (entry: ProviderRuntimeTestCheckpoint) => entry.turnId === "turn-p1",
     );
     expect(checkpoint?.status).toBe("missing");
-    expect(checkpoint?.assistantMessageId).toBe("assistant:item-p1-assistant");
+    // A diff update names no assistant message: it is turn-scoped, and the id
+    // it used to synthesise matched no message that would ever exist.
+    expect(checkpoint?.assistantMessageId).toBeNull();
     expect(checkpoint?.checkpointRef).toBe("provider-diff:evt-turn-diff-updated");
   });
 

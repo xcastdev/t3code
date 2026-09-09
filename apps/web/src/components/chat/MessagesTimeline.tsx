@@ -1320,8 +1320,12 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
           onOpenTurnDiff={ctx.onOpenTurnDiff}
         />
         {row.showAssistantMeta ? (
-          <div className="@container/turn-footer mt-1.5 flex items-center gap-2 text-xs tabular-nums opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover/assistant:opacity-100">
-            <AssistantCopyButton row={row} />
+          <div className="@container/turn-footer mt-1.5 flex items-center gap-2 text-xs tabular-nums">
+            {/* The provenance and timestamp are always readable; the copy
+                action stays hover-revealed so the row keeps its quiet look. */}
+            <span className="flex items-center opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover/assistant:opacity-100">
+              <AssistantCopyButton row={row} />
+            </span>
             <TurnFooterProvenance row={row} />
             {!row.message.streaming && (
               <Tooltip>

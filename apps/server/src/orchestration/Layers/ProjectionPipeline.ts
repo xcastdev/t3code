@@ -1704,7 +1704,11 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
                 });
             yield* projectionTurnRepository.upsertByTurnId({
               ...existingTurn.value,
-              assistantMessageId: event.payload.assistantMessageId,
+              // A diff that names no message must not erase the one the turn
+              // already found: a placeholder capture carries no item, and
+              // blanking here left the turn pointing at nothing.
+              assistantMessageId:
+                event.payload.assistantMessageId ?? existingTurn.value.assistantMessageId,
               state: turnStillRunning ? existingTurn.value.state : nextState,
               ...settledCounts,
               checkpointTurnCount: event.payload.checkpointTurnCount,
