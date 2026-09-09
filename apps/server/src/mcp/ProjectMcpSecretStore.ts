@@ -122,6 +122,7 @@ const JournalOperation = Schema.Struct({
   preparedCredentialIds: Schema.Array(ProjectMcpCredentialId),
   nextCredentialIds: Schema.Array(ProjectMcpCredentialId),
   replacedCredentialIds: Schema.Array(ProjectMcpCredentialId),
+  oauthStateOwnerIds: Schema.optional(Schema.Array(McpServerId)),
 });
 type JournalOperation = typeof JournalOperation.Type;
 
@@ -220,11 +221,13 @@ export interface ProjectMcpSecretStoreShape {
   readonly prepareCreate: (
     serverId: McpServerId,
     transport: ProjectMcpTransportDraft,
+    oauthStateOwnerIds?: ReadonlyArray<McpServerId>,
   ) => Effect.Effect<PreparedProjectMcpSecrets, ProjectMcpSecretError>;
   readonly prepareUpdate: (
     serverId: McpServerId,
     previous: ProjectMcpTransport,
     transport: ProjectMcpTransportDraft,
+    oauthStateOwnerIds?: ReadonlyArray<McpServerId>,
   ) => Effect.Effect<PreparedProjectMcpSecrets, ProjectMcpSecretError>;
   readonly retireTransport: (
     serverId: McpServerId,
@@ -234,6 +237,10 @@ export interface ProjectMcpSecretStoreShape {
     serverId: McpServerId,
     value: string,
   ) => Effect.Effect<ProjectMcpCredentialIdType, ProjectMcpSecretError>;
+  /** Ensure a definition-scoped OAuth owner exists before state is written or leased. */
+  readonly ensureOAuthStateOwner: (
+    serverId: McpServerId,
+  ) => Effect.Effect<void, ProjectMcpSecretError>;
   readonly listAuxiliarySecrets: (
     serverId: McpServerId,
   ) => Effect.Effect<ReadonlyArray<ProjectMcpCredentialIdType>, ProjectMcpSecretError>;
@@ -260,6 +267,7 @@ export interface ProjectMcpSecretStoreShape {
     catalog: ReadonlyArray<{
       readonly id: McpServerId;
       readonly transport?: ProjectMcpTransport | undefined;
+      readonly oauthStateOwnerId?: McpServerId | undefined;
     }>,
   ) => Effect.Effect<void, ProjectMcpSecretError>;
 }
@@ -452,7 +460,16 @@ const make = Effect.gen(function* () {
           ? unique([...server.auxiliary, ...operation.preparedCredentialIds])
           : server.auxiliary,
     } satisfies ServerSecrets;
-    yield* persistManifest(serverSecretsWith(manifest, operation.serverId, next));
+    let nextManifest = serverSecretsWith(manifest, operation.serverId, next);
+    for (const ownerId of operation.oauthStateOwnerIds ?? []) {
+      if (ownerId === operation.serverId) continue;
+      const owner = nextManifest.servers[ownerId] ?? noServerSecrets();
+      nextManifest = serverSecretsWith(nextManifest, ownerId, {
+        ...owner,
+        removed: false,
+      });
+    }
+    yield* persistManifest(nextManifest);
     // Catalog replacements may still be referenced by a durable session
     // baseline/desired snapshot. The catalog reconciliation pass owns
     // retirement once it has seen every reference; auxiliary operations have
@@ -607,6 +624,7 @@ const make = Effect.gen(function* () {
     serverId: McpServerId,
     previous: ProjectMcpTransport | undefined,
     draft: ProjectMcpTransportDraft,
+    oauthStateOwnerIds: ReadonlyArray<McpServerId> = [],
   ): Effect.Effect<PreparedProjectMcpSecrets, ProjectMcpSecretError> =>
     mutex.withPermits(1)(
       Effect.gen(function* () {
@@ -631,6 +649,9 @@ const make = Effect.gen(function* () {
           replacedCredentialIds: previousCredentialIds.filter(
             (id) => !nextCredentialIds.includes(id),
           ),
+          ...(oauthStateOwnerIds.length === 0
+            ? {}
+            : { oauthStateOwnerIds: unique(oauthStateOwnerIds) }),
         } satisfies JournalOperation;
         const journal = yield* Ref.get(journals);
         yield* persistJournal({
@@ -658,13 +679,17 @@ const make = Effect.gen(function* () {
       }),
     );
 
-  const prepareCreate: ProjectMcpSecretStoreShape["prepareCreate"] = (serverId, transport) =>
-    prepare(serverId, undefined, transport);
+  const prepareCreate: ProjectMcpSecretStoreShape["prepareCreate"] = (
+    serverId,
+    transport,
+    oauthStateOwnerIds,
+  ) => prepare(serverId, undefined, transport, oauthStateOwnerIds);
   const prepareUpdate: ProjectMcpSecretStoreShape["prepareUpdate"] = (
     serverId,
     previous,
     transport,
-  ) => prepare(serverId, previous, transport);
+    oauthStateOwnerIds,
+  ) => prepare(serverId, previous, transport, oauthStateOwnerIds);
 
   const retireTransport: ProjectMcpSecretStoreShape["retireTransport"] = (serverId, transport) =>
     mutex.withPermits(1)(
@@ -748,6 +773,21 @@ const make = Effect.gen(function* () {
     serverId,
     value,
   ) => createAuxiliarySecretFor(serverId, value);
+
+  const ensureOAuthStateOwner: ProjectMcpSecretStoreShape["ensureOAuthStateOwner"] = (serverId) =>
+    mutex.withPermits(1)(
+      Effect.gen(function* () {
+        const manifest = yield* Ref.get(manifests);
+        const current = manifest.servers[serverId];
+        if (current !== undefined && current.removed !== true) return;
+        yield* persistManifest(
+          serverSecretsWith(manifest, serverId, {
+            ...(current ?? noServerSecrets()),
+            removed: false,
+          }),
+        );
+      }),
+    );
 
   const removeServer: ProjectMcpSecretStoreShape["removeServer"] = (serverId) =>
     mutex.withPermits(1)(
@@ -1020,6 +1060,11 @@ const make = Effect.gen(function* () {
             currentByServer.set(server.id, []);
           }
         }
+        for (const server of catalog) {
+          if (server.oauthStateOwnerId !== undefined) {
+            currentByServer.set(server.oauthStateOwnerId, []);
+          }
+        }
         const currentCredentialIds = (
           serverId: McpServerId,
         ): ReadonlyArray<ProjectMcpCredentialIdType> =>
@@ -1039,10 +1084,14 @@ const make = Effect.gen(function* () {
         )) {
           const current = currentByServer.get(operation.serverId);
           const currentIds = currentCredentialIds(operation.serverId);
+          const oauthOwnersPresent = (operation.oauthStateOwnerIds ?? []).every((id) =>
+            currentByServer.has(id),
+          );
           if (
             operation.kind === "auxiliary"
               ? current !== undefined
               : current !== undefined &&
+                oauthOwnersPresent &&
                 operation.nextCredentialIds.every((id) => currentIds.includes(id))
           ) {
             yield* commitOperation(operationId);
@@ -1083,6 +1132,7 @@ const make = Effect.gen(function* () {
     prepareUpdate,
     retireTransport,
     createAuxiliarySecret,
+    ensureOAuthStateOwner,
     listAuxiliarySecrets,
     listServerIds,
     removeAuxiliarySecret,

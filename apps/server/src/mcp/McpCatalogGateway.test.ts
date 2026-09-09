@@ -49,6 +49,7 @@ const proxy = () => {
     revokeProviderSession: vi.fn(() => Effect.void),
     revokeThread: () => Effect.void,
     revokeServer: () => Effect.void,
+    revokeOAuthStorage: () => Effect.void,
     revokeAll: Effect.void,
   } satisfies ProjectMcpProxyRegistry.ProjectMcpProxyRegistryShape;
 };

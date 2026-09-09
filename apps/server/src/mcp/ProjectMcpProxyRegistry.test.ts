@@ -1,4 +1,4 @@
-import { McpServerId, ThreadId } from "@t3tools/contracts";
+import { McpDefinitionId, McpServerId, ThreadId } from "@t3tools/contracts";
 import { expect, it, vi } from "@effect/vitest";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { InMemoryTransport, Server, type Notification } from "@modelcontextprotocol/server";
@@ -12,6 +12,7 @@ import type { ProjectMcpClient, ProjectMcpConnection } from "./ProjectMcpConnect
 import * as ProjectMcpProxyHttpServer from "./ProjectMcpProxyHttpServer.ts";
 import * as ProjectMcpProxyRegistry from "./ProjectMcpProxyRegistry.ts";
 import { makeScopedFetch } from "./ProjectMcpProxyRegistry.fetch.fixture.ts";
+import * as ProjectMcpOAuth from "./ProjectMcpOAuth.ts";
 
 const serverId = McpServerId.make("server/with-untrusted-path");
 const transport = {
@@ -232,6 +233,33 @@ it.effect("revokes sessions registered after the registry was created", () =>
 
     expect(yield* registry.resolve("provider-a", issued!.endpointHandle)).toBeUndefined();
   }),
+);
+
+it.effect(
+  "revokes only the exact scoped OAuth definition while legacy revocation stays broad",
+  () =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry(async () => connection(async () => undefined));
+      const definitionA = McpDefinitionId.make("definition-a");
+      const definitionB = McpDefinitionId.make("definition-b");
+      const [issuedA] = yield* registry.registerSession({
+        providerSessionId: "provider-a",
+        threadId: ThreadId.make("thread-a"),
+        servers: [{ ...server, transportDefinitionId: definitionA }],
+      });
+      const [issuedB] = yield* registry.registerSession({
+        providerSessionId: "provider-b",
+        threadId: ThreadId.make("thread-b"),
+        servers: [{ ...server, transportDefinitionId: definitionB }],
+      });
+
+      yield* registry.revokeOAuthStorage(ProjectMcpOAuth.storageIdForServer(serverId, definitionA));
+      expect(yield* registry.resolve("provider-a", issuedA!.endpointHandle)).toBeUndefined();
+      expect(yield* registry.resolve("provider-b", issuedB!.endpointHandle)).toBeDefined();
+
+      yield* registry.revokeServer(serverId);
+      expect(yield* registry.resolve("provider-b", issuedB!.endpointHandle)).toBeUndefined();
+    }),
 );
 
 it.effect("serializes concurrent first acquisition and closes exactly once", () =>

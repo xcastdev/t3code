@@ -129,6 +129,7 @@ interface SessionRecord {
   readonly resolveSecret?: ProjectMcpProxySessionInput["resolveSecret"];
   readonly oauthStateLeases?: ProjectMcpProxySessionInput["oauthStateLeases"];
   readonly revokedServerIds: Set<McpServerId>;
+  readonly revokedOAuthStorageIds: Set<McpServerId>;
   revoked: boolean;
 }
 
@@ -150,6 +151,7 @@ export interface ProjectMcpProxyRegistryShape {
   readonly revokeProviderSession: (providerSessionId: string) => Effect.Effect<void>;
   readonly revokeThread: (threadId: ThreadId) => Effect.Effect<void>;
   readonly revokeServer: (serverId: McpServerId) => Effect.Effect<void>;
+  readonly revokeOAuthStorage: (storageId: McpServerId) => Effect.Effect<void>;
   readonly revokeAll: Effect.Effect<void>;
 }
 
@@ -508,6 +510,7 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
       resolveSecret: input.resolveSecret,
       oauthStateLeases: input.oauthStateLeases,
       revokedServerIds: new Set(),
+      revokedOAuthStorageIds: new Set(),
       revoked: false,
     });
     return [...endpointMap.values()];
@@ -517,7 +520,13 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
     Effect.sync(() => {
       const session = sessions.get(providerSessionId);
       const server = session?.servers.get(endpointHandle);
-      return server && session && !session.revoked && !session.revokedServerIds.has(server.id)
+      return server &&
+        session &&
+        !session.revoked &&
+        !session.revokedServerIds.has(server.id) &&
+        !session.revokedOAuthStorageIds.has(
+          ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId),
+        )
         ? { server, threadId: session.threadId }
         : undefined;
     });
@@ -732,7 +741,13 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
     if (!session || session.revoked) {
       return yield* Effect.fail<ProjectMcpProxyError>(new ProjectMcpProxyUnauthorizedError());
     }
-    if (!server || session.revokedServerIds.has(server.id)) {
+    if (
+      !server ||
+      session.revokedServerIds.has(server.id) ||
+      session.revokedOAuthStorageIds.has(
+        ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId),
+      )
+    ) {
       return yield* Effect.fail<ProjectMcpProxyError>(new ProjectMcpProxyUnknownEndpointError());
     }
     yield* Effect.tryPromise({
@@ -843,6 +858,32 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
     );
   });
 
+  const revokeOAuthStorage: ProjectMcpProxyRegistryShape["revokeOAuthStorage"] = Effect.fn(
+    "ProjectMcpProxyRegistry.revokeOAuthStorage",
+  )(function* (storageId) {
+    const targets: Array<{ readonly session: SessionRecord; readonly handle: string }> = [];
+    for (const session of sessions.values()) {
+      for (const [handle, server] of session.servers) {
+        if (
+          ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId) === storageId
+        ) {
+          targets.push({ session, handle });
+        }
+      }
+    }
+    yield* Effect.forEach(
+      targets,
+      ({ session, handle }) =>
+        Effect.promise(async () => {
+          session.revokedOAuthStorageIds.add(storageId);
+          const entry = session.connections.get(handle);
+          session.connections.delete(handle);
+          if (entry) await closeConnection(entry);
+        }).pipe(Effect.ignore),
+      { discard: true },
+    );
+  });
+
   if (oauth._tag === "Some") {
     oauth.value.setAuthorizedHandler?.(async (serverId) => {
       await Effect.runPromise(closeServerConnections(serverId));
@@ -859,6 +900,7 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
     revokeProviderSession,
     revokeThread,
     revokeServer,
+    revokeOAuthStorage,
     revokeAll,
   });
 });

@@ -65,6 +65,7 @@ const makeProxyRegistry = (
   revokeProviderSession: vi.fn(),
   revokeThread: vi.fn(),
   revokeServer: vi.fn(),
+  revokeOAuthStorage: vi.fn(),
   revokeAll: Effect.void,
 });
 

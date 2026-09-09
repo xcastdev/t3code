@@ -51,6 +51,7 @@ const makeOverride = (overrides: Partial<McpCatalogOverride> = {}): McpCatalogOv
 
 const makeReadModel = (
   overrides: {
+    readonly globalDefinitions?: ReadonlyArray<McpCatalogDefinition>;
     readonly projectOverrides?: ReadonlyArray<{
       projectId: ProjectId;
       override: McpCatalogOverride;
@@ -69,7 +70,7 @@ const makeReadModel = (
   mcpCatalog: {
     environmentId: EnvironmentId.make("environment-1"),
     globalRevision: 1,
-    globalDefinitions: [globalDefinition],
+    globalDefinitions: overrides.globalDefinitions ?? [globalDefinition],
     projectRevisions: [],
     projectDefinitions: overrides.projectDefinitions ?? [],
     projectOverrides: overrides.projectOverrides ?? [],
@@ -90,6 +91,97 @@ const expectCatalogError = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   });
 
 it.layer(NodeServices.layer)("MCP catalog decider invariants", (it) => {
+  it.effect("rejects a global conflict hidden by every current project's override", () =>
+    Effect.gen(function* () {
+      const secondGlobal: McpCatalogDefinition = {
+        ...globalDefinition,
+        definitionId: McpDefinitionId.make("global-definition-2"),
+        logicalServerId: McpServerId.make("global-server-2"),
+        name: "Second global server",
+      };
+      const readModel = makeReadModel({
+        globalDefinitions: [globalDefinition, secondGlobal],
+        projectOverrides: [
+          {
+            projectId,
+            override: makeOverride({
+              id: McpCatalogOverrideId.make("mask-project-1"),
+              scopeId: projectId,
+              targetId: secondGlobal.logicalServerId,
+              enabled: false,
+            }),
+          },
+          {
+            projectId: otherProjectId,
+            override: makeOverride({
+              id: McpCatalogOverrideId.make("mask-project-2"),
+              scopeId: otherProjectId,
+              targetId: secondGlobal.logicalServerId,
+              enabled: false,
+            }),
+          },
+        ],
+      });
+
+      const error = yield* Effect.flip(
+        decide(
+          {
+            type: "environment.mcp-definition.update",
+            commandId: CommandId.make("masked-global-conflict"),
+            environmentId: EnvironmentId.make("environment-1"),
+            definition: { ...secondGlobal, name: globalDefinition.name },
+            expectedRevision: 1,
+            updatedAt: "2026-01-01T00:00:00.000Z",
+          },
+          readModel,
+        ),
+      );
+      expect(error.cause).toBeInstanceOf(McpCatalogNameConflictError);
+    }),
+  );
+
+  it.effect("rejects a masked global catalog that already exceeds the provider limit", () =>
+    Effect.gen(function* () {
+      const globals = Array.from({ length: 51 }, (_, index) => ({
+        ...globalDefinition,
+        definitionId: McpDefinitionId.make(`over-limit-global-definition-${index}`),
+        logicalServerId: McpServerId.make(`over-limit-global-server-${index}`),
+        name: `Global ${index}`,
+      }));
+      const masked = globals.slice(-2);
+      const projectOverrides = [projectId, otherProjectId].flatMap((scopeId, projectIndex) =>
+        masked.map((definition, index) => ({
+          projectId: scopeId,
+          override: makeOverride({
+            id: McpCatalogOverrideId.make(`over-limit-mask-${projectIndex}-${index}`),
+            scopeId,
+            targetId: definition.logicalServerId,
+            enabled: false,
+          }),
+        })),
+      );
+      const error = yield* Effect.flip(
+        decide(
+          {
+            type: "environment.mcp-definition.create",
+            commandId: CommandId.make("masked-global-limit"),
+            environmentId: EnvironmentId.make("environment-1"),
+            definition: {
+              ...globals[0]!,
+              definitionId: McpDefinitionId.make("over-limit-new-definition"),
+              logicalServerId: McpServerId.make("over-limit-new-server"),
+              name: "New global",
+            },
+            expectedRevision: 1,
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+          makeReadModel({ globalDefinitions: globals, projectOverrides }),
+        ),
+      );
+      expect(error.cause).toBeInstanceOf(McpCatalogProviderLimitExceededError);
+    }),
+  );
+
   it.effect("rejects persistent mutations that create invalid effective catalogs", () =>
     Effect.gen(function* () {
       const duplicateDefinition: McpCatalogDefinition = {

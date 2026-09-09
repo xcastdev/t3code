@@ -139,6 +139,13 @@ export const McpCatalogProjectState = Schema.Struct({
 });
 export type McpCatalogProjectState = typeof McpCatalogProjectState.Type;
 
+/** Raw environment-wide catalog state used by global editors. */
+export const McpCatalogGlobalState = Schema.Struct({
+  definitions: Schema.Array(McpCatalogDefinition),
+  globalRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+});
+export type McpCatalogGlobalState = typeof McpCatalogGlobalState.Type;
+
 export const McpCatalogApplication = Schema.Union([
   Schema.Struct({
     status: Schema.Literal("applied"),

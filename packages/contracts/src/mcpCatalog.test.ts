@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   McpCatalogDefinition,
+  McpCatalogGlobalState,
   McpCatalogOAuthBeginInput,
   McpCatalogProjectState,
   McpCatalogOverride,
@@ -36,6 +37,15 @@ const base = {
 };
 
 describe("MCP catalog contracts", () => {
+  it("decodes global state with an empty but nonzero revision", () => {
+    expect(
+      Schema.decodeUnknownSync(McpCatalogGlobalState)({
+        definitions: [],
+        globalRevision: 7,
+      }),
+    ).toEqual({ definitions: [], globalRevision: 7 });
+  });
+
   it("accepts editable raw project state with both scope revisions", () => {
     const state = {
       globalDefinitions: [],

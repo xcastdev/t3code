@@ -187,23 +187,23 @@ const validatePersistentCatalogInvariant = (
     for (const entry of input.projectOverrides) projectIds.add(String(entry.projectId));
   }
 
-  if (projectIds.size === 0) {
-    return validateEffectiveCatalogInvariant(commandType, input.globalDefinitions);
-  }
-  return Effect.forEach(
-    projectIds,
-    (projectId) =>
-      validateEffectiveCatalogInvariant(
-        commandType,
-        catalogBaselineForProject({
-          globalDefinitions: input.globalDefinitions,
-          projectDefinitions: input.projectDefinitions.map((entry) => entry.definition),
-          projectOverrides: input.projectOverrides.map((entry) => entry.override),
-          projectId,
-        }),
-      ),
-    { discard: true },
-  );
+  return Effect.gen(function* () {
+    yield* validateEffectiveCatalogInvariant(commandType, input.globalDefinitions);
+    yield* Effect.forEach(
+      projectIds,
+      (projectId) =>
+        validateEffectiveCatalogInvariant(
+          commandType,
+          catalogBaselineForProject({
+            globalDefinitions: input.globalDefinitions,
+            projectDefinitions: input.projectDefinitions.map((entry) => entry.definition),
+            projectOverrides: input.projectOverrides.map((entry) => entry.override),
+            projectId,
+          }),
+        ),
+      { discard: true },
+    );
+  });
 };
 
 const catalogRevisionInvariantError = (

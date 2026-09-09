@@ -231,6 +231,7 @@ import {
   McpCatalogChanged,
   McpCatalogCreateInput,
   McpCatalogDefinition,
+  McpCatalogGlobalState,
   McpCatalogDeleteOverrideInput,
   McpCatalogListInput,
   McpCatalogMutationError,
@@ -268,6 +269,7 @@ export const WS_METHODS = {
   // Scoped MCP catalog methods. Legacy projectMcp.* methods above remain
   // available during the compatibility window.
   mcpCatalogGlobalList: "mcpCatalog.global.list",
+  mcpCatalogGlobalStateList: "mcpCatalog.global.state.list",
   mcpCatalogGlobalCreate: "mcpCatalog.global.create",
   mcpCatalogGlobalUpdate: "mcpCatalog.global.update",
   mcpCatalogGlobalRemove: "mcpCatalog.global.remove",
@@ -809,6 +811,12 @@ const mcpCatalogMutationError = Schema.Union([
 export const WsMcpCatalogGlobalListRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalList, {
   payload: McpCatalogListInput,
   success: Schema.Array(McpCatalogDefinition),
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsMcpCatalogGlobalStateListRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalStateList, {
+  payload: McpCatalogListInput,
+  success: McpCatalogGlobalState,
   error: EnvironmentAuthorizationError,
 });
 
@@ -1357,6 +1365,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectMcpOAuthContinueRpc,
   WsProjectMcpOAuthDisconnectRpc,
   WsMcpCatalogGlobalListRpc,
+  WsMcpCatalogGlobalStateListRpc,
   WsMcpCatalogGlobalCreateRpc,
   WsMcpCatalogGlobalUpdateRpc,
   WsMcpCatalogGlobalRemoveRpc,

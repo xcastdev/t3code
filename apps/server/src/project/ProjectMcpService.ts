@@ -1,6 +1,7 @@
 import {
   CommandId,
   McpCatalogDefinition,
+  McpDefinitionId,
   McpCatalogOverride,
   McpCatalogSnapshot,
   McpServerId,
@@ -87,6 +88,7 @@ const ProjectMcpProjectionRow = Schema.Struct({
 });
 const McpCatalogDefinitionProjectionRow = Schema.Struct({
   serverId: McpServerId,
+  definitionId: McpDefinitionId,
   transportJson: Schema.String,
 });
 const McpCatalogOverrideProjectionRow = Schema.Struct({
@@ -112,6 +114,15 @@ const decodeMcpCatalogDefinitionsJson = Schema.decodeUnknownEffect(
 );
 
 const foldName = (name: string): string => name.toLocaleLowerCase();
+
+const scopedOAuthOwnerId = (
+  serverId: McpServerId,
+  definitionId: McpDefinitionId,
+  transport: ProjectMcpTransport,
+): McpServerId | undefined =>
+  transport.type !== "stdio" && transport.authorization.type === "oauth"
+    ? ProjectMcpOAuth.storageIdForServer(serverId, definitionId)
+    : undefined;
 
 const isAllowedUrl = (value: string): boolean => {
   try {
@@ -682,9 +693,14 @@ const makeProjectMcpService = Effect.gen(function* () {
       (server) => {
         const oauthStateLease =
           server.transport.type !== "stdio" && server.transport.authorization.type === "oauth"
-            ? mcpSecrets.acquireOAuthStateLease(
-                ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId),
-              )
+            ? Effect.gen(function* () {
+                const storageId = ProjectMcpOAuth.storageIdForServer(
+                  server.id,
+                  server.transportDefinitionId,
+                );
+                yield* mcpSecrets.ensureOAuthStateOwner(storageId);
+                return yield* mcpSecrets.acquireOAuthStateLease(storageId);
+              })
             : Effect.succeed(undefined);
         return Effect.flatMap(oauthStateLease, (stateLease) =>
           Effect.flatMap(
@@ -779,7 +795,7 @@ const makeProjectMcpService = Effect.gen(function* () {
       ),
     );
     const definitions = yield* sql<Schema.Schema.Type<typeof McpCatalogDefinitionProjectionRow>>`
-      SELECT logical_server_id AS "serverId", transport_json AS "transportJson"
+      SELECT logical_server_id AS "serverId", definition_id AS "definitionId", transport_json AS "transportJson"
       FROM projection_mcp_definitions
     `;
     const overrides = yield* sql<Schema.Schema.Type<typeof McpCatalogOverrideProjectionRow>>`
@@ -798,11 +814,15 @@ const makeProjectMcpService = Effect.gen(function* () {
     const references: Array<{
       readonly id: McpServerId;
       readonly transport?: ProjectMcpTransport;
+      readonly oauthStateOwnerId?: McpServerId;
     }> = legacyRows.map((server) => ({ id: server.id, transport: getProjectMcpTransport(server) }));
     for (const row of definitions) {
+      const transport = yield* decodeProjectMcpTransportJson(row.transportJson);
+      const oauthStateOwnerId = scopedOAuthOwnerId(row.serverId, row.definitionId, transport);
       references.push({
         id: row.serverId,
-        transport: yield* decodeProjectMcpTransportJson(row.transportJson),
+        transport,
+        ...(oauthStateOwnerId === undefined ? {} : { oauthStateOwnerId }),
       });
     }
     for (const row of overrides) {
@@ -810,14 +830,31 @@ const makeProjectMcpService = Effect.gen(function* () {
         row.patchJson,
       );
       if (override.transport !== undefined) {
-        references.push({ id: row.serverId, transport: override.transport });
+        const oauthStateOwnerId =
+          override.transportDefinitionId === undefined
+            ? undefined
+            : scopedOAuthOwnerId(row.serverId, override.transportDefinitionId, override.transport);
+        references.push({
+          id: row.serverId,
+          transport: override.transport,
+          ...(oauthStateOwnerId === undefined ? {} : { oauthStateOwnerId }),
+        });
       }
     }
     for (const row of sessions) {
       for (const json of [row.baselineJson, row.desiredJson]) {
         const definitions = yield* decodeMcpCatalogDefinitionsJson(json);
         for (const definition of definitions) {
-          references.push({ id: definition.logicalServerId, transport: definition.transport });
+          const oauthStateOwnerId = scopedOAuthOwnerId(
+            definition.logicalServerId,
+            definition.definitionId,
+            definition.transport,
+          );
+          references.push({
+            id: definition.logicalServerId,
+            transport: definition.transport,
+            ...(oauthStateOwnerId === undefined ? {} : { oauthStateOwnerId }),
+          });
         }
       }
     }

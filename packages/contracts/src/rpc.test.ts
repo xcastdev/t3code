@@ -4,6 +4,7 @@ import * as Schema from "effect/Schema";
 
 import {
   WS_METHODS,
+  WsMcpCatalogGlobalStateListRpc,
   WsProjectMcpCreateRpc,
   WsProjectMcpRemoveRpc,
   WsProjectMcpOAuthBeginRpc,
@@ -126,5 +127,17 @@ describe("project MCP OAuth RPC contracts", () => {
     });
     expect(() => decodeUpdateError({ ...error, operation: "other" })).toThrow();
     expect(() => decodeUpdateError({ ...error, sequence: 0 })).toThrow();
+  });
+});
+
+describe("scoped MCP catalog global state RPC", () => {
+  it("publishes a compatibility-safe state response with the revision", () => {
+    expect(WS_METHODS.mcpCatalogGlobalStateList).toBe("mcpCatalog.global.state.list");
+    expect(
+      Schema.decodeUnknownSync(WsMcpCatalogGlobalStateListRpc.successSchema)({
+        definitions: [],
+        globalRevision: 7,
+      }),
+    ).toEqual({ definitions: [], globalRevision: 7 });
   });
 });

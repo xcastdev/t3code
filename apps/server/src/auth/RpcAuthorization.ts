@@ -91,6 +91,7 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.projectMcpOauthContinue]: AuthOrchestrationOperateScope,
   [WS_METHODS.projectMcpOauthDisconnect]: AuthOrchestrationOperateScope,
   [WS_METHODS.mcpCatalogGlobalList]: AuthOrchestrationReadScope,
+  [WS_METHODS.mcpCatalogGlobalStateList]: AuthOrchestrationReadScope,
   [WS_METHODS.mcpCatalogGlobalCreate]: AuthOrchestrationOperateScope,
   [WS_METHODS.mcpCatalogGlobalUpdate]: AuthOrchestrationOperateScope,
   [WS_METHODS.mcpCatalogGlobalRemove]: AuthOrchestrationOperateScope,

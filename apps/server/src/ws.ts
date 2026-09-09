@@ -53,6 +53,7 @@ import {
   McpCatalogStaleSessionError,
   McpDefinitionId,
   type ProjectMcpTransport,
+  type ProjectMcpTransportDraft,
   ProviderInstanceId,
   ProjectMcpCreateError,
   ProjectMcpCatalogCommittedCleanupPendingError,
@@ -203,6 +204,15 @@ const isMcpCatalogMutationError = Schema.is(McpCatalogMutationError);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const CONFIG_DISCOVERY_TIMEOUT = Duration.seconds(5);
+
+const scopedOAuthOwnerIdsFor = (
+  logicalServerId: McpServerId,
+  definitionId: McpDefinitionId,
+  transport: ProjectMcpTransport | ProjectMcpTransportDraft,
+): ReadonlyArray<McpServerId> =>
+  transport.type !== "stdio" && transport.authorization.type === "oauth"
+    ? [ProjectMcpOAuth.storageIdForServer(logicalServerId, definitionId)]
+    : [];
 
 const resolveDiscoveryForConfig = <A, E, R>(
   discovery: Effect.Effect<A, E, R>,
@@ -1536,25 +1546,25 @@ const makeWsRpcLayer = (
           for (const entry of input.projectDefinitions) projectIds.add(String(entry.projectId));
           for (const entry of input.projectOverrides) projectIds.add(String(entry.projectId));
         }
-        if (projectIds.size === 0) {
-          return validateCatalogTopology(input.globalDefinitions);
-        }
-        return Effect.forEach(
-          projectIds,
-          (projectId) =>
-            validateCatalogTopology([
-              ...applyMcpCatalogValidationOverrides(
-                input.globalDefinitions,
-                input.projectOverrides
+        return Effect.gen(function* () {
+          yield* validateCatalogTopology(input.globalDefinitions);
+          yield* Effect.forEach(
+            projectIds,
+            (projectId) =>
+              validateCatalogTopology([
+                ...applyMcpCatalogValidationOverrides(
+                  input.globalDefinitions,
+                  input.projectOverrides
+                    .filter((entry) => String(entry.projectId) === projectId)
+                    .map((entry) => entry.override),
+                ),
+                ...input.projectDefinitions
                   .filter((entry) => String(entry.projectId) === projectId)
-                  .map((entry) => entry.override),
-              ),
-              ...input.projectDefinitions
-                .filter((entry) => String(entry.projectId) === projectId)
-                .map((entry) => entry.definition),
-            ]),
-          { discard: true },
-        );
+                  .map((entry) => entry.definition),
+              ]),
+            { discard: true },
+          );
+        });
       };
 
       const validateCatalogProviderIds = (
@@ -1708,6 +1718,7 @@ const makeWsRpcLayer = (
             definition.logicalServerId,
             definition.definitionId,
           );
+          yield* projectMcpSecrets.ensureOAuthStateOwner(storageId);
           return {
             ...binding,
             serverId: storageId,
@@ -2212,6 +2223,18 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "mcp-catalog" },
           ),
+        [WS_METHODS.mcpCatalogGlobalStateList]: (_input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogGlobalStateList,
+            readMcpCatalog().pipe(
+              Effect.map((readModel) => ({
+                definitions: readModel.mcpCatalog?.globalDefinitions ?? [],
+                globalRevision: readModel.mcpCatalog?.globalRevision ?? 0,
+              })),
+              Effect.orDie,
+            ),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
         [WS_METHODS.mcpCatalogGlobalCreate]: (input) =>
           observeRpcEffect(
             WS_METHODS.mcpCatalogGlobalCreate,
@@ -2260,15 +2283,17 @@ const makeWsRpcLayer = (
                       override: validationOverride(entry.override),
                     })) ?? [],
                 });
+                const definitionId = McpDefinitionId.make(yield* crypto.randomUUIDv4);
                 const prepared = yield* projectMcpSecrets.prepareCreate(
                   logicalServerId,
                   input.definition.transport,
+                  scopedOAuthOwnerIdsFor(logicalServerId, definitionId, input.definition.transport),
                 );
                 const definition = catalogDefinition({
                   scope: "global",
                   scopeId: environmentId,
                   logicalServerId,
-                  definitionId: yield* crypto.randomUUIDv4,
+                  definitionId,
                   name: input.definition.name,
                   transport: prepared.transport,
                   enabled: input.definition.enabled,
@@ -2346,16 +2371,22 @@ const makeWsRpcLayer = (
                       override: validationOverride(entry.override),
                     })) ?? [],
                 });
+                const definitionId = McpDefinitionId.make(yield* crypto.randomUUIDv4);
                 const prepared = yield* projectMcpSecrets.prepareUpdate(
                   existing.logicalServerId,
                   existing.transport,
                   input.definition.transport,
+                  scopedOAuthOwnerIdsFor(
+                    existing.logicalServerId,
+                    definitionId,
+                    input.definition.transport,
+                  ),
                 );
                 const definition = catalogDefinition({
                   scope: "global",
                   scopeId: environmentId,
                   logicalServerId: existing.logicalServerId,
-                  definitionId: yield* crypto.randomUUIDv4,
+                  definitionId,
                   name: input.definition.name,
                   transport: prepared.transport,
                   enabled: input.definition.enabled,
@@ -2537,15 +2568,21 @@ const makeWsRpcLayer = (
                       })) ?? [],
                     projectId,
                   });
+                  const definitionId = McpDefinitionId.make(yield* crypto.randomUUIDv4);
                   const prepared = yield* projectMcpSecrets.prepareCreate(
                     logicalServerId,
                     input.definition.transport,
+                    scopedOAuthOwnerIdsFor(
+                      logicalServerId,
+                      definitionId,
+                      input.definition.transport,
+                    ),
                   );
                   const definition = catalogDefinition({
                     scope: "project",
                     scopeId: projectId,
                     logicalServerId,
-                    definitionId: yield* crypto.randomUUIDv4,
+                    definitionId,
                     name: input.definition.name,
                     transport: prepared.transport,
                     enabled: input.definition.enabled,
@@ -2636,16 +2673,22 @@ const makeWsRpcLayer = (
                       })) ?? [],
                     projectId,
                   });
+                  const definitionId = McpDefinitionId.make(yield* crypto.randomUUIDv4);
                   const prepared = yield* projectMcpSecrets.prepareUpdate(
                     existing.logicalServerId,
                     existing.transport,
                     input.definition.transport,
+                    scopedOAuthOwnerIdsFor(
+                      existing.logicalServerId,
+                      definitionId,
+                      input.definition.transport,
+                    ),
                   );
                   const definition = catalogDefinition({
                     scope: "project",
                     scopeId: projectId,
                     logicalServerId: existing.logicalServerId,
-                    definitionId: yield* crypto.randomUUIDv4,
+                    definitionId,
                     name: input.definition.name,
                     transport: prepared.transport,
                     enabled: input.definition.enabled,
@@ -2800,6 +2843,10 @@ const makeWsRpcLayer = (
                     applyMcpCatalogOverrides([globalDefinition], projectOverrides)[0]?.transport ??
                     globalDefinition.transport;
                   const draftTransport = input.override.transport;
+                  const transportDefinitionId =
+                    draftTransport === undefined
+                      ? undefined
+                      : McpDefinitionId.make(yield* crypto.randomUUIDv4);
                   const prepared =
                     draftTransport === undefined
                       ? undefined
@@ -2807,6 +2854,11 @@ const makeWsRpcLayer = (
                           globalDefinition.logicalServerId,
                           previousEffectiveTransport,
                           draftTransport,
+                          scopedOAuthOwnerIdsFor(
+                            globalDefinition.logicalServerId,
+                            transportDefinitionId!,
+                            draftTransport,
+                          ),
                         );
                   const {
                     transport: _draftTransport,
@@ -2819,7 +2871,7 @@ const makeWsRpcLayer = (
                       ? {}
                       : {
                           transport: prepared.transport,
-                          transportDefinitionId: McpDefinitionId.make(yield* crypto.randomUUIDv4),
+                          transportDefinitionId: transportDefinitionId!,
                         }),
                   };
                   yield* dispatchPreparedCatalog(
@@ -3015,15 +3067,17 @@ const makeWsRpcLayer = (
                   ],
                   [providerInstanceId],
                 );
+                const definitionId = McpDefinitionId.make(yield* crypto.randomUUIDv4);
                 const prepared = yield* projectMcpSecrets.prepareCreate(
                   logicalServerId,
                   input.definition.transport,
+                  scopedOAuthOwnerIdsFor(logicalServerId, definitionId, input.definition.transport),
                 );
                 const definition = catalogDefinition({
                   scope: "session",
                   scopeId: String(input.mcpCatalogSessionId),
                   logicalServerId,
-                  definitionId: yield* crypto.randomUUIDv4,
+                  definitionId,
                   name: input.definition.name,
                   transport: prepared.transport,
                   enabled: input.definition.enabled,
@@ -3122,16 +3176,22 @@ const makeWsRpcLayer = (
                   ),
                   [snapshot.providerInstanceId],
                 );
+                const definitionId = McpDefinitionId.make(yield* crypto.randomUUIDv4);
                 const prepared = yield* projectMcpSecrets.prepareUpdate(
                   existing.logicalServerId,
                   existing.transport,
                   input.definition.transport,
+                  scopedOAuthOwnerIdsFor(
+                    existing.logicalServerId,
+                    definitionId,
+                    input.definition.transport,
+                  ),
                 );
                 const definition = catalogDefinition({
                   scope: existing.scope,
                   scopeId: existing.scopeId,
                   logicalServerId: existing.logicalServerId,
-                  definitionId: existing.definitionId,
+                  definitionId,
                   name: input.definition.name,
                   transport: prepared.transport,
                   enabled: input.definition.enabled,
@@ -3415,7 +3475,7 @@ const makeWsRpcLayer = (
               input.projectId,
               scopedOauthServerFor(input).pipe(
                 Effect.tap((server) => projectMcpOAuth.disconnect(server.serverId)),
-                Effect.tap(() => projectMcpProxy.revokeServer(input.logicalServerId)),
+                Effect.tap((server) => projectMcpProxy.revokeOAuthStorage(server.serverId)),
                 Effect.asVoid,
                 Effect.mapError((error) =>
                   Schema.is(ProjectMcpOAuthActionError)(error)

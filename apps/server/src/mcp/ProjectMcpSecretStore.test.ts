@@ -7,7 +7,7 @@ import {
   type ProjectMcpTransportDraft,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
-import { assert, it } from "@effect/vitest";
+import { assert, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -21,6 +21,7 @@ import * as ProjectMcpSecretStore from "./ProjectMcpSecretStore.ts";
 
 const serverA = McpServerId.make("mcp-secret-server-a");
 const serverB = McpServerId.make("mcp-secret-server-b");
+const scopedOAuthOwner = McpServerId.make("scoped:owner");
 
 const httpDraft = (value: string): ProjectMcpTransportDraft => ({
   type: "streamable-http",
@@ -113,6 +114,45 @@ it.layer(NodeServices.layer)("ProjectMcpSecretStore", (it) => {
         ServerConfig.layerTest(process.cwd(), { prefix: "t3-project-mcp-secret-store-test-" }),
       ),
     ),
+  );
+
+  it.effect(
+    "commits scoped OAuth owners atomically and rolls them back with prepared credentials",
+    () =>
+      Effect.gen(function* () {
+        const config = yield* ServerConfig.ServerConfig;
+        yield* Effect.gen(function* () {
+          const secrets = yield* ProjectMcpSecretStore.ProjectMcpSecretStore;
+
+          const rolledBack = yield* secrets.prepareCreate(serverA, oauthDraft(), [
+            scopedOAuthOwner,
+          ]);
+          yield* rolledBack.rollback;
+          expect(yield* secrets.listServerIds()).not.toContain(scopedOAuthOwner);
+          const missingOwner = yield* Effect.flip(
+            secrets.createAuxiliarySecret(scopedOAuthOwner, "pending-state"),
+          );
+          assert.instanceOf(missingOwner, ProjectMcpSecretStore.ProjectMcpSecretDraftError);
+
+          const committed = yield* secrets.prepareCreate(serverA, oauthDraft(), [scopedOAuthOwner]);
+          yield* committed.commit;
+          expect(yield* secrets.listServerIds()).toContain(scopedOAuthOwner);
+          const pendingId = yield* secrets.createAuxiliarySecret(scopedOAuthOwner, "pending-state");
+          assert.equal(yield* secrets.resolve(scopedOAuthOwner, pendingId), "pending-state");
+          yield* Effect.scoped(
+            Effect.gen(function* () {
+              const lease = yield* secrets.acquireOAuthStateLease(scopedOAuthOwner);
+              assert.deepEqual(yield* lease.listAuxiliarySecrets(), [pendingId]);
+            }),
+          );
+        }).pipe(Effect.provide(makeSecretLayer(config)));
+      }).pipe(
+        Effect.provide(
+          ServerConfig.layerTest(process.cwd(), {
+            prefix: "t3-project-mcp-secret-store-scoped-owner-",
+          }),
+        ),
+      ),
   );
 
   it.effect("retains a rotated value for an existing lease until the lease closes", () =>

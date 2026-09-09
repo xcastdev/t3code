@@ -19,6 +19,7 @@ import {
   McpServerId,
   McpCatalogOverrideId,
   McpDefinitionId,
+  type McpCatalogDefinition,
   MessageId,
   ExternalLauncherCommandNotFoundError,
   OrchestrationThreadDetailSnapshot,
@@ -5511,6 +5512,259 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         assert.isDefined(command.override.transport);
       }
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "rejects a global conflict masked by every existing project before preparing secrets",
+    () =>
+      Effect.gen(function* () {
+        const projectId = ProjectId.make("project-mcp-masked-global-1");
+        const otherProjectId = ProjectId.make("project-mcp-masked-global-2");
+        const serverA = McpServerId.make("masked-global-a");
+        const serverB = McpServerId.make("masked-global-b");
+        const providerInstanceId = ProviderInstanceId.make("codex-primary");
+        const project = (id: ProjectId) => ({
+          id,
+          title: String(id),
+          workspaceRoot: `/tmp/${id}`,
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: "2026-09-02T00:00:00.000Z",
+          updatedAt: "2026-09-02T00:00:00.000Z",
+        });
+        const definition = (
+          logicalServerId: McpServerId,
+          definitionId: McpDefinitionId,
+          name: string,
+        ): McpCatalogDefinition => ({
+          definitionId,
+          logicalServerId,
+          scope: "global",
+          scopeId: testEnvironmentDescriptor.environmentId,
+          name,
+          transport: {
+            type: "streamable-http",
+            url: "https://masked-global.example.test/mcp",
+            headers: [],
+            authorization: { type: "none" },
+          },
+          enabled: true,
+          providerInstanceIds: [providerInstanceId],
+          revision: 1,
+        });
+        const globalA = definition(
+          serverA,
+          McpDefinitionId.make("masked-global-definition-a"),
+          "A",
+        );
+        const globalB = definition(
+          serverB,
+          McpDefinitionId.make("masked-global-definition-b"),
+          "B",
+        );
+        const readModel = {
+          ...makeDefaultOrchestrationReadModel(),
+          projects: [project(projectId), project(otherProjectId)].map((entry) => ({
+            ...entry,
+            deletedAt: null,
+          })),
+          mcpCatalog: {
+            environmentId: testEnvironmentDescriptor.environmentId,
+            globalRevision: 1,
+            globalDefinitions: [globalA, globalB],
+            projectRevisions: [],
+            projectDefinitions: [],
+            projectOverrides: [projectId, otherProjectId].map((scopeId, index) => ({
+              projectId: scopeId,
+              revision: 1,
+              override: {
+                id: McpCatalogOverrideId.make(`masked-global-override-${index}`),
+                scope: "project" as const,
+                scopeId,
+                targetId: serverB,
+                enabled: false,
+              },
+            })),
+            sessions: [],
+          },
+        } satisfies OrchestrationReadModel;
+        const dispatched: Array<OrchestrationCommand> = [];
+
+        yield* buildAppUnderTest({
+          layers: {
+            orchestrationEngine: {
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  dispatched.push(command);
+                  return { sequence: dispatched.length };
+                }),
+            },
+            projectionSnapshotQuery: {
+              getCommandReadModel: () => Effect.succeed(readModel),
+              getProjectShellById: (requestedProjectId) =>
+                Effect.succeed(
+                  requestedProjectId === projectId || requestedProjectId === otherProjectId
+                    ? Option.some(project(requestedProjectId))
+                    : Option.none(),
+                ),
+            },
+            projectMcpService: {
+              withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+            },
+          },
+        });
+
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const error = yield* Effect.flip(
+          Effect.scoped(
+            withWsRpcClient(wsUrl, (client) =>
+              client[WS_METHODS.mcpCatalogGlobalUpdate]({
+                scope: "global",
+                scopeId: testEnvironmentDescriptor.environmentId,
+                expectedRevision: 1,
+                logicalServerId: serverB,
+                definition: {
+                  name: "A",
+                  transport: globalB.transport,
+                  enabled: true,
+                  providerInstanceIds: [providerInstanceId],
+                },
+              }),
+            ),
+          ),
+        );
+        assert.equal(error._tag, "McpCatalogNameConflictError");
+        assert.deepEqual(dispatched, []);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect(
+    "rejects a masked global catalog over the provider limit before preparing secrets",
+    () =>
+      Effect.gen(function* () {
+        const projectIds = [
+          ProjectId.make("project-mcp-masked-limit-1"),
+          ProjectId.make("project-mcp-masked-limit-2"),
+        ];
+        const providerInstanceId = ProviderInstanceId.make("codex-primary");
+        const globalDefinitions = Array.from(
+          { length: 51 },
+          (_, index): McpCatalogDefinition => ({
+            definitionId: McpDefinitionId.make(`masked-limit-definition-${index}`),
+            logicalServerId: McpServerId.make(`masked-limit-server-${index}`),
+            scope: "global",
+            scopeId: testEnvironmentDescriptor.environmentId,
+            name: `Global ${index}`,
+            transport: {
+              type: "streamable-http",
+              url: "https://masked-limit.example.test/mcp",
+              headers: [],
+              authorization: { type: "none" },
+            },
+            enabled: true,
+            providerInstanceIds: [providerInstanceId],
+            revision: 1,
+          }),
+        );
+        const masked = globalDefinitions.slice(-2);
+        const project = (id: ProjectId) => ({
+          id,
+          title: String(id),
+          workspaceRoot: `/tmp/${id}`,
+          defaultModelSelection: null,
+          scripts: [],
+          createdAt: "2026-09-02T00:00:00.000Z",
+          updatedAt: "2026-09-02T00:00:00.000Z",
+        });
+        const readModel = {
+          ...makeDefaultOrchestrationReadModel(),
+          projects: projectIds.map((id) => ({ ...project(id), deletedAt: null })),
+          mcpCatalog: {
+            environmentId: testEnvironmentDescriptor.environmentId,
+            globalRevision: 51,
+            globalDefinitions,
+            projectRevisions: [],
+            projectDefinitions: [],
+            projectOverrides: projectIds.flatMap((scopeId, projectIndex) =>
+              masked.map((definition, index) => ({
+                projectId: scopeId,
+                revision: 1,
+                override: {
+                  id: McpCatalogOverrideId.make(`masked-limit-override-${projectIndex}-${index}`),
+                  scope: "project" as const,
+                  scopeId,
+                  targetId: definition.logicalServerId,
+                  enabled: false,
+                },
+              })),
+            ),
+            sessions: [],
+          },
+        } satisfies OrchestrationReadModel;
+        const dispatched: Array<OrchestrationCommand> = [];
+
+        yield* buildAppUnderTest({
+          layers: {
+            providerRegistry: {
+              getProviders: Effect.succeed([
+                {
+                  instanceId: providerInstanceId,
+                  driver: ProviderDriverKind.make("codex"),
+                  enabled: true,
+                  installed: true,
+                  version: "1.0.0",
+                  status: "ready" as const,
+                  auth: { status: "authenticated" as const },
+                  checkedAt: "2026-09-02T00:00:00.000Z",
+                  models: [],
+                  slashCommands: [],
+                  skills: [],
+                },
+              ]),
+            },
+            orchestrationEngine: {
+              dispatch: (command) =>
+                Effect.sync(() => {
+                  dispatched.push(command);
+                  return { sequence: dispatched.length };
+                }),
+            },
+            projectionSnapshotQuery: {
+              getCommandReadModel: () => Effect.succeed(readModel),
+              getProjectShellById: (requestedProjectId) =>
+                Effect.succeed(
+                  projectIds.includes(requestedProjectId)
+                    ? Option.some(project(requestedProjectId))
+                    : Option.none(),
+                ),
+            },
+            projectMcpService: {
+              withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+            },
+          },
+        });
+
+        const wsUrl = yield* getWsServerUrl("/ws");
+        const error = yield* Effect.flip(
+          Effect.scoped(
+            withWsRpcClient(wsUrl, (client) =>
+              client[WS_METHODS.mcpCatalogGlobalCreate]({
+                scope: "global",
+                scopeId: testEnvironmentDescriptor.environmentId,
+                expectedRevision: 51,
+                definition: {
+                  name: "New global",
+                  transport: globalDefinitions[0]!.transport,
+                  enabled: true,
+                  providerInstanceIds: [providerInstanceId],
+                },
+              }),
+            ),
+          ),
+        );
+        assert.equal(error._tag, "McpCatalogProviderLimitExceededError");
+        assert.deepEqual(dispatched, []);
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect("requires a safe browser origin before starting project MCP OAuth", () =>
