@@ -2246,6 +2246,22 @@ describe("createWorkingStatusDwell", () => {
     expect(dwell.label).toBe("Reading file");
   });
 
+  it("abandons the previous turn's queued tool when reset for a new turn", () => {
+    const dwell = createWorkingStatusDwell("Running command", 0);
+    // A tool change queues behind the shown label, still inside the window.
+    dwell.push("Reading file", 300);
+    expect(dwell.label).toBe("Running command");
+
+    // The turn is steered. Everything queued describes work that is over, so
+    // the new turn's status shows at once instead of waiting behind it.
+    dwell.reset("Thinking", 400);
+    expect(dwell.label).toBe("Thinking");
+
+    // The abandoned tool must never surface once the old window elapses.
+    dwell.push("Thinking", WORKING_STATUS_DWELL_MS + 1);
+    expect(dwell.label).toBe("Thinking");
+  });
+
   it("drops queued labels when the status reverts to what is already shown", () => {
     const dwell = createWorkingStatusDwell("Reading file", 0);
     // A tool starts and finishes inside the dwell window, so the status falls

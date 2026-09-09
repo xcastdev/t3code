@@ -33,6 +33,7 @@ import {
   resolveDraftPromotionNavigationTarget,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
+  resolveActivityWindowMayBeTruncated,
   resolveDraftHeroState,
   scheduleEnvironmentReconnectWarning,
   startNewThreadForProject,
@@ -877,5 +878,38 @@ describe("resolveTimelineScrollModeForSend", () => {
     expect(resolveTimelineScrollModeForSend({ isFirstMessageInThread: false })).toBe(
       "following-end",
     );
+  });
+});
+
+describe("resolveActivityWindowMayBeTruncated", () => {
+  it("trusts a server that sends turn records, however many activities it sent", () => {
+    // A modern server omits `partialTurnIds` when it cut nothing, so a full
+    // window is not evidence of truncation. Threads cross the window through
+    // pagination and ordinary live growth; treating that as a cut would blank
+    // the counts on every turn the server has not stamped.
+    expect(
+      resolveActivityWindowMayBeTruncated({
+        hasTurnRecords: true,
+        activityCount: 900,
+        windowLimit: 500,
+      }),
+    ).toBe(false);
+  });
+
+  it("falls back to window size only for a host too old to send turn records", () => {
+    expect(
+      resolveActivityWindowMayBeTruncated({
+        hasTurnRecords: false,
+        activityCount: 500,
+        windowLimit: 500,
+      }),
+    ).toBe(true);
+    expect(
+      resolveActivityWindowMayBeTruncated({
+        hasTurnRecords: false,
+        activityCount: 499,
+        windowLimit: 500,
+      }),
+    ).toBe(false);
   });
 });

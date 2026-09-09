@@ -390,6 +390,7 @@ import {
   isVideoPreviewRequestCurrent,
   reconcileMountedTerminalThreadIds,
   resolveBackgroundDraftWorkspaceOptions,
+  resolveActivityWindowMayBeTruncated,
   resolveDraftHeroState,
   resolveTimelineScrollModeForSend,
   resolveThreadMetadataUpdateForNextTurn,
@@ -2231,7 +2232,17 @@ function ChatViewContent(props: ChatViewProps) {
   // Fallback for a host too old to name the turns it cut: a full window is the
   // only hint left that rows are missing. Reported alongside so the timeline can
   // stay silent rather than derive a count from a partial thread.
-  const activityWindowMayBeTruncated = threadActivities.length >= THREAD_ACTIVITY_WINDOW_LIMIT;
+  //
+  // Gated on `turns` being absent, which is the actual older-host signal. A
+  // modern server omits `partialTurnIds` when it cut nothing, so size alone
+  // cannot tell "older host" from "nothing was cut" — and a thread grows past
+  // the window through pagination and live rows without anything being cut,
+  // which would otherwise blank the counts on every unstamped turn.
+  const activityWindowMayBeTruncated = resolveActivityWindowMayBeTruncated({
+    hasTurnRecords: activeThread?.turns !== undefined,
+    activityCount: threadActivities.length,
+    windowLimit: THREAD_ACTIVITY_WINDOW_LIMIT,
+  });
   // Native subagent fold: memoized by activity-list identity, shared by the
   // Agents surface, live strip, and workflow cards. v2Projection is null
   // until orchestration-v2 lands (source precedence lives in the derive).

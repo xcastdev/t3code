@@ -2840,10 +2840,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           )
         : [];
       const partialTurnIds = turnActivityTotals
-        .filter((row) => {
-          const retained = retainedCountsByTurnId.get(row.turnId);
-          return retained !== undefined && retained < row.activityCount;
-        })
+        // A turn the window cut down to nothing is partial too, and is the case
+        // that matters most: with no rows left, a client counting what it holds
+        // would report zero work as fact rather than staying silent.
+        .filter((row) => (retainedCountsByTurnId.get(row.turnId) ?? 0) < row.activityCount)
         .map((row) => row.turnId);
 
       const selectedActivityRows = [

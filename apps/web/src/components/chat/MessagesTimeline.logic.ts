@@ -263,6 +263,12 @@ export type MessagesTimelineRow =
        * when nothing specific is identifiable. Only rendered when `showThinking`.
        */
       statusLabel: string;
+      /**
+       * The turn the label describes. The working row keeps one id across a
+       * steer, so this is what tells the renderer the label now belongs to a
+       * different turn and any label still held for the old one is stale.
+       */
+      statusTurnId: TurnId | null;
     };
 
 export interface StableMessagesTimelineRowsState {
@@ -940,6 +946,7 @@ export function deriveMessagesTimelineRows(input: {
       statusLabel:
         runningToolPhrase ??
         stableFallbackPhrase(unsettledTurnId ?? input.activeTurnStartedAt ?? "working"),
+      statusTurnId: unsettledTurnId,
     });
   };
   const appendActiveWorkRows = () => {
@@ -1177,7 +1184,8 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
       return (
         a.createdAt === (b as typeof a).createdAt &&
         a.showThinking === (b as typeof a).showThinking &&
-        a.statusLabel === (b as typeof a).statusLabel
+        a.statusLabel === (b as typeof a).statusLabel &&
+        a.statusTurnId === (b as typeof a).statusTurnId
       );
 
     case "turn-fold": {
@@ -1329,6 +1337,12 @@ export interface WorkingStatusDwell {
   readonly droppedCount: number;
   /** Offers the newest desired label at `now`; returns the label to render. */
   push: (nextLabel: string, now: number) => string;
+  /**
+   * Drops everything pending and shows `nextLabel` immediately, re-arming the
+   * window. For when the labels queued so far describe work that is over — a
+   * new turn's status must not wait behind the previous turn's tools.
+   */
+  reset: (nextLabel: string, now: number) => void;
 }
 
 /**
@@ -1385,6 +1399,11 @@ export function createWorkingStatusDwell(initialLabel: string, now = 0): Working
     },
     get droppedCount() {
       return droppedCount;
+    },
+    reset(nextLabel: string, at: number) {
+      queue.length = 0;
+      label = nextLabel;
+      shownAt = at;
     },
     push(nextLabel: string, at: number) {
       if (nextLabel === label) {

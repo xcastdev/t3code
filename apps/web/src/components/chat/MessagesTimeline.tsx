@@ -1419,7 +1419,7 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
               "Working..."
             )}
           </span>
-          <WorkingStatusLabel statusLabel={row.statusLabel} />
+          <WorkingStatusLabel statusLabel={row.statusLabel} statusTurnId={row.statusTurnId} />
         </div>
       </div>
       {row.showThinking ? (
@@ -1435,14 +1435,29 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
  * Names the work currently running, held for the dwell window so fast-changing
  * tools read as status rather than as a flicker.
  */
-function WorkingStatusLabel({ statusLabel }: { statusLabel: string }) {
+function WorkingStatusLabel({
+  statusLabel,
+  statusTurnId,
+}: {
+  statusLabel: string;
+  statusTurnId: TurnId | null;
+}) {
   const dwellRef = useRef<WorkingStatusDwell | null>(null);
   dwellRef.current ??= createWorkingStatusDwell(statusLabel, Date.now());
   const dwell = dwellRef.current;
+  // The working row survives a steer, so without this the previous turn's
+  // queued tool name would be promoted as the new turn's status.
+  const dwellTurnIdRef = useRef<TurnId | null>(statusTurnId);
 
   const [displayLabel, setDisplayLabel] = useState(dwell.label);
 
   useEffect(() => {
+    if (dwellTurnIdRef.current !== statusTurnId) {
+      dwellTurnIdRef.current = statusTurnId;
+      dwell.reset(statusLabel, Date.now());
+      setDisplayLabel(statusLabel);
+      return;
+    }
     const shown = dwell.push(statusLabel, Date.now());
     setDisplayLabel(shown);
     if (shown === statusLabel) return;
@@ -1453,7 +1468,7 @@ function WorkingStatusLabel({ statusLabel }: { statusLabel: string }) {
       setDisplayLabel(dwell.push(statusLabel, Date.now()));
     }, WORKING_STATUS_DWELL_MS);
     return () => clearTimeout(id);
-  }, [dwell, statusLabel]);
+  }, [dwell, statusLabel, statusTurnId]);
 
   return <span className="min-w-0 truncate text-secondary-label">{displayLabel}</span>;
 }

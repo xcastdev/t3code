@@ -2371,6 +2371,58 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
     }),
   );
 
+  it.effect("names a turn the window cut down to no rows at all", () =>
+    Effect.gen(function* () {
+      // The turn that lost *every* row is the one a client is most likely to
+      // misreport: with nothing retained it has no activity rows to count, so
+      // an unnamed turn publishes "0 commands" as fact rather than staying
+      // silent about work it can no longer see.
+      yield* seedFanOutThread();
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* sql`DELETE FROM projection_thread_activities`;
+      // turn-gone: 2 rows, both cut -> 0 retained.
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        )
+        VALUES
+          ('activity-0001', 'thread-w', 'turn-gone', 'tool', 'tool.completed', 'ran tool', '{}', NULL, '2026-03-01T00:01:00.000Z'),
+          ('activity-0002', 'thread-w', 'turn-gone', 'tool', 'tool.completed', 'ran tool', '{}', NULL, '2026-03-01T00:01:01.000Z')
+      `;
+      // turn-late fills the window on its own, pushing turn-gone out entirely.
+      yield* sql`
+        WITH RECURSIVE activity_rows(n) AS (
+          SELECT 1
+          UNION ALL
+          SELECT n + 1 FROM activity_rows WHERE n < 500
+        )
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        )
+        SELECT
+          printf('activity-1%03d', n),
+          'thread-w',
+          'turn-late',
+          'tool',
+          'tool.completed',
+          'ran tool',
+          '{}',
+          NULL,
+          printf('2026-03-01T00:02:%02d.000Z', n % 60)
+        FROM activity_rows
+      `;
+
+      const detail = yield* snapshotQuery.getThreadDetailById(threadW);
+      assert.equal(detail._tag, "Some");
+      if (detail._tag === "Some") {
+        assert.equal(detail.value.activities.length, 500);
+        assert.deepEqual([...(detail.value.partialTurnIds ?? [])], ["turn-gone"]);
+      }
+    }),
+  );
+
   it.effect("names the cut turn even when the discarded row has no turn", () =>
     Effect.gen(function* () {
       // Rows without a turn are interleaved throughout a real thread, so the
