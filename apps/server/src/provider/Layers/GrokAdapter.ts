@@ -936,6 +936,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           ...(yield* makeEventStamp()),
           provider: PROVIDER,
           threadId: ctx.threadId,
+          providerRefs: { sessionId: parseGrokResume(ctx.session.resumeCursor)?.sessionId },
           payload: { exitKind },
         });
       }).pipe(Effect.uninterruptible);

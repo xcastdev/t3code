@@ -477,6 +477,7 @@ export function makeCursorAdapter(
           ...(yield* makeEventStamp()),
           provider: PROVIDER,
           threadId: ctx.threadId,
+          providerRefs: { sessionId: parseCursorResume(ctx.session.resumeCursor)?.sessionId },
           payload: { exitKind },
         });
       }).pipe(Effect.uninterruptible);

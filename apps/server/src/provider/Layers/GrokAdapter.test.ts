@@ -131,13 +131,27 @@ it.effect("removes an idle Grok session before publishing unexpected process exi
       Stream.runCollect,
       Effect.forkScoped({ startImmediately: true }),
     );
-    yield* adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+    const started = yield* adapter.startSession({
+      threadId,
+      cwd: process.cwd(),
+      runtimeMode: "full-access",
+    });
     const child = spawned.at(-1)!;
     assert.isTrue(yield* child.isRunning);
     yield* child.kill({ killSignal: "SIGKILL" });
     const events = yield* Fiber.join(exited);
     assert.equal(events.length, 1);
     assert.equal(events[0]?.payload.exitKind, "error");
+    const resumeCursor = started.resumeCursor;
+    if (
+      resumeCursor === null ||
+      typeof resumeCursor !== "object" ||
+      !("sessionId" in resumeCursor) ||
+      typeof resumeCursor.sessionId !== "string"
+    ) {
+      throw new Error("expected Grok session to expose its native resume session ID");
+    }
+    assert.equal(events[0]?.providerRefs?.sessionId, resumeCursor.sessionId);
   }).pipe(Effect.provide(grokAdapterTestLayer)),
 );
 

@@ -41,9 +41,9 @@ import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as SchemaIssue from "effect/SchemaIssue";
-import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as Scope from "effect/Scope";
+import * as Semaphore from "effect/Semaphore";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import * as ServerConfig from "../../config.ts";
@@ -100,7 +100,16 @@ interface ProjectMcpLeaseOwner {
   readonly instanceId: ProviderInstanceId;
   readonly generation: number;
   readonly providerGeneration?: ProviderAdapterGenerationHandle;
+  mcpProviderSessionId: string | undefined;
   nativeSessionId: string | undefined;
+  resourcesReleased: boolean;
+}
+
+interface PendingSessionReplacement {
+  readonly candidate: ProjectMcpLeaseOwner;
+  readonly previous: ProjectMcpLeaseOwner | undefined;
+  readonly sameAdapter: boolean;
+  readonly exitedNativeSessionIds: Set<string>;
 }
 
 /**
@@ -119,7 +128,7 @@ export interface ProviderServiceLiveOptions {
   readonly issueMcpCredential?: typeof McpSessionRegistry.issueActiveMcpCredential;
   /** Same seam as `issueMcpCredential`, for observing the deny path's revoke. */
   readonly revokeMcpCredential?: typeof McpSessionRegistry.revokeActiveMcpThread;
-  /** Credential-specific revocation used to commit or roll back a replacement. */
+  /** Credential-specific revocation used when committing or rolling back a replacement. */
   readonly revokeMcpProviderCredential?: typeof McpSessionRegistry.revokeActiveMcpProviderSession;
 }
 
@@ -301,13 +310,22 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     new Map(),
   );
   const projectMcpLeaseScopes = yield* Ref.make(new Map<ThreadId, ProjectMcpLeaseOwner>());
+  const pendingSessionReplacements = yield* Ref.make(
+    new Map<ThreadId, PendingSessionReplacement>(),
+  );
+  const retiringSessionOwners = yield* Ref.make(
+    new Map<ThreadId, ReadonlyArray<ProjectMcpLeaseOwner>>(),
+  );
   let startGeneration = 0;
   let catalogOperationGeneration = 0;
   const lifecycleLocks = new Map<ThreadId, { mutex: Semaphore.Semaphore; users: number }>();
   const withThreadLifecycle = <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
     Effect.acquireUseRelease(
       Effect.sync(() => {
-        const lock = lifecycleLocks.get(threadId) ?? { mutex: Semaphore.makeUnsafe(1), users: 0 };
+        const lock = lifecycleLocks.get(threadId) ?? {
+          mutex: Semaphore.makeUnsafe(1),
+          users: 0,
+        };
         lock.users += 1;
         lifecycleLocks.set(threadId, lock);
         return lock;
@@ -367,21 +385,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const managedProjectServers =
         capabilities.projectMcpProxy === "unsupported" ? undefined : projectMcpServers;
       if (!includePreview && (!managedProjectServers || managedProjectServers.length === 0)) {
-        // Revoke as well as clear. Every other prepare path reaches
-        // `issueActiveMcpCredential`, which revokes the thread first, so
-        // skipping it here would leave a previously issued bearer token valid
-        // against `/mcp` for the rest of its liveness window — and later turns
-        // would keep refreshing it. A session restart (runtime mode, cwd,
-        yield* revokeMcpCredential(threadId);
-        yield* Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId));
         const replacement = {
           previous,
           candidate: undefined,
           accessWasDisabled: true,
         } satisfies McpProviderSession.McpProviderSessionReplacement;
-        yield* Effect.sync(() =>
-          McpProviderSession.beginMcpProviderSessionReplacement(threadId, replacement),
-        );
+        yield* Effect.sync(() => {
+          McpProviderSession.beginMcpProviderSessionReplacement(threadId, replacement);
+          if (previous === undefined) {
+            McpProviderSession.clearMcpProviderSession(threadId);
+          } else {
+            McpProviderSession.clearMcpProviderSessionIf(threadId, previous.providerSessionId);
+          }
+        });
         return replacement;
       }
       const credential = yield* issueMcpCredential({
@@ -405,7 +421,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           // Project MCP endpoints are passed explicitly to the adapter below.
           // Do not leave the shared session config populated: adapters use
           // its presence to attach the managed `t3-code` preview server.
-          McpProviderSession.clearMcpProviderSession(threadId);
+          if (previous === undefined) {
+            McpProviderSession.clearMcpProviderSession(threadId);
+          } else {
+            McpProviderSession.clearMcpProviderSessionIf(threadId, previous.providerSessionId);
+          }
         } else if (credential) {
           McpProviderSession.setMcpProviderSession(credential.config);
         }
@@ -417,8 +437,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     replacement: McpProviderSession.McpProviderSessionReplacement,
   ) =>
     Effect.gen(function* () {
-      // Restore the in-memory configuration before revoking the candidate so
-      // a surviving provider context never observes a gap in its MCP access.
       yield* Effect.sync(() => McpProviderSession.rollbackMcpProviderSessionReplacement(threadId));
       if (replacement.candidate !== undefined) {
         yield* revokeMcpProviderCredential(replacement.candidate.providerSessionId);
@@ -435,7 +453,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             next.set(threadId, { ...current, users: current.users + 1 });
             return [current, next] as const;
           }
-          const lock = { semaphore: newLock, users: 1 } satisfies McpTransactionLock;
+          const lock = {
+            semaphore: newLock,
+            users: 1,
+          } satisfies McpTransactionLock;
           const next = new Map(locks);
           next.set(threadId, lock);
           return [lock, next] as const;
@@ -572,119 +593,76 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     use: (lease: ThreadLifecycleLease) => Effect.Effect<A, E, R>,
   ): Effect.Effect<A, E | ProviderValidationError, R> =>
     Effect.acquireUseRelease(acquireLifecycleLease(threadId, kind), use, releaseLifecycleLease);
-  const commitMcpSession = (
-    threadId: ThreadId,
-    replacement: McpProviderSession.McpProviderSessionReplacement,
-  ) =>
+  const clearMcpSession = (threadId: ThreadId) =>
     Effect.gen(function* () {
-      yield* Effect.sync(() => McpProviderSession.commitMcpProviderSessionReplacement(threadId));
-      if (
-        !replacement.accessWasDisabled &&
-        replacement.candidate !== undefined &&
-        replacement.previous !== undefined
-      ) {
-        yield* revokeMcpProviderCredential(replacement.previous.providerSessionId);
-      }
+      yield* Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId));
+      yield* revokeMcpCredential(threadId);
     });
-  const withMcpReplacement = <E, R>(input: {
-    readonly threadId: ThreadId;
-    readonly providerInstanceId: ProviderInstanceId;
-    readonly prepare: () => Effect.Effect<McpProviderSession.McpProviderSessionReplacement, E, R>;
-    readonly use: (
-      replacement: McpProviderSession.McpProviderSessionReplacement,
-    ) => Effect.Effect<ProviderSession, E, R>;
-    readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
-    readonly beforeCommit?: (
-      session: ProviderSession,
-    ) => Effect.Effect<void, E | ProviderSessionDirectory.ProviderSessionDirectoryWriteError, R>;
-    readonly onRollback?: Effect.Effect<void, never, R>;
-  }): Effect.Effect<
-    ProviderSession,
-    E | ProviderAdapterError | ProviderSessionDirectory.ProviderSessionDirectoryWriteError,
-    R
-  > =>
+  const clearMcpSessionForOwner = (threadId: ThreadId, owner: ProjectMcpLeaseOwner) =>
     Effect.gen(function* () {
-      const replacement = yield* input.prepare();
-      let startedSession: ProviderSession | undefined;
-      const result = yield* Effect.gen(function* () {
-        const result = yield* input.use(replacement);
-        startedSession = result;
-        if (input.beforeCommit) {
-          yield* input.beforeCommit(result);
-        }
-        return result;
-      }).pipe(
-        Effect.onExit((exit) =>
-          Exit.isSuccess(exit)
-            ? Effect.void
-            : Effect.uninterruptible(
-                Effect.gen(function* () {
-                  const settlementExit =
-                    startedSession !== undefined && input.adapter.settleStartedSession !== undefined
-                      ? yield* Effect.exit(
-                          input.adapter.settleStartedSession({
-                            threadId: input.threadId,
-                            session: startedSession,
-                            outcome: "rollback",
-                          }),
-                        )
-                      : Exit.succeed(undefined);
-                  // Restore the in-memory registry and revoke the candidate only
-                  // after the adapter has restored any native state it changed in
-                  // place. Capture each cleanup result so one failed cleanup does
-                  // not skip the remaining rollback steps.
-                  const mcpRollbackExit = yield* Effect.exit(
-                    rollbackMcpSession(input.threadId, replacement),
-                  );
-                  const onRollbackExit = input.onRollback
-                    ? yield* Effect.exit(input.onRollback)
-                    : Exit.succeed(undefined);
-                  if (Exit.isFailure(settlementExit)) {
-                    return yield* Effect.failCause(settlementExit.cause);
-                  }
-                  if (Exit.isFailure(mcpRollbackExit)) {
-                    return yield* Effect.failCause(mcpRollbackExit.cause);
-                  }
-                  if (Exit.isFailure(onRollbackExit)) {
-                    return yield* Effect.failCause(onRollbackExit.cause);
-                  }
-                }),
-              ),
-        ),
+      if (owner.mcpProviderSessionId === undefined) {
+        yield* clearMcpSession(threadId);
+        return;
+      }
+      yield* Effect.sync(() =>
+        McpProviderSession.clearMcpProviderSessionIf(threadId, owner.mcpProviderSessionId!),
       );
-
-      // OpenCode's commit settlement only discards an identity-matched
-      // in-memory snapshot. Settle it before the infallible MCP commit so a
-      // commit hook cannot leave a published credential with pending state.
-      if (input.adapter.settleStartedSession !== undefined) {
-        const commitSettlementExit = yield* Effect.exit(
-          input.adapter.settleStartedSession({
-            threadId: input.threadId,
-            session: result,
-            outcome: "commit",
-          }),
-        );
-        if (Exit.isFailure(commitSettlementExit)) {
-          const rollbackSettlementExit = yield* Effect.exit(
-            input.adapter.settleStartedSession({
-              threadId: input.threadId,
-              session: result,
-              outcome: "rollback",
-            }),
-          );
-          yield* rollbackMcpSession(input.threadId, replacement);
-          if (input.onRollback) {
-            yield* input.onRollback;
-          }
-          if (Exit.isFailure(rollbackSettlementExit)) {
-            return yield* Effect.failCause(rollbackSettlementExit.cause);
-          }
-          return yield* Effect.failCause(commitSettlementExit.cause);
-        }
-      }
-      yield* commitMcpSession(input.threadId, replacement);
-      return result;
+      yield* revokeMcpProviderCredential(owner.mcpProviderSessionId);
     });
+
+  const closeProjectMcpLeaseScope = (scope: Scope.Scope) =>
+    Effect.uninterruptible(Scope.close(scope, Exit.void));
+
+  const releaseProviderGeneration = Effect.fn("ProviderService.releaseProviderGeneration")(
+    function* (owner: ProjectMcpLeaseOwner) {
+      if (owner.providerGeneration !== undefined) {
+        yield* owner.providerGeneration.release;
+      }
+    },
+  );
+
+  const cleanupDetachedOwner = Effect.fn("ProviderService.cleanupDetachedMcpOwner")(
+    function* (threadId: ThreadId, owner: ProjectMcpLeaseOwner, cleanupAdapterMcp: boolean) {
+      if (owner.resourcesReleased) return;
+      yield* clearMcpSessionForOwner(threadId, owner);
+      if (cleanupAdapterMcp && owner.adapter.cleanupSessionMcp !== undefined) {
+        yield* owner.adapter.cleanupSessionMcp(threadId).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.mcp.adapter-cleanup-failed", {
+              threadId,
+              providerInstanceId: owner.instanceId,
+              cause,
+            }),
+          ),
+        );
+      }
+      yield* closeProjectMcpLeaseScope(owner.scope);
+      yield* releaseProviderGeneration(owner);
+      owner.resourcesReleased = true;
+    },
+    (effect) =>
+      effect.pipe(
+        Effect.catchCause((cause) =>
+          Cause.hasInterrupts(cause) ? Effect.failCause(cause) : effect,
+        ),
+      ),
+  );
+
+  const cleanupOwner = Effect.fn("ProviderService.cleanupMcpOwner")(function* (
+    threadId: ThreadId,
+    owner: ProjectMcpLeaseOwner,
+  ) {
+    if ((yield* Ref.get(projectMcpLeaseScopes)).get(threadId) !== owner) return;
+    const pending = (yield* Ref.get(pendingSessionReplacements)).get(threadId);
+    yield* cleanupDetachedOwner(threadId, owner, pending?.candidate.adapter !== owner.adapter);
+    yield* Ref.update(projectMcpLeaseScopes, (current) => {
+      if (current.get(threadId) !== owner) return current;
+      const next = new Map(current);
+      next.delete(threadId);
+      return next;
+    });
+  });
+
   const stopBoundAdapterSession = (
     adapter: ProviderAdapterShape<ProviderAdapterError>,
     threadId: ThreadId,
@@ -697,78 +675,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         () => Effect.succeed(false),
       ),
     );
-  const cleanupCandidateIfOwned = (
-    adapter: ProviderAdapterShape<ProviderAdapterError>,
-    threadId: ThreadId,
-    hadSessionBeforeStart: boolean,
-  ): Effect.Effect<void> => {
-    if (hadSessionBeforeStart) return Effect.void;
-    return stopBoundAdapterSession(adapter, threadId).pipe(
-      Effect.asVoid,
-      Effect.catchCause((cause) =>
-        Effect.logWarning("provider.session.cleanup-candidate-failed", {
-          threadId,
-          provider: adapter.provider,
-          cause,
-        }),
-      ),
-    );
-  };
-  const clearMcpSession = (threadId: ThreadId) =>
-    Effect.gen(function* () {
-      yield* Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId));
-      yield* revokeMcpCredential(threadId);
-    });
-
-  const closeProjectMcpLeaseScope = (scope: Scope.Scope) =>
-    Effect.uninterruptible(Scope.close(scope, Exit.void));
-
-  const releaseProjectMcpLease = Effect.fn("ProviderService.releaseProjectMcpLease")(function* (
-    threadId: ThreadId,
-  ) {
-    const owner = (yield* Ref.get(projectMcpLeaseScopes)).get(threadId);
-    if (!owner) return;
-    yield* closeProjectMcpLeaseScope(owner.scope);
-    yield* Ref.update(projectMcpLeaseScopes, (current) => {
-      if (current.get(threadId) !== owner) return current;
-      const next = new Map(current);
-      next.delete(threadId);
-      return next;
-    });
-  });
-
-  const cleanupOwner = Effect.fn("ProviderService.cleanupMcpOwner")(
-    function* (threadId: ThreadId, owner: ProjectMcpLeaseOwner) {
-      if ((yield* Ref.get(projectMcpLeaseScopes)).get(threadId) !== owner) return;
-      yield* clearMcpSession(threadId);
-      if (owner.adapter.cleanupSessionMcp !== undefined) {
-        yield* owner.adapter.cleanupSessionMcp(threadId).pipe(
-          Effect.catchCause((cause) =>
-            Effect.logWarning("provider.mcp.adapter-cleanup-failed", {
-              threadId,
-              providerInstanceId: owner.instanceId,
-              cause,
-            }),
-          ),
-        );
-      }
-      yield* releaseProjectMcpLease(threadId);
-    },
-    (effect) =>
-      effect.pipe(
-        Effect.catchCause((cause) =>
-          Cause.hasInterrupts(cause) ? Effect.failCause(cause) : effect,
-        ),
-      ),
-  );
-
-  const releaseProviderGeneration = Effect.fn("ProviderService.releaseProviderGeneration")(
-    function* (owner: ProjectMcpLeaseOwner) {
-      if (owner.providerGeneration !== undefined) {
-        yield* owner.providerGeneration.release;
-      }
-    },
-  );
 
   const finishOwner = Effect.fn("ProviderService.finishSessionOwner")(function* (
     threadId: ThreadId,
@@ -776,13 +682,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     stopNative: boolean,
   ) {
     if (stopNative) {
-      // `hasSession` intentionally hides quarantined OpenCode sessions. The
-      // adapter still owns a terminating handle for them, so only a confirmed
-      // stop or a typed not-found result can make their MCP resources stale.
       yield* stopBoundAdapterSession(owner.adapter, threadId);
     }
     yield* cleanupOwner(threadId, owner);
-    yield* releaseProviderGeneration(owner);
   });
 
   const releaseAllProjectMcpLeases = Effect.gen(function* () {
@@ -794,6 +696,197 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       if (Exit.isFailure(result)) return yield* Effect.failCause(result.cause);
     }
   });
+
+  const commitMcpSession = (
+    threadId: ThreadId,
+    replacement: McpProviderSession.McpProviderSessionReplacement,
+  ) =>
+    Effect.gen(function* () {
+      yield* Effect.sync(() => McpProviderSession.commitMcpProviderSessionReplacement(threadId));
+    });
+
+  const withMcpReplacement = <E, R>(input: {
+    readonly threadId: ThreadId;
+    readonly prepare: () => Effect.Effect<McpProviderSession.McpProviderSessionReplacement, E, R>;
+    readonly use: (
+      replacement: McpProviderSession.McpProviderSessionReplacement,
+    ) => Effect.Effect<ProviderSession, E | ProviderAdapterError, R>;
+    readonly beforeCommit?: (
+      session: ProviderSession,
+    ) => Effect.Effect<
+      void,
+      E | ProviderValidationError | ProviderSessionDirectory.ProviderSessionDirectoryWriteError,
+      R
+    >;
+    readonly onCommit?: Effect.Effect<
+      void,
+      E | ProviderValidationError | ProviderSessionDirectory.ProviderSessionDirectoryWriteError,
+      R
+    >;
+    readonly onRollback: (adapterRestoredPrevious: boolean) => Effect.Effect<void, never, R>;
+    readonly allowAdapterRollbackRestore: boolean;
+    readonly stopCandidate: boolean;
+    readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+  }): Effect.Effect<
+    ProviderSession,
+    | E
+    | ProviderAdapterError
+    | ProviderValidationError
+    | ProviderSessionDirectory.ProviderSessionDirectoryWriteError,
+    R
+  > =>
+    Effect.gen(function* () {
+      const replacement = yield* input.prepare();
+      let startedSession: ProviderSession | undefined;
+      const rollback = (attemptAdapterRestore: boolean) =>
+        Effect.uninterruptible(
+          Effect.gen(function* () {
+            const settlementExit =
+              attemptAdapterRestore &&
+              startedSession !== undefined &&
+              input.adapter.settleStartedSession !== undefined
+                ? yield* Effect.exit(
+                    input.adapter.settleStartedSession({
+                      threadId: input.threadId,
+                      session: startedSession,
+                      outcome: "rollback",
+                    }),
+                  )
+                : Exit.succeed(undefined);
+            const adapterRestoredPrevious =
+              input.allowAdapterRollbackRestore &&
+              startedSession !== undefined &&
+              input.adapter.settleStartedSession !== undefined &&
+              Exit.isSuccess(settlementExit);
+            const stopExit =
+              !adapterRestoredPrevious && (input.stopCandidate || startedSession !== undefined)
+                ? yield* Effect.exit(stopBoundAdapterSession(input.adapter, input.threadId))
+                : Exit.succeed(false);
+            const mcpExit = yield* Effect.exit(rollbackMcpSession(input.threadId, replacement));
+            const ownerExit = yield* Effect.exit(input.onRollback(adapterRestoredPrevious));
+            if (Exit.isFailure(settlementExit)) {
+              yield* Effect.logWarning("provider.session.rollback-settlement-failed", {
+                threadId: input.threadId,
+                provider: input.adapter.provider,
+                cause: settlementExit.cause,
+              });
+            }
+            if (Exit.isFailure(stopExit)) {
+              yield* Effect.logWarning("provider.session.rollback-stop-failed", {
+                threadId: input.threadId,
+                provider: input.adapter.provider,
+                cause: stopExit.cause,
+              });
+            }
+            if (Exit.isFailure(mcpExit)) {
+              yield* Effect.logWarning("provider.session.rollback-mcp-failed", {
+                threadId: input.threadId,
+                provider: input.adapter.provider,
+                cause: mcpExit.cause,
+              });
+            }
+            if (Exit.isFailure(ownerExit)) {
+              yield* Effect.logWarning("provider.session.rollback-owner-failed", {
+                threadId: input.threadId,
+                provider: input.adapter.provider,
+                cause: ownerExit.cause,
+              });
+            }
+          }),
+        );
+      const result = yield* Effect.gen(function* () {
+        const started = yield* input.use(replacement);
+        startedSession = started;
+        if (input.beforeCommit !== undefined) {
+          yield* input.beforeCommit(started);
+        }
+        return started;
+      }).pipe(Effect.onExit((exit) => (Exit.isSuccess(exit) ? Effect.void : rollback(true))));
+      if (input.adapter.settleStartedSession !== undefined) {
+        const commitSettlementExit = yield* Effect.exit(
+          input.adapter.settleStartedSession({
+            threadId: input.threadId,
+            session: result,
+            outcome: "commit",
+          }),
+        );
+        if (Exit.isFailure(commitSettlementExit)) {
+          yield* rollback(true);
+          return yield* Effect.failCause(commitSettlementExit.cause);
+        }
+      }
+      if (input.onCommit !== undefined) {
+        yield* input.onCommit.pipe(Effect.onError(() => rollback(false)));
+      }
+      yield* commitMcpSession(input.threadId, replacement);
+      return result;
+    });
+
+  const retainRetiringOwner = (threadId: ThreadId, owner: ProjectMcpLeaseOwner) =>
+    Ref.update(retiringSessionOwners, (current) => {
+      const existing = current.get(threadId) ?? [];
+      if (existing.includes(owner)) return current;
+      return new Map(current).set(threadId, [...existing, owner]);
+    });
+
+  const removeRetiringOwner = (threadId: ThreadId, owner: ProjectMcpLeaseOwner) =>
+    Ref.update(retiringSessionOwners, (current) => {
+      const existing = current.get(threadId);
+      if (existing === undefined) return current;
+      const remaining = existing.filter((candidate) => candidate !== owner);
+      const next = new Map(current);
+      if (remaining.length === 0) next.delete(threadId);
+      else next.set(threadId, remaining);
+      return next;
+    });
+
+  const retryRetiringOwnersUnsafe = Effect.fn("ProviderService.retryRetiringOwners")(function* (
+    threadId: ThreadId,
+  ) {
+    const owners = [...((yield* Ref.get(retiringSessionOwners)).get(threadId) ?? [])];
+    for (const owner of owners) {
+      const result = yield* Effect.exit(
+        stopBoundAdapterSession(owner.adapter, threadId).pipe(
+          Effect.andThen(cleanupDetachedOwner(threadId, owner, true)),
+        ),
+      );
+      if (Exit.isSuccess(result)) {
+        yield* removeRetiringOwner(threadId, owner);
+      } else {
+        yield* Effect.logWarning("provider.session.retry-retiring-failed", {
+          threadId,
+          providerInstanceId: owner.instanceId,
+          cause: result.cause,
+        });
+      }
+    }
+  });
+
+  const retirePreviousOwner = (
+    threadId: ThreadId,
+    owner: ProjectMcpLeaseOwner,
+    replacementAdapter: ProviderAdapterShape<ProviderAdapterError>,
+  ) =>
+    Effect.gen(function* () {
+      if (owner.resourcesReleased) return;
+      const sameAdapter = owner.adapter === replacementAdapter;
+      const result = yield* Effect.exit(
+        Effect.gen(function* () {
+          // A different adapter owns an independent native session. Stop it
+          // before retiring its MCP resources. A same-adapter start already
+          // replaced the adapter's thread slot, so stopping again would stop
+          // the committed candidate.
+          if (!sameAdapter) {
+            yield* stopBoundAdapterSession(owner.adapter, threadId);
+          }
+          yield* cleanupDetachedOwner(threadId, owner, !sameAdapter);
+        }),
+      );
+      if (Exit.isFailure(result)) {
+        if (!sameAdapter) yield* retainRetiringOwner(threadId, owner);
+        return yield* Effect.failCause(result.cause);
+      }
+    });
 
   const startAdapterSession = Effect.fn("ProviderService.startAdapterSession")(
     function* (input: {
@@ -827,17 +920,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 `Provider instance '${input.providerInstanceId}' changed before its session could start.`,
               );
             }
-            if (
-              providerGeneration !== undefined &&
-              !providerGeneration.enabled &&
-              input.operation === "ProviderService.startSession"
-            ) {
+            if (providerGeneration !== undefined && !providerGeneration.enabled) {
               return yield* toValidationError(
                 input.operation,
                 `Provider instance '${input.providerInstanceId}' changed to disabled before its session could start.`,
               );
             }
             const adapter = providerGeneration?.adapter ?? input.adapter;
+            yield* retryRetiringOwnersUnsafe(input.sessionInput.threadId);
             const thread = yield* projectionSnapshotQuery
               .getThreadShellById(input.sessionInput.threadId)
               .pipe(
@@ -1050,27 +1140,69 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               instanceId: input.providerInstanceId,
               generation: ++startGeneration,
               ...(providerGeneration ? { providerGeneration } : {}),
+              mcpProviderSessionId: undefined,
               nativeSessionId: undefined,
+              resourcesReleased: false,
             };
-            let ownerPublished = false;
-            const restorePreviousOwner = Effect.uninterruptible(
-              Ref.update(projectMcpLeaseScopes, (current) => {
-                if (current.get(input.sessionInput.threadId) !== owner) return current;
-                const next = new Map(current);
-                if (previousOwner === undefined) {
+            const sameAdapter = previousOwner?.adapter === adapter;
+            const pending: PendingSessionReplacement = {
+              candidate: owner,
+              previous: previousOwner,
+              sameAdapter,
+              exitedNativeSessionIds: new Set(),
+            };
+            const removePending = Ref.update(pendingSessionReplacements, (current) => {
+              if (current.get(input.sessionInput.threadId) !== pending) return current;
+              const next = new Map(current);
+              next.delete(input.sessionInput.threadId);
+              return next;
+            });
+            yield* Ref.update(pendingSessionReplacements, (current) =>
+              new Map(current).set(input.sessionInput.threadId, pending),
+            );
+            let candidateStartInvoked = false;
+            let previousRestoredByAdapter = false;
+            const markBindingStopped =
+              previousOwner === undefined
+                ? Effect.void
+                : directory
+                    .upsert({
+                      threadId: input.sessionInput.threadId,
+                      provider: previousOwner.adapter.provider,
+                      providerInstanceId: previousOwner.instanceId,
+                      status: "stopped",
+                      runtimePayload: { activeTurnId: null },
+                    })
+                    .pipe(
+                      Effect.catchCause((cause) =>
+                        Effect.logWarning("provider.session.rollback-binding-failed", {
+                          threadId: input.sessionInput.threadId,
+                          providerInstanceId: previousOwner.instanceId,
+                          cause,
+                        }),
+                      ),
+                    );
+            const failClosedSameAdapterReplacement = Effect.uninterruptible(
+              Effect.gen(function* () {
+                if (
+                  !candidateStartInvoked ||
+                  previousRestoredByAdapter ||
+                  !sameAdapter ||
+                  previousOwner === undefined
+                )
+                  return;
+                yield* Ref.update(projectMcpLeaseScopes, (current) => {
+                  if (current.get(input.sessionInput.threadId) !== previousOwner) return current;
+                  const next = new Map(current);
                   next.delete(input.sessionInput.threadId);
-                } else {
-                  next.set(input.sessionInput.threadId, previousOwner);
-                }
-                return next;
+                  return next;
+                });
+                // The adapter may have stopped this owner before failing the
+                // candidate start. Do not restore its metadata or MCP access.
+                yield* cleanupDetachedOwner(input.sessionInput.threadId, previousOwner, false);
+                yield* markBindingStopped;
               }),
             );
-            yield* Effect.uninterruptible(
-              Ref.update(projectMcpLeaseScopes, (current) =>
-                new Map(current).set(input.sessionInput.threadId, owner),
-              ),
-            );
-            ownerPublished = true;
             const started = yield* Effect.gen(function* () {
               const currentAdapter = yield* registry
                 .getByInstance(input.providerInstanceId)
@@ -1091,7 +1223,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               }
               return yield* withMcpReplacement({
                 threadId: input.sessionInput.threadId,
-                providerInstanceId: input.providerInstanceId,
                 adapter,
                 prepare: () =>
                   prepareMcpSession(
@@ -1104,41 +1235,121 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   ),
                 beforeCommit: (session) =>
                   Effect.gen(function* () {
+                    if (
+                      (yield* Ref.get(pendingSessionReplacements)).get(
+                        input.sessionInput.threadId,
+                      ) !== pending
+                    ) {
+                      return yield* Effect.fail(
+                        toValidationError(
+                          input.operation,
+                          "Provider session exited before its binding could be committed.",
+                        ),
+                      );
+                    }
+                    const activeOwner = (yield* Ref.get(projectMcpLeaseScopes)).get(
+                      input.sessionInput.threadId,
+                    );
+                    if (activeOwner !== undefined && activeOwner !== previousOwner) {
+                      return yield* Effect.fail(
+                        toValidationError(
+                          input.operation,
+                          "Provider session exited before its binding could be committed.",
+                        ),
+                      );
+                    }
+                    if (
+                      owner.nativeSessionId !== undefined &&
+                      pending.exitedNativeSessionIds.has(owner.nativeSessionId)
+                    ) {
+                      return yield* Effect.fail(
+                        toValidationError(
+                          input.operation,
+                          "Provider session exited before its binding could be committed.",
+                        ),
+                      );
+                    }
+                    if (!(yield* adapter.hasSession(input.sessionInput.threadId))) {
+                      return yield* Effect.fail(
+                        toValidationError(
+                          input.operation,
+                          "Provider session exited before its binding could be committed.",
+                        ),
+                      );
+                    }
+                    if (session.provider !== adapter.provider) {
+                      return yield* Effect.fail(
+                        toValidationError(
+                          input.operation,
+                          `Adapter/provider mismatch: requested '${adapter.provider}', received '${session.provider}'.`,
+                        ),
+                      );
+                    }
                     if (input.beforeCommit !== undefined) {
-                      yield* input.beforeCommit(session);
+                      yield* input.beforeCommit({
+                        ...session,
+                        providerInstanceId: input.providerInstanceId,
+                      });
                     }
                   }),
-                onRollback: Effect.gen(function* () {
-                  if (ownerPublished) {
-                    yield* restorePreviousOwner;
-                  }
-                  yield* closeProjectMcpLeaseScope(sessionScope);
-                }),
+                onCommit: Effect.uninterruptible(
+                  Effect.gen(function* () {
+                    const activeOwner = (yield* Ref.get(projectMcpLeaseScopes)).get(
+                      input.sessionInput.threadId,
+                    );
+                    if (activeOwner !== undefined && activeOwner !== previousOwner) {
+                      return yield* Effect.fail(
+                        toValidationError(
+                          input.operation,
+                          "Another provider session committed while this session was starting.",
+                        ),
+                      );
+                    }
+                    yield* Ref.update(projectMcpLeaseScopes, (current) =>
+                      new Map(current).set(input.sessionInput.threadId, owner),
+                    );
+                    yield* removePending;
+                  }),
+                ),
+                onRollback: (adapterRestoredPrevious) =>
+                  Effect.gen(function* () {
+                    previousRestoredByAdapter = adapterRestoredPrevious;
+                    yield* removePending;
+                    yield* closeProjectMcpLeaseScope(sessionScope);
+                    yield* failClosedSameAdapterReplacement;
+                  }),
+                allowAdapterRollbackRestore: sameAdapter,
+                stopCandidate: true,
                 use: (replacement) => {
+                  owner.mcpProviderSessionId = replacement.candidate?.providerSessionId;
                   const issuedProjectMcpServers = replacement.candidate?.projectServers;
-                  return adapter.startSession({
-                    ...input.sessionInput,
-                    ...(issuedProjectMcpServers && issuedProjectMcpServers.length > 0
-                      ? { projectMcpServers: issuedProjectMcpServers }
-                      : {}),
-                  });
+                  candidateStartInvoked = true;
+                  return adapter
+                    .startSession({
+                      ...input.sessionInput,
+                      ...(issuedProjectMcpServers && issuedProjectMcpServers.length > 0
+                        ? { projectMcpServers: issuedProjectMcpServers }
+                        : {}),
+                    })
+                    .pipe(
+                      Effect.tap((session) =>
+                        Effect.sync(() => {
+                          owner.nativeSessionId = nativeSessionId(session.resumeCursor);
+                        }),
+                      ),
+                    );
                 },
               });
             }).pipe(
               Effect.onError(() =>
                 Effect.gen(function* () {
-                  if (ownerPublished) {
-                    yield* restorePreviousOwner;
-                  }
+                  yield* removePending;
                   yield* closeProjectMcpLeaseScope(sessionScope);
+                  yield* failClosedSameAdapterReplacement;
                 }),
               ),
             );
             providerGenerationTransferred = true;
-            if (previousOwner !== undefined) {
-              yield* closeProjectMcpLeaseScope(previousOwner.scope);
-              yield* releaseProviderGeneration(previousOwner);
-            }
             if (durableCatalogSnapshot !== undefined && Option.isSome(orchestrationEngine)) {
               const shouldRecordUnsupported =
                 durableCatalogCapability === "unsupported" &&
@@ -1256,28 +1467,68 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       Effect.tap((canonicalEvent) =>
         canonicalEvent.type === "session.exited"
           ? Effect.gen(function* () {
-              const owner = (yield* Ref.get(projectMcpLeaseScopes)).get(canonicalEvent.threadId);
-              if (
-                !owner ||
-                owner.adapter !== source.adapter ||
-                owner.instanceId !== source.instanceId
-              )
-                return;
+              const eventNativeId =
+                nativeSessionId(canonicalEvent.providerRefs) ??
+                nativeSessionId(canonicalEvent.raw?.payload);
               yield* withThreadLifecycle(
                 canonicalEvent.threadId,
                 Effect.gen(function* () {
+                  const activeOwner = (yield* Ref.get(projectMcpLeaseScopes)).get(
+                    canonicalEvent.threadId,
+                  );
+                  const pending = (yield* Ref.get(pendingSessionReplacements)).get(
+                    canonicalEvent.threadId,
+                  );
+                  const sourceOwns = (owner: ProjectMcpLeaseOwner) =>
+                    owner.adapter === source.adapter && owner.instanceId === source.instanceId;
+                  const activeOwnsSource = activeOwner !== undefined && sourceOwns(activeOwner);
+
+                  // An ID matching the committed owner is always its exit,
+                  // including while a replacement is staged on the same
+                  // adapter. An ID that does not match the active owner is a
+                  // candidate exit only when it is explicit; ID-less events
+                  // must never be assigned to a pending candidate.
                   if (
-                    (yield* Ref.get(projectMcpLeaseScopes)).get(canonicalEvent.threadId)
-                      ?.generation !== owner.generation
+                    activeOwnsSource &&
+                    eventNativeId !== undefined &&
+                    activeOwner.nativeSessionId === eventNativeId
+                  ) {
+                    yield* finishOwner(canonicalEvent.threadId, activeOwner, false);
+                    return;
+                  }
+
+                  if (pending !== undefined && sourceOwns(pending.candidate)) {
+                    if (eventNativeId !== undefined) {
+                      pending.exitedNativeSessionIds.add(eventNativeId);
+                    }
+                    return;
+                  }
+
+                  if (activeOwnsSource) {
+                    if (eventNativeId !== undefined) return;
+                    if (pending !== undefined && pending.candidate.adapter === source.adapter) {
+                      return;
+                    }
+                    if (yield* source.adapter.hasSession(canonicalEvent.threadId)) return;
+                    yield* finishOwner(canonicalEvent.threadId, activeOwner, false);
+                    return;
+                  }
+
+                  const retiringOwner = (
+                    (yield* Ref.get(retiringSessionOwners)).get(canonicalEvent.threadId) ?? []
+                  ).find(
+                    (owner) =>
+                      sourceOwns(owner) &&
+                      (eventNativeId === undefined || owner.nativeSessionId === eventNativeId),
+                  );
+                  if (retiringOwner === undefined) return;
+                  if (
+                    eventNativeId === undefined &&
+                    (yield* source.adapter.hasSession(canonicalEvent.threadId))
                   )
                     return;
-                  const eventNativeId =
-                    nativeSessionId(canonicalEvent.providerRefs) ??
-                    nativeSessionId(canonicalEvent.raw?.payload);
-                  if (eventNativeId !== undefined && owner.nativeSessionId !== undefined) {
-                    if (eventNativeId !== owner.nativeSessionId) return;
-                  } else if (yield* source.adapter.hasSession(canonicalEvent.threadId)) return;
-                  yield* finishOwner(canonicalEvent.threadId, owner, false);
+                  yield* cleanupDetachedOwner(canonicalEvent.threadId, retiringOwner, true);
+                  yield* removeRetiringOwner(canonicalEvent.threadId, retiringOwner);
                 }),
               );
             })
@@ -1330,12 +1581,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const getAdapterEntries = Effect.gen(function* () {
     const current = yield* getCurrentAdapterEntries;
     const owners = yield* Ref.get(projectMcpLeaseScopes);
+    const retiring = yield* Ref.get(retiringSessionOwners);
     const result = [...current];
     const seen = new Set(result.map(([, adapter]) => adapter));
     for (const [, owner] of owners) {
       if (seen.has(owner.adapter)) continue;
       seen.add(owner.adapter);
       result.push([owner.instanceId, owner.adapter]);
+    }
+    for (const retainedOwners of retiring.values()) {
+      for (const owner of retainedOwners) {
+        if (seen.has(owner.adapter)) continue;
+        seen.add(owner.adapter);
+        result.push([owner.instanceId, owner.adapter]);
+      }
     }
     return result;
   });
@@ -1450,7 +1709,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
 
         const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
         const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
-
+        const previousOwner = (yield* Ref.get(projectMcpLeaseScopes)).get(input.binding.threadId);
         const resumed = yield* startAdapterSession({
           adapter,
           providerInstanceId: bindingInstanceId,
@@ -1480,7 +1739,17 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             `Adapter/provider mismatch while recovering thread '${input.binding.threadId}'. Expected '${adapter.provider}', received '${resumed.provider}'.`,
           );
         }
-
+        if (previousOwner !== undefined) {
+          yield* retirePreviousOwner(input.binding.threadId, previousOwner, adapter).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("provider.session.retire-previous-failed", {
+                threadId: input.binding.threadId,
+                providerInstanceId: previousOwner.instanceId,
+                cause,
+              }),
+            ),
+          );
+        }
         yield* analytics.record("provider.session.recovered", {
           provider: resumed.provider,
           strategy: "resume-thread",
@@ -1530,7 +1799,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         yield* finishOwner(input.threadId, owner, false);
       }
       const adapter = yield* registry.getByInstance(instanceId);
-
       const hasRequestedSession = yield* adapter.hasSession(input.threadId);
       if (hasRequestedSession) {
         return {
@@ -1541,7 +1809,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           isActive: true,
         } as const;
       }
-
       if (!input.allowRecovery) {
         return {
           adapter,
@@ -1551,7 +1818,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           isActive: false,
         } as const;
       }
-
       const recovered = yield* recoverSessionForThread({
         binding,
         operation: input.operation,
@@ -1586,29 +1852,35 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const stopStaleSessionsForThread = Effect.fn("stopStaleSessionsForThread")(function* (input: {
     readonly threadId: ThreadId;
     readonly currentInstanceId: ProviderInstanceId;
+    readonly skipAdapter?: ProviderAdapterShape<ProviderAdapterError>;
   }) {
     const currentAdapters = yield* getAdapterEntries;
     yield* Effect.forEach(
       currentAdapters,
       ([instanceId, adapter]) =>
-        instanceId === input.currentInstanceId
+        instanceId === input.currentInstanceId || adapter === input.skipAdapter
           ? Effect.void
           : Effect.gen(function* () {
-              const stopped = yield* stopBoundAdapterSession(adapter, input.threadId);
-              if (stopped) {
-                yield* analytics.record("provider.session.stopped", {
-                  provider: adapter.provider,
-                });
+              const hasSession = yield* adapter.hasSession(input.threadId);
+              if (!hasSession) {
+                return;
               }
-            }).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logWarning("provider.session.stop-stale-failed", {
-                  threadId: input.threadId,
-                  provider: adapter.provider,
-                  cause,
-                }),
-              ),
-            ),
+
+              yield* adapter.stopSession(input.threadId).pipe(
+                Effect.tap(() =>
+                  analytics.record("provider.session.stopped", {
+                    provider: adapter.provider,
+                  }),
+                ),
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("provider.session.stop-stale-failed", {
+                    threadId: input.threadId,
+                    provider: adapter.provider,
+                    cause,
+                  }),
+                ),
+              );
+            }),
       { discard: true },
     );
   });
@@ -1688,6 +1960,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               "provider.cwd.effective": effectiveCwd ?? "",
             });
             const adapter = yield* registry.getByInstance(resolvedInstanceId);
+            const previousOwner = (yield* Ref.get(projectMcpLeaseScopes)).get(threadId);
             const session = yield* startAdapterSession({
               adapter,
               providerInstanceId: resolvedInstanceId,
@@ -1696,7 +1969,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 Effect.gen(function* () {
                   yield* ensureLifecycleLease(lifecycleLease, "ProviderService.startSession");
                   yield* upsertSessionBinding(
-                    { ...startedSession, providerInstanceId: resolvedInstanceId },
+                    {
+                      ...startedSession,
+                      providerInstanceId: resolvedInstanceId,
+                    },
                     threadId,
                     { modelSelection: input.modelSelection },
                   );
@@ -1710,8 +1986,26 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   : {}),
               },
             });
-            yield* stopStaleSessionsForThread({ threadId, currentInstanceId: resolvedInstanceId });
-            const sessionWithInstance = { ...session, providerInstanceId: resolvedInstanceId };
+            if (previousOwner !== undefined) {
+              yield* retirePreviousOwner(threadId, previousOwner, adapter).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("provider.session.retire-previous-failed", {
+                    threadId,
+                    providerInstanceId: previousOwner.instanceId,
+                    cause,
+                  }),
+                ),
+              );
+            }
+            yield* stopStaleSessionsForThread({
+              threadId,
+              currentInstanceId: resolvedInstanceId,
+              ...(previousOwner !== undefined ? { skipAdapter: previousOwner.adapter } : {}),
+            });
+            const sessionWithInstance = {
+              ...session,
+              providerInstanceId: resolvedInstanceId,
+            };
             yield* analytics.record("provider.session.started", {
               provider: sessionWithInstance.provider,
               runtimeMode: input.runtimeMode,
@@ -2033,6 +2327,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   yield* stopBoundAdapterSession(routed.adapter, routed.threadId);
                   yield* clearMcpSession(input.threadId);
                 }
+                yield* retryRetiringOwnersUnsafe(input.threadId);
               }),
             );
             yield* directory.upsert({
@@ -2269,13 +2564,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         }),
       ),
     ).pipe(Effect.asVoid);
-    const owners = yield* Ref.get(projectMcpLeaseScopes);
     yield* releaseAllProjectMcpLeases;
-    yield* Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll()).pipe(
-      Effect.asVoid,
-      Effect.ensuring(Effect.forEach(owners, ([, owner]) => releaseProviderGeneration(owner))),
+    const stopAllResult = yield* Effect.exit(
+      Effect.forEach(currentAdapters, ([, adapter]) => adapter.stopAll()).pipe(Effect.asVoid),
     );
-    yield* McpSessionRegistry.revokeAllActiveMcpCredentials();
+    const retiringThreadIds = [...(yield* Ref.get(retiringSessionOwners)).keys()];
+    yield* Effect.forEach(
+      retiringThreadIds,
+      (threadId) => withThreadLifecycle(threadId, retryRetiringOwnersUnsafe(threadId)),
+      { discard: true },
+    );
+    if (Exit.isFailure(stopAllResult)) return yield* Effect.failCause(stopAllResult.cause);
+    if ((yield* Ref.get(retiringSessionOwners)).size === 0) {
+      yield* McpSessionRegistry.revokeAllActiveMcpCredentials();
+    }
     McpProviderSession.clearAllMcpProviderSessions();
     const bindings = yield* directory.listBindings().pipe(Effect.orElseSucceed(() => []));
     yield* Effect.forEach(bindings, (binding) =>
