@@ -44,6 +44,12 @@ export interface ProviderThreadSnapshot {
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
 }
 
+export interface ProviderSessionSettlementInput {
+  readonly threadId: ThreadId;
+  readonly session: ProviderSession;
+  readonly outcome: "commit" | "rollback";
+}
+
 export interface ProviderAdapterShape<TError> {
   /**
    * Provider kind implemented by this adapter.
@@ -57,6 +63,15 @@ export interface ProviderAdapterShape<TError> {
   readonly startSession: (
     input: ProviderSessionStartInput,
   ) => Effect.Effect<ProviderSession, TError>;
+
+  /**
+   * Settle provider-native mutations made by a successful start after the
+   * service decides whether its MCP replacement can commit. Adapters that do
+   * not mutate an existing native session can omit this hook.
+   */
+  readonly settleStartedSession?: (
+    input: ProviderSessionSettlementInput,
+  ) => Effect.Effect<void, TError>;
 
   /**
    * Send a turn to an active provider session.

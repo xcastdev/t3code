@@ -479,32 +479,101 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         yield* revokeMcpProviderCredential(replacement.previous.providerSessionId);
       }
     });
-  const withMcpReplacement = <A, E, R>(input: {
+  const withMcpReplacement = <E, R>(input: {
     readonly threadId: ThreadId;
     readonly providerInstanceId: ProviderInstanceId;
     readonly use: (
       replacement: McpProviderSession.McpProviderSessionReplacement,
-    ) => Effect.Effect<A, E, R>;
-    readonly beforeCommit?: Effect.Effect<void, E, R>;
+    ) => Effect.Effect<ProviderSession, E, R>;
+    readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+    readonly beforeCommit?: (
+      session: ProviderSession,
+    ) => Effect.Effect<void, E | ProviderSessionDirectory.ProviderSessionDirectoryWriteError, R>;
     readonly onRollback?: Effect.Effect<void, never, R>;
-  }): Effect.Effect<A, E, R> =>
+  }): Effect.Effect<
+    ProviderSession,
+    E | ProviderAdapterError | ProviderSessionDirectory.ProviderSessionDirectoryWriteError,
+    R
+  > =>
     Effect.gen(function* () {
       const replacement = yield* prepareMcpSession(input.threadId, input.providerInstanceId);
+      let startedSession: ProviderSession | undefined;
       const result = yield* Effect.gen(function* () {
         const result = yield* input.use(replacement);
+        startedSession = result;
         if (input.beforeCommit) {
-          yield* input.beforeCommit;
+          yield* input.beforeCommit(result);
         }
         return result;
       }).pipe(
         Effect.onExit((exit) =>
           Exit.isSuccess(exit)
             ? Effect.void
-            : rollbackMcpSession(input.threadId, replacement).pipe(
-                Effect.andThen(input.onRollback ?? Effect.void),
+            : Effect.uninterruptible(
+                Effect.gen(function* () {
+                  const settlementExit =
+                    startedSession !== undefined && input.adapter.settleStartedSession !== undefined
+                      ? yield* Effect.exit(
+                          input.adapter.settleStartedSession({
+                            threadId: input.threadId,
+                            session: startedSession,
+                            outcome: "rollback",
+                          }),
+                        )
+                      : Exit.succeed(undefined);
+                  // Restore the in-memory registry and revoke the candidate only
+                  // after the adapter has restored any native state it changed in
+                  // place. Capture each cleanup result so one failed cleanup does
+                  // not skip the remaining rollback steps.
+                  const mcpRollbackExit = yield* Effect.exit(
+                    rollbackMcpSession(input.threadId, replacement),
+                  );
+                  const onRollbackExit = input.onRollback
+                    ? yield* Effect.exit(input.onRollback)
+                    : Exit.succeed(undefined);
+                  if (Exit.isFailure(settlementExit)) {
+                    return yield* Effect.failCause(settlementExit.cause);
+                  }
+                  if (Exit.isFailure(mcpRollbackExit)) {
+                    return yield* Effect.failCause(mcpRollbackExit.cause);
+                  }
+                  if (Exit.isFailure(onRollbackExit)) {
+                    return yield* Effect.failCause(onRollbackExit.cause);
+                  }
+                }),
               ),
         ),
       );
+
+      // OpenCode's commit settlement only discards an identity-matched
+      // in-memory snapshot. Settle it before the infallible MCP commit so a
+      // commit hook cannot leave a published credential with pending state.
+      if (input.adapter.settleStartedSession !== undefined) {
+        const commitSettlementExit = yield* Effect.exit(
+          input.adapter.settleStartedSession({
+            threadId: input.threadId,
+            session: result,
+            outcome: "commit",
+          }),
+        );
+        if (Exit.isFailure(commitSettlementExit)) {
+          const rollbackSettlementExit = yield* Effect.exit(
+            input.adapter.settleStartedSession({
+              threadId: input.threadId,
+              session: result,
+              outcome: "rollback",
+            }),
+          );
+          yield* rollbackMcpSession(input.threadId, replacement);
+          if (input.onRollback) {
+            yield* input.onRollback;
+          }
+          if (Exit.isFailure(rollbackSettlementExit)) {
+            return yield* Effect.failCause(rollbackSettlementExit.cause);
+          }
+          return yield* Effect.failCause(commitSettlementExit.cause);
+        }
+      }
       yield* commitMcpSession(input.threadId, replacement);
       return result;
     });
@@ -708,7 +777,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         const resumed = yield* withMcpReplacement({
           threadId: input.binding.threadId,
           providerInstanceId: bindingInstanceId,
-          beforeCommit: ensureLifecycleLease(input.lifecycleLease, input.operation),
+          adapter,
+          beforeCommit: (session) =>
+            Effect.gen(function* () {
+              yield* ensureLifecycleLease(input.lifecycleLease, input.operation);
+              yield* upsertSessionBinding(
+                { ...session, providerInstanceId: bindingInstanceId },
+                input.binding.threadId,
+              );
+            }),
           onRollback: cleanupCandidateIfOwned(adapter, input.binding.threadId, hasActiveSession),
           use: () =>
             adapter
@@ -734,18 +811,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 ),
               ),
         });
-        if (!(yield* lifecycleLeaseIsCurrent(input.lifecycleLease))) {
-          yield* cleanupCandidateIfOwned(adapter, input.binding.threadId, hasActiveSession);
-          yield* clearMcpSession(input.binding.threadId);
-          return yield* toValidationError(
-            input.operation,
-            `Operation for thread '${input.binding.threadId}' was superseded by a stop request.`,
-          );
-        }
-        yield* upsertSessionBinding(
-          { ...resumed, providerInstanceId: bindingInstanceId },
-          input.binding.threadId,
-        );
         yield* analytics.record("provider.session.recovered", {
           provider: resumed.provider,
           strategy: "resume-thread",
@@ -951,7 +1016,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             const session = yield* withMcpReplacement({
               threadId,
               providerInstanceId: resolvedInstanceId,
-              beforeCommit: ensureLifecycleLease(lifecycleLease, "ProviderService.startSession"),
+              adapter,
+              beforeCommit: (startedSession) =>
+                Effect.gen(function* () {
+                  yield* ensureLifecycleLease(lifecycleLease, "ProviderService.startSession");
+                  yield* upsertSessionBinding(
+                    { ...startedSession, providerInstanceId: resolvedInstanceId },
+                    threadId,
+                    { modelSelection: input.modelSelection },
+                  );
+                }),
               onRollback: cleanupCandidateIfOwned(adapter, threadId, hadSessionBeforeStart),
               use: () =>
                 adapter
@@ -976,28 +1050,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                     ),
                   ),
             });
-            const sessionWithInstance = {
-              ...session,
-              providerInstanceId: resolvedInstanceId,
-            };
-
-            if (!(yield* lifecycleLeaseIsCurrent(lifecycleLease))) {
-              yield* cleanupCandidateIfOwned(adapter, threadId, hadSessionBeforeStart);
-              yield* clearMcpSession(threadId);
-              return yield* toValidationError(
-                "ProviderService.startSession",
-                `Operation for thread '${threadId}' was superseded by a stop request.`,
-              );
-            }
-
             yield* stopStaleSessionsForThread({
               threadId,
               currentInstanceId: resolvedInstanceId,
             });
-            yield* ensureLifecycleLease(lifecycleLease, "ProviderService.startSession");
-            yield* upsertSessionBinding(sessionWithInstance, threadId, {
-              modelSelection: input.modelSelection,
-            });
+            const sessionWithInstance = {
+              ...session,
+              providerInstanceId: resolvedInstanceId,
+            };
             yield* analytics.record("provider.session.started", {
               provider: sessionWithInstance.provider,
               runtimeMode: input.runtimeMode,

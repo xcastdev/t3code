@@ -7027,6 +7027,141 @@ it.layer(OpenCodeAdapterManagedTestLayer)("OpenCodeAdapterManaged", (it) => {
     }),
   );
 
+  it.effect("restores native state when a managed replacement is rejected", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-managed-settlement-rollback");
+      const initialMcp = {
+        environmentId: EnvironmentId.make("environment-1"),
+        threadId,
+        providerSessionId: "provider-session-initial",
+        providerInstanceId: ProviderInstanceId.make("opencode"),
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer initial-token",
+      } satisfies McpProviderSession.McpProviderSessionConfig;
+      const candidateMcp = {
+        ...initialMcp,
+        providerSessionId: "provider-session-candidate",
+        authorizationHeader: "Bearer candidate-token",
+      };
+      McpProviderSession.setMcpProviderSession(initialMcp);
+      runtimeMock.state.mcpConfig = {
+        "t3-code": {
+          type: "remote",
+          url: initialMcp.endpoint,
+          headers: { Authorization: initialMcp.authorizationHeader },
+          oauth: false,
+        },
+      };
+
+      const original = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      McpProviderSession.setMcpProviderSession(candidateMcp);
+      const replacement = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        resumeCursor: original.resumeCursor,
+      });
+
+      yield* adapter.settleStartedSession!({
+        threadId,
+        session: replacement,
+        outcome: "rollback",
+      });
+
+      NodeAssert.equal((yield* adapter.listSessions())[0]?.runtimeMode, "approval-required");
+      NodeAssert.deepEqual(runtimeMock.state.sessionUpdateCalls, [
+        {
+          sessionID: "/session",
+          permission: buildOpenCodePermissionRules("full-access"),
+        },
+        {
+          sessionID: "/session",
+          permission: buildOpenCodePermissionRules("approval-required"),
+        },
+      ]);
+      NodeAssert.deepEqual(runtimeMock.state.mcpAddCalls.at(-1), {
+        name: "t3-code",
+        config: {
+          type: "remote",
+          url: initialMcp.endpoint,
+          headers: { Authorization: initialMcp.authorizationHeader },
+          oauth: false,
+        },
+      });
+      NodeAssert.equal(yield* adapter.hasSession(threadId), true);
+
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
+  );
+
+  it.effect("quarantines a managed context when replacement restoration fails", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-managed-settlement-failure");
+      const initialMcp = {
+        environmentId: EnvironmentId.make("environment-1"),
+        threadId,
+        providerSessionId: "provider-session-initial-failure",
+        providerInstanceId: ProviderInstanceId.make("opencode"),
+        endpoint: "http://127.0.0.1:43123/mcp",
+        authorizationHeader: "Bearer initial-token",
+      } satisfies McpProviderSession.McpProviderSessionConfig;
+      McpProviderSession.setMcpProviderSession(initialMcp);
+      runtimeMock.state.mcpConfig = {
+        "t3-code": {
+          type: "remote",
+          url: initialMcp.endpoint,
+          headers: { Authorization: initialMcp.authorizationHeader },
+          oauth: false,
+        },
+      };
+
+      const original = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      McpProviderSession.setMcpProviderSession({
+        ...initialMcp,
+        providerSessionId: "provider-session-candidate-failure",
+        authorizationHeader: "Bearer candidate-token",
+      });
+      const replacement = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+        resumeCursor: original.resumeCursor,
+      });
+      runtimeMock.state.mcpAddError = new Error("restore MCP failed");
+
+      const settlement = yield* adapter.settleStartedSession!({
+        threadId,
+        session: replacement,
+        outcome: "rollback",
+      }).pipe(Effect.result);
+
+      NodeAssert.equal(settlement._tag, "Failure");
+      NodeAssert.equal(yield* adapter.hasSession(threadId), false);
+      NodeAssert.deepEqual(yield* adapter.listSessions(), []);
+      const send = yield* adapter
+        .sendTurn({ threadId, input: "should not route" })
+        .pipe(Effect.result);
+      NodeAssert.equal(send._tag, "Failure");
+
+      runtimeMock.state.mcpAddError = null;
+      yield* adapter.stopSession(threadId);
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
+  );
+
   it.effect("keeps the managed context when in-place recovery fails", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
