@@ -26,6 +26,7 @@ import {
   ModelSelection,
   ProjectId,
   ThreadLinkedPullRequest,
+  THREAD_ACTIVITY_WINDOW_LIMIT,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Arr from "effect/Array";
@@ -74,7 +75,7 @@ const decodeThread = Schema.decodeUnknownEffect(OrchestrationThread);
 // Keep detail reads consistent with the in-memory projector's retained
 // activity window. Applying the limit in SQL avoids decoding an unbounded
 // payload_json set before the projector can enforce that invariant.
-const THREAD_DETAIL_ACTIVITY_LIMIT = 500;
+const THREAD_DETAIL_ACTIVITY_LIMIT = THREAD_ACTIVITY_WINDOW_LIMIT;
 // One row past the window. A bare LIMIT cannot say whether a full page means
 // "exactly this many rows exist" or "more were cut"; reading one extra row and
 // discarding it turns that ambiguity into a fact.
@@ -1217,6 +1218,29 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
   // Most recent THREAD_TURN_LIMIT turns for one thread, returned ascending.
   // The cap mirrors the activity window: a thread with thousands of turns must
   // not decode all of them to render a timeline.
+  // Total rows a thread holds per turn, for the turns a truncated window kept.
+  // Position cannot answer this: `sequence` is never populated, so rows order by
+  // time, and a provider completing an earlier turn after a later one has begun
+  // interleaves them. Comparing a turn's total against what the window retained
+  // is the only way to know it was cut.
+  const countActivityRowsByTurn = SqlSchema.findAll({
+    Request: ThreadIdLookupInput,
+    Result: Schema.Struct({
+      turnId: TurnId,
+      activityCount: Schema.Number,
+    }),
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          turn_id AS "turnId",
+          COUNT(*) AS "activityCount"
+        FROM projection_thread_activities
+        WHERE thread_id = ${threadId}
+          AND turn_id IS NOT NULL
+        GROUP BY turn_id
+      `,
+  });
+
   const listTurnRowsByThread = SqlSchema.findAll({
     Request: ThreadIdLookupInput,
     Result: ProjectionTurnSummaryDbRowSchema,
@@ -2785,28 +2809,42 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       }
 
       // The query reads one row past the window, so an over-full result is
-      // proof that older rows were cut. Rows arrive oldest-first, and a turn's
-      // rows are contiguous, so at most one turn can straddle the cut: the one
-      // owning the oldest row still inside the window. Turns older than it kept
-      // nothing and never render a fold; newer turns kept everything.
-      //
-      // Naming that turn rather than the discarded probe row's turn matters:
-      // rows with no turn are interleaved throughout (most turns in a long
-      // thread contain some), so a probe that lands on one would report nothing
-      // while a turn really was cut — and the client would show a count derived
-      // from the rows that happened to survive. Over-reporting a whole turn
-      // costs a hidden count; under-reporting states a wrong number as fact.
+      // proof that older rows were cut. Which turns lost rows is then a
+      // counting question, not a positional one: `sequence` is never written,
+      // so rows order by time, and a provider finishing an earlier turn after
+      // a later one has begun interleaves the two. Compare each retained turn's
+      // total against what survived — anything short of its total is partial.
       const activityWindowTruncated = activityRows.length > THREAD_DETAIL_ACTIVITY_LIMIT;
       const retainedActivityRows = activityWindowTruncated
         ? activityRows.slice(activityRows.length - THREAD_DETAIL_ACTIVITY_LIMIT)
         : activityRows;
-      const oldestRetainedTurnId = activityWindowTruncated
-        ? retainedActivityRows.find((row) => row.turnId !== null)?.turnId
-        : undefined;
-      const partialTurnIds =
-        oldestRetainedTurnId === undefined || oldestRetainedTurnId === null
-          ? []
-          : [oldestRetainedTurnId];
+      const retainedCountsByTurnId = new Map<string, number>();
+      if (activityWindowTruncated) {
+        for (const row of retainedActivityRows) {
+          if (row.turnId !== null) {
+            retainedCountsByTurnId.set(
+              row.turnId,
+              (retainedCountsByTurnId.get(row.turnId) ?? 0) + 1,
+            );
+          }
+        }
+      }
+      const turnActivityTotals = activityWindowTruncated
+        ? yield* countActivityRowsByTurn({ threadId }).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getThreadDetailById:countActivitiesByTurn:query",
+                "ProjectionSnapshotQuery.getThreadDetailById:countActivitiesByTurn:decodeRows",
+              ),
+            ),
+          )
+        : [];
+      const partialTurnIds = turnActivityTotals
+        .filter((row) => {
+          const retained = retainedCountsByTurnId.get(row.turnId);
+          return retained !== undefined && retained < row.activityCount;
+        })
+        .map((row) => row.turnId);
 
       const selectedActivityRows = [
         ...new Map(

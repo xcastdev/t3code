@@ -249,6 +249,7 @@ interface MessagesTimelineProps {
    * began before it cannot be counted client-side without undercounting.
    */
   partialTurnIds?: ReadonlySet<TurnId> | undefined;
+  activityWindowMayBeTruncated?: boolean | undefined;
   /** Turn folds to render expanded on mount. Test seam and deep links. */
   initialExpandedTurnIds?: ReadonlySet<TurnId>;
   /** Tool groups to render expanded on mount. Test seam and deep links. */
@@ -300,6 +301,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   latestTurn,
   turns = null,
   partialTurnIds,
+  activityWindowMayBeTruncated,
   initialExpandedTurnIds,
   initialExpandedWorkGroupIds,
   runningTurnId,
@@ -461,6 +463,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         latestTurn,
         turns,
         partialTurnIds,
+        activityWindowMayBeTruncated,
         runningTurnId,
         expandedTurnIds,
         expandedWorkGroupIds,
@@ -474,6 +477,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       latestTurn,
       turns,
       partialTurnIds,
+      activityWindowMayBeTruncated,
       runningTurnId,
       expandedTurnIds,
       expandedWorkGroupIds,

@@ -129,11 +129,15 @@ cannot tell a full page from a trimmed one. It names turns, not a timestamp, bec
 drops, merges and reorders activity rows on the way to the screen — no `createdAt` survives that
 trip intact, while a turn id rides along untouched.
 
-A turn's rows are contiguous, so at most one turn straddles the cut: the one owning the oldest row
-still inside the window. The server names that turn rather than the discarded row's, because rows
-carrying no turn are interleaved throughout a long thread — a discarded row is often one of them,
-and reading the turn off it would report nothing while a turn really was cut. Naming a turn that
-kept all its rows costs a hidden count; missing one states a wrong number as fact.
+Which turns were cut is a counting question, not a positional one. Activity rows carry no usable
+sequence, so they order by time, and a provider that finishes an earlier turn after a later one has
+begun interleaves the two — the cut turn is then not the one owning the oldest retained row. The
+server compares each retained turn's total row count against how many the window kept, and names
+every turn that came up short.
+
+A client talking to a host too old to send the field falls back to the window's own size: at the
+cap it treats every turn as possibly cut and shows no derived counts. Silence costs a hidden count;
+the alternative states a wrong number as fact.
 
 `+N/−M` sums the turn's checkpoint additions and deletions and is suppressed unless the checkpoint
 status is `ready`. The changed-file count survives suppression either way.

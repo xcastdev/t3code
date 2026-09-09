@@ -2307,6 +2307,70 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
     }),
   );
 
+  it.effect("names a cut turn whose rows are interleaved with a later turn", () =>
+    Effect.gen(function* () {
+      // `sequence` is never written, so rows order by time, and a provider that
+      // finishes an earlier turn after a later one has begun interleaves the
+      // two. The cut turn is then not the one owning the oldest retained row,
+      // and reading it off position reports the wrong turn — leaving a turn
+      // that lost hundreds of rows to publish a count built from the few that
+      // survived.
+      yield* seedFanOutThread();
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* sql`DELETE FROM projection_thread_activities`;
+      // turn-early: 2 rows cut, 1 row retained (late completion) -> partial.
+      // turn-late: 499 rows, all retained -> whole.
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        )
+        VALUES
+          ('activity-0001', 'thread-w', 'turn-early', 'tool', 'tool.completed', 'ran tool', '{}', NULL, '2026-03-01T00:01:00.000Z'),
+          ('activity-0002', 'thread-w', 'turn-early', 'tool', 'tool.completed', 'ran tool', '{}', NULL, '2026-03-01T00:01:01.000Z')
+      `;
+      yield* sql`
+        WITH RECURSIVE activity_rows(n) AS (
+          SELECT 1
+          UNION ALL
+          SELECT n + 1 FROM activity_rows WHERE n < 499
+        )
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        )
+        SELECT
+          printf('activity-1%03d', n),
+          'thread-w',
+          'turn-late',
+          'tool',
+          'tool.completed',
+          'ran tool',
+          '{}',
+          NULL,
+          printf('2026-03-01T00:02:%02d.000Z', n % 60)
+        FROM activity_rows
+      `;
+      // turn-early completes last, so its final row sorts after turn-late's.
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        )
+        VALUES
+          ('activity-9999', 'thread-w', 'turn-early', 'tool', 'tool.completed', 'ran tool', '{}', NULL, '2026-03-01T00:09:00.000Z')
+      `;
+
+      const detail = yield* snapshotQuery.getThreadDetailById(threadW);
+      assert.equal(detail._tag, "Some");
+      if (detail._tag === "Some") {
+        assert.equal(detail.value.activities.length, 500);
+        // turn-early kept 1 of 3 rows: it must be named, even though the oldest
+        // retained row belongs to turn-late.
+        assert.deepEqual([...(detail.value.partialTurnIds ?? [])], ["turn-early"]);
+      }
+    }),
+  );
+
   it.effect("names the cut turn even when the discarded row has no turn", () =>
     Effect.gen(function* () {
       // Rows without a turn are interleaved throughout a real thread, so the
@@ -2318,15 +2382,16 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
       const sql = yield* SqlClient.SqlClient;
 
       yield* sql`DELETE FROM projection_thread_activities`;
-      // 502 rows so exactly one falls outside the window, and that discarded
-      // row is turnless. turn-5 has a row older still (also cut) and rows
-      // inside the window, so it straddles the cut with nothing in the
-      // discarded row to name it.
+      // The two oldest rows fall outside the window: one belongs to turn-5 and
+      // one has no turn at all. turn-5 keeps rows inside the window, so it is
+      // genuinely partial — and the row nearest the boundary names no turn, so
+      // reading the cut turn off position alone would report nothing.
       yield* sql`
         INSERT INTO projection_thread_activities (
           activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
         )
         VALUES
+          ('activity-0000', 'thread-w', 'turn-5', 'tool', 'tool.completed', 'ran tool', '{}', 0, '2026-03-01T00:04:00.000Z'),
           ('activity-0001', 'thread-w', NULL, 'info', 'context-window.updated', 'ctx', '{}', 1, '2026-03-01T00:04:00.000Z')
       `;
       yield* sql`
@@ -2355,8 +2420,8 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
       assert.equal(detail._tag, "Some");
       if (detail._tag === "Some") {
         assert.equal(detail.value.activities.length, 500);
-        // The discarded row is the turnless activity-0001, so the cut turn can
-        // only be found by reading the oldest row still inside the window.
+        // turn-5 lost activity-0000 to the window and kept the rest, so it must
+        // be named even though the row nearest the boundary carries no turn.
         assert.deepEqual([...(detail.value.partialTurnIds ?? [])], ["turn-5"]);
       }
     }),

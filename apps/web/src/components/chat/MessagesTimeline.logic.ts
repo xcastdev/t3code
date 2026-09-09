@@ -609,6 +609,13 @@ function deriveTurnFolds(input: {
   unsettledTurnId: TurnId | null;
   turns?: ReadonlyArray<TimelineTurnSummary> | undefined;
   partialTurnIds?: ReadonlySet<TurnId> | undefined;
+  /**
+   * True when the thread's activity list may be missing older rows and the
+   * server said nothing about which turns lost them — an older host that does
+   * not send `partialTurnIds`. Without it the guard would read "no turn was
+   * cut" and publish an undercount as fact.
+   */
+  activityWindowMayBeTruncated?: boolean | undefined;
   checkpointsByTurnId?: ReadonlyMap<TurnId, TurnDiffSummary> | undefined;
 }): ReadonlyMap<string, TurnFold> {
   const turnSummaryById = new Map<TurnId, TimelineTurnSummary>();
@@ -737,7 +744,12 @@ function deriveTurnFolds(input: {
     // counts for a turn whose rows it holds in full — the server names the
     // turns it cut, and counting the survivors of one would undercount it.
     const stampedCounts = turnSummary?.counts;
-    const activitiesMayHaveAgedOut = input.partialTurnIds?.has(turnId) === true;
+    const activitiesMayHaveAgedOut =
+      input.partialTurnIds === undefined
+        ? // An older host names no turns, so the window's own size is the only
+          // signal left: at the cap, treat every turn as possibly cut.
+          input.activityWindowMayBeTruncated === true
+        : input.partialTurnIds.has(turnId);
 
     const derivedCounts = countTurnWork(collectTurnWorkActivities(group.entries));
     const counts: TurnWorkCounts | null =
@@ -793,6 +805,7 @@ export function deriveMessagesTimelineRows(input: {
    * began before it cannot be counted client-side without undercounting.
    */
   partialTurnIds?: ReadonlySet<TurnId> | undefined;
+  activityWindowMayBeTruncated?: boolean | undefined;
   runningTurnId?: TurnId | null;
   expandedTurnIds?: ReadonlySet<TurnId>;
   expandedWorkGroupIds?: ReadonlySet<string>;
@@ -822,6 +835,9 @@ export function deriveMessagesTimelineRows(input: {
     unsettledTurnId,
     turns: input.turns ?? undefined,
     ...(input.partialTurnIds === undefined ? {} : { partialTurnIds: input.partialTurnIds }),
+    ...(input.activityWindowMayBeTruncated === undefined
+      ? {}
+      : { activityWindowMayBeTruncated: input.activityWindowMayBeTruncated }),
     checkpointsByTurnId,
   });
   const collapsedEntryIds = new Set<string>();

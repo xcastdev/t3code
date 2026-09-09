@@ -2,6 +2,7 @@ import {
   type ApprovalRequestId,
   type ChatFileAttachment,
   DEFAULT_MODEL,
+  THREAD_ACTIVITY_WINDOW_LIMIT,
   defaultInstanceIdForDriver,
   type EnvironmentId,
   type MessageId,
@@ -2227,6 +2228,10 @@ function ChatViewContent(props: ChatViewProps) {
       activeThread?.partialTurnIds === undefined ? undefined : new Set(activeThread.partialTurnIds),
     [activeThread?.partialTurnIds],
   );
+  // Fallback for a host too old to name the turns it cut: a full window is the
+  // only hint left that rows are missing. Reported alongside so the timeline can
+  // stay silent rather than derive a count from a partial thread.
+  const activityWindowMayBeTruncated = threadActivities.length >= THREAD_ACTIVITY_WINDOW_LIMIT;
   // Native subagent fold: memoized by activity-list identity, shared by the
   // Agents surface, live strip, and workflow cards. v2Projection is null
   // until orchestration-v2 lands (source precedence lives in the derive).
@@ -6846,6 +6851,7 @@ function ChatViewContent(props: ChatViewProps) {
                 latestTurn={activeLatestTurn}
                 turns={activeThread.turns ?? null}
                 partialTurnIds={partialTurnIds}
+                activityWindowMayBeTruncated={activityWindowMayBeTruncated}
                 runningTurnId={activeRunningTurnId}
                 turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
                 activeThreadEnvironmentId={activeThread.environmentId}

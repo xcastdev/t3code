@@ -738,6 +738,14 @@ export const OrchestrationThreadDetailPage = Schema.Struct({
 });
 export type OrchestrationThreadDetailPage = typeof OrchestrationThreadDetailPage.Type;
 
+/**
+ * Rows a single thread-detail read returns per thread. A client seeing this
+ * many activities cannot tell a full thread from a trimmed one on size alone,
+ * which is why the server names the turns it cut; the number is shared so an
+ * older host that names none can still be treated conservatively.
+ */
+export const THREAD_ACTIVITY_WINDOW_LIMIT = 500;
+
 export const OrchestrationThreadDetailSnapshot = Schema.Struct({
   snapshotSequence: NonNegativeInt,
   thread: OrchestrationThread,
