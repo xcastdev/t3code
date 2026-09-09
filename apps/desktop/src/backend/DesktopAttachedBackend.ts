@@ -205,6 +205,15 @@ const sameAttachedPreferenceIdentity = (
 const secretFingerprint = (value: string): string =>
   NodeCrypto.createHash("sha256").update(value, "utf8").digest("hex");
 
+type DesktopAttachPairingTarget = {
+  readonly credential: string;
+  readonly httpBaseUrl: string;
+  readonly wsBaseUrl: string;
+};
+
+const attachmentFingerprint = (target: DesktopAttachPairingTarget): string =>
+  secretFingerprint(`${target.httpBaseUrl}\0${target.credential}`);
+
 const invalidPairingUrl = (reason: string): DesktopAttachPairingUrlError =>
   new DesktopAttachPairingUrlError({ reason });
 
@@ -308,10 +317,16 @@ export const make = Effect.gen(function* () {
     readonly preferenceIdentity: AttachedPreferenceIdentity;
     readonly bearerExpiresAt: string;
   };
+  type CompletedPairing = {
+    readonly pairingFingerprint: string;
+    readonly preferenceIdentity: AttachedPreferenceIdentity;
+    readonly bearerExpiresAt: string;
+  };
+  type Restore = <A, E, R>(effect: Effect.Effect<A, E, R>) => Effect.Effect<A, E, R>;
   let preparedAttachment: PreparedAttachment | null = null;
   let consumedPairingFingerprints = new Set<string>();
   let consumedRenewalFingerprints = new Set<string>();
-  let completedPairingFingerprint: string | null = null;
+  let completedPairing: CompletedPairing | null = null;
   let preparedRenewal: PreparedCredentialRenewal | null = null;
   let completedRenewal: CompletedCredentialRenewal | null = null;
   let nextRenewalId = 0;
@@ -328,7 +343,7 @@ export const make = Effect.gen(function* () {
       // closure's ownership bookkeeping when this layer is finalized.
       consumedPairingFingerprints = new Set();
       consumedRenewalFingerprints = new Set();
-      completedPairingFingerprint = null;
+      completedPairing = null;
       completedRenewal = null;
     }),
   );
@@ -412,13 +427,11 @@ export const make = Effect.gen(function* () {
     return preference;
   });
 
-  const prepare = Effect.fn("desktop.attachedBackend.prepare")(function* (pairingUrl: string) {
-    const normalizedPairingUrl = pairingUrl.trim();
-    const pairingFingerprint = secretFingerprint(normalizedPairingUrl);
-    const target = yield* resolveDesktopAttachPairingTarget(normalizedPairingUrl);
-    if (completedPairingFingerprint === pairingFingerprint && preparedAttachment === null) {
-      return yield* new DesktopAttachFreshPairingUrlRequiredError();
-    }
+  const prepare = Effect.fn("desktop.attachedBackend.prepare")(function* (
+    target: DesktopAttachPairingTarget,
+    pairingFingerprint: string,
+    restore: Restore,
+  ) {
     if (preparedAttachment?.pairingFingerprint === pairingFingerprint) {
       if (Date.parse(preparedAttachment.bearerExpiresAt) <= (yield* Clock.currentTimeMillis)) {
         preparedAttachment = null;
@@ -430,9 +443,9 @@ export const make = Effect.gen(function* () {
       return yield* new DesktopAttachFreshPairingUrlRequiredError();
     }
 
-    const instances = yield* pool.list;
+    const instances = yield* restore(pool.list);
     for (const instance of instances) {
-      const config = yield* instance.currentConfig;
+      const config = yield* restore(instance.currentConfig);
       if (
         Option.isSome(config) &&
         config.value.httpBaseUrl.origin === new URL(target.httpBaseUrl).origin
@@ -446,12 +459,14 @@ export const make = Effect.gen(function* () {
     preparedAttachment = null;
     clearPreparedRenewal();
     completedRenewal = null;
-    completedPairingFingerprint = null;
+    completedPairing = null;
     consumedPairingFingerprints.add(pairingFingerprint);
-    const session = yield* exchangeCredential({
-      httpBaseUrl: target.httpBaseUrl,
-      credential: target.credential,
-    });
+    const session = yield* restore(
+      exchangeCredential({
+        httpBaseUrl: target.httpBaseUrl,
+        credential: target.credential,
+      }),
+    );
     const bearerExpiresAt = attachedBearerExpiry(
       yield* Clock.currentTimeMillis,
       session.expires_in,
@@ -472,17 +487,24 @@ export const make = Effect.gen(function* () {
 
   const complete = Effect.fn("desktop.attachedBackend.complete")(function* (
     transaction: PreparedAttachment,
+    restore: Restore,
   ) {
-    const descriptor = yield* fetchDescriptor(transaction.httpBaseUrl);
-    const preference = yield* persistAttached({
-      descriptor,
-      httpBaseUrl: transaction.httpBaseUrl,
-      wsBaseUrl: transaction.wsBaseUrl,
-      accessToken: transaction.accessToken,
-      bearerExpiresAt: transaction.bearerExpiresAt,
-    });
+    const descriptor = yield* restore(fetchDescriptor(transaction.httpBaseUrl));
+    const preference = yield* restore(
+      persistAttached({
+        descriptor,
+        httpBaseUrl: transaction.httpBaseUrl,
+        wsBaseUrl: transaction.wsBaseUrl,
+        accessToken: transaction.accessToken,
+        bearerExpiresAt: transaction.bearerExpiresAt,
+      }),
+    );
     preparedAttachment = null;
-    completedPairingFingerprint = transaction.pairingFingerprint;
+    completedPairing = {
+      pairingFingerprint: transaction.pairingFingerprint,
+      preferenceIdentity: attachedPreferenceIdentity(preference),
+      bearerExpiresAt: transaction.bearerExpiresAt,
+    };
     return redactedState(preference);
   });
 
@@ -490,30 +512,40 @@ export const make = Effect.gen(function* () {
     ownershipLock.withPermits(1)(
       Effect.gen(function* () {
         const normalizedPairingUrl = pairingUrl.trim();
-        const pairingFingerprint = secretFingerprint(normalizedPairingUrl);
-        if (completedPairingFingerprint === pairingFingerprint && preparedAttachment === null) {
-          return yield* readPreference.pipe(Effect.map(redactedState));
-        }
-        clearPreparedRenewal();
-        completedRenewal = null;
-        if (preparedAttachment?.pairingFingerprint !== pairingFingerprint) {
-          preparedAttachment = null;
-        }
-        const transaction = yield* prepare(normalizedPairingUrl);
-        return yield* complete(transaction);
-      }).pipe(
-        Effect.onInterrupt(() =>
-          Effect.sync(() => {
-            preparedAttachment = null;
+        const target = yield* resolveDesktopAttachPairingTarget(normalizedPairingUrl);
+        const pairingFingerprint = attachmentFingerprint(target);
+        return yield* Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            if (
+              completedPairing?.pairingFingerprint === pairingFingerprint &&
+              preparedAttachment === null
+            ) {
+              const preference = yield* restore(readPreference);
+              const now = yield* Clock.currentTimeMillis;
+              if (
+                preference.mode === "attached" &&
+                sameAttachedPreferenceIdentity(preference, completedPairing.preferenceIdentity) &&
+                Date.parse(completedPairing.bearerExpiresAt) > now
+              ) {
+                return redactedState(preference);
+              }
+              completedPairing = null;
+            }
+
+            clearPreparedRenewal();
+            completedRenewal = null;
+            const transaction = yield* prepare(target, pairingFingerprint, restore);
+            return yield* complete(transaction, restore);
           }),
-        ),
-      ),
+        );
+      }),
     );
 
   const completeRenewal = Effect.fn("desktop.attachedBackend.completeRenewal")(function* (
     transaction: PreparedCredentialRenewal,
+    restore: Restore,
   ) {
-    const currentPreference = yield* readPreference;
+    const currentPreference = yield* restore(readPreference);
     if (
       currentPreference.mode !== "attached" ||
       !sameAttachedPreferenceIdentity(
@@ -525,7 +557,7 @@ export const make = Effect.gen(function* () {
       return yield* new DesktopAttachOwnershipChangedError();
     }
 
-    const postcheckDescriptor = yield* fetchDescriptor(transaction.preference.httpBaseUrl);
+    const postcheckDescriptor = yield* restore(fetchDescriptor(transaction.preference.httpBaseUrl));
     if (postcheckDescriptor.environmentId !== transaction.preference.environmentId) {
       return yield* new DesktopAttachedIdentityMismatchError();
     }
@@ -533,7 +565,7 @@ export const make = Effect.gen(function* () {
     // Re-check ownership immediately before the only write. Production
     // ownership writers share ownershipLock; this comparison also protects
     // against an accidental future writer bypassing that lock.
-    const currentBeforePersist = yield* readPreference;
+    const currentBeforePersist = yield* restore(readPreference);
     if (
       currentBeforePersist.mode !== "attached" ||
       !sameAttachedPreferenceIdentity(
@@ -545,13 +577,15 @@ export const make = Effect.gen(function* () {
       return yield* new DesktopAttachOwnershipChangedError();
     }
 
-    const persistedPreference = yield* persistAttached({
-      descriptor: postcheckDescriptor,
-      httpBaseUrl: transaction.preference.httpBaseUrl,
-      wsBaseUrl: transaction.preference.wsBaseUrl,
-      accessToken: transaction.accessToken,
-      bearerExpiresAt: transaction.bearerExpiresAt,
-    });
+    const persistedPreference = yield* restore(
+      persistAttached({
+        descriptor: postcheckDescriptor,
+        httpBaseUrl: transaction.preference.httpBaseUrl,
+        wsBaseUrl: transaction.preference.wsBaseUrl,
+        accessToken: transaction.accessToken,
+        bearerExpiresAt: transaction.bearerExpiresAt,
+      }),
+    );
     if (preparedRenewal?.renewalId === transaction.renewalId) {
       preparedRenewal = null;
       completedRenewal = {
@@ -566,7 +600,7 @@ export const make = Effect.gen(function* () {
     ownershipLock.withPermits(1)(
       Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
-          const preference = yield* readPreference;
+          const preference = yield* restore(readPreference);
           if (preference.mode !== "attached") {
             return yield* new DesktopAttachedCredentialUnavailableError();
           }
@@ -582,7 +616,7 @@ export const make = Effect.gen(function* () {
               ) &&
               Date.parse(preparedRenewal.bearerExpiresAt) > now
             ) {
-              return yield* completeRenewal(preparedRenewal);
+              return yield* completeRenewal(preparedRenewal, restore);
             }
             clearPreparedRenewal();
           }
@@ -605,7 +639,7 @@ export const make = Effect.gen(function* () {
           // The descriptor is public and unauthenticated; these checks reduce
           // endpoint substitution risk but do not authenticate a capable local
           // impersonator.
-          const precheckDescriptor = yield* fetchDescriptor(preference.httpBaseUrl);
+          const precheckDescriptor = yield* restore(fetchDescriptor(preference.httpBaseUrl));
           if (precheckDescriptor.environmentId !== preference.environmentId) {
             return yield* new DesktopAttachedIdentityMismatchError();
           }
@@ -644,7 +678,7 @@ export const make = Effect.gen(function* () {
           // Publication happens inside the uninterruptible region. Typed
           // failures after this point leave the bearer available for retry.
           preparedRenewal = transaction;
-          return yield* completeRenewal(transaction);
+          return yield* completeRenewal(transaction, restore);
         }),
       ),
     );
@@ -682,6 +716,7 @@ export const make = Effect.gen(function* () {
       clearPreparedRenewal();
       preparedAttachment = null;
       completedRenewal = null;
+      completedPairing = null;
       const preference = yield* readPreference;
       if (preference.mode === "managed") return;
       yield* settings.setPrimaryBackendPreference({ mode: "managed" }).pipe(

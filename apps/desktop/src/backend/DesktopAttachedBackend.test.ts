@@ -190,6 +190,10 @@ function makeAttachHarness(
     readonly encryptionFailures?: number;
     readonly writeFailures?: number;
     readonly managedConflict?: boolean;
+    readonly descriptorStarted?: Deferred.Deferred<void>;
+    readonly releaseDescriptor?: Deferred.Deferred<void>;
+    readonly persistenceStarted?: Deferred.Deferred<void>;
+    readonly releasePersistence?: Deferred.Deferred<void>;
   } = {},
 ) {
   const requestUrls: Array<string> = [];
@@ -199,8 +203,16 @@ function makeAttachHarness(
   const httpClientLayer = Layer.succeed(
     HttpClient.HttpClient,
     HttpClient.make((request) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         requestUrls.push(request.url);
+        if (request.url.endsWith("/.well-known/t3/environment")) {
+          if (options.descriptorStarted !== undefined) {
+            yield* Deferred.succeed(options.descriptorStarted, undefined);
+          }
+          if (options.releaseDescriptor !== undefined) {
+            yield* Deferred.await(options.releaseDescriptor);
+          }
+        }
         const response = responses[responseIndex++];
         if (response === undefined) throw new Error(`Unexpected request: ${request.url}`);
         return jsonResponse(request, response.body, response.status);
@@ -229,7 +241,19 @@ function makeAttachHarness(
             }),
           );
         }
-        return Ref.update(settingsRef, (settings) => ({ ...settings, primaryBackend: preference }));
+        const write = Ref.update(settingsRef, (settings) => ({
+          ...settings,
+          primaryBackend: preference,
+        }));
+        const { persistenceStarted, releasePersistence } = options;
+        if (persistenceStarted === undefined || releasePersistence === undefined) {
+          return write;
+        }
+        return Effect.gen(function* () {
+          yield* Deferred.succeed(persistenceStarted, undefined);
+          yield* Deferred.await(releasePersistence);
+          yield* write;
+        });
       };
       return DesktopAppSettings.DesktopAppSettings.of({
         get: Ref.get(settingsRef),
@@ -432,6 +456,91 @@ describe("DesktopAttachedBackend", () => {
         const error = second.cause;
         assert.include(String(error), "FreshPairingUrl");
       }
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("retains the initial bearer when descriptor retrieval is interrupted", () => {
+    return Effect.gen(function* () {
+      const descriptorStarted = yield* Deferred.make<void>();
+      const releaseDescriptor = yield* Deferred.make<void>();
+      const harness = makeAttachHarness(
+        [{ body: administrativeToken() }, { body: descriptorFor() }, { body: descriptorFor() }],
+        { descriptorStarted, releaseDescriptor },
+      );
+      return yield* Effect.gen(function* () {
+        const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+        const attachFiber = yield* Effect.forkChild(
+          attached.attach("http://127.0.0.1:4100/pair#token=one-time-owner-token"),
+        );
+        yield* Deferred.await(descriptorStarted);
+        yield* Fiber.interrupt(attachFiber);
+        yield* Deferred.succeed(releaseDescriptor, undefined);
+
+        const state = yield* attached.attach(
+          "http://127.0.0.1:4100/pair#token=one-time-owner-token",
+        );
+        assert.equal(state.mode, "attached");
+        assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+      }).pipe(Effect.provide(harness.layer));
+    });
+  });
+
+  it.effect("retains the initial bearer when persistence is interrupted", () => {
+    return Effect.gen(function* () {
+      const persistenceStarted = yield* Deferred.make<void>();
+      const releasePersistence = yield* Deferred.make<void>();
+      const harness = makeAttachHarness(
+        [{ body: administrativeToken() }, { body: descriptorFor() }, { body: descriptorFor() }],
+        { persistenceStarted, releasePersistence },
+      );
+      return yield* Effect.gen(function* () {
+        const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+        const attachFiber = yield* Effect.forkChild(
+          attached.attach("http://127.0.0.1:4100/pair#token=one-time-owner-token"),
+        );
+        yield* Deferred.await(persistenceStarted);
+        yield* Fiber.interrupt(attachFiber);
+        yield* Deferred.succeed(releasePersistence, undefined);
+
+        const state = yield* attached.attach(
+          "http://127.0.0.1:4100/pair#token=one-time-owner-token",
+        );
+        assert.equal(state.mode, "attached");
+        assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+      }).pipe(Effect.provide(harness.layer));
+    });
+  });
+
+  it.effect("does not replay an equivalent URL after an uncertain exchange", () => {
+    const harness = makeAttachHarness([{ status: 503, body: { unavailable: true } }]);
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      yield* Effect.exit(attached.attach("http://127.0.0.1:4100/pair#token=one-time-owner-token"));
+      const retry = yield* Effect.exit(
+        attached.attach("http://127.0.0.1:4100/#token=one-time-owner-token"),
+      );
+
+      assert.equal(retry._tag, "Failure");
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+      if (retry._tag === "Failure") assert.include(String(retry.cause), "FreshPairingUrl");
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("retries an equivalent URL from a retained initial bearer", () => {
+    const harness = makeAttachHarness([
+      { body: administrativeToken() },
+      { status: 503, body: { unavailable: true } },
+      { body: descriptorFor() },
+    ]);
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      yield* Effect.exit(attached.attach("http://127.0.0.1:4100/pair#token=one-time-owner-token"));
+      const state = yield* attached.attach("http://127.0.0.1:4100/#token=one-time-owner-token");
+
+      assert.equal(state.mode, "attached");
       assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
     }).pipe(Effect.provide(harness.layer));
   });
