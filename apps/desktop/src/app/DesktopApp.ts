@@ -141,40 +141,63 @@ const handleFatalStartupError = Effect.fn("desktop.startup.handleFatalStartupErr
 const fatalStartupCause = <E>(stage: string, cause: Cause.Cause<E>) =>
   handleFatalStartupError(stage, Cause.pretty(cause)).pipe(Effect.andThen(Effect.failCause(cause)));
 
-const awaitAttachedBackend = Effect.fn("desktop.startup.awaitAttachedBackend")(function* (input: {
-  readonly attachedBackend: DesktopAttachedBackend.DesktopAttachedBackend["Service"];
-  readonly dialog: ElectronDialog.ElectronDialog["Service"];
-  readonly lifecycle: DesktopLifecycle.DesktopLifecycle["Service"];
-  readonly shutdown: DesktopShutdown.DesktopShutdown["Service"];
-  readonly electronApp: ElectronApp.ElectronApp["Service"];
-  readonly state: DesktopState.DesktopState["Service"];
-}) {
-  while (true) {
-    const probe = yield* Effect.exit(input.attachedBackend.probe);
-    if (probe._tag === "Success") return true;
+const ATTACHED_BACKEND_RECOVERY_DIALOG = {
+  type: "warning" as const,
+  title: "Attached backend unavailable",
+  message: "T3 Code could not connect to the attached primary backend.",
+  detail: "Check that the T3 server is running, then choose Retry, Use desktop backend, or Quit.",
+  buttons: ["Retry", "Use desktop backend", "Quit"],
+  defaultId: 0,
+  cancelId: 2,
+};
 
-    const error = Cause.squash(probe.cause);
-    const response = yield* input.dialog.showMessageBox({
-      type: "warning",
-      title: "Attached backend unavailable",
-      message: "T3 Code could not connect to the attached primary backend.",
-      detail: error instanceof Error ? error.message : String(error),
-      buttons: ["Retry", "Use desktop backend", "Quit"],
-      defaultId: 0,
-      cancelId: 2,
-    });
-    if (response.response === 0) continue;
-    if (response.response === 1) {
-      yield* input.attachedBackend.useManagedBackend;
-      yield* input.lifecycle.relaunch("attached-backend-recovery");
+export const awaitAttachedBackend = Effect.fn("desktop.startup.awaitAttachedBackend")(
+  function* (input: {
+    readonly attachedBackend: DesktopAttachedBackend.DesktopAttachedBackend["Service"];
+    readonly dialog: ElectronDialog.ElectronDialog["Service"];
+    readonly lifecycle: DesktopLifecycle.DesktopLifecycle["Service"];
+    readonly shutdown: DesktopShutdown.DesktopShutdown["Service"];
+    readonly electronApp: ElectronApp.ElectronApp["Service"];
+    readonly state: DesktopState.DesktopState["Service"];
+    readonly pairingUrl?: string;
+  }) {
+    let pendingPairingUrl = input.pairingUrl;
+    while (true) {
+      if (pendingPairingUrl !== undefined) {
+        const attach = yield* Effect.exit(input.attachedBackend.attach(pendingPairingUrl));
+        if (attach._tag === "Failure") {
+          const response = yield* input.dialog.showMessageBox(ATTACHED_BACKEND_RECOVERY_DIALOG);
+          if (response.response === 0) continue;
+          if (response.response === 1) {
+            yield* input.attachedBackend.useManagedBackend;
+            yield* input.lifecycle.relaunch("attached-backend-recovery");
+            return false;
+          }
+          yield* Ref.set(input.state.quitting, true);
+          yield* input.shutdown.request;
+          yield* input.electronApp.quit;
+          return false;
+        }
+        pendingPairingUrl = undefined;
+      }
+
+      const probe = yield* Effect.exit(input.attachedBackend.probe);
+      if (probe._tag === "Success") return true;
+
+      const response = yield* input.dialog.showMessageBox(ATTACHED_BACKEND_RECOVERY_DIALOG);
+      if (response.response === 0) continue;
+      if (response.response === 1) {
+        yield* input.attachedBackend.useManagedBackend;
+        yield* input.lifecycle.relaunch("attached-backend-recovery");
+        return false;
+      }
+      yield* Ref.set(input.state.quitting, true);
+      yield* input.shutdown.request;
+      yield* input.electronApp.quit;
       return false;
     }
-    yield* Ref.set(input.state.quitting, true);
-    yield* input.shutdown.request;
-    yield* input.electronApp.quit;
-    return false;
-  }
-});
+  },
+);
 
 const bootstrap = Effect.gen(function* () {
   const pool = yield* DesktopBackendPool.DesktopBackendPool;
@@ -192,32 +215,39 @@ const bootstrap = Effect.gen(function* () {
   yield* logBootstrapInfo("bootstrap start");
 
   const pendingLaunchIntent = yield* launchIntent.consume;
-  if (Option.isSome(pendingLaunchIntent)) {
-    yield* attachedBackend.attach(pendingLaunchIntent.value);
+  const settings = yield* desktopSettings.get;
+  const initialPrimaryBackendState = yield* attachedBackend.getState;
+  const pendingPairingUrl = Option.getOrUndefined(pendingLaunchIntent);
+  const recoveredBeforeBackendSelection =
+    pendingPairingUrl !== undefined ||
+    initialPrimaryBackendState.mode === "invalid-attached" ||
+    initialPrimaryBackendState.mode === "attached";
+  if (recoveredBeforeBackendSelection) {
+    const canContinue = yield* awaitAttachedBackend({
+      attachedBackend,
+      dialog,
+      lifecycle,
+      shutdown: yield* DesktopShutdown.DesktopShutdown,
+      electronApp: yield* ElectronApp.ElectronApp,
+      state,
+      ...(pendingPairingUrl === undefined ? {} : { pairingUrl: pendingPairingUrl }),
+    });
+    if (!canContinue) return;
   }
 
-  const settings = yield* desktopSettings.get;
   const primaryBackendState = yield* attachedBackend.getState;
-  if (primaryBackendState.mode === "invalid-attached") {
-    const canContinue = yield* awaitAttachedBackend({
-      attachedBackend,
-      dialog,
-      lifecycle,
-      shutdown: yield* DesktopShutdown.DesktopShutdown,
-      electronApp: yield* ElectronApp.ElectronApp,
-      state,
-    });
-    if (!canContinue) return;
-  } else if (primaryBackendState.mode === "attached") {
-    const canContinue = yield* awaitAttachedBackend({
-      attachedBackend,
-      dialog,
-      lifecycle,
-      shutdown: yield* DesktopShutdown.DesktopShutdown,
-      electronApp: yield* ElectronApp.ElectronApp,
-      state,
-    });
-    if (!canContinue) return;
+  if (primaryBackendState.mode === "attached") {
+    if (!recoveredBeforeBackendSelection) {
+      const canContinue = yield* awaitAttachedBackend({
+        attachedBackend,
+        dialog,
+        lifecycle,
+        shutdown: yield* DesktopShutdown.DesktopShutdown,
+        electronApp: yield* ElectronApp.ElectronApp,
+        state,
+      });
+      if (!canContinue) return;
+    }
 
     const attachedState = yield* attachedBackend.getState;
     if (attachedState.mode !== "attached") return;

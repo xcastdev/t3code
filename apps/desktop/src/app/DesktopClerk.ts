@@ -10,6 +10,7 @@ import * as Scope from "effect/Scope";
 import { clerkFrontendApiHostnameFromPublishableKey } from "@t3tools/shared/relayAuth";
 import * as DesktopAttachedBackend from "../backend/DesktopAttachedBackend.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
+import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as ElectronProtocol from "../electron/ElectronProtocol.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
@@ -21,6 +22,7 @@ declare const __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: string | undefined;
 
 type DesktopClerkEventHandlerServices =
   | ElectronWindow.ElectronWindow
+  | ElectronDialog.ElectronDialog
   | DesktopAttachedBackend.DesktopAttachedBackend
   | DesktopLifecycle.DesktopLifecycle
   | DesktopLifecycle.DesktopLifecycleRuntimeServices;
@@ -81,6 +83,14 @@ export const desktopClerkFrontendApiHostname = resolveDesktopClerkFrontendApiHos
     : __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__,
 );
 
+const ATTACHED_BACKEND_ATTACH_FAILURE_DIALOG = {
+  type: "warning" as const,
+  title: "Could not attach to T3 server",
+  message: "T3 Code could not attach to the requested primary backend.",
+  detail: "Open the desktop app and try again with a new owner pairing URL.",
+  buttons: ["OK"],
+};
+
 export function createDesktopClerkBridge(stateDir: string, isDevelopment: boolean) {
   return createClerkBridge({
     storage: storage({ path: stateDir }),
@@ -131,6 +141,7 @@ export const make = Effect.gen(function* () {
     configure: Effect.gen(function* () {
       const electronApp = yield* ElectronApp.ElectronApp;
       const electronWindow = yield* ElectronWindow.ElectronWindow;
+      const electronDialog = yield* ElectronDialog.ElectronDialog;
       const context = yield* Effect.context<DesktopClerkEventHandlerServices>();
       const runPromise = Effect.runPromiseWith(context);
 
@@ -149,8 +160,23 @@ export const make = Effect.gen(function* () {
           Effect.gen(function* () {
             const attachedBackend = yield* DesktopAttachedBackend.DesktopAttachedBackend;
             const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
-            yield* attachedBackend.attach(pairingUrl);
-            yield* lifecycle.relaunch("primary-backend-attached");
+            const attach = yield* Effect.exit(attachedBackend.attach(pairingUrl));
+            if (attach._tag === "Success") {
+              yield* lifecycle.relaunch("primary-backend-attached");
+              return;
+            }
+
+            const mainWindow = yield* electronWindow.currentMainOrFirst.pipe(
+              Effect.catchCause(() => Effect.succeed(Option.none())),
+            );
+            if (Option.isSome(mainWindow)) {
+              yield* electronWindow
+                .reveal(mainWindow.value)
+                .pipe(Effect.catchCause(() => Effect.void));
+            }
+            yield* electronDialog
+              .showMessageBox(ATTACHED_BACKEND_ATTACH_FAILURE_DIALOG)
+              .pipe(Effect.catchCause(() => Effect.void));
           }).pipe(Effect.catchCause(() => Effect.void)),
         );
       };

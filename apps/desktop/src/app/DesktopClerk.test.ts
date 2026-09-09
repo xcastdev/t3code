@@ -31,6 +31,7 @@ import * as DesktopLifecycle from "./DesktopLifecycle.ts";
 import * as DesktopShutdown from "./DesktopShutdown.ts";
 import * as DesktopState from "./DesktopState.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
+import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as ElectronTheme from "../electron/ElectronTheme.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopClerk from "./DesktopClerk.ts";
@@ -65,7 +66,9 @@ const makeDesktopClerkLayer = (isDevelopment = true, events: string[] = []) => {
   );
 };
 
-const makeDesktopClerkEventContextLayer = () =>
+const makeDesktopClerkEventContextLayer = (
+  electronDialog: ElectronDialog.ElectronDialog["Service"] = {} as ElectronDialog.ElectronDialog["Service"],
+) =>
   Layer.mergeAll(
     Layer.succeed(
       DesktopEnvironment.DesktopEnvironment,
@@ -75,6 +78,7 @@ const makeDesktopClerkEventContextLayer = () =>
     DesktopState.layer,
     Layer.succeed(DesktopWindow.DesktopWindow, {} as DesktopWindow.DesktopWindow["Service"]),
     Layer.succeed(ElectronTheme.ElectronTheme, {} as ElectronTheme.ElectronTheme["Service"]),
+    Layer.succeed(ElectronDialog.ElectronDialog, electronDialog),
   );
 
 describe("DesktopClerk", () => {
@@ -336,6 +340,130 @@ describe("DesktopClerk", () => {
       assert.equal(relaunch.mock.calls.length, 0);
     }).pipe(
       Effect.provide(Layer.mergeAll(makeDesktopClerkLayer(), makeDesktopClerkEventContextLayer())),
+      Effect.provideService(ElectronApp.ElectronApp, electronApp),
+      Effect.provideService(ElectronWindow.ElectronWindow, electronWindow),
+      Effect.provideService(DesktopAttachedBackend.DesktopAttachedBackend, attachedBackend),
+      Effect.provideService(DesktopLifecycle.DesktopLifecycle, lifecycle),
+    );
+  });
+
+  it.effect(
+    "reveals the current window and shows a static warning after second-instance attach fails",
+    () => {
+      storageMock.mockReturnValue(storageAdapter);
+      createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: true });
+      const handlers = new Map<string, (...args: Array<unknown>) => void>();
+      const warningShown = Effect.runSync(Deferred.make<void>());
+      const pairingUrl = "http://127.0.0.1:3773/pair#token=owner-token";
+      const attachUrl = `t3code://attach-primary?pairingUrl=${encodeURIComponent(pairingUrl)}`;
+      const attachAttempted = vi.fn();
+      const reveal = vi.fn(() => Effect.void);
+      const relaunch = vi.fn(() => Effect.die("unexpected relaunch"));
+      let warningOptions: unknown;
+      const electronApp = {
+        quit: Effect.void,
+        on: (eventName: string, listener: (...args: Array<unknown>) => void) =>
+          Effect.sync(() => {
+            handlers.set(eventName, listener);
+          }),
+      } as unknown as ElectronApp.ElectronApp["Service"];
+      const electronWindow = {
+        currentMainOrFirst: Effect.succeed(Option.some({})),
+        reveal,
+      } as unknown as ElectronWindow.ElectronWindow["Service"];
+      const attachedBackend = {
+        attach: vi.fn(() =>
+          Effect.sync(() => {
+            attachAttempted();
+          }).pipe(Effect.andThen(Effect.fail({ _tag: "TestAttachFailure" }))),
+        ),
+      } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"];
+      const lifecycle = { relaunch } as unknown as DesktopLifecycle.DesktopLifecycle["Service"];
+      const dialog = {
+        showMessageBox: (options: unknown) =>
+          Effect.gen(function* () {
+            warningOptions = options;
+            yield* Deferred.succeed(warningShown, undefined);
+            return { response: 0, checkboxChecked: false };
+          }),
+      } as unknown as ElectronDialog.ElectronDialog["Service"];
+
+      return Effect.gen(function* () {
+        const clerk = yield* DesktopClerk.DesktopClerk;
+        yield* Effect.scoped(clerk.configure);
+        handlers.get("second-instance")?.({}, ["/desktop", attachUrl]);
+        yield* Deferred.await(warningShown);
+
+        assert.equal(attachAttempted.mock.calls.length, 1);
+        assert.equal(reveal.mock.calls.length, 1);
+        assert.equal(relaunch.mock.calls.length, 0);
+        assert.deepEqual(warningOptions, {
+          type: "warning",
+          title: "Could not attach to T3 server",
+          message: "T3 Code could not attach to the requested primary backend.",
+          detail: "Open the desktop app and try again with a new owner pairing URL.",
+          buttons: ["OK"],
+        });
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(makeDesktopClerkLayer(), makeDesktopClerkEventContextLayer(dialog)),
+        ),
+        Effect.provideService(ElectronApp.ElectronApp, electronApp),
+        Effect.provideService(ElectronWindow.ElectronWindow, electronWindow),
+        Effect.provideService(DesktopAttachedBackend.DesktopAttachedBackend, attachedBackend),
+        Effect.provideService(DesktopLifecycle.DesktopLifecycle, lifecycle),
+      );
+    },
+  );
+
+  it.effect("uses the same warning recovery for a failed macOS open-url attach", () => {
+    storageMock.mockReturnValue(storageAdapter);
+    createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: true });
+    const handlers = new Map<string, (...args: Array<unknown>) => void>();
+    const warningShown = Effect.runSync(Deferred.make<void>());
+    const pairingUrl = "http://127.0.0.1:3773/pair#token=owner-token";
+    const attachUrl = `t3code://attach-primary?pairingUrl=${encodeURIComponent(pairingUrl)}`;
+    const reveal = vi.fn(() => Effect.void);
+    const attach = vi.fn(() => Effect.fail({ _tag: "TestAttachFailure" }));
+    const electronApp = {
+      quit: Effect.void,
+      on: (eventName: string, listener: (...args: Array<unknown>) => void) =>
+        Effect.sync(() => {
+          handlers.set(eventName, listener);
+        }),
+    } as unknown as ElectronApp.ElectronApp["Service"];
+    const electronWindow = {
+      currentMainOrFirst: Effect.succeed(Option.some({})),
+      reveal,
+    } as unknown as ElectronWindow.ElectronWindow["Service"];
+    const attachedBackend = {
+      attach,
+    } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"];
+    const lifecycle = {
+      relaunch: vi.fn(() => Effect.die("unexpected relaunch")),
+    } as unknown as DesktopLifecycle.DesktopLifecycle["Service"];
+    const dialog = {
+      showMessageBox: () =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(warningShown, undefined);
+          return { response: 0, checkboxChecked: false };
+        }),
+    } as unknown as ElectronDialog.ElectronDialog["Service"];
+    const preventDefault = vi.fn();
+
+    return Effect.gen(function* () {
+      const clerk = yield* DesktopClerk.DesktopClerk;
+      yield* Effect.scoped(clerk.configure);
+      handlers.get("open-url")?.({ preventDefault }, attachUrl);
+      yield* Deferred.await(warningShown);
+
+      assert.equal(attach.mock.calls.length, 1);
+      assert.equal(reveal.mock.calls.length, 1);
+      assert.equal(preventDefault.mock.calls.length, 1);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(makeDesktopClerkLayer(), makeDesktopClerkEventContextLayer(dialog)),
+      ),
       Effect.provideService(ElectronApp.ElectronApp, electronApp),
       Effect.provideService(ElectronWindow.ElectronWindow, electronWindow),
       Effect.provideService(DesktopAttachedBackend.DesktopAttachedBackend, attachedBackend),

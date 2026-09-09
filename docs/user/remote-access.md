@@ -107,9 +107,9 @@ same machine as the desktop app:
 npx t3 serve
 ```
 
-Open the printed **Desktop attach URL** while the desktop app is closed. The desktop app uses the
-server's bundled web client and sends API and WebSocket traffic to the existing server. It does not
-start another backend.
+Open the printed **Desktop attach URL** while the desktop app is closed. The desktop app uses its
+bundled web client and sends API and WebSocket traffic to the existing server. It does not start
+another backend.
 
 The desktop attach URL is printed when the server uses an unspecified host, `localhost`, a
 `127.0.0.0/8` address, or `[::1]`. The desktop app and server must share a filesystem namespace.
@@ -118,14 +118,22 @@ Native file actions, terminals, previews, and editor actions use that shared fil
 To attach an already-open desktop app, open **Settings** → **Connections** → **Backend process** and
 paste the full owner pairing URL. The desktop app relaunches after it saves the attachment.
 
-To renew an expired or revoked desktop session, run:
+To renew an expired or revoked session while the desktop app is attached, use **Pair with this
+environment** in the auth screen. On the server machine, run:
 
 ```bash
 npx t3 pair --owner
 ```
 
-Paste the new owner pairing URL into the same **Backend process** control. A standard pairing token
-does not have the administrative scopes required by the desktop attachment flow.
+Paste the replacement owner token from the command into that pairing screen. This keeps the current
+attached endpoint and does not create another environment. A standard pairing token does not have
+the administrative scopes required by the desktop attachment flow. While attached, the **Backend
+process** row only offers **Use desktop backend**. It changes process ownership; it is not the input
+for renewing the attached credential.
+
+If startup is blocked because the stored attachment is invalid or expired, open a fresh printed
+**Desktop attach URL** from `t3 serve`, or choose **Use desktop backend** in the native recovery
+dialog. Desktop does not start a managed backend automatically in this state.
 
 To return ownership to the desktop app, choose **Use desktop backend** under **Backend process**.
 The desktop app then uses the stored WSL, exposure, and other managed-backend preferences again.
