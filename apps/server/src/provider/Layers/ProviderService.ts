@@ -288,7 +288,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       ? mcpSessionRegistry.value.revokeThread
       : McpSessionRegistry.revokeActiveMcpThread);
   const revokeMcpProviderCredential =
-    options?.revokeMcpProviderCredential ?? McpSessionRegistry.revokeActiveMcpProviderSession;
+    options?.revokeMcpProviderCredential ??
+    (Option.isSome(mcpSessionRegistry)
+      ? mcpSessionRegistry.value.revokeProviderSession
+      : McpSessionRegistry.revokeActiveMcpProviderSession);
   const runtimeEventPubSub = yield* PubSub.unbounded<ProviderRuntimeEvent>();
   type McpTransactionLock = {
     readonly semaphore: Semaphore.Semaphore;
@@ -586,6 +589,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const withMcpReplacement = <E, R>(input: {
     readonly threadId: ThreadId;
     readonly providerInstanceId: ProviderInstanceId;
+    readonly prepare: () => Effect.Effect<McpProviderSession.McpProviderSessionReplacement, E, R>;
     readonly use: (
       replacement: McpProviderSession.McpProviderSessionReplacement,
     ) => Effect.Effect<ProviderSession, E, R>;
@@ -600,7 +604,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     R
   > =>
     Effect.gen(function* () {
-      const replacement = yield* prepareMcpSession(input.threadId, input.providerInstanceId);
+      const replacement = yield* input.prepare();
       let startedSession: ProviderSession | undefined;
       const result = yield* Effect.gen(function* () {
         const result = yield* input.use(replacement);
@@ -771,12 +775,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     owner: ProjectMcpLeaseOwner,
     stopNative: boolean,
   ) {
+    if (stopNative) {
+      // `hasSession` intentionally hides quarantined OpenCode sessions. The
+      // adapter still owns a terminating handle for them, so only a confirmed
+      // stop or a typed not-found result can make their MCP resources stale.
+      yield* stopBoundAdapterSession(owner.adapter, threadId);
+    }
     yield* cleanupOwner(threadId, owner);
-    yield* Effect.gen(function* () {
-      if (stopNative && (yield* owner.adapter.hasSession(threadId))) {
-        yield* owner.adapter.stopSession(threadId);
-      }
-    }).pipe(Effect.ensuring(releaseProviderGeneration(owner)));
+    yield* releaseProviderGeneration(owner);
   });
 
   const releaseAllProjectMcpLeases = Effect.gen(function* () {
@@ -795,6 +801,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       readonly providerInstanceId: ProviderInstanceId;
       readonly operation: string;
       readonly providerGeneration?: ProviderAdapterGenerationHandle;
+      readonly beforeCommit?: (
+        session: ProviderSession,
+      ) => Effect.Effect<void, ProviderSessionDirectory.ProviderSessionDirectoryWriteError>;
       readonly sessionInput: Omit<
         Parameters<ProviderAdapterShape<ProviderAdapterError>["startSession"]>[0],
         "projectMcpServers"
@@ -1008,11 +1017,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             const previousOwner = (yield* Ref.get(projectMcpLeaseScopes)).get(
               input.sessionInput.threadId,
             );
-            if (previousOwner !== undefined) {
-              // Stale providers are stopped after the replacement has started.
-              // Releasing this lease here must not issue a duplicate stop.
-              yield* finishOwner(input.sessionInput.threadId, previousOwner, false);
-            }
             const sessionScope = yield* Scope.make("sequential");
             const projectMcpSession = yield* adapter.capabilities.projectMcpProxy === "unsupported"
               ? Effect.succeed({
@@ -1045,14 +1049,25 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               ...(providerGeneration ? { providerGeneration } : {}),
               nativeSessionId: undefined,
             };
-            yield* Effect.uninterruptible(
-              Effect.gen(function* () {
-                yield* Ref.update(projectMcpLeaseScopes, (current) =>
-                  new Map(current).set(input.sessionInput.threadId, owner),
-                ).pipe(Effect.onError(() => closeProjectMcpLeaseScope(sessionScope)));
-                providerGenerationTransferred = true;
+            let ownerPublished = false;
+            const restorePreviousOwner = Effect.uninterruptible(
+              Ref.update(projectMcpLeaseScopes, (current) => {
+                if (current.get(input.sessionInput.threadId) !== owner) return current;
+                const next = new Map(current);
+                if (previousOwner === undefined) {
+                  next.delete(input.sessionInput.threadId);
+                } else {
+                  next.set(input.sessionInput.threadId, previousOwner);
+                }
+                return next;
               }),
             );
+            yield* Effect.uninterruptible(
+              Ref.update(projectMcpLeaseScopes, (current) =>
+                new Map(current).set(input.sessionInput.threadId, owner),
+              ),
+            );
+            ownerPublished = true;
             const started = yield* Effect.gen(function* () {
               const currentAdapter = yield* registry
                 .getByInstance(input.providerInstanceId)
@@ -1071,30 +1086,56 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   "Provider instance changed while acquiring MCP credentials.",
                 );
               }
-              const replacement = yield* prepareMcpSession(
-                input.sessionInput.threadId,
-                input.providerInstanceId,
-                adapter.capabilities,
-                projectMcpSession.servers,
-                projectMcpSession.resolveSecret,
-                projectMcpSession.oauthStateLeases,
-              );
-              const issuedProjectMcpServers = replacement.candidate?.projectServers;
-              const session = yield* adapter.startSession({
-                ...input.sessionInput,
-                ...(issuedProjectMcpServers && issuedProjectMcpServers.length > 0
-                  ? { projectMcpServers: issuedProjectMcpServers }
-                  : {}),
+              return yield* withMcpReplacement({
+                threadId: input.sessionInput.threadId,
+                providerInstanceId: input.providerInstanceId,
+                adapter,
+                prepare: () =>
+                  prepareMcpSession(
+                    input.sessionInput.threadId,
+                    input.providerInstanceId,
+                    adapter.capabilities,
+                    projectMcpSession.servers,
+                    projectMcpSession.resolveSecret,
+                    projectMcpSession.oauthStateLeases,
+                  ),
+                beforeCommit: (session) =>
+                  Effect.gen(function* () {
+                    if (input.beforeCommit !== undefined) {
+                      yield* input.beforeCommit(session);
+                    }
+                  }),
+                onRollback: Effect.gen(function* () {
+                  if (ownerPublished) {
+                    yield* restorePreviousOwner;
+                  }
+                  yield* closeProjectMcpLeaseScope(sessionScope);
+                }),
+                use: (replacement) => {
+                  const issuedProjectMcpServers = replacement.candidate?.projectServers;
+                  return adapter.startSession({
+                    ...input.sessionInput,
+                    ...(issuedProjectMcpServers && issuedProjectMcpServers.length > 0
+                      ? { projectMcpServers: issuedProjectMcpServers }
+                      : {}),
+                  });
+                },
               });
-              yield* commitMcpSession(input.sessionInput.threadId, replacement);
-              return session;
             }).pipe(
-              Effect.onExit((exit) =>
-                Exit.isSuccess(exit)
-                  ? Effect.void
-                  : finishOwner(input.sessionInput.threadId, owner, false),
+              Effect.onError(() =>
+                Effect.gen(function* () {
+                  if (ownerPublished) {
+                    yield* restorePreviousOwner;
+                  }
+                  yield* closeProjectMcpLeaseScope(sessionScope);
+                }),
               ),
             );
+            providerGenerationTransferred = true;
+            if (previousOwner !== undefined) {
+              yield* closeProjectMcpLeaseScope(previousOwner.scope);
+              yield* releaseProviderGeneration(previousOwner);
+            }
             if (durableCatalogSnapshot !== undefined && Option.isSome(orchestrationEngine)) {
               const shouldRecordUnsupported =
                 durableCatalogCapability === "unsupported" &&
@@ -1411,6 +1452,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           adapter,
           providerInstanceId: bindingInstanceId,
           operation: input.operation,
+          beforeCommit: (session) =>
+            Effect.gen(function* () {
+              yield* ensureLifecycleLease(input.lifecycleLease, input.operation);
+              yield* upsertSessionBinding(
+                { ...session, providerInstanceId: bindingInstanceId },
+                input.binding.threadId,
+              );
+            }),
           sessionInput: {
             threadId: input.binding.threadId,
             provider: input.binding.provider,
@@ -1429,10 +1478,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           );
         }
 
-        yield* upsertSessionBinding(
-          { ...resumed, providerInstanceId: bindingInstanceId },
-          input.binding.threadId,
-        );
         yield* analytics.record("provider.session.recovered", {
           provider: resumed.provider,
           strategy: "resume-thread",
@@ -1644,6 +1689,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               adapter,
               providerInstanceId: resolvedInstanceId,
               operation: "ProviderService.startSession",
+              beforeCommit: (startedSession) =>
+                Effect.gen(function* () {
+                  yield* ensureLifecycleLease(lifecycleLease, "ProviderService.startSession");
+                  yield* upsertSessionBinding(
+                    { ...startedSession, providerInstanceId: resolvedInstanceId },
+                    threadId,
+                    { modelSelection: input.modelSelection },
+                  );
+                }),
               sessionInput: {
                 ...input,
                 providerInstanceId: resolvedInstanceId,
@@ -1653,12 +1707,6 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   : {}),
               },
             });
-            yield* ensureLifecycleLease(lifecycleLease, "ProviderService.startSession");
-            yield* upsertSessionBinding(
-              { ...session, providerInstanceId: resolvedInstanceId },
-              threadId,
-              { modelSelection: input.modelSelection },
-            );
             yield* stopStaleSessionsForThread({ threadId, currentInstanceId: resolvedInstanceId });
             const sessionWithInstance = { ...session, providerInstanceId: resolvedInstanceId };
             yield* analytics.record("provider.session.started", {
@@ -1977,8 +2025,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               Effect.gen(function* () {
                 const owner = (yield* Ref.get(projectMcpLeaseScopes)).get(input.threadId);
                 if (owner?.adapter === routed.adapter) {
-                  yield* finishOwner(input.threadId, owner, routed.isActive);
-                } else if (routed.isActive) {
+                  yield* finishOwner(input.threadId, owner, true);
+                } else {
                   yield* stopBoundAdapterSession(routed.adapter, routed.threadId);
                   yield* clearMcpSession(input.threadId);
                 }

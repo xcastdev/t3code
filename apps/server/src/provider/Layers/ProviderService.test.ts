@@ -1079,6 +1079,8 @@ const makeMcpLifecycleHarness = Effect.fn("makeMcpLifecycleHarness")(function* (
           }
           return credentials.revokeThread(threadId);
         }),
+      revokeMcpProviderCredential: (providerSessionId) =>
+        credentials.revokeProviderSession(providerSessionId),
       canonicalEventLogger: {
         filePath: "memory://mcp-lifecycle",
         write: (event) => Queue.offer(forwarded, event as ProviderRuntimeEvent).pipe(Effect.asVoid),
@@ -1517,11 +1519,12 @@ it.effect.each(["start", "stop", "stopAll"])(
             : h.closeProvider
       ).pipe(Effect.exit, Effect.ensuring(Effect.sync(() => spy.mockRestore())));
       assert.equal(Exit.isFailure(result), operation !== "stopAll");
-      assert.deepEqual(yield* h.credentialAlive(0), {
-        credential: false,
-        proxy: false,
-        lease: false,
-      });
+      assert.deepEqual(
+        yield* h.credentialAlive(0),
+        operation === "stop"
+          ? { credential: true, proxy: true, lease: true }
+          : { credential: false, proxy: false, lease: false },
+      );
     }).pipe(Effect.provide(NodeServices.layer)),
 );
 
@@ -1872,7 +1875,7 @@ it.effect(
 );
 
 routing.layer("ProviderServiceLive routing", (it) => {
-  it.effect("releases the MCP lease when an adapter stop fails", () =>
+  it.effect("preserves MCP access when an adapter stop fails", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
       const threadId = asThreadId("thread-mcp-failed-stop");
@@ -1896,9 +1899,12 @@ routing.layer("ProviderServiceLive routing", (it) => {
         .stopSession({ threadId })
         .pipe(Effect.exit, Effect.ensuring(Effect.sync(() => stop.mockRestore())));
       assert.isTrue(Exit.isFailure(stopped));
+      assert.equal(routing.releasedSessionLeases, releasedBefore);
+      assert.isDefined(McpProviderSession.readMcpProviderSession(threadId));
+      yield* provider.sendTurn({ threadId, input: "still active", attachments: [] });
+      assert.equal(routing.codex.sendTurn.mock.calls.length, 1);
+      yield* provider.stopSession({ threadId });
       assert.equal(routing.releasedSessionLeases, releasedBefore + 1);
-      assert.isUndefined(McpProviderSession.readMcpProviderSession(threadId));
-      yield* routing.codex.stopSession(threadId);
     }),
   );
 
