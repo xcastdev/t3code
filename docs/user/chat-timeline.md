@@ -27,17 +27,11 @@ be wrong.
 Turns from before this feature shipped show the duration by itself. Their work was never recorded,
 and T3 Code shows nothing rather than an undercount.
 
-Expand a summary to see the work itself. Inside, contiguous stretches of work between the agent's
-messages are grouped so you can see the shape of what happened:
-
-```
-3 Commands
-2 Tool Calls · 1 Subagent
-```
+Expand a summary to see the work itself.
 
 ## What ran the turn
 
-Hover a finished response to see the model that produced it, along with the reasoning effort,
+A finished response shows the model that produced it, along with the reasoning effort,
 duration, and time:
 
 ```

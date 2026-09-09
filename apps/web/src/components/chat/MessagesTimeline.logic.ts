@@ -233,8 +233,6 @@ export type MessagesTimelineRow =
       createdAt: string;
       turnId: TurnId;
       label: string;
-      /** Per-work-group summaries between assistant messages, in order. */
-      subfoldLabels: ReadonlyArray<string>;
       expanded: boolean;
     }
   | {
@@ -501,12 +499,6 @@ interface TurnFold {
   createdAt: string;
   hiddenEntryIds: ReadonlySet<string>;
   label: string;
-  /**
-   * One label per contiguous run of work between assistant messages, in order.
-   * Same vocabulary as the turn label but without a duration. Rendering is
-   * owned by the timeline component; this is the derived data behind it.
-   */
-  subfoldLabels: ReadonlyArray<string>;
 }
 
 function pluralizeWorkSegment(count: number, singular: string, plural: string): string | null {
@@ -786,38 +778,12 @@ function deriveTurnFolds(input: {
       .filter((segment): segment is string => segment != null && segment.length > 0)
       .join(" · ");
 
-    // Subfolds always derive client-side: they describe runs of rows that are
-    // present, so a stamped turn total cannot be split across them.
-    const subfoldLabels: string[] = [];
-    let pendingSubfoldEntries: TimelineEntry[] = [];
-    const flushSubfold = () => {
-      if (pendingSubfoldEntries.length === 0) {
-        return;
-      }
-      const segments = workCountSegments(
-        countTurnWork(collectTurnWorkActivities(pendingSubfoldEntries)),
-      );
-      if (segments.length > 0) {
-        subfoldLabels.push(segments.join(" · "));
-      }
-      pendingSubfoldEntries = [];
-    };
-    for (const entry of group.entries) {
-      if (entry.kind === "message" && entry.message.role === "assistant") {
-        flushSubfold();
-        continue;
-      }
-      pendingSubfoldEntries.push(entry);
-    }
-    flushSubfold();
-
     foldsByAnchorEntryId.set(firstHiddenEntry.id, {
       turnId,
       anchorEntryId: firstHiddenEntry.id,
       createdAt: firstHiddenEntry.createdAt,
       hiddenEntryIds,
       label,
-      subfoldLabels,
     });
   }
   return foldsByAnchorEntryId;
@@ -1003,7 +969,6 @@ export function deriveMessagesTimelineRows(input: {
         createdAt: anchoredTurnFold.createdAt,
         turnId: anchoredTurnFold.turnId,
         label: anchoredTurnFold.label,
-        subfoldLabels: anchoredTurnFold.subfoldLabels,
         expanded: input.expandedTurnIds?.has(anchoredTurnFold.turnId) ?? false,
       });
     }
@@ -1206,13 +1171,7 @@ function isRowUnchanged(a: MessagesTimelineRow, b: MessagesTimelineRow): boolean
 
     case "turn-fold": {
       const bf = b as typeof a;
-      return (
-        a.createdAt === bf.createdAt &&
-        a.label === bf.label &&
-        a.expanded === bf.expanded &&
-        a.subfoldLabels.length === bf.subfoldLabels.length &&
-        a.subfoldLabels.every((label, index) => label === bf.subfoldLabels[index])
-      );
+      return a.createdAt === bf.createdAt && a.label === bf.label && a.expanded === bf.expanded;
     }
 
     case "proposed-plan":

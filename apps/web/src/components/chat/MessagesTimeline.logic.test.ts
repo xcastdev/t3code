@@ -1774,9 +1774,7 @@ describe("deriveTurnFolds work summaries", () => {
 
   const foldRowOf = (rows: ReadonlyArray<unknown>, turnId: string) =>
     rows.find(
-      (
-        row,
-      ): row is { kind: "turn-fold"; turnId: string; label: string; subfoldLabels?: string[] } =>
+      (row): row is { kind: "turn-fold"; turnId: string; label: string } =>
         (row as { kind?: string }).kind === "turn-fold" &&
         (row as { turnId?: string }).turnId === turnId,
     );
@@ -2004,7 +2002,7 @@ describe("deriveTurnFolds work summaries", () => {
     expect(foldRowOf(rows, "turn-1")?.label).toBe("You stopped after 10s · 1 Command");
   });
 
-  it("splits subfolds at assistant boundaries and reconciles them with the turn total", () => {
+  it("totals work across runs split by assistant messages", () => {
     const rows = deriveMessagesTimelineRows({
       timelineEntries: [
         userEntry("2026-01-01T00:00:00Z"),
@@ -2031,56 +2029,6 @@ describe("deriveTurnFolds work summaries", () => {
 
     const fold = foldRowOf(rows, "turn-1");
     expect(fold?.label).toBe("Worked for 20s · 3 Commands · 2 Tool Calls · 1 Subagent");
-    expect(fold?.subfoldLabels).toEqual(["3 Commands", "2 Tool Calls · 1 Subagent"]);
-  });
-
-  it("renders a single-item subfold", () => {
-    const rows = deriveMessagesTimelineRows({
-      timelineEntries: [
-        userEntry("2026-01-01T00:00:00Z"),
-        workEntry("w1", "turn-1", "2026-01-01T00:00:02Z", "command_execution", "c1"),
-        assistantEntry("a1", "turn-1", "2026-01-01T00:00:05Z", "2026-01-01T00:00:05Z", "Mid"),
-        workEntry("w2", "turn-1", "2026-01-01T00:00:06Z", "file_change", "t1"),
-        assistantEntry("a2", "turn-1", "2026-01-01T00:00:20Z", "2026-01-01T00:00:20Z", "Final"),
-      ],
-      latestTurn: {
-        turnId: "turn-1" as never,
-        state: "completed",
-        startedAt: "2026-01-01T00:00:00Z",
-        completedAt: "2026-01-01T00:00:20Z",
-      },
-      isWorking: false,
-      activeTurnStartedAt: null,
-      turnDiffSummaryByAssistantMessageId: new Map(),
-      revertTurnCountByUserMessageId: new Map(),
-    });
-
-    expect(foldRowOf(rows, "turn-1")?.subfoldLabels).toEqual(["1 Command", "1 Tool Call"]);
-  });
-});
-
-describe("turn-fold row identity", () => {
-  it("treats a fold whose subfolds changed as a new row", () => {
-    const foldRow = (subfoldLabels: string[]) =>
-      ({
-        kind: "turn-fold" as const,
-        id: "turn-fold:turn-1",
-        createdAt: "2026-01-01T00:00:02Z",
-        turnId: "turn-1" as never,
-        label: "Worked for 20s · 3 Commands",
-        subfoldLabels,
-        expanded: false,
-      }) as never;
-
-    const initial = computeStableMessagesTimelineRows([foldRow(["1 Command", "2 Commands"])], {
-      byId: new Map(),
-      result: [],
-    });
-    // Same label and expansion, different breakdown: the row must not be
-    // reused, or the expanded fold keeps rendering stale subfold rows.
-    const updated = computeStableMessagesTimelineRows([foldRow(["3 Commands"])], initial);
-
-    expect(updated.result[0]).not.toBe(initial.result[0]);
   });
 });
 

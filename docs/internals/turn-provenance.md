@@ -83,8 +83,8 @@ discards partials wholesale — which would also throw away the counts the clien
 
 ### Classification
 
-`packages/shared/src/turnWorkCounts.ts` is shared by the server (stamping) and the client (live turn
-and subfolds) so the two can never disagree about what a command is.
+`packages/shared/src/turnWorkCounts.ts` is shared by the server (stamping) and the client (live
+turn) so the two can never disagree about what a command is.
 
 - Dedupe by `toolCallId` — one call emits several lifecycle rows.
 - Classify by `itemType`, never `toolName`, which is null for the large majority of stored command
@@ -103,15 +103,15 @@ and subfolds) so the two can never disagree about what a command is.
 activity table stores `tone` and `kind`.
 
 > Turns stamped before this filter existed keep their inflated counts: `settleCountsFor` skips an
-> already-stamped turn, and nothing backfills. Only turns settling from now on reconcile with their
-> subfolds.
+> already-stamped turn, and nothing backfills. Only turns settling from now on reconcile with the
+> rows a user can expand.
 
 ## The client refuses to guess
 
 Two rules keep the timeline honest.
 
-**Stamped beats derived.** Settled turns read their stamped counts. The live turn and all subfolds
-derive client-side from retained activities.
+**Stamped beats derived.** Settled turns read their stamped counts. The live turn derives
+client-side from retained activities.
 
 **A count it cannot trust is not rendered.** The guard is one expression:
 
@@ -122,9 +122,6 @@ stampedCounts ?? (activitiesMayHaveAgedOut ? null : derivedCounts)
 When a pre-stamp turn began before the oldest retained activity, counts are `null` and every segment
 drops, leaving the bare duration. `null` rather than zeroes is the point — zeroed counts would
 render a label with segments silently missing, which is precisely the partial count to avoid.
-
-Subfolds always derive from present rows and never read the stamp, so turn totals reconcile with
-subfold sums by construction.
 
 `+N/−M` sums the turn's checkpoint additions and deletions and is suppressed unless the checkpoint
 status is `ready`. The changed-file count survives suppression either way.
@@ -165,7 +162,7 @@ helper in `packages/shared/src/chatList.ts`, which is why the web removal left i
 
 Per-turn tokens and cost are not plumbed from adapters. Reasoning is emitted by Claude, OpenCode,
 and Codex but dropped at ingestion, which filters to `assistant_text`; when it is picked up, the
-subfold structure absorbs it without redesign. Mobile's parallel timeline still renders the old
+fold label absorbs it without redesign. Mobile's parallel timeline still renders the old
 fold label — the additive contract keeps it working unchanged.
 
 A steer that changes the model mid-turn is not re-stamped. Claude, Cursor, and Grok all gate

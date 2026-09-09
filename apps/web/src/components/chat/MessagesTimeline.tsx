@@ -1248,20 +1248,6 @@ function RevertUserMessageButton({ messageId }: { messageId: MessageId }) {
   );
 }
 
-/**
- * Subfold labels are positional summaries, so two runs of the same shape share
- * text. Disambiguating repeats by occurrence keeps each list item's key stable
- * as long as the fold's shape is.
- */
-function subfoldKeys(turnId: TurnId, labels: ReadonlyArray<string>) {
-  const seen = new Map<string, number>();
-  return labels.map((label) => {
-    const occurrence = seen.get(label) ?? 0;
-    seen.set(label, occurrence + 1);
-    return { key: `${turnId}:${label}:${occurrence}`, label };
-  });
-}
-
 function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-fold" }> }) {
   const ctx = use(TimelineRowCtx);
   const Icon = row.expanded ? ChevronDownIcon : ChevronRightIcon;
@@ -1278,20 +1264,6 @@ function TurnFoldTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "turn-
         <span>{row.label}</span>
         <Icon className="size-3.5" />
       </button>
-      {row.expanded && row.subfoldLabels.length > 0 ? (
-        <ul className="mt-0.5 ms-1 flex flex-col gap-0.5">
-          {subfoldKeys(row.turnId, row.subfoldLabels).map(({ key, label }) => (
-            <li
-              key={key}
-              data-timeline-subfold
-              className="flex items-center gap-1 px-1 text-xs leading-relaxed text-muted-foreground tabular-nums"
-            >
-              <ChevronRightIcon className="size-3 shrink-0 text-icon-muted" aria-hidden />
-              <span className="min-w-0 truncate">{label}</span>
-            </li>
-          ))}
-        </ul>
-      ) : null}
     </div>
   );
 }

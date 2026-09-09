@@ -53,7 +53,7 @@ Commands, tool calls, subagents, and changed files performed by a turn, computed
 
 #### Turn fold
 
-The collapsed summary row standing in for a settled turn's intermediate work, labelled with the duration and the turn's work counts. Contiguous work between assistant messages inside an expanded fold groups into subfolds, whose counts sum to the turn total.
+The collapsed summary row standing in for a settled turn's intermediate work, labelled with the duration and the turn's work counts.
 
 ### Orchestration
 
