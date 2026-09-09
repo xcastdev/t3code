@@ -1903,6 +1903,78 @@ describe("deriveTurnFolds work summaries", () => {
     expect(foldRowOf(rows, "turn-1")?.label).toBe("Worked for 5m 10s");
   });
 
+  it("shows no derived counts when an older host names no cut turns", () => {
+    // A host too old to send `partialTurnIds` leaves the field undefined. That
+    // must read as "unknown", not "nothing was cut" — otherwise every turn in a
+    // trimmed thread publishes a count built from the rows that survived.
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        userEntry("2026-01-01T00:00:00Z"),
+        workEntry("w1", "turn-1", "2026-01-01T00:05:00Z", "command_execution", "c1"),
+        assistantEntry("a1", "turn-1", "2026-01-01T00:05:10Z", "2026-01-01T00:05:10Z"),
+      ],
+      // No partialTurnIds: the host never sent one.
+      activityWindowMayBeTruncated: true,
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:05:10Z",
+      },
+      turns: [
+        {
+          turnId: "turn-1" as never,
+          state: "completed",
+          requestedAt: "2026-01-01T00:00:00Z",
+          startedAt: "2026-01-01T00:00:00Z",
+          completedAt: "2026-01-01T00:05:10Z",
+          assistantMessageId: "a1" as never,
+        },
+      ] as never,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(foldRowOf(rows, "turn-1")?.label).toBe("Worked for 5m 10s");
+  });
+
+  it("counts turns when an older host's window was not full", () => {
+    // The same older host, but the thread is small enough that nothing could
+    // have been trimmed: derive and show the counts.
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        userEntry("2026-01-01T00:00:00Z"),
+        workEntry("w1", "turn-1", "2026-01-01T00:05:00Z", "command_execution", "c1"),
+        assistantEntry("a1", "turn-1", "2026-01-01T00:05:10Z", "2026-01-01T00:05:10Z"),
+      ],
+      activityWindowMayBeTruncated: false,
+      latestTurn: {
+        turnId: "turn-1" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:00:00Z",
+        completedAt: "2026-01-01T00:05:10Z",
+      },
+      turns: [
+        {
+          turnId: "turn-1" as never,
+          state: "completed",
+          requestedAt: "2026-01-01T00:00:00Z",
+          startedAt: "2026-01-01T00:00:00Z",
+          completedAt: "2026-01-01T00:05:10Z",
+          assistantMessageId: "a1" as never,
+        },
+      ] as never,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(foldRowOf(rows, "turn-1")?.label).toBe("Worked for 5m 10s · 1 Command");
+  });
+
   it("counts an unstamped turn the server did not cut", () => {
     // Same fixture, minus the truncation signal. A dropped tool.started and a
     // collapsed updated/completed pair are present on purpose: a guard keyed on
