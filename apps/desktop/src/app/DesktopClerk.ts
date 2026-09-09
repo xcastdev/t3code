@@ -8,14 +8,22 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 
 import { clerkFrontendApiHostnameFromPublishableKey } from "@t3tools/shared/relayAuth";
+import * as DesktopAttachedBackend from "../backend/DesktopAttachedBackend.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
 import * as ElectronProtocol from "../electron/ElectronProtocol.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopLifecycle from "./DesktopLifecycle.ts";
 import { findDesktopLaunchIntentInArgv, parseDesktopLaunchIntent } from "./DesktopLaunchIntent.ts";
 
 declare const __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: string | undefined;
+
+type DesktopClerkEventHandlerServices =
+  | ElectronWindow.ElectronWindow
+  | DesktopAttachedBackend.DesktopAttachedBackend
+  | DesktopLifecycle.DesktopLifecycle
+  | DesktopLifecycle.DesktopLifecycleRuntimeServices;
 
 export class DesktopClerkBridgeInitializationError extends Schema.TaggedErrorClass<DesktopClerkBridgeInitializationError>()(
   "DesktopClerkBridgeInitializationError",
@@ -49,7 +57,7 @@ export class DesktopClerk extends Context.Service<
     readonly configure: Effect.Effect<
       void,
       never,
-      ElectronApp.ElectronApp | ElectronWindow.ElectronWindow | Scope.Scope
+      ElectronApp.ElectronApp | DesktopClerkEventHandlerServices | Scope.Scope
     >;
   }
 >()("@t3tools/desktop/app/DesktopClerk") {}
@@ -123,7 +131,7 @@ export const make = Effect.gen(function* () {
     configure: Effect.gen(function* () {
       const electronApp = yield* ElectronApp.ElectronApp;
       const electronWindow = yield* ElectronWindow.ElectronWindow;
-      const context = yield* Effect.context<ElectronWindow.ElectronWindow>();
+      const context = yield* Effect.context<DesktopClerkEventHandlerServices>();
       const runPromise = Effect.runPromiseWith(context);
 
       // The SDK bridge holds Electron's single-instance lock (acquired at
@@ -136,18 +144,14 @@ export const make = Effect.gen(function* () {
         return yield* Effect.interrupt;
       }
 
-      const relaunchForAttachIntent = (raw: string) => {
+      const handleAttachIntent = (pairingUrl: string) => {
         void runPromise(
           Effect.gen(function* () {
-            const existingAttachArgs = new Set(
-              process.argv.slice(1).filter((arg) => parseDesktopLaunchIntent(arg) !== null),
-            );
-            yield* electronApp.relaunch({
-              execPath: process.execPath,
-              args: [...process.argv.slice(1).filter((arg) => !existingAttachArgs.has(arg)), raw],
-            });
-            yield* electronApp.exit(0);
-          }),
+            const attachedBackend = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+            const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
+            yield* attachedBackend.attach(pairingUrl);
+            yield* lifecycle.relaunch("primary-backend-attached");
+          }).pipe(Effect.catchCause(() => Effect.void)),
         );
       };
 
@@ -157,11 +161,8 @@ export const make = Effect.gen(function* () {
           : [];
         const pairingUrl = findDesktopLaunchIntentInArgv(argv);
         if (pairingUrl !== null) {
-          const raw = argv.find((arg) => parseDesktopLaunchIntent(arg) === pairingUrl);
-          if (raw !== undefined) {
-            relaunchForAttachIntent(raw);
-            return;
-          }
+          handleAttachIntent(pairingUrl);
+          return;
         }
         void runPromise(
           Effect.gen(function* () {
@@ -177,7 +178,8 @@ export const make = Effect.gen(function* () {
         const electronEvent = event as { preventDefault?: () => void };
         if (parseDesktopLaunchIntent(url) === null) return;
         electronEvent.preventDefault?.();
-        relaunchForAttachIntent(url);
+        const pairingUrl = parseDesktopLaunchIntent(url);
+        if (pairingUrl !== null) handleAttachIntent(pairingUrl);
       });
     }).pipe(Effect.withSpan("desktop.clerk.configure")),
   });

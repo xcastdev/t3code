@@ -4,6 +4,7 @@ import {
   buildDesktopAttachUrl,
   findDesktopLaunchIntentInArgv,
   parseDesktopLaunchIntent,
+  stripDesktopLaunchIntentsFromArgv,
 } from "./DesktopLaunchIntent.ts";
 
 describe("DesktopLaunchIntent", () => {
@@ -29,5 +30,21 @@ describe("DesktopLaunchIntent", () => {
         buildDesktopAttachUrl(pairingUrl),
       ]),
     ).toBe(pairingUrl);
+  });
+
+  it("strips every attach intent while preserving ordinary and OAuth arguments", () => {
+    const pairingUrl = "http://localhost:3773/#token=owner-token";
+    const attachUrl = buildDesktopAttachUrl(pairingUrl);
+    const oauthUrl = "t3code://clerk-callback?code=oauth-code";
+
+    expect(
+      stripDesktopLaunchIntentsFromArgv([
+        "--hidden-window",
+        attachUrl,
+        "--another-flag",
+        attachUrl,
+        oauthUrl,
+      ]),
+    ).toEqual(["--hidden-window", "--another-flag", oauthUrl]);
   });
 });

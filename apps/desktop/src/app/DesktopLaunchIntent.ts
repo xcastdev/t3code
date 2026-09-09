@@ -54,6 +54,10 @@ export function findDesktopLaunchIntentInArgv(argv: readonly string[]): string |
   return null;
 }
 
+export function stripDesktopLaunchIntentsFromArgv(argv: readonly string[]): Array<string> {
+  return argv.filter((arg) => parseDesktopLaunchIntent(arg) === null);
+}
+
 export function capturePreReadyDesktopLaunchIntent(raw: string): boolean {
   const pairingUrl = parseDesktopLaunchIntent(raw);
   if (pairingUrl === null) return false;

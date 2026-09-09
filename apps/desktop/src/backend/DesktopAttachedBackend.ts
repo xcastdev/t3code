@@ -21,11 +21,10 @@ import * as Schema from "effect/Schema";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 
 import * as DesktopBackendPool from "./DesktopBackendPool.ts";
+import { parseDesktopAttachedBackendEndpoints } from "./DesktopAttachedBackendEndpoints.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
 import * as DesktopAppSettings from "../settings/DesktopAppSettings.ts";
 import * as ElectronSafeStorage from "../electron/ElectronSafeStorage.ts";
-
-const ATTACHED_PAIRING_HTTP_PROTOCOL = "http:";
 
 const attachedBearerExpiry = (now: number, expiresIn: number): string =>
   DateTime.formatIso(DateTime.makeUnsafe(now + Math.max(0, expiresIn) * 1000));
@@ -158,17 +157,6 @@ type AttachedPreference = Extract<
   { readonly mode: "attached" }
 >;
 
-const isLoopbackHost = (hostname: string): boolean => {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  if (normalized === "localhost" || normalized === "::1") return true;
-  const octets = normalized.split(".");
-  return (
-    octets.length === 4 &&
-    octets[0] === "127" &&
-    octets.slice(1).every((octet) => /^(?:0|[1-9]\d{0,2})$/u.test(octet) && Number(octet) <= 255)
-  );
-};
-
 const invalidPairingUrl = (reason: string): DesktopAttachPairingUrlError =>
   new DesktopAttachPairingUrlError({ reason });
 
@@ -176,12 +164,7 @@ export const resolveDesktopAttachPairingTarget = (pairingUrl: string) =>
   Effect.suspend(() => {
     try {
       const url = new URL(pairingUrl.trim());
-      if (
-        url.protocol !== ATTACHED_PAIRING_HTTP_PROTOCOL ||
-        url.username.length > 0 ||
-        url.password.length > 0 ||
-        !isLoopbackHost(url.hostname)
-      ) {
+      if (url.protocol !== "http:" || url.username.length > 0 || url.password.length > 0) {
         return Effect.fail(
           invalidPairingUrl("Desktop attach links must use an HTTP loopback backend URL."),
         );
@@ -201,12 +184,13 @@ export const resolveDesktopAttachPairingTarget = (pairingUrl: string) =>
       }
 
       const target = resolveRemotePairingTarget({ pairingUrl: url.toString() });
-      if (target.httpBaseUrl.startsWith("https:")) {
+      const endpoints = parseDesktopAttachedBackendEndpoints(target.httpBaseUrl, target.wsBaseUrl);
+      if (endpoints === null) {
         return Effect.fail(
           invalidPairingUrl("Desktop attach links must use an HTTP loopback backend URL."),
         );
       }
-      return Effect.succeed(target);
+      return Effect.succeed({ ...target, ...endpoints });
     } catch {
       return Effect.fail(invalidPairingUrl("Desktop attach URL is invalid."));
     }

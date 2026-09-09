@@ -134,6 +134,18 @@ describe("ElectronProtocol", () => {
         assert.equal(route.status, 200);
         assert.equal(await route.text(), "<app>");
         assert.equal(route.headers.get("content-security-policy"), policy);
+        assert.equal(route.headers.get("content-type"), "text/html; charset=utf-8");
+        assert.equal(route.headers.get("cache-control"), "no-cache");
+
+        const dottedRoute = await ElectronProtocol.serveStaticDesktopRendererRequest(
+          new Request("t3code://app/settings.v2"),
+          directory,
+          policy,
+        );
+        assert.equal(dottedRoute.status, 200);
+        assert.equal(await dottedRoute.text(), "<app>");
+        assert.equal(dottedRoute.headers.get("content-type"), "text/html; charset=utf-8");
+        assert.equal(dottedRoute.headers.get("cache-control"), "no-cache");
 
         const asset = await ElectronProtocol.serveStaticDesktopRendererRequest(
           new Request("t3code://app/assets/app.js?v=1"),
@@ -142,6 +154,15 @@ describe("ElectronProtocol", () => {
         );
         assert.equal(asset.status, 200);
         assert.equal(await asset.text(), "console.log(1)");
+        assert.equal(asset.headers.get("content-type"), "text/javascript; charset=utf-8");
+        assert.equal(asset.headers.get("cache-control"), "public, max-age=31536000, immutable");
+
+        const missingAsset = await ElectronProtocol.serveStaticDesktopRendererRequest(
+          new Request("t3code://app/assets/missing.js"),
+          directory,
+          policy,
+        );
+        assert.equal(missingAsset.status, 404);
 
         const traversal = await ElectronProtocol.serveStaticDesktopRendererRequest(
           new Request("t3code://app/%2e%2e%5csecret.js"),

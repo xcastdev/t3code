@@ -250,13 +250,16 @@ export async function serveStaticDesktopRendererRequest(
   }
 
   let body: Buffer;
+  let servedFilePath = filePath;
   try {
     body = await FileSystemPromises.readFile(filePath);
   } catch (cause) {
     const code = typeof cause === "object" && cause !== null && "code" in cause ? cause.code : null;
-    if (code === "ENOENT" && !NodePath.basename(filePath).includes(".")) {
+    const requestedExtension = NodePath.extname(filePath).toLowerCase();
+    if (code === "ENOENT" && STATIC_CONTENT_TYPES[requestedExtension] === undefined) {
+      servedFilePath = NodePath.resolve(directory, "index.html");
       try {
-        body = await FileSystemPromises.readFile(NodePath.resolve(directory, "index.html"));
+        body = await FileSystemPromises.readFile(servedFilePath);
       } catch {
         return withContentSecurityPolicy(
           new Response(null, { status: 404 }),
@@ -268,7 +271,7 @@ export async function serveStaticDesktopRendererRequest(
     }
   }
 
-  const extension = NodePath.extname(filePath).toLowerCase();
+  const extension = NodePath.extname(servedFilePath).toLowerCase();
   const headers = new Headers({
     "content-type": STATIC_CONTENT_TYPES[extension] ?? "application/octet-stream",
     "cache-control": extension === ".html" ? "no-cache" : "public, max-age=31536000, immutable",

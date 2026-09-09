@@ -8,6 +8,7 @@ import * as HttpClientResponse from "effect/unstable/http/HttpClientResponse";
 import { PRIMARY_LOCAL_ENVIRONMENT_ID } from "@t3tools/contracts";
 
 import * as DesktopBackendPool from "./DesktopBackendPool.ts";
+import * as DesktopAttachedBackend from "./DesktopAttachedBackend.ts";
 import * as DesktopLocalEnvironmentAuth from "./DesktopLocalEnvironmentAuth.ts";
 
 const config = {
@@ -64,8 +65,15 @@ describe("DesktopLocalEnvironmentAuth", () => {
           },
         ]),
       } as unknown as DesktopBackendPool.DesktopBackendPool["Service"]);
-      const testLayer = DesktopLocalEnvironmentAuth.layer.pipe(
-        Layer.provide(Layer.mergeAll(poolLayer, httpClientLayer)),
+      const attachedBackendLayer = Layer.succeed(DesktopAttachedBackend.DesktopAttachedBackend, {
+        getState: Effect.succeed({ mode: "managed" as const }),
+        getBearerToken: Effect.die("unexpected attached bearer read"),
+      } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"]);
+      const testLayer = Layer.mergeAll(
+        DesktopLocalEnvironmentAuth.layer.pipe(
+          Layer.provide(Layer.mergeAll(poolLayer, httpClientLayer)),
+        ),
+        attachedBackendLayer,
       );
 
       const [first, second] = yield* Effect.gen(function* () {
@@ -76,6 +84,42 @@ describe("DesktopLocalEnvironmentAuth", () => {
       assert.strictEqual(first, "desktop-bearer-token");
       assert.strictEqual(second, "desktop-bearer-token");
       assert.strictEqual(yield* Ref.get(requestCount), 1);
+    }),
+  );
+
+  it.effect("reads an attached bearer again after the encrypted setting changes", () =>
+    Effect.gen(function* () {
+      const bearerToken = yield* Ref.make("old-attached-bearer");
+      const attachedBackendLayer = Layer.succeed(DesktopAttachedBackend.DesktopAttachedBackend, {
+        getState: Effect.succeed({
+          mode: "attached" as const,
+          httpBaseUrl: "http://127.0.0.1:3773/",
+          environmentId: PRIMARY_LOCAL_ENVIRONMENT_ID,
+          label: "Attached",
+          bearerExpiresAt: "2026-10-08T12:00:00.000Z",
+        }),
+        getBearerToken: Ref.get(bearerToken),
+      } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"]);
+      const poolLayer = Layer.succeed(DesktopBackendPool.DesktopBackendPool, {
+        list: Effect.succeed([]),
+      } as unknown as DesktopBackendPool.DesktopBackendPool["Service"]);
+      const httpClientLayer = Layer.succeed(
+        HttpClient.HttpClient,
+        HttpClient.make(() => Effect.die("unexpected HTTP request")),
+      );
+      const testLayer = Layer.mergeAll(
+        DesktopLocalEnvironmentAuth.layer.pipe(
+          Layer.provide(Layer.mergeAll(poolLayer, httpClientLayer)),
+        ),
+        attachedBackendLayer,
+      );
+
+      yield* Effect.gen(function* () {
+        const auth = yield* DesktopLocalEnvironmentAuth.DesktopLocalEnvironmentAuth;
+        assert.equal(yield* auth.getBearerToken, "old-attached-bearer");
+        yield* Ref.set(bearerToken, "new-attached-bearer");
+        assert.equal(yield* auth.getBearerToken, "new-attached-bearer");
+      }).pipe(Effect.provide(testLayer));
     }),
   );
 });

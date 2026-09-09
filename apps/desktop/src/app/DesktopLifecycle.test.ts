@@ -14,10 +14,12 @@ import * as DesktopLifecycle from "./DesktopLifecycle.ts";
 import * as DesktopShutdown from "./DesktopShutdown.ts";
 import * as DesktopState from "./DesktopState.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
+import { buildDesktopAttachUrl } from "./DesktopLaunchIntent.ts";
 
 function makeElectronAppLayer(
   appListeners: Map<string, (...args: readonly unknown[]) => void>,
   quit: Effect.Effect<void> = Effect.void,
+  relaunch: (options: Electron.RelaunchOptions) => Effect.Effect<void> = () => Effect.void,
 ) {
   const registerListener = (eventName: string, listener: (...args: readonly unknown[]) => void) =>
     Effect.acquireRelease(
@@ -37,7 +39,7 @@ function makeElectronAppLayer(
     whenReady: Effect.void,
     quit,
     exit: () => Effect.void,
-    relaunch: () => Effect.void,
+    relaunch,
     setPath: () => Effect.void,
     setName: () => Effect.void,
     setAboutPanelOptions: () => Effect.void,
@@ -240,6 +242,55 @@ describe("DesktopLifecycle", () => {
           assert.equal(activationCount, 0);
         }),
       ).pipe(Effect.provide(layer));
+    }),
+  );
+
+  it.effect("strips attach intents from its own relaunch arguments", () =>
+    Effect.gen(function* () {
+      const appListeners = new Map<string, (...args: readonly unknown[]) => void>();
+      const relaunchOptions = yield* Deferred.make<Electron.RelaunchOptions>();
+      const pairingUrl = "http://127.0.0.1:3773/pair#token=owner-token";
+      const attachUrl = buildDesktopAttachUrl(pairingUrl);
+      const originalArgv = process.argv;
+      process.argv = ["/electron", "--profile=work", attachUrl, attachUrl, "t3code://oauth"];
+
+      const shutdownLayer = Layer.succeed(DesktopShutdown.DesktopShutdown, {
+        request: Effect.void,
+        awaitRequest: Effect.void,
+        markComplete: Effect.void,
+        awaitComplete: Effect.void,
+        isComplete: Effect.succeed(true),
+      });
+      const environmentLayer = Layer.succeed(DesktopEnvironment.DesktopEnvironment, {
+        platform: "darwin",
+        isDevelopment: false,
+      } as DesktopEnvironment.DesktopEnvironment["Service"]);
+      const layer = DesktopLifecycle.layer.pipe(
+        Layer.provideMerge(
+          makeElectronAppLayer(appListeners, Effect.void, (options) =>
+            Deferred.succeed(relaunchOptions, options).pipe(Effect.asVoid),
+          ),
+        ),
+        Layer.provideMerge(electronThemeLayer),
+        Layer.provideMerge(makeElectronWindowLayer()),
+        Layer.provideMerge(makeDesktopWindowLayer()),
+        Layer.provideMerge(environmentLayer),
+        Layer.provideMerge(shutdownLayer),
+        Layer.provideMerge(DesktopState.layer),
+      );
+
+      try {
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
+            yield* lifecycle.relaunch("test");
+            const options = yield* Deferred.await(relaunchOptions);
+            assert.deepEqual(options.args, ["--profile=work", "t3code://oauth"]);
+          }),
+        ).pipe(Effect.provide(layer));
+      } finally {
+        process.argv = originalArgv;
+      }
     }),
   );
 });

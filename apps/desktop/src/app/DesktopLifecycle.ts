@@ -15,6 +15,7 @@ import * as ElectronTheme from "../electron/ElectronTheme.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopState from "./DesktopState.ts";
 import * as DesktopWindow from "../window/DesktopWindow.ts";
+import { stripDesktopLaunchIntentsFromArgv } from "./DesktopLaunchIntent.ts";
 
 export class DesktopLifecycleRelaunchError extends Schema.TaggedErrorClass<DesktopLifecycleRelaunchError>()(
   "DesktopLifecycleRelaunchError",
@@ -175,7 +176,7 @@ export const make = DesktopLifecycle.of({
       }
       yield* electronApp.relaunch({
         execPath: process.execPath,
-        args: process.argv.slice(1),
+        args: stripDesktopLaunchIntentsFromArgv(process.argv.slice(1)),
       });
       yield* electronApp.exit(0);
     }).pipe(

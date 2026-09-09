@@ -135,7 +135,7 @@ describe("DesktopSettings", () => {
           environmentId: testEnvironmentId,
           label: "Remote server",
           encryptedBearerToken: "encrypted-token",
-          bearerExpiresAt: "2026-09-08T18:00:00.000Z",
+          bearerExpiresAt: "2099-09-08T18:00:00.000Z",
         };
 
         const change = yield* settings.setPrimaryBackendPreference(attached);
@@ -173,6 +173,89 @@ describe("DesktopSettings", () => {
       }),
     ),
   );
+
+  it.each([
+    {
+      httpBaseUrl: "https://127.0.0.1:4100/",
+      wsBaseUrl: "wss://127.0.0.1:4100/",
+      bearerExpiresAt: "2099-09-08T18:00:00.000Z",
+    },
+    {
+      httpBaseUrl: "http://example.test:4100/",
+      wsBaseUrl: "ws://example.test:4100/",
+      bearerExpiresAt: "2099-09-08T18:00:00.000Z",
+    },
+    {
+      httpBaseUrl: "http://127.0.0.1:4100/private",
+      wsBaseUrl: "ws://127.0.0.1:4100/",
+      bearerExpiresAt: "2099-09-08T18:00:00.000Z",
+    },
+    {
+      httpBaseUrl: "http://127.0.0.1:4100/",
+      wsBaseUrl: "ws://127.0.0.2:4100/",
+      bearerExpiresAt: "2099-09-08T18:00:00.000Z",
+    },
+    {
+      httpBaseUrl: "http://127.0.0.1:4100/",
+      wsBaseUrl: "ws://127.0.0.1:4100/",
+      bearerExpiresAt: "not-an-iso-date",
+    },
+    {
+      httpBaseUrl: "http://127.0.0.1:4100/",
+      wsBaseUrl: "ws://127.0.0.1:4100/",
+      bearerExpiresAt: "2026-09-08T12:00:00.000Z",
+    },
+    {
+      httpBaseUrl: "http://127.0.0.1:4100/",
+      wsBaseUrl: "ws://127.0.0.1:4100/",
+      bearerExpiresAt: "2099-02-30T12:00:00.000Z",
+    },
+  ])(
+    "preserves unsafe persisted attached state as invalid-attached ($httpBaseUrl)",
+    (endpoints) => {
+      const normalized = DesktopAppSettings.normalizePrimaryBackendPreference(
+        {
+          mode: "attached",
+          ...endpoints,
+          environmentId: testEnvironmentId,
+          label: "Workstation",
+          encryptedBearerToken: "ciphertext",
+        },
+        Date.parse("2026-09-08T12:00:00.000Z"),
+      );
+
+      assert.deepEqual(normalized, {
+        mode: "invalid-attached",
+        reason: "Stored attached backend settings are invalid.",
+      });
+    },
+  );
+
+  it("accepts a complete future attached record at a fixed read time", () => {
+    assert.deepEqual(
+      DesktopAppSettings.normalizePrimaryBackendPreference(
+        {
+          mode: "attached",
+          httpBaseUrl: "http://127.0.0.1:4100/",
+          wsBaseUrl: "ws://127.0.0.1:4100/",
+          environmentId: testEnvironmentId,
+          label: "Workstation",
+          encryptedBearerToken: "ciphertext",
+          bearerExpiresAt: "2026-09-08T13:00:00.000Z",
+        },
+        Date.parse("2026-09-08T12:00:00.000Z"),
+      ),
+      {
+        mode: "attached",
+        httpBaseUrl: "http://127.0.0.1:4100/",
+        wsBaseUrl: "ws://127.0.0.1:4100/",
+        environmentId: testEnvironmentId,
+        label: "Workstation",
+        encryptedBearerToken: "ciphertext",
+        bearerExpiresAt: "2026-09-08T13:00:00.000Z",
+      },
+    );
+  });
 
   it.effect("loads persisted settings and applies semantic updates", () =>
     withSettings(

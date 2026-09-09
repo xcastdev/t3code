@@ -8,6 +8,7 @@ import {
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
 import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -24,6 +25,7 @@ import {
 } from "../linuxSecretStorage.ts";
 import { resolveDefaultDesktopUpdateChannel } from "../updates/updateChannels.ts";
 import { isValidDistroName } from "../wsl/wslPathParsing.ts";
+import { parseDesktopAttachedBackendEndpoints } from "../backend/DesktopAttachedBackendEndpoints.ts";
 
 export interface DesktopSettings {
   readonly linuxPasswordStore: LinuxPasswordStorePreference;
@@ -144,7 +146,34 @@ const invalidPrimaryBackend = (reason: string): DesktopPrimaryBackendPreference 
   reason,
 });
 
-export function normalizePrimaryBackendPreference(value: unknown): DesktopPrimaryBackendPreference {
+const ISO_DATE_TIME_PATTERN =
+  /^(\d{4})-(\d{2})-(\d{2})T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/u;
+
+const isFutureIsoDateTime = (value: string, now: number): boolean => {
+  const match = ISO_DATE_TIME_PATTERN.exec(value);
+  if (match === null) return false;
+
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const daysInMonth =
+    month === 2
+      ? year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0)
+        ? 29
+        : 28
+      : month === 4 || month === 6 || month === 9 || month === 11
+        ? 30
+        : 31;
+  if (month < 1 || month > 12 || day < 1 || day > daysInMonth) return false;
+
+  const timestamp = Date.parse(value);
+  return Number.isFinite(timestamp) && timestamp > now;
+};
+
+export function normalizePrimaryBackendPreference(
+  value: unknown,
+  now: number,
+): DesktopPrimaryBackendPreference {
   if (value === undefined) {
     return { mode: "managed" };
   }
@@ -176,10 +205,18 @@ export function normalizePrimaryBackendPreference(value: unknown): DesktopPrimar
     return invalidPrimaryBackend("Stored attached backend settings are incomplete.");
   }
 
+  const endpoints = parseDesktopAttachedBackendEndpoints(
+    candidate.httpBaseUrl as string,
+    candidate.wsBaseUrl as string,
+  );
+  if (endpoints === null || !isFutureIsoDateTime(candidate.bearerExpiresAt as string, now)) {
+    return invalidPrimaryBackend("Stored attached backend settings are invalid.");
+  }
+
   return {
     mode: "attached",
-    httpBaseUrl: candidate.httpBaseUrl as string,
-    wsBaseUrl: candidate.wsBaseUrl as string,
+    httpBaseUrl: endpoints.httpBaseUrl,
+    wsBaseUrl: endpoints.wsBaseUrl,
     environmentId: candidate.environmentId,
     label: candidate.label as string,
     encryptedBearerToken: candidate.encryptedBearerToken as string,
@@ -277,6 +314,7 @@ export function normalizeMainWindowBounds(value: unknown): DesktopWindowBounds |
 function normalizeDesktopSettingsDocument(
   parsed: DesktopSettingsDocument,
   appVersion: string,
+  now: number,
 ): DesktopSettings {
   const defaultSettings = resolveDefaultDesktopSettings(appVersion);
   const mainWindowBounds = normalizeMainWindowBounds(parsed.mainWindowBounds);
@@ -308,7 +346,7 @@ function normalizeDesktopSettingsDocument(
     wslBackendEnabled,
     wslDistro: normalizeWslDistro(parsed.wslDistro),
     wslOnly: parsed.wslOnly === true,
-    primaryBackend: normalizePrimaryBackendPreference(parsed.primaryBackend),
+    primaryBackend: normalizePrimaryBackendPreference(parsed.primaryBackend, now),
   };
 }
 
@@ -475,6 +513,7 @@ function readSettings(
   fileSystem: FileSystem.FileSystem,
   settingsPath: string,
   appVersion: string,
+  now: number,
 ): Effect.Effect<DesktopSettings> {
   const defaultSettings = resolveDefaultDesktopSettings(appVersion);
 
@@ -485,7 +524,7 @@ function readSettings(
         onNone: () => Effect.succeed(defaultSettings),
         onSome: (raw) =>
           decodeDesktopSettingsJson(raw).pipe(
-            Effect.map((parsed) => normalizeDesktopSettingsDocument(parsed, appVersion)),
+            Effect.map((parsed) => normalizeDesktopSettingsDocument(parsed, appVersion, now)),
             Effect.orElseSucceed(() => defaultSettings),
           ),
       }),
@@ -600,6 +639,7 @@ export const make = Effect.gen(function* () {
         fileSystem,
         environment.desktopSettingsPath,
         environment.appVersion,
+        yield* Clock.currentTimeMillis,
       );
       return yield* SynchronizedRef.setAndGet(settingsRef, settings);
     }).pipe(Effect.withSpan("desktop.settings.load")),

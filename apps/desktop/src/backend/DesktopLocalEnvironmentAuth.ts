@@ -52,20 +52,21 @@ export const make = Effect.gen(function* () {
   const getBearerToken = mutex
     .withPermits(1)(
       Effect.gen(function* () {
+        const attached = yield* Effect.serviceOption(DesktopAttachedBackend.DesktopAttachedBackend);
+        if (Option.isSome(attached)) {
+          const state = yield* attached.value.getState;
+          if (state.mode === "attached") {
+            return yield* attached.value.getBearerToken.pipe(
+              Effect.mapError(
+                (cause) => new DesktopLocalEnvironmentAuthSessionBootstrapError({ cause }),
+              ),
+            );
+          }
+        }
+
         const cached = yield* Ref.get(tokenRef);
         if (Option.isSome(cached)) {
           return cached.value;
-        }
-
-        const attached = yield* Effect.serviceOption(DesktopAttachedBackend.DesktopAttachedBackend);
-        if (Option.isSome(attached)) {
-          const token = yield* attached.value.getBearerToken.pipe(
-            Effect.mapError(
-              (cause) => new DesktopLocalEnvironmentAuthSessionBootstrapError({ cause }),
-            ),
-          );
-          yield* Ref.set(tokenRef, Option.some(token));
-          return token;
         }
 
         const instances = yield* pool.list;
