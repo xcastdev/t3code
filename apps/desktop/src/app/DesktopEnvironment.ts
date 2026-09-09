@@ -59,6 +59,7 @@ export class DesktopEnvironment extends Context.Service<
     // ELECTRON_RUN_AS_NODE primary reads in place and the WSL backend
     // extracts on demand (see DesktopWslServerTree).
     readonly serverRoot: string;
+    readonly bundledClientDir: string;
     readonly backendEntryPath: string;
     readonly backendCwd: string;
     readonly preloadPath: string;
@@ -209,6 +210,7 @@ const make = Effect.fn("desktop.environment.make")(function* (
     rootDir,
     appRoot,
     serverRoot,
+    bundledClientDir: path.join(serverRoot, "apps/server/dist/client"),
     backendEntryPath: path.join(serverRoot, "apps/server/dist/bin.mjs"),
     backendCwd: input.isPackaged ? homeDirectory : appRoot,
     preloadPath: path.join(input.dirname, "preload.cjs"),

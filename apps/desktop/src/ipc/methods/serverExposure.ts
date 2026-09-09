@@ -7,13 +7,25 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import * as DesktopLifecycle from "../../app/DesktopLifecycle.ts";
+import * as DesktopAppSettings from "../../settings/DesktopAppSettings.ts";
 import * as DesktopServerExposure from "../../backend/DesktopServerExposure.ts";
+import * as DesktopAttachedBackend from "../../backend/DesktopAttachedBackend.ts";
 import * as IpcChannels from "../channels.ts";
 import * as DesktopIpc from "../DesktopIpc.ts";
 
 const SetTailscaleServeEnabledInput = Schema.Struct({
   enabled: Schema.Boolean,
   port: Schema.optionalKey(Schema.Number),
+});
+
+const ensureManagedPrimaryBackend = Effect.gen(function* () {
+  const settings = yield* DesktopAppSettings.DesktopAppSettings;
+  const primaryBackend = yield* settings.get;
+  if (primaryBackend.primaryBackend.mode === "attached") {
+    return yield* new DesktopAttachedBackend.DesktopPrimaryBackendNotManagedError({
+      operation: "server exposure",
+    });
+  }
 });
 
 export const getServerExposureState = DesktopIpc.makeIpcMethod({
@@ -31,6 +43,7 @@ export const setServerExposureMode = DesktopIpc.makeIpcMethod({
   payload: DesktopServerExposureModeSchema,
   result: DesktopServerExposureStateSchema,
   handler: Effect.fn("desktop.ipc.serverExposure.setMode")(function* (mode) {
+    yield* ensureManagedPrimaryBackend;
     const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
     const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
     const change = yield* serverExposure.setMode(mode);
@@ -46,6 +59,7 @@ export const setTailscaleServeEnabled = DesktopIpc.makeIpcMethod({
   payload: SetTailscaleServeEnabledInput,
   result: DesktopServerExposureStateSchema,
   handler: Effect.fn("desktop.ipc.serverExposure.setTailscaleServeEnabled")(function* (input) {
+    yield* ensureManagedPrimaryBackend;
     const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
     const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
     const change = yield* serverExposure.setTailscaleServeEnabled(input);

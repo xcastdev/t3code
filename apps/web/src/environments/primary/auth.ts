@@ -7,7 +7,11 @@ import type {
   AuthSessionId,
   AuthSessionState,
 } from "@t3tools/contracts";
-import { EnvironmentHttpCommonError, PRIMARY_LOCAL_ENVIRONMENT_ID } from "@t3tools/contracts";
+import {
+  EnvironmentHttpCommonError,
+  PRIMARY_LOCAL_ENVIRONMENT_ID,
+  type DesktopEnvironmentBootstrap,
+} from "@t3tools/contracts";
 import type { EnvironmentHttpCommonError as EnvironmentHttpCommonErrorType } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -21,6 +25,11 @@ import {
 
 import { PrimaryEnvironmentHttpClient } from "./httpClient";
 import { runPrimaryHttp } from "../../lib/runtime";
+import {
+  clearDesktopPrimaryBearerToken,
+  isDesktopPrimaryAttached,
+  resetDesktopPrimaryAuthRecoveryNotification,
+} from "./desktopAuth";
 
 const PrimaryEnvironmentRequestOperation = Schema.Literals([
   "fetch-session-state",
@@ -279,6 +288,13 @@ async function waitForAuthenticatedSessionAfterBootstrap(): Promise<AuthSessionS
 const TRANSIENT_BOOTSTRAP_STATUS_CODES = new Set([502, 503, 504]);
 const BOOTSTRAP_RETRY_TIMEOUT_MS = 15_000;
 const BOOTSTRAP_RETRY_STEP_MS = 500;
+const ATTACHED_REAUTH_MESSAGE =
+  "The attached backend needs a new owner credential. Run `t3 pair --owner` on the server machine, then paste the new token.";
+
+export function getDesktopPrimaryBootstrap(): DesktopEnvironmentBootstrap | null {
+  const bootstraps = window.desktopBridge?.getLocalEnvironmentBootstraps() ?? [];
+  return bootstraps.find((entry) => entry.id === PRIMARY_LOCAL_ENVIRONMENT_ID) ?? null;
+}
 
 export async function retryTransientBootstrap<T>(operation: () => Promise<T>): Promise<T> {
   const startedAt = Date.now();
@@ -319,7 +335,28 @@ function isTransientBootstrapError(error: unknown): boolean {
 
 async function bootstrapServerAuth(): Promise<ServerAuthGateState> {
   const bootstrapCredential = getDesktopBootstrapCredential();
-  const currentSession = await fetchSessionState();
+  let currentSession: AuthSessionState;
+  try {
+    currentSession = await fetchSessionState();
+  } catch (error) {
+    if (
+      !isDesktopPrimaryAttached() ||
+      !isPrimaryEnvironmentRequestError(error) ||
+      error.status !== 401
+    ) {
+      throw error;
+    }
+    return {
+      status: "requires-auth",
+      auth: {
+        policy: "remote-reachable",
+        bootstrapMethods: ["one-time-token"],
+        sessionMethods: ["bearer-access-token"],
+        sessionCookieName: "t3_session",
+      },
+      errorMessage: ATTACHED_REAUTH_MESSAGE,
+    };
+  }
   if (currentSession.authenticated) {
     return { status: "authenticated" };
   }
@@ -328,6 +365,7 @@ async function bootstrapServerAuth(): Promise<ServerAuthGateState> {
     return {
       status: "requires-auth",
       auth: currentSession.auth,
+      ...(isDesktopPrimaryAttached() ? { errorMessage: ATTACHED_REAUTH_MESSAGE } : {}),
     };
   }
 
@@ -353,6 +391,18 @@ export async function submitServerAuthCredential(credential: string): Promise<vo
   }
 
   resolvedAuthenticatedGateState = null;
+  if (isDesktopPrimaryAttached()) {
+    const bridge = window.desktopBridge;
+    if (!bridge) {
+      throw new Error("Desktop bridge is unavailable.");
+    }
+    await bridge.refreshAttachedPrimaryCredential(trimmedCredential);
+    clearDesktopPrimaryBearerToken();
+    resetDesktopPrimaryAuthRecoveryNotification();
+    bootstrapPromise = null;
+    stripPairingTokenFromUrl();
+    return;
+  }
   await exchangeBootstrapCredential(trimmedCredential);
   bootstrapPromise = null;
   stripPairingTokenFromUrl();

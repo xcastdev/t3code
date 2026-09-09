@@ -5,6 +5,7 @@ const PrimaryEnvironmentTargetSource = Schema.Literals([
   "configured",
   "window-origin",
   "desktop-managed",
+  "desktop-attached",
 ]);
 type PrimaryEnvironmentTargetSource = typeof PrimaryEnvironmentTargetSource.Type;
 
@@ -73,7 +74,7 @@ export interface PrimaryEnvironmentTarget {
   };
 }
 
-const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
+const LOOPBACK_HOSTNAMES = new Set(["::1", "localhost"]);
 
 function getDesktopLocalEnvironmentBootstrap(): DesktopEnvironmentBootstrap | null {
   // The primary (Windows-native) backend keeps the "primary" id. The
@@ -138,7 +139,14 @@ function normalizeHostname(hostname: string): string {
 }
 
 export function isLoopbackHostname(hostname: string): boolean {
-  return LOOPBACK_HOSTNAMES.has(normalizeHostname(hostname));
+  const normalized = normalizeHostname(hostname);
+  if (LOOPBACK_HOSTNAMES.has(normalized)) return true;
+  const octets = normalized.split(".");
+  return (
+    octets.length === 4 &&
+    octets[0] === "127" &&
+    octets.slice(1).every((octet) => /^(?:0|[1-9]\d{0,2})$/u.test(octet) && Number(octet) <= 255)
+  );
 }
 
 function resolveHttpRequestBaseUrl(primaryTarget: PrimaryEnvironmentTarget): string {
@@ -254,19 +262,12 @@ function resolveDesktopPrimaryTarget(): PrimaryEnvironmentTarget | null {
     });
   }
 
+  const source = desktopBootstrap.ownership === "attached" ? "desktop-attached" : "desktop-managed";
   return {
-    source: "desktop-managed",
+    source,
     target: {
-      httpBaseUrl: normalizeBaseUrl(
-        desktopBootstrap.httpBaseUrl,
-        "desktop-managed",
-        "http-base-url",
-      ),
-      wsBaseUrl: normalizeBaseUrl(
-        desktopBootstrap.wsBaseUrl,
-        "desktop-managed",
-        "websocket-base-url",
-      ),
+      httpBaseUrl: normalizeBaseUrl(desktopBootstrap.httpBaseUrl, source, "http-base-url"),
+      wsBaseUrl: normalizeBaseUrl(desktopBootstrap.wsBaseUrl, source, "websocket-base-url"),
     },
   };
 }

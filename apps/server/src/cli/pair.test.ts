@@ -194,6 +194,32 @@ describe("t3 pair", () => {
     ).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  it.effect("prints a desktop attachment URL for an owner pairing", () =>
+    withDescriptorServer((origin) =>
+      Effect.gen(function* () {
+        const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pair-owner-test-"));
+        const port = Number(new URL(origin).port);
+        const statePath = NodePath.join(baseDir, "userdata", "server-runtime.json");
+        yield* persistServerRuntimeState({
+          path: statePath,
+          state: yield* makePersistedServerRuntimeState({
+            config: { host: "127.0.0.1", devUrl: undefined },
+            port,
+          }),
+        });
+
+        const output = yield* captureStdout(runCli(["pair", "--owner", "--base-dir", baseDir]));
+
+        assert.include(output, "Desktop attach URL: t3code://attach-primary?");
+        assert.include(output, "Pairing URL: http://127.0.0.1:");
+        const listed = yield* captureStdout(
+          runCli(["auth", "pairing", "list", "--base-dir", baseDir, "--json"]),
+        );
+        assert.include(listed, "t3 pair --owner");
+      }),
+    ).pipe(Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("directs to t3 serve or t3 connect when no server is running", () =>
     Effect.gen(function* () {
       const baseDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-pair-none-test-"));

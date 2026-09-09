@@ -43,7 +43,12 @@ import * as Stream from "effect/Stream";
 import { FetchHttpClient } from "effect/unstable/http";
 
 import { APP_VERSION } from "../branding";
-import { readDesktopPrimaryBearerToken } from "../environments/primary/desktopAuth";
+import {
+  clearDesktopPrimaryBearerToken,
+  isDesktopPrimaryAttached,
+  notifyDesktopPrimaryAuthRequired,
+  readDesktopPrimaryBearerToken,
+} from "../environments/primary/desktopAuth";
 import { primaryEnvironmentHttpLayer } from "../environments/primary/httpLayer";
 import {
   readPrimaryEnvironmentTarget,
@@ -220,6 +225,12 @@ const capabilitiesLayer = Layer.effectContext(
             detail: `Could not load the desktop primary credential: ${String(cause)}`,
           }),
       }).pipe(Effect.map(Option.fromNullishOr)),
+      onAuthFailure: Effect.sync(() => {
+        if (isDesktopPrimaryAttached()) {
+          clearDesktopPrimaryBearerToken();
+          notifyDesktopPrimaryAuthRequired();
+        }
+      }),
     });
     const ssh = SshEnvironmentGateway.of({
       provision: Effect.fn("web.connectionPlatform.ssh.provision")(function* (target) {

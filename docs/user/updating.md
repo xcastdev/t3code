@@ -31,6 +31,23 @@ The update does not remove saved threads, settings, or project files.
 The available action depends on how that server was started. T3 Code does not update connected
 servers silently in the background.
 
+### Attached desktop servers
+
+When the desktop app uses an attached `t3 serve` process, the terminal or service that started the
+server owns its updates and restarts. Use the server's normal update command on that machine.
+Desktop settings and direct project actions continue to use the attached server, but the desktop
+app does not restart or stop that server.
+
+If an active attached desktop session expires or is revoked, choose **Pair with this environment**
+in the auth screen. On the server machine, run `npx t3 pair --owner`, then paste the replacement
+owner token into that screen. The endpoint stays the same. The **Backend process** row is not the
+renewal input while attached. Its **Use desktop backend** action returns process ownership to the
+desktop app.
+
+If desktop startup is blocked by an invalid or expired stored attachment, open a fresh printed
+**Desktop attach URL** from `t3 serve`, or choose **Use desktop backend** in the native recovery
+dialog. Desktop will not start its managed backend without that explicit choice.
+
 An older background-service launcher may ask you to run the exact
 `npx t3@<version> service update` command on the server machine. That one local update installs the
 rollback support needed for later remote updates, including versions that change the database.

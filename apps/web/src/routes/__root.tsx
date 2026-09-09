@@ -43,7 +43,11 @@ import {
 import { useUiStateStore } from "../uiStateStore";
 import { syncBrowserChromeTheme } from "../hooks/useTheme";
 import { configureClientTracing } from "../observability/clientTracing";
-import { resolveInitialServerAuthGateState } from "../environments/primary";
+import {
+  DESKTOP_PRIMARY_AUTH_REQUIRED_EVENT,
+  reauthenticatePrimaryEnvironment,
+  resolveInitialServerAuthGateState,
+} from "../environments/primary";
 import { hasHostedPairingRequest, isHostedStaticApp } from "../hostedPairing";
 import { shellEnvironment } from "../state/shell";
 import { useAtomValue } from "@effect/atom-react";
@@ -103,6 +107,18 @@ function RootRouteView() {
       window.cancelAnimationFrame(frame);
     };
   }, [pathname]);
+
+  useEffect(() => {
+    const handlePrimaryAuthRequired = () => {
+      void reauthenticatePrimaryEnvironment().finally(() => {
+        window.location.assign("/pair");
+      });
+    };
+    window.addEventListener(DESKTOP_PRIMARY_AUTH_REQUIRED_EVENT, handlePrimaryAuthRequired);
+    return () => {
+      window.removeEventListener(DESKTOP_PRIMARY_AUTH_REQUIRED_EVENT, handlePrimaryAuthRequired);
+    };
+  }, []);
 
   if (pathname === "/pair" || pathname === "/connect" || pathname.startsWith("/connect/")) {
     return (

@@ -5,6 +5,7 @@ import * as Schema from "effect/Schema";
 
 import * as DesktopLifecycle from "../../app/DesktopLifecycle.ts";
 import * as DesktopAppSettings from "../../settings/DesktopAppSettings.ts";
+import * as DesktopAttachedBackend from "../../backend/DesktopAttachedBackend.ts";
 import * as DesktopWslBackend from "../../wsl/DesktopWslBackend.ts";
 import * as DesktopWslEnvironment from "../../wsl/DesktopWslEnvironment.ts";
 import * as IpcChannels from "../channels.ts";
@@ -38,6 +39,16 @@ const readWslState: Effect.Effect<
   };
 });
 
+const ensureManagedPrimaryBackend = Effect.gen(function* () {
+  const settings = yield* DesktopAppSettings.DesktopAppSettings;
+  const primaryBackend = yield* settings.get;
+  if (primaryBackend.primaryBackend.mode === "attached") {
+    return yield* new DesktopAttachedBackend.DesktopPrimaryBackendNotManagedError({
+      operation: "WSL",
+    });
+  }
+});
+
 export const getWslState = makeIpcMethod({
   channel: IpcChannels.GET_WSL_STATE_CHANNEL,
   payload: Schema.Void,
@@ -52,6 +63,7 @@ export const setWslBackendEnabled = makeIpcMethod({
   payload: Schema.Boolean,
   result: DesktopWslStateSchema,
   handler: Effect.fn("desktop.ipc.wsl.setEnabled")(function* (enabled) {
+    yield* ensureManagedPrimaryBackend;
     const appSettings = yield* DesktopAppSettings.DesktopAppSettings;
     const wslBackend = yield* DesktopWslBackend.DesktopWslBackend;
     const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
@@ -83,6 +95,7 @@ export const setWslDistro = makeIpcMethod({
   payload: Schema.NullOr(Schema.String),
   result: DesktopWslStateSchema,
   handler: Effect.fn("desktop.ipc.wsl.setDistro")(function* (distro) {
+    yield* ensureManagedPrimaryBackend;
     const appSettings = yield* DesktopAppSettings.DesktopAppSettings;
     const wslBackend = yield* DesktopWslBackend.DesktopWslBackend;
     const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
@@ -106,6 +119,7 @@ export const setWslOnly = makeIpcMethod({
   payload: Schema.Boolean,
   result: DesktopWslStateSchema,
   handler: Effect.fn("desktop.ipc.wsl.setOnly")(function* (enabled) {
+    yield* ensureManagedPrimaryBackend;
     // wsl-only decides which backend the pool spins up as "primary", and that
     // decision is captured once at layer init. A disabled WSL backend always
     // leaves Windows primary active, so mode changes can be staged without a

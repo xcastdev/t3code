@@ -6,6 +6,20 @@ Remote server updates use one stable launcher selected by the platform service m
 Linux, launchd on macOS). Foreground CLI processes do not self-update, and a running server never
 edits its service definition or durable service state.
 
+## Attached desktop ownership
+
+The desktop app can attach to a foreground `t3 serve` process. Attachment does not transfer process
+ownership. The CLI process or service that started the server remains responsible for updates,
+restarts, exposure, and shutdown.
+
+The desktop client keeps its bundled renderer and sends API and WebSocket traffic to the attached
+server. It may use server settings and server-owned update capabilities when the attached session
+has the required scopes. It does not call desktop-owned restart or update controls.
+
+When the desktop app exits, it closes its connection and leaves the attached server running. When
+the attached server stops, desktop recovery offers **Retry**, **Use desktop backend**, or **Quit**.
+Retry never starts a managed backend.
+
 ## Ownership
 
 The service files under `<baseDir>/runtime` are:

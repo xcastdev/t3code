@@ -1,8 +1,10 @@
 import { assert, expect, it } from "@effect/vitest";
 
 import {
+  buildDesktopAttachUrl,
   buildPairingUrl,
   formatHeadlessServeOutput,
+  isLoopbackHost,
   renderTerminalQrCode,
   resolveHeadlessConnectionHost,
   resolveHeadlessConnectionString,
@@ -17,6 +19,13 @@ it("prefers localhost when no explicit host is configured", () => {
 it("keeps explicit bind hosts in the connection string", () => {
   expect(resolveHeadlessConnectionString("127.0.0.1", 3773)).toBe("http://127.0.0.1:3773");
   expect(resolveHeadlessConnectionString("::1", 3773)).toBe("http://[::1]:3773");
+});
+
+it("recognizes only valid loopback IPv4 addresses", () => {
+  expect(isLoopbackHost("127.0.0.1")).toBe(true);
+  expect(isLoopbackHost("127.255.255.255")).toBe(true);
+  expect(isLoopbackHost("127.256.0.1")).toBe(false);
+  expect(isLoopbackHost("127.1.2")).toBe(false);
 });
 
 it("resolves wildcard hosts to a concrete external interface when one is available", () => {
@@ -58,6 +67,12 @@ it("builds a pairing URL that embeds the token in the hash", () => {
   );
 });
 
+it("builds a desktop attachment URL from an owner pairing URL", () => {
+  expect(buildDesktopAttachUrl("http://127.0.0.1:4773/pair#token=OWNER", "t3code")).toBe(
+    "t3code://attach-primary?pairingUrl=http%3A%2F%2F127.0.0.1%3A4773%2Fpair%23token%3DOWNER",
+  );
+});
+
 it("renders terminal QR codes as a multi-line unicode block grid", () => {
   const qrCode = renderTerminalQrCode("http://192.168.1.42:3773/pair#token=PAIRCODE");
 
@@ -76,4 +91,16 @@ it("formats headless serve output with the connection string, token, pairing url
   expect(output).toContain("Token: PAIRCODE");
   expect(output).toContain("Pairing URL: http://192.168.1.42:3773/pair#token=PAIRCODE");
   assert.isTrue(output.includes("█") || output.includes("▀") || output.includes("▄"));
+});
+
+it("formats a desktop attachment URL when one is available", () => {
+  const output = formatHeadlessServeOutput({
+    connectionString: "http://localhost:3773",
+    token: "PAIRCODE",
+    pairingUrl: "http://localhost:3773/pair#token=PAIRCODE",
+    desktopAttachUrl:
+      "t3code://attach-primary?pairingUrl=http%3A%2F%2F127.0.0.1%3A3773%2Fpair%23token%3DOWNER",
+  });
+
+  expect(output).toContain("Desktop attach URL: t3code://attach-primary?");
 });

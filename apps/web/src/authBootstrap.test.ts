@@ -269,6 +269,35 @@ describe("resolveInitialServerAuthGateState", () => {
     expect(attempts).toBe(4);
   });
 
+  it("keeps an attached backend transport failure distinct from credential recovery", async () => {
+    const testWindow = installTestBrowser("t3code://app/");
+    testWindow.desktopBridge = {
+      getLocalEnvironmentBootstraps: () => [
+        {
+          id: "primary",
+          label: "Attached server",
+          httpBaseUrl: "http://127.0.0.1:3773",
+          wsBaseUrl: "ws://127.0.0.1:3773",
+          ownership: "attached",
+        },
+      ],
+    } as unknown as DesktopBridge;
+    __setPrimaryHttpRunnerForTests(async () => {
+      throw new TypeError("attached server is unreachable");
+    });
+
+    const { PrimaryEnvironmentRequestError, resolveInitialServerAuthGateState } =
+      await import("./environments/primary");
+
+    await expect(resolveInitialServerAuthGateState()).rejects.toMatchObject({
+      _tag: "PrimaryEnvironmentRequestError",
+      status: 500,
+    });
+    await expect(resolveInitialServerAuthGateState()).rejects.toBeInstanceOf(
+      PrimaryEnvironmentRequestError,
+    );
+  });
+
   it("takes a pairing token from the location hash and strips it immediately", async () => {
     const testWindow = installTestBrowser("http://localhost/#token=pairing-token");
     const { takePairingTokenFromUrl } = await import("./environments/primary");
@@ -308,6 +337,38 @@ describe("resolveInitialServerAuthGateState", () => {
     });
     expect(testApi.calls.browserSession).toEqual([{ credential: "retry-token" }]);
     expect(testApi.calls.session).toBe(2);
+  });
+
+  it("refreshes an attached primary with a trimmed owner credential without browser exchange", async () => {
+    const testWindow = installTestBrowser("t3code://app/?token=stale-token");
+    const refreshAttachedPrimaryCredential = vi.fn().mockResolvedValue(undefined);
+    const browserSession = vi.fn(() => {
+      throw new Error("attached primary must not use browser session exchange");
+    });
+    const testApi = await installAuthApi({ browserSession });
+    testWindow.desktopBridge = {
+      getLocalEnvironmentBootstraps: () => [
+        {
+          id: "primary",
+          label: "Attached server",
+          httpBaseUrl: "http://127.0.0.1:3773",
+          wsBaseUrl: "ws://127.0.0.1:3773",
+          ownership: "attached",
+        },
+      ],
+      refreshAttachedPrimaryCredential,
+    } as unknown as DesktopBridge;
+
+    const { submitServerAuthCredential } = await import("./environments/primary");
+
+    await expect(
+      submitServerAuthCredential("  replacement-owner-token  "),
+    ).resolves.toBeUndefined();
+
+    expect(refreshAttachedPrimaryCredential).toHaveBeenCalledWith("replacement-owner-token");
+    expect(browserSession).not.toHaveBeenCalled();
+    expect(testApi.calls.browserSession).toEqual([]);
+    expect(testWindow.location.searchParams.get("token")).toBeNull();
   });
 
   it("rejects a blank pairing token with a structured validation error", async () => {

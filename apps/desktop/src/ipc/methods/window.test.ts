@@ -8,6 +8,7 @@ import type * as Electron from "electron";
 
 import * as DesktopBackendManager from "../../backend/DesktopBackendManager.ts";
 import * as DesktopBackendPool from "../../backend/DesktopBackendPool.ts";
+import * as DesktopAttachedBackend from "../../backend/DesktopAttachedBackend.ts";
 import * as ElectronDialog from "../../electron/ElectronDialog.ts";
 import * as ElectronWindow from "../../electron/ElectronWindow.ts";
 import {
@@ -56,6 +57,46 @@ const defaultWslInstance: DesktopBackendManager.DesktopBackendInstance = {
 };
 
 describe("getLocalEnvironmentBootstraps", () => {
+  it.effect("publishes an attached primary without requiring a pool config", () =>
+    Effect.gen(function* () {
+      const result = yield* getLocalEnvironmentBootstraps.handler();
+      assert.deepEqual(result, [
+        {
+          id: "primary",
+          label: "Workstation",
+          runningDistro: null,
+          httpBaseUrl: "http://127.0.0.1:4773/",
+          wsBaseUrl: "ws://127.0.0.1:4773/",
+          ownership: "attached",
+        },
+      ]);
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          Layer.succeed(DesktopAttachedBackend.DesktopAttachedBackend, {
+            getState: Effect.succeed({
+              mode: "attached",
+              httpBaseUrl: "http://127.0.0.1:4773/",
+              environmentId: "environment-1",
+              label: "Workstation",
+              bearerExpiresAt: "2026-10-08T12:00:00.000Z",
+            }),
+          } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"]),
+          Layer.succeed(
+            DesktopBackendPool.DesktopBackendPool,
+            DesktopBackendPool.DesktopBackendPool.of({
+              get: () => Effect.succeed(Option.none()),
+              list: Effect.succeed([]),
+              primary: Effect.die("unexpected primary lookup"),
+              register: () => Effect.die("unexpected register"),
+              unregister: () => Effect.die("unexpected unregister"),
+            }),
+          ),
+        ),
+      ),
+    ),
+  );
+
   it.effect("publishes the concrete running distro without replacing the stable instance id", () =>
     Effect.gen(function* () {
       const result = yield* getLocalEnvironmentBootstraps.handler();

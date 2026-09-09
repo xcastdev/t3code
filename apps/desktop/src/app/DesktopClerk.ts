@@ -8,13 +8,28 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 
 import { clerkFrontendApiHostnameFromPublishableKey } from "@t3tools/shared/relayAuth";
+import * as DesktopAttachedBackend from "../backend/DesktopAttachedBackend.ts";
 import * as ElectronApp from "../electron/ElectronApp.ts";
+import * as ElectronDialog from "../electron/ElectronDialog.ts";
 import * as ElectronProtocol from "../electron/ElectronProtocol.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import * as DesktopLifecycle from "./DesktopLifecycle.ts";
+import {
+  findDesktopLaunchIntentInArgv,
+  parseDesktopLaunchIntent,
+  registerDesktopRuntimeLaunchIntentHandler,
+} from "./DesktopLaunchIntent.ts";
 
 declare const __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: string | undefined;
+
+type DesktopClerkEventHandlerServices =
+  | ElectronWindow.ElectronWindow
+  | ElectronDialog.ElectronDialog
+  | DesktopAttachedBackend.DesktopAttachedBackend
+  | DesktopLifecycle.DesktopLifecycle
+  | DesktopLifecycle.DesktopLifecycleRuntimeServices;
 
 export class DesktopClerkBridgeInitializationError extends Schema.TaggedErrorClass<DesktopClerkBridgeInitializationError>()(
   "DesktopClerkBridgeInitializationError",
@@ -48,7 +63,7 @@ export class DesktopClerk extends Context.Service<
     readonly configure: Effect.Effect<
       void,
       never,
-      ElectronApp.ElectronApp | ElectronWindow.ElectronWindow | Scope.Scope
+      ElectronApp.ElectronApp | DesktopClerkEventHandlerServices | Scope.Scope
     >;
   }
 >()("@t3tools/desktop/app/DesktopClerk") {}
@@ -71,6 +86,14 @@ export const desktopClerkFrontendApiHostname = resolveDesktopClerkFrontendApiHos
     ? undefined
     : __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__,
 );
+
+const ATTACHED_BACKEND_ATTACH_FAILURE_DIALOG = {
+  type: "warning" as const,
+  title: "Could not attach to T3 server",
+  message: "T3 Code could not attach to the requested primary backend.",
+  detail: "Open the desktop app and try again with a new owner pairing URL.",
+  buttons: ["OK"],
+};
 
 export function createDesktopClerkBridge(stateDir: string, isDevelopment: boolean) {
   return createClerkBridge({
@@ -122,7 +145,8 @@ export const make = Effect.gen(function* () {
     configure: Effect.gen(function* () {
       const electronApp = yield* ElectronApp.ElectronApp;
       const electronWindow = yield* ElectronWindow.ElectronWindow;
-      const context = yield* Effect.context<ElectronWindow.ElectronWindow>();
+      const electronDialog = yield* ElectronDialog.ElectronDialog;
+      const context = yield* Effect.context<DesktopClerkEventHandlerServices>();
       const runPromise = Effect.runPromiseWith(context);
 
       // The SDK bridge holds Electron's single-instance lock (acquired at
@@ -135,7 +159,42 @@ export const make = Effect.gen(function* () {
         return yield* Effect.interrupt;
       }
 
-      yield* electronApp.on("second-instance", () => {
+      const handleAttachIntent = (pairingUrl: string) => {
+        void runPromise(
+          Effect.gen(function* () {
+            const attachedBackend = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+            const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
+            const attach = yield* Effect.exit(attachedBackend.attach(pairingUrl));
+            if (attach._tag === "Success") {
+              yield* lifecycle.relaunch("primary-backend-attached");
+              return;
+            }
+
+            const mainWindow = yield* electronWindow.currentMainOrFirst.pipe(
+              Effect.catchCause(() => Effect.succeed(Option.none())),
+            );
+            if (Option.isSome(mainWindow)) {
+              yield* electronWindow
+                .reveal(mainWindow.value)
+                .pipe(Effect.catchCause(() => Effect.void));
+            }
+            yield* electronDialog
+              .showMessageBox(ATTACHED_BACKEND_ATTACH_FAILURE_DIALOG)
+              .pipe(Effect.catchCause(() => Effect.void));
+          }).pipe(Effect.catchCause(() => Effect.void)),
+        );
+      };
+
+      yield* Effect.acquireRelease(
+        Effect.sync(() => registerDesktopRuntimeLaunchIntentHandler(handleAttachIntent)),
+        (unregister) => Effect.sync(unregister),
+      );
+
+      yield* electronApp.on<[unknown, unknown]>("second-instance", (_event, rawArgv) => {
+        const argv = Array.isArray(rawArgv)
+          ? rawArgv.filter((arg): arg is string => typeof arg === "string")
+          : [];
+        if (findDesktopLaunchIntentInArgv(argv) !== null) return;
         void runPromise(
           Effect.gen(function* () {
             const mainWindow = yield* electronWindow.currentMainOrFirst;
@@ -144,6 +203,12 @@ export const make = Effect.gen(function* () {
             }
           }),
         );
+      });
+
+      yield* electronApp.on<[unknown, string]>("open-url", (_event, url) => {
+        if (parseDesktopLaunchIntent(url) === null) return;
+        // main.ts owns process-level attachment capture. Leave this event
+        // alone here so Clerk remains the sole owner of OAuth callbacks.
       });
     }).pipe(Effect.withSpan("desktop.clerk.configure")),
   });

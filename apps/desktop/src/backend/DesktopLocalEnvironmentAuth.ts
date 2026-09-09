@@ -10,6 +10,7 @@ import * as Semaphore from "effect/Semaphore";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 
 import * as DesktopBackendPool from "./DesktopBackendPool.ts";
+import * as DesktopAttachedBackend from "./DesktopAttachedBackend.ts";
 
 export class DesktopLocalEnvironmentAuthBackendNotConfiguredError extends Schema.TaggedErrorClass<DesktopLocalEnvironmentAuthBackendNotConfiguredError>()(
   "DesktopLocalEnvironmentAuthBackendNotConfiguredError",
@@ -51,6 +52,18 @@ export const make = Effect.gen(function* () {
   const getBearerToken = mutex
     .withPermits(1)(
       Effect.gen(function* () {
+        const attached = yield* Effect.serviceOption(DesktopAttachedBackend.DesktopAttachedBackend);
+        if (Option.isSome(attached)) {
+          const state = yield* attached.value.getState;
+          if (state.mode === "attached") {
+            return yield* attached.value.getBearerToken.pipe(
+              Effect.mapError(
+                (cause) => new DesktopLocalEnvironmentAuthSessionBootstrapError({ cause }),
+              ),
+            );
+          }
+        }
+
         const cached = yield* Ref.get(tokenRef);
         if (Option.isSome(cached)) {
           return cached.value;

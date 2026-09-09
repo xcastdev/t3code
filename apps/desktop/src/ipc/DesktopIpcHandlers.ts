@@ -46,6 +46,12 @@ import {
 } from "./methods/window.ts";
 import * as PreviewIpc from "./methods/preview.ts";
 import { getWslState, setWslBackendEnabled, setWslDistro, setWslOnly } from "./methods/wsl.ts";
+import {
+  attachPrimaryBackend,
+  getPrimaryBackendState,
+  refreshAttachedPrimaryCredential,
+  useManagedPrimaryBackend,
+} from "./methods/primaryBackend.ts";
 
 export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers")(function* () {
   const ipc = yield* DesktopIpc.DesktopIpc;
@@ -56,6 +62,10 @@ export const installDesktopIpcHandlers = Effect.fn("desktop.ipc.installHandlers"
   yield* ipc.handleSync(getWindowFullscreenState);
   yield* ipc.handleSync(getLocalEnvironmentBootstraps);
   yield* ipc.handle(getLocalEnvironmentBearerToken);
+  yield* ipc.handle(getPrimaryBackendState);
+  yield* ipc.handle(attachPrimaryBackend);
+  yield* ipc.handle(refreshAttachedPrimaryCredential);
+  yield* ipc.handle(useManagedPrimaryBackend);
 
   yield* ipc.handle(getClientSettings);
   yield* ipc.handle(setClientSettings);

@@ -5,6 +5,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import { EnvironmentId } from "@t3tools/contracts";
 
 import * as DesktopConfig from "../app/DesktopConfig.ts";
 import * as DesktopEnvironment from "../app/DesktopEnvironment.ts";
@@ -34,10 +35,12 @@ const DesktopSettingsPatch = Schema.Struct({
   wslMode: Schema.optionalKey(Schema.Literals(["local", "wsl"])),
   wslDistro: Schema.optionalKey(Schema.NullOr(Schema.String)),
   wslOnly: Schema.optionalKey(Schema.Boolean),
+  primaryBackend: Schema.optionalKey(Schema.Unknown),
 });
 
 const decodeDesktopSettingsPatch = Schema.decodeEffect(Schema.fromJsonString(DesktopSettingsPatch));
 const encodeDesktopSettingsPatch = Schema.encodeEffect(Schema.fromJsonString(DesktopSettingsPatch));
+const testEnvironmentId = Schema.decodeUnknownSync(EnvironmentId)("remote-environment");
 
 function makeEnvironmentLayer(baseDir: string, appVersion = "0.0.17") {
   return DesktopEnvironment.layer({
@@ -116,7 +119,141 @@ describe("DesktopSettings", () => {
         wslBackendEnabled: false,
         wslOnly: false,
         wslDistro: null,
+        primaryBackend: { mode: "managed" },
       } satisfies DesktopAppSettings.DesktopSettings,
+    );
+  });
+
+  it.effect("persists and reloads an attached primary backend without exposing its bearer", () =>
+    withSettings(
+      Effect.gen(function* () {
+        const settings = yield* DesktopAppSettings.DesktopAppSettings;
+        const attached = {
+          mode: "attached" as const,
+          httpBaseUrl: "http://127.0.0.1:4100/",
+          wsBaseUrl: "ws://127.0.0.1:4100/",
+          environmentId: testEnvironmentId,
+          label: "Remote server",
+          encryptedBearerToken: "encrypted-token",
+          bearerExpiresAt: "2099-09-08T18:00:00.000Z",
+        };
+
+        const change = yield* settings.setPrimaryBackendPreference(attached);
+        assert.isTrue(change.changed);
+        assert.deepEqual((yield* settings.get).primaryBackend, attached);
+
+        const reloaded = yield* settings.load;
+        assert.deepEqual(reloaded.primaryBackend, attached);
+
+        const fileSystem = yield* FileSystem.FileSystem;
+        const environment = yield* DesktopEnvironment.DesktopEnvironment;
+        const persisted = yield* fileSystem.readFileString(environment.desktopSettingsPath);
+        assert.notInclude(persisted, "bearer-token");
+        assert.include(persisted, "encrypted-token");
+      }),
+    ),
+  );
+
+  it.effect("keeps malformed attached settings in an explicit recovery state", () =>
+    withSettings(
+      Effect.gen(function* () {
+        yield* writeSettingsPatch({
+          primaryBackend: {
+            mode: "attached",
+            httpBaseUrl: "http://127.0.0.1:4100/",
+            // Missing identity, encrypted credential, and expiry on purpose.
+          },
+        });
+
+        const settings = yield* DesktopAppSettings.DesktopAppSettings;
+        assert.deepEqual((yield* settings.load).primaryBackend, {
+          mode: "invalid-attached",
+          reason: "Stored attached backend settings are incomplete.",
+        });
+      }),
+    ),
+  );
+
+  it.each([
+    {
+      httpBaseUrl: "https://127.0.0.1:4100/",
+      wsBaseUrl: "wss://127.0.0.1:4100/",
+      bearerExpiresAt: "2099-09-08T18:00:00.000Z",
+    },
+    {
+      httpBaseUrl: "http://example.test:4100/",
+      wsBaseUrl: "ws://example.test:4100/",
+      bearerExpiresAt: "2099-09-08T18:00:00.000Z",
+    },
+    {
+      httpBaseUrl: "http://127.0.0.1:4100/private",
+      wsBaseUrl: "ws://127.0.0.1:4100/",
+      bearerExpiresAt: "2099-09-08T18:00:00.000Z",
+    },
+    {
+      httpBaseUrl: "http://127.0.0.1:4100/",
+      wsBaseUrl: "ws://127.0.0.2:4100/",
+      bearerExpiresAt: "2099-09-08T18:00:00.000Z",
+    },
+    {
+      httpBaseUrl: "http://127.0.0.1:4100/",
+      wsBaseUrl: "ws://127.0.0.1:4100/",
+      bearerExpiresAt: "not-an-iso-date",
+    },
+    {
+      httpBaseUrl: "http://127.0.0.1:4100/",
+      wsBaseUrl: "ws://127.0.0.1:4100/",
+      bearerExpiresAt: "2026-09-08T12:00:00.000Z",
+    },
+    {
+      httpBaseUrl: "http://127.0.0.1:4100/",
+      wsBaseUrl: "ws://127.0.0.1:4100/",
+      bearerExpiresAt: "2099-02-30T12:00:00.000Z",
+    },
+  ])(
+    "preserves unsafe persisted attached state as invalid-attached ($httpBaseUrl)",
+    (endpoints) => {
+      const normalized = DesktopAppSettings.normalizePrimaryBackendPreference(
+        {
+          mode: "attached",
+          ...endpoints,
+          environmentId: testEnvironmentId,
+          label: "Workstation",
+          encryptedBearerToken: "ciphertext",
+        },
+        Date.parse("2026-09-08T12:00:00.000Z"),
+      );
+
+      assert.deepEqual(normalized, {
+        mode: "invalid-attached",
+        reason: "Stored attached backend settings are invalid.",
+      });
+    },
+  );
+
+  it("accepts a complete future attached record at a fixed read time", () => {
+    assert.deepEqual(
+      DesktopAppSettings.normalizePrimaryBackendPreference(
+        {
+          mode: "attached",
+          httpBaseUrl: "http://127.0.0.1:4100/",
+          wsBaseUrl: "ws://127.0.0.1:4100/",
+          environmentId: testEnvironmentId,
+          label: "Workstation",
+          encryptedBearerToken: "ciphertext",
+          bearerExpiresAt: "2026-09-08T13:00:00.000Z",
+        },
+        Date.parse("2026-09-08T12:00:00.000Z"),
+      ),
+      {
+        mode: "attached",
+        httpBaseUrl: "http://127.0.0.1:4100/",
+        wsBaseUrl: "ws://127.0.0.1:4100/",
+        environmentId: testEnvironmentId,
+        label: "Workstation",
+        encryptedBearerToken: "ciphertext",
+        bearerExpiresAt: "2026-09-08T13:00:00.000Z",
+      },
     );
   });
 
@@ -145,6 +282,7 @@ describe("DesktopSettings", () => {
           wslBackendEnabled: false,
           wslOnly: false,
           wslDistro: null,
+          primaryBackend: { mode: "managed" },
         } satisfies DesktopAppSettings.DesktopSettings);
 
         const exposure = yield* settings.setServerExposureMode("local-only");
@@ -252,6 +390,7 @@ describe("DesktopSettings", () => {
           wslBackendEnabled: false,
           wslOnly: false,
           wslDistro: null,
+          primaryBackend: { mode: "managed" },
         } satisfies DesktopAppSettings.DesktopSettings);
       }),
     ),
@@ -308,6 +447,7 @@ describe("DesktopSettings", () => {
             wslBackendEnabled: false,
             wslOnly: false,
             wslDistro: null,
+            primaryBackend: { mode: "managed" },
           } satisfies DesktopAppSettings.DesktopSettings);
         }),
       ),
@@ -356,6 +496,7 @@ describe("DesktopSettings", () => {
           wslBackendEnabled: false,
           wslOnly: false,
           wslDistro: null,
+          primaryBackend: { mode: "managed" },
         } satisfies DesktopAppSettings.DesktopSettings);
       }),
       { appVersion: "0.0.17-nightly.20260415.1" },
@@ -384,6 +525,7 @@ describe("DesktopSettings", () => {
           wslBackendEnabled: false,
           wslOnly: false,
           wslDistro: null,
+          primaryBackend: { mode: "managed" },
         } satisfies DesktopAppSettings.DesktopSettings);
       }),
       { appVersion: "0.0.17-nightly.20260415.1" },
@@ -411,6 +553,7 @@ describe("DesktopSettings", () => {
           wslBackendEnabled: false,
           wslOnly: false,
           wslDistro: null,
+          primaryBackend: { mode: "managed" },
         } satisfies DesktopAppSettings.DesktopSettings);
       }),
     ),

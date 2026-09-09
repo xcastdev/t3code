@@ -1,12 +1,19 @@
 import * as ManagedRuntime from "effect/ManagedRuntime";
 import type * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as Socket from "effect/unstable/socket/Socket";
 
+import { EnvironmentHttpCommonError } from "@t3tools/contracts";
 import { remoteHttpClientLayer } from "@t3tools/client-runtime/rpc";
 import { makeRelayClientTracingLayer } from "@t3tools/shared/relayTracing";
 import * as PrimaryEnvironmentHttpClient from "../environments/primary/httpClient";
 import { primaryEnvironmentHttpLayer } from "../environments/primary/httpLayer";
+import {
+  clearDesktopPrimaryBearerToken,
+  isDesktopPrimaryAttached,
+  notifyDesktopPrimaryAuthRequired,
+} from "../environments/primary/desktopAuth";
 
 import { browserCryptoLayer } from "../cloud/dpop";
 import { managedRelayClientLayer } from "../cloud/managedRelayLayer";
@@ -48,7 +55,24 @@ let primaryHttpRunner = livePrimaryHttpRunner;
 
 export const runPrimaryHttp = <A, E>(
   effect: Effect.Effect<A, E, PrimaryEnvironmentHttpClient.PrimaryEnvironmentHttpClient>,
-) => primaryHttpRunner(effect);
+) =>
+  primaryHttpRunner(effect).catch((error) => {
+    const isAuthenticationFailure =
+      (Schema.is(EnvironmentHttpCommonError)(error) &&
+        error._tag === "EnvironmentAuthInvalidError") ||
+      (typeof error === "object" &&
+        error !== null &&
+        "response" in error &&
+        typeof error.response === "object" &&
+        error.response !== null &&
+        "status" in error.response &&
+        error.response.status === 401);
+    if (isAuthenticationFailure && isDesktopPrimaryAttached()) {
+      clearDesktopPrimaryBearerToken();
+      notifyDesktopPrimaryAuthRequired();
+    }
+    throw error;
+  });
 
 export function __setPrimaryHttpRunnerForTests(runner?: PrimaryHttpEffectRunner): void {
   primaryHttpRunner = runner ?? livePrimaryHttpRunner;

@@ -283,6 +283,9 @@ export interface DesktopEnvironmentBootstrap {
   httpBaseUrl: string | null;
   wsBaseUrl: string | null;
   bootstrapToken?: string;
+  // The primary backend can be owned by this desktop process or attached to
+  // an already-running server elsewhere on the loopback interface.
+  ownership?: "managed" | "attached";
 }
 
 export const DesktopEnvironmentBootstrapSchema = Schema.Struct({
@@ -292,7 +295,26 @@ export const DesktopEnvironmentBootstrapSchema = Schema.Struct({
   httpBaseUrl: Schema.NullOr(Schema.String),
   wsBaseUrl: Schema.NullOr(Schema.String),
   bootstrapToken: Schema.optionalKey(Schema.String),
+  ownership: Schema.optionalKey(Schema.Literals(["managed", "attached"])),
 });
+
+export const DesktopPrimaryBackendStateSchema = Schema.Union([
+  Schema.Struct({
+    mode: Schema.Literal("managed"),
+  }),
+  Schema.Struct({
+    mode: Schema.Literal("attached"),
+    httpBaseUrl: Schema.String,
+    environmentId: EnvironmentId,
+    label: Schema.String,
+    bearerExpiresAt: Schema.String,
+  }),
+  Schema.Struct({
+    mode: Schema.Literal("invalid-attached"),
+    reason: Schema.String,
+  }),
+]);
+export type DesktopPrimaryBackendState = typeof DesktopPrimaryBackendStateSchema.Type;
 
 export const DesktopSshEnvironmentTargetSchema = Schema.Struct({
   alias: Schema.String,
@@ -1096,6 +1118,10 @@ export interface DesktopBridge {
   // The primary backend is identified by id === PRIMARY_LOCAL_ENVIRONMENT_ID.
   getLocalEnvironmentBootstraps: () => readonly DesktopEnvironmentBootstrap[];
   getLocalEnvironmentBearerToken: () => Promise<string>;
+  getPrimaryBackendState: () => Promise<DesktopPrimaryBackendState>;
+  attachPrimaryBackend: (pairingUrl: string) => Promise<DesktopPrimaryBackendState>;
+  refreshAttachedPrimaryCredential: (pairingCredential: string) => Promise<void>;
+  useManagedPrimaryBackend: () => Promise<void>;
   getClientSettings: () => Promise<ClientSettings | null>;
   setClientSettings: (settings: ClientSettings) => Promise<void>;
   getConnectionCatalog?: () => Promise<string | null>;

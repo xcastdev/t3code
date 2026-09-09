@@ -32,6 +32,7 @@ import * as ElectronTheme from "./electron/ElectronTheme.ts";
 import * as ElectronUpdater from "./electron/ElectronUpdater.ts";
 import * as ElectronWindow from "./electron/ElectronWindow.ts";
 import * as DesktopApp from "./app/DesktopApp.ts";
+import * as DesktopLaunchIntent from "./app/DesktopLaunchIntent.ts";
 import * as DesktopAppIdentity from "./app/DesktopAppIdentity.ts";
 import * as DesktopConnectionCatalogStore from "./app/DesktopConnectionCatalogStore.ts";
 import * as DesktopClerk from "./app/DesktopClerk.ts";
@@ -40,6 +41,7 @@ import * as DesktopAssets from "./app/DesktopAssets.ts";
 import * as DesktopBackendConfiguration from "./backend/DesktopBackendConfiguration.ts";
 import * as DesktopBackendPool from "./backend/DesktopBackendPool.ts";
 import * as DesktopLocalEnvironmentAuth from "./backend/DesktopLocalEnvironmentAuth.ts";
+import * as DesktopAttachedBackend from "./backend/DesktopAttachedBackend.ts";
 import * as DesktopNetworkInterfaces from "./backend/DesktopNetworkInterfaces.ts";
 import * as DesktopEnvironment from "./app/DesktopEnvironment.ts";
 import * as DesktopLifecycle from "./app/DesktopLifecycle.ts";
@@ -63,6 +65,24 @@ import * as DesktopWindow from "./window/DesktopWindow.ts";
 import * as DesktopWslBackend from "./wsl/DesktopWslBackend.ts";
 import * as DesktopWslEnvironment from "./wsl/DesktopWslEnvironment.ts";
 import * as DesktopWslServerTree from "./wsl/DesktopWslServerTree.ts";
+
+// macOS may deliver a custom URL before Electron emits `ready`; capture only
+// our attach links and leave Clerk's OAuth callback URLs untouched.
+Electron.app.on("open-url", (event, url) => {
+  if (DesktopLaunchIntent.capturePreReadyDesktopLaunchIntent(url)) {
+    event.preventDefault();
+  }
+});
+
+// Windows and Linux deliver second-instance after ready. Register this before
+// the asynchronous Clerk/application layers can leave a gap in which an
+// attachment argv would otherwise be lost.
+Electron.app.on("second-instance", (_event, argv) => {
+  const stringArgv = Array.isArray(argv)
+    ? argv.filter((arg): arg is string => typeof arg === "string")
+    : [];
+  DesktopLaunchIntent.captureDesktopSecondInstanceLaunchIntent(stringArgv);
+});
 
 const desktopEnvironmentLayer = Layer.unwrap(
   Effect.gen(function* () {
@@ -178,8 +198,15 @@ const desktopWslBackendLayer = DesktopWslBackend.layer.pipe(
   Layer.provideMerge(desktopBackendLayer),
 );
 
+const desktopAttachedBackendLayer = DesktopAttachedBackend.layer.pipe(
+  Layer.provideMerge(desktopBackendLayer),
+);
+
+const desktopLaunchIntentLayer = DesktopLaunchIntent.layer;
+
 const desktopLocalEnvironmentAuthLayer = DesktopLocalEnvironmentAuth.layer.pipe(
   Layer.provideMerge(desktopBackendLayer),
+  Layer.provideMerge(desktopAttachedBackendLayer),
 );
 
 const desktopApplicationLayer = Layer.mergeAll(
@@ -188,6 +215,7 @@ const desktopApplicationLayer = Layer.mergeAll(
   DesktopLinuxUrlHandler.layer,
   DesktopShellEnvironment.layer,
   desktopSshLayer,
+  desktopLaunchIntentLayer,
 ).pipe(
   Layer.provideMerge(DesktopUpdates.layer),
   Layer.provideMerge(desktopWslBackendLayer),

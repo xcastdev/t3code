@@ -130,6 +130,8 @@ import { ConnectionStatusDot } from "../ConnectionStatusDot";
 import { ServerUpdateAction, ServerUpdateProgress } from "../ServerUpdateAction";
 import { CloudEnvironmentConnectRows } from "../cloud/CloudEnvironmentConnectList";
 import { ITEM_ROW_CLASSNAME, ITEM_ROW_INNER_CLASSNAME } from "./itemRows";
+import { PrimaryBackendSettings } from "./PrimaryBackendSettings";
+import { desktopPrimaryBackendStateAtom } from "~/state/desktopPrimaryBackendState";
 
 const DEFAULT_TAILSCALE_SERVE_PORT = 443;
 const EMPTY_ADVERTISED_ENDPOINTS: ReadonlyArray<AdvertisedEndpoint> = [];
@@ -1755,12 +1757,21 @@ export function ConnectionsSettings() {
   const retryEnvironment = useAtomCommand(environmentCatalog.retryNow, { reportFailure: false });
   const primaryEnvironmentId = primaryEnvironment?.environmentId ?? null;
   const primarySessionState = usePrimarySessionState();
-  const currentSessionScopes = desktopBridge
-    ? AuthAdministrativeScopes
-    : primarySessionState.data?.authenticated
-      ? (primarySessionState.data.scopes ?? null)
-      : null;
-  const currentAuthPolicy = desktopBridge ? null : (primarySessionState.data?.auth.policy ?? null);
+  const desktopPrimaryBackend = useEnvironmentQuery(
+    desktopBridge ? desktopPrimaryBackendStateAtom : null,
+  );
+  const isAttachedPrimaryBackend = desktopPrimaryBackend.data?.mode === "attached";
+  const isInvalidPrimaryBackend = desktopPrimaryBackend.data?.mode === "invalid-attached";
+  const currentSessionScopes =
+    desktopBridge && !isAttachedPrimaryBackend
+      ? AuthAdministrativeScopes
+      : primarySessionState.data?.authenticated
+        ? (primarySessionState.data.scopes ?? null)
+        : null;
+  const currentAuthPolicy =
+    desktopBridge && !isAttachedPrimaryBackend
+      ? null
+      : (primarySessionState.data?.auth.policy ?? null);
   const savedEnvironments = useMemo(
     () =>
       environments
@@ -1889,7 +1900,9 @@ export function ConnectionsSettings() {
       : null,
   );
   const desktopNetworkAccess = useEnvironmentQuery(
-    canManageLocalBackend && desktopBridge ? desktopNetworkAccessStateAtom : null,
+    canManageLocalBackend && desktopBridge && !isAttachedPrimaryBackend && !isInvalidPrimaryBackend
+      ? desktopNetworkAccessStateAtom
+      : null,
   );
   const desktopSshHosts = useEnvironmentQuery(
     desktopBridge && addBackendDialogOpen && savedBackendMode === "ssh"
@@ -1897,7 +1910,9 @@ export function ConnectionsSettings() {
       : null,
   );
   const desktopWsl = useEnvironmentQuery(
-    canManageLocalBackend && desktopBridge ? desktopWslStateAtom : null,
+    canManageLocalBackend && desktopBridge && !isAttachedPrimaryBackend && !isInvalidPrimaryBackend
+      ? desktopWslStateAtom
+      : null,
   );
   const desktopWslState = desktopWsl.data;
   const desktopWslError = desktopWslMutationError ?? desktopWsl.error;
@@ -1945,9 +1960,10 @@ export function ConnectionsSettings() {
       ),
     );
   }, [authAccessChanges.data]);
-  const isLocalBackendNetworkAccessible = desktopBridge
-    ? desktopServerExposureState?.mode === "network-accessible"
-    : currentAuthPolicy === "remote-reachable";
+  const isLocalBackendNetworkAccessible =
+    desktopBridge && !isAttachedPrimaryBackend
+      ? desktopServerExposureState?.mode === "network-accessible"
+      : currentAuthPolicy === "remote-reachable";
   const trimmedTailscaleServePortInput = tailscaleServePortInput.trim();
   const parsedTailscaleServePort = Number(trimmedTailscaleServePortInput);
   const isTailscaleServePortValid =
@@ -3014,9 +3030,10 @@ export function ConnectionsSettings() {
 
   return (
     <SettingsPageContainer>
-      {canManageLocalBackend ? (
+      {canManageLocalBackend || desktopBridge ? (
         <>
           <SettingsSection title="This environment">
+            {desktopBridge ? <PrimaryBackendSettings bridge={desktopBridge} /> : null}
             {primaryVersionMismatch || primaryServerUpdateState.status !== "idle" ? (
               <SettingsRow
                 title={
@@ -3060,7 +3077,7 @@ export function ConnectionsSettings() {
                 }
               />
             ) : null}
-            {desktopBridge ? (
+            {desktopBridge && !isAttachedPrimaryBackend && !isInvalidPrimaryBackend ? (
               <>
                 {renderNetworkAccessRow()}
                 {renderEndpointRows("endpoint-rail")}
