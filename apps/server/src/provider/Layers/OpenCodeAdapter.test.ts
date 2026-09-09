@@ -7159,6 +7159,9 @@ it.layer(OpenCodeAdapterManagedTestLayer)("OpenCodeAdapterManaged", (it) => {
 
       runtimeMock.state.mcpAddError = null;
       yield* adapter.stopSession(threadId);
+      NodeAssert.deepEqual(runtimeMock.state.closeCalls, [""]);
+      const secondStop = yield* adapter.stopSession(threadId).pipe(Effect.result);
+      NodeAssert.equal(secondStop._tag, "Failure");
     }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
   );
 

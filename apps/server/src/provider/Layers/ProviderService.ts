@@ -50,7 +50,11 @@ import {
   providerTurnMetricAttributes,
   withMetrics,
 } from "../../observability/Metrics.ts";
-import { type ProviderAdapterError, ProviderValidationError } from "../Errors.ts";
+import {
+  type ProviderAdapterError,
+  ProviderAdapterSessionNotFoundError,
+  ProviderValidationError,
+} from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
@@ -577,14 +581,26 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       yield* commitMcpSession(input.threadId, replacement);
       return result;
     });
+  const stopBoundAdapterSession = (
+    adapter: ProviderAdapterShape<ProviderAdapterError>,
+    threadId: ThreadId,
+  ): Effect.Effect<boolean, ProviderAdapterError> =>
+    adapter.stopSession(threadId).pipe(
+      Effect.as(true),
+      Effect.catchIf(
+        (error): error is ProviderAdapterSessionNotFoundError =>
+          error._tag === "ProviderAdapterSessionNotFoundError",
+        () => Effect.succeed(false),
+      ),
+    );
   const cleanupCandidateIfOwned = (
     adapter: ProviderAdapterShape<ProviderAdapterError>,
     threadId: ThreadId,
     hadSessionBeforeStart: boolean,
   ): Effect.Effect<void> => {
     if (hadSessionBeforeStart) return Effect.void;
-    return adapter.hasSession(threadId).pipe(
-      Effect.flatMap((hasSession) => (hasSession ? adapter.stopSession(threadId) : Effect.void)),
+    return stopBoundAdapterSession(adapter, threadId).pipe(
+      Effect.asVoid,
       Effect.catchCause((cause) =>
         Effect.logWarning("provider.session.cleanup-candidate-failed", {
           threadId,
@@ -910,26 +926,21 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         instanceId === input.currentInstanceId
           ? Effect.void
           : Effect.gen(function* () {
-              const hasSession = yield* adapter.hasSession(input.threadId);
-              if (!hasSession) {
-                return;
+              const stopped = yield* stopBoundAdapterSession(adapter, input.threadId);
+              if (stopped) {
+                yield* analytics.record("provider.session.stopped", {
+                  provider: adapter.provider,
+                });
               }
-
-              yield* adapter.stopSession(input.threadId).pipe(
-                Effect.tap(() =>
-                  analytics.record("provider.session.stopped", {
-                    provider: adapter.provider,
-                  }),
-                ),
-                Effect.catchCause((cause) =>
-                  Effect.logWarning("provider.session.stop-stale-failed", {
-                    threadId: input.threadId,
-                    provider: adapter.provider,
-                    cause,
-                  }),
-                ),
-              );
-            }),
+            }).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("provider.session.stop-stale-failed", {
+                  threadId: input.threadId,
+                  provider: adapter.provider,
+                  cause,
+                }),
+              ),
+            ),
       { discard: true },
     );
   });
@@ -1369,9 +1380,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               "provider.kind": routed.adapter.provider,
               "provider.thread_id": input.threadId,
             });
-            if (routed.isActive) {
-              yield* routed.adapter.stopSession(routed.threadId);
-            }
+            yield* stopBoundAdapterSession(routed.adapter, routed.threadId);
             yield* clearMcpSession(input.threadId);
             yield* directory.upsert({
               threadId: input.threadId,

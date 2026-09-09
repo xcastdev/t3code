@@ -347,6 +347,10 @@ function makeProviderServiceLayer() {
   const codex = makeFakeCodexAdapter();
   const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const cursor = makeFakeCodexAdapter(CURSOR_DRIVER);
+  const analyticsRecords: Array<{
+    readonly event: string;
+    readonly properties?: Readonly<Record<string, unknown>>;
+  }> = [];
   const registry = makeAdapterRegistryMock({
     [ProviderDriverKind.make("codex")]: codex.adapter,
     [ProviderDriverKind.make("claudeAgent")]: claude.adapter,
@@ -361,33 +365,47 @@ function makeProviderServiceLayer() {
     Layer.provide(SqlitePersistenceMemory),
   );
   const directoryLayer = ProviderSessionDirectoryLive.pipe(Layer.provide(runtimeRepositoryLayer));
+  const analyticsLayer = Layer.succeed(
+    AnalyticsService.AnalyticsService,
+    AnalyticsService.AnalyticsService.of({
+      record: (event, properties) =>
+        Effect.sync(() => {
+          analyticsRecords.push({
+            event,
+            ...(properties !== undefined ? { properties } : {}),
+          });
+        }),
+      flush: Effect.void,
+    }),
+  );
 
-  const layer = it.layer(
-    Layer.mergeAll(
-      makeProviderServiceLive().pipe(
-        Layer.provide(providerAdapterLayer),
-        Layer.provide(directoryLayer),
-        Layer.provide(defaultServerSettingsLayer),
-        Layer.provide(serverConfigTestLayer),
-        Layer.provideMerge(AnalyticsService.layerTest),
-        Layer.provide(
-          Layer.succeed(
-            ProviderEventLoggers.ProviderEventLoggers,
-            ProviderEventLoggers.NoOpProviderEventLoggers,
-          ),
+  const rawLayer = Layer.mergeAll(
+    makeProviderServiceLive().pipe(
+      Layer.provide(providerAdapterLayer),
+      Layer.provide(directoryLayer),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(serverConfigTestLayer),
+      Layer.provideMerge(analyticsLayer),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
         ),
       ),
-      directoryLayer,
-
-      runtimeRepositoryLayer,
-      NodeServices.layer,
     ),
+    directoryLayer,
+
+    runtimeRepositoryLayer,
+    NodeServices.layer,
   );
+  const layer = it.layer(rawLayer);
 
   return {
     codex,
     claude,
     cursor,
+    analyticsRecords,
+    rawLayer,
     layer,
   };
 }
@@ -457,6 +475,115 @@ describe("MCP replacement transactions", () => {
     input: "hello",
     attachments: [],
   });
+
+  it.effect("stops a bound session even when the adapter hides it from routing", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-stop-hidden-session");
+      const codex = makeFakeCodexAdapter();
+      const providerLayer = makeMcpTransactionTestLayer({
+        codex,
+        issueMcpCredential: (request) =>
+          Effect.succeed(makeTestMcpCredential(request.threadId, "hidden-session")),
+      });
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
+        codex.stopSession.mockClear();
+        codex.hasSession.mockImplementation(() => Effect.succeed(false));
+
+        yield* provider.stopSession({ threadId });
+
+        assert.deepEqual(codex.stopSession.mock.calls, [[threadId]]);
+        assert.deepEqual(yield* codex.listSessions(), []);
+        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
+        const persisted = yield* runtimeRepository.getByThreadId({ threadId });
+        assert.equal(Option.isSome(persisted), true);
+        if (Option.isSome(persisted)) {
+          assert.equal(persisted.value.status, "stopped");
+        }
+      }).pipe(Effect.provide(providerLayer));
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
+  );
+
+  it.effect("keeps explicit stop idempotent for an adapter that reports not found", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-stop-not-found");
+      const codex = makeFakeCodexAdapter();
+      const providerLayer = makeMcpTransactionTestLayer({
+        codex,
+        issueMcpCredential: (request) =>
+          Effect.succeed(makeTestMcpCredential(request.threadId, "not-found-session")),
+      });
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
+        codex.stopSession.mockClear();
+        codex.hasSession.mockImplementation(() => Effect.succeed(false));
+        codex.stopSession.mockImplementation(() =>
+          Effect.fail(
+            new ProviderAdapterSessionNotFoundError({
+              provider: String(CODEX_DRIVER),
+              threadId,
+            }),
+          ),
+        );
+
+        yield* provider.stopSession({ threadId });
+
+        assert.deepEqual(codex.stopSession.mock.calls, [[threadId]]);
+        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
+        const persisted = yield* runtimeRepository.getByThreadId({ threadId });
+        assert.equal(Option.isSome(persisted), true);
+        if (Option.isSome(persisted)) {
+          assert.equal(persisted.value.status, "stopped");
+        }
+      }).pipe(Effect.provide(providerLayer));
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
+  );
+
+  it.effect("preserves state when a hidden session cannot be stopped", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-mcp-stop-hidden-failure");
+      const codex = makeFakeCodexAdapter();
+      const stopError = new ProviderAdapterRequestError({
+        provider: String(CODEX_DRIVER),
+        method: "stopSession",
+        detail: "hidden session termination failed",
+      });
+      const providerLayer = makeMcpTransactionTestLayer({
+        codex,
+        issueMcpCredential: (request) =>
+          Effect.succeed(makeTestMcpCredential(request.threadId, "hidden-failure-session")),
+      });
+
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
+        yield* provider.startSession(threadId, startInput(threadId, "full-access"));
+        const persistedBefore = yield* runtimeRepository.getByThreadId({ threadId });
+        codex.hasSession.mockImplementation(() => Effect.succeed(false));
+        codex.stopSession.mockImplementation(() => Effect.fail(stopError));
+
+        const failure = yield* provider.stopSession({ threadId }).pipe(Effect.flip);
+
+        assert.equal(failure, stopError);
+        assert.deepEqual(
+          McpProviderSession.readMcpProviderSession(threadId)?.providerSessionId,
+          "hidden-failure-session",
+        );
+        const persistedAfterFailure = yield* runtimeRepository.getByThreadId({ threadId });
+        assert.deepEqual(persistedAfterFailure, persistedBefore);
+
+        codex.stopSession.mockImplementation(() => Effect.void);
+        yield* provider.stopSession({ threadId });
+        assert.equal(McpProviderSession.readMcpProviderSession(threadId), undefined);
+      }).pipe(Effect.provide(providerLayer));
+    }).pipe(Effect.ensuring(Effect.sync(() => McpProviderSession.clearAllMcpProviderSessions()))),
+  );
 
   it.effect("serializes overlapping recovery rollbacks before the next recovery prepares", () =>
     Effect.gen(function* () {
@@ -1056,6 +1183,8 @@ describe("MCP replacement transactions", () => {
         const runtimeRepository = yield* ProviderSessionRuntime.ProviderSessionRuntimeRepository;
         yield* provider.startSession(threadId, startInput(threadId, "full-access"));
         yield* provider.stopSession({ threadId });
+        codex.hasSession.mockImplementation(() => Effect.succeed(false));
+        codex.stopSession.mockClear();
         codex.startSession.mockImplementationOnce(() =>
           Effect.fail(
             new ProviderAdapterRequestError({
@@ -1071,6 +1200,7 @@ describe("MCP replacement transactions", () => {
           .pipe(Effect.exit);
         assert.equal(Exit.isFailure(restartExit), true);
         assert.deepEqual(revokedProviderSessions, ["failed"]);
+        assert.deepEqual(codex.stopSession.mock.calls, [[threadId]]);
 
         const persisted = yield* runtimeRepository.getByThreadId({ threadId });
         assert.equal(Option.isSome(persisted), true);
@@ -1306,6 +1436,48 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
 );
 
 const routing = makeProviderServiceLayer();
+const hiddenStaleRouting = makeProviderServiceLayer();
+
+it.effect("stops hidden stale sessions without recording a stop for an absent session", () =>
+  Effect.gen(function* () {
+    const provider = yield* ProviderService.ProviderService;
+    const threadId = asThreadId("thread-hidden-stale-session");
+
+    yield* provider.startSession(threadId, {
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      threadId,
+      runtimeMode: "full-access",
+    });
+    hiddenStaleRouting.codex.stopSession.mockClear();
+    hiddenStaleRouting.codex.hasSession.mockImplementation(() => Effect.succeed(false));
+    hiddenStaleRouting.codex.stopSession.mockImplementation(() =>
+      Effect.fail(
+        new ProviderAdapterSessionNotFoundError({
+          provider: String(CODEX_DRIVER),
+          threadId,
+        }),
+      ),
+    );
+
+    yield* provider.startSession(threadId, {
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      threadId,
+      runtimeMode: "full-access",
+    });
+
+    assert.deepEqual(hiddenStaleRouting.codex.stopSession.mock.calls, [[threadId]]);
+    assert.equal(
+      hiddenStaleRouting.analyticsRecords.filter(
+        (record) =>
+          record.event === "provider.session.stopped" &&
+          record.properties?.provider === String(CODEX_DRIVER),
+      ).length,
+      0,
+    );
+  }).pipe(Effect.provide(hiddenStaleRouting.rawLayer)),
+);
 
 it.effect(
   "ProviderServiceLive uploads feedback through the adapter that recovered the session",
@@ -2044,7 +2216,6 @@ routing.layer("ProviderServiceLive routing", (it) => {
       });
 
       routing.codex.stopSession.mockClear();
-      routing.claude.stopSession.mockClear();
 
       const claudeSession = yield* provider.startSession(threadId, {
         provider: ProviderDriverKind.make("claudeAgent"),
@@ -2057,7 +2228,6 @@ routing.layer("ProviderServiceLive routing", (it) => {
       assert.equal(codexSession.provider, "codex");
       assert.equal(claudeSession.provider, "claudeAgent");
       assert.deepEqual(routing.codex.stopSession.mock.calls, [[threadId]]);
-      assert.equal(routing.claude.stopSession.mock.calls.length, 0);
 
       const sessions = yield* provider.listSessions();
       assert.deepEqual(
