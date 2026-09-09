@@ -2785,23 +2785,28 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       }
 
       // The query reads one row past the window, so an over-full result is
-      // proof that older rows were cut. Drop the probe row and keep the turns
-      // that straddle the cut: they are the only ones the client holds
-      // partially, and so the only ones whose rows it must not count. Turns
-      // entirely beyond the cut retain nothing and never render a fold.
+      // proof that older rows were cut. Rows arrive oldest-first, and a turn's
+      // rows are contiguous, so at most one turn can straddle the cut: the one
+      // owning the oldest row still inside the window. Turns older than it kept
+      // nothing and never render a fold; newer turns kept everything.
+      //
+      // Naming that turn rather than the discarded probe row's turn matters:
+      // rows with no turn are interleaved throughout (most turns in a long
+      // thread contain some), so a probe that lands on one would report nothing
+      // while a turn really was cut — and the client would show a count derived
+      // from the rows that happened to survive. Over-reporting a whole turn
+      // costs a hidden count; under-reporting states a wrong number as fact.
       const activityWindowTruncated = activityRows.length > THREAD_DETAIL_ACTIVITY_LIMIT;
       const retainedActivityRows = activityWindowTruncated
         ? activityRows.slice(activityRows.length - THREAD_DETAIL_ACTIVITY_LIMIT)
         : activityRows;
-      const partialTurnIds = activityWindowTruncated
-        ? [
-            ...new Set(
-              activityRows
-                .slice(0, activityRows.length - THREAD_DETAIL_ACTIVITY_LIMIT)
-                .flatMap((row) => (row.turnId === null ? [] : [row.turnId])),
-            ),
-          ].filter((turnId) => retainedActivityRows.some((row) => row.turnId === turnId))
-        : [];
+      const oldestRetainedTurnId = activityWindowTruncated
+        ? retainedActivityRows.find((row) => row.turnId !== null)?.turnId
+        : undefined;
+      const partialTurnIds =
+        oldestRetainedTurnId === undefined || oldestRetainedTurnId === null
+          ? []
+          : [oldestRetainedTurnId];
 
       const selectedActivityRows = [
         ...new Map(

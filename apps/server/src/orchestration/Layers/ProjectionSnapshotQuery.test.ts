@@ -2307,6 +2307,61 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
     }),
   );
 
+  it.effect("names the cut turn even when the discarded row has no turn", () =>
+    Effect.gen(function* () {
+      // Rows without a turn are interleaved throughout a real thread, so the
+      // row that falls outside the window often has none. Reading the turn off
+      // that row would report nothing while a turn really was cut, and the
+      // client would present a count built from the rows that survived.
+      yield* seedFanOutThread();
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* sql`DELETE FROM projection_thread_activities`;
+      // 502 rows so exactly one falls outside the window, and that discarded
+      // row is turnless. turn-5 has a row older still (also cut) and rows
+      // inside the window, so it straddles the cut with nothing in the
+      // discarded row to name it.
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        )
+        VALUES
+          ('activity-0001', 'thread-w', NULL, 'info', 'context-window.updated', 'ctx', '{}', 1, '2026-03-01T00:04:00.000Z')
+      `;
+      yield* sql`
+        WITH RECURSIVE activity_rows(sequence) AS (
+          SELECT 2
+          UNION ALL
+          SELECT sequence + 1 FROM activity_rows WHERE sequence < 501
+        )
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        )
+        SELECT
+          printf('activity-%04d', sequence),
+          'thread-w',
+          'turn-5',
+          'tool',
+          'tool.completed',
+          'ran tool',
+          '{}',
+          sequence,
+          '2026-03-01T00:04:00.000Z'
+        FROM activity_rows
+      `;
+
+      const detail = yield* snapshotQuery.getThreadDetailById(threadW);
+      assert.equal(detail._tag, "Some");
+      if (detail._tag === "Some") {
+        assert.equal(detail.value.activities.length, 500);
+        // The discarded row is the turnless activity-0001, so the cut turn can
+        // only be found by reading the oldest row still inside the window.
+        assert.deepEqual([...(detail.value.partialTurnIds ?? [])], ["turn-5"]);
+      }
+    }),
+  );
+
   it.effect("reports no cut turns when the window is exactly full", () =>
     Effect.gen(function* () {
       // A bare LIMIT cannot tell a full window from a cut one. Reading one row
