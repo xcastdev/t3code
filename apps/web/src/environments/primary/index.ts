@@ -30,11 +30,20 @@ export {
   revokeServerPairingLink,
   stripPairingTokenFromUrl,
   submitServerAuthCredential,
+  getDesktopPrimaryBootstrap,
   takePairingTokenFromUrl,
   type ServerClientSessionRecord,
   type ServerPairingLinkRecord,
   __resetServerAuthBootstrapForTests,
 } from "./auth";
+
+export {
+  clearDesktopPrimaryBearerToken,
+  DESKTOP_PRIMARY_AUTH_REQUIRED_EVENT,
+  isDesktopPrimaryAttached,
+  notifyDesktopPrimaryAuthRequired,
+  resetDesktopPrimaryAuthRecoveryNotification,
+} from "./desktopAuth";
 
 export { refreshPrimarySessionState, usePrimarySessionState } from "./sessionState";
 

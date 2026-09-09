@@ -95,7 +95,43 @@ npx t3 serve --host "$(tailscale ip -4)"
 - a connection string
 - a pairing token
 - a pairing URL
+- a desktop attach URL when the server listens on an eligible local endpoint
 - a QR code for the pairing URL
+
+### Attach the desktop app to the server
+
+To use the `t3 serve` process as the desktop app's primary environment, start the server on the
+same machine as the desktop app:
+
+```bash
+npx t3 serve
+```
+
+Open the printed **Desktop attach URL** while the desktop app is closed. The desktop app uses the
+server's bundled web client and sends API and WebSocket traffic to the existing server. It does not
+start another backend.
+
+The desktop attach URL is printed when the server uses an unspecified host, `localhost`, a
+`127.0.0.0/8` address, or `[::1]`. The desktop app and server must share a filesystem namespace.
+Native file actions, terminals, previews, and editor actions use that shared filesystem.
+
+To attach an already-open desktop app, open **Settings** → **Connections** → **Backend process** and
+paste the full owner pairing URL. The desktop app relaunches after it saves the attachment.
+
+To renew an expired or revoked desktop session, run:
+
+```bash
+npx t3 pair --owner
+```
+
+Paste the new owner pairing URL into the same **Backend process** control. A standard pairing token
+does not have the administrative scopes required by the desktop attachment flow.
+
+To return ownership to the desktop app, choose **Use desktop backend** under **Backend process**.
+The desktop app then uses the stored WSL, exposure, and other managed-backend preferences again.
+
+Quitting the desktop app does not stop the attached `t3 serve` process. Stop that process from the
+terminal or service that started it.
 
 From there, connect from another device in either of these ways:
 

@@ -10,6 +10,7 @@
  * HTTPS and pairs through the tailnet URL instead.
  */
 import {
+  AuthAdministrativeScopes,
   AuthStandardClientScopes,
   ExecutionEnvironmentDescriptor,
   PortSchema,
@@ -47,6 +48,7 @@ import {
 } from "../serverRuntimeState.ts";
 import {
   buildPairingUrl,
+  buildDesktopAttachUrl,
   formatHostForUrl,
   isLoopbackHost,
   isWildcardHost,
@@ -179,6 +181,7 @@ export const formatPairOutput = (input: {
   readonly token: string;
   readonly expiresAt: DateTime.Utc;
   readonly notes: ReadonlyArray<string>;
+  readonly desktopAttachUrl?: string;
 }): string =>
   [
     `Pairing with ${input.serverLabel} (${input.origin}).`,
@@ -188,6 +191,7 @@ export const formatPairOutput = (input: {
     `Pairing URL: ${input.pairingUrl}`,
     `Token: ${input.token}`,
     `Expires: ${DateTime.formatIso(input.expiresAt)}`,
+    ...(input.desktopAttachUrl ? [`Desktop attach URL: ${input.desktopAttachUrl}`] : []),
     ...input.notes.flatMap((note) => ["", `Note: ${note}`]),
     "",
   ].join("\n");
@@ -436,13 +440,14 @@ const mintPairingLink = Effect.fn("pair.mintPairingLink")(function* (input: {
   readonly config: ServerConfig.ServerConfig["Service"];
   readonly ttl: Option.Option<Duration.Duration>;
   readonly label: Option.Option<string>;
+  readonly owner: boolean;
 }) {
   return yield* Effect.gen(function* () {
     const environmentAuth = yield* EnvironmentAuth.EnvironmentAuth;
     return yield* environmentAuth.createPairingLink({
-      scopes: AuthStandardClientScopes,
-      subject: "one-time-token",
-      label: Option.getOrElse(input.label, () => "t3 pair"),
+      scopes: input.owner ? AuthAdministrativeScopes : AuthStandardClientScopes,
+      subject: input.owner ? "desktop-attach" : "one-time-token",
+      label: Option.getOrElse(input.label, () => (input.owner ? "t3 pair --owner" : "t3 pair")),
       ...(Option.isSome(input.ttl) ? { ttl: input.ttl.value } : {}),
     });
   }).pipe(
@@ -468,6 +473,11 @@ const labelFlag = Flag.string("label").pipe(
   Flag.optional,
 );
 
+const ownerFlag = Flag.boolean("owner").pipe(
+  Flag.withDescription("Mint the administrative credential required to attach a desktop."),
+  Flag.withDefault(false),
+);
+
 const tailscaleFlag = Flag.boolean("tailscale").pipe(
   Flag.withDescription(
     "Publish the server over Tailscale Serve HTTPS and pair through the tailnet URL.",
@@ -485,6 +495,7 @@ export const pairCommand = Command.make("pair", {
   baseDir: baseDirFlag,
   ttl: ttlFlag,
   label: labelFlag,
+  owner: ownerFlag,
   tailscale: tailscaleFlag,
   tailscaleServePort: tailscaleServePortFlag,
 }).pipe(
@@ -524,8 +535,23 @@ export const pairCommand = Command.make("pair", {
       }
 
       const config = yield* makePairServerConfig({ target, logLevel });
-      const issued = yield* mintPairingLink({ config, ttl: flags.ttl, label: flags.label });
+      const issued = yield* mintPairingLink({
+        config,
+        ttl: flags.ttl,
+        label: flags.label,
+        owner: flags.owner,
+      });
       const pairingUrl = buildPairingUrl(pairingBaseUrl, issued.credential);
+      const desktopAttachUrl =
+        flags.owner &&
+        !flags.tailscale &&
+        (target.state.host === undefined ||
+          isLoopbackHost(target.state.host) ||
+          isWildcardHost(target.state.host))
+          ? buildDesktopAttachUrl(
+              buildPairingUrl(`http://127.0.0.1:${String(target.state.port)}`, issued.credential),
+            )
+          : undefined;
 
       yield* Console.log(
         formatPairOutput({
@@ -535,6 +561,7 @@ export const pairCommand = Command.make("pair", {
           token: issued.credential,
           expiresAt: issued.expiresAt,
           notes,
+          ...(desktopAttachUrl ? { desktopAttachUrl } : {}),
         }),
       );
     }).pipe(Effect.provide(FetchHttpClient.layer)),

@@ -1,3 +1,4 @@
+// @effect-diagnostics nodeBuiltinImport:off - Electron protocol handlers need direct ASAR-aware filesystem access.
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -5,6 +6,8 @@ import * as NodeTimersPromises from "node:timers/promises";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
+import * as FileSystemPromises from "node:fs/promises";
+import * as NodePath from "node:path";
 
 import * as Electron from "electron";
 
@@ -50,10 +53,16 @@ export class ElectronProtocolUnregistrationError extends Schema.TaggedErrorClass
 
 export interface DesktopProtocolRegistrationInput {
   readonly scheme: string;
-  readonly targetOrigin: URL;
+  readonly rendererSource?: DesktopRendererSource;
+  /** @deprecated Use rendererSource: { _tag: "Proxy", origin }. */
+  readonly targetOrigin?: URL;
   readonly backendOrigin: URL;
   readonly clerkFrontendApiHostname: string | undefined;
 }
+
+export type DesktopRendererSource =
+  | { readonly _tag: "Proxy"; readonly origin: URL }
+  | { readonly _tag: "Static"; readonly directory: string };
 
 export class ElectronProtocol extends Context.Service<
   ElectronProtocol,
@@ -183,6 +192,94 @@ async function proxyRequest(
   return withContentSecurityPolicy(response, contentSecurityPolicy);
 }
 
+const STATIC_CONTENT_TYPES: Readonly<Record<string, string>> = {
+  ".css": "text/css; charset=utf-8",
+  ".html": "text/html; charset=utf-8",
+  ".ico": "image/x-icon",
+  ".js": "text/javascript; charset=utf-8",
+  ".jpeg": "image/jpeg",
+  ".jpg": "image/jpeg",
+  ".json": "application/json; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".png": "image/png",
+  ".svg": "image/svg+xml",
+  ".wasm": "application/wasm",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
+  ".webp": "image/webp",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+};
+
+const isPathInsideDirectory = (directory: string, candidate: string): boolean => {
+  const relative = NodePath.relative(directory, candidate);
+  return (
+    relative === "" ||
+    (relative !== ".." &&
+      !relative.startsWith(`..${NodePath.sep}`) &&
+      !NodePath.isAbsolute(relative))
+  );
+};
+
+const staticFilePath = (directory: string, pathname: string): string | null => {
+  let decodedPath: string;
+  try {
+    decodedPath = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  if (decodedPath.includes("\0") || decodedPath.includes("\\")) return null;
+  const relativePath = decodedPath === "/" ? "index.html" : decodedPath.replace(/^\/+/, "");
+  const candidate = NodePath.resolve(directory, relativePath);
+  return isPathInsideDirectory(NodePath.resolve(directory), candidate) ? candidate : null;
+};
+
+/** Serves the packaged renderer without allowing URL paths to escape its directory. */
+export async function serveStaticDesktopRendererRequest(
+  request: Request,
+  directory: string,
+  contentSecurityPolicy: string,
+): Promise<Response> {
+  const requestUrl = new URL(request.url);
+  if (requestUrl.host !== DESKTOP_HOST || (request.method !== "GET" && request.method !== "HEAD")) {
+    return withContentSecurityPolicy(new Response(null, { status: 404 }), contentSecurityPolicy);
+  }
+
+  const filePath = staticFilePath(directory, requestUrl.pathname);
+  if (filePath === null) {
+    return withContentSecurityPolicy(new Response(null, { status: 400 }), contentSecurityPolicy);
+  }
+
+  let body: Buffer;
+  try {
+    body = await FileSystemPromises.readFile(filePath);
+  } catch (cause) {
+    const code = typeof cause === "object" && cause !== null && "code" in cause ? cause.code : null;
+    if (code === "ENOENT" && !NodePath.basename(filePath).includes(".")) {
+      try {
+        body = await FileSystemPromises.readFile(NodePath.resolve(directory, "index.html"));
+      } catch {
+        return withContentSecurityPolicy(
+          new Response(null, { status: 404 }),
+          contentSecurityPolicy,
+        );
+      }
+    } else {
+      return withContentSecurityPolicy(new Response(null, { status: 404 }), contentSecurityPolicy);
+    }
+  }
+
+  const extension = NodePath.extname(filePath).toLowerCase();
+  const headers = new Headers({
+    "content-type": STATIC_CONTENT_TYPES[extension] ?? "application/octet-stream",
+    "cache-control": extension === ".html" ? "no-cache" : "public, max-age=31536000, immutable",
+  });
+  headers.set("Content-Security-Policy", contentSecurityPolicy);
+  return new Response(
+    request.method === "HEAD" ? null : new Blob([body as unknown as ArrayBuffer]),
+    { status: 200, headers },
+  );
+}
+
 const TRANSIENT_FETCH_RETRY_DELAYS_MS = [0, 50, 150] as const;
 
 async function fetchWithTransientRetry(url: string, init: RequestInit): Promise<Response> {
@@ -211,12 +308,27 @@ export const make = Effect.gen(function* () {
       if (yield* Ref.get(registered)) return;
 
       const contentSecurityPolicy = makeDesktopContentSecurityPolicy(input);
+      const rendererSource =
+        input.rendererSource ??
+        (input.targetOrigin ? { _tag: "Proxy", origin: input.targetOrigin } : undefined);
+      if (!rendererSource) {
+        return yield* new ElectronProtocolRegistrationError({
+          scheme: input.scheme,
+          cause: new Error("Desktop renderer source is missing."),
+        });
+      }
 
       yield* Effect.acquireRelease(
         Effect.try({
           try: () => {
             Electron.protocol.handle(input.scheme, (request) =>
-              proxyRequest(request, input.targetOrigin, contentSecurityPolicy),
+              rendererSource._tag === "Static"
+                ? serveStaticDesktopRendererRequest(
+                    request,
+                    rendererSource.directory,
+                    contentSecurityPolicy,
+                  )
+                : proxyRequest(request, rendererSource.origin, contentSecurityPolicy),
             );
           },
           catch: (cause) => new ElectronProtocolRegistrationError({ scheme: input.scheme, cause }),

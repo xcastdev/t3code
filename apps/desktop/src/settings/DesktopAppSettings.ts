@@ -1,6 +1,7 @@
 import {
   DesktopServerExposureModeSchema,
   DesktopUpdateChannelSchema,
+  EnvironmentId,
   type DesktopServerExposureMode,
   type DesktopUpdateChannel,
 } from "@t3tools/contracts";
@@ -48,7 +49,21 @@ export interface DesktopSettings {
   // this requires a desktop restart because the pool's primary spec is
   // chosen once at layer init.
   readonly wslOnly: boolean;
+  readonly primaryBackend: DesktopPrimaryBackendPreference;
 }
+
+export type DesktopPrimaryBackendPreference =
+  | { readonly mode: "managed" }
+  | {
+      readonly mode: "attached";
+      readonly httpBaseUrl: string;
+      readonly wsBaseUrl: string;
+      readonly environmentId: EnvironmentId;
+      readonly label: string;
+      readonly encryptedBearerToken: string;
+      readonly bearerExpiresAt: string;
+    }
+  | { readonly mode: "invalid-attached"; readonly reason: string };
 
 export interface DesktopSettingsChange {
   readonly settings: DesktopSettings;
@@ -84,6 +99,7 @@ export const DEFAULT_DESKTOP_SETTINGS: DesktopSettings = {
   wslBackendEnabled: false,
   wslDistro: null,
   wslOnly: false,
+  primaryBackend: { mode: "managed" },
 };
 
 const DesktopWindowBoundsDocument = Schema.Struct({
@@ -109,6 +125,9 @@ const DesktopSettingsDocument = Schema.Struct({
   wslMode: Schema.optionalKey(Schema.Literals(["local", "wsl"])),
   wslDistro: Schema.optionalKey(Schema.NullOr(Schema.String)),
   wslOnly: Schema.optionalKey(Schema.Boolean),
+  // Keep this unknown at the JSON boundary so malformed records become an
+  // explicit recovery state instead of silently becoming managed.
+  primaryBackend: Schema.optionalKey(Schema.Unknown),
 });
 
 type DesktopSettingsDocument = typeof DesktopSettingsDocument.Type;
@@ -119,6 +138,54 @@ const decodeDesktopSettingsJson = Schema.decodeEffect(DesktopSettingsJson);
 const encodeDesktopSettingsJson = Schema.encodeEffect(DesktopSettingsJson);
 const decodeDesktopWindowBounds = Schema.decodeUnknownOption(DesktopWindowBoundsSchema);
 const desktopWindowBoundsEquivalence = Schema.toEquivalence(DesktopWindowBoundsSchema);
+
+const invalidPrimaryBackend = (reason: string): DesktopPrimaryBackendPreference => ({
+  mode: "invalid-attached",
+  reason,
+});
+
+export function normalizePrimaryBackendPreference(value: unknown): DesktopPrimaryBackendPreference {
+  if (value === undefined) {
+    return { mode: "managed" };
+  }
+  if (typeof value !== "object" || value === null) {
+    return invalidPrimaryBackend("Stored attached backend settings are invalid.");
+  }
+
+  const candidate = value as Record<string, unknown>;
+  if (candidate.mode === "managed") {
+    return { mode: "managed" };
+  }
+  if (candidate.mode !== "attached") {
+    return invalidPrimaryBackend("Stored attached backend settings have an unknown mode.");
+  }
+
+  const stringFields = [
+    "httpBaseUrl",
+    "wsBaseUrl",
+    "label",
+    "encryptedBearerToken",
+    "bearerExpiresAt",
+  ] as const;
+  if (
+    !stringFields.every(
+      (field) => typeof candidate[field] === "string" && candidate[field].length > 0,
+    ) ||
+    !Schema.is(EnvironmentId)(candidate.environmentId)
+  ) {
+    return invalidPrimaryBackend("Stored attached backend settings are incomplete.");
+  }
+
+  return {
+    mode: "attached",
+    httpBaseUrl: candidate.httpBaseUrl as string,
+    wsBaseUrl: candidate.wsBaseUrl as string,
+    environmentId: candidate.environmentId,
+    label: candidate.label as string,
+    encryptedBearerToken: candidate.encryptedBearerToken as string,
+    bearerExpiresAt: candidate.bearerExpiresAt as string,
+  };
+}
 
 const settingsChange = (settings: DesktopSettings, changed: boolean): DesktopSettingsChange => ({
   settings,
@@ -174,6 +241,9 @@ export class DesktopAppSettings extends Context.Service<
     ) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
     readonly setWslOnly: (
       enabled: boolean,
+    ) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
+    readonly setPrimaryBackendPreference: (
+      preference: Exclude<DesktopPrimaryBackendPreference, { readonly mode: "invalid-attached" }>,
     ) => Effect.Effect<DesktopSettingsChange, DesktopSettingsWriteError>;
     readonly applyWslWindowsFallback: Effect.Effect<
       DesktopSettingsChange,
@@ -238,6 +308,7 @@ function normalizeDesktopSettingsDocument(
     wslBackendEnabled,
     wslDistro: normalizeWslDistro(parsed.wslDistro),
     wslOnly: parsed.wslOnly === true,
+    primaryBackend: normalizePrimaryBackendPreference(parsed.primaryBackend),
   };
 }
 
@@ -279,6 +350,9 @@ function toDesktopSettingsDocument(
   }
   if (settings.wslOnly !== defaults.wslOnly) {
     document.wslOnly = settings.wslOnly;
+  }
+  if (settings.primaryBackend.mode !== "managed") {
+    document.primaryBackend = settings.primaryBackend;
   }
 
   return document;
@@ -368,6 +442,29 @@ function setWslOnly(settings: DesktopSettings, enabled: boolean): DesktopSetting
         ...settings,
         wslOnly: enabled,
       };
+}
+
+function setPrimaryBackendPreference(
+  settings: DesktopSettings,
+  preference: Exclude<DesktopPrimaryBackendPreference, { readonly mode: "invalid-attached" }>,
+): DesktopSettings {
+  if (settings.primaryBackend.mode === preference.mode) {
+    if (preference.mode === "managed") {
+      return settings;
+    }
+    if (
+      settings.primaryBackend.mode === "attached" &&
+      settings.primaryBackend.httpBaseUrl === preference.httpBaseUrl &&
+      settings.primaryBackend.wsBaseUrl === preference.wsBaseUrl &&
+      settings.primaryBackend.environmentId === preference.environmentId &&
+      settings.primaryBackend.label === preference.label &&
+      settings.primaryBackend.encryptedBearerToken === preference.encryptedBearerToken &&
+      settings.primaryBackend.bearerExpiresAt === preference.bearerExpiresAt
+    ) {
+      return settings;
+    }
+  }
+  return { ...settings, primaryBackend: preference };
 }
 
 function applyWslWindowsFallback(settings: DesktopSettings): DesktopSettings {
@@ -544,6 +641,12 @@ export const make = Effect.gen(function* () {
       persist((settings) => setWslOnly(settings, enabled)).pipe(
         Effect.withSpan("desktop.settings.setWslOnly", { attributes: { enabled } }),
       ),
+    setPrimaryBackendPreference: (preference) =>
+      persist((settings) => setPrimaryBackendPreference(settings, preference)).pipe(
+        Effect.withSpan("desktop.settings.setPrimaryBackendPreference", {
+          attributes: { mode: preference.mode },
+        }),
+      ),
     applyWslWindowsFallback: persist(applyWslWindowsFallback).pipe(
       Effect.withSpan("desktop.settings.applyWslWindowsFallback"),
     ),
@@ -585,6 +688,8 @@ export const layerTest = (initialSettings: DesktopSettings = DEFAULT_DESKTOP_SET
           update((settings) => setWslBackendEnabled(settings, enabled)),
         setWslDistro: (distro) => update((settings) => setWslDistro(settings, distro)),
         setWslOnly: (enabled) => update((settings) => setWslOnly(settings, enabled)),
+        setPrimaryBackendPreference: (preference) =>
+          update((settings) => setPrimaryBackendPreference(settings, preference)),
         applyWslWindowsFallback: update(applyWslWindowsFallback),
         applyWslWindowsFallbackInMemory: update(applyWslWindowsFallback),
       });

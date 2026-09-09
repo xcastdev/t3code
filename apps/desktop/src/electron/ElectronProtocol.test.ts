@@ -1,6 +1,10 @@
 import { assert, describe, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+// @effect-diagnostics nodeBuiltinImport:off - test fixture files are created at the filesystem boundary.
+import * as NodeFs from "node:fs/promises";
+import * as NodeOs from "node:os";
+import * as NodePath from "node:path";
 import { beforeEach, vi } from "vite-plus/test";
 
 const { handleMock, netFetchMock, unhandleMock } = vi.hoisted(() => ({
@@ -111,6 +115,44 @@ describe("ElectronProtocol", () => {
       assert.equal(response.status, 404);
       assert.equal(netFetchMock.mock.calls.length, 0);
     }).pipe(Effect.provide(ElectronProtocol.layer)),
+  );
+
+  it.effect("serves the bundled renderer with SPA fallback and traversal protection", () =>
+    Effect.promise(async () => {
+      const directory = await NodeFs.mkdtemp(NodePath.join(NodeOs.tmpdir(), "t3-renderer-"));
+      try {
+        await NodeFs.writeFile(NodePath.join(directory, "index.html"), "<app>");
+        await NodeFs.mkdir(NodePath.join(directory, "assets"));
+        await NodeFs.writeFile(NodePath.join(directory, "assets", "app.js"), "console.log(1)");
+
+        const policy = "default-src 'self'";
+        const route = await ElectronProtocol.serveStaticDesktopRendererRequest(
+          new Request("t3code://app/settings?tab=connections"),
+          directory,
+          policy,
+        );
+        assert.equal(route.status, 200);
+        assert.equal(await route.text(), "<app>");
+        assert.equal(route.headers.get("content-security-policy"), policy);
+
+        const asset = await ElectronProtocol.serveStaticDesktopRendererRequest(
+          new Request("t3code://app/assets/app.js?v=1"),
+          directory,
+          policy,
+        );
+        assert.equal(asset.status, 200);
+        assert.equal(await asset.text(), "console.log(1)");
+
+        const traversal = await ElectronProtocol.serveStaticDesktopRendererRequest(
+          new Request("t3code://app/%2e%2e%5csecret.js"),
+          directory,
+          policy,
+        );
+        assert.equal(traversal.status, 400);
+      } finally {
+        await NodeFs.rm(directory, { recursive: true, force: true });
+      }
+    }),
   );
 
   it.effect("retries transient renderer target failures", () =>

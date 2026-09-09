@@ -8,6 +8,7 @@ import {
   peekPairingTokenFromUrl,
   stripPairingTokenFromUrl,
   submitServerAuthCredential,
+  isDesktopPrimaryAttached,
 } from "../../environments/primary";
 import { readHostedPairingRequest } from "../../hostedPairing";
 import { Button } from "../ui/button";
@@ -52,6 +53,7 @@ export function PairingRouteSurface({
   const [errorMessage, setErrorMessage] = useState(initialErrorMessage ?? "");
   const [isSubmitting, setIsSubmitting] = useState(false);
   const autoSubmitAttemptedRef = useRef(false);
+  const attachedPrimary = isDesktopPrimaryAttached();
 
   const submitCredential = useCallback(
     async (nextCredential: string) => {
@@ -112,8 +114,17 @@ export function PairingRouteSurface({
           Pair with this environment
         </h1>
         <p className="mt-2 text-sm leading-relaxed text-muted-foreground">
-          {describeAuthGate(auth.bootstrapMethods)}
+          {attachedPrimary
+            ? "The desktop is attached to a backend that needs an administrative owner credential."
+            : describeAuthGate(auth.bootstrapMethods)}
         </p>
+
+        {attachedPrimary ? (
+          <p className="mt-3 rounded-lg border border-border/70 bg-background/55 px-3 py-3 text-xs leading-relaxed text-muted-foreground">
+            Run <code className="font-mono text-foreground/80">t3 pair --owner</code> on the server
+            machine, then paste the new token below.
+          </p>
+        ) : null}
 
         <form className="mt-6 space-y-4" onSubmit={(event) => void handleSubmit(event)}>
           <div className="space-y-2">
@@ -128,7 +139,9 @@ export function PairingRouteSurface({
               disabled={isSubmitting}
               nativeInput
               onChange={(event) => setCredential(event.currentTarget.value)}
-              placeholder="Paste a one-time token or pairing secret"
+              placeholder={
+                attachedPrimary ? "Paste an owner token" : "Paste a pairing token or pairing secret"
+              }
               spellCheck={false}
               value={credential}
             />

@@ -57,6 +57,18 @@ Electron telemetry is unavailable. The native monitor still runs beside the
 server and tracks the server process tree. Power fields degrade to `unknown`
 instead of invoking platform shell commands.
 
+### Attached desktop primary
+
+An attached desktop primary keeps telemetry ownership split between the two processes. The desktop
+app continues to report Electron process metrics and host power state. The attached server reports
+its own process tree and native resource telemetry. The desktop app does not start a second server or
+a second server-side telemetry monitor for the primary environment.
+
+Desktop telemetry file descriptors belong to the desktop-managed server process. An attached CLI
+server does not receive those descriptors, so it reports only the telemetry available to its own
+native monitor. WSL and desktop process controls remain inactive because the desktop app does not
+own the attached server process.
+
 ### WSL backend limitation
 
 Windows desktop packages currently ship the Windows resource-monitor executable.

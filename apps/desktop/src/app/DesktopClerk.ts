@@ -13,6 +13,7 @@ import * as ElectronProtocol from "../electron/ElectronProtocol.ts";
 import * as ElectronWindow from "../electron/ElectronWindow.ts";
 import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
+import { findDesktopLaunchIntentInArgv, parseDesktopLaunchIntent } from "./DesktopLaunchIntent.ts";
 
 declare const __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: string | undefined;
 
@@ -135,7 +136,33 @@ export const make = Effect.gen(function* () {
         return yield* Effect.interrupt;
       }
 
-      yield* electronApp.on("second-instance", () => {
+      const relaunchForAttachIntent = (raw: string) => {
+        void runPromise(
+          Effect.gen(function* () {
+            const existingAttachArgs = new Set(
+              process.argv.slice(1).filter((arg) => parseDesktopLaunchIntent(arg) !== null),
+            );
+            yield* electronApp.relaunch({
+              execPath: process.execPath,
+              args: [...process.argv.slice(1).filter((arg) => !existingAttachArgs.has(arg)), raw],
+            });
+            yield* electronApp.exit(0);
+          }),
+        );
+      };
+
+      yield* electronApp.on<[unknown, unknown]>("second-instance", (_event, rawArgv) => {
+        const argv = Array.isArray(rawArgv)
+          ? rawArgv.filter((arg): arg is string => typeof arg === "string")
+          : [];
+        const pairingUrl = findDesktopLaunchIntentInArgv(argv);
+        if (pairingUrl !== null) {
+          const raw = argv.find((arg) => parseDesktopLaunchIntent(arg) === pairingUrl);
+          if (raw !== undefined) {
+            relaunchForAttachIntent(raw);
+            return;
+          }
+        }
         void runPromise(
           Effect.gen(function* () {
             const mainWindow = yield* electronWindow.currentMainOrFirst;
@@ -144,6 +171,13 @@ export const make = Effect.gen(function* () {
             }
           }),
         );
+      });
+
+      yield* electronApp.on<[unknown, string]>("open-url", (event, url) => {
+        const electronEvent = event as { preventDefault?: () => void };
+        if (parseDesktopLaunchIntent(url) === null) return;
+        electronEvent.preventDefault?.();
+        relaunchForAttachIntent(url);
       });
     }).pipe(Effect.withSpan("desktop.clerk.configure")),
   });

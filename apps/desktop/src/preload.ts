@@ -52,6 +52,13 @@ contextBridge.exposeInMainWorld("desktopBridge", {
   },
   getLocalEnvironmentBearerToken: () =>
     ipcRenderer.invoke(IpcChannels.GET_LOCAL_ENVIRONMENT_BEARER_TOKEN_CHANNEL),
+  getPrimaryBackendState: () => ipcRenderer.invoke(IpcChannels.GET_PRIMARY_BACKEND_STATE_CHANNEL),
+  attachPrimaryBackend: (pairingUrl) =>
+    ipcRenderer.invoke(IpcChannels.ATTACH_PRIMARY_BACKEND_CHANNEL, pairingUrl),
+  refreshAttachedPrimaryCredential: (pairingCredential) =>
+    ipcRenderer.invoke(IpcChannels.REFRESH_ATTACHED_PRIMARY_CREDENTIAL_CHANNEL, pairingCredential),
+  useManagedPrimaryBackend: () =>
+    ipcRenderer.invoke(IpcChannels.USE_MANAGED_PRIMARY_BACKEND_CHANNEL),
   getClientSettings: () => ipcRenderer.invoke(IpcChannels.GET_CLIENT_SETTINGS_CHANNEL),
   setClientSettings: (settings) =>
     ipcRenderer.invoke(IpcChannels.SET_CLIENT_SETTINGS_CHANNEL, settings),

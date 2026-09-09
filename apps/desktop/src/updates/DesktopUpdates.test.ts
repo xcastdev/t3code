@@ -185,6 +185,7 @@ function makeHarness(options: UpdatesHarnessOptions = {}) {
           setWslBackendEnabled: () => Effect.die("unexpected WSL backend toggle"),
           setWslDistro: () => Effect.die("unexpected WSL distro change"),
           setWslOnly: () => Effect.die("unexpected WSL-only toggle"),
+          setPrimaryBackendPreference: () => Effect.die("unexpected primary backend update"),
           applyWslWindowsFallback: Effect.die("unexpected WSL Windows fallback"),
           applyWslWindowsFallbackInMemory: Effect.die("unexpected WSL Windows fallback"),
         } satisfies DesktopAppSettings.DesktopAppSettings["Service"])

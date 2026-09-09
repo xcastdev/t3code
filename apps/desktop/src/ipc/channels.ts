@@ -20,6 +20,11 @@ export const GET_SYSTEM_LOCALE_CHANNEL = "desktop:get-system-locale";
 export const GET_LOCAL_ENVIRONMENT_BOOTSTRAPS_CHANNEL = "desktop:get-local-environment-bootstraps";
 export const GET_LOCAL_ENVIRONMENT_BEARER_TOKEN_CHANNEL =
   "desktop:get-local-environment-bearer-token";
+export const GET_PRIMARY_BACKEND_STATE_CHANNEL = "desktop:get-primary-backend-state";
+export const ATTACH_PRIMARY_BACKEND_CHANNEL = "desktop:attach-primary-backend";
+export const REFRESH_ATTACHED_PRIMARY_CREDENTIAL_CHANNEL =
+  "desktop:refresh-attached-primary-credential";
+export const USE_MANAGED_PRIMARY_BACKEND_CHANNEL = "desktop:use-managed-primary-backend";
 export const GET_CLIENT_SETTINGS_CHANNEL = "desktop:get-client-settings";
 export const SET_CLIENT_SETTINGS_CHANNEL = "desktop:set-client-settings";
 export const GET_CONNECTION_CATALOG_CHANNEL = "desktop:get-connection-catalog";

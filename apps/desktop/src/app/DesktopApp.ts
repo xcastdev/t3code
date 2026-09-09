@@ -28,6 +28,8 @@ import * as DesktopShellEnvironment from "../shell/DesktopShellEnvironment.ts";
 import * as DesktopState from "./DesktopState.ts";
 import * as DesktopUpdates from "../updates/DesktopUpdates.ts";
 import * as DesktopWslBackend from "../wsl/DesktopWslBackend.ts";
+import * as DesktopAttachedBackend from "../backend/DesktopAttachedBackend.ts";
+import * as DesktopLaunchIntent from "./DesktopLaunchIntent.ts";
 
 const DEFAULT_DESKTOP_BACKEND_PORT = 3773;
 const MAX_TCP_PORT = 65_535;
@@ -139,6 +141,41 @@ const handleFatalStartupError = Effect.fn("desktop.startup.handleFatalStartupErr
 const fatalStartupCause = <E>(stage: string, cause: Cause.Cause<E>) =>
   handleFatalStartupError(stage, Cause.pretty(cause)).pipe(Effect.andThen(Effect.failCause(cause)));
 
+const awaitAttachedBackend = Effect.fn("desktop.startup.awaitAttachedBackend")(function* (input: {
+  readonly attachedBackend: DesktopAttachedBackend.DesktopAttachedBackend["Service"];
+  readonly dialog: ElectronDialog.ElectronDialog["Service"];
+  readonly lifecycle: DesktopLifecycle.DesktopLifecycle["Service"];
+  readonly shutdown: DesktopShutdown.DesktopShutdown["Service"];
+  readonly electronApp: ElectronApp.ElectronApp["Service"];
+  readonly state: DesktopState.DesktopState["Service"];
+}) {
+  while (true) {
+    const probe = yield* Effect.exit(input.attachedBackend.probe);
+    if (probe._tag === "Success") return true;
+
+    const error = Cause.squash(probe.cause);
+    const response = yield* input.dialog.showMessageBox({
+      type: "warning",
+      title: "Attached backend unavailable",
+      message: "T3 Code could not connect to the attached primary backend.",
+      detail: error instanceof Error ? error.message : String(error),
+      buttons: ["Retry", "Use desktop backend", "Quit"],
+      defaultId: 0,
+      cancelId: 2,
+    });
+    if (response.response === 0) continue;
+    if (response.response === 1) {
+      yield* input.attachedBackend.useManagedBackend;
+      yield* input.lifecycle.relaunch("attached-backend-recovery");
+      return false;
+    }
+    yield* Ref.set(input.state.quitting, true);
+    yield* input.shutdown.request;
+    yield* input.electronApp.quit;
+    return false;
+  }
+});
+
 const bootstrap = Effect.gen(function* () {
   const pool = yield* DesktopBackendPool.DesktopBackendPool;
   const primaryBackend = yield* pool.primary;
@@ -148,7 +185,62 @@ const bootstrap = Effect.gen(function* () {
   const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
   const wslBackend = yield* DesktopWslBackend.DesktopWslBackend;
   const desktopWindow = yield* DesktopWindow.DesktopWindow;
+  const attachedBackend = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+  const launchIntent = yield* DesktopLaunchIntent.DesktopLaunchIntent;
+  const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
+  const dialog = yield* ElectronDialog.ElectronDialog;
   yield* logBootstrapInfo("bootstrap start");
+
+  const pendingLaunchIntent = yield* launchIntent.consume;
+  if (Option.isSome(pendingLaunchIntent)) {
+    yield* attachedBackend.attach(pendingLaunchIntent.value);
+  }
+
+  const settings = yield* desktopSettings.get;
+  const primaryBackendState = yield* attachedBackend.getState;
+  if (primaryBackendState.mode === "invalid-attached") {
+    const canContinue = yield* awaitAttachedBackend({
+      attachedBackend,
+      dialog,
+      lifecycle,
+      shutdown: yield* DesktopShutdown.DesktopShutdown,
+      electronApp: yield* ElectronApp.ElectronApp,
+      state,
+    });
+    if (!canContinue) return;
+  } else if (primaryBackendState.mode === "attached") {
+    const canContinue = yield* awaitAttachedBackend({
+      attachedBackend,
+      dialog,
+      lifecycle,
+      shutdown: yield* DesktopShutdown.DesktopShutdown,
+      electronApp: yield* ElectronApp.ElectronApp,
+      state,
+    });
+    if (!canContinue) return;
+
+    const attachedState = yield* attachedBackend.getState;
+    if (attachedState.mode !== "attached") return;
+    const electronProtocol = yield* ElectronProtocol.ElectronProtocol;
+    yield* electronProtocol.registerDesktopProtocol({
+      scheme: ElectronProtocol.getDesktopScheme(environment.isDevelopment),
+      rendererSource:
+        environment.isDevelopment && Option.isSome(environment.devServerUrl)
+          ? { _tag: "Proxy", origin: environment.devServerUrl.value }
+          : { _tag: "Static", directory: environment.bundledClientDir },
+      backendOrigin: new URL(attachedState.httpBaseUrl),
+      clerkFrontendApiHostname: DesktopClerk.desktopClerkFrontendApiHostname,
+    });
+    yield* installDesktopIpcHandlers();
+    if (!(yield* Ref.get(state.quitting))) {
+      yield* desktopWindow.handleBackendReady(new URL(attachedState.httpBaseUrl));
+    }
+    yield* logBootstrapInfo("bootstrap attached to existing backend", {
+      baseUrl: attachedState.httpBaseUrl,
+      environmentId: attachedState.environmentId,
+    });
+    return;
+  }
 
   if (environment.isDevelopment && Option.isNone(environment.configuredBackendPort)) {
     return yield* new DesktopDevelopmentBackendPortRequiredError();
@@ -166,7 +258,6 @@ const bootstrap = Effect.gen(function* () {
     },
   );
 
-  const settings = yield* desktopSettings.get;
   if (settings.serverExposureMode !== environment.defaultDesktopSettings.serverExposureMode) {
     yield* logBootstrapInfo("bootstrap restoring persisted server exposure mode", {
       mode: settings.serverExposureMode,

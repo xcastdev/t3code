@@ -269,6 +269,35 @@ describe("resolveInitialServerAuthGateState", () => {
     expect(attempts).toBe(4);
   });
 
+  it("keeps an attached backend transport failure distinct from credential recovery", async () => {
+    const testWindow = installTestBrowser("t3code://app/");
+    testWindow.desktopBridge = {
+      getLocalEnvironmentBootstraps: () => [
+        {
+          id: "primary",
+          label: "Attached server",
+          httpBaseUrl: "http://127.0.0.1:3773",
+          wsBaseUrl: "ws://127.0.0.1:3773",
+          ownership: "attached",
+        },
+      ],
+    } as unknown as DesktopBridge;
+    __setPrimaryHttpRunnerForTests(async () => {
+      throw new TypeError("attached server is unreachable");
+    });
+
+    const { PrimaryEnvironmentRequestError, resolveInitialServerAuthGateState } =
+      await import("./environments/primary");
+
+    await expect(resolveInitialServerAuthGateState()).rejects.toMatchObject({
+      _tag: "PrimaryEnvironmentRequestError",
+      status: 500,
+    });
+    await expect(resolveInitialServerAuthGateState()).rejects.toBeInstanceOf(
+      PrimaryEnvironmentRequestError,
+    );
+  });
+
   it("takes a pairing token from the location hash and strips it immediately", async () => {
     const testWindow = installTestBrowser("http://localhost/#token=pairing-token");
     const { takePairingTokenFromUrl } = await import("./environments/primary");
