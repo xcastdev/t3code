@@ -517,6 +517,18 @@ export const OrchestrationThread = Schema.Struct({
   // Per-turn history. Optional so payloads from pre-provenance servers, and
   // snapshots cached before this change, still decode.
   turns: Schema.optional(Schema.Array(OrchestrationTurnSummary)),
+  /**
+   * Turns whose activity rows were cut by the retention window, so only part of
+   * their work is in `activities`. A client counting the rows it holds would
+   * undercount these, and reports nothing instead.
+   *
+   * Turn ids rather than a timestamp: the client drops, merges and reorders
+   * activity rows on the way to the screen, so no `createdAt` survives that
+   * trip intact, while a turn id rides along untouched. Optional so payloads
+   * from older servers, and snapshots cached before this field existed, decode
+   * unchanged — absent means nothing was cut.
+   */
+  partialTurnIds: Schema.optional(Schema.Array(TurnId)),
   session: Schema.NullOr(OrchestrationSession),
 });
 export type OrchestrationThread = typeof OrchestrationThread.Type;

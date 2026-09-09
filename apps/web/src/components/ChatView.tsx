@@ -2219,18 +2219,14 @@ function ChatViewContent(props: ChatViewProps) {
     [threadActivities],
   );
   const workLogEntries = useMemo(() => deriveWorkLogEntries(threadActivities), [threadActivities]);
-  // Turns that began before the oldest retained activity cannot be counted from
-  // activity rows without undercounting; the timeline uses this to decide when
-  // to trust the server's stamped counts instead.
-  const oldestRetainedActivityAt = useMemo(() => {
-    let oldest: string | null = null;
-    for (const activity of threadActivities) {
-      if (oldest === null || activity.createdAt < oldest) {
-        oldest = activity.createdAt;
-      }
-    }
-    return oldest;
-  }, [threadActivities]);
+  // Turns the server had to cut rows from: counting the rows that survived
+  // would undercount them, so the timeline reports nothing for these unless
+  // the turn carries stamped counts.
+  const partialTurnIds = useMemo(
+    () =>
+      activeThread?.partialTurnIds === undefined ? undefined : new Set(activeThread.partialTurnIds),
+    [activeThread?.partialTurnIds],
+  );
   // Native subagent fold: memoized by activity-list identity, shared by the
   // Agents surface, live strip, and workflow cards. v2Projection is null
   // until orchestration-v2 lands (source precedence lives in the derive).
@@ -6849,7 +6845,7 @@ function ChatViewContent(props: ChatViewProps) {
                 timelineEntries={timelineEntries}
                 latestTurn={activeLatestTurn}
                 turns={activeThread.turns ?? null}
-                oldestRetainedActivityAt={oldestRetainedActivityAt}
+                partialTurnIds={partialTurnIds}
                 runningTurnId={activeRunningTurnId}
                 turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
                 activeThreadEnvironmentId={activeThread.environmentId}

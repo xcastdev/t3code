@@ -248,7 +248,7 @@ interface MessagesTimelineProps {
    * Timestamp of the oldest activity row the thread still retains. Turns that
    * began before it cannot be counted client-side without undercounting.
    */
-  oldestRetainedActivityAt?: string | null;
+  partialTurnIds?: ReadonlySet<TurnId> | undefined;
   /** Turn folds to render expanded on mount. Test seam and deep links. */
   initialExpandedTurnIds?: ReadonlySet<TurnId>;
   /** Tool groups to render expanded on mount. Test seam and deep links. */
@@ -299,7 +299,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   timelineEntries,
   latestTurn,
   turns = null,
-  oldestRetainedActivityAt = null,
+  partialTurnIds,
   initialExpandedTurnIds,
   initialExpandedWorkGroupIds,
   runningTurnId,
@@ -460,7 +460,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         timelineEntries,
         latestTurn,
         turns,
-        oldestRetainedActivityAt,
+        partialTurnIds,
         runningTurnId,
         expandedTurnIds,
         expandedWorkGroupIds,
@@ -473,7 +473,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       timelineEntries,
       latestTurn,
       turns,
-      oldestRetainedActivityAt,
+      partialTurnIds,
       runningTurnId,
       expandedTurnIds,
       expandedWorkGroupIds,

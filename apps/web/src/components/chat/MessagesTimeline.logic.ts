@@ -608,7 +608,7 @@ function deriveTurnFolds(input: {
   latestTurn: TimelineLatestTurn | null;
   unsettledTurnId: TurnId | null;
   turns?: ReadonlyArray<TimelineTurnSummary> | undefined;
-  oldestRetainedActivityAt?: string | null | undefined;
+  partialTurnIds?: ReadonlySet<TurnId> | undefined;
   checkpointsByTurnId?: ReadonlyMap<TurnId, TurnDiffSummary> | undefined;
 }): ReadonlyMap<string, TurnFold> {
   const turnSummaryById = new Map<TurnId, TimelineTurnSummary>();
@@ -734,15 +734,10 @@ function deriveTurnFolds(input: {
 
     // Stamped counts win for a settled turn: they were computed when every
     // activity row still existed. Without a stamp the client may only derive
-    // counts when it can see the turn's whole history — activities are capped
-    // per thread, so a turn that began before the oldest retained row would
-    // otherwise render a count that silently undercounts the work.
+    // counts for a turn whose rows it holds in full — the server names the
+    // turns it cut, and counting the survivors of one would undercount it.
     const stampedCounts = turnSummary?.counts;
-    const turnStartedAt = turnSummary?.startedAt ?? group.startBoundary;
-    const activitiesMayHaveAgedOut =
-      input.oldestRetainedActivityAt != null &&
-      turnStartedAt != null &&
-      turnStartedAt < input.oldestRetainedActivityAt;
+    const activitiesMayHaveAgedOut = input.partialTurnIds?.has(turnId) === true;
 
     const derivedCounts = countTurnWork(collectTurnWorkActivities(group.entries));
     const counts: TurnWorkCounts | null =
@@ -797,7 +792,7 @@ export function deriveMessagesTimelineRows(input: {
    * Timestamp of the oldest activity row the thread still retains. Turns that
    * began before it cannot be counted client-side without undercounting.
    */
-  oldestRetainedActivityAt?: string | null;
+  partialTurnIds?: ReadonlySet<TurnId> | undefined;
   runningTurnId?: TurnId | null;
   expandedTurnIds?: ReadonlySet<TurnId>;
   expandedWorkGroupIds?: ReadonlySet<string>;
@@ -826,7 +821,7 @@ export function deriveMessagesTimelineRows(input: {
     latestTurn: input.latestTurn ?? null,
     unsettledTurnId,
     turns: input.turns ?? undefined,
-    oldestRetainedActivityAt: input.oldestRetainedActivityAt ?? null,
+    ...(input.partialTurnIds === undefined ? {} : { partialTurnIds: input.partialTurnIds }),
     checkpointsByTurnId,
   });
   const collapsedEntryIds = new Set<string>();

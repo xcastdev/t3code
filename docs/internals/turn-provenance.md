@@ -119,9 +119,18 @@ client-side from retained activities.
 stampedCounts ?? (activitiesMayHaveAgedOut ? null : derivedCounts)
 ```
 
-When a pre-stamp turn began before the oldest retained activity, counts are `null` and every segment
-drops, leaving the bare duration. `null` rather than zeroes is the point — zeroed counts would
-render a label with segments silently missing, which is precisely the partial count to avoid.
+`activitiesMayHaveAgedOut` asks whether the turn is in `thread.partialTurnIds`, the set the server
+sends naming turns whose activity rows the retention window cut. Counts are then `null` and every
+segment drops, leaving the bare duration. `null` rather than zeroes is the point — zeroed counts
+would render a label with segments silently missing, which is precisely the partial count to avoid.
+
+The server knows it cut rows by reading one past the window and discarding the extra: a bare `LIMIT`
+cannot tell a full page from a trimmed one. It names turns, not a timestamp, because the client
+drops, merges and reorders activity rows on the way to the screen — no `createdAt` survives that
+trip intact, while a turn id rides along untouched.
+
+With interleaved subagent fan-out, rows from more than one turn can straddle the cut. The server
+reports every turn with rows on both sides, so the set is exact for the window it describes.
 
 `+N/−M` sums the turn's checkpoint additions and deletions and is suppressed unless the checkpoint
 status is `ready`. The changed-file count survives suppression either way.

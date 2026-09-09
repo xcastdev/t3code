@@ -2307,6 +2307,47 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
     }),
   );
 
+  it.effect("reports no cut turns when the window is exactly full", () =>
+    Effect.gen(function* () {
+      // A bare LIMIT cannot tell a full window from a cut one. Reading one row
+      // past the window can: at exactly the limit the probe comes back empty,
+      // so nothing is reported and the client counts the rows it holds.
+      yield* seedFanOutThread();
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* sql`DELETE FROM projection_thread_activities`;
+      yield* sql`
+        WITH RECURSIVE activity_rows(sequence) AS (
+          SELECT 1
+          UNION ALL
+          SELECT sequence + 1 FROM activity_rows WHERE sequence < 500
+        )
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at
+        )
+        SELECT
+          printf('activity-%04d', sequence),
+          'thread-w',
+          'turn-5',
+          'tool',
+          'tool.completed',
+          'ran tool',
+          printf('{"sequence":%d}', sequence),
+          sequence,
+          '2026-03-01T00:04:00.000Z'
+        FROM activity_rows
+      `;
+
+      const detail = yield* snapshotQuery.getThreadDetailById(threadW);
+      assert.equal(detail._tag, "Some");
+      if (detail._tag === "Some") {
+        assert.equal(detail.value.activities.length, 500);
+        assert.equal(detail.value.partialTurnIds, undefined);
+      }
+    }),
+  );
+
   it.effect("bounds activity hydration and preserves unresolved requests", () =>
     Effect.gen(function* () {
       yield* seedFanOutThread();
@@ -2342,6 +2383,9 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
         assert.equal(fullDetail.value.activities.length, 500);
         assert.equal(fullDetail.value.activities[0]?.id, asEventId("activity-0002"));
         assert.equal(fullDetail.value.activities.at(-1)?.id, asEventId("activity-0501"));
+        // 501 rows existed, so the window cut one and the turn owning it is
+        // only partly loaded — the client must not count what survived.
+        assert.deepEqual([...(fullDetail.value.partialTurnIds ?? [])], ["turn-5"]);
       }
 
       const windowedDetail = yield* snapshotQuery.getThreadDetailSnapshot(threadW, {
@@ -2352,6 +2396,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
         assert.equal(windowedDetail.value.thread.activities.length, 500);
         assert.equal(windowedDetail.value.thread.activities[0]?.id, asEventId("activity-0002"));
         assert.equal(windowedDetail.value.thread.activities.at(-1)?.id, asEventId("activity-0501"));
+        assert.deepEqual([...(windowedDetail.value.thread.partialTurnIds ?? [])], ["turn-5"]);
       }
 
       yield* sql`

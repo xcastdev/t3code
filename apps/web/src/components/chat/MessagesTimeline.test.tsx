@@ -1416,7 +1416,7 @@ describe("MessagesTimeline", () => {
               },
             },
           ]}
-          oldestRetainedActivityAt="2026-03-17T19:12:21.000Z"
+          partialTurnIds={new Set([STAMPED_TURN_ID])}
           timelineEntries={buildAgedOutTurnEntries()}
         />,
       );
@@ -1427,7 +1427,7 @@ describe("MessagesTimeline", () => {
       expect(markup).toContain("2 Subagents");
     });
 
-    it("omits counts for an aged-out turn that carries no stamp", () => {
+    it("omits counts for a cut turn that carries no stamp", () => {
       const markup = renderToStaticMarkup(
         <MessagesTimeline
           {...buildProps()}
@@ -1448,7 +1448,7 @@ describe("MessagesTimeline", () => {
             },
           ]}
           // The turn began before the oldest row the thread still retains.
-          oldestRetainedActivityAt="2026-03-17T19:12:21.000Z"
+          partialTurnIds={new Set([STAMPED_TURN_ID])}
           timelineEntries={buildAgedOutTurnEntries()}
         />,
       );
@@ -1456,6 +1456,33 @@ describe("MessagesTimeline", () => {
       // Undercounting is worse than silence.
       expect(markup).toContain("Worked for 8.0s");
       expect(markup).not.toContain("Command");
+    });
+
+    it("counts an unstamped turn the server did not cut", () => {
+      const markup = renderToStaticMarkup(
+        <MessagesTimeline
+          {...buildProps()}
+          latestTurn={{
+            turnId: STAMPED_TURN_ID,
+            state: "completed",
+            startedAt: "2026-03-17T19:12:20.000Z",
+            completedAt: "2026-03-17T19:12:28.000Z",
+          }}
+          turns={[
+            {
+              turnId: STAMPED_TURN_ID,
+              state: "completed",
+              startedAt: "2026-03-17T19:12:20.000Z",
+              completedAt: "2026-03-17T19:12:28.000Z",
+            },
+          ]}
+          timelineEntries={buildAgedOutTurnEntries()}
+        />,
+      );
+
+      // The same rows, with no turn named as cut: derive and show them.
+      expect(markup).toContain("Worked for 8.0s");
+      expect(markup).toContain("1 Command");
     });
 
     it("styles a turn as interrupted from its own record, not the latest turn", () => {

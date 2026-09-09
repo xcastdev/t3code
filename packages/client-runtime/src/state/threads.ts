@@ -441,6 +441,17 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           ...older.checkpoints.filter((row) => !seenCheckpoints.has(row.turnId)),
           ...loaded.checkpoints,
         ],
+        // Each page is capped on its own, so both windows can leave a turn
+        // partially loaded. Union rather than replace: the older page's cut is
+        // still a cut once its rows sit below the loaded ones. A turn the
+        // older page completes stays listed, which only costs a hidden count.
+        ...(older.partialTurnIds === undefined && loaded.partialTurnIds === undefined
+          ? {}
+          : {
+              partialTurnIds: [
+                ...new Set([...(older.partialTurnIds ?? []), ...(loaded.partialTurnIds ?? [])]),
+              ],
+            }),
       };
       return {
         ...value,

@@ -75,6 +75,10 @@ const decodeThread = Schema.decodeUnknownEffect(OrchestrationThread);
 // activity window. Applying the limit in SQL avoids decoding an unbounded
 // payload_json set before the projector can enforce that invariant.
 const THREAD_DETAIL_ACTIVITY_LIMIT = 500;
+// One row past the window. A bare LIMIT cannot say whether a full page means
+// "exactly this many rows exist" or "more were cut"; reading one extra row and
+// discarding it turns that ambiguity into a fact.
+const THREAD_DETAIL_ACTIVITY_PROBE_LIMIT = THREAD_DETAIL_ACTIVITY_LIMIT + 1;
 // Same window as activities, for the same reason: bound the decode cost of a
 // long-lived thread. Turns are far cheaper than activities, so this is generous.
 const THREAD_TURN_LIMIT = 500;
@@ -1155,7 +1159,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             sequence DESC,
             created_at DESC,
             activity_id DESC
-          LIMIT ${THREAD_DETAIL_ACTIVITY_LIMIT}
+          LIMIT ${THREAD_DETAIL_ACTIVITY_PROBE_LIMIT}
         ) AS recent_activities
         ORDER BY
           sequence ASC,
@@ -1552,7 +1556,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             sequence DESC,
             created_at DESC,
             activity_id DESC
-          LIMIT ${THREAD_DETAIL_ACTIVITY_LIMIT}
+          LIMIT ${THREAD_DETAIL_ACTIVITY_PROBE_LIMIT}
         ) AS recent_activities
         ORDER BY
           sequence ASC,
@@ -2780,9 +2784,30 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         return Option.none<OrchestrationThread>();
       }
 
+      // The query reads one row past the window, so an over-full result is
+      // proof that older rows were cut. Drop the probe row and keep the turns
+      // that straddle the cut: they are the only ones the client holds
+      // partially, and so the only ones whose rows it must not count. Turns
+      // entirely beyond the cut retain nothing and never render a fold.
+      const activityWindowTruncated = activityRows.length > THREAD_DETAIL_ACTIVITY_LIMIT;
+      const retainedActivityRows = activityWindowTruncated
+        ? activityRows.slice(activityRows.length - THREAD_DETAIL_ACTIVITY_LIMIT)
+        : activityRows;
+      const partialTurnIds = activityWindowTruncated
+        ? [
+            ...new Set(
+              activityRows
+                .slice(0, activityRows.length - THREAD_DETAIL_ACTIVITY_LIMIT)
+                .flatMap((row) => (row.turnId === null ? [] : [row.turnId])),
+            ),
+          ].filter((turnId) => retainedActivityRows.some((row) => row.turnId === turnId))
+        : [];
+
       const selectedActivityRows = [
         ...new Map(
-          [...activityRows, ...pinnedActivityRows].map((row) => [row.activityId, row] as const),
+          [...retainedActivityRows, ...pinnedActivityRows].map(
+            (row) => [row.activityId, row] as const,
+          ),
         ).values(),
       ].toSorted(
         (left, right) =>
@@ -2857,6 +2882,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           completedAt: row.completedAt,
         })),
         turns: turnRows.map(mapTurnSummary),
+        // Omitted when nothing was cut, so the field reads as "no turn is
+        // partial" rather than as an empty answer to a question never asked.
+        ...(partialTurnIds.length === 0 ? {} : { partialTurnIds }),
         session: Option.isSome(sessionRow) ? mapSessionRow(sessionRow.value) : null,
       };
 

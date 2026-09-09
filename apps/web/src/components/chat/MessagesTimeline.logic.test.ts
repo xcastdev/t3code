@@ -1865,7 +1865,7 @@ describe("deriveTurnFolds work summaries", () => {
     expect(foldRowOf(rows, "turn-1")?.label).toBe("Worked for 10s · 9 Commands · 4 Tool Calls");
   });
 
-  it("falls back to the bare duration when an unstamped turn predates retained activity", () => {
+  it("falls back to the bare duration when the server cut the turn's rows", () => {
     const rows = deriveMessagesTimelineRows({
       timelineEntries: [
         userEntry("2026-01-01T00:00:00Z"),
@@ -1876,7 +1876,7 @@ describe("deriveTurnFolds work summaries", () => {
         workEntry("w2", "turn-2", "2026-01-01T00:06:02Z", "command_execution", "c2"),
         assistantEntry("a2", "turn-2", "2026-01-01T00:06:10Z", "2026-01-01T00:06:10Z"),
       ],
-      oldestRetainedActivityAt: "2026-01-01T00:05:00Z",
+      partialTurnIds: new Set(["turn-1"]) as never,
       latestTurn: {
         turnId: "turn-2" as never,
         state: "completed",
@@ -1899,9 +1899,46 @@ describe("deriveTurnFolds work summaries", () => {
       revertTurnCountByUserMessageId: new Map(),
     });
 
-    // No stamp and the turn started before the oldest retained row: never a
-    // partial count.
+    // No stamp and the server named this turn as cut: never a partial count.
     expect(foldRowOf(rows, "turn-1")?.label).toBe("Worked for 5m 10s");
+  });
+
+  it("counts an unstamped turn the server did not cut", () => {
+    // Same fixture, minus the truncation signal. A dropped tool.started and a
+    // collapsed updated/completed pair are present on purpose: a guard keyed on
+    // a row timestamp would lose them and wrongly fall back to a bare duration.
+    const rows = deriveMessagesTimelineRows({
+      timelineEntries: [
+        userEntry("2026-01-01T00:00:00Z"),
+        workEntry("w1", "turn-1", "2026-01-01T00:05:00Z", "command_execution", "c1"),
+        assistantEntry("a1", "turn-1", "2026-01-01T00:05:10Z", "2026-01-01T00:05:10Z"),
+        userEntry("2026-01-01T00:06:00Z", "user-2"),
+        workEntry("w2", "turn-2", "2026-01-01T00:06:02Z", "command_execution", "c2"),
+        assistantEntry("a2", "turn-2", "2026-01-01T00:06:10Z", "2026-01-01T00:06:10Z"),
+      ],
+      latestTurn: {
+        turnId: "turn-2" as never,
+        state: "completed",
+        startedAt: "2026-01-01T00:06:00Z",
+        completedAt: "2026-01-01T00:06:10Z",
+      },
+      turns: [
+        {
+          turnId: "turn-1" as never,
+          state: "completed",
+          requestedAt: "2026-01-01T00:00:00Z",
+          startedAt: "2026-01-01T00:00:00Z",
+          completedAt: "2026-01-01T00:05:10Z",
+          assistantMessageId: "a1" as never,
+        },
+      ] as never,
+      isWorking: false,
+      activeTurnStartedAt: null,
+      turnDiffSummaryByAssistantMessageId: new Map(),
+      revertTurnCountByUserMessageId: new Map(),
+    });
+
+    expect(foldRowOf(rows, "turn-1")?.label).toBe("Worked for 5m 10s · 1 Command");
   });
 
   it("suppresses the diff but keeps the changed-file count when the checkpoint is not ready", () => {
