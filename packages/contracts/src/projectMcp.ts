@@ -402,6 +402,8 @@ export interface ResolvedProjectMcpServer {
   readonly id: McpServerId;
   readonly name: string;
   readonly transport: ProjectMcpTransport;
+  /** The catalog definition that supplied this transport, when one exists. */
+  readonly transportDefinitionId?: string;
 }
 
 const ManagedProjectMcpUrl = Schema.String.check(

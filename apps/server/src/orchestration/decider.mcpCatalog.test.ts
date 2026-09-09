@@ -1,5 +1,7 @@
 import {
   CommandId,
+  McpCatalogNameConflictError,
+  McpCatalogProviderLimitExceededError,
   McpCatalogOperationError,
   McpCatalogOverrideId,
   McpDefinitionId,
@@ -88,6 +90,64 @@ const expectCatalogError = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   });
 
 it.layer(NodeServices.layer)("MCP catalog decider invariants", (it) => {
+  it.effect("rejects persistent mutations that create invalid effective catalogs", () =>
+    Effect.gen(function* () {
+      const duplicateDefinition: McpCatalogDefinition = {
+        ...globalDefinition,
+        definitionId: McpDefinitionId.make("duplicate-definition"),
+        logicalServerId: McpServerId.make("duplicate-server"),
+        scope: "project",
+        scopeId: projectId,
+        revision: 1,
+      };
+      const duplicateFailure = yield* Effect.flip(
+        decide(
+          {
+            type: "project.mcp-definition.create",
+            commandId: CommandId.make("invalid-duplicate"),
+            projectId,
+            definition: duplicateDefinition,
+            expectedRevision: 0,
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+          makeReadModel(),
+        ),
+      );
+      expect(duplicateFailure.cause).toBeInstanceOf(McpCatalogNameConflictError);
+
+      const tooMany = Array.from({ length: 50 }, (_, index) => ({
+        ...globalDefinition,
+        definitionId: McpDefinitionId.make(`limit-definition-${index}`),
+        logicalServerId: McpServerId.make(`limit-server-${index}`),
+        scope: "project" as const,
+        scopeId: projectId,
+        name: `Limit ${index}`,
+        revision: 1,
+      }));
+      const limitFailure = yield* Effect.flip(
+        decide(
+          {
+            type: "project.mcp-definition.create",
+            commandId: CommandId.make("invalid-limit"),
+            projectId,
+            definition: {
+              ...duplicateDefinition,
+              definitionId: McpDefinitionId.make("limit-definition-50"),
+              logicalServerId: McpServerId.make("limit-server-50"),
+              name: "Limit 50",
+            },
+            expectedRevision: 0,
+            createdAt: "2026-01-01T00:00:00.000Z",
+          },
+          makeReadModel({
+            projectDefinitions: tooMany.map((definition) => ({ projectId, definition })),
+          }),
+        ),
+      );
+      expect(limitFailure.cause).toBeInstanceOf(McpCatalogProviderLimitExceededError);
+    }),
+  );
+
   it.effect("rejects missing definition and override removals without emitting events", () =>
     Effect.gen(function* () {
       const globalError = yield* expectCatalogError(

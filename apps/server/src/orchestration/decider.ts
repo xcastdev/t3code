@@ -32,6 +32,7 @@ import {
   requireThreadNotArchived,
 } from "./commandInvariants.ts";
 import { projectEvent } from "./projector.ts";
+import { catalogBaselineForProject, validateEffectiveCatalog } from "../mcp/McpCatalogResolver.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 
@@ -138,6 +139,71 @@ const validateCatalogDefinitions = (
     }
   }
   return Effect.void;
+};
+
+const validateEffectiveCatalogInvariant = (
+  commandType: string,
+  definitions: ReadonlyArray<McpCatalogDefinition>,
+  providerInstanceIds?: ReadonlyArray<McpCatalogDefinition["providerInstanceIds"][number]>,
+) =>
+  Effect.try({
+    try: () =>
+      providerInstanceIds === undefined
+        ? validateEffectiveCatalog({ definitions })
+        : validateEffectiveCatalog({ definitions, providerInstanceIds }),
+    catch: (cause) =>
+      new OrchestrationCommandInvariantError({
+        commandType,
+        detail: cause instanceof Error ? cause.message : "Invalid MCP catalog topology.",
+        cause,
+      }),
+  });
+
+const validatePersistentCatalogInvariant = (
+  readModel: OrchestrationReadModel,
+  commandType: string,
+  input: {
+    readonly globalDefinitions: ReadonlyArray<McpCatalogDefinition>;
+    readonly projectDefinitions: ReadonlyArray<{
+      readonly projectId: OrchestrationReadModel["projects"][number]["id"];
+      readonly definition: McpCatalogDefinition;
+    }>;
+    readonly projectOverrides: ReadonlyArray<{
+      readonly projectId: OrchestrationReadModel["projects"][number]["id"];
+      readonly override: NonNullable<
+        OrchestrationReadModel["mcpCatalog"]
+      >["projectOverrides"][number]["override"];
+    }>;
+    readonly projectId?: OrchestrationReadModel["projects"][number]["id"];
+  },
+) => {
+  const projectIds = new Set<string>();
+  if (input.projectId !== undefined) projectIds.add(String(input.projectId));
+  else {
+    for (const project of readModel.projects) {
+      if (project.deletedAt === null) projectIds.add(String(project.id));
+    }
+    for (const entry of input.projectDefinitions) projectIds.add(String(entry.projectId));
+    for (const entry of input.projectOverrides) projectIds.add(String(entry.projectId));
+  }
+
+  if (projectIds.size === 0) {
+    return validateEffectiveCatalogInvariant(commandType, input.globalDefinitions);
+  }
+  return Effect.forEach(
+    projectIds,
+    (projectId) =>
+      validateEffectiveCatalogInvariant(
+        commandType,
+        catalogBaselineForProject({
+          globalDefinitions: input.globalDefinitions,
+          projectDefinitions: input.projectDefinitions.map((entry) => entry.definition),
+          projectOverrides: input.projectOverrides.map((entry) => entry.override),
+          projectId,
+        }),
+      ),
+    { discard: true },
+  );
 };
 
 const catalogRevisionInvariantError = (
@@ -447,6 +513,19 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           actualRevision,
         );
       }
+      const globalDefinitions =
+        command.type === "environment.mcp-definition.create"
+          ? [...(readModel.mcpCatalog?.globalDefinitions ?? []), command.definition]
+          : (readModel.mcpCatalog?.globalDefinitions ?? []).map((definition) =>
+              definition.logicalServerId === command.definition.logicalServerId
+                ? command.definition
+                : definition,
+            );
+      yield* validatePersistentCatalogInvariant(readModel, command.type, {
+        globalDefinitions,
+        projectDefinitions: readModel.mcpCatalog?.projectDefinitions ?? [],
+        projectOverrides: readModel.mcpCatalog?.projectOverrides ?? [],
+      });
       return {
         ...(yield* withEventBase({
           aggregateKind: "environment",
@@ -489,6 +568,13 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           "Global MCP definition was not found.",
         );
       }
+      yield* validatePersistentCatalogInvariant(readModel, command.type, {
+        globalDefinitions: (readModel.mcpCatalog?.globalDefinitions ?? []).filter(
+          (definition) => definition.logicalServerId !== command.logicalServerId,
+        ),
+        projectDefinitions: readModel.mcpCatalog?.projectDefinitions ?? [],
+        projectOverrides: readModel.mcpCatalog?.projectOverrides ?? [],
+      });
       return {
         ...(yield* withEventBase({
           aggregateKind: "environment",
@@ -531,6 +617,25 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           actualRevision,
         );
       }
+      const projectDefinitions = readModel.mcpCatalog?.projectDefinitions ?? [];
+      const nextDefinition =
+        command.type === "project.mcp-definition.create"
+          ? [
+              ...projectDefinitions,
+              { projectId: command.projectId, definition: command.definition },
+            ]
+          : projectDefinitions.map((entry) =>
+              entry.projectId === command.projectId &&
+              entry.definition.logicalServerId === command.definition.logicalServerId
+                ? { projectId: command.projectId, definition: command.definition }
+                : entry,
+            );
+      yield* validatePersistentCatalogInvariant(readModel, command.type, {
+        globalDefinitions: readModel.mcpCatalog?.globalDefinitions ?? [],
+        projectDefinitions: nextDefinition,
+        projectOverrides: readModel.mcpCatalog?.projectOverrides ?? [],
+        projectId: command.projectId,
+      });
       return {
         ...(yield* withEventBase({
           aggregateKind: "project",
@@ -579,6 +684,18 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           "Project MCP definition was not found.",
         );
       }
+      yield* validatePersistentCatalogInvariant(readModel, command.type, {
+        globalDefinitions: readModel.mcpCatalog?.globalDefinitions ?? [],
+        projectDefinitions: (readModel.mcpCatalog?.projectDefinitions ?? []).filter(
+          (entry) =>
+            !(
+              entry.projectId === command.projectId &&
+              entry.definition.logicalServerId === command.logicalServerId
+            ),
+        ),
+        projectOverrides: readModel.mcpCatalog?.projectOverrides ?? [],
+        projectId: command.projectId,
+      });
       return {
         ...(yield* withEventBase({
           aggregateKind: "project",
@@ -642,6 +759,18 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           actualRevision,
         );
       }
+      yield* validatePersistentCatalogInvariant(readModel, command.type, {
+        globalDefinitions: readModel.mcpCatalog?.globalDefinitions ?? [],
+        projectDefinitions: readModel.mcpCatalog?.projectDefinitions ?? [],
+        projectOverrides: [
+          ...(readModel.mcpCatalog?.projectOverrides ?? []).filter(
+            (entry) =>
+              !(entry.projectId === command.projectId && entry.override.id === command.override.id),
+          ),
+          { projectId: command.projectId, override: command.override },
+        ],
+        projectId: command.projectId,
+      });
       return {
         ...(yield* withEventBase({
           aggregateKind: "project",
@@ -685,6 +814,15 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           "MCP project override was not found.",
         );
       }
+      yield* validatePersistentCatalogInvariant(readModel, command.type, {
+        globalDefinitions: readModel.mcpCatalog?.globalDefinitions ?? [],
+        projectDefinitions: readModel.mcpCatalog?.projectDefinitions ?? [],
+        projectOverrides: (readModel.mcpCatalog?.projectOverrides ?? []).filter(
+          (entry) =>
+            !(entry.projectId === command.projectId && entry.override.id === command.overrideId),
+        ),
+        projectId: command.projectId,
+      });
       return {
         ...(yield* withEventBase({
           aggregateKind: "project",
@@ -731,6 +869,12 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         String(command.snapshot.catalogSessionId),
         command.snapshot.baseline,
       );
+      yield* validateEffectiveCatalogInvariant(command.type, command.snapshot.baseline, [
+        command.snapshot.providerInstanceId,
+      ]);
+      yield* validateEffectiveCatalogInvariant(command.type, command.snapshot.desired, [
+        command.snapshot.providerInstanceId,
+      ]);
       if (
         command.snapshot.desiredRevision === 0 &&
         !catalogDefinitionsEqual(command.snapshot.baseline, command.snapshot.desired)
@@ -905,6 +1049,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           cause,
         });
       }
+      yield* validateEffectiveCatalogInvariant(command.type, requestedCatalog, [
+        snapshot.providerInstanceId,
+      ]);
       const actualRevision = snapshot.desiredRevision;
       if (command.expectedRevision !== actualRevision) {
         return yield* catalogRevisionInvariantError(

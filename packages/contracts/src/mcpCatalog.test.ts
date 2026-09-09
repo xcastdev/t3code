@@ -3,6 +3,8 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   McpCatalogDefinition,
+  McpCatalogOAuthBeginInput,
+  McpCatalogProjectState,
   McpCatalogOverride,
   McpCatalogOverrideDraft,
   McpCatalogSnapshot,
@@ -34,6 +36,38 @@ const base = {
 };
 
 describe("MCP catalog contracts", () => {
+  it("accepts editable raw project state with both scope revisions", () => {
+    const state = {
+      globalDefinitions: [],
+      projectDefinitions: [],
+      projectOverrides: [],
+      globalRevision: 2,
+      projectRevision: 4,
+    } satisfies McpCatalogProjectState;
+
+    expect(state.globalRevision).toBe(2);
+    expect(state.projectRevision).toBe(4);
+  });
+  it("requires a complete session identity for scoped OAuth targets", () => {
+    const decodeTarget = Schema.decodeUnknownSync(McpCatalogOAuthBeginInput);
+    expect(
+      decodeTarget({
+        projectId: "project-1",
+        logicalServerId: "server-1",
+        transportDefinitionId: "definition-1",
+        threadId: "thread-1",
+        mcpCatalogSessionId: "session-1",
+      }),
+    ).toMatchObject({ threadId: "thread-1", mcpCatalogSessionId: "session-1" });
+    expect(() =>
+      decodeTarget({
+        projectId: "project-1",
+        logicalServerId: "server-1",
+        transportDefinitionId: "definition-1",
+        threadId: "thread-1",
+      }),
+    ).toThrow();
+  });
   it("decodes a complete definition and metadata-only override", () => {
     expect(decodeDefinition(base)).toMatchObject(base);
     expect(

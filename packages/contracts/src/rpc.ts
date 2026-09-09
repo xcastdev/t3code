@@ -137,6 +137,7 @@ import {
   ProjectMcpOAuthBeginInput,
   ProjectMcpOAuthBeginResult,
   ProjectMcpOAuthDisconnectInput,
+  ProjectMcpOAuthActionError,
   ProjectMcpRemoveError,
   ProjectMcpRemoveInput,
   ProjectMcpServer,
@@ -233,6 +234,10 @@ import {
   McpCatalogDeleteOverrideInput,
   McpCatalogListInput,
   McpCatalogMutationError,
+  McpCatalogOAuthBeginInput,
+  McpCatalogOAuthContinueInput,
+  McpCatalogOAuthDisconnectInput,
+  McpCatalogProjectState,
   McpCatalogOverrideInput,
   McpCatalogRemoveInput,
   McpCatalogSessionMutationInput,
@@ -267,6 +272,7 @@ export const WS_METHODS = {
   mcpCatalogGlobalUpdate: "mcpCatalog.global.update",
   mcpCatalogGlobalRemove: "mcpCatalog.global.remove",
   mcpCatalogProjectList: "mcpCatalog.project.list",
+  mcpCatalogProjectStateList: "mcpCatalog.project.state.list",
   mcpCatalogProjectCreate: "mcpCatalog.project.create",
   mcpCatalogProjectUpdate: "mcpCatalog.project.update",
   mcpCatalogProjectRemove: "mcpCatalog.project.remove",
@@ -278,6 +284,9 @@ export const WS_METHODS = {
   mcpCatalogSessionRemove: "mcpCatalog.session.remove",
   mcpCatalogSessionReset: "mcpCatalog.session.reset",
   mcpCatalogSubscribe: "mcpCatalog.subscribe",
+  mcpCatalogOAuthBegin: "mcpCatalog.oauth.begin",
+  mcpCatalogOAuthContinue: "mcpCatalog.oauth.continue",
+  mcpCatalogOAuthDisconnect: "mcpCatalog.oauth.disconnect",
 
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
@@ -826,6 +835,12 @@ export const WsMcpCatalogProjectListRpc = Rpc.make(WS_METHODS.mcpCatalogProjectL
   error: mcpCatalogMutationError,
 });
 
+export const WsMcpCatalogProjectStateListRpc = Rpc.make(WS_METHODS.mcpCatalogProjectStateList, {
+  payload: McpCatalogListInput,
+  success: McpCatalogProjectState,
+  error: mcpCatalogMutationError,
+});
+
 export const WsMcpCatalogProjectCreateRpc = Rpc.make(WS_METHODS.mcpCatalogProjectCreate, {
   payload: McpCatalogCreateInput,
   success: McpCatalogDefinition,
@@ -903,6 +918,24 @@ export const WsMcpCatalogSubscribeRpc = Rpc.make(WS_METHODS.mcpCatalogSubscribe,
   success: McpCatalogChanged,
   error: EnvironmentAuthorizationError,
   stream: true,
+});
+
+export const WsMcpCatalogOAuthBeginRpc = Rpc.make(WS_METHODS.mcpCatalogOAuthBegin, {
+  payload: McpCatalogOAuthBeginInput,
+  success: ProjectMcpOAuthBeginResult,
+  error: Schema.Union([ProjectMcpOAuthActionError, EnvironmentAuthorizationError]),
+});
+
+export const WsMcpCatalogOAuthContinueRpc = Rpc.make(WS_METHODS.mcpCatalogOAuthContinue, {
+  payload: McpCatalogOAuthContinueInput,
+  success: ProjectMcpOAuthBeginResult,
+  error: Schema.Union([ProjectMcpOAuthActionError, EnvironmentAuthorizationError]),
+});
+
+export const WsMcpCatalogOAuthDisconnectRpc = Rpc.make(WS_METHODS.mcpCatalogOAuthDisconnect, {
+  payload: McpCatalogOAuthDisconnectInput,
+  success: Schema.Void,
+  error: Schema.Union([ProjectMcpOAuthActionError, EnvironmentAuthorizationError]),
 });
 
 export const WsShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
@@ -1328,6 +1361,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsMcpCatalogGlobalUpdateRpc,
   WsMcpCatalogGlobalRemoveRpc,
   WsMcpCatalogProjectListRpc,
+  WsMcpCatalogProjectStateListRpc,
   WsMcpCatalogProjectCreateRpc,
   WsMcpCatalogProjectUpdateRpc,
   WsMcpCatalogProjectRemoveRpc,
@@ -1339,6 +1373,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsMcpCatalogSessionRemoveRpc,
   WsMcpCatalogSessionResetRpc,
   WsMcpCatalogSubscribeRpc,
+  WsMcpCatalogOAuthBeginRpc,
+  WsMcpCatalogOAuthContinueRpc,
+  WsMcpCatalogOAuthDisconnectRpc,
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAssetsCreateUrlRpc,

@@ -682,7 +682,9 @@ const makeProjectMcpService = Effect.gen(function* () {
       (server) => {
         const oauthStateLease =
           server.transport.type !== "stdio" && server.transport.authorization.type === "oauth"
-            ? mcpSecrets.acquireOAuthStateLease(server.id)
+            ? mcpSecrets.acquireOAuthStateLease(
+                ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId),
+              )
             : Effect.succeed(undefined);
         return Effect.flatMap(oauthStateLease, (stateLease) =>
           Effect.flatMap(
@@ -714,7 +716,12 @@ const makeProjectMcpService = Effect.gen(function* () {
         >();
         for (const { credentials, oauthStateLease, server } of leased) {
           for (const [credentialId, value] of credentials) secretValues.set(credentialId, value);
-          if (oauthStateLease !== undefined) oauthStateLeases.set(server.id, oauthStateLease);
+          if (oauthStateLease !== undefined) {
+            oauthStateLeases.set(
+              ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId),
+              oauthStateLease,
+            );
+          }
         }
         return {
           servers: leased.map(({ server }) => server),

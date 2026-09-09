@@ -71,7 +71,14 @@ behaviors must be appended here when those cases are run.
 ## Compatibility
 
 The old `projectMcp.*` RPCs continue to expose only project-local definitions.
-New clients gate global, project-override, and session RPCs independently on
-the environment capability flags `globalMcpCatalog`, `projectMcpOverrides`, and
-`sessionMcpCatalog`. Catalog subscriptions are opt-in and carry only scope id
-and revision notices.
+The versioned `mcpCatalog.project.state.list` RPC exposes raw project state,
+including disabled definitions, overrides, and source-removed tombstones, with
+global and project revisions. New clients gate global, project-override, and
+session RPCs independently on the environment capability flags
+`globalMcpCatalog`, `projectMcpOverrides`, and `sessionMcpCatalog`.
+
+The scoped catalog editor is not yet exposed in the web or desktop clients;
+desktop shares the web surface. Mobile can consume configured catalogs and view
+thread state but does not edit catalogs. The legacy project panel remains the
+only client editor during this compatibility window. Catalog subscriptions are
+opt-in and carry only scope id and revision notices.

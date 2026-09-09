@@ -36,6 +36,22 @@ export interface ResolveSessionCatalogInput {
   readonly providerCapability: ProviderSessionMcpCatalogMode;
 }
 
+export type CatalogValidationDefinition = Pick<
+  McpCatalogDefinition,
+  "logicalServerId" | "scope" | "scopeId" | "name" | "enabled" | "providerInstanceIds"
+>;
+
+export type CatalogValidationOverride = Pick<
+  McpCatalogOverride,
+  "targetId" | "enabled" | "name" | "providerInstanceIds"
+>;
+
+export interface ValidateEffectiveCatalogInput {
+  readonly definitions: ReadonlyArray<CatalogValidationDefinition>;
+  /** Omit to validate every provider assigned to an enabled definition. */
+  readonly providerInstanceIds?: ReadonlyArray<ProviderInstanceId>;
+}
+
 const foldName = (name: string): string => name.toLocaleLowerCase();
 
 const applyOverride = (
@@ -68,20 +84,41 @@ const applyOverrides = (
   });
 };
 
-const selectForProvider = (
-  definitions: ReadonlyArray<McpCatalogDefinition>,
+const applyValidationOverrides = (
+  definitions: ReadonlyArray<CatalogValidationDefinition>,
+  overrides: ReadonlyArray<CatalogValidationOverride>,
+): ReadonlyArray<CatalogValidationDefinition> => {
+  const latest = new Map<string, CatalogValidationOverride>();
+  for (const override of overrides) latest.set(String(override.targetId), override);
+  return definitions.map((definition) => {
+    const override = latest.get(String(definition.logicalServerId));
+    return override === undefined
+      ? definition
+      : {
+          ...definition,
+          ...(override.enabled === undefined ? {} : { enabled: override.enabled }),
+          ...(override.name === undefined ? {} : { name: override.name }),
+          ...(override.providerInstanceIds === undefined
+            ? {}
+            : { providerInstanceIds: override.providerInstanceIds }),
+        };
+  });
+};
+
+const selectForProvider = <A extends CatalogValidationDefinition>(
+  definitions: ReadonlyArray<A>,
   providerInstanceId: ProviderInstanceId,
-): ReadonlyArray<McpCatalogDefinition> =>
+): ReadonlyArray<A> =>
   definitions.filter(
     (definition) =>
       definition.enabled && definition.providerInstanceIds.includes(providerInstanceId),
   );
 
 const conflictsFor = (
-  definitions: ReadonlyArray<McpCatalogDefinition>,
+  definitions: ReadonlyArray<CatalogValidationDefinition>,
   providerInstanceId: ProviderInstanceId,
-): ReadonlyArray<McpCatalogDefinition> => {
-  const byName = new Map<string, McpCatalogDefinition[]>();
+): ReadonlyArray<CatalogValidationDefinition> => {
+  const byName = new Map<string, CatalogValidationDefinition[]>();
   for (const definition of selectForProvider(definitions, providerInstanceId)) {
     const key = foldName(definition.name);
     const values = byName.get(key) ?? [];
@@ -89,6 +126,34 @@ const conflictsFor = (
     byName.set(key, values);
   }
   return [...byName.values()].filter((values) => values.length > 1).flat();
+};
+
+/** Validate the provider-facing topology without reading credentials or runtime state. */
+export const validateEffectiveCatalog = (input: ValidateEffectiveCatalogInput): void => {
+  const providerInstanceIds = input.providerInstanceIds ?? [
+    ...new Set(input.definitions.flatMap((definition) => definition.providerInstanceIds)),
+  ];
+  for (const providerInstanceId of providerInstanceIds) {
+    const conflicts = conflictsFor(input.definitions, providerInstanceId);
+    if (conflicts.length > 0) {
+      throw new McpCatalogNameConflictError({
+        conflicts: conflicts.map((definition) => ({
+          logicalServerId: definition.logicalServerId,
+          name: definition.name,
+          scope: definition.scope,
+          scopeId: definition.scopeId,
+          providerInstanceIds: definition.providerInstanceIds,
+        })),
+      });
+    }
+    const enabledCount = selectForProvider(input.definitions, providerInstanceId).length;
+    if (enabledCount > 50) {
+      throw new McpCatalogProviderLimitExceededError({
+        providerInstanceId,
+        limit: 50,
+      });
+    }
+  }
 };
 
 const toEntries = (
@@ -112,26 +177,9 @@ const resolve = (
 ): ReadonlyArray<ResolvedMcpCatalogEntry> => {
   if (providerCapability === "unsupported") return [];
 
-  const conflicts = conflictsFor(definitions, providerInstanceId);
-  if (conflicts.length > 0) {
-    throw new McpCatalogNameConflictError({
-      conflicts: conflicts.map((definition) => ({
-        logicalServerId: definition.logicalServerId,
-        name: definition.name,
-        scope: definition.scope,
-        scopeId: definition.scopeId,
-        providerInstanceIds: definition.providerInstanceIds,
-      })),
-    });
-  }
+  validateEffectiveCatalog({ definitions, providerInstanceIds: [providerInstanceId] });
 
   const entries = toEntries(definitions, providerInstanceId);
-  if (entries.length > 50) {
-    throw new McpCatalogProviderLimitExceededError({
-      providerInstanceId,
-      limit: 50,
-    });
-  }
   return entries;
 };
 
@@ -153,6 +201,10 @@ export const catalogBaselineForProject = (input: CatalogBaselineInput) => [
     (definition) => definition.scope === "project" && definition.scopeId === input.projectId,
   ),
 ];
+
+export const effectiveCatalogForProject = catalogBaselineForProject;
+
+export const applyMcpCatalogValidationOverrides = applyValidationOverrides;
 
 /** Resolve global defaults, project overrides, and project-local definitions. */
 export const resolveProjectCatalog = (

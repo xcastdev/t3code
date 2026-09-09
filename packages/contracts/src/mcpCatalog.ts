@@ -129,6 +129,16 @@ export const ResolvedMcpCatalogEntry = Schema.Struct({
 });
 export type ResolvedMcpCatalogEntry = typeof ResolvedMcpCatalogEntry.Type;
 
+/** Raw state used by editors. Resolution intentionally remains a separate view. */
+export const McpCatalogProjectState = Schema.Struct({
+  globalDefinitions: Schema.Array(McpCatalogDefinition),
+  projectDefinitions: Schema.Array(McpCatalogDefinition),
+  projectOverrides: Schema.Array(McpCatalogOverride),
+  globalRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  projectRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+});
+export type McpCatalogProjectState = typeof McpCatalogProjectState.Type;
+
 export const McpCatalogApplication = Schema.Union([
   Schema.Struct({
     status: Schema.Literal("applied"),
@@ -280,6 +290,27 @@ export const McpCatalogSessionRequest = Schema.Struct({
   mcpCatalogSessionId: McpCatalogSessionId,
 });
 export type McpCatalogSessionRequest = typeof McpCatalogSessionRequest.Type;
+
+export const McpCatalogOAuthTarget = Schema.Struct({
+  projectId: ProjectId,
+  logicalServerId: McpServerId,
+  transportDefinitionId: McpDefinitionId,
+  threadId: Schema.optional(ThreadId),
+  mcpCatalogSessionId: Schema.optional(McpCatalogSessionId),
+}).check(
+  Schema.makeFilter(
+    (target) => (target.threadId === undefined) === (target.mcpCatalogSessionId === undefined),
+    { message: "A scoped MCP OAuth session target requires both thread and session ids." },
+  ),
+);
+export type McpCatalogOAuthTarget = typeof McpCatalogOAuthTarget.Type;
+
+export const McpCatalogOAuthBeginInput = McpCatalogOAuthTarget;
+export type McpCatalogOAuthBeginInput = typeof McpCatalogOAuthBeginInput.Type;
+export const McpCatalogOAuthContinueInput = McpCatalogOAuthTarget;
+export type McpCatalogOAuthContinueInput = typeof McpCatalogOAuthContinueInput.Type;
+export const McpCatalogOAuthDisconnectInput = McpCatalogOAuthTarget;
+export type McpCatalogOAuthDisconnectInput = typeof McpCatalogOAuthDisconnectInput.Type;
 
 export const McpCatalogSessionMutationInput = Schema.Struct({
   ...McpCatalogSessionRequest.fields,

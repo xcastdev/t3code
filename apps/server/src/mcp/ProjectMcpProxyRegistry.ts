@@ -493,6 +493,9 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
           id: server.id,
           name: server.name,
           transport: structuredClone(server.transport),
+          ...(server.transportDefinitionId === undefined
+            ? {}
+            : { transportDefinitionId: server.transportDefinitionId }),
         }),
       );
     }
@@ -546,9 +549,19 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
               ).pipe(
                 Effect.flatMap((binding) =>
                   oauth.value.providerFor(
-                    server.id,
-                    binding,
-                    session.oauthStateLeases?.get(server.id),
+                    ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId),
+                    binding === undefined
+                      ? undefined
+                      : {
+                          ...binding,
+                          serverId: ProjectMcpOAuth.storageIdForServer(
+                            server.id,
+                            server.transportDefinitionId,
+                          ),
+                        },
+                    session.oauthStateLeases?.get(
+                      ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId),
+                    ),
                   ),
                 ),
               ),
@@ -785,7 +798,12 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
     const targets: Array<{ readonly session: SessionRecord; readonly handle: string }> = [];
     for (const session of sessions.values()) {
       for (const [handle, server] of session.servers) {
-        if (server.id === serverId) targets.push({ session, handle });
+        if (
+          server.id === serverId ||
+          ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId) === serverId
+        ) {
+          targets.push({ session, handle });
+        }
       }
     }
     return Effect.forEach(

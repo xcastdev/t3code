@@ -10,7 +10,7 @@ import * as Layer from "effect/Layer";
 import * as NodeCrypto from "node:crypto";
 import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
-import { McpServerId, ProjectMcpCredentialId } from "@t3tools/contracts";
+import { McpDefinitionId, McpServerId, ProjectMcpCredentialId } from "@t3tools/contracts";
 import * as ServerConfig from "../config.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ProjectMcpOAuth from "./ProjectMcpOAuth.ts";
@@ -18,6 +18,16 @@ import * as ProjectMcpSecretStore from "./ProjectMcpSecretStore.ts";
 
 const serverId = McpServerId.make("oauth-test-server");
 const resource = "https://mcp.example.test/rpc";
+
+it("isolates scoped OAuth storage by transport definition while retaining legacy ids", () => {
+  const definitionA = McpDefinitionId.make("definition-a");
+  const definitionB = McpDefinitionId.make("definition-b");
+  assert.equal(ProjectMcpOAuth.storageIdForServer(serverId), serverId);
+  assert.notEqual(
+    ProjectMcpOAuth.storageIdForServer(serverId, definitionA),
+    ProjectMcpOAuth.storageIdForServer(serverId, definitionB),
+  );
+});
 
 for (const clientSecret of ["leased-client-secret", undefined]) {
   it.effect(

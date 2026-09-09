@@ -1,9 +1,10 @@
 # Project MCP servers
 
-Use **Settings** → **Integrations** → **MCP servers** to manage environment-global MCP servers.
-Use a project's **MCP servers** section for project-local definitions and project overrides. The
-active thread settings expose session-only definitions and overrides. The same server-side catalog
-works from web, desktop, mobile, local, remote, relay, and tunnel connections.
+The existing **Settings** → **Integrations** → **MCP servers** panel manages legacy project-local
+MCP servers. The scoped global, project-override, and active-session catalog controls are currently
+server-side RPCs; web and desktop editors are not yet exposed for them. Mobile can use configured
+catalogs but does not provide catalog editing. This distinction keeps the documentation accurate
+for local, remote, relay, and tunnel connections.
 
 The effective catalog is resolved in this order: global definitions, project overrides, project-local
 definitions, the logical session baseline, session overrides, and session-local definitions. Disabled

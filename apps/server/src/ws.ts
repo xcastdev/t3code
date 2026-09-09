@@ -46,7 +46,9 @@ import {
   type McpCatalogOverride,
   McpCatalogMutationError,
   McpCatalogOperationError,
+  McpCatalogUnsupportedProviderError,
   McpCatalogSnapshot,
+  type McpCatalogOAuthTarget,
   McpCatalogStaleRevisionError,
   McpCatalogStaleSessionError,
   McpDefinitionId,
@@ -147,7 +149,11 @@ import * as McpCatalogService from "./mcp/McpCatalogService.ts";
 import {
   catalogBaselineForProject as buildCatalogBaselineForProject,
   applyMcpCatalogOverrides,
+  applyMcpCatalogValidationOverrides,
   resolveProjectCatalog,
+  validateEffectiveCatalog,
+  type CatalogValidationDefinition,
+  type CatalogValidationOverride,
 } from "./mcp/McpCatalogResolver.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as ProjectMcpProxyRegistry from "./mcp/ProjectMcpProxyRegistry.ts";
@@ -1471,6 +1477,106 @@ const makeWsRpcLayer = (
         revision: input.revision,
       });
 
+      const validationDefinition = (input: {
+        readonly logicalServerId: McpServerId;
+        readonly scope: McpCatalogDefinition["scope"];
+        readonly scopeId: string;
+        readonly name: McpCatalogDefinition["name"];
+        readonly enabled: boolean;
+        readonly providerInstanceIds: ReadonlyArray<ProviderInstanceId>;
+      }): CatalogValidationDefinition => input;
+
+      const validationOverride = (override: {
+        readonly targetId: McpCatalogOverride["targetId"];
+        readonly enabled?: boolean | undefined;
+        readonly name?: McpCatalogOverride["name"] | undefined;
+        readonly providerInstanceIds?: ReadonlyArray<ProviderInstanceId> | undefined;
+      }): CatalogValidationOverride => ({
+        targetId: override.targetId,
+        ...(override.enabled === undefined ? {} : { enabled: override.enabled }),
+        ...(override.name === undefined ? {} : { name: override.name }),
+        ...(override.providerInstanceIds === undefined
+          ? {}
+          : { providerInstanceIds: override.providerInstanceIds }),
+      });
+
+      const validateCatalogTopology = (
+        definitions: ReadonlyArray<CatalogValidationDefinition>,
+        providerInstanceIds?: ReadonlyArray<ProviderInstanceId>,
+      ) =>
+        Effect.try({
+          try: () =>
+            providerInstanceIds === undefined
+              ? validateEffectiveCatalog({ definitions })
+              : validateEffectiveCatalog({ definitions, providerInstanceIds }),
+          catch: (cause) => toCatalogMutationError(cause),
+        });
+
+      const validatePersistentCatalogTopology = (
+        readModel: OrchestrationReadModel,
+        input: {
+          readonly globalDefinitions: ReadonlyArray<CatalogValidationDefinition>;
+          readonly projectDefinitions: ReadonlyArray<{
+            readonly projectId: ProjectId;
+            readonly definition: CatalogValidationDefinition;
+          }>;
+          readonly projectOverrides: ReadonlyArray<{
+            readonly projectId: ProjectId;
+            readonly override: CatalogValidationOverride;
+          }>;
+          readonly projectId?: ProjectId;
+        },
+      ) => {
+        const projectIds = new Set<string>();
+        if (input.projectId !== undefined) projectIds.add(String(input.projectId));
+        else {
+          for (const project of readModel.projects) {
+            if (project.deletedAt === null) projectIds.add(String(project.id));
+          }
+          for (const entry of input.projectDefinitions) projectIds.add(String(entry.projectId));
+          for (const entry of input.projectOverrides) projectIds.add(String(entry.projectId));
+        }
+        if (projectIds.size === 0) {
+          return validateCatalogTopology(input.globalDefinitions);
+        }
+        return Effect.forEach(
+          projectIds,
+          (projectId) =>
+            validateCatalogTopology([
+              ...applyMcpCatalogValidationOverrides(
+                input.globalDefinitions,
+                input.projectOverrides
+                  .filter((entry) => String(entry.projectId) === projectId)
+                  .map((entry) => entry.override),
+              ),
+              ...input.projectDefinitions
+                .filter((entry) => String(entry.projectId) === projectId)
+                .map((entry) => entry.definition),
+            ]),
+          { discard: true },
+        );
+      };
+
+      const validateCatalogProviderIds = (
+        providerInstanceIds: ReadonlyArray<ProviderInstanceId>,
+        previouslyPersistedIds: ReadonlyArray<ProviderInstanceId>,
+      ) =>
+        providerRegistry.getProviders.pipe(
+          Effect.flatMap((providers) => {
+            const knownIds = new Set(providers.map((provider) => provider.instanceId));
+            const retainedIds = new Set(previouslyPersistedIds);
+            const unknown = providerInstanceIds.find(
+              (providerInstanceId) =>
+                !knownIds.has(providerInstanceId) && !retainedIds.has(providerInstanceId),
+            );
+            return unknown === undefined
+              ? Effect.void
+              : Effect.fail(
+                  new McpCatalogUnsupportedProviderError({ providerInstanceId: unknown }),
+                );
+          }),
+        );
+
       const catalogBaselineForProject = (
         readModel: OrchestrationReadModel,
         projectId: ProjectId,
@@ -1534,6 +1640,77 @@ const makeWsRpcLayer = (
           }
           return {
             ...binding,
+            ...(requestOrigin === undefined
+              ? {}
+              : {
+                  redirectUrl: new URL("/oauth/project-mcp/callback", requestOrigin).toString(),
+                  ...(new URL(requestOrigin).protocol === "https:"
+                    ? {
+                        clientMetadataUrl: new URL(
+                          "/oauth/project-mcp/client-metadata",
+                          requestOrigin,
+                        ).toString(),
+                      }
+                    : {}),
+                }),
+          } satisfies ProjectMcpOAuth.ProjectMcpOAuthServer;
+        });
+
+      const scopedOauthServerFor = (input: McpCatalogOAuthTarget) =>
+        Effect.gen(function* () {
+          const readModel = yield* readMcpCatalog();
+          yield* requireOwnedProject(WS_METHODS.mcpCatalogOAuthBegin, input.projectId);
+          let definition: McpCatalogDefinition | undefined;
+          if (input.threadId !== undefined && input.mcpCatalogSessionId !== undefined) {
+            const thread = readModel.threads.find((entry) => entry.id === input.threadId);
+            const snapshot = readModel.mcpCatalog?.sessions.find(
+              (entry) => entry.catalogSessionId === input.mcpCatalogSessionId,
+            );
+            if (
+              thread?.projectId !== input.projectId ||
+              thread.session?.mcpCatalogSessionId !== input.mcpCatalogSessionId ||
+              snapshot?.threadId !== input.threadId
+            ) {
+              return yield* new ProjectMcpOAuthActionError({
+                id: input.logicalServerId,
+                reason: "The MCP catalog session target is stale or unauthorized.",
+              });
+            }
+            definition = snapshot?.desired.find(
+              (entry) =>
+                entry.logicalServerId === input.logicalServerId &&
+                entry.definitionId === input.transportDefinitionId,
+            );
+          } else {
+            definition = catalogBaselineForProject(readModel, input.projectId).find(
+              (entry) =>
+                entry.logicalServerId === input.logicalServerId &&
+                entry.definitionId === input.transportDefinitionId,
+            );
+          }
+          if (definition === undefined) {
+            return yield* new ProjectMcpOAuthActionError({
+              id: input.logicalServerId,
+              reason: "The MCP catalog definition target is stale or unauthorized.",
+            });
+          }
+          const binding = yield* ProjectMcpOAuth.resolveServerBinding(
+            { id: definition.logicalServerId, transport: definition.transport },
+            projectMcpSecrets.resolve,
+          );
+          if (binding === undefined) {
+            return yield* new ProjectMcpOAuthActionError({
+              id: input.logicalServerId,
+              reason: "This MCP server does not use OAuth authorization.",
+            });
+          }
+          const storageId = ProjectMcpOAuth.storageIdForServer(
+            definition.logicalServerId,
+            definition.definitionId,
+          );
+          return {
+            ...binding,
+            serverId: storageId,
             ...(requestOrigin === undefined
               ? {}
               : {
@@ -2056,6 +2233,33 @@ const makeWsRpcLayer = (
                     actualRevision,
                   });
                 }
+                yield* validateCatalogProviderIds(input.definition.providerInstanceIds, []);
+                const candidate = validationDefinition({
+                  logicalServerId,
+                  scope: "global",
+                  scopeId: String(environmentId),
+                  name: input.definition.name,
+                  enabled: input.definition.enabled,
+                  providerInstanceIds: input.definition.providerInstanceIds,
+                });
+                yield* validatePersistentCatalogTopology(readModel, {
+                  globalDefinitions: [
+                    ...(readModel.mcpCatalog?.globalDefinitions ?? []).map((definition) =>
+                      validationDefinition(definition),
+                    ),
+                    candidate,
+                  ],
+                  projectDefinitions:
+                    readModel.mcpCatalog?.projectDefinitions.map((entry) => ({
+                      projectId: entry.projectId,
+                      definition: validationDefinition(entry.definition),
+                    })) ?? [],
+                  projectOverrides:
+                    readModel.mcpCatalog?.projectOverrides.map((entry) => ({
+                      projectId: entry.projectId,
+                      override: validationOverride(entry.override),
+                    })) ?? [],
+                });
                 const prepared = yield* projectMcpSecrets.prepareCreate(
                   logicalServerId,
                   input.definition.transport,
@@ -2112,6 +2316,36 @@ const makeWsRpcLayer = (
                     actualRevision,
                   });
                 }
+                yield* validateCatalogProviderIds(
+                  input.definition.providerInstanceIds,
+                  existing.providerInstanceIds,
+                );
+                const candidate = validationDefinition({
+                  logicalServerId: existing.logicalServerId,
+                  scope: "global",
+                  scopeId: String(environmentId),
+                  name: input.definition.name,
+                  enabled: input.definition.enabled,
+                  providerInstanceIds: input.definition.providerInstanceIds,
+                });
+                yield* validatePersistentCatalogTopology(readModel, {
+                  globalDefinitions: (readModel.mcpCatalog?.globalDefinitions ?? []).map(
+                    (definition) =>
+                      definition.logicalServerId === existing.logicalServerId
+                        ? candidate
+                        : validationDefinition(definition),
+                  ),
+                  projectDefinitions:
+                    readModel.mcpCatalog?.projectDefinitions.map((entry) => ({
+                      projectId: entry.projectId,
+                      definition: validationDefinition(entry.definition),
+                    })) ?? [],
+                  projectOverrides:
+                    readModel.mcpCatalog?.projectOverrides.map((entry) => ({
+                      projectId: entry.projectId,
+                      override: validationOverride(entry.override),
+                    })) ?? [],
+                });
                 const prepared = yield* projectMcpSecrets.prepareUpdate(
                   existing.logicalServerId,
                   existing.transport,
@@ -2151,6 +2385,22 @@ const makeWsRpcLayer = (
             preserveCatalogMutationError(
               Effect.gen(function* () {
                 const environmentId = yield* serverEnvironment.getEnvironmentId;
+                const readModel = yield* readMcpCatalog();
+                yield* validatePersistentCatalogTopology(readModel, {
+                  globalDefinitions: (readModel.mcpCatalog?.globalDefinitions ?? [])
+                    .filter((definition) => definition.logicalServerId !== input.logicalServerId)
+                    .map((definition) => validationDefinition(definition)),
+                  projectDefinitions:
+                    readModel.mcpCatalog?.projectDefinitions.map((entry) => ({
+                      projectId: entry.projectId,
+                      definition: validationDefinition(entry.definition),
+                    })) ?? [],
+                  projectOverrides:
+                    readModel.mcpCatalog?.projectOverrides.map((entry) => ({
+                      projectId: entry.projectId,
+                      override: validationOverride(entry.override),
+                    })) ?? [],
+                });
                 yield* dispatchFromClient({
                   type: "environment.mcp-definition.remove",
                   commandId: yield* serverCommandId("mcp-catalog-global-remove"),
@@ -2197,6 +2447,41 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "mcp-catalog" },
           ),
+        [WS_METHODS.mcpCatalogProjectStateList]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogProjectStateList,
+            runProjectMcpOperation(
+              WS_METHODS.mcpCatalogProjectStateList,
+              input.scopeId as ProjectId,
+              preserveCatalogMutationError(
+                Effect.gen(function* () {
+                  if (input.scope !== "project") {
+                    return yield* new McpCatalogOperationError({
+                      message: "Raw project catalog state requires the project scope.",
+                    });
+                  }
+                  const readModel = yield* readMcpCatalog();
+                  const catalog = readModel.mcpCatalog;
+                  return {
+                    globalDefinitions: catalog?.globalDefinitions ?? [],
+                    projectDefinitions:
+                      catalog?.projectDefinitions
+                        .filter((entry) => entry.projectId === input.scopeId)
+                        .map((entry) => entry.definition) ?? [],
+                    projectOverrides:
+                      catalog?.projectOverrides
+                        .filter((entry) => entry.projectId === input.scopeId)
+                        .map((entry) => entry.override) ?? [],
+                    globalRevision: catalog?.globalRevision ?? 0,
+                    projectRevision:
+                      catalog?.projectRevisions.find((entry) => entry.projectId === input.scopeId)
+                        ?.revision ?? 0,
+                  };
+                }),
+              ),
+            ),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
         [WS_METHODS.mcpCatalogProjectCreate]: (input) =>
           observeRpcEffect(
             WS_METHODS.mcpCatalogProjectCreate,
@@ -2224,6 +2509,34 @@ const makeWsRpcLayer = (
                       actualRevision,
                     });
                   }
+                  yield* validateCatalogProviderIds(input.definition.providerInstanceIds, []);
+                  const candidate = validationDefinition({
+                    logicalServerId,
+                    scope: "project",
+                    scopeId: String(projectId),
+                    name: input.definition.name,
+                    enabled: input.definition.enabled,
+                    providerInstanceIds: input.definition.providerInstanceIds,
+                  });
+                  yield* validatePersistentCatalogTopology(readModel, {
+                    globalDefinitions:
+                      readModel.mcpCatalog?.globalDefinitions.map((definition) =>
+                        validationDefinition(definition),
+                      ) ?? [],
+                    projectDefinitions: [
+                      ...(readModel.mcpCatalog?.projectDefinitions ?? []).map((entry) => ({
+                        projectId: entry.projectId,
+                        definition: validationDefinition(entry.definition),
+                      })),
+                      { projectId, definition: candidate },
+                    ],
+                    projectOverrides:
+                      readModel.mcpCatalog?.projectOverrides.map((entry) => ({
+                        projectId: entry.projectId,
+                        override: validationOverride(entry.override),
+                      })) ?? [],
+                    projectId,
+                  });
                   const prepared = yield* projectMcpSecrets.prepareCreate(
                     logicalServerId,
                     input.definition.transport,
@@ -2289,6 +2602,40 @@ const makeWsRpcLayer = (
                       actualRevision,
                     });
                   }
+                  yield* validateCatalogProviderIds(
+                    input.definition.providerInstanceIds,
+                    existing.providerInstanceIds,
+                  );
+                  const candidate = validationDefinition({
+                    logicalServerId: existing.logicalServerId,
+                    scope: "project",
+                    scopeId: String(projectId),
+                    name: input.definition.name,
+                    enabled: input.definition.enabled,
+                    providerInstanceIds: input.definition.providerInstanceIds,
+                  });
+                  yield* validatePersistentCatalogTopology(readModel, {
+                    globalDefinitions:
+                      readModel.mcpCatalog?.globalDefinitions.map((definition) =>
+                        validationDefinition(definition),
+                      ) ?? [],
+                    projectDefinitions: (readModel.mcpCatalog?.projectDefinitions ?? []).map(
+                      (entry) =>
+                        entry.projectId === projectId &&
+                        entry.definition.logicalServerId === existing.logicalServerId
+                          ? { projectId, definition: candidate }
+                          : {
+                              projectId: entry.projectId,
+                              definition: validationDefinition(entry.definition),
+                            },
+                    ),
+                    projectOverrides:
+                      readModel.mcpCatalog?.projectOverrides.map((entry) => ({
+                        projectId: entry.projectId,
+                        override: validationOverride(entry.override),
+                      })) ?? [],
+                    projectId,
+                  });
                   const prepared = yield* projectMcpSecrets.prepareUpdate(
                     existing.logicalServerId,
                     existing.transport,
@@ -2331,6 +2678,32 @@ const makeWsRpcLayer = (
               input.scopeId as ProjectId,
               preserveCatalogMutationError(
                 Effect.gen(function* () {
+                  const readModel = yield* readMcpCatalog();
+                  const projectId = input.scopeId as ProjectId;
+                  yield* validatePersistentCatalogTopology(readModel, {
+                    globalDefinitions:
+                      readModel.mcpCatalog?.globalDefinitions.map((definition) =>
+                        validationDefinition(definition),
+                      ) ?? [],
+                    projectDefinitions: (readModel.mcpCatalog?.projectDefinitions ?? [])
+                      .filter(
+                        (entry) =>
+                          !(
+                            entry.projectId === projectId &&
+                            entry.definition.logicalServerId === input.logicalServerId
+                          ),
+                      )
+                      .map((entry) => ({
+                        projectId: entry.projectId,
+                        definition: validationDefinition(entry.definition),
+                      })),
+                    projectOverrides:
+                      readModel.mcpCatalog?.projectOverrides.map((entry) => ({
+                        projectId: entry.projectId,
+                        override: validationOverride(entry.override),
+                      })) ?? [],
+                    projectId,
+                  });
                   yield* dispatchFromClient({
                     type: "project.mcp-definition.remove",
                     commandId: yield* serverCommandId("mcp-catalog-project-remove"),
@@ -2386,6 +2759,43 @@ const makeWsRpcLayer = (
                     readModel.mcpCatalog?.projectOverrides
                       .filter((entry) => entry.projectId === projectId)
                       .map((entry) => entry.override) ?? [];
+                  const previousOverride = projectOverrides.find(
+                    (override) => override.id === input.override.id,
+                  );
+                  yield* validateCatalogProviderIds(
+                    input.override.providerInstanceIds ?? [],
+                    previousOverride?.providerInstanceIds ?? [],
+                  );
+                  const candidateOverride: CatalogValidationOverride = validationOverride(
+                    input.override,
+                  );
+                  yield* validatePersistentCatalogTopology(readModel, {
+                    globalDefinitions:
+                      readModel.mcpCatalog?.globalDefinitions.map((definition) =>
+                        validationDefinition(definition),
+                      ) ?? [],
+                    projectDefinitions:
+                      readModel.mcpCatalog?.projectDefinitions.map((entry) => ({
+                        projectId: entry.projectId,
+                        definition: validationDefinition(entry.definition),
+                      })) ?? [],
+                    projectOverrides: [
+                      ...(readModel.mcpCatalog?.projectOverrides ?? [])
+                        .filter(
+                          (entry) =>
+                            !(
+                              entry.projectId === projectId &&
+                              entry.override.id === input.override.id
+                            ),
+                        )
+                        .map((entry) => ({
+                          projectId: entry.projectId,
+                          override: validationOverride(entry.override),
+                        })),
+                      { projectId, override: candidateOverride },
+                    ],
+                    projectId,
+                  });
                   const previousEffectiveTransport =
                     applyMcpCatalogOverrides([globalDefinition], projectOverrides)[0]?.transport ??
                     globalDefinition.transport;
@@ -2437,6 +2847,31 @@ const makeWsRpcLayer = (
               input.scopeId as ProjectId,
               preserveCatalogMutationError(
                 Effect.gen(function* () {
+                  const projectId = input.scopeId as ProjectId;
+                  const readModel = yield* readMcpCatalog();
+                  yield* validatePersistentCatalogTopology(readModel, {
+                    globalDefinitions:
+                      readModel.mcpCatalog?.globalDefinitions.map((definition) =>
+                        validationDefinition(definition),
+                      ) ?? [],
+                    projectDefinitions:
+                      readModel.mcpCatalog?.projectDefinitions.map((entry) => ({
+                        projectId: entry.projectId,
+                        definition: validationDefinition(entry.definition),
+                      })) ?? [],
+                    projectOverrides: (readModel.mcpCatalog?.projectOverrides ?? [])
+                      .filter(
+                        (entry) =>
+                          !(
+                            entry.projectId === projectId && entry.override.id === input.overrideId
+                          ),
+                      )
+                      .map((entry) => ({
+                        projectId: entry.projectId,
+                        override: validationOverride(entry.override),
+                      })),
+                    projectId,
+                  });
                   yield* dispatchFromClient({
                     type: "project.mcp-override.remove",
                     commandId: yield* serverCommandId("mcp-catalog-project-override-remove"),
@@ -2563,6 +2998,23 @@ const makeWsRpcLayer = (
                     actualRevision: 0,
                   });
                 }
+                yield* validateCatalogProviderIds(input.definition.providerInstanceIds, []);
+                yield* validateCatalogTopology(
+                  [
+                    ...(existing?.desired ?? baseline).map((definition) =>
+                      validationDefinition(definition),
+                    ),
+                    validationDefinition({
+                      logicalServerId,
+                      scope: "session",
+                      scopeId: String(input.mcpCatalogSessionId),
+                      name: input.definition.name,
+                      enabled: input.definition.enabled,
+                      providerInstanceIds: input.definition.providerInstanceIds,
+                    }),
+                  ],
+                  [providerInstanceId],
+                );
                 const prepared = yield* projectMcpSecrets.prepareCreate(
                   logicalServerId,
                   input.definition.transport,
@@ -2651,6 +3103,25 @@ const makeWsRpcLayer = (
                     activeSessionId: input.mcpCatalogSessionId,
                   });
                 }
+                yield* validateCatalogProviderIds(
+                  input.definition.providerInstanceIds,
+                  existing.providerInstanceIds,
+                );
+                yield* validateCatalogTopology(
+                  snapshot.desired.map((entry) =>
+                    entry.logicalServerId === existing.logicalServerId
+                      ? validationDefinition({
+                          logicalServerId: existing.logicalServerId,
+                          scope: existing.scope,
+                          scopeId: String(existing.scopeId),
+                          name: input.definition.name,
+                          enabled: input.definition.enabled,
+                          providerInstanceIds: input.definition.providerInstanceIds,
+                        })
+                      : validationDefinition(entry),
+                  ),
+                  [snapshot.providerInstanceId],
+                );
                 const prepared = yield* projectMcpSecrets.prepareUpdate(
                   existing.logicalServerId,
                   existing.transport,
@@ -2712,6 +3183,12 @@ const makeWsRpcLayer = (
                     activeSessionId: input.mcpCatalogSessionId,
                   });
                 }
+                yield* validateCatalogTopology(
+                  snapshot.desired
+                    .filter((entry) => entry.logicalServerId !== input.logicalServerId)
+                    .map((entry) => validationDefinition(entry)),
+                  [snapshot.providerInstanceId],
+                );
                 yield* dispatchFromClient({
                   type: "thread.mcp-catalog.update",
                   commandId: yield* serverCommandId("mcp-catalog-session-remove"),
@@ -2755,6 +3232,10 @@ const makeWsRpcLayer = (
                   });
                 }
                 const baseline = catalogBaselineForProject(readModel, thread.projectId);
+                yield* validateCatalogTopology(
+                  baseline.map((entry) => validationDefinition(entry)),
+                  [snapshot.providerInstanceId],
+                );
                 yield* dispatchFromClient({
                   type: "thread.mcp-catalog.reset",
                   commandId: yield* serverCommandId("mcp-catalog-session-reset"),
@@ -2868,6 +3349,84 @@ const makeWsRpcLayer = (
                     ),
                   );
                 }),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogOAuthBegin]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogOAuthBegin,
+            runProjectMcpOperation(
+              WS_METHODS.mcpCatalogOAuthBegin,
+              input.projectId,
+              requestOrigin === undefined
+                ? Effect.fail(
+                    new ProjectMcpOAuthActionError({
+                      id: input.logicalServerId,
+                      reason:
+                        "OAuth needs this T3 server at an HTTPS address. Open it through T3 Connect or another HTTPS reverse proxy, then try again.",
+                    }),
+                  )
+                : scopedOauthServerFor(input).pipe(
+                    Effect.flatMap((server) =>
+                      projectMcpOAuth.begin({
+                        serverId: server.serverId,
+                        server,
+                        redirectOrigin: requestOrigin,
+                      }),
+                    ),
+                    Effect.mapError((error) =>
+                      Schema.is(ProjectMcpOAuthActionError)(error)
+                        ? error
+                        : new ProjectMcpOAuthActionError({
+                            id: input.logicalServerId,
+                            reason: "The authorization server could not start authorization.",
+                          }),
+                    ),
+                  ),
+            ),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogOAuthContinue]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogOAuthContinue,
+            runProjectMcpOperation(
+              WS_METHODS.mcpCatalogOAuthContinue,
+              input.projectId,
+              scopedOauthServerFor(input).pipe(
+                Effect.flatMap((server) =>
+                  projectMcpOAuth.continuePending(server.serverId, server),
+                ),
+                Effect.mapError((error) =>
+                  Schema.is(ProjectMcpOAuthActionError)(error)
+                    ? error
+                    : new ProjectMcpOAuthActionError({
+                        id: input.logicalServerId,
+                        reason: "The pending authorization could not be continued.",
+                      }),
+                ),
+              ),
+            ),
+            { "rpc.aggregate": "mcp-catalog" },
+          ),
+        [WS_METHODS.mcpCatalogOAuthDisconnect]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.mcpCatalogOAuthDisconnect,
+            runProjectMcpOperation(
+              WS_METHODS.mcpCatalogOAuthDisconnect,
+              input.projectId,
+              scopedOauthServerFor(input).pipe(
+                Effect.tap((server) => projectMcpOAuth.disconnect(server.serverId)),
+                Effect.tap(() => projectMcpProxy.revokeServer(input.logicalServerId)),
+                Effect.asVoid,
+                Effect.mapError((error) =>
+                  Schema.is(ProjectMcpOAuthActionError)(error)
+                    ? error
+                    : new ProjectMcpOAuthActionError({
+                        id: input.logicalServerId,
+                        reason: "The OAuth credentials could not be disconnected.",
+                      }),
+                ),
+              ),
+            ),
             { "rpc.aggregate": "mcp-catalog" },
           ),
         [WS_METHODS.projectMcpOauthBegin]: (input) =>

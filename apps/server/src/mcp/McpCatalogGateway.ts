@@ -187,6 +187,7 @@ const make = Effect.gen(function* () {
           id: entry.logicalServerId,
           name: entry.exposedName,
           transport: entry.transport,
+          transportDefinitionId: entry.transportDefinitionId,
         })),
         ...(input.resolveSecret === undefined ? {} : { resolveSecret: input.resolveSecret }),
         ...(input.oauthStateLeases === undefined

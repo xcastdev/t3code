@@ -587,6 +587,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   id: entry.logicalServerId,
                   name: entry.name,
                   transport: entry.transport,
+                  transportDefinitionId: entry.transportDefinitionId,
                 })),
               catch: (cause) =>
                 toValidationError(

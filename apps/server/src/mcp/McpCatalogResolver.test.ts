@@ -10,6 +10,7 @@ import {
 import {
   resolveProjectCatalog,
   resolveSessionCatalog,
+  validateEffectiveCatalog,
   type ResolveProjectCatalogInput,
   type ResolveSessionCatalogInput,
 } from "./McpCatalogResolver.ts";
@@ -156,6 +157,34 @@ describe("McpCatalogResolver", () => {
     expect(() =>
       resolveProjectCatalog(projectInput({ globalDefinitions: [], projectDefinitions: many })),
     ).toThrow(McpCatalogProviderLimitExceededError);
+  });
+
+  it("validates effective names and limits across the selected providers", () => {
+    expect(() =>
+      validateEffectiveCatalog({
+        definitions: [server("one", "Same"), server("two", "same")],
+        providerInstanceIds: [provider],
+      }),
+    ).toThrow(McpCatalogNameConflictError);
+
+    expect(() =>
+      validateEffectiveCatalog({
+        definitions: Array.from({ length: 51 }, (_, index) =>
+          server(`limit-${index}`, `Server ${index}`),
+        ),
+        providerInstanceIds: [provider],
+      }),
+    ).toThrow(McpCatalogProviderLimitExceededError);
+
+    expect(() =>
+      validateEffectiveCatalog({
+        definitions: [
+          { ...server("codex", "Same"), providerInstanceIds: [provider] },
+          { ...server("claude", "Same"), providerInstanceIds: [otherProvider] },
+        ],
+        providerInstanceIds: [provider, otherProvider],
+      }),
+    ).not.toThrow();
   });
 
   it("resolves the session's desired catalog directly, including inherited edits and removals", () => {

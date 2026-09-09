@@ -1,6 +1,7 @@
 import {
   McpServerId,
   parseProjectMcpOAuthAuthorizationUrl,
+  type McpDefinitionId,
   type ProjectMcpCredentialId,
   type ProjectMcpOAuthBeginResult,
   type ResolvedProjectMcpServer,
@@ -32,6 +33,21 @@ import * as ProjectMcpSecretStore from "./ProjectMcpSecretStore.ts";
 
 const STATE_TTL_MS = 10 * 60 * 1000;
 const RECORD_NAME = "project-mcp-oauth";
+
+/**
+ * Legacy OAuth records are keyed by logical server id. Scoped catalog records
+ * need the transport definition in their key so a replacement transport does
+ * not reuse another definition's pending state or grant.
+ */
+export const storageIdForServer = (
+  serverId: McpServerId,
+  transportDefinitionId?: McpDefinitionId | string,
+): McpServerId =>
+  transportDefinitionId === undefined
+    ? serverId
+    : McpServerId.make(
+        `scoped:${String(serverId).length}:${String(serverId)}:${String(transportDefinitionId).length}:${String(transportDefinitionId)}`,
+      );
 
 const oauthErrorResponse = (message: string): Response =>
   new Response(message, {
