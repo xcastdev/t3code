@@ -517,6 +517,8 @@ interface OpenCodeExternalMcpState {
   readonly client: OpencodeClient;
   readonly directory: string;
   readonly attemptedNames: Set<string>;
+  readonly cleanupDone: Deferred.Deferred<void, never>;
+  cleanupStarted: boolean;
 }
 
 interface OpenCodeExternalMcpReadState {
@@ -1251,6 +1253,34 @@ export function makeOpenCodeAdapter(
     ) {
       const result = yield* Effect.exit(
         Effect.gen(function* () {
+          if (!(yield* externalMcpCoordinator!.isCurrent(state.lease))) {
+            yield* Effect.logWarning(
+              "Skipping external OpenCode MCP cleanup for an obsolete lease",
+              {
+                name,
+                directory: state.directory,
+                generation: state.lease.generation,
+              },
+            );
+            return;
+          }
+          const before = yield* readExternalMcpState(state.client, state.directory);
+          const entry = before.config[name];
+          if (entry === undefined) {
+            yield* Effect.logWarning("Skipping missing external OpenCode MCP cleanup entry", {
+              name,
+              directory: state.directory,
+            });
+            return;
+          }
+          if (!isCurrentGeneration(entry, state.lease.environmentId, state.lease.generation)) {
+            yield* Effect.logWarning("Skipping foreign external OpenCode MCP cleanup entry", {
+              name,
+              directory: state.directory,
+              generation: state.lease.generation,
+            });
+            return;
+          }
           yield* runOpenCodeSdk("mcp.disconnect", (signal) =>
             state.client.mcp.disconnect({ name, directory: state.directory }, { signal }),
           ).pipe(Effect.catchIf(isOpenCodeNotFound, () => Effect.void));
@@ -1283,29 +1313,36 @@ export function makeOpenCodeAdapter(
       state: OpenCodeExternalMcpState,
     ) {
       if (externalMcpCoordinator === undefined) return;
-      yield* Effect.uninterruptibleMask((restore) =>
-        restore(
-          Effect.gen(function* () {
-            if (!(yield* externalMcpCoordinator.isCurrent(state.lease))) return;
-            yield* Effect.forEach(
-              [...state.attemptedNames],
-              (name) => attemptExternalDisconnect(state, name),
-              { concurrency: "unbounded", discard: true },
-            );
-          }),
-        ).pipe(
-          Effect.ensuring(
-            externalMcpCoordinator.release(state.lease).pipe(
+      yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (state.cleanupStarted) {
+            yield* Deferred.await(state.cleanupDone);
+            return;
+          }
+          state.cleanupStarted = true;
+          yield* Effect.ignoreCause(
+            Effect.gen(function* () {
+              yield* Effect.forEach(
+                [...state.attemptedNames],
+                (name) => attemptExternalDisconnect(state, name),
+                { concurrency: "unbounded", discard: true },
+              );
+            }).pipe(
               Effect.ensuring(
-                Effect.sync(() => {
-                  if (externalMcpStates.get(state.lease.threadId) === state) {
-                    externalMcpStates.delete(state.lease.threadId);
-                  }
-                }),
+                externalMcpCoordinator.release(state.lease).pipe(
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      if (externalMcpStates.get(state.lease.threadId) === state) {
+                        externalMcpStates.delete(state.lease.threadId);
+                      }
+                    }),
+                  ),
+                ),
               ),
             ),
-          ),
-        ),
+          );
+          yield* Deferred.succeed(state.cleanupDone, undefined);
+        }),
       );
     });
 
@@ -3993,7 +4030,7 @@ export function makeOpenCodeAdapter(
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
         const hasExternalMcpWork =
           mcpSession !== undefined || (input.projectMcpServers?.length ?? 0) > 0;
-        if (serverUrl && openCodeSettings.manageExternalMcp && hasExternalMcpWork) {
+        if (serverUrl && openCodeSettings.manageExternalMcp) {
           yield* Effect.try({
             try: () => {
               validateExternalOpenCodeUrl(serverUrl);
@@ -4059,6 +4096,8 @@ export function makeOpenCodeAdapter(
                   client,
                   directory,
                   attemptedNames: new Set(),
+                  cleanupDone: Deferred.makeUnsafe(),
+                  cleanupStarted: false,
                 };
                 externalMcpStates.set(input.threadId, externalMcp);
                 yield* registerExternalMcp(externalMcp, mcpSession, input.projectMcpServers ?? []);

@@ -1008,6 +1008,9 @@ const routing = makeProviderServiceLayer((request) =>
 const makeMcpLifecycleHarness = Effect.fn("makeMcpLifecycleHarness")(function* (
   leaseGate: Effect.Effect<void> = Effect.void,
   lifecycleEvents?: Array<string>,
+  generationFactory?: (
+    adapter: ReturnType<typeof makeFakeCodexAdapter>,
+  ) => ProviderAdapterRegistry.ProviderAdapterGenerationHandle,
 ) {
   const original = makeFakeCodexAdapter(CODEX_DRIVER, lifecycleEvents);
   let current: ReturnType<typeof makeFakeCodexAdapter> | undefined = original;
@@ -1015,6 +1018,7 @@ const makeMcpLifecycleHarness = Effect.fn("makeMcpLifecycleHarness")(function* (
   const forwarded = yield* Queue.unbounded<ProviderRuntimeEvent>();
   let reconcileBarrier: { remaining: number; done: Deferred.Deferred<void> } | undefined;
   const base = makeAdapterRegistryMock({ [CODEX_DRIVER]: original.adapter });
+  const providerGeneration = generationFactory?.(original);
   const registry: ProviderAdapterRegistry.ProviderAdapterRegistryShape = {
     ...base,
     getByInstance: () =>
@@ -1030,6 +1034,9 @@ const makeMcpLifecycleHarness = Effect.fn("makeMcpLifecycleHarness")(function* (
       }),
     subscribeChanges: PubSub.subscribe(changes),
     streamChanges: Stream.fromPubSub(changes),
+    ...(providerGeneration === undefined
+      ? {}
+      : { acquireInstance: () => Effect.succeed(providerGeneration) }),
   };
   const proxy = yield* ProjectMcpProxyRegistry.__testing.make({
     endpointBase: "http://127.0.0.1:43123/mcp",
@@ -1200,6 +1207,42 @@ it.effect("orders credential revocation before adapter MCP cleanup and project l
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
+it.effect("releases an acquired generation when project lease acquisition is interrupted", () =>
+  Effect.gen(function* () {
+    const leaseEntered = yield* Deferred.make<void>();
+    const releaseLease = yield* Deferred.make<void>();
+    let generationReleases = 0;
+    const h = yield* makeMcpLifecycleHarness(
+      Deferred.succeed(leaseEntered, undefined).pipe(Effect.andThen(Deferred.await(releaseLease))),
+      undefined,
+      (adapter) => ({
+        instanceId: codexInstanceId,
+        generation: 1,
+        enabled: true,
+        adapter: adapter.adapter,
+        release: Effect.sync(() => {
+          generationReleases += 1;
+        }),
+      }),
+    );
+    const threadId = asThreadId("interrupted-provider-generation");
+    const starting = yield* h.provider
+      .startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      })
+      .pipe(Effect.exit, Effect.forkChild);
+
+    yield* Deferred.await(leaseEntered);
+    yield* Fiber.interrupt(starting);
+
+    assert.equal(generationReleases, 1);
+    assert.equal(h.issuedCount, 0);
+  }).pipe(Effect.provide(NodeServices.layer)),
+);
+
 it.effect("keeps an active OpenCode session on its generation when settings disable it", () =>
   Effect.gen(function* () {
     const threadId = asThreadId("opencode-generation-preservation");
@@ -1211,6 +1254,7 @@ it.effect("keeps an active OpenCode session on its generation when settings disa
     let current = original;
     let enabled = true;
     let originalReleased = 0;
+    let disabledReleased = 0;
 
     const makeGeneration = (
       adapter: ReturnType<typeof makeFakeCodexAdapter>,
@@ -1232,7 +1276,7 @@ it.effect("keeps an active OpenCode session on its generation when settings disa
           instanceId,
           driverKind: OPENCODE_DRIVER,
           displayName: undefined,
-          enabled,
+          enabled: true,
           continuationIdentity: {
             driverKind: OPENCODE_DRIVER,
             continuationKey: `opencode:instance:${instanceId}`,
@@ -1244,7 +1288,7 @@ it.effect("keeps an active OpenCode session on its generation when settings disa
             current,
             enabled ? 1 : 2,
             enabled,
-            enabled ? () => (originalReleased += 1) : () => undefined,
+            enabled ? () => (originalReleased += 1) : () => (disabledReleased += 1),
           ),
         ),
       listInstances: () =>
@@ -1306,6 +1350,7 @@ it.effect("keeps an active OpenCode session on its generation when settings disa
         .pipe(Effect.exit);
       assert.isTrue(Exit.isFailure(newStart));
       assert.equal(disabled.startSession.mock.calls.length, 0);
+      assert.equal(disabledReleased, 1);
 
       yield* provider.stopSession({ threadId });
       assert.equal(originalReleased, 1);

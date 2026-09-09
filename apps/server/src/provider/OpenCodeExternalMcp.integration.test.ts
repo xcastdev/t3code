@@ -1,22 +1,30 @@
+// @effect-diagnostics nodeBuiltinImport:off globalDate:off
 import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk/v2";
+import * as NodeHttpServer from "@effect/platform-node/NodeHttpServer";
 import { describe, expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import {
   EnvironmentId,
+  ProjectMcpHeaderName,
+  ProjectMcpCredentialId,
   McpServerId,
   OpenCodeSettings,
   ProviderDriverKind,
   ProviderInstanceId,
+  ProjectMcpUrl,
   ProjectId,
   ThreadId,
 } from "@t3tools/contracts";
 
 import * as McpProviderSession from "../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
+import * as ProjectMcpProxyHttpServer from "../mcp/ProjectMcpProxyHttpServer.ts";
+import * as ProjectMcpProxyRegistry from "../mcp/ProjectMcpProxyRegistry.ts";
 import * as ServerConfig from "../config.ts";
 import * as AnalyticsService from "../telemetry/AnalyticsService.ts";
 import * as OpenCodeExternalMcpCoordinator from "./OpenCodeExternalMcpCoordinator.ts";
@@ -30,7 +38,7 @@ import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSn
 import * as ProjectMcpService from "../project/ProjectMcpService.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerSettings from "../serverSettings.ts";
-import { HttpServer } from "effect/unstable/http";
+import { HttpRouter, HttpServer } from "effect/unstable/http";
 import { makeAdapterRegistryMock } from "./testUtils/providerAdapterRegistryMock.ts";
 import { OpenCodeRuntime, type OpenCodeRuntimeShape } from "./opencodeRuntime.ts";
 import { startOpenCodeExternalMcpFixture } from "./testUtils/openCodeExternalMcpFixture.ts";
@@ -118,8 +126,43 @@ const startInput = (threadId: ThreadId, endpoint: string) => ({
   ],
 });
 
+const startInputWithProjectEndpoint = (
+  threadId: ThreadId,
+  projectEndpoint: string,
+  projectAuthorizationHeader: string,
+) => ({
+  provider: ProviderDriverKind.make("opencode"),
+  threadId,
+  runtimeMode: "full-access" as const,
+  cwd: "/fixture/workspace",
+  projectMcpServers: [
+    {
+      id: McpServerId.make("fixture-project-mcp"),
+      name: "Fixture project MCP",
+      endpoint: new URL(projectEndpoint),
+      authorizationHeader: projectAuthorizationHeader,
+    },
+  ],
+});
+
+const startLoopbackProjectMcpServer = Effect.fn("startLoopbackProjectMcpServer")(function* () {
+  const context = yield* NodeHttpServer.layerTest.pipe(Layer.build);
+  const server = Context.get(context, HttpServer.HttpServer);
+  const address = server.address;
+  if (typeof address === "string" || !("port" in address)) {
+    return yield* Effect.die("Project MCP route did not expose a TCP address.");
+  }
+  return {
+    context,
+    endpointBase: `http://127.0.0.1:${address.port}/mcp`,
+  };
+});
+
 const findPreviewName = (fixture: Awaited<ReturnType<typeof startOpenCodeExternalMcpFixture>>) =>
   [...fixture.registeredClients.keys()].find((name) => name.endsWith("-preview"));
+
+const findProjectName = (fixture: Awaited<ReturnType<typeof startOpenCodeExternalMcpFixture>>) =>
+  [...fixture.registeredClients.keys()].find((name) => name.includes("-project-"));
 
 describe("external OpenCode MCP integration", () => {
   it.effect("invokes a real MCP tool through OpenCode's registered client", () => {
@@ -132,29 +175,91 @@ describe("external OpenCode MCP integration", () => {
         try: startOpenCodeExternalMcpFixture,
         catch: (cause) => new OpenCodeExternalMcpFixtureError(cause),
       });
+      let credentials: McpSessionRegistry.McpSessionRegistryShape | undefined;
 
       yield* Effect.ensuring(
         Effect.scoped(
           Effect.gen(function* () {
+            const projectRoute = yield* startLoopbackProjectMcpServer();
             const coordinator =
               yield* OpenCodeExternalMcpCoordinator.OpenCodeExternalMcpCoordinator;
+            const proxy = yield* ProjectMcpProxyRegistry.__testing.make({
+              endpointBase: projectRoute.endpointBase,
+            });
+            const fixturePort = Number(new URL(fixture.mcpUrl).port);
+            const sessionRegistry = yield* McpSessionRegistry.__testing
+              .make({
+                now: () => Date.now(),
+              })
+              .pipe(
+                Effect.provideService(HttpServer.HttpServer, {
+                  address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: fixturePort },
+                  serve: () => Effect.void,
+                }),
+                Effect.provideService(ServerEnvironment.ServerEnvironment, {
+                  getEnvironmentId: Effect.succeed(environmentId),
+                  getDescriptor: Effect.die("descriptor is not used by this test"),
+                }),
+                Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, proxy),
+              );
+            credentials = sessionRegistry;
+            yield* HttpRouter.serve(ProjectMcpProxyHttpServer.layer, {
+              disableListenLog: true,
+              disableLogger: true,
+            }).pipe(
+              Layer.provide(
+                Layer.mergeAll(
+                  Layer.succeed(McpSessionRegistry.McpSessionRegistry, sessionRegistry),
+                  Layer.succeed(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, proxy),
+                ),
+              ),
+              Layer.build,
+              Effect.provideContext(projectRoute.context),
+            );
+            const projectServer = {
+              id: McpServerId.make("fixture-project-upstream"),
+              name: "Fixture project upstream",
+              transport: {
+                type: "streamable-http" as const,
+                url: ProjectMcpUrl.make(fixture.mcpUrl),
+                headers: [
+                  {
+                    name: ProjectMcpHeaderName.make("Authorization"),
+                    credential: {
+                      id: ProjectMcpCredentialId.make("11111111-1111-4111-8111-111111111111"),
+                      name: "Fixture token",
+                    },
+                  },
+                ],
+                authorization: { type: "none" as const },
+              },
+            };
+            const issued = yield* sessionRegistry.issue({
+              threadId,
+              providerInstanceId,
+              projectMcpServers: [projectServer],
+              resolveProjectMcpSecret: () => `Bearer ${fixture.token}`,
+            });
+            const projectEndpoint = issued.config.projectServers?.[0];
+            if (projectEndpoint === undefined) {
+              return yield* Effect.die("expected a project MCP endpoint");
+            }
+            const providerToken = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+            fixture.setTokenValidator(async (candidate) => candidate === providerToken);
             const adapter = yield* makeOpenCodeAdapter(settingsFor(fixture.openCodeUrl), {
               environmentId,
               instanceId: providerInstanceId,
               externalMcpCoordinator: coordinator,
             }).pipe(Effect.provide(makeAdapterDependencies()));
 
-            yield* Effect.sync(() =>
-              McpProviderSession.setMcpProviderSession({
-                environmentId,
+            yield* Effect.sync(() => McpProviderSession.setMcpProviderSession(issued.config));
+            yield* adapter.startSession(
+              startInputWithProjectEndpoint(
                 threadId,
-                providerSessionId: "integration-provider-session",
-                providerInstanceId,
-                endpoint: fixture.mcpUrl,
-                authorizationHeader: `Bearer ${fixture.token}`,
-              }),
+                projectEndpoint.endpoint.toString(),
+                issued.config.authorizationHeader,
+              ),
             );
-            yield* adapter.startSession(startInput(threadId, fixture.mcpUrl));
 
             const previewName = findPreviewName(fixture);
             expect(previewName).toBeDefined();
@@ -164,6 +269,12 @@ describe("external OpenCode MCP integration", () => {
               content?: ReadonlyArray<{ readonly type?: string; readonly text?: string }>;
             };
             expect(result.content?.[0]?.text).toBe("external-mcp-sentinel");
+            const projectName = findProjectName(fixture);
+            expect(projectName).toBeDefined();
+            const projectResult = (yield* Effect.promise(() =>
+              fixture.invokeRegisteredTool(projectName!),
+            )) as { content?: ReadonlyArray<{ readonly text?: string }> };
+            expect(projectResult.content?.[0]?.text).toBe("external-mcp-sentinel");
 
             yield* adapter.cleanupSessionMcp!(threadId);
             yield* adapter.stopSession(threadId);
@@ -177,6 +288,7 @@ describe("external OpenCode MCP integration", () => {
         ),
         Effect.gen(function* () {
           yield* Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId));
+          if (credentials !== undefined) yield* credentials.revokeAll;
           yield* Effect.promise(fixture.close);
         }),
       );

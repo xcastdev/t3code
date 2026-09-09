@@ -67,6 +67,7 @@ type MessageEntry = {
 const runtimeMock = {
   state: {
     startCalls: [] as string[],
+    connectCalls: [] as string[],
     sessionCreateUrls: [] as string[],
     sessionCreateInputs: [] as Array<Record<string, unknown>>,
     createdSessionIds: [] as string[],
@@ -130,6 +131,7 @@ const runtimeMock = {
   },
   reset() {
     this.state.startCalls.length = 0;
+    this.state.connectCalls.length = 0;
     this.state.sessionCreateUrls.length = 0;
     this.state.sessionCreateInputs.length = 0;
     this.state.createdSessionIds.length = 0;
@@ -212,6 +214,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
   connectToOpenCodeServer: ({ serverUrl, serverPassword }) =>
     Effect.gen(function* () {
       const url = serverUrl ?? "http://127.0.0.1:4301";
+      runtimeMock.state.connectCalls.push(url);
       // Always register a finalizer so the closeCalls/closeError probes fire;
       // production attaches none for external servers.
       yield* Effect.addFinalizer(() =>
@@ -666,12 +669,210 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       });
 
       expect(acquireCalls).toBe(0);
+      expect(runtimeMock.state.connectCalls).toEqual(["https://opencode.example.test"]);
       expect(runtimeMock.state.mcpConfigGetCalls).toBe(0);
       expect(runtimeMock.state.mcpStatusCalls).toBe(0);
       expect(runtimeMock.state.mcpAddCalls).toHaveLength(0);
       expect(runtimeMock.state.mcpDisconnectCalls).toHaveLength(0);
       yield* adapter.stopSession(threadId);
     }),
+  );
+
+  it.effect("skips a remembered MCP entry whose owner changed before cleanup", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-opencode-external-foreign-cleanup");
+      const fixed = makeFixedExternalMcpCoordinator("generation-foreign-cleanup");
+      const adapter = yield* makeOpenCodeAdapter(externalOpenCodeAdapterTestSettings, {
+        environmentId: fixed.lease.environmentId,
+        instanceId: fixed.lease.providerInstanceId,
+        externalMcpCoordinator: {
+          ...fixed.coordinator,
+          acquire: () => Effect.succeed({ ...fixed.lease, threadId }),
+        },
+      });
+      yield* Effect.sync(() =>
+        McpProviderSession.setMcpProviderSession({
+          environmentId: fixed.lease.environmentId,
+          threadId,
+          providerSessionId: "preview-session",
+          providerInstanceId: fixed.lease.providerInstanceId,
+          endpoint: "http://127.0.0.1:4310/mcp",
+          authorizationHeader: "Bearer preview-token",
+        }),
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        cwd: fixed.lease.target.directory,
+      });
+      const [name] = runtimeMock.state.mcpAddCalls.map((input) => (input as { name: string }).name);
+      if (name === undefined) return yield* Effect.die("expected a remembered MCP entry");
+      const config = runtimeMock.state.mcpConfig[name] as { headers: Record<string, string> };
+      config.headers["X-T3-MCP-Owner"] = "foreign-environment";
+
+      yield* adapter.cleanupSessionMcp!(threadId);
+
+      expect(runtimeMock.state.mcpDisconnectCalls).toHaveLength(0);
+      yield* adapter.stopSession(threadId);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(
+            asThreadId("thread-opencode-external-foreign-cleanup"),
+          ),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("skips a remembered MCP entry whose generation was replaced before cleanup", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-opencode-external-replacement-cleanup");
+      const fixed = makeFixedExternalMcpCoordinator("generation-replacement-cleanup");
+      const adapter = yield* makeOpenCodeAdapter(externalOpenCodeAdapterTestSettings, {
+        environmentId: fixed.lease.environmentId,
+        instanceId: fixed.lease.providerInstanceId,
+        externalMcpCoordinator: {
+          ...fixed.coordinator,
+          acquire: () => Effect.succeed({ ...fixed.lease, threadId }),
+        },
+      });
+      yield* Effect.sync(() =>
+        McpProviderSession.setMcpProviderSession({
+          environmentId: fixed.lease.environmentId,
+          threadId,
+          providerSessionId: "preview-session",
+          providerInstanceId: fixed.lease.providerInstanceId,
+          endpoint: "http://127.0.0.1:4310/mcp",
+          authorizationHeader: "Bearer preview-token",
+        }),
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        cwd: fixed.lease.target.directory,
+      });
+      const [name] = runtimeMock.state.mcpAddCalls.map((input) => (input as { name: string }).name);
+      if (name === undefined) return yield* Effect.die("expected a remembered MCP entry");
+      const config = runtimeMock.state.mcpConfig[name] as { headers: Record<string, string> };
+      config.headers["X-T3-MCP-Generation"] = "replacement-generation";
+
+      yield* adapter.cleanupSessionMcp!(threadId);
+
+      expect(runtimeMock.state.mcpDisconnectCalls).toHaveLength(0);
+      yield* adapter.stopSession(threadId);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(
+            asThreadId("thread-opencode-external-replacement-cleanup"),
+          ),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("runs concurrent external MCP cleanup only once per state", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-opencode-external-concurrent-cleanup");
+      const releaseDisconnect = promiseWithResolvers<void>();
+      const disconnectStarted = promiseWithResolvers<void>();
+      const fixed = makeFixedExternalMcpCoordinator("generation-concurrent-cleanup");
+      let releaseCalls = 0;
+      const adapter = yield* makeOpenCodeAdapter(externalOpenCodeAdapterTestSettings, {
+        environmentId: fixed.lease.environmentId,
+        instanceId: fixed.lease.providerInstanceId,
+        externalMcpCoordinator: {
+          ...fixed.coordinator,
+          acquire: () => Effect.succeed({ ...fixed.lease, threadId }),
+          release: () => Effect.sync(() => (releaseCalls += 1)),
+        },
+      });
+      runtimeMock.state.mcpDisconnectObserved = () => disconnectStarted.resolve(undefined);
+      yield* Effect.sync(() =>
+        McpProviderSession.setMcpProviderSession({
+          environmentId: fixed.lease.environmentId,
+          threadId,
+          providerSessionId: "preview-session",
+          providerInstanceId: fixed.lease.providerInstanceId,
+          endpoint: "http://127.0.0.1:4310/mcp",
+          authorizationHeader: "Bearer preview-token",
+        }),
+      );
+      const sessionStart = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+          cwd: fixed.lease.target.directory,
+        })
+        .pipe(Effect.exit, Effect.forkChild);
+      yield* Effect.yieldNow;
+      yield* Fiber.join(sessionStart);
+      runtimeMock.state.mcpDisconnectImplementation = async () => releaseDisconnect.promise;
+
+      const firstCleanup = yield* adapter.cleanupSessionMcp!(threadId).pipe(Effect.forkChild);
+      yield* Effect.promise(() => disconnectStarted.promise);
+      const secondCleanup = yield* adapter.cleanupSessionMcp!(threadId).pipe(Effect.forkChild);
+      yield* Effect.yieldNow;
+      expect(runtimeMock.state.mcpDisconnectCalls).toHaveLength(1);
+
+      releaseDisconnect.resolve(undefined);
+      yield* Effect.all([Fiber.join(firstCleanup), Fiber.join(secondCleanup)]);
+      expect(releaseCalls).toBe(1);
+      yield* adapter.stopSession(threadId);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(
+            asThreadId("thread-opencode-external-concurrent-cleanup"),
+          ),
+        ),
+      ),
+    ),
+  );
+
+  it.effect.each([
+    {
+      label: "an unsafe external OpenCode URL",
+      serverUrl: "http://opencode.example.test",
+      externalMcpBaseUrl: "",
+    },
+    {
+      label: "an unsafe T3 MCP public origin",
+      serverUrl: "https://opencode.example.test",
+      externalMcpBaseUrl: "http://t3.example.test",
+    },
+  ] as const)(
+    "rejects $label before connecting an MCP-less session",
+    ({ label, serverUrl, externalMcpBaseUrl }) => {
+      const settings = Schema.decodeSync(OpenCodeSettings)({
+        binaryPath: "fake-opencode",
+        serverUrl,
+        manageExternalMcp: true,
+        externalMcpBaseUrl,
+      });
+      return Effect.gen(function* () {
+        const adapter = yield* makeOpenCodeAdapter(settings);
+        const result = yield* adapter
+          .startSession({
+            provider: ProviderDriverKind.make("opencode"),
+            threadId: asThreadId(`thread-opencode-preflight-${label}`),
+            runtimeMode: "full-access",
+            cwd: "/workspace/external",
+          })
+          .pipe(Effect.result);
+
+        expect(result._tag).toBe("Failure");
+        expect(runtimeMock.state.connectCalls).toHaveLength(0);
+        expect(runtimeMock.state.mcpConfigGetCalls).toBe(0);
+        expect(runtimeMock.state.mcpStatusCalls).toBe(0);
+        expect(runtimeMock.state.mcpAddCalls).toHaveLength(0);
+        expect(runtimeMock.state.mcpDisconnectCalls).toHaveLength(0);
+      });
+    },
   );
 
   it.effect("holds the external MCP lease until bounded disconnect cleanup settles", () =>
@@ -1238,8 +1439,12 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       let addCount = 0;
       runtimeMock.state.mcpAddImplementation = async (input) => {
         addCount += 1;
-        if (addCount === 2) throw new Error("simulated mcp.add failure");
         const name = String((input as { name: string }).name);
+        if (addCount === 2) {
+          runtimeMock.state.mcpConfig[name] = (input as { config: unknown }).config;
+          runtimeMock.state.mcpStatus[name] = { status: "failed" };
+          throw new Error("simulated mcp.add failure");
+        }
         runtimeMock.state.mcpConfig[name] = (input as { config: unknown }).config;
         runtimeMock.state.mcpStatus[name] = { status: "connected" };
         return { data: { [name]: { status: "connected" } } };
