@@ -2,6 +2,8 @@ import { assert, describe, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
+import * as TestClock from "effect/testing/TestClock";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 import {
   AuthAdministrativeScopes,
@@ -118,7 +120,257 @@ function makeRefreshHarness(
   return { layer, encryptedCredentials, requestUrls, initialSettings };
 }
 
+function makeAttachHarness(
+  responses: ReadonlyArray<{ readonly body: unknown; readonly status?: number }>,
+  options: {
+    readonly encryptionFailures?: number;
+    readonly writeFailures?: number;
+    readonly managedConflict?: boolean;
+  } = {},
+) {
+  const requestUrls: Array<string> = [];
+  let responseIndex = 0;
+  let encryptionFailures = options.encryptionFailures ?? 0;
+  let writeFailures = options.writeFailures ?? 0;
+  const httpClientLayer = Layer.succeed(
+    HttpClient.HttpClient,
+    HttpClient.make((request) =>
+      Effect.sync(() => {
+        requestUrls.push(request.url);
+        const response = responses[responseIndex++];
+        if (response === undefined) throw new Error(`Unexpected request: ${request.url}`);
+        return jsonResponse(request, response.body, response.status);
+      }),
+    ),
+  );
+  const initialSettings: DesktopAppSettings.DesktopSettings = {
+    ...DesktopAppSettings.DEFAULT_DESKTOP_SETTINGS,
+    primaryBackend: { mode: "managed" },
+  };
+  const settingsRefEffect = Ref.make(initialSettings);
+  const settingsLayer = Layer.effect(
+    DesktopAppSettings.DesktopAppSettings,
+    Effect.gen(function* () {
+      const settingsRef = yield* settingsRefEffect;
+      const update = (
+        preference: DesktopAppSettings.DesktopPrimaryBackendPreference,
+      ): Effect.Effect<void, DesktopAppSettings.DesktopSettingsWriteError> => {
+        if (writeFailures > 0) {
+          writeFailures -= 1;
+          return Effect.fail(
+            new DesktopAppSettings.DesktopSettingsWriteError({
+              operation: "replace-settings-file",
+              path: "/tmp/desktop-settings.json",
+              cause: "settings write failed",
+            }),
+          );
+        }
+        return Ref.update(settingsRef, (settings) => ({ ...settings, primaryBackend: preference }));
+      };
+      return DesktopAppSettings.DesktopAppSettings.of({
+        get: Ref.get(settingsRef),
+        load: Ref.get(settingsRef),
+        setMainWindowBounds: () => Effect.die("unexpected settings update"),
+        setServerExposureMode: () => Effect.die("unexpected settings update"),
+        setTailscaleServe: () => Effect.die("unexpected settings update"),
+        setUpdateChannel: () => Effect.die("unexpected settings update"),
+        setWslBackendEnabled: () => Effect.die("unexpected settings update"),
+        setWslDistro: () => Effect.die("unexpected settings update"),
+        setWslOnly: () => Effect.die("unexpected settings update"),
+        setPrimaryBackendPreference: (preference) =>
+          update(preference).pipe(
+            Effect.map(() => ({
+              settings: { ...initialSettings, primaryBackend: preference },
+              changed: true,
+            })),
+          ),
+        applyWslWindowsFallback: Effect.die("unexpected settings update"),
+        applyWslWindowsFallbackInMemory: Effect.die("unexpected settings update"),
+      });
+    }),
+  );
+  const encryptedCredentials: Array<string> = [];
+  const safeStorageLayer = Layer.succeed(ElectronSafeStorage.ElectronSafeStorage, {
+    isEncryptionAvailable: Effect.succeed(true),
+    encryptString: (credential: string) =>
+      Effect.gen(function* () {
+        if (encryptionFailures > 0) {
+          encryptionFailures -= 1;
+          return yield* Effect.fail({ _tag: "TestEncryptionFailure" as const });
+        }
+        encryptedCredentials.push(credential);
+        return new TextEncoder().encode(`encrypted:${credential}`);
+      }),
+    decryptString: () => Effect.succeed("stored-bearer-token"),
+    selectedStorageBackend: Effect.succeed(Option.none()),
+  } as unknown as ElectronSafeStorage.ElectronSafeStorage["Service"]);
+  const environmentLayer = Layer.succeed(DesktopEnvironment.DesktopEnvironment, {
+    platform: "darwin",
+    appVersion: "0.0.17",
+  } as unknown as DesktopEnvironment.DesktopEnvironment["Service"]);
+  const poolLayer = Layer.succeed(DesktopBackendPool.DesktopBackendPool, {
+    list: Effect.succeed(
+      options.managedConflict
+        ? [
+            {
+              currentConfig: Effect.succeed(
+                Option.some({ httpBaseUrl: new URL(ATTACHED_HTTP_BASE_URL) }),
+              ),
+            },
+          ]
+        : [],
+    ),
+  } as unknown as DesktopBackendPool.DesktopBackendPool["Service"]);
+  const dependencies = Layer.mergeAll(
+    settingsLayer,
+    safeStorageLayer,
+    httpClientLayer,
+    environmentLayer,
+    poolLayer,
+  );
+  const layer = Layer.merge(
+    DesktopAttachedBackend.layer.pipe(Layer.provide(dependencies)),
+    settingsLayer,
+  );
+
+  return { layer, encryptedCredentials, requestUrls, initialSettings };
+}
+
 describe("DesktopAttachedBackend", () => {
+  it.effect("performs one initial exchange and persists only encrypted attachment state", () => {
+    const harness = makeAttachHarness([{ body: administrativeToken() }, { body: descriptorFor() }]);
+
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-09-08T12:00:00.000Z"));
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      const state = yield* attached.attach("http://127.0.0.1:4100/pair#token=one-time-owner-token");
+      const persisted = yield* (yield* DesktopAppSettings.DesktopAppSettings).get;
+
+      assert.deepEqual(harness.requestUrls, [
+        "http://127.0.0.1:4100/oauth/token",
+        "http://127.0.0.1:4100/.well-known/t3/environment",
+      ]);
+      assert.equal(harness.encryptedCredentials.length, 1);
+      assert.notInclude(harness.encryptedCredentials[0] ?? "", "one-time-owner-token");
+      assert.equal(state.mode, "attached");
+      assert.equal(persisted.primaryBackend.mode, "attached");
+      if (persisted.primaryBackend.mode === "attached") {
+        assert.notInclude(persisted.primaryBackend.encryptedBearerToken, "one-time-owner-token");
+        assert.notInclude(
+          persisted.primaryBackend.encryptedBearerToken,
+          "replacement-access-token",
+        );
+        assert.equal(persisted.primaryBackend.bearerExpiresAt, "2026-09-08T13:00:00.000Z");
+      }
+    }).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
+  it.effect("rejects a managed endpoint conflict before exchanging the owner credential", () => {
+    const harness = makeAttachHarness([], { managedConflict: true });
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      const error = yield* attached
+        .attach("http://127.0.0.1:4100/pair#token=one-time-owner-token")
+        .pipe(Effect.flip);
+
+      assert.instanceOf(error, DesktopAttachedBackend.DesktopAttachManagedBackendConflictError);
+      assert.deepEqual(harness.requestUrls, []);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect(
+    "completes a retained transaction after descriptor failure without re-exchanging",
+    () => {
+      const harness = makeAttachHarness([
+        { body: administrativeToken() },
+        { status: 503, body: { unavailable: true } },
+        { body: descriptorFor() },
+      ]);
+
+      return Effect.gen(function* () {
+        const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+        const first = yield* Effect.exit(
+          attached.attach("http://127.0.0.1:4100/pair#token=one-time-owner-token"),
+        );
+        assert.equal(first._tag, "Failure");
+        const second = yield* attached.attach(
+          "http://127.0.0.1:4100/pair#token=one-time-owner-token",
+        );
+
+        assert.equal(second.mode, "attached");
+        assert.deepEqual(harness.requestUrls, [
+          "http://127.0.0.1:4100/oauth/token",
+          "http://127.0.0.1:4100/.well-known/t3/environment",
+          "http://127.0.0.1:4100/.well-known/t3/environment",
+        ]);
+        assert.equal(harness.encryptedCredentials.length, 1);
+      }).pipe(Effect.provide(harness.layer));
+    },
+  );
+
+  it.effect(
+    "completes a retained transaction after encryption failure without re-exchanging",
+    () => {
+      const harness = makeAttachHarness(
+        [{ body: administrativeToken() }, { body: descriptorFor() }, { body: descriptorFor() }],
+        { encryptionFailures: 1 },
+      );
+
+      return Effect.gen(function* () {
+        const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+        const first = yield* Effect.exit(
+          attached.attach("http://127.0.0.1:4100/pair#token=one-time-owner-token"),
+        );
+        assert.equal(first._tag, "Failure");
+        yield* attached.attach("http://127.0.0.1:4100/pair#token=one-time-owner-token");
+
+        assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+        assert.equal(harness.requestUrls.filter((url) => url.endsWith("/environment")).length, 2);
+      }).pipe(Effect.provide(harness.layer));
+    },
+  );
+
+  it.effect("completes a retained transaction after settings failure without re-exchanging", () => {
+    const harness = makeAttachHarness(
+      [{ body: administrativeToken() }, { body: descriptorFor() }, { body: descriptorFor() }],
+      { writeFailures: 1 },
+    );
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      const first = yield* Effect.exit(
+        attached.attach("http://127.0.0.1:4100/pair#token=one-time-owner-token"),
+      );
+      assert.equal(first._tag, "Failure");
+      yield* attached.attach("http://127.0.0.1:4100/pair#token=one-time-owner-token");
+
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+      assert.equal(harness.encryptedCredentials.length, 2);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("never replays an owner URL after an uncertain exchange", () => {
+    const harness = makeAttachHarness([{ status: 503, body: { unavailable: true } }]);
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      const first = yield* Effect.exit(
+        attached.attach("http://127.0.0.1:4100/pair#token=one-time-owner-token"),
+      );
+      const second = yield* Effect.exit(
+        attached.attach("http://127.0.0.1:4100/pair#token=one-time-owner-token"),
+      );
+
+      assert.equal(first._tag, "Failure");
+      assert.equal(second._tag, "Failure");
+      if (second._tag === "Failure") {
+        const error = second.cause;
+        assert.include(String(error), "FreshPairingUrl");
+      }
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+    }).pipe(Effect.provide(harness.layer));
+  });
   it.effect("accepts only loopback HTTP pairing URLs and normalizes their targets", () =>
     Effect.gen(function* () {
       const target = yield* resolveDesktopAttachPairingTarget(

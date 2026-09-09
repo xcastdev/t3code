@@ -152,6 +152,26 @@ const ATTACHED_BACKEND_RECOVERY_DIALOG = {
   cancelId: 2,
 };
 
+const isAttachCredentialExchangeError = Schema.is(
+  DesktopAttachedBackend.DesktopAttachCredentialExchangeError,
+);
+const isAttachAdministrativeScopeError = Schema.is(
+  DesktopAttachedBackend.DesktopAttachAdministrativeScopeError,
+);
+const isAttachFreshPairingUrlRequiredError = Schema.is(
+  DesktopAttachedBackend.DesktopAttachFreshPairingUrlRequiredError,
+);
+
+const attachedBackendRecoveryDialog = (error: unknown = undefined) => ({
+  ...ATTACHED_BACKEND_RECOVERY_DIALOG,
+  detail:
+    isAttachCredentialExchangeError(error) ||
+    isAttachAdministrativeScopeError(error) ||
+    isAttachFreshPairingUrlRequiredError(error)
+      ? "This owner pairing URL cannot be reused. Run `t3 pair --owner` for a fresh owner pairing URL, then open the new Desktop attach URL."
+      : ATTACHED_BACKEND_RECOVERY_DIALOG.detail,
+});
+
 export const awaitAttachedBackend = Effect.fn("desktop.startup.awaitAttachedBackend")(
   function* (input: {
     readonly attachedBackend: DesktopAttachedBackend.DesktopAttachedBackend["Service"];
@@ -161,19 +181,36 @@ export const awaitAttachedBackend = Effect.fn("desktop.startup.awaitAttachedBack
     readonly electronApp: ElectronApp.ElectronApp["Service"];
     readonly state: DesktopState.DesktopState["Service"];
     readonly pairingUrl?: string;
+    readonly launchIntent?: DesktopLaunchIntent.DesktopLaunchIntent["Service"];
+    readonly selectionId?: number;
   }) {
     let pendingPairingUrl = input.pairingUrl;
+    const takeReplacement = Effect.gen(function* () {
+      if (input.launchIntent === undefined || input.selectionId === undefined) return false;
+      const replacement = yield* input.launchIntent.claimPendingForStartup(input.selectionId);
+      if (Option.isNone(replacement)) return false;
+      pendingPairingUrl = replacement.value;
+      return true;
+    });
     while (true) {
+      if (yield* takeReplacement) continue;
       if (pendingPairingUrl !== undefined) {
         const attach = yield* Effect.exit(input.attachedBackend.attach(pendingPairingUrl));
         if (attach._tag === "Failure") {
-          const response = yield* input.dialog.showMessageBox(ATTACHED_BACKEND_RECOVERY_DIALOG);
+          if (yield* takeReplacement) continue;
+          const response = yield* input.dialog.showMessageBox(
+            attachedBackendRecoveryDialog(
+              Cause.findErrorOption(attach.cause).pipe(Option.getOrUndefined),
+            ),
+          );
           if (response.response === 0) continue;
           if (response.response === 1) {
+            if (input.launchIntent !== undefined) yield* input.launchIntent.abortStartupSelection;
             yield* input.attachedBackend.useManagedBackend;
             yield* input.lifecycle.relaunch("attached-backend-recovery");
             return false;
           }
+          if (input.launchIntent !== undefined) yield* input.launchIntent.abortStartupSelection;
           yield* Ref.set(input.state.quitting, true);
           yield* input.shutdown.request;
           yield* input.electronApp.quit;
@@ -183,15 +220,21 @@ export const awaitAttachedBackend = Effect.fn("desktop.startup.awaitAttachedBack
       }
 
       const probe = yield* Effect.exit(input.attachedBackend.probe);
-      if (probe._tag === "Success") return true;
+      if (probe._tag === "Success") {
+        if (yield* takeReplacement) continue;
+        return true;
+      }
 
+      if (yield* takeReplacement) continue;
       const response = yield* input.dialog.showMessageBox(ATTACHED_BACKEND_RECOVERY_DIALOG);
       if (response.response === 0) continue;
       if (response.response === 1) {
+        if (input.launchIntent !== undefined) yield* input.launchIntent.abortStartupSelection;
         yield* input.attachedBackend.useManagedBackend;
         yield* input.lifecycle.relaunch("attached-backend-recovery");
         return false;
       }
+      if (input.launchIntent !== undefined) yield* input.launchIntent.abortStartupSelection;
       yield* Ref.set(input.state.quitting, true);
       yield* input.shutdown.request;
       yield* input.electronApp.quit;
@@ -220,42 +263,50 @@ export const selectDesktopPrimaryBackend = Effect.fn("desktop.startup.selectDesk
     readonly electronApp: ElectronApp.ElectronApp["Service"];
     readonly state: DesktopState.DesktopState["Service"];
   }) {
-    const pendingLaunchIntent = yield* input.launchIntent.consume;
+    const startupSelection = yield* input.launchIntent.claimForStartup;
     const initialPrimaryBackendState = yield* input.attachedBackend.getState;
-    const pendingPairingUrl = Option.getOrUndefined(pendingLaunchIntent);
-    const needsAttachedRecovery =
-      pendingPairingUrl !== undefined ||
-      initialPrimaryBackendState.mode === "invalid-attached" ||
-      initialPrimaryBackendState.mode === "attached";
+    let pendingPairingUrl = startupSelection.pairingUrl ?? undefined;
+    while (true) {
+      const needsAttachedRecovery =
+        pendingPairingUrl !== undefined ||
+        initialPrimaryBackendState.mode === "invalid-attached" ||
+        initialPrimaryBackendState.mode === "attached";
 
-    if (needsAttachedRecovery) {
-      const canContinue = yield* awaitAttachedBackend({
-        attachedBackend: input.attachedBackend,
-        dialog: input.dialog,
-        lifecycle: input.lifecycle,
-        shutdown: input.shutdown,
-        electronApp: input.electronApp,
-        state: input.state,
-        ...(pendingPairingUrl === undefined ? {} : { pairingUrl: pendingPairingUrl }),
-      });
-      if (!canContinue) return { _tag: "Aborted" };
+      if (needsAttachedRecovery) {
+        const canContinue = yield* awaitAttachedBackend({
+          attachedBackend: input.attachedBackend,
+          dialog: input.dialog,
+          lifecycle: input.lifecycle,
+          shutdown: input.shutdown,
+          electronApp: input.electronApp,
+          state: input.state,
+          ...(pendingPairingUrl === undefined ? {} : { pairingUrl: pendingPairingUrl }),
+          launchIntent: input.launchIntent,
+          selectionId: startupSelection.selectionId,
+        });
+        if (!canContinue) return { _tag: "Aborted" };
+      }
+
+      const commit = yield* input.launchIntent.commitStartupSelection(startupSelection.selectionId);
+      if (commit._tag === "Superseded") {
+        pendingPairingUrl = commit.pairingUrl;
+        continue;
+      }
+      if (commit._tag === "Aborted") return { _tag: "Aborted" };
+
+      const primaryBackendState = yield* input.attachedBackend.getState;
+      return primaryBackendState.mode === "attached"
+        ? { _tag: "Attached", state: primaryBackendState }
+        : { _tag: "Managed" };
     }
-
-    const primaryBackendState = yield* input.attachedBackend.getState;
-    return primaryBackendState.mode === "attached"
-      ? { _tag: "Attached", state: primaryBackendState }
-      : { _tag: "Managed" };
   },
 );
 
 const bootstrap = Effect.gen(function* () {
   const pool = yield* DesktopBackendPool.DesktopBackendPool;
-  const primaryBackend = yield* pool.primary;
   const state = yield* DesktopState.DesktopState;
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const desktopSettings = yield* DesktopAppSettings.DesktopAppSettings;
-  const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
-  const wslBackend = yield* DesktopWslBackend.DesktopWslBackend;
   const desktopWindow = yield* DesktopWindow.DesktopWindow;
   const attachedBackend = yield* DesktopAttachedBackend.DesktopAttachedBackend;
   const launchIntent = yield* DesktopLaunchIntent.DesktopLaunchIntent;
@@ -274,7 +325,6 @@ const bootstrap = Effect.gen(function* () {
   });
   if (primaryBackendSelection._tag === "Aborted") return;
 
-  const settings = yield* desktopSettings.get;
   if (primaryBackendSelection._tag === "Attached") {
     const attachedState = primaryBackendSelection.state as AttachedDesktopPrimaryBackendState;
     const electronProtocol = yield* ElectronProtocol.ElectronProtocol;
@@ -291,6 +341,7 @@ const bootstrap = Effect.gen(function* () {
     if (!(yield* Ref.get(state.quitting))) {
       yield* desktopWindow.handleBackendReady(new URL(attachedState.httpBaseUrl));
     }
+    yield* launchIntent.activateRuntime;
     yield* logBootstrapInfo("bootstrap attached to existing backend", {
       baseUrl: attachedState.httpBaseUrl,
       environmentId: attachedState.environmentId,
@@ -298,6 +349,7 @@ const bootstrap = Effect.gen(function* () {
     return;
   }
 
+  const settings = yield* desktopSettings.get;
   if (environment.isDevelopment && Option.isNone(environment.configuredBackendPort)) {
     return yield* new DesktopDevelopmentBackendPortRequiredError();
   }
@@ -319,6 +371,7 @@ const bootstrap = Effect.gen(function* () {
       mode: settings.serverExposureMode,
     });
   }
+  const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
   const serverExposureState = yield* serverExposure.configureFromSettings({ port: backendPort });
   const backendConfig = yield* serverExposure.backendConfig;
   const electronProtocol = yield* ElectronProtocol.ElectronProtocol;
@@ -355,12 +408,15 @@ const bootstrap = Effect.gen(function* () {
     if (settings.wslOnly === true && settings.wslBackendEnabled === true) {
       yield* desktopWindow.showConnectingSplash;
     }
+    const primaryBackend = yield* pool.primary;
     yield* primaryBackend.start;
+    yield* launchIntent.activateRuntime;
     yield* logBootstrapInfo("bootstrap backend start requested");
     // Bring up the WSL backend if the user previously enabled it. The
     // primary is already starting; reconcile fires off the WSL register
     // in parallel rather than blocking primary readiness on a possibly
     // slow first wsl.exe spawn.
+    const wslBackend = yield* DesktopWslBackend.DesktopWslBackend;
     yield* Effect.forkScoped(wslBackend.reconcile);
   }
 }).pipe(Effect.withSpan("desktop.bootstrap"));

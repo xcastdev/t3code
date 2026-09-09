@@ -18,6 +18,7 @@ import * as Encoding from "effect/Encoding";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as HttpClient from "effect/unstable/http/HttpClient";
 
 import * as DesktopBackendPool from "./DesktopBackendPool.ts";
@@ -101,6 +102,15 @@ export class DesktopAttachPersistenceError extends Schema.TaggedErrorClass<Deskt
   }
 }
 
+export class DesktopAttachFreshPairingUrlRequiredError extends Schema.TaggedErrorClass<DesktopAttachFreshPairingUrlRequiredError>()(
+  "DesktopAttachFreshPairingUrlRequiredError",
+  {},
+) {
+  override get message(): string {
+    return "This owner pairing URL cannot be reused. Run `t3 pair --owner` to create a fresh desktop pairing URL.";
+  }
+}
+
 export class DesktopAttachedCredentialUnavailableError extends Schema.TaggedErrorClass<DesktopAttachedCredentialUnavailableError>()(
   "DesktopAttachedCredentialUnavailableError",
   {},
@@ -146,6 +156,7 @@ export const DesktopAttachedBackendError = Schema.Union([
   DesktopAttachEncryptionUnavailableError,
   DesktopAttachEncryptionError,
   DesktopAttachPersistenceError,
+  DesktopAttachFreshPairingUrlRequiredError,
   DesktopAttachedCredentialUnavailableError,
   DesktopAttachedProbeError,
   DesktopAttachedIdentityMismatchError,
@@ -239,6 +250,18 @@ export const make = Effect.gen(function* () {
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const pool = yield* DesktopBackendPool.DesktopBackendPool;
   const httpClient = yield* HttpClient.HttpClient;
+  const attachLock = yield* Semaphore.make(1);
+
+  type PreparedAttachment = {
+    readonly pairingUrl: string;
+    readonly httpBaseUrl: string;
+    readonly wsBaseUrl: string;
+    readonly accessToken: string;
+    readonly bearerExpiresAt: string;
+  };
+  let preparedAttachment: PreparedAttachment | null = null;
+  let consumedPairingUrl: string | null = null;
+  let completedPairingUrl: string | null = null;
 
   const withHttpClient = <A, E, R>(effect: Effect.Effect<A, E, R | HttpClient.HttpClient>) =>
     effect.pipe(Effect.provideService(HttpClient.HttpClient, httpClient));
@@ -301,7 +324,7 @@ export const make = Effect.gen(function* () {
     readonly httpBaseUrl: string;
     readonly wsBaseUrl: string;
     readonly accessToken: string;
-    readonly expiresIn: number;
+    readonly bearerExpiresAt: string;
   }) {
     const encryptedBearerToken = yield* protectCredential(input.accessToken);
     const preference: AttachedPreference = {
@@ -311,7 +334,7 @@ export const make = Effect.gen(function* () {
       environmentId: input.descriptor.environmentId,
       label: input.descriptor.label,
       encryptedBearerToken,
-      bearerExpiresAt: attachedBearerExpiry(yield* Clock.currentTimeMillis, input.expiresIn),
+      bearerExpiresAt: input.bearerExpiresAt,
     };
     yield* settings
       .setPrimaryBackendPreference(preference)
@@ -319,8 +342,17 @@ export const make = Effect.gen(function* () {
     return preference;
   });
 
-  const attach = Effect.fn("desktop.attachedBackend.attach")(function* (pairingUrl: string) {
-    const target = yield* resolveDesktopAttachPairingTarget(pairingUrl);
+  const prepare = Effect.fn("desktop.attachedBackend.prepare")(function* (pairingUrl: string) {
+    const normalizedPairingUrl = pairingUrl.trim();
+    const target = yield* resolveDesktopAttachPairingTarget(normalizedPairingUrl);
+    if (completedPairingUrl === normalizedPairingUrl && preparedAttachment === null) {
+      return yield* new DesktopAttachFreshPairingUrlRequiredError();
+    }
+    if (preparedAttachment?.pairingUrl === normalizedPairingUrl) return preparedAttachment;
+    if (consumedPairingUrl === normalizedPairingUrl) {
+      return yield* new DesktopAttachFreshPairingUrlRequiredError();
+    }
+
     const instances = yield* pool.list;
     for (const instance of instances) {
       const config = yield* instance.currentConfig;
@@ -331,24 +363,67 @@ export const make = Effect.gen(function* () {
         return yield* new DesktopAttachManagedBackendConflictError();
       }
     }
+
+    // A valid replacement supersedes any incomplete transaction. The old
+    // bearer is dropped before a new one-time credential is exchanged.
+    preparedAttachment = null;
+    completedPairingUrl = null;
+    consumedPairingUrl = normalizedPairingUrl;
     const session = yield* exchangeCredential({
       httpBaseUrl: target.httpBaseUrl,
       credential: target.credential,
     });
+    const bearerExpiresAt = attachedBearerExpiry(
+      yield* Clock.currentTimeMillis,
+      session.expires_in,
+    );
     const missingScopes = missingAdministrativeScopes(session.scope);
     if (missingScopes.length > 0) {
       return yield* new DesktopAttachAdministrativeScopeError({ missingScopes });
     }
-    const descriptor = yield* fetchDescriptor(target.httpBaseUrl);
-    const preference = yield* persistAttached({
-      descriptor,
+    preparedAttachment = {
+      pairingUrl: normalizedPairingUrl,
       httpBaseUrl: target.httpBaseUrl,
       wsBaseUrl: target.wsBaseUrl,
       accessToken: session.access_token,
-      expiresIn: session.expires_in,
+      bearerExpiresAt,
+    };
+    return preparedAttachment;
+  });
+
+  const complete = Effect.fn("desktop.attachedBackend.complete")(function* (
+    transaction: PreparedAttachment,
+  ) {
+    const descriptor = yield* fetchDescriptor(transaction.httpBaseUrl);
+    const preference = yield* persistAttached({
+      descriptor,
+      httpBaseUrl: transaction.httpBaseUrl,
+      wsBaseUrl: transaction.wsBaseUrl,
+      accessToken: transaction.accessToken,
+      bearerExpiresAt: transaction.bearerExpiresAt,
     });
+    preparedAttachment = null;
+    completedPairingUrl = transaction.pairingUrl;
     return redactedState(preference);
   });
+
+  const attach = (pairingUrl: string) =>
+    attachLock.withPermits(1)(
+      Effect.gen(function* () {
+        const normalizedPairingUrl = pairingUrl.trim();
+        if (completedPairingUrl === normalizedPairingUrl && preparedAttachment === null) {
+          return yield* readPreference.pipe(Effect.map(redactedState));
+        }
+        const transaction = yield* prepare(normalizedPairingUrl);
+        return yield* complete(transaction);
+      }).pipe(
+        Effect.onInterrupt(() =>
+          Effect.sync(() => {
+            preparedAttachment = null;
+          }),
+        ),
+      ),
+    );
 
   const refreshCredential = Effect.fn("desktop.attachedBackend.refreshCredential")(function* (
     pairingCredential: string,
@@ -367,6 +442,10 @@ export const make = Effect.gen(function* () {
       httpBaseUrl: preference.httpBaseUrl,
       credential: pairingCredential,
     });
+    const bearerExpiresAt = attachedBearerExpiry(
+      yield* Clock.currentTimeMillis,
+      session.expires_in,
+    );
     const missingScopes = missingAdministrativeScopes(session.scope);
     if (missingScopes.length > 0) {
       return yield* new DesktopAttachAdministrativeScopeError({ missingScopes });
@@ -380,7 +459,7 @@ export const make = Effect.gen(function* () {
       httpBaseUrl: preference.httpBaseUrl,
       wsBaseUrl: preference.wsBaseUrl,
       accessToken: session.access_token,
-      expiresIn: session.expires_in,
+      bearerExpiresAt,
     });
   });
 

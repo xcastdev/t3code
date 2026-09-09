@@ -89,7 +89,17 @@ describe("DesktopClerk", () => {
   beforeEach(() => {
     createClerkBridgeMock.mockReset();
     storageMock.mockReset();
+    DesktopLaunchIntent.resetDesktopLaunchIntentCoordinator();
   });
+
+  const markStartupRunning = () => {
+    const selection = DesktopLaunchIntent.claimDesktopStartupSelection();
+    assert.equal(
+      DesktopLaunchIntent.commitDesktopStartupSelection(selection.selectionId)._tag,
+      "Running",
+    );
+    DesktopLaunchIntent.activateDesktopRuntimeLaunchIntents();
+  };
 
   it("derives the Clerk Frontend API hostname used by the desktop CSP", () => {
     const publishableKey = `pk_test_${btoa("clerk.t3.codes$")}`;
@@ -256,6 +266,7 @@ describe("DesktopClerk", () => {
   it.effect("attaches in the existing process before requesting a sanitized relaunch", () => {
     storageMock.mockReturnValue(storageAdapter);
     createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: true });
+    markStartupRunning();
     const events: string[] = [];
     const handlers = new Map<string, (...args: Array<unknown>) => void>();
     const relaunchComplete = Effect.runSync(Deferred.make<void>());
@@ -288,11 +299,15 @@ describe("DesktopClerk", () => {
 
     return Effect.gen(function* () {
       const clerk = yield* DesktopClerk.DesktopClerk;
-      yield* Effect.scoped(clerk.configure);
-      handlers.get("second-instance")?.({}, ["/desktop", attachUrl]);
-      yield* Deferred.await(relaunchComplete);
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* clerk.configure;
+          handlers.get("second-instance")?.({}, ["/desktop", attachUrl]);
+          yield* Deferred.await(relaunchComplete);
 
-      assert.deepEqual(events, [`attach:${pairingUrl}`, "relaunch:primary-backend-attached"]);
+          assert.deepEqual(events, [`attach:${pairingUrl}`, "relaunch:primary-backend-attached"]);
+        }),
+      );
     }).pipe(
       Effect.provide(Layer.mergeAll(makeDesktopClerkLayer(), makeDesktopClerkEventContextLayer())),
       Effect.provideService(ElectronApp.ElectronApp, electronApp),
@@ -305,6 +320,7 @@ describe("DesktopClerk", () => {
   it.effect("does not relaunch after a failed existing-instance attach", () => {
     storageMock.mockReturnValue(storageAdapter);
     createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: true });
+    markStartupRunning();
     const relaunch = vi.fn();
     const attachAttempted = Effect.runSync(Deferred.make<void>());
     const attach = vi.fn(() =>
@@ -336,12 +352,16 @@ describe("DesktopClerk", () => {
 
     return Effect.gen(function* () {
       const clerk = yield* DesktopClerk.DesktopClerk;
-      yield* Effect.scoped(clerk.configure);
-      handlers.get("second-instance")?.({}, ["/desktop", attachUrl]);
-      yield* Deferred.await(attachAttempted);
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* clerk.configure;
+          handlers.get("second-instance")?.({}, ["/desktop", attachUrl]);
+          yield* Deferred.await(attachAttempted);
 
-      assert.equal(attach.mock.calls.length, 1);
-      assert.equal(relaunch.mock.calls.length, 0);
+          assert.equal(attach.mock.calls.length, 1);
+          assert.equal(relaunch.mock.calls.length, 0);
+        }),
+      );
     }).pipe(
       Effect.provide(Layer.mergeAll(makeDesktopClerkLayer(), makeDesktopClerkEventContextLayer())),
       Effect.provideService(ElectronApp.ElectronApp, electronApp),
@@ -356,6 +376,7 @@ describe("DesktopClerk", () => {
     () => {
       storageMock.mockReturnValue(storageAdapter);
       createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: true });
+      markStartupRunning();
       const handlers = new Map<string, (...args: Array<unknown>) => void>();
       const warningShown = Effect.runSync(Deferred.make<void>());
       const pairingUrl = "http://127.0.0.1:3773/pair#token=owner-token";
@@ -394,20 +415,24 @@ describe("DesktopClerk", () => {
 
       return Effect.gen(function* () {
         const clerk = yield* DesktopClerk.DesktopClerk;
-        yield* Effect.scoped(clerk.configure);
-        handlers.get("second-instance")?.({}, ["/desktop", attachUrl]);
-        yield* Deferred.await(warningShown);
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* clerk.configure;
+            handlers.get("second-instance")?.({}, ["/desktop", attachUrl]);
+            yield* Deferred.await(warningShown);
 
-        assert.equal(attachAttempted.mock.calls.length, 1);
-        assert.equal(reveal.mock.calls.length, 1);
-        assert.equal(relaunch.mock.calls.length, 0);
-        assert.deepEqual(warningOptions, {
-          type: "warning",
-          title: "Could not attach to T3 server",
-          message: "T3 Code could not attach to the requested primary backend.",
-          detail: "Open the desktop app and try again with a new owner pairing URL.",
-          buttons: ["OK"],
-        });
+            assert.equal(attachAttempted.mock.calls.length, 1);
+            assert.equal(reveal.mock.calls.length, 1);
+            assert.equal(relaunch.mock.calls.length, 0);
+            assert.deepEqual(warningOptions, {
+              type: "warning",
+              title: "Could not attach to T3 server",
+              message: "T3 Code could not attach to the requested primary backend.",
+              detail: "Open the desktop app and try again with a new owner pairing URL.",
+              buttons: ["OK"],
+            });
+          }),
+        );
       }).pipe(
         Effect.provide(
           Layer.mergeAll(makeDesktopClerkLayer(), makeDesktopClerkEventContextLayer(dialog)),
@@ -423,6 +448,7 @@ describe("DesktopClerk", () => {
   it.effect("uses the same warning recovery for a failed macOS open-url attach", () => {
     storageMock.mockReturnValue(storageAdapter);
     createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: true });
+    markStartupRunning();
     const handlers = new Map<string, (...args: Array<unknown>) => void>();
     const warningShown = Effect.runSync(Deferred.make<void>());
     const pairingUrl = "http://127.0.0.1:3773/pair#token=owner-token";
@@ -457,14 +483,18 @@ describe("DesktopClerk", () => {
 
     return Effect.gen(function* () {
       const clerk = yield* DesktopClerk.DesktopClerk;
-      yield* Effect.scoped(clerk.configure);
-      assert.isTrue(DesktopLaunchIntent.capturePreReadyDesktopLaunchIntent(attachUrl));
-      handlers.get("open-url")?.({ preventDefault }, attachUrl);
-      yield* Deferred.await(warningShown);
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* clerk.configure;
+          assert.isTrue(DesktopLaunchIntent.capturePreReadyDesktopLaunchIntent(attachUrl));
+          handlers.get("open-url")?.({ preventDefault }, attachUrl);
+          yield* Deferred.await(warningShown);
 
-      assert.equal(attach.mock.calls.length, 1);
-      assert.equal(reveal.mock.calls.length, 1);
-      assert.equal(preventDefault.mock.calls.length, 1);
+          assert.equal(attach.mock.calls.length, 1);
+          assert.equal(reveal.mock.calls.length, 1);
+          assert.equal(preventDefault.mock.calls.length, 1);
+        }),
+      );
     }).pipe(
       Effect.provide(
         Layer.mergeAll(makeDesktopClerkLayer(), makeDesktopClerkEventContextLayer(dialog)),
@@ -476,16 +506,14 @@ describe("DesktopClerk", () => {
     );
   });
 
-  it.effect("claims a pre-ready intent before bootstrap can consume the same URL", () => {
+  it.effect("queues a pre-ready intent until bootstrap claims it", () => {
     storageMock.mockReturnValue(storageAdapter);
     createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: true });
     const handlers = new Map<string, (...args: Array<unknown>) => void>();
-    const attachComplete = Effect.runSync(Deferred.make<void>());
     const pairingUrl = "http://127.0.0.1:3773/pair#token=owner-token";
     const attachUrl = `t3code://attach-primary?pairingUrl=${encodeURIComponent(pairingUrl)}`;
     const prebuiltContext = Effect.runSync(Effect.scoped(Layer.build(DesktopLaunchIntent.layer)));
     const launchIntent = Context.get(prebuiltContext, DesktopLaunchIntent.DesktopLaunchIntent);
-    Effect.runSync(launchIntent.consume);
     assert.isTrue(DesktopLaunchIntent.capturePreReadyDesktopLaunchIntent(attachUrl));
 
     const electronApp = {
@@ -496,13 +524,7 @@ describe("DesktopClerk", () => {
         }),
     } as unknown as ElectronApp.ElectronApp["Service"];
     const electronWindow = {} as ElectronWindow.ElectronWindow["Service"];
-    const attach = vi.fn((value: string) =>
-      Effect.gen(function* () {
-        assert.equal(value, pairingUrl);
-        yield* Deferred.succeed(attachComplete, undefined);
-        return { mode: "attached" as const };
-      }),
-    );
+    const attach = vi.fn(() => Effect.die("unexpected runtime attach"));
     const attachedBackend = {
       attach,
     } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"];
@@ -513,11 +535,18 @@ describe("DesktopClerk", () => {
     return Effect.gen(function* () {
       const clerk = yield* DesktopClerk.DesktopClerk;
       yield* Effect.scoped(clerk.configure);
-      handlers.get("open-url")?.({ preventDefault: vi.fn() }, attachUrl);
-      yield* Deferred.await(attachComplete);
+      const preventDefault = vi.fn();
+      handlers.get("open-url")?.({ preventDefault }, attachUrl);
 
-      assert.equal(attach.mock.calls.length, 1);
+      assert.equal(attach.mock.calls.length, 0);
+      assert.equal(preventDefault.mock.calls.length, 1);
+      const selection = yield* launchIntent.claimForStartup;
+      assert.equal(selection.pairingUrl, pairingUrl);
       assert.isTrue(Option.isNone(yield* launchIntent.consume));
+      assert.equal(
+        (yield* launchIntent.commitStartupSelection(selection.selectionId))._tag,
+        "Running",
+      );
     }).pipe(
       Effect.provide(
         Layer.mergeAll(

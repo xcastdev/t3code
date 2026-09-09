@@ -17,10 +17,10 @@ import * as DesktopAppIdentity from "./DesktopAppIdentity.ts";
 import * as DesktopEnvironment from "./DesktopEnvironment.ts";
 import * as DesktopLifecycle from "./DesktopLifecycle.ts";
 import {
-  claimDesktopLaunchIntent,
-  clearDesktopLaunchIntent,
   findDesktopLaunchIntentInArgv,
   parseDesktopLaunchIntent,
+  registerDesktopRuntimeLaunchIntentHandler,
+  routeDesktopLaunchIntent,
 } from "./DesktopLaunchIntent.ts";
 
 declare const __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: string | undefined;
@@ -186,14 +186,19 @@ export const make = Effect.gen(function* () {
         );
       };
 
+      yield* Effect.acquireRelease(
+        Effect.sync(() => registerDesktopRuntimeLaunchIntentHandler(handleAttachIntent)),
+        (unregister) => Effect.sync(unregister),
+      );
+
       yield* electronApp.on<[unknown, unknown]>("second-instance", (_event, rawArgv) => {
         const argv = Array.isArray(rawArgv)
           ? rawArgv.filter((arg): arg is string => typeof arg === "string")
           : [];
         const pairingUrl = findDesktopLaunchIntentInArgv(argv);
         if (pairingUrl !== null) {
-          clearDesktopLaunchIntent();
-          handleAttachIntent(pairingUrl);
+          const rawAttachUrl = argv.find((arg) => parseDesktopLaunchIntent(arg) === pairingUrl);
+          if (rawAttachUrl !== undefined) routeDesktopLaunchIntent(rawAttachUrl);
           return;
         }
         void runPromise(
@@ -207,13 +212,9 @@ export const make = Effect.gen(function* () {
       });
 
       yield* electronApp.on<[unknown, string]>("open-url", (event, url) => {
-        const electronEvent = event as { preventDefault?: () => void };
         if (parseDesktopLaunchIntent(url) === null) return;
-        electronEvent.preventDefault?.();
-        const pairingUrl = parseDesktopLaunchIntent(url);
-        if (pairingUrl !== null && claimDesktopLaunchIntent(pairingUrl)) {
-          handleAttachIntent(pairingUrl);
-        }
+        (event as { preventDefault?: () => void }).preventDefault?.();
+        routeDesktopLaunchIntent(url);
       });
     }).pipe(Effect.withSpan("desktop.clerk.configure")),
   });

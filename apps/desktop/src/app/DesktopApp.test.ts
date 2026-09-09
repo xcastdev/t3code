@@ -1,4 +1,6 @@
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -25,6 +27,25 @@ const primaryEnvironmentId = PRIMARY_LOCAL_ENVIRONMENT_ID as Extract<
   { readonly mode: "attached" }
 >["environmentId"];
 type TestAttachFailure = { readonly _tag: "TestAttachFailure" };
+
+function makeTestLaunchIntent(pendingPairingUrl: string | undefined) {
+  const selectionId = 1;
+  return DesktopLaunchIntent.DesktopLaunchIntent.of({
+    capture: () => Effect.succeed(false),
+    captureArgv: () => Effect.succeed(false),
+    consume: Effect.succeed(
+      pendingPairingUrl === undefined ? Option.none() : Option.some(pendingPairingUrl),
+    ),
+    claimForStartup: Effect.succeed({
+      selectionId,
+      pairingUrl: pendingPairingUrl ?? null,
+    }),
+    claimPendingForStartup: () => Effect.succeed(Option.none()),
+    commitStartupSelection: () => Effect.succeed({ _tag: "Running" as const }),
+    activateRuntime: Effect.void,
+    abortStartupSelection: Effect.void,
+  });
+}
 
 type RecoveryInput = {
   readonly attachedBackend: DesktopAttachedBackend.DesktopAttachedBackend["Service"];
@@ -283,11 +304,7 @@ describe("DesktopApp attached startup recovery", () => {
         probe: Effect.suspend(() => probe()),
         useManagedBackend: Effect.void,
       } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"];
-      const launchIntent = DesktopLaunchIntent.DesktopLaunchIntent.of({
-        capture: () => Effect.succeed(false),
-        captureArgv: () => Effect.succeed(false),
-        consume: Effect.succeed(Option.some(pairingUrl)),
-      });
+      const launchIntent = makeTestLaunchIntent(pairingUrl);
       const harness = yield* makeHarness();
       const selection = yield* runRecovery(
         DesktopApp.selectDesktopPrimaryBackend({
@@ -343,11 +360,7 @@ describe("DesktopApp attached startup recovery", () => {
         probe: Effect.suspend(() => probe()),
         useManagedBackend: Effect.void,
       } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"];
-      const launchIntent = DesktopLaunchIntent.DesktopLaunchIntent.of({
-        capture: () => Effect.succeed(false),
-        captureArgv: () => Effect.succeed(false),
-        consume: Effect.succeed(Option.none()),
-      });
+      const launchIntent = makeTestLaunchIntent(undefined);
 
       const selection = yield* runRecovery(
         DesktopApp.selectDesktopPrimaryBackend({
@@ -399,11 +412,7 @@ describe("DesktopApp attached startup recovery", () => {
         probe: Effect.suspend(() => probe()),
         useManagedBackend: Effect.void,
       } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"];
-      const launchIntent = DesktopLaunchIntent.DesktopLaunchIntent.of({
-        capture: () => Effect.succeed(false),
-        captureArgv: () => Effect.succeed(false),
-        consume: Effect.succeed(Option.none()),
-      });
+      const launchIntent = makeTestLaunchIntent(undefined);
 
       const selection = yield* runRecovery(
         DesktopApp.selectDesktopPrimaryBackend({
@@ -428,6 +437,78 @@ describe("DesktopApp attached startup recovery", () => {
         primaryStart: 0,
         wslReconcile: 0,
       });
+    }),
+  );
+
+  it.effect("supersedes a held startup attachment with a newer launch intent", () =>
+    Effect.gen(function* () {
+      DesktopLaunchIntent.resetDesktopLaunchIntentCoordinator();
+      const firstPairingUrl = "http://127.0.0.1:3773/pair#token=first";
+      const latestPairingUrl = "http://127.0.0.1:4773/pair#token=latest";
+      const firstAttachStarted = yield* Deferred.make<void>();
+      const releaseFirstAttach = yield* Deferred.make<void>();
+      let currentState: DesktopPrimaryBackendState = { mode: "managed" };
+      const attachedState = {
+        mode: "attached" as const,
+        httpBaseUrl: "http://127.0.0.1:4773/",
+        environmentId: primaryEnvironmentId,
+        label: "Latest workstation",
+        bearerExpiresAt: "2026-10-08T12:00:00.000Z",
+      };
+      const attach = vi.fn((url: string) =>
+        Effect.gen(function* () {
+          if (url === firstPairingUrl) {
+            yield* Deferred.succeed(firstAttachStarted, undefined);
+            yield* Deferred.await(releaseFirstAttach);
+          }
+          currentState = attachedState;
+        }),
+      );
+      const attachedBackend = {
+        getState: Effect.sync(() => currentState),
+        attach,
+        probe: Effect.succeed({}),
+        useManagedBackend: Effect.void,
+      } as unknown as DesktopAttachedBackend.DesktopAttachedBackend["Service"];
+      const launchIntent = DesktopLaunchIntent.DesktopLaunchIntent.of({
+        capture: (raw) =>
+          Effect.sync(() => DesktopLaunchIntent.routeDesktopLaunchIntent(raw).accepted),
+        captureArgv: () => Effect.succeed(false),
+        consume: Effect.succeed(Option.some(firstPairingUrl)),
+        claimForStartup: Effect.sync(DesktopLaunchIntent.claimDesktopStartupSelection),
+        claimPendingForStartup: (selectionId) =>
+          Effect.sync(() =>
+            Option.fromNullishOr(DesktopLaunchIntent.claimPendingDesktopStartupIntent(selectionId)),
+          ),
+        commitStartupSelection: (selectionId) =>
+          Effect.sync(() => DesktopLaunchIntent.commitDesktopStartupSelection(selectionId)),
+        activateRuntime: Effect.sync(DesktopLaunchIntent.activateDesktopRuntimeLaunchIntents),
+        abortStartupSelection: Effect.sync(DesktopLaunchIntent.abortDesktopStartupSelection),
+      });
+      const harness = yield* makeHarness();
+      DesktopLaunchIntent.routeDesktopLaunchIntent(
+        DesktopLaunchIntent.buildDesktopAttachUrl(firstPairingUrl),
+      );
+      const selectionFiber = yield* runRecovery(
+        DesktopApp.selectDesktopPrimaryBackend({
+          ...harness.input,
+          attachedBackend,
+          launchIntent,
+        }),
+        harness.input,
+      ).pipe(Effect.forkChild);
+      yield* Deferred.await(firstAttachStarted);
+      DesktopLaunchIntent.routeDesktopLaunchIntent(
+        DesktopLaunchIntent.buildDesktopAttachUrl(latestPairingUrl),
+      );
+      yield* Deferred.succeed(releaseFirstAttach, undefined);
+      const selection = yield* Fiber.join(selectionFiber);
+
+      assert.deepEqual(
+        attach.mock.calls.map(([url]) => url),
+        [firstPairingUrl, latestPairingUrl],
+      );
+      assert.deepEqual(selection, { _tag: "Attached", state: attachedState });
     }),
   );
 });
