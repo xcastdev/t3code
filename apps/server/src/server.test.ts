@@ -18,8 +18,10 @@ import {
   KeybindingRule,
   McpServerId,
   McpCatalogOverrideId,
+  McpCatalogSessionId,
   McpDefinitionId,
   type McpCatalogDefinition,
+  type McpCatalogSnapshot,
   MessageId,
   ExternalLauncherCommandNotFoundError,
   OrchestrationThreadDetailSnapshot,
@@ -122,6 +124,7 @@ import * as ServerConfig from "./config.ts";
 import { makeRoutesLayer } from "./server.ts";
 import {
   isThreadDetailEvent,
+  findScopedMcpCatalogDefinition,
   resolveAvailableEditorsForConfig,
   resolveFileManagerRevealKindForConfig,
 } from "./ws.ts";
@@ -1531,6 +1534,59 @@ const NodeHttpServerTestWithWsDeflate = HttpServer.layerTestClient.pipe(
 );
 
 it.layer(NodeServices.layer)("server router seam", (it) => {
+  it("prefers the applied session catalog for OAuth disconnect targets", () => {
+    const makeDefinition = (definitionId: string, name: string): McpCatalogDefinition => ({
+      definitionId: McpDefinitionId.make(definitionId),
+      logicalServerId: McpServerId.make("session-oauth-server"),
+      scope: "session",
+      scopeId: "catalog-session-oauth",
+      name,
+      transport: {
+        type: "streamable-http",
+        url: `https://${definitionId}.example.test/mcp`,
+        headers: [],
+        authorization: { type: "oauth", registration: { type: "automatic" } },
+      },
+      enabled: true,
+      providerInstanceIds: [ProviderInstanceId.make("codex-primary")],
+      revision: 1,
+    });
+    const applied = makeDefinition("definition-applied-oauth", "Applied OAuth");
+    const desired = makeDefinition("definition-desired-oauth", "Desired OAuth");
+    const snapshot: McpCatalogSnapshot = {
+      catalogSessionId: McpCatalogSessionId.make("catalog-session-oauth"),
+      threadId: ThreadId.make("thread-oauth"),
+      providerInstanceId: ProviderInstanceId.make("codex-primary"),
+      baseline: [applied],
+      desired: [desired],
+      applied: [applied],
+      desiredRevision: 1,
+      appliedRevision: 0,
+    };
+
+    assert.equal(
+      findScopedMcpCatalogDefinition({
+        snapshot,
+        target: {
+          logicalServerId: applied.logicalServerId,
+          transportDefinitionId: applied.definitionId,
+        },
+        preferApplied: true,
+      }),
+      applied,
+    );
+    assert.equal(
+      findScopedMcpCatalogDefinition({
+        snapshot,
+        target: {
+          logicalServerId: desired.logicalServerId,
+          transportDefinitionId: desired.definitionId,
+        },
+      }),
+      desired,
+    );
+  });
+
   it.effect("parks HTTP ingress until command readiness", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
@@ -5765,6 +5821,49 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         assert.equal(error._tag, "McpCatalogProviderLimitExceededError");
         assert.deepEqual(dispatched, []);
       }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects a global catalog request for another environment before dispatch", () =>
+    Effect.gen(function* () {
+      const dispatched = yield* Ref.make(0);
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            dispatch: () =>
+              Ref.update(dispatched, (count) => count + 1).pipe(Effect.as({ sequence: 1 })),
+          },
+          projectMcpService: {
+            withCatalogMutation: <A, E, R>(effect: Effect.Effect<A, E, R>) => effect,
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const error = yield* Effect.flip(
+        Effect.scoped(
+          withWsRpcClient(wsUrl, (client) =>
+            client[WS_METHODS.mcpCatalogGlobalCreate]({
+              scope: "global",
+              scopeId: EnvironmentId.make("another-environment"),
+              expectedRevision: 0,
+              definition: {
+                name: "Foreign",
+                transport: {
+                  type: "streamable-http",
+                  url: "https://foreign.example.test/mcp",
+                  headers: [],
+                  authorization: { type: "none" },
+                },
+                enabled: true,
+                providerInstanceIds: [ProviderInstanceId.make("codex-primary")],
+              },
+            }),
+          ),
+        ),
+      );
+      assert.equal(error._tag, "EnvironmentAuthorizationError");
+      assert.equal(yield* Ref.get(dispatched), 0);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
   it.effect("requires a safe browser origin before starting project MCP OAuth", () =>

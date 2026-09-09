@@ -229,22 +229,29 @@ import {
 import { VcsError } from "./vcs.ts";
 import {
   McpCatalogChanged,
-  McpCatalogCreateInput,
   McpCatalogDefinition,
   McpCatalogGlobalState,
-  McpCatalogDeleteOverrideInput,
-  McpCatalogListInput,
+  McpCatalogGlobalListInput,
+  McpCatalogGlobalCreateInput,
+  McpCatalogGlobalUpdateInput,
+  McpCatalogGlobalRemoveInput,
   McpCatalogMutationError,
   McpCatalogOAuthBeginInput,
   McpCatalogOAuthContinueInput,
   McpCatalogOAuthDisconnectInput,
   McpCatalogProjectState,
-  McpCatalogOverrideInput,
-  McpCatalogRemoveInput,
+  McpCatalogProjectListInput,
+  McpCatalogProjectCreateInput,
+  McpCatalogProjectUpdateInput,
+  McpCatalogProjectRemoveInput,
+  McpCatalogProjectOverrideInput,
+  McpCatalogProjectDeleteOverrideInput,
   McpCatalogSessionMutationInput,
+  McpCatalogSessionCreateInput,
+  McpCatalogSessionUpdateInput,
+  McpCatalogSessionRemoveInput,
   McpCatalogSessionRequest,
   McpCatalogSnapshot,
-  McpCatalogUpdateInput,
   ResolvedMcpCatalogEntry,
 } from "./mcpCatalog.ts";
 
@@ -809,65 +816,65 @@ const mcpCatalogMutationError = Schema.Union([
 ]);
 
 export const WsMcpCatalogGlobalListRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalList, {
-  payload: McpCatalogListInput,
+  payload: McpCatalogGlobalListInput,
   success: Schema.Array(McpCatalogDefinition),
   error: EnvironmentAuthorizationError,
 });
 
 export const WsMcpCatalogGlobalStateListRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalStateList, {
-  payload: McpCatalogListInput,
+  payload: McpCatalogGlobalListInput,
   success: McpCatalogGlobalState,
   error: EnvironmentAuthorizationError,
 });
 
 export const WsMcpCatalogGlobalCreateRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalCreate, {
-  payload: McpCatalogCreateInput,
+  payload: McpCatalogGlobalCreateInput,
   success: McpCatalogDefinition,
   error: mcpCatalogMutationError,
 });
 
 export const WsMcpCatalogGlobalUpdateRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalUpdate, {
-  payload: McpCatalogUpdateInput,
+  payload: McpCatalogGlobalUpdateInput,
   success: McpCatalogDefinition,
   error: mcpCatalogMutationError,
 });
 
 export const WsMcpCatalogGlobalRemoveRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalRemove, {
-  payload: McpCatalogRemoveInput,
+  payload: McpCatalogGlobalRemoveInput,
   error: mcpCatalogMutationError,
 });
 
 export const WsMcpCatalogProjectListRpc = Rpc.make(WS_METHODS.mcpCatalogProjectList, {
-  payload: McpCatalogListInput,
+  payload: McpCatalogProjectListInput,
   success: Schema.Array(ResolvedMcpCatalogEntry),
   error: mcpCatalogMutationError,
 });
 
 export const WsMcpCatalogProjectStateListRpc = Rpc.make(WS_METHODS.mcpCatalogProjectStateList, {
-  payload: McpCatalogListInput,
+  payload: McpCatalogProjectListInput,
   success: McpCatalogProjectState,
   error: mcpCatalogMutationError,
 });
 
 export const WsMcpCatalogProjectCreateRpc = Rpc.make(WS_METHODS.mcpCatalogProjectCreate, {
-  payload: McpCatalogCreateInput,
+  payload: McpCatalogProjectCreateInput,
   success: McpCatalogDefinition,
   error: mcpCatalogMutationError,
 });
 
 export const WsMcpCatalogProjectUpdateRpc = Rpc.make(WS_METHODS.mcpCatalogProjectUpdate, {
-  payload: McpCatalogUpdateInput,
+  payload: McpCatalogProjectUpdateInput,
   success: McpCatalogDefinition,
   error: mcpCatalogMutationError,
 });
 
 export const WsMcpCatalogProjectRemoveRpc = Rpc.make(WS_METHODS.mcpCatalogProjectRemove, {
-  payload: McpCatalogRemoveInput,
+  payload: McpCatalogProjectRemoveInput,
   error: mcpCatalogMutationError,
 });
 
 export const WsMcpCatalogProjectOverrideRpc = Rpc.make(WS_METHODS.mcpCatalogProjectOverride, {
-  payload: McpCatalogOverrideInput,
+  payload: McpCatalogProjectOverrideInput,
   success: Schema.Void,
   error: mcpCatalogMutationError,
 });
@@ -875,7 +882,7 @@ export const WsMcpCatalogProjectOverrideRpc = Rpc.make(WS_METHODS.mcpCatalogProj
 export const WsMcpCatalogProjectDeleteOverrideRpc = Rpc.make(
   WS_METHODS.mcpCatalogProjectDeleteOverride,
   {
-    payload: McpCatalogDeleteOverrideInput,
+    payload: McpCatalogProjectDeleteOverrideInput,
     error: mcpCatalogMutationError,
   },
 );
@@ -887,28 +894,19 @@ export const WsMcpCatalogSessionGetRpc = Rpc.make(WS_METHODS.mcpCatalogSessionGe
 });
 
 export const WsMcpCatalogSessionCreateRpc = Rpc.make(WS_METHODS.mcpCatalogSessionCreate, {
-  payload: Schema.Struct({
-    ...McpCatalogCreateInput.fields,
-    ...McpCatalogSessionRequest.fields,
-  }),
+  payload: McpCatalogSessionCreateInput,
   success: McpCatalogSnapshot,
   error: mcpCatalogMutationError,
 });
 
 export const WsMcpCatalogSessionUpdateRpc = Rpc.make(WS_METHODS.mcpCatalogSessionUpdate, {
-  payload: Schema.Struct({
-    ...McpCatalogSessionMutationInput.fields,
-    ...McpCatalogUpdateInput.fields,
-  }),
+  payload: McpCatalogSessionUpdateInput,
   success: McpCatalogSnapshot,
   error: mcpCatalogMutationError,
 });
 
 export const WsMcpCatalogSessionRemoveRpc = Rpc.make(WS_METHODS.mcpCatalogSessionRemove, {
-  payload: Schema.Struct({
-    ...McpCatalogSessionMutationInput.fields,
-    ...McpCatalogRemoveInput.fields,
-  }),
+  payload: McpCatalogSessionRemoveInput,
   success: McpCatalogSnapshot,
   error: mcpCatalogMutationError,
 });

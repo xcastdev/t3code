@@ -875,6 +875,15 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       yield* validateEffectiveCatalogInvariant(command.type, command.snapshot.desired, [
         command.snapshot.providerInstanceId,
       ]);
+      yield* validateCatalogDefinitions(
+        readModel,
+        command.type,
+        String(command.snapshot.catalogSessionId),
+        command.snapshot.applied,
+      );
+      yield* validateEffectiveCatalogInvariant(command.type, command.snapshot.applied, [
+        command.snapshot.providerInstanceId,
+      ]);
       if (
         command.snapshot.desiredRevision === 0 &&
         !catalogDefinitionsEqual(command.snapshot.baseline, command.snapshot.desired)
@@ -1128,6 +1137,18 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           cause,
         });
       }
+      if (command.type === "thread.mcp-catalog.applied") {
+        const appliedCatalog = command.appliedCatalog ?? snapshot.desired;
+        yield* validateCatalogDefinitions(
+          readModel,
+          command.type,
+          String(command.mcpCatalogSessionId),
+          appliedCatalog,
+        );
+        yield* validateEffectiveCatalogInvariant(command.type, appliedCatalog, [
+          snapshot.providerInstanceId,
+        ]);
+      }
       const isInitialApplicationReceipt =
         command.revision === 0 &&
         snapshot.appliedRevision === 0 &&
@@ -1179,6 +1200,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
                   threadId: command.threadId,
                   mcpCatalogSessionId: command.mcpCatalogSessionId,
                   revision: command.revision,
+                  ...(command.appliedCatalog === undefined
+                    ? {}
+                    : { appliedCatalog: command.appliedCatalog }),
                   appliedAt: command.appliedAt,
                 }
               : {

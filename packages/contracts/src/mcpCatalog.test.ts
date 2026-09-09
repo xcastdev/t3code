@@ -140,12 +140,14 @@ describe("MCP catalog contracts", () => {
       providerInstanceId: "codex",
       baseline: [base],
       desired: [base],
+      applied: [base],
       desiredRevision: 1,
       appliedRevision: 1,
       application: { status: "applied", revision: 1, appliedAt: "2026-09-08T00:00:00.000Z" },
     });
     expect(snapshot.baseline[0]?.transport).toEqual(transport);
     expect(snapshot.baseline[0]?.definitionId).toBe("definition-1");
+    expect(snapshot.applied[0]?.definitionId).toBe("definition-1");
   });
 
   it("decodes stale revision and stale logical session errors", () => {

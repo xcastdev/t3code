@@ -219,6 +219,7 @@ const ProjectionMcpCatalogSessionDbRowSchema = Schema.Struct({
   providerInstanceId: ProviderInstanceId,
   baseline: Schema.fromJsonString(Schema.Array(McpCatalogDefinition)),
   desired: Schema.fromJsonString(Schema.Array(McpCatalogDefinition)),
+  applied: Schema.NullOr(Schema.fromJsonString(Schema.Array(McpCatalogDefinition))),
   desiredRevision: NonNegativeInt,
   appliedRevision: NonNegativeInt,
   applicationError: Schema.NullOr(Schema.String),
@@ -757,6 +758,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           provider_instance_id AS "providerInstanceId",
           baseline_json AS "baseline",
           desired_catalog_json AS "desired",
+          applied_catalog_json AS "applied",
           desired_revision AS "desiredRevision",
           applied_revision AS "appliedRevision",
           application_error AS "applicationError",
@@ -2099,6 +2101,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 providerInstanceId: row.providerInstanceId,
                 baseline: row.baseline,
                 desired: row.desired,
+                // NULL is the explicit migration residual for pre-048 rows
+                // whose older applied catalog cannot be reconstructed safely.
+                applied: row.applied ?? [],
                 desiredRevision: row.desiredRevision,
                 appliedRevision: row.appliedRevision,
                 ...(row.applicationStatus === "applied" &&

@@ -75,6 +75,7 @@ const projectMcpCleanupEventTypes = new Set([
   "thread.mcp-catalog.initialized",
   "thread.mcp-catalog.updated",
   "thread.mcp-catalog.reset",
+  "thread.mcp-catalog.applied",
   "thread.mcp-catalog.disposed",
 ]);
 
@@ -98,6 +99,7 @@ const McpCatalogOverrideProjectionRow = Schema.Struct({
 const McpCatalogSessionProjectionRow = Schema.Struct({
   baselineJson: Schema.String,
   desiredJson: Schema.String,
+  appliedJson: Schema.NullOr(Schema.String),
 });
 
 const decodeProjectMcpServer = Schema.decodeUnknownEffect(ProjectMcpServer);
@@ -804,7 +806,10 @@ const makeProjectMcpService = Effect.gen(function* () {
       WHERE scope_type = 'project'
     `;
     const sessions = yield* sql<Schema.Schema.Type<typeof McpCatalogSessionProjectionRow>>`
-      SELECT sessions.baseline_json AS "baselineJson", sessions.desired_catalog_json AS "desiredJson"
+      SELECT
+        sessions.baseline_json AS "baselineJson",
+        sessions.desired_catalog_json AS "desiredJson",
+        sessions.applied_catalog_json AS "appliedJson"
       FROM projection_mcp_catalog_sessions AS sessions
       INNER JOIN projection_threads AS threads
         ON threads.thread_id = sessions.thread_id
@@ -842,7 +847,8 @@ const makeProjectMcpService = Effect.gen(function* () {
       }
     }
     for (const row of sessions) {
-      for (const json of [row.baselineJson, row.desiredJson]) {
+      for (const json of [row.baselineJson, row.desiredJson, row.appliedJson]) {
+        if (json === null) continue;
         const definitions = yield* decodeMcpCatalogDefinitionsJson(json);
         for (const definition of definitions) {
           const oauthStateOwnerId = scopedOAuthOwnerId(

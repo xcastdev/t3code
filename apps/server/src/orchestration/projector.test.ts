@@ -44,6 +44,94 @@ function makeEvent(input: {
 }
 
 describe("orchestration projector", () => {
+  it("retains the provider-applied catalog when desired changes", async () => {
+    const applied = {
+      definitionId: "definition-applied",
+      logicalServerId: "server-applied",
+      scope: "session" as const,
+      scopeId: "catalog-session-applied",
+      name: "Applied",
+      transport: {
+        type: "streamable-http" as const,
+        url: "https://applied.example/mcp",
+        headers: [],
+        authorization: { type: "none" as const },
+      },
+      enabled: true,
+      providerInstanceIds: ["codex"],
+      revision: 1,
+    };
+    const desired = { ...applied, definitionId: "definition-desired", name: "Desired" };
+    let model = createEmptyReadModel("2026-01-01T00:00:00.000Z");
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        makeEvent({
+          sequence: 1,
+          type: "thread.mcp-catalog.initialized",
+          occurredAt: "2026-01-01T00:00:01.000Z",
+          aggregateKind: "thread",
+          aggregateId: "thread-applied",
+          commandId: "init-applied",
+          payload: {
+            threadId: "thread-applied",
+            snapshot: {
+              catalogSessionId: "catalog-session-applied",
+              threadId: "thread-applied",
+              providerInstanceId: "codex",
+              baseline: [applied],
+              desired: [applied],
+              applied: [],
+              desiredRevision: 0,
+              appliedRevision: 0,
+            },
+          },
+        }),
+      ),
+    );
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        makeEvent({
+          sequence: 2,
+          type: "thread.mcp-catalog.updated",
+          occurredAt: "2026-01-01T00:00:02.000Z",
+          aggregateKind: "thread",
+          aggregateId: "thread-applied",
+          commandId: "update-applied",
+          payload: {
+            threadId: "thread-applied",
+            mcpCatalogSessionId: "catalog-session-applied",
+            desiredCatalog: [desired],
+            desiredRevision: 1,
+          },
+        }),
+      ),
+    );
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        makeEvent({
+          sequence: 3,
+          type: "thread.mcp-catalog.applied",
+          occurredAt: "2026-01-01T00:00:03.000Z",
+          aggregateKind: "thread",
+          aggregateId: "thread-applied",
+          commandId: "apply-applied",
+          payload: {
+            threadId: "thread-applied",
+            mcpCatalogSessionId: "catalog-session-applied",
+            revision: 0,
+            appliedCatalog: [applied],
+            appliedAt: "2026-01-01T00:00:03.000Z",
+          },
+        }),
+      ),
+    );
+    expect(model.mcpCatalog?.sessions[0]?.desired[0]?.name).toBe("Desired");
+    expect(model.mcpCatalog?.sessions[0]?.applied[0]?.name).toBe("Applied");
+  });
+
   it("records an initial revision-zero application failure", async () => {
     const snapshot = {
       catalogSessionId: "catalog-session-zero",
@@ -51,6 +139,7 @@ describe("orchestration projector", () => {
       providerInstanceId: "codex",
       baseline: [],
       desired: [],
+      applied: [],
       desiredRevision: 0,
       appliedRevision: 0,
     };

@@ -1256,6 +1256,7 @@ export function projectEvent(
                         (payload.revision === 0 && entry.application === undefined))
                         ? {
                             appliedRevision: payload.revision,
+                            applied: payload.appliedCatalog ?? entry.desired,
                             application: {
                               status: "applied" as const,
                               revision: payload.revision,

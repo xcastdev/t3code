@@ -172,6 +172,7 @@ export const McpCatalogSnapshot = Schema.Struct({
   providerInstanceId: ProviderInstanceId,
   baseline: Schema.Array(McpCatalogDefinition),
   desired: Schema.Array(McpCatalogDefinition),
+  applied: Schema.Array(McpCatalogDefinition).pipe(Schema.withDecodingDefault(Effect.succeed([]))),
   desiredRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   appliedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
   application: Schema.optional(McpCatalogApplication),
@@ -254,6 +255,141 @@ export const McpCatalogMutationBase = Schema.Struct({
   expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
 });
 export type McpCatalogMutationBase = typeof McpCatalogMutationBase.Type;
+
+const McpCatalogGlobalScope = Schema.Struct({
+  scope: Schema.Literal("global"),
+  scopeId: EnvironmentId,
+});
+
+const McpCatalogProjectScope = Schema.Struct({
+  scope: Schema.Literal("project"),
+  scopeId: ProjectId,
+});
+
+const McpCatalogSessionScope = Schema.Struct({
+  scope: Schema.Literal("session"),
+  scopeId: McpCatalogSessionId,
+});
+
+export const McpCatalogGlobalListInput = Schema.Struct({
+  ...McpCatalogGlobalScope.fields,
+  providerInstanceId: Schema.optional(ProviderInstanceId),
+});
+export type McpCatalogGlobalListInput = typeof McpCatalogGlobalListInput.Type;
+
+export const McpCatalogProjectListInput = Schema.Struct({
+  ...McpCatalogProjectScope.fields,
+  providerInstanceId: Schema.optional(ProviderInstanceId),
+});
+export type McpCatalogProjectListInput = typeof McpCatalogProjectListInput.Type;
+
+export const McpCatalogGlobalCreateInput = Schema.Struct({
+  ...McpCatalogGlobalScope.fields,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  definition: McpCatalogDefinitionDraft,
+  logicalServerId: Schema.optional(McpServerId),
+});
+export type McpCatalogGlobalCreateInput = typeof McpCatalogGlobalCreateInput.Type;
+
+export const McpCatalogGlobalUpdateInput = Schema.Struct({
+  ...McpCatalogGlobalScope.fields,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  logicalServerId: McpServerId,
+  definition: McpCatalogDefinitionDraft,
+});
+export type McpCatalogGlobalUpdateInput = typeof McpCatalogGlobalUpdateInput.Type;
+
+export const McpCatalogGlobalRemoveInput = Schema.Struct({
+  ...McpCatalogGlobalScope.fields,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  logicalServerId: McpServerId,
+});
+export type McpCatalogGlobalRemoveInput = typeof McpCatalogGlobalRemoveInput.Type;
+
+export const McpCatalogProjectCreateInput = Schema.Struct({
+  ...McpCatalogProjectScope.fields,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  definition: McpCatalogDefinitionDraft,
+  logicalServerId: Schema.optional(McpServerId),
+});
+export type McpCatalogProjectCreateInput = typeof McpCatalogProjectCreateInput.Type;
+
+export const McpCatalogProjectUpdateInput = Schema.Struct({
+  ...McpCatalogProjectScope.fields,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  logicalServerId: McpServerId,
+  definition: McpCatalogDefinitionDraft,
+});
+export type McpCatalogProjectUpdateInput = typeof McpCatalogProjectUpdateInput.Type;
+
+export const McpCatalogProjectRemoveInput = Schema.Struct({
+  ...McpCatalogProjectScope.fields,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  logicalServerId: McpServerId,
+});
+export type McpCatalogProjectRemoveInput = typeof McpCatalogProjectRemoveInput.Type;
+
+export const McpCatalogProjectOverrideInput = Schema.Struct({
+  ...McpCatalogProjectScope.fields,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  override: McpCatalogOverrideDraft,
+}).check(
+  Schema.makeFilter(
+    (input) => input.override.scope === "project" && input.override.scopeId === input.scopeId,
+    { message: "The MCP project override must target the request project." },
+  ),
+);
+export type McpCatalogProjectOverrideInput = typeof McpCatalogProjectOverrideInput.Type;
+
+export const McpCatalogProjectDeleteOverrideInput = Schema.Struct({
+  ...McpCatalogProjectScope.fields,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  overrideId: McpCatalogOverrideId,
+});
+export type McpCatalogProjectDeleteOverrideInput = typeof McpCatalogProjectDeleteOverrideInput.Type;
+
+const McpCatalogSessionMutationScope = Schema.Struct({
+  ...McpCatalogSessionScope.fields,
+  threadId: ThreadId,
+  mcpCatalogSessionId: McpCatalogSessionId,
+  expectedRevision: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+}).check(
+  Schema.makeFilter((input) => input.scopeId === input.mcpCatalogSessionId, {
+    message: "The MCP session scope id must match the catalog session id.",
+  }),
+);
+
+export const McpCatalogSessionCreateInput = Schema.Struct({
+  ...McpCatalogSessionMutationScope.fields,
+  definition: McpCatalogDefinitionDraft,
+  logicalServerId: Schema.optional(McpServerId),
+}).check(
+  Schema.makeFilter((input) => input.scopeId === input.mcpCatalogSessionId, {
+    message: "The MCP session scope id must match the catalog session id.",
+  }),
+);
+export type McpCatalogSessionCreateInput = typeof McpCatalogSessionCreateInput.Type;
+
+export const McpCatalogSessionUpdateInput = Schema.Struct({
+  ...McpCatalogSessionMutationScope.fields,
+  logicalServerId: McpServerId,
+  definition: McpCatalogDefinitionDraft,
+}).check(
+  Schema.makeFilter((input) => input.scopeId === input.mcpCatalogSessionId, {
+    message: "The MCP session scope id must match the catalog session id.",
+  }),
+);
+export type McpCatalogSessionUpdateInput = typeof McpCatalogSessionUpdateInput.Type;
+
+export const McpCatalogSessionRemoveInput = Schema.Struct({
+  ...McpCatalogSessionMutationScope.fields,
+  logicalServerId: McpServerId,
+}).check(
+  Schema.makeFilter((input) => input.scopeId === input.mcpCatalogSessionId, {
+    message: "The MCP session scope id must match the catalog session id.",
+  }),
+);
+export type McpCatalogSessionRemoveInput = typeof McpCatalogSessionRemoveInput.Type;
 
 export const McpCatalogCreateInput = Schema.Struct({
   ...McpCatalogMutationBase.fields,

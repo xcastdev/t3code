@@ -524,6 +524,7 @@ const makeCatalogService = Effect.gen(function* () {
         providerInstanceId: input.providerInstanceId,
         baseline,
         desired: baseline,
+        applied: [],
         desiredRevision: 0,
         appliedRevision: 0,
       };

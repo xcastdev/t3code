@@ -558,6 +558,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   providerInstanceId: input.providerInstanceId,
                   baseline,
                   desired: baseline,
+                  applied: [],
                   desiredRevision: 0,
                   appliedRevision: 0,
                 };
@@ -699,6 +700,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                   threadId: input.sessionInput.threadId,
                   mcpCatalogSessionId: durableCatalogSnapshot.catalogSessionId,
                   revision: durableCatalogSnapshot.desiredRevision,
+                  appliedCatalog: durableCatalogSnapshot.desired,
                   appliedAt: yield* nowIso,
                 },
           ).pipe(Effect.ignoreCause({ log: true }));

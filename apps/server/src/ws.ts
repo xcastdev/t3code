@@ -202,6 +202,26 @@ const isProjectMcpCatalogCommittedCleanupPendingError = Schema.is(
 );
 const isMcpCatalogMutationError = Schema.is(McpCatalogMutationError);
 
+export const findScopedMcpCatalogDefinition = (input: {
+  readonly snapshot: McpCatalogSnapshot;
+  readonly target: Pick<McpCatalogOAuthTarget, "logicalServerId" | "transportDefinitionId">;
+  readonly preferApplied?: boolean;
+}): McpCatalogDefinition | undefined => {
+  const catalogs =
+    input.preferApplied === true
+      ? [input.snapshot.applied, input.snapshot.desired]
+      : [input.snapshot.desired, input.snapshot.applied];
+  for (const catalog of catalogs) {
+    const definition = catalog.find(
+      (entry) =>
+        entry.logicalServerId === input.target.logicalServerId &&
+        entry.definitionId === input.target.transportDefinitionId,
+    );
+    if (definition !== undefined) return definition;
+  }
+  return undefined;
+};
+
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
 const CONFIG_DISCOVERY_TIMEOUT = Duration.seconds(5);
 
@@ -1397,6 +1417,17 @@ const makeWsRpcLayer = (
         projectId: ProjectId,
         operation: Effect.Effect<A, E, R>,
       ) => requireOwnedProject(method, projectId).pipe(Effect.andThen(operation));
+      const requireEnvironmentCatalogScope = (method: string, scopeId: string) =>
+        Effect.gen(function* () {
+          const environmentId = yield* serverEnvironment.getEnvironmentId;
+          if (String(environmentId) !== scopeId) {
+            return yield* new EnvironmentAuthorizationError({
+              message: `Environment '${scopeId}' does not belong to this server.`,
+              requiredScope: requiredScopeForRpcMethod(method),
+            });
+          }
+          return environmentId;
+        });
       const preserveProjectMcpMutationError = <A, E extends ProjectMcpMutationError, R>(
         operation: Effect.Effect<A, Error, R>,
         isExpected: (input: unknown) => input is E,
@@ -1666,7 +1697,10 @@ const makeWsRpcLayer = (
           } satisfies ProjectMcpOAuth.ProjectMcpOAuthServer;
         });
 
-      const scopedOauthServerFor = (input: McpCatalogOAuthTarget) =>
+      const scopedOauthServerFor = (
+        input: McpCatalogOAuthTarget,
+        options: { readonly preferApplied?: boolean } = {},
+      ) =>
         Effect.gen(function* () {
           const readModel = yield* readMcpCatalog();
           yield* requireOwnedProject(WS_METHODS.mcpCatalogOAuthBegin, input.projectId);
@@ -1679,18 +1713,24 @@ const makeWsRpcLayer = (
             if (
               thread?.projectId !== input.projectId ||
               thread.session?.mcpCatalogSessionId !== input.mcpCatalogSessionId ||
-              snapshot?.threadId !== input.threadId
+              snapshot?.threadId !== input.threadId ||
+              snapshot?.disposedAt !== undefined
             ) {
               return yield* new ProjectMcpOAuthActionError({
                 id: input.logicalServerId,
                 reason: "The MCP catalog session target is stale or unauthorized.",
               });
             }
-            definition = snapshot?.desired.find(
-              (entry) =>
-                entry.logicalServerId === input.logicalServerId &&
-                entry.definitionId === input.transportDefinitionId,
-            );
+            definition =
+              snapshot === undefined
+                ? undefined
+                : findScopedMcpCatalogDefinition({
+                    snapshot,
+                    target: input,
+                    ...(options.preferApplied === undefined
+                      ? {}
+                      : { preferApplied: options.preferApplied }),
+                  });
           } else {
             definition = catalogBaselineForProject(readModel, input.projectId).find(
               (entry) =>
@@ -2214,19 +2254,24 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "project-mcp" },
           ),
-        [WS_METHODS.mcpCatalogGlobalList]: (_input) =>
+        [WS_METHODS.mcpCatalogGlobalList]: (input) =>
           observeRpcEffect(
             WS_METHODS.mcpCatalogGlobalList,
-            readMcpCatalog().pipe(
+            requireEnvironmentCatalogScope(WS_METHODS.mcpCatalogGlobalList, input.scopeId).pipe(
+              Effect.andThen(readMcpCatalog()),
               Effect.map((readModel) => readModel.mcpCatalog?.globalDefinitions ?? []),
               Effect.orDie,
             ),
             { "rpc.aggregate": "mcp-catalog" },
           ),
-        [WS_METHODS.mcpCatalogGlobalStateList]: (_input) =>
+        [WS_METHODS.mcpCatalogGlobalStateList]: (input) =>
           observeRpcEffect(
             WS_METHODS.mcpCatalogGlobalStateList,
-            readMcpCatalog().pipe(
+            requireEnvironmentCatalogScope(
+              WS_METHODS.mcpCatalogGlobalStateList,
+              input.scopeId,
+            ).pipe(
+              Effect.andThen(readMcpCatalog()),
               Effect.map((readModel) => ({
                 definitions: readModel.mcpCatalog?.globalDefinitions ?? [],
                 globalRevision: readModel.mcpCatalog?.globalRevision ?? 0,
@@ -2240,7 +2285,10 @@ const makeWsRpcLayer = (
             WS_METHODS.mcpCatalogGlobalCreate,
             preserveCatalogMutationError(
               Effect.gen(function* () {
-                const environmentId = yield* serverEnvironment.getEnvironmentId;
+                const environmentId = yield* requireEnvironmentCatalogScope(
+                  WS_METHODS.mcpCatalogGlobalCreate,
+                  input.scopeId,
+                );
                 const readModel = yield* readMcpCatalog();
                 const logicalServerId =
                   input.logicalServerId ?? McpServerId.make(yield* crypto.randomUUIDv4);
@@ -2322,7 +2370,10 @@ const makeWsRpcLayer = (
             WS_METHODS.mcpCatalogGlobalUpdate,
             preserveCatalogMutationError(
               Effect.gen(function* () {
-                const environmentId = yield* serverEnvironment.getEnvironmentId;
+                const environmentId = yield* requireEnvironmentCatalogScope(
+                  WS_METHODS.mcpCatalogGlobalUpdate,
+                  input.scopeId,
+                );
                 const readModel = yield* readMcpCatalog();
                 const existing = readModel.mcpCatalog?.globalDefinitions.find(
                   (entry) => entry.logicalServerId === input.logicalServerId,
@@ -2415,7 +2466,10 @@ const makeWsRpcLayer = (
             WS_METHODS.mcpCatalogGlobalRemove,
             preserveCatalogMutationError(
               Effect.gen(function* () {
-                const environmentId = yield* serverEnvironment.getEnvironmentId;
+                const environmentId = yield* requireEnvironmentCatalogScope(
+                  WS_METHODS.mcpCatalogGlobalRemove,
+                  input.scopeId,
+                );
                 const readModel = yield* readMcpCatalog();
                 yield* validatePersistentCatalogTopology(readModel, {
                   globalDefinitions: (readModel.mcpCatalog?.globalDefinitions ?? [])
@@ -3091,6 +3145,7 @@ const makeWsRpcLayer = (
                     providerInstanceId,
                     baseline,
                     desired: [...baseline, definition],
+                    applied: [],
                     desiredRevision: 1,
                     appliedRevision: 0,
                   } satisfies McpCatalogSnapshot;
@@ -3473,7 +3528,7 @@ const makeWsRpcLayer = (
             runProjectMcpOperation(
               WS_METHODS.mcpCatalogOAuthDisconnect,
               input.projectId,
-              scopedOauthServerFor(input).pipe(
+              scopedOauthServerFor(input, { preferApplied: true }).pipe(
                 Effect.tap((server) => projectMcpOAuth.disconnect(server.serverId)),
                 Effect.tap((server) => projectMcpProxy.revokeOAuthStorage(server.serverId)),
                 Effect.asVoid,

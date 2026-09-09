@@ -19,6 +19,7 @@ import {
   ApprovalRequestId,
   EventId,
   McpCatalogSessionId,
+  McpCatalogDefinition,
   McpDefinitionId,
   McpServerId,
   ProviderDriverKind,
@@ -44,6 +45,7 @@ import * as PubSub from "effect/PubSub";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Scope from "effect/Scope";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -455,14 +457,14 @@ it.effect("starts providers from the durable catalog and persists application", 
     const sessionId = McpCatalogSessionId.make("catalog-session-durable");
     const projectId = ProjectId.make("project-durable-catalog");
     const logicalServerId = McpServerId.make("durable-server");
-    const definition = {
-      definitionId: "definition-durable",
+    const definition = yield* Schema.decodeUnknownEffect(McpCatalogDefinition)({
+      definitionId: McpDefinitionId.make("definition-durable"),
       logicalServerId,
-      scope: "global" as const,
+      scope: "global",
       scopeId: "environment-durable",
       name: "Durable server",
       transport: {
-        type: "streamable-http" as const,
+        type: "streamable-http",
         url: "https://durable.example.test/mcp",
         headers: [
           {
@@ -470,18 +472,19 @@ it.effect("starts providers from the durable catalog and persists application", 
             credential: { id: "11111111-1111-4111-8111-111111111111", name: "api-key" },
           },
         ],
-        authorization: { type: "none" as const },
+        authorization: { type: "none" },
       },
       enabled: true,
       providerInstanceIds: [codexInstanceId],
       revision: 1,
-    };
+    });
     const snapshot = {
       catalogSessionId: sessionId,
       threadId,
       providerInstanceId: codexInstanceId,
       baseline: [definition],
       desired: [definition],
+      applied: [],
       desiredRevision: 1,
       appliedRevision: 0,
     };
@@ -589,6 +592,7 @@ it.effect("starts providers from the durable catalog and persists application", 
         threadId,
         mcpCatalogSessionId: sessionId,
         revision: 1,
+        appliedCatalog: [definition],
         appliedAt: "1970-01-01T00:00:00.000Z",
       });
     }).pipe(Effect.provide(providerLayer));

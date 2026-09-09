@@ -692,6 +692,7 @@ it.layer(NodeServices.layer)("settled thread decider", (it) => {
         providerInstanceId: ProviderInstanceId.make("codex"),
         baseline: [],
         desired: [],
+        applied: [],
         desiredRevision: 3,
         appliedRevision: 3,
       };

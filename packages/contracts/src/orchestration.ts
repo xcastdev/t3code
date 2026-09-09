@@ -906,6 +906,7 @@ const ThreadMcpCatalogAppliedCommand = Schema.Struct({
   threadId: ThreadId,
   mcpCatalogSessionId: McpCatalogSessionId,
   revision: NonNegativeInt,
+  appliedCatalog: Schema.optional(Schema.Array(McpCatalogDefinition)),
   appliedAt: IsoDateTime,
 });
 
@@ -1520,6 +1521,7 @@ export const ThreadMcpCatalogAppliedPayload = Schema.Struct({
   threadId: ThreadId,
   mcpCatalogSessionId: McpCatalogSessionId,
   revision: NonNegativeInt,
+  appliedCatalog: Schema.optional(Schema.Array(McpCatalogDefinition)),
   appliedAt: IsoDateTime,
 });
 

@@ -118,6 +118,7 @@ it.effect("hydrates saved definitions and sessions once across websocket clients
       providerInstanceId: provider,
       baseline: [definition],
       desired: [definition],
+      applied: [],
       desiredRevision: 0,
       appliedRevision: 0,
     };

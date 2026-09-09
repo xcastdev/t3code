@@ -60,6 +60,7 @@ import Migration0044 from "./Migrations/044_ProjectionProjectMcpServers.ts";
 import Migration0045 from "./Migrations/045_ProjectionProjectMcpTransport.ts";
 import Migration0046 from "./Migrations/046_McpCatalogScopes.ts";
 import Migration0047 from "./Migrations/047_McpCatalogRevisions.ts";
+import Migration0048 from "./Migrations/048_McpCatalogAppliedCatalog.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -119,6 +120,7 @@ export const migrationEntries = [
   [45, "ProjectionProjectMcpTransport", Migration0045],
   [46, "McpCatalogScopes", Migration0046],
   [47, "McpCatalogRevisions", Migration0047],
+  [48, "McpCatalogAppliedCatalog", Migration0048],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

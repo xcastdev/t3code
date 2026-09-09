@@ -884,13 +884,14 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               INSERT INTO projection_mcp_catalog_sessions (
                 catalog_session_id, thread_id, provider_instance_id,
                 baseline_json, desired_catalog_json, desired_revision,
-                applied_revision, application_error, application_status,
+                applied_catalog_json, applied_revision, application_error, application_status,
                 application_revision, application_applied_at, application_failed_at,
                 disposed_at
               ) VALUES (
                 ${snapshot.catalogSessionId}, ${snapshot.threadId}, ${snapshot.providerInstanceId},
                 ${encodeMcpCatalogDefinitionArray(snapshot.baseline)},
                 ${encodeMcpCatalogDefinitionArray(snapshot.desired)},
+                ${encodeMcpCatalogDefinitionArray(snapshot.applied)},
                 ${snapshot.desiredRevision}, ${snapshot.appliedRevision}, NULL,
                 NULL, NULL, NULL, NULL, NULL
               )
@@ -946,23 +947,45 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             return;
 
           case "thread.mcp-catalog.applied":
-            yield* sql`
-              UPDATE projection_mcp_catalog_sessions
-              SET applied_revision = ${event.payload.revision},
-                  application_error = NULL,
-                  application_status = 'applied',
-                  application_revision = ${event.payload.revision},
-                  application_applied_at = ${event.payload.appliedAt},
-                  application_failed_at = NULL
-              WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
-                AND thread_id = ${event.payload.threadId}
-                AND disposed_at IS NULL
-                AND ${event.payload.revision} <= desired_revision
-                AND (
-                  ${event.payload.revision} > applied_revision
-                  OR (${event.payload.revision} = 0 AND application_revision IS NULL)
-                )
-            `;
+            if (event.payload.appliedCatalog === undefined) {
+              yield* sql`
+                UPDATE projection_mcp_catalog_sessions
+                SET applied_catalog_json = desired_catalog_json,
+                    applied_revision = ${event.payload.revision},
+                    application_error = NULL,
+                    application_status = 'applied',
+                    application_revision = ${event.payload.revision},
+                    application_applied_at = ${event.payload.appliedAt},
+                    application_failed_at = NULL
+                WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                  AND thread_id = ${event.payload.threadId}
+                  AND disposed_at IS NULL
+                  AND ${event.payload.revision} <= desired_revision
+                  AND (
+                    ${event.payload.revision} > applied_revision
+                    OR (${event.payload.revision} = 0 AND application_revision IS NULL)
+                  )
+              `;
+            } else {
+              yield* sql`
+                UPDATE projection_mcp_catalog_sessions
+                SET applied_catalog_json = ${encodeMcpCatalogDefinitionArray(event.payload.appliedCatalog)},
+                    applied_revision = ${event.payload.revision},
+                    application_error = NULL,
+                    application_status = 'applied',
+                    application_revision = ${event.payload.revision},
+                    application_applied_at = ${event.payload.appliedAt},
+                    application_failed_at = NULL
+                WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                  AND thread_id = ${event.payload.threadId}
+                  AND disposed_at IS NULL
+                  AND ${event.payload.revision} <= desired_revision
+                  AND (
+                    ${event.payload.revision} > applied_revision
+                    OR (${event.payload.revision} = 0 AND application_revision IS NULL)
+                  )
+              `;
+            }
             return;
 
           case "thread.mcp-catalog.apply-failed":

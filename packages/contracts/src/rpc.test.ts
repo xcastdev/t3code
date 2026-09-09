@@ -5,6 +5,9 @@ import * as Schema from "effect/Schema";
 import {
   WS_METHODS,
   WsMcpCatalogGlobalStateListRpc,
+  WsMcpCatalogGlobalCreateRpc,
+  WsMcpCatalogProjectCreateRpc,
+  WsMcpCatalogSessionCreateRpc,
   WsProjectMcpCreateRpc,
   WsProjectMcpRemoveRpc,
   WsProjectMcpOAuthBeginRpc,
@@ -139,5 +142,75 @@ describe("scoped MCP catalog global state RPC", () => {
         globalRevision: 7,
       }),
     ).toEqual({ definitions: [], globalRevision: 7 });
+  });
+});
+
+describe("scoped MCP catalog payload identities", () => {
+  const definition = {
+    name: "Docs",
+    transport: {
+      type: "streamable-http" as const,
+      url: "https://docs.example.test/mcp",
+      headers: [],
+      authorization: { type: "none" as const },
+    },
+    enabled: true,
+    providerInstanceIds: ["codex"],
+  };
+
+  it("rejects a contradictory global scope", () => {
+    const decode = Schema.decodeUnknownSync(WsMcpCatalogGlobalCreateRpc.payloadSchema);
+    expect(() =>
+      decode({
+        scope: "project",
+        scopeId: "project-1",
+        expectedRevision: 0,
+        definition,
+      }),
+    ).toThrow();
+    expect(
+      decode({
+        scope: "global",
+        scopeId: "environment-1",
+        expectedRevision: 0,
+        definition,
+      }),
+    ).toMatchObject({ scope: "global", scopeId: "environment-1" });
+  });
+
+  it("rejects a project create with a non-project scope", () => {
+    const decode = Schema.decodeUnknownSync(WsMcpCatalogProjectCreateRpc.payloadSchema);
+    expect(() =>
+      decode({
+        scope: "global",
+        scopeId: "environment-1",
+        expectedRevision: 0,
+        definition,
+      }),
+    ).toThrow();
+  });
+
+  it("requires session scope id to match the session identity", () => {
+    const decode = Schema.decodeUnknownSync(WsMcpCatalogSessionCreateRpc.payloadSchema);
+    expect(() =>
+      decode({
+        scope: "session",
+        scopeId: "session-other",
+        threadId: "thread-1",
+        mcpCatalogSessionId: "session-1",
+        expectedRevision: 0,
+        definition,
+      }),
+    ).toThrow();
+    expect(
+      decode({
+        scope: "session",
+        scopeId: "session-1",
+        threadId: "thread-1",
+        mcpCatalogSessionId: "session-1",
+        expectedRevision: 0,
+        definition,
+      }),
+    ).toMatchObject({ scopeId: "session-1", mcpCatalogSessionId: "session-1" });
   });
 });
