@@ -3742,6 +3742,86 @@ it.layer(makeProjectionPipelinePrefixedTestLayer("t3-turn-provenance-test-"))(
       }),
     );
 
+    it.effect("stamps work counts on a turn settled by its diff", () =>
+      Effect.gen(function* () {
+        // On a rebuild every projector replays the whole log on its own, so the
+        // sessions projector is already at its final state when this one
+        // replays the diff — the diff settles the turn, and the terminal
+        // session set that would otherwise count it skips a settled turn.
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const threadId = ThreadId.make("thread-prov-diff");
+        const turnId = TurnId.make("turn-prov-diff");
+
+        yield* appendThreadCreated(threadId, "prov-diff");
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-diff-start",
+          status: "running",
+          activeTurnId: turnId,
+          at: "2026-03-01T00:00:01.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "df1",
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: "call-df-1",
+          at: "2026-03-01T00:00:02.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "df2",
+          tone: "tool",
+          itemType: "file_change",
+          toolCallId: "call-df-2",
+          at: "2026-03-01T00:00:03.000Z",
+        });
+        const eventStore = yield* OrchestrationEventStore;
+        yield* eventStore.append({
+          type: "thread.turn-diff-completed",
+          eventId: EventId.make("evt-prov-diff"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-03-01T00:00:10.000Z",
+          commandId: CommandId.make("cmd-prov-diff"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-prov-diff"),
+          metadata: {},
+          payload: {
+            threadId,
+            turnId,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-prov-diff/turn/1"),
+            status: "ready",
+            files: [
+              { path: "a.ts", kind: "modified", additions: 2, deletions: 1 },
+              { path: "b.ts", kind: "added", additions: 1, deletions: 0 },
+            ],
+            assistantMessageId: MessageId.make("message-prov-diff"),
+            completedAt: "2026-03-01T00:00:10.000Z",
+          },
+        });
+
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-diff-end",
+          status: "ready",
+          activeTurnId: null,
+          at: "2026-03-01T00:00:11.000Z",
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const rows = yield* readProvenance(threadId, turnId);
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0]?.commandCount, 1);
+        assert.strictEqual(rows[0]?.toolCallCount, 1);
+        assert.strictEqual(rows[0]?.changedFileCount, 2);
+      }),
+    );
+
     it.effect("stamps work counts on an interrupted turn", () =>
       Effect.gen(function* () {
         const projectionPipeline = yield* OrchestrationProjectionPipeline;

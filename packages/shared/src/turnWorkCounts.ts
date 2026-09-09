@@ -77,12 +77,14 @@ function isHiddenFromTimeline(activity: TurnWorkActivity): boolean {
  *
  * Rows are deduped by `toolCallId` because one call emits several lifecycle
  * rows, and `info`-tone rows are excluded because they narrate rather than
- * report work. Rows without a `toolCallId` cannot be deduped against each
- * other, so each counts once. Rows the timeline hides are skipped, so a fold's
- * total always reconciles with the rows a user can actually expand.
+ * report work. Rows without a `toolCallId` fall back to deduping by content,
+ * matching how the client's work log folds them. Rows the timeline hides are
+ * skipped, so a fold's total always reconciles with the rows a user can
+ * actually expand.
  */
 export function countTurnWork(activities: Iterable<TurnWorkActivity>): TurnWorkCounts {
   const seenToolCallIds = new Set<string>();
+  const seenContentKeys = new Set<string>();
   let commandCount = 0;
   let toolCallCount = 0;
   let subagentCount = 0;
@@ -103,6 +105,21 @@ export function countTurnWork(activities: Iterable<TurnWorkActivity>): TurnWorkC
         continue;
       }
       seenToolCallIds.add(toolCallId);
+    } else {
+      // A provider that omits the call id leaves lifecycle rows with nothing
+      // to dedupe on, so the client's work log folds them together by content
+      // instead. Count them the same way here, or a settled turn would report
+      // more work than the rows the user can actually expand. A row carrying
+      // no detail has nothing to fold on, and the client keeps those separate
+      // too, so each one stays its own unit of work.
+      const detail = activity.detail?.trim() ?? "";
+      if (detail.length > 0) {
+        const contentKey = `${activity.itemType ?? ""}\u001f${detail}`;
+        if (seenContentKeys.has(contentKey)) {
+          continue;
+        }
+        seenContentKeys.add(contentKey);
+      }
     }
 
     if (category === "command") {

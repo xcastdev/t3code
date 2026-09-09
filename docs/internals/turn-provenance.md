@@ -167,3 +167,12 @@ Per-turn tokens and cost are not plumbed from adapters. Reasoning is emitted by 
 and Codex but dropped at ingestion, which filters to `assistant_text`; when it is picked up, the
 subfold structure absorbs it without redesign. Mobile's parallel timeline still renders the old
 fold label — the additive contract keeps it working unchanged.
+
+A steer that changes the model mid-turn is not re-stamped. Claude, Cursor, and Grok all gate
+`turn.started` on there being no steering turn, so the run switches model while the turn keeps the
+provenance it opened with. Provenance describes what a turn _started_ as; correcting it would need a
+second turn-scoped event, which is not worth a row that already reads as history.
+
+Cursor and Grok report `model` but never `effort`, and OpenCode maps its variant selection into the
+`effort` field. These are best-effort: the footer renders whatever the adapter reports, and an
+adapter that reports nothing renders no chip.

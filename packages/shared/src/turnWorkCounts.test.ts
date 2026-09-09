@@ -142,4 +142,26 @@ describe("countTurnWork", () => {
       ]),
     ).toEqual({ commandCount: 0, toolCallCount: 1, subagentCount: 0 });
   });
+
+  it("folds id-less lifecycle rows the client shows as one row", () => {
+    // A provider that omits the call id emits several rows for one call. The
+    // work log folds them by content, so counting each would report more work
+    // than the turn's own subfolds can account for.
+    expect(
+      countTurnWork([
+        { tone: "tool", itemType: "file_change", toolCallId: null, detail: "Read File: a.ts" },
+        { tone: "tool", itemType: "file_change", toolCallId: null, detail: "Read File: a.ts" },
+        { tone: "tool", itemType: "file_change", toolCallId: null, detail: "Read File: a.ts" },
+      ]),
+    ).toEqual({ commandCount: 0, toolCallCount: 1, subagentCount: 0 });
+  });
+
+  it("keeps id-less rows apart when they describe different work", () => {
+    expect(
+      countTurnWork([
+        { tone: "tool", itemType: "command_execution", toolCallId: null, detail: "ls" },
+        { tone: "tool", itemType: "command_execution", toolCallId: null, detail: "pwd" },
+      ]),
+    ).toEqual({ commandCount: 2, toolCallCount: 0, subagentCount: 0 });
+  });
 });

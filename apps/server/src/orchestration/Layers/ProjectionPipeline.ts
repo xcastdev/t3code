@@ -1665,10 +1665,25 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           });
 
           if (Option.isSome(existingTurn)) {
+            // This event settles the turn whenever its session has already
+            // moved on, and on every rebuild — each projector replays the whole
+            // log independently, so the sessions projector is at its final
+            // state before this one replays. A settle here is the turn's last
+            // chance to be counted: the terminal session set that would
+            // otherwise stamp it skips turns that are no longer running.
+            const settledCounts = turnStillRunning
+              ? {}
+              : yield* settleCountsFor({
+                  threadId: event.payload.threadId,
+                  turnId: event.payload.turnId,
+                  commandCount: existingTurn.value.commandCount,
+                  checkpointFiles: event.payload.files,
+                });
             yield* projectionTurnRepository.upsertByTurnId({
               ...existingTurn.value,
               assistantMessageId: event.payload.assistantMessageId,
               state: turnStillRunning ? existingTurn.value.state : nextState,
+              ...settledCounts,
               checkpointTurnCount: event.payload.checkpointTurnCount,
               checkpointRef: event.payload.checkpointRef,
               checkpointStatus: event.payload.status,
