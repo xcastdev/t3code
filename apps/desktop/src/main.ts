@@ -74,6 +74,16 @@ Electron.app.on("open-url", (event, url) => {
   }
 });
 
+// Windows and Linux deliver second-instance after ready. Register this before
+// the asynchronous Clerk/application layers can leave a gap in which an
+// attachment argv would otherwise be lost.
+Electron.app.on("second-instance", (_event, argv) => {
+  const stringArgv = Array.isArray(argv)
+    ? argv.filter((arg): arg is string => typeof arg === "string")
+    : [];
+  DesktopLaunchIntent.captureDesktopSecondInstanceLaunchIntent(stringArgv);
+});
+
 const desktopEnvironmentLayer = Layer.unwrap(
   Effect.gen(function* () {
     const metadata = yield* Effect.service(ElectronApp.ElectronApp).pipe(

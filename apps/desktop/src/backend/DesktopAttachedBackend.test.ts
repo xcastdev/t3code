@@ -1,5 +1,8 @@
 import { assert, describe, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
@@ -59,14 +62,30 @@ function jsonResponse(
 
 function makeRefreshHarness(
   responses: ReadonlyArray<{ readonly body: unknown; readonly status?: number }>,
+  options: {
+    readonly encryptionFailures?: number;
+    readonly writeFailures?: number;
+    readonly exchangeStarted?: Deferred.Deferred<void>;
+    readonly releaseExchange?: Deferred.Deferred<void>;
+  } = {},
 ) {
   const requestUrls: Array<string> = [];
   let responseIndex = 0;
+  let encryptionFailures = options.encryptionFailures ?? 0;
+  let writeFailures = options.writeFailures ?? 0;
   const httpClientLayer = Layer.succeed(
     HttpClient.HttpClient,
     HttpClient.make((request) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         requestUrls.push(request.url);
+        if (request.url.endsWith("/oauth/token")) {
+          if (options.exchangeStarted !== undefined) {
+            yield* Deferred.succeed(options.exchangeStarted, undefined);
+          }
+          if (options.releaseExchange !== undefined) {
+            yield* Deferred.await(options.releaseExchange);
+          }
+        }
         const response = responses[responseIndex++];
         if (response === undefined) throw new Error(`Unexpected request: ${request.url}`);
         return jsonResponse(request, response.body, response.status);
@@ -86,12 +105,57 @@ function makeRefreshHarness(
       bearerExpiresAt: "2099-09-08T18:00:00.000Z",
     },
   };
-  const settingsLayer = DesktopAppSettings.layerTest(initialSettings);
+  const settingsRefEffect = Ref.make(initialSettings);
+  const settingsLayer = Layer.effect(
+    DesktopAppSettings.DesktopAppSettings,
+    Effect.gen(function* () {
+      const settingsRef = yield* settingsRefEffect;
+      const update = (
+        preference: DesktopAppSettings.DesktopPrimaryBackendPreference,
+      ): Effect.Effect<void, DesktopAppSettings.DesktopSettingsWriteError> => {
+        if (writeFailures > 0) {
+          writeFailures -= 1;
+          return Effect.fail(
+            new DesktopAppSettings.DesktopSettingsWriteError({
+              operation: "replace-settings-file",
+              path: "/tmp/desktop-settings.json",
+              cause: "settings write failed",
+            }),
+          );
+        }
+        return Ref.update(settingsRef, (settings) => ({ ...settings, primaryBackend: preference }));
+      };
+      return DesktopAppSettings.DesktopAppSettings.of({
+        get: Ref.get(settingsRef),
+        load: Ref.get(settingsRef),
+        setMainWindowBounds: () => Effect.die("unexpected settings update"),
+        setServerExposureMode: () => Effect.die("unexpected settings update"),
+        setTailscaleServe: () => Effect.die("unexpected settings update"),
+        setUpdateChannel: () => Effect.die("unexpected settings update"),
+        setWslBackendEnabled: () => Effect.die("unexpected settings update"),
+        setWslDistro: () => Effect.die("unexpected settings update"),
+        setWslOnly: () => Effect.die("unexpected settings update"),
+        setPrimaryBackendPreference: (preference) =>
+          update(preference).pipe(
+            Effect.map(() => ({
+              settings: { ...initialSettings, primaryBackend: preference },
+              changed: true,
+            })),
+          ),
+        applyWslWindowsFallback: Effect.die("unexpected settings update"),
+        applyWslWindowsFallbackInMemory: Effect.die("unexpected settings update"),
+      });
+    }),
+  );
   const encryptedCredentials: Array<string> = [];
   const safeStorageLayer = Layer.succeed(ElectronSafeStorage.ElectronSafeStorage, {
     isEncryptionAvailable: Effect.succeed(true),
     encryptString: (credential: string) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
+        if (encryptionFailures > 0) {
+          encryptionFailures -= 1;
+          return yield* Effect.fail({ _tag: "TestEncryptionFailure" as const });
+        }
         encryptedCredentials.push(credential);
         return new TextEncoder().encode(`encrypted:${credential}`);
       }),
@@ -497,6 +561,233 @@ describe("DesktopAttachedBackend", () => {
     }).pipe(Effect.provide(harness.layer));
   });
 
+  it.effect("retains the renewal bearer after a post-exchange descriptor failure", () => {
+    const harness = makeRefreshHarness([
+      { body: descriptorFor() },
+      { body: administrativeToken() },
+      { status: 503, body: { unavailable: true } },
+      { body: descriptorFor() },
+    ]);
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      const first = yield* Effect.exit(attached.refreshCredential("replacement-owner-token"));
+      assert.equal(first._tag, "Failure");
+      yield* attached.refreshCredential("replacement-owner-token");
+
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+      assert.deepEqual(harness.encryptedCredentials, ["replacement-access-token"]);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("retains the renewal bearer after encryption failure", () => {
+    const harness = makeRefreshHarness(
+      [
+        { body: descriptorFor() },
+        { body: administrativeToken() },
+        { body: descriptorFor() },
+        { body: descriptorFor() },
+      ],
+      { encryptionFailures: 1 },
+    );
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      const first = yield* Effect.exit(attached.refreshCredential("replacement-owner-token"));
+      assert.equal(first._tag, "Failure");
+      yield* attached.refreshCredential("replacement-owner-token");
+
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+      assert.deepEqual(harness.encryptedCredentials, ["replacement-access-token"]);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("retains the renewal bearer after settings persistence failure", () => {
+    const harness = makeRefreshHarness(
+      [
+        { body: descriptorFor() },
+        { body: administrativeToken() },
+        { body: descriptorFor() },
+        { body: descriptorFor() },
+      ],
+      { writeFailures: 1 },
+    );
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      const first = yield* Effect.exit(attached.refreshCredential("replacement-owner-token"));
+      assert.equal(first._tag, "Failure");
+      yield* attached.refreshCredential("replacement-owner-token");
+
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+      assert.deepEqual(harness.encryptedCredentials, [
+        "replacement-access-token",
+        "replacement-access-token",
+      ]);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("makes duplicate successful renewals idempotent", () => {
+    const harness = makeRefreshHarness([
+      { body: descriptorFor() },
+      { body: administrativeToken() },
+      { body: descriptorFor() },
+    ]);
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      yield* attached.refreshCredential("replacement-owner-token");
+      yield* attached.refreshCredential("replacement-owner-token");
+
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+      assert.equal(harness.encryptedCredentials.length, 1);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("requires a fresh credential after a completed renewal expires", () => {
+    const harness = makeRefreshHarness([
+      { body: descriptorFor() },
+      { body: { ...administrativeToken(), expires_in: 1 } },
+      { body: descriptorFor() },
+    ]);
+
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-09-08T12:00:00.000Z"));
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      yield* attached.refreshCredential("replacement-owner-token");
+      yield* TestClock.adjust(Duration.seconds(2));
+      const retry = yield* Effect.exit(attached.refreshCredential("replacement-owner-token"));
+
+      assert.equal(retry._tag, "Failure");
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+    }).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
+  it.effect("requires a fresh renewal credential after the retained bearer expires", () => {
+    const harness = makeRefreshHarness([
+      { body: descriptorFor() },
+      { body: { ...administrativeToken(), expires_in: 1 } },
+      { status: 503, body: { unavailable: true } },
+    ]);
+
+    return Effect.gen(function* () {
+      yield* TestClock.setTime(Date.parse("2026-09-08T12:00:00.000Z"));
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      const first = yield* Effect.exit(attached.refreshCredential("replacement-owner-token"));
+      assert.equal(first._tag, "Failure");
+      yield* TestClock.adjust(Duration.seconds(2));
+      const second = yield* Effect.exit(attached.refreshCredential("replacement-owner-token"));
+
+      assert.equal(second._tag, "Failure");
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+      assert.equal(harness.encryptedCredentials.length, 0);
+    }).pipe(Effect.provide(Layer.merge(TestClock.layer(), harness.layer)));
+  });
+
+  it.effect("does not replay a consumed renewal credential after interruption", () => {
+    const exchangeStarted = Effect.runSync(Deferred.make<void>());
+    const releaseExchange = Effect.runSync(Deferred.make<void>());
+    const harness = makeRefreshHarness(
+      [{ body: descriptorFor() }, { body: administrativeToken() }, { body: descriptorFor() }],
+      { exchangeStarted, releaseExchange },
+    );
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      const refreshFiber = yield* Effect.forkChild(
+        attached.refreshCredential("replacement-owner-token"),
+      );
+      yield* Deferred.await(exchangeStarted);
+      yield* Fiber.interrupt(refreshFiber);
+
+      const retry = yield* Effect.exit(attached.refreshCredential("replacement-owner-token"));
+      assert.equal(retry._tag, "Failure");
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("serializes duplicate renewal calls to one exchange and one write", () => {
+    const exchangeStarted = Effect.runSync(Deferred.make<void>());
+    const releaseExchange = Effect.runSync(Deferred.make<void>());
+    const harness = makeRefreshHarness(
+      [{ body: descriptorFor() }, { body: administrativeToken() }, { body: descriptorFor() }],
+      { exchangeStarted, releaseExchange },
+    );
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      const first = yield* Effect.forkChild(attached.refreshCredential("replacement-owner-token"));
+      yield* Deferred.await(exchangeStarted);
+      const second = yield* Effect.forkChild(attached.refreshCredential("replacement-owner-token"));
+      yield* Deferred.succeed(releaseExchange, undefined);
+      yield* Fiber.join(first);
+      yield* Fiber.join(second);
+
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
+      assert.equal(harness.encryptedCredentials.length, 1);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("orders managed fallback after an in-flight renewal", () => {
+    const exchangeStarted = Effect.runSync(Deferred.make<void>());
+    const releaseExchange = Effect.runSync(Deferred.make<void>());
+    const harness = makeRefreshHarness(
+      [{ body: descriptorFor() }, { body: administrativeToken() }, { body: descriptorFor() }],
+      { exchangeStarted, releaseExchange },
+    );
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      const refresh = yield* Effect.forkChild(
+        attached.refreshCredential("replacement-owner-token"),
+      );
+      yield* Deferred.await(exchangeStarted);
+      const fallback = yield* Effect.forkChild(attached.useManagedBackend);
+      yield* Deferred.succeed(releaseExchange, undefined);
+      yield* Fiber.join(refresh);
+      yield* Fiber.join(fallback);
+
+      assert.deepEqual((yield* (yield* DesktopAppSettings.DesktopAppSettings).get).primaryBackend, {
+        mode: "managed",
+      });
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("orders replacement attachment after an in-flight renewal", () => {
+    const exchangeStarted = Effect.runSync(Deferred.make<void>());
+    const releaseExchange = Effect.runSync(Deferred.make<void>());
+    const harness = makeRefreshHarness(
+      [
+        { body: descriptorFor() },
+        { body: administrativeToken() },
+        { body: descriptorFor() },
+        { body: administrativeToken() },
+        { body: descriptorFor("replacement-environment") },
+      ],
+      { exchangeStarted, releaseExchange },
+    );
+
+    return Effect.gen(function* () {
+      const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+      const refresh = yield* Effect.forkChild(
+        attached.refreshCredential("replacement-owner-token"),
+      );
+      yield* Deferred.await(exchangeStarted);
+      const replacement = yield* Effect.forkChild(
+        attached.attach("http://127.0.0.1:4200/pair#token=new-owner-token"),
+      );
+      yield* Deferred.succeed(releaseExchange, undefined);
+      yield* Fiber.join(refresh);
+      yield* Fiber.join(replacement);
+
+      const state = yield* attached.getState;
+      assert.equal(state.mode, "attached");
+      if (state.mode === "attached") {
+        assert.equal(state.httpBaseUrl, "http://127.0.0.1:4200/");
+      }
+    }).pipe(Effect.provide(harness.layer));
+  });
+
   it.effect("rejects a precheck identity mismatch before exchanging any credential", () => {
     const harness = makeRefreshHarness([{ body: descriptorFor("other-environment") }]);
 
@@ -545,9 +836,12 @@ describe("DesktopAttachedBackend", () => {
     return Effect.gen(function* () {
       const attached = yield* DesktopAttachedBackend.DesktopAttachedBackend;
       const error = yield* attached.refreshCredential("replacement-owner-token").pipe(Effect.flip);
+      const retry = yield* Effect.exit(attached.refreshCredential("replacement-owner-token"));
 
       assert.instanceOf(error, DesktopAttachedBackend.DesktopAttachAdministrativeScopeError);
+      assert.equal(retry._tag, "Failure");
       assert.deepEqual(harness.encryptedCredentials, []);
+      assert.equal(harness.requestUrls.filter((url) => url.endsWith("/oauth/token")).length, 1);
       assert.deepEqual(
         yield* (yield* DesktopAppSettings.DesktopAppSettings).get,
         harness.initialSettings,

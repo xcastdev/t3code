@@ -41,7 +41,9 @@ function makeTestLaunchIntent(pendingPairingUrl: string | undefined) {
       pairingUrl: pendingPairingUrl ?? null,
     }),
     claimPendingForStartup: () => Effect.succeed(Option.none()),
-    commitStartupSelection: () => Effect.succeed({ _tag: "Running" as const }),
+    completeStartupSelection: () => Effect.succeed({ _tag: "Bootstrapping" as const, selectionId }),
+    beginAttachedStartup: () => Effect.succeed({ _tag: "StartAttached" as const, selectionId }),
+    beginManagedStartup: () => Effect.succeed({ _tag: "StartManaged" as const, selectionId }),
     activateRuntime: Effect.void,
     abortStartupSelection: Effect.void,
   });
@@ -323,6 +325,7 @@ describe("DesktopApp attached startup recovery", () => {
 
       assert.deepEqual(selection, {
         _tag: "Attached",
+        selectionId: 1,
         state: attachedState,
       });
       assert.equal(attach.mock.calls.length, 1);
@@ -377,7 +380,7 @@ describe("DesktopApp attached startup recovery", () => {
         operations.wslReconcile += 1;
       }
 
-      assert.deepEqual(selection, { _tag: "Attached", state: storedState });
+      assert.deepEqual(selection, { _tag: "Attached", selectionId: 1, state: storedState });
       assert.equal(attach.mock.calls.length, 0);
       assert.equal(probe.mock.calls.length, 1);
       assert.deepEqual(operations, {
@@ -478,10 +481,16 @@ describe("DesktopApp attached startup recovery", () => {
         claimForStartup: Effect.sync(DesktopLaunchIntent.claimDesktopStartupSelection),
         claimPendingForStartup: (selectionId) =>
           Effect.sync(() =>
-            Option.fromNullishOr(DesktopLaunchIntent.claimPendingDesktopStartupIntent(selectionId)),
+            Option.fromNullishOr(
+              DesktopLaunchIntent.claimPendingDesktopStartupSelection(selectionId),
+            ),
           ),
-        commitStartupSelection: (selectionId) =>
-          Effect.sync(() => DesktopLaunchIntent.commitDesktopStartupSelection(selectionId)),
+        completeStartupSelection: (selectionId) =>
+          Effect.sync(() => DesktopLaunchIntent.completeDesktopStartupSelection(selectionId)),
+        beginAttachedStartup: (selectionId) =>
+          Effect.sync(() => DesktopLaunchIntent.beginDesktopAttachedStartup(selectionId)),
+        beginManagedStartup: (selectionId) =>
+          Effect.sync(() => DesktopLaunchIntent.beginDesktopManagedStartup(selectionId)),
         activateRuntime: Effect.sync(DesktopLaunchIntent.activateDesktopRuntimeLaunchIntents),
         abortStartupSelection: Effect.sync(DesktopLaunchIntent.abortDesktopStartupSelection),
       });
@@ -508,7 +517,7 @@ describe("DesktopApp attached startup recovery", () => {
         attach.mock.calls.map(([url]) => url),
         [firstPairingUrl, latestPairingUrl],
       );
-      assert.deepEqual(selection, { _tag: "Attached", state: attachedState });
+      assert.deepEqual(selection, { _tag: "Attached", selectionId: 2, state: attachedState });
     }),
   );
 });

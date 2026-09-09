@@ -10,7 +10,14 @@ import {
 
 export const DESKTOP_ATTACH_HOST = "attach-primary";
 
-export type DesktopLaunchIntentPhase = "collecting" | "selecting" | "running" | "aborted";
+export type DesktopLaunchIntentPhase =
+  | "collecting"
+  | "selecting"
+  | "bootstrapping"
+  | "starting-attached"
+  | "starting-managed"
+  | "running"
+  | "aborted";
 
 export type DesktopLaunchIntentRoute =
   | { readonly _tag: "Ignored"; readonly accepted: false }
@@ -24,7 +31,17 @@ export interface DesktopStartupSelection {
 }
 
 export type DesktopStartupSelectionCommit =
-  | { readonly _tag: "Running" }
+  | { readonly _tag: "Bootstrapping"; readonly selectionId: number }
+  | {
+      readonly _tag: "Superseded";
+      readonly selectionId: number;
+      readonly pairingUrl: string;
+    }
+  | { readonly _tag: "Aborted" };
+
+export type DesktopStartupGate =
+  | { readonly _tag: "StartAttached"; readonly selectionId: number }
+  | { readonly _tag: "StartManaged"; readonly selectionId: number }
   | {
       readonly _tag: "Superseded";
       readonly selectionId: number;
@@ -95,6 +112,15 @@ export function findDesktopLaunchIntentInArgv(argv: readonly string[]): string |
   return null;
 }
 
+/** Captures the first attach URL from a second-instance command line. */
+export function captureDesktopSecondInstanceLaunchIntent(argv: readonly string[]): boolean {
+  const rawAttachUrl = argv.find((arg) => parseDesktopLaunchIntent(arg) !== null);
+  if (rawAttachUrl === undefined) return false;
+  routeDesktopLaunchIntent(rawAttachUrl);
+  // This reports what was present in argv, not whether startup currently accepts it.
+  return true;
+}
+
 export function stripDesktopLaunchIntentsFromArgv(argv: readonly string[]): Array<string> {
   return argv.filter((arg) => parseDesktopLaunchIntent(arg) === null);
 }
@@ -103,14 +129,14 @@ export function routeDesktopLaunchIntent(raw: string): DesktopLaunchIntentRoute 
   const pairingUrl = parseDesktopLaunchIntent(raw);
   if (pairingUrl === null) return { _tag: "Ignored", accepted: false };
 
+  if (coordinatorState.phase === "aborted") {
+    return { _tag: "Ignored", accepted: false };
+  }
   if (coordinatorState.lastRoutedPairingUrl === pairingUrl) {
     return { _tag: "Duplicate", accepted: true, pairingUrl };
   }
   coordinatorState.lastRoutedPairingUrl = pairingUrl;
 
-  if (coordinatorState.phase === "aborted") {
-    return { _tag: "Ignored", accepted: false };
-  }
   if (coordinatorState.phase === "running") {
     if (coordinatorState.runtimeReady && coordinatorState.runtimeHandler !== null) {
       coordinatorState.runtimeHandler(pairingUrl);
@@ -126,19 +152,6 @@ export function capturePreReadyDesktopLaunchIntent(raw: string): boolean {
   if (parseDesktopLaunchIntent(raw) === null) return false;
   routeDesktopLaunchIntent(raw);
   return true;
-}
-
-/** Claims an intent captured by the process-level pre-ready listener. */
-export function claimDesktopLaunchIntent(pairingUrl: string): boolean {
-  if (coordinatorState.pendingPairingUrl !== pairingUrl) return false;
-  coordinatorState.pendingPairingUrl = null;
-  return true;
-}
-
-/** Discards a stale startup intent before handling a newer second-instance request. */
-export function clearDesktopLaunchIntent(): void {
-  coordinatorState.pendingPairingUrl = null;
-  coordinatorState.lastRoutedPairingUrl = null;
 }
 
 export function resetDesktopLaunchIntentCoordinator(): void {
@@ -165,7 +178,13 @@ export function registerDesktopRuntimeLaunchIntentHandler(
 }
 
 export function activateDesktopRuntimeLaunchIntents(): void {
-  if (coordinatorState.phase !== "running") return;
+  if (
+    coordinatorState.phase !== "starting-attached" &&
+    coordinatorState.phase !== "starting-managed"
+  ) {
+    return;
+  }
+  coordinatorState.phase = "running";
   coordinatorState.runtimeReady = true;
   const pairingUrl = coordinatorState.pendingPairingUrl;
   if (pairingUrl === null || coordinatorState.runtimeHandler === null) return;
@@ -186,18 +205,28 @@ export function claimDesktopStartupSelection(): DesktopStartupSelection {
   };
 }
 
-export function claimPendingDesktopStartupIntent(selectionId: number): string | null {
+export function claimPendingDesktopStartupSelection(
+  selectionId: number,
+): DesktopStartupSelection | null {
   if (coordinatorState.phase !== "selecting" || coordinatorState.selectionId !== selectionId) {
     return null;
   }
-  const pairingUrl = coordinatorState.pendingPairingUrl;
-  if (pairingUrl === null) return null;
-  coordinatorState.pendingPairingUrl = null;
-  coordinatorState.activePairingUrl = pairingUrl;
-  return pairingUrl;
+  if (coordinatorState.pendingPairingUrl !== null) {
+    const pairingUrl = coordinatorState.pendingPairingUrl;
+    coordinatorState.pendingPairingUrl = null;
+    coordinatorState.activePairingUrl = pairingUrl;
+    coordinatorState.selectionId += 1;
+    return {
+      selectionId: coordinatorState.selectionId,
+      pairingUrl,
+    };
+  }
+  return null;
 }
 
-export function commitDesktopStartupSelection(selectionId: number): DesktopStartupSelectionCommit {
+export function completeDesktopStartupSelection(
+  selectionId: number,
+): DesktopStartupSelectionCommit {
   if (coordinatorState.phase !== "selecting" || coordinatorState.selectionId !== selectionId) {
     return { _tag: "Aborted" };
   }
@@ -205,12 +234,49 @@ export function commitDesktopStartupSelection(selectionId: number): DesktopStart
     const pairingUrl = coordinatorState.pendingPairingUrl;
     coordinatorState.pendingPairingUrl = null;
     coordinatorState.activePairingUrl = pairingUrl;
-    return { _tag: "Superseded", selectionId, pairingUrl };
+    coordinatorState.selectionId += 1;
+    return {
+      _tag: "Superseded",
+      selectionId: coordinatorState.selectionId,
+      pairingUrl,
+    };
   }
-  coordinatorState.phase = "running";
-  coordinatorState.runtimeReady = false;
-  coordinatorState.activePairingUrl = null;
-  return { _tag: "Running" };
+  coordinatorState.phase = "bootstrapping";
+  return { _tag: "Bootstrapping", selectionId };
+}
+
+const beginDesktopStartup = (
+  selectionId: number,
+  mode: "attached" | "managed",
+): DesktopStartupGate => {
+  if (coordinatorState.phase !== "bootstrapping" || coordinatorState.selectionId !== selectionId) {
+    return { _tag: "Aborted" };
+  }
+  if (coordinatorState.pendingPairingUrl !== null) {
+    const pairingUrl = coordinatorState.pendingPairingUrl;
+    coordinatorState.pendingPairingUrl = null;
+    coordinatorState.activePairingUrl = pairingUrl;
+    coordinatorState.selectionId += 1;
+    coordinatorState.phase = "selecting";
+    return {
+      _tag: "Superseded",
+      selectionId: coordinatorState.selectionId,
+      pairingUrl,
+    };
+  }
+  coordinatorState.phase = mode === "attached" ? "starting-attached" : "starting-managed";
+  return {
+    _tag: mode === "attached" ? "StartAttached" : "StartManaged",
+    selectionId,
+  };
+};
+
+export function beginDesktopAttachedStartup(selectionId: number): DesktopStartupGate {
+  return beginDesktopStartup(selectionId, "attached");
+}
+
+export function beginDesktopManagedStartup(selectionId: number): DesktopStartupGate {
+  return beginDesktopStartup(selectionId, "managed");
 }
 
 export function abortDesktopStartupSelection(): void {
@@ -228,10 +294,14 @@ export class DesktopLaunchIntent extends Context.Service<
     readonly captureArgv: (argv: readonly string[]) => Effect.Effect<boolean>;
     readonly consume: Effect.Effect<Option.Option<string>>;
     readonly claimForStartup: Effect.Effect<DesktopStartupSelection>;
-    readonly claimPendingForStartup: (selectionId: number) => Effect.Effect<Option.Option<string>>;
-    readonly commitStartupSelection: (
+    readonly claimPendingForStartup: (
+      selectionId: number,
+    ) => Effect.Effect<Option.Option<DesktopStartupSelection>>;
+    readonly completeStartupSelection: (
       selectionId: number,
     ) => Effect.Effect<DesktopStartupSelectionCommit>;
+    readonly beginAttachedStartup: (selectionId: number) => Effect.Effect<DesktopStartupGate>;
+    readonly beginManagedStartup: (selectionId: number) => Effect.Effect<DesktopStartupGate>;
     readonly activateRuntime: Effect.Effect<void>;
     readonly abortStartupSelection: Effect.Effect<void>;
   }
@@ -243,12 +313,7 @@ const capture = (raw: string) =>
   });
 
 const captureArgv = (argv: readonly string[]) =>
-  Effect.sync(() => {
-    const pairingUrl = findDesktopLaunchIntentInArgv(argv);
-    if (pairingUrl === null) return false;
-    const raw = argv.find((arg) => parseDesktopLaunchIntent(arg) === pairingUrl);
-    return raw !== undefined && routeDesktopLaunchIntent(raw).accepted;
-  });
+  Effect.sync(() => captureDesktopSecondInstanceLaunchIntent(argv));
 
 export const layer = Layer.succeed(
   DesktopLaunchIntent,
@@ -262,9 +327,13 @@ export const layer = Layer.succeed(
     }),
     claimForStartup: Effect.sync(claimDesktopStartupSelection),
     claimPendingForStartup: (selectionId) =>
-      Effect.sync(() => Option.fromNullishOr(claimPendingDesktopStartupIntent(selectionId))),
-    commitStartupSelection: (selectionId) =>
-      Effect.sync(() => commitDesktopStartupSelection(selectionId)),
+      Effect.sync(() => Option.fromNullishOr(claimPendingDesktopStartupSelection(selectionId))),
+    completeStartupSelection: (selectionId) =>
+      Effect.sync(() => completeDesktopStartupSelection(selectionId)),
+    beginAttachedStartup: (selectionId) =>
+      Effect.sync(() => beginDesktopAttachedStartup(selectionId)),
+    beginManagedStartup: (selectionId) =>
+      Effect.sync(() => beginDesktopManagedStartup(selectionId)),
     activateRuntime: Effect.sync(activateDesktopRuntimeLaunchIntents),
     abortStartupSelection: Effect.sync(abortDesktopStartupSelection),
   }),

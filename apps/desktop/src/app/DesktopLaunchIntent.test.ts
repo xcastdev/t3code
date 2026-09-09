@@ -8,9 +8,8 @@ import * as DesktopLaunchIntent from "./DesktopLaunchIntent.ts";
 
 import {
   buildDesktopAttachUrl,
-  claimDesktopLaunchIntent,
+  captureDesktopSecondInstanceLaunchIntent,
   capturePreReadyDesktopLaunchIntent,
-  clearDesktopLaunchIntent,
   findDesktopLaunchIntentInArgv,
   parseDesktopLaunchIntent,
   stripDesktopLaunchIntentsFromArgv,
@@ -45,6 +44,32 @@ describe("DesktopLaunchIntent", () => {
     ).toBe(pairingUrl);
   });
 
+  it("captures a second-instance attachment without consuming OAuth or ordinary argv", () => {
+    const pairingUrl = "http://localhost:3773/#token=owner-token";
+    const attachUrl = buildDesktopAttachUrl(pairingUrl);
+    const context = Effect.runSync(Effect.scoped(Layer.build(DesktopLaunchIntent.layer)));
+    const launchIntent = Context.get(context, DesktopLaunchIntent.DesktopLaunchIntent);
+
+    expect(
+      captureDesktopSecondInstanceLaunchIntent([
+        "/desktop",
+        "t3code://clerk-callback?code=oauth-code",
+        attachUrl,
+        "--ordinary-flag",
+      ]),
+    ).toBe(true);
+    expect(Effect.runSync(launchIntent.consume)).toEqual(Option.some(pairingUrl));
+
+    expect(
+      captureDesktopSecondInstanceLaunchIntent([
+        "/desktop",
+        "t3code://clerk-callback?code=oauth-code",
+        "--ordinary-flag",
+      ]),
+    ).toBe(false);
+    expect(Effect.runSync(launchIntent.consume)).toEqual(Option.none());
+  });
+
   it("strips every attach intent while preserving ordinary and OAuth arguments", () => {
     const pairingUrl = "http://localhost:3773/#token=owner-token";
     const attachUrl = buildDesktopAttachUrl(pairingUrl);
@@ -75,17 +100,19 @@ describe("DesktopLaunchIntent", () => {
     expect(Effect.runSync(launchIntent.consume)).toEqual(Option.none());
   });
 
-  it("claims a pre-ready intent synchronously before a later bootstrap consume", () => {
+  it("claims a pre-ready intent synchronously for startup selection", () => {
     const pairingUrl = "http://127.0.0.1:3773/#token=owner-token";
     const context = Effect.runSync(Effect.scoped(Layer.build(DesktopLaunchIntent.layer)));
     const launchIntent = Context.get(context, DesktopLaunchIntent.DesktopLaunchIntent);
 
     Effect.runSync(launchIntent.consume);
     expect(capturePreReadyDesktopLaunchIntent(buildDesktopAttachUrl(pairingUrl))).toBe(true);
-    expect(claimDesktopLaunchIntent(pairingUrl)).toBe(true);
-    expect(Effect.runSync(launchIntent.consume)).toEqual(Option.none());
-    expect(claimDesktopLaunchIntent(pairingUrl)).toBe(false);
-    clearDesktopLaunchIntent();
+    const selection = Effect.runSync(launchIntent.claimForStartup);
+    expect(selection.pairingUrl).toBe(pairingUrl);
+    expect(Effect.runSync(launchIntent.completeStartupSelection(selection.selectionId))).toEqual({
+      _tag: "Bootstrapping",
+      selectionId: selection.selectionId,
+    });
   });
 
   it("keeps the latest valid intent without letting invalid captures overwrite it", () => {
@@ -115,9 +142,15 @@ describe("DesktopLaunchIntent", () => {
     const launchIntent = Context.get(context, DesktopLaunchIntent.DesktopLaunchIntent);
     const claim = Effect.runSync(launchIntent.claimForStartup);
     expect(claim).toMatchObject({ pairingUrl });
-    expect(Effect.runSync(launchIntent.commitStartupSelection(claim.selectionId))).toEqual({
-      _tag: "Running",
+    expect(Effect.runSync(launchIntent.completeStartupSelection(claim.selectionId))).toEqual({
+      _tag: "Bootstrapping",
+      selectionId: claim.selectionId,
     });
+    expect(Effect.runSync(launchIntent.beginManagedStartup(claim.selectionId))).toEqual({
+      _tag: "StartManaged",
+      selectionId: claim.selectionId,
+    });
+    Effect.runSync(launchIntent.activateRuntime);
   });
 
   it("keeps startup selection synchronous while a newer second-instance URL supersedes the first", () => {
@@ -135,13 +168,22 @@ describe("DesktopLaunchIntent", () => {
     expect(
       DesktopLaunchIntent.routeDesktopLaunchIntent(buildDesktopAttachUrl(latestPairingUrl))._tag,
     ).toBe("Pending");
-    expect(Effect.runSync(launchIntent.commitStartupSelection(claim.selectionId))).toEqual({
+    const superseded = Effect.runSync(launchIntent.completeStartupSelection(claim.selectionId));
+    expect(superseded).toEqual({
       _tag: "Superseded",
       pairingUrl: latestPairingUrl,
-      selectionId: claim.selectionId,
+      selectionId: claim.selectionId + 1,
     });
-    expect(Effect.runSync(launchIntent.commitStartupSelection(claim.selectionId))).toEqual({
-      _tag: "Running",
+    expect(Effect.runSync(launchIntent.completeStartupSelection(claim.selectionId))).toEqual({
+      _tag: "Aborted",
+    });
+    expect(Effect.runSync(launchIntent.completeStartupSelection(claim.selectionId + 1))).toEqual({
+      _tag: "Bootstrapping",
+      selectionId: claim.selectionId + 1,
+    });
+    expect(Effect.runSync(launchIntent.beginManagedStartup(claim.selectionId + 1))).toEqual({
+      _tag: "StartManaged",
+      selectionId: claim.selectionId + 1,
     });
   });
 
@@ -151,8 +193,13 @@ describe("DesktopLaunchIntent", () => {
     const context = Effect.runSync(Effect.scoped(Layer.build(DesktopLaunchIntent.layer)));
     const launchIntent = Context.get(context, DesktopLaunchIntent.DesktopLaunchIntent);
     const claim = Effect.runSync(launchIntent.claimForStartup);
-    expect(Effect.runSync(launchIntent.commitStartupSelection(claim.selectionId))).toEqual({
-      _tag: "Running",
+    expect(Effect.runSync(launchIntent.completeStartupSelection(claim.selectionId))).toEqual({
+      _tag: "Bootstrapping",
+      selectionId: claim.selectionId,
+    });
+    expect(Effect.runSync(launchIntent.beginManagedStartup(claim.selectionId))).toEqual({
+      _tag: "StartManaged",
+      selectionId: claim.selectionId,
     });
     const unregister = DesktopLaunchIntent.registerDesktopRuntimeLaunchIntentHandler(runtimeAttach);
 
@@ -169,6 +216,42 @@ describe("DesktopLaunchIntent", () => {
     unregister();
   });
 
+  it("rejects a managed or attached start when a replacement arrives before the final gate", () => {
+    const replacementPairingUrl = "http://127.0.0.1:4773/#token=replacement";
+    const context = Effect.runSync(Effect.scoped(Layer.build(DesktopLaunchIntent.layer)));
+    const launchIntent = Context.get(context, DesktopLaunchIntent.DesktopLaunchIntent);
+    const selection = Effect.runSync(launchIntent.claimForStartup);
+
+    expect(Effect.runSync(launchIntent.completeStartupSelection(selection.selectionId))).toEqual({
+      _tag: "Bootstrapping",
+      selectionId: selection.selectionId,
+    });
+    expect(
+      DesktopLaunchIntent.routeDesktopLaunchIntent(buildDesktopAttachUrl(replacementPairingUrl))
+        ._tag,
+    ).toBe("Pending");
+    expect(Effect.runSync(launchIntent.beginManagedStartup(selection.selectionId))).toEqual({
+      _tag: "Superseded",
+      selectionId: selection.selectionId + 1,
+      pairingUrl: replacementPairingUrl,
+    });
+    expect(Effect.runSync(launchIntent.beginAttachedStartup(selection.selectionId))).toEqual({
+      _tag: "Aborted",
+    });
+
+    expect(
+      Effect.runSync(launchIntent.completeStartupSelection(selection.selectionId + 1)),
+    ).toEqual({
+      _tag: "Bootstrapping",
+      selectionId: selection.selectionId + 1,
+    });
+    expect(Effect.runSync(launchIntent.beginAttachedStartup(selection.selectionId + 1))).toEqual({
+      _tag: "StartAttached",
+      selectionId: selection.selectionId + 1,
+    });
+    Effect.runSync(launchIntent.activateRuntime);
+  });
+
   it("aborts startup atomically so late URLs cannot be committed or drained", () => {
     const pairingUrl = "http://127.0.0.1:3773/#token=owner-token";
     const context = Effect.runSync(Effect.scoped(Layer.build(DesktopLaunchIntent.layer)));
@@ -181,7 +264,10 @@ describe("DesktopLaunchIntent", () => {
     expect(
       DesktopLaunchIntent.routeDesktopLaunchIntent(buildDesktopAttachUrl(pairingUrl))._tag,
     ).toBe("Ignored");
-    expect(Effect.runSync(launchIntent.commitStartupSelection(claim.selectionId))).toEqual({
+    expect(captureDesktopSecondInstanceLaunchIntent([buildDesktopAttachUrl(pairingUrl)])).toBe(
+      true,
+    );
+    expect(Effect.runSync(launchIntent.completeStartupSelection(claim.selectionId))).toEqual({
       _tag: "Aborted",
     });
     expect(Effect.runSync(launchIntent.consume)).toEqual(Option.none());

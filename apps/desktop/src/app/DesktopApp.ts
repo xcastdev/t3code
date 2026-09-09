@@ -183,13 +183,20 @@ export const awaitAttachedBackend = Effect.fn("desktop.startup.awaitAttachedBack
     readonly pairingUrl?: string;
     readonly launchIntent?: DesktopLaunchIntent.DesktopLaunchIntent["Service"];
     readonly selectionId?: number;
+    readonly onStartupSelectionSuperseded?: (
+      selection: DesktopLaunchIntent.DesktopStartupSelection,
+    ) => void;
   }) {
     let pendingPairingUrl = input.pairingUrl;
+    let selectionId = input.selectionId;
     const takeReplacement = Effect.gen(function* () {
-      if (input.launchIntent === undefined || input.selectionId === undefined) return false;
-      const replacement = yield* input.launchIntent.claimPendingForStartup(input.selectionId);
+      if (input.launchIntent === undefined || selectionId === undefined) return false;
+      const replacement = yield* input.launchIntent.claimPendingForStartup(selectionId);
       if (Option.isNone(replacement)) return false;
-      pendingPairingUrl = replacement.value;
+      if (replacement.value.pairingUrl === null) return false;
+      pendingPairingUrl = replacement.value.pairingUrl;
+      selectionId = replacement.value.selectionId;
+      input.onStartupSelectionSuperseded?.(replacement.value);
       return true;
     });
     while (true) {
@@ -249,8 +256,12 @@ type AttachedDesktopPrimaryBackendState = Extract<
 >;
 
 export type DesktopPrimaryBackendSelection =
-  | { readonly _tag: "Attached"; readonly state: AttachedDesktopPrimaryBackendState }
-  | { readonly _tag: "Managed" }
+  | {
+      readonly _tag: "Attached";
+      readonly selectionId: number;
+      readonly state: AttachedDesktopPrimaryBackendState;
+    }
+  | { readonly _tag: "Managed"; readonly selectionId: number }
   | { readonly _tag: "Aborted" };
 
 export const selectDesktopPrimaryBackend = Effect.fn("desktop.startup.selectDesktopPrimaryBackend")(
@@ -266,6 +277,7 @@ export const selectDesktopPrimaryBackend = Effect.fn("desktop.startup.selectDesk
     const startupSelection = yield* input.launchIntent.claimForStartup;
     const initialPrimaryBackendState = yield* input.attachedBackend.getState;
     let pendingPairingUrl = startupSelection.pairingUrl ?? undefined;
+    let selectionId = startupSelection.selectionId;
     while (true) {
       const needsAttachedRecovery =
         pendingPairingUrl !== undefined ||
@@ -282,22 +294,27 @@ export const selectDesktopPrimaryBackend = Effect.fn("desktop.startup.selectDesk
           state: input.state,
           ...(pendingPairingUrl === undefined ? {} : { pairingUrl: pendingPairingUrl }),
           launchIntent: input.launchIntent,
-          selectionId: startupSelection.selectionId,
+          selectionId,
+          onStartupSelectionSuperseded: (selection) => {
+            selectionId = selection.selectionId;
+            pendingPairingUrl = selection.pairingUrl ?? undefined;
+          },
         });
-        if (!canContinue) return { _tag: "Aborted" };
+        if (!canContinue) return { _tag: "Aborted" as const };
       }
 
-      const commit = yield* input.launchIntent.commitStartupSelection(startupSelection.selectionId);
+      const commit = yield* input.launchIntent.completeStartupSelection(selectionId);
       if (commit._tag === "Superseded") {
+        selectionId = commit.selectionId;
         pendingPairingUrl = commit.pairingUrl;
         continue;
       }
-      if (commit._tag === "Aborted") return { _tag: "Aborted" };
+      if (commit._tag === "Aborted") return { _tag: "Aborted" as const };
 
       const primaryBackendState = yield* input.attachedBackend.getState;
       return primaryBackendState.mode === "attached"
-        ? { _tag: "Attached", state: primaryBackendState }
-        : { _tag: "Managed" };
+        ? { _tag: "Attached" as const, selectionId, state: primaryBackendState }
+        : { _tag: "Managed" as const, selectionId };
     }
   },
 );
@@ -313,103 +330,120 @@ const bootstrap = Effect.gen(function* () {
   const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
   const dialog = yield* ElectronDialog.ElectronDialog;
   yield* logBootstrapInfo("bootstrap start");
-
-  const primaryBackendSelection = yield* selectDesktopPrimaryBackend({
-    attachedBackend,
-    launchIntent,
-    dialog,
-    lifecycle,
-    shutdown: yield* DesktopShutdown.DesktopShutdown,
-    electronApp: yield* ElectronApp.ElectronApp,
-    state,
-  });
-  if (primaryBackendSelection._tag === "Aborted") return;
-
-  if (primaryBackendSelection._tag === "Attached") {
-    const attachedState = primaryBackendSelection.state as AttachedDesktopPrimaryBackendState;
-    const electronProtocol = yield* ElectronProtocol.ElectronProtocol;
-    yield* electronProtocol.registerDesktopProtocol({
-      scheme: ElectronProtocol.getDesktopScheme(environment.isDevelopment),
-      rendererSource:
-        environment.isDevelopment && Option.isSome(environment.devServerUrl)
-          ? { _tag: "Proxy", origin: environment.devServerUrl.value }
-          : { _tag: "Static", directory: environment.bundledClientDir },
-      backendOrigin: new URL(attachedState.httpBaseUrl),
-      clerkFrontendApiHostname: DesktopClerk.desktopClerkFrontendApiHostname,
+  while (true) {
+    const primaryBackendSelection = yield* selectDesktopPrimaryBackend({
+      attachedBackend,
+      launchIntent,
+      dialog,
+      lifecycle,
+      shutdown: yield* DesktopShutdown.DesktopShutdown,
+      electronApp: yield* ElectronApp.ElectronApp,
+      state,
     });
-    yield* installDesktopIpcHandlers();
-    if (!(yield* Ref.get(state.quitting))) {
-      yield* desktopWindow.handleBackendReady(new URL(attachedState.httpBaseUrl));
+    if (primaryBackendSelection._tag === "Aborted") return;
+
+    if (primaryBackendSelection._tag === "Attached") {
+      const attachedState = primaryBackendSelection.state;
+      const electronProtocol = yield* ElectronProtocol.ElectronProtocol;
+      const registration = {
+        scheme: ElectronProtocol.getDesktopScheme(environment.isDevelopment),
+        rendererSource:
+          environment.isDevelopment && Option.isSome(environment.devServerUrl)
+            ? { _tag: "Proxy" as const, origin: environment.devServerUrl.value }
+            : { _tag: "Static" as const, directory: environment.bundledClientDir },
+        backendOrigin: new URL(attachedState.httpBaseUrl),
+        clerkFrontendApiHostname: DesktopClerk.desktopClerkFrontendApiHostname,
+      };
+      const gate = yield* launchIntent.beginAttachedStartup(primaryBackendSelection.selectionId);
+      if (gate._tag === "Superseded") continue;
+      if (gate._tag === "Aborted") return;
+
+      // The gate is deliberately adjacent to protocol registration. Electron
+      // only permits one handler for this scheme, so an abandoned managed
+      // selection must never register before an attached replacement wins.
+      yield* electronProtocol.registerDesktopProtocol(registration);
+      yield* installDesktopIpcHandlers();
+      if (!(yield* Ref.get(state.quitting))) {
+        yield* desktopWindow.handleBackendReady(new URL(attachedState.httpBaseUrl));
+      }
+      yield* launchIntent.activateRuntime;
+      yield* logBootstrapInfo("bootstrap attached to existing backend", {
+        baseUrl: attachedState.httpBaseUrl,
+        environmentId: attachedState.environmentId,
+      });
+      return;
     }
-    yield* launchIntent.activateRuntime;
-    yield* logBootstrapInfo("bootstrap attached to existing backend", {
-      baseUrl: attachedState.httpBaseUrl,
-      environmentId: attachedState.environmentId,
-    });
-    return;
-  }
 
-  const settings = yield* desktopSettings.get;
-  if (environment.isDevelopment && Option.isNone(environment.configuredBackendPort)) {
-    return yield* new DesktopDevelopmentBackendPortRequiredError();
-  }
+    const settings = yield* desktopSettings.get;
+    if (environment.isDevelopment && Option.isNone(environment.configuredBackendPort)) {
+      return yield* new DesktopDevelopmentBackendPortRequiredError();
+    }
 
-  const backendPortSelection = yield* resolveDesktopBackendPort(environment.configuredBackendPort);
-  const backendPort = backendPortSelection.port;
-  yield* logBootstrapInfo(
-    backendPortSelection.selectedByScan
-      ? "selected backend port via sequential scan"
-      : "using configured backend port",
-    {
-      port: backendPort,
-      ...(backendPortSelection.selectedByScan ? { startPort: DEFAULT_DESKTOP_BACKEND_PORT } : {}),
-    },
-  );
-
-  if (settings.serverExposureMode !== environment.defaultDesktopSettings.serverExposureMode) {
-    yield* logBootstrapInfo("bootstrap restoring persisted server exposure mode", {
-      mode: settings.serverExposureMode,
-    });
-  }
-  const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
-  const serverExposureState = yield* serverExposure.configureFromSettings({ port: backendPort });
-  const backendConfig = yield* serverExposure.backendConfig;
-  const electronProtocol = yield* ElectronProtocol.ElectronProtocol;
-  const rendererTarget = environment.isDevelopment
-    ? Option.getOrThrow(environment.devServerUrl)
-    : backendConfig.httpBaseUrl;
-  yield* electronProtocol.registerDesktopProtocol({
-    scheme: ElectronProtocol.getDesktopScheme(environment.isDevelopment),
-    targetOrigin: rendererTarget,
-    backendOrigin: backendConfig.httpBaseUrl,
-    clerkFrontendApiHostname: DesktopClerk.desktopClerkFrontendApiHostname,
-  });
-  yield* logBootstrapInfo("bootstrap resolved backend endpoint", {
-    baseUrl: backendConfig.httpBaseUrl.href,
-  });
-  if (serverExposureState.endpointUrl) {
-    yield* logBootstrapInfo("bootstrap enabled network access", {
-      endpointUrl: serverExposureState.endpointUrl,
-    });
-  } else if (settings.serverExposureMode === "network-accessible") {
-    yield* logBootstrapWarning(
-      "bootstrap fell back to local-only because no advertised network host was available",
+    const backendPortSelection = yield* resolveDesktopBackendPort(
+      environment.configuredBackendPort,
     );
-  }
+    const backendPort = backendPortSelection.port;
+    yield* logBootstrapInfo(
+      backendPortSelection.selectedByScan
+        ? "selected backend port via sequential scan"
+        : "using configured backend port",
+      {
+        port: backendPort,
+        ...(backendPortSelection.selectedByScan ? { startPort: DEFAULT_DESKTOP_BACKEND_PORT } : {}),
+      },
+    );
 
-  yield* installDesktopIpcHandlers();
-  yield* logBootstrapInfo("bootstrap ipc handlers registered");
+    if (settings.serverExposureMode !== environment.defaultDesktopSettings.serverExposureMode) {
+      yield* logBootstrapInfo("bootstrap restoring persisted server exposure mode", {
+        mode: settings.serverExposureMode,
+      });
+    }
+    const serverExposure = yield* DesktopServerExposure.DesktopServerExposure;
+    const serverExposureState = yield* serverExposure.configureFromSettings({ port: backendPort });
+    const backendConfig = yield* serverExposure.backendConfig;
+    const electronProtocol = yield* ElectronProtocol.ElectronProtocol;
+    const rendererTarget = environment.isDevelopment
+      ? Option.getOrThrow(environment.devServerUrl)
+      : backendConfig.httpBaseUrl;
+    const registration = {
+      scheme: ElectronProtocol.getDesktopScheme(environment.isDevelopment),
+      targetOrigin: rendererTarget,
+      backendOrigin: backendConfig.httpBaseUrl,
+      clerkFrontendApiHostname: DesktopClerk.desktopClerkFrontendApiHostname,
+    };
+    yield* logBootstrapInfo("bootstrap resolved backend endpoint", {
+      baseUrl: backendConfig.httpBaseUrl.href,
+    });
+    if (serverExposureState.endpointUrl) {
+      yield* logBootstrapInfo("bootstrap enabled network access", {
+        endpointUrl: serverExposureState.endpointUrl,
+      });
+    } else if (settings.serverExposureMode === "network-accessible") {
+      yield* logBootstrapWarning(
+        "bootstrap fell back to local-only because no advertised network host was available",
+      );
+    }
 
-  if (!(yield* Ref.get(state.quitting))) {
-    // In wsl-only mode the renderer is served by the WSL backend, which can be
-    // slow to cold-boot — show a "Connecting to WSL" splash immediately so the
-    // app feels responsive instead of presenting no window until WSL is ready.
-    // (Dual mode opens fast off the Windows primary, so no splash there.)
+    if (yield* Ref.get(state.quitting)) {
+      yield* launchIntent.abortStartupSelection;
+      return;
+    }
+
+    // Resolve the backend before the gate so the gate-to-start sequence has
+    // no asynchronous work that could let an attachment change the mode.
+    const primaryBackend = yield* pool.primary;
     if (settings.wslOnly === true && settings.wslBackendEnabled === true) {
       yield* desktopWindow.showConnectingSplash;
     }
-    const primaryBackend = yield* pool.primary;
+    const gate = yield* launchIntent.beginManagedStartup(primaryBackendSelection.selectionId);
+    if (gate._tag === "Superseded") continue;
+    if (gate._tag === "Aborted") return;
+
+    // Keep this call immediately after the managed gate. Attachments arriving
+    // after the gate are intentionally queued for runtime handoff.
     yield* primaryBackend.start;
+    yield* electronProtocol.registerDesktopProtocol(registration);
+    yield* installDesktopIpcHandlers();
     yield* launchIntent.activateRuntime;
     yield* logBootstrapInfo("bootstrap backend start requested");
     // Bring up the WSL backend if the user previously enabled it. The
@@ -418,6 +452,7 @@ const bootstrap = Effect.gen(function* () {
     // slow first wsl.exe spawn.
     const wslBackend = yield* DesktopWslBackend.DesktopWslBackend;
     yield* Effect.forkScoped(wslBackend.reconcile);
+    return;
   }
 }).pipe(Effect.withSpan("desktop.bootstrap"));
 

@@ -95,8 +95,12 @@ describe("DesktopClerk", () => {
   const markStartupRunning = () => {
     const selection = DesktopLaunchIntent.claimDesktopStartupSelection();
     assert.equal(
-      DesktopLaunchIntent.commitDesktopStartupSelection(selection.selectionId)._tag,
-      "Running",
+      DesktopLaunchIntent.completeDesktopStartupSelection(selection.selectionId)._tag,
+      "Bootstrapping",
+    );
+    assert.equal(
+      DesktopLaunchIntent.beginDesktopManagedStartup(selection.selectionId)._tag,
+      "StartManaged",
     );
     DesktopLaunchIntent.activateDesktopRuntimeLaunchIntents();
   };
@@ -302,6 +306,7 @@ describe("DesktopClerk", () => {
       yield* Effect.scoped(
         Effect.gen(function* () {
           yield* clerk.configure;
+          DesktopLaunchIntent.captureDesktopSecondInstanceLaunchIntent(["/desktop", attachUrl]);
           handlers.get("second-instance")?.({}, ["/desktop", attachUrl]);
           yield* Deferred.await(relaunchComplete);
 
@@ -355,6 +360,7 @@ describe("DesktopClerk", () => {
       yield* Effect.scoped(
         Effect.gen(function* () {
           yield* clerk.configure;
+          DesktopLaunchIntent.captureDesktopSecondInstanceLaunchIntent(["/desktop", attachUrl]);
           handlers.get("second-instance")?.({}, ["/desktop", attachUrl]);
           yield* Deferred.await(attachAttempted);
 
@@ -418,6 +424,7 @@ describe("DesktopClerk", () => {
         yield* Effect.scoped(
           Effect.gen(function* () {
             yield* clerk.configure;
+            DesktopLaunchIntent.captureDesktopSecondInstanceLaunchIntent(["/desktop", attachUrl]);
             handlers.get("second-instance")?.({}, ["/desktop", attachUrl]);
             yield* Deferred.await(warningShown);
 
@@ -487,12 +494,13 @@ describe("DesktopClerk", () => {
         Effect.gen(function* () {
           yield* clerk.configure;
           assert.isTrue(DesktopLaunchIntent.capturePreReadyDesktopLaunchIntent(attachUrl));
+          DesktopLaunchIntent.capturePreReadyDesktopLaunchIntent(attachUrl);
           handlers.get("open-url")?.({ preventDefault }, attachUrl);
           yield* Deferred.await(warningShown);
 
           assert.equal(attach.mock.calls.length, 1);
           assert.equal(reveal.mock.calls.length, 1);
-          assert.equal(preventDefault.mock.calls.length, 1);
+          assert.equal(preventDefault.mock.calls.length, 0);
         }),
       );
     }).pipe(
@@ -506,7 +514,7 @@ describe("DesktopClerk", () => {
     );
   });
 
-  it.effect("queues a pre-ready intent until bootstrap claims it", () => {
+  it.effect("captures a pre-config second-instance intent before Clerk can observe it", () => {
     storageMock.mockReturnValue(storageAdapter);
     createClerkBridgeMock.mockReturnValue({ cleanup: vi.fn(), isPrimaryInstance: true });
     const handlers = new Map<string, (...args: Array<unknown>) => void>();
@@ -514,7 +522,9 @@ describe("DesktopClerk", () => {
     const attachUrl = `t3code://attach-primary?pairingUrl=${encodeURIComponent(pairingUrl)}`;
     const prebuiltContext = Effect.runSync(Effect.scoped(Layer.build(DesktopLaunchIntent.layer)));
     const launchIntent = Context.get(prebuiltContext, DesktopLaunchIntent.DesktopLaunchIntent);
-    assert.isTrue(DesktopLaunchIntent.capturePreReadyDesktopLaunchIntent(attachUrl));
+    assert.isTrue(
+      DesktopLaunchIntent.captureDesktopSecondInstanceLaunchIntent(["/desktop", attachUrl]),
+    );
 
     const electronApp = {
       quit: Effect.void,
@@ -535,17 +545,19 @@ describe("DesktopClerk", () => {
     return Effect.gen(function* () {
       const clerk = yield* DesktopClerk.DesktopClerk;
       yield* Effect.scoped(clerk.configure);
-      const preventDefault = vi.fn();
-      handlers.get("open-url")?.({ preventDefault }, attachUrl);
+      handlers.get("second-instance")?.({}, ["/desktop", attachUrl]);
 
       assert.equal(attach.mock.calls.length, 0);
-      assert.equal(preventDefault.mock.calls.length, 1);
       const selection = yield* launchIntent.claimForStartup;
       assert.equal(selection.pairingUrl, pairingUrl);
       assert.isTrue(Option.isNone(yield* launchIntent.consume));
       assert.equal(
-        (yield* launchIntent.commitStartupSelection(selection.selectionId))._tag,
-        "Running",
+        (yield* launchIntent.completeStartupSelection(selection.selectionId))._tag,
+        "Bootstrapping",
+      );
+      assert.equal(
+        (yield* launchIntent.beginManagedStartup(selection.selectionId))._tag,
+        "StartManaged",
       );
     }).pipe(
       Effect.provide(

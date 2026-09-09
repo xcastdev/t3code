@@ -20,7 +20,6 @@ import {
   findDesktopLaunchIntentInArgv,
   parseDesktopLaunchIntent,
   registerDesktopRuntimeLaunchIntentHandler,
-  routeDesktopLaunchIntent,
 } from "./DesktopLaunchIntent.ts";
 
 declare const __T3CODE_BUILD_CLERK_PUBLISHABLE_KEY__: string | undefined;
@@ -195,12 +194,7 @@ export const make = Effect.gen(function* () {
         const argv = Array.isArray(rawArgv)
           ? rawArgv.filter((arg): arg is string => typeof arg === "string")
           : [];
-        const pairingUrl = findDesktopLaunchIntentInArgv(argv);
-        if (pairingUrl !== null) {
-          const rawAttachUrl = argv.find((arg) => parseDesktopLaunchIntent(arg) === pairingUrl);
-          if (rawAttachUrl !== undefined) routeDesktopLaunchIntent(rawAttachUrl);
-          return;
-        }
+        if (findDesktopLaunchIntentInArgv(argv) !== null) return;
         void runPromise(
           Effect.gen(function* () {
             const mainWindow = yield* electronWindow.currentMainOrFirst;
@@ -211,10 +205,10 @@ export const make = Effect.gen(function* () {
         );
       });
 
-      yield* electronApp.on<[unknown, string]>("open-url", (event, url) => {
+      yield* electronApp.on<[unknown, string]>("open-url", (_event, url) => {
         if (parseDesktopLaunchIntent(url) === null) return;
-        (event as { preventDefault?: () => void }).preventDefault?.();
-        routeDesktopLaunchIntent(url);
+        // main.ts owns process-level attachment capture. Leave this event
+        // alone here so Clerk remains the sole owner of OAuth callbacks.
       });
     }).pipe(Effect.withSpan("desktop.clerk.configure")),
   });
