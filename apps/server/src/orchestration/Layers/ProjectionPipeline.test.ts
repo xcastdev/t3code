@@ -3519,6 +3519,133 @@ it.layer(makeProjectionPipelinePrefixedTestLayer("t3-turn-provenance-test-"))(
       }),
     );
 
+    it.effect("restamps the changed file count when the real diff lands late", () =>
+      Effect.gen(function* () {
+        // The checkpoint is captured asynchronously, so the turn settles first
+        // and stamps zero files. The diff arriving afterwards is the real
+        // answer and must replace that guess.
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const eventStore = yield* OrchestrationEventStore;
+        const threadId = ThreadId.make("thread-prov-late-diff");
+        const turnId = TurnId.make("turn-prov-late-diff");
+
+        yield* appendThreadCreated(threadId, "prov-late-diff");
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-late-diff-start",
+          status: "running",
+          activeTurnId: turnId,
+          at: "2026-03-01T00:00:01.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId,
+          suffix: "ld1",
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: "call-1",
+          at: "2026-03-01T00:00:02.000Z",
+        });
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-late-diff-end",
+          status: "ready",
+          activeTurnId: null,
+          at: "2026-03-01T00:01:00.000Z",
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const settled = yield* readProvenance(threadId, turnId);
+        assert.strictEqual(settled[0]?.changedFileCount, 0);
+
+        yield* eventStore.append({
+          type: "thread.turn-diff-completed",
+          eventId: EventId.make("evt-prov-late-diff"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-03-01T00:01:05.000Z",
+          commandId: CommandId.make("cmd-prov-late-diff"),
+          causationEventId: null,
+          correlationId: CorrelationId.make("cmd-prov-late-diff"),
+          metadata: {},
+          payload: {
+            threadId,
+            turnId,
+            checkpointTurnCount: 1,
+            checkpointRef: CheckpointRef.make("refs/t3/checkpoints/thread-prov-late-diff/turn/1"),
+            status: "ready",
+            files: [
+              { path: "a.ts", kind: "modified", additions: 3, deletions: 1 },
+              { path: "b.ts", kind: "added", additions: 2, deletions: 0 },
+            ],
+            assistantMessageId: MessageId.make("message-prov-late-diff"),
+            completedAt: "2026-03-01T00:01:05.000Z",
+          },
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const rows = yield* readProvenance(threadId, turnId);
+        assert.strictEqual(rows[0]?.changedFileCount, 2);
+        // Work counts stamped at settle time survive the restamp.
+        assert.strictEqual(rows[0]?.commandCount, 1);
+      }),
+    );
+
+    it.effect("stamps work counts on a turn superseded by steering", () =>
+      Effect.gen(function* () {
+        // Steering settles the old turn without the provider completing it.
+        // Nothing backfills a turn that settles unstamped.
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const threadId = ThreadId.make("thread-prov-steer");
+        const oldTurnId = TurnId.make("turn-prov-steer-old");
+        const newTurnId = TurnId.make("turn-prov-steer-new");
+
+        yield* appendThreadCreated(threadId, "prov-steer");
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-steer-start",
+          status: "running",
+          activeTurnId: oldTurnId,
+          at: "2026-03-01T00:00:01.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId: oldTurnId,
+          suffix: "st1",
+          tone: "tool",
+          itemType: "command_execution",
+          toolCallId: "call-1",
+          at: "2026-03-01T00:00:02.000Z",
+        });
+        yield* appendActivity({
+          threadId,
+          turnId: oldTurnId,
+          suffix: "st2",
+          tone: "tool",
+          itemType: "file_change",
+          toolCallId: "call-2",
+          at: "2026-03-01T00:00:03.000Z",
+        });
+        yield* appendSessionSet({
+          threadId,
+          suffix: "prov-steer-new",
+          status: "running",
+          activeTurnId: newTurnId,
+          at: "2026-03-01T00:00:10.000Z",
+        });
+
+        yield* projectionPipeline.bootstrap;
+
+        const rows = yield* readProvenance(threadId, oldTurnId);
+        assert.strictEqual(rows.length, 1);
+        assert.strictEqual(rows[0]?.state, "completed");
+        assert.strictEqual(rows[0]?.commandCount, 1);
+        assert.strictEqual(rows[0]?.toolCallCount, 1);
+      }),
+    );
+
     it.effect("stamps work counts on an interrupted turn", () =>
       Effect.gen(function* () {
         const projectionPipeline = yield* OrchestrationProjectionPipeline;

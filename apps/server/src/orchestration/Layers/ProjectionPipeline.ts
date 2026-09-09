@@ -1370,11 +1370,27 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             (turn) =>
               turn.turnId === null
                 ? Effect.void
-                : projectionTurnRepository.upsertByTurnId({
-                    ...turn,
-                    turnId: turn.turnId,
-                    state: "completed",
-                    completedAt: event.payload.session.updatedAt,
+                : Effect.gen(function* () {
+                    const turnId = turn.turnId;
+                    if (turnId === null) {
+                      return;
+                    }
+                    // Steering settles this turn just as truly as the provider
+                    // completing it would, so stamp its work here too —
+                    // nothing backfills a turn that settles unstamped.
+                    const counts = yield* settleCountsFor({
+                      threadId: turn.threadId,
+                      turnId,
+                      commandCount: turn.commandCount,
+                      checkpointFiles: turn.checkpointFiles,
+                    });
+                    yield* projectionTurnRepository.upsertByTurnId({
+                      ...turn,
+                      turnId,
+                      state: "completed",
+                      completedAt: event.payload.session.updatedAt,
+                      ...counts,
+                    });
                   }),
             { concurrency: 1 },
           );
@@ -1632,6 +1648,15 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               startedAt: existingTurn.value.startedAt ?? event.payload.completedAt,
               requestedAt: existingTurn.value.requestedAt ?? event.payload.completedAt,
               completedAt: event.payload.completedAt,
+              // The checkpoint is captured asynchronously, so a turn that
+              // settled first stamped its file count from an empty (or
+              // mid-turn placeholder) file list. This is where the real diff
+              // finally lands, so restamp the count the settle path guessed.
+              ...(turnStillRunning
+                ? {}
+                : {
+                    changedFileCount: new Set(event.payload.files.map((file) => file.path)).size,
+                  }),
             });
             return;
           }

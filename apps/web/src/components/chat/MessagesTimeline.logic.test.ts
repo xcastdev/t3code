@@ -2189,6 +2189,20 @@ describe("createWorkingStatusDwell", () => {
     expect(dwell.label).toBe("Reading file");
   });
 
+  it("drops queued labels when the status reverts to what is already shown", () => {
+    const dwell = createWorkingStatusDwell("Reading file", 0);
+    // A tool starts and finishes inside the dwell window, so the status falls
+    // back to the label already on screen.
+    dwell.push("Editing file", 100);
+    dwell.push("Reading file", 200);
+    expect(dwell.label).toBe("Reading file");
+
+    // "Editing file" is long finished. A later transition must show the tool
+    // that is actually running, not resurrect the dead one.
+    dwell.push("Running command", WORKING_STATUS_DWELL_MS + 1);
+    expect(dwell.label).toBe("Running command");
+  });
+
   it("shows genuine tool changes in order once the dwell elapses", () => {
     const dwell = createWorkingStatusDwell("Running command", 0);
     dwell.push("Reading file", 100);

@@ -748,7 +748,14 @@ function deriveTurnFolds(input: {
       stampedCounts ?? (activitiesMayHaveAgedOut ? null : derivedCounts);
 
     const checkpoint = input.checkpointsByTurnId?.get(turnId);
-    const changedFileCount = stampedCounts?.changedFileCount ?? checkpoint?.files.length ?? 0;
+    // A turn can settle before its checkpoint is captured, stamping a file
+    // count of zero. A ready checkpoint is the later, better answer, so it
+    // wins over a zero stamp rather than being skipped by a nullish check.
+    const stampedChangedFileCount = stampedCounts?.changedFileCount;
+    const changedFileCount =
+      stampedChangedFileCount !== undefined && stampedChangedFileCount > 0
+        ? stampedChangedFileCount
+        : (checkpoint?.files.length ?? stampedChangedFileCount ?? 0);
     // Line counts are only trustworthy once the checkpoint is ready; the file
     // count still stands either way.
     const diff =
@@ -1401,10 +1408,16 @@ export function createWorkingStatusDwell(initialLabel: string, now = 0): Working
       return droppedCount;
     },
     push(nextLabel: string, at: number) {
-      if (nextLabel !== label || queue.length > 0) {
-        if (nextLabel !== label) enqueue(nextLabel);
-        drain(at);
+      if (nextLabel === label) {
+        // Reverting to the shown label makes everything queued behind it dead
+        // work: the caller stops re-offering once shown matches, so those
+        // entries would sit until some later transition promoted a tool that
+        // finished seconds ago.
+        queue.length = 0;
+        return label;
       }
+      enqueue(nextLabel);
+      drain(at);
       return label;
     },
   };

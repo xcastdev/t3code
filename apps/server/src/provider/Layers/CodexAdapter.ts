@@ -1902,8 +1902,14 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     // notification carries neither model nor effort, so the event pump reads
     // these back when it maps the notification.
     const turnProvenance = resolveTurnProvenance(input.modelSelection);
-    session.turnModel = turnProvenance.model ?? session.turnModel;
-    session.turnEffort = turnProvenance.model ? turnProvenance.effort : session.turnEffort;
+    // Model and effort are resolved together, so they fall back together.
+    // Keying effort on the model alone would let an unresolved selection
+    // report the *previous* turn's effort as this turn's, and provenance is
+    // never backfilled once stamped.
+    if (turnProvenance.model !== undefined) {
+      session.turnModel = turnProvenance.model;
+      session.turnEffort = turnProvenance.effort;
+    }
 
     return yield* session.runtime
       .sendTurn({

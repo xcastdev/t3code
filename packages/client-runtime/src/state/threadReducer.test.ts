@@ -570,6 +570,101 @@ describe("applyThreadDetailEvent", () => {
         expect(result.thread.latestTurn?.state).toBe("running");
       }
     });
+
+    it("records the opening turn in turns with its provenance", () => {
+      // `turns` otherwise only arrives on a snapshot, so a turn opened while
+      // the thread is watched would render no provenance footer at all.
+      const result = applyThreadDetailEvent(baseThread, {
+        ...baseEventFields,
+        sequence: 9,
+        occurredAt: "2026-04-01T08:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.session-set",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: TurnId.make("turn-1"),
+            lastError: null,
+            updatedAt: "2026-04-01T08:00:00.000Z",
+          },
+          turnProvenance: {
+            turnId: TurnId.make("turn-1"),
+            model: "gpt-5.4",
+            effort: "high",
+          },
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        expect(result.thread.turns?.length).toBe(1);
+        expect(result.thread.turns?.[0]?.turnId).toBe("turn-1");
+        expect(result.thread.turns?.[0]?.model).toBe("gpt-5.4");
+        expect(result.thread.turns?.[0]?.effort).toBe("high");
+      }
+    });
+
+    it("settles the matching turns record and keeps its stamped provenance", () => {
+      const threadWithRunningTurn: OrchestrationThread = {
+        ...baseThread,
+        latestTurn: {
+          turnId: TurnId.make("turn-1"),
+          state: "running",
+          requestedAt: "2026-04-01T07:00:00.000Z",
+          startedAt: "2026-04-01T07:00:00.000Z",
+          completedAt: null,
+          assistantMessageId: MessageId.make("msg-3"),
+        },
+        turns: [
+          {
+            turnId: TurnId.make("turn-1"),
+            state: "running",
+            requestedAt: "2026-04-01T07:00:00.000Z",
+            startedAt: "2026-04-01T07:00:00.000Z",
+            completedAt: null,
+            assistantMessageId: MessageId.make("msg-3"),
+            model: "claude-opus-5",
+            effort: "high",
+          },
+        ],
+      };
+
+      const result = applyThreadDetailEvent(threadWithRunningTurn, {
+        ...baseEventFields,
+        sequence: 9,
+        occurredAt: "2026-04-01T08:00:00.000Z",
+        aggregateKind: "thread",
+        aggregateId: ThreadId.make("thread-1"),
+        type: "thread.session-set",
+        payload: {
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "interrupted",
+            providerName: "claude",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: "2026-04-01T08:00:00.000Z",
+          },
+        },
+      });
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        // A stale "running" record would otherwise outrank the live interrupt
+        // and render "Worked for…" instead of "You stopped after…".
+        expect(result.thread.turns?.length).toBe(1);
+        expect(result.thread.turns?.[0]?.state).toBe("interrupted");
+        expect(result.thread.turns?.[0]?.completedAt).toBe("2026-04-01T08:00:00.000Z");
+        expect(result.thread.turns?.[0]?.model).toBe("claude-opus-5");
+      }
+    });
   });
 
   describe("thread.session-stop-requested", () => {

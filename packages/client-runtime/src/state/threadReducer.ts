@@ -10,6 +10,8 @@ import type {
   OrchestrationSession,
   OrchestrationThread,
   OrchestrationThreadActivity,
+  OrchestrationTurnProvenance,
+  OrchestrationTurnSummary,
   TurnId,
 } from "@t3tools/contracts";
 
@@ -28,6 +30,40 @@ const checkpointOrder = O.mapInput(
   (cp: OrchestrationThread["checkpoints"][number]) =>
     cp.checkpointTurnCount ?? Number.MAX_SAFE_INTEGER,
 );
+
+/**
+ * Keeps `turns` in step with the turn the reducer just resolved.
+ *
+ * `turns` otherwise only ever arrives on a snapshot, so a turn that opened or
+ * settled while the thread was open carried no record until the next
+ * subscribe — leaving the fold with no provenance footer and letting a stale
+ * "running" record outrank a live interrupt. Stamped server counts on an
+ * existing record are preserved: the server is authoritative for them, and it
+ * has seen activity rows the client may no longer retain.
+ */
+const mergeTurnSummary = (
+  turns: OrchestrationThread["turns"],
+  latestTurn: OrchestrationLatestTurn | null,
+  turnProvenance: OrchestrationTurnProvenance | undefined,
+): OrchestrationThread["turns"] => {
+  if (latestTurn === null) {
+    return turns;
+  }
+  const provenance =
+    turnProvenance !== undefined && turnProvenance.turnId === latestTurn.turnId
+      ? turnProvenance
+      : undefined;
+  const existing = turns?.find((turn) => turn.turnId === latestTurn.turnId);
+  const merged: OrchestrationTurnSummary = {
+    ...existing,
+    ...latestTurn,
+    ...(provenance?.model === undefined ? {} : { model: provenance.model }),
+    ...(provenance?.effort === undefined ? {} : { effort: provenance.effort }),
+  };
+  return existing === undefined
+    ? [...(turns ?? []), merged]
+    : (turns ?? []).map((turn) => (turn.turnId === latestTurn.turnId ? merged : turn));
+};
 
 const activityOrder = O.combineAll<OrchestrationThreadActivity>([
   O.mapInput(O.Number, (a) => a.sequence ?? Number.MAX_SAFE_INTEGER),
@@ -432,6 +468,7 @@ export function applyThreadDetailEvent(
           ...thread,
           session: event.payload.session,
           latestTurn,
+          turns: mergeTurnSummary(thread.turns, latestTurn, event.payload.turnProvenance),
           updatedAt: event.occurredAt,
         },
       };
