@@ -34,6 +34,7 @@ import { resolveWorktreeT3Home } from "@t3tools/shared/devHome";
 import * as Console from "effect/Console";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Config from "effect/Config";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
@@ -167,9 +168,25 @@ export interface RunMigrateDevDbInput {
 }
 
 export interface RunMigrateDevDbOptions {
-  /** Overridable for tests; the directory writes must never target. */
+  /** Overridable for tests; the directory writes must never target.
+   * Defaults to T3CODE_HOME, then `~/.t3`. */
   readonly sharedHome?: string | undefined;
 }
+
+const envT3Home = Config.string("T3CODE_HOME").pipe(Config.option);
+
+/** Same precedence as the rest of the CLI: explicit option, then
+ * T3CODE_HOME, then the default home. A developer who relocated their
+ * install must not have this script silently target a path that does not
+ * exist - and `sharedHome` is also what the write guard below protects. */
+const resolveSharedHome = Effect.fn("resolveSharedHome")(function* (explicit?: string) {
+  if (explicit !== undefined) {
+    return explicit;
+  }
+  const path = yield* Path.Path;
+  const envHome = Option.filter(yield* envT3Home, (value) => value.trim().length > 0);
+  return Option.getOrElse(envHome, () => path.join(NodeOS.homedir(), ".t3"));
+});
 
 interface KeptProject {
   readonly title: string;
@@ -392,7 +409,7 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
 
-  const sharedHome = path.resolve(options.sharedHome ?? path.join(NodeOS.homedir(), ".t3"));
+  const sharedHome = path.resolve(yield* resolveSharedHome(options.sharedHome));
   const sourcePath = path.resolve(
     input.source ?? path.join(sharedHome, "userdata", "state.sqlite"),
   );

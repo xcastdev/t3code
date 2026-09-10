@@ -1,5 +1,6 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
+import * as ConfigProvider from "effect/ConfigProvider";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -260,6 +261,30 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
         { sharedHome: sourceDir },
       ).pipe(Effect.flip);
       assert.equal(error._tag, "MigrateDevDbSharedHomeError");
+    }),
+  );
+
+  it.effect("reads the shared home from T3CODE_HOME", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-env-" });
+      const destDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-env-dest-" });
+      // No explicit sharedHome and no --source: the source must be derived
+      // from T3CODE_HOME, not from ~/.t3. A developer who relocated their
+      // install would otherwise get SourceMissing for a path they never use.
+      yield* createFixtureSource(sourceDir);
+
+      const result = yield* runMigrateDevDb({
+        baseDir: destDir,
+        projects: 5,
+        threadsPerProject: 10,
+      }).pipe(
+        Effect.provide(
+          ConfigProvider.layer(ConfigProvider.fromEnv({ env: { T3CODE_HOME: sourceDir } })),
+        ),
+      );
+
+      assert.equal(result.projects.length > 0, true);
     }),
   );
 });
