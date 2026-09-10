@@ -413,6 +413,10 @@ describe("external OpenCode MCP integration", () => {
                 credentials
                   .revokeThread(id)
                   .pipe(Effect.tap(() => Effect.sync(() => activeTokens.clear()))),
+              revokeMcpProviderCredential: (id) =>
+                credentials
+                  .revokeProviderSession(id)
+                  .pipe(Effect.tap(() => Effect.sync(() => activeTokens.clear()))),
             }).pipe(
               Layer.provide(projectLayer),
               Layer.provide(
