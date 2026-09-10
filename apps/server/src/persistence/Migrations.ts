@@ -1,8 +1,22 @@
 /**
- * MigrationsLive - Migration runner with inline loader
+ * MigrationsLive - Migration runners with inline loaders
  *
  * Uses Migrator.make with fromRecord to define migrations inline.
  * All migrations are statically imported - no dynamic file system loading.
+ *
+ * There are two independent sequences, each with its own tracking table:
+ *
+ * - Upstream migrations own `effect_sql_migrations` and keep the ids they
+ *   ship with, so a database written by upstream T3 Code and one written
+ *   here agree on what a given id means.
+ * - Fork migrations own `t3_fork_migrations` and are numbered from 1 in this
+ *   repository only. Because the runner only compares an id against the
+ *   latest id in its own table, upstream can add ids forever without
+ *   colliding with, skipping, or reordering anything here.
+ *
+ * Upstream runs first on every startup, so a fork migration may depend on
+ * upstream tables. Add new fork work to `forkMigrationEntries`; only touch
+ * `migrationEntries` when carrying an upstream migration across.
  *
  * Migrations run automatically when the MigrationLayer is provided,
  * ensuring the database schema is always up-to-date before the application starts.
@@ -56,12 +70,14 @@ import Migration0040 from "./Migrations/040_ProjectionProjectFaviconPath.ts";
 import Migration0041 from "./Migrations/041_AuthSessionClientConnection.ts";
 import Migration0042 from "./Migrations/042_ProjectionThreadLinkedPullRequest.ts";
 import Migration0043 from "./Migrations/043_ProjectionThreadsUnsettledAt.ts";
-import Migration0044 from "./Migrations/044_ProjectionTurnsProvenance.ts";
-import Migration0045 from "./Migrations/045_ProjectionProjectMcpServers.ts";
-import Migration0046 from "./Migrations/046_ProjectionProjectMcpTransport.ts";
-import Migration0047 from "./Migrations/047_McpCatalogScopes.ts";
-import Migration0048 from "./Migrations/048_McpCatalogRevisions.ts";
-import Migration0049 from "./Migrations/049_McpCatalogAppliedCatalog.ts";
+
+// Fork migrations - separate sequence, separate tracking table.
+import ForkMigration0001 from "./Migrations/fork/001_ProjectionTurnsProvenance.ts";
+import ForkMigration0002 from "./Migrations/fork/002_ProjectionProjectMcpServers.ts";
+import ForkMigration0003 from "./Migrations/fork/003_ProjectionProjectMcpTransport.ts";
+import ForkMigration0004 from "./Migrations/fork/004_McpCatalogScopes.ts";
+import ForkMigration0005 from "./Migrations/fork/005_McpCatalogRevisions.ts";
+import ForkMigration0006 from "./Migrations/fork/006_McpCatalogAppliedCatalog.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -117,24 +133,46 @@ export const migrationEntries = [
   [41, "AuthSessionClientConnection", Migration0041],
   [42, "ProjectionThreadLinkedPullRequest", Migration0042],
   [43, "ProjectionThreadsUnsettledAt", Migration0043],
-  [44, "ProjectionTurnsProvenance", Migration0044],
-  [45, "ProjectionProjectMcpServers", Migration0045],
-  [46, "ProjectionProjectMcpTransport", Migration0046],
-  [47, "McpCatalogScopes", Migration0047],
-  [48, "McpCatalogRevisions", Migration0048],
-  [49, "McpCatalogAppliedCatalog", Migration0049],
 ] as const;
+
+/**
+ * Fork-only migrations, numbered from 1 and tracked in their own table.
+ *
+ * New schema work in this repository belongs here, not in
+ * `migrationEntries` - see the note at the top of this file.
+ */
+export const forkMigrationEntries = [
+  [1, "ProjectionTurnsProvenance", ForkMigration0001],
+  [2, "ProjectionProjectMcpServers", ForkMigration0002],
+  [3, "ProjectionProjectMcpTransport", ForkMigration0003],
+  [4, "McpCatalogScopes", ForkMigration0004],
+  [5, "McpCatalogRevisions", ForkMigration0005],
+  [6, "McpCatalogAppliedCatalog", ForkMigration0006],
+] as const;
+
+/** Tracking table for the fork sequence. Upstream keeps `effect_sql_migrations`. */
+export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
 
-export const makeMigrationLoader = (throughId?: number) =>
+export const forkMigrationManifest = forkMigrationEntries.map(([id, name]) => [id, name] as const);
+
+const makeLoader = (
+  entries: typeof migrationEntries | typeof forkMigrationEntries,
+  throughId?: number,
+) =>
   Migrator.fromRecord(
     Object.fromEntries(
-      migrationEntries
+      entries
         .filter(([id]) => throughId === undefined || id <= throughId)
         .map(([id, name, migration]) => [`${id}_${name}`, migration]),
     ),
   );
+
+export const makeMigrationLoader = (throughId?: number) => makeLoader(migrationEntries, throughId);
+
+export const makeForkMigrationLoader = (throughId?: number) =>
+  makeLoader(forkMigrationEntries, throughId);
 
 /**
  * Migrator run function - no schema dumping needed
@@ -143,29 +181,65 @@ export const makeMigrationLoader = (throughId?: number) =>
 const run = Migrator.make({});
 
 export interface RunMigrationsOptions {
+  /** Stop after this upstream migration id. */
   readonly toMigrationInclusive?: number | undefined;
+  /**
+   * Stop after this fork migration id. Omit to run every fork migration;
+   * pass 0 to run none, which is how a test reconstructs a database as it
+   * looked before the fork sequence existed.
+   */
+  readonly toForkMigrationInclusive?: number | undefined;
 }
 
 /**
- * Run all pending migrations.
+ * Run all pending migrations, upstream first and then fork.
  *
- * Creates the migrations tracking table (effect_sql_migrations) if it doesn't exist,
- * then runs any migrations with ID greater than the latest recorded migration.
+ * Each sequence creates its own tracking table if needed and runs the
+ * migrations whose id is greater than the latest id recorded in that table.
  *
- * Returns array of [id, name] tuples for migrations that were run.
+ * Returns the executed migrations as [id, name] tuples, upstream ids first
+ * and fork ids after; the two ranges overlap, so callers that need to tell
+ * them apart should use `runUpstreamMigrations` or `runForkMigrations`.
  *
  * @returns Effect containing array of executed migrations
  */
 export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
+  toForkMigrationInclusive,
 }: RunMigrationsOptions = {}) {
-  const executedMigrations = yield* run({ loader: makeMigrationLoader(toMigrationInclusive) });
-  const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);
-  yield* migrations.length === 0
-    ? Effect.logDebug("Database schema is current")
-    : Effect.log("Migrations ran successfully").pipe(Effect.annotateLogs({ migrations }));
+  const executedUpstream = yield* runUpstreamMigrations(toMigrationInclusive);
+  const executedFork = yield* runForkMigrations(toForkMigrationInclusive);
+  return [...executedUpstream, ...executedFork];
+});
+
+/** Run the upstream sequence only, tracked in `effect_sql_migrations`. */
+export const runUpstreamMigrations = Effect.fn("runUpstreamMigrations")(function* (
+  throughId?: number,
+) {
+  const executedMigrations = yield* run({ loader: makeMigrationLoader(throughId) });
+  yield* logExecuted(executedMigrations, "upstream");
   return executedMigrations;
 });
+
+/** Run the fork sequence only, tracked in `t3_fork_migrations`. */
+export const runForkMigrations = Effect.fn("runForkMigrations")(function* (throughId?: number) {
+  const executedMigrations = yield* run({
+    loader: makeForkMigrationLoader(throughId),
+    table: FORK_MIGRATIONS_TABLE,
+  });
+  yield* logExecuted(executedMigrations, "fork");
+  return executedMigrations;
+});
+
+const logExecuted = (
+  executed: ReadonlyArray<readonly [id: number, name: string]>,
+  sequence: "upstream" | "fork",
+) => {
+  const migrations = executed.map(([id, name]) => `${id}_${name}`);
+  return migrations.length === 0
+    ? Effect.logDebug("Database schema is current", { sequence })
+    : Effect.log("Migrations ran successfully").pipe(Effect.annotateLogs({ sequence, migrations }));
+};
 
 /**
  * Layer that runs migrations when the layer is built.

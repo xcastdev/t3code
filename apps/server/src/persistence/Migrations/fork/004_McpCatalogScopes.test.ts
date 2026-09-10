@@ -5,12 +5,12 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import { ProjectMcpTransport } from "@t3tools/contracts";
-import migration from "./047_McpCatalogScopes.ts";
-import * as NodeSqliteClient from "../NodeSqliteClient.ts";
+import migration from "./004_McpCatalogScopes.ts";
+import * as NodeSqliteClient from "../../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("047 MCP catalog scopes", (it) => {
+layer("fork 004 MCP catalog scopes", (it) => {
   it.effect("normalizes URL-only and explicit project transports", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;

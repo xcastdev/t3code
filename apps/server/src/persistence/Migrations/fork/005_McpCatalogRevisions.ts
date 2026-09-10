@@ -9,7 +9,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 export default Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
 
-  // Migration 047 populated definitions from legacy rows. Collapse any
+  // Fork migration 004 populated definitions from legacy rows. Collapse any
   // duplicate logical identities deterministically before enforcing the
   // replacement invariant used by the SQL projector.
   yield* sql`

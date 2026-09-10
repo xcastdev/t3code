@@ -33,6 +33,7 @@ policy in [CONTRIBUTING.md](../CONTRIBUTING.md); agent rules in [AGENTS.md](../A
 - [Glossary](./internals/glossary.md)
 - [Scripts](./internals/scripts.md)
 - [Connection runtime](./internals/connection-runtime.md)
+- [Database migrations](./internals/database-migrations.md)
 - [Voice input](./internals/voice-input.md)
 - [Providers](./internals/providers.md)
 - [Turn provenance](./internals/turn-provenance.md)

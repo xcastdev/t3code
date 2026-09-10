@@ -3,8 +3,8 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { runMigrations } from "../Migrations.ts";
-import * as NodeSqliteClient from "../NodeSqliteClient.ts";
+import { runMigrations } from "../../Migrations.ts";
+import * as NodeSqliteClient from "../../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
@@ -17,11 +17,11 @@ const PROVENANCE_COLUMNS = [
   "changed_file_count",
 ] as const;
 
-layer("044_ProjectionTurnsProvenance", (it) => {
+layer("fork 001 ProjectionTurnsProvenance", (it) => {
   it.effect("adds the per-turn provenance columns", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 43 });
+      yield* runMigrations({ toForkMigrationInclusive: 0 });
 
       const before = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(projection_turns)
@@ -31,7 +31,7 @@ layer("044_ProjectionTurnsProvenance", (it) => {
         assert.isFalse(beforeNames.has(column), `expected ${column} to be absent at 43`);
       }
 
-      yield* runMigrations({ toMigrationInclusive: 44 });
+      yield* runMigrations({ toForkMigrationInclusive: 1 });
 
       const after = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(projection_turns)
@@ -46,7 +46,7 @@ layer("044_ProjectionTurnsProvenance", (it) => {
   it.effect("leaves existing turn rows readable with null provenance", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 43 });
+      yield* runMigrations({ toForkMigrationInclusive: 0 });
 
       // A turn that settled before the migration must survive it untouched:
       // the columns are additive and nullable, and nothing is backfilled.
@@ -56,7 +56,7 @@ layer("044_ProjectionTurnsProvenance", (it) => {
         ) VALUES ('thread-1', 'turn-1', 'completed', '2026-01-01T00:00:00.000Z', '[]')
       `;
 
-      yield* runMigrations({ toMigrationInclusive: 44 });
+      yield* runMigrations({ toForkMigrationInclusive: 1 });
 
       const rows = yield* sql<{
         readonly turnId: string;
@@ -83,8 +83,8 @@ layer("044_ProjectionTurnsProvenance", (it) => {
   it.effect("is idempotent when the columns already exist", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 44 });
-      yield* runMigrations({ toMigrationInclusive: 44 });
+      yield* runMigrations({ toForkMigrationInclusive: 1 });
+      yield* runMigrations({ toForkMigrationInclusive: 1 });
 
       const columns = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(projection_turns)

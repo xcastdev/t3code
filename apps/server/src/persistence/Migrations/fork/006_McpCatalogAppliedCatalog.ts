@@ -4,7 +4,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 /**
  * Retain the exact definition set handed to a provider independently from
  * the session's desired catalog. Older rows with a stale desired revision
- * remain NULL because the pre-049 projection did not retain enough
+ * remain NULL because the pre-006 projection did not retain enough
  * information to reconstruct the applied catalog safely.
  */
 export default Effect.gen(function* () {

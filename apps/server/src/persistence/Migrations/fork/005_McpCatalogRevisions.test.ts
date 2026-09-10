@@ -3,16 +3,16 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { runMigrations } from "../Migrations.ts";
-import * as NodeSqliteClient from "../NodeSqliteClient.ts";
+import { runMigrations } from "../../Migrations.ts";
+import * as NodeSqliteClient from "../../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("048 MCP catalog revisions", (it) => {
+layer("fork 005 MCP catalog revisions", (it) => {
   it.effect("backfills deterministic identities, revisions, and application state", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations({ toMigrationInclusive: 47 });
+      yield* runMigrations({ toForkMigrationInclusive: 4 });
 
       const transport =
         '{"type":"streamable-http","url":"https://catalog.example/mcp","headers":[],"authorization":{"type":"none"}}';
@@ -44,7 +44,7 @@ layer("048 MCP catalog revisions", (it) => {
         )
       `;
 
-      yield* runMigrations({ toMigrationInclusive: 48 });
+      yield* runMigrations({ toForkMigrationInclusive: 5 });
 
       const definitions = yield* sql<{
         readonly definitionId: string;
