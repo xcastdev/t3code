@@ -5,7 +5,11 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
-import { runMigrations } from "../src/persistence/Migrations.ts";
+import {
+  FORK_MIGRATIONS_TABLE,
+  forkMigrationManifest,
+  runMigrations,
+} from "../src/persistence/Migrations.ts";
 import * as NodeSqliteClient from "../src/persistence/NodeSqliteClient.ts";
 import { runMigrateDevDb } from "./migrate-dev-db.ts";
 
@@ -18,6 +22,7 @@ const withDatabase = <A, E>(
  * `stopped-thread` qualifies for the clone. */
 const createFixtureSource = Effect.fn("createMigrateDevDbFixtureSource")(function* (
   baseDir: string,
+  migrations: { readonly toForkMigrationInclusive?: number } = {},
 ) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -28,7 +33,7 @@ const createFixtureSource = Effect.fn("createMigrateDevDbFixtureSource")(functio
     databasePath,
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
-      yield* runMigrations();
+      yield* runMigrations(migrations);
       // The real shared db carries this column from a branch build without a
       // matching migration; reproduce that drift so the filter is exercised.
       yield* sql`ALTER TABLE projection_threads ADD COLUMN monitor_json TEXT`;
@@ -103,7 +108,7 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
     }),
   );
 
-  it.effect("fails loudly on a migration slot collision", () =>
+  it.effect("fails loudly on an upstream migration slot collision", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
       const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-slot-" });
@@ -126,9 +131,74 @@ it.layer(NodeServices.layer)("migrate-dev-db", (it) => {
       ).pipe(Effect.flip);
       assert.equal(error._tag, "MigrateDevDbSlotCollisionError");
       if (error._tag === "MigrateDevDbSlotCollisionError") {
+        assert.equal(error.sequence, "upstream");
         assert.equal(error.slot, 1);
         assert.equal(error.appliedName, "SomebodyElsesMigration");
       }
+    }),
+  );
+
+  it.effect("fails loudly on a fork migration slot collision", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-fork-" });
+      const destDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-fork-dest-" });
+      const source = yield* createFixtureSource(sourceDir);
+      // The fork sequence restarts at 1, so its slots collide exactly the way
+      // upstream's do - and used to go unchecked entirely.
+      yield* withDatabase(
+        source,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`UPDATE ${sql(FORK_MIGRATIONS_TABLE)}
+            SET name = 'SomebodyElsesForkMigration' WHERE migration_id = 1`;
+        }),
+      );
+
+      const error = yield* runMigrateDevDb(
+        { baseDir: destDir, source, projects: 5, threadsPerProject: 10 },
+        { sharedHome: sourceDir },
+      ).pipe(Effect.flip);
+      assert.equal(error._tag, "MigrateDevDbSlotCollisionError");
+      if (error._tag === "MigrateDevDbSlotCollisionError") {
+        assert.equal(error.sequence, "fork");
+        assert.equal(error.slot, 1);
+        assert.equal(error.appliedName, "SomebodyElsesForkMigration");
+      }
+    }),
+  );
+
+  it.effect("accepts a snapshot taken before the fork sequence existed", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const sourceDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-nofork-" });
+      const destDir = yield* fs.makeTempDirectoryScoped({ prefix: "migrate-dev-db-nofork-dest-" });
+      // A genuinely pre-fork database: no fork tracking table and none of the
+      // schema those migrations create. The migrate phase must create the
+      // table and apply every fork migration, and the slot check must not
+      // mistake that clean upgrade for a collision.
+      const source = yield* createFixtureSource(sourceDir, { toForkMigrationInclusive: 0 });
+      // The migrator creates its table even when no migration is pending, so
+      // drop it to reach the real pre-fork shape: no tracking table, and none
+      // of the schema the fork migrations create.
+      yield* withDatabase(
+        source,
+        Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          yield* sql`DROP TABLE ${sql(FORK_MIGRATIONS_TABLE)}`;
+        }),
+      );
+
+      const result = yield* runMigrateDevDb(
+        { baseDir: destDir, source, projects: 5, threadsPerProject: 10 },
+        { sharedHome: sourceDir },
+      );
+
+      // The fork sequence re-ran and is reported under its own namespace.
+      assert.deepStrictEqual(
+        result.executedMigrations.filter((entry) => entry.startsWith("fork/")),
+        forkMigrationManifest.map(([id, name]) => `fork/${id}_${name}`),
+      );
     }),
   );
 
