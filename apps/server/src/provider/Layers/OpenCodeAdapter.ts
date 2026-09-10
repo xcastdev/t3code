@@ -1787,26 +1787,33 @@ export function makeOpenCodeAdapter(
     // `startOpenCodeServerProcess`) and interrupts the forked event/exit
     // fibers. Consumers that can't reason about Effect scopes therefore
     // cannot leak OpenCode child processes by forgetting to call `stopAll`.
+    // Detach every session, then drop the MCP entries this adapter registered
+    // on external OpenCode servers. Shared by `stopAll` and the layer
+    // finalizer so both paths leave external servers in the same state.
+    // `ignoreCause` swallows both typed failures (none here) and defects from
+    // throwing scope finalizers so a sibling's death can't interrupt the
+    // remaining cleanups.
+    const closeAllSessions = Effect.gen(function* () {
+      const contexts = [...sessions.values()];
+      sessions.clear();
+      yield* Effect.forEach(
+        contexts,
+        (context) =>
+          Effect.ignoreCause(
+            closeOpenCodeContext(context, "detach", settlePendingOpenCodeRequests),
+          ),
+        { concurrency: "unbounded", discard: true },
+      );
+      yield* Effect.forEach(
+        [...externalMcpStates.values()],
+        (state) => Effect.ignoreCause(cleanupExternalMcpState(state)),
+        { concurrency: "unbounded", discard: true },
+      );
+    });
+
     yield* Effect.addFinalizer(() =>
       Effect.gen(function* () {
-        const contexts = [...sessions.values()];
-        sessions.clear();
-        // `ignoreCause` swallows both typed failures (none here) and defects
-        // from throwing scope finalizers so a sibling's death can't interrupt
-        // the remaining cleanups.
-        yield* Effect.forEach(
-          contexts,
-          (context) =>
-            Effect.ignoreCause(
-              closeOpenCodeContext(context, "detach", settlePendingOpenCodeRequests),
-            ),
-          { concurrency: "unbounded", discard: true },
-        );
-        yield* Effect.forEach(
-          [...externalMcpStates.values()],
-          (state) => Effect.ignoreCause(cleanupExternalMcpState(state)),
-          { concurrency: "unbounded", discard: true },
-        );
+        yield* closeAllSessions;
         // Close the logger AFTER session teardown so any final lifecycle
         // events emitted during shutdown still get written. `close` flushes
         // the `Logger.batched` window and closes each per-thread
@@ -5677,23 +5684,7 @@ export function makeOpenCodeAdapter(
       },
     );
 
-    const stopAll: OpenCodeAdapterShape["stopAll"] = () =>
-      Effect.gen(function* () {
-        const contexts = [...sessions.values()];
-        sessions.clear();
-        // `closeOpenCodeContext` is typed as never-failing — SDK aborts are
-        // already `Effect.ignore`'d inside it. `ignoreCause` here also
-        // swallows defects from throwing finalizers so one bad close can't
-        // interrupt the sibling fibers. Same pattern as the layer finalizer.
-        yield* Effect.forEach(
-          contexts,
-          (context) =>
-            Effect.ignoreCause(
-              closeOpenCodeContext(context, "detach", settlePendingOpenCodeRequests),
-            ),
-          { concurrency: "unbounded", discard: true },
-        );
-      });
+    const stopAll: OpenCodeAdapterShape["stopAll"] = () => closeAllSessions;
 
     return {
       provider: PROVIDER,

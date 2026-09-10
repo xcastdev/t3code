@@ -838,6 +838,54 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     ),
   );
 
+  it.effect("stopAll disconnects external MCP entries like the layer finalizer", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-opencode-external-stop-all");
+      const fixed = makeFixedExternalMcpCoordinator("generation-stop-all");
+      let releaseCalls = 0;
+      const adapter = yield* makeOpenCodeAdapter(externalOpenCodeAdapterTestSettings, {
+        environmentId: fixed.lease.environmentId,
+        instanceId: fixed.lease.providerInstanceId,
+        externalMcpCoordinator: {
+          ...fixed.coordinator,
+          acquire: () => Effect.succeed({ ...fixed.lease, threadId }),
+          release: () => Effect.sync(() => (releaseCalls += 1)),
+        },
+      });
+      yield* Effect.sync(() =>
+        McpProviderSession.setMcpProviderSession({
+          environmentId: fixed.lease.environmentId,
+          threadId,
+          providerSessionId: "preview-session",
+          providerInstanceId: fixed.lease.providerInstanceId,
+          endpoint: "http://127.0.0.1:4310/mcp",
+          authorizationHeader: "Bearer preview-token",
+        }),
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        cwd: fixed.lease.target.directory,
+      });
+      expect(runtimeMock.state.mcpAddCalls).toHaveLength(1);
+
+      yield* adapter.stopAll();
+
+      expect(runtimeMock.state.mcpDisconnectCalls).toHaveLength(1);
+      expect(releaseCalls).toBe(1);
+      expect(yield* adapter.hasSession(threadId)).toBe(false);
+    }).pipe(
+      Effect.ensuring(
+        Effect.sync(() =>
+          McpProviderSession.clearMcpProviderSession(
+            asThreadId("thread-opencode-external-stop-all"),
+          ),
+        ),
+      ),
+    ),
+  );
+
   it.effect("runs concurrent external MCP cleanup only once per state", () =>
     Effect.gen(function* () {
       const threadId = asThreadId("thread-opencode-external-concurrent-cleanup");
