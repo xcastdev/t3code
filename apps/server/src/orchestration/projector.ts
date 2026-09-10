@@ -610,6 +610,12 @@ export function projectEvent(
               globalDefinitions: catalog.globalDefinitions.filter(
                 (entry) => entry.logicalServerId !== payload.logicalServerId,
               ),
+              // Overrides can only target global definitions, so a removed
+              // definition takes its overrides with it instead of leaving
+              // rows that nothing can resolve or delete.
+              projectOverrides: catalog.projectOverrides.filter(
+                (entry) => entry.override.targetId !== payload.logicalServerId,
+              ),
             },
           };
         }),

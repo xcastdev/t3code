@@ -573,7 +573,9 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           (definition) => definition.logicalServerId !== command.logicalServerId,
         ),
         projectDefinitions: readModel.mcpCatalog?.projectDefinitions ?? [],
-        projectOverrides: readModel.mcpCatalog?.projectOverrides ?? [],
+        projectOverrides: (readModel.mcpCatalog?.projectOverrides ?? []).filter(
+          (entry) => entry.override.targetId !== command.logicalServerId,
+        ),
       });
       return {
         ...(yield* withEventBase({

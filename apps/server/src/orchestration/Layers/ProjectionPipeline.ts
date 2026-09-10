@@ -711,6 +711,10 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
                 AND scope_id = ${event.payload.environmentId}
                 AND logical_server_id = ${event.payload.logicalServerId}
             `;
+            yield* sql`
+              DELETE FROM projection_mcp_overrides
+              WHERE target_logical_server_id = ${event.payload.logicalServerId}
+            `;
             yield* recordRevision("global", event.payload.environmentId, event.payload.revision);
             return;
 

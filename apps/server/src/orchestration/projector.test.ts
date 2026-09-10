@@ -335,6 +335,60 @@ describe("orchestration projector", () => {
     });
   });
 
+  it("drops project overrides that target a removed global definition", async () => {
+    const override = {
+      id: McpCatalogOverrideId.make("override-1"),
+      scope: "project" as const,
+      scopeId: "project-1",
+      targetId: "global-server",
+      enabled: false,
+    };
+    let model = createEmptyReadModel("2026-01-01T00:00:00.000Z");
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        makeEvent({
+          sequence: 1,
+          type: "project.mcp-override.upserted",
+          occurredAt: "2026-01-01T00:00:01.000Z",
+          aggregateKind: "project",
+          aggregateId: "project-1",
+          commandId: "override-1",
+          payload: {
+            projectId: "project-1",
+            override,
+            revision: 1,
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          },
+        }),
+      ),
+    );
+    expect(model.mcpCatalog?.projectOverrides).toEqual([{ projectId: "project-1", override }]);
+
+    model = await Effect.runPromise(
+      projectEvent(
+        model,
+        makeEvent({
+          sequence: 2,
+          type: "environment.mcp-definition.removed",
+          occurredAt: "2026-01-01T00:00:02.000Z",
+          aggregateKind: "environment",
+          aggregateId: "environment-1",
+          commandId: "remove-global-server",
+          payload: {
+            environmentId: "environment-1",
+            logicalServerId: "global-server",
+            revision: 1,
+            removedAt: "2026-01-01T00:00:02.000Z",
+          },
+        }),
+      ),
+    );
+
+    expect(model.mcpCatalog?.projectOverrides).toEqual([]);
+    expect(model.mcpCatalog?.projectRevisions).toEqual([{ projectId: "project-1", revision: 1 }]);
+  });
+
   it("does not move a project override identity across projects", async () => {
     const overrideId = McpCatalogOverrideId.make("shared-override-id");
     const makeOverride = (projectId: string) => ({

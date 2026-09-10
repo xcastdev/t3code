@@ -377,6 +377,61 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
     }),
   );
 
+  it.effect("drops override rows when their global target is removed", () =>
+    Effect.gen(function* () {
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const eventStore = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* eventStore.append({
+        type: "project.mcp-override.upserted" as const,
+        eventId: EventId.make("evt-override-target-1"),
+        aggregateKind: "project" as const,
+        aggregateId: ProjectId.make("project-a"),
+        occurredAt: "2026-01-01T00:00:01.000Z",
+        commandId: CommandId.make("cmd-override-target-1"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-override-target-1"),
+        metadata: {},
+        payload: {
+          projectId: ProjectId.make("project-a"),
+          override: {
+            id: McpCatalogOverrideId.make("override-target"),
+            scope: "project" as const,
+            scopeId: "project-a",
+            targetId: McpServerId.make("global-target"),
+            enabled: false,
+          },
+          revision: 1,
+          updatedAt: "2026-01-01T00:00:01.000Z",
+        },
+      });
+      yield* eventStore.append({
+        type: "environment.mcp-definition.removed" as const,
+        eventId: EventId.make("evt-override-target-2"),
+        aggregateKind: "environment" as const,
+        aggregateId: EnvironmentId.make("environment-1"),
+        occurredAt: "2026-01-01T00:00:02.000Z",
+        commandId: CommandId.make("cmd-override-target-2"),
+        causationEventId: null,
+        correlationId: CommandId.make("cmd-override-target-2"),
+        metadata: {},
+        payload: {
+          environmentId: EnvironmentId.make("environment-1"),
+          logicalServerId: McpServerId.make("global-target"),
+          revision: 1,
+          removedAt: "2026-01-01T00:00:02.000Z",
+        },
+      });
+      yield* projectionPipeline.bootstrap;
+
+      const rows = yield* sql<{ readonly overrideId: string }>`
+        SELECT override_id AS "overrideId" FROM projection_mcp_overrides
+      `;
+      assert.deepEqual(rows, []);
+    }),
+  );
+
   it.effect("hydrates explicit MCP transports from persisted projection rows", () =>
     Effect.gen(function* () {
       const projectionPipeline = yield* OrchestrationProjectionPipeline;
