@@ -157,6 +157,11 @@ function ChangesView(
   const pageRequestId = useRef(0);
   const files = workingTreePages.files;
   const workflowAvailable = availability === "available";
+  const authoritativeWorkingTreeCount = status?.workingTree.totalCount ?? files.length;
+  const authoritativeStagedCount =
+    status?.workingTree.stagedCount ??
+    files.filter((file) => file.indexStatus === "staged" || file.indexStatus === "both").length;
+  const hasPendingMerge = (status?.pendingMergeHeads?.length ?? 0) > 0;
 
   useEffect(() => {
     pageRequestId.current += 1;
@@ -229,7 +234,7 @@ function ChangesView(
     });
     if (isAtomCommandInterrupted(result)) return;
     if (result._tag === "Failure") {
-      setPageError(failureMessage(result));
+      if (requestId === pageRequestId.current) setPageError(failureMessage(result));
       return;
     }
     setWorkingTreePages((current) =>
@@ -331,6 +336,9 @@ function ChangesView(
     setReviewError(null);
     setReviewedStatus(null);
   }, []);
+  const reviewPendingMerge = useCallback(() => {
+    void reviewFile({ path: ".", insertions: 0, deletions: 0 }, "index");
+  }, [reviewFile]);
   useEffect(() => {
     if (activeReviewedStatus === null || status === null) return;
     if (
@@ -350,15 +358,14 @@ function ChangesView(
         activeReviewedStatus === null ||
         !canSubmitSourceControlCommit({
           workflowAvailable,
-          stagedCount: files.filter(
-            (file) => file.indexStatus === "staged" || file.indexStatus === "both",
-          ).length,
+          stagedCount: authoritativeStagedCount,
           message,
           reviewedStateAvailable:
             activeReviewedStatus.headCommit !== undefined &&
             activeReviewedStatus.indexTree !== undefined,
           hasReviewedBranch:
             activeReviewedStatus.refName !== null && activeReviewedStatus.refName !== undefined,
+          hasReviewedMerge: hasPendingMerge && activeReviewedStatus.pendingMergeHeads?.length !== 0,
         })
       )
         return;
@@ -408,6 +415,8 @@ function ChangesView(
       props.environmentId,
       refreshStatus,
       activeReviewedStatus,
+      authoritativeStagedCount,
+      hasPendingMerge,
       workflowAvailable,
     ],
   );
@@ -429,6 +438,11 @@ function ChangesView(
     return (
       <div className="space-y-2 p-4 text-center text-xs text-muted-foreground">
         <p>This project is not a Git repository.</p>
+        {error ? (
+          <p className="text-destructive" role="alert">
+            {error}
+          </p>
+        ) : null}
         <Button
           size="xs"
           variant="outline"
@@ -463,7 +477,7 @@ function ChangesView(
           </Button>
         </div>
         <p className="text-xs text-muted-foreground">
-          {status?.workingTree.totalCount ?? files.length} changes ·{" "}
+          {authoritativeWorkingTreeCount} changes ·{" "}
           {status?.workingTree.stagedCount ??
             files.filter((file) => file.indexStatus === "staged" || file.indexStatus === "both")
               .length}{" "}
@@ -553,10 +567,22 @@ function ChangesView(
               </div>
             );
           })}
-          {status?.workingTree.totalCount === 0 ? (
+          {authoritativeWorkingTreeCount === 0 ? (
             <p className="px-2 py-4 text-center text-xs text-muted-foreground">
               Working tree clean.
             </p>
+          ) : null}
+          {hasPendingMerge && authoritativeStagedCount === 0 ? (
+            <div className="px-2">
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={!workflowAvailable}
+                onClick={reviewPendingMerge}
+              >
+                Review pending merge
+              </Button>
+            </div>
           ) : null}
           {status && (status.aheadCount > 0 || status.behindCount > 0) ? (
             <p className="px-2 text-xs text-muted-foreground">
@@ -615,11 +641,7 @@ function ChangesView(
             disabled={
               !canSubmitSourceControlCommit({
                 workflowAvailable,
-                stagedCount:
-                  status?.workingTree.stagedCount ??
-                  files.filter(
-                    (file) => file.indexStatus === "staged" || file.indexStatus === "both",
-                  ).length,
+                stagedCount: authoritativeStagedCount,
                 message,
                 reviewedStateAvailable:
                   activeReviewedStatus?.headCommit !== undefined &&
@@ -627,6 +649,8 @@ function ChangesView(
                 hasReviewedBranch:
                   activeReviewedStatus?.refName !== null &&
                   activeReviewedStatus?.refName !== undefined,
+                hasReviewedMerge:
+                  hasPendingMerge && activeReviewedStatus?.pendingMergeHeads?.length !== 0,
               })
             }
             onClick={() => void submit(false)}

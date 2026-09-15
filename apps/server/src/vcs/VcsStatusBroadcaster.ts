@@ -432,7 +432,12 @@ export const make = Effect.gen(function* () {
 
       yield* workflow.invalidateLocalStatus(cwd);
       const local = yield* workflow.localStatus({ cwd });
-      if (!local.isRepo || !local.isDefaultRef || local.hasWorkingTreeChanges) return null;
+      // This read minted the current working-tree snapshot. Returning it even
+      // when pull is declined prevents the caller from publishing an older
+      // cached local status whose snapshot was just invalidated.
+      if (!local.isRepo || !local.isDefaultRef || local.hasWorkingTreeChanges) {
+        return { local, remote };
+      }
 
       yield* workflow.pullCurrentBranch(cwd);
       yield* workflow.invalidateStatus(cwd);
@@ -440,7 +445,6 @@ export const make = Effect.gen(function* () {
         [workflow.localStatus({ cwd }), workflow.remoteStatus({ cwd }, { refreshUpstream: false })],
         { concurrency: "unbounded" },
       );
-      yield* updateCachedStatus(cwd, refreshedLocal, refreshedRemote, { publish: true });
       return { local: refreshedLocal, remote: refreshedRemote };
     }).pipe(
       Effect.catch(() =>
@@ -464,7 +468,10 @@ export const make = Effect.gen(function* () {
         }
         const remote = yield* workflow.remoteStatus({ cwd }, options);
         const pulled = yield* maybeAutoPull(cwd, remote, options?.policyCwds ?? [cwd]);
-        if (pulled !== null) return pulled.remote;
+        if (pulled !== null) {
+          yield* updateCachedStatus(cwd, pulled.local, pulled.remote, { publish: true });
+          return pulled.remote;
+        }
         return yield* updateCachedRemoteStatus(cwd, remote, { publish: true });
       }),
     );
@@ -485,7 +492,9 @@ export const make = Effect.gen(function* () {
           { concurrency: "unbounded" },
         );
         const pulled = yield* maybeAutoPull(cwd, remote, [rawCwd]);
-        if (pulled !== null) return mergeGitStatusParts(pulled.local, pulled.remote);
+        if (pulled !== null) {
+          return yield* updateCachedStatus(cwd, pulled.local, pulled.remote, { publish: true });
+        }
         return yield* updateCachedStatus(cwd, local, remote, { publish: true });
       }),
     );

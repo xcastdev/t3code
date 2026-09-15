@@ -145,6 +145,47 @@ function makeBackgroundPolicyLayer(shouldRunScopeWork: (scope: BackgroundScope) 
 }
 
 describe("VcsStatusBroadcaster", () => {
+  it.effect("retains the reread snapshot when auto-pull declines a dirty branch", () => {
+    let localReads = 0;
+    const first = {
+      ...baseLocalStatus,
+      isDefaultRef: true,
+      refName: "main",
+      workingTree: { ...baseLocalStatus.workingTree, snapshotId: "snapshot-1" },
+    };
+    const reread = {
+      ...first,
+      hasWorkingTreeChanges: true,
+      workingTree: { ...first.workingTree, snapshotId: "snapshot-2" },
+    };
+    const layer = VcsStatusBroadcaster.layer.pipe(
+      Layer.provideMerge(NodeServices.layer),
+      Layer.provide(makeBackgroundPolicyLayer(() => true)),
+      Layer.provide(
+        Layer.succeed(VcsStatusBroadcaster.VcsAutoPullPolicy, {
+          isEnabled: () => Effect.succeed(true),
+        }),
+      ),
+      Layer.provide(
+        Layer.mock(GitWorkflowService.GitWorkflowService)({
+          localStatus: () => Effect.sync(() => (localReads++ === 0 ? first : reread)),
+          remoteStatus: () => Effect.succeed({ ...baseRemoteStatus, behindCount: 1 }),
+          invalidateLocalStatus: () => Effect.void,
+          invalidateRemoteStatus: () => Effect.void,
+          invalidateStatus: () => Effect.void,
+          pullCurrentBranch: () => Effect.die("dirty branch must not pull"),
+        }),
+      ),
+    );
+    return Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-vcs-snapshot-race-" });
+      const broadcaster = yield* VcsStatusBroadcaster.VcsStatusBroadcaster;
+      const status = yield* broadcaster.refreshStatus(cwd);
+      assert.equal(status.workingTree.snapshotId, "snapshot-2");
+    }).pipe(Effect.provide(layer));
+  });
+
   it.effect.skipIf(!symlinksSupported)(
     "automatically pulls an enabled clean default branch when status detects it is behind",
     () => {

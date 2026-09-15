@@ -1,6 +1,7 @@
 import type { VcsStatusResult } from "@t3tools/contracts";
 import { assert, describe, it } from "vite-plus/test";
 import {
+  buildGitCommitFilePaths,
   buildGitActionProgressStages,
   buildMenuItems,
   requiresDefaultBranchConfirmation,
@@ -1151,5 +1152,18 @@ describe("resolveAutoFeatureBranchName", () => {
   it("falls back to feature/update when no preferred name is provided", () => {
     const ref = resolveAutoFeatureBranchName(["main"]);
     assert.equal(ref, "feature/update");
+  });
+});
+
+describe("buildGitCommitFilePaths", () => {
+  it("keeps whole-tree commits pathless and retains explicit off-page selections", () => {
+    assert.equal(buildGitCommitFilePaths({ mode: "all" }), undefined);
+    assert.deepEqual(
+      buildGitCommitFilePaths({
+        mode: "paths",
+        paths: new Set(["preview-file.ts", "off-page-file.ts"]),
+      }),
+      ["preview-file.ts", "off-page-file.ts"],
+    );
   });
 });

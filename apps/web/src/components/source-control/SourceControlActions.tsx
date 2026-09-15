@@ -9,6 +9,7 @@ import type {
   GitRunStackedActionResult,
   GitStackedAction,
   VcsStatusResult,
+  VcsWorkingTreeFile,
 } from "@t3tools/contracts";
 import {
   type MouseEvent,
@@ -29,10 +30,12 @@ import {
   InfoIcon,
 } from "lucide-react";
 import {
+  buildGitCommitFilePaths,
   buildGitActionProgressStages,
   buildMenuItems,
   type GitActionIconName,
   type GitActionMenuItem,
+  type GitCommitFileSelection,
   type GitQuickAction,
   type DefaultBranchConfirmableAction,
   requiresDefaultBranchConfirmation,
@@ -128,10 +131,6 @@ interface RunGitActionWithToastInput {
   progressToastId?: GitActionToastId;
   filePaths?: string[];
 }
-
-type WorkingTreeSelection =
-  | { readonly mode: "all" }
-  | { readonly mode: "paths"; readonly paths: ReadonlySet<string> };
 
 const GIT_STATUS_WINDOW_REFRESH_DEBOUNCE_MS = 250;
 
@@ -314,8 +313,12 @@ export default function SourceControlActions({
   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
   const [isCommitDialogOpen, setIsCommitDialogOpen] = useState(false);
   const [dialogCommitMessage, setDialogCommitMessage] = useState("");
-  const [selection, setSelection] = useState<WorkingTreeSelection>({ mode: "all" });
+  const [selection, setSelection] = useState<GitCommitFileSelection>({ mode: "all" });
   const [isEditingFiles, setIsEditingFiles] = useState(false);
+  const [loadedWorkingTree, setLoadedWorkingTree] = useState<{
+    readonly snapshotId: string | null;
+    readonly files: readonly VcsWorkingTreeFile[];
+  } | null>(null);
   const [isPublishDialogOpen, setIsPublishDialogOpen] = useState(false);
   const [pendingDefaultBranchAction, setPendingDefaultBranchAction] =
     useState<PendingDefaultBranchAction | null>(null);
@@ -408,6 +411,9 @@ export default function SourceControlActions({
   const refreshVcsStatus = useAtomCommand(vcsEnvironment.refreshStatus, {
     reportFailure: false,
   });
+  const loadWorkingTreePage = useAtomCommand(vcsEnvironment.workingTreePage, {
+    reportFailure: false,
+  });
   const { data: gitStatus, error: gitStatusError } = gitStatusQuery;
   const sourceControlPresentation = useMemo(
     () => getSourceControlPresentation(gitStatus?.sourceControlProvider),
@@ -420,12 +426,17 @@ export default function SourceControlActions({
   const hasPrimaryRemote = gitStatus?.hasPrimaryRemote ?? false;
   const gitStatusForActions = gitStatus;
 
-  const allFiles = gitStatusForActions?.workingTree.files ?? [];
+  const statusSnapshotId = gitStatusForActions?.workingTree.snapshotId ?? null;
+  const allFiles =
+    loadedWorkingTree?.snapshotId === statusSnapshotId
+      ? loadedWorkingTree.files
+      : (gitStatusForActions?.workingTree.files ?? []);
+  const totalFileCount = gitStatusForActions?.workingTree.totalCount ?? allFiles.length;
   const selectedFiles =
     selection.mode === "all" ? allFiles : allFiles.filter((file) => selection.paths.has(file.path));
   const allSelected = selection.mode === "all";
   const noneSelected = selectedFiles.length === 0;
-  const selectedFilePaths = selection.mode === "paths" ? [...selection.paths] : undefined;
+  const selectedFilePaths = buildGitCommitFilePaths(selection);
 
   const initAction = useVcsInitAction(sourceControlScope);
   const runImmediateGitAction = useGitStackedAction(sourceControlScope);
@@ -438,6 +449,60 @@ export default function SourceControlActions({
     !activeServerThread &&
     activeDraftThread?.envMode === "worktree" &&
     activeDraftThread.worktreePath === null;
+
+  useEffect(() => {
+    setLoadedWorkingTree(null);
+    setIsEditingFiles(false);
+  }, [statusSnapshotId]);
+
+  const loadAllWorkingTreeFiles = useCallback(async () => {
+    if (!gitStatusForActions || activeEnvironmentId === null || gitCwd === null) return false;
+    const snapshotId = gitStatusForActions.workingTree.snapshotId;
+    if (snapshotId === undefined) {
+      // Legacy servers provide their complete list in the status response.
+      return true;
+    }
+    let files = [...gitStatusForActions.workingTree.files];
+    let cursor = gitStatusForActions.workingTree.nextCursor ?? null;
+    while (cursor !== null) {
+      const result = await loadWorkingTreePage({
+        environmentId: activeEnvironmentId,
+        input: { cwd: gitCwd, snapshotId, cursor },
+      });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          const failure = squashAtomCommandFailure(result);
+          toastManager.add({
+            type: "error",
+            title: "Unable to load all changed files.",
+            description: failure instanceof Error ? failure.message : "Refresh and try again.",
+            data: threadToastData,
+          });
+        }
+        return false;
+      }
+      if (result.value.snapshotId !== snapshotId) {
+        toastManager.add({
+          type: "error",
+          title: "Changed files were refreshed.",
+          description: "Refresh the commit dialog and choose files again.",
+          data: threadToastData,
+        });
+        return false;
+      }
+      const existing = new Set(files.map((file) => file.path));
+      files.push(...result.value.files.filter((file) => !existing.has(file.path)));
+      cursor = result.value.nextCursor;
+    }
+    setLoadedWorkingTree({ snapshotId, files });
+    return true;
+  }, [activeEnvironmentId, gitCwd, gitStatusForActions, loadWorkingTreePage, threadToastData]);
+
+  const beginEditingFiles = useCallback(() => {
+    void (async () => {
+      if (await loadAllWorkingTreeFiles()) setIsEditingFiles(true);
+    })();
+  }, [loadAllWorkingTreeFiles]);
 
   useEffect(() => {
     if (isGitActionRunning || isSelectingWorktreeBase || activeServerThread) {
@@ -1197,7 +1262,7 @@ export default function SourceControlActions({
                     <span className="text-muted-foreground">Files</span>
                     {!allSelected && !isEditingFiles && (
                       <span className="text-muted-foreground">
-                        ({selectedFiles.length} of {allFiles.length})
+                        ({selectedFiles.length} of {totalFileCount})
                       </span>
                     )}
                   </div>
@@ -1205,7 +1270,10 @@ export default function SourceControlActions({
                     <Button
                       variant="ghost"
                       size="xs"
-                      onClick={() => setIsEditingFiles((prev) => !prev)}
+                      onClick={() => {
+                        if (isEditingFiles) setIsEditingFiles(false);
+                        else beginEditingFiles();
+                      }}
                     >
                       {isEditingFiles ? "Done" : "Edit"}
                     </Button>

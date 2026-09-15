@@ -106,6 +106,11 @@ interface WorkingTreeSnapshot {
   readonly stagedCount: number;
 }
 
+function serializedJsonBytes(value: unknown): number {
+  // @effect-diagnostics-next-line preferSchemaOverJson:off
+  return Buffer.byteLength(JSON.stringify(value), "utf8");
+}
+
 export class GitManager extends Context.Service<
   GitManager,
   {
@@ -152,6 +157,9 @@ const STATUS_RESULT_CACHE_CAPACITY = 2_048;
 const WORKING_TREE_STATUS_PREVIEW_LIMIT = 64;
 const WORKING_TREE_PAGE_MAX_SIZE = 100;
 const WORKING_TREE_PAGE_BYTE_BUDGET = 64 * 1024;
+// Headroom for the enclosing status event and repository/remote metadata.
+// The working-tree value itself is measured with the transport encoder.
+const WORKING_TREE_STATUS_BYTE_BUDGET = 48 * 1024;
 const WORKING_TREE_SNAPSHOT_CACHE_CAPACITY = 256;
 // Matches the automatic settlement sweep cadence so every background sweep
 // reads fresh branch state: an external merge settles within about a minute
@@ -1048,22 +1056,45 @@ export const make = Effect.gen(function* () {
     const snapshot = details.isRepo
       ? rememberWorkingTreeSnapshot(cwd, details.workingTree.files)
       : null;
-    const workingTree = snapshot
-      ? {
-          files: snapshot.files.slice(0, WORKING_TREE_STATUS_PREVIEW_LIMIT),
+    let workingTree = details.workingTree;
+    if (snapshot) {
+      const preview: VcsWorkingTreeFile[] = [];
+      for (const file of snapshot.files.slice(0, WORKING_TREE_STATUS_PREVIEW_LIMIT)) {
+        const candidate = {
+          files: [...preview, file],
           insertions: details.workingTree.insertions,
           deletions: details.workingTree.deletions,
           totalCount: snapshot.totalCount,
           stagedCount: snapshot.stagedCount,
           hasStagedChanges: snapshot.stagedCount > 0,
           snapshotId: snapshot.id,
-          nextCursor:
-            snapshot.totalCount > WORKING_TREE_STATUS_PREVIEW_LIMIT
-              ? WORKING_TREE_STATUS_PREVIEW_LIMIT
-              : null,
-          truncated: snapshot.totalCount > WORKING_TREE_STATUS_PREVIEW_LIMIT,
+          nextCursor: preview.length + 1 < snapshot.totalCount ? preview.length + 1 : null,
+          truncated: preview.length + 1 < snapshot.totalCount,
+        };
+        if (serializedJsonBytes(candidate) > WORKING_TREE_STATUS_BYTE_BUDGET) {
+          if (preview.length === 0) {
+            return yield* new GitManagerError({
+              operation: "readLocalStatus",
+              cwd,
+              detail: "A working tree entry exceeds the bounded status response limit.",
+            });
+          }
+          break;
         }
-      : details.workingTree;
+        preview.push(file);
+      }
+      workingTree = {
+        files: preview,
+        insertions: details.workingTree.insertions,
+        deletions: details.workingTree.deletions,
+        totalCount: snapshot.totalCount,
+        stagedCount: snapshot.stagedCount,
+        hasStagedChanges: snapshot.stagedCount > 0,
+        snapshotId: snapshot.id,
+        nextCursor: preview.length < snapshot.totalCount ? preview.length : null,
+        truncated: preview.length < snapshot.totalCount,
+      };
+    }
     return {
       isRepo: details.isRepo,
       ...(details.repositoryRoot ? { repositoryRoot: details.repositoryRoot } : {}),
@@ -2205,16 +2236,27 @@ export const make = Effect.gen(function* () {
         WORKING_TREE_PAGE_MAX_SIZE,
       );
       const files: VcsWorkingTreeFile[] = [];
-      let bytes = 0;
       for (const file of snapshot.files.slice(cursor, cursor + requested)) {
-        // Rows carry one path, two small counts, and an optional status. The
-        // constant accounts for keys/encoding without serializing a transport
-        // object just to enforce this conservative response budget.
-        const fileBytes = Buffer.byteLength(file.path, "utf8") + 96;
-        if (files.length > 0 && bytes + fileBytes > WORKING_TREE_PAGE_BYTE_BUDGET) break;
-        // Always return one row, even if a pathological path is unusually long.
+        const candidate = {
+          snapshotId: snapshot.id,
+          files: [...files, file],
+          nextCursor:
+            cursor + files.length + 1 < snapshot.totalCount ? cursor + files.length + 1 : null,
+          totalCount: snapshot.totalCount,
+          stagedCount: snapshot.stagedCount,
+          hasStagedChanges: snapshot.stagedCount > 0,
+        } satisfies VcsWorkingTreePageResult;
+        if (serializedJsonBytes(candidate) > WORKING_TREE_PAGE_BYTE_BUDGET) {
+          if (files.length === 0) {
+            return yield* new GitManagerError({
+              operation: "workingTreePage",
+              cwd: input.cwd,
+              detail: "A working tree entry exceeds the bounded page response limit.",
+            });
+          }
+          break;
+        }
         files.push(file);
-        bytes += fileBytes;
       }
       const next = cursor + files.length;
       return {

@@ -37,6 +37,17 @@ export interface DefaultBranchActionDialogCopy {
   continueLabel: string;
 }
 
+/** `all` deliberately omits paths so Git retains whole-tree semantics. */
+export type GitCommitFileSelection =
+  | { readonly mode: "all" }
+  | { readonly mode: "paths"; readonly paths: ReadonlySet<string> };
+
+export function buildGitCommitFilePaths(
+  selection: GitCommitFileSelection,
+): readonly string[] | undefined {
+  return selection.mode === "all" ? undefined : [...selection.paths];
+}
+
 export type DefaultBranchConfirmableAction =
   | "push"
   | "create_pr"

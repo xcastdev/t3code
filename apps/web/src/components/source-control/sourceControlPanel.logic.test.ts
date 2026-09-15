@@ -1,10 +1,26 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
   buildSourceControlCommitInput,
+  canSubmitSourceControlCommit,
   fileAction,
   gitIndexWorkflowAvailability,
   sourceControlFileStatusLabel,
 } from "./sourceControlPanel.logic.ts";
+
+describe("merge-only guarded commits", () => {
+  it("allows a reviewed pending merge without deriving staged state from rows", () => {
+    expect(
+      canSubmitSourceControlCommit({
+        workflowAvailable: true,
+        stagedCount: 0,
+        message: "Merge branch",
+        reviewedStateAvailable: true,
+        hasReviewedBranch: true,
+        hasReviewedMerge: true,
+      }),
+    ).toBe(true);
+  });
+});
 
 describe("source control panel logic", () => {
   it("keeps index controls unavailable for older servers", () => {

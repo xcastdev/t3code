@@ -96,10 +96,11 @@ export function canSubmitSourceControlCommit(input: {
   readonly message: string;
   readonly reviewedStateAvailable: boolean;
   readonly hasReviewedBranch: boolean;
+  readonly hasReviewedMerge?: boolean;
 }): boolean {
   return (
     input.workflowAvailable &&
-    input.stagedCount > 0 &&
+    (input.stagedCount > 0 || input.hasReviewedMerge) &&
     input.message.trim().length > 0 &&
     input.reviewedStateAvailable &&
     input.hasReviewedBranch

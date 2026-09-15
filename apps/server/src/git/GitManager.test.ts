@@ -5951,4 +5951,31 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         expect(stale.message).toContain("stale");
       }),
   );
+
+  it.effect("bounds escaped working-tree status and page JSON", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-escaped-pages-");
+      yield* initRepo(repoDir);
+      yield* Effect.sync(() => {
+        for (let index = 0; index < 70; index += 1) {
+          // JSON expands each control character to six bytes; source byte length is not enough.
+          const name = `${"\u0001".repeat(180)}-${String(index).padStart(3, "0")}.txt`;
+          NodeFS.writeFileSync(NodePath.join(repoDir, name), "changed\n");
+        }
+      });
+      const { manager } = yield* makeManager();
+      const status = yield* manager.localStatus({ cwd: repoDir });
+      expect(Buffer.byteLength(JSON.stringify(status.workingTree), "utf8")).toBeLessThanOrEqual(
+        48 * 1024,
+      );
+      expect(status.workingTree.nextCursor).not.toBeNull();
+      const page = yield* manager.workingTreePage({
+        cwd: repoDir,
+        snapshotId: status.workingTree.snapshotId!,
+        cursor: status.workingTree.nextCursor!,
+        pageSize: 100,
+      });
+      expect(Buffer.byteLength(JSON.stringify(page), "utf8")).toBeLessThanOrEqual(64 * 1024);
+    }),
+  );
 });
