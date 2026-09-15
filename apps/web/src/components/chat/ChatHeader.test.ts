@@ -138,7 +138,6 @@ function header(overrides: Partial<React.ComponentProps<typeof ChatHeader>> = {}
     keybindings: DEFAULT_RESOLVED_KEYBINDINGS,
     availableEditors: ["vscode"],
     rightPanelOpen: true,
-    gitCwd: "/repo",
     onNewThreadInProject: () => undefined,
     onRunProjectScript: () => undefined,
     onAddProjectScript: unusedAddScript,
@@ -174,6 +173,12 @@ afterEach(async () => {
 });
 
 describe("ChatHeader rendered action controls", () => {
+  it("does not render the Git workflow control", async () => {
+    await mountHeader();
+
+    expect(document.querySelector('[data-testid="git"]')).toBeNull();
+  });
+
   it.each([
     [projectScripts, true, "Project actions", null],
     [projectScripts, false, "Project scripts", "Open in editor"],

@@ -77,6 +77,9 @@ vi.mock("../pullRequest/PullRequestsUnavailableState", () => ({
 vi.mock("~/state/pullRequests", () => ({
   usePullRequestList: () => ({ data: null }),
 }));
+vi.mock("./SourceControlActions", () => ({
+  default: () => <div data-source-control-actions />,
+}));
 vi.mock("../ui/scroll-area", () => ({
   ScrollArea: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
 }));
@@ -237,6 +240,12 @@ afterEach(async () => {
 });
 
 describe("SourceControlPanel guarded commit interaction", () => {
+  it("exposes the Git workflow control in the changes view", async () => {
+    await renderPanel();
+
+    expect(document.querySelector("[data-source-control-actions]")).not.toBeNull();
+  });
+
   it("keeps reviewed tokens and refreshes after a stale-state rejection", async () => {
     const refreshStatus = vi.fn();
     const setError = vi.fn();

@@ -9101,6 +9101,10 @@ export default function ChatView(props: ChatViewProps) {
         pullRequestsCapabilityKnown={pullRequestsCapabilityKnown}
         gitIndexWorkflowCapabilityKnown={gitIndexWorkflowCapabilityKnown}
         supportsGitIndexWorkflow={supportsGitIndexWorkflow}
+        {...(!supportsPullRequests || activeProjectRepository === null
+          ? {}
+          : { onOpenPullRequest: openProjectPullRequest })}
+        {...(routeKind === "draft" && draftId ? { draftId } : {})}
       />
     ) : renderedRightPanelSurface?.kind === "pull-request" && !pullRequestsCapabilityKnown ? (
       <PullRequestDetailGhost />
@@ -9291,12 +9295,8 @@ export default function ChatView(props: ChatViewProps) {
           ) : null}
           {!rightPanelControlsAtRoot && !rightPanelControlsInPanel ? panelLayoutControls : null}
           <ChatHeader
-            {...(!supportsPullRequests || activeProjectRepository === null
-              ? {}
-              : { onOpenPullRequest: openProjectPullRequest })}
             activeThreadEnvironmentId={activeThread.environmentId}
             activeThreadId={activeThread.id}
-            {...(routeKind === "draft" && draftId ? { draftId } : {})}
             activeThreadTitle={activeThread.title}
             isServerThread={isServerThread}
             activeProject={activeProject}
@@ -9308,7 +9308,6 @@ export default function ChatView(props: ChatViewProps) {
             keybindings={keybindings}
             availableEditors={availableEditors}
             rightPanelOpen={rightPanelOpen}
-            gitCwd={gitCwd}
             onNewThreadInProject={handleNewThreadInActiveProject}
             {...(activeDraftLogicalProjectKey
               ? { onOpenProjectSettings: handleOpenDraftProjectSettings }

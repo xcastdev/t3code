@@ -7,6 +7,7 @@ import type {
   VcsStatusResult,
   VcsWorkingTreeFile,
 } from "@t3tools/contracts";
+import type { DraftId } from "~/composerDraftStore";
 import { GitBranchIcon, GitCommitIcon, GitPullRequestIcon, RefreshCwIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
@@ -46,6 +47,7 @@ import {
   sourceControlFileStatusLabel,
   type SourceControlPanelView,
 } from "./sourceControlPanel.logic";
+import SourceControlActions from "./SourceControlActions";
 
 const SOURCE_CONTROL_SHORTCUT_CONTEXT: ShortcutMatchContext = {
   terminalFocus: false,
@@ -72,6 +74,8 @@ export interface SourceControlPanelProps {
   readonly pullRequestsCapabilityKnown: boolean;
   readonly gitIndexWorkflowCapabilityKnown: boolean;
   readonly supportsGitIndexWorkflow: boolean;
+  readonly draftId?: DraftId;
+  readonly onOpenPullRequest?: ((number: number) => void) | undefined;
 }
 
 function failureMessage(result: { readonly cause: unknown }): string {
@@ -635,6 +639,12 @@ export function SourceControlPanel(props: SourceControlPanelProps) {
           <GitBranchIcon className="size-4 text-muted-foreground" />
           <h2 className="text-sm font-semibold">Source Control</h2>
         </div>
+        <SourceControlActions
+          gitCwd={props.cwd}
+          activeThreadRef={props.threadRef}
+          onOpenPullRequest={props.onOpenPullRequest}
+          {...(props.draftId ? { draftId: props.draftId } : {})}
+        />
         <div className="flex rounded bg-muted p-0.5" role="tablist">
           {(["changes", "pull-requests"] as const).map((view) => (
             <button

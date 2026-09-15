@@ -8,7 +8,7 @@ import {
   DEFAULT_CHANGE_REQUEST_TERMINOLOGY,
   getChangeRequestTerminology,
   type ChangeRequestTerminology,
-} from "../sourceControlPresentation";
+} from "../../sourceControlPresentation";
 
 export type GitActionIconName = "commit" | "push" | "pr";
 

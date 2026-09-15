@@ -10,7 +10,7 @@ import {
   resolveQuickAction,
   resolveThreadBranchUpdate,
   resolveThreadBranchMetadataPatch,
-} from "./GitActionsControl.logic";
+} from "./sourceControlActions.logic";
 
 function status(overrides: Partial<VcsStatusResult> = {}): VcsStatusResult {
   return {
