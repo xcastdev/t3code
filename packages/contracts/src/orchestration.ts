@@ -973,6 +973,8 @@ export const OrchestrationShellStreamEvent = Schema.Union([
     kind: Schema.Literal("thread-removed"),
     sequence: NonNegativeInt,
     threadId: ThreadId,
+    /** Present on authoritative delete/archive events; omitted by older/refetch paths. */
+    reason: Schema.optional(Schema.Literals(["deleted", "archived"])),
   }),
 ]);
 export type OrchestrationShellStreamEvent = typeof OrchestrationShellStreamEvent.Type;

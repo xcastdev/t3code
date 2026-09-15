@@ -13,15 +13,23 @@ import {
   enabledEnvironmentIds,
 } from "@t3tools/client-runtime/state/connections";
 import type { EnvironmentId } from "@t3tools/contracts";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import * as Option from "effect/Option";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
 
 import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
 import { isHostedStaticApp } from "../hostedPairing";
+import { removeThreadPaneState } from "../paneStateCleanup";
 
 export const shellEnvironment = createShellEnvironmentAtoms(connectionAtomRuntime);
-export const environmentShell = createEnvironmentShellAtoms(connectionAtomRuntime);
+export const environmentShell = createEnvironmentShellAtoms(
+  connectionAtomRuntime,
+  ({ environmentId, event }) => {
+    if (event.reason !== "deleted") return;
+    removeThreadPaneState(scopeThreadRef(environmentId, event.threadId));
+  },
+);
 export const environmentSnapshotAtom = createEnvironmentSnapshotAtom(environmentShell.stateAtom);
 
 export const allEnvironmentShellsBootstrappedAtom = Atom.make((get) => {

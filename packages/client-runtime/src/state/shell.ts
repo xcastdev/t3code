@@ -2,6 +2,7 @@ import {
   ORCHESTRATION_WS_METHODS,
   type EnvironmentId,
   type OrchestrationShellSnapshot,
+  type OrchestrationShellStreamEvent,
   type OrchestrationShellStreamItem,
   type ServerConfig,
 } from "@t3tools/contracts";
@@ -49,7 +50,18 @@ function shellStatusForSnapshot(
 
 const SHELL_SYNCHRONIZATION_ERROR_MESSAGE = "Could not synchronize environment data.";
 
-export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")(function* () {
+export type EnvironmentShellThreadRemoval = {
+  readonly environmentId: EnvironmentId;
+  readonly event: Extract<OrchestrationShellStreamEvent, { kind: "thread-removed" }>;
+};
+
+export type EnvironmentShellThreadRemovalObserver = (
+  removal: EnvironmentShellThreadRemoval,
+) => void;
+
+export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")(function* (
+  onThreadRemoved?: EnvironmentShellThreadRemovalObserver,
+) {
   const supervisor = yield* EnvironmentSupervisor;
   const cache = yield* EnvironmentCacheStore;
   const snapshotLoader = yield* ShellSnapshotLoader;
@@ -145,6 +157,9 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     let waiting = yield* Ref.get(awaitingCompletion);
     let next = initial;
     let receivedSnapshot = false;
+    const acceptedThreadRemovals: Array<
+      Extract<OrchestrationShellStreamEvent, { kind: "thread-removed" }>
+    > = [];
     for (const item of items) {
       if (item.kind === "synchronized") {
         waiting = false;
@@ -152,6 +167,13 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
           next = { ...next, status: "live", error: Option.none() };
         }
         continue;
+      }
+      const acceptedEvent =
+        item.kind !== "snapshot" &&
+        Option.isSome(next.snapshot) &&
+        item.sequence > next.snapshot.value.snapshotSequence;
+      if (acceptedEvent && item.kind === "thread-removed") {
+        acceptedThreadRemovals.push(item);
       }
       const nextSnapshot =
         item.kind === "snapshot"
@@ -182,6 +204,14 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     }
     if (next.snapshot !== initial.snapshot && Option.isSome(next.snapshot)) {
       yield* Queue.offer(persistence, next.snapshot.value);
+    }
+    if (onThreadRemoved !== undefined) {
+      for (const event of acceptedThreadRemovals) {
+        onThreadRemoved({
+          environmentId,
+          event,
+        });
+      }
     }
   });
 
@@ -276,10 +306,15 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
   return state;
 });
 
-function shellStateChanges(environmentId: EnvironmentId) {
+function shellStateChanges(
+  environmentId: EnvironmentId,
+  onThreadRemoved?: EnvironmentShellThreadRemovalObserver,
+) {
   return followStreamInEnvironment(
     environmentId,
-    Stream.unwrap(makeEnvironmentShellState().pipe(Effect.map(SubscriptionRef.changes))),
+    Stream.unwrap(
+      makeEnvironmentShellState(onThreadRemoved).pipe(Effect.map(SubscriptionRef.changes)),
+    ),
   );
 }
 
@@ -402,9 +437,10 @@ export function createEnvironmentShellAtoms<R, E>(
     EnvironmentRegistry | EnvironmentCacheStore | ShellSnapshotLoader | R,
     E
   >,
+  onThreadRemoved?: EnvironmentShellThreadRemovalObserver,
 ) {
   const stateAtom = Atom.family((environmentId: EnvironmentId) =>
-    runtime.atom(shellStateChanges(environmentId), {
+    runtime.atom(shellStateChanges(environmentId, onThreadRemoved), {
       initialValue: EMPTY_SHELL_STATE,
     }),
   );

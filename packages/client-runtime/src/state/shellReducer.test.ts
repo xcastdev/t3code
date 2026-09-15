@@ -159,23 +159,27 @@ describe("applyShellStreamEvent", () => {
   });
 
   describe("thread-removed", () => {
-    it("removes a thread by id", () => {
-      const snapshotWithThread: OrchestrationShellSnapshot = {
-        ...baseSnapshot,
-        threads: [stubThread],
-      };
+    it.each([undefined, "deleted", "archived"] as const)(
+      "removes a thread by id with reason %s",
+      (reason) => {
+        const snapshotWithThread: OrchestrationShellSnapshot = {
+          ...baseSnapshot,
+          threads: [stubThread],
+        };
 
-      const event: OrchestrationShellStreamEvent = {
-        kind: "thread-removed",
-        sequence: 6,
-        threadId: ThreadId.make("thread-1"),
-      };
+        const event: OrchestrationShellStreamEvent = {
+          kind: "thread-removed",
+          sequence: 6,
+          threadId: ThreadId.make("thread-1"),
+          ...(reason === undefined ? {} : { reason }),
+        };
 
-      const next = applyShellStreamEvent(snapshotWithThread, event);
+        const next = applyShellStreamEvent(snapshotWithThread, event);
 
-      expect(next.threads).toHaveLength(0);
-      expect(next.snapshotSequence).toBe(6);
-    });
+        expect(next.threads).toHaveLength(0);
+        expect(next.snapshotSequence).toBe(6);
+      },
+    );
   });
 
   it("returns original snapshot for unrecognized event kinds", () => {

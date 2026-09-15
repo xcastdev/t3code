@@ -957,6 +957,8 @@ const makeWsRpcLayer = (
                 kind: "thread-removed" as const,
                 sequence: event.sequence,
                 threadId: ThreadId.make(event.aggregateId),
+                reason:
+                  event.type === "thread.deleted" ? ("deleted" as const) : ("archived" as const),
               }),
             );
           case "thread.unarchived":
@@ -1034,6 +1036,7 @@ const makeWsRpcLayer = (
       const threadUpsertOrRemove = (
         threadId: ThreadId,
         sequence: number,
+        removalReason?: "deleted" | "archived",
       ): Effect.Effect<Option.Option<OrchestrationShellStreamEvent>, never, never> =>
         retryShellProjectionRead(
           "thread",
@@ -1048,6 +1051,7 @@ const makeWsRpcLayer = (
                     kind: "thread-removed" as const,
                     sequence,
                     threadId,
+                    ...(removalReason === undefined ? {} : { reason: removalReason }),
                   }),
                 onSome: (nextThread) =>
                   Option.some<OrchestrationShellStreamEvent>({
@@ -1081,15 +1085,42 @@ const makeWsRpcLayer = (
             return [];
           }
           const latestByAggregate = new Map<string, ShellEvent>();
+          const terminalRemovalReasonByAggregate = new Map<string, "deleted" | "archived">();
           for (const event of events) {
-            latestByAggregate.set(`${event.aggregateKind}:${event.aggregateId}`, event);
+            const aggregateKey = `${event.aggregateKind}:${event.aggregateId}`;
+            latestByAggregate.set(aggregateKey, event);
+            if (event.type === "thread.deleted" || event.type === "thread.archived") {
+              terminalRemovalReasonByAggregate.set(
+                aggregateKey,
+                event.type === "thread.deleted" ? "deleted" : "archived",
+              );
+            }
           }
           const survivors = Array.from(latestByAggregate.values()).sort(
             (left, right) => left.sequence - right.sequence,
           );
-          const shellEvents = yield* Effect.forEach(survivors, toShellStreamEvent, {
-            concurrency: SHELL_REFETCH_CONCURRENCY,
-          });
+          const shellEvents = yield* Effect.forEach(
+            survivors,
+            (event) => {
+              const aggregateKey = `${event.aggregateKind}:${event.aggregateId}`;
+              const removalReason = terminalRemovalReasonByAggregate.get(aggregateKey);
+              if (
+                event.aggregateKind === "thread" &&
+                event.type !== "thread.deleted" &&
+                event.type !== "thread.archived"
+              ) {
+                return threadUpsertOrRemove(
+                  ThreadId.make(event.aggregateId),
+                  event.sequence,
+                  removalReason,
+                );
+              }
+              return toShellStreamEvent(event);
+            },
+            {
+              concurrency: SHELL_REFETCH_CONCURRENCY,
+            },
+          );
           return shellEvents.flatMap((option) => (Option.isSome(option) ? [option.value] : []));
         });
 

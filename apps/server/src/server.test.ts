@@ -8606,7 +8606,12 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       ).pipe(Effect.timeout("2 seconds"));
 
       assert.equal(items[0]?.kind, "snapshot");
-      assert.equal(items[1]?.kind, "thread-removed");
+      assert.deepEqual(items[1], {
+        kind: "thread-removed",
+        sequence: 2,
+        threadId: defaultThreadId,
+        reason: "deleted",
+      });
       assert.deepEqual(items[2], { kind: "synchronized" });
     }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
   );
@@ -9532,7 +9537,12 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                   Stream.runCollect,
                 );
                 assert.deepEqual(shellItems, [
-                  { kind: "thread-removed", sequence: deleted.sequence, threadId: defaultThreadId },
+                  {
+                    kind: "thread-removed",
+                    sequence: deleted.sequence,
+                    threadId: defaultThreadId,
+                    reason: "deleted",
+                  },
                   { kind: "synchronized" },
                 ]);
               }),
@@ -9993,14 +10003,17 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest), TestClock.withLive),
   );
 
-  it.effect("subscribeShell coalescing still emits a removal for a deleted thread", () =>
+  it.effect.each([
+    { terminalType: "thread.deleted" as const, reason: "deleted" as const },
+    { terminalType: "thread.archived" as const, reason: "archived" as const },
+  ])("subscribeShell coalescing preserves a $reason removal", ({ terminalType, reason }) =>
     Effect.gen(function* () {
       const goneThreadId = ThreadId.make("thread-gone");
       const now = "2026-01-01T00:00:00.000Z";
 
       const makeThreadEvent = (
         sequence: number,
-        type: "thread.deleted" | "thread.message-sent",
+        type: "thread.deleted" | "thread.archived" | "thread.message-sent",
       ): OrchestrationEvent =>
         ({
           sequence,
@@ -10013,20 +10026,25 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           correlationId: null,
           metadata: {},
           type,
-          payload: type === "thread.deleted" ? { threadId: goneThreadId, deletedAt: now } : {},
+          payload:
+            type === "thread.deleted"
+              ? { threadId: goneThreadId, deletedAt: now }
+              : type === "thread.archived"
+                ? { threadId: goneThreadId, archivedAt: now, updatedAt: now }
+                : {},
         }) as OrchestrationEvent;
 
       yield* buildAppUnderTest({
         layers: {
           orchestrationEngine: {
             latestSequence: Effect.succeed(2),
-            // A thread.deleted followed, within the same coalescing window, by a
+            // A terminal thread removal followed, within the same coalescing window, by a
             // later refetchable event for the same thread. The later event wins
             // coalescing; its shell refetch returns none (the row is gone), which
             // must still surface a removal rather than be swallowed.
             readEvents: () =>
               Stream.fromIterable([
-                makeThreadEvent(1, "thread.deleted"),
+                makeThreadEvent(1, terminalType),
                 makeThreadEvent(2, "thread.message-sent"),
               ]),
           },
@@ -10049,6 +10067,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       const [first] = Array.from(items);
       assert.equal(first?.kind, "thread-removed");
       assert.equal(first?.kind === "thread-removed" ? first.threadId : null, goneThreadId);
+      assert.equal(first?.kind === "thread-removed" ? first.reason : null, reason);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

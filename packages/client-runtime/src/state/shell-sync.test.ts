@@ -1,6 +1,7 @@
 import {
   EnvironmentId,
   ORCHESTRATION_WS_METHODS,
+  ThreadId,
   type OrchestrationShellSnapshot,
   type OrchestrationShellStreamItem,
 } from "@t3tools/contracts";
@@ -98,7 +99,13 @@ describe("environment shell synchronization", () => {
       const snapshotLoader = ShellSnapshotLoader.of({
         load: () => Effect.succeed(Option.none()),
       });
-      const shellState = yield* makeEnvironmentShellState().pipe(
+      const removals: Array<{ sequence: number; reason?: "deleted" | "archived" }> = [];
+      const shellState = yield* makeEnvironmentShellState(({ event }) => {
+        removals.push({
+          sequence: event.sequence,
+          ...(event.reason === undefined ? {} : { reason: event.reason }),
+        });
+      }).pipe(
         Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
         Effect.provideService(Persistence.EnvironmentCacheStore, cache),
         Effect.provideService(ShellSnapshotLoader, snapshotLoader),
@@ -142,13 +149,45 @@ describe("environment shell synchronization", () => {
         lastFailure: null,
         retryAt: null,
       });
+      yield* Queue.offer(events, {
+        kind: "thread-removed",
+        sequence: 1,
+        threadId: ThreadId.make("stale-thread"),
+        reason: "deleted",
+      });
+      yield* Queue.offer(events, {
+        kind: "thread-removed",
+        sequence: 2,
+        threadId: ThreadId.make("archived-thread"),
+        reason: "archived",
+      });
+      yield* Queue.offer(events, {
+        kind: "thread-removed",
+        sequence: 3,
+        threadId: ThreadId.make("deleted-thread"),
+        reason: "deleted",
+      });
+      yield* SubscriptionRef.changes(shellState).pipe(
+        Stream.filter(
+          (state) => Option.isSome(state.snapshot) && state.snapshot.value.snapshotSequence === 3,
+        ),
+        Stream.runHead,
+      );
+      yield* Effect.yieldNow;
+      expect(removals).toEqual([
+        { sequence: 2, reason: "archived" },
+        { sequence: 3, reason: "deleted" },
+      ]);
       for (let index = 0; index < 10; index += 1) {
         yield* Effect.yieldNow;
       }
 
       const state = yield* SubscriptionRef.get(shellState);
       expect(state.status).toBe("live");
-      expect(Option.getOrThrow(state.snapshot)).toEqual(LIVE_SHELL_SNAPSHOT);
+      expect(Option.getOrThrow(state.snapshot)).toEqual({
+        ...LIVE_SHELL_SNAPSHOT,
+        snapshotSequence: 3,
+      });
     }),
   );
 
