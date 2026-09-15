@@ -277,6 +277,7 @@ describe("rightPanelStore", () => {
       byThreadKey: {
         "env-1:thread-A": { isOpen: false, activeSurfaceId: null, surfaces: [] },
       },
+      legacyTerminalIdsByThreadKey: { "env-1:thread-A": ["term-1"] },
     });
   });
 

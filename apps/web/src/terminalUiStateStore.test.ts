@@ -7,6 +7,7 @@ import {
   selectThreadTerminalUiState,
   useTerminalUiStateStore,
 } from "./terminalUiStateStore";
+import { migratePersistedRightPanelState, useRightPanelStore } from "./rightPanelStore";
 import { DEFAULT_THREAD_TERMINAL_ID } from "./types";
 
 const THREAD_ID = ThreadId.make("thread-1");
@@ -19,6 +20,11 @@ describe("terminalUiStateStore actions", () => {
     useTerminalUiStateStore.setState({
       terminalUiStateByThreadKey: {},
       suppressedTerminalIdsByThreadKey: {},
+    });
+    useRightPanelStore.setState({
+      byThreadKey: {},
+      legacyTerminalIdsByThreadKey: {},
+      userActionRevisionByThreadKey: {},
     });
   });
 
@@ -273,6 +279,48 @@ describe("terminalUiStateStore actions", () => {
         THREAD_REF,
       ),
     ).toMatchObject({ terminalOpen: false, terminalIds: ["terminal-1"] });
+  });
+
+  it("moves legacy panel terminals into a visible drawer when their sessions reconcile", () => {
+    const legacyPanelState = migratePersistedRightPanelState({
+      byThreadKey: {
+        [scopedThreadKey(THREAD_REF)]: {
+          isOpen: true,
+          activeSurfaceId: "terminal:term-a",
+          surfaces: [
+            {
+              id: "terminal:term-a",
+              kind: "terminal",
+              resourceId: "term-a",
+              terminalIds: ["term-a", "term-b"],
+              activeTerminalId: "term-b",
+            },
+          ],
+        },
+      },
+    });
+    expect(legacyPanelState.legacyTerminalIdsByThreadKey).toEqual({
+      [scopedThreadKey(THREAD_REF)]: ["term-a", "term-b"],
+    });
+    useRightPanelStore.setState(legacyPanelState);
+
+    const knownTerminalIds = ["term-a", "term-b"];
+    const terminalIdsToMigrate = (
+      useRightPanelStore.getState().legacyTerminalIdsByThreadKey[scopedThreadKey(THREAD_REF)] ?? []
+    ).filter((terminalId) => knownTerminalIds.includes(terminalId));
+    useTerminalUiStateStore
+      .getState()
+      .migrateLegacyPanelTerminalIds(THREAD_REF, terminalIdsToMigrate);
+    useRightPanelStore.getState().completeLegacyTerminalMigration(THREAD_REF, terminalIdsToMigrate);
+
+    expect(
+      selectThreadTerminalUiState(
+        useTerminalUiStateStore.getState().terminalUiStateByThreadKey,
+        THREAD_REF,
+      ),
+    ).toMatchObject({ terminalOpen: true, terminalIds: ["term-a", "term-b"] });
+    expect(useTerminalUiStateStore.getState().suppressedTerminalIdsByThreadKey).toEqual({});
+    expect(useRightPanelStore.getState().legacyTerminalIdsByThreadKey).toEqual({});
   });
 
   it("does not restore a closed terminal from stale session metadata", () => {

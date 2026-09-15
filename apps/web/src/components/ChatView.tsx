@@ -608,6 +608,7 @@ const DevicePanel = lazy(() =>
 );
 const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
 const EMPTY_PENDING_FILE_SURFACE_IDS: ReadonlySet<string> = new Set();
+const EMPTY_LEGACY_TERMINAL_IDS: readonly string[] = [];
 const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
   "input",
   "textarea",
@@ -1810,6 +1811,11 @@ export default function ChatView(props: ChatViewProps) {
   const rightPanelState = useRightPanelStore((state) =>
     selectThreadRightPanelState(state.byThreadKey, activeThreadRef),
   );
+  const legacyPanelTerminalIds = useRightPanelStore((state) =>
+    activeThreadKey
+      ? (state.legacyTerminalIdsByThreadKey[activeThreadKey] ?? EMPTY_LEGACY_TERMINAL_IDS)
+      : EMPTY_LEGACY_TERMINAL_IDS,
+  );
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
@@ -1848,6 +1854,19 @@ export default function ChatView(props: ChatViewProps) {
       .getState()
       .reconcileTerminalIds(activeThreadRef, activeServerOrderedTerminalIds);
   }, [activeServerOrderedTerminalIds, activeThreadRef]);
+  useEffect(() => {
+    if (!activeThreadRef || legacyPanelTerminalIds.length === 0) return;
+    const knownLegacyTerminalIds = legacyPanelTerminalIds.filter((terminalId) =>
+      activeServerOrderedTerminalIds.includes(terminalId),
+    );
+    if (knownLegacyTerminalIds.length === 0) return;
+    useTerminalUiStateStore
+      .getState()
+      .migrateLegacyPanelTerminalIds(activeThreadRef, knownLegacyTerminalIds);
+    useRightPanelStore
+      .getState()
+      .completeLegacyTerminalMigration(activeThreadRef, knownLegacyTerminalIds);
+  }, [activeServerOrderedTerminalIds, activeThreadRef, legacyPanelTerminalIds]);
   const rightPanelPresenceValue = useMemo(
     () => ({
       activeSurface: activeRightPanelSurface,

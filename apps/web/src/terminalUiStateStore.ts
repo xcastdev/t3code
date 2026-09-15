@@ -574,6 +574,10 @@ interface TerminalUiStateStoreState {
     terminalId: string,
     options?: { open?: boolean; active?: boolean },
   ) => void;
+  migrateLegacyPanelTerminalIds: (
+    threadRef: ScopedThreadRef,
+    terminalIds: readonly string[],
+  ) => void;
   setActiveTerminal: (threadRef: ScopedThreadRef, terminalId: string) => void;
   closeTerminal: (threadRef: ScopedThreadRef, terminalId: string) => void;
   reconcileTerminalIds: (threadRef: ScopedThreadRef, nextIds: string[]) => void;
@@ -680,6 +684,16 @@ export const useTerminalUiStateStore = create<TerminalUiStateStoreState>()(
             },
             { terminalId, suppressed: false },
           ),
+        migrateLegacyPanelTerminalIds: (threadRef, terminalIds) =>
+          updateTerminal(threadRef, (state) => {
+            let nextState = state;
+            const migratedTerminalIds = normalizeTerminalIds([...terminalIds]);
+            if (migratedTerminalIds.length === 0) return state;
+            for (const terminalId of migratedTerminalIds) {
+              nextState = newThreadTerminal(nextState, terminalId);
+            }
+            return setThreadTerminalOpen(nextState, true);
+          }),
         setActiveTerminal: (threadRef, terminalId) =>
           updateTerminal(threadRef, (state) => setThreadActiveTerminal(state, terminalId)),
         closeTerminal: (threadRef, terminalId) =>

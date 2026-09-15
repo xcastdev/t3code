@@ -99,7 +99,9 @@ const RIGHT_PANEL_STORAGE_KEY = "t3code:right-panel-state:v2";
 // retained legacy entries before removing them; attachments remain here.
 // v16 removes terminal surfaces. The terminal sessions are server-owned and
 // stay alive; only their obsolete right-panel presentation is discarded.
-const RIGHT_PANEL_STORAGE_VERSION = 16;
+// v17 retains a one-shot terminal-id handoff until the drawer can reconcile
+// the matching server sessions, then discards it with the old presentation.
+const RIGHT_PANEL_STORAGE_VERSION = 17;
 
 /** A fixed workspace-level ref: each PR surface carries its own real environment. */
 export const PULL_REQUESTS_PANEL_REF = scopeThreadRef(
@@ -126,6 +128,8 @@ export type LegacyWorkspaceFileSurface = Extract<RightPanelSurface, { kind: "fil
 
 interface RightPanelStoreState {
   byThreadKey: Record<string, ThreadRightPanelState>;
+  /** Legacy panel terminal ids waiting for their server sessions to reach the drawer. */
+  legacyTerminalIdsByThreadKey: Record<string, string[]>;
   /** Session-only count of user panel choices per thread. Automatic updates do not advance it. */
   userActionRevisionByThreadKey: Record<string, number>;
   getUserActionRevision: (ref: ScopedThreadRef) => number;
@@ -172,6 +176,7 @@ interface RightPanelStoreState {
     readonly activeSurfaceId: string | null;
   };
   removeLegacyWorkspaceFileSurfaces: (ref: ScopedThreadRef) => void;
+  completeLegacyTerminalMigration: (ref: ScopedThreadRef, terminalIds: readonly string[]) => void;
   show: (ref: ScopedThreadRef) => void;
   close: (ref: ScopedThreadRef) => void;
   toggleVisibility: (ref: ScopedThreadRef) => void;
@@ -355,10 +360,12 @@ function normalizeRevealLine(line: number | undefined): number | null {
 
 export function migratePersistedRightPanelState(persistedState: unknown): {
   byThreadKey: Record<string, ThreadRightPanelState>;
+  legacyTerminalIdsByThreadKey?: Record<string, string[]>;
 } {
   if (!persistedState || typeof persistedState !== "object") {
     return { byThreadKey: {} };
   }
+  const legacyTerminalIdsByThreadKey: Record<string, string[]> = {};
   const byThreadKey =
     "byThreadKey" in persistedState &&
     persistedState.byThreadKey &&
@@ -369,6 +376,34 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
             .map(([threadKey, threadState]) => {
               const validThreadState =
                 threadState && typeof threadState === "object" ? threadState : null;
+              const legacyTerminalIds = Array.isArray(validThreadState?.surfaces)
+                ? [
+                    ...new Set(
+                      validThreadState.surfaces.flatMap((surface) => {
+                        if ((surface as { kind?: unknown }).kind !== "terminal") return [];
+                        const legacySurface = surface as {
+                          resourceId?: unknown;
+                          terminalIds?: unknown;
+                        };
+                        const terminalIds = Array.isArray(legacySurface.terminalIds)
+                          ? legacySurface.terminalIds.filter(
+                              (terminalId): terminalId is string =>
+                                typeof terminalId === "string" && terminalId.trim().length > 0,
+                            )
+                          : [];
+                        return terminalIds.length > 0
+                          ? terminalIds
+                          : typeof legacySurface.resourceId === "string" &&
+                              legacySurface.resourceId.trim().length > 0
+                            ? [legacySurface.resourceId]
+                            : [];
+                      }),
+                    ),
+                  ]
+                : [];
+              if (legacyTerminalIds.length > 0) {
+                legacyTerminalIdsByThreadKey[threadKey] = legacyTerminalIds;
+              }
               const surfaces = Array.isArray(validThreadState?.surfaces)
                 ? validThreadState.surfaces.flatMap<RightPanelSurface>((surface) => {
                     // Dropped surface kind: plans now render inline in the
@@ -457,13 +492,16 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
             }),
         )
       : {};
-  return { byThreadKey };
+  return Object.keys(legacyTerminalIdsByThreadKey).length > 0
+    ? { byThreadKey, legacyTerminalIdsByThreadKey }
+    : { byThreadKey };
 }
 
 export const useRightPanelStore = create<RightPanelStoreState>()(
   persist(
     (set, get) => ({
       byThreadKey: {},
+      legacyTerminalIdsByThreadKey: {},
       userActionRevisionByThreadKey: {},
       getUserActionRevision: (ref) =>
         get().userActionRevisionByThreadKey[scopedThreadKey(ref)] ?? 0,
@@ -788,6 +826,26 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             };
           }),
         ),
+      completeLegacyTerminalMigration: (ref, terminalIds) =>
+        set((state) => {
+          const threadKey = scopedThreadKey(ref);
+          const pendingIds = state.legacyTerminalIdsByThreadKey[threadKey];
+          if (!pendingIds) return state;
+          const migratedIds = new Set(terminalIds);
+          const remainingIds = pendingIds.filter((terminalId) => !migratedIds.has(terminalId));
+          if (remainingIds.length === pendingIds.length) return state;
+          if (remainingIds.length > 0) {
+            return {
+              legacyTerminalIdsByThreadKey: {
+                ...state.legacyTerminalIdsByThreadKey,
+                [threadKey]: remainingIds,
+              },
+            };
+          }
+          const { [threadKey]: _completed, ...legacyTerminalIdsByThreadKey } =
+            state.legacyTerminalIdsByThreadKey;
+          return { legacyTerminalIdsByThreadKey };
+        }),
       show: (ref) =>
         set((state) =>
           userAction(state, scopedThreadKey(ref), (current) =>
@@ -828,14 +886,21 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
           const threadKey = scopedThreadKey(ref);
           if (
             !(threadKey in state.byThreadKey) &&
-            !(threadKey in state.userActionRevisionByThreadKey)
+            !(threadKey in state.userActionRevisionByThreadKey) &&
+            !(threadKey in state.legacyTerminalIdsByThreadKey)
           ) {
             return state;
           }
           const { [threadKey]: _removed, ...rest } = state.byThreadKey;
           const { [threadKey]: _revision, ...userActionRevisionByThreadKey } =
             state.userActionRevisionByThreadKey;
-          return { byThreadKey: rest, userActionRevisionByThreadKey };
+          const { [threadKey]: _legacyTerminalIds, ...legacyTerminalIdsByThreadKey } =
+            state.legacyTerminalIdsByThreadKey;
+          return {
+            byThreadKey: rest,
+            userActionRevisionByThreadKey,
+            legacyTerminalIdsByThreadKey,
+          };
         }),
     }),
     {
@@ -847,6 +912,11 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
       partialize: (state) => ({
         byThreadKey: Object.fromEntries(
           Object.entries(state.byThreadKey).filter(
+            ([threadKey]) => !isPullRequestsPanelKey(threadKey),
+          ),
+        ),
+        legacyTerminalIdsByThreadKey: Object.fromEntries(
+          Object.entries(state.legacyTerminalIdsByThreadKey).filter(
             ([threadKey]) => !isPullRequestsPanelKey(threadKey),
           ),
         ),
