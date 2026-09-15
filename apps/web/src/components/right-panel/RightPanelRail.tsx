@@ -39,7 +39,7 @@ function RailAction(props: { action: RightPanelSurfaceAction; onProfile: (id: st
         </TooltipTrigger>
         <TooltipPopup side="left">{label}</TooltipPopup>
       </Tooltip>
-      {action.id === "browser" && (action.profiles?.length ?? 0) > 1 ? (
+      {action.id === "browser" && action.available && (action.profiles?.length ?? 0) > 1 ? (
         <Menu>
           <MenuTrigger
             render={

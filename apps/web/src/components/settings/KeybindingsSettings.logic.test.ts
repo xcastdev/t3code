@@ -17,6 +17,11 @@ import {
 } from "./KeybindingsSettings.logic";
 
 describe("KeybindingsSettings.logic", () => {
+  it("labels registered right-panel surface commands", () => {
+    expect(commandLabel("rightPanel.openLinkedPullRequests")).toBe(
+      "Right Panel: Open Linked Pull Requests",
+    );
+  });
   it("lists composer, provider, and pull request commands with editable defaults", () => {
     const rows = buildKeybindingRows(DEFAULT_RESOLVED_KEYBINDINGS, "");
     for (const command of [

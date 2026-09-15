@@ -48,6 +48,18 @@ it.effect("parses keybinding rules", () =>
       when: "!terminalFocus",
     });
     assert.strictEqual(parsedSourceControlOpen.command, "sourceControl.open");
+    for (const command of [
+      "rightPanel.openBrowser",
+      "rightPanel.openFiles",
+      "rightPanel.openSourceControl",
+      "rightPanel.openAgents",
+      "rightPanel.openPullRequest",
+      "rightPanel.openLinkedPullRequests",
+      "rightPanel.openDevice",
+    ] as const) {
+      const parsedSurface = yield* decode(KeybindingRule, { key: "mod+alt+1", command });
+      assert.strictEqual(parsedSurface.command, command);
+    }
 
     const parsedRightPanelToggleMaximized = yield* decode(KeybindingRule, {
       key: "mod+shift+m",

@@ -36,4 +36,29 @@ describe("buildRightPanelSurfaceActions", () => {
     ]);
     expect(actions[0]?.profiles).toEqual([{ id: "work", name: "Work" }]);
   });
+  it("falls back to Source Control without provider status", () => {
+    const actions = buildRightPanelSurfaceActions({
+      browserProfiles: [],
+      sourceControlProviderName: null,
+      availability: {
+        browser: false,
+        files: false,
+        "source-control": false,
+        agents: false,
+        "pull-request": false,
+        "pull-requests": false,
+        device: false,
+      },
+      onAddBrowser: noop,
+      onAddBrowserInProfile: noop,
+      onAddFiles: noop,
+      onAddSourceControl: noop,
+      onAddAgents: noop,
+      onAddPullRequest: noop,
+      onAddPullRequests: noop,
+      onAddDevice: noop,
+      liveAgentCount: 0,
+    });
+    expect(actions[2]?.label).toBe("Source Control");
+  });
 });
