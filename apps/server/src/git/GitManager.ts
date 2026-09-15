@@ -107,7 +107,6 @@ interface WorkingTreeSnapshot {
 }
 
 function serializedJsonBytes(value: unknown): number {
-  // @effect-diagnostics-next-line preferSchemaOverJson:off
   return Buffer.byteLength(JSON.stringify(value), "utf8");
 }
 
