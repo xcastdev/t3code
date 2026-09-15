@@ -134,6 +134,17 @@ export const VcsStatusInput = Schema.Struct({
 });
 export type VcsStatusInput = typeof VcsStatusInput.Type;
 
+/** A snapshot cursor is deliberately independent of the Git commit precondition.
+ * It names one immutable, bounded working-tree listing and becomes stale after a
+ * status invalidation. */
+export const VcsWorkingTreePageInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  snapshotId: TrimmedNonEmptyStringSchema,
+  cursor: Schema.NullOr(NonNegativeInt),
+  pageSize: Schema.optional(NonNegativeInt),
+});
+export type VcsWorkingTreePageInput = typeof VcsWorkingTreePageInput.Type;
+
 const NonEmptyPaths = Schema.Array(GitPath).check(Schema.isMinLength(1));
 
 export const VcsStageFilesInput = Schema.Struct({
@@ -287,6 +298,13 @@ const VcsStatusLocalShape = {
     files: Schema.Array(VcsWorkingTreeFile),
     insertions: NonNegativeInt,
     deletions: NonNegativeInt,
+    /** Additive so clients connected to an older server can still use files. */
+    totalCount: Schema.optional(NonNegativeInt),
+    stagedCount: Schema.optional(NonNegativeInt),
+    hasStagedChanges: Schema.optional(Schema.Boolean),
+    snapshotId: Schema.optional(TrimmedNonEmptyStringSchema),
+    nextCursor: Schema.optional(Schema.NullOr(NonNegativeInt)),
+    truncated: Schema.optional(Schema.Boolean),
   }),
 };
 
@@ -309,6 +327,16 @@ export const VcsStatusResult = Schema.Struct({
   ...VcsStatusRemoteShape,
 });
 export type VcsStatusResult = typeof VcsStatusResult.Type;
+
+export const VcsWorkingTreePageResult = Schema.Struct({
+  snapshotId: TrimmedNonEmptyStringSchema,
+  files: Schema.Array(VcsWorkingTreeFile),
+  nextCursor: Schema.NullOr(NonNegativeInt),
+  totalCount: NonNegativeInt,
+  stagedCount: NonNegativeInt,
+  hasStagedChanges: Schema.Boolean,
+});
+export type VcsWorkingTreePageResult = typeof VcsWorkingTreePageResult.Type;
 
 export const VcsStatusStreamEvent = Schema.Union([
   Schema.TaggedStruct("snapshot", {

@@ -1917,7 +1917,9 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         ...(indexStatuses.has(filePath) ? { indexStatus: indexStatuses.get(filePath)! } : {}),
       });
     }
-    files.sort((a, b) => a.path.localeCompare(b.path));
+    // Git paths are bytes. Locale ordering would make cursor pages disagree
+    // between hosts, so retain a stable binary order.
+    files.sort((a, b) => Buffer.compare(Buffer.from(a.path), Buffer.from(b.path)));
 
     const [headResult, indexTreeResult] = yield* Effect.all([
       executeGit("GitVcsDriver.statusDetails.head", cwd, ["rev-parse", "--verify", "HEAD"], {

@@ -19,6 +19,7 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
+import { applyWorkingTreePage, type WorkingTreePageState } from "@t3tools/client-runtime/state/vcs";
 import { BranchToolbarBranchSelector } from "../BranchToolbarBranchSelector";
 import { PullRequestDetailPanel } from "../pullRequest/PullRequestDetailPanel";
 import { PullRequestListGhost } from "../pullRequest/PullRequestGhosts";
@@ -46,6 +47,7 @@ import {
   sourceControlFileStatusLabel,
   type SourceControlPanelView,
 } from "./sourceControlPanel.logic";
+import { WorkingTreeDiffPreview } from "./WorkingTreeDiffPreview";
 
 const SOURCE_CONTROL_SHORTCUT_CONTEXT: ShortcutMatchContext = {
   terminalFocus: false,
@@ -119,9 +121,21 @@ function ChangesView(
   const refresh = useAtomCommand(vcsEnvironment.refreshStatus, {
     reportFailure: false,
   });
+  const init = useAtomCommand(vcsEnvironment.init, { reportFailure: false });
+  const loadWorkingTreePage = useAtomCommand(vcsEnvironment.workingTreePage, {
+    reportFailure: false,
+  });
   const [message, setMessage] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pendingPath, setPendingPath] = useState<string | null>(null);
+  const [workingTreePages, setWorkingTreePages] = useState<WorkingTreePageState>(() => ({
+    snapshotId: status?.workingTree.snapshotId ?? null,
+    files: status?.workingTree.files ?? [],
+    nextCursor: status?.workingTree.nextCursor ?? null,
+    requestId: 0,
+  }));
+  const [pageError, setPageError] = useState<string | null>(null);
+  const [initializing, setInitializing] = useState(false);
   const [reviewedStatus, setReviewedStatus] = useState<{
     readonly scope: string;
     readonly status: ReviewedStatus;
@@ -140,8 +154,22 @@ function ChangesView(
   const reviewScopeRef = useRef(reviewScope);
   reviewScopeRef.current = reviewScope;
   const activeReviewedStatus = reviewedStatus?.scope === reviewScope ? reviewedStatus.status : null;
-  const files = status?.workingTree.files ?? [];
+  const pageRequestId = useRef(0);
+  const files = workingTreePages.files;
   const workflowAvailable = availability === "available";
+
+  useEffect(() => {
+    pageRequestId.current += 1;
+    const requestId = pageRequestId.current;
+    const snapshotId = status?.workingTree.snapshotId ?? null;
+    setPageError(null);
+    setWorkingTreePages({
+      snapshotId,
+      files: status?.workingTree.files ?? [],
+      nextCursor: status?.workingTree.nextCursor ?? null,
+      requestId,
+    });
+  }, [status?.workingTree.files, status?.workingTree.nextCursor, status?.workingTree.snapshotId]);
 
   useEffect(
     () => () => {
@@ -169,6 +197,45 @@ function ChangesView(
     if (result._tag === "Failure" && !isAtomCommandInterrupted(result))
       setError(failureMessage(result));
   }, [props.cwd, props.environmentId, refresh]);
+  const initializeRepository = useCallback(async () => {
+    if (props.cwd === null) return;
+    setError(null);
+    setInitializing(true);
+    const result = await init({ environmentId: props.environmentId, input: { cwd: props.cwd } });
+    setInitializing(false);
+    if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+      setError(failureMessage(result));
+      return;
+    }
+    if (result._tag === "Success") void refreshStatus();
+  }, [init, props.cwd, props.environmentId, refreshStatus]);
+  const loadMore = useCallback(async () => {
+    if (
+      props.cwd === null ||
+      workingTreePages.snapshotId === null ||
+      workingTreePages.nextCursor === null
+    )
+      return;
+    const requestId = pageRequestId.current + 1;
+    pageRequestId.current = requestId;
+    setPageError(null);
+    const result = await loadWorkingTreePage({
+      environmentId: props.environmentId,
+      input: {
+        cwd: props.cwd,
+        snapshotId: workingTreePages.snapshotId,
+        cursor: workingTreePages.nextCursor,
+      },
+    });
+    if (isAtomCommandInterrupted(result)) return;
+    if (result._tag === "Failure") {
+      setPageError(failureMessage(result));
+      return;
+    }
+    setWorkingTreePages((current) =>
+      applyWorkingTreePage(current, result.value, requestId, "append"),
+    );
+  }, [loadWorkingTreePage, props.cwd, props.environmentId, workingTreePages]);
   const mutateFile = useCallback(
     async (file: VcsWorkingTreeFile, kind: "stage" | "unstage") => {
       if (props.cwd === null || !workflowAvailable) return;
@@ -264,6 +331,18 @@ function ChangesView(
     setReviewError(null);
     setReviewedStatus(null);
   }, []);
+  useEffect(() => {
+    if (activeReviewedStatus === null || status === null) return;
+    if (
+      activeReviewedStatus.headCommit !== status.headCommit ||
+      activeReviewedStatus.indexTree !== status.indexTree ||
+      activeReviewedStatus.refName !== status.refName ||
+      JSON.stringify(activeReviewedStatus.pendingMergeHeads ?? []) !==
+        JSON.stringify(status.pendingMergeHeads ?? [])
+    ) {
+      cancelReview();
+    }
+  }, [activeReviewedStatus, cancelReview, status]);
   const submit = useCallback(
     async (confirmDefaultRef: boolean) => {
       if (
@@ -335,11 +414,30 @@ function ChangesView(
 
   if (statusQuery.isPending && status === null)
     return <p className="p-3 text-xs text-muted-foreground">Loading repository status...</p>;
+  if (statusQuery.error && status === null)
+    return (
+      <div className="space-y-2 p-3 text-xs">
+        <p className="text-destructive" role="alert">
+          Unable to read repository status.
+        </p>
+        <Button size="xs" variant="outline" onClick={() => void refreshStatus()}>
+          Retry
+        </Button>
+      </div>
+    );
   if (status?.isRepo === false)
     return (
-      <p className="p-4 text-center text-xs text-muted-foreground">
-        This project is not a Git repository.
-      </p>
+      <div className="space-y-2 p-4 text-center text-xs text-muted-foreground">
+        <p>This project is not a Git repository.</p>
+        <Button
+          size="xs"
+          variant="outline"
+          disabled={initializing}
+          onClick={() => void initializeRepository()}
+        >
+          {initializing ? "Initializing..." : "Initialize repository"}
+        </Button>
+      </div>
     );
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -365,8 +463,11 @@ function ChangesView(
           </Button>
         </div>
         <p className="text-xs text-muted-foreground">
-          {files.length} changes · +{status?.workingTree.insertions ?? 0} · -
-          {status?.workingTree.deletions ?? 0}
+          {status?.workingTree.totalCount ?? files.length} changes ·{" "}
+          {status?.workingTree.stagedCount ??
+            files.filter((file) => file.indexStatus === "staged" || file.indexStatus === "both")
+              .length}{" "}
+          staged · +{status?.workingTree.insertions ?? 0} · -{status?.workingTree.deletions ?? 0}
         </p>
         {availability === "loading" ? (
           <p className="text-xs text-muted-foreground">Checking Source Control support...</p>
@@ -452,6 +553,24 @@ function ChangesView(
               </div>
             );
           })}
+          {status?.workingTree.totalCount === 0 ? (
+            <p className="px-2 py-4 text-center text-xs text-muted-foreground">
+              Working tree clean.
+            </p>
+          ) : null}
+          {status && (status.aheadCount > 0 || status.behindCount > 0) ? (
+            <p className="px-2 text-xs text-muted-foreground">
+              {status.aheadCount > 0 ? `${status.aheadCount} ahead` : ""}
+              {status.aheadCount > 0 && status.behindCount > 0 ? " · " : ""}
+              {status.behindCount > 0 ? `${status.behindCount} behind` : ""}
+            </p>
+          ) : null}
+          {workingTreePages.nextCursor !== null ? (
+            <Button size="xs" variant="outline" className="mx-2" onClick={() => void loadMore()}>
+              Load more changes
+            </Button>
+          ) : null}
+          {pageError ? <p className="px-2 text-xs text-destructive">{pageError}</p> : null}
           {review ? (
             <div className="rounded border border-border/70 bg-muted/30 p-2 text-xs">
               <div className="mb-2 flex items-center justify-between gap-2">
@@ -467,9 +586,7 @@ function ChangesView(
               ) : review.diff.length === 0 ? (
                 <p className="text-muted-foreground">No changes in this version.</p>
               ) : (
-                <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded border border-border/60 bg-background p-2 font-mono text-[11px] leading-relaxed">
-                  {review.diff}
-                </pre>
+                <WorkingTreeDiffPreview diff={review.diff} />
               )}
               {review.truncated ? (
                 <p className="mt-2 text-muted-foreground">This diff was truncated.</p>
@@ -498,9 +615,11 @@ function ChangesView(
             disabled={
               !canSubmitSourceControlCommit({
                 workflowAvailable,
-                stagedCount: files.filter(
-                  (file) => file.indexStatus === "staged" || file.indexStatus === "both",
-                ).length,
+                stagedCount:
+                  status?.workingTree.stagedCount ??
+                  files.filter(
+                    (file) => file.indexStatus === "staged" || file.indexStatus === "both",
+                  ).length,
                 message,
                 reviewedStateAvailable:
                   activeReviewedStatus?.headCommit !== undefined &&

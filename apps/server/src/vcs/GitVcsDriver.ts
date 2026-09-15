@@ -72,10 +72,15 @@ export interface ExecuteGitResult {
 
 export interface GitStatusDetails {
   isRepo: boolean;
+  repositoryRoot?: string;
   sourceControlProvider?: VcsStatusResult["sourceControlProvider"];
   hasOriginRemote: boolean;
   isDefaultBranch: boolean;
   branch: string | null;
+  localRevision?: string;
+  headCommit?: string | null;
+  indexTree?: string;
+  pendingMergeHeads?: readonly string[];
   upstreamRef: string | null;
   hasWorkingTreeChanges: boolean;
   workingTree: VcsStatusResult["workingTree"];

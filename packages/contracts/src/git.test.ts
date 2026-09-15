@@ -9,6 +9,9 @@ import {
   GitRunStackedActionInput,
   GitResolvePullRequestResult,
   VcsWorkingTreeDiffInput,
+  VcsWorkingTreePageInput,
+  VcsWorkingTreePageResult,
+  VcsStatusResult,
 } from "./git.ts";
 
 const decodeCreateWorktreeInput = Schema.decodeUnknownSync(VcsCreateWorktreeInput);
@@ -22,6 +25,50 @@ const decodeRunStackedActionInput = Schema.decodeUnknownSync(GitRunStackedAction
 const decodeRunStackedActionResult = Schema.decodeUnknownSync(GitRunStackedActionResult);
 const decodeResolvePullRequestResult = Schema.decodeUnknownSync(GitResolvePullRequestResult);
 const decodeWorkingTreeDiffInput = Schema.decodeUnknownSync(VcsWorkingTreeDiffInput);
+const decodeWorkingTreePageInput = Schema.decodeUnknownSync(VcsWorkingTreePageInput);
+const decodeWorkingTreePageResult = Schema.decodeUnknownSync(VcsWorkingTreePageResult);
+const decodeStatus = Schema.decodeUnknownSync(VcsStatusResult);
+
+describe("bounded working-tree status", () => {
+  it("keeps legacy status payloads decodable while accepting bounded metadata", () => {
+    const legacy = decodeStatus({
+      isRepo: true,
+      hasPrimaryRemote: false,
+      isDefaultRef: false,
+      refName: "main",
+      hasWorkingTreeChanges: false,
+      workingTree: { files: [], insertions: 0, deletions: 0 },
+      hasUpstream: false,
+      aheadCount: 0,
+      behindCount: 0,
+      pr: null,
+    });
+    expect(legacy.workingTree.totalCount).toBeUndefined();
+
+    const page = decodeWorkingTreePageResult({
+      snapshotId: "snapshot-1",
+      files: [],
+      nextCursor: null,
+      totalCount: 0,
+      stagedCount: 0,
+      hasStagedChanges: false,
+    });
+    expect(page.snapshotId).toBe("snapshot-1");
+  });
+
+  it("requires a snapshot identity and nullable numeric cursor for page requests", () => {
+    const page = decodeWorkingTreePageInput({
+      cwd: "/repo",
+      snapshotId: "snapshot-1",
+      cursor: null,
+      pageSize: 24,
+    });
+    expect(page.cursor).toBeNull();
+    expect(() =>
+      decodeWorkingTreePageInput({ cwd: "/repo", snapshotId: "snapshot-1", cursor: -1 }),
+    ).toThrow();
+  });
+});
 
 describe("VcsWorkingTreeDiffInput", () => {
   it("accepts an explicit working-tree-versus-index comparison", () => {

@@ -5910,4 +5910,45 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       ]);
     }),
   );
+
+  it.effect(
+    "returns deterministic bounded working-tree pages and rejects an invalidated snapshot",
+    () =>
+      Effect.gen(function* () {
+        const repoDir = yield* makeTempDir("t3code-git-manager-pages-");
+        yield* initRepo(repoDir);
+        yield* Effect.sync(() => {
+          for (let index = 0; index < 70; index += 1) {
+            NodeFS.writeFileSync(
+              NodePath.join(repoDir, `file-${String(70 - index).padStart(3, "0")}.txt`),
+              "changed\n",
+            );
+          }
+        });
+        const { manager } = yield* makeManager();
+        const status = yield* manager.localStatus({ cwd: repoDir });
+        expect(status.workingTree.files).toHaveLength(64);
+        expect(status.workingTree.totalCount).toBe(70);
+        expect(status.workingTree.snapshotId).toBeDefined();
+        const page = yield* manager.workingTreePage({
+          cwd: repoDir,
+          snapshotId: status.workingTree.snapshotId!,
+          cursor: status.workingTree.nextCursor!,
+          pageSize: 100,
+        });
+        expect(page.files.map((file) => file.path)).toEqual([
+          "file-065.txt",
+          "file-066.txt",
+          "file-067.txt",
+          "file-068.txt",
+          "file-069.txt",
+          "file-070.txt",
+        ]);
+        yield* manager.invalidateLocalStatus(repoDir);
+        const stale = yield* manager
+          .workingTreePage({ cwd: repoDir, snapshotId: page.snapshotId, cursor: 0 })
+          .pipe(Effect.flip);
+        expect(stale.message).toContain("stale");
+      }),
+  );
 });

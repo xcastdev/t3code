@@ -93,6 +93,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   pullRequests: Schema.optionalKey(Schema.Boolean),
   /** Per-file stage, unstage, bounded diff, and index-only commit RPCs. */
   gitIndexWorkflow: Schema.optionalKey(Schema.Boolean),
+  /** Server supports bounded, snapshot-paged working-tree file listings. */
+  gitWorkingTreePagination: Schema.optionalKey(Schema.Boolean),
   /** Server exposes project-scoped remote HTTP MCP catalog RPCs. */
   projectMcpCatalog: Schema.optionalKey(Schema.Boolean),
   /** Server exposes environment-global MCP definition RPCs. */

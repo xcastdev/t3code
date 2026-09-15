@@ -28,6 +28,9 @@ import {
   type VcsStatusLocalResult,
   type VcsStatusRemoteResult,
   VcsStatusResult,
+  type VcsWorkingTreeFile,
+  type VcsWorkingTreePageInput,
+  type VcsWorkingTreePageResult,
   ModelSelection,
   type ProjectId,
   SourceControlProviderError,
@@ -96,6 +99,13 @@ interface SourceControlTextGenerationSettings {
   readonly style: SourceControlWritingStyleSettings;
 }
 
+interface WorkingTreeSnapshot {
+  readonly id: string;
+  readonly files: readonly VcsWorkingTreeFile[];
+  readonly totalCount: number;
+  readonly stagedCount: number;
+}
+
 export class GitManager extends Context.Service<
   GitManager,
   {
@@ -109,6 +119,9 @@ export class GitManager extends Context.Service<
       input: VcsStatusInput,
       options?: GitRemoteStatusOptions,
     ) => Effect.Effect<VcsStatusRemoteResult | null, GitManagerServiceError>;
+    readonly workingTreePage: (
+      input: VcsWorkingTreePageInput,
+    ) => Effect.Effect<VcsWorkingTreePageResult, GitManagerServiceError>;
     /** Resolve the PR for a saved branch without changing the current checkout. */
     readonly branchPullRequest: (
       input: { readonly cwd: string; readonly branch: string },
@@ -136,6 +149,10 @@ const SHORT_SHA_LENGTH = 7;
 const TOAST_DESCRIPTION_MAX = 72;
 const STATUS_RESULT_CACHE_TTL = Duration.seconds(1);
 const STATUS_RESULT_CACHE_CAPACITY = 2_048;
+const WORKING_TREE_STATUS_PREVIEW_LIMIT = 64;
+const WORKING_TREE_PAGE_MAX_SIZE = 100;
+const WORKING_TREE_PAGE_BYTE_BUDGET = 64 * 1024;
+const WORKING_TREE_SNAPSHOT_CACHE_CAPACITY = 256;
 // Matches the automatic settlement sweep cadence so every background sweep
 // reads fresh branch state: an external merge settles within about a minute
 // instead of waiting out a longer cache. Unpublished branches never reach the
@@ -972,7 +989,40 @@ export const make = Effect.gen(function* () {
   const canonicalizeExistingPath = (value: string) =>
     fileSystem.realPath(value).pipe(Effect.orElseSucceed(() => value));
   const normalizeStatusCacheKey = canonicalizeExistingPath;
-  const nonRepositoryStatusDetails = {
+  let workingTreeSnapshotSequence = 0;
+  const workingTreeSnapshots = new Map<string, WorkingTreeSnapshot>();
+  const clearWorkingTreeSnapshot = (cwd: string) =>
+    Effect.flatMap(normalizeStatusCacheKey(cwd), (cacheKey) =>
+      Effect.sync(() => {
+        workingTreeSnapshots.delete(cacheKey);
+      }),
+    );
+  const rememberWorkingTreeSnapshot = (
+    cwd: string,
+    files: readonly VcsWorkingTreeFile[],
+  ): WorkingTreeSnapshot => {
+    const sorted = [...files].sort((left, right) =>
+      Buffer.compare(Buffer.from(left.path), Buffer.from(right.path)),
+    );
+    const snapshot: WorkingTreeSnapshot = {
+      // A sequence is intentionally unrelated to the guarded Git revision.
+      id: `wt-${++workingTreeSnapshotSequence}`,
+      files: sorted,
+      totalCount: sorted.length,
+      stagedCount: sorted.filter(
+        (file) => file.indexStatus === "staged" || file.indexStatus === "both",
+      ).length,
+    };
+    workingTreeSnapshots.delete(cwd);
+    workingTreeSnapshots.set(cwd, snapshot);
+    while (workingTreeSnapshots.size > WORKING_TREE_SNAPSHOT_CACHE_CAPACITY) {
+      const oldest = workingTreeSnapshots.keys().next().value;
+      if (oldest === undefined) break;
+      workingTreeSnapshots.delete(oldest);
+    }
+    return snapshot;
+  };
+  const nonRepositoryStatusDetails: GitVcsDriver.GitStatusDetails = {
     isRepo: false,
     hasOriginRemote: false,
     isDefaultBranch: false,
@@ -984,7 +1034,7 @@ export const make = Effect.gen(function* () {
     aheadCount: 0,
     behindCount: 0,
     aheadOfDefaultCount: 0,
-  } satisfies GitVcsDriver.GitStatusDetails;
+  };
   const readLocalStatus = Effect.fn("readLocalStatus")(function* (cwd: string) {
     const details = yield* gitCore
       .statusDetailsLocal(cwd)
@@ -995,14 +1045,40 @@ export const make = Effect.gen(function* () {
       ? yield* resolveHostingProvider(cwd, details.branch)
       : null;
 
+    const snapshot = details.isRepo
+      ? rememberWorkingTreeSnapshot(cwd, details.workingTree.files)
+      : null;
+    const workingTree = snapshot
+      ? {
+          files: snapshot.files.slice(0, WORKING_TREE_STATUS_PREVIEW_LIMIT),
+          insertions: details.workingTree.insertions,
+          deletions: details.workingTree.deletions,
+          totalCount: snapshot.totalCount,
+          stagedCount: snapshot.stagedCount,
+          hasStagedChanges: snapshot.stagedCount > 0,
+          snapshotId: snapshot.id,
+          nextCursor:
+            snapshot.totalCount > WORKING_TREE_STATUS_PREVIEW_LIMIT
+              ? WORKING_TREE_STATUS_PREVIEW_LIMIT
+              : null,
+          truncated: snapshot.totalCount > WORKING_TREE_STATUS_PREVIEW_LIMIT,
+        }
+      : details.workingTree;
     return {
       isRepo: details.isRepo,
+      ...(details.repositoryRoot ? { repositoryRoot: details.repositoryRoot } : {}),
       ...(hostingProvider ? { sourceControlProvider: hostingProvider } : {}),
       hasPrimaryRemote: details.hasOriginRemote,
       isDefaultRef: details.isDefaultBranch,
       refName: details.branch,
+      ...(details.localRevision !== undefined ? { localRevision: details.localRevision } : {}),
+      ...(details.headCommit !== undefined ? { headCommit: details.headCommit } : {}),
+      ...(details.indexTree !== undefined ? { indexTree: details.indexTree } : {}),
+      ...(details.pendingMergeHeads !== undefined
+        ? { pendingMergeHeads: [...details.pendingMergeHeads] }
+        : {}),
       hasWorkingTreeChanges: details.hasWorkingTreeChanges,
-      workingTree: details.workingTree,
+      workingTree,
     } satisfies VcsStatusLocalResult;
   });
   const localStatusResultCache = yield* Cache.makeWith(readLocalStatus, {
@@ -1011,7 +1087,12 @@ export const make = Effect.gen(function* () {
   });
   const invalidateLocalStatusResultCache = (cwd: string) =>
     normalizeStatusCacheKey(cwd).pipe(
-      Effect.flatMap((cacheKey) => Cache.invalidate(localStatusResultCache, cacheKey)),
+      Effect.flatMap((cacheKey) =>
+        Effect.gen(function* () {
+          yield* Cache.invalidate(localStatusResultCache, cacheKey);
+          yield* clearWorkingTreeSnapshot(cacheKey);
+        }),
+      ),
     );
   // PR lookups hit the hosting provider's API (gh/glab/...), so they refresh
   // on their own, slower cadence: ahead/behind counts stay fresh on every
@@ -2092,6 +2173,60 @@ export const make = Effect.gen(function* () {
       return yield* Cache.get(localStatusResultCache, cacheKey);
     },
   );
+  const workingTreePage: GitManager["Service"]["workingTreePage"] = Effect.fn("workingTreePage")(
+    function* (input) {
+      const cacheKey = yield* normalizeStatusCacheKey(input.cwd);
+      const snapshot = workingTreeSnapshots.get(cacheKey);
+      if (snapshot === undefined || snapshot.id !== input.snapshotId) {
+        return yield* new GitManagerError({
+          operation: "workingTreePage",
+          cwd: input.cwd,
+          detail: "Working tree snapshot is stale. Refresh repository status and try again.",
+        });
+      }
+      const cursor = input.cursor ?? 0;
+      if (!Number.isSafeInteger(cursor) || cursor < 0 || cursor > snapshot.totalCount) {
+        return yield* new GitManagerError({
+          operation: "workingTreePage",
+          cwd: input.cwd,
+          detail: "Working tree page cursor is invalid. Refresh repository status and try again.",
+        });
+      }
+      if (cursor === snapshot.totalCount && snapshot.totalCount > 0) {
+        return yield* new GitManagerError({
+          operation: "workingTreePage",
+          cwd: input.cwd,
+          detail:
+            "Working tree page cursor is out of range. Refresh repository status and try again.",
+        });
+      }
+      const requested = Math.min(
+        Math.max(input.pageSize ?? WORKING_TREE_STATUS_PREVIEW_LIMIT, 1),
+        WORKING_TREE_PAGE_MAX_SIZE,
+      );
+      const files: VcsWorkingTreeFile[] = [];
+      let bytes = 0;
+      for (const file of snapshot.files.slice(cursor, cursor + requested)) {
+        // Rows carry one path, two small counts, and an optional status. The
+        // constant accounts for keys/encoding without serializing a transport
+        // object just to enforce this conservative response budget.
+        const fileBytes = Buffer.byteLength(file.path, "utf8") + 96;
+        if (files.length > 0 && bytes + fileBytes > WORKING_TREE_PAGE_BYTE_BUDGET) break;
+        // Always return one row, even if a pathological path is unusually long.
+        files.push(file);
+        bytes += fileBytes;
+      }
+      const next = cursor + files.length;
+      return {
+        snapshotId: snapshot.id,
+        files,
+        nextCursor: next < snapshot.totalCount ? next : null,
+        totalCount: snapshot.totalCount,
+        stagedCount: snapshot.stagedCount,
+        hasStagedChanges: snapshot.stagedCount > 0,
+      } satisfies VcsWorkingTreePageResult;
+    },
+  );
   const remoteStatus: GitManager["Service"]["remoteStatus"] = Effect.fn("remoteStatus")(
     function* (input, options) {
       const cacheKey = yield* normalizeStatusCacheKey(input.cwd);
@@ -2805,6 +2940,7 @@ export const make = Effect.gen(function* () {
 
   return GitManager.of({
     localStatus,
+    workingTreePage,
     remoteStatus,
     status,
     branchPullRequest,

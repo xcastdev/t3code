@@ -5131,6 +5131,10 @@ const makeWsRpcLayer = (
               "rpc.aggregate": "vcs",
             },
           ),
+        [WS_METHODS.vcsWorkingTreePage]: (input) =>
+          observeRpcEffect(WS_METHODS.vcsWorkingTreePage, gitWorkflow.workingTreePage(input), {
+            "rpc.aggregate": "vcs",
+          }),
         [WS_METHODS.vcsPull]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsPull,

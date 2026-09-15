@@ -29,10 +29,37 @@ import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 
 import {
+  applyWorkingTreePage,
   commitVcsRefsRefresh,
   createVcsEnvironmentAtoms,
   makeCachedVcsRefsChanges,
 } from "./vcs.ts";
+
+describe("working-tree pagination", () => {
+  it("appends a matching snapshot and ignores late or stale pages", () => {
+    const initial = {
+      snapshotId: "one",
+      files: [{ path: "a", insertions: 1, deletions: 0 }],
+      nextCursor: 1,
+      requestId: 2,
+    };
+    const page = {
+      snapshotId: "one",
+      files: [{ path: "b", insertions: 0, deletions: 1 }],
+      nextCursor: null,
+      totalCount: 2,
+      stagedCount: 1,
+      hasStagedChanges: true,
+    } as const;
+    expect(applyWorkingTreePage(initial, page, 3, "append").files.map((file) => file.path)).toEqual(
+      ["a", "b"],
+    );
+    expect(applyWorkingTreePage(initial, { ...page, snapshotId: "two" }, 3, "append")).toBe(
+      initial,
+    );
+    expect(applyWorkingTreePage(initial, page, 1, "append")).toBe(initial);
+  });
+});
 import {
   invalidateCachedVcsRefs,
   invalidateVcsRefs,

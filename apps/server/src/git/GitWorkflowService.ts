@@ -30,6 +30,8 @@ import {
   type VcsStatusLocalResult,
   type VcsStatusRemoteResult,
   type VcsStatusResult,
+  type VcsWorkingTreePageInput,
+  type VcsWorkingTreePageResult,
   type VcsStageFilesInput,
   type VcsWorkingTreeDiffInput,
   type VcsWorkingTreeDiffResult,
@@ -57,6 +59,9 @@ export class GitWorkflowService extends Context.Service<
       input: VcsStatusInput,
       options?: GitManager.GitRemoteStatusOptions,
     ) => Effect.Effect<VcsStatusRemoteResult | null, GitManagerServiceError>;
+    readonly workingTreePage: (
+      input: VcsWorkingTreePageInput,
+    ) => Effect.Effect<VcsWorkingTreePageResult, GitManagerServiceError>;
     readonly invalidateLocalStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateRemoteStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateStatus: (cwd: string) => Effect.Effect<void, never>;
@@ -367,6 +372,21 @@ export const make = Effect.gen(function* () {
       detectGitRepositoryForStatus("GitWorkflowService.remoteStatus", input.cwd).pipe(
         Effect.flatMap((isGitRepository) =>
           isGitRepository ? gitManager.remoteStatus(input, options) : Effect.succeed(null),
+        ),
+      ),
+    workingTreePage: (input) =>
+      detectGitRepositoryForStatus("GitWorkflowService.workingTreePage", input.cwd).pipe(
+        Effect.flatMap((isGitRepository) =>
+          isGitRepository
+            ? gitManager.workingTreePage(input)
+            : Effect.fail(
+                new GitManagerError({
+                  operation: "GitWorkflowService.workingTreePage",
+                  cwd: input.cwd,
+                  detail:
+                    "Working tree pages require a Git repository. Refresh repository status and try again.",
+                }),
+              ),
         ),
       ),
     invalidateLocalStatus: gitManager.invalidateLocalStatus,

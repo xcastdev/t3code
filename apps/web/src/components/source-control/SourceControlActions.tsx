@@ -129,6 +129,10 @@ interface RunGitActionWithToastInput {
   filePaths?: string[];
 }
 
+type WorkingTreeSelection =
+  | { readonly mode: "all" }
+  | { readonly mode: "paths"; readonly paths: ReadonlySet<string> };
+
 const GIT_STATUS_WINDOW_REFRESH_DEBOUNCE_MS = 250;
 
 type RefreshVcsStatus = (target: {
@@ -310,7 +314,7 @@ export default function SourceControlActions({
   const setDraftThreadContext = useComposerDraftStore((store) => store.setDraftThreadContext);
   const [isCommitDialogOpen, setIsCommitDialogOpen] = useState(false);
   const [dialogCommitMessage, setDialogCommitMessage] = useState("");
-  const [excludedFiles, setExcludedFiles] = useState<ReadonlySet<string>>(new Set());
+  const [selection, setSelection] = useState<WorkingTreeSelection>({ mode: "all" });
   const [isEditingFiles, setIsEditingFiles] = useState(false);
   const [isPublishDialogOpen, setIsPublishDialogOpen] = useState(false);
   const [pendingDefaultBranchAction, setPendingDefaultBranchAction] =
@@ -417,9 +421,11 @@ export default function SourceControlActions({
   const gitStatusForActions = gitStatus;
 
   const allFiles = gitStatusForActions?.workingTree.files ?? [];
-  const selectedFiles = allFiles.filter((f) => !excludedFiles.has(f.path));
-  const allSelected = excludedFiles.size === 0;
+  const selectedFiles =
+    selection.mode === "all" ? allFiles : allFiles.filter((file) => selection.paths.has(file.path));
+  const allSelected = selection.mode === "all";
   const noneSelected = selectedFiles.length === 0;
+  const selectedFilePaths = selection.mode === "paths" ? [...selection.paths] : undefined;
 
   const initAction = useVcsInitAction(sourceControlScope);
   const runImmediateGitAction = useGitStackedAction(sourceControlScope);
@@ -826,13 +832,13 @@ export default function SourceControlActions({
 
     setIsCommitDialogOpen(false);
     setDialogCommitMessage("");
-    setExcludedFiles(new Set());
+    setSelection({ mode: "all" });
     setIsEditingFiles(false);
 
     void runGitActionWithToast({
       action: "commit",
       ...(commitMessage ? { commitMessage } : {}),
-      ...(!allSelected ? { filePaths: selectedFiles.map((f) => f.path) } : {}),
+      ...(selectedFilePaths ? { filePaths: selectedFilePaths } : {}),
       featureBranch: true,
       skipDefaultBranchPrompt: true,
     });
@@ -915,7 +921,7 @@ export default function SourceControlActions({
       void runGitActionWithToast({ action: "create_pr" });
       return;
     }
-    setExcludedFiles(new Set());
+    setSelection({ mode: "all" });
     setIsEditingFiles(false);
     setIsCommitDialogOpen(true);
   };
@@ -925,12 +931,12 @@ export default function SourceControlActions({
     const commitMessage = dialogCommitMessage.trim();
     setIsCommitDialogOpen(false);
     setDialogCommitMessage("");
-    setExcludedFiles(new Set());
+    setSelection({ mode: "all" });
     setIsEditingFiles(false);
     void runGitActionWithToast({
       action: "commit",
       ...(commitMessage ? { commitMessage } : {}),
-      ...(!allSelected ? { filePaths: selectedFiles.map((f) => f.path) } : {}),
+      ...(selectedFilePaths ? { filePaths: selectedFilePaths } : {}),
     });
   };
 
@@ -1153,7 +1159,7 @@ export default function SourceControlActions({
           if (!open) {
             setIsCommitDialogOpen(false);
             setDialogCommitMessage("");
-            setExcludedFiles(new Set());
+            setSelection({ mode: "all" });
             setIsEditingFiles(false);
           }
         }}
@@ -1182,8 +1188,8 @@ export default function SourceControlActions({
                         checked={allSelected}
                         indeterminate={!allSelected && !noneSelected}
                         onCheckedChange={() => {
-                          setExcludedFiles(
-                            allSelected ? new Set(allFiles.map((f) => f.path)) : new Set(),
+                          setSelection(
+                            allSelected ? { mode: "paths", paths: new Set() } : { mode: "all" },
                           );
                         }}
                       />
@@ -1212,7 +1218,7 @@ export default function SourceControlActions({
                     <ScrollArea className="h-44 rounded-lg bg-card ring-1 ring-black/5 dark:bg-white/[0.025] dark:ring-white/5">
                       <div className="space-y-1 p-1">
                         {allFiles.map((file) => {
-                          const isExcluded = excludedFiles.has(file.path);
+                          const isExcluded = !allSelected && !selection.paths.has(file.path);
                           return (
                             <div
                               key={file.path}
@@ -1220,16 +1226,23 @@ export default function SourceControlActions({
                             >
                               {isEditingFiles && (
                                 <Checkbox
-                                  checked={!excludedFiles.has(file.path)}
+                                  checked={!isExcluded}
                                   onCheckedChange={() => {
-                                    setExcludedFiles((prev) => {
-                                      const next = new Set(prev);
-                                      if (next.has(file.path)) {
-                                        next.delete(file.path);
-                                      } else {
-                                        next.add(file.path);
+                                    setSelection((current) => {
+                                      if (current.mode === "all") {
+                                        return {
+                                          mode: "paths",
+                                          paths: new Set(
+                                            allFiles
+                                              .filter((entry) => entry.path !== file.path)
+                                              .map((entry) => entry.path),
+                                          ),
+                                        };
                                       }
-                                      return next;
+                                      const paths = new Set(current.paths);
+                                      if (paths.has(file.path)) paths.delete(file.path);
+                                      else paths.add(file.path);
+                                      return { mode: "paths", paths };
                                     });
                                   }}
                                 />
@@ -1290,7 +1303,7 @@ export default function SourceControlActions({
               onClick={() => {
                 setIsCommitDialogOpen(false);
                 setDialogCommitMessage("");
-                setExcludedFiles(new Set());
+                setSelection({ mode: "all" });
                 setIsEditingFiles(false);
               }}
             >

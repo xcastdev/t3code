@@ -3,6 +3,8 @@ import {
   type VcsListRefsInput,
   type VcsListRefsResult,
   type VcsStatusResult,
+  type VcsWorkingTreeFile,
+  type VcsWorkingTreePageResult,
   WS_METHODS,
 } from "@t3tools/contracts";
 import { applyGitStatusStreamEvent } from "@t3tools/shared/git";
@@ -38,6 +40,32 @@ const VCS_REFS_IDLE_TTL_MS = 30_000;
 // Rows keep the last status they rendered, so the live stream only needs a
 // short grace period when virtualization or scrolling releases its consumer.
 const VCS_STATUS_IDLE_TTL_MS = 10_000;
+
+export interface WorkingTreePageState {
+  readonly snapshotId: string | null;
+  readonly files: readonly VcsWorkingTreeFile[];
+  readonly nextCursor: number | null;
+  readonly requestId: number;
+}
+
+/** Ignore late, duplicate, and cross-snapshot pages at the client boundary. */
+export function applyWorkingTreePage(
+  current: WorkingTreePageState,
+  page: VcsWorkingTreePageResult,
+  requestId: number,
+  mode: "reset" | "append",
+): WorkingTreePageState {
+  if (requestId < current.requestId) return current;
+  if (mode === "append" && current.snapshotId !== page.snapshotId) return current;
+  const files = mode === "reset" ? page.files : [...current.files, ...page.files];
+  const unique = [...new Map(files.map((file) => [file.path, file])).values()];
+  return {
+    snapshotId: page.snapshotId,
+    files: unique,
+    nextCursor: page.nextCursor,
+    requestId,
+  };
+}
 const VCS_REFS_RETRY_SCHEDULE = Schedule.exponential("1 second").pipe(
   Schedule.modifyDelay(({ duration }) =>
     Effect.succeed(Duration.min(duration, Duration.seconds(30))),
@@ -307,6 +335,12 @@ export function createVcsEnvironmentAtoms<R, E>(
       scheduler: vcsCommandScheduler,
       concurrency: vcsCommandConcurrency,
       onSettled: invalidateRefs,
+    }),
+    workingTreePage: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:vcs:working-tree-page",
+      tag: WS_METHODS.vcsWorkingTreePage,
+      scheduler: vcsCommandScheduler,
+      concurrency: vcsCommandConcurrency,
     }),
     stageFiles: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:vcs:stage-files",
