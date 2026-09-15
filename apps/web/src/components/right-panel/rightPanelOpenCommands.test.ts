@@ -26,6 +26,7 @@ describe("dispatchRightPanelOpenCommand", () =>
       expect(
         dispatchRightPanelOpenCommand({
           command,
+          event: { repeat: false, preventDefault() {}, stopPropagation() {} },
           available: Object.fromEntries(keys.map((key) => [key, key === target])) as Record<
             (typeof keys)[number],
             boolean

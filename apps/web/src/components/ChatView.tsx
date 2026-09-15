@@ -217,6 +217,14 @@ import { SourceControlPanel } from "./source-control/SourceControlPanel";
 import SourceControlActions from "./source-control/SourceControlActions";
 import { RightPanelTabs } from "./RightPanelTabs";
 import { dispatchRightPanelOpenCommand } from "./right-panel/rightPanelOpenCommands";
+import {
+  eventPathContainsSelector,
+  TYPE_TO_FOCUS_EDITABLE_SELECTOR,
+  TYPE_TO_FOCUS_FLOATING_LAYER_SELECTOR,
+  shouldRedirectInputToComposer,
+  pasteTextToFocusComposer,
+  redirectTypedKeyToComposer,
+} from "./chat/composerInputRouting";
 import { getSourceControlPresentation } from "../sourceControlPresentation";
 import { SecondaryPaneShell } from "./workspace/SecondaryPaneShell";
 import { SecondaryPaneTabs } from "./workspace/SecondaryPaneTabs";
@@ -614,88 +622,12 @@ const DevicePanel = lazy(() =>
 const FilePreviewPanel = lazy(() => import("./files/FilePreviewPanel"));
 const EMPTY_PENDING_FILE_SURFACE_IDS: ReadonlySet<string> = new Set();
 const EMPTY_LEGACY_TERMINAL_IDS: readonly string[] = [];
-const TYPE_TO_FOCUS_EDITABLE_SELECTOR = [
-  "input",
-  "textarea",
-  "select",
-  '[contenteditable="true"]',
-  '[contenteditable="plaintext-only"]',
-  '[role="textbox"]',
-].join(",");
-const TYPE_TO_FOCUS_INTERACTIVE_SELECTOR = [
-  "button",
-  "a[href]",
-  "summary",
-  '[role="button"]',
-  '[role="checkbox"]',
-  '[role="menuitem"]',
-  '[role="option"]',
-  '[role="radio"]',
-  '[role="switch"]',
-  '[role="tab"]',
-  "[data-right-panel-rail]:focus",
-  "[data-right-panel-rail]:focus-within",
-].join(",");
-const TYPE_TO_FOCUS_FLOATING_LAYER_SELECTOR = [
-  '[role="dialog"][aria-modal="true"]',
-  '[data-slot="alert-dialog-popup"]:is([data-open],[data-ending-style])',
-  '[data-slot="command-dialog-popup"]:is([data-open],[data-ending-style])',
-  '[data-slot="dialog-popup"]:is([data-open],[data-ending-style])',
-  '[data-slot="sheet-popup"]:is([data-open],[data-ending-style])',
-  '[data-slot="sidebar"][data-mobile="true"]:is([data-open],[data-ending-style])',
-  '[data-slot="menu-popup"]',
-  '[data-slot="select-popup"]',
-  '[data-slot="popover-popup"]',
-  '[data-slot="combobox-popup"]',
-  '[data-slot="autocomplete-popup"]',
-].join(",");
 
 type EnvironmentUnavailableState = {
   readonly environmentId: EnvironmentId;
   readonly label: string;
   readonly connection: EnvironmentConnectionPresentation;
 };
-
-function eventPathContainsSelector(event: Event, selector: string): boolean {
-  const path = event.composedPath();
-  if (path.length === 0 && event.target) {
-    path.push(event.target);
-  }
-  return path.some((target) => target instanceof Element && target.closest(selector));
-}
-
-/**
- * Whether input that landed outside any editable or interactive element
- * should be redirected into the composer. Shared by type-to-focus and
- * paste-to-focus so both honour the same surfaces.
- */
-function shouldRedirectInputToComposer(event: Event): boolean {
-  if (event.defaultPrevented) return false;
-  if (eventPathContainsSelector(event, TYPE_TO_FOCUS_EDITABLE_SELECTOR)) return false;
-  if (eventPathContainsSelector(event, TYPE_TO_FOCUS_INTERACTIVE_SELECTOR)) return false;
-  if (document.querySelector(TYPE_TO_FOCUS_FLOATING_LAYER_SELECTOR)) return false;
-  return true;
-}
-
-function shouldTypeToFocusComposer(event: KeyboardEvent): boolean {
-  if (event.isComposing) return false;
-  if (event.metaKey || event.ctrlKey || event.altKey) return false;
-  if (event.key.length !== 1) return false;
-  if (!shouldRedirectInputToComposer(event)) return false;
-
-  return true;
-}
-
-/**
- * Plain text pasted with nothing editable focused, such as after the resting
- * composer blurred. Files are left to the composer's own paste handler.
- */
-function pasteTextToFocusComposer(event: ClipboardEvent): string | null {
-  if (!event.clipboardData || event.clipboardData.files.length > 0) return null;
-  if (!shouldRedirectInputToComposer(event)) return null;
-  const text = event.clipboardData.getData("text/plain");
-  return text.length > 0 ? text : null;
-}
 
 function formatOutgoingPrompt(params: {
   provider: ProviderDriverKind;
@@ -1889,7 +1821,8 @@ export default function ChatView(props: ChatViewProps) {
     activePreviewMiniPlayer?.source ?? null,
     renderedRightPanelSurface,
   );
-  const canMaximizeRightPanel = rightPanelOpen && !shouldUseRightPanelSheet;
+  const canMaximizeRightPanel =
+    rightPanelOpen && activeRightPanelSurface !== null && !shouldUseRightPanelSheet;
   const rightPanelMaximized =
     canMaximizeRightPanel && maximizedRightPanelThreadKey === routeThreadKey;
   const secondaryPaneOpen =
@@ -6427,13 +6360,9 @@ export default function ChatView(props: ChatViewProps) {
       if (
         !shortcutContext.terminalFocus &&
         !shortcutContext.modelPickerOpen &&
-        shouldTypeToFocusComposer(event)
+        redirectTypedKeyToComposer(event, (text) => composerRef.current?.insertTextAtEnd(text))
       ) {
-        if (composerRef.current?.insertTextAtEnd(event.key)) {
-          event.preventDefault();
-          event.stopPropagation();
-          return;
-        }
+        return;
       }
 
       const command = resolveShortcutCommand(event, keybindings, {
@@ -6579,6 +6508,7 @@ export default function ChatView(props: ChatViewProps) {
       if (
         dispatchRightPanelOpenCommand({
           command,
+          event,
           available: {
             browser: isPreviewSupportedInRuntime(),
             files: activeThreadRef !== null && activeProject !== null,
@@ -6589,81 +6519,16 @@ export default function ChatView(props: ChatViewProps) {
             device: activeThreadRef !== null,
           },
           open: {
-            browser: () => {
-              if (!event.repeat) createBrowserSurface();
-            },
-            files: () => {
-              if (!event.repeat) addFilesSurface();
-            },
-            sourceControl: () => {
-              if (!event.repeat) addSourceControlSurface();
-            },
-            agents: () => {
-              if (!event.repeat) addAgentsSurface();
-            },
-            pullRequest: () => {
-              if (!event.repeat) addPullRequestSurface();
-            },
-            pullRequests: () => {
-              if (!event.repeat) addPullRequestsSurface();
-            },
-            device: () => {
-              if (!event.repeat) addDeviceSurface();
-            },
+            browser: createBrowserSurface,
+            files: addFilesSurface,
+            sourceControl: addSourceControlSurface,
+            agents: addAgentsSurface,
+            pullRequest: addPullRequestSurface,
+            pullRequests: addPullRequestsSurface,
+            device: addDeviceSurface,
           },
         })
       ) {
-        event.preventDefault();
-        event.stopPropagation();
-        return;
-      }
-      if (command === "rightPanel.openBrowser") {
-        if (!isPreviewSupportedInRuntime()) return;
-        event.preventDefault();
-        event.stopPropagation();
-        if (!event.repeat) createBrowserSurface();
-        return;
-      }
-      if (command === "rightPanel.openFiles") {
-        if (!activeThreadRef || !activeProject) return;
-        event.preventDefault();
-        event.stopPropagation();
-        if (!event.repeat) addFilesSurface();
-        return;
-      }
-      if (command === "rightPanel.openSourceControl") {
-        if (!activeThreadRef || !activeProject) return;
-        event.preventDefault();
-        event.stopPropagation();
-        if (!event.repeat) addSourceControlSurface();
-        return;
-      }
-      if (command === "rightPanel.openAgents") {
-        if (!activeThreadRef) return;
-        event.preventDefault();
-        event.stopPropagation();
-        if (!event.repeat) addAgentsSurface();
-        return;
-      }
-      if (command === "rightPanel.openPullRequest") {
-        if (!pullRequestSurfaceAvailable) return;
-        event.preventDefault();
-        event.stopPropagation();
-        if (!event.repeat) addPullRequestSurface();
-        return;
-      }
-      if (command === "rightPanel.openLinkedPullRequests") {
-        if (!pullRequestsSurfaceAvailable) return;
-        event.preventDefault();
-        event.stopPropagation();
-        if (!event.repeat) addPullRequestsSurface();
-        return;
-      }
-      if (command === "rightPanel.openDevice") {
-        if (!activeThreadRef) return;
-        event.preventDefault();
-        event.stopPropagation();
-        if (!event.repeat) addDeviceSurface();
         return;
       }
 

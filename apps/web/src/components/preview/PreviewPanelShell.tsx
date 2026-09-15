@@ -69,8 +69,8 @@ export function PreviewPanelShell(props: {
   const isInline = props.mode === "inline";
   const collapsible = isInline && props.open !== undefined;
   const open = props.open ?? true;
-  const maximized = props.maximized ?? false;
   const rail = isInline && props.rail === true;
+  const maximized = !rail && (props.maximized ?? false);
   const hostRef = useRef<HTMLDivElement | null>(null);
   // Only inline non-maximized mode applies `width`/`maxWidth`; skip the
   // container measurement (and its re-renders) everywhere else.
