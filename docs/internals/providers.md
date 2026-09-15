@@ -18,6 +18,18 @@ let them replace each other's connection. Catalog and text-generation work can s
 after an idle period. External OpenCode servers remain externally owned and can require an
 external restart to pick up configuration changes.
 
+OpenCode's install, account, and model state are instance-global, but its slash commands and skills
+are directory-scoped. The provider catalog must therefore be read for the target project or worktree
+before a composer presents those entries. A failed catalog read is an enhancement failure, not a
+reason to make an otherwise usable provider unavailable. Do not reuse a command or skill list from
+one checkout for another. See the [workspace catalog contract](../../apps/server/src/provider/Services/ProviderRegistry.ts).
+
+T3 does not manage MCP entries on an external OpenCode server unless that provider instance opts in.
+With opt-in enabled, one T3 process permits one managed session for each exact OpenCode URL and
+directory pair. The coordinator cannot lock another T3 process or a native OpenCode client. Cleanup
+disables the dynamic entry rather than removing it because the current OpenCode API has no removal
+operation. The user-facing constraints are in [project MCP servers](../user/project-mcp-servers.md).
+
 OpenCode also stores persistent approval grants per directory. Automatic full-access replies use
 `once` so they cannot widen a supervised thread's permissions on a shared external server.
 See the [adapter](../../apps/server/src/provider/Layers/OpenCodeAdapter.ts).

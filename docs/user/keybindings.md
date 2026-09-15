@@ -11,6 +11,11 @@ workspace, and `mod+shift+g` for the Git branch. The workspace menu includes the
 current checkout, a new worktree, and the previous worktree when available.
 Use `mod+shift+l` to reuse the previous worktree directly.
 
+Use `mod+alt+g` to open Source Control for the current project. You can change
+or remove that shortcut in Settings.
+
+Use `mod+alt+b` to show or hide the right sidebar.
+
 In the model picker, press Left in an empty search field or Shift+Tab to reach
 the provider list. Use Up/Down to move and Enter to choose. Right returns to
 model search. `mod+shift+up` and `mod+shift+down` switch providers directly and clear the
@@ -67,7 +72,11 @@ Available context keys are `terminalFocus`, `terminalOpen`, `previewFocus`,
 Combine keys with `!` for not, `&&` for and, `||` for or, and parentheses:
 
 ```json
-{ "key": "mod+j", "command": "terminal.toggle", "when": "terminalOpen && !terminalFocus" }
+{
+  "key": "mod+j",
+  "command": "terminal.toggle",
+  "when": "terminalOpen && !terminalFocus"
+}
 ```
 
 ## Precedence
@@ -80,6 +89,10 @@ a shortcut.
 
 `thread.stop` interrupts the running turn in the focused thread. It has no default
 shortcut; assign one in **Settings → Keybindings**.
+
+`rightPanel.toggleMaximized` toggles the open inline right sidebar between its
+normal width and the workspace. It has no effect while the sidebar is closed or
+rendered as a narrow-window sheet.
 
 `chat.new` may ask you to choose a project when there is more than one.
 `chat.newLocal` skips that chooser. Both use your

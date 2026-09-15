@@ -93,6 +93,23 @@ messages, review titles, and descriptions from your changes.
 Choose the writing style and model in **Settings → Source Control**. **Repository conventions**
 uses the project's instructions and recent commit subjects.
 
+## Stage and commit selected changes
+
+Open **Source Control** from the right sidebar, the command palette, or
+`mod+alt+g`. It applies to the active thread's project and checkout.
+
+In **Changes**, stage modified or untracked files before entering a commit message.
+The panel commits only staged changes. Use **Unstage** to remove a staged file
+from that commit; it keeps the file's working-tree changes. A file marked
+**Staged + modified** has both an indexed version and newer unstaged work, so
+review the state again before committing.
+
+The panel refreshes the repository after stage and unstage operations. It refuses
+a commit when the reviewed branch, index, or merge state changed in the meantime.
+If that happens, refresh and review the staged changes again. Older environments
+may show the repository status but not support staging or committing from this
+panel; update the environment to use those actions.
+
 ## Review and merge
 
 Open **Pull requests** to review changes and comments, request reviewers, check out a branch,

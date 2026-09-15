@@ -118,6 +118,17 @@ For a plain HTTP LAN endpoint, use the direct pairing URL in a browser that can
 open it, or pair from the desktop app. On mobile, an IP address entered without a
 scheme uses HTTP, so include `https://` when your server uses HTTPS.
 
+## External notification delivery
+
+External notifications are sent by the environment's server, not by a paired
+browser, desktop app, or phone. T3 Connect does not carry these webhook requests.
+The machine running the environment must be able to reach the destination, such
+as Home Assistant. Once saved, delivery continues while the server is running
+even if the client that configured it disconnects.
+
+Configure destinations for the owning environment in **Settings → Integrations**.
+See [external notifications](./external-notifications.md) for setup and testing.
+
 ## Desktop-managed SSH
 
 In the desktop app, open **Settings → Connections → Add environment**, choose

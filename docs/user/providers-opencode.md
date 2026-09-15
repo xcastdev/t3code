@@ -20,6 +20,32 @@ fail, check the URL, credentials, and OpenCode version, then refresh provider st
 After a lost connection, send another prompt to reconnect to the same OpenCode
 session.
 
+## Commands and skills follow the workspace
+
+OpenCode discovers commands and skills for the current project checkout. When you
+switch projects or worktrees, the composer refreshes that catalog for the new
+directory. A command or skill shown in one checkout is not evidence that it is
+available in another.
+
+Use `/` to browse commands. Use `$` to browse skills. Whether skills also appear
+under `/` is controlled by **Settings → General → Show skills in slash menu**.
+
+## Project MCP with an external server
+
+By default, T3 Code leaves an external OpenCode server's MCP configuration alone,
+so project MCP servers cannot be attached to its sessions. If you opt that provider
+instance into T3-managed MCP, T3 can register the project servers for a new session.
+
+Use that opt-in only when T3 Code is the manager for the selected OpenCode URL and
+directory. One T3 Code process allows only one such MCP-enabled session for a URL
+and exact directory. On cleanup, OpenCode keeps the dynamic entry disabled because
+its API cannot remove it.
+
+When OpenCode and T3 Code run on different machines, set **T3 MCP public origin**
+to the HTTPS origin OpenCode can reach. A loopback HTTP origin works only when both
+processes run on the same machine. See [project MCP servers](./project-mcp-servers.md)
+for transport, credentials, and OAuth rules.
+
 ## Approvals
 
 OpenCode follows the shared [permission modes](./permission-modes.md). **Auto** has

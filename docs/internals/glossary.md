@@ -15,6 +15,8 @@ Terms whose meaning matters across T3 Code. Architecture and lifecycle constrain
 | Thread         | The durable conversation and work history for a project. It survives provider process exits.      |
 | Turn           | One user-to-agent work cycle. Provider work can finish before checkpoint and diff work settles.   |
 | Activity       | A non-message timeline item, such as a tool action, approval, or failure.                         |
+| Partial turn   | A turn whose retained activity window is incomplete. Clients hide derived work counts for it.     |
+| Work counts    | Commands, tool calls, subagents, and changed files stamped when a turn settles.                   |
 | T3 home        | The base data directory. Runtime state normally lives under its `userdata` directory.             |
 
 ## Orchestration
@@ -45,6 +47,20 @@ Terms whose meaning matters across T3 Code. Architecture and lifecycle constrain
 | Checkpoint          | A saved workspace state used for diffs and restore, stored as a hidden Git ref.                              |
 | Checkpoint baseline | The workspace state captured before the work being compared.                                                 |
 | Turn diff           | The workspace changes attributed to one turn.                                                                |
+
+See [turn provenance](./turn-provenance.md) for the stamping and retention rules behind turn
+history.
+
+## MCP catalog
+
+| Term                    | Meaning                                                                                                           |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------- |
+| MCP definition          | One complete MCP transport and its credentials, identified by a definition ID.                                    |
+| MCP override            | A scope-specific change to an inherited logical server, such as metadata or enabled state.                        |
+| Logical catalog session | The effective MCP catalog captured when a provider session starts. It survives recoverable runtime restarts.      |
+| Session mutation        | A change to the active logical catalog session. It can apply immediately or wait for the provider's next runtime. |
+
+See [scoped MCP catalogs](./mcp-catalog-scopes.md) for resolution, revisions, and provider support.
 
 ## Pull requests
 
