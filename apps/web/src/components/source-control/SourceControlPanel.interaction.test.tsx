@@ -237,12 +237,13 @@ afterEach(async () => {
 });
 
 describe("SourceControlPanel guarded commit interaction", () => {
-  it("provides a named container for responsive action labels", async () => {
+  it("provides a full-width named ancestor for responsive action labels", async () => {
     await renderPanel();
 
     const target = document.querySelector("[data-source-control-actions-target]");
     expect(target).not.toBeNull();
-    expect(target?.classList.contains("@container/header-actions")).toBe(true);
+    expect(target?.parentElement?.classList.contains("@container/header-actions")).toBe(true);
+    expect(target?.parentElement?.classList.contains("w-full")).toBe(true);
   });
 
   it("keeps reviewed tokens and refreshes after a stale-state rejection", async () => {

@@ -631,16 +631,12 @@ function PullRequestsView(
 export function SourceControlPanel(props: SourceControlPanelProps) {
   return (
     <section className="flex min-h-0 flex-1 flex-col" data-source-control-panel>
-      <div className="flex items-center justify-between border-b border-border/70 px-3 py-2">
+      <div className="@container/header-actions flex w-full items-center justify-between border-b border-border/70 px-3 py-2">
         <div className="flex items-center gap-2">
           <GitBranchIcon className="size-4 text-muted-foreground" />
           <h2 className="text-sm font-semibold">Source Control</h2>
         </div>
-        <div
-          ref={props.actionsTargetRef}
-          className="@container/header-actions shrink-0"
-          data-source-control-actions-target
-        />
+        <div ref={props.actionsTargetRef} className="shrink-0" data-source-control-actions-target />
         <div className="flex rounded bg-muted p-0.5" role="tablist">
           {(["changes", "pull-requests"] as const).map((view) => (
             <button
