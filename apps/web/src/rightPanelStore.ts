@@ -689,14 +689,14 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             if (current.activeSurfaceId !== surfaceId) {
               return {
                 ...current,
-                isOpen: surfaces.length > 0 && current.isOpen,
+                isOpen: current.isOpen,
                 surfaces,
               };
             }
             const fallback = surfaces[Math.min(index, surfaces.length - 1)] ?? null;
             return {
               ...current,
-              isOpen: surfaces.length > 0 && current.isOpen,
+              isOpen: current.isOpen,
               surfaces,
               activeSurfaceId: fallback?.id ?? null,
             };
@@ -738,7 +738,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               ? current
               : {
                   ...current,
-                  isOpen: false,
+                  isOpen: current.isOpen,
                   surfaces: [],
                   activeSurfaceId: null,
                 },

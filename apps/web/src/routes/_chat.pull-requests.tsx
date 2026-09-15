@@ -1951,7 +1951,7 @@ function PullRequestsRouteView() {
         {pullRequestsSupported && rightPanelPresent ? openPanelControls : null}
         <PullRequestsColumn {...columnProps} />
 
-        {rightPanelPresent && renderedPullRequestSurface && panelEnvironmentId !== null ? (
+        {rightPanelPresent && panelEnvironmentId !== null ? (
           <RightPanelTabs
             mode="inline"
             open={rightPanelState.isOpen}
@@ -1962,7 +1962,7 @@ function PullRequestsRouteView() {
             defaultWidth={typeof window === "undefined" ? 640 : Math.floor(window.innerWidth / 2)}
             surfaces={renderedRightPanelSurfaces}
             environmentId={panelEnvironmentId}
-            activeSurfaceId={renderedPullRequestSurface.id}
+            activeSurfaceId={renderedPullRequestSurface?.id ?? null}
             pendingSurfaceIds={EMPTY_PENDING_SURFACES}
             previewSessions={EMPTY_PREVIEW_SESSIONS}
             desktopByTabId={EMPTY_PREVIEW_DESKTOP_STATE}
@@ -1984,6 +1984,7 @@ function PullRequestsRouteView() {
             onAddBrowserInProfile={() => undefined}
             onAddDiff={() => undefined}
             onAddFiles={() => undefined}
+            onAddSourceControl={() => undefined}
             onAddPullRequest={() => undefined}
             onAddPullRequests={() => undefined}
             onAddAgents={() => undefined}
@@ -1995,52 +1996,55 @@ function PullRequestsRouteView() {
             pullRequestsAvailable={false}
             agentsAvailable={false}
             deviceAvailable={false}
+            sourceControlAvailable={false}
             liveAgentCount={0}
             pullRequestStatusSeeds={listedPullRequestTabStatuses}
           >
-            <PullRequestDetailPanel
-              getShortcutContext={getShortcutContext}
-              shortcutsEnabled={activePullRequestSurface?.id === renderedPullRequestSurface.id}
-              key={renderedPullRequestSurface.id}
-              environmentId={panelEnvironmentId}
-              onSelectPullRequest={(reference) => {
-                if (rightPanelRef === null) return;
-                useRightPanelStore.getState().openPullRequest(rightPanelRef, {
-                  projectId: reference.projectId,
-                  repository: reference.repository,
-                  number: reference.number,
-                  ...(reference.host ? { host: reference.host } : {}),
-                  environmentId: panelEnvironmentId,
-                });
-                updateSearch({
-                  repository: reference.repository,
-                  number: reference.number,
-                  selectedHost: reference.host,
-                  selectedProjectId: reference.projectId,
-                  selectedEnvironmentId: panelEnvironmentId,
-                });
-              }}
-              reference={{
-                projectId: renderedPullRequestSurface.projectId as ProjectId,
-                repository: renderedPullRequestSurface.repository,
-                number: renderedPullRequestSurface.number,
-                ...(renderedPullRequestSurface.host
-                  ? { host: renderedPullRequestSurface.host }
-                  : {}),
-              }}
-              listEntry={
-                listedPullRequestsBySurface.get(
-                  pullRequestListEntryId(renderedPullRequestSurface),
-                ) ?? null
-              }
-              refreshToken={detailRefreshToken}
-              // Host actions can change both readiness and diff size, so refresh the counts
-              // alongside the list. The panel already refreshes itself after each action.
-              onActed={() => {
-                // Mutations already invalidate the host's affected caches.
-                refreshListAndStats(undefined, panelEnvironmentId);
-              }}
-            />
+            {renderedPullRequestSurface ? (
+              <PullRequestDetailPanel
+                getShortcutContext={getShortcutContext}
+                shortcutsEnabled={activePullRequestSurface?.id === renderedPullRequestSurface.id}
+                key={renderedPullRequestSurface.id}
+                environmentId={panelEnvironmentId}
+                onSelectPullRequest={(reference) => {
+                  if (rightPanelRef === null) return;
+                  useRightPanelStore.getState().openPullRequest(rightPanelRef, {
+                    projectId: reference.projectId,
+                    repository: reference.repository,
+                    number: reference.number,
+                    ...(reference.host ? { host: reference.host } : {}),
+                    environmentId: panelEnvironmentId,
+                  });
+                  updateSearch({
+                    repository: reference.repository,
+                    number: reference.number,
+                    selectedHost: reference.host,
+                    selectedProjectId: reference.projectId,
+                    selectedEnvironmentId: panelEnvironmentId,
+                  });
+                }}
+                reference={{
+                  projectId: renderedPullRequestSurface.projectId as ProjectId,
+                  repository: renderedPullRequestSurface.repository,
+                  number: renderedPullRequestSurface.number,
+                  ...(renderedPullRequestSurface.host
+                    ? { host: renderedPullRequestSurface.host }
+                    : {}),
+                }}
+                listEntry={
+                  listedPullRequestsBySurface.get(
+                    pullRequestListEntryId(renderedPullRequestSurface),
+                  ) ?? null
+                }
+                refreshToken={detailRefreshToken}
+                // Host actions can change both readiness and diff size, so refresh the counts
+                // alongside the list. The panel already refreshes itself after each action.
+                onActed={() => {
+                  // Mutations already invalidate the host's affected caches.
+                  refreshListAndStats(undefined, panelEnvironmentId);
+                }}
+              />
+            ) : null}
           </RightPanelTabs>
         ) : null}
       </div>

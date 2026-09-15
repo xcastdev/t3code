@@ -62,6 +62,7 @@ export function PreviewPanelShell(props: {
   widthStorageKey?: string;
   /** Overrides the initial width (px) before the user has resized the panel. */
   defaultWidth?: number;
+  rail?: boolean;
   children: ReactNode;
 }) {
   const useDragRegion = isElectron && props.mode !== "sheet" && props.mode !== "embedded";
@@ -69,6 +70,7 @@ export function PreviewPanelShell(props: {
   const collapsible = isInline && props.open !== undefined;
   const open = props.open ?? true;
   const maximized = props.maximized ?? false;
+  const rail = isInline && props.rail === true;
   const hostRef = useRef<HTMLDivElement | null>(null);
   // Only inline non-maximized mode applies `width`/`maxWidth`; skip the
   // container measurement (and its re-renders) everywhere else.
@@ -135,7 +137,13 @@ export function PreviewPanelShell(props: {
       style={
         isInline
           ? {
-              width: maximized ? "100%" : collapsible && !open ? "0px" : `${width}px`,
+              width: maximized
+                ? "100%"
+                : collapsible && !open
+                  ? "0px"
+                  : rail
+                    ? "48px"
+                    : `${width}px`,
               transitionDuration: suppressWidthTransition ? "0ms" : undefined,
             }
           : undefined
@@ -143,11 +151,15 @@ export function PreviewPanelShell(props: {
       data-preview-panel-mode={props.mode}
       data-preview-panel-maximized={maximized ? "true" : "false"}
     >
-      {isInline && !maximized ? <RightPanelResizeHandle handlers={handlers} /> : null}
+      {isInline && !maximized && !rail ? <RightPanelResizeHandle handlers={handlers} /> : null}
       <div className={cn("h-full min-h-0 w-full", collapsible && "overflow-clip")}>
         <div
           className="flex h-full min-h-0 min-w-0 flex-col"
-          style={collapsible && !maximized ? { width: `calc(${width}px - 1px)` } : undefined}
+          style={
+            collapsible && !maximized
+              ? { width: rail ? "47px" : `calc(${width}px - 1px)` }
+              : undefined
+          }
         >
           {useDragRegion ? <div className="electron-drag-region h-0 w-full" aria-hidden /> : null}
           {props.children}

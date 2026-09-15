@@ -120,6 +120,7 @@ function renderTabs(
       onAddPullRequests={() => undefined}
       onAddDiff={() => undefined}
       onAddFiles={() => undefined}
+      onAddSourceControl={() => undefined}
       onAddAgents={() => undefined}
       onAddDevice={() => undefined}
       liveAgentCount={0}
@@ -130,6 +131,7 @@ function renderTabs(
       pullRequestsAvailable={false}
       agentsAvailable={false}
       deviceAvailable={false}
+      sourceControlAvailable={false}
     >
       <div>content</div>
     </RightPanelTabs>,
@@ -158,6 +160,7 @@ function renderEmptyTabs() {
       onAddPullRequests={() => undefined}
       onAddDiff={() => undefined}
       onAddFiles={() => undefined}
+      onAddSourceControl={() => undefined}
       onAddAgents={() => undefined}
       onAddDevice={() => undefined}
       liveAgentCount={0}
@@ -168,6 +171,7 @@ function renderEmptyTabs() {
       pullRequestsAvailable={false}
       agentsAvailable={false}
       deviceAvailable={false}
+      sourceControlAvailable={false}
     >
       <div>content</div>
     </RightPanelTabs>,

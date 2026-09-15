@@ -213,6 +213,7 @@ import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavaila
 import { SourceControlPanel } from "./source-control/SourceControlPanel";
 import SourceControlActions from "./source-control/SourceControlActions";
 import { RightPanelTabs } from "./RightPanelTabs";
+import { getSourceControlPresentation } from "../sourceControlPresentation";
 import { SecondaryPaneShell } from "./workspace/SecondaryPaneShell";
 import { SecondaryPaneTabs } from "./workspace/SecondaryPaneTabs";
 import { AgentsPanel } from "./AgentsPanel";
@@ -1898,7 +1899,8 @@ export default function ChatView(props: ChatViewProps) {
   const canMaximizeSecondaryPane = secondaryPaneOpen && !secondaryPaneIsStacked;
   const secondaryPaneMaximized =
     canMaximizeSecondaryPane && maximizedSecondaryPaneThreadKey === routeThreadKey;
-  const inlineRightPanelOwnsTitleBar = rightPanelOpen && !shouldUseRightPanelSheet;
+  const inlineRightPanelOwnsTitleBar =
+    rightPanelOpen && activeRightPanelSurface !== null && !shouldUseRightPanelSheet;
 
   useEffect(() => {
     if (!activeThreadRef) return;
@@ -3556,6 +3558,10 @@ export default function ChatView(props: ChatViewProps) {
           input: { cwd: gitStatusCwd },
         }),
   );
+  const rightPanelSourceControlPresentation =
+    activeProject && gitStatusQuery.data?.sourceControlProvider
+      ? getSourceControlPresentation(gitStatusQuery.data.sourceControlProvider)
+      : null;
   useWorkspaceMutationRefresh({
     enabled: gitStatusCwd !== null,
     mutationId: workspaceMutationId,
@@ -6567,6 +6573,55 @@ export default function ChatView(props: ChatViewProps) {
         if (!event.repeat) useRightPanelStore.getState().openSourceControl(activeThreadRef);
         return;
       }
+      if (command === "rightPanel.openBrowser") {
+        if (!isPreviewSupportedInRuntime()) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (!event.repeat) createBrowserSurface();
+        return;
+      }
+      if (command === "rightPanel.openFiles") {
+        if (!activeThreadRef || !activeProject) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (!event.repeat) addFilesSurface();
+        return;
+      }
+      if (command === "rightPanel.openSourceControl") {
+        if (!activeThreadRef || !activeProject) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (!event.repeat) addSourceControlSurface();
+        return;
+      }
+      if (command === "rightPanel.openAgents") {
+        if (!activeThreadRef) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (!event.repeat) addAgentsSurface();
+        return;
+      }
+      if (command === "rightPanel.openPullRequest") {
+        if (!pullRequestSurfaceAvailable) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (!event.repeat) addPullRequestSurface();
+        return;
+      }
+      if (command === "rightPanel.openLinkedPullRequests") {
+        if (!pullRequestsSurfaceAvailable) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (!event.repeat) addPullRequestsSurface();
+        return;
+      }
+      if (command === "rightPanel.openDevice") {
+        if (!activeThreadRef) return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (!event.repeat) addDeviceSurface();
+        return;
+      }
 
       if (command === "modelPicker.toggle") {
         event.preventDefault();
@@ -9527,9 +9582,11 @@ export default function ChatView(props: ChatViewProps) {
           filesAvailable={activeProject !== null}
           pullRequestAvailable={pullRequestSurfaceAvailable}
           pullRequestsAvailable={pullRequestsSurfaceAvailable}
-          agentsAvailable
+          agentsAvailable={activeThreadRef !== null}
           deviceAvailable={activeThreadRef !== null}
           sourceControlAvailable={activeProject !== null}
+          sourceControlProviderName={rightPanelSourceControlPresentation?.providerName}
+          sourceControlIcon={rightPanelSourceControlPresentation?.Icon}
           liveAgentCount={agentPanelModel.liveCount}
         >
           {rightPanelContent}
@@ -9584,9 +9641,11 @@ export default function ChatView(props: ChatViewProps) {
             filesAvailable={activeProject !== null}
             pullRequestAvailable={pullRequestSurfaceAvailable}
             pullRequestsAvailable={pullRequestsSurfaceAvailable}
-            agentsAvailable
+            agentsAvailable={activeThreadRef !== null}
             deviceAvailable={activeThreadRef !== null}
             sourceControlAvailable={activeProject !== null}
+            sourceControlProviderName={rightPanelSourceControlPresentation?.providerName}
+            sourceControlIcon={rightPanelSourceControlPresentation?.Icon}
             liveAgentCount={agentPanelModel.liveCount}
           >
             {rightPanelContent}

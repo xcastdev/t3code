@@ -852,14 +852,14 @@ describe("rightPanelStore", () => {
     });
   });
 
-  it("closing all surfaces closes the panel", () => {
+  it("closing all surfaces retains the visible empty rail", () => {
     useRightPanelStore.getState().openBrowser(refA, "tab-a");
     useRightPanelStore.getState().openFile(refA, "src/index.ts");
 
     useRightPanelStore.getState().closeAllSurfaces(refA);
 
     expect(selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA)).toEqual({
-      isOpen: false,
+      isOpen: true,
       activeSurfaceId: null,
       surfaces: [],
     });
