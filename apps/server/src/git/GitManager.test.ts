@@ -5969,6 +5969,9 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       expect(Buffer.byteLength(JSON.stringify(status.workingTree), "utf8")).toBeLessThanOrEqual(
         48 * 1024,
       );
+      // The 48KiB preview allowance leaves a measured 16KiB envelope headroom.
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      expect(Buffer.byteLength(JSON.stringify(status), "utf8")).toBeLessThanOrEqual(64 * 1024);
       expect(status.workingTree.nextCursor).not.toBeNull();
       const page = yield* manager.workingTreePage({
         cwd: repoDir,

@@ -46,6 +46,15 @@ export function buildGitCommitFilePaths(selection: GitCommitFileSelection): stri
   return selection.mode === "all" ? undefined : [...selection.paths];
 }
 
+/** Snapshot sequence IDs are scoped to one environment repository. */
+export function workingTreeSnapshotScope(
+  environmentId: string | null,
+  cwd: string | null,
+  snapshotId: string | null,
+): string {
+  return `${environmentId ?? ""}\0${cwd ?? ""}\0${snapshotId ?? ""}`;
+}
+
 export type DefaultBranchConfirmableAction =
   | "push"
   | "create_pr"

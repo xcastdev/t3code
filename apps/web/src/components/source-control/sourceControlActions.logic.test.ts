@@ -2,6 +2,7 @@ import type { VcsStatusResult } from "@t3tools/contracts";
 import { assert, describe, it } from "vite-plus/test";
 import {
   buildGitCommitFilePaths,
+  workingTreeSnapshotScope,
   buildGitActionProgressStages,
   buildMenuItems,
   requiresDefaultBranchConfirmation,
@@ -1164,6 +1165,15 @@ describe("buildGitCommitFilePaths", () => {
         paths: new Set(["preview-file.ts", "off-page-file.ts"]),
       }),
       ["preview-file.ts", "off-page-file.ts"],
+    );
+  });
+});
+
+describe("workingTreeSnapshotScope", () => {
+  it("does not let same-named snapshots collide across environment repositories", () => {
+    assert.notEqual(
+      workingTreeSnapshotScope("environment-a", "/repo-a", "wt-1"),
+      workingTreeSnapshotScope("environment-b", "/repo-b", "wt-1"),
     );
   });
 });

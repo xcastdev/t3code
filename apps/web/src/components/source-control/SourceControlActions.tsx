@@ -31,6 +31,7 @@ import {
 } from "lucide-react";
 import {
   buildGitCommitFilePaths,
+  workingTreeSnapshotScope,
   buildGitActionProgressStages,
   buildMenuItems,
   type GitActionIconName,
@@ -317,7 +318,7 @@ export default function SourceControlActions({
   const [selection, setSelection] = useState<GitCommitFileSelection>({ mode: "all" });
   const [isEditingFiles, setIsEditingFiles] = useState(false);
   const [loadedWorkingTree, setLoadedWorkingTree] = useState<{
-    readonly snapshotId: string | null;
+    readonly scope: string;
     readonly files: readonly VcsWorkingTreeFile[];
   } | null>(null);
   const [visibleFileCount, setVisibleFileCount] = useState(COMMIT_FILE_CHOOSER_WINDOW_SIZE);
@@ -326,6 +327,7 @@ export default function SourceControlActions({
     useState<PendingDefaultBranchAction | null>(null);
   const activeGitActionProgressRef = useRef<ActiveGitActionProgress | null>(null);
   const workingTreeLoadRequestId = useRef(0);
+  const workingTreeScopeRef = useRef("");
   const sourceControlScope = useMemo(
     () => ({ environmentId: activeEnvironmentId, cwd: gitCwd }),
     [activeEnvironmentId, gitCwd],
@@ -430,8 +432,12 @@ export default function SourceControlActions({
   const gitStatusForActions = gitStatus;
 
   const statusSnapshotId = gitStatusForActions?.workingTree.snapshotId ?? null;
+  // Snapshot counters are server-local. Include transport scope so `wt-1` on
+  // another environment can never reuse rows or settle an older request.
+  const workingTreeScope = workingTreeSnapshotScope(activeEnvironmentId, gitCwd, statusSnapshotId);
+  workingTreeScopeRef.current = workingTreeScope;
   const allFiles =
-    loadedWorkingTree?.snapshotId === statusSnapshotId
+    loadedWorkingTree?.scope === workingTreeScope
       ? loadedWorkingTree.files
       : (gitStatusForActions?.workingTree.files ?? []);
   const totalFileCount = gitStatusForActions?.workingTree.totalCount ?? allFiles.length;
@@ -458,7 +464,7 @@ export default function SourceControlActions({
     setLoadedWorkingTree(null);
     setIsEditingFiles(false);
     setVisibleFileCount(COMMIT_FILE_CHOOSER_WINDOW_SIZE);
-  }, [statusSnapshotId]);
+  }, [workingTreeScope]);
 
   useEffect(
     () => () => {
@@ -471,6 +477,7 @@ export default function SourceControlActions({
     if (!gitStatusForActions || activeEnvironmentId === null || gitCwd === null) return false;
     const requestId = workingTreeLoadRequestId.current + 1;
     workingTreeLoadRequestId.current = requestId;
+    const requestScope = workingTreeScope;
     const snapshotId = gitStatusForActions.workingTree.snapshotId;
     if (snapshotId === undefined) {
       // Legacy servers provide their complete list in the status response.
@@ -483,7 +490,11 @@ export default function SourceControlActions({
         environmentId: activeEnvironmentId,
         input: { cwd: gitCwd, snapshotId, cursor },
       });
-      if (requestId !== workingTreeLoadRequestId.current) return false;
+      if (
+        requestId !== workingTreeLoadRequestId.current ||
+        requestScope !== workingTreeScopeRef.current
+      )
+        return false;
       if (result._tag === "Failure") {
         if (!isAtomCommandInterrupted(result)) {
           const failure = squashAtomCommandFailure(result);
@@ -509,10 +520,21 @@ export default function SourceControlActions({
       files.push(...result.value.files.filter((file) => !existing.has(file.path)));
       cursor = result.value.nextCursor;
     }
-    if (requestId !== workingTreeLoadRequestId.current) return false;
-    setLoadedWorkingTree({ snapshotId, files });
+    if (
+      requestId !== workingTreeLoadRequestId.current ||
+      requestScope !== workingTreeScopeRef.current
+    )
+      return false;
+    setLoadedWorkingTree({ scope: requestScope, files });
     return true;
-  }, [activeEnvironmentId, gitCwd, gitStatusForActions, loadWorkingTreePage, threadToastData]);
+  }, [
+    activeEnvironmentId,
+    gitCwd,
+    gitStatusForActions,
+    loadWorkingTreePage,
+    threadToastData,
+    workingTreeScope,
+  ]);
 
   const beginEditingFiles = useCallback(() => {
     void (async () => {
