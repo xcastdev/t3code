@@ -118,6 +118,16 @@ export function shouldShowOpenInPicker(input: {
   return input.remoteOpenMode !== "local-exec";
 }
 
+export function resolveChatHeaderActionLayout(input: {
+  readonly hasScripts: boolean;
+  readonly showOpenInPicker: boolean;
+}): "combined" | "scripts" | "open-in" | "none" {
+  if (input.hasScripts && input.showOpenInPicker) return "combined";
+  if (input.hasScripts) return "scripts";
+  if (input.showOpenInPicker) return "open-in";
+  return "none";
+}
+
 export const ChatHeader = memo(function ChatHeader({
   activeThreadEnvironmentId,
   activeThreadId,
@@ -168,6 +178,10 @@ export const ChatHeader = memo(function ChatHeader({
     activeThreadEnvironmentId,
     primaryEnvironmentId,
     remoteOpenMode: remoteOpenState.mode,
+  });
+  const actionLayout = resolveChatHeaderActionLayout({
+    hasScripts: activeProjectScripts !== undefined,
+    showOpenInPicker,
   });
   const activeThreadRef = useMemo(
     () => scopeThreadRef(activeThreadEnvironmentId, activeThreadId),
@@ -409,10 +423,21 @@ export const ChatHeader = memo(function ChatHeader({
           "[[data-panel-animations=true]_&]:motion-safe:transition-[padding-right] [[data-panel-animations=true]_&]:motion-safe:[transition-duration:var(--panel-animation-duration)] [[data-panel-animations=true]_&]:motion-safe:ease-out",
         )}
       >
-        {activeProjectScripts && (
+        {actionLayout === "combined" ? (
           <ProjectScriptsControl
-            scripts={activeProjectScripts}
+            scripts={activeProjectScripts!}
             fileScripts={fileScripts}
+            split
+            selectionKey={`${activeThreadEnvironmentId}:${activeProjectCwd ?? activeProjectName}`}
+            menuContents={
+              <OpenInPicker
+                environmentId={activeThreadEnvironmentId}
+                keybindings={keybindings}
+                availableEditors={availableEditors}
+                openInCwd={openInCwd}
+                menu
+              />
+            }
             keybindings={keybindings}
             preferredScriptId={preferredScriptId}
             onRunScript={onRunProjectScript}
@@ -420,14 +445,29 @@ export const ChatHeader = memo(function ChatHeader({
             onUpdateScript={onUpdateProjectScript}
             onDeleteScript={onDeleteProjectScript}
           />
-        )}
-        {showOpenInPicker && (
-          <OpenInPicker
-            environmentId={activeThreadEnvironmentId}
-            keybindings={keybindings}
-            availableEditors={availableEditors}
-            openInCwd={openInCwd}
-          />
+        ) : (
+          <>
+            {actionLayout === "scripts" && activeProjectScripts && (
+              <ProjectScriptsControl
+                scripts={activeProjectScripts}
+                fileScripts={fileScripts}
+                keybindings={keybindings}
+                preferredScriptId={preferredScriptId}
+                onRunScript={onRunProjectScript}
+                onAddScript={onAddProjectScript}
+                onUpdateScript={onUpdateProjectScript}
+                onDeleteScript={onDeleteProjectScript}
+              />
+            )}
+            {actionLayout === "open-in" && (
+              <OpenInPicker
+                environmentId={activeThreadEnvironmentId}
+                keybindings={keybindings}
+                availableEditors={availableEditors}
+                openInCwd={openInCwd}
+              />
+            )}
+          </>
         )}
         {activeProjectName && (
           <GitActionsControl

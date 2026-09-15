@@ -1,7 +1,22 @@
 import { EnvironmentId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { resolveRenameCommit, shouldShowOpenInPicker } from "./ChatHeader";
+import {
+  resolveChatHeaderActionLayout,
+  resolveRenameCommit,
+  shouldShowOpenInPicker,
+} from "./ChatHeader";
+
+describe("resolveChatHeaderActionLayout", () => {
+  it.each([
+    [true, true, "combined"],
+    [true, false, "scripts"],
+    [false, true, "open-in"],
+    [false, false, "none"],
+  ] as const)("maps scripts=%s and open-in=%s to %s", (hasScripts, showOpenInPicker, expected) => {
+    expect(resolveChatHeaderActionLayout({ hasScripts, showOpenInPicker })).toBe(expected);
+  });
+});
 
 describe("shouldShowOpenInPicker", () => {
   const primaryEnvironmentId = EnvironmentId.make("environment-primary");

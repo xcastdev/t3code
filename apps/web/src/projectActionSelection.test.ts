@@ -27,4 +27,20 @@ describe("project action selection", () => {
       resolveProjectActionSelection(scripts, null, { kind: "script", scriptId: "gone" }),
     ).toEqual({ kind: "script", scriptId: "dev" });
   });
+
+  it("clears a stale selection when changing projects", () => {
+    const nextScripts: readonly ProjectScript[] = [
+      {
+        id: "build",
+        name: "Build",
+        command: "vp build",
+        icon: "play",
+        runOnWorktreeCreate: false,
+      },
+    ];
+
+    expect(
+      resolveProjectActionSelection(nextScripts, "build", { kind: "script", scriptId: "dev" }),
+    ).toEqual({ kind: "script", scriptId: "build" });
+  });
 });

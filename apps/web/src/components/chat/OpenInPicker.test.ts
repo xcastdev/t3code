@@ -2,7 +2,17 @@ import { FolderClosedIcon } from "lucide-react";
 import { describe, expect, it } from "vite-plus/test";
 
 import { FileExplorerIcon, FinderIcon } from "../Icons";
-import { resolveOpenInOptions } from "./OpenInPicker";
+import { resolveOpenInOptions, resolveOpenInPickerPresentation } from "./OpenInPicker";
+
+describe("resolveOpenInPickerPresentation", () => {
+  it("renders the Open With submenu when embedded in the project-actions menu", () => {
+    expect(resolveOpenInPickerPresentation(true)).toBe("submenu");
+  });
+
+  it("renders the standalone editor control otherwise", () => {
+    expect(resolveOpenInPickerPresentation(false)).toBe("toolbar");
+  });
+});
 
 describe("resolveOpenInOptions", () => {
   it.each([
