@@ -79,7 +79,11 @@ import { isElectron } from "../env";
 import { useTerminalFocus } from "../hooks/useTerminalFocus";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
 import { releaseProjectDraftUploads } from "../lib/composerDraftUploads";
-import { removeThreadPaneState } from "../paneStateCleanup";
+import {
+  collectProjectThreadRefs,
+  removeProjectPaneStateAfterSuccessfulDeletion,
+} from "../paneStateCleanup";
+import { useArchivedThreadSnapshots } from "../lib/archivedThreadsState";
 import { isTerminalFocused } from "../lib/terminalFocus";
 import { isMacPlatform } from "../lib/utils";
 import { useSidebarPendingFileDropStore } from "../sidebarPendingFileDropStore";
@@ -1245,6 +1249,11 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   });
   const openPrLink = useOpenPrLink();
   const sidebarThreads = useThreadShellsForProjectRefs(project.memberProjectRefs);
+  const archivedEnvironmentIds = useMemo(
+    () => [...new Set(project.memberProjectRefs.map((ref) => ref.environmentId))],
+    [project.memberProjectRefs],
+  );
+  const { snapshots: archivedSnapshots } = useArchivedThreadSnapshots(archivedEnvironmentIds);
   const sidebarThreadByKey = useMemo(
     () =>
       new Map(
@@ -1508,12 +1517,11 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   const removeProject = useCallback(
     async (member: SidebarProjectGroupMember) => {
       const memberProjectRef = scopeProjectRef(member.environmentId, member.id);
-      const projectThreadRefs = sidebarThreads
-        .filter(
-          (thread) =>
-            thread.environmentId === member.environmentId && thread.projectId === member.id,
-        )
-        .map((thread) => scopeThreadRef(thread.environmentId, thread.id));
+      const projectThreadRefs = collectProjectThreadRefs({
+        projectRefs: [memberProjectRef],
+        activeThreads: sidebarThreads,
+        archivedSnapshots,
+      });
       const result = await deleteProject({
         environmentId: member.environmentId,
         input: {
@@ -1524,9 +1532,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       if (result._tag === "Failure") {
         return result;
       }
-      for (const threadRef of projectThreadRefs) {
-        removeThreadPaneState(threadRef);
-      }
+      removeProjectPaneStateAfterSuccessfulDeletion(result, projectThreadRefs);
       const draftStore = useComposerDraftStore.getState();
       releaseProjectDraftUploads(memberProjectRef, projectThreadRefs);
       const projectDraftThread = draftStore.getDraftThreadByProjectRef(memberProjectRef);
@@ -1536,7 +1542,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       draftStore.clearProjectDraftThreadId(memberProjectRef);
       return result;
     },
-    [deleteProject, sidebarThreads],
+    [archivedSnapshots, deleteProject, sidebarThreads],
   );
 
   const handleRemoveProject = useCallback(

@@ -6,6 +6,7 @@ import {
   createEnvironmentShellAtoms,
   createEnvironmentSnapshotAtom,
   createShellEnvironmentAtoms,
+  type EnvironmentShellThreadRemoval,
   type EnvironmentShellState,
 } from "@t3tools/client-runtime/state/shell";
 import {
@@ -23,12 +24,15 @@ import { isHostedStaticApp } from "../hostedPairing";
 import { removeThreadPaneState } from "../paneStateCleanup";
 
 export const shellEnvironment = createShellEnvironmentAtoms(connectionAtomRuntime);
+
+export function handleEnvironmentShellThreadRemoval(removal: EnvironmentShellThreadRemoval): void {
+  if (removal.event.reason !== "deleted") return;
+  removeThreadPaneState(scopeThreadRef(removal.environmentId, removal.event.threadId));
+}
+
 export const environmentShell = createEnvironmentShellAtoms(
   connectionAtomRuntime,
-  ({ environmentId, event }) => {
-    if (event.reason !== "deleted") return;
-    removeThreadPaneState(scopeThreadRef(environmentId, event.threadId));
-  },
+  handleEnvironmentShellThreadRemoval,
 );
 export const environmentSnapshotAtom = createEnvironmentSnapshotAtom(environmentShell.stateAtom);
 

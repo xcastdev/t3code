@@ -339,7 +339,16 @@ describe("environment shell synchronization", () => {
       const snapshotLoader = ShellSnapshotLoader.of({
         load: () => Ref.update(loaderCalls, (count) => count + 1).pipe(Effect.as(Option.none())),
       });
-      const shellState = yield* makeEnvironmentShellState().pipe(
+      const removals: Array<{
+        readonly sequence: number;
+        readonly reason?: "deleted" | "archived";
+      }> = [];
+      const shellState = yield* makeEnvironmentShellState(({ event }) => {
+        removals.push({
+          sequence: event.sequence,
+          ...(event.reason === undefined ? {} : { reason: event.reason }),
+        });
+      }).pipe(
         Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
         Effect.provideService(Persistence.EnvironmentCacheStore, cache),
         Effect.provideService(ShellSnapshotLoader, snapshotLoader),
@@ -356,6 +365,7 @@ describe("environment shell synchronization", () => {
       const synchronizing = yield* SubscriptionRef.get(shellState);
       expect(synchronizing.status).toBe("synchronizing");
       expect(Option.getOrThrow(synchronizing.snapshot)).toEqual(cachedSnapshot);
+      expect(removals).toEqual([]);
 
       yield* Queue.offer(events, { kind: "snapshot", snapshot: resetSnapshot });
       yield* Queue.offer(events, { kind: "synchronized" });
@@ -367,6 +377,7 @@ describe("environment shell synchronization", () => {
       const live = yield* SubscriptionRef.get(shellState);
       expect(Option.getOrThrow(live.snapshot)).toEqual(resetSnapshot);
       expect(yield* Ref.get(loaderCalls)).toBe(1);
+      expect(removals).toEqual([]);
 
       yield* Queue.offer(wakeups, "application-active");
       const resumedInput = yield* Queue.take(subscribeInputs);

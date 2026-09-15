@@ -4,12 +4,18 @@ import {
 } from "@t3tools/client-runtime/connection";
 import type { EnvironmentCatalogState } from "@t3tools/client-runtime/state/connections";
 import type { EnvironmentShellState } from "@t3tools/client-runtime/state/shell";
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import * as Option from "effect/Option";
 import { Atom, AtomRegistry } from "effect/unstable/reactivity";
-import { describe, expect, it } from "vite-plus/test";
+import { beforeEach, describe, expect, it } from "vite-plus/test";
 
-import { createAllEnvironmentProjectSnapshotsReadyAtom } from "./shell";
+import {
+  handleEnvironmentShellThreadRemoval,
+  createAllEnvironmentProjectSnapshotsReadyAtom,
+} from "./shell";
+import { useRightPanelStore } from "../rightPanelStore";
+import { useSecondaryPaneStore } from "../secondaryPaneStore";
+import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 
 const LOCAL = EnvironmentId.make("local");
 const REMOTE = EnvironmentId.make("remote");
@@ -133,4 +139,51 @@ describe("project snapshot readiness", () => {
     expect(registry.get(ready)).toBe(true);
     registry.dispose();
   });
+});
+
+describe("web shell thread-removal owner", () => {
+  const ref = scopeThreadRef(
+    EnvironmentId.make("web-shell-env"),
+    ThreadId.make("web-shell-thread"),
+  );
+
+  beforeEach(() => {
+    useRightPanelStore.setState({ byThreadKey: {}, userActionRevisionByThreadKey: {} });
+    useSecondaryPaneStore.setState({ byThreadKey: {} });
+    useRightPanelStore.getState().open(ref, "files");
+    useSecondaryPaneStore.getState().openFile(ref, "src/index.ts");
+  });
+
+  it("clears both pane stores for an accepted live deleted event", () => {
+    handleEnvironmentShellThreadRemoval({
+      environmentId: ref.environmentId,
+      event: {
+        kind: "thread-removed",
+        sequence: 2,
+        threadId: ref.threadId,
+        reason: "deleted",
+      },
+    });
+
+    expect(useRightPanelStore.getState().byThreadKey).toEqual({});
+    expect(useSecondaryPaneStore.getState().byThreadKey).toEqual({});
+  });
+
+  it.each(["archived", undefined] as const)(
+    "does not clear pane state for a %s removal reason",
+    (reason) => {
+      handleEnvironmentShellThreadRemoval({
+        environmentId: ref.environmentId,
+        event: {
+          kind: "thread-removed",
+          sequence: 2,
+          threadId: ref.threadId,
+          ...(reason === undefined ? {} : { reason }),
+        },
+      });
+
+      expect(Object.keys(useRightPanelStore.getState().byThreadKey)).toHaveLength(1);
+      expect(Object.keys(useSecondaryPaneStore.getState().byThreadKey)).toHaveLength(1);
+    },
+  );
 });
