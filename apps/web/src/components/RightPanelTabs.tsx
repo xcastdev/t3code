@@ -12,7 +12,6 @@ import type {
   ProjectId,
   PullRequestState,
 } from "@t3tools/contracts";
-import { getTerminalLabel } from "@t3tools/shared/terminalLabels";
 import {
   Bot,
   Smartphone,
@@ -26,7 +25,6 @@ import {
   GitBranch,
   Globe2,
   Plus,
-  TerminalSquare,
   Volume2,
   VolumeOff,
 } from "lucide-react";
@@ -97,7 +95,6 @@ interface RightPanelTabsProps {
    * process, so desktop operations must not be addressed with them.
    */
   previewRuntimeTabId?: ((tabId: string) => string) | undefined;
-  terminalLabelsById: ReadonlyMap<string, string>;
   onActivate: (surface: RightPanelSurface) => void;
   onRenameDevice?: (surfaceId: string, title: string) => void;
   onCloseSurface: (surface: RightPanelSurface) => void;
@@ -112,7 +109,6 @@ interface RightPanelTabsProps {
    * accept the MouseEvent as a profile id.
    */
   onAddBrowserInProfile: (profileId: string) => void;
-  onAddTerminal: () => void;
   onAddDiff: () => void;
   onAddFiles: () => void;
   onAddPullRequest: () => void;
@@ -121,7 +117,6 @@ interface RightPanelTabsProps {
   onAddDevice: () => void;
   onAddSourceControl?: () => void;
   browserAvailable: boolean;
-  terminalAvailable: boolean;
   diffAvailable: boolean;
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
@@ -153,7 +148,6 @@ export function shouldOpenDefaultBrowserProfileFromMenuClick(
 
 const SURFACE_DISABLED_REASONS = {
   browser: "Browser previews are only available in the T3 Code desktop app.",
-  terminal: "Terminal surfaces are only available from a project thread.",
   files: "Files are only available when a project is open.",
   diff: "Diff is only available for server threads in Git repositories.",
   pullRequest: "This thread's branch has no pull request yet.",
@@ -178,7 +172,6 @@ const LAUNCHER_SHORTCUT_BLOCKING_LAYERS = [
 /** One-line unavailability hints for the empty-state rows. */
 const SURFACE_UNAVAILABLE_HINTS = {
   browser: "Only available in the desktop app.",
-  terminal: "Available when a project is open.",
   files: "Available when a project is open.",
   diff: "Available for Git repositories.",
   pullRequest: "No pull request on this branch yet.",
@@ -322,7 +315,6 @@ function RightPanelEmptyState(props: {
     readonly id: string;
     readonly name: string;
   }>;
-  onAddTerminal: () => void;
   onAddDiff: () => void;
   onAddFiles: () => void;
   onAddPullRequest: () => void;
@@ -330,7 +322,6 @@ function RightPanelEmptyState(props: {
   onAddAgents: () => void;
   onAddDevice: () => void;
   browserAvailable: boolean;
-  terminalAvailable: boolean;
   diffAvailable: boolean;
   filesAvailable: boolean;
   pullRequestAvailable: boolean;
@@ -350,15 +341,6 @@ function RightPanelEmptyState(props: {
       available: props.browserAvailable,
       disabledReason: SURFACE_UNAVAILABLE_HINTS.browser,
       onClick: props.onAddBrowser,
-      badgeCount: 0,
-    },
-    {
-      label: "Terminal",
-      icon: TerminalSquare,
-      shortcut: "T",
-      available: props.terminalAvailable,
-      disabledReason: SURFACE_UNAVAILABLE_HINTS.terminal,
-      onClick: props.onAddTerminal,
       badgeCount: 0,
     },
     {
@@ -616,7 +598,6 @@ function RightPanelEmptyState(props: {
 function surfaceTitle(
   surface: RightPanelSurface,
   sessions: Readonly<Record<string, PreviewSessionSnapshot>>,
-  terminalLabelsById: ReadonlyMap<string, string>,
 ): string {
   switch (surface.kind) {
     case "diff":
@@ -626,11 +607,6 @@ function surfaceTitle(
     case "file":
       return surface.relativePath.slice(
         Math.max(surface.relativePath.lastIndexOf("/"), surface.relativePath.lastIndexOf("\\")) + 1,
-      );
-    case "terminal":
-      return (
-        terminalLabelsById.get(surface.activeTerminalId) ??
-        getTerminalLabel(surface.activeTerminalId)
       );
     case "pull-request":
       return `#${surface.number}`;
@@ -711,8 +687,6 @@ function SurfaceIcon({
           className="size-3"
         />
       );
-    case "terminal":
-      return <TerminalSquare className="size-3 shrink-0" />;
     case "pull-request":
       return (
         <PullRequestSurfaceIcon
@@ -883,14 +857,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       available: props.browserAvailable,
       disabledReason: SURFACE_DISABLED_REASONS.browser,
       onClick: props.onAddBrowser,
-    },
-    {
-      label: "Terminal",
-      icon: TerminalSquare,
-      shortcut: "T",
-      available: props.terminalAvailable,
-      disabledReason: SURFACE_DISABLED_REASONS.terminal,
-      onClick: props.onAddTerminal,
     },
     {
       label: "Files",
@@ -1157,7 +1123,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             {props.surfaces.map((surface) => {
               const active = surface.id === props.activeSurfaceId;
               const pending = props.pendingSurfaceIds.has(surface.id);
-              const title = surfaceTitle(surface, props.previewSessions, props.terminalLabelsById);
+              const title = surfaceTitle(surface, props.previewSessions);
               const previewTabId = previewTabIdOf(surface, props.previewSessions);
               // Desktop state is keyed by the session id, but desktop actions
               // must be addressed with the runtime id.
@@ -1422,7 +1388,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             onAddBrowser={props.onAddBrowser}
             onAddBrowserInProfile={props.onAddBrowserInProfile}
             browserProfiles={browserProfiles}
-            onAddTerminal={props.onAddTerminal}
             onAddDiff={props.onAddDiff}
             onAddFiles={props.onAddFiles}
             onAddPullRequest={props.onAddPullRequest}
@@ -1430,7 +1395,6 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             onAddAgents={props.onAddAgents}
             onAddDevice={props.onAddDevice}
             browserAvailable={props.browserAvailable}
-            terminalAvailable={props.terminalAvailable}
             diffAvailable={props.diffAvailable}
             filesAvailable={props.filesAvailable}
             pullRequestAvailable={props.pullRequestAvailable}

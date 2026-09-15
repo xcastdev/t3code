@@ -65,7 +65,7 @@ describe("isTerminalFocused", () => {
     expect(isTerminalFocused()).toBe(true);
   });
 
-  it("returns the right panel owner for focus inside its terminal UI", () => {
+  it("ignores a legacy right panel terminal owner", () => {
     const sidebarButton = new MockHTMLElement();
     sidebarButton.className = "terminal-sidebar-button";
     sidebarButton.isConnected = true;
@@ -75,7 +75,7 @@ describe("isTerminalFocused", () => {
     globalThis.HTMLElement = MockHTMLElement as unknown as typeof HTMLElement;
     globalThis.document = { activeElement: sidebarButton } as unknown as Document;
 
-    expect(getTerminalFocusOwner()).toBe("right-panel");
-    expect(isTerminalFocused()).toBe(true);
+    expect(getTerminalFocusOwner()).toBeNull();
+    expect(isTerminalFocused()).toBe(false);
   });
 });

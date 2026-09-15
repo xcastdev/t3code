@@ -17,6 +17,7 @@ import {
   SquareSplitVertical,
   TerminalSquare,
   Trash2,
+  X,
 } from "lucide-react";
 import {
   type ContextMenuItem,
@@ -987,7 +988,6 @@ export function TerminalViewport({
 }
 
 interface ThreadTerminalDrawerProps {
-  mode?: "drawer" | "panel";
   threadRef: ScopedThreadRef;
   threadId: ThreadId;
   cwd: string;
@@ -1009,6 +1009,7 @@ interface ThreadTerminalDrawerProps {
   closeShortcutLabel?: string | undefined;
   onActiveTerminalChange: (terminalId: string) => void;
   onCloseTerminal: (terminalId: string) => void;
+  onCollapse: () => void;
   onHeightChange: (height: number) => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
   keybindings: ResolvedKeybindingsConfig;
@@ -1047,8 +1048,18 @@ function TerminalActionButton({ label, className, onClick, children }: TerminalA
   );
 }
 
+export function terminalDrawerControlHandlers(input: {
+  activeTerminalId: string;
+  onCollapse: () => void;
+  onConfirmClose: (terminalId: string) => void;
+}) {
+  return {
+    collapse: input.onCollapse,
+    closeActive: () => input.onConfirmClose(input.activeTerminalId),
+  };
+}
+
 export default function ThreadTerminalDrawer({
-  mode = "drawer",
   threadRef,
   threadId,
   cwd,
@@ -1070,13 +1081,13 @@ export default function ThreadTerminalDrawer({
   closeShortcutLabel,
   onActiveTerminalChange,
   onCloseTerminal,
+  onCollapse,
   onHeightChange,
   onAddTerminalContext,
   keybindings,
   terminalLabelsById,
   terminalLaunchLocationsById,
 }: ThreadTerminalDrawerProps) {
-  const isPanel = mode === "panel";
   const [advancedTypography] = useLocalStorage(
     TYPOGRAPHY_ADVANCED_STORAGE_KEY,
     false,
@@ -1286,6 +1297,11 @@ export default function ThreadTerminalDrawer({
     },
     [onCloseTerminal, terminalLabelById],
   );
+  const terminalControls = terminalDrawerControlHandlers({
+    activeTerminalId: resolvedActiveTerminalId,
+    onCollapse,
+    onConfirmClose: confirmCloseTerminal,
+  });
 
   useEffect(() => {
     onHeightChangeRef.current = onHeightChange;
@@ -1392,22 +1408,17 @@ export default function ThreadTerminalDrawer({
   if (normalizedTerminalIds.length === 0) {
     return (
       <aside
-        data-terminal-owner={isPanel ? "right-panel" : "drawer"}
-        className={cn(
-          "thread-terminal-drawer relative flex min-w-0 flex-col overflow-hidden bg-background",
-          isPanel ? "h-full flex-1" : "shrink-0 border-t border-border/80",
-        )}
-        style={isPanel ? undefined : { height: `${drawerHeight}px` }}
+        data-terminal-owner="drawer"
+        className="thread-terminal-drawer relative flex min-w-0 shrink-0 flex-col overflow-hidden border-t border-border/80 bg-background"
+        style={{ height: `${drawerHeight}px` }}
       >
-        {!isPanel ? (
-          <div
-            className="absolute inset-x-0 top-0 z-20 h-1.5 cursor-row-resize"
-            onPointerDown={handleResizePointerDown}
-            onPointerMove={handleResizePointerMove}
-            onPointerUp={handleResizePointerEnd}
-            onPointerCancel={handleResizePointerEnd}
-          />
-        ) : null}
+        <div
+          className="absolute inset-x-0 top-0 z-20 h-1.5 cursor-row-resize"
+          onPointerDown={handleResizePointerDown}
+          onPointerMove={handleResizePointerMove}
+          onPointerUp={handleResizePointerEnd}
+          onPointerCancel={handleResizePointerEnd}
+        />
         <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-4 py-6 text-center text-sm text-muted-foreground">
           <p>No terminal sessions for this thread yet.</p>
           <Button size="xs" variant="outline" onClick={onNewTerminalAction}>
@@ -1422,22 +1433,17 @@ export default function ThreadTerminalDrawer({
 
   return (
     <aside
-      data-terminal-owner={isPanel ? "right-panel" : "drawer"}
-      className={cn(
-        "thread-terminal-drawer relative flex min-w-0 flex-col overflow-hidden bg-background",
-        isPanel ? "h-full flex-1" : "shrink-0 border-t border-border/80",
-      )}
-      style={isPanel ? undefined : { height: `${drawerHeight}px` }}
+      data-terminal-owner="drawer"
+      className="thread-terminal-drawer relative flex min-w-0 shrink-0 flex-col overflow-hidden border-t border-border/80 bg-background"
+      style={{ height: `${drawerHeight}px` }}
     >
-      {!isPanel ? (
-        <div
-          className="absolute inset-x-0 top-0 z-20 h-1.5 cursor-row-resize"
-          onPointerDown={handleResizePointerDown}
-          onPointerMove={handleResizePointerMove}
-          onPointerUp={handleResizePointerEnd}
-          onPointerCancel={handleResizePointerEnd}
-        />
-      ) : null}
+      <div
+        className="absolute inset-x-0 top-0 z-20 h-1.5 cursor-row-resize"
+        onPointerDown={handleResizePointerDown}
+        onPointerMove={handleResizePointerMove}
+        onPointerUp={handleResizePointerEnd}
+        onPointerCancel={handleResizePointerEnd}
+      />
 
       {!hasTerminalSidebar && (
         <div className="pointer-events-none absolute right-2 top-2 z-20">
@@ -1476,10 +1482,18 @@ export default function ThreadTerminalDrawer({
             <div className="h-4 w-px bg-border/80" />
             <TerminalActionButton
               className="p-1 text-foreground/90 transition-colors hover:bg-accent"
-              onClick={() => confirmCloseTerminal(resolvedActiveTerminalId)}
+              onClick={terminalControls.closeActive}
               label={closeTerminalActionLabel}
             >
               <Trash2 className="size-3.25" />
+            </TerminalActionButton>
+            <div className="h-4 w-px bg-border/80" />
+            <TerminalActionButton
+              className="p-1 text-foreground/90 transition-colors hover:bg-accent"
+              onClick={terminalControls.collapse}
+              label="Collapse terminal drawer"
+            >
+              <X className="size-3.25" />
             </TerminalActionButton>
           </div>
         </div>
@@ -1618,10 +1632,17 @@ export default function ThreadTerminalDrawer({
                   </TerminalActionButton>
                   <TerminalActionButton
                     className="inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors hover:bg-accent/70"
-                    onClick={() => confirmCloseTerminal(resolvedActiveTerminalId)}
+                    onClick={terminalControls.closeActive}
                     label={closeTerminalActionLabel}
                   >
                     <Trash2 className="size-3.25" />
+                  </TerminalActionButton>
+                  <TerminalActionButton
+                    className="inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors hover:bg-accent/70"
+                    onClick={terminalControls.collapse}
+                    label="Collapse terminal drawer"
+                  >
+                    <X className="size-3.25" />
                   </TerminalActionButton>
                 </div>
               </div>

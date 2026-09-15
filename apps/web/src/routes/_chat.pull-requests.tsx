@@ -1966,7 +1966,6 @@ function PullRequestsRouteView() {
             pendingSurfaceIds={EMPTY_PENDING_SURFACES}
             previewSessions={EMPTY_PREVIEW_SESSIONS}
             desktopByTabId={EMPTY_PREVIEW_DESKTOP_STATE}
-            terminalLabelsById={EMPTY_TERMINAL_LABELS}
             onActivate={(surface) => {
               if (surface.kind === "pull-request") activateSurface(surface);
             }}
@@ -1983,7 +1982,6 @@ function PullRequestsRouteView() {
             onCopyFilePath={() => undefined}
             onAddBrowser={() => undefined}
             onAddBrowserInProfile={() => undefined}
-            onAddTerminal={() => undefined}
             onAddDiff={() => undefined}
             onAddFiles={() => undefined}
             onAddPullRequest={() => undefined}
@@ -1991,7 +1989,6 @@ function PullRequestsRouteView() {
             onAddAgents={() => undefined}
             onAddDevice={() => undefined}
             browserAvailable={false}
-            terminalAvailable={false}
             diffAvailable={false}
             filesAvailable={false}
             pullRequestAvailable={false}

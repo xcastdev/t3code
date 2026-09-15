@@ -262,7 +262,20 @@ describe("terminalUiStateStore actions", () => {
     ]);
   });
 
-  it("does not import a closed panel terminal from stale metadata", () => {
+  it("keeps terminal sessions registered when the dock is collapsed", () => {
+    const store = useTerminalUiStateStore.getState();
+    store.newTerminal(THREAD_REF, "terminal-1");
+    store.setTerminalOpen(THREAD_REF, false);
+
+    expect(
+      selectThreadTerminalUiState(
+        useTerminalUiStateStore.getState().terminalUiStateByThreadKey,
+        THREAD_REF,
+      ),
+    ).toMatchObject({ terminalOpen: false, terminalIds: ["terminal-1"] });
+  });
+
+  it("does not restore a closed terminal from stale session metadata", () => {
     const store = useTerminalUiStateStore.getState();
     store.newTerminal(THREAD_REF, "term-2");
     store.closeTerminal(THREAD_REF, "term-1");

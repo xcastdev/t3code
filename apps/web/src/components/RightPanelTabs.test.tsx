@@ -108,7 +108,6 @@ function renderTabs(
         ...(second ? { "tab-2": overlay(second) } : {}),
       }}
       {...(previewRuntimeTabId ? { previewRuntimeTabId } : {})}
-      terminalLabelsById={new Map()}
       onActivate={() => undefined}
       onCloseSurface={() => undefined}
       onCloseOtherSurfaces={() => undefined}
@@ -117,7 +116,6 @@ function renderTabs(
       onCopyFilePath={() => undefined}
       onAddBrowser={() => undefined}
       onAddBrowserInProfile={() => undefined}
-      onAddTerminal={() => undefined}
       onAddPullRequest={() => undefined}
       onAddPullRequests={() => undefined}
       onAddDiff={() => undefined}
@@ -126,7 +124,6 @@ function renderTabs(
       onAddDevice={() => undefined}
       liveAgentCount={0}
       browserAvailable
-      terminalAvailable={false}
       diffAvailable={false}
       filesAvailable={false}
       pullRequestAvailable={false}
@@ -138,6 +135,50 @@ function renderTabs(
     </RightPanelTabs>,
   );
 }
+
+function renderEmptyTabs() {
+  return renderToStaticMarkup(
+    <RightPanelTabs
+      mode="inline"
+      surfaces={[]}
+      environmentId={null}
+      activeSurfaceId={null}
+      pendingSurfaceIds={new Set()}
+      previewSessions={{}}
+      desktopByTabId={{}}
+      onActivate={() => undefined}
+      onCloseSurface={() => undefined}
+      onCloseOtherSurfaces={() => undefined}
+      onCloseSurfacesToRight={() => undefined}
+      onCloseAllSurfaces={() => undefined}
+      onCopyFilePath={() => undefined}
+      onAddBrowser={() => undefined}
+      onAddBrowserInProfile={() => undefined}
+      onAddPullRequest={() => undefined}
+      onAddPullRequests={() => undefined}
+      onAddDiff={() => undefined}
+      onAddFiles={() => undefined}
+      onAddAgents={() => undefined}
+      onAddDevice={() => undefined}
+      liveAgentCount={0}
+      browserAvailable={false}
+      diffAvailable={false}
+      filesAvailable={false}
+      pullRequestAvailable={false}
+      pullRequestsAvailable={false}
+      agentsAvailable={false}
+      deviceAvailable={false}
+    >
+      <div>content</div>
+    </RightPanelTabs>,
+  );
+}
+
+describe("right-panel surface launcher", () => {
+  it("does not offer terminal as a right-panel surface", () => {
+    expect(renderEmptyTabs()).not.toContain("Terminal");
+  });
+});
 
 describe("RightPanelTabs preview favicon", () => {
   it("prefers a live capture and never asks Google about a private hostname", () => {

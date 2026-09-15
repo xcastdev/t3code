@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   shouldClearTerminalSelectionAction,
   shouldHandleTerminalExit,
+  terminalDrawerControlHandlers,
   terminalContextMenuItems,
   terminalSelectionLineRange,
   terminalSelectionMenuItems,
@@ -141,5 +142,26 @@ describe("terminal selection actions", () => {
     expect(shouldHandleTerminalExit("exited", "running", false)).toBe(true);
     expect(shouldHandleTerminalExit("exited", "exited", false)).toBe(false);
     expect(shouldHandleTerminalExit("closed", "running", true)).toBe(false);
+  });
+});
+
+describe("terminal drawer controls", () => {
+  it("collapses the dock without routing through the destructive close action", () => {
+    let collapsed = 0;
+    const closed: string[] = [];
+    const controls = terminalDrawerControlHandlers({
+      activeTerminalId: "terminal-1",
+      onCollapse: () => {
+        collapsed += 1;
+      },
+      onConfirmClose: (terminalId) => {
+        closed.push(terminalId);
+      },
+    });
+
+    controls.collapse();
+
+    expect(collapsed).toBe(1);
+    expect(closed).toEqual([]);
   });
 });
