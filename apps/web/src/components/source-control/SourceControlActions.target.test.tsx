@@ -23,6 +23,7 @@ const statusQuery = vi.hoisted(() => ({
   },
   error: null,
 }));
+const gitActionRun = vi.hoisted(() => vi.fn(() => Promise.resolve({ _tag: "Success", value: {} })));
 
 const sourceControlDiscovery = vi.hoisted(() => Symbol("source-control-discovery"));
 const sourceControlDiscoveryQuery = vi.hoisted(() => ({
@@ -89,7 +90,7 @@ vi.mock("~/sourceControlPresentation", () => ({
   }),
 }));
 vi.mock("~/lib/sourceControlActions", () => ({
-  useGitStackedAction: () => ({ run: vi.fn() }),
+  useGitStackedAction: () => ({ run: gitActionRun }),
   useSourceControlActionRunning: () => false,
   useVcsInitAction: () => ({ isPending: false, run: vi.fn() }),
   useVcsPullAction: () => ({ run: vi.fn() }),
@@ -116,7 +117,11 @@ vi.mock("../ui/button", () => ({
     <button {...props} />
   ),
 }));
-vi.mock("../ui/checkbox", () => ({ Checkbox: () => <input type="checkbox" /> }));
+vi.mock("../ui/checkbox", () => ({
+  Checkbox: ({ onCheckedChange, ...props }: { onCheckedChange?: () => void }) => (
+    <input type="checkbox" onChange={() => onCheckedChange?.()} {...props} />
+  ),
+}));
 vi.mock("../ui/radio-group", () => ({
   RadioGroup: ({
     children,
@@ -253,6 +258,7 @@ async function typeMessage(input: HTMLTextAreaElement, value: string): Promise<v
 
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  gitActionRun.mockClear();
   document.body.replaceChildren();
 });
 
@@ -264,6 +270,52 @@ afterEach(async () => {
 });
 
 describe("SourceControlActions target lifetime", () => {
+  it("windows a large chooser while preserving exact all and partial commit scopes", async () => {
+    statusQuery.data = {
+      ...statusQuery.data,
+      workingTree: {
+        files: Array.from({ length: 101 }, (_, index) => ({
+          path: `src/file-${String(index + 1).padStart(3, "0")}.ts`,
+          insertions: 1,
+          deletions: 0,
+          indexStatus: "unstaged" as const,
+        })),
+        insertions: 101,
+        deletions: 0,
+        totalCount: 101,
+      },
+    };
+    const host = document.createElement("div");
+    const target = document.createElement("div");
+    document.body.append(host, target);
+    const root = createRoot(host);
+    roots.push(root);
+    await render(root, target);
+    await act(async () => {
+      [...target.querySelectorAll("button")]
+        .filter((button) => button.textContent === "Commit")
+        .at(-1)
+        ?.click();
+    });
+    await act(async () => {
+      [...document.querySelectorAll("button")]
+        .find((button) => button.textContent === "Edit")
+        ?.click();
+    });
+    expect(document.querySelectorAll('input[type="checkbox"]')).toHaveLength(101);
+    expect(
+      [...document.querySelectorAll("button")].some((button) =>
+        button.textContent?.includes("Show 1more files"),
+      ),
+    ).toBe(true);
+    await act(async () => {
+      [...document.querySelectorAll("button")]
+        .find((button) => button.textContent?.includes("Show 1more files"))
+        ?.click();
+    });
+    expect(document.querySelectorAll('input[type="checkbox"]')).toHaveLength(102);
+  });
+
   it("keeps an open commit draft when its Source Control target disappears and returns", async () => {
     const host = document.createElement("div");
     const firstTarget = document.createElement("div");
