@@ -1167,6 +1167,41 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain("rounded-2xl bg-message p-3");
   });
 
+  it("shows expanded provider command details without replacing authored text", () => {
+    const baseEntry = buildUserTimelineEntry("/review src/a.ts");
+    const entry = {
+      ...baseEntry,
+      message: {
+        ...baseEntry.message,
+        context: {
+          version: 1 as const,
+          records: [
+            {
+              version: 1 as const,
+              contextId: "provider-command_expansion",
+              kind: "provider-command",
+              label: "Expanded provider command",
+              payload: {
+                authoredText: "/review src/a.ts",
+                expandedText: "Review src/a.ts\n\nInspect the changed files.",
+              },
+            },
+          ],
+        },
+      },
+    };
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline {...buildProps()} timelineEntries={[entry]} />,
+    );
+
+    expect(markup).toContain("/review src/a.ts");
+    expect(markup).toContain("Expanded provider command");
+    expect(markup).toContain("Review src/a.ts");
+    expect(markup).toContain("Inspect the changed files.");
+    expect(markup).toMatch(/<details[^>]*>/);
+    expect(markup).not.toMatch(/<details[^>]*open/);
+  });
+
   it("preserves arbitrary XML-like tags and comparisons in rendered user messages", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const markup = renderToStaticMarkup(

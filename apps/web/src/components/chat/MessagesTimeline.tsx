@@ -201,6 +201,7 @@ import {
 } from "../contextChipParts";
 import {
   asKnownContextRecord,
+  extractProviderCommandExpansion,
   isPullRequestSummaryContext,
   pullRequestContextDisplayState,
   pullRequestContextKindLabel,
@@ -1618,6 +1619,10 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
     (attachment) => !isImageAttachment(attachment) && !isFileAttachment(attachment),
   );
   const resolvedContext = useMemo(() => resolveUserMessageContext(row.message), [row.message]);
+  const providerCommandExpansion = useMemo(
+    () => extractProviderCommandExpansion(resolvedContext.records),
+    [resolvedContext.records],
+  );
   const previewImages = useMemo(
     () => userImages.filter((image) => image.name.startsWith("preview-annotation-")),
     [userImages],
@@ -1854,6 +1859,16 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
             markdownCwd={ctx.markdownCwd}
           />
         </div>
+        {providerCommandExpansion !== undefined ? (
+          <details className="mt-2 rounded-md border border-border/60 bg-background/30 px-2 py-1 text-xs">
+            <summary className="cursor-pointer select-none text-muted-foreground">
+              Expanded provider command
+            </summary>
+            <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words text-secondary-label">
+              {providerCommandExpansion.expandedText}
+            </pre>
+          </details>
+        ) : null}
       </div>
       <div className="flex w-full max-w-[80%] items-center justify-end pe-1 text-xs tabular-nums opacity-0 transition-opacity duration-200 pointer-coarse:opacity-100 focus-within:opacity-100 group-hover:opacity-100">
         <div className="flex shrink-0 items-center gap-2">

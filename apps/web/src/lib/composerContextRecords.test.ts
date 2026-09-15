@@ -20,12 +20,14 @@ import {
   attachmentContextRecord,
   buildMessageContext,
   composerContextImportLookupIds,
+  extractProviderCommandExpansion,
   isPullRequestSummaryContext,
   isSameComposerContextPayload,
   pullRequestContextDisplayState,
   pullRequestContextKindLabel,
   previewAnnotationContextLabel,
   previewAnnotationContextRecord,
+  providerCommandContextRecord,
   previewAnnotationFromRecord,
   resolveUserMessageContext,
   selectedMessageContextFragment,
@@ -73,6 +75,43 @@ const annotation: PreviewAnnotationPayload = {
 };
 
 describe("composerContextRecords", () => {
+  it("persists provider-command disclosure metadata without ordinary context records", () => {
+    const context = buildMessageContext({
+      terminalContexts: [],
+      reviewComments: [],
+      previewAnnotations: [],
+      providerCommand: {
+        authoredText: "/review src/a.ts",
+        expandedText: "Review src/a.ts",
+      },
+    });
+
+    expect(context?.records).toEqual([
+      providerCommandContextRecord({
+        authoredText: "/review src/a.ts",
+        expandedText: "Review src/a.ts",
+      }),
+    ]);
+    expect(extractProviderCommandExpansion(context?.records ?? [])).toEqual({
+      authoredText: "/review src/a.ts",
+      expandedText: "Review src/a.ts",
+    });
+    expect(asKnownContextRecord(context?.records[0])).toBeUndefined();
+  });
+
+  it("omits an oversized provider disclosure while preserving other context", () => {
+    const context = buildMessageContext({
+      terminalContexts: [],
+      reviewComments: [],
+      previewAnnotations: [],
+      providerCommand: {
+        authoredText: "/review",
+        expandedText: "x".repeat(65_000),
+      },
+    });
+
+    expect(context).toBeUndefined();
+  });
   it("copies only ready or persisted server-side attachment IDs", () => {
     const environmentId = EnvironmentId.make("env");
     const image = {

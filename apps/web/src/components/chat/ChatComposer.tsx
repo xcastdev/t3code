@@ -27,6 +27,7 @@ import type {
   ProviderInteractionMode,
   ResolvedKeybindingsConfig,
   RuntimeMode,
+  ServerProviderSlashCommand,
   ScopedThreadRef,
   ServerProvider,
   ThreadId,
@@ -1263,6 +1264,7 @@ export interface ChatComposerHandle {
     selectedModelSelection: ModelSelection;
     providerAvailable: boolean;
     selectedProvider: ProviderDriverKind;
+    selectedProviderSlashCommands: ReadonlyArray<ServerProviderSlashCommand>;
     selectedModel: string;
     selectedProviderModels: ReadonlyArray<ServerProvider["models"][number]>;
     interactionMode: ProviderInteractionMode;
@@ -5836,6 +5838,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         selectedModelSelection,
         providerAvailable: !noProviderAvailable && providerSendBlockReason === null,
         selectedProvider,
+        selectedProviderSlashCommands,
         selectedModel,
         selectedProviderModels,
         interactionMode,
@@ -5885,6 +5888,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       providerSendBlockReason,
       selectedPromptEffort,
       selectedProvider,
+      selectedProviderSlashCommands,
       selectedProviderModels,
       interactionMode,
       planModeUiEnabled,

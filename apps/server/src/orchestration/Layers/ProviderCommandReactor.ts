@@ -1224,6 +1224,10 @@ const make = Effect.gen(function* () {
       return;
     }
     const { message, hasOtherUserMessages } = turnStart.value;
+    // The projection keeps the authored/display text. Provider command expansion travels on the
+    // intent event so auth handling and sends continue to use the exact provider input across
+    // compaction queueing and resume.
+    const providerText = event.payload.providerText ?? message.text;
     const appendTurnStartFailure = (summary: string, detail: string) =>
       appendProviderFailureActivity({
         threadId: event.payload.threadId,
@@ -1276,7 +1280,7 @@ const make = Effect.gen(function* () {
         thread.modelSelection.instanceId;
       const handled = yield* providerAuthService.tryHandlePromptCommand({
         instanceId,
-        text: message.text,
+        text: providerText,
         hasAttachments: (message.attachments?.length ?? 0) > 0,
       });
       if (!handled) {
@@ -1470,7 +1474,7 @@ const make = Effect.gen(function* () {
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
       messageText: projectComposerContextForProvider({
-        text: message.text,
+        text: providerText,
         records: message.context?.records ?? [],
       }),
       ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),

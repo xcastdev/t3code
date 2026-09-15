@@ -1369,6 +1369,37 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("passes expanded provider text to OpenCode prompt parts", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-expanded-command");
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Review src/a.ts\n\nInspect the changed files.",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "anthropic/sonnet",
+        ),
+      });
+
+      const prompt = runtimeMock.state.promptCalls[0] as {
+        parts: Array<{ type: string; text?: string }>;
+      };
+      NodeAssert.deepEqual(prompt.parts[0], {
+        type: "text",
+        text: "Review src/a.ts\n\nInspect the changed files.",
+      });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("compacts through the native OpenCode session API", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;

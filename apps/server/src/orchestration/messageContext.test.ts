@@ -111,6 +111,40 @@ it.layer(NodeServices.layer)("message context plumbing", (it) => {
     }),
   );
 
+  it.effect("keeps authored display text separate from provider text", () =>
+    Effect.gen(function* () {
+      const result = yield* decideOrchestrationCommand({
+        command: {
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-display-text"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: MessageId.make("message-display-text"),
+            role: "user",
+            text: "Review src/a.ts",
+            displayText: "/review src/a.ts",
+            attachments: [],
+          },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdAt: NOW,
+        },
+        readModel: makeReadModel(),
+      });
+      const events = Array.isArray(result) ? result : [result];
+      const sent = events.find((event) => event.type === "thread.message-sent");
+      const requested = events.find((event) => event.type === "thread.turn-start-requested");
+      expect(sent?.type === "thread.message-sent" ? sent.payload.text : undefined).toBe(
+        "/review src/a.ts",
+      );
+      expect(
+        requested?.type === "thread.turn-start-requested"
+          ? requested.payload.providerText
+          : undefined,
+      ).toBe("Review src/a.ts");
+    }),
+  );
+
   it.effect("projects context records onto the read-model message", () =>
     Effect.gen(function* () {
       const afterCreate = yield* projectEvent(
@@ -160,6 +194,60 @@ it.layer(NodeServices.layer)("message context plumbing", (it) => {
         }),
       );
       expect(afterUpdate.threads[0]?.messages[0]?.context).toEqual(context);
+    }),
+  );
+
+  it.effect("projects provider command metadata without turning it into provider text", () =>
+    Effect.gen(function* () {
+      const providerCommandContext: OrchestrationMessageContext = {
+        version: 1,
+        records: [
+          {
+            version: 1,
+            contextId:
+              "provider-command_expansion" as OrchestrationMessageContext["records"][number]["contextId"],
+            kind: "provider-command",
+            label: "Expanded provider command",
+            payload: {
+              authoredText: "/review src/a.ts",
+              expandedText: "Review src/a.ts",
+            },
+          },
+        ],
+      };
+      const afterCreate = yield* projectEvent(
+        createEmptyReadModel(NOW),
+        makeEvent(1, "thread.created", {
+          threadId: "thread-1",
+          projectId: "project-1",
+          title: "demo",
+          modelSelection: { provider: ProviderDriverKind.make("codex"), model: "gpt-5.4" },
+          runtimeMode: "full-access",
+          branch: null,
+          worktreePath: null,
+          createdAt: NOW,
+          updatedAt: NOW,
+        }),
+      );
+      const afterMessage = yield* projectEvent(
+        afterCreate,
+        makeEvent(2, "thread.message-sent", {
+          threadId: "thread-1",
+          messageId: "message-provider-command",
+          role: "user",
+          text: "/review src/a.ts",
+          attachments: [],
+          context: providerCommandContext,
+          turnId: null,
+          streaming: false,
+          createdAt: NOW,
+          updatedAt: NOW,
+        }),
+      );
+      expect(afterMessage.threads[0]?.messages[0]).toMatchObject({
+        text: "/review src/a.ts",
+        context: providerCommandContext,
+      });
     }),
   );
 });

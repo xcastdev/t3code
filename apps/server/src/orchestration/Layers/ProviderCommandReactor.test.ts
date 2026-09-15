@@ -849,6 +849,46 @@ describe("ProviderCommandReactor", () => {
     }),
   );
 
+  effectIt.effect("uses providerText for auth handling and provider sends", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          tryHandlePromptCommandEffect: ({ text }) =>
+            Effect.sync(() => text === "Review src/a.ts").pipe(Effect.as(false)),
+        }),
+      );
+
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-provider-text"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: MessageId.make("message-provider-text"),
+          role: "user",
+          text: "Review src/a.ts",
+          displayText: "/review src/a.ts",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:00.000Z",
+      });
+      yield* Effect.promise(() =>
+        waitFor(() => harness.tryHandlePromptCommand.mock.calls.length === 1),
+      );
+      yield* Effect.promise(() => harness.drain());
+
+      expect(harness.tryHandlePromptCommand).toHaveBeenCalledWith({
+        instanceId: ProviderInstanceId.make("codex"),
+        text: "Review src/a.ts",
+        hasAttachments: false,
+      });
+      expect(harness.sendTurn).toHaveBeenCalledWith(
+        expect.objectContaining({ input: "Review src/a.ts" }),
+      );
+    }),
+  );
+
   it("reacts to thread.turn.start by ensuring session and sending provider turn", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
@@ -1088,7 +1128,7 @@ describe("ProviderCommandReactor", () => {
           ),
         );
         const now = "2026-01-01T00:00:00.000Z";
-        const dispatchTurn = (id: string, text: string, createdAt: string) =>
+        const dispatchTurn = (id: string, text: string, createdAt: string, displayText?: string) =>
           harness.engine.dispatch({
             type: "thread.turn.start",
             commandId: CommandId.make(`cmd-${id}`),
@@ -1097,6 +1137,7 @@ describe("ProviderCommandReactor", () => {
               messageId: asMessageId(`user-message-${id}`),
               role: "user",
               text,
+              ...(displayText !== undefined ? { displayText } : {}),
               attachments: [],
             },
             interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -1134,7 +1175,12 @@ describe("ProviderCommandReactor", () => {
           interactionMode: "plan",
           createdAt: now,
         });
-        yield* dispatchTurn("during-compact-recovery", "first queued", "2026-01-01T00:00:02.000Z");
+        yield* dispatchTurn(
+          "during-compact-recovery",
+          "Review src/a.ts",
+          "2026-01-01T00:00:02.000Z",
+          "/review src/a.ts",
+        );
         yield* harness.engine.dispatch({
           type: "thread.interaction-mode.set",
           commandId: CommandId.make("cmd-queued-mode-default"),
@@ -1221,14 +1267,14 @@ describe("ProviderCommandReactor", () => {
         }
         yield* Deferred.await(queuedSent);
         expect(harness.sendTurn.mock.calls.slice(1).map(([request]) => request)).toEqual([
-          expect.objectContaining({ input: "first queued", interactionMode: "plan" }),
+          expect.objectContaining({ input: "Review src/a.ts", interactionMode: "plan" }),
           expect.objectContaining({ input: "second queued", interactionMode: "default" }),
         ]);
         const afterRestore = (yield* Effect.promise(() => harness.readModel())).threads.find(
           (entry) => entry.id === threadId,
         );
         expect(
-          afterRestore?.messages.filter((message) => message.text === "first queued"),
+          afterRestore?.messages.filter((message) => message.text === "/review src/a.ts"),
         ).toHaveLength(1);
         expect(
           afterRestore?.messages.filter((message) => message.text === "second queued"),

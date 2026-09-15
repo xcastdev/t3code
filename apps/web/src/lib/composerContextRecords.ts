@@ -16,6 +16,7 @@ import type {
   ReviewCommentContextRecord,
   TerminalContextRecord,
   ThreadId,
+  UnknownContextRecord,
 } from "@t3tools/contracts";
 import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
 import { encodeComposerContextFragment } from "@t3tools/shared/composerContextClipboard";
@@ -52,6 +53,50 @@ const PREVIEW_LABEL_MAX_CHARS = 48;
  * rather than failing to encode at send time.
  */
 const TRUNCATION_MARKER = "\n… truncated …";
+const PROVIDER_COMMAND_CONTEXT_KIND = "provider-command";
+const PROVIDER_COMMAND_CONTEXT_ID = toKindScopedComposerContextId(
+  PROVIDER_COMMAND_CONTEXT_KIND,
+  "expansion",
+);
+const PROVIDER_COMMAND_CONTEXT_MAX_SERIALIZED_CHARS = 64_000;
+
+export interface ProviderCommandExpansion {
+  readonly authoredText: string;
+  readonly expandedText: string;
+}
+
+export function providerCommandContextRecord(
+  expansion: ProviderCommandExpansion,
+): UnknownContextRecord | undefined {
+  const payload = {
+    authoredText: expansion.authoredText,
+    expandedText: expansion.expandedText,
+  };
+  if (JSON.stringify(payload).length > PROVIDER_COMMAND_CONTEXT_MAX_SERIALIZED_CHARS) {
+    return undefined;
+  }
+  return {
+    version: 1,
+    contextId: PROVIDER_COMMAND_CONTEXT_ID,
+    kind: PROVIDER_COMMAND_CONTEXT_KIND,
+    label: "Expanded provider command",
+    payload,
+  };
+}
+
+export function extractProviderCommandExpansion(
+  records: ReadonlyArray<ComposerContextRecord>,
+): ProviderCommandExpansion | undefined {
+  const record = records.find(
+    (candidate): candidate is UnknownContextRecord =>
+      candidate.kind === PROVIDER_COMMAND_CONTEXT_KIND && "payload" in candidate,
+  );
+  if (!record || typeof record.payload !== "object" || record.payload === null) return undefined;
+  const payload = record.payload as Record<string, unknown>;
+  return typeof payload.authoredText === "string" && typeof payload.expandedText === "string"
+    ? { authoredText: payload.authoredText, expandedText: payload.expandedText }
+    : undefined;
+}
 
 function clampContextText(value: string, max: number): string {
   if (value.length <= max) return value;
@@ -296,6 +341,7 @@ export function buildMessageContext(input: {
   reviewComments: ReadonlyArray<ReviewCommentContext>;
   previewAnnotations: ReadonlyArray<PreviewAnnotationPayload>;
   attachments?: ReadonlyArray<BoundComposerAttachment>;
+  providerCommand?: ProviderCommandExpansion;
 }): OrchestrationMessageContext | undefined {
   // An annotation's screenshot travels as the image attachment that reuses its id.
   const screenshotAttachmentIds = new Set(
@@ -313,6 +359,10 @@ export function buildMessageContext(input: {
     ),
     ...(input.attachments ?? []).map(attachmentContextRecord),
   ];
+  const providerCommandRecord = input.providerCommand
+    ? providerCommandContextRecord(input.providerCommand)
+    : undefined;
+  if (providerCommandRecord !== undefined) records.push(providerCommandRecord);
   return records.length === 0 ? undefined : { version: 1, records };
 }
 

@@ -20,6 +20,7 @@ import {
   type AssistantCitation,
   type ApprovalRequestId,
   type ChatFileAttachment,
+  expandOpenCodeCommandTemplate,
   DEFAULT_MODEL,
   type EnvironmentId,
   type MessageId,
@@ -325,6 +326,7 @@ import {
 import { serializeLegacyContextMessage } from "@t3tools/shared/composerContextLegacySend";
 import {
   buildMessageContext,
+  type ProviderCommandExpansion,
   previewAnnotationContextLabel,
   previewAnnotationContextReference,
   reviewCommentContextLabel,
@@ -6992,6 +6994,7 @@ export default function ChatView(props: ChatViewProps) {
       previewAnnotations: sendContextPreviewAnnotations,
       reviewComments: composerReviewComments,
       selectedProvider: ctxSelectedProvider,
+      selectedProviderSlashCommands: ctxSelectedProviderSlashCommands,
       selectedModel: ctxSelectedModel,
       selectedProviderModels: ctxSelectedProviderModels,
       selectedPromptEffort: ctxSelectedPromptEffort,
@@ -7244,6 +7247,17 @@ export default function ChatView(props: ChatViewProps) {
         promptForSend,
       )
       .trim();
+    const expandedProviderCommandText =
+      ctxSelectedProvider === "opencode"
+        ? expandOpenCodeCommandTemplate(messageTextForSend, ctxSelectedProviderSlashCommands)
+        : messageTextForSend;
+    const providerCommandExpansion: ProviderCommandExpansion | undefined =
+      expandedProviderCommandText !== messageTextForSend
+        ? {
+            authoredText: messageTextForSend,
+            expandedText: expandedProviderCommandText,
+          }
+        : undefined;
     // Records bind attachments by the id each side knows: the local id for the optimistic
     // row, the upload id (or local id on the data-URL path) on the wire; the server
     // rebinds them to the persisted id.
@@ -7256,6 +7270,9 @@ export default function ChatView(props: ChatViewProps) {
           attachment,
           attachmentId: attachmentIds[index] ?? attachment.id,
         })),
+        ...(providerCommandExpansion !== undefined
+          ? { providerCommand: providerCommandExpansion }
+          : {}),
       });
     const outgoingMessageContext = buildOutgoingMessageContext(
       composerAttachmentsSnapshot.map((attachment) => attachment.id),
@@ -7265,7 +7282,7 @@ export default function ChatView(props: ChatViewProps) {
       model: ctxSelectedModel,
       models: ctxSelectedProviderModels,
       effort: ctxSelectedPromptEffort,
-      text: messageTextForSend || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
+      text: expandedProviderCommandText || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
     });
     if (composerRef.current?.validateProviderInput(outgoingMessageText) === false) {
       return;
@@ -7452,7 +7469,7 @@ export default function ChatView(props: ChatViewProps) {
       {
         id: messageIdForSend,
         role: "user",
-        text: outgoingMessageText,
+        text: providerCommandExpansion?.authoredText ?? outgoingMessageText,
         ...(optimisticAttachments.length > 0 ? { attachments: optimisticAttachments } : {}),
         ...(outgoingMessageContext !== undefined ? { context: outgoingMessageContext } : {}),
         turnId: null,
@@ -7599,6 +7616,9 @@ export default function ChatView(props: ChatViewProps) {
             messageId: messageIdForSend,
             role: "user",
             text: outgoingMessageText,
+            ...(providerCommandExpansion !== undefined
+              ? { displayText: providerCommandExpansion.authoredText }
+              : {}),
             attachments: turnAttachmentsResult.value,
             ...(() => {
               const context = buildOutgoingMessageContext(
