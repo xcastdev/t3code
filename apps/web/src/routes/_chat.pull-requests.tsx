@@ -151,7 +151,10 @@ import { cn } from "~/lib/utils";
 import { primaryServerKeybindingsAtom } from "~/state/server";
 import { getSourceControlPresentationForKind } from "~/sourceControlPresentation";
 import {
+  canTogglePullRequestsPanel,
+  dispatchPullRequestsPanelToggleShortcut,
   resolvePullRequestsPanelEnvironment,
+  shouldReservePullRequestsNativeControls,
   shouldRenderPullRequestsPanel,
 } from "./pullRequestsRightPanel";
 
@@ -1472,7 +1475,9 @@ function PullRequestsRouteView() {
         : null,
     [search.number, search.repository, selectedProject, selectedHost],
   );
-  const rightPanelAvailable = selectedPullRequestSurface !== null;
+  const rightPanelAvailable = canTogglePullRequestsPanel({
+    panelRefAvailable: rightPanelRef !== null,
+  });
   useEffect(() => {
     if (!pullRequestsSupported || rightPanelRef === null || linkedSelection === null) return;
     useRightPanelStore.getState().openPullRequest(rightPanelRef, linkedSelection);
@@ -1518,9 +1523,8 @@ function PullRequestsRouteView() {
       updateSearch(clearedSelection);
       return;
     }
-    if (selectedPullRequestSurface === null) return;
     useRightPanelStore.getState().show(rightPanelRef);
-    selectSurfaceInUrl(selectedPullRequestSurface);
+    if (selectedPullRequestSurface !== null) selectSurfaceInUrl(selectedPullRequestSurface);
   };
 
   // The provider list is the workspace's hosts, not the filtered ones, so switching to a host
@@ -1870,6 +1874,7 @@ function PullRequestsRouteView() {
         )
       ) : null,
     rightPanelOpen: rightPanelState.isOpen,
+    rightPanelHasActiveSurface: activePullRequestSurface !== null,
     listBody,
     scrollRef,
   };
@@ -1936,10 +1941,11 @@ function PullRequestsRouteView() {
     if (!event.repeat) closeSurface(activePullRequestSurface);
   });
   const toggleRightPanelFromShortcut = useEffectEvent((event: KeyboardEvent) => {
-    if (!rightPanelAvailable) return;
-    event.preventDefault();
-    event.stopPropagation();
-    if (!event.repeat) toggleRightPanel();
+    dispatchPullRequestsPanelToggleShortcut({
+      available: rightPanelAvailable,
+      event,
+      onToggle: toggleRightPanel,
+    });
   });
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -2241,6 +2247,7 @@ function PullRequestsColumn({
   rightPanelControl,
   titlebarControls,
   rightPanelOpen,
+  rightPanelHasActiveSurface,
   listBody,
   scrollRef,
 }: {
@@ -2260,6 +2267,7 @@ function PullRequestsColumn({
   rightPanelControl: ReactNode;
   titlebarControls: ReactNode;
   rightPanelOpen: boolean;
+  rightPanelHasActiveSurface: boolean;
   listBody: ReactNode;
   scrollRef: RefObject<HTMLDivElement | null>;
 }) {
@@ -2322,7 +2330,7 @@ function PullRequestsColumn({
     // Painted flat like the chat column: the inset underneath carries the chrome grain, and a
     // content surface that lets it show reads as a different background than every thread.
     <div className="@container/pr-list flex min-h-0 min-w-0 flex-1 flex-col bg-background">
-      {/* A closed right panel leaves this column full-width, so the shared header
+      {/* A closed or empty right panel leaves this column owning the titlebar, so the shared header
           reserves native window controls and hosts the controls strip itself: on
           desktop the header is a drag-region, and only a no-drag descendant wins
           clicks from it - a floating sibling loses to app-region hit-testing no
@@ -2331,7 +2339,10 @@ function PullRequestsColumn({
           fixed top-right anchor. */}
       <WorkspacePageHeader
         electron={isElectron}
-        reserveNativeControls={!rightPanelOpen}
+        reserveNativeControls={shouldReservePullRequestsNativeControls({
+          rightPanelOpen,
+          rightPanelHasActiveSurface,
+        })}
         className="relative bg-background"
       >
         {titlebarControls}
