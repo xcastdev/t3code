@@ -16,10 +16,8 @@ or remove that shortcut in Settings.
 
 Use `mod+alt+b` to show or hide the right sidebar.
 
-The `rightPanel.openBrowser`, `rightPanel.openFiles`, `rightPanel.openSourceControl`,
-`rightPanel.openAgents`, `rightPanel.openPullRequest`, `rightPanel.openLinkedPullRequests`, and
-`rightPanel.openDevice` commands open their matching right-panel surface. They have no default
-shortcuts. `sourceControl.open` keeps its default `mod+alt+g` shortcut.
+To assign a shortcut for a right-panel surface, find its **Right Panel: Open ...** command in
+**Settings → Keybindings**. These commands have no defaults.
 
 In the model picker, press Left in an empty search field or Shift+Tab to reach
 the provider list. Use Up/Down to move and Enter to choose. Right returns to
@@ -95,10 +93,10 @@ a shortcut.
 `thread.stop` interrupts the running turn in the focused thread. It has no default
 shortcut; assign one in **Settings → Keybindings**.
 
-`rightPanel.toggleMaximized` toggles the open inline right sidebar between its
-normal width and the workspace. If an inline secondary pane is open, it
-maximizes that pane instead. It has no effect while the sidebar is closed or
-rendered as a narrow-window sheet.
+`rightPanel.toggleMaximized` maximizes an open inline secondary pane first,
+whether or not the right sidebar is open. When no secondary pane is open, it
+toggles an open inline right sidebar between its normal width and the workspace.
+Stacked secondary panes and narrow-window sidebar sheets cannot be maximized.
 
 `terminal.toggle` shows or collapses the bottom terminal dock without closing its
 sessions. `terminal.close` closes the active terminal session.

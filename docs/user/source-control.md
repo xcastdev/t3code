@@ -107,7 +107,7 @@ from that commit; it keeps the file's working-tree changes. A file marked
 **Staged + modified** has both an indexed version and newer unstaged work, so
 review the state again before committing.
 
-Large working trees load a bounded first set of changes. The count above the list covers the whole
+Large working trees initially show only some changes. The count above the list covers the whole
 working tree. Use **Load more changes** until the files you need are listed, then stage or review
 each file. During a pending merge with no staged files, use **Review pending merge** to review the
 repository-wide merge before committing it.
