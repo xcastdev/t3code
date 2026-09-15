@@ -216,6 +216,7 @@ import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavaila
 import { SourceControlPanel } from "./source-control/SourceControlPanel";
 import SourceControlActions from "./source-control/SourceControlActions";
 import { RightPanelTabs } from "./RightPanelTabs";
+import { dispatchRightPanelOpenCommand } from "./right-panel/rightPanelOpenCommands";
 import { getSourceControlPresentation } from "../sourceControlPresentation";
 import { SecondaryPaneShell } from "./workspace/SecondaryPaneShell";
 import { SecondaryPaneTabs } from "./workspace/SecondaryPaneTabs";
@@ -6573,6 +6574,47 @@ export default function ChatView(props: ChatViewProps) {
         event.stopPropagation();
         if (!activeThreadRef || !activeProject) return;
         if (!event.repeat) useRightPanelStore.getState().openSourceControl(activeThreadRef);
+        return;
+      }
+      if (
+        dispatchRightPanelOpenCommand({
+          command,
+          available: {
+            browser: isPreviewSupportedInRuntime(),
+            files: activeThreadRef !== null && activeProject !== null,
+            sourceControl: activeThreadRef !== null && activeProject !== null,
+            agents: activeThreadRef !== null,
+            pullRequest: pullRequestSurfaceAvailable,
+            pullRequests: pullRequestsSurfaceAvailable,
+            device: activeThreadRef !== null,
+          },
+          open: {
+            browser: () => {
+              if (!event.repeat) createBrowserSurface();
+            },
+            files: () => {
+              if (!event.repeat) addFilesSurface();
+            },
+            sourceControl: () => {
+              if (!event.repeat) addSourceControlSurface();
+            },
+            agents: () => {
+              if (!event.repeat) addAgentsSurface();
+            },
+            pullRequest: () => {
+              if (!event.repeat) addPullRequestSurface();
+            },
+            pullRequests: () => {
+              if (!event.repeat) addPullRequestsSurface();
+            },
+            device: () => {
+              if (!event.repeat) addDeviceSurface();
+            },
+          },
+        })
+      ) {
+        event.preventDefault();
+        event.stopPropagation();
         return;
       }
       if (command === "rightPanel.openBrowser") {
