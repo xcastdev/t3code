@@ -5,7 +5,10 @@ import { buildRightPanelSurfaceActions } from "./rightPanelSurfaceActions";
 
 const noop = () => undefined;
 const actionInput = {
-  browserProfiles: [{ id: "work", name: "Work" }],
+  browserProfiles: [
+    { id: "work", name: "Work" },
+    { id: "personal", name: "Personal" },
+  ],
   sourceControlProviderName: null,
   availability: {
     browser: false,

@@ -173,7 +173,10 @@ import { subscribeSnapShotComposerFocus } from "../lib/desktopSnapShot";
 import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "../rightPanelLayout";
-import { SECONDARY_PANE_COMPACT_MEDIA_QUERY } from "../workspacePaneLayout";
+import {
+  resolveWorkspaceTitlebarOwner,
+  SECONDARY_PANE_COMPACT_MEDIA_QUERY,
+} from "../workspacePaneLayout";
 import {
   pullRequestSurface,
   selectActiveRightPanel,
@@ -629,6 +632,8 @@ const TYPE_TO_FOCUS_INTERACTIVE_SELECTOR = [
   '[role="radio"]',
   '[role="switch"]',
   '[role="tab"]',
+  "[data-right-panel-rail]:focus",
+  "[data-right-panel-rail]:focus-within",
 ].join(",");
 const TYPE_TO_FOCUS_FLOATING_LAYER_SELECTOR = [
   '[role="dialog"][aria-modal="true"]',
@@ -1892,7 +1897,12 @@ export default function ChatView(props: ChatViewProps) {
   const secondaryPaneMaximized =
     canMaximizeSecondaryPane && maximizedSecondaryPaneThreadKey === routeThreadKey;
   const inlineRightPanelOwnsTitleBar =
-    rightPanelOpen && activeRightPanelSurface !== null && !shouldUseRightPanelSheet;
+    resolveWorkspaceTitlebarOwner({
+      secondaryPaneOpen,
+      rightPanelOpen,
+      rightPanelHasActiveSurface: activeRightPanelSurface !== null,
+      rightPanelUsesSheet: shouldUseRightPanelSheet,
+    }) === "right-panel";
 
   useEffect(() => {
     if (!activeThreadRef) return;
