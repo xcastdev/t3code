@@ -100,6 +100,7 @@ import {
   resolveRenameCommit,
   shouldShowOpenInPicker,
 } from "./ChatHeader";
+import { WorkspacePageHeader } from "../WorkspacePageHeader";
 
 const environmentId = EnvironmentId.make("environment");
 const projectScripts: readonly ProjectScript[] = [
@@ -138,6 +139,7 @@ function header(overrides: Partial<React.ComponentProps<typeof ChatHeader>> = {}
     keybindings: DEFAULT_RESOLVED_KEYBINDINGS,
     availableEditors: ["vscode"],
     rightPanelOpen: true,
+    rightPanelHasActiveSurface: false,
     onNewThreadInProject: () => undefined,
     onRunProjectScript: () => undefined,
     onAddProjectScript: unusedAddScript,
@@ -173,6 +175,39 @@ afterEach(async () => {
 });
 
 describe("ChatHeader rendered action controls", () => {
+  it("keeps fixed panel-control clearance while the open sidebar is only the rail", async () => {
+    await mountHeader({ rightPanelOpen: true });
+
+    expect(document.querySelector("[data-chat-header-actions]")!.className).toContain("pr-16");
+  });
+
+  it("releases the control clearance only for an active panel surface", async () => {
+    await mountHeader({ rightPanelOpen: true, rightPanelHasActiveSurface: true });
+
+    expect(document.querySelector("[data-chat-header-actions]")!.className).toContain("pr-0");
+  });
+
+  it("keeps rail control clearance alongside the native titlebar inset", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    headerRoots.push(root);
+    await act(async () =>
+      root.render(
+        createElement(
+          WorkspacePageHeader,
+          { electron: true },
+          header({ rightPanelOpen: true, rightPanelHasActiveSurface: false }),
+        ),
+      ),
+    );
+
+    expect(container.querySelector("header")!.className).toContain(
+      "wco:pr-[var(--workspace-native-controls-inset)]",
+    );
+    expect(container.querySelector("[data-chat-header-actions]")!.className).toContain("pr-16");
+  });
+
   it("does not render the Git workflow control", async () => {
     await mountHeader();
 

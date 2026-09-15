@@ -150,6 +150,10 @@ import { useAtomCommand } from "../state/use-atom-command";
 import { cn } from "~/lib/utils";
 import { primaryServerKeybindingsAtom } from "~/state/server";
 import { getSourceControlPresentationForKind } from "~/sourceControlPresentation";
+import {
+  resolvePullRequestsPanelEnvironment,
+  shouldRenderPullRequestsPanel,
+} from "./pullRequestsRightPanel";
 
 function getShortcutContext() {
   return {
@@ -459,7 +463,10 @@ function PullRequestsRouteView() {
     [rightPanelState.surfaces, selectedPullRequestSurface],
   );
   const rightPanelPresence = usePanelPresence(
-    rightPanelState.isOpen && selectedPullRequestSurface !== null,
+    shouldRenderPullRequestsPanel({
+      isOpen: rightPanelState.isOpen,
+      panelRefAvailable: rightPanelRef !== null,
+    }),
     rightPanelPresenceValue,
     panelAnimationsActive,
     rightPanelRef?.threadId ?? null,
@@ -468,12 +475,15 @@ function PullRequestsRouteView() {
   const rightPanelPresent = rightPanelPresence.present;
   const renderedPullRequestSurface = rightPanelPresence.value?.activeSurface ?? null;
   const renderedRightPanelSurfaces = rightPanelPresence.value?.surfaces ?? [];
-  // The open tab names its own server; a link that arrived before any tab was opened names it
-  // through the project it selected.
-  const panelEnvironmentId =
-    (renderedPullRequestSurface?.environmentId as EnvironmentId | undefined) ??
-    selectedProject?.environmentId ??
-    null;
+  // The open tab names its own server. Once no tab is selected, use list scope
+  // or a stable capable-server fallback rather than reviving a closed selection.
+  const panelEnvironmentId = resolvePullRequestsPanelEnvironment({
+    activeSurfaceEnvironmentId:
+      (renderedPullRequestSurface?.environmentId as EnvironmentId | undefined) ?? null,
+    scopedProjectEnvironmentId: scopedProject?.environmentId ?? null,
+    scopedEnvironmentId,
+    capableEnvironmentIds: capableEnvironments.map((environment) => environment.environmentId),
+  });
   const updateSearch = useCallback(
     (patch: {
       [Key in keyof PullRequestsSearch]?: PullRequestsSearch[Key] | undefined;

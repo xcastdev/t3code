@@ -100,12 +100,15 @@ export const PanelLayoutControls = memo(function PanelLayoutControls({
 });
 
 export const RightPanelMaximizeControl = memo(function RightPanelMaximizeControl({
+  available = true,
   maximized,
   onToggle,
 }: {
+  available?: boolean;
   maximized: boolean;
   onToggle: () => void;
 }) {
+  if (!available) return null;
   const label = maximized ? "Restore panel size" : "Maximize panel";
   return (
     <Tooltip>

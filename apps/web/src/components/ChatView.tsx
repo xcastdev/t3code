@@ -8646,21 +8646,11 @@ export default function ChatView(props: ChatViewProps) {
       data-workspace-titlebar-controls
     >
       {!shouldUseRightPanelSheet ? (
-        <span
-          aria-hidden={!rightPanelOpen}
-          className={cn(
-            "flex shrink-0",
-            panelAnimationsActive &&
-              "motion-safe:transition-opacity motion-safe:[transition-duration:var(--panel-animation-duration)] motion-safe:ease-out",
-            rightPanelOpen ? "pointer-events-auto opacity-100" : "pointer-events-none opacity-0",
-          )}
-          inert={!rightPanelOpen}
-        >
-          <RightPanelMaximizeControl
-            maximized={rightPanelMaximized}
-            onToggle={toggleRightPanelMaximized}
-          />
-        </span>
+        <RightPanelMaximizeControl
+          available={canMaximizeRightPanel}
+          maximized={rightPanelMaximized}
+          onToggle={toggleRightPanelMaximized}
+        />
       ) : null}
       <div className="pointer-events-auto flex h-full items-center">{panelToggleControls}</div>
     </div>
@@ -8920,6 +8910,7 @@ export default function ChatView(props: ChatViewProps) {
             keybindings={keybindings}
             availableEditors={availableEditors}
             rightPanelOpen={rightPanelOpen}
+            rightPanelHasActiveSurface={activeRightPanelSurface !== null}
             onNewThreadInProject={handleNewThreadInActiveProject}
             {...(activeDraftLogicalProjectKey
               ? { onOpenProjectSettings: handleOpenDraftProjectSettings }
