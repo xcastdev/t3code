@@ -211,6 +211,7 @@ import { PullRequestDetailPanel } from "./pullRequest/PullRequestDetailPanel";
 import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { SourceControlPanel } from "./source-control/SourceControlPanel";
+import SourceControlActions from "./source-control/SourceControlActions";
 import { RightPanelTabs } from "./RightPanelTabs";
 import { SecondaryPaneShell } from "./workspace/SecondaryPaneShell";
 import { SecondaryPaneTabs } from "./workspace/SecondaryPaneTabs";
@@ -3717,6 +3718,8 @@ export default function ChatView(props: ChatViewProps) {
       })
     : null;
   const gitStatusCwd = activeThread?.worktreePath ?? gitCwd;
+  const [sourceControlActionsTarget, setSourceControlActionsTarget] =
+    useState<HTMLDivElement | null>(null);
   const gitStatusQuery = useEnvironmentQuery(
     gitStatusCwd === null
       ? null
@@ -9101,10 +9104,7 @@ export default function ChatView(props: ChatViewProps) {
         pullRequestsCapabilityKnown={pullRequestsCapabilityKnown}
         gitIndexWorkflowCapabilityKnown={gitIndexWorkflowCapabilityKnown}
         supportsGitIndexWorkflow={supportsGitIndexWorkflow}
-        {...(!supportsPullRequests || activeProjectRepository === null
-          ? {}
-          : { onOpenPullRequest: openProjectPullRequest })}
-        {...(routeKind === "draft" && draftId ? { draftId } : {})}
+        actionsTargetRef={setSourceControlActionsTarget}
       />
     ) : renderedRightPanelSurface?.kind === "pull-request" && !pullRequestsCapabilityKnown ? (
       <PullRequestDetailGhost />
@@ -9287,6 +9287,17 @@ export default function ChatView(props: ChatViewProps) {
           reserveNativeControls={reserveTitleBarControlInset && !inlineRightPanelOwnsTitleBar}
           className="relative bg-background"
         >
+          {activeProject ? (
+            <SourceControlActions
+              target={sourceControlActionsTarget}
+              gitCwd={gitCwd}
+              activeThreadRef={activeThreadRef}
+              {...(!supportsPullRequests || activeProjectRepository === null
+                ? {}
+                : { onOpenPullRequest: openProjectPullRequest })}
+              {...(routeKind === "draft" && draftId ? { draftId } : {})}
+            />
+          ) : null}
           {isElectron && rightPanelControlsAtRoot ? (
             <span
               aria-hidden

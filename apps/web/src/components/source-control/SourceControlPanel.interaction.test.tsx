@@ -77,9 +77,6 @@ vi.mock("../pullRequest/PullRequestsUnavailableState", () => ({
 vi.mock("~/state/pullRequests", () => ({
   usePullRequestList: () => ({ data: null }),
 }));
-vi.mock("./SourceControlActions", () => ({
-  default: () => <div data-source-control-actions />,
-}));
 vi.mock("../ui/scroll-area", () => ({
   ScrollArea: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
 }));
@@ -240,10 +237,12 @@ afterEach(async () => {
 });
 
 describe("SourceControlPanel guarded commit interaction", () => {
-  it("exposes the Git workflow control in the changes view", async () => {
+  it("provides a named container for responsive action labels", async () => {
     await renderPanel();
 
-    expect(document.querySelector("[data-source-control-actions]")).not.toBeNull();
+    const target = document.querySelector("[data-source-control-actions-target]");
+    expect(target).not.toBeNull();
+    expect(target?.classList.contains("@container/header-actions")).toBe(true);
   });
 
   it("keeps reviewed tokens and refreshes after a stale-state rejection", async () => {

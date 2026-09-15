@@ -19,7 +19,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { flushSync } from "react-dom";
+import { createPortal, flushSync } from "react-dom";
 import {
   ChevronDownIcon,
   CloudDownloadIcon,
@@ -85,6 +85,8 @@ import { PublishRepositoryDialog } from "./PublishRepositoryDialog";
 interface SourceControlActionsProps {
   gitCwd: string | null;
   activeThreadRef: ScopedThreadRef | null;
+  /** The conditional Source Control surface owns the visual placement, not this stateful host. */
+  target: HTMLElement | null;
   draftId?: DraftId;
   /**
    * Opens the thread's own change request beside it. Absent when the thread has no project to
@@ -277,6 +279,7 @@ function GitQuickActionIcon({
 export default function SourceControlActions({
   gitCwd,
   activeThreadRef,
+  target,
   draftId,
   onOpenPullRequest,
 }: SourceControlActionsProps) {
@@ -963,9 +966,9 @@ export default function SourceControlActions({
 
   const canPublishRepository = isRepo && gitStatusForActions !== null && !hasPrimaryRemote;
 
-  if (!gitCwd) return null;
+  if (!gitCwd || target === null) return null;
 
-  return (
+  return createPortal(
     <>
       {!isRepo ? (
         <Button
@@ -1342,6 +1345,7 @@ export default function SourceControlActions({
           </DialogFooter>
         </DialogPopup>
       </Dialog>
-    </>
+    </>,
+    target,
   );
 }
