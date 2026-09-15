@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { canTogglePullRequestsPanel } from "../../routes/pullRequestsRightPanel";
+import { canTogglePullRequestsPanel } from "../../routes/-pullRequestsRightPanel";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./PanelLayoutControls";
 
 describe("RightPanelMaximizeControl", () => {

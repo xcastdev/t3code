@@ -156,7 +156,7 @@ import {
   resolvePullRequestsPanelEnvironment,
   shouldReservePullRequestsNativeControls,
   shouldRenderPullRequestsPanel,
-} from "./pullRequestsRightPanel";
+} from "./-pullRequestsRightPanel";
 
 function getShortcutContext() {
   return {

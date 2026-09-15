@@ -7,7 +7,7 @@ import {
   resolvePullRequestsPanelEnvironment,
   shouldReservePullRequestsNativeControls,
   shouldRenderPullRequestsPanel,
-} from "./pullRequestsRightPanel";
+} from "./-pullRequestsRightPanel";
 
 const serverA = EnvironmentId.make("server-a");
 const serverB = EnvironmentId.make("server-b");
