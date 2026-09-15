@@ -261,7 +261,7 @@ function ChangesView(
     [props.cwd, props.environmentId, stage, unstage, workflowAvailable],
   );
   const reviewFile = useCallback(
-    async (file: VcsWorkingTreeFile, comparison: "head" | "index" | "worktree-index") => {
+    async (file: VcsWorkingTreeFile | null, comparison: "head" | "index" | "worktree-index") => {
       if (props.cwd === null || status === null || !workflowAvailable) return;
       const requestScope = reviewScope;
       const capturedStatus = {
@@ -272,13 +272,15 @@ function ChangesView(
         refName: status.refName,
       };
       const reviewLabel =
-        comparison === "index"
-          ? "staged vs HEAD"
-          : comparison === "worktree-index" && file.indexStatus === "untracked"
-            ? "untracked vs empty"
-            : comparison === "worktree-index"
-              ? "working tree vs index"
-              : "working tree vs HEAD";
+        comparison === "index" && file === null
+          ? "pending merge vs HEAD"
+          : comparison === "index"
+            ? "staged vs HEAD"
+            : comparison === "worktree-index" && file?.indexStatus === "untracked"
+              ? "untracked vs empty"
+              : comparison === "worktree-index"
+                ? "working tree vs index"
+                : "working tree vs HEAD";
       const requestId = reviewRequestId.current + 1;
       reviewRequestId.current = requestId;
       setReviewedStatus(null);
@@ -286,7 +288,7 @@ function ChangesView(
         comparison,
         diff: null,
         label: reviewLabel,
-        path: file.path,
+        path: file?.path ?? "Pending merge",
         truncated: false,
       });
       setReviewError(null);
@@ -294,7 +296,7 @@ function ChangesView(
         environmentId: props.environmentId,
         input: {
           cwd: props.cwd,
-          path: file.path,
+          ...(file ? { path: file.path } : {}),
           comparison,
           ...(comparison === "index" &&
           capturedStatus.headCommit !== undefined &&
@@ -324,7 +326,7 @@ function ChangesView(
         comparison,
         diff: result.value.diff,
         label: reviewLabel,
-        path: file.path,
+        path: file?.path ?? "Pending merge",
         truncated: result.value.truncated,
       });
     },
@@ -337,7 +339,7 @@ function ChangesView(
     setReviewedStatus(null);
   }, []);
   const reviewPendingMerge = useCallback(() => {
-    void reviewFile({ path: ".", insertions: 0, deletions: 0 }, "index");
+    void reviewFile(null, "index");
   }, [reviewFile]);
   useEffect(() => {
     if (activeReviewedStatus === null || status === null) return;

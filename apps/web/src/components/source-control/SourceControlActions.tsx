@@ -133,6 +133,7 @@ interface RunGitActionWithToastInput {
 }
 
 const GIT_STATUS_WINDOW_REFRESH_DEBOUNCE_MS = 250;
+const COMMIT_FILE_CHOOSER_WINDOW_SIZE = 100;
 
 type RefreshVcsStatus = (target: {
   readonly environmentId: ScopedThreadRef["environmentId"];
@@ -319,10 +320,12 @@ export default function SourceControlActions({
     readonly snapshotId: string | null;
     readonly files: readonly VcsWorkingTreeFile[];
   } | null>(null);
+  const [visibleFileCount, setVisibleFileCount] = useState(COMMIT_FILE_CHOOSER_WINDOW_SIZE);
   const [isPublishDialogOpen, setIsPublishDialogOpen] = useState(false);
   const [pendingDefaultBranchAction, setPendingDefaultBranchAction] =
     useState<PendingDefaultBranchAction | null>(null);
   const activeGitActionProgressRef = useRef<ActiveGitActionProgress | null>(null);
+  const workingTreeLoadRequestId = useRef(0);
   const sourceControlScope = useMemo(
     () => ({ environmentId: activeEnvironmentId, cwd: gitCwd }),
     [activeEnvironmentId, gitCwd],
@@ -451,12 +454,23 @@ export default function SourceControlActions({
     activeDraftThread.worktreePath === null;
 
   useEffect(() => {
+    workingTreeLoadRequestId.current += 1;
     setLoadedWorkingTree(null);
     setIsEditingFiles(false);
+    setVisibleFileCount(COMMIT_FILE_CHOOSER_WINDOW_SIZE);
   }, [statusSnapshotId]);
+
+  useEffect(
+    () => () => {
+      workingTreeLoadRequestId.current += 1;
+    },
+    [],
+  );
 
   const loadAllWorkingTreeFiles = useCallback(async () => {
     if (!gitStatusForActions || activeEnvironmentId === null || gitCwd === null) return false;
+    const requestId = workingTreeLoadRequestId.current + 1;
+    workingTreeLoadRequestId.current = requestId;
     const snapshotId = gitStatusForActions.workingTree.snapshotId;
     if (snapshotId === undefined) {
       // Legacy servers provide their complete list in the status response.
@@ -469,6 +483,7 @@ export default function SourceControlActions({
         environmentId: activeEnvironmentId,
         input: { cwd: gitCwd, snapshotId, cursor },
       });
+      if (requestId !== workingTreeLoadRequestId.current) return false;
       if (result._tag === "Failure") {
         if (!isAtomCommandInterrupted(result)) {
           const failure = squashAtomCommandFailure(result);
@@ -494,6 +509,7 @@ export default function SourceControlActions({
       files.push(...result.value.files.filter((file) => !existing.has(file.path)));
       cursor = result.value.nextCursor;
     }
+    if (requestId !== workingTreeLoadRequestId.current) return false;
     setLoadedWorkingTree({ snapshotId, files });
     return true;
   }, [activeEnvironmentId, gitCwd, gitStatusForActions, loadWorkingTreePage, threadToastData]);
@@ -1285,7 +1301,7 @@ export default function SourceControlActions({
                   <div className="space-y-2">
                     <ScrollArea className="h-44 rounded-lg bg-card ring-1 ring-black/5 dark:bg-white/[0.025] dark:ring-white/5">
                       <div className="space-y-1 p-1">
-                        {allFiles.map((file) => {
+                        {allFiles.slice(0, visibleFileCount).map((file) => {
                           const isExcluded = !allSelected && !selection.paths.has(file.path);
                           return (
                             <div
@@ -1341,6 +1357,23 @@ export default function SourceControlActions({
                         })}
                       </div>
                     </ScrollArea>
+                    {allFiles.length > visibleFileCount ? (
+                      <Button
+                        size="xs"
+                        variant="ghost"
+                        className="w-full"
+                        onClick={() =>
+                          setVisibleFileCount((count) => count + COMMIT_FILE_CHOOSER_WINDOW_SIZE)
+                        }
+                      >
+                        Show{" "}
+                        {Math.min(
+                          COMMIT_FILE_CHOOSER_WINDOW_SIZE,
+                          allFiles.length - visibleFileCount,
+                        )}
+                        more files
+                      </Button>
+                    ) : null}
                     <div className="flex justify-end font-mono">
                       <span className="text-diff-addition">
                         +{selectedFiles.reduce((sum, f) => sum + f.insertions, 0)}

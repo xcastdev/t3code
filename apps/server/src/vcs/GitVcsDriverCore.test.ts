@@ -248,6 +248,45 @@ it.effect("invalidates origin remote cache when a driver mutation adds origin", 
 );
 
 describe("Git index workflow", () => {
+  it.effect("reviews and commits a pending merge without inventing a file path", () =>
+    Effect.gen(function* () {
+      const cwd = yield* makeTmpDir();
+      const driver = yield* GitVcsDriver.GitVcsDriver;
+      const { initialBranch } = yield* initRepoWithCommit(cwd);
+      yield* git(cwd, ["checkout", "-b", "feature/pending-merge"]);
+      yield* git(cwd, ["commit", "--allow-empty", "-m", "feature metadata"]);
+      yield* git(cwd, ["checkout", initialBranch]);
+      yield* git(cwd, ["merge", "--no-commit", "--no-ff", "feature/pending-merge"]);
+
+      const status = yield* driver.statusDetailsLocal(cwd);
+      assert.isDefined(status.headCommit);
+      assert.isDefined(status.indexTree);
+      assert.deepEqual(status.pendingMergeHeads, [
+        yield* git(cwd, ["rev-parse", "feature/pending-merge"]),
+      ]);
+      const diff = yield* driver.getWorkingTreeDiff({
+        cwd,
+        comparison: "index",
+        reviewedState: { headCommit: status.headCommit!, indexTree: status.indexTree! },
+      });
+      assert.equal(diff.diff, "");
+
+      const committed = yield* driver.commitIndex({
+        cwd,
+        message: "merge feature metadata",
+        precondition: {
+          expectedHeadCommit: status.headCommit!,
+          expectedIndexTree: status.indexTree!,
+          expectedRefName: initialBranch,
+          expectedMergeHeads: status.pendingMergeHeads,
+        },
+        confirmDefaultRef: true,
+      });
+      assert.match(committed.commitSha, /^[a-f0-9]{40}$/);
+      assert.equal((yield* git(cwd, ["show", "-s", "--format=%P", "HEAD"])).split(" ").length, 2);
+    }).pipe(Effect.provide(TestLayer)),
+  );
+
   it.effect("reviews a repository-relative status path from a nested project directory", () =>
     Effect.gen(function* () {
       const repository = yield* makeTmpDir();

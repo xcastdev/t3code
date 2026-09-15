@@ -3871,26 +3871,58 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
   const getWorkingTreeDiff: GitVcsDriver.GitVcsDriver["Service"]["getWorkingTreeDiff"] = Effect.fn(
     "getWorkingTreeDiff",
   )(function* (input) {
-    const validated = yield* validateIndexPaths("GitVcsDriver.getWorkingTreeDiff", input.cwd, [
-      input.path,
-    ]);
-    const relativePath = validated.paths[0]!;
+    if (
+      input.path === undefined &&
+      (input.comparison !== "index" || input.reviewedState === undefined)
+    ) {
+      return yield* new GitCommandError({
+        ...gitCommandContext({
+          operation: "GitVcsDriver.getWorkingTreeDiff",
+          cwd: input.cwd,
+          args: [],
+        }),
+        detail: "A repository-wide diff is only available for a guarded index review.",
+      });
+    }
+    const validated =
+      input.path === undefined
+        ? null
+        : yield* validateIndexPaths("GitVcsDriver.getWorkingTreeDiff", input.cwd, [input.path]);
+    let root: string;
+    if (validated) {
+      root = validated.root;
+    } else {
+      const repository = yield* resolveRepositoryPaths(input.cwd);
+      if (repository?.worktreeRoot === null || repository === null) {
+        return yield* new GitCommandError({
+          ...gitCommandContext({
+            operation: "GitVcsDriver.getWorkingTreeDiff",
+            cwd: input.cwd,
+            args: [],
+          }),
+          detail: "Index operations require a non-bare Git worktree.",
+        });
+      }
+      root = repository.worktreeRoot;
+    }
+    const relativePath = validated?.paths[0];
     if (input.comparison === "index" && input.reviewedState !== undefined) {
       const reviewed = input.reviewedState;
-      const indexTree = yield* runGitStdout(
-        "GitVcsDriver.getWorkingTreeDiff.reviewedIndex",
-        validated.root,
-        ["rev-parse", "--verify", "--end-of-options", `${reviewed.indexTree}^{tree}`],
-      ).pipe(Effect.map((value) => value.trim()));
+      const indexTree = yield* runGitStdout("GitVcsDriver.getWorkingTreeDiff.reviewedIndex", root, [
+        "rev-parse",
+        "--verify",
+        "--end-of-options",
+        `${reviewed.indexTree}^{tree}`,
+      ]).pipe(Effect.map((value) => value.trim()));
       const baseTree =
         reviewed.headCommit === null
           ? yield* runGitStdoutWithOptions(
               "GitVcsDriver.getWorkingTreeDiff.emptyTree",
-              validated.root,
+              root,
               ["hash-object", "-t", "tree", "--stdin"],
               { stdin: "" },
             ).pipe(Effect.map((value) => value.trim()))
-          : yield* runGitStdout("GitVcsDriver.getWorkingTreeDiff.reviewedHead", validated.root, [
+          : yield* runGitStdout("GitVcsDriver.getWorkingTreeDiff.reviewedHead", root, [
               "rev-parse",
               "--verify",
               "--end-of-options",
@@ -3905,12 +3937,11 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
         "--minimal",
         baseTree,
         indexTree,
-        "--",
-        relativePath,
+        ...(relativePath ? ["--", relativePath] : []),
       ];
       const result = yield* executeGit(
         "GitVcsDriver.getWorkingTreeDiff.reviewedState",
-        validated.root,
+        root,
         args,
         {
           allowNonZeroExit: true,
@@ -3933,19 +3964,25 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }
       return truncateWorkingTreeDiff(result.stdout, result.stdoutTruncated);
     }
-    const untracked = yield* runGitStdout(
-      "GitVcsDriver.getWorkingTreeDiff.untracked",
-      validated.root,
-      [
-        "--literal-pathspecs",
-        "ls-files",
-        "--others",
-        "--exclude-standard",
-        "-z",
-        "--",
-        relativePath,
-      ],
-    );
+    if (relativePath === undefined) {
+      return yield* new GitCommandError({
+        ...gitCommandContext({
+          operation: "GitVcsDriver.getWorkingTreeDiff",
+          cwd: input.cwd,
+          args: [],
+        }),
+        detail: "A file path is required for this working-tree diff comparison.",
+      });
+    }
+    const untracked = yield* runGitStdout("GitVcsDriver.getWorkingTreeDiff.untracked", root, [
+      "--literal-pathspecs",
+      "ls-files",
+      "--others",
+      "--exclude-standard",
+      "-z",
+      "--",
+      relativePath,
+    ]);
     const isUntracked = untracked.split("\0").includes(relativePath);
     const args =
       input.comparison !== "index" && isUntracked
@@ -3964,7 +4001,7 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
             "--",
             relativePath,
           ];
-    const result = yield* executeGit("GitVcsDriver.getWorkingTreeDiff", validated.root, args, {
+    const result = yield* executeGit("GitVcsDriver.getWorkingTreeDiff", root, args, {
       allowNonZeroExit: true,
       maxOutputBytes: MAX_WORKING_TREE_DIFF_BYTES,
       appendTruncationMarker: true,

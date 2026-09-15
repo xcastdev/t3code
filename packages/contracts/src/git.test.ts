@@ -80,6 +80,16 @@ describe("VcsWorkingTreeDiffInput", () => {
       }),
     ).toMatchObject({ comparison: "worktree-index" });
   });
+
+  it("accepts a repository-wide index review for a pending merge", () => {
+    expect(
+      decodeWorkingTreeDiffInput({
+        cwd: "/repo",
+        comparison: "index",
+        reviewedState: { headCommit: "a".repeat(40), indexTree: "b".repeat(40) },
+      }),
+    ).toMatchObject({ comparison: "index" });
+  });
 });
 
 describe("VcsCreateWorktreeInput", () => {

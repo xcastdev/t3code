@@ -5965,6 +5965,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       });
       const { manager } = yield* makeManager();
       const status = yield* manager.localStatus({ cwd: repoDir });
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
       expect(Buffer.byteLength(JSON.stringify(status.workingTree), "utf8")).toBeLessThanOrEqual(
         48 * 1024,
       );
@@ -5975,6 +5976,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
         cursor: status.workingTree.nextCursor!,
         pageSize: 100,
       });
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
       expect(Buffer.byteLength(JSON.stringify(page), "utf8")).toBeLessThanOrEqual(64 * 1024);
     }),
   );

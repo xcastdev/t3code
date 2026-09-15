@@ -155,7 +155,8 @@ export type VcsStageFilesInput = typeof VcsStageFilesInput.Type;
 
 export const VcsWorkingTreeDiffInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
-  path: GitPath,
+  /** Omit for a guarded repository-wide index review, such as a pending merge. */
+  path: Schema.optional(GitPath),
   comparison: Schema.Literals(["index", "head", "worktree-index"]),
   reviewedState: Schema.optional(
     Schema.Struct({
