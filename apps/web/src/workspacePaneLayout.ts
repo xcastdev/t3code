@@ -28,6 +28,7 @@ export function getSecondaryPaneMaxWidth(workspaceWidth: number): number {
 
 export function resolveWorkspaceTitlebarOwner(input: {
   secondaryPaneOpen: boolean;
+  secondaryPaneLayout?: SecondaryPaneLayoutMode;
   rightPanelOpen: boolean;
   rightPanelHasActiveSurface: boolean;
   rightPanelUsesSheet: boolean;
@@ -35,7 +36,7 @@ export function resolveWorkspaceTitlebarOwner(input: {
   if (input.rightPanelOpen && input.rightPanelHasActiveSurface && !input.rightPanelUsesSheet) {
     return "right-panel";
   }
-  if (input.secondaryPaneOpen) return "secondary";
+  if (input.secondaryPaneOpen && input.secondaryPaneLayout !== "stack") return "secondary";
   return "chat";
 }
 

@@ -1830,9 +1830,18 @@ export default function ChatView(props: ChatViewProps) {
   const canMaximizeSecondaryPane = secondaryPaneOpen && !secondaryPaneIsStacked;
   const secondaryPaneMaximized =
     canMaximizeSecondaryPane && maximizedSecondaryPaneThreadKey === routeThreadKey;
+  const inlineSecondaryPaneOwnsTitleBar =
+    resolveWorkspaceTitlebarOwner({
+      secondaryPaneOpen,
+      secondaryPaneLayout: secondaryPaneIsStacked ? "stack" : "inline",
+      rightPanelOpen,
+      rightPanelHasActiveSurface: activeRightPanelSurface !== null,
+      rightPanelUsesSheet: shouldUseRightPanelSheet,
+    }) === "secondary";
   const inlineRightPanelOwnsTitleBar =
     resolveWorkspaceTitlebarOwner({
       secondaryPaneOpen,
+      secondaryPaneLayout: secondaryPaneIsStacked ? "stack" : "inline",
       rightPanelOpen,
       rightPanelHasActiveSurface: activeRightPanelSurface !== null,
       rightPanelUsesSheet: shouldUseRightPanelSheet,
@@ -8655,6 +8664,16 @@ export default function ChatView(props: ChatViewProps) {
       <div className="pointer-events-auto flex h-full items-center">{panelToggleControls}</div>
     </div>
   );
+  const secondaryPaneHeaderControls = inlineSecondaryPaneOwnsTitleBar ? (
+    <>
+      <RightPanelMaximizeControl
+        available={canMaximizeSecondaryPane}
+        maximized={secondaryPaneMaximized}
+        onToggle={toggleSecondaryPaneMaximized}
+      />
+      {panelToggleControls}
+    </>
+  ) : null;
   const rightPanelContent = activeThreadRef ? (
     renderedRightPanelSurface?.kind === "preview" ? (
       <Suspense fallback={null}>
@@ -8794,8 +8813,6 @@ export default function ChatView(props: ChatViewProps) {
           projectName={activeProject?.title ?? ""}
           threadRef={activeThreadRef}
           composerDraftTarget={composerDraftTarget}
-          keybindings={keybindings}
-          availableEditors={availableEditors}
           relativePath={
             renderedRightPanelSurface.kind === "file"
               ? renderedRightPanelSurface.relativePath
@@ -8875,7 +8892,11 @@ export default function ChatView(props: ChatViewProps) {
         <WorkspacePageHeader
           data-chat-header
           electron={isElectron}
-          reserveNativeControls={reserveTitleBarControlInset && !inlineRightPanelOwnsTitleBar}
+          reserveNativeControls={
+            reserveTitleBarControlInset &&
+            !inlineRightPanelOwnsTitleBar &&
+            !inlineSecondaryPaneOwnsTitleBar
+          }
           className="relative bg-background"
         >
           {activeProject ? (
@@ -8895,7 +8916,11 @@ export default function ChatView(props: ChatViewProps) {
               className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]"
             />
           ) : null}
-          {!rightPanelControlsAtRoot && !rightPanelControlsInPanel ? panelLayoutControls : null}
+          {!rightPanelControlsAtRoot &&
+          !rightPanelControlsInPanel &&
+          !inlineSecondaryPaneOwnsTitleBar
+            ? panelLayoutControls
+            : null}
           <ChatHeader
             activeThreadEnvironmentId={activeThread.environmentId}
             activeThreadId={activeThread.id}
@@ -9412,11 +9437,33 @@ export default function ChatView(props: ChatViewProps) {
           <SecondaryPaneTabs
             surfaces={activeSecondaryPaneState.surfaces}
             activeSurfaceId={activeSecondaryPaneState.activeSurfaceId}
+            layout={secondaryPaneIsStacked ? "stack" : "inline"}
+            workspaceFile={{
+              environmentId: activeThread.environmentId,
+              cwd: activeWorkspaceRoot,
+              relativePath:
+                activeSecondaryPaneState.surfaces.find(
+                  (surface) => surface.id === activeSecondaryPaneState.activeSurfaceId,
+                )?.relativePath ?? "",
+              keybindings,
+              availableEditors,
+            }}
+            headerControls={secondaryPaneHeaderControls}
             onActivate={(surfaceId) =>
               useSecondaryPaneStore.getState().activateSurface(activeThreadRef, surfaceId)
             }
             onClose={(surfaceId) =>
               useSecondaryPaneStore.getState().closeSurface(activeThreadRef, surfaceId)
+            }
+            onCopyFilePath={copyRightPanelFilePath}
+            onCloseOtherSurfaces={(surfaceId) =>
+              useSecondaryPaneStore.getState().closeOtherSurfaces(activeThreadRef, surfaceId)
+            }
+            onCloseSurfacesToRight={(surfaceId) =>
+              useSecondaryPaneStore.getState().closeSurfacesToRight(activeThreadRef, surfaceId)
+            }
+            onCloseAllSurfaces={() =>
+              useSecondaryPaneStore.getState().closeAllSurfaces(activeThreadRef)
             }
           />
           <Suspense fallback={null}>
@@ -9430,8 +9477,6 @@ export default function ChatView(props: ChatViewProps) {
                   projectName={activeProject.title}
                   threadRef={activeThreadRef}
                   composerDraftTarget={composerDraftTarget}
-                  keybindings={keybindings}
-                  availableEditors={availableEditors}
                   relativePath={surface.relativePath}
                   revealLine={surface.revealLine}
                   revealRequestId={surface.revealRequestId}

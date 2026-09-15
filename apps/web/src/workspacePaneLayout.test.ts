@@ -34,11 +34,12 @@ describe("workspacePaneLayout", () => {
     expect(
       resolveWorkspaceTitlebarOwner({
         secondaryPaneOpen: true,
+        secondaryPaneLayout: "stack",
         rightPanelOpen: true,
         rightPanelHasActiveSurface: false,
         rightPanelUsesSheet: false,
       }),
-    ).toBe("secondary");
+    ).toBe("chat");
     expect(
       resolveWorkspaceTitlebarOwner({
         secondaryPaneOpen: true,

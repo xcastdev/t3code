@@ -1,5 +1,5 @@
 import { ReadOnlySourcePreview } from "../files/AttachmentFilePreview";
-import { useRightPanelStore } from "~/rightPanelStore";
+import { useSecondaryPaneStore } from "~/secondaryPaneStore";
 import {
   getQuestionAnswerPreview,
   getQuestionAnswerText,
@@ -2774,7 +2774,7 @@ function UserMessageMentionChip(props: {
             data-markdown-copy={props.copyMarkdown}
             onClick={() => {
               if (ctx.threadRef)
-                useRightPanelStore.getState().openFile(ctx.threadRef, props.record.path);
+                useSecondaryPaneStore.getState().openFile(ctx.threadRef, props.record.path);
             }}
           >
             <PierreEntryIcon
