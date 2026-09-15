@@ -1,4 +1,8 @@
-import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
+import {
+  scopedThreadKey,
+  scopeProjectRef,
+  scopeThreadRef,
+} from "@t3tools/client-runtime/environment";
 import { EnvironmentId, ProjectId, ThreadId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
@@ -191,18 +195,15 @@ describe("removeThreadPaneState", () => {
     await deletion;
     expect(sequence).toEqual(["snapshot", "delete"]);
     expect(capturedRefs).toEqual(expect.arrayContaining([activeRef, archivedRef]));
-    expect(Object.keys(useRightPanelStore.getState().byThreadKey)).toEqual(
-      expect.arrayContaining([
-        expect.stringContaining(`${String(environmentA)}:${String(otherProjectRef.threadId)}`),
-        expect.stringContaining(String(environmentB)),
-      ]),
-    );
-    expect(Object.keys(useSecondaryPaneStore.getState().byThreadKey)).toEqual(
-      expect.arrayContaining([
-        expect.stringContaining(`${String(environmentA)}:${String(otherProjectRef.threadId)}`),
-        expect.stringContaining(String(environmentB)),
-      ]),
-    );
+    const expectedSurvivorKeys = new Set([scopedThreadKey(otherProjectRef), scopedThreadKey(refB)]);
+    const rightPanelState = useRightPanelStore.getState().byThreadKey;
+    const secondaryPaneState = useSecondaryPaneStore.getState().byThreadKey;
+    expect(new Set(Object.keys(rightPanelState))).toEqual(expectedSurvivorKeys);
+    expect(new Set(Object.keys(secondaryPaneState))).toEqual(expectedSurvivorKeys);
+    for (const deletedRef of [activeRef, archivedRef]) {
+      expect(rightPanelState).not.toHaveProperty(scopedThreadKey(deletedRef));
+      expect(secondaryPaneState).not.toHaveProperty(scopedThreadKey(deletedRef));
+    }
   });
 
   it("retains project pane state and skips mutation when the archived snapshot fails", async () => {
