@@ -1623,6 +1623,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
     () => extractProviderCommandExpansion(resolvedContext.records),
     [resolvedContext.records],
   );
+  const [providerCommandDetailsOpen, setProviderCommandDetailsOpen] = useState(false);
   const previewImages = useMemo(
     () => userImages.filter((image) => image.name.startsWith("preview-annotation-")),
     [userImages],
@@ -1860,13 +1861,33 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           />
         </div>
         {providerCommandExpansion !== undefined ? (
-          <details className="mt-2 rounded-md border border-border/60 bg-background/30 px-2 py-1 text-xs">
-            <summary className="cursor-pointer select-none text-muted-foreground">
+          <details
+            open={providerCommandDetailsOpen}
+            className="mt-2 rounded-md border border-border/60 bg-background/30 px-2 py-1 text-xs"
+          >
+            <summary
+              aria-expanded={providerCommandDetailsOpen}
+              aria-label="Expanded provider command"
+              className="cursor-pointer select-none text-muted-foreground"
+              role="button"
+              tabIndex={0}
+              onClick={(event) => {
+                event.preventDefault();
+                setProviderCommandDetailsOpen((open) => !open);
+              }}
+              onKeyDown={(event) => {
+                if (event.key !== "Enter" && event.key !== " ") return;
+                event.preventDefault();
+                setProviderCommandDetailsOpen((open) => !open);
+              }}
+            >
               Expanded provider command
             </summary>
-            <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words text-secondary-label">
-              {providerCommandExpansion.expandedText}
-            </pre>
+            {providerCommandDetailsOpen ? (
+              <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap break-words text-secondary-label">
+                {providerCommandExpansion.expandedText}
+              </pre>
+            ) : null}
           </details>
         ) : null}
       </div>

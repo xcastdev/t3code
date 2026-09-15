@@ -20,6 +20,7 @@ import type { Thread, ThreadShell, TurnDiffSummary } from "../types";
 import { deriveProviderInstanceEntries, NO_PROVIDER_MODEL_SELECTION } from "../providerInstances";
 import type { CodexArtifactTemplate } from "@t3tools/client-runtime/codex-artifact-templates";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { resolveProviderSlashCommandsForCwd } from "@t3tools/client-runtime/providerSkills";
 import {
   type RightPanelSurface,
   pullRequestSurface,
@@ -88,7 +89,59 @@ import {
   toolGroupConsumesUpwardNavigation,
   waitForRevertedMessage,
   prepareRevertedMessageAttachments,
+  prepareProviderCommandSubmission,
 } from "./ChatView.logic";
+
+describe("provider command submission", () => {
+  it("uses the active cwd command template for OpenCode while retaining authored text", () => {
+    const provider = {
+      instanceId: ProviderInstanceId.make("opencode"),
+      driver: ProviderDriverKind.make("opencode"),
+      enabled: true,
+      installed: true,
+      version: "1.0.0",
+      status: "ready",
+      auth: { status: "authenticated" },
+      checkedAt: "2026-01-01T00:00:00.000Z",
+      models: [],
+      slashCommands: [{ name: "global", template: "Global $ARGUMENTS" }],
+      skills: [],
+      workspaceSnapshots: [
+        {
+          cwd: "/workspace/project",
+          checkedAt: "2026-01-01T00:01:00.000Z",
+          slashCommands: [{ name: "review", template: "Review $ARGUMENTS" }],
+          skills: [],
+        },
+      ],
+    } satisfies ServerProvider;
+    const commands = resolveProviderSlashCommandsForCwd(provider, "/workspace/project");
+
+    expect(
+      prepareProviderCommandSubmission({
+        provider: ProviderDriverKind.make("opencode"),
+        text: "/review src/a.ts",
+        commands,
+      }),
+    ).toEqual({
+      providerText: "Review src/a.ts",
+      displayText: "/review src/a.ts",
+    });
+  });
+
+  it.each([
+    { provider: ProviderDriverKind.make("codex"), text: "/review src/a.ts" },
+    { provider: ProviderDriverKind.make("opencode"), text: "/missing src/a.ts" },
+  ])("leaves $provider $text unchanged", ({ provider, text }) => {
+    expect(
+      prepareProviderCommandSubmission({
+        provider,
+        text,
+        commands: [{ name: "review", template: "Review $ARGUMENTS" }],
+      }),
+    ).toEqual({ providerText: text });
+  });
+});
 
 describe("agent browser close confirmation", () => {
   const surfaces = [

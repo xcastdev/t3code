@@ -339,6 +339,8 @@ const make = Effect.gen(function* () {
       const sent = yield* Deferred.make<void>();
       resumedTurnStarts.set(commandId, { event, queued, sent });
       const { messageId, ...request } = event.payload;
+      const authoredText = turnStart.value.message.text;
+      const providerText = event.payload.providerText ?? authoredText;
       yield* orchestrationEngine
         .dispatch({
           type: "thread.turn.start",
@@ -347,7 +349,11 @@ const make = Effect.gen(function* () {
           message: {
             messageId,
             role: "user",
-            text: turnStart.value.message.text,
+            text: providerText,
+            ...(providerText !== authoredText ? { displayText: authoredText } : {}),
+            ...(turnStart.value.message.context !== undefined
+              ? { context: turnStart.value.message.context }
+              : {}),
             attachments: turnStart.value.message.attachments ?? [],
           },
         })

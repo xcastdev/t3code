@@ -10,6 +10,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSetupError,
+  type OrchestrationMessageContext,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import {
@@ -79,6 +80,22 @@ const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
 const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asTurnId = (value: string): TurnId => TurnId.make(value);
+
+const providerCommandContext: OrchestrationMessageContext = {
+  version: 1,
+  records: [
+    {
+      version: 1,
+      contextId: ComposerContextId.make("provider-command_expansion"),
+      kind: "provider-command",
+      label: "Expanded provider command",
+      payload: {
+        authoredText: "/review src/a.ts",
+        expandedText: "Review src/a.ts",
+      },
+    },
+  ],
+};
 
 const assistantQuoteText = "Retain the reconnect backoff.";
 const assistantCitation = {
@@ -1128,7 +1145,13 @@ describe("ProviderCommandReactor", () => {
           ),
         );
         const now = "2026-01-01T00:00:00.000Z";
-        const dispatchTurn = (id: string, text: string, createdAt: string, displayText?: string) =>
+        const dispatchTurn = (
+          id: string,
+          text: string,
+          createdAt: string,
+          displayText?: string,
+          context?: OrchestrationMessageContext,
+        ) =>
           harness.engine.dispatch({
             type: "thread.turn.start",
             commandId: CommandId.make(`cmd-${id}`),
@@ -1138,6 +1161,7 @@ describe("ProviderCommandReactor", () => {
               role: "user",
               text,
               ...(displayText !== undefined ? { displayText } : {}),
+              ...(context !== undefined ? { context } : {}),
               attachments: [],
             },
             interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -1180,6 +1204,7 @@ describe("ProviderCommandReactor", () => {
           "Review src/a.ts",
           "2026-01-01T00:00:02.000Z",
           "/review src/a.ts",
+          providerCommandContext,
         );
         yield* harness.engine.dispatch({
           type: "thread.interaction-mode.set",
@@ -1279,6 +1304,30 @@ describe("ProviderCommandReactor", () => {
         expect(
           afterRestore?.messages.filter((message) => message.text === "second queued"),
         ).toHaveLength(1);
+        const persistedEvents = yield* Effect.promise(() =>
+          harness.runEffect(Stream.runCollect(harness.engine.readEvents(0))),
+        );
+        const resumedMessage = Array.from(persistedEvents).find(
+          (event) =>
+            event.type === "thread.message-sent" &&
+            event.payload.messageId === "user-message-during-compact-recovery" &&
+            event.commandId?.startsWith("server:after-compaction:"),
+        );
+        expect(
+          resumedMessage?.type === "thread.message-sent" ? resumedMessage.payload : null,
+        ).toMatchObject({
+          text: "/review src/a.ts",
+          context: providerCommandContext,
+        });
+        const resumedIntent = Array.from(persistedEvents).find(
+          (event) =>
+            event.type === "thread.turn-start-requested" &&
+            event.payload.messageId === "user-message-during-compact-recovery" &&
+            event.commandId?.startsWith("server:after-compaction:"),
+        );
+        expect(
+          resumedIntent?.type === "thread.turn-start-requested" ? resumedIntent.payload : null,
+        ).toMatchObject({ providerText: "Review src/a.ts" });
       }),
   );
 

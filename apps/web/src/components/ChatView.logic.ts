@@ -4,6 +4,7 @@ import {
   type AssetCreateUrlResult,
   type ChatFileAttachment,
   type EnvironmentId,
+  expandOpenCodeCommandTemplate,
   isProviderDriverKind,
   ProjectId,
   type MessageId,
@@ -13,6 +14,7 @@ import {
   ProviderDriverKind,
   type ProviderInstanceId,
   type ServerProvider,
+  type ServerProviderSlashCommand,
   type ScopedProjectRef,
   type ScopedThreadRef,
   type ThreadId,
@@ -62,6 +64,18 @@ export const LAST_INVOKED_SCRIPT_BY_PROJECT_KEY = "t3code:last-invoked-script-by
 export const MAX_HIDDEN_MOUNTED_TERMINAL_THREADS = 10;
 export const MAX_HIDDEN_MOUNTED_PREVIEW_THREADS = 3;
 export const ENVIRONMENT_RECONNECT_WARNING_GRACE_MS = 2_000;
+
+export function prepareProviderCommandSubmission(input: {
+  readonly provider: ProviderDriverKind;
+  readonly text: string;
+  readonly commands: ReadonlyArray<ServerProviderSlashCommand>;
+}): { readonly providerText: string; readonly displayText?: string } {
+  const providerText =
+    input.provider === "opencode"
+      ? expandOpenCodeCommandTemplate(input.text, input.commands)
+      : input.text;
+  return providerText === input.text ? { providerText } : { providerText, displayText: input.text };
+}
 
 export const LastInvokedScriptByProjectSchema = Schema.Record(ProjectId, Schema.String);
 

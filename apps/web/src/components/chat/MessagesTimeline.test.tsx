@@ -12,6 +12,7 @@ import { create, type ReactTestRenderer } from "react-test-renderer";
 import { beforeAll, describe, expect, it, vi } from "vite-plus/test";
 import type { LegendListRef, MaintainScrollAtEndOptions } from "@legendapp/list/react";
 import { shouldUseRestingComposerLayout } from "../composerFooterLayout";
+import { providerCommandContextRecord } from "../../lib/composerContextRecords";
 import { useComposerFocusState } from "./useComposerFocusState";
 
 vi.mock("@legendapp/list/react", async () => {
@@ -1167,39 +1168,81 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain("rounded-2xl bg-message p-3");
   });
 
-  it("shows expanded provider command details without replacing authored text", () => {
+  it("opens and closes expanded provider command details from the mounted disclosure", async () => {
     const baseEntry = buildUserTimelineEntry("/review src/a.ts");
+    const providerCommandRecord = providerCommandContextRecord({
+      authoredText: "/review src/a.ts",
+      expandedText: "Review src/a.ts\n\nInspect the changed files.",
+    });
+    expect(providerCommandRecord).toBeDefined();
     const entry = {
       ...baseEntry,
       message: {
         ...baseEntry.message,
         context: {
           version: 1 as const,
-          records: [
-            {
-              version: 1 as const,
-              contextId: "provider-command_expansion",
-              kind: "provider-command",
-              label: "Expanded provider command",
-              payload: {
-                authoredText: "/review src/a.ts",
-                expandedText: "Review src/a.ts\n\nInspect the changed files.",
-              },
-            },
-          ],
+          records: [providerCommandRecord!],
         },
       },
     };
-    const markup = renderToStaticMarkup(
-      <MessagesTimeline {...buildProps()} timelineEntries={[entry]} />,
-    );
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    const elementStub = Object;
+    vi.stubGlobal("Element", elementStub);
+    vi.stubGlobal("localStorage", {
+      getItem: () => null,
+      setItem: () => {},
+      removeItem: () => {},
+      clear: () => {},
+    });
+    vi.stubGlobal("window", {
+      Element: elementStub,
+      matchMedia,
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      requestAnimationFrame: () => 0,
+      cancelAnimationFrame: () => {},
+      desktopBridge: undefined,
+    });
+    vi.stubGlobal("document", {
+      documentElement: {
+        classList: {
+          add: () => {},
+          remove: () => {},
+          toggle: () => {},
+          contains: () => false,
+        },
+        offsetHeight: 0,
+      },
+    });
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(<MessagesTimeline {...buildProps()} timelineEntries={[entry]} />);
+      });
+      const summary = renderer!.root.findByProps({
+        "aria-label": "Expanded provider command",
+        "aria-expanded": false,
+      });
+      const initialMarkup = JSON.stringify(renderer!.toJSON());
+      expect(initialMarkup).toContain("/review src/a.ts");
+      expect(initialMarkup).not.toContain("Inspect the changed files.");
+      expect(summary.props.role).toBe("button");
+      expect(summary.props.tabIndex).toBe(0);
 
-    expect(markup).toContain("/review src/a.ts");
-    expect(markup).toContain("Expanded provider command");
-    expect(markup).toContain("Review src/a.ts");
-    expect(markup).toContain("Inspect the changed files.");
-    expect(markup).toMatch(/<details[^>]*>/);
-    expect(markup).not.toMatch(/<details[^>]*open/);
+      await act(() => summary.props.onClick({ preventDefault: vi.fn() }));
+      expect(summary.props["aria-expanded"]).toBe(true);
+      expect(JSON.stringify(renderer!.toJSON())).toContain("Inspect the changed files.");
+
+      const preventDefault = vi.fn();
+      await act(() => summary.props.onKeyDown({ key: " ", preventDefault }));
+      expect(preventDefault).toHaveBeenCalledOnce();
+      expect(summary.props["aria-expanded"]).toBe(false);
+      expect(JSON.stringify(renderer!.toJSON())).not.toContain("Inspect the changed files.");
+    } finally {
+      await act(() => renderer?.unmount());
+    }
   });
 
   it("preserves arbitrary XML-like tags and comparisons in rendered user messages", async () => {

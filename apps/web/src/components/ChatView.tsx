@@ -20,7 +20,6 @@ import {
   type AssistantCitation,
   type ApprovalRequestId,
   type ChatFileAttachment,
-  expandOpenCodeCommandTemplate,
   DEFAULT_MODEL,
   type EnvironmentId,
   type MessageId,
@@ -449,6 +448,7 @@ import {
   deriveLockedProvider,
   readFileAsDataUrl,
   resolveFileAttachmentUrl,
+  prepareProviderCommandSubmission,
   prepareRevertedMessageAttachments,
   waitForRevertedMessage,
   reconcileMountedTerminalThreadIds,
@@ -7247,14 +7247,16 @@ export default function ChatView(props: ChatViewProps) {
         promptForSend,
       )
       .trim();
-    const expandedProviderCommandText =
-      ctxSelectedProvider === "opencode"
-        ? expandOpenCodeCommandTemplate(messageTextForSend, ctxSelectedProviderSlashCommands)
-        : messageTextForSend;
+    const providerCommandSubmission = prepareProviderCommandSubmission({
+      provider: ctxSelectedProvider,
+      text: messageTextForSend,
+      commands: ctxSelectedProviderSlashCommands,
+    });
+    const expandedProviderCommandText = providerCommandSubmission.providerText;
     const providerCommandExpansion: ProviderCommandExpansion | undefined =
-      expandedProviderCommandText !== messageTextForSend
+      providerCommandSubmission.displayText !== undefined
         ? {
-            authoredText: messageTextForSend,
+            authoredText: providerCommandSubmission.displayText,
             expandedText: expandedProviderCommandText,
           }
         : undefined;

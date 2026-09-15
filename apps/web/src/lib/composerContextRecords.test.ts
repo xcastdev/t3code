@@ -101,7 +101,18 @@ describe("composerContextRecords", () => {
 
   it("omits an oversized provider disclosure while preserving other context", () => {
     const context = buildMessageContext({
-      terminalContexts: [],
+      terminalContexts: [
+        {
+          id: "terminal-1",
+          threadId: ThreadId.make("thread-1"),
+          createdAt: "2026-01-01T00:00:00.000Z",
+          terminalId: "terminal-1",
+          terminalLabel: "Terminal",
+          lineStart: 1,
+          lineEnd: 1,
+          text: "output",
+        },
+      ],
       reviewComments: [],
       previewAnnotations: [],
       providerCommand: {
@@ -110,7 +121,9 @@ describe("composerContextRecords", () => {
       },
     });
 
-    expect(context).toBeUndefined();
+    expect(context?.records).toHaveLength(1);
+    expect(context?.records[0]?.kind).toBe("terminal");
+    expect(extractProviderCommandExpansion(context?.records ?? [])).toBeUndefined();
   });
   it("copies only ready or persisted server-side attachment IDs", () => {
     const environmentId = EnvironmentId.make("env");
