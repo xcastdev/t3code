@@ -16,6 +16,11 @@ or remove that shortcut in Settings.
 
 Use `mod+alt+b` to show or hide the right sidebar.
 
+The `rightPanel.openBrowser`, `rightPanel.openFiles`, `rightPanel.openSourceControl`,
+`rightPanel.openAgents`, `rightPanel.openPullRequest`, `rightPanel.openLinkedPullRequests`, and
+`rightPanel.openDevice` commands open their matching right-panel surface. They have no default
+shortcuts. `sourceControl.open` keeps its default `mod+alt+g` shortcut.
+
 In the model picker, press Left in an empty search field or Shift+Tab to reach
 the provider list. Use Up/Down to move and Enter to choose. Right returns to
 model search. `mod+shift+up` and `mod+shift+down` switch providers directly and clear the
@@ -91,8 +96,12 @@ a shortcut.
 shortcut; assign one in **Settings → Keybindings**.
 
 `rightPanel.toggleMaximized` toggles the open inline right sidebar between its
-normal width and the workspace. It has no effect while the sidebar is closed or
+normal width and the workspace. If an inline secondary pane is open, it
+maximizes that pane instead. It has no effect while the sidebar is closed or
 rendered as a narrow-window sheet.
+
+`terminal.toggle` shows or collapses the bottom terminal dock without closing its
+sessions. `terminal.close` closes the active terminal session.
 
 `chat.new` may ask you to choose a project when there is more than one.
 `chat.newLocal` skips that chooser. Both use your

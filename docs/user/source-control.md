@@ -87,8 +87,11 @@ make your first commit before pushing.
 
 ## Create a pull request
 
-Use a thread's Git actions to commit, push, and create a pull request. T3 Code can generate commit
-messages, review titles, and descriptions from your changes.
+On web and desktop, use the Source Control surface to commit, push, publish a repository, and
+create a pull request. Open it from the right sidebar, command palette, or `mod+alt+g`. Its
+icon-rail entry uses the detected source-control provider's name when available, such as GitHub;
+otherwise it is called Source Control. T3 Code can generate commit messages, review titles, and
+descriptions from your changes.
 
 Choose the writing style and model in **Settings → Source Control**. **Repository conventions**
 uses the project's instructions and recent commit subjects.
@@ -103,6 +106,11 @@ The panel commits only staged changes. Use **Unstage** to remove a staged file
 from that commit; it keeps the file's working-tree changes. A file marked
 **Staged + modified** has both an indexed version and newer unstaged work, so
 review the state again before committing.
+
+Large working trees load a bounded first set of changes. The count above the list covers the whole
+working tree. Use **Load more changes** until the files you need are listed, then stage or review
+each file. During a pending merge with no staged files, use **Review pending merge** to review the
+repository-wide merge before committing it.
 
 The panel refreshes the repository after stage and unstage operations. It refuses
 a commit when the reviewed branch, index, or merge state changed in the meantime.
@@ -133,7 +141,7 @@ Browsers and mobile clients need a paired environment to use its GitHub CLI cred
 Credentials stay on their machines. Previously verified credentials remain usable for routing
 for ten minutes during a GitHub outage; new credentials must be verified first. An action with
 an uncertain result is never automatically retried elsewhere. Listings, diffs, and checkout or
-PR creation from Git actions continue to use the project's environment.
+PR creation from Source Control continues to use the project's environment.
 
 For Azure DevOps, use the host website to view diffs or change comments. Bitbucket does not support
 reopening a declined pull request.
@@ -152,7 +160,7 @@ reopening a declined pull request.
 
 A thread can hold several pull requests, including reviews from another repository on the same host.
 Use **Link pull request** in the command palette or **Linked pull requests** panel, or right-click a
-pull request link in the conversation. Creating a pull request from Git actions links it automatically.
+pull request link in the conversation. Creating a pull request from Source Control links it automatically.
 Agents can link their pull requests with the `link_pull_request` tool.
 
 Use **Link this PR** in a branch-detected badge's tooltip to keep it with the thread. From a review
