@@ -636,6 +636,7 @@ function makeManager(input?: {
   serverSettings?: Parameters<typeof ServerSettings.layerTest>[0];
   setupScriptRunner?: ProjectSetupScriptRunner.ProjectSetupScriptRunner["Service"];
   gitConfigReads?: string[];
+  workingTreeFiles?: GitVcsDriver.GitStatusDetails["workingTree"]["files"];
 }) {
   const { service: gitHubCli, ghCalls } = createGitHubCliWithFakeGh(input?.ghScenario);
   const textGeneration = createTextGeneration(input?.textGeneration);
@@ -645,30 +646,42 @@ function makeManager(input?: {
 
   const serverSettingsLayer = ServerSettings.ServerSettingsService.layerTest(input?.serverSettings);
 
-  const vcsDriverLayer = input?.gitConfigReads
-    ? Layer.effect(
-        GitVcsDriver.GitVcsDriver,
-        GitVcsDriver.make.pipe(
-          Effect.map((service) =>
-            GitVcsDriver.GitVcsDriver.of({
-              ...service,
-              readConfigValue: (cwd, key) =>
-                Effect.sync(() => input.gitConfigReads?.push(key)).pipe(
-                  Effect.andThen(service.readConfigValue(cwd, key)),
-                ),
-            }),
+  const vcsDriverLayer =
+    input?.gitConfigReads || input?.workingTreeFiles
+      ? Layer.effect(
+          GitVcsDriver.GitVcsDriver,
+          GitVcsDriver.make.pipe(
+            Effect.map((service) =>
+              GitVcsDriver.GitVcsDriver.of({
+                ...service,
+                statusDetailsLocal: (cwd) =>
+                  service.statusDetailsLocal(cwd).pipe(
+                    Effect.map((status) =>
+                      input.workingTreeFiles
+                        ? {
+                            ...status,
+                            workingTree: { ...status.workingTree, files: input.workingTreeFiles },
+                          }
+                        : status,
+                    ),
+                  ),
+                readConfigValue: (cwd, key) =>
+                  Effect.sync(() => input.gitConfigReads?.push(key)).pipe(
+                    Effect.andThen(service.readConfigValue(cwd, key)),
+                  ),
+              }),
+            ),
           ),
-        ),
-      ).pipe(
-        Layer.provideMerge(VcsProcess.layer),
-        Layer.provideMerge(NodeServices.layer),
-        Layer.provideMerge(serverConfigLayer),
-      )
-    : GitVcsDriver.layer.pipe(
-        Layer.provideMerge(VcsProcess.layer),
-        Layer.provideMerge(NodeServices.layer),
-        Layer.provideMerge(serverConfigLayer),
-      );
+        ).pipe(
+          Layer.provideMerge(VcsProcess.layer),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(serverConfigLayer),
+        )
+      : GitVcsDriver.layer.pipe(
+          Layer.provideMerge(VcsProcess.layer),
+          Layer.provideMerge(NodeServices.layer),
+          Layer.provideMerge(serverConfigLayer),
+        );
   const sourceControlRegistryLayer = Layer.effect(
     SourceControlProviderRegistry.SourceControlProviderRegistry,
     (input?.sourceControlProvider === undefined
@@ -5950,6 +5963,29 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
           .pipe(Effect.flip);
         expect(stale.message).toContain("stale");
       }),
+  );
+
+  it.effect("rejects a single oversized working-tree row with a typed error", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-oversized-row-");
+      yield* initRepo(repoDir);
+      const { manager } = yield* makeManager({
+        workingTreeFiles: [
+          {
+            path: "\u0001".repeat(12_000),
+            insertions: 0,
+            deletions: 0,
+          },
+        ],
+      });
+      const failure = yield* manager.localStatus({ cwd: repoDir }).pipe(Effect.flip);
+      expect(failure).toMatchObject({
+        _tag: "GitManagerError",
+        operation: "readLocalStatus",
+        cwd: repoDir,
+        detail: "A working tree entry exceeds the bounded status response limit.",
+      });
+    }),
   );
 
   it.effect("bounds escaped working-tree status and page JSON", () =>

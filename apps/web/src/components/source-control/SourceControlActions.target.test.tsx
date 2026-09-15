@@ -3,6 +3,7 @@
 import { act, Children, cloneElement, isValidElement, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import type { VcsStatusResult } from "@t3tools/contracts";
 
 const statusQuery = vi.hoisted(() => ({
   data: {
@@ -12,10 +13,10 @@ const statusQuery = vi.hoisted(() => ({
     refName: "feature/test",
     hasWorkingTreeChanges: true,
     workingTree: {
-      files: [{ path: "src/file.ts", insertions: 1, deletions: 0, indexStatus: "modified" }],
+      files: [{ path: "src/file.ts", insertions: 1, deletions: 0, indexStatus: "unstaged" }],
       insertions: 1,
       deletions: 0,
-    },
+    } as VcsStatusResult["workingTree"],
     hasUpstream: true,
     aheadCount: 0,
     behindCount: 0,
@@ -23,7 +24,20 @@ const statusQuery = vi.hoisted(() => ({
   },
   error: null,
 }));
-const gitActionRun = vi.hoisted(() => vi.fn(() => Promise.resolve({ _tag: "Success", value: {} })));
+const gitActionRun = vi.hoisted(() =>
+  vi.fn((_input: unknown) =>
+    Promise.resolve({
+      _tag: "Success",
+      value: {
+        branch: { status: "unchanged" },
+        toast: { cta: { kind: "none" }, title: "Committed" },
+      },
+    }),
+  ),
+);
+const workingTreePage = vi.hoisted(() => Symbol("working-tree-page"));
+const loadPage = vi.hoisted(() => vi.fn());
+const toastAdd = vi.hoisted(() => vi.fn());
 
 const sourceControlDiscovery = vi.hoisted(() => Symbol("source-control-discovery"));
 const sourceControlDiscoveryQuery = vi.hoisted(() => ({
@@ -58,9 +72,15 @@ vi.mock("~/state/server", () => ({
   serverEnvironment: { configValueAtom: () => Symbol("config") },
 }));
 vi.mock("~/state/threads", () => ({ threadEnvironment: { updateMetadata: Symbol("update") } }));
-vi.mock("~/state/use-atom-command", () => ({ useAtomCommand: () => vi.fn() }));
+vi.mock("~/state/use-atom-command", () => ({
+  useAtomCommand: (command: symbol) => (command === workingTreePage ? loadPage : vi.fn()),
+}));
 vi.mock("~/state/vcs", () => ({
-  vcsEnvironment: { status: () => Symbol("status"), refreshStatus: Symbol("refresh") },
+  vcsEnvironment: {
+    status: () => Symbol("status"),
+    refreshStatus: Symbol("refresh"),
+    workingTreePage,
+  },
 }));
 vi.mock("~/state/sourceControl", () => ({
   sourceControlEnvironment: { discovery: () => sourceControlDiscovery },
@@ -107,7 +127,9 @@ vi.mock("@base-ui/react/radio", () => ({
   },
 }));
 
-vi.mock("../StartTruncatedPath", () => ({ StartTruncatedPath: () => <span /> }));
+vi.mock("../StartTruncatedPath", () => ({
+  StartTruncatedPath: ({ path }: { path: string }) => <span>{path}</span>,
+}));
 vi.mock("../ui/button", () => ({
   Button: ({
     size: _size,
@@ -118,9 +140,14 @@ vi.mock("../ui/button", () => ({
   ),
 }));
 vi.mock("../ui/checkbox", () => ({
-  Checkbox: ({ onCheckedChange, ...props }: { onCheckedChange?: () => void }) => (
-    <input type="checkbox" onChange={() => onCheckedChange?.()} {...props} />
-  ),
+  Checkbox: ({
+    onCheckedChange,
+    indeterminate: _indeterminate,
+    ...props
+  }: {
+    onCheckedChange?: () => void;
+    indeterminate?: boolean;
+  }) => <input type="checkbox" onChange={() => onCheckedChange?.()} {...props} />,
 }));
 vi.mock("../ui/radio-group", () => ({
   RadioGroup: ({
@@ -203,7 +230,7 @@ vi.mock("../ui/input", () => ({
 }));
 vi.mock("../ui/toast", () => ({
   stackedThreadToast: (value: unknown) => value,
-  toastManager: { add: vi.fn(), close: vi.fn(), update: vi.fn() },
+  toastManager: { add: toastAdd, close: vi.fn(), update: vi.fn() },
 }));
 vi.mock("../ui/tooltip", () => ({
   Tooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
@@ -238,12 +265,17 @@ const ActionsWithTarget = SourceControlActions as unknown as (props: {
   target: HTMLElement | null;
 }) => React.ReactNode;
 
-async function render(root: Root, target: HTMLElement | null): Promise<void> {
+async function render(
+  root: Root,
+  target: HTMLElement | null,
+  environmentId = "environment",
+  cwd = "/repo",
+): Promise<void> {
   await act(async () => {
     root.render(
       <ActionsWithTarget
-        activeThreadRef={{ environmentId: "environment", threadId: "thread" }}
-        gitCwd="/repo"
+        activeThreadRef={{ environmentId, threadId: "thread" }}
+        gitCwd={cwd}
         target={target}
       />,
     );
@@ -259,6 +291,13 @@ async function typeMessage(input: HTMLTextAreaElement, value: string): Promise<v
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   gitActionRun.mockClear();
+  loadPage.mockReset();
+  toastAdd.mockClear();
+  statusQuery.data.workingTree = {
+    files: [{ path: "src/file.ts", insertions: 1, deletions: 0 }],
+    insertions: 1,
+    deletions: 0,
+  };
   document.body.replaceChildren();
 });
 
@@ -269,51 +308,157 @@ afterEach(async () => {
   vi.unstubAllGlobals();
 });
 
+async function clickButton(text: string) {
+  const button = [...document.querySelectorAll("button")].find(
+    (entry) => entry.textContent === text,
+  );
+  expect(button, text).toBeDefined();
+  await act(async () => button!.click());
+}
+
 describe("SourceControlActions target lifetime", () => {
-  it("windows a large chooser while preserving exact all and partial commit scopes", async () => {
-    statusQuery.data = {
-      ...statusQuery.data,
-      workingTree: {
-        files: Array.from({ length: 101 }, (_, index) => ({
-          path: `src/file-${String(index + 1).padStart(3, "0")}.ts`,
-          insertions: 1,
+  it.each(["all", "partial"])(
+    "windows a large chooser and submits %s commit scope",
+    async (mode) => {
+      statusQuery.data = {
+        ...statusQuery.data,
+        workingTree: {
+          files: Array.from({ length: 64 }, (_, index) => ({
+            path: `src/file-${String(index + 1).padStart(3, "0")}.ts`,
+            insertions: 1,
+            deletions: 0,
+            indexStatus: "unstaged" as const,
+          })),
+          insertions: 101,
           deletions: 0,
-          indexStatus: "unstaged" as const,
-        })),
-        insertions: 101,
-        deletions: 0,
-        totalCount: 101,
-      },
+          totalCount: 101,
+          snapshotId: "wt-1",
+          nextCursor: 64,
+        },
+      };
+      loadPage.mockResolvedValue({
+        _tag: "Success",
+        value: {
+          snapshotId: "wt-1",
+          nextCursor: null,
+          files: Array.from({ length: 37 }, (_, index) => ({
+            path: `src/file-${String(index + 65).padStart(3, "0")}.ts`,
+            insertions: 1,
+            deletions: 0,
+          })),
+        },
+      });
+      const host = document.createElement("div");
+      const target = document.createElement("div");
+      document.body.append(host, target);
+      const root = createRoot(host);
+      roots.push(root);
+      await render(root, target);
+      await act(async () => {
+        [...target.querySelectorAll("button")]
+          .find((button) => button.textContent === "Commit")
+          ?.click();
+      });
+      await act(async () => {
+        [...document.querySelectorAll("button")]
+          .find((button) => button.textContent === "Edit")
+          ?.click();
+      });
+      expect(document.querySelectorAll('input[type="checkbox"]')).toHaveLength(101);
+      expect(
+        [...document.querySelectorAll("button")].some((button) =>
+          button.textContent?.includes("Show 1more files"),
+        ),
+      ).toBe(true);
+      await act(async () => {
+        [...document.querySelectorAll("button")]
+          .find((button) => button.textContent?.includes("Show 1more files"))
+          ?.click();
+      });
+      expect(document.querySelectorAll('input[type="checkbox"]')).toHaveLength(102);
+      if (mode === "partial") {
+        await act(async () =>
+          document.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click(),
+        );
+        const row = [...document.querySelectorAll("button")].find((button) =>
+          button.textContent?.includes("src/file-101.ts"),
+        )!.parentElement!;
+        await act(async () =>
+          row.querySelector<HTMLInputElement>('input[type="checkbox"]')!.click(),
+        );
+      }
+      await clickButton("Done");
+      await typeMessage(document.querySelector("textarea")!, "commit selected files");
+      const commit = [...host.querySelectorAll("button")].find(
+        (button) => button.textContent === "Commit",
+      )!;
+      await act(async () => commit.click());
+      expect(gitActionRun).toHaveBeenCalledTimes(1);
+      const input = gitActionRun.mock.calls[0]![0];
+      expect(input).toMatchObject({ action: "commit", commitMessage: "commit selected files" });
+      if (mode === "partial") expect(input).toMatchObject({ filePaths: ["src/file-101.ts"] });
+      else expect(input).not.toHaveProperty("filePaths");
+    },
+  );
+
+  it.each([
+    ["environment", "Success"],
+    ["environment", "Failure"],
+    ["cwd", "Success"],
+    ["cwd", "Failure"],
+  ])("discards a deferred %s scope response (%s)", async (changed, outcome) => {
+    statusQuery.data.workingTree = {
+      files: [{ path: "preview.ts", insertions: 1, deletions: 0 }],
+      totalCount: 2,
+      snapshotId: "wt-1",
+      nextCursor: 1,
+      insertions: 2,
+      deletions: 0,
     };
+    let resolvePage!: (value: unknown) => void;
+    const pending = new Promise<unknown>((resolve) => {
+      resolvePage = resolve;
+    });
+    loadPage.mockReturnValueOnce(pending);
     const host = document.createElement("div");
     const target = document.createElement("div");
     document.body.append(host, target);
     const root = createRoot(host);
     roots.push(root);
-    await render(root, target);
-    await act(async () => {
-      [...target.querySelectorAll("button")]
-        .filter((button) => button.textContent === "Commit")
-        .at(-1)
-        ?.click();
+    await render(root, target, "envA", "/cwdX");
+    await clickButton("Commit");
+    await clickButton("Edit");
+    expect(loadPage).toHaveBeenCalledWith({
+      environmentId: "envA",
+      input: { cwd: "/cwdX", snapshotId: "wt-1", cursor: 1 },
     });
+    await render(
+      root,
+      target,
+      changed === "environment" ? "envB" : "envA",
+      changed === "cwd" ? "/cwdY" : "/cwdX",
+    );
     await act(async () => {
-      [...document.querySelectorAll("button")]
-        .find((button) => button.textContent === "Edit")
-        ?.click();
+      resolvePage(
+        outcome === "Success"
+          ? {
+              _tag: "Success",
+              value: {
+                snapshotId: "wt-1",
+                nextCursor: null,
+                files: [{ path: "stale-A.ts", insertions: 1, deletions: 0 }],
+              },
+            }
+          : { _tag: "Failure", cause: new Error("stale A failure") },
+      );
+      await pending;
     });
-    expect(document.querySelectorAll('input[type="checkbox"]')).toHaveLength(101);
+    expect(document.body.textContent).not.toContain("stale-A.ts");
+    expect(document.querySelectorAll('input[type="checkbox"]')).toHaveLength(0);
     expect(
-      [...document.querySelectorAll("button")].some((button) =>
-        button.textContent?.includes("Show 1more files"),
-      ),
-    ).toBe(true);
-    await act(async () => {
-      [...document.querySelectorAll("button")]
-        .find((button) => button.textContent?.includes("Show 1more files"))
-        ?.click();
-    });
-    expect(document.querySelectorAll('input[type="checkbox"]')).toHaveLength(102);
+      [...document.querySelectorAll("button")].some((button) => button.textContent === "Done"),
+    ).toBe(false);
+    expect(toastAdd).not.toHaveBeenCalled();
   });
 
   it("keeps an open commit draft when its Source Control target disappears and returns", async () => {
