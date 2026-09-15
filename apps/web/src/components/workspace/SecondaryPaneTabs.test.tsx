@@ -4,9 +4,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 
 import { SecondaryPaneTabs } from "./SecondaryPaneTabs";
 import { selectThreadSecondaryPaneState, useSecondaryPaneStore } from "~/secondaryPaneStore";
+import { PanelLayoutControls, RightPanelMaximizeControl } from "../chat/PanelLayoutControls";
 
 const showContextMenu =
   vi.fn<
@@ -21,6 +23,10 @@ vi.mock("~/localApi", () => ({
 vi.mock("~/env", async (original) => ({
   ...(await original<typeof import("~/env")>()),
   isElectron: true,
+}));
+vi.mock("~/state/environments", async (original) => ({
+  ...(await original<typeof import("~/state/environments")>()),
+  usePrimaryEnvironmentId: () => EnvironmentId.make("secondary-tabs"),
 }));
 
 const surfaces = [
@@ -219,5 +225,89 @@ describe("SecondaryPaneTabs", () => {
     const stackedHeader = host.querySelector<HTMLElement>("[data-secondary-pane-tabbar]")!;
     expect(stackedHeader.dataset.secondaryPaneTitlebarOwner).toBe("false");
     expect(stackedHeader.className).not.toContain("drag-region");
+  });
+
+  it("keeps blank inline titlebar space draggable while tabs stay interactive and applies the collapsed-sidebar inset when maximized", async () => {
+    await act(async () =>
+      root.render(
+        <SecondaryPaneTabs
+          surfaces={surfaces}
+          activeSurfaceId={surfaces[0]!.id}
+          layout="inline"
+          maximized
+          onActivate={() => undefined}
+          onClose={() => undefined}
+          onCopyFilePath={() => undefined}
+          onCloseOtherSurfaces={() => undefined}
+          onCloseSurfacesToRight={() => undefined}
+          onCloseAllSurfaces={() => undefined}
+        />,
+      ),
+    );
+
+    const header = host.querySelector<HTMLElement>("[data-secondary-pane-tabbar]")!;
+    const tabList = host.querySelector<HTMLElement>("[data-secondary-pane-tab-list]")!;
+    const tab = host.querySelector<HTMLElement>('[role="tab"]')!;
+    expect(header.className).toContain("workspace-titlebar-content-left");
+    expect(tabList.className).not.toContain("-webkit-app-region:no-drag");
+    expect(tab.parentElement!.className).toContain("-webkit-app-region:no-drag");
+  });
+
+  it("mounts the workspace Open With, maximize, and panel toggles in the inline header", async () => {
+    const maximize = vi.fn();
+    const terminal = vi.fn();
+    const rightPanel = vi.fn();
+    await act(async () =>
+      root.render(
+        <SecondaryPaneTabs
+          surfaces={surfaces}
+          activeSurfaceId={surfaces[0]!.id}
+          layout="inline"
+          workspaceFile={{
+            environmentId: threadRef.environmentId,
+            cwd: "/repo",
+            relativePath: "src/one.ts",
+            keybindings: DEFAULT_RESOLVED_KEYBINDINGS,
+            availableEditors: [],
+          }}
+          onActivate={() => undefined}
+          onClose={() => undefined}
+          onCopyFilePath={() => undefined}
+          onCloseOtherSurfaces={() => undefined}
+          onCloseSurfacesToRight={() => undefined}
+          onCloseAllSurfaces={() => undefined}
+          headerControls={
+            <>
+              <RightPanelMaximizeControl maximized={false} onToggle={maximize} />
+              <PanelLayoutControls
+                terminalAvailable
+                terminalOpen={false}
+                terminalShortcutLabel={null}
+                rightPanelAvailable
+                rightPanelOpen={false}
+                rightPanelShortcutLabel={null}
+                liveAgentCount={0}
+                onToggleTerminal={terminal}
+                onToggleRightPanel={rightPanel}
+              />
+            </>
+          }
+        />,
+      ),
+    );
+
+    expect(host.querySelector('[aria-label="Open in editor"]')).not.toBeNull();
+    await act(async () =>
+      host.querySelector<HTMLButtonElement>('[aria-label="Maximize panel"]')!.click(),
+    );
+    await act(async () =>
+      host.querySelector<HTMLButtonElement>('[aria-label="Toggle terminal drawer"]')!.click(),
+    );
+    await act(async () =>
+      host.querySelector<HTMLButtonElement>('[aria-label="Toggle right panel"]')!.click(),
+    );
+    expect(maximize).toHaveBeenCalledOnce();
+    expect(terminal).toHaveBeenCalledOnce();
+    expect(rightPanel).toHaveBeenCalledOnce();
   });
 });

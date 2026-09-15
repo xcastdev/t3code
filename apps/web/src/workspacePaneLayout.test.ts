@@ -5,11 +5,36 @@ import {
   getSecondaryPaneMaxWidth,
   getWorkspacePaneFlexDirection,
   resolveWorkspaceHeaderRightInsetMode,
+  resolveWorkspacePanelControlsOwner,
   resolveWorkspaceTitlebarOwner,
   shouldAlignHeaderControlsWithRightPanelRail,
 } from "./workspacePaneLayout";
 
 describe("workspacePaneLayout", () => {
+  it("assigns one controls host when an inline secondary pane shares an empty right rail", () => {
+    expect(
+      resolveWorkspacePanelControlsOwner({
+        titlebarOwner: "secondary",
+        rightPanelControlsAtRoot: true,
+        rightPanelControlsInPanel: false,
+      }),
+    ).toBe("secondary");
+    expect(
+      resolveWorkspacePanelControlsOwner({
+        titlebarOwner: "chat",
+        rightPanelControlsAtRoot: true,
+        rightPanelControlsInPanel: false,
+      }),
+    ).toBe("right-panel");
+    expect(
+      resolveWorkspacePanelControlsOwner({
+        titlebarOwner: "chat",
+        rightPanelControlsAtRoot: false,
+        rightPanelControlsInPanel: true,
+      }),
+    ).toBe("sheet");
+  });
+
   it("preserves the chat minimum when calculating the editor maximum", () => {
     expect(getSecondaryPaneMaxWidth(1200)).toBe(840);
     expect(getSecondaryPaneMaxWidth(500)).toBe(420);

@@ -16,6 +16,7 @@ import { cn } from "~/lib/utils";
 import { resolvePathLinkTarget } from "~/terminal-links";
 import { useRemoteOpenState } from "~/remoteOpen";
 import { usePrimaryEnvironmentId } from "~/state/environments";
+import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { OpenInPicker } from "../chat/OpenInPicker";
 import type { SecondaryPaneSurface } from "../../secondaryPaneStore";
 
@@ -63,6 +64,7 @@ export function SecondaryPaneTabs(props: {
   workspaceFile?: WorkspaceFileHeader;
   headerControls?: ReactNode;
   layout?: "inline" | "stack";
+  maximized?: boolean;
 }) {
   const ownsDesktopTitlebar = isElectron && props.layout !== "stack";
   const handleTabContextMenu = useCallback(
@@ -113,6 +115,7 @@ export function SecondaryPaneTabs(props: {
       className={cn(
         "flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] min-w-0 shrink-0 items-center border-b border-border/60 px-2",
         ownsDesktopTitlebar && "drag-region wco:pr-[var(--workspace-native-controls-inset)]",
+        props.maximized && COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
       )}
       data-secondary-pane-tabbar
       data-secondary-pane-titlebar-owner={ownsDesktopTitlebar ? "true" : "false"}
@@ -122,10 +125,8 @@ export function SecondaryPaneTabs(props: {
       <ScrollArea
         hideScrollbars
         scrollFade
-        className={cn(
-          "min-w-0 flex-1 rounded-none",
-          ownsDesktopTitlebar && "[-webkit-app-region:no-drag]",
-        )}
+        className="min-w-0 flex-1 rounded-none"
+        data-secondary-pane-tab-list
       >
         <div className="flex h-full w-max min-w-full items-center gap-1">
           {props.surfaces.map((surface) => {

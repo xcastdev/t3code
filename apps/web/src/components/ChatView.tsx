@@ -174,6 +174,7 @@ import { buildTemporaryWorktreeBranchName } from "@t3tools/shared/git";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "../rightPanelLayout";
 import {
+  resolveWorkspacePanelControlsOwner,
   resolveWorkspaceTitlebarOwner,
   SECONDARY_PANE_COMPACT_MEDIA_QUERY,
 } from "../workspacePaneLayout";
@@ -1830,22 +1831,20 @@ export default function ChatView(props: ChatViewProps) {
   const canMaximizeSecondaryPane = secondaryPaneOpen && !secondaryPaneIsStacked;
   const secondaryPaneMaximized =
     canMaximizeSecondaryPane && maximizedSecondaryPaneThreadKey === routeThreadKey;
-  const inlineSecondaryPaneOwnsTitleBar =
-    resolveWorkspaceTitlebarOwner({
-      secondaryPaneOpen,
-      secondaryPaneLayout: secondaryPaneIsStacked ? "stack" : "inline",
-      rightPanelOpen,
-      rightPanelHasActiveSurface: activeRightPanelSurface !== null,
-      rightPanelUsesSheet: shouldUseRightPanelSheet,
-    }) === "secondary";
-  const inlineRightPanelOwnsTitleBar =
-    resolveWorkspaceTitlebarOwner({
-      secondaryPaneOpen,
-      secondaryPaneLayout: secondaryPaneIsStacked ? "stack" : "inline",
-      rightPanelOpen,
-      rightPanelHasActiveSurface: activeRightPanelSurface !== null,
-      rightPanelUsesSheet: shouldUseRightPanelSheet,
-    }) === "right-panel";
+  const workspaceTitlebarOwner = resolveWorkspaceTitlebarOwner({
+    secondaryPaneOpen,
+    secondaryPaneLayout: secondaryPaneIsStacked ? "stack" : "inline",
+    rightPanelOpen,
+    rightPanelHasActiveSurface: activeRightPanelSurface !== null,
+    rightPanelUsesSheet: shouldUseRightPanelSheet,
+  });
+  const inlineSecondaryPaneOwnsTitleBar = workspaceTitlebarOwner === "secondary";
+  const inlineRightPanelOwnsTitleBar = workspaceTitlebarOwner === "right-panel";
+  const panelControlsOwner = resolveWorkspacePanelControlsOwner({
+    titlebarOwner: workspaceTitlebarOwner,
+    rightPanelControlsAtRoot,
+    rightPanelControlsInPanel,
+  });
 
   useEffect(() => {
     if (!activeThreadRef) return;
@@ -8664,7 +8663,7 @@ export default function ChatView(props: ChatViewProps) {
       <div className="pointer-events-auto flex h-full items-center">{panelToggleControls}</div>
     </div>
   );
-  const secondaryPaneHeaderControls = inlineSecondaryPaneOwnsTitleBar ? (
+  const secondaryPaneHeaderControls = (
     <>
       <RightPanelMaximizeControl
         available={canMaximizeSecondaryPane}
@@ -8673,7 +8672,7 @@ export default function ChatView(props: ChatViewProps) {
       />
       {panelToggleControls}
     </>
-  ) : null;
+  );
   const rightPanelContent = activeThreadRef ? (
     renderedRightPanelSurface?.kind === "preview" ? (
       <Suspense fallback={null}>
@@ -8878,7 +8877,7 @@ export default function ChatView(props: ChatViewProps) {
           ) : null}
         </WizardPopup>
       </Dialog>
-      {rightPanelControlsAtRoot ? panelLayoutControls : null}
+      {panelControlsOwner === "right-panel" ? panelLayoutControls : null}
       <div
         className={cn(
           "flex min-h-0 min-w-0 flex-col overflow-x-hidden",
@@ -8910,17 +8909,13 @@ export default function ChatView(props: ChatViewProps) {
               {...(routeKind === "draft" && draftId ? { draftId } : {})}
             />
           ) : null}
-          {isElectron && rightPanelControlsAtRoot ? (
+          {isElectron && panelControlsOwner === "right-panel" ? (
             <span
               aria-hidden
               className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]"
             />
           ) : null}
-          {!rightPanelControlsAtRoot &&
-          !rightPanelControlsInPanel &&
-          !inlineSecondaryPaneOwnsTitleBar
-            ? panelLayoutControls
-            : null}
+          {panelControlsOwner === "chat" ? panelLayoutControls : null}
           <ChatHeader
             activeThreadEnvironmentId={activeThread.environmentId}
             activeThreadId={activeThread.id}
@@ -9438,6 +9433,7 @@ export default function ChatView(props: ChatViewProps) {
             surfaces={activeSecondaryPaneState.surfaces}
             activeSurfaceId={activeSecondaryPaneState.activeSurfaceId}
             layout={secondaryPaneIsStacked ? "stack" : "inline"}
+            maximized={secondaryPaneMaximized}
             workspaceFile={{
               environmentId: activeThread.environmentId,
               cwd: activeWorkspaceRoot,
@@ -9448,7 +9444,9 @@ export default function ChatView(props: ChatViewProps) {
               keybindings,
               availableEditors,
             }}
-            headerControls={secondaryPaneHeaderControls}
+            headerControls={
+              panelControlsOwner === "secondary" ? secondaryPaneHeaderControls : undefined
+            }
             onActivate={(surfaceId) =>
               useSecondaryPaneStore.getState().activateSurface(activeThreadRef, surfaceId)
             }
@@ -9551,7 +9549,7 @@ export default function ChatView(props: ChatViewProps) {
             // right inset plus mr-px), so the cluster does not creep when
             // the sheet opens.
             layoutControls={
-              rightPanelOpen ? (
+              panelControlsOwner === "sheet" ? (
                 <div className="mr-px flex items-center">{panelToggleControls}</div>
               ) : null
             }

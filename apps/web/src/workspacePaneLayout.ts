@@ -1,4 +1,5 @@
 export type WorkspaceTitlebarOwner = "chat" | "secondary" | "right-panel";
+export type WorkspacePanelControlsOwner = "chat" | "secondary" | "right-panel" | "sheet";
 export type SecondaryPaneLayoutMode = "inline" | "stack";
 export type WorkspaceHeaderRightInsetMode = "default" | "right-panel-control" | "native-controls";
 export type WorkspacePaneFlexDirection = "flex-row" | "flex-col";
@@ -37,6 +38,18 @@ export function resolveWorkspaceTitlebarOwner(input: {
     return "right-panel";
   }
   if (input.secondaryPaneOpen && input.secondaryPaneLayout !== "stack") return "secondary";
+  return "chat";
+}
+
+/** The controls are rendered exactly once, in the header that owns their geometry. */
+export function resolveWorkspacePanelControlsOwner(input: {
+  titlebarOwner: WorkspaceTitlebarOwner;
+  rightPanelControlsAtRoot: boolean;
+  rightPanelControlsInPanel: boolean;
+}): WorkspacePanelControlsOwner {
+  if (input.rightPanelControlsInPanel) return "sheet";
+  if (input.titlebarOwner === "secondary") return "secondary";
+  if (input.rightPanelControlsAtRoot) return "right-panel";
   return "chat";
 }
 
