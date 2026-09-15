@@ -5,6 +5,7 @@ import type {
   ScopedProjectRef,
   ScopedThreadRef,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 
 import { useRightPanelStore } from "./rightPanelStore";
 import { useSecondaryPaneStore } from "./secondaryPaneStore";
@@ -15,16 +16,21 @@ export function removeThreadPaneState(threadRef: ScopedThreadRef): void {
   useSecondaryPaneStore.getState().removeThread(threadRef);
 }
 
-type DeletionResult = { readonly _tag: "Success" | "Failure" };
+type MutationResult =
+  | { readonly _tag: "Success" }
+  | { readonly _tag: "Failure"; readonly cause: Cause.Cause<unknown> };
 
-/** Clear a thread's panes only after its authoritative deletion command succeeds. */
-export function removeThreadPaneStateAfterSuccessfulDeletion(
-  result: DeletionResult,
+/** Run a thread lifecycle mutation and clear panes only for an actual deletion success. */
+export async function executeThreadLifecycleMutation<T extends MutationResult>(
+  kind: "delete" | "archive",
+  mutate: () => Promise<T>,
   threadRef: ScopedThreadRef,
-): boolean {
-  if (result._tag !== "Success") return false;
-  removeThreadPaneState(threadRef);
-  return true;
+): Promise<T> {
+  const result = await mutate();
+  if (kind === "delete" && result._tag === "Success") {
+    removeThreadPaneState(threadRef);
+  }
+  return result;
 }
 
 export interface ProjectThreadRefCaptureInput {
@@ -72,14 +78,47 @@ export function collectProjectThreadRefs(
   return [...refsByKey.values()];
 }
 
-/** Clear every captured project thread only after the project deletion succeeds. */
-export function removeProjectPaneStateAfterSuccessfulDeletion(
-  result: DeletionResult,
-  threadRefs: ReadonlyArray<ScopedThreadRef>,
-): boolean {
-  if (result._tag !== "Success") return false;
-  for (const threadRef of threadRefs) {
-    removeThreadPaneState(threadRef);
+type ArchivedSnapshotResult =
+  | {
+      readonly _tag: "Success";
+      readonly value: {
+        readonly threads: ReadonlyArray<Pick<OrchestrationThreadShell, "id" | "projectId">>;
+      };
+    }
+  | { readonly _tag: "Failure"; readonly cause: unknown };
+
+/** Read archived refs before project deletion, then clear active and archived panes on success. */
+export async function deleteProjectWithPaneCleanup<
+  TMutation extends MutationResult,
+  TArchivedSnapshot extends ArchivedSnapshotResult,
+>(input: {
+  readonly projectRefs: ReadonlyArray<ScopedProjectRef>;
+  readonly activeThreads: ProjectThreadRefCaptureInput["activeThreads"];
+  readonly archivedEnvironmentId: EnvironmentId;
+  readonly readArchivedSnapshot: () => Promise<TArchivedSnapshot>;
+  readonly deleteProject: () => Promise<TMutation>;
+  readonly onCapturedThreadRefs?: (threadRefs: ReadonlyArray<ScopedThreadRef>) => void;
+}): Promise<TMutation | TArchivedSnapshot> {
+  const archivedResult = await input.readArchivedSnapshot();
+  if (archivedResult._tag === "Failure") {
+    return archivedResult;
   }
-  return true;
+  const threadRefs = collectProjectThreadRefs({
+    projectRefs: input.projectRefs,
+    activeThreads: input.activeThreads,
+    archivedSnapshots: [
+      {
+        environmentId: input.archivedEnvironmentId,
+        snapshot: archivedResult.value,
+      },
+    ],
+  });
+  input.onCapturedThreadRefs?.(threadRefs);
+  const result = await input.deleteProject();
+  if (result._tag === "Success") {
+    for (const threadRef of threadRefs) {
+      removeThreadPaneState(threadRef);
+    }
+  }
+  return result;
 }

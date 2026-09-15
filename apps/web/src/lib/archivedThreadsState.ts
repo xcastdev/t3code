@@ -4,6 +4,7 @@ import {
   createArchivedThreadSnapshotsAtomFamily,
   makeArchivedThreadsEnvironmentKey,
 } from "@t3tools/client-runtime/state/threads";
+import { executeAtomQuery } from "@t3tools/client-runtime/state/runtime";
 import type { EnvironmentId } from "@t3tools/contracts";
 import { useCallback, useMemo } from "react";
 
@@ -24,6 +25,15 @@ const archivedSnapshotsAtom = createArchivedThreadSnapshotsAtomFamily({
 
 export function refreshArchivedThreadsForEnvironment(environmentId: EnvironmentId): void {
   appAtomRegistry.refresh(archivedSnapshotAtom(environmentId));
+}
+
+/** Read archived threads from the environment before a destructive project mutation. */
+export function readFreshArchivedThreadSnapshot(environmentId: EnvironmentId) {
+  return executeAtomQuery(appAtomRegistry, archivedSnapshotAtom(environmentId), {
+    refresh: true,
+    reportFailure: false,
+    reportDefect: false,
+  });
 }
 
 export function useArchivedThreadSnapshots(environmentIds: ReadonlyArray<EnvironmentId>): {

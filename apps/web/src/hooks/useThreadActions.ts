@@ -40,7 +40,7 @@ import { formatWorktreePathForDisplay, getOrphanedWorktreePathForThread } from "
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
 import { useClientSettings } from "./useSettings";
 import { useAtomCommand } from "../state/use-atom-command";
-import { removeThreadPaneStateAfterSuccessfulDeletion } from "../paneStateCleanup";
+import { executeThreadLifecycleMutation } from "../paneStateCleanup";
 
 export class ThreadArchiveBlockedError extends Schema.TaggedError<ThreadArchiveBlockedError>()(
   "ThreadArchiveBlockedError",
@@ -268,10 +268,15 @@ export function useThreadActions() {
       const shouldNavigateToDraft =
         currentRouteThreadRef?.threadId === threadRef.threadId &&
         currentRouteThreadRef.environmentId === threadRef.environmentId;
-      const archiveResult = await archiveThreadMutation({
-        environmentId: threadRef.environmentId,
-        input: { threadId: threadRef.threadId },
-      });
+      const archiveResult = await executeThreadLifecycleMutation(
+        "archive",
+        () =>
+          archiveThreadMutation({
+            environmentId: threadRef.environmentId,
+            input: { threadId: threadRef.threadId },
+          }),
+        threadRef,
+      );
       if (archiveResult._tag === "Failure") {
         return archiveResult;
       }
@@ -316,12 +321,16 @@ export function useThreadActions() {
       const resolved = resolveThreadTarget(target);
       if (!resolved) {
         // Thread not in main store (e.g. archived thread) — dispatch delete directly.
-        const result = await deleteThreadMutation({
-          environmentId: target.environmentId,
-          input: { threadId: target.threadId },
-        });
+        const result = await executeThreadLifecycleMutation(
+          "delete",
+          () =>
+            deleteThreadMutation({
+              environmentId: target.environmentId,
+              input: { threadId: target.threadId },
+            }),
+          target,
+        );
         if (result._tag === "Success") {
-          removeThreadPaneStateAfterSuccessfulDeletion(result, target);
           refreshArchivedThreadsForEnvironment(target.environmentId);
         }
         return result;
@@ -399,14 +408,18 @@ export function useThreadActions() {
         deletedThreadIds,
         sortOrder: sidebarThreadSortOrder,
       });
-      const deleteResult = await deleteThreadMutation({
-        environmentId: threadRef.environmentId,
-        input: { threadId: threadRef.threadId },
-      });
+      const deleteResult = await executeThreadLifecycleMutation(
+        "delete",
+        () =>
+          deleteThreadMutation({
+            environmentId: threadRef.environmentId,
+            input: { threadId: threadRef.threadId },
+          }),
+        threadRef,
+      );
       if (deleteResult._tag === "Failure") {
         return deleteResult;
       }
-      removeThreadPaneStateAfterSuccessfulDeletion(deleteResult, threadRef);
       refreshArchivedThreadsForEnvironment(threadRef.environmentId);
       releaseComposerDraftUploads(threadRef);
       clearComposerDraftForThread(threadRef);
