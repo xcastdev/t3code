@@ -29,6 +29,14 @@ export const VcsDriverCapabilities = Schema.Struct({
 });
 export type VcsDriverCapabilities = typeof VcsDriverCapabilities.Type;
 
+/** A mutation was rejected because the client has not confirmed or reviewed current Git state. */
+export const VcsMutationRejectionCode = Schema.Literals([
+  "dirty_worktree_confirmation_required",
+  "default_ref_confirmation_required",
+  "stale_git_state",
+]);
+export type VcsMutationRejectionCode = typeof VcsMutationRejectionCode.Type;
+
 export const VcsRepositoryIdentity = Schema.Struct({
   kind: VcsDriverKind,
   rootPath: TrimmedNonEmptyString,

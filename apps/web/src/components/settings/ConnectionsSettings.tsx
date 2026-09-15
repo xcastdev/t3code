@@ -67,6 +67,7 @@ import {
   useRelativeTimeTick,
 } from "./settingsLayout";
 import { LocalEnvironmentSetting } from "./LocalEnvironmentSetting";
+import { PrimaryBackendSettings } from "./PrimaryBackendSettings";
 import { searchableSetting } from "./settingsSearch";
 import { EnvironmentIconMenu } from "./EnvironmentIconPicker";
 import {
@@ -151,6 +152,7 @@ import {
   connectSshEnvironment as connectSshEnvironmentAtom,
 } from "~/connection/onboarding";
 import { useEnvironmentQuery } from "~/state/query";
+import { desktopPrimaryBackendStateAtom } from "~/state/desktopPrimaryBackendState";
 import {
   desktopNetworkAccessStateAtom,
   refreshDesktopNetworkAccessState,
@@ -1806,12 +1808,22 @@ export function ConnectionsSettings() {
   });
   const primaryEnvironmentId = primaryEnvironment?.environmentId ?? null;
   const primarySessionState = usePrimarySessionState();
-  const currentSessionScopes = desktopBridge
-    ? AuthAdministrativeScopes
-    : primarySessionState.data?.authenticated
-      ? (primarySessionState.data.scopes ?? null)
-      : null;
-  const currentAuthPolicy = desktopBridge ? null : (primarySessionState.data?.auth.policy ?? null);
+  const desktopPrimaryBackend = useEnvironmentQuery(
+    desktopBridge ? desktopPrimaryBackendStateAtom : null,
+  );
+  const isAttachedDesktopPrimary =
+    desktopPrimaryBackend.data?.mode === "attached" ||
+    desktopPrimaryBackend.data?.mode === "invalid-attached";
+  const currentSessionScopes =
+    desktopBridge && !isAttachedDesktopPrimary
+      ? AuthAdministrativeScopes
+      : primarySessionState.data?.authenticated
+        ? (primarySessionState.data.scopes ?? null)
+        : null;
+  const currentAuthPolicy =
+    desktopBridge && !isAttachedDesktopPrimary
+      ? null
+      : (primarySessionState.data?.auth.policy ?? null);
   // Catalog order is the order the machines were added; rows never jump when
   // one is switched off.
   const savedEnvironments = useMemo(
@@ -1989,6 +2001,7 @@ export function ConnectionsSettings() {
   );
   const canManageLocalBackend =
     !isLocalEnvironmentDisabled() &&
+    !isAttachedDesktopPrimary &&
     (currentSessionScopes?.includes(AuthAccessWriteScope) ?? false);
   const canManageRelay = currentSessionScopes?.includes(AuthRelayWriteScope) ?? false;
   const authAccessChanges = useEnvironmentQuery(
@@ -3283,6 +3296,7 @@ export function ConnectionsSettings() {
             }
           >
             <LocalEnvironmentSetting />
+            {desktopBridge ? <PrimaryBackendSettings bridge={desktopBridge} /> : null}
             {canManageLocalBackend ? (
               <SettingsRow
                 title="Version"

@@ -88,6 +88,7 @@ import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import { projectMcpNativeKey } from "../Services/ProviderAdapter.ts";
 import { resolveClaudeSdkExecutablePath } from "../Drivers/ClaudeExecutable.ts";
 import { claudeSignedOutMessage, makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
 import { planClaudeSkillDispatch } from "../Drivers/ClaudeSkillDispatch.ts";
@@ -437,6 +438,18 @@ function getEffectiveClaudeAgentEffort(
 ): ClaudeSdkEffort | null {
   const normalized = normalizeClaudeCatalogEffort(catalog, effort, model);
   return normalized ? (normalized as ClaudeSdkEffort) : null;
+}
+
+function turnStartedPayload(
+  context: ClaudeSessionContext,
+  model: string | null | undefined,
+): { model?: string; effort?: string } {
+  const resolvedModel = model?.trim() || context.session.model?.trim();
+  const resolvedEffort = context.currentEffort?.trim();
+  return {
+    ...(resolvedModel ? { model: resolvedModel } : {}),
+    ...(resolvedEffort ? { effort: resolvedEffort } : {}),
+  };
 }
 
 function isClaudeInterruptedMessage(message: string): boolean {
@@ -3224,7 +3237,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         createdAt: turnStartedStamp.createdAt,
         threadId: context.session.threadId,
         turnId,
-        payload: {},
+        payload: turnStartedPayload(context, context.session.model),
         providerRefs: {
           ...nativeProviderRefs(context),
           providerTurnId: turnId,
@@ -4709,6 +4722,16 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           : {}),
       };
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+      const projectMcpServers = Object.fromEntries(
+        (input.projectMcpServers ?? mcpSession?.projectServers ?? []).map((server) => [
+          projectMcpNativeKey(server),
+          {
+            type: "http" as const,
+            url: server.endpoint.toString(),
+            headers: { Authorization: server.authorizationHeader },
+          },
+        ]),
+      );
       // The attachments dir grant lets the agent Read/copy pasted images at
       // the paths ProviderService injects into the turn text, without an
       // approval prompt. It is a leaf directory holding only attachment
@@ -4749,16 +4772,21 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         env: McpProviderSession.withAgentDeviceEnvironment(claudeEnvironment, mcpSession),
         additionalDirectories,
         ...(Object.keys(extraArgs).length > 0 ? { extraArgs } : {}),
-        ...(mcpSession
+        ...(Object.keys(projectMcpServers).length > 0 || mcpSession
           ? {
               mcpServers: {
-                "t3-code": {
-                  type: "http",
-                  url: mcpSession.endpoint,
-                  headers: {
-                    Authorization: mcpSession.authorizationHeader,
-                  },
-                },
+                ...projectMcpServers,
+                ...(mcpSession
+                  ? {
+                      "t3-code": {
+                        type: "http",
+                        url: mcpSession.endpoint,
+                        headers: {
+                          Authorization: mcpSession.authorizationHeader,
+                        },
+                      },
+                    }
+                  : {}),
               },
             }
           : {}),
@@ -4916,7 +4944,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             }
             return handleStreamExit(context, exit).pipe(
               Effect.catch((cause) =>
-                Effect.logError("Failed to close Claude runtime stream.", { cause }),
+                Effect.logError("Failed to close Claude runtime stream.", {
+                  cause,
+                }),
               ),
             );
           }),
@@ -4943,7 +4973,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ? input.modelSelection
         : undefined;
     const modelSelection = selectedModel
-      ? { ...selectedModel, model: resolveClaudeModelSlug(modelCatalog, selectedModel.model) }
+      ? {
+          ...selectedModel,
+          model: resolveClaudeModelSlug(modelCatalog, selectedModel.model),
+        }
       : undefined;
     if (modelSelection) {
       context.startInput = { ...context.startInput, modelSelection };
@@ -5034,7 +5067,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         createdAt: turnStartedStamp.createdAt,
         threadId: context.session.threadId,
         turnId,
-        payload: modelSelection?.model ? { model: modelSelection.model } : {},
+        payload: turnStartedPayload(context, modelSelection?.model),
         providerRefs: {},
       });
     }
@@ -5070,7 +5103,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       type: "message",
       message:
         steeringTurnState === null
-          ? { ...message, uuid: turnId as NonNullable<SDKUserMessage["uuid"]> }
+          ? {
+              ...message,
+              uuid: turnId as NonNullable<SDKUserMessage["uuid"]>,
+            }
           : message,
     }).pipe(Effect.mapError((cause) => toRequestError(input.threadId, "turn/start", cause)));
 
@@ -5369,7 +5405,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
   yield* Effect.addFinalizer(() =>
     stopSessions(Array.from(sessions.values()), false).pipe(
       Effect.catch((cause) =>
-        Effect.logError("Failed to emit Claude session shutdown event.", { cause }),
+        Effect.logError("Failed to emit Claude session shutdown event.", {
+          cause,
+        }),
       ),
       Effect.tap(() => Queue.shutdown(runtimeEventQueue)),
       Effect.tap(() => managedNativeEventLogger?.close() ?? Effect.void),
@@ -5380,6 +5418,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     provider: PROVIDER,
     capabilities: {
       sessionModelSwitch: "in-session",
+      remoteHttpMcp: "next-session",
+      projectMcpProxy: "next-session",
+      managedPreviewMcp: "next-session",
+      sessionMcpCatalog: "restart-required",
     },
     compaction: { type: "slash-command", command: "/compact" },
     startSession,

@@ -453,7 +453,9 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
     const layer = Layer.effect(
       CodexAdapter,
       Effect.gen(function* () {
-        const codexConfig = decodeCodexSettings({ launchArgs: "--strict-config --enable foo" });
+        const codexConfig = decodeCodexSettings({
+          launchArgs: "--strict-config --enable foo",
+        });
         return yield* makeCodexAdapter(codexConfig, {
           makeRuntime: runtimeFactory.factory,
         });
@@ -484,9 +486,13 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
     const layer = Layer.effect(
       CodexAdapter,
       Effect.gen(function* () {
-        const codexConfig = decodeCodexSettings({ launchArgs: "--enable settings-feature" });
+        const codexConfig = decodeCodexSettings({
+          launchArgs: "--enable settings-feature",
+        });
         return yield* makeCodexAdapter(codexConfig, {
-          environment: { T3CODE_CODEX_LAUNCH_ARGS: " --strict-config --enable env-feature " },
+          environment: {
+            T3CODE_CODEX_LAUNCH_ARGS: " --strict-config --enable env-feature ",
+          },
           makeRuntime: runtimeFactory.factory,
         });
       }),
@@ -1355,7 +1361,10 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
             id: "browser_1",
             server: "node_repl",
             tool: "js",
-            arguments: { code: "await tab.playwright.domSnapshot()", title: "Inspect checkout" },
+            arguments: {
+              code: "await tab.playwright.domSnapshot()",
+              title: "Inspect checkout",
+            },
             durationMs: 12,
             error: null,
             result: {
@@ -2006,7 +2015,11 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
           conversationId: "provider-thread-1",
           reason: "   ",
           fileChanges: {
-            "/tmp/moved.ts": { type: "update", unified_diff: "@@", move_path: "/tmp/renamed.ts" },
+            "/tmp/moved.ts": {
+              type: "update",
+              unified_diff: "@@",
+              move_path: "/tmp/renamed.ts",
+            },
           },
         },
       } satisfies ProviderEvent);
@@ -2043,7 +2056,11 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
         requestKind: "file-change",
         requestId: ApprovalRequestId.make("req-patch-many"),
         turnId: asTurnId("turn-1"),
-        payload: { callId: "call-4", conversationId: "provider-thread-1", fileChanges },
+        payload: {
+          callId: "call-4",
+          conversationId: "provider-thread-1",
+          fileChanges,
+        },
       } satisfies ProviderEvent);
 
       const firstEvent = yield* Fiber.join(firstEventFiber);
@@ -2073,7 +2090,11 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
         requestKind: "file-change",
         requestId: ApprovalRequestId.make("req-patch-empty"),
         turnId: asTurnId("turn-1"),
-        payload: { callId: "call-5", conversationId: "provider-thread-1", fileChanges: {} },
+        payload: {
+          callId: "call-5",
+          conversationId: "provider-thread-1",
+          fileChanges: {},
+        },
       } satisfies ProviderEvent);
 
       const firstEvent = yield* Fiber.join(firstEventFiber);
@@ -2587,7 +2608,9 @@ scopedLifecycleLayer("CodexAdapterLive scoped lifecycle", (it) => {
   );
 });
 
-const scopedFailureRuntimeFactory = makeScopedRuntimeFactory({ failConstruction: true });
+const scopedFailureRuntimeFactory = makeScopedRuntimeFactory({
+  failConstruction: true,
+});
 const scopedFailureLayer = it.layer(
   Layer.effect(
     CodexAdapter,
@@ -2760,8 +2783,14 @@ function codexErrorNotification(input: {
 function codexRateLimitsNotification(input: {
   readonly id: string;
   readonly rateLimitReachedType?: string;
-  readonly primary?: { readonly usedPercent: number; readonly resetsInSeconds: number };
-  readonly secondary?: { readonly usedPercent: number; readonly resetsInSeconds: number };
+  readonly primary?: {
+    readonly usedPercent: number;
+    readonly resetsInSeconds: number;
+  };
+  readonly secondary?: {
+    readonly usedPercent: number;
+    readonly resetsInSeconds: number;
+  };
 }): ProviderEvent {
   return {
     id: asEventId(input.id),
@@ -2813,7 +2842,10 @@ function codexUsageLimitTurnFailed(id: string, turnId = "turn-limit"): ProviderE
         id: turnId,
         items: [],
         status: "failed",
-        error: { message: CODEX_OUT_OF_CREDITS, codexErrorInfo: "usageLimitExceeded" },
+        error: {
+          message: CODEX_OUT_OF_CREDITS,
+          codexErrorInfo: "usageLimitExceeded",
+        },
       },
     },
   };
@@ -2841,7 +2873,10 @@ usageLimitLayer("CodexAdapterLive usage limits", (it) => {
           id: "evt-limit-rate-limits",
           rateLimitReachedType: "workspace_owner_credits_depleted",
           primary: { usedPercent: 40, resetsInSeconds: 3_600 },
-          secondary: { usedPercent: 100, resetsInSeconds: 5 * 86_400 + 5 * 3_600 },
+          secondary: {
+            usedPercent: 100,
+            resetsInSeconds: 5 * 86_400 + 5 * 3_600,
+          },
         }),
       );
       yield* runtime.emit(codexUsageLimitTurnFailed("evt-limit-turn"));
@@ -2990,6 +3025,124 @@ usageLimitLayer("CodexAdapterLive usage limits", (it) => {
       if (first._tag !== "Some" || first.value.type !== "runtime.error") return;
       NodeAssert.equal(first.value.payload.message, "Codex is temporarily unavailable.");
       NodeAssert.equal(first.value.payload.class, "provider_error");
+    }),
+  );
+});
+
+const turnStartedRuntimeFactory = makeRuntimeFactory();
+const turnStartedLayer = it.layer(
+  Layer.effect(
+    CodexAdapter,
+    Effect.gen(function* () {
+      return yield* makeCodexAdapter(decodeCodexSettings({}), {
+        makeRuntime: turnStartedRuntimeFactory.factory,
+        resolveDefaultReasoningEffort: (model) =>
+          model === "gpt-5.3-codex" ? "high" : model === "gpt-5.6-sol" ? "medium" : undefined,
+      });
+    }),
+  ).pipe(
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  ),
+);
+
+function collectTurnStartedPayload(input: {
+  readonly threadId: string;
+  readonly startSelection?: ReturnType<typeof createModelSelection>;
+  readonly sendSelection?: ReturnType<typeof createModelSelection>;
+  readonly sendTurn: boolean;
+}) {
+  return Effect.gen(function* () {
+    const adapter = yield* CodexAdapter;
+    yield* adapter.startSession({
+      provider: ProviderDriverKind.make("codex"),
+      threadId: asThreadId(input.threadId),
+      ...(input.startSelection ? { modelSelection: input.startSelection } : {}),
+      runtimeMode: "full-access",
+    });
+    const runtime = turnStartedRuntimeFactory.lastRuntime;
+    NodeAssert.ok(runtime);
+
+    if (input.sendTurn) {
+      yield* adapter.sendTurn({
+        threadId: asThreadId(input.threadId),
+        input: "hello",
+        ...(input.sendSelection ? { modelSelection: input.sendSelection } : {}),
+      });
+    }
+
+    const eventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+    yield* runtime.emit({
+      id: asEventId(`evt-turn-started-${input.threadId}`),
+      kind: "notification",
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      method: "turn/started",
+      threadId: asThreadId(input.threadId),
+      turnId: asTurnId("turn-1"),
+    } satisfies ProviderEvent);
+
+    const event = Option.getOrUndefined(yield* Fiber.join(eventFiber));
+    NodeAssert.ok(event);
+    NodeAssert.equal(event.type, "turn.started");
+    return event.payload as Record<string, unknown>;
+  });
+}
+
+turnStartedLayer("CodexAdapter turn provenance", (it) => {
+  it.effect("reports the explicit reasoning effort selected for the turn", () =>
+    Effect.gen(function* () {
+      const payload = yield* collectTurnStartedPayload({
+        threadId: "thread-effort-explicit",
+        sendTurn: true,
+        sendSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.6-sol", [
+          { id: "reasoningEffort", value: "xhigh" },
+        ]),
+      });
+      NodeAssert.equal(payload.model, "gpt-5.6-sol");
+      NodeAssert.equal(payload.effort, "xhigh");
+    }),
+  );
+
+  it.effect("falls back to the model's default reasoning effort", () =>
+    Effect.gen(function* () {
+      const payload = yield* collectTurnStartedPayload({
+        threadId: "thread-effort-default",
+        sendTurn: true,
+        sendSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.3-codex"),
+      });
+      NodeAssert.equal(payload.model, "gpt-5.3-codex");
+      NodeAssert.equal(payload.effort, "high");
+    }),
+  );
+
+  it.effect("omits effort when the selected model has no resolved level", () =>
+    Effect.gen(function* () {
+      const payload = yield* collectTurnStartedPayload({
+        threadId: "thread-effort-absent",
+        sendTurn: true,
+        startSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.3-codex"),
+        sendSelection: createModelSelection(
+          ProviderInstanceId.make("codex"),
+          "model-without-efforts",
+        ),
+      });
+      NodeAssert.equal(payload.model, "model-without-efforts");
+      NodeAssert.equal("effort" in payload, false);
+    }),
+  );
+
+  it.effect("reports the session selection before the first sendTurn", () =>
+    Effect.gen(function* () {
+      const payload = yield* collectTurnStartedPayload({
+        threadId: "thread-model-from-session",
+        sendTurn: false,
+        startSelection: createModelSelection(ProviderInstanceId.make("codex"), "gpt-5.6-sol"),
+      });
+      NodeAssert.equal(payload.model, "gpt-5.6-sol");
+      NodeAssert.equal(payload.effort, "medium");
     }),
   );
 });

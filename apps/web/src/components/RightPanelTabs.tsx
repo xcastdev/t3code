@@ -23,6 +23,7 @@ import {
   Files,
   GitPullRequest,
   GitPullRequestArrow,
+  GitBranch,
   Globe2,
   Plus,
   TerminalSquare,
@@ -118,6 +119,7 @@ interface RightPanelTabsProps {
   onAddPullRequests: () => void;
   onAddAgents: () => void;
   onAddDevice: () => void;
+  onAddSourceControl?: () => void;
   browserAvailable: boolean;
   terminalAvailable: boolean;
   diffAvailable: boolean;
@@ -126,6 +128,7 @@ interface RightPanelTabsProps {
   pullRequestsAvailable: boolean;
   agentsAvailable: boolean;
   deviceAvailable: boolean;
+  sourceControlAvailable?: boolean;
   pullRequestStatusSeeds?: Readonly<Record<string, PullRequestTabStatusSeed>>;
   /** Running + waiting subagents; badges the Agents card in the empty state. */
   liveAgentCount: number;
@@ -155,6 +158,7 @@ const SURFACE_DISABLED_REASONS = {
   diff: "Diff is only available for server threads in Git repositories.",
   pullRequest: "This thread's branch has no pull request yet.",
   pullRequests: "No linked pull requests are available for this thread.",
+  sourceControl: "Source Control is only available when a project is open.",
   agents: "Agents are only available from a thread.",
   device: "Devices are only available from a thread.",
 } as const;
@@ -179,6 +183,7 @@ const SURFACE_UNAVAILABLE_HINTS = {
   diff: "Available for Git repositories.",
   pullRequest: "No pull request on this branch yet.",
   pullRequests: "No linked pull requests available.",
+  sourceControl: "Available when a project is open.",
   agents: "Available from a thread.",
   device: "Available from a thread.",
 } as const;
@@ -313,7 +318,10 @@ function SurfaceMenuItem(props: {
 function RightPanelEmptyState(props: {
   onAddBrowser: () => void;
   onAddBrowserInProfile: (profileId: string) => void;
-  browserProfiles: ReadonlyArray<{ readonly id: string; readonly name: string }>;
+  browserProfiles: ReadonlyArray<{
+    readonly id: string;
+    readonly name: string;
+  }>;
   onAddTerminal: () => void;
   onAddDiff: () => void;
   onAddFiles: () => void;
@@ -628,6 +636,8 @@ function surfaceTitle(
       return `#${surface.number}`;
     case "pull-requests":
       return "Pull requests";
+    case "source-control":
+      return "Source Control";
     case "agents":
       return "Agents";
     case "device":
@@ -713,6 +723,8 @@ function SurfaceIcon({
       );
     case "pull-requests":
       return <GitPullRequestArrow className="size-3 shrink-0" />;
+    case "source-control":
+      return <GitBranch className="size-3 shrink-0" />;
     case "agents":
       return <Bot className="size-3 shrink-0" />;
     case "device":
@@ -812,7 +824,10 @@ function PullRequestSurfaceIcon({
   if (status === null) {
     return <GitPullRequest className="size-3 shrink-0 text-muted-foreground" />;
   }
-  const presentation = resolvePullRequestState({ state: status.state, isDraft: status.isDraft });
+  const presentation = resolvePullRequestState({
+    state: status.state,
+    isDraft: status.isDraft,
+  });
   return <presentation.Icon className={cn("size-3 shrink-0", presentation.toneClassName)} />;
 }
 
@@ -909,6 +924,18 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
       disabledReason: SURFACE_DISABLED_REASONS.pullRequests,
       onClick: props.onAddPullRequests,
     },
+    ...(props.onAddSourceControl
+      ? [
+          {
+            label: "Source Control",
+            icon: GitBranch,
+            shortcut: "G",
+            available: props.sourceControlAvailable === true,
+            disabledReason: SURFACE_DISABLED_REASONS.sourceControl,
+            onClick: props.onAddSourceControl,
+          },
+        ]
+      : []),
     {
       label: "Agents",
       icon: Bot,
@@ -991,7 +1018,10 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
         },
       );
 
-      const action = await api.contextMenu.show(items, { x: event.clientX, y: event.clientY });
+      const action = await api.contextMenu.show(items, {
+        x: event.clientX,
+        y: event.clientY,
+      });
       switch (action) {
         case "rename":
           setRenamingDevice(surface.id);
@@ -1059,7 +1089,9 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
     const resizeObserver = new ResizeObserver(updateTabScrollState);
     resizeObserver.observe(viewport);
     if (content) resizeObserver.observe(content);
-    viewport.addEventListener("scroll", updateTabScrollState, { passive: true });
+    viewport.addEventListener("scroll", updateTabScrollState, {
+      passive: true,
+    });
     updateTabScrollState();
 
     return () => {

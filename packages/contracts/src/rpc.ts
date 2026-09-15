@@ -54,6 +54,8 @@ import {
 } from "./worktreeSetup.ts";
 import {
   GitActionProgressEvent,
+  GitCommitIndexInput,
+  GitCommitIndexResult,
   VcsSwitchRefInput,
   VcsSwitchRefResult,
   GitCommandError,
@@ -76,6 +78,9 @@ import {
   VcsStatusInput,
   VcsStatusResult,
   VcsStatusStreamEvent,
+  VcsStageFilesInput,
+  VcsWorkingTreeDiffInput,
+  VcsWorkingTreeDiffResult,
 } from "./git.ts";
 import {
   ReviewDiffFileContentsInput,
@@ -85,6 +90,7 @@ import {
   ReviewDiffPreviewResult,
 } from "./review.ts";
 import { KeybindingsConfigError } from "./keybindings.ts";
+import { ProjectId, ThreadId } from "./baseSchemas.ts";
 import {
   ClientOrchestrationCommand,
   ORCHESTRATION_WS_METHODS,
@@ -162,6 +168,21 @@ import {
   ProjectWriteFileResult,
 } from "./project.ts";
 import {
+  ProjectMcpCreateInput,
+  ProjectMcpCreateError,
+  ProjectMcpListInput,
+  ProjectMcpCatalog,
+  ProjectMcpOAuthBeginInput,
+  ProjectMcpOAuthBeginResult,
+  ProjectMcpOAuthDisconnectInput,
+  ProjectMcpOAuthActionError,
+  ProjectMcpRemoveError,
+  ProjectMcpRemoveInput,
+  ProjectMcpServer,
+  ProjectMcpUpdateError,
+  ProjectMcpUpdateInput,
+} from "./projectMcp.ts";
+import {
   TerminalAttachInput,
   TerminalAttachStreamEvent,
   TerminalClearInput,
@@ -216,6 +237,7 @@ import {
   ServerConfigStreamEvent,
   DesktopUpdateCommitInput,
   ServerConfig,
+  ServerProviderCatalogPayload,
   ServerProviderUpdateError,
   ServerProviderUpdateInput,
   ServerLifecycleStreamEvent,
@@ -258,6 +280,11 @@ import {
   ProjectCloneSubscribeInput,
 } from "./projectClone.ts";
 import {
+  ExternalNotificationError,
+  ExternalNotificationTestInput,
+  ExternalNotificationTestResult,
+} from "./externalNotifications.ts";
+import {
   SourceControlCloneRepositoryInput,
   SourceControlCloneRepositoryResult,
   SourceControlDiscoveryResult,
@@ -268,6 +295,34 @@ import {
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
+import {
+  McpCatalogChanged,
+  McpCatalogDefinition,
+  McpCatalogGlobalState,
+  McpCatalogGlobalListInput,
+  McpCatalogGlobalCreateInput,
+  McpCatalogGlobalUpdateInput,
+  McpCatalogGlobalRemoveInput,
+  McpCatalogMutationError,
+  McpCatalogOAuthBeginInput,
+  McpCatalogOAuthContinueInput,
+  McpCatalogOAuthDisconnectInput,
+  McpCatalogProjectState,
+  McpCatalogProjectListInput,
+  McpCatalogProjectStateListInput,
+  McpCatalogProjectCreateInput,
+  McpCatalogProjectUpdateInput,
+  McpCatalogProjectRemoveInput,
+  McpCatalogProjectOverrideInput,
+  McpCatalogProjectDeleteOverrideInput,
+  McpCatalogSessionMutationInput,
+  McpCatalogSessionCreateInput,
+  McpCatalogSessionUpdateInput,
+  McpCatalogSessionRemoveInput,
+  McpCatalogSessionRequest,
+  McpCatalogSnapshot,
+  ResolvedMcpCatalogEntry,
+} from "./mcpCatalog.ts";
 
 export const WS_METHODS = {
   // Project registry methods
@@ -279,6 +334,37 @@ export const WS_METHODS = {
   projectsSearchContents: "projects.searchContents",
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
+  projectMcpList: "projectMcp.list",
+  projectMcpCreate: "projectMcp.create",
+  projectMcpUpdate: "projectMcp.update",
+  projectMcpRemove: "projectMcp.remove",
+  projectMcpOauthBegin: "projectMcp.oauth.begin",
+  projectMcpOauthContinue: "projectMcp.oauth.continue",
+  projectMcpOauthDisconnect: "projectMcp.oauth.disconnect",
+
+  // Scoped MCP catalog methods. Legacy projectMcp.* methods above remain
+  // available during the compatibility window.
+  mcpCatalogGlobalList: "mcpCatalog.global.list",
+  mcpCatalogGlobalStateList: "mcpCatalog.global.state.list",
+  mcpCatalogGlobalCreate: "mcpCatalog.global.create",
+  mcpCatalogGlobalUpdate: "mcpCatalog.global.update",
+  mcpCatalogGlobalRemove: "mcpCatalog.global.remove",
+  mcpCatalogProjectList: "mcpCatalog.project.list",
+  mcpCatalogProjectStateList: "mcpCatalog.project.state.list",
+  mcpCatalogProjectCreate: "mcpCatalog.project.create",
+  mcpCatalogProjectUpdate: "mcpCatalog.project.update",
+  mcpCatalogProjectRemove: "mcpCatalog.project.remove",
+  mcpCatalogProjectOverride: "mcpCatalog.project.override",
+  mcpCatalogProjectDeleteOverride: "mcpCatalog.project.deleteOverride",
+  mcpCatalogSessionGet: "mcpCatalog.session.get",
+  mcpCatalogSessionCreate: "mcpCatalog.session.create",
+  mcpCatalogSessionUpdate: "mcpCatalog.session.update",
+  mcpCatalogSessionRemove: "mcpCatalog.session.remove",
+  mcpCatalogSessionReset: "mcpCatalog.session.reset",
+  mcpCatalogSubscribe: "mcpCatalog.subscribe",
+  mcpCatalogOAuthBegin: "mcpCatalog.oauth.begin",
+  mcpCatalogOAuthContinue: "mcpCatalog.oauth.continue",
+  mcpCatalogOAuthDisconnect: "mcpCatalog.oauth.disconnect",
 
   // Shell methods
   shellOpenInEditor: "shell.openInEditor",
@@ -313,11 +399,15 @@ export const WS_METHODS = {
   vcsCreateRef: "vcs.createRef",
   vcsSwitchRef: "vcs.switchRef",
   vcsInit: "vcs.init",
+  vcsStageFiles: "vcs.stageFiles",
+  vcsUnstageFiles: "vcs.unstageFiles",
+  vcsGetWorkingTreeDiff: "vcs.getWorkingTreeDiff",
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
   gitResolvePullRequest: "git.resolvePullRequest",
   gitPreparePullRequestThread: "git.preparePullRequestThread",
+  gitCommitIndex: "git.commitIndex",
 
   // Review methods
   reviewGetDiffPreview: "review.getDiffPreview",
@@ -357,6 +447,7 @@ export const WS_METHODS = {
   // Server meta
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
+  serverGetProviderCatalog: "server.getProviderCatalog",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
   serverUpdateServer: "server.updateServer",
@@ -366,6 +457,7 @@ export const WS_METHODS = {
   serverRemoveKeybinding: "server.removeKeybinding",
   serverGetSettings: "server.getSettings",
   serverUpdateSettings: "server.updateSettings",
+  serverTestExternalNotification: "server.testExternalNotification",
   serverDiscoverSourceControl: "server.discoverSourceControl",
   serverGetTraceDiagnostics: "server.getTraceDiagnostics",
   serverGetProcessDiagnostics: "server.getProcessDiagnostics",
@@ -458,6 +550,17 @@ const WsServerGetConfigRpc = Rpc.make(WS_METHODS.serverGetConfig, {
   payload: Schema.Struct({}),
   success: ServerConfig,
   error: Schema.Union([KeybindingsConfigError, ServerSettingsError, EnvironmentAuthorizationError]),
+});
+
+export const WsServerGetProviderCatalogRpc = Rpc.make(WS_METHODS.serverGetProviderCatalog, {
+  payload: Schema.Struct({
+    /** The server resolves this thread to its authoritative project/worktree cwd. */
+    threadId: Schema.optional(ThreadId),
+    /** Drafts have no thread yet, so resolve their project workspace directly. */
+    projectId: Schema.optional(ProjectId),
+  }),
+  success: ServerProviderCatalogPayload,
+  error: EnvironmentAuthorizationError,
 });
 
 const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
@@ -577,6 +680,15 @@ const WsServerUpdateSettingsRpc = Rpc.make(WS_METHODS.serverUpdateSettings, {
   success: ServerSettings,
   error: Schema.Union([ServerSettingsError, EnvironmentAuthorizationError]),
 });
+
+export const WsServerTestExternalNotificationRpc = Rpc.make(
+  WS_METHODS.serverTestExternalNotification,
+  {
+    payload: ExternalNotificationTestInput,
+    success: ExternalNotificationTestResult,
+    error: Schema.Union([ExternalNotificationError, EnvironmentAuthorizationError]),
+  },
+);
 
 const WsServerDiscoverSourceControlRpc = Rpc.make(WS_METHODS.serverDiscoverSourceControl, {
   payload: Schema.Struct({}),
@@ -921,6 +1033,182 @@ const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   error: Schema.Union([ProjectWriteFileError, EnvironmentAuthorizationError]),
 });
 
+export const WsProjectMcpListRpc = Rpc.make(WS_METHODS.projectMcpList, {
+  payload: ProjectMcpListInput,
+  success: ProjectMcpCatalog,
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsProjectMcpCreateRpc = Rpc.make(WS_METHODS.projectMcpCreate, {
+  payload: ProjectMcpCreateInput,
+  success: ProjectMcpServer,
+  error: Schema.Union([ProjectMcpCreateError, EnvironmentAuthorizationError]),
+});
+
+export const WsProjectMcpUpdateRpc = Rpc.make(WS_METHODS.projectMcpUpdate, {
+  payload: ProjectMcpUpdateInput,
+  success: ProjectMcpServer,
+  error: Schema.Union([ProjectMcpUpdateError, EnvironmentAuthorizationError]),
+});
+
+export const WsProjectMcpRemoveRpc = Rpc.make(WS_METHODS.projectMcpRemove, {
+  payload: ProjectMcpRemoveInput,
+  success: Schema.Void,
+  error: Schema.Union([ProjectMcpRemoveError, EnvironmentAuthorizationError]),
+});
+
+export const WsProjectMcpOAuthBeginRpc = Rpc.make(WS_METHODS.projectMcpOauthBegin, {
+  payload: ProjectMcpOAuthBeginInput,
+  success: ProjectMcpOAuthBeginResult,
+  error: Schema.Union([ProjectMcpUpdateError, EnvironmentAuthorizationError]),
+});
+
+export const WsProjectMcpOAuthContinueRpc = Rpc.make(WS_METHODS.projectMcpOauthContinue, {
+  payload: ProjectMcpOAuthBeginInput,
+  success: ProjectMcpOAuthBeginResult,
+  error: Schema.Union([ProjectMcpUpdateError, EnvironmentAuthorizationError]),
+});
+
+export const WsProjectMcpOAuthDisconnectRpc = Rpc.make(WS_METHODS.projectMcpOauthDisconnect, {
+  payload: ProjectMcpOAuthDisconnectInput,
+  success: ProjectMcpServer,
+  error: Schema.Union([ProjectMcpUpdateError, EnvironmentAuthorizationError]),
+});
+
+const mcpCatalogMutationError = Schema.Union([
+  McpCatalogMutationError,
+  EnvironmentAuthorizationError,
+]);
+
+export const WsMcpCatalogGlobalListRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalList, {
+  payload: McpCatalogGlobalListInput,
+  success: Schema.Array(McpCatalogDefinition),
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsMcpCatalogGlobalStateListRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalStateList, {
+  payload: McpCatalogGlobalListInput,
+  success: McpCatalogGlobalState,
+  error: EnvironmentAuthorizationError,
+});
+
+export const WsMcpCatalogGlobalCreateRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalCreate, {
+  payload: McpCatalogGlobalCreateInput,
+  success: McpCatalogDefinition,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogGlobalUpdateRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalUpdate, {
+  payload: McpCatalogGlobalUpdateInput,
+  success: McpCatalogDefinition,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogGlobalRemoveRpc = Rpc.make(WS_METHODS.mcpCatalogGlobalRemove, {
+  payload: McpCatalogGlobalRemoveInput,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectListRpc = Rpc.make(WS_METHODS.mcpCatalogProjectList, {
+  payload: McpCatalogProjectListInput,
+  success: Schema.Array(ResolvedMcpCatalogEntry),
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectStateListRpc = Rpc.make(WS_METHODS.mcpCatalogProjectStateList, {
+  payload: McpCatalogProjectStateListInput,
+  success: McpCatalogProjectState,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectCreateRpc = Rpc.make(WS_METHODS.mcpCatalogProjectCreate, {
+  payload: McpCatalogProjectCreateInput,
+  success: McpCatalogDefinition,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectUpdateRpc = Rpc.make(WS_METHODS.mcpCatalogProjectUpdate, {
+  payload: McpCatalogProjectUpdateInput,
+  success: McpCatalogDefinition,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectRemoveRpc = Rpc.make(WS_METHODS.mcpCatalogProjectRemove, {
+  payload: McpCatalogProjectRemoveInput,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectOverrideRpc = Rpc.make(WS_METHODS.mcpCatalogProjectOverride, {
+  payload: McpCatalogProjectOverrideInput,
+  success: Schema.Void,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogProjectDeleteOverrideRpc = Rpc.make(
+  WS_METHODS.mcpCatalogProjectDeleteOverride,
+  {
+    payload: McpCatalogProjectDeleteOverrideInput,
+    error: mcpCatalogMutationError,
+  },
+);
+
+export const WsMcpCatalogSessionGetRpc = Rpc.make(WS_METHODS.mcpCatalogSessionGet, {
+  payload: McpCatalogSessionRequest,
+  success: McpCatalogSnapshot,
+  error: Schema.Union([McpCatalogMutationError, EnvironmentAuthorizationError]),
+});
+
+export const WsMcpCatalogSessionCreateRpc = Rpc.make(WS_METHODS.mcpCatalogSessionCreate, {
+  payload: McpCatalogSessionCreateInput,
+  success: McpCatalogSnapshot,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogSessionUpdateRpc = Rpc.make(WS_METHODS.mcpCatalogSessionUpdate, {
+  payload: McpCatalogSessionUpdateInput,
+  success: McpCatalogSnapshot,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogSessionRemoveRpc = Rpc.make(WS_METHODS.mcpCatalogSessionRemove, {
+  payload: McpCatalogSessionRemoveInput,
+  success: McpCatalogSnapshot,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogSessionResetRpc = Rpc.make(WS_METHODS.mcpCatalogSessionReset, {
+  payload: McpCatalogSessionMutationInput,
+  success: McpCatalogSnapshot,
+  error: mcpCatalogMutationError,
+});
+
+export const WsMcpCatalogSubscribeRpc = Rpc.make(WS_METHODS.mcpCatalogSubscribe, {
+  // Omitted preserves the original always-on stream behavior. Clients can
+  // explicitly send false when they only need the RPC connection.
+  payload: Schema.Struct({ catalog: Schema.optional(Schema.Boolean) }),
+  success: McpCatalogChanged,
+  error: EnvironmentAuthorizationError,
+  stream: true,
+});
+
+export const WsMcpCatalogOAuthBeginRpc = Rpc.make(WS_METHODS.mcpCatalogOAuthBegin, {
+  payload: McpCatalogOAuthBeginInput,
+  success: ProjectMcpOAuthBeginResult,
+  error: Schema.Union([ProjectMcpOAuthActionError, EnvironmentAuthorizationError]),
+});
+
+export const WsMcpCatalogOAuthContinueRpc = Rpc.make(WS_METHODS.mcpCatalogOAuthContinue, {
+  payload: McpCatalogOAuthContinueInput,
+  success: ProjectMcpOAuthBeginResult,
+  error: Schema.Union([ProjectMcpOAuthActionError, EnvironmentAuthorizationError]),
+});
+
+export const WsMcpCatalogOAuthDisconnectRpc = Rpc.make(WS_METHODS.mcpCatalogOAuthDisconnect, {
+  payload: McpCatalogOAuthDisconnectInput,
+  success: Schema.Void,
+  error: Schema.Union([ProjectMcpOAuthActionError, EnvironmentAuthorizationError]),
+});
+
 const WsShellOpenInEditorRpc = Rpc.make(WS_METHODS.shellOpenInEditor, {
   payload: LaunchEditorInput,
   error: Schema.Union([ExternalLauncherError, EnvironmentAuthorizationError]),
@@ -1023,6 +1311,12 @@ const WsGitPreparePullRequestThreadRpc = Rpc.make(WS_METHODS.gitPreparePullReque
   error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
 });
 
+const WsGitCommitIndexRpc = Rpc.make(WS_METHODS.gitCommitIndex, {
+  payload: GitCommitIndexInput,
+  success: GitCommitIndexResult,
+  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+});
+
 const WsVcsListRefsRpc = Rpc.make(WS_METHODS.vcsListRefs, {
   payload: VcsListRefsInput,
   success: VcsListRefsResult,
@@ -1055,6 +1349,22 @@ const WsVcsSwitchRefRpc = Rpc.make(WS_METHODS.vcsSwitchRef, {
 const WsVcsInitRpc = Rpc.make(WS_METHODS.vcsInit, {
   payload: VcsInitInput,
   error: Schema.Union([VcsError, EnvironmentAuthorizationError]),
+});
+
+const WsVcsStageFilesRpc = Rpc.make(WS_METHODS.vcsStageFiles, {
+  payload: VcsStageFilesInput,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsVcsUnstageFilesRpc = Rpc.make(WS_METHODS.vcsUnstageFiles, {
+  payload: VcsStageFilesInput,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsVcsGetWorkingTreeDiffRpc = Rpc.make(WS_METHODS.vcsGetWorkingTreeDiff, {
+  payload: VcsWorkingTreeDiffInput,
+  success: VcsWorkingTreeDiffResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
 });
 
 /**
@@ -1360,6 +1670,7 @@ const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeResourceTel
 export const WsRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
+  WsServerGetProviderCatalogRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,
@@ -1379,6 +1690,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerRemoveKeybindingRpc,
   WsServerGetSettingsRpc,
   WsServerUpdateSettingsRpc,
+  WsServerTestExternalNotificationRpc,
   WsServerDiscoverSourceControlRpc,
   WsServerGetTraceDiagnosticsRpc,
   WsServerGetProcessDiagnosticsRpc,
@@ -1431,6 +1743,34 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectsSearchContentsRpc,
   WsProjectsSearchEntriesRpc,
   WsProjectsWriteFileRpc,
+  WsProjectMcpListRpc,
+  WsProjectMcpCreateRpc,
+  WsProjectMcpUpdateRpc,
+  WsProjectMcpRemoveRpc,
+  WsProjectMcpOAuthBeginRpc,
+  WsProjectMcpOAuthContinueRpc,
+  WsProjectMcpOAuthDisconnectRpc,
+  WsMcpCatalogGlobalListRpc,
+  WsMcpCatalogGlobalStateListRpc,
+  WsMcpCatalogGlobalCreateRpc,
+  WsMcpCatalogGlobalUpdateRpc,
+  WsMcpCatalogGlobalRemoveRpc,
+  WsMcpCatalogProjectListRpc,
+  WsMcpCatalogProjectStateListRpc,
+  WsMcpCatalogProjectCreateRpc,
+  WsMcpCatalogProjectUpdateRpc,
+  WsMcpCatalogProjectRemoveRpc,
+  WsMcpCatalogProjectOverrideRpc,
+  WsMcpCatalogProjectDeleteOverrideRpc,
+  WsMcpCatalogSessionGetRpc,
+  WsMcpCatalogSessionCreateRpc,
+  WsMcpCatalogSessionUpdateRpc,
+  WsMcpCatalogSessionRemoveRpc,
+  WsMcpCatalogSessionResetRpc,
+  WsMcpCatalogSubscribeRpc,
+  WsMcpCatalogOAuthBeginRpc,
+  WsMcpCatalogOAuthContinueRpc,
+  WsMcpCatalogOAuthDisconnectRpc,
   WsShellOpenInEditorRpc,
   WsFilesystemBrowseRpc,
   WsAgentSessionsScanRpc,
@@ -1447,12 +1787,16 @@ export const WsRpcGroup = RpcGroup.make(
   WsGitRunStackedActionRpc,
   WsGitResolvePullRequestRpc,
   WsGitPreparePullRequestThreadRpc,
+  WsGitCommitIndexRpc,
   WsVcsListRefsRpc,
   WsVcsCreateWorktreeRpc,
   WsVcsRemoveWorktreeRpc,
   WsVcsCreateRefRpc,
   WsVcsSwitchRefRpc,
   WsVcsInitRpc,
+  WsVcsStageFilesRpc,
+  WsVcsUnstageFilesRpc,
+  WsVcsGetWorkingTreeDiffRpc,
   WsReviewGetDiffPreviewRpc,
   WsReviewGetDiffFileContentsRpc,
   WsTerminalOpenRpc,

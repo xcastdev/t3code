@@ -129,6 +129,7 @@ import type {
   ComposerContextId,
   ComposerContextRecord,
   KnownComposerContextRecord,
+  OrchestrationTurnSummary,
 } from "@t3tools/contracts";
 import { Button } from "../ui/button";
 import { useAssetUrlRefresh, useAssetUrls, useAssetUrlState } from "../../assets/assetUrls";
@@ -280,6 +281,8 @@ interface TimelineRowSharedState {
   onCancelWorktreeSetup: (() => void) | null;
   onWorktreeSetupWorkLocally: (() => void) | null;
   onOpenWorktreeSetupTerminal: ((terminalId: string) => void) | null;
+  /** Persisted terminal turn records, keyed to avoid widening virtualized rows. */
+  turnSummaryByAssistantMessageId: ReadonlyMap<MessageId, OrchestrationTurnSummary>;
 }
 
 interface TimelineRowActivityState {
@@ -388,6 +391,9 @@ interface MessagesTimelineProps {
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
   latestTurn: TimelineLatestTurn | null;
   runningTurnId: TurnId | null;
+  turns?: ReadonlyArray<OrchestrationTurnSummary> | undefined;
+  partialTurnIds?: ReadonlyArray<TurnId> | undefined;
+  activityWindowMayBeTruncated?: boolean | undefined;
   turnDiffSummaries: ReadonlyArray<TurnDiffSummary>;
   routeThreadKey: string;
   /**
@@ -456,6 +462,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   timelineEntries,
   latestTurn,
   runningTurnId,
+  turns,
+  partialTurnIds,
+  activityWindowMayBeTruncated,
   turnDiffSummaries,
   routeThreadKey,
   displayThreadKey,
@@ -692,6 +701,10 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         : new Set(liveAgentTaskKey.length > 0 ? liveAgentTaskKey.split("\n") : []),
     [liveAgentTaskKey],
   );
+  const retainedPartialTurnIds = useMemo(
+    () => (partialTurnIds ? new Set(partialTurnIds) : undefined),
+    [partialTurnIds],
+  );
   const rawRows = useMemo(() => {
     const previous = rowsProjectionRef.current;
     const projection = deriveMessagesTimelineRowsWithState(
@@ -699,6 +712,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         timelineEntries,
         latestTurn,
         runningTurnId,
+        turns,
+        partialTurnIds: retainedPartialTurnIds,
+        activityWindowMayBeTruncated,
         expandedTurnIds: paintedExpandedTurnIds,
         expandedWorkGroupIds: paintedExpandedWorkGroupIds,
         isWorking,
@@ -712,7 +728,11 @@ export const MessagesTimeline = memo(function MessagesTimeline({
         ? previous.projection
         : null,
     );
-    rowsProjectionRef.current = { threadKey: listIdentityKey, workspaceRoot, projection };
+    rowsProjectionRef.current = {
+      threadKey: listIdentityKey,
+      workspaceRoot,
+      projection,
+    };
     return projection.rows;
   }, [
     rowsProjectionRef,
@@ -721,6 +741,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     timelineEntries,
     latestTurn,
     runningTurnId,
+    turns,
+    retainedPartialTurnIds,
+    activityWindowMayBeTruncated,
     paintedExpandedTurnIds,
     paintedExpandedWorkGroupIds,
     isWorking,
@@ -731,6 +754,17 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     worktreeSetup,
   ]);
   const rows = useStableRows(rawRows, listIdentityKey);
+  // A footer belongs to the terminal assistant message recorded by the turn,
+  // not whichever message happens to share its turn id after a provider retry.
+  const turnSummaryByAssistantMessageId = useMemo(() => {
+    const byAssistantMessageId = new Map<MessageId, OrchestrationTurnSummary>();
+    for (const turn of turns ?? []) {
+      if (turn.assistantMessageId) {
+        byAssistantMessageId.set(turn.assistantMessageId, turn);
+      }
+    }
+    return byAssistantMessageId;
+  }, [turns]);
   const minimapItems = useMemo(() => deriveTimelineMinimapItems(rows), [rows]);
   const [timelineViewportElement, setTimelineViewportElement] = useState<HTMLDivElement | null>(
     null,
@@ -924,6 +958,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onCancelWorktreeSetup: onCancelWorktreeSetup ?? null,
       onWorktreeSetupWorkLocally: onWorktreeSetupWorkLocally ?? null,
       onOpenWorktreeSetupTerminal: onOpenWorktreeSetupTerminal ?? null,
+      turnSummaryByAssistantMessageId,
     }),
     [
       readyCitationRequest,
@@ -954,6 +989,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onCancelWorktreeSetup,
       onWorktreeSetupWorkLocally,
       onOpenWorktreeSetupTerminal,
+      turnSummaryByAssistantMessageId,
     ],
   );
   const activityState = useMemo<TimelineRowActivityState>(
@@ -1846,7 +1882,9 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
                 }
                 {...(contextClipboardFragment
                   ? {
-                      extraFlavors: { [COMPOSER_CONTEXT_CLIPBOARD_MIME]: contextClipboardFragment },
+                      extraFlavors: {
+                        [COMPOSER_CONTEXT_CLIPBOARD_MIME]: contextClipboardFragment,
+                      },
                     }
                   : {})}
                 variant="ghost"
@@ -2014,18 +2052,25 @@ function AssistantMessageMeta({
   return (
     <div
       className={cn(
-        "flex items-center gap-2 text-xs tabular-nums transition-opacity duration-200",
-        alwaysVisible
-          ? "opacity-100"
-          : "opacity-0 pointer-coarse:opacity-100 focus-within:opacity-100 group-hover/assistant:opacity-100",
+        "@container/turn-footer flex items-center gap-2 text-xs tabular-nums",
         className,
       )}
     >
-      <AssistantCopyButton
-        message={message}
-        showCopyButton={showCopyButton}
-        streaming={copyStreaming}
-      />
+      <span
+        className={cn(
+          "flex transition-opacity duration-200",
+          alwaysVisible
+            ? "opacity-100"
+            : "opacity-0 pointer-coarse:opacity-100 focus-within:opacity-100 group-hover/assistant:opacity-100",
+        )}
+      >
+        <AssistantCopyButton
+          message={message}
+          showCopyButton={showCopyButton}
+          streaming={copyStreaming}
+        />
+      </span>
+      <TurnFooterProvenance message={message} />
       {!message.streaming && (
         <Tooltip>
           <TooltipTrigger render={<p className="text-muted-foreground text-xs tabular-nums" />}>
@@ -2037,6 +2082,46 @@ function AssistantMessageMeta({
         </Tooltip>
       )}
     </div>
+  );
+}
+
+const EFFORT_SENTINEL = "default";
+
+/**
+ * A terminal message may outlive provider configuration changes, so its
+ * footer reads the turn's recorded model and effort rather than live settings.
+ */
+function TurnFooterProvenance({ message }: { message: ChatMessage }) {
+  const { turnSummaryByAssistantMessageId } = use(TimelineRowCtx);
+  const turn = turnSummaryByAssistantMessageId.get(message.id);
+  const model = turn?.model?.trim();
+  if (!turn || !model || message.streaming) return null;
+
+  const rawEffort = turn.effort?.trim();
+  const effort = rawEffort && rawEffort.toLowerCase() !== EFFORT_SENTINEL ? rawEffort : null;
+  const duration =
+    turn.startedAt && turn.completedAt
+      ? formatWorkingTimer(turn.startedAt, turn.completedAt)
+      : null;
+
+  return (
+    <span className="flex min-w-0 items-center gap-1.5 text-muted-foreground">
+      <span className="flex min-w-0 items-center gap-1" data-turn-footer-model>
+        <BotIcon className="size-3 shrink-0" aria-hidden />
+        <span className="hidden min-w-0 truncate @[16rem]/turn-footer:inline">{model}</span>
+      </span>
+      {effort ? (
+        <span className="flex shrink-0 items-center gap-1" data-turn-footer-effort>
+          <ZapIcon className="size-3 shrink-0" aria-hidden />
+          <span className="hidden @[16rem]/turn-footer:inline">{effort}</span>
+        </span>
+      ) : null}
+      {duration ? (
+        <span className="shrink-0" data-turn-footer-duration>
+          {duration}
+        </span>
+      ) : null}
+    </span>
   );
 }
 
@@ -2238,7 +2323,11 @@ function ExpandedWorkGroupEntries({
   );
   const [restoringPosition, setRestoringPosition] = useState(initialScrollIndex !== undefined);
   const listRef = useRef<LegendListRef>(null);
-  const [fades, setFades] = useState({ top: false, bottom: false, viewportHeight: 0 });
+  const [fades, setFades] = useState({
+    top: false,
+    bottom: false,
+    viewportHeight: 0,
+  });
   const [appendState, setAppendState] = useState({ entries, follow: false });
   // Capture the pre-change edge once per incoming array, before new layout
   // metrics arrive. Edge/viewport changes never turn a status update into a follow.

@@ -101,6 +101,31 @@ describe("ServerSettings usage price overrides", () => {
   });
 });
 
+describe("external notification settings", () => {
+  it("defaults to no destinations and accepts a write-only Home Assistant URL", () => {
+    expect(decodeServerSettings({}).externalNotifications).toEqual({
+      appScheme: "t3code-dev",
+      destinations: [],
+    });
+    expect(
+      decodeServerSettingsPatch({
+        externalNotifications: {
+          destinations: [
+            {
+              _tag: "home-assistant-webhook",
+              id: "home",
+              label: "Home Assistant",
+              enabled: true,
+              configured: false,
+              webhookUrl: "https://home.example.test/api/webhook/token",
+            },
+          ],
+        },
+      }).externalNotifications?.destinations?.[0],
+    ).toMatchObject({ _tag: "home-assistant-webhook", configured: false });
+  });
+});
+
 describe("custom model settings", () => {
   const capabilities = {
     optionDescriptors: [

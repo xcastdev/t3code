@@ -30,6 +30,7 @@ import {
   ProviderApprovalDecision,
   ThreadId,
   ProviderSendTurnInput,
+  type ModelSelection,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as NodeCrypto from "node:crypto";
@@ -58,6 +59,7 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { type CodexAdapterShape } from "../Services/CodexAdapter.ts";
+import { projectMcpNativeKey, projectMcpTokenEnvironmentKey } from "../Services/ProviderAdapter.ts";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import {
@@ -98,6 +100,7 @@ export interface CodexAdapterLiveOptions {
   >;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly resolveDefaultReasoningEffort?: (model: string) => string | undefined;
 }
 
 interface CodexAdapterSessionContext {
@@ -106,6 +109,8 @@ interface CodexAdapterSessionContext {
   readonly runtime: CodexSessionRuntimeShape;
   readonly eventFiber: Fiber.Fiber<void, never>;
   readonly turnTokenUsage: CodexTurnTokenUsageState;
+  turnModel: string | undefined;
+  turnEffort: string | undefined;
   stopped: boolean;
 }
 
@@ -344,7 +349,10 @@ function mcpToolPresentation(
       { record: browserUse, url: browserUse?.url },
       { record: latestOpenTab, url: latestOpenTab?.url },
     ]
-      .map((candidate) => ({ ...candidate, pageUrl: normalizedHttpUrl(candidate.url) }))
+      .map((candidate) => ({
+        ...candidate,
+        pageUrl: normalizedHttpUrl(candidate.url),
+      }))
       .find((candidate) => candidate.pageUrl !== undefined);
     const pageUrl = selectedPage?.pageUrl;
     const faviconUrl = normalizedImageUrl(
@@ -528,7 +536,9 @@ function codexTurnTokenUsageDelta(
     ...(current.cacheCreationTokens !== undefined &&
     previous.cacheCreationTokens !== undefined &&
     current.cacheCreationTokens >= previous.cacheCreationTokens
-      ? { cacheCreationTokens: current.cacheCreationTokens - previous.cacheCreationTokens }
+      ? {
+          cacheCreationTokens: current.cacheCreationTokens - previous.cacheCreationTokens,
+        }
       : {}),
     outputTokens: current.outputTokens - previous.outputTokens,
     reasoningTokens: current.reasoningTokens - previous.reasoningTokens,
@@ -608,7 +618,9 @@ function completeCodexTurnTokenUsage(
     inputTokens: usage.inputTokens,
     cachedInputTokens: Math.min(usage.inputTokens, usage.cachedInputTokens),
     ...(usage.cacheCreationTokens !== undefined
-      ? { cacheCreationTokens: Math.min(usage.inputTokens, usage.cacheCreationTokens) }
+      ? {
+          cacheCreationTokens: Math.min(usage.inputTokens, usage.cacheCreationTokens),
+        }
       : {}),
     outputTokens: usage.outputTokens,
     reasoningTokens: Math.min(usage.outputTokens, usage.reasoningTokens),
@@ -1191,7 +1203,11 @@ function mapCollabAgentEvent(
           {
             ...base,
             type: "task.updated",
-            payload: { taskId, status: waiting ? "waiting" : "running", ...linkage },
+            payload: {
+              taskId,
+              status: waiting ? "waiting" : "running",
+              ...linkage,
+            },
           },
         ];
       }
@@ -1300,6 +1316,10 @@ function mapCollabAgentEvent(
 function mapToRuntimeEvents(
   event: ProviderEvent,
   canonicalThreadId: ThreadId,
+  turnProvenance?: {
+    readonly model?: string;
+    readonly effort?: string;
+  },
 ): ReadonlyArray<ProviderRuntimeEvent> {
   if (event.kind === "notification" && event.method.startsWith("collabAgent/")) {
     return mapCollabAgentEvent(event, canonicalThreadId);
@@ -1587,7 +1607,10 @@ function mapToRuntimeEvents(
         ...runtimeEventBase(event, canonicalThreadId),
         turnId,
         type: "turn.started",
-        payload: {},
+        payload: {
+          ...(trimText(turnProvenance?.model) ? { model: trimText(turnProvenance?.model) } : {}),
+          ...(trimText(turnProvenance?.effort) ? { effort: trimText(turnProvenance?.effort) } : {}),
+        },
       },
     ];
   }
@@ -1683,7 +1706,10 @@ function mapToRuntimeEvents(
               id: String(index),
               header: "Question",
               question: question.title,
-              options: (question.options ?? []).map((label) => ({ label, description: "" })),
+              options: (question.options ?? []).map((label) => ({
+                label,
+                description: "",
+              })),
               allowCustomAnswer: true,
               multiSelect: false,
             })),
@@ -2233,6 +2259,19 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
   const runtimeEventQueue = yield* Queue.unbounded<ProviderRuntimeEvent>();
   const sessions = new Map<ThreadId, CodexAdapterSessionContext>();
+  const resolveTurnProvenance = (modelSelection: ModelSelection | null | undefined) => {
+    const selection = modelSelection?.instanceId === boundInstanceId ? modelSelection : undefined;
+    const model = trimText(selection?.model);
+    const explicitEffort = selection
+      ? getModelSelectionStringOptionValue(selection, "reasoningEffort")
+      : undefined;
+    return {
+      model,
+      effort:
+        trimText(explicitEffort) ??
+        (model ? trimText(options?.resolveDefaultReasoningEffort?.(model)) : undefined),
+    };
+  };
 
   const startSession: CodexAdapterShape["startSession"] = (input) =>
     Effect.scoped(
@@ -2255,6 +2294,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? getCodexServiceTierOptionValue(input.modelSelection)
             : undefined;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const projectMcpServers = input.projectMcpServers ?? mcpSession?.projectServers ?? [];
+        const projectMcpArgs = projectMcpServers.flatMap((server) => {
+          const nativeKey = projectMcpNativeKey(server);
+          const tokenEnvironmentKey = projectMcpTokenEnvironmentKey(server);
+          return [
+            "-c",
+            `mcp_servers.${nativeKey}.url=${JSON.stringify(server.endpoint.toString())}`,
+            "-c",
+            `mcp_servers.${nativeKey}.bearer_token_env_var=${JSON.stringify(tokenEnvironmentKey)}`,
+          ];
+        });
         const runtimeInput: CodexSessionRuntimeOptions = {
           threadId: input.threadId,
           providerInstanceId: boundInstanceId,
@@ -2271,26 +2321,46 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? { model: input.modelSelection.model }
             : {}),
           ...(serviceTier ? { serviceTier } : {}),
-          ...(mcpSession
+          ...(projectMcpArgs.length > 0 || mcpSession
             ? {
                 environment: {
                   ...McpProviderSession.withAgentDeviceEnvironment(
                     options?.environment ?? process.env,
                     mcpSession,
                   ),
-                  T3_MCP_BEARER_TOKEN: mcpSession.authorizationHeader.replace(/^Bearer\s+/, ""),
+                  ...Object.fromEntries(
+                    projectMcpServers.map((server) => [
+                      projectMcpTokenEnvironmentKey(server),
+                      server.authorizationHeader.replace(/^Bearer\s+/i, ""),
+                    ]),
+                  ),
+                  ...(mcpSession
+                    ? {
+                        T3_MCP_BEARER_TOKEN: mcpSession.authorizationHeader.replace(
+                          /^Bearer\s+/,
+                          "",
+                        ),
+                      }
+                    : {}),
                 },
                 appServerArgs: [
-                  "-c",
-                  `mcp_servers.t3-code.url=${mcpSession.endpoint}`,
-                  "-c",
-                  'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
+                  ...projectMcpArgs,
+                  ...(mcpSession
+                    ? [
+                        "-c",
+                        `mcp_servers.t3-code.url=${mcpSession.endpoint}`,
+                        "-c",
+                        'mcp_servers.t3-code.bearer_token_env_var="T3_MCP_BEARER_TOKEN"',
+                      ]
+                    : []),
                 ],
-                mcpCapabilities: mcpSession.capabilities,
+                ...(mcpSession ? { mcpCapabilities: mcpSession.capabilities } : {}),
               }
             : {}),
         };
         const turnTokenUsage = makeCodexTurnTokenUsageState();
+        const initialTurnProvenance = resolveTurnProvenance(input.modelSelection);
+        let sessionContext: CodexAdapterSessionContext | undefined;
         // Codex reports a usage-limit stop as OpenAI's own sentence, which on a
         // Business workspace blames credits for a window that ran out. The
         // snapshot naming that window arrives in its own notification, before or
@@ -2397,7 +2467,16 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               }
             }
 
-            const mappedEvents = mapToRuntimeEvents(event, event.threadId).map((runtimeEvent) => {
+            const turnModel = sessionContext
+              ? sessionContext.turnModel
+              : initialTurnProvenance.model;
+            const turnEffort = sessionContext
+              ? sessionContext.turnEffort
+              : initialTurnProvenance.effort;
+            const mappedEvents = mapToRuntimeEvents(event, event.threadId, {
+              ...(turnModel ? { model: turnModel } : {}),
+              ...(turnEffort ? { effort: turnEffort } : {}),
+            }).map((runtimeEvent) => {
               if (runtimeEvent.type === "turn.completed" && runtimeEvent.turnId) {
                 return {
                   ...runtimeEvent,
@@ -2462,14 +2541,17 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           ),
         );
 
-        sessions.set(input.threadId, {
+        sessionContext = {
           threadId: input.threadId,
           scope: sessionScope,
           runtime,
           eventFiber,
           turnTokenUsage,
+          turnModel: initialTurnProvenance.model,
+          turnEffort: initialTurnProvenance.effort,
           stopped: false,
-        });
+        };
+        sessions.set(input.threadId, sessionContext);
         sessionScopeTransferred = true;
 
         return started;
@@ -2519,6 +2601,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     );
 
     const session = yield* requireSession(input.threadId);
+    const turnProvenance = resolveTurnProvenance(input.modelSelection);
+    if (turnProvenance.model !== undefined) {
+      session.turnModel = turnProvenance.model;
+      session.turnEffort = turnProvenance.effort;
+    }
     const reasoningEffort =
       input.modelSelection?.instanceId === boundInstanceId
         ? getModelSelectionStringOptionValue(input.modelSelection, "reasoningEffort")
@@ -2715,6 +2802,10 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     capabilities: {
       sessionModelSwitch: "in-session",
       promptlessTurnContinuation: true,
+      remoteHttpMcp: "next-session",
+      projectMcpProxy: "next-session",
+      managedPreviewMcp: "next-session",
+      sessionMcpCatalog: "restart-required",
     },
     startSession,
     sendTurn,

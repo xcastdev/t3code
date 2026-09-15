@@ -1,5 +1,6 @@
 import {
   EventId,
+  type EnvironmentId,
   type OpenCodeSettings,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -35,6 +36,13 @@ import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import * as OpenCodeExternalMcpCoordinator from "../OpenCodeExternalMcpCoordinator.ts";
+import {
+  OpenCodeExternalMcpUrlError,
+  rebaseExternalMcpUrl,
+  validateExternalMcpBaseUrl,
+  validateExternalOpenCodeUrl,
+} from "../OpenCodeExternalMcpUrl.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import {
   ProviderAdapterProcessError,
@@ -45,6 +53,10 @@ import {
 } from "../Errors.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
 import { type OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
+import {
+  projectMcpNativeKey,
+  type ProviderAdapterSessionStartInput,
+} from "../Services/ProviderAdapter.ts";
 import {
   buildOpenCodePermissionRules,
   OpenCodeRuntime,
@@ -335,6 +347,7 @@ type OpenCodeStepUsage = Pick<Extract<Part, { readonly type: "step-finish" }>, "
 
 interface OpenCodeSessionContext {
   session: ProviderSession;
+  closing: boolean;
   readonly client: OpencodeClient;
   readonly server: OpenCodeServerConnection;
   readonly directory: string;
@@ -380,6 +393,24 @@ interface OpenCodeSessionContext {
    */
   readonly sessionScope: Scope.Closeable;
 }
+
+interface OpenCodeExternalMcpState {
+  readonly lease: OpenCodeExternalMcpCoordinator.OpenCodeExternalMcpLease;
+  readonly client: OpencodeClient;
+  readonly directory: string;
+  readonly attemptedNames: Set<string>;
+  readonly cleanupDone: Deferred.Deferred<void, never>;
+  cleanupStarted: boolean;
+}
+
+interface OpenCodeExternalMcpReadState {
+  readonly config: Readonly<Record<string, unknown>>;
+  readonly status: Readonly<Record<string, unknown>>;
+}
+
+type OpenCodeProjectMcpServer = NonNullable<
+  ProviderAdapterSessionStartInput["projectMcpServers"]
+>[number];
 
 interface OpenCodeTurnTokenUsageAccumulator {
   readonly partIds: Set<string>;
@@ -455,6 +486,8 @@ function takeOpenCodeTurnTokenUsage(
 
 export interface OpenCodeAdapterLiveOptions {
   readonly instanceId?: ProviderInstanceId;
+  readonly environmentId?: EnvironmentId;
+  readonly externalMcpCoordinator?: OpenCodeExternalMcpCoordinator.OpenCodeExternalMcpCoordinatorShape;
   readonly environment?: NodeJS.ProcessEnv;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
@@ -474,6 +507,21 @@ const toRequestError = (cause: OpenCodeRuntimeError): ProviderAdapterRequestErro
     method: cause.operation,
     detail: cause.detail,
     cause: cause.cause,
+  });
+
+const toExternalMcpRequestError = (method: string, cause: unknown): ProviderAdapterRequestError =>
+  new ProviderAdapterRequestError({
+    provider: PROVIDER,
+    method,
+    detail:
+      cause instanceof OpenCodeExternalMcpUrlError
+        ? cause.reason
+        : cause instanceof OpenCodeExternalMcpCoordinator.OpenCodeExternalMcpCoordinatorError
+          ? cause.detail
+          : cause instanceof Error
+            ? cause.message
+            : String(cause),
+    ...(cause === undefined ? {} : { cause }),
   });
 
 /**
@@ -861,6 +909,29 @@ const abortOpenCodeSessionForTeardown = Effect.fn("abortOpenCodeSessionForTeardo
   );
 });
 
+const confirmOpenCodeTermination = Effect.fn("confirmOpenCodeTermination")(function* (
+  context: OpenCodeSessionContext,
+) {
+  yield* Effect.gen(function* () {
+    yield* runOpenCodeSdk("session.abort", (signal) =>
+      context.client.session.abort({ sessionID: context.openCodeSessionId }, { signal }),
+    ).pipe(Effect.mapError(toRequestError));
+    yield* abortOpenCodeDescendants(context).pipe(Effect.mapError(toRequestError));
+  }).pipe(
+    Effect.timeoutOrElse({
+      duration: "10 seconds",
+      orElse: () =>
+        Effect.fail(
+          new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "session.abort",
+            detail: "OpenCode session termination was not confirmed within 10 seconds.",
+          }),
+        ),
+    }),
+  );
+});
+
 const cancelPendingOpenCodePrompt = Effect.fn("cancelPendingOpenCodePrompt")(function* (
   context: OpenCodeSessionContext,
 ) {
@@ -901,6 +972,7 @@ const closeStartingOpenCodeContext = Effect.fn("closeStartingOpenCodeContext")(f
 
 const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
   context: OpenCodeSessionContext,
+  remoteTerminationConfirmed = false,
 ) {
   // Race-safe one-shot: first caller flips the flag, everyone else no-ops.
   if (yield* Ref.getAndSet(context.stopped, true)) {
@@ -925,12 +997,40 @@ const stopOpenCodeContext = Effect.fn("stopOpenCodeContext")(function* (
   // Best-effort remote abort. The scope close below tears down the local
   // handles (event-pump fiber, server-exit fiber, event-subscribe fetch),
   // but we still want to tell OpenCode that this session is done.
-  yield* abortOpenCodeSessionForTeardown(context);
+  if (!remoteTerminationConfirmed) {
+    yield* abortOpenCodeSessionForTeardown(context);
+  }
 
   // Closing the session scope interrupts every fiber forked into it and
   // runs each finalizer we registered — the `AbortController.abort()` call,
   // the child-process termination, etc.
   yield* Scope.close(context.sessionScope, Exit.void);
+  return true;
+});
+
+/**
+ * Stop observing an externally owned server without stopping its remote turn.
+ * Reconnects, adapter shutdown, and replacement handoffs only own T3's local
+ * subscription. An explicit `stopSession` remains the termination path.
+ */
+const detachExternalOpenCodeContext = Effect.fn("detachExternalOpenCodeContext")(function* (
+  context: OpenCodeSessionContext,
+) {
+  if (!context.server.external) {
+    return yield* stopOpenCodeContext(context);
+  }
+  if (yield* Ref.getAndSet(context.stopped, true)) {
+    return false;
+  }
+  yield* Deferred.fail(
+    context.firstConnection,
+    new ProviderAdapterRequestError({
+      provider: PROVIDER,
+      method: "session.detach",
+      detail: "OpenCode session detached before the event stream connected.",
+    }),
+  ).pipe(Effect.ignore);
+  yield* Scope.close(context.sessionScope, Exit.void).pipe(Effect.ignoreCause);
   return true;
 });
 
@@ -960,6 +1060,300 @@ export function makeOpenCodeAdapter(
       options?.nativeEventLogger === undefined ? nativeEventLogger : undefined;
     const runtimeEvents = yield* Queue.unbounded<ProviderRuntimeEvent>();
     const sessions = new Map<ThreadId, OpenCodeSessionContext>();
+    const externalMcpStates = new Map<ThreadId, OpenCodeExternalMcpState>();
+    const externalMcpCoordinator = options?.externalMcpCoordinator;
+    const externalEnvironmentId = options?.environmentId;
+
+    const nameHash = Effect.fn("OpenCodeExternalMcp.nameHash")(function* (value: string) {
+      return yield* crypto.digest("SHA-256", new TextEncoder().encode(value)).pipe(
+        Effect.map((bytes) => Buffer.from(bytes).toString("hex").slice(0, 6)),
+        Effect.mapError(
+          (cause) =>
+            new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "crypto.digest",
+              detail: "Failed to generate an external OpenCode MCP name.",
+              cause,
+            }),
+        ),
+      );
+    });
+
+    const readExternalMcpState = Effect.fn("OpenCodeExternalMcp.readState")(function* (
+      client: OpencodeClient,
+      directory: string,
+    ): Effect.fn.Return<OpenCodeExternalMcpReadState, ProviderAdapterRequestError> {
+      const configResponse = yield* runOpenCodeSdk("config.get", (signal) =>
+        client.config.get({ directory }, { signal }),
+      ).pipe(Effect.mapError(toRequestError));
+      const statusResponse = yield* runOpenCodeSdk("mcp.status", (signal) =>
+        client.mcp.status({ directory }, { signal }),
+      ).pipe(Effect.mapError(toRequestError));
+      const config =
+        configResponse.data &&
+        typeof configResponse.data === "object" &&
+        !Array.isArray(configResponse.data) &&
+        "mcp" in configResponse.data &&
+        configResponse.data.mcp &&
+        typeof configResponse.data.mcp === "object" &&
+        !Array.isArray(configResponse.data.mcp)
+          ? (configResponse.data.mcp as Record<string, unknown>)
+          : {};
+      const status =
+        statusResponse.data &&
+        typeof statusResponse.data === "object" &&
+        !Array.isArray(statusResponse.data)
+          ? (statusResponse.data as Record<string, unknown>)
+          : {};
+      return { config, status };
+    });
+
+    const configHeader = (entry: unknown, name: string): string | undefined => {
+      if (entry === null || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+      const headers = (entry as Record<string, unknown>).headers;
+      if (headers === null || typeof headers !== "object" || Array.isArray(headers)) {
+        return undefined;
+      }
+      const value = (headers as Record<string, unknown>)[name];
+      return typeof value === "string" ? value : undefined;
+    };
+
+    const isEnvironmentOwned = (entry: unknown, environmentId: EnvironmentId): boolean =>
+      configHeader(entry, "X-T3-MCP-Owner") === String(environmentId);
+
+    const isCurrentGeneration = (
+      entry: unknown,
+      environmentId: EnvironmentId,
+      generation: string,
+    ): boolean =>
+      isEnvironmentOwned(entry, environmentId) &&
+      configHeader(entry, "X-T3-MCP-Generation") === generation;
+
+    const disconnectForRegistration = Effect.fn("OpenCodeExternalMcp.disconnectForRegistration")(
+      function* (state: OpenCodeExternalMcpState, name: string) {
+        state.attemptedNames.add(name);
+        yield* runOpenCodeSdk("mcp.disconnect", (signal) =>
+          state.client.mcp.disconnect({ name, directory: state.directory }, { signal }),
+        ).pipe(
+          Effect.timeout("2 seconds"),
+          Effect.mapError((cause) => toExternalMcpRequestError("mcp.disconnect", cause)),
+        );
+        const after = yield* readExternalMcpState(state.client, state.directory);
+        const status = after.status[name];
+        if (status !== undefined && typeof status === "object" && status !== null) {
+          if ((status as { readonly status?: unknown }).status === "connected") {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "mcp.disconnect",
+              detail: `OpenCode kept MCP server '${name}' connected after disconnect.`,
+            });
+          }
+        }
+      },
+    );
+
+    const attemptExternalDisconnect = Effect.fn("OpenCodeExternalMcp.attemptDisconnect")(function* (
+      state: OpenCodeExternalMcpState,
+      name: string,
+    ) {
+      const result = yield* Effect.exit(
+        Effect.gen(function* () {
+          if (!(yield* externalMcpCoordinator!.isCurrent(state.lease))) return;
+          const before = yield* readExternalMcpState(state.client, state.directory);
+          const entry = before.config[name];
+          if (
+            entry === undefined ||
+            !isCurrentGeneration(entry, state.lease.environmentId, state.lease.generation)
+          ) {
+            return;
+          }
+          yield* runOpenCodeSdk("mcp.disconnect", (signal) =>
+            state.client.mcp.disconnect({ name, directory: state.directory }, { signal }),
+          ).pipe(Effect.catchIf(isOpenCodeNotFound, () => Effect.void));
+          const after = yield* readExternalMcpState(state.client, state.directory);
+          const status = after.status[name];
+          if (
+            status !== undefined &&
+            typeof status === "object" &&
+            status !== null &&
+            (status as { readonly status?: unknown }).status === "connected"
+          ) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "mcp.disconnect",
+              detail: `OpenCode kept MCP server '${name}' connected after cleanup.`,
+            });
+          }
+        }).pipe(Effect.timeout("2 seconds")),
+      );
+      if (Exit.isFailure(result)) {
+        yield* Effect.logWarning("OpenCode external MCP cleanup verification failed", {
+          name,
+          directory: state.directory,
+          cause: Cause.squash(result.cause),
+        });
+      }
+    });
+
+    const cleanupExternalMcpState = Effect.fn("OpenCodeExternalMcp.cleanupState")(function* (
+      state: OpenCodeExternalMcpState,
+    ) {
+      if (externalMcpCoordinator === undefined) return;
+      yield* Effect.uninterruptible(
+        Effect.gen(function* () {
+          if (state.cleanupStarted) {
+            yield* Deferred.await(state.cleanupDone);
+            return;
+          }
+          state.cleanupStarted = true;
+          yield* Effect.ignoreCause(
+            Effect.forEach(
+              [...state.attemptedNames],
+              (name) => attemptExternalDisconnect(state, name),
+              {
+                concurrency: "unbounded",
+                discard: true,
+              },
+            ).pipe(
+              Effect.ensuring(
+                externalMcpCoordinator.release(state.lease).pipe(
+                  Effect.ensuring(
+                    Effect.sync(() => {
+                      if (externalMcpStates.get(state.lease.threadId) === state) {
+                        externalMcpStates.delete(state.lease.threadId);
+                      }
+                    }),
+                  ),
+                ),
+              ),
+            ),
+          );
+          yield* Deferred.succeed(state.cleanupDone, undefined);
+        }),
+      );
+    });
+
+    const cleanupExternalMcpForThread = Effect.fn("OpenCodeExternalMcp.cleanupThread")(function* (
+      threadId: ThreadId,
+    ) {
+      const state = externalMcpStates.get(threadId);
+      if (state !== undefined) yield* cleanupExternalMcpState(state);
+    });
+
+    const registerExternalMcp = Effect.fn("OpenCodeExternalMcp.register")(function* (
+      state: OpenCodeExternalMcpState,
+      mcpSession: McpProviderSession.McpProviderSessionConfig | undefined,
+      projectMcpServers: ReadonlyArray<OpenCodeProjectMcpServer>,
+    ) {
+      const environmentId = state.lease.environmentId;
+      const envHash = yield* nameHash(environmentId);
+      const desired: Array<{
+        readonly name: string;
+        readonly url: string;
+        readonly authorizationHeader: string;
+      }> = [];
+      if (mcpSession !== undefined) {
+        const url = yield* Effect.try({
+          try: () =>
+            rebaseExternalMcpUrl({
+              issuedEndpoint: mcpSession.endpoint,
+              externalMcpBaseUrl: openCodeSettings.externalMcpBaseUrl,
+              serverUrl: state.lease.target.serverUrl,
+            }),
+          catch: (cause) => toExternalMcpRequestError("startSession", cause),
+        });
+        desired.push({
+          name: `t3-${envHash}-${state.lease.generation}-preview`,
+          url,
+          authorizationHeader: mcpSession.authorizationHeader,
+        });
+      }
+      for (const projectMcpServer of projectMcpServers) {
+        const serverHash = yield* nameHash(String(projectMcpServer.id));
+        const url = yield* Effect.try({
+          try: () =>
+            rebaseExternalMcpUrl({
+              issuedEndpoint: projectMcpServer.endpoint,
+              externalMcpBaseUrl: openCodeSettings.externalMcpBaseUrl,
+              serverUrl: state.lease.target.serverUrl,
+            }),
+          catch: (cause) => toExternalMcpRequestError("startSession", cause),
+        });
+        desired.push({
+          name: `t3-${envHash}-${state.lease.generation}-project-${serverHash}`,
+          url,
+          authorizationHeader: projectMcpServer.authorizationHeader,
+        });
+      }
+      const desiredNames = new Set(desired.map((entry) => entry.name));
+
+      let current = yield* readExternalMcpState(state.client, state.directory);
+      for (const [name, entry] of Object.entries(current.config)) {
+        if (
+          isEnvironmentOwned(entry, environmentId) &&
+          (!isCurrentGeneration(entry, environmentId, state.lease.generation) ||
+            !desiredNames.has(name))
+        ) {
+          yield* disconnectForRegistration(state, name);
+          current = yield* readExternalMcpState(state.client, state.directory);
+        }
+      }
+      for (const requested of desired) {
+        current = yield* readExternalMcpState(state.client, state.directory);
+        const existing = current.config[requested.name];
+        if (
+          existing !== undefined &&
+          !isCurrentGeneration(existing, environmentId, state.lease.generation)
+        ) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "mcp.add",
+            detail: `OpenCode MCP name '${requested.name}' is already configured without T3's expected ownership markers. Rename the existing server before enabling external MCP management.`,
+          });
+        }
+        state.attemptedNames.add(requested.name);
+        const response = yield* runOpenCodeSdk("mcp.add", (signal) =>
+          state.client.mcp.add(
+            {
+              directory: state.directory,
+              name: requested.name,
+              config: {
+                type: "remote",
+                url: requested.url,
+                headers: {
+                  Authorization: requested.authorizationHeader,
+                  "X-T3-MCP-Owner": String(environmentId),
+                  "X-T3-MCP-Generation": state.lease.generation,
+                },
+                oauth: false,
+              },
+            },
+            { signal },
+          ),
+        ).pipe(Effect.mapError(toRequestError));
+        if (response.data?.[requested.name]?.status !== "connected") {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "mcp.add",
+            detail: `OpenCode MCP server '${requested.name}' did not connect.`,
+          });
+        }
+        current = yield* readExternalMcpState(state.client, state.directory);
+        const status = current.status[requested.name];
+        if (
+          status === undefined ||
+          typeof status !== "object" ||
+          status === null ||
+          (status as { readonly status?: unknown }).status !== "connected"
+        ) {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "mcp.status",
+            detail: `OpenCode MCP server '${requested.name}' was not connected by the follow-up status check.`,
+          });
+        }
+      }
+    });
     const deleteContextIfCurrent = (context: OpenCodeSessionContext) => {
       if (sessions.get(context.session.threadId) === context) {
         sessions.delete(context.session.threadId);
@@ -1050,18 +1444,29 @@ export function makeOpenCodeAdapter(
     // `startOpenCodeServerProcess`) and interrupts the forked event/exit
     // fibers. Consumers that can't reason about Effect scopes therefore
     // cannot leak OpenCode child processes by forgetting to call `stopAll`.
+    const closeAllSessions = Effect.gen(function* () {
+      const contexts = [...sessions.values()];
+      sessions.clear();
+      yield* Effect.forEach(
+        contexts,
+        (context) =>
+          Effect.ignoreCause(
+            context.server.external
+              ? detachExternalOpenCodeContext(context)
+              : stopOpenCodeContext(context),
+          ),
+        { concurrency: "unbounded", discard: true },
+      );
+      yield* Effect.forEach(
+        [...externalMcpStates.values()],
+        (state) => Effect.ignoreCause(cleanupExternalMcpState(state)),
+        { concurrency: "unbounded", discard: true },
+      );
+    });
+
     yield* Effect.addFinalizer(() =>
       Effect.gen(function* () {
-        const contexts = [...sessions.values()];
-        sessions.clear();
-        // `ignoreCause` swallows both typed failures (none here) and defects
-        // from throwing scope finalizers so a sibling's death can't interrupt
-        // the remaining cleanups.
-        yield* Effect.forEach(
-          contexts,
-          (context) => Effect.ignoreCause(stopOpenCodeContext(context)),
-          { concurrency: "unbounded", discard: true },
-        );
+        yield* closeAllSessions;
         // Close the logger AFTER session teardown so any final lifecycle
         // events emitted during shutdown still get written. `close` flushes
         // the `Logger.batched` window and closes each per-thread
@@ -1242,7 +1647,10 @@ export function makeOpenCodeAdapter(
           if (!pending.warned) {
             pending.warned = true;
             yield* emit({
-              ...(yield* buildEventBase({ threadId: context.session.threadId, turnId })),
+              ...(yield* buildEventBase({
+                threadId: context.session.threadId,
+                turnId,
+              })),
               type: "runtime.warning",
               payload: {
                 message: "OpenCode turn completion is waiting for session status.",
@@ -1587,7 +1995,9 @@ export function makeOpenCodeAdapter(
       // Inline the teardown that `stopOpenCodeContext` would do; we can't
       // delegate to it because our `getAndSet` above already flipped the
       // one-shot guard, so the call would no-op.
-      yield* abortOpenCodeSessionForTeardown(context);
+      if (!context.server.external) {
+        yield* abortOpenCodeSessionForTeardown(context);
+      }
       yield* Scope.close(context.sessionScope, Exit.void);
     });
 
@@ -1920,7 +2330,9 @@ export function makeOpenCodeAdapter(
         emitUnsafe({
           ...base,
           type: "request.resolved",
-          payload: { requestType: mapPermissionToRequestType(request.permission) },
+          payload: {
+            requestType: mapPermissionToRequestType(request.permission),
+          },
         });
       }
       for (const request of questions) {
@@ -1935,7 +2347,11 @@ export function makeOpenCodeAdapter(
         if (context.emittedTerminalRequestIds.has(request.id)) continue;
         context.pendingQuestions.delete(request.id);
         context.emittedTerminalRequestIds.add(request.id);
-        emitUnsafe({ ...base, type: "user-input.resolved", payload: { answers: {} } });
+        emitUnsafe({
+          ...base,
+          type: "user-input.resolved",
+          payload: { answers: {} },
+        });
       }
     });
 
@@ -2041,7 +2457,10 @@ export function makeOpenCodeAdapter(
         context.pendingRequestRecovery.rerun = true;
         return;
       }
-      const recovery: OpenCodePendingRequestRecovery = { warned: false, rerun: false };
+      const recovery: OpenCodePendingRequestRecovery = {
+        warned: false,
+        rerun: false,
+      };
       context.pendingRequestRecovery = recovery;
       const run = Effect.gen(function* () {
         let retryCount = 0;
@@ -2073,7 +2492,9 @@ export function makeOpenCodeAdapter(
             if (!recovery.warned) {
               recovery.warned = true;
               yield* emit({
-                ...(yield* buildEventBase({ threadId: context.session.threadId })),
+                ...(yield* buildEventBase({
+                  threadId: context.session.threadId,
+                })),
                 type: "runtime.warning",
                 payload: {
                   message: "OpenCode pending request recovery failed and will retry.",
@@ -2092,7 +2513,9 @@ export function makeOpenCodeAdapter(
             if (!recovery.warned) {
               recovery.warned = true;
               yield* emit({
-                ...(yield* buildEventBase({ threadId: context.session.threadId })),
+                ...(yield* buildEventBase({
+                  threadId: context.session.threadId,
+                })),
                 type: "runtime.warning",
                 payload: {
                   message: "OpenCode pending request recovery returned no data and will retry.",
@@ -2117,8 +2540,16 @@ export function makeOpenCodeAdapter(
             (request) =>
               scheduleRequestRelationRetry(
                 context,
-                { id: `recovered:${request.id}`, type: "permission.asked", properties: request },
-                { type: "permission.asked", properties: request, recovered: true },
+                {
+                  id: `recovered:${request.id}`,
+                  type: "permission.asked",
+                  properties: request,
+                },
+                {
+                  type: "permission.asked",
+                  properties: request,
+                  recovered: true,
+                },
               ),
             { discard: true },
           );
@@ -2127,8 +2558,16 @@ export function makeOpenCodeAdapter(
             (request) =>
               scheduleRequestRelationRetry(
                 context,
-                { id: `recovered:${request.id}`, type: "question.asked", properties: request },
-                { type: "question.asked", properties: request, recovered: true },
+                {
+                  id: `recovered:${request.id}`,
+                  type: "question.asked",
+                  properties: request,
+                },
+                {
+                  type: "question.asked",
+                  properties: request,
+                  recovered: true,
+                },
               ),
             { discard: true },
           );
@@ -2602,7 +3041,10 @@ export function makeOpenCodeAdapter(
               break;
             }
             if (context.promptAdmission?.turnId === turnId) {
-              context.promptAdmission.idleDuringAdmission = { turnId, raw: event };
+              context.promptAdmission.idleDuringAdmission = {
+                turnId,
+                raw: event,
+              };
               context.promptAdmission.idleObservedAfterMessage =
                 context.promptAdmission.messageObserved;
               yield* schedulePromptAdmissionRecovery(context, event);
@@ -2811,12 +3253,113 @@ export function makeOpenCodeAdapter(
         const serverPassword = openCodeSettings.serverPassword;
         const directory = input.cwd ?? serverConfig.cwd;
         const resumeSessionId = parseOpenCodeResume(input.resumeCursor)?.sessionId;
+        const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+        const projectMcpServers = input.projectMcpServers ?? mcpSession?.projectServers ?? [];
+        const hasExternalMcpWork = mcpSession !== undefined || projectMcpServers.length > 0;
+        if (serverUrl && openCodeSettings.manageExternalMcp) {
+          yield* Effect.try({
+            try: () => {
+              validateExternalOpenCodeUrl(serverUrl);
+              validateExternalMcpBaseUrl(openCodeSettings.externalMcpBaseUrl);
+            },
+            catch: (cause) => toExternalMcpRequestError("startSession", cause),
+          });
+        }
         const existing = sessions.get(input.threadId);
         if (existing) {
-          if (existing.session.status === "connecting" && !(yield* Ref.get(existing.stopped))) {
+          if (
+            existing.session.status === "connecting" &&
+            !existing.closing &&
+            !(yield* Ref.get(existing.stopped))
+          ) {
             return (yield* awaitOpenCodeContextReady(existing)).session;
           }
-          yield* stopOpenCodeContext(existing);
+          const resumesExistingExternalSession =
+            existing.server.external &&
+            !existing.closing &&
+            resumeSessionId === existing.openCodeSessionId &&
+            (yield* sameDirectory(existing.directory, directory));
+          if (resumesExistingExternalSession && !(yield* Ref.get(existing.stopped))) {
+            yield* runOpenCodeSdk("session.update", (signal) =>
+              existing.client.session.update(
+                {
+                  sessionID: existing.openCodeSessionId,
+                  permission: buildOpenCodePermissionRules(input.runtimeMode),
+                },
+                { signal },
+              ),
+            ).pipe(Effect.mapError(toRequestError));
+            const replacement = McpProviderSession.readMcpProviderSessionReplacement(
+              input.threadId,
+            );
+            let externalMcp = externalMcpStates.get(input.threadId);
+            let acquiredExternalMcp = false;
+            if (hasExternalMcpWork && externalMcp === undefined) {
+              if (externalMcpCoordinator === undefined || externalEnvironmentId === undefined) {
+                return yield* new ProviderAdapterRequestError({
+                  provider: PROVIDER,
+                  method: "startSession",
+                  detail:
+                    "External OpenCode MCP management is not available because the server environment is not configured.",
+                });
+              }
+              const lease = yield* externalMcpCoordinator
+                .acquire({
+                  target: {
+                    serverUrl: validateExternalOpenCodeUrl(existing.server.url),
+                    directory,
+                  },
+                  environmentId: externalEnvironmentId,
+                  providerInstanceId: boundInstanceId,
+                  threadId: input.threadId,
+                })
+                .pipe(Effect.mapError((cause) => toExternalMcpRequestError("mcp.acquire", cause)));
+              externalMcp = {
+                lease,
+                client: existing.client,
+                directory,
+                attemptedNames: new Set(),
+                cleanupDone: Deferred.makeUnsafe(),
+                cleanupStarted: false,
+              };
+              externalMcpStates.set(input.threadId, externalMcp);
+              acquiredExternalMcp = true;
+            }
+            if (externalMcp !== undefined && hasExternalMcpWork) {
+              const handoffExit = yield* Effect.exit(
+                registerExternalMcp(externalMcp, mcpSession, projectMcpServers),
+              );
+              if (Exit.isFailure(handoffExit)) {
+                if (acquiredExternalMcp) {
+                  yield* cleanupExternalMcpState(externalMcp);
+                } else if (replacement?.previous !== undefined) {
+                  yield* registerExternalMcp(
+                    externalMcp,
+                    replacement.previous,
+                    replacement.previous.projectServers ?? [],
+                  ).pipe(Effect.ignoreCause);
+                }
+                return yield* Effect.failCause(handoffExit.cause);
+              }
+            } else if (externalMcp !== undefined) {
+              yield* cleanupExternalMcpState(externalMcp);
+            }
+            const resumed = yield* updateProviderSession(existing, {
+              runtimeMode: input.runtimeMode,
+              ...(input.modelSelection ? { model: input.modelSelection.model } : {}),
+            });
+            return resumed;
+          }
+          // A different target is a replacement. Do not discard the old
+          // context unless OpenCode confirms its remote work was terminated.
+          existing.closing = true;
+          const terminationExit = yield* Effect.exit(confirmOpenCodeTermination(existing));
+          if (Exit.isFailure(terminationExit)) {
+            existing.closing = false;
+            return yield* Effect.failCause(terminationExit.cause);
+          }
+          yield* stopOpenCodeContext(existing, true);
+          yield* cleanupExternalMcpForThread(input.threadId);
           deleteContextIfCurrent(existing);
         }
 
@@ -2827,7 +3370,6 @@ export function makeOpenCodeAdapter(
               // The runtime binds the server's lifetime to the Scope.Scope
               // we provide below — closing `sessionScope` kills the child
               // process automatically. No manual `server.close()` needed.
-              const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
               const server = yield* openCodeRuntime.connectToOpenCodeServer({
                 binaryPath,
                 directory,
@@ -2843,6 +3385,40 @@ export function makeOpenCodeAdapter(
                 directory,
                 ...(server.serverPassword ? { serverPassword: server.serverPassword } : {}),
               });
+              let externalMcp: OpenCodeExternalMcpState | undefined;
+              if (server.external && openCodeSettings.manageExternalMcp && hasExternalMcpWork) {
+                if (externalMcpCoordinator === undefined || externalEnvironmentId === undefined) {
+                  return yield* new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "startSession",
+                    detail:
+                      "External OpenCode MCP management is not available because the server environment is not configured.",
+                  });
+                }
+                const lease = yield* externalMcpCoordinator
+                  .acquire({
+                    target: {
+                      serverUrl: validateExternalOpenCodeUrl(server.url),
+                      directory,
+                    },
+                    environmentId: externalEnvironmentId,
+                    providerInstanceId: boundInstanceId,
+                    threadId: input.threadId,
+                  })
+                  .pipe(
+                    Effect.mapError((cause) => toExternalMcpRequestError("mcp.acquire", cause)),
+                  );
+                externalMcp = {
+                  lease,
+                  client,
+                  directory,
+                  attemptedNames: new Set(),
+                  cleanupDone: Deferred.makeUnsafe(),
+                  cleanupStarted: false,
+                };
+                externalMcpStates.set(input.threadId, externalMcp);
+                yield* registerExternalMcp(externalMcp, mcpSession, projectMcpServers);
+              }
               if (mcpSession && !server.external) {
                 yield* runOpenCodeSdk("mcp.add", () =>
                   client.mcp.add({
@@ -2857,6 +3433,30 @@ export function makeOpenCodeAdapter(
                     },
                   }),
                 );
+              }
+              if (!server.external) {
+                yield* Effect.forEach(projectMcpServers, (projectMcpServer) =>
+                  runOpenCodeSdk("mcp.add", () =>
+                    client.mcp.add({
+                      name: projectMcpNativeKey(projectMcpServer),
+                      config: {
+                        type: "remote",
+                        url: projectMcpServer.endpoint.toString(),
+                        headers: {
+                          Authorization: projectMcpServer.authorizationHeader,
+                        },
+                        oauth: false,
+                      },
+                    }),
+                  ),
+                );
+              } else if (projectMcpServers.length > 0 && !openCodeSettings.manageExternalMcp) {
+                return yield* new ProviderAdapterValidationError({
+                  provider: PROVIDER,
+                  operation: "startSession",
+                  issue:
+                    "T3 cannot configure project MCP servers on externally managed OpenCode servers.",
+                });
               }
               // Resume: re-adopt the session named by the durable cursor —
               // OpenCode scopes history by session id. The probe recovers only
@@ -2947,6 +3547,7 @@ export function makeOpenCodeAdapter(
                 sessionScope,
                 server,
                 client,
+                externalMcp,
                 openCodeSession: resolved.openCodeSession,
                 created: resolved.created,
               };
@@ -2954,6 +3555,7 @@ export function makeOpenCodeAdapter(
           );
           if (Exit.isFailure(startedExit)) {
             yield* Scope.close(sessionScope, Exit.void).pipe(Effect.ignore);
+            yield* cleanupExternalMcpForThread(input.threadId);
             return yield* toProcessError(input.threadId, Cause.squash(startedExit.cause));
           }
           return startedExit.value;
@@ -2981,6 +3583,7 @@ export function makeOpenCodeAdapter(
 
         const context: OpenCodeSessionContext = {
           session,
+          closing: false,
           client: started.client,
           server: started.server,
           directory,
@@ -3016,11 +3619,21 @@ export function makeOpenCodeAdapter(
           // Another start published first. A newly created remote session
           // belongs to this loser; a resumed session is shared upstream state.
           yield* closeStartingOpenCodeContext(context, started.created);
+          if (started.externalMcp !== undefined) {
+            yield* cleanupExternalMcpState(started.externalMcp);
+          }
           return (yield* awaitOpenCodeContextReady(raceWinner)).session;
         }
         sessions.set(input.threadId, context);
         const cleanupStartingContext = closeStartingOpenCodeContext(context, started.created).pipe(
-          Effect.ensuring(Effect.sync(() => deleteContextIfCurrent(context))),
+          Effect.ensuring(
+            Effect.gen(function* () {
+              if (started.externalMcp !== undefined) {
+                yield* cleanupExternalMcpState(started.externalMcp);
+              }
+              deleteContextIfCurrent(context);
+            }),
+          ),
         );
         const connectionExit = yield* Effect.gen(function* () {
           yield* startEventPump(context);
@@ -3127,7 +3740,11 @@ export function makeOpenCodeAdapter(
               return yield* cancellationResult.failure;
             }
           }
-          if (sessions.get(input.threadId) !== context || (yield* Ref.get(context.stopped))) {
+          if (
+            context.closing ||
+            sessions.get(input.threadId) !== context ||
+            (yield* Ref.get(context.stopped))
+          ) {
             return yield* Effect.interrupt;
           }
           // A sendTurn while a turn is active is a steer. OpenCode queues the
@@ -3191,10 +3808,14 @@ export function makeOpenCodeAdapter(
 
           if (steeringTurnId === undefined) {
             yield* emit({
-              ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
+              ...(yield* buildEventBase({
+                threadId: input.threadId,
+                turnId,
+              })),
               type: "turn.started",
               payload: {
                 model: modelSelection?.model ?? context.session.model,
+                ...(variant ? { effort: variant } : {}),
               },
             });
           }
@@ -3274,7 +3895,10 @@ export function makeOpenCodeAdapter(
                         { clearActiveTurnId: true },
                       );
                       yield* emit({
-                        ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
+                        ...(yield* buildEventBase({
+                          threadId: input.threadId,
+                          turnId,
+                        })),
                         type: "turn.aborted",
                         payload: {
                           reason: requestError.detail,
@@ -3293,7 +3917,10 @@ export function makeOpenCodeAdapter(
                     );
                     if (Exit.isFailure(cleanupExit)) {
                       yield* emit({
-                        ...(yield* buildEventBase({ threadId: input.threadId, turnId })),
+                        ...(yield* buildEventBase({
+                          threadId: input.threadId,
+                          turnId,
+                        })),
                         type: "runtime.warning",
                         payload: {
                           message:
@@ -3628,7 +4255,9 @@ export function makeOpenCodeAdapter(
           } else {
             context.cancellation = undefined;
             context.reconcileIdleStatus = true;
-            yield* clearPendingOpenCodeRequests(context, { type: "session.abort" });
+            yield* clearPendingOpenCodeRequests(context, {
+              type: "session.abort",
+            });
           }
         }
         yield* Deferred.succeed(cancellation.completion, undefined).pipe(Effect.ignore);
@@ -3681,7 +4310,11 @@ export function makeOpenCodeAdapter(
         {
           id: `reply:${requestId}`,
           type: "permission.replied",
-          properties: { sessionID: request.sessionID, requestID: requestId, reply },
+          properties: {
+            sessionID: request.sessionID,
+            requestID: requestId,
+            reply,
+          },
         },
         { type: "permission.reply", requestID: requestId, reply },
       );
@@ -3752,7 +4385,13 @@ export function makeOpenCodeAdapter(
             threadId,
           });
         }
-        const stopped = yield* stopOpenCodeContext(context);
+        context.closing = true;
+        const terminationExit = yield* Effect.exit(confirmOpenCodeTermination(context));
+        if (Exit.isFailure(terminationExit)) {
+          context.closing = false;
+          return yield* Effect.failCause(terminationExit.cause);
+        }
+        const stopped = yield* stopOpenCodeContext(context, true);
         deleteContextIfCurrent(context);
         if (!stopped) {
           return;
@@ -3813,7 +4452,9 @@ export function makeOpenCodeAdapter(
         const target = snapshot.turns[targetIndex];
         if (target) {
           const messages = yield* runOpenCodeSdk("session.messages", () =>
-            context.client.session.messages({ sessionID: context.openCodeSessionId }),
+            context.client.session.messages({
+              sessionID: context.openCodeSessionId,
+            }),
           ).pipe(Effect.mapError(toRequestError));
           const entries = messages.data ?? [];
           const targetMessageIndex = entries.findIndex((entry) => entry.info.id === target.id);
@@ -3878,7 +4519,10 @@ export function makeOpenCodeAdapter(
           context.pendingIdleReconciliation = undefined;
           context.session = {
             ...context.session,
-            resumeCursor: { schemaVersion: OPENCODE_RESUME_VERSION, sessionId: forkedSessionId },
+            resumeCursor: {
+              schemaVersion: OPENCODE_RESUME_VERSION,
+              sessionId: forkedSessionId,
+            },
             updatedAt: yield* nowIso,
           };
           yield* emit({
@@ -3901,25 +4545,31 @@ export function makeOpenCodeAdapter(
       },
     );
 
-    const stopAll: OpenCodeAdapterShape["stopAll"] = () =>
-      Effect.gen(function* () {
-        const contexts = [...sessions.values()];
-        sessions.clear();
-        // `stopOpenCodeContext` is typed as never-failing — SDK aborts are
-        // already `Effect.ignore`'d inside it. `ignoreCause` here also
-        // swallows defects from throwing finalizers so one bad close can't
-        // interrupt the sibling fibers. Same pattern as the layer finalizer.
-        yield* Effect.forEach(
-          contexts,
-          (context) => Effect.ignoreCause(stopOpenCodeContext(context)),
-          { concurrency: "unbounded", discard: true },
-        );
-      });
+    const stopAll: OpenCodeAdapterShape["stopAll"] = () => closeAllSessions;
 
     return {
       provider: PROVIDER,
       capabilities: {
         sessionModelSwitch: "in-session",
+        remoteHttpMcp:
+          openCodeSettings.serverUrl && !openCodeSettings.manageExternalMcp
+            ? "unsupported"
+            : "next-session",
+        projectMcpProxy:
+          openCodeSettings.serverUrl && !openCodeSettings.manageExternalMcp
+            ? "unsupported"
+            : "next-session",
+        managedPreviewMcp: "next-session",
+        sessionMcpCatalog:
+          openCodeSettings.serverUrl && !openCodeSettings.manageExternalMcp
+            ? "unsupported"
+            : "restart-required",
+        ...(openCodeSettings.serverUrl && !openCodeSettings.manageExternalMcp
+          ? {
+              projectMcpUnsupportedReason:
+                "Enable T3-managed MCP before using project MCP with an external OpenCode server.",
+            }
+          : {}),
       },
       startSession,
       sendTurn,
@@ -3932,6 +4582,7 @@ export function makeOpenCodeAdapter(
       hasSession,
       readThread,
       rollbackThread,
+      cleanupSessionMcp: cleanupExternalMcpForThread,
       stopAll,
       get streamEvents() {
         return Stream.fromQueue(runtimeEvents);

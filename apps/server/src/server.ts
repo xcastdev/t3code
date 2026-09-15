@@ -55,6 +55,7 @@ import { ProviderRegistry } from "./provider/Services/ProviderRegistry.ts";
 import { ProviderSessionReaperLive } from "./provider/Layers/ProviderSessionReaper.ts";
 import { ProviderUsageLimitsIngestionLive } from "./provider/Layers/ProviderUsageLimitsIngestion.ts";
 import * as OpenCodeRuntime from "./provider/opencodeRuntime.ts";
+import * as OpenCodeExternalMcpCoordinator from "./provider/OpenCodeExternalMcpCoordinator.ts";
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import * as CheckpointStore from "./checkpointing/CheckpointStore.ts";
 import * as AzureDevOpsCli from "./sourceControl/AzureDevOpsCli.ts";
@@ -67,6 +68,10 @@ import { ProviderInstanceRegistryHydrationLive } from "./provider/Layers/Provide
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
+import * as ProjectMcpProxyHttpServer from "./mcp/ProjectMcpProxyHttpServer.ts";
+import * as ProjectMcpProxyRegistry from "./mcp/ProjectMcpProxyRegistry.ts";
+import * as ProjectMcpOAuth from "./mcp/ProjectMcpOAuth.ts";
+import * as ProjectMcpOAuthHttp from "./mcp/ProjectMcpOAuthHttp.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as DeviceService from "./device/DeviceService.ts";
 import { deviceHubProxyRouteLayer } from "./device/DeviceHubProxy.ts";
@@ -78,6 +83,8 @@ import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { OrchestrationReactorLive } from "./orchestration/Layers/OrchestrationReactor.ts";
+import * as ExternalNotificationDispatcher from "./notifications/ExternalNotificationDispatcher.ts";
+import * as HomeAssistantWebhookAdapter from "./notifications/HomeAssistantWebhookAdapter.ts";
 import { RuntimeReceiptBusLive } from "./orchestration/Layers/RuntimeReceiptBus.ts";
 import { ProviderRuntimeIngestionLive } from "./orchestration/Layers/ProviderRuntimeIngestion.ts";
 import { ProviderCommandReactorLive } from "./orchestration/Layers/ProviderCommandReactor.ts";
@@ -112,6 +119,9 @@ import * as SourceControlRateLimit from "./sourceControl/SourceControlRateLimit.
 import * as SourceControlRepositoryService from "./sourceControl/SourceControlRepositoryService.ts";
 import * as ProjectSetupScriptRunner from "./project/ProjectSetupScriptRunner.ts";
 import * as WorktreeSetupTracker from "./project/WorktreeSetupTracker.ts";
+import * as ProjectMcpService from "./project/ProjectMcpService.ts";
+import * as McpCatalogService from "./mcp/McpCatalogService.ts";
+import * as ProjectMcpSecretStore from "./mcp/ProjectMcpSecretStore.ts";
 import { ObservabilityLive } from "./observability/Layers/Observability.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
@@ -250,12 +260,61 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ThreadSettlementReactor.layer),
   Layer.provideMerge(PullRequestSyncReactor.layer),
   Layer.provideMerge(ThreadPullRequestReactor.layer),
-  Layer.provideMerge(AgentAwarenessRelay.layer.pipe(Layer.provide(ServerSecretStore.layer))),
+  Layer.provideMerge(
+    AgentAwarenessRelay.layer.pipe(
+      Layer.provide(ServerSecretStore.layer),
+      Layer.provideMerge(
+        ExternalNotificationDispatcher.layer.pipe(
+          Layer.provide(HomeAssistantWebhookAdapter.layer),
+          Layer.provide(ServerEnvironment.layer),
+        ),
+      ),
+    ),
+  ),
   Layer.provideMerge(RuntimeReceiptBusLive),
 );
 
 const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
   Layer.provide(ProviderSessionRuntime.layer),
+);
+
+const ProjectMcpSecretStoreLayerLive = ProjectMcpSecretStore.layer.pipe(
+  Layer.provide(ServerSecretStore.layer),
+);
+
+const ProjectMcpOAuthLayerLive = ProjectMcpOAuth.layer({ servers: [] }).pipe(
+  Layer.provideMerge(ProjectMcpSecretStoreLayerLive),
+);
+
+const ProjectMcpServiceLayerLive = ProjectMcpService.layer.pipe(
+  Layer.provideMerge(ProjectMcpSecretStoreLayerLive),
+  Layer.provideMerge(ProjectMcpOAuthLayerLive),
+);
+
+const ProjectMcpProxyRegistryLayerLive = ProjectMcpProxyRegistry.layer.pipe(
+  Layer.provide(ProjectMcpOAuthLayerLive),
+);
+
+const McpSessionRegistryLayerLive = McpSessionRegistry.layer.pipe(
+  Layer.provide(ProjectMcpProxyRegistryLayerLive),
+);
+
+const ProjectMcpRouteServicesLive = Layer.mergeAll(
+  McpSessionRegistryLayerLive,
+  ProjectMcpProxyRegistryLayerLive,
+  ProjectMcpOAuthLayerLive,
+).pipe(Layer.provideMerge(ProjectMcpSecretStoreLayerLive));
+
+const ProjectMcpHttpRoutesLive = Layer.mergeAll(
+  McpHttpServer.layer.pipe(Layer.provide(ProjectMcpRouteServicesLive)),
+  ProjectMcpProxyHttpServer.layer.pipe(Layer.provide(ProjectMcpRouteServicesLive)),
+  ProjectMcpOAuthHttp.layer.pipe(Layer.provide(ProjectMcpOAuthLayerLive)),
+).pipe(Layer.provide(ProjectMcpSecretStoreLayerLive));
+
+const ProjectMcpWebsocketRpcRouteLayer = websocketRpcRouteLayer.pipe(
+  Layer.provide(ProjectMcpRouteServicesLive),
+  Layer.provide(McpCatalogService.layer),
+  Layer.provide(ProjectMcpServiceLayerLive),
 );
 
 // `ProviderAdapterRegistryLive` is now a facade that resolves kind → adapter
@@ -267,6 +326,8 @@ const ProviderSessionDirectoryLayerLive = ProviderSessionDirectoryLive.pipe(
 const ProviderLayerLive = ProviderServiceLive.pipe(
   Layer.provide(ProviderAdapterRegistryLive),
   Layer.provideMerge(ProviderSessionDirectoryLayerLive),
+  Layer.provideMerge(ProjectMcpServiceLayerLive),
+  Layer.provide(OrchestrationLayerLive),
 );
 
 const PersistenceLayerLive = Layer.empty.pipe(Layer.provideMerge(SqlitePersistenceLayerLive));
@@ -524,6 +585,7 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // no longer transitively provides it. Exposing it at the runtime level
   // keeps a single Live for all opencode consumers.
   Layer.provideMerge(OpenCodeRuntime.OpenCodeRuntimeLive),
+  Layer.provideMerge(OpenCodeExternalMcpCoordinator.layer),
   Layer.provideMerge(WorkspaceLayerLive),
   Layer.provideMerge(Layer.mergeAll(NativeAppIconResolver.layer, ProjectFaviconResolverLayerLive)),
   Layer.provideMerge(RepositoryIdentityResolverLayerLive),
@@ -577,9 +639,9 @@ export const makeRoutesLayer = Layer.mergeAll(
     attachmentUploadRouteLayer,
     deviceHubProxyRouteLayer,
     staticAndDevRouteLayer,
-    websocketRpcRouteLayer,
+    ProjectMcpWebsocketRpcRouteLayer,
   ),
-  McpHttpServer.layer.pipe(Layer.provide(McpSessionRegistry.layer)),
+  ProjectMcpHttpRoutesLive,
 ).pipe(
   // Both transports consume the same service instance, so caches single-flight across clients
   // and mutations observed on WebSocket invalidate patches subsequently read over HTTP.
@@ -589,6 +651,8 @@ export const makeRoutesLayer = Layer.mergeAll(
   Layer.provide(commandReadinessLayer),
   Layer.provide(browserApiCorsLayer),
   Layer.provide(httpCompressionLayer),
+  Layer.provide(ProjectMcpRouteServicesLive),
+  Layer.provide(ProjectMcpServiceLayerLive),
 );
 
 const makeServerLayer = Layer.unwrap(

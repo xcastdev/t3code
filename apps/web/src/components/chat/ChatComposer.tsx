@@ -1,6 +1,6 @@
 import { DESKTOP_PASTE_AS_TEXT_EVENT } from "../../lib/desktopPasteAsText";
 import { runtimeModeConfig, runtimeModeOptions } from "./runtimeModeConfig";
-import { useRightPanelStore } from "~/rightPanelStore";
+import { useSecondaryPaneStore } from "~/secondaryPaneStore";
 import { AttachmentFilePreview } from "../files/AttachmentFilePreview";
 import { Dialog, DialogPopup, DialogTitle } from "../ui/dialog";
 import { filterComposerPullRequestMatches } from "@t3tools/shared/composerPullRequestMatches";
@@ -1608,7 +1608,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         if (preview) onExpandImage(preview);
       },
       openFile: setPreviewFileId,
-      openMention: (path: string) => useRightPanelStore.getState().openFile(routeThreadRef, path),
+      openMention: (path: string) =>
+        useSecondaryPaneStore.getState().openFile(routeThreadRef, path),
       expandVideo: (fileId: string) => {
         const file = composerFiles.find((candidate) => candidate.id === fileId);
         if (!file || !isVideoAttachment(file)) return;

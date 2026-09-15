@@ -44,6 +44,7 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import { projectMcpNativeKey } from "../Services/ProviderAdapter.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
@@ -541,6 +542,16 @@ export function makeCursorAdapter(
             : cursorSettings;
 
           const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+          const projectMcpServers = (
+            input.projectMcpServers ??
+            mcpSession?.projectServers ??
+            []
+          ).map((server) => ({
+            type: "http" as const,
+            name: projectMcpNativeKey(server),
+            url: server.endpoint.toString(),
+            headers: [{ name: "Authorization", value: server.authorizationHeader }],
+          }));
           const acp = yield* makeCursorAcpRuntime({
             cursorSettings: effectiveCursorSettings,
             ...(options?.environment || mcpSession?.agentDeviceEnvironment
@@ -556,20 +567,25 @@ export function makeCursorAdapter(
             runtimeMode: input.runtimeMode,
             ...(resumeSessionId ? { resumeSessionId } : {}),
             clientInfo: { name: "t3-code", version: "0.0.0" },
-            ...(mcpSession
+            ...(projectMcpServers.length > 0 || mcpSession
               ? {
                   mcpServers: [
-                    {
-                      type: "http" as const,
-                      name: "t3-code",
-                      url: mcpSession.endpoint,
-                      headers: [
-                        {
-                          name: "Authorization",
-                          value: mcpSession.authorizationHeader,
-                        },
-                      ],
-                    },
+                    ...projectMcpServers,
+                    ...(mcpSession
+                      ? [
+                          {
+                            type: "http" as const,
+                            name: "t3-code",
+                            url: mcpSession.endpoint,
+                            headers: [
+                              {
+                                name: "Authorization",
+                                value: mcpSession.authorizationHeader,
+                              },
+                            ],
+                          },
+                        ]
+                      : []),
                   ],
                 }
               : {}),
@@ -1237,7 +1253,14 @@ export function makeCursorAdapter(
 
     return {
       provider: PROVIDER,
-      capabilities: { sessionModelSwitch: "in-session", supportsConversationRollback: false },
+      capabilities: {
+        sessionModelSwitch: "in-session",
+        supportsConversationRollback: false,
+        remoteHttpMcp: "next-session",
+        projectMcpProxy: "next-session",
+        managedPreviewMcp: "next-session",
+        sessionMcpCatalog: "restart-required",
+      },
       compaction: { type: "slash-command", command: "/compress" },
       startSession,
       sendTurn,

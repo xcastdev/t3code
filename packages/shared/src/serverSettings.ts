@@ -336,6 +336,21 @@ export function applyServerSettingsPatch(
     ...(patch.providerInstances !== undefined
       ? { providerInstances: patch.providerInstances }
       : {}),
+    // A destination list is a replacement, not an element-wise merge. An
+    // element-wise merge can retain a removed destination and its secret.
+    ...(patch.externalNotifications !== undefined
+      ? {
+          externalNotifications: {
+            ...next.externalNotifications,
+            ...(patch.externalNotifications.appScheme !== undefined
+              ? { appScheme: patch.externalNotifications.appScheme }
+              : {}),
+            ...(patch.externalNotifications.destinations !== undefined
+              ? { destinations: patch.externalNotifications.destinations }
+              : {}),
+          },
+        }
+      : {}),
     ...(projectSettingsOverridesPatch !== undefined
       ? {
           projectSettingsOverrides: Object.fromEntries(

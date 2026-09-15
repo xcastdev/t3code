@@ -42,6 +42,13 @@ it.effect("parses keybinding rules", () =>
     });
     assert.strictEqual(parsedRightPanelToggle.command, "rightPanel.toggle");
 
+    const parsedSourceControlOpen = yield* decode(KeybindingRule, {
+      key: "mod+alt+g",
+      command: "sourceControl.open",
+      when: "!terminalFocus",
+    });
+    assert.strictEqual(parsedSourceControlOpen.command, "sourceControl.open");
+
     const parsedRightPanelToggleMaximized = yield* decode(KeybindingRule, {
       key: "mod+shift+m",
       command: "rightPanel.toggleMaximized",
@@ -164,7 +171,11 @@ it.effect("parses keybindings array payload", () =>
     const parsed = yield* decode(KeybindingsConfig, [
       { key: "mod+j", command: "terminal.toggle" },
       { key: "mod+d", command: "terminal.split", when: "terminalFocus" },
-      { key: "mod+shift+d", command: "terminal.splitVertical", when: "terminalFocus" },
+      {
+        key: "mod+shift+d",
+        command: "terminal.splitVertical",
+        when: "terminalFocus",
+      },
     ]);
     assert.lengthOf(parsed, 3);
   }),

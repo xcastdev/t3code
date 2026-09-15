@@ -46,6 +46,7 @@ import {
   FileSearchIcon,
   FolderIcon,
   FolderPlusIcon,
+  GitBranchIcon,
   GitPullRequestArrowIcon,
   LinkIcon,
   MessageSquareIcon,
@@ -1488,7 +1489,13 @@ function OpenCommandPaletteDialog(props: {
         });
       }
 
-      return [{ value: `sources:${environmentId}`, label: "Sources", items: sourceItems }];
+      return [
+        {
+          value: `sources:${environmentId}`,
+          label: "Sources",
+          items: sourceItems,
+        },
+      ];
     },
     [openSourceControlSettings, startAddProjectBrowse, startAddProjectClone],
   );
@@ -1699,6 +1706,21 @@ function OpenCommandPaletteDialog(props: {
       icon: <LinkIcon className={ITEM_ICON_CLASS} />,
       shortcutCommand: "thread.copyReference",
       run: copyActiveThreadReference,
+    });
+  }
+
+  if (activeThread !== null && currentProjectId !== null) {
+    const threadRef = scopeThreadRef(activeThread.environmentId, activeThread.id);
+    actionItems.push({
+      kind: "action",
+      value: "action:open-source-control",
+      searchTerms: ["source control", "git", "changes", "commit", "branch", "pull requests"],
+      title: "Open Source Control",
+      icon: <GitBranchIcon className={ITEM_ICON_CLASS} />,
+      shortcutCommand: "sourceControl.open",
+      run: async () => {
+        useRightPanelStore.getState().openSourceControl(threadRef);
+      },
     });
   }
 
@@ -2597,7 +2619,13 @@ function OpenCommandPaletteDialog(props: {
               (candidate) => candidate.httpBaseUrl === environment.displayUrl,
             );
             const runningDistro = bootstrap?.runningDistro ?? null;
-            return [{ environmentId: environment.environmentId, backendId, runningDistro }];
+            return [
+              {
+                environmentId: environment.environmentId,
+                backendId,
+                runningDistro,
+              },
+            ];
           }),
           primaryEnvironmentId,
           desktopWslState ?? null,
@@ -2809,9 +2837,13 @@ function OpenCommandPaletteDialog(props: {
                   : "Enter a repository path and press Enter to look it up.",
             }
           : addProjectCloneFlow?.step === "confirm"
-            ? { emptyStateMessage: "Choose a destination path and press Enter to clone." }
+            ? {
+                emptyStateMessage: "Choose a destination path and press Enter to clone.",
+              }
             : relativePathNeedsActiveProject
-              ? { emptyStateMessage: "Relative paths require an active project." }
+              ? {
+                  emptyStateMessage: "Relative paths require an active project.",
+                }
               : willCreateProjectPath
                 ? {
                     emptyStateMessage: "Press Enter to create this folder and add it as a project.",

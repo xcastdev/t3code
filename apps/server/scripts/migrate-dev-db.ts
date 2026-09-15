@@ -37,7 +37,13 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { Command, Flag } from "effect/unstable/cli";
 
-import { migrationManifest, runMigrations } from "../src/persistence/Migrations.ts";
+import {
+  FORK_MIGRATIONS_TABLE,
+  forkMigrationManifest,
+  migrationManifest,
+  runForkMigrations,
+  runUpstreamMigrations,
+} from "../src/persistence/Migrations.ts";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 export class MigrateDevDbNotInWorktreeError extends Schema.TaggedError<MigrateDevDbNotInWorktreeError>()(
@@ -110,20 +116,20 @@ export class MigrateDevDbDestinationBusyError extends Schema.TaggedError<Migrate
 }
 
 /**
- * Two branches claimed the same Migrations/NNN_ slot: the id was already
- * recorded under a different name, so this checkout's migration was
- * silently skipped and its schema changes never applied.
+ * Two branches claimed the same sequence-local slot. `sequence` distinguishes
+ * upstream ids from fork ids, which intentionally overlap.
  */
 export class MigrateDevDbSlotCollisionError extends Schema.TaggedError<MigrateDevDbSlotCollisionError>()(
   "MigrateDevDbSlotCollisionError",
   {
+    sequence: Schema.Literals(["upstream", "fork"]),
     slot: Schema.Number,
     codeName: Schema.String,
     appliedName: Schema.String,
   },
 ) {
   override get message(): string {
-    return `Migration slot collision at ${this.slot}: this checkout registers '${this.codeName}' but the database already applied '${this.appliedName}' in that slot. Renumber the new migration to a free slot.`;
+    return `${this.sequence} migration slot collision at ${this.slot}: this checkout registers '${this.codeName}' but the database already applied '${this.appliedName}' in that slot.`;
   }
 }
 
@@ -332,20 +338,26 @@ const pruneSnapshot = Effect.fn("pruneDevDbSnapshot")(function* (input: RunMigra
   };
 });
 
-/** Compare this checkout's migration registry against what the cloned
- * database recorded: same slot under a different name means the migration
- * was skipped, not applied. */
-const verifyMigrationSlots = Effect.fn("verifyMigrationSlots")(function* () {
+const verifySequenceSlots = Effect.fn("verifySequenceSlots")(function* (
+  sequence: "upstream" | "fork",
+  table: string,
+  manifest: ReadonlyArray<readonly [id: number, name: string]>,
+) {
   const sql = yield* SqlClient.SqlClient;
   const applied = yield* sql<{ migration_id: number; name: string }>`
-    SELECT migration_id, name FROM effect_sql_migrations`;
+    SELECT migration_id, name FROM ${sql(table)}`;
   const appliedById = new Map(applied.map((row) => [Number(row.migration_id), row.name]));
-  for (const [slot, codeName] of migrationManifest) {
+  for (const [slot, codeName] of manifest) {
     const appliedName = appliedById.get(slot);
     if (appliedName !== undefined && appliedName !== codeName) {
-      return yield* new MigrateDevDbSlotCollisionError({ slot, codeName, appliedName });
+      return yield* new MigrateDevDbSlotCollisionError({ sequence, slot, codeName, appliedName });
     }
   }
+});
+
+const verifyMigrationSlots = Effect.fn("verifyMigrationSlots")(function* () {
+  yield* verifySequenceSlots("upstream", "effect_sql_migrations", migrationManifest);
+  yield* verifySequenceSlots("fork", FORK_MIGRATIONS_TABLE, forkMigrationManifest);
 });
 
 export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
@@ -435,7 +447,12 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
       const sql = yield* SqlClient.SqlClient;
       // Mirror server boot (persistence/Layers/Sqlite.ts).
       yield* sql.unsafe("PRAGMA foreign_keys = ON").unprepared;
-      return yield* runMigrations();
+      const upstream = yield* runUpstreamMigrations();
+      const fork = yield* runForkMigrations();
+      return [
+        ...upstream.map(([id, name]) => `${id}_${name}`),
+        ...fork.map(([id, name]) => `fork/${id}_${name}`),
+      ];
     }).pipe(
       Effect.provide(NodeSqliteClient.layer({ filename: snapshotPath })),
       wrapPhase("migrate", snapshotPath),
@@ -494,7 +511,7 @@ export const runMigrateDevDb = Effect.fn("runMigrateDevDb")(function* (
     sizeBytes: Number(size),
     projects: pruned.projects,
     eventCount: pruned.eventCount,
-    executedMigrations: executedMigrations.map(([id, name]) => `${id}_${name}`),
+    executedMigrations,
   };
 });
 

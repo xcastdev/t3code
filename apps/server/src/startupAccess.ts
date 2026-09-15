@@ -11,6 +11,7 @@ export interface HeadlessServeAccessInfo {
   readonly connectionString: string;
   readonly token: string;
   readonly pairingUrl: string;
+  readonly desktopAttachUrl?: string;
 }
 
 type NetworkInterfacesMap = ReturnType<typeof NodeOS.networkInterfaces>;
@@ -20,12 +21,14 @@ export const isLoopbackHost = (host: string | undefined): boolean => {
     return true;
   }
 
+  const normalized = host.toLowerCase().replace(/^\[|\]$/gu, "");
+  if (normalized === "localhost" || normalized === "::1") return true;
+
+  const octets = normalized.split(".");
   return (
-    host === "localhost" ||
-    host === "127.0.0.1" ||
-    host === "::1" ||
-    host === "[::1]" ||
-    host.startsWith("127.")
+    octets.length === 4 &&
+    octets[0] === "127" &&
+    octets.slice(1).every((octet) => /^\d{1,3}$/u.test(octet) && Number(octet) <= 255)
   );
 };
 
@@ -97,6 +100,13 @@ export const buildPairingUrl = (connectionString: string, token: string): string
   return url.toString();
 };
 
+/** A desktop-only wrapper around a loopback owner pairing URL. */
+export const buildDesktopAttachUrl = (pairingUrl: string, scheme = "t3code"): string => {
+  const url = new URL(`${scheme}://attach-primary`);
+  url.searchParams.set("pairingUrl", pairingUrl);
+  return url.toString();
+};
+
 export const renderTerminalQrCode = (value: string, margin = 2): string => {
   const qrCode = QrCode.encodeText(value, QrCode.Ecc.MEDIUM);
   const rows: Array<string> = [];
@@ -125,6 +135,7 @@ export const formatHeadlessServeOutput = (accessInfo: HeadlessServeAccessInfo): 
     `Connection string: ${accessInfo.connectionString}`,
     `Token: ${accessInfo.token}`,
     `Pairing URL: ${accessInfo.pairingUrl}`,
+    ...(accessInfo.desktopAttachUrl ? [`Desktop attach URL: ${accessInfo.desktopAttachUrl}`] : []),
     "",
     renderTerminalQrCode(accessInfo.pairingUrl),
     "",
@@ -134,15 +145,22 @@ export const issueHeadlessServeAccessInfo = Effect.fn("issueHeadlessServeAccessI
   const serverConfig = yield* ServerConfig;
   const httpServer = yield* HttpServer.HttpServer;
   const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
-  const connectionString = resolveHeadlessConnectionString(
-    serverConfig.host,
-    resolveListeningPort(httpServer.address, serverConfig.port),
-  );
+  const listeningPort = resolveListeningPort(httpServer.address, serverConfig.port);
+  const connectionString = resolveHeadlessConnectionString(serverConfig.host, listeningPort);
   const issued = yield* serverAuth.issueStartupPairingCredential();
 
   return {
     connectionString,
     token: issued.credential,
     pairingUrl: buildPairingUrl(connectionString, issued.credential),
+    ...(serverConfig.host === undefined ||
+    isLoopbackHost(serverConfig.host) ||
+    isWildcardHost(serverConfig.host)
+      ? {
+          desktopAttachUrl: buildDesktopAttachUrl(
+            buildPairingUrl(`http://127.0.0.1:${String(listeningPort)}`, issued.credential),
+          ),
+        }
+      : {}),
   } satisfies HeadlessServeAccessInfo;
 });

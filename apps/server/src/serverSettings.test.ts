@@ -78,6 +78,43 @@ const recordProviderUsage = (provider: string, instanceId: string | null = provi
   });
 
 it.layer(NodeServices.layer)("server settings", (it) => {
+  it.effect("keeps Home Assistant webhook URLs out of settings.json and client settings", () =>
+    Effect.gen(function* () {
+      const service = yield* ServerSettingsModule.ServerSettingsService;
+      const config = yield* ServerConfig.ServerConfig;
+      const fileSystem = yield* FileSystem.FileSystem;
+      const webhookUrl = "https://home.example.test/api/webhook/private-token";
+      const next = yield* service.updateSettings({
+        externalNotifications: {
+          destinations: [
+            {
+              _tag: "home-assistant-webhook",
+              id: "home",
+              label: "Home Assistant",
+              enabled: true,
+              configured: false,
+              webhookUrl,
+            },
+          ],
+        },
+      });
+      const persisted = yield* fileSystem.readFileString(config.settingsPath);
+      assert.notInclude(persisted, webhookUrl);
+      assert.equal(next.externalNotifications.destinations[0]?.webhookUrl, webhookUrl);
+      assert.deepEqual(
+        ServerSettingsModule.redactServerSettingsForClient(next).externalNotifications
+          .destinations[0],
+        {
+          _tag: "home-assistant-webhook",
+          id: "home",
+          label: "Home Assistant",
+          enabled: true,
+          configured: true,
+        },
+      );
+    }).pipe(Effect.provide(makeServerSettingsLayer())),
+  );
+
   it.effect("preserves context when reading a provider environment secret fails", () => {
     const platformCause = PlatformError.systemError({
       _tag: "PermissionDenied",
@@ -955,6 +992,8 @@ it.layer(NodeServices.layer)("server settings", (it) => {
         binaryPath: "/opt/homebrew/bin/opencode",
         serverUrl: "http://127.0.0.1:4096",
         serverPassword: "secret-password",
+        manageExternalMcp: false,
+        externalMcpBaseUrl: "",
         customModels: [],
       });
     }).pipe(Effect.provide(makeServerSettingsLayer())),

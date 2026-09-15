@@ -131,6 +131,10 @@
       "types": "./src/orchestrationTiming.ts",
       "import": "./src/orchestrationTiming.ts"
     },
+    "./turnWorkCounts": {
+      "types": "./src/turnWorkCounts.ts",
+      "import": "./src/turnWorkCounts.ts"
+    },
     "./remote": {
       "types": "./src/remote.ts",
       "import": "./src/remote.ts"

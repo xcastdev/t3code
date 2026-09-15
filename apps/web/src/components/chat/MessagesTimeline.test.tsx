@@ -42,7 +42,9 @@ vi.mock("@legendapp/list/react", async () => {
     ref?: Ref<LegendListRef>;
   }) => {
     if (props.anchoredEndSpace) {
-      props.anchoredEndSpace.onReady?.({ anchorIndex: props.anchoredEndSpace.anchorIndex });
+      props.anchoredEndSpace.onReady?.({
+        anchorIndex: props.anchoredEndSpace.anchorIndex,
+      });
     }
     return (
       <div
@@ -320,7 +322,10 @@ describe("MessagesTimeline", () => {
                     questionAnswer: {
                       requestId: ApprovalRequestId.make("question-request"),
                       answers,
-                      questionTextById: { file: "Provide a spec", image: "Provide a screenshot" },
+                      questionTextById: {
+                        file: "Provide a spec",
+                        image: "Provide a screenshot",
+                      },
                       attachmentsByQuestionId: {
                         file: [
                           {
@@ -500,6 +505,48 @@ describe("MessagesTimeline", () => {
     expect(markup).toContain("Worked for 8.0s");
   });
 
+  it("renders recorded model and effort for the terminal assistant response", () => {
+    const turnId = TurnId.make("turn-with-provenance");
+    const assistantMessageId = MessageId.make("assistant-with-provenance");
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        turns={[
+          {
+            turnId,
+            state: "completed",
+            requestedAt: "2026-03-17T19:12:20.000Z",
+            startedAt: "2026-03-17T19:12:20.000Z",
+            completedAt: "2026-03-17T19:12:28.000Z",
+            assistantMessageId,
+            model: "Claude Opus 4.6",
+            effort: "high",
+          },
+        ]}
+        timelineEntries={[
+          {
+            id: "assistant-with-provenance-entry",
+            kind: "message",
+            createdAt: "2026-03-17T19:12:28.000Z",
+            message: {
+              id: assistantMessageId,
+              role: "assistant",
+              text: "Completed.",
+              turnId,
+              createdAt: "2026-03-17T19:12:28.000Z",
+              updatedAt: "2026-03-17T19:12:28.000Z",
+              streaming: false,
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).toContain("Claude Opus 4.6");
+    expect(markup).toContain("high");
+    expect(markup).toContain("8s");
+  });
+
   it("keeps assistant changed-files headers sticky below the thread header", () => {
     const assistantMessageId = MessageId.make("message-assistant-with-files");
     const turnId = TurnId.make("turn-with-files");
@@ -534,7 +581,14 @@ describe("MessagesTimeline", () => {
             checkpointTurnCount: 1,
             checkpointRef: CheckpointRef.make("checkpoint-with-files"),
             status: "ready",
-            files: [{ path: "README.md", kind: "modified", additions: 2, deletions: 1 }],
+            files: [
+              {
+                path: "README.md",
+                kind: "modified",
+                additions: 2,
+                deletions: 1,
+              },
+            ],
             assistantMessageId,
             completedAt: MESSAGE_CREATED_AT,
           },
@@ -2099,7 +2153,9 @@ describe("MessagesTimeline", () => {
       // toggle; the plain click has to reach it so the label can collapse.
       for (const isCollapsed of [false, true]) {
         label!.props.onClick({
-          currentTarget: { ownerDocument: { getSelection: () => ({ isCollapsed }) } },
+          currentTarget: {
+            ownerDocument: { getSelection: () => ({ isCollapsed }) },
+          },
           stopPropagation,
         });
       }

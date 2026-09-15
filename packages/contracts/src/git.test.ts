@@ -8,6 +8,7 @@ import {
   GitRunStackedActionResult,
   GitRunStackedActionInput,
   GitResolvePullRequestResult,
+  VcsWorkingTreeDiffInput,
 } from "./git.ts";
 
 const decodeCreateWorktreeInput = Schema.decodeUnknownSync(VcsCreateWorktreeInput);
@@ -20,6 +21,19 @@ const decodePreparePullRequestThreadResult = Schema.decodeUnknownSync(
 const decodeRunStackedActionInput = Schema.decodeUnknownSync(GitRunStackedActionInput);
 const decodeRunStackedActionResult = Schema.decodeUnknownSync(GitRunStackedActionResult);
 const decodeResolvePullRequestResult = Schema.decodeUnknownSync(GitResolvePullRequestResult);
+const decodeWorkingTreeDiffInput = Schema.decodeUnknownSync(VcsWorkingTreeDiffInput);
+
+describe("VcsWorkingTreeDiffInput", () => {
+  it("accepts an explicit working-tree-versus-index comparison", () => {
+    expect(
+      decodeWorkingTreeDiffInput({
+        cwd: "/repo",
+        path: "src/file.ts",
+        comparison: "worktree-index",
+      }),
+    ).toMatchObject({ comparison: "worktree-index" });
+  });
+});
 
 describe("VcsCreateWorktreeInput", () => {
   it("accepts omitted newRefName for existing-refName worktrees", () => {

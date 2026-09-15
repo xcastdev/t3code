@@ -7,6 +7,7 @@ import type {
   ChatImageAttachment,
   EnvironmentId,
   MessageId,
+  OrchestrationTurnSummary,
   OrchestrationMessageContext,
   ThreadId,
   TurnId,
@@ -247,6 +248,7 @@ export interface ThreadFeedProps {
   readonly contentPresentation: ThreadContentPresentation;
   readonly agentLabel: string;
   readonly latestTurn: ThreadFeedLatestTurn | null;
+  readonly turns?: ReadonlyArray<OrchestrationTurnSummary>;
   readonly activeWorkStartedAt: string | null;
   readonly listRef: RefObject<LegendListRef | null>;
   readonly freeze: SharedValue<boolean>;
@@ -2396,6 +2398,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
           expandedTurnIds,
           expandedWorkGroupIds,
           props.activeWorkStartedAt,
+          props.turns,
         ),
         props.feed,
         props.queuedMessages,
@@ -2407,6 +2410,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       props.activeWorkStartedAt,
       props.feed,
       props.latestTurn,
+      props.turns,
     ],
   );
   // The empty↔filled key below remounts the list and resets its imperative

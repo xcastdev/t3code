@@ -2,9 +2,12 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { SourceControlProviderError, SourceControlProviderInfo } from "./sourceControl.ts";
-import { VcsDriverKind } from "./vcs.ts";
+import { VcsDriverKind, VcsMutationRejectionCode } from "./vcs.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
+const GitPath = Schema.String.check(Schema.isNonEmpty()).check(
+  Schema.makeFilter((path) => !path.includes("\u0000") || "Git paths must not contain NUL."),
+);
 const GIT_LIST_BRANCHES_MAX_LIMIT = 200;
 
 // Domain Types
@@ -84,6 +87,32 @@ export const VcsRef = Schema.Struct({
 });
 export type VcsRef = typeof VcsRef.Type;
 
+export const VcsIndexStatus = Schema.Literals([
+  "staged",
+  "unstaged",
+  "both",
+  "untracked",
+  "conflicted",
+]);
+export type VcsIndexStatus = typeof VcsIndexStatus.Type;
+
+export const VcsWorkingTreeFile = Schema.Struct({
+  path: GitPath,
+  insertions: NonNegativeInt,
+  deletions: NonNegativeInt,
+  /** Omitted by older servers that predate index operations. */
+  indexStatus: Schema.optional(VcsIndexStatus),
+});
+export type VcsWorkingTreeFile = typeof VcsWorkingTreeFile.Type;
+
+export const GitMutationPrecondition = Schema.Struct({
+  expectedHeadCommit: Schema.NullOr(Schema.String),
+  expectedIndexTree: Schema.String,
+  expectedRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
+  expectedMergeHeads: Schema.optional(Schema.Array(TrimmedNonEmptyStringSchema)),
+});
+export type GitMutationPrecondition = typeof GitMutationPrecondition.Type;
+
 const VcsWorktree = Schema.Struct({
   path: TrimmedNonEmptyStringSchema,
   refName: TrimmedNonEmptyStringSchema,
@@ -104,6 +133,35 @@ export const VcsStatusInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
 });
 export type VcsStatusInput = typeof VcsStatusInput.Type;
+
+const NonEmptyPaths = Schema.Array(GitPath).check(Schema.isMinLength(1));
+
+export const VcsStageFilesInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  paths: NonEmptyPaths,
+});
+export type VcsStageFilesInput = typeof VcsStageFilesInput.Type;
+
+export const VcsWorkingTreeDiffInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  path: GitPath,
+  comparison: Schema.Literals(["index", "head", "worktree-index"]),
+  reviewedState: Schema.optional(
+    Schema.Struct({
+      headCommit: Schema.NullOr(Schema.String),
+      indexTree: Schema.String,
+    }),
+  ),
+});
+export type VcsWorkingTreeDiffInput = typeof VcsWorkingTreeDiffInput.Type;
+
+export const GitCommitIndexInput = Schema.Struct({
+  cwd: TrimmedNonEmptyStringSchema,
+  message: TrimmedNonEmptyStringSchema.check(Schema.isMaxLength(10_000)),
+  precondition: Schema.optional(GitMutationPrecondition),
+  confirmDefaultRef: Schema.optional(Schema.Boolean),
+});
+export type GitCommitIndexInput = typeof GitCommitIndexInput.Type;
 
 export const VcsPullInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
@@ -171,6 +229,7 @@ export const VcsCreateRefInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
   refName: TrimmedNonEmptyStringSchema,
   switchRef: Schema.optional(Schema.Boolean),
+  confirmDirtyWorkingTree: Schema.optional(Schema.Boolean),
 });
 export type VcsCreateRefInput = typeof VcsCreateRefInput.Type;
 
@@ -182,6 +241,7 @@ export type VcsCreateRefResult = typeof VcsCreateRefResult.Type;
 export const VcsSwitchRefInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
   refName: TrimmedNonEmptyStringSchema,
+  confirmDirtyWorkingTree: Schema.optional(Schema.Boolean),
 });
 export type VcsSwitchRefInput = typeof VcsSwitchRefInput.Type;
 
@@ -212,19 +272,19 @@ const VcsStatusChangeRequest = Schema.Struct({
 
 const VcsStatusLocalShape = {
   isRepo: Schema.Boolean,
+  repositoryRoot: Schema.optional(TrimmedNonEmptyStringSchema),
   sourceControlProvider: Schema.optional(SourceControlProviderInfo),
   hasPrimaryRemote: Schema.Boolean,
   isDefaultRef: Schema.Boolean,
   refName: Schema.NullOr(TrimmedNonEmptyStringSchema),
+  /** Revision fields are optional so clients remain compatible with older servers. */
+  localRevision: Schema.optional(Schema.String),
+  headCommit: Schema.optional(Schema.NullOr(Schema.String)),
+  indexTree: Schema.optional(Schema.String),
+  pendingMergeHeads: Schema.optional(Schema.Array(TrimmedNonEmptyStringSchema)),
   hasWorkingTreeChanges: Schema.Boolean,
   workingTree: Schema.Struct({
-    files: Schema.Array(
-      Schema.Struct({
-        path: TrimmedNonEmptyStringSchema,
-        insertions: NonNegativeInt,
-        deletions: NonNegativeInt,
-      }),
-    ),
+    files: Schema.Array(VcsWorkingTreeFile),
     insertions: NonNegativeInt,
     deletions: NonNegativeInt,
   }),
@@ -301,6 +361,17 @@ export const VcsSwitchRefResult = Schema.Struct({
 });
 export type VcsSwitchRefResult = typeof VcsSwitchRefResult.Type;
 
+export const VcsWorkingTreeDiffResult = Schema.Struct({
+  diff: Schema.String,
+  truncated: Schema.Boolean,
+});
+export type VcsWorkingTreeDiffResult = typeof VcsWorkingTreeDiffResult.Type;
+
+export const GitCommitIndexResult = Schema.Struct({
+  commitSha: TrimmedNonEmptyStringSchema,
+});
+export type GitCommitIndexResult = typeof GitCommitIndexResult.Type;
+
 export const GitRunStackedActionResult = Schema.Struct({
   action: GitStackedAction,
   branch: Schema.Struct({
@@ -348,6 +419,7 @@ export class GitCommandError extends Schema.TaggedError<GitCommandError>()("GitC
   stderrLength: Schema.optional(Schema.Number),
   outputLength: Schema.optional(Schema.Number),
   detail: Schema.String,
+  code: Schema.optional(VcsMutationRejectionCode),
   cause: Schema.optional(Schema.Defect()),
 }) {
   override get message(): string {

@@ -405,6 +405,16 @@ export function BranchToolbarBranchSelector({
     });
   };
 
+  const confirmDirtyBranchSwitch = useCallback(
+    (branchName: string) => {
+      if (branchStatusQuery.data?.hasWorkingTreeChanges !== true) return true;
+      return window.confirm(
+        `Switch to "${branchName}" with uncommitted changes? Your working tree will carry over if Git can apply it cleanly.`,
+      );
+    },
+    [branchStatusQuery.data?.hasWorkingTreeChanges],
+  );
+
   const selectBranch = (refName: VcsRef) => {
     if (!branchCwd || !activeProjectCwd || isBranchActionPending) return;
 
@@ -431,6 +441,7 @@ export function BranchToolbarBranchSelector({
     const selectedBranchName = refName.isRemote
       ? deriveLocalBranchNameFromRemoteRef(refName.name)
       : refName.name;
+    if (!confirmDirtyBranchSwitch(selectedBranchName)) return;
 
     setIsBranchMenuOpen(false);
     onComposerFocusRequest?.();
@@ -443,6 +454,7 @@ export function BranchToolbarBranchSelector({
         input: {
           cwd: selectionTarget.checkoutCwd,
           refName: refName.name,
+          confirmDirtyWorkingTree: true,
         },
       });
       if (checkoutResult._tag === "Success") {
@@ -469,6 +481,7 @@ export function BranchToolbarBranchSelector({
   const createRef = (rawName: string) => {
     const name = sanitizeNewRefName(rawName);
     if (!branchCwd || !name || isBranchActionPending) return;
+    if (!confirmDirtyBranchSwitch(name)) return;
 
     setIsBranchMenuOpen(false);
     onComposerFocusRequest?.();
@@ -482,6 +495,7 @@ export function BranchToolbarBranchSelector({
           cwd: branchCwd,
           refName: name,
           switchRef: true,
+          confirmDirtyWorkingTree: true,
         },
       });
       if (createBranchResult._tag === "Success") {
@@ -628,7 +642,10 @@ export function BranchToolbarBranchSelector({
       return;
     }
 
-    void branchListRef.current?.scrollToOffset?.({ offset: 0, animated: false });
+    void branchListRef.current?.scrollToOffset?.({
+      offset: 0,
+      animated: false,
+    });
   }, [deferredTrimmedBranchQuery, isBranchMenuOpen]);
 
   const triggerLabel = resolveBranchTriggerLabel({

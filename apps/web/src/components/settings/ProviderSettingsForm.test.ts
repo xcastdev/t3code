@@ -35,6 +35,33 @@ describe("ProviderSettingsForm helpers", () => {
     });
   });
 
+  it("exposes external OpenCode MCP controls from schema annotations", () => {
+    const opencode = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("opencode")];
+    expect(opencode).toBeDefined();
+
+    expect(deriveProviderSettingsFields(opencode!).map((field) => field.key)).toEqual([
+      "binaryPath",
+      "serverUrl",
+      "serverPassword",
+      "manageExternalMcp",
+      "externalMcpBaseUrl",
+    ]);
+    expect(
+      deriveProviderSettingsFields(opencode!).find((field) => field.key === "manageExternalMcp"),
+    ).toMatchObject({
+      label: "Manage MCP servers on external OpenCode",
+      control: "switch",
+      defaultBooleanValue: false,
+    });
+    expect(
+      deriveProviderSettingsFields(opencode!).find((field) => field.key === "externalMcpBaseUrl"),
+    ).toMatchObject({
+      label: "T3 MCP public origin",
+      control: "text",
+      placeholder: "https://t3.example.com",
+    });
+  });
+
   it("derives a select control with its choices for the Antigravity sign-in method", () => {
     const antigravity = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("antigravity")];
     expect(antigravity).toBeDefined();
@@ -48,7 +75,10 @@ describe("ProviderSettingsForm helpers", () => {
       "binaryPath",
     ]);
     const authMethod = fields.find((field) => field.key === "authMethod");
-    expect(authMethod).toMatchObject({ control: "select", clearWhenEmpty: "omit" });
+    expect(authMethod).toMatchObject({
+      control: "select",
+      clearWhenEmpty: "omit",
+    });
     expect(authMethod?.options?.map((option) => option.value)).toEqual([
       "oauth-personal",
       "oauth-business",

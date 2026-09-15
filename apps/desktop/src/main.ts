@@ -32,6 +32,7 @@ import * as ElectronTheme from "./electron/ElectronTheme.ts";
 import * as ElectronUpdater from "./electron/ElectronUpdater.ts";
 import * as ElectronWindow from "./electron/ElectronWindow.ts";
 import * as DesktopApp from "./app/DesktopApp.ts";
+import * as DesktopLaunchIntent from "./app/DesktopLaunchIntent.ts";
 import * as DesktopAppActivation from "./app/DesktopAppActivation.ts";
 import * as DesktopAppIdentity from "./app/DesktopAppIdentity.ts";
 import * as DesktopConnectionCatalogStore from "./app/DesktopConnectionCatalogStore.ts";
@@ -40,6 +41,7 @@ import * as DesktopApplicationMenu from "./window/DesktopApplicationMenu.ts";
 import * as DesktopAssets from "./app/DesktopAssets.ts";
 import * as DesktopBackendConfiguration from "./backend/DesktopBackendConfiguration.ts";
 import * as DesktopBackendPool from "./backend/DesktopBackendPool.ts";
+import * as DesktopAttachedBackend from "./backend/DesktopAttachedBackend.ts";
 import * as DesktopLocalEnvironmentAuth from "./backend/DesktopLocalEnvironmentAuth.ts";
 import * as DesktopNetworkInterfaces from "./backend/DesktopNetworkInterfaces.ts";
 import * as DesktopEnvironment from "./app/DesktopEnvironment.ts";
@@ -67,6 +69,17 @@ import * as DesktopWindow from "./window/DesktopWindow.ts";
 import * as DesktopWslBackend from "./wsl/DesktopWslBackend.ts";
 import * as DesktopWslEnvironment from "./wsl/DesktopWslEnvironment.ts";
 import * as DesktopWslServerTree from "./wsl/DesktopWslServerTree.ts";
+
+// macOS can deliver a URL before ready. Only consume the attach host so
+// Clerk's OAuth callback URLs retain their existing handler.
+Electron.app.on("open-url", (event, url) => {
+  if (DesktopLaunchIntent.captureDesktopLaunchIntent(url)) event.preventDefault();
+});
+Electron.app.on("second-instance", (_event, argv) => {
+  DesktopLaunchIntent.captureDesktopSecondInstanceLaunchIntent(
+    Array.isArray(argv) ? argv.filter((arg): arg is string => typeof arg === "string") : [],
+  );
+});
 
 const desktopEnvironmentLayer = Layer.unwrap(
   Effect.gen(function* () {
@@ -186,8 +199,13 @@ const desktopWslBackendLayer = DesktopWslBackend.layer.pipe(
   Layer.provideMerge(desktopBackendLayer),
 );
 
+const desktopAttachedBackendLayer = DesktopAttachedBackend.layer.pipe(
+  Layer.provideMerge(desktopBackendLayer),
+);
+
 const desktopLocalEnvironmentAuthLayer = DesktopLocalEnvironmentAuth.layer.pipe(
   Layer.provideMerge(desktopBackendLayer),
+  Layer.provideMerge(desktopAttachedBackendLayer),
 );
 
 const desktopApplicationLayer = Layer.mergeAll(
@@ -201,6 +219,7 @@ const desktopApplicationLayer = Layer.mergeAll(
   Layer.provideMerge(desktopSnapShotLayer),
   Layer.provideMerge(DesktopUpdates.layer),
   Layer.provideMerge(desktopWslBackendLayer),
+  Layer.provideMerge(desktopAttachedBackendLayer),
   Layer.provideMerge(desktopLocalEnvironmentAuthLayer),
 );
 

@@ -28,9 +28,11 @@ const RIGHT_PANEL_KINDS = [
   "terminal",
   "pull-request",
   "pull-requests",
+  "source-control",
   "agents",
 ] as const;
 export type RightPanelKind = (typeof RIGHT_PANEL_KINDS)[number];
+export type SourceControlPanelView = "changes" | "pull-requests";
 
 export interface DeviceTabTarget {
   hostId: string;
@@ -42,7 +44,12 @@ export interface DeviceTabTarget {
 export type RightPanelSurface =
   | { id: `browser:${string}`; kind: "preview"; resourceId: string }
   | { id: "browser:new"; kind: "preview"; resourceId: null }
-  | { id: "device" | `device:${string}`; kind: "device"; target?: DeviceTabTarget; title?: string }
+  | {
+      id: "device" | `device:${string}`;
+      kind: "device";
+      target?: DeviceTabTarget;
+      title?: string;
+    }
   | {
       id: `terminal:${string}`;
       kind: "terminal";
@@ -85,6 +92,11 @@ export type RightPanelSurface =
     }
   /** The thread's linked pull requests, one singleton tab beside any number of `pull-request` tabs. */
   | { id: "pull-requests"; kind: "pull-requests" }
+  | {
+      id: "source-control";
+      kind: "source-control";
+      view: SourceControlPanelView;
+    }
   | { id: "agents"; kind: "agents" };
 
 const RIGHT_PANEL_STORAGE_KEY = "t3code:right-panel-state:v2";
@@ -92,7 +104,9 @@ const RIGHT_PANEL_STORAGE_KEY = "t3code:right-panel-state:v2";
 // v10 keys pull-request surfaces by reference instead of a singleton tab.
 // v11 stops persisting the pull-request list's shared panel, so a restart opens the page fresh.
 // v12 adds the device surface.
-const RIGHT_PANEL_STORAGE_VERSION = 13;
+// v15 moves workspace file tabs into the secondary pane. ChatView imports
+// retained legacy entries before removing them; attachments remain here.
+const RIGHT_PANEL_STORAGE_VERSION = 15;
 
 /** A fixed workspace-level ref: each PR surface carries its own real environment. */
 export const PULL_REQUESTS_PANEL_REF = scopeThreadRef(
@@ -113,6 +127,10 @@ export interface ThreadRightPanelState {
   dismissedDeviceSurfaceIds?: string[];
 }
 
+export type LegacyWorkspaceFileSurface = Extract<RightPanelSurface, { kind: "file" }> & {
+  readonly attachment?: undefined;
+};
+
 interface RightPanelStoreState {
   byThreadKey: Record<string, ThreadRightPanelState>;
   /** Session-only count of user panel choices per thread. Automatic updates do not advance it. */
@@ -129,8 +147,10 @@ interface RightPanelStoreState {
   ) => boolean;
   open: (
     ref: ScopedThreadRef,
-    kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request">,
+    kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request" | "source-control">,
   ) => void;
+  openSourceControl: (ref: ScopedThreadRef, view?: SourceControlPanelView) => void;
+  setSourceControlView: (ref: ScopedThreadRef, view: SourceControlPanelView) => void;
   openDevice: (ref: ScopedThreadRef, target: DeviceTabTarget, automatic?: boolean) => void;
   renameDevice: (ref: ScopedThreadRef, surfaceId: string, title: string) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
@@ -163,12 +183,17 @@ interface RightPanelStoreState {
   closeAllSurfaces: (ref: ScopedThreadRef) => void;
   reconcileBrowserSurfaces: (ref: ScopedThreadRef, tabIds: readonly string[]) => void;
   reconcileFileSurfaces: (ref: ScopedThreadRef, workspaceAvailable: boolean) => void;
+  legacyWorkspaceFileSurfaces: (ref: ScopedThreadRef) => {
+    readonly surfaces: readonly LegacyWorkspaceFileSurface[];
+    readonly activeSurfaceId: string | null;
+  };
+  removeLegacyWorkspaceFileSurfaces: (ref: ScopedThreadRef) => void;
   show: (ref: ScopedThreadRef) => void;
   close: (ref: ScopedThreadRef) => void;
   toggleVisibility: (ref: ScopedThreadRef) => void;
   toggle: (
     ref: ScopedThreadRef,
-    kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request">,
+    kind: Exclude<RightPanelKind, "file" | "terminal" | "pull-request" | "source-control">,
   ) => void;
   removeThread: (ref: ScopedThreadRef) => void;
 }
@@ -180,7 +205,10 @@ const EMPTY_THREAD_STATE: ThreadRightPanelState = {
 };
 
 const singletonSurface = (
-  kind: Exclude<RightPanelKind, "file" | "preview" | "terminal" | "pull-request">,
+  kind: Exclude<
+    RightPanelKind,
+    "file" | "preview" | "terminal" | "pull-request" | "source-control"
+  >,
 ): RightPanelSurface => {
   switch (kind) {
     case "diff":
@@ -195,6 +223,12 @@ const singletonSurface = (
       return { id: "device", kind };
   }
 };
+
+const sourceControlSurface = (view: SourceControlPanelView): RightPanelSurface => ({
+  id: "source-control",
+  kind: "source-control",
+  view,
+});
 
 const browserSurface = (tabId: string | null): RightPanelSurface =>
   tabId
@@ -400,6 +434,13 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
                         }),
                       ];
                     }
+                    if (surface.kind === "source-control") {
+                      return [
+                        sourceControlSurface(
+                          surface.view === "pull-requests" ? "pull-requests" : "changes",
+                        ),
+                      ];
+                    }
                     if (surface.kind !== "terminal") return [surface];
                     if (
                       !("resourceId" in surface) ||
@@ -515,6 +556,40 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             return upsertSurface(current, singletonSurface(kind));
           }),
         ),
+      openSourceControl: (ref, view = "changes") =>
+        set((state) =>
+          userAction(state, scopedThreadKey(ref), (current) => {
+            const surface = sourceControlSurface(view);
+            const existing = current.surfaces.some((entry) => entry.kind === "source-control");
+            return {
+              ...upsertSurface(
+                {
+                  ...current,
+                  surfaces: existing
+                    ? current.surfaces.filter((entry) => entry.kind !== "source-control")
+                    : current.surfaces,
+                },
+                surface,
+              ),
+            };
+          }),
+        ),
+      setSourceControlView: (ref, view) =>
+        set((state) =>
+          userAction(state, scopedThreadKey(ref), (current) => {
+            const existing = current.surfaces.find((entry) => entry.kind === "source-control");
+            if (!existing) return current;
+            const surface = sourceControlSurface(view);
+            return {
+              ...current,
+              isOpen: true,
+              activeSurfaceId: surface.id,
+              surfaces: current.surfaces.map((entry) =>
+                entry.id === existing.id ? surface : entry,
+              ),
+            };
+          }),
+        ),
       openDevice: (ref, target, automatic = false) =>
         set((state) =>
           (automatic ? automaticUpdate : userAction)(state, scopedThreadKey(ref), (current) => {
@@ -544,7 +619,10 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             ...current,
             surfaces: current.surfaces.map((surface) =>
               surface.id === surfaceId && surface.kind === "device"
-                ? { ...surface, title: title.trim() || surface.target?.name || "Device" }
+                ? {
+                    ...surface,
+                    title: title.trim() || surface.target?.name || "Device",
+                  }
                 : surface,
             ),
           })),
@@ -707,7 +785,11 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             if (index < 0) return current;
             const surfaces = current.surfaces.filter((surface) => surface.id !== surfaceId);
             if (current.activeSurfaceId !== surfaceId) {
-              return { ...current, isOpen: surfaces.length > 0 && current.isOpen, surfaces };
+              return {
+                ...current,
+                isOpen: surfaces.length > 0 && current.isOpen,
+                surfaces,
+              };
             }
             const fallback = surfaces[Math.min(index, surfaces.length - 1)] ?? null;
             return {
@@ -752,7 +834,12 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
           userAction(state, scopedThreadKey(ref), (current) =>
             current.surfaces.length === 0
               ? current
-              : { ...current, isOpen: false, surfaces: [], activeSurfaceId: null },
+              : {
+                  ...current,
+                  isOpen: false,
+                  surfaces: [],
+                  activeSurfaceId: null,
+                },
           ),
         ),
       reconcileBrowserSurfaces: (ref, tabIds) =>
@@ -792,6 +879,36 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
               (surface) =>
                 surface.kind !== "files" &&
                 (surface.kind !== "file" || surface.attachment !== undefined),
+            );
+            if (surfaces.length === current.surfaces.length) return current;
+            const activeStillExists = surfaces.some(
+              (surface) => surface.id === current.activeSurfaceId,
+            );
+            return {
+              ...current,
+              isOpen: surfaces.length > 0 ? current.isOpen : false,
+              surfaces,
+              activeSurfaceId: activeStillExists
+                ? current.activeSurfaceId
+                : (surfaces.at(-1)?.id ?? null),
+            };
+          }),
+        ),
+      legacyWorkspaceFileSurfaces: (ref) => {
+        const current = selectThreadRightPanelState(get().byThreadKey, ref);
+        return {
+          surfaces: current.surfaces.filter(
+            (surface): surface is LegacyWorkspaceFileSurface =>
+              surface.kind === "file" && surface.attachment === undefined,
+          ),
+          activeSurfaceId: current.activeSurfaceId,
+        };
+      },
+      removeLegacyWorkspaceFileSurfaces: (ref) =>
+        set((state) =>
+          automaticUpdate(state, scopedThreadKey(ref), (current) => {
+            const surfaces = current.surfaces.filter(
+              (surface) => surface.kind !== "file" || surface.attachment !== undefined,
             );
             if (surfaces.length === current.surfaces.length) return current;
             const activeStillExists = surfaces.some(

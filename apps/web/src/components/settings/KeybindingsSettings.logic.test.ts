@@ -42,7 +42,10 @@ describe("KeybindingsSettings.logic", () => {
     (query) => {
       const rows = buildKeybindingRows(DEFAULT_RESOLVED_KEYBINDINGS, query);
       expect(rows).toContainEqual(
-        expect.objectContaining({ command: "thread.copyReference", key: "mod+shift+c" }),
+        expect.objectContaining({
+          command: "thread.copyReference",
+          key: "mod+shift+c",
+        }),
       );
     },
   );
@@ -83,13 +86,27 @@ describe("KeybindingsSettings.logic", () => {
   it("captures platform-specific mod shortcuts", () => {
     expect(
       keybindingFromKeyboardEvent(
-        { key: "K", code: "KeyK", metaKey: true, ctrlKey: false, altKey: false, shiftKey: true },
+        {
+          key: "K",
+          code: "KeyK",
+          metaKey: true,
+          ctrlKey: false,
+          altKey: false,
+          shiftKey: true,
+        },
         "MacIntel",
       ),
     ).toBe("mod+shift+k");
     expect(
       keybindingFromKeyboardEvent(
-        { key: "K", code: "KeyK", metaKey: false, ctrlKey: true, altKey: false, shiftKey: true },
+        {
+          key: "K",
+          code: "KeyK",
+          metaKey: false,
+          ctrlKey: true,
+          altKey: false,
+          shiftKey: true,
+        },
         "Win32",
       ),
     ).toBe("mod+shift+k");
@@ -190,7 +207,11 @@ describe("KeybindingsSettings.logic", () => {
   it("describes the scope of each visual expression removal", () => {
     const condition = { type: "identifier", name: "terminalFocus" } as const;
     const negatedCondition = { type: "not", node: condition } as const;
-    const group = { type: "and", left: condition, right: negatedCondition } as const;
+    const group = {
+      type: "and",
+      left: condition,
+      right: negatedCondition,
+    } as const;
     const negatedGroup = { type: "not", node: group } as const;
 
     expect(whenNodeRemoveLabel(group, 0)).toBe("Clear all conditions");
@@ -234,6 +255,7 @@ describe("KeybindingsSettings.logic", () => {
       expect.arrayContaining([
         "chat.new",
         "rightPanel.toggleMaximized",
+        "sourceControl.open",
         "thread.stop",
         "script.setup-db.run",
       ]),

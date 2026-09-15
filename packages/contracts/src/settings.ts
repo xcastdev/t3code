@@ -99,7 +99,10 @@ const DEFAULT_GLASS_OPACITY: GlassOpacity = 80;
 export const MIN_APPEARANCE_CONTRAST = 50;
 export const MAX_APPEARANCE_CONTRAST = 200;
 export const AppearanceContrast = Schema.Int.check(
-  Schema.isBetween({ minimum: MIN_APPEARANCE_CONTRAST, maximum: MAX_APPEARANCE_CONTRAST }),
+  Schema.isBetween({
+    minimum: MIN_APPEARANCE_CONTRAST,
+    maximum: MAX_APPEARANCE_CONTRAST,
+  }),
 );
 export type AppearanceContrast = typeof AppearanceContrast.Type;
 const DEFAULT_APPEARANCE_CONTRAST: AppearanceContrast = 100;
@@ -121,7 +124,10 @@ const DEFAULT_PANEL_ANIMATION_DURATION_MS: PanelAnimationDurationMs = 0;
 export const MIN_INTERFACE_FONT_SIZE = 12;
 export const MAX_INTERFACE_FONT_SIZE = 20;
 export const InterfaceFontSize = Schema.Int.check(
-  Schema.isBetween({ minimum: MIN_INTERFACE_FONT_SIZE, maximum: MAX_INTERFACE_FONT_SIZE }),
+  Schema.isBetween({
+    minimum: MIN_INTERFACE_FONT_SIZE,
+    maximum: MAX_INTERFACE_FONT_SIZE,
+  }),
 );
 export type InterfaceFontSize = typeof InterfaceFontSize.Type;
 export const DEFAULT_INTERFACE_FONT_SIZE: InterfaceFontSize = 16;
@@ -129,7 +135,10 @@ export const DEFAULT_INTERFACE_FONT_SIZE: InterfaceFontSize = 16;
 export const MIN_PROMPT_FONT_SIZE = 12;
 export const MAX_PROMPT_FONT_SIZE = 20;
 export const PromptFontSize = Schema.Int.check(
-  Schema.isBetween({ minimum: MIN_PROMPT_FONT_SIZE, maximum: MAX_PROMPT_FONT_SIZE }),
+  Schema.isBetween({
+    minimum: MIN_PROMPT_FONT_SIZE,
+    maximum: MAX_PROMPT_FONT_SIZE,
+  }),
 );
 export type PromptFontSize = typeof PromptFontSize.Type;
 export const DEFAULT_PROMPT_FONT_SIZE: PromptFontSize = 14;
@@ -137,7 +146,10 @@ export const DEFAULT_PROMPT_FONT_SIZE: PromptFontSize = 14;
 export const MIN_CODE_FONT_SIZE = 10;
 export const MAX_CODE_FONT_SIZE = 18;
 export const CodeFontSize = Schema.Int.check(
-  Schema.isBetween({ minimum: MIN_CODE_FONT_SIZE, maximum: MAX_CODE_FONT_SIZE }),
+  Schema.isBetween({
+    minimum: MIN_CODE_FONT_SIZE,
+    maximum: MAX_CODE_FONT_SIZE,
+  }),
 );
 export type CodeFontSize = typeof CodeFontSize.Type;
 export const DEFAULT_CODE_FONT_SIZE: CodeFontSize = 13;
@@ -145,7 +157,10 @@ export const DEFAULT_CODE_FONT_SIZE: CodeFontSize = 13;
 export const MIN_TERMINAL_FONT_SIZE = 8;
 export const MAX_TERMINAL_FONT_SIZE = 20;
 export const TerminalFontSize = Schema.Int.check(
-  Schema.isBetween({ minimum: MIN_TERMINAL_FONT_SIZE, maximum: MAX_TERMINAL_FONT_SIZE }),
+  Schema.isBetween({
+    minimum: MIN_TERMINAL_FONT_SIZE,
+    maximum: MAX_TERMINAL_FONT_SIZE,
+  }),
 );
 export type TerminalFontSize = typeof TerminalFontSize.Type;
 const DEFAULT_TERMINAL_FONT_SIZE: TerminalFontSize = 12;
@@ -171,7 +186,10 @@ export const SnapShotModifier = Schema.Literals(SNAP_SHOT_MODIFIERS);
 export type SnapShotModifier = typeof SnapShotModifier.Type;
 export const SnapShotShortcut = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("both-shift-keys") }),
-  Schema.Struct({ kind: Schema.Literal("modifier-pair"), modifier: SnapShotModifier }),
+  Schema.Struct({
+    kind: Schema.Literal("modifier-pair"),
+    modifier: SnapShotModifier,
+  }),
   SnapShotKeyChord,
 ]);
 export type SnapShotShortcut = typeof SnapShotShortcut.Type;
@@ -629,7 +647,10 @@ export const ClaudeSettings = makeProviderSettingsSchema(
         title: "CLAUDE_CONFIG_DIR path",
         description:
           "Custom Claude home and config directory. Keeps .claude.json and .claude separate.",
-        providerSettingsForm: { placeholder: "~/.claude", clearWhenEmpty: "omit" },
+        providerSettingsForm: {
+          placeholder: "~/.claude",
+          clearWhenEmpty: "omit",
+        },
       }),
     ),
     customModels: Schema.Array(CustomModelSetting).pipe(
@@ -679,7 +700,10 @@ export const CursorSettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "Binary path",
         description: "Path to the Cursor agent binary.",
-        providerSettingsForm: { placeholder: "cursor-agent", clearWhenEmpty: "omit" },
+        providerSettingsForm: {
+          placeholder: "cursor-agent",
+          clearWhenEmpty: "omit",
+        },
       }),
     ),
     apiEndpoint: TrimmedString.pipe(
@@ -783,7 +807,10 @@ export const AntigravitySettings = makeProviderSettingsSchema(
         title: "GCP project",
         description:
           "Required for Gemini Enterprise. Agent Platform uses it when no API key is set.",
-        providerSettingsForm: { placeholder: "my-project-id", clearWhenEmpty: "omit" },
+        providerSettingsForm: {
+          placeholder: "my-project-id",
+          clearWhenEmpty: "omit",
+        },
       }),
     ),
     gcpLocation: TrimmedString.pipe(
@@ -791,7 +818,10 @@ export const AntigravitySettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "GCP location",
         description: "Region for Gemini Enterprise or Agent Platform.",
-        providerSettingsForm: { placeholder: "us-central1", clearWhenEmpty: "omit" },
+        providerSettingsForm: {
+          placeholder: "us-central1",
+          clearWhenEmpty: "omit",
+        },
       }),
     ),
     binaryPath: TrimmedString.pipe(
@@ -799,7 +829,10 @@ export const AntigravitySettings = makeProviderSettingsSchema(
       Schema.annotateKey({
         title: "Binary path",
         description: "Custom ACP executable. Leave empty to select automatically.",
-        providerSettingsForm: { placeholder: "Automatic", clearWhenEmpty: "persist" },
+        providerSettingsForm: {
+          placeholder: "Automatic",
+          clearWhenEmpty: "persist",
+        },
       }),
     ),
     customModels: Schema.Array(CustomModelSetting).pipe(
@@ -807,7 +840,9 @@ export const AntigravitySettings = makeProviderSettingsSchema(
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
-  { order: ["authMethod", "apiKey", "gcpProject", "gcpLocation", "binaryPath"] },
+  {
+    order: ["authMethod", "apiKey", "gcpProject", "gcpLocation", "binaryPath"],
+  },
 );
 export type AntigravitySettings = typeof AntigravitySettings.Type;
 
@@ -852,13 +887,34 @@ export const OpenCodeSettings = makeProviderSettingsSchema(
         },
       }),
     ),
+    manageExternalMcp: Schema.Boolean.pipe(
+      Schema.withDecodingDefault(Effect.succeed(false)),
+      Schema.annotateKey({
+        title: "Manage MCP servers on external OpenCode",
+        description:
+          "T3 changes directory-scoped MCP entries on the configured OpenCode server while a T3 session runs.",
+        providerSettingsForm: { control: "switch", clearWhenEmpty: "omit" },
+      }),
+    ),
+    externalMcpBaseUrl: TrimmedString.pipe(
+      Schema.withDecodingDefault(Effect.succeed("")),
+      Schema.annotateKey({
+        title: "T3 MCP public origin",
+        description:
+          "Set an origin such as https://t3.example.com when OpenCode must reach T3 from another machine. Leave empty only when both run on the same machine.",
+        providerSettingsForm: {
+          placeholder: "https://t3.example.com",
+          clearWhenEmpty: "omit",
+        },
+      }),
+    ),
     customModels: Schema.Array(CustomModelSetting).pipe(
       Schema.withDecodingDefault(Effect.succeed([])),
       Schema.annotateKey({ providerSettingsForm: { hidden: true } }),
     ),
   },
   {
-    order: ["binaryPath", "serverUrl", "serverPassword"],
+    order: ["binaryPath", "serverUrl", "serverPassword", "manageExternalMcp", "externalMcpBaseUrl"],
   },
 );
 export type OpenCodeSettings = typeof OpenCodeSettings.Type;
@@ -943,6 +999,40 @@ export const BackgroundActivitySettings = Schema.Struct({
   overrides: BackgroundActivityOverrides.pipe(Schema.withDecodingDefault(Effect.succeed({}))),
 }).pipe(Schema.withDecodingDefault(Effect.succeed({})));
 export type BackgroundActivitySettings = typeof BackgroundActivitySettings.Type;
+
+/** Destinations are a closed union so a new delivery adapter is a deliberate contract change. */
+export const ExternalNotificationAppScheme = Schema.Literals([
+  "t3code-dev",
+  "t3code-preview",
+  "t3code",
+]);
+export type ExternalNotificationAppScheme = typeof ExternalNotificationAppScheme.Type;
+
+export const ExternalNotificationHomeAssistantDestination = Schema.TaggedStruct(
+  "home-assistant-webhook",
+  {
+    id: TrimmedNonEmptyString,
+    label: TrimmedNonEmptyString,
+    enabled: Schema.Boolean,
+    /** Whether the write-only webhook URL is held in ServerSecretStore. */
+    configured: Schema.Boolean,
+    webhookUrl: Schema.optionalKey(TrimmedString),
+  },
+);
+export const ExternalNotificationDestination = Schema.Union([
+  ExternalNotificationHomeAssistantDestination,
+]);
+export type ExternalNotificationDestination = typeof ExternalNotificationDestination.Type;
+
+export const ExternalNotificationSettings = Schema.Struct({
+  appScheme: ExternalNotificationAppScheme.pipe(
+    Schema.withDecodingDefault(Effect.succeed("t3code-dev" as const)),
+  ),
+  destinations: Schema.Array(ExternalNotificationDestination).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
+}).pipe(Schema.withDecodingDefault(Effect.succeed({})));
+export type ExternalNotificationSettings = typeof ExternalNotificationSettings.Type;
 
 /**
  * Server settings a project may override. Every other server setting is
@@ -1084,6 +1174,7 @@ export const ServerSettings = Schema.Struct({
     Schema.withDecodingDefault(Effect.succeed(DEFAULT_SIDEBAR_AUTO_SETTLE_AFTER_DAYS)),
   ),
   sidebarAutoSettleOnMerge: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(true))),
+  externalNotifications: ExternalNotificationSettings,
   backgroundActivity: BackgroundActivitySettings,
   // Legacy flat fields retained for old settings files and old clients. New
   // consumers should resolve `backgroundActivity` instead.
@@ -1340,6 +1431,8 @@ const OpenCodeSettingsPatch = Schema.Struct({
   binaryPath: Schema.optionalKey(TrimmedString),
   serverUrl: Schema.optionalKey(TrimmedString),
   serverPassword: Schema.optionalKey(TrimmedString),
+  manageExternalMcp: Schema.optionalKey(Schema.Boolean),
+  externalMcpBaseUrl: Schema.optionalKey(TrimmedString),
   customModels: Schema.optionalKey(Schema.Array(CustomModelSetting)),
 });
 
@@ -1378,6 +1471,12 @@ export const ServerSettingsPatch = Schema.Struct({
   deviceHosts: Schema.optionalKey(SshDeviceHostConfigs),
   sidebarAutoSettleAfterDays: Schema.optionalKey(Schema.NullOr(SidebarAutoSettleAfterDays)),
   sidebarAutoSettleOnMerge: Schema.optionalKey(Schema.Boolean),
+  externalNotifications: Schema.optionalKey(
+    Schema.Struct({
+      appScheme: Schema.optionalKey(ExternalNotificationAppScheme),
+      destinations: Schema.optionalKey(Schema.Array(ExternalNotificationDestination)),
+    }),
+  ),
   backgroundActivity: Schema.optionalKey(
     Schema.Struct({
       schemaVersion: Schema.optionalKey(Schema.Literal(1)),

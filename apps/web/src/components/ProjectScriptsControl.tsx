@@ -8,7 +8,13 @@ import {
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
 import { ChevronDownIcon, DownloadIcon, PlusIcon, SettingsIcon } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useMemo, useState, type ReactNode } from "react";
+import {
+  initialProjectActionSelection,
+  projectScriptForSelection,
+  resolveProjectActionSelection,
+  type ProjectActionSelection,
+} from "~/projectActionSelection";
 
 import { commandForProjectScript, primaryProjectScript } from "~/projectScripts";
 import { shortcutLabelForCommand } from "~/keybindings";
@@ -43,6 +49,9 @@ interface ProjectScriptsControlProps {
   scripts: ReadonlyArray<ProjectScript>;
   /** Scripts declared in the project's checked-in t3.json, offered for import. */
   fileScripts?: ReadonlyArray<T3ProjectFileScript>;
+  split?: boolean;
+  selectionKey?: string | null;
+  menuContents?: ReactNode;
   keybindings: ResolvedKeybindingsConfig;
   preferredScriptId?: string | null;
   onRunScript: (script: ProjectScript) => void;
@@ -57,6 +66,9 @@ interface ProjectScriptsControlProps {
 export default function ProjectScriptsControl({
   scripts,
   fileScripts = NO_FILE_SCRIPTS,
+  split = false,
+  selectionKey = null,
+  menuContents,
   keybindings,
   preferredScriptId = null,
   onRunScript,
@@ -69,6 +81,14 @@ export default function ProjectScriptsControl({
     imports: false,
   });
   const [editorRequest, setEditorRequest] = useState<ProjectScriptEditorRequest | null>(null);
+  const [splitMenuOpen, setSplitMenuOpen] = useState(false);
+  const [splitSelection, setSplitSelection] = useState<{
+    key: string | null;
+    value: ProjectActionSelection;
+  }>(() => ({
+    key: selectionKey,
+    value: initialProjectActionSelection(scripts, preferredScriptId),
+  }));
 
   const primaryScript = useMemo(() => {
     if (preferredScriptId) {
@@ -77,6 +97,12 @@ export default function ProjectScriptsControl({
     }
     return primaryProjectScript(scripts);
   }, [preferredScriptId, scripts]);
+  const selectedAction = resolveProjectActionSelection(
+    scripts,
+    preferredScriptId,
+    splitSelection.key === selectionKey ? splitSelection.value : null,
+  );
+  const selectedScript = projectScriptForSelection(scripts, selectedAction);
   const importableScripts = useMemo(
     () =>
       fileScripts.filter(
@@ -152,6 +178,75 @@ export default function ProjectScriptsControl({
       </MenuGroup>
     </>
   );
+
+  if (split) {
+    return (
+      <>
+        <Menu open={splitMenuOpen} onOpenChange={setSplitMenuOpen}>
+          <Group aria-label="Project actions">
+            <Button
+              size="xs"
+              variant="outline"
+              aria-label={selectedScript ? `Run ${selectedScript.name}` : "Add action"}
+              onClick={() => (selectedScript ? onRunScript(selectedScript) : openAddDialog())}
+            >
+              {selectedScript ? (
+                <ScriptIcon icon={selectedScript.icon} />
+              ) : (
+                <PlusIcon className="size-3.5" />
+              )}
+              <span className="sr-only @3xl/header-actions:not-sr-only @3xl/header-actions:ml-0.5">
+                {selectedScript?.name ?? "Add action"}
+              </span>
+            </Button>
+            <GroupSeparator />
+            <MenuTrigger
+              render={
+                <Button size="icon-xs" variant="outline" aria-label="Choose project action" />
+              }
+            >
+              <ChevronDownIcon className="size-4" />
+            </MenuTrigger>
+          </Group>
+          <MenuPopup align="end">
+            {scripts.map((script) => (
+              <MenuItem
+                key={script.id}
+                className={dropdownItemClassName}
+                onClick={() =>
+                  setSplitSelection({
+                    key: selectionKey,
+                    value: { kind: "script", scriptId: script.id },
+                  })
+                }
+              >
+                <ScriptIcon icon={script.icon} className="size-4" />
+                {script.name}
+              </MenuItem>
+            ))}
+            {importMenuItems}
+            <MenuItem className={dropdownItemClassName} onClick={openAddDialog}>
+              <PlusIcon className="size-4" />
+              Add action
+            </MenuItem>
+            {menuContents ? (
+              <>
+                <MenuSeparator />
+                {menuContents}
+              </>
+            ) : null}
+          </MenuPopup>
+        </Menu>
+        <ProjectScriptEditorDialog
+          request={editorRequest}
+          scripts={scripts}
+          onSubmit={submitScript}
+          onDelete={(scriptId) => void onDeleteScript(scriptId)}
+          onClose={() => setEditorRequest(null)}
+        />
+      </>
+    );
+  }
 
   return (
     <>

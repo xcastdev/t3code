@@ -10,6 +10,7 @@ import type {
   OrchestrationLatestTurn,
   OrchestrationThread,
   OrchestrationThreadActivity,
+  OrchestrationTurnSummary,
   ToolLifecycleItemType,
   TurnId,
   UserInputQuestion,
@@ -1613,7 +1614,9 @@ interface ThreadFeedTurnFold {
 function deriveThreadFeedTurnFolds(
   feed: ReadonlyArray<ThreadFeedEntry>,
   latestTurn: ThreadFeedLatestTurn | null,
+  turns: ReadonlyArray<OrchestrationTurnSummary> | undefined = undefined,
 ): ReadonlyMap<string, ThreadFeedTurnFold> {
+  const turnsById = new Map((turns ?? []).map((turn) => [turn.turnId, turn]));
   const firstAssistantMessageIdByTurn = new Map<TurnId, string>();
   const terminalAssistantMessageIdByTurn = new Map<TurnId, string>();
   for (const entry of feed) {
@@ -1717,14 +1720,29 @@ function deriveThreadFeedTurnFolds(
             ) ?? lastEntryEnd,
           );
     const duration = elapsedMs === null ? null : formatDuration(elapsedMs);
-    const interrupted = latestTurnMatches && latestTurn.state === "interrupted";
-    const label = interrupted
+    const turn = turnsById.get(turnId);
+    const interrupted =
+      turn?.state === "interrupted" ||
+      (turn === undefined && latestTurnMatches && latestTurn.state === "interrupted");
+    const durationPhrase = interrupted
       ? duration
         ? `You stopped after ${duration}`
         : "You stopped this response"
       : duration
         ? `Worked for ${duration}`
         : "Worked";
+    const count = (value: number, singular: string, plural: string) =>
+      value > 0 ? `${value} ${value === 1 ? singular : plural}` : null;
+    const label = [
+      durationPhrase,
+      ...(turn?.counts
+        ? [
+            count(turn.counts.commandCount, "Command", "Commands"),
+            count(turn.counts.toolCallCount, "Tool Call", "Tool Calls"),
+            count(turn.counts.subagentCount, "Subagent", "Subagents"),
+          ].filter((value): value is string => value !== null)
+        : []),
+    ].join(" · ");
 
     foldsByAnchorId.set(firstHiddenEntry.id, {
       turnId,
@@ -1742,6 +1760,7 @@ export function deriveThreadFeedPresentation(
   expandedTurnIds: ReadonlySet<TurnId>,
   expandedWorkGroupIds: ReadonlySet<string> = new Set(),
   activeWorkStartedAt: string | null = null,
+  turns?: ReadonlyArray<OrchestrationTurnSummary>,
 ): ThreadFeedEntry[] {
   const sourceFeed = feed.filter(
     (entry) =>
@@ -1753,7 +1772,7 @@ export function deriveThreadFeedPresentation(
   const activeTailGroup = sourceFeed.findLast(
     (entry) => entry.type !== "message" || !isEmptyMessage(entry),
   );
-  const foldsByAnchorId = deriveThreadFeedTurnFolds(sourceFeed, latestTurn);
+  const foldsByAnchorId = deriveThreadFeedTurnFolds(sourceFeed, latestTurn, turns);
   const unsettledTurnId = deriveUnsettledTurnId(latestTurn);
   const isWorking = activeWorkStartedAt !== null;
   const collapsedEntryIds = new Set<string>();

@@ -1,13 +1,21 @@
 import {
+  McpCatalogDefinition,
+  McpCatalogOverride,
+  McpDefinitionId,
   ApprovalRequestId,
   isImportedAgentSessionMessageId,
   UserInputAttachmentAnswerPayload,
+  ProjectMcpTransport,
+  getProjectMcpTransport,
+  ProviderInstanceId,
   type ChatAttachment,
   type OrchestrationEvent,
   type OrchestrationSessionStatus,
   ThreadId,
+  TurnId,
 } from "@t3tools/contracts";
 import { compareDateTimeStrings } from "@t3tools/shared/dateTime";
+import { countTurnWork } from "@t3tools/shared/turnWorkCounts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -66,6 +74,7 @@ import {
 
 export const ORCHESTRATION_PROJECTOR_NAMES = {
   projects: "projection.projects",
+  projectMcpServers: "projection.project-mcp-servers",
   threads: "projection.threads",
   threadMessages: "projection.thread-messages",
   threadProposedPlans: "projection.thread-proposed-plans",
@@ -74,7 +83,17 @@ export const ORCHESTRATION_PROJECTOR_NAMES = {
   threadTurns: "projection.thread-turns",
   checkpoints: "projection.checkpoints",
   pendingApprovals: "projection.pending-approvals",
+  mcpCatalog: "projection.mcp-catalog",
 } as const;
+
+const encodeProviderInstanceIds = Schema.encodeSync(
+  Schema.fromJsonString(Schema.Array(ProviderInstanceId)),
+);
+const encodeProjectMcpTransport = Schema.encodeSync(Schema.fromJsonString(ProjectMcpTransport));
+const encodeMcpCatalogDefinitionArray = Schema.encodeSync(
+  Schema.fromJsonString(Schema.Array(McpCatalogDefinition)),
+);
+const encodeMcpCatalogOverride = Schema.encodeSync(Schema.fromJsonString(McpCatalogOverride));
 
 type ProjectorName =
   (typeof ORCHESTRATION_PROJECTOR_NAMES)[keyof typeof ORCHESTRATION_PROJECTOR_NAMES];
@@ -568,6 +587,430 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           return;
       }
     });
+
+    const applyProjectMcpServersProjection: ProjectorDefinition["apply"] = (
+      event,
+      _attachmentSideEffects,
+    ) =>
+      Effect.gen(function* () {
+        switch (event.type) {
+          case "project.mcp-server.created":
+          case "project.mcp-server.updated":
+            const providerInstanceIdsJson = encodeProviderInstanceIds(
+              event.payload.server.providerInstanceIds,
+            );
+            const transportJson = event.payload.server.transport
+              ? encodeProjectMcpTransport(event.payload.server.transport)
+              : null;
+            yield* sql`
+            INSERT INTO projection_project_mcp_servers (
+              server_id,
+              project_id,
+              name,
+              url,
+              transport_json,
+              enabled,
+              provider_instance_ids_json
+            )
+            VALUES (
+              ${event.payload.server.id},
+              ${event.payload.projectId},
+              ${event.payload.server.name},
+              ${event.payload.server.url ?? ""},
+              ${transportJson},
+              ${event.payload.server.enabled ? 1 : 0},
+              ${providerInstanceIdsJson}
+            )
+            ON CONFLICT (server_id)
+            DO UPDATE SET
+              project_id = excluded.project_id,
+              name = excluded.name,
+              url = excluded.url,
+              transport_json = excluded.transport_json,
+              enabled = excluded.enabled,
+              provider_instance_ids_json = excluded.provider_instance_ids_json
+          `;
+            return;
+
+          case "project.mcp-server.removed":
+            yield* sql`
+            DELETE FROM projection_project_mcp_servers
+            WHERE project_id = ${event.payload.projectId}
+              AND server_id = ${event.payload.id}
+          `;
+            return;
+
+          case "project.deleted":
+            yield* sql`
+            DELETE FROM projection_project_mcp_servers
+            WHERE project_id = ${event.payload.projectId}
+          `;
+            return;
+
+          default:
+            return;
+        }
+      }).pipe(Effect.mapError(toPersistenceSqlError("ProjectionPipeline.projectMcpServers:query")));
+
+    const applyMcpCatalogProjection: ProjectorDefinition["apply"] = (
+      event,
+      _attachmentSideEffects,
+    ) =>
+      Effect.gen(function* () {
+        const recordRevision = (scopeType: string, scopeId: string, revision: number) =>
+          sql`
+            INSERT INTO projection_mcp_catalog_revisions (scope_type, scope_id, revision)
+            VALUES (${scopeType}, ${scopeId}, ${revision})
+            ON CONFLICT (scope_type, scope_id) DO UPDATE SET
+              revision = MAX(projection_mcp_catalog_revisions.revision, excluded.revision)
+          `;
+
+        switch (event.type) {
+          case "environment.mcp-definition.created":
+          case "environment.mcp-definition.updated": {
+            const definition = event.payload.definition;
+            yield* sql`
+              INSERT INTO projection_mcp_definitions (
+                definition_id, logical_server_id, scope_type, scope_id, name,
+                transport_json, enabled, provider_instance_ids_json, revision
+              ) VALUES (
+                ${definition.definitionId}, ${definition.logicalServerId}, ${definition.scope},
+                ${definition.scopeId}, ${definition.name},
+                ${encodeProjectMcpTransport(definition.transport)},
+                ${definition.enabled ? 1 : 0},
+                ${encodeProviderInstanceIds(definition.providerInstanceIds)},
+                ${definition.revision}
+              )
+              ON CONFLICT (scope_type, scope_id, logical_server_id) DO UPDATE SET
+                definition_id = excluded.definition_id,
+                name = excluded.name,
+                transport_json = excluded.transport_json,
+                enabled = excluded.enabled,
+                provider_instance_ids_json = excluded.provider_instance_ids_json,
+                revision = excluded.revision
+            `;
+            yield* recordRevision(
+              "global",
+              event.payload.environmentId,
+              event.payload.definition.revision,
+            );
+            return;
+          }
+
+          case "environment.mcp-definition.removed":
+            yield* sql`
+              DELETE FROM projection_mcp_definitions
+              WHERE scope_type = 'global'
+                AND scope_id = ${event.payload.environmentId}
+                AND logical_server_id = ${event.payload.logicalServerId}
+            `;
+            yield* sql`
+              DELETE FROM projection_mcp_overrides
+              WHERE target_logical_server_id = ${event.payload.logicalServerId}
+            `;
+            yield* recordRevision("global", event.payload.environmentId, event.payload.revision);
+            return;
+
+          case "project.mcp-definition.created":
+          case "project.mcp-definition.updated": {
+            const definition = event.payload.definition;
+            yield* sql`
+              INSERT INTO projection_mcp_definitions (
+                definition_id, logical_server_id, scope_type, scope_id, name,
+                transport_json, enabled, provider_instance_ids_json, revision
+              ) VALUES (
+                ${definition.definitionId}, ${definition.logicalServerId}, 'project',
+                ${event.payload.projectId}, ${definition.name},
+                ${encodeProjectMcpTransport(definition.transport)},
+                ${definition.enabled ? 1 : 0},
+                ${encodeProviderInstanceIds(definition.providerInstanceIds)},
+                ${event.payload.revision}
+              )
+              ON CONFLICT (scope_type, scope_id, logical_server_id) DO UPDATE SET
+                definition_id = excluded.definition_id,
+                name = excluded.name,
+                transport_json = excluded.transport_json,
+                enabled = excluded.enabled,
+                provider_instance_ids_json = excluded.provider_instance_ids_json,
+                revision = excluded.revision
+            `;
+            yield* sql`
+              INSERT INTO projection_project_mcp_servers (
+                server_id, project_id, name, url, transport_json, enabled,
+                provider_instance_ids_json
+              ) VALUES (
+                ${definition.logicalServerId}, ${event.payload.projectId}, ${definition.name},
+                '', ${encodeProjectMcpTransport(definition.transport)},
+                ${definition.enabled ? 1 : 0},
+                ${encodeProviderInstanceIds(definition.providerInstanceIds)}
+              )
+              ON CONFLICT (server_id) DO UPDATE SET
+                project_id = excluded.project_id,
+                name = excluded.name,
+                url = excluded.url,
+                transport_json = excluded.transport_json,
+                enabled = excluded.enabled,
+                provider_instance_ids_json = excluded.provider_instance_ids_json
+            `;
+            yield* recordRevision("project", event.payload.projectId, event.payload.revision);
+            return;
+          }
+
+          case "project.mcp-definition.removed":
+            yield* sql`
+              DELETE FROM projection_mcp_definitions
+              WHERE scope_type = 'project'
+                AND scope_id = ${event.payload.projectId}
+                AND logical_server_id = ${event.payload.logicalServerId}
+            `;
+            yield* sql`
+              DELETE FROM projection_project_mcp_servers
+              WHERE project_id = ${event.payload.projectId}
+                AND server_id = ${event.payload.logicalServerId}
+            `;
+            yield* recordRevision("project", event.payload.projectId, event.payload.revision);
+            return;
+
+          case "project.mcp-server.created":
+          case "project.mcp-server.updated": {
+            const server = event.payload.server;
+            const rows = yield* sql<{ revision: number }>`
+              SELECT revision
+              FROM projection_mcp_catalog_revisions
+              WHERE scope_type = 'project' AND scope_id = ${event.payload.projectId}
+            `;
+            const revision = (rows[0]?.revision ?? 0) + 1;
+            const definition = {
+              definitionId: McpDefinitionId.make(`legacy-project-mcp-${server.id}`),
+              logicalServerId: server.id,
+              scope: "project" as const,
+              scopeId: event.payload.projectId,
+              name: server.name,
+              transport: getProjectMcpTransport(server),
+              enabled: server.enabled,
+              providerInstanceIds: server.providerInstanceIds,
+              revision,
+            };
+            yield* sql`
+              INSERT INTO projection_mcp_definitions (
+                definition_id, logical_server_id, scope_type, scope_id, name,
+                transport_json, enabled, provider_instance_ids_json, revision
+              ) VALUES (
+                ${definition.definitionId}, ${definition.logicalServerId}, 'project',
+                ${event.payload.projectId}, ${definition.name},
+                ${encodeProjectMcpTransport(definition.transport)},
+                ${definition.enabled ? 1 : 0},
+                ${encodeProviderInstanceIds(definition.providerInstanceIds)}, ${revision}
+              )
+              ON CONFLICT (scope_type, scope_id, logical_server_id) DO UPDATE SET
+                definition_id = excluded.definition_id,
+                name = excluded.name,
+                transport_json = excluded.transport_json,
+                enabled = excluded.enabled,
+                provider_instance_ids_json = excluded.provider_instance_ids_json,
+                revision = excluded.revision
+            `;
+            yield* recordRevision("project", event.payload.projectId, revision);
+            return;
+          }
+
+          case "project.mcp-server.removed": {
+            const rows = yield* sql<{ revision: number }>`
+              SELECT revision
+              FROM projection_mcp_catalog_revisions
+              WHERE scope_type = 'project' AND scope_id = ${event.payload.projectId}
+            `;
+            const revision = (rows[0]?.revision ?? 0) + 1;
+            yield* sql`
+              DELETE FROM projection_mcp_definitions
+              WHERE scope_type = 'project'
+                AND scope_id = ${event.payload.projectId}
+                AND logical_server_id = ${event.payload.id}
+            `;
+            yield* recordRevision("project", event.payload.projectId, revision);
+            return;
+          }
+
+          case "project.deleted":
+            yield* sql`
+              DELETE FROM projection_mcp_definitions WHERE scope_type = 'project' AND scope_id = ${event.payload.projectId}
+            `;
+            yield* sql`
+              DELETE FROM projection_mcp_overrides WHERE scope_id = ${event.payload.projectId}
+            `;
+            return;
+
+          case "project.mcp-override.upserted":
+            if (
+              event.payload.override.scope !== "project" ||
+              String(event.payload.override.scopeId) !== String(event.payload.projectId)
+            ) {
+              return;
+            }
+            yield* sql`
+              INSERT INTO projection_mcp_overrides (
+                override_id, scope_type, scope_id, target_logical_server_id,
+                patch_json, revision
+              ) VALUES (
+                ${event.payload.override.id}, ${event.payload.override.scope},
+                ${event.payload.projectId}, ${event.payload.override.targetId},
+                ${encodeMcpCatalogOverride(event.payload.override)}, ${event.payload.revision}
+              )
+              ON CONFLICT (override_id) DO UPDATE SET
+                scope_type = excluded.scope_type,
+                scope_id = excluded.scope_id,
+                target_logical_server_id = excluded.target_logical_server_id,
+                patch_json = excluded.patch_json,
+                revision = excluded.revision
+              WHERE projection_mcp_overrides.scope_type = excluded.scope_type
+                AND projection_mcp_overrides.scope_id = excluded.scope_id
+            `;
+            yield* recordRevision("project", event.payload.projectId, event.payload.revision);
+            return;
+
+          case "project.mcp-override.removed":
+            yield* sql`
+              DELETE FROM projection_mcp_overrides
+              WHERE override_id = ${event.payload.overrideId}
+                AND scope_id = ${event.payload.projectId}
+            `;
+            yield* recordRevision("project", event.payload.projectId, event.payload.revision);
+            return;
+
+          case "thread.mcp-catalog.initialized": {
+            const snapshot = event.payload.snapshot;
+            yield* sql`
+              INSERT INTO projection_mcp_catalog_sessions (
+                catalog_session_id, thread_id, provider_instance_id,
+                baseline_json, desired_catalog_json, desired_revision,
+                applied_catalog_json, applied_revision, application_error, application_status,
+                application_revision, application_applied_at, application_failed_at,
+                disposed_at
+              ) VALUES (
+                ${snapshot.catalogSessionId}, ${snapshot.threadId}, ${snapshot.providerInstanceId},
+                ${encodeMcpCatalogDefinitionArray(snapshot.baseline)},
+                ${encodeMcpCatalogDefinitionArray(snapshot.desired)},
+                ${snapshot.desiredRevision},
+                ${encodeMcpCatalogDefinitionArray(snapshot.applied)},
+                ${snapshot.appliedRevision}, NULL,
+                NULL, NULL, NULL, NULL, NULL
+              )
+              ON CONFLICT (catalog_session_id) DO NOTHING
+            `;
+            return;
+          }
+
+          case "thread.mcp-catalog.updated":
+            yield* sql`
+              UPDATE projection_mcp_catalog_sessions
+              SET desired_catalog_json = ${encodeMcpCatalogDefinitionArray(event.payload.desiredCatalog)},
+                  desired_revision = ${event.payload.desiredRevision},
+                  application_error = NULL,
+                  application_status = NULL,
+                  application_revision = NULL,
+                  application_applied_at = NULL,
+                  application_failed_at = NULL
+              WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                AND thread_id = ${event.payload.threadId}
+                AND disposed_at IS NULL
+                AND desired_revision < ${event.payload.desiredRevision}
+            `;
+            return;
+
+          case "thread.mcp-catalog.reset":
+            yield* sql`
+              UPDATE projection_mcp_catalog_sessions
+              SET baseline_json = ${encodeMcpCatalogDefinitionArray(event.payload.baseline)},
+                  desired_catalog_json = ${encodeMcpCatalogDefinitionArray(event.payload.baseline)},
+                  desired_revision = ${event.payload.desiredRevision},
+                  application_error = NULL,
+                  application_status = NULL,
+                  application_revision = NULL,
+                  application_applied_at = NULL,
+                  application_failed_at = NULL
+              WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                AND thread_id = ${event.payload.threadId}
+                AND disposed_at IS NULL
+                AND desired_revision < ${event.payload.desiredRevision}
+            `;
+            return;
+
+          case "thread.mcp-catalog.disposed":
+            yield* sql`
+              UPDATE projection_mcp_catalog_sessions
+              SET disposed_at = ${event.payload.disposedAt}
+              WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                AND thread_id = ${event.payload.threadId}
+                AND disposed_at IS NULL
+                AND desired_revision <= ${event.payload.revision}
+            `;
+            return;
+
+          case "thread.mcp-catalog.applied":
+            if (event.payload.appliedCatalog === undefined) {
+              yield* sql`
+                UPDATE projection_mcp_catalog_sessions
+                SET applied_catalog_json = desired_catalog_json,
+                    applied_revision = ${event.payload.revision},
+                    application_error = NULL,
+                    application_status = 'applied',
+                    application_revision = ${event.payload.revision},
+                    application_applied_at = ${event.payload.appliedAt},
+                    application_failed_at = NULL
+                WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                  AND thread_id = ${event.payload.threadId}
+                  AND disposed_at IS NULL
+                  AND ${event.payload.revision} <= desired_revision
+                  AND (
+                    ${event.payload.revision} > applied_revision
+                    OR (${event.payload.revision} = 0 AND application_revision IS NULL)
+                  )
+              `;
+            } else {
+              yield* sql`
+                UPDATE projection_mcp_catalog_sessions
+                SET applied_catalog_json = ${encodeMcpCatalogDefinitionArray(event.payload.appliedCatalog)},
+                    applied_revision = ${event.payload.revision},
+                    application_error = NULL,
+                    application_status = 'applied',
+                    application_revision = ${event.payload.revision},
+                    application_applied_at = ${event.payload.appliedAt},
+                    application_failed_at = NULL
+                WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                  AND thread_id = ${event.payload.threadId}
+                  AND disposed_at IS NULL
+                  AND ${event.payload.revision} <= desired_revision
+                  AND (
+                    ${event.payload.revision} > applied_revision
+                    OR (${event.payload.revision} = 0 AND application_revision IS NULL)
+                  )
+              `;
+            }
+            return;
+
+          case "thread.mcp-catalog.apply-failed":
+            yield* sql`
+              UPDATE projection_mcp_catalog_sessions
+              SET application_error = ${event.payload.reason},
+                  application_status = 'failed',
+                  application_revision = ${event.payload.revision},
+                  application_applied_at = NULL,
+                  application_failed_at = ${event.payload.failedAt}
+              WHERE catalog_session_id = ${event.payload.mcpCatalogSessionId}
+                AND thread_id = ${event.payload.threadId}
+                AND disposed_at IS NULL
+                AND ${event.payload.revision} <= desired_revision
+                AND (
+                  ${event.payload.revision} > applied_revision
+                  OR (${event.payload.revision} = 0 AND application_revision IS NULL)
+                )
+            `;
+            return;
+
+          default:
+            return;
+        }
+      }).pipe(Effect.mapError(toPersistenceSqlError("ProjectionPipeline.mcpCatalog:query")));
 
     const refreshThreadShellSummary = Effect.fn("refreshThreadShellSummary")(function* (
       threadId: ThreadId,
@@ -1354,9 +1797,114 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         providerInstanceId: event.payload.session.providerInstanceId ?? null,
         runtimeMode: event.payload.session.runtimeMode,
         activeTurnId: event.payload.session.activeTurnId,
+        mcpCatalogSessionId: event.payload.session.mcpCatalogSessionId ?? null,
         lastError: event.payload.session.lastError,
         updatedAt: event.payload.session.updatedAt,
       });
+    });
+
+    /**
+     * Counts the work a turn performed, for stamping onto the turn as it
+     * settles. `itemType` and `toolCallId` live inside the activity payload
+     * rather than in columns, so the rows are parsed here and handed to the
+     * shared classifier the client also uses.
+     */
+    const countWorkForTurn = Effect.fn("countWorkForTurn")(function* (
+      threadId: ThreadId,
+      turnId: TurnId,
+    ) {
+      const rows = yield* sql<{
+        readonly tone: string;
+        readonly kind: string;
+        readonly summary: string;
+        readonly payloadJson: string | null;
+      }>`
+        SELECT tone, kind, summary, payload_json AS "payloadJson"
+        FROM projection_thread_activities
+        WHERE thread_id = ${threadId}
+          AND turn_id = ${turnId}
+        ORDER BY
+          CASE WHEN sequence IS NULL THEN 0 ELSE 1 END ASC,
+          sequence ASC,
+          created_at ASC,
+          activity_id ASC
+      `.pipe(Effect.mapError(toPersistenceSqlError("ProjectionPipeline.countWorkForTurn:query")));
+
+      return countTurnWork(
+        rows.map((row) => {
+          if (row.payloadJson === null) {
+            return { tone: row.tone, kind: row.kind, summary: row.summary };
+          }
+          const payload: unknown = JSON.parse(row.payloadJson);
+          if (typeof payload !== "object" || payload === null) {
+            return { tone: row.tone, kind: row.kind, summary: row.summary };
+          }
+          const record = payload as {
+            readonly itemType?: unknown;
+            readonly toolCallId?: unknown;
+            readonly agentId?: unknown;
+            readonly detail?: unknown;
+          };
+          return {
+            tone: row.tone,
+            // Ordered rows plus the lifecycle kind let the shared counter fold
+            // id-less rows into runs the same way the work log does.
+            kind: row.kind,
+            summary: row.summary,
+            itemType: typeof record.itemType === "string" ? record.itemType : null,
+            toolCallId: typeof record.toolCallId === "string" ? record.toolCallId : null,
+            // Carried so the stamp skips the same rows the timeline hides;
+            // without them the settled fold outruns its own subfolds.
+            agentId: typeof record.agentId === "string" ? record.agentId : null,
+            detail: typeof record.detail === "string" ? record.detail : null,
+          };
+        }),
+      );
+    });
+
+    /**
+     * Turns the session-end signal still has to finish.
+     *
+     * A running turn is the ordinary case. An interrupted turn is included only
+     * while it is unstamped: interrupt is a *request*, and the provider keeps
+     * emitting until it lands, so the counts belong to the terminal session
+     * event rather than the request. Its "interrupted" state is preserved.
+     */
+    const needsSettling = (turn: {
+      readonly state: string;
+      readonly commandCount: number | null;
+    }) => turn.state === "running" || (turn.state === "interrupted" && turn.commandCount === null);
+
+    /**
+     * Builds the count columns for a turn that is settling. Already-stamped
+     * turns keep their original numbers: counts are turn history, and a later
+     * event must not recount them against activities that have since aged out
+     * or been appended.
+     */
+    const settleCountsFor = Effect.fn("settleCountsFor")(function* (turn: {
+      readonly threadId: ThreadId;
+      readonly turnId: TurnId;
+      readonly commandCount: number | null;
+      readonly checkpointFiles: ReadonlyArray<{ readonly path: string }>;
+      /**
+       * Whether the file list is real. A placeholder checkpoint reports none,
+       * and the capture that would replace it may never land, so its count is
+       * left unstamped instead of frozen at zero.
+       */
+      readonly countsChangedFiles?: boolean;
+    }) {
+      if (turn.commandCount !== null) {
+        return {};
+      }
+      const counts = yield* countWorkForTurn(turn.threadId, turn.turnId);
+      return {
+        commandCount: counts.commandCount,
+        toolCallCount: counts.toolCallCount,
+        subagentCount: counts.subagentCount,
+        ...(turn.countsChangedFiles === false
+          ? {}
+          : { changedFileCount: new Set(turn.checkpointFiles.map((file) => file.path)).size }),
+      };
     });
 
     const applyThreadTurnsProjection: ProjectorDefinition["apply"] = Effect.fn(
@@ -1451,19 +1999,34 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               threadId: event.payload.threadId,
             });
             yield* Effect.forEach(
-              existingTurns.filter((turn) => turn.turnId !== null && turn.state === "running"),
-              (turn) =>
-                turn.turnId === null
-                  ? Effect.void
-                  : projectionTurnRepository.upsertByTurnId({
-                      ...turn,
-                      turnId: turn.turnId,
-                      state: settledTurnState,
-                      // A running turn's completedAt can only hold a mid-turn
-                      // placeholder checkpoint timestamp — the session leaving
-                      // "running" is the authoritative turn end.
-                      completedAt: event.payload.session.updatedAt,
-                    }),
+              existingTurns.filter((turn) => turn.turnId !== null && needsSettling(turn)),
+              Effect.fn("settleRunningTurn")(function* (turn) {
+                if (turn.turnId === null) {
+                  return;
+                }
+                const counts = yield* settleCountsFor({
+                  threadId: turn.threadId,
+                  turnId: turn.turnId,
+                  commandCount: turn.commandCount,
+                  checkpointFiles: turn.checkpointFiles,
+                });
+                yield* projectionTurnRepository.upsertByTurnId({
+                  ...turn,
+                  turnId: turn.turnId,
+                  // An interrupted turn is only here to be stamped; the user
+                  // stopping it is the more specific truth about how it ended,
+                  // and the interrupt already recorded when that happened.
+                  state: turn.state === "interrupted" ? "interrupted" : settledTurnState,
+                  // A running turn's completedAt can only hold a mid-turn
+                  // placeholder checkpoint timestamp — the session leaving
+                  // "running" is the authoritative turn end.
+                  completedAt:
+                    turn.state === "interrupted"
+                      ? (turn.completedAt ?? event.payload.session.updatedAt)
+                      : event.payload.session.updatedAt,
+                  ...counts,
+                });
+              }),
               { concurrency: 1 },
             );
             return;
@@ -1477,19 +2040,52 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           });
           yield* Effect.forEach(
             otherRunningTurns.filter(
-              (turn) => turn.turnId !== null && turn.turnId !== turnId && turn.state === "running",
+              (turn) => turn.turnId !== null && turn.turnId !== turnId && needsSettling(turn),
             ),
             (turn) =>
               turn.turnId === null
                 ? Effect.void
-                : projectionTurnRepository.upsertByTurnId({
-                    ...turn,
-                    turnId: turn.turnId,
-                    state: "completed",
-                    completedAt: event.payload.session.updatedAt,
+                : Effect.gen(function* () {
+                    const turnId = turn.turnId;
+                    if (turnId === null) {
+                      return;
+                    }
+                    // Steering settles this turn just as truly as the provider
+                    // completing it would, so stamp its work here too —
+                    // nothing backfills a turn that settles unstamped.
+                    const counts = yield* settleCountsFor({
+                      threadId: turn.threadId,
+                      turnId,
+                      commandCount: turn.commandCount,
+                      checkpointFiles: turn.checkpointFiles,
+                    });
+                    yield* projectionTurnRepository.upsertByTurnId({
+                      ...turn,
+                      turnId,
+                      state: turn.state === "interrupted" ? "interrupted" : "completed",
+                      completedAt:
+                        turn.state === "interrupted"
+                          ? (turn.completedAt ?? event.payload.session.updatedAt)
+                          : event.payload.session.updatedAt,
+                      ...counts,
+                    });
                   }),
             { concurrency: 1 },
           );
+
+          // Only the session set that opened this turn carries provenance;
+          // later writes for the same turn must not blank what it recorded.
+          const turnProvenance =
+            event.payload.turnProvenance?.turnId === turnId
+              ? event.payload.turnProvenance
+              : undefined;
+          const turnProvenanceColumns =
+            turnProvenance === undefined
+              ? {}
+              : {
+                  ...(turnProvenance.model === undefined ? {} : { model: turnProvenance.model }),
+                  ...(turnProvenance.effort === undefined ? {} : { effort: turnProvenance.effort }),
+                };
 
           const existingTurn = yield* projectionTurnRepository.getByTurnId({
             threadId: event.payload.threadId,
@@ -1519,6 +2115,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
                 (Option.isSome(pendingTurnStart)
                   ? pendingTurnStart.value.sourceProposedPlanId
                   : null),
+              ...turnProvenanceColumns,
               startedAt:
                 existingTurn.value.startedAt ??
                 (Option.isSome(pendingTurnStart)
@@ -1556,6 +2153,13 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               checkpointRef: null,
               checkpointStatus: null,
               checkpointFiles: [],
+              model: null,
+              effort: null,
+              commandCount: null,
+              toolCallCount: null,
+              subagentCount: null,
+              changedFileCount: null,
+              ...turnProvenanceColumns,
             });
           }
 
@@ -1587,9 +2191,18 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             turnId: event.payload.turnId,
           });
           if (Option.isSome(existingTurn)) {
+            const counts = settlesTurn
+              ? yield* settleCountsFor({
+                  threadId: event.payload.threadId,
+                  turnId: event.payload.turnId,
+                  commandCount: existingTurn.value.commandCount,
+                  checkpointFiles: existingTurn.value.checkpointFiles,
+                })
+              : {};
             yield* projectionTurnRepository.upsertByTurnId({
               ...existingTurn.value,
               assistantMessageId: event.payload.messageId,
+              ...counts,
               state: settlesTurn
                 ? existingTurn.value.state === "interrupted"
                   ? "interrupted"
@@ -1620,6 +2233,12 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             checkpointRef: null,
             checkpointStatus: null,
             checkpointFiles: [],
+            model: null,
+            effort: null,
+            commandCount: null,
+            toolCallCount: null,
+            subagentCount: null,
+            changedFileCount: null,
           });
           return;
         }
@@ -1633,6 +2252,10 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             turnId: event.payload.turnId,
           });
           if (Option.isSome(existingTurn)) {
+            // Counts are deliberately not stamped here. An interrupt is a
+            // request the provider has not seen yet, so work started in the
+            // meantime would be counted out. The terminal session event settles
+            // this turn's counts; only the state and timestamps land now.
             yield* projectionTurnRepository.upsertByTurnId({
               ...existingTurn.value,
               state: "interrupted",
@@ -1657,6 +2280,12 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             checkpointRef: null,
             checkpointStatus: null,
             checkpointFiles: [],
+            model: null,
+            effort: null,
+            commandCount: null,
+            toolCallCount: null,
+            subagentCount: null,
+            changedFileCount: null,
           });
           return;
         }
@@ -1683,13 +2312,33 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           });
 
           if (Option.isSome(existingTurn)) {
+            // This event settles the turn whenever its session has already
+            // moved on, and on every rebuild — each projector replays the whole
+            // log independently, so the sessions projector is at its final
+            // state before this one replays. A settle here is the turn's last
+            // chance to be counted: the terminal session set that would
+            // otherwise stamp it skips turns that are no longer running.
+            const settledCounts = turnStillRunning
+              ? {}
+              : yield* settleCountsFor({
+                  threadId: event.payload.threadId,
+                  turnId: event.payload.turnId,
+                  commandCount: existingTurn.value.commandCount,
+                  checkpointFiles: event.payload.files,
+                  // A placeholder carries no files, and the real capture may
+                  // never arrive to restamp it. Leave the file count unstamped
+                  // rather than freezing a zero the reader would trust.
+                  countsChangedFiles: event.payload.status !== "missing",
+                });
             yield* projectionTurnRepository.upsertByTurnId({
               ...existingTurn.value,
-              assistantMessageId: event.payload.assistantMessageId,
+              assistantMessageId:
+                event.payload.assistantMessageId ?? existingTurn.value.assistantMessageId,
               state:
                 turnStillRunning || existingTurn.value.state === "interrupted"
                   ? existingTurn.value.state
                   : nextState,
+              ...settledCounts,
               checkpointTurnCount: event.payload.checkpointTurnCount,
               checkpointRef: event.payload.checkpointRef,
               checkpointStatus: event.payload.status,
@@ -1697,6 +2346,18 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
               startedAt: existingTurn.value.startedAt ?? event.payload.completedAt,
               requestedAt: existingTurn.value.requestedAt ?? event.payload.completedAt,
               completedAt: event.payload.completedAt,
+              // The checkpoint is captured asynchronously, so a turn that
+              // settled first stamped its file count from an empty (or
+              // mid-turn placeholder) file list. This is where the real diff
+              // finally lands, so restamp the count the settle path guessed.
+              // Only for a turn that was actually stamped: a file count on an
+              // otherwise unstamped row is a partial the reader discards
+              // wholesale, which would lose the client's derived counts too.
+              ...(turnStillRunning || existingTurn.value.commandCount === null
+                ? {}
+                : {
+                    changedFileCount: new Set(event.payload.files.map((file) => file.path)).size,
+                  }),
             });
             return;
           }
@@ -1715,6 +2376,12 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             checkpointRef: event.payload.checkpointRef,
             checkpointStatus: event.payload.status,
             checkpointFiles: event.payload.files,
+            model: null,
+            effort: null,
+            commandCount: null,
+            toolCallCount: null,
+            subagentCount: null,
+            changedFileCount: null,
           });
           return;
         }
@@ -1926,6 +2593,14 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
       {
         name: ORCHESTRATION_PROJECTOR_NAMES.projects,
         apply: applyProjectsProjection,
+      },
+      {
+        name: ORCHESTRATION_PROJECTOR_NAMES.projectMcpServers,
+        apply: applyProjectMcpServersProjection,
+      },
+      {
+        name: ORCHESTRATION_PROJECTOR_NAMES.mcpCatalog,
+        apply: applyMcpCatalogProjection,
       },
       {
         name: ORCHESTRATION_PROJECTOR_NAMES.threadMessages,

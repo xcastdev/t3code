@@ -5012,7 +5012,7 @@ describe("agent browser access", () => {
           Effect.sync(() => {
             issued.push({
               threadId: request.threadId,
-              capabilities: [...request.capabilities].toSorted(),
+              capabilities: [...(request.capabilities ?? [])].toSorted(),
             });
             return undefined;
           }),

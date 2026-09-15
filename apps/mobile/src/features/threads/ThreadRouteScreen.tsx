@@ -857,6 +857,7 @@ function ThreadRouteContent(
       >
         <ThreadDetailScreen
           selectedThread={selectedThreadWithDraftSettings ?? selectedThread}
+          turns={selectedThreadDetail?.turns}
           contentPresentation={contentPresentation}
           screenTone={connectionTone(routeConnectionState)}
           connectionError={routeConnectionError}

@@ -22,8 +22,10 @@ import {
   DEFAULT_BROWSER_LINK_TARGET,
   DEFAULT_BROWSER_RECORDING_FRAME_RATE,
   DEFAULT_BROWSER_VIEWPORT,
+  DEFAULT_UNIFIED_SETTINGS,
   DEFAULT_PREVIEW_APPEARANCE,
   DEFAULT_PREVIEW_ZOOM_FACTOR,
+  type ExternalNotificationDestination,
   FILL_PREVIEW_VIEWPORT,
   PREVIEW_VIEWPORT_MAX_AREA,
   PREVIEW_VIEWPORT_MAX_DIMENSION,
@@ -45,7 +47,12 @@ import { AnimatedHeight } from "~/components/AnimatedHeight";
 import { resolveEnvironmentOptionLabel } from "~/components/BranchToolbar.logic";
 import { previewBridge } from "~/components/preview/previewBridge";
 import { cn, randomUUID } from "~/lib/utils";
-import { useEnvironments, usePrimaryEnvironment } from "~/state/environments";
+import {
+  useEnvironments,
+  usePrimaryEnvironment,
+  usePrimaryEnvironmentId,
+} from "~/state/environments";
+import { serverEnvironment } from "~/state/server";
 import { deviceEnvironment, useDeviceState } from "~/state/device";
 import { useAtomCommand } from "~/state/use-atom-command";
 import {
@@ -82,6 +89,7 @@ import {
 } from "../ui/alert-dialog";
 import { Button } from "../ui/button";
 import { DraftInput } from "../ui/draft-input";
+import { Input } from "../ui/input";
 import { NumberField, NumberFieldGroup, NumberFieldInput } from "../ui/number-field";
 import {
   Select,
@@ -581,6 +589,310 @@ function DeviceIntegrationSettings() {
         agentAccessEnabled={settings.enableAgentDeviceAccess}
       />
     </SettingsSection>
+  );
+}
+
+export function homeAssistantNotificationDestination(input: {
+  readonly id?: string;
+  readonly enabled: boolean;
+  readonly webhookUrl?: string;
+}): ExternalNotificationDestination {
+  return {
+    _tag: "home-assistant-webhook",
+    id: input.id ?? "home-assistant",
+    label: "Home Assistant",
+    enabled: input.enabled,
+    configured: input.webhookUrl !== undefined && input.webhookUrl.length > 0,
+    ...(input.webhookUrl === undefined ? {} : { webhookUrl: input.webhookUrl }),
+  };
+}
+
+function HomeAssistantNotificationSettings() {
+  const settings = useScopedSettings();
+  const updateSettings = useUpdateScopedSettings();
+  const destination = settings.externalNotifications.destinations.find(
+    (item) => item._tag === "home-assistant-webhook",
+  );
+  const [webhookUrl, setWebhookUrl] = useState("");
+  const save = (next: ExternalNotificationDestination) =>
+    updateSettings({
+      externalNotifications: {
+        destinations: settings.externalNotifications.destinations.some(
+          (item) => item.id === next.id,
+        )
+          ? settings.externalNotifications.destinations.map((item) =>
+              item.id === next.id ? next : item,
+            )
+          : [...settings.externalNotifications.destinations, next],
+      },
+    });
+  const current = destination ?? homeAssistantNotificationDestination({ enabled: false });
+
+  return (
+    <SettingsSection id="external-notifications" title="External notifications">
+      <SettingsRow
+        description="Send agent activity and completion updates to a Home Assistant webhook. The URL is write-only."
+        title="Home Assistant"
+        control={
+          <Switch
+            checked={current.enabled}
+            onCheckedChange={(enabled) => save({ ...current, enabled })}
+          />
+        }
+      >
+        <div className="flex gap-2">
+          <Input
+            type="url"
+            value={webhookUrl}
+            placeholder={
+              current.configured ? "Webhook configured" : "https://home-assistant/api/webhook/..."
+            }
+            onChange={(event) => setWebhookUrl(event.target.value)}
+            onBlur={() => {
+              const url = webhookUrl.trim();
+              if (url.length > 0) save({ ...current, webhookUrl: url });
+            }}
+          />
+          {destination ? (
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() =>
+                updateSettings({
+                  externalNotifications: {
+                    destinations: settings.externalNotifications.destinations.filter(
+                      (item) => item.id !== destination.id,
+                    ),
+                  },
+                })
+              }
+            >
+              Remove
+            </Button>
+          ) : null}
+        </div>
+      </SettingsRow>
+    </SettingsSection>
+  );
+}
+
+export function ExternalNotificationDestinationCard(props: {
+  destination: ExternalNotificationDestination;
+  readOnly: boolean;
+  onChange: (destination: ExternalNotificationDestination) => void;
+  onChangeType: (type: ExternalNotificationDestination["_tag"]) => void;
+  onRemove: () => void;
+  onTest: () => Promise<void>;
+}) {
+  const [url, setUrl] = useState("");
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+  const save = () => {
+    const next = url.trim();
+    if (!next) return;
+    props.onChange({ ...props.destination, webhookUrl: next, configured: true });
+    setUrl("");
+  };
+  return (
+    <SettingsRow title="Integration" description="Webhook URL saved securely.">
+      <div className="grid gap-2">
+        <span className="sr-only">Integration</span>
+        <label>
+          Name
+          <Input
+            value={props.destination.label}
+            disabled={props.readOnly}
+            onChange={(event) =>
+              props.onChange({ ...props.destination, label: event.target.value })
+            }
+          />
+        </label>
+        <label>
+          Webhook URL
+          <Input
+            aria-label="Replace Home Assistant webhook URL"
+            type="url"
+            value={url}
+            disabled={props.readOnly}
+            placeholder={
+              props.destination.configured
+                ? "Webhook URL saved securely."
+                : "https://home-assistant/api/webhook/..."
+            }
+            onChange={(event) => setUrl(event.target.value)}
+          />
+        </label>
+        {props.destination.configured ? (
+          <span className="text-muted-foreground text-xs">Webhook URL saved securely.</span>
+        ) : null}
+        <div className="flex gap-2">
+          <Button disabled={props.readOnly || !url.trim()} onClick={save}>
+            Save
+          </Button>
+          <Button disabled={props.readOnly} onClick={() => void props.onTest()}>
+            Test notification
+          </Button>
+          <Button
+            aria-label="Remove Home Assistant"
+            disabled={props.readOnly}
+            variant="ghost"
+            onClick={() => setConfirmingDelete(true)}
+          >
+            Remove
+          </Button>
+        </div>
+        {confirmingDelete ? (
+          <Button disabled={props.readOnly} variant="destructive" onClick={props.onRemove}>
+            Delete destination
+          </Button>
+        ) : null}
+        <span className="sr-only">Actions</span>
+      </div>
+    </SettingsRow>
+  );
+}
+
+export function EnvironmentExternalNotificationsSettings(props: {
+  environmentId: EnvironmentId;
+  environmentLabel: string;
+  readOnly: boolean;
+  deviceTabs: React.ReactNode;
+  environment?: unknown;
+}) {
+  const environments = useEnvironments();
+  const environment = environments.environments.find(
+    (item) => item.environmentId === props.environmentId,
+  );
+  const settings =
+    environment?.serverConfig?.settings ?? useScopedSettings() ?? DEFAULT_UNIFIED_SETTINGS;
+  const update = useAtomCommand(serverEnvironment.updateSettings, "update notifications");
+  const test = useAtomCommand(serverEnvironment.testExternalNotification, "test notification");
+  const destinations = settings.externalNotifications.destinations;
+  const updateDestinations = (next: readonly ExternalNotificationDestination[]) =>
+    void update({
+      environmentId: props.environmentId,
+      input: {
+        patch: { externalNotifications: { ...settings.externalNotifications, destinations: next } },
+      },
+    });
+  return (
+    <SettingsSection id="external-notifications" title="External notifications">
+      {props.deviceTabs}
+      <SettingsRow
+        title="Notification URL scheme"
+        control={
+          <Select
+            disabled={props.readOnly}
+            value={settings.externalNotifications.appScheme ?? "t3code"}
+            onValueChange={(appScheme) =>
+              appScheme === null
+                ? undefined
+                : void update({
+                    environmentId: props.environmentId,
+                    input: {
+                      patch: {
+                        externalNotifications: { ...settings.externalNotifications, appScheme },
+                      },
+                    },
+                  })
+            }
+          >
+            <SelectTrigger>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectPopup>
+              <SelectItem value="t3code">t3code</SelectItem>
+              <SelectItem value="t3code-preview">t3code-preview</SelectItem>
+            </SelectPopup>
+          </Select>
+        }
+      />
+      {destinations.map((destination) => (
+        <ExternalNotificationDestinationCard
+          key={destination.id}
+          destination={destination}
+          readOnly={props.readOnly}
+          onChange={(next) =>
+            updateDestinations(destinations.map((item) => (item.id === next.id ? next : item)))
+          }
+          onChangeType={() => undefined}
+          onRemove={() =>
+            updateDestinations(destinations.filter((item) => item.id !== destination.id))
+          }
+          onTest={async () => {
+            await test({
+              environmentId: props.environmentId,
+              input: { destinationId: destination.id },
+            });
+          }}
+        />
+      ))}
+      <Button
+        disabled={props.readOnly}
+        onClick={() =>
+          updateDestinations([
+            ...destinations,
+            homeAssistantNotificationDestination({ id: randomUUID(), enabled: true }),
+          ])
+        }
+      >
+        Add external notification
+      </Button>
+    </SettingsSection>
+  );
+}
+
+export function AccessGatedExternalNotificationsSettings(props: {
+  environment: { environmentId: EnvironmentId; label: string };
+  operateAccess: "granted" | "denied";
+  deviceTabs: React.ReactNode;
+}) {
+  return (
+    <EnvironmentExternalNotificationsSettings
+      environment={props.environment}
+      environmentId={props.environment.environmentId}
+      environmentLabel={props.environment.label}
+      readOnly={props.operateAccess !== "granted"}
+      deviceTabs={props.deviceTabs}
+    />
+  );
+}
+
+export function ExternalNotificationsSettings() {
+  const { environments, isReady } = useEnvironments();
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const [selected, setSelected] = useState<EnvironmentId | null>(
+    primaryEnvironmentId ?? environments[0]?.environmentId ?? null,
+  );
+  const environment =
+    environments.find((item) => item.environmentId === selected) ?? environments[0];
+  if (!environment)
+    return (
+      <SettingsSection title="External notifications">
+        <SettingsRow title={isReady ? "No connected devices" : "Loading devices"} />
+      </SettingsSection>
+    );
+  const tabs = (
+    <div role="tablist">
+      {environments.map((item) => (
+        <button
+          key={item.environmentId}
+          role="tab"
+          aria-selected={item.environmentId === environment.environmentId}
+          onClick={() => setSelected(item.environmentId)}
+        >
+          {item.label}
+        </button>
+      ))}
+    </div>
+  );
+  return (
+    <EnvironmentExternalNotificationsSettings
+      environment={environment}
+      environmentId={environment.environmentId}
+      environmentLabel={environment.label}
+      readOnly={false}
+      deviceTabs={tabs}
+    />
   );
 }
 
@@ -1346,6 +1658,7 @@ export function IntegrationsSettingsPanel() {
         )}
       </SettingsSection>
       <DeviceIntegrationSettings />
+      <ExternalNotificationsSettings />
     </SettingsPageContainer>
   );
 }

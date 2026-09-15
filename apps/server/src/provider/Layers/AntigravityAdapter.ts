@@ -38,6 +38,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 import { ServerConfig } from "../../config.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import { projectMcpNativeKey } from "../Services/ProviderAdapter.ts";
 import type { AntigravityAuth } from "../AntigravityAuth.ts";
 import {
   ProviderAdapterRequestError,
@@ -786,6 +787,14 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
             stopOwned,
             Effect.gen(function* () {
               const mcp = McpProviderSession.readMcpProviderSession(input.threadId);
+              const projectMcpServers = (input.projectMcpServers ?? mcp?.projectServers ?? []).map(
+                (server) => ({
+                  type: "http" as const,
+                  name: projectMcpNativeKey(server),
+                  url: server.endpoint.toString(),
+                  headers: [{ name: "Authorization", value: server.authorizationHeader }],
+                }),
+              );
               // The attachments dir grant lets the agent read pasted files at
               // the paths ProviderService injects into the turn text. It is a
               // leaf directory holding only uploads.
@@ -798,16 +807,19 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                   : {}),
                 additionalDirectories: [serverConfig.attachmentsDir],
                 ...(Option.isSome(cursor) ? { resumeSessionId: cursor.value.sessionId } : {}),
-                mcpServers: mcp
-                  ? [
-                      {
-                        type: "http",
-                        name: "t3-code",
-                        url: mcp.endpoint,
-                        headers: [{ name: "Authorization", value: mcp.authorizationHeader }],
-                      },
-                    ]
-                  : [],
+                mcpServers: [
+                  ...projectMcpServers,
+                  ...(mcp
+                    ? [
+                        {
+                          type: "http" as const,
+                          name: "t3-code",
+                          url: mcp.endpoint,
+                          headers: [{ name: "Authorization", value: mcp.authorizationHeader }],
+                        },
+                      ]
+                    : []),
+                ],
                 ...makeNativeLoggers({
                   nativeEventLogger: options.nativeEventLogger,
                   provider: PROVIDER,
@@ -1247,7 +1259,14 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
 
   return {
     provider: PROVIDER,
-    capabilities: { sessionModelSwitch: "in-session", supportsConversationRollback: false },
+    capabilities: {
+      sessionModelSwitch: "in-session",
+      supportsConversationRollback: false,
+      remoteHttpMcp: "next-session",
+      projectMcpProxy: "next-session",
+      managedPreviewMcp: "next-session",
+      sessionMcpCatalog: "restart-required",
+    },
     compaction: { type: "slash-command", command: "/compact" },
     startSession,
     sendTurn,

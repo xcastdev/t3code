@@ -3,7 +3,7 @@ import { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { openDiffFilePrimaryAction, resolveDiffPathForWorkspace } from "./diffFileActions";
-import { selectThreadRightPanelState, useRightPanelStore } from "./rightPanelStore";
+import { selectThreadSecondaryPaneState, useSecondaryPaneStore } from "./secondaryPaneStore";
 
 const THREAD_REF = scopeThreadRef(
   EnvironmentId.make("environment-local"),
@@ -12,7 +12,7 @@ const THREAD_REF = scopeThreadRef(
 
 describe("openDiffFilePrimaryAction", () => {
   beforeEach(() => {
-    useRightPanelStore.setState({ byThreadKey: {} });
+    useSecondaryPaneStore.setState({ byThreadKey: {} });
   });
 
   it("opens diff files in the thread file viewer", () => {
@@ -26,7 +26,7 @@ describe("openDiffFilePrimaryAction", () => {
     });
 
     expect(
-      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, THREAD_REF),
+      selectThreadSecondaryPaneState(useSecondaryPaneStore.getState().byThreadKey, THREAD_REF),
     ).toMatchObject({
       isOpen: true,
       activeSurfaceId: "file:apps/web/src/components/DiffPanel.tsx",
@@ -61,7 +61,7 @@ describe("openDiffFilePrimaryAction", () => {
     });
 
     expect(
-      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, THREAD_REF),
+      selectThreadSecondaryPaneState(useSecondaryPaneStore.getState().byThreadKey, THREAD_REF),
     ).toMatchObject({
       isOpen: true,
       activeSurfaceId: "file:Dockerfile",
@@ -116,7 +116,7 @@ describe("openDiffFilePrimaryAction", () => {
       });
 
       expect(
-        selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, THREAD_REF),
+        selectThreadSecondaryPaneState(useSecondaryPaneStore.getState().byThreadKey, THREAD_REF),
       ).toMatchObject({ isOpen: false });
       expect(openInEditor).not.toHaveBeenCalled();
     },

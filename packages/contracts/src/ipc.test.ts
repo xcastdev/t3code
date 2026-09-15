@@ -1,7 +1,7 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { DesktopEnvironmentBootstrapSchema } from "./ipc.ts";
+import { DesktopEnvironmentBootstrapSchema, DesktopPrimaryBackendStateSchema } from "./ipc.ts";
 
 describe("DesktopEnvironmentBootstrapSchema", () => {
   const decode = Schema.decodeUnknownSync(DesktopEnvironmentBootstrapSchema);
@@ -34,5 +34,32 @@ describe("DesktopEnvironmentBootstrapSchema", () => {
         wsBaseUrl: null,
       }).runningDistro,
     ).toBeNull();
+  });
+
+  it("carries attached ownership without exposing a credential", () => {
+    expect(
+      Schema.decodeUnknownSync(DesktopEnvironmentBootstrapSchema)({
+        id: "primary",
+        label: "Attached server",
+        httpBaseUrl: "http://127.0.0.1:3773/",
+        wsBaseUrl: "ws://127.0.0.1:3773/",
+        ownership: "attached",
+      }).ownership,
+    ).toBe("attached");
+  });
+});
+
+describe("DesktopPrimaryBackendStateSchema", () => {
+  it("never includes the attached credential", () => {
+    expect(
+      Schema.decodeUnknownSync(DesktopPrimaryBackendStateSchema)({
+        mode: "attached",
+        httpBaseUrl: "http://127.0.0.1:3773/",
+        environmentId: "environment-1",
+        label: "Local server",
+        bearerExpiresAt: "2099-01-01T00:00:00.000Z",
+        encryptedBearerToken: "must-not-cross-ipc",
+      }),
+    ).not.toHaveProperty("encryptedBearerToken");
   });
 });

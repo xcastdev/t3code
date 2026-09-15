@@ -10,6 +10,8 @@ import type {
   OrchestrationSession,
   OrchestrationThread,
   OrchestrationThreadActivity,
+  OrchestrationTurnProvenance,
+  OrchestrationTurnSummary,
   ThreadPullRequestLink,
   TurnId,
 } from "@t3tools/contracts";
@@ -55,6 +57,26 @@ const checkpointOrder = O.mapInput(
   (cp: OrchestrationThread["checkpoints"][number]) =>
     cp.checkpointTurnCount ?? Number.MAX_SAFE_INTEGER,
 );
+
+/** Keep the snapshot's turn summaries aligned with live session transitions. */
+const mergeTurnSummary = (
+  turns: OrchestrationThread["turns"],
+  latestTurn: OrchestrationLatestTurn | null,
+  turnProvenance: OrchestrationTurnProvenance | undefined,
+): OrchestrationThread["turns"] => {
+  if (latestTurn === null) return turns;
+  const provenance = turnProvenance?.turnId === latestTurn.turnId ? turnProvenance : undefined;
+  const existing = turns?.find((turn) => turn.turnId === latestTurn.turnId);
+  const merged: OrchestrationTurnSummary = {
+    ...existing,
+    ...latestTurn,
+    ...(provenance?.model === undefined ? {} : { model: provenance.model }),
+    ...(provenance?.effort === undefined ? {} : { effort: provenance.effort }),
+  };
+  return existing === undefined
+    ? [...(turns ?? []), merged]
+    : (turns ?? []).map((turn) => (turn.turnId === latestTurn.turnId ? merged : turn));
+};
 
 const activityOrder = O.combineAll<OrchestrationThreadActivity>([
   O.mapInput(O.Number, (a) => a.sequence ?? Number.MAX_SAFE_INTEGER),
@@ -520,6 +542,7 @@ export function applyThreadDetailEvent(
           ...thread,
           session: event.payload.session,
           latestTurn,
+          turns: mergeTurnSummary(thread.turns, latestTurn, event.payload.turnProvenance),
           updatedAt: event.occurredAt,
         },
       };

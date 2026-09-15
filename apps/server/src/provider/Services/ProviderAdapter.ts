@@ -22,10 +22,31 @@ import type {
   ProviderTurnStartResult,
   TurnId,
 } from "@t3tools/contracts";
+import type { McpIssuedProjectServer } from "../../mcp/McpProviderSession.ts";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
+export type ProviderRemoteHttpMcpMode = "active-session" | "next-session" | "unsupported";
+export type ProviderSessionMcpCatalogMode = "live" | "restart-required" | "unsupported";
+
+export type ProviderAdapterSessionStartInput = ProviderSessionStartInput & {
+  /** T3-issued proxy records only; upstream transport details stay server-side. */
+  readonly projectMcpServers?: ReadonlyArray<McpIssuedProjectServer>;
+};
+
+const encodeProjectMcpId = (id: Pick<McpIssuedProjectServer, "id">["id"]): string =>
+  Array.from(String(id), (character) =>
+    /^[A-Za-z0-9-]$/.test(character)
+      ? character
+      : `_${character.codePointAt(0)?.toString(16).toUpperCase() ?? "00"}_`,
+  ).join("");
+
+export const projectMcpNativeKey = (server: Pick<McpIssuedProjectServer, "id">): string =>
+  `t3-project-${encodeProjectMcpId(server.id)}`;
+
+export const projectMcpTokenEnvironmentKey = (server: Pick<McpIssuedProjectServer, "id">): string =>
+  `T3_PROJECT_MCP_${encodeProjectMcpId(server.id).replaceAll("-", "_")}`;
 
 /**
  * How ProviderService runs manual context compaction for an adapter.
@@ -47,6 +68,11 @@ export interface ProviderAdapterCapabilities {
    * Declares whether changing the model on an existing session is supported.
    */
   readonly sessionModelSwitch: ProviderSessionModelSwitchMode;
+  readonly remoteHttpMcp?: ProviderRemoteHttpMcpMode;
+  readonly projectMcpProxy?: ProviderRemoteHttpMcpMode;
+  readonly projectMcpUnsupportedReason?: string;
+  readonly managedPreviewMcp?: ProviderRemoteHttpMcpMode;
+  readonly sessionMcpCatalog?: ProviderSessionMcpCatalogMode;
   /** Starts a resumed turn with no synthetic user prompt. Omitted means the
       adapter needs an explicit continuation instruction. */
   readonly promptlessTurnContinuation?: boolean;
@@ -75,7 +101,7 @@ export interface ProviderAdapterShape<TError> {
    * Start a provider-backed session.
    */
   readonly startSession: (
-    input: ProviderSessionStartInput,
+    input: ProviderAdapterSessionStartInput,
   ) => Effect.Effect<ProviderSession, TError>;
 
   /**
@@ -115,6 +141,12 @@ export interface ProviderAdapterShape<TError> {
    * Stop one provider session.
    */
   readonly stopSession: (threadId: ThreadId) => Effect.Effect<void, TError>;
+
+  /**
+   * Remove MCP entries owned by this adapter before its issued credentials are
+   * discarded. Only adapters that configure an external MCP host implement it.
+   */
+  readonly cleanupSessionMcp?: (threadId: ThreadId) => Effect.Effect<void, TError>;
 
   /**
    * List currently active provider sessions for this adapter.

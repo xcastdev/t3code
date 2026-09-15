@@ -17,10 +17,26 @@ const refA = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-A"))
 const refB = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-B"));
 
 beforeEach(() => {
-  useRightPanelStore.setState({ byThreadKey: {}, userActionRevisionByThreadKey: {} });
+  useRightPanelStore.setState({
+    byThreadKey: {},
+    userActionRevisionByThreadKey: {},
+  });
 });
 
 describe("rightPanelStore", () => {
+  it("keeps one source-control tab while switching its view", () => {
+    const store = useRightPanelStore.getState();
+
+    store.openSourceControl(refA);
+    store.setSourceControlView(refA, "pull-requests");
+
+    const state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
+    expect(state.activeSurfaceId).toBe("source-control");
+    expect(state.surfaces).toEqual([
+      { id: "source-control", kind: "source-control", view: "pull-requests" },
+    ]);
+  });
+
   it("gives each host/device its own tab and preserves renamed tabs", () => {
     const store = useRightPanelStore.getState();
     const android = {
@@ -29,7 +45,12 @@ describe("rightPanelStore", () => {
       name: "Pixel",
       platform: "android",
     } as const;
-    const ios = { hostId: "macmini", deviceId: "ios-1", name: "iPhone", platform: "ios" } as const;
+    const ios = {
+      hostId: "macmini",
+      deviceId: "ios-1",
+      name: "iPhone",
+      platform: "ios",
+    } as const;
     store.open(refA, "device");
     store.openDevice(refA, android);
     store.open(refA, "device");
@@ -46,7 +67,10 @@ describe("rightPanelStore", () => {
     store.openDevice(refA, android);
     state = selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA);
     expect(state.surfaces).toHaveLength(2);
-    expect(state.surfaces[0]).toMatchObject({ title: "Android test", target: android });
+    expect(state.surfaces[0]).toMatchObject({
+      title: "Android test",
+      target: android,
+    });
     expect(state.activeSurfaceId).toBe("device:nucbox:emulator-5580");
     store.closeSurface(refA, state.activeSurfaceId!);
     expect(
@@ -56,7 +80,11 @@ describe("rightPanelStore", () => {
 
   it("does not collide when two hosts expose the same device id", () => {
     const store = useRightPanelStore.getState();
-    const device = { deviceId: "emulator-5554", name: "Pixel", platform: "android" } as const;
+    const device = {
+      deviceId: "emulator-5554",
+      name: "Pixel",
+      platform: "android",
+    } as const;
     store.openDevice(refA, { ...device, hostId: "a:b" });
     store.openDevice(refA, { ...device, hostId: "a" });
     expect(
@@ -84,7 +112,9 @@ describe("rightPanelStore", () => {
       if (mode === "others") store.closeOtherSurfaces(refA, "files");
       if (mode === "right") store.closeSurfacesToRight(refA, "files");
       const persisted = JSON.parse(
-        JSON.stringify({ byThreadKey: useRightPanelStore.getState().byThreadKey }),
+        JSON.stringify({
+          byThreadKey: useRightPanelStore.getState().byThreadKey,
+        }),
       );
       useRightPanelStore.setState(migratePersistedRightPanelState(persisted));
       store.openDevice(refA, target, true);
@@ -132,13 +162,19 @@ describe("rightPanelStore", () => {
   );
 
   it.each([
-    { choice: "file", choose: () => useRightPanelStore.getState().openFile(refA, "src/app.ts") },
+    {
+      choice: "file",
+      choose: () => useRightPanelStore.getState().openFile(refA, "src/app.ts"),
+    },
     {
       choice: "pull request",
       choose: () =>
         useRightPanelStore.getState().openPullRequest(refA, { ...linkedPullRequest, number: 41 }),
     },
-    { choice: "browser", choose: () => useRightPanelStore.getState().openBrowser(refA, "tab-a") },
+    {
+      choice: "browser",
+      choose: () => useRightPanelStore.getState().openBrowser(refA, "tab-a"),
+    },
     {
       choice: "terminal",
       choose: () => useRightPanelStore.getState().openTerminal(refA, "term-1"),
@@ -148,8 +184,14 @@ describe("rightPanelStore", () => {
       choose: () => useRightPanelStore.getState().activateSurface(refA, "diff"),
     },
     { choice: "hide", choose: () => useRightPanelStore.getState().close(refA) },
-    { choice: "toggle", choose: () => useRightPanelStore.getState().toggle(refA, "diff") },
-    { choice: "close all", choose: () => useRightPanelStore.getState().closeAllSurfaces(refA) },
+    {
+      choice: "toggle",
+      choose: () => useRightPanelStore.getState().toggle(refA, "diff"),
+    },
+    {
+      choice: "close all",
+      choose: () => useRightPanelStore.getState().closeAllSurfaces(refA),
+    },
     {
       choice: "terminal close",
       choose: () => {
@@ -262,14 +304,20 @@ describe("rightPanelStore", () => {
     });
   });
 
-  it("upgrades saved file surfaces with neutral reveal state", () => {
+  it("retains saved workspace file surfaces until the secondary pane imports them", () => {
     expect(
       migratePersistedRightPanelState({
         byThreadKey: {
           "env-1:thread-A": {
             isOpen: true,
             activeSurfaceId: "file:src/index.ts",
-            surfaces: [{ id: "file:src/index.ts", kind: "file", relativePath: "src/index.ts" }],
+            surfaces: [
+              {
+                id: "file:src/index.ts",
+                kind: "file",
+                relativePath: "src/index.ts",
+              },
+            ],
           },
         },
       }),
@@ -289,6 +337,25 @@ describe("rightPanelStore", () => {
           ],
         },
       },
+    });
+  });
+
+  it("exposes legacy workspace files before removing only those files", () => {
+    const store = useRightPanelStore.getState();
+    store.openBrowser(refA, "preview-a");
+    store.openFile(refA, "src/index.ts", 42);
+
+    expect(store.legacyWorkspaceFileSurfaces(refA)).toMatchObject({
+      activeSurfaceId: "file:src/index.ts",
+      surfaces: [{ relativePath: "src/index.ts", revealLine: 42 }],
+    });
+    store.removeLegacyWorkspaceFileSurfaces(refA);
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, refA),
+    ).toMatchObject({
+      isOpen: true,
+      activeSurfaceId: "browser:preview-a",
+      surfaces: [{ id: "browser:preview-a", kind: "preview" }],
     });
   });
 
@@ -666,8 +733,16 @@ describe("rightPanelStore", () => {
   });
 
   it("tracks one surface per pull request", () => {
-    const first = { projectId: "project-a", repository: "pingdotgg/t3code", number: 4909 };
-    const second = { projectId: "project-a", repository: "pingdotgg/t3code", number: 4910 };
+    const first = {
+      projectId: "project-a",
+      repository: "pingdotgg/t3code",
+      number: 4909,
+    };
+    const second = {
+      projectId: "project-a",
+      repository: "pingdotgg/t3code",
+      number: 4910,
+    };
     useRightPanelStore.getState().openPullRequest(refA, first);
     useRightPanelStore.getState().openPullRequest(refA, second);
     const url = "https://gitlab.example.com/pingdotgg/t3code/-/merge_requests/4909";
@@ -687,7 +762,12 @@ describe("rightPanelStore", () => {
   });
 
   it("keeps matching repository and number on different hosts as separate tabs", () => {
-    const first = { projectId: "project-a", repository: "acme/api", number: 7, host: "github.com" };
+    const first = {
+      projectId: "project-a",
+      repository: "acme/api",
+      number: 7,
+      host: "github.com",
+    };
     const second = { ...first, host: "github.example.com" };
     useRightPanelStore.getState().openPullRequest(refA, first);
     useRightPanelStore.getState().openPullRequest(refA, second);

@@ -65,6 +65,17 @@ import Migration0050 from "./Migrations/050_ProjectionThreadPullRequests.ts";
 import Migration0051 from "./Migrations/051_ProjectionThreadMessageContext.ts";
 import Migration0052 from "./Migrations/052_ProjectionThreadTitleState.ts";
 
+// Fork migrations use their own sequence so their ids never collide with
+// upstream's continuing `effect_sql_migrations` history.
+import ForkMigration0001 from "./Migrations/fork/001_ProjectionTurnsProvenance.ts";
+import ForkMigration0002 from "./Migrations/fork/002_ProjectionProjectMcpServers.ts";
+import ForkMigration0003 from "./Migrations/fork/003_ProjectionProjectMcpTransport.ts";
+import ForkMigration0004 from "./Migrations/fork/004_McpCatalogScopes.ts";
+import ForkMigration0005 from "./Migrations/fork/005_McpCatalogRevisions.ts";
+import ForkMigration0006 from "./Migrations/fork/006_McpCatalogAppliedCatalog.ts";
+import ForkMigration0007 from "./Migrations/fork/007_RepairMcpCatalogInitialization.ts";
+import ForkMigration0008 from "./Migrations/fork/008_RepairTextMcpCatalogInitialization.ts";
+
 /**
  * Migration loader with all migrations defined inline.
  *
@@ -75,7 +86,7 @@ import Migration0052 from "./Migrations/052_ProjectionThreadTitleState.ts";
  * Uses Migrator.fromRecord which parses the key format and
  * returns migrations sorted by ID.
  */
-const migrationEntries = [
+export const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
   [2, "OrchestrationCommandReceipts", Migration0002],
   [3, "CheckpointDiffBlobs", Migration0003],
@@ -130,16 +141,37 @@ const migrationEntries = [
   [52, "ProjectionThreadTitleState", Migration0052],
 ] as const;
 
+export const forkMigrationEntries = [
+  [1, "ProjectionTurnsProvenance", ForkMigration0001],
+  [2, "ProjectionProjectMcpServers", ForkMigration0002],
+  [3, "ProjectionProjectMcpTransport", ForkMigration0003],
+  [4, "McpCatalogScopes", ForkMigration0004],
+  [5, "McpCatalogRevisions", ForkMigration0005],
+  [6, "McpCatalogAppliedCatalog", ForkMigration0006],
+  [7, "RepairMcpCatalogInitialization", ForkMigration0007],
+  [8, "RepairTextMcpCatalogInitialization", ForkMigration0008],
+] as const;
+
+export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";
+
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
 
-const makeMigrationLoader = (throughId?: number) =>
+export const forkMigrationManifest = forkMigrationEntries.map(([id, name]) => [id, name] as const);
+
+const makeLoader = (
+  entries: typeof migrationEntries | typeof forkMigrationEntries,
+  throughId?: number,
+) =>
   Migrator.fromRecord(
     Object.fromEntries(
-      migrationEntries
+      entries
         .filter(([id]) => throughId === undefined || id <= throughId)
         .map(([id, name, migration]) => [`${id}_${name}`, migration]),
     ),
   );
+
+const makeMigrationLoader = (throughId?: number) => makeLoader(migrationEntries, throughId);
+const makeForkMigrationLoader = (throughId?: number) => makeLoader(forkMigrationEntries, throughId);
 
 /**
  * Migrator run function - no schema dumping needed
@@ -149,6 +181,7 @@ const run = Migrator.make({});
 
 export interface RunMigrationsOptions {
   readonly toMigrationInclusive?: number | undefined;
+  readonly toForkMigrationInclusive?: number | undefined;
 }
 
 /**
@@ -163,11 +196,36 @@ export interface RunMigrationsOptions {
  */
 export const runMigrations = Effect.fn("runMigrations")(function* ({
   toMigrationInclusive,
+  toForkMigrationInclusive,
 }: RunMigrationsOptions = {}) {
-  const executedMigrations = yield* run({ loader: makeMigrationLoader(toMigrationInclusive) });
-  const migrations = executedMigrations.map(([id, name]) => `${id}_${name}`);
-  yield* migrations.length === 0
-    ? Effect.logDebug("Database schema is current")
-    : Effect.log("Migrations ran successfully").pipe(Effect.annotateLogs({ migrations }));
-  return executedMigrations;
+  const executedUpstream = yield* runUpstreamMigrations(toMigrationInclusive);
+  const executedFork = yield* runForkMigrations(toForkMigrationInclusive);
+  return [...executedUpstream, ...executedFork];
 });
+
+export const runUpstreamMigrations = Effect.fn("runUpstreamMigrations")(function* (
+  throughId?: number,
+) {
+  const executed = yield* run({ loader: makeMigrationLoader(throughId) });
+  yield* logExecuted(executed, "upstream");
+  return executed;
+});
+
+export const runForkMigrations = Effect.fn("runForkMigrations")(function* (throughId?: number) {
+  const executed = yield* run({
+    loader: makeForkMigrationLoader(throughId),
+    table: FORK_MIGRATIONS_TABLE,
+  });
+  yield* logExecuted(executed, "fork");
+  return executed;
+});
+
+const logExecuted = (
+  executed: ReadonlyArray<readonly [id: number, name: string]>,
+  sequence: "upstream" | "fork",
+) => {
+  const migrations = executed.map(([id, name]) => `${id}_${name}`);
+  return migrations.length === 0
+    ? Effect.logDebug("Database schema is current", { sequence })
+    : Effect.log("Migrations ran successfully").pipe(Effect.annotateLogs({ sequence, migrations }));
+};

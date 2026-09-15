@@ -39,6 +39,7 @@ import {
   ProjectFaviconPickerDialog,
 } from "./ProjectFaviconPickerDialog";
 import { ProjectActionsSettings } from "./ProjectActionsSettings";
+import { ProjectMcpSettings } from "./ProjectMcpSettings";
 import { projectGroupTitleNeedsUpdate } from "./ProjectSettingsPanel.logic";
 import { useSettingsProjectGroups } from "./useSettingsProjectGroups";
 
@@ -480,6 +481,10 @@ function ProjectDetail({
         </SettingsSection>
         <ProjectActionsSettings />
         {hasMultipleCheckouts ? checkoutChoices : null}
+        <ProjectMcpSettings
+          environmentId={representative.environmentId}
+          projectId={representative.id}
+        />
         <SettingsSection title="Danger">
           <SettingsRow
             title={

@@ -1494,6 +1494,44 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
           const rebuiltInstance = makeInstance(rebuiltProvider, () =>
             Ref.update(snapshotCalls, (count) => count + 1).pipe(Effect.as(scopedProvider)),
           );
+          const secondInstanceId = ProviderInstanceId.make("codex-work");
+          const secondProvider = {
+            ...machineProvider,
+            instanceId: secondInstanceId,
+            slashCommands: [{ name: "work-global" }],
+            skills: [{ name: "work-global", path: "/work/SKILL.md", enabled: true }],
+          } as const satisfies ServerProvider;
+          const secondScopedProvider = {
+            ...secondProvider,
+            slashCommands: [{ name: "work-project" }],
+            skills: [{ name: "work-project", path: "/workspace/work/SKILL.md", enabled: true }],
+          } as const satisfies ServerProvider;
+          const secondInstance: ProviderInstance = {
+            instanceId: secondInstanceId,
+            driverKind: driver,
+            continuationIdentity: {
+              driverKind: driver,
+              continuationKey: "codex:instance:codex-work",
+            },
+            displayName: "Work",
+            enabled: true,
+            snapshot: {
+              resolveMaintenance: () =>
+                Effect.succeed(
+                  makeManualOnlyProviderMaintenanceCapabilities({
+                    provider: driver,
+                    packageName: null,
+                  }),
+                ),
+              getSnapshot: Effect.succeed(secondProvider),
+              refresh: Effect.succeed(secondProvider),
+              streamChanges: Stream.empty,
+              applyUsageLimits: () => Effect.void,
+            },
+            snapshotForCwd: () => Effect.succeed(secondScopedProvider),
+            adapter: {} as ProviderInstance["adapter"],
+            textGeneration: {} as ProviderInstance["textGeneration"],
+          };
           const registryChanges = yield* PubSub.unbounded<void>();
           const instancesRef = yield* Ref.make<ReadonlyArray<ProviderInstance>>([firstInstance]);
           const instanceRegistryLayer = Layer.succeed(
@@ -1557,6 +1595,25 @@ it.layer(Layer.mergeAll(NodeServices.layer, ServerSettingsModule.layerTest(), Te
             );
             yield* registry.refreshWorkspaceSnapshot({ instanceId, cwd: "/workspace" });
             assert.strictEqual(yield* Ref.get(snapshotCalls), 2);
+
+            if (registry.getProviderCatalogs === undefined) {
+              return yield* Effect.die("Provider catalog discovery is unavailable.");
+            }
+            yield* Ref.set(instancesRef, [firstInstance, secondInstance]);
+            yield* PubSub.publish(registryChanges, undefined);
+            const catalogs = yield* registry.getProviderCatalogs("/workspace");
+            assert.deepStrictEqual(catalogs, [
+              {
+                instanceId,
+                slashCommands: scopedProvider.slashCommands,
+                skills: scopedProvider.skills,
+              },
+              {
+                instanceId: secondInstanceId,
+                slashCommands: secondScopedProvider.slashCommands,
+                skills: secondScopedProvider.skills,
+              },
+            ]);
 
             yield* Ref.set(instancesRef, [rebuiltInstance]);
             yield* PubSub.publish(registryChanges, undefined);

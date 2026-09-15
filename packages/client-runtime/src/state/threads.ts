@@ -592,6 +592,13 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           ...older.checkpoints.filter((row) => !seenCheckpoints.has(row.turnId)),
           ...loaded.checkpoints,
         ],
+        ...(older.partialTurnIds === undefined && loaded.partialTurnIds === undefined
+          ? {}
+          : {
+              partialTurnIds: [
+                ...new Set([...(older.partialTurnIds ?? []), ...(loaded.partialTurnIds ?? [])]),
+              ],
+            }),
       };
       return {
         ...value,

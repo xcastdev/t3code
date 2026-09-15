@@ -1,10 +1,14 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Ref from "effect/Ref";
+import * as Semaphore from "effect/Semaphore";
 
 import {
   GitManagerError,
   GitCommandError,
+  type GitCommitIndexInput,
+  type GitCommitIndexResult,
   type VcsSwitchRefInput,
   type VcsSwitchRefResult,
   type VcsCreateRefInput,
@@ -26,6 +30,9 @@ import {
   type VcsStatusLocalResult,
   type VcsStatusRemoteResult,
   type VcsStatusResult,
+  type VcsStageFilesInput,
+  type VcsWorkingTreeDiffInput,
+  type VcsWorkingTreeDiffResult,
 } from "@t3tools/contracts";
 
 import * as GitManager from "./GitManager.ts";
@@ -53,6 +60,20 @@ export class GitWorkflowService extends Context.Service<
     readonly invalidateLocalStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateRemoteStatus: (cwd: string) => Effect.Effect<void, never>;
     readonly invalidateStatus: (cwd: string) => Effect.Effect<void, never>;
+    /** Serialize mutations by resolved repository root, not by an arbitrary subdirectory. */
+    readonly withRepositoryPermit: <A, E, R>(
+      operation: string,
+      cwd: string,
+      effect: Effect.Effect<A, E, R>,
+    ) => Effect.Effect<A, E | GitCommandError, R>;
+    readonly stageFiles: (input: VcsStageFilesInput) => Effect.Effect<void, GitCommandError>;
+    readonly unstageFiles: (input: VcsStageFilesInput) => Effect.Effect<void, GitCommandError>;
+    readonly getWorkingTreeDiff: (
+      input: VcsWorkingTreeDiffInput,
+    ) => Effect.Effect<VcsWorkingTreeDiffResult, GitCommandError>;
+    readonly commitIndex: (
+      input: GitCommitIndexInput,
+    ) => Effect.Effect<GitCommitIndexResult, GitCommandError>;
     readonly pullCurrentBranch: (cwd: string) => Effect.Effect<VcsPullResult, GitCommandError>;
     readonly runStackedAction: (
       input: GitRunStackedActionInput,
@@ -153,6 +174,7 @@ export const make = Effect.gen(function* () {
   const registry = yield* VcsDriverRegistry.VcsDriverRegistry;
   const git = yield* GitVcsDriver.GitVcsDriver;
   const gitManager = yield* GitManager.GitManager;
+  const mutationSemaphores = yield* Ref.make<ReadonlyMap<string, Semaphore.Semaphore>>(new Map());
 
   const ensureGit = Effect.fn("GitWorkflowService.ensureGit")(function* (
     operation: string,
@@ -176,7 +198,39 @@ export const make = Effect.gen(function* () {
         detail: `The ${operation} workflow currently supports Git repositories only; detected ${handle.kind}. (${cwd})`,
       });
     }
+    return handle;
   });
+
+  const mutationKey = (handle: VcsDriverRegistry.VcsDriverHandle) =>
+    `${handle.kind}\0${handle.repository.rootPath}`;
+
+  const getMutationSemaphore = Effect.fn("GitWorkflowService.getMutationSemaphore")(function* (
+    key: string,
+  ) {
+    const existing = (yield* Ref.get(mutationSemaphores)).get(key);
+    if (existing) return existing;
+    const candidate = yield* Semaphore.make(1);
+    return yield* Ref.modify(mutationSemaphores, (semaphores) => {
+      const current = semaphores.get(key);
+      if (current) return [current, semaphores] as const;
+      const next = new Map(semaphores);
+      next.set(key, candidate);
+      return [candidate, next] as const;
+    });
+  });
+
+  const serializedMutation = <A, E, R>(
+    operation: string,
+    cwd: string,
+    mutation: Effect.Effect<A, E, R>,
+  ): Effect.Effect<A, E | GitCommandError, R> =>
+    ensureGitCommand(operation, cwd).pipe(
+      Effect.flatMap((handle) =>
+        getMutationSemaphore(mutationKey(handle)).pipe(
+          Effect.flatMap((semaphore) => semaphore.withPermit(mutation)),
+        ),
+      ),
+    );
 
   const ensureGitCommand = Effect.fn("GitWorkflowService.ensureGitCommand")(function* (
     operation: string,
@@ -202,6 +256,7 @@ export const make = Effect.gen(function* () {
         detail: `The ${operation} command currently supports Git repositories only; detected ${handle.kind}.`,
       });
     }
+    return handle;
   });
 
   const detectGitRepositoryForStatus = Effect.fn("GitWorkflowService.detectGitRepositoryForStatus")(
@@ -317,13 +372,26 @@ export const make = Effect.gen(function* () {
     invalidateLocalStatus: gitManager.invalidateLocalStatus,
     invalidateRemoteStatus: gitManager.invalidateRemoteStatus,
     invalidateStatus: gitManager.invalidateStatus,
-    pullCurrentBranch: (cwd) =>
-      ensureGitCommand("GitWorkflowService.pullCurrentBranch", cwd).pipe(
-        Effect.andThen(git.pullCurrentBranch(cwd)),
+    withRepositoryPermit: serializedMutation,
+    stageFiles: (input) =>
+      serializedMutation("GitWorkflowService.stageFiles", input.cwd, git.stageFiles(input)),
+    unstageFiles: (input) =>
+      serializedMutation("GitWorkflowService.unstageFiles", input.cwd, git.unstageFiles(input)),
+    getWorkingTreeDiff: (input) =>
+      ensureGitCommand("GitWorkflowService.getWorkingTreeDiff", input.cwd).pipe(
+        Effect.andThen(git.getWorkingTreeDiff(input)),
       ),
+    commitIndex: (input) =>
+      serializedMutation("GitWorkflowService.commitIndex", input.cwd, git.commitIndex(input)),
+    pullCurrentBranch: (cwd) =>
+      serializedMutation("GitWorkflowService.pullCurrentBranch", cwd, git.pullCurrentBranch(cwd)),
     runStackedAction: (input, options) =>
-      ensureGit("GitWorkflowService.runStackedAction", input.cwd).pipe(
-        Effect.andThen(gitManager.runStackedAction(input, options)),
+      serializedMutation(
+        "GitWorkflowService.runStackedAction",
+        input.cwd,
+        ensureGit("GitWorkflowService.runStackedAction", input.cwd).pipe(
+          Effect.andThen(gitManager.runStackedAction(input, options)),
+        ),
       ),
     resolvePullRequest: routeGitManager(
       "GitWorkflowService.resolvePullRequest",
@@ -368,12 +436,12 @@ export const make = Effect.gen(function* () {
         Effect.andThen(git.pruneWorktrees(input)),
       ),
     createRef: (input) =>
-      ensureGitCommand("GitWorkflowService.createRef", input.cwd).pipe(
-        Effect.andThen(git.createRef(input)),
-      ),
+      serializedMutation("GitWorkflowService.createRef", input.cwd, git.createRef(input)),
     switchRef: (input) =>
-      ensureGitCommand("GitWorkflowService.switchRef", input.cwd).pipe(
-        Effect.andThen(Effect.scoped(git.switchRef(input))),
+      serializedMutation(
+        "GitWorkflowService.switchRef",
+        input.cwd,
+        Effect.scoped(git.switchRef(input)),
       ),
     renameBranch: (input) =>
       ensureGit("GitWorkflowService.renameBranch", input.cwd).pipe(

@@ -23,6 +23,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
 import * as DesktopBackendPool from "../../backend/DesktopBackendPool.ts";
+import * as DesktopAttachedBackend from "../../backend/DesktopAttachedBackend.ts";
 import * as DesktopLocalEnvironmentAuth from "../../backend/DesktopLocalEnvironmentAuth.ts";
 import * as DesktopEnvironment from "../../app/DesktopEnvironment.ts";
 import * as DesktopAppSettings from "../../settings/DesktopAppSettings.ts";
@@ -93,6 +94,24 @@ export const getLocalEnvironmentBootstraps = DesktopIpc.makeSyncIpcMethod({
   channel: IpcChannels.GET_LOCAL_ENVIRONMENT_BOOTSTRAPS_CHANNEL,
   result: Schema.Array(DesktopEnvironmentBootstrapSchema),
   handler: Effect.fn("desktop.ipc.window.getLocalEnvironmentBootstraps")(function* () {
+    const attached = yield* Effect.serviceOption(DesktopAttachedBackend.DesktopAttachedBackend);
+    if (Option.isSome(attached)) {
+      const state = yield* attached.value.getState;
+      if (state.mode === "attached") {
+        const ws = new URL(state.httpBaseUrl);
+        ws.protocol = "ws:";
+        return [
+          {
+            id: PRIMARY_LOCAL_ENVIRONMENT_ID,
+            label: state.label,
+            runningDistro: null,
+            httpBaseUrl: state.httpBaseUrl,
+            wsBaseUrl: ws.toString(),
+            ownership: "attached" as const,
+          },
+        ];
+      }
+    }
     const pool = yield* DesktopBackendPool.DesktopBackendPool;
     const instances = yield* pool.list;
     const bootstraps: DesktopEnvironmentBootstrap[] = [];

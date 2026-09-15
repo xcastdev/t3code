@@ -27,6 +27,7 @@ import {
   ProviderDriverKind,
   type ProviderInstanceId,
   type ServerProvider,
+  type ServerProviderCatalog,
   type ServerProviderUpdateState,
 } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
@@ -867,6 +868,55 @@ export const ProviderRegistryLive = Layer.effect(
 
     return {
       getProviders: Ref.get(providersRef),
+      getProviderCatalogs: (cwd) =>
+        Effect.gen(function* () {
+          const [instances, providers] = yield* Effect.all([
+            instanceRegistry.listInstances,
+            Ref.get(providersRef),
+          ]);
+          const catalogs = yield* Effect.forEach(
+            instances,
+            (instance): Effect.Effect<ServerProviderCatalog | undefined> => {
+              const cached = providers.find(
+                (provider) => provider.instanceId === instance.instanceId,
+              );
+              const fallback = cached?.workspaceSnapshots?.find((snapshot) => snapshot.cwd === cwd);
+              if (instance.snapshotForCwd === undefined) {
+                return Effect.succeed(
+                  cached === undefined
+                    ? undefined
+                    : {
+                        instanceId: instance.instanceId,
+                        slashCommands: fallback?.slashCommands ?? cached.slashCommands,
+                        skills: fallback?.skills ?? cached.skills,
+                      },
+                );
+              }
+              return instance.snapshotForCwd(cwd).pipe(
+                Effect.map((snapshot) => ({
+                  instanceId: instance.instanceId,
+                  slashCommands: snapshot.slashCommands,
+                  skills: snapshot.skills,
+                })),
+                // Catalog discovery is a composer enhancement. One provider's
+                // broken workspace probe must not hide other configured agents.
+                Effect.orElseSucceed(() =>
+                  cached === undefined
+                    ? undefined
+                    : {
+                        instanceId: instance.instanceId,
+                        slashCommands: fallback?.slashCommands ?? cached.slashCommands,
+                        skills: fallback?.skills ?? cached.skills,
+                      },
+                ),
+              );
+            },
+            { concurrency: "unbounded" },
+          );
+          return catalogs.filter(
+            (catalog): catalog is ServerProviderCatalog => catalog !== undefined,
+          );
+        }),
       refresh: (provider?: ProviderDriverKind) =>
         refresh(provider).pipe(Effect.catchCause(recoverRefreshFailure)),
       refreshInstance: (instanceId: ProviderInstanceId) =>

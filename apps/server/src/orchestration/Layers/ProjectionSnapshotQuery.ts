@@ -3,6 +3,7 @@ import {
   ApprovalRequestId,
   ChatAttachment,
   OrchestrationMessageContext,
+  EnvironmentId,
   CheckpointRef,
   IsoDateTime,
   MessageId,
@@ -14,11 +15,22 @@ import {
   OrchestrationShellSnapshot,
   OrchestrationThread,
   OrchestrationThreadDetailSnapshot,
+  ProjectMcpServer,
+  ProjectMcpTransport,
   ProjectScript,
   ProjectIconOverride,
+  McpServerId,
+  McpCatalogDefinition,
+  McpCatalogOverride,
+  McpCatalogSessionId,
+  McpCatalogScope,
+  McpDefinitionId,
+  ProjectMcpUrl,
+  ProviderInstanceId,
   TurnId,
   type OrchestrationCheckpointSummary,
   type OrchestrationLatestTurn,
+  type OrchestrationTurnSummary,
   type OrchestrationMessage,
   type OrchestrationProjectShell,
   type OrchestrationProposedPlan,
@@ -30,6 +42,7 @@ import {
   ProjectId,
   ThreadLinkedPullRequest,
   ThreadTitleState,
+  THREAD_ACTIVITY_WINDOW_LIMIT,
   ThreadId,
   ThreadPullRequestSnapshot,
   ThreadPullRequestStack,
@@ -94,13 +107,20 @@ const decodeAgentSessionImportSource = Schema.decodeUnknownOption(AgentSessionIm
 // Keep detail reads consistent with the in-memory projector's retained
 // activity window. Applying the limit in SQL avoids decoding an unbounded
 // payload_json set before the projector can enforce that invariant.
-const THREAD_DETAIL_ACTIVITY_LIMIT = 500;
+const THREAD_DETAIL_ACTIVITY_LIMIT = THREAD_ACTIVITY_WINDOW_LIMIT;
 // Snapshot payloads are decoded and projected in small sequential batches so
 // one client read does not retain the raw payloads for the full activity window.
 const THREAD_DETAIL_ACTIVITY_PAYLOAD_BATCH_SIZE = 25;
 // SQLite trim defaults to spaces. Match the whitespace removed by String.trim.
 const MESSAGE_TRIM_WHITESPACE =
   "\t\n\v\f\r \u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
+// One row past the window. A bare LIMIT cannot say whether a full page means
+// "exactly this many rows exist" or "more were cut"; reading one extra row and
+// discarding it turns that ambiguity into a fact.
+const THREAD_DETAIL_ACTIVITY_PROBE_LIMIT = THREAD_DETAIL_ACTIVITY_LIMIT + 1;
+// Same window as activities, for the same reason: bound the decode cost of a
+// long-lived thread. Turns are far cheaper than activities, so this is generous.
+const THREAD_TURN_LIMIT = 500;
 const ProjectionProjectDbRowSchema = ProjectionProject.mapFields(
   Struct.assign({
     defaultModelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
@@ -166,6 +186,21 @@ const ProjectionLatestTurnDbRowSchema = Schema.Struct({
   assistantMessageId: Schema.NullOr(MessageId),
   sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
   sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
+});
+const ProjectionTurnSummaryDbRowSchema = Schema.Struct({
+  threadId: ProjectionThread.fields.threadId,
+  turnId: TurnId,
+  state: Schema.String,
+  requestedAt: IsoDateTime,
+  startedAt: Schema.NullOr(IsoDateTime),
+  completedAt: Schema.NullOr(IsoDateTime),
+  assistantMessageId: Schema.NullOr(MessageId),
+  model: Schema.NullOr(Schema.String),
+  effort: Schema.NullOr(Schema.String),
+  commandCount: Schema.NullOr(Schema.Number),
+  toolCallCount: Schema.NullOr(Schema.Number),
+  subagentCount: Schema.NullOr(Schema.Number),
+  changedFileCount: Schema.NullOr(Schema.Number),
 });
 const ProjectionStateDbRowSchema = ProjectionState;
 const ProjectionCountsRowSchema = Schema.Struct({
@@ -246,6 +281,52 @@ const ThreadTurnRangeLookupInput = Schema.Struct({
   beforeTurnKey: Schema.String,
 });
 const ProjectionProjectLookupRowSchema = ProjectionProjectDbRowSchema;
+const ProjectionProjectMcpServerDbRowSchema = Schema.Struct({
+  projectId: ProjectId,
+  serverId: McpServerId,
+  name: Schema.String,
+  url: Schema.String,
+  transportJson: Schema.NullOr(Schema.String),
+  enabled: Schema.Number,
+  providerInstanceIds: Schema.fromJsonString(Schema.Array(ProviderInstanceId)),
+});
+const ProjectionMcpCatalogDefinitionDbRowSchema = Schema.Struct({
+  definitionId: McpDefinitionId,
+  logicalServerId: McpServerId,
+  scopeType: McpCatalogScope,
+  scopeId: Schema.String,
+  name: Schema.String,
+  transport: Schema.fromJsonString(ProjectMcpTransport),
+  enabled: Schema.Number,
+  providerInstanceIds: Schema.fromJsonString(Schema.Array(ProviderInstanceId)),
+  revision: NonNegativeInt,
+});
+const ProjectionMcpCatalogOverrideDbRowSchema = Schema.Struct({
+  projectId: ProjectId,
+  override: Schema.fromJsonString(McpCatalogOverride),
+  revision: NonNegativeInt,
+});
+const ProjectionMcpCatalogRevisionDbRowSchema = Schema.Struct({
+  scopeType: McpCatalogScope,
+  scopeId: Schema.String,
+  revision: NonNegativeInt,
+});
+const ProjectionMcpCatalogSessionDbRowSchema = Schema.Struct({
+  catalogSessionId: McpCatalogSessionId,
+  threadId: ThreadId,
+  providerInstanceId: ProviderInstanceId,
+  baseline: Schema.fromJsonString(Schema.Array(McpCatalogDefinition)),
+  desired: Schema.fromJsonString(Schema.Array(McpCatalogDefinition)),
+  applied: Schema.NullOr(Schema.fromJsonString(Schema.Array(McpCatalogDefinition))),
+  desiredRevision: NonNegativeInt,
+  appliedRevision: NonNegativeInt,
+  applicationError: Schema.NullOr(Schema.String),
+  applicationStatus: Schema.NullOr(Schema.Literals(["applied", "failed"])),
+  applicationRevision: Schema.NullOr(NonNegativeInt),
+  applicationAppliedAt: Schema.NullOr(IsoDateTime),
+  applicationFailedAt: Schema.NullOr(IsoDateTime),
+  disposedAt: Schema.NullOr(IsoDateTime),
+});
 const ProjectionThreadIdLookupRowSchema = Schema.Struct({
   threadId: ThreadId,
 });
@@ -267,6 +348,29 @@ const ProjectionFullThreadDiffContextRowSchema = Schema.Struct({
   latestCheckpointTurnCount: Schema.NullOr(NonNegativeInt),
   toCheckpointRef: Schema.NullOr(CheckpointRef),
 });
+const decodeProjectMcpServer = Schema.decodeUnknownEffect(ProjectMcpServer);
+const decodeProjectMcpTransportJson = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(ProjectMcpTransport),
+);
+const decodeProjectMcpUrl = Schema.decodeUnknownEffect(ProjectMcpUrl);
+
+const hydrateProjectMcpServerRow = (
+  row: Schema.Schema.Type<typeof ProjectionProjectMcpServerDbRowSchema>,
+) =>
+  Effect.gen(function* () {
+    const connection =
+      row.transportJson === null
+        ? { url: yield* decodeProjectMcpUrl(row.url) }
+        : { transport: yield* decodeProjectMcpTransportJson(row.transportJson) };
+    const server = yield* decodeProjectMcpServer({
+      id: row.serverId,
+      name: row.name,
+      ...connection,
+      enabled: row.enabled === 1,
+      providerInstanceIds: row.providerInstanceIds,
+    });
+    return { projectId: row.projectId, server };
+  });
 
 const REQUIRED_SNAPSHOT_PROJECTORS = [
   ORCHESTRATION_PROJECTOR_NAMES.projects,
@@ -362,6 +466,48 @@ function mapLatestTurn(
   };
 }
 
+/**
+ * Turns that settled before per-turn provenance existed carry NULL columns, and
+ * those map to omitted optional fields rather than nulls so a client can tell
+ * "not recorded" from "recorded as zero".
+ */
+function mapTurnSummary(
+  row: Schema.Schema.Type<typeof ProjectionTurnSummaryDbRowSchema>,
+): OrchestrationTurnSummary {
+  const counts =
+    row.commandCount !== null &&
+    row.toolCallCount !== null &&
+    row.subagentCount !== null &&
+    row.changedFileCount !== null
+      ? {
+          counts: {
+            commandCount: row.commandCount,
+            toolCallCount: row.toolCallCount,
+            subagentCount: row.subagentCount,
+            changedFileCount: row.changedFileCount,
+          },
+        }
+      : {};
+  return {
+    turnId: row.turnId,
+    state:
+      row.state === "error"
+        ? "error"
+        : row.state === "interrupted"
+          ? "interrupted"
+          : row.state === "completed"
+            ? "completed"
+            : "running",
+    requestedAt: row.requestedAt,
+    startedAt: row.startedAt,
+    completedAt: row.completedAt,
+    assistantMessageId: row.assistantMessageId,
+    ...(row.model === null ? {} : { model: row.model }),
+    ...(row.effort === null ? {} : { effort: row.effort }),
+    ...counts,
+  };
+}
+
 function mapTitleRegeneration(row: Schema.Schema.Type<typeof ProjectionThreadDbRowSchema>) {
   return row.titleRegenerationRequestId != null && row.titleRegenerationStartedAt != null
     ? {
@@ -381,6 +527,7 @@ function mapSessionRow(
     ...(row.providerInstanceId !== null ? { providerInstanceId: row.providerInstanceId } : {}),
     runtimeMode: row.runtimeMode,
     activeTurnId: row.activeTurnId,
+    ...(row.mcpCatalogSessionId != null ? { mcpCatalogSessionId: row.mcpCatalogSessionId } : {}),
     lastError: row.lastError,
     updatedAt: row.updatedAt,
   };
@@ -826,10 +973,103 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           provider_thread_id AS "providerThreadId",
           runtime_mode AS "runtimeMode",
           active_turn_id AS "activeTurnId",
+          mcp_catalog_session_id AS "mcpCatalogSessionId",
           last_error AS "lastError",
           updated_at AS "updatedAt"
         FROM projection_thread_sessions
         ORDER BY thread_id ASC
+      `,
+  });
+
+  const listProjectMcpServerRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionProjectMcpServerDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          project_id AS "projectId",
+          server_id AS "serverId",
+          name,
+          url,
+          transport_json AS "transportJson",
+          enabled,
+          provider_instance_ids_json AS "providerInstanceIds"
+        FROM projection_project_mcp_servers
+        ORDER BY project_id ASC, name COLLATE NOCASE ASC, server_id ASC
+      `,
+  });
+
+  const listMcpCatalogDefinitionRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionMcpCatalogDefinitionDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          definition_id AS "definitionId",
+          logical_server_id AS "logicalServerId",
+          scope_type AS "scopeType",
+          scope_id AS "scopeId",
+          name,
+          transport_json AS "transport",
+          enabled,
+          provider_instance_ids_json AS "providerInstanceIds",
+          revision
+        FROM projection_mcp_definitions
+        ORDER BY scope_type ASC, scope_id ASC, name COLLATE NOCASE ASC, definition_id ASC
+      `,
+  });
+
+  const listMcpCatalogOverrideRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionMcpCatalogOverrideDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          scope_id AS "projectId",
+          patch_json AS "override",
+          revision
+        FROM projection_mcp_overrides
+        WHERE scope_type = 'project'
+        ORDER BY scope_id ASC, override_id ASC
+      `,
+  });
+
+  const listMcpCatalogSessionRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionMcpCatalogSessionDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          catalog_session_id AS "catalogSessionId",
+          thread_id AS "threadId",
+          provider_instance_id AS "providerInstanceId",
+          baseline_json AS "baseline",
+          desired_catalog_json AS "desired",
+          applied_catalog_json AS "applied",
+          desired_revision AS "desiredRevision",
+          applied_revision AS "appliedRevision",
+          application_error AS "applicationError",
+          application_status AS "applicationStatus",
+          application_revision AS "applicationRevision",
+          application_applied_at AS "applicationAppliedAt",
+          application_failed_at AS "applicationFailedAt",
+          disposed_at AS "disposedAt"
+        FROM projection_mcp_catalog_sessions
+        ORDER BY thread_id ASC, catalog_session_id ASC
+      `,
+  });
+
+  const listMcpCatalogRevisionRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionMcpCatalogRevisionDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          scope_type AS "scopeType",
+          scope_id AS "scopeId",
+          revision
+        FROM projection_mcp_catalog_revisions
+        ORDER BY scope_type ASC, scope_id ASC
       `,
   });
 
@@ -847,6 +1087,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           sessions.provider_thread_id AS "providerThreadId",
           sessions.runtime_mode AS "runtimeMode",
           sessions.active_turn_id AS "activeTurnId",
+          sessions.mcp_catalog_session_id AS "mcpCatalogSessionId",
           sessions.last_error AS "lastError",
           sessions.updated_at AS "updatedAt"
         FROM projection_thread_sessions sessions
@@ -872,6 +1113,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           sessions.provider_thread_id AS "providerThreadId",
           sessions.runtime_mode AS "runtimeMode",
           sessions.active_turn_id AS "activeTurnId",
+          sessions.mcp_catalog_session_id AS "mcpCatalogSessionId",
           sessions.last_error AS "lastError",
           sessions.updated_at AS "updatedAt"
         FROM projection_thread_sessions sessions
@@ -900,6 +1142,54 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         FROM projection_turns
         WHERE checkpoint_turn_count IS NOT NULL
         ORDER BY thread_id ASC, checkpoint_turn_count ASC
+      `,
+  });
+
+  // Per-thread capped turn history for the full snapshot. The window is applied
+  // per thread so one busy thread cannot starve the others.
+  const listTurnRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionTurnSummaryDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT
+          "threadId",
+          "turnId",
+          state,
+          "requestedAt",
+          "startedAt",
+          "completedAt",
+          "assistantMessageId",
+          model,
+          effort,
+          "commandCount",
+          "toolCallCount",
+          "subagentCount",
+          "changedFileCount"
+        FROM (
+          SELECT
+            thread_id AS "threadId",
+            turn_id AS "turnId",
+            state,
+            requested_at AS "requestedAt",
+            started_at AS "startedAt",
+            completed_at AS "completedAt",
+            assistant_message_id AS "assistantMessageId",
+            model,
+            effort,
+            command_count AS "commandCount",
+            tool_call_count AS "toolCallCount",
+            subagent_count AS "subagentCount",
+            changed_file_count AS "changedFileCount",
+            ROW_NUMBER() OVER (
+              PARTITION BY thread_id
+              ORDER BY requested_at DESC, turn_id DESC
+            ) AS "recencyRank"
+          FROM projection_turns
+          WHERE turn_id IS NOT NULL
+        ) AS ranked_turns
+        WHERE "recencyRank" <= ${THREAD_TURN_LIMIT}
+        ORDER BY "threadId" ASC, "requestedAt" ASC, "turnId" ASC
       `,
   });
 
@@ -1407,7 +1697,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             sequence DESC,
             created_at DESC,
             activity_id DESC
-          LIMIT ${THREAD_DETAIL_ACTIVITY_LIMIT}
+          LIMIT ${THREAD_DETAIL_ACTIVITY_PROBE_LIMIT}
         ) AS recent_activities
         ORDER BY
           sequence ASC,
@@ -1542,6 +1832,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           provider_instance_id AS "providerInstanceId",
           runtime_mode AS "runtimeMode",
           active_turn_id AS "activeTurnId",
+          mcp_catalog_session_id AS "mcpCatalogSessionId",
           last_error AS "lastError",
           updated_at AS "updatedAt"
         FROM projection_thread_sessions
@@ -1573,6 +1864,62 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           AND threads.deleted_at IS NULL
           AND threads.archived_at IS NULL
         LIMIT 1
+      `,
+  });
+
+  // Most recent THREAD_TURN_LIMIT turns for one thread, returned ascending.
+  // The cap mirrors the activity window: a thread with thousands of turns must
+  // not decode all of them to render a timeline.
+  // Total rows a thread holds per turn, for the turns a truncated window kept.
+  // Position cannot answer this: `sequence` is never populated, so rows order by
+  // time, and a provider completing an earlier turn after a later one has begun
+  // interleaves them. Comparing a turn's total against what the window retained
+  // is the only way to know it was cut.
+  const countActivityRowsByTurn = SqlSchema.findAll({
+    Request: ThreadIdLookupInput,
+    Result: Schema.Struct({
+      turnId: TurnId,
+      activityCount: Schema.Number,
+    }),
+    execute: ({ threadId }) =>
+      sql`
+        SELECT
+          turn_id AS "turnId",
+          COUNT(*) AS "activityCount"
+        FROM projection_thread_activities
+        WHERE thread_id = ${threadId}
+          AND turn_id IS NOT NULL
+        GROUP BY turn_id
+      `,
+  });
+
+  const listTurnRowsByThread = SqlSchema.findAll({
+    Request: ThreadIdLookupInput,
+    Result: ProjectionTurnSummaryDbRowSchema,
+    execute: ({ threadId }) =>
+      sql`
+        SELECT * FROM (
+          SELECT
+            thread_id AS "threadId",
+            turn_id AS "turnId",
+            state,
+            requested_at AS "requestedAt",
+            started_at AS "startedAt",
+            completed_at AS "completedAt",
+            assistant_message_id AS "assistantMessageId",
+            model,
+            effort,
+            command_count AS "commandCount",
+            tool_call_count AS "toolCallCount",
+            subagent_count AS "subagentCount",
+            changed_file_count AS "changedFileCount"
+          FROM projection_turns
+          WHERE thread_id = ${threadId}
+            AND turn_id IS NOT NULL
+          ORDER BY requested_at DESC, turn_id DESC
+          LIMIT ${THREAD_TURN_LIMIT}
+        ) AS recent_turns
+        ORDER BY "requestedAt" ASC, "turnId" ASC
       `,
   });
 
@@ -1901,7 +2248,7 @@ pending_approval_requests AS (
             sequence DESC,
             created_at DESC,
             activity_id DESC
-          LIMIT ${THREAD_DETAIL_ACTIVITY_LIMIT}
+          LIMIT ${THREAD_DETAIL_ACTIVITY_PROBE_LIMIT}
         ) AS recent_activities
         ORDER BY
           sequence ASC,
@@ -2060,6 +2407,14 @@ pending_approval_requests AS (
               ),
             ),
           ),
+          listTurnRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getSnapshot:listTurns:query",
+                "ProjectionSnapshotQuery.getSnapshot:listTurns:decodeRows",
+              ),
+            ),
+          ),
           listProjectionStateRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
@@ -2082,6 +2437,7 @@ pending_approval_requests AS (
             sessionRows,
             checkpointRows,
             latestTurnRows,
+            turnRows,
             stateRows,
           ]) =>
             Effect.gen(function* () {
@@ -2092,6 +2448,7 @@ pending_approval_requests AS (
               const checkpointsByThread = new Map<string, Array<OrchestrationCheckpointSummary>>();
               const sessionsByThread = new Map<string, OrchestrationSession>();
               const latestTurnByThread = new Map<string, OrchestrationLatestTurn>();
+              const turnsByThread = new Map<string, Array<OrchestrationTurnSummary>>();
 
               let updatedAt: string | null = null;
 
@@ -2168,6 +2525,12 @@ pending_approval_requests AS (
                 checkpointsByThread.set(row.threadId, threadCheckpoints);
               }
 
+              for (const row of turnRows) {
+                const threadTurns = turnsByThread.get(row.threadId) ?? [];
+                threadTurns.push(mapTurnSummary(row));
+                turnsByThread.set(row.threadId, threadTurns);
+              }
+
               for (const row of latestTurnRows) {
                 updatedAt = maxIso(updatedAt, row.requestedAt);
                 if (row.startedAt !== null) {
@@ -2215,6 +2578,9 @@ pending_approval_requests AS (
                     : {}),
                   runtimeMode: row.runtimeMode,
                   activeTurnId: row.activeTurnId,
+                  ...(row.mcpCatalogSessionId != null
+                    ? { mcpCatalogSessionId: row.mcpCatalogSessionId }
+                    : {}),
                   lastError: row.lastError,
                   updatedAt: row.updatedAt,
                 });
@@ -2275,6 +2641,7 @@ pending_approval_requests AS (
                 proposedPlans: proposedPlansByThread.get(row.threadId) ?? [],
                 activities: activitiesByThread.get(row.threadId) ?? [],
                 checkpoints: checkpointsByThread.get(row.threadId) ?? [],
+                turns: turnsByThread.get(row.threadId) ?? [],
                 session: sessionsByThread.get(row.threadId) ?? null,
               }));
 
@@ -2309,6 +2676,47 @@ pending_approval_requests AS (
               toPersistenceSqlOrDecodeError(
                 "ProjectionSnapshotQuery.getCommandReadModel:listProjects:query",
                 "ProjectionSnapshotQuery.getCommandReadModel:listProjects:decodeRows",
+              ),
+            ),
+          ),
+          listProjectMcpServerRows(undefined).pipe(
+            Effect.flatMap((rows) => Effect.forEach(rows, hydrateProjectMcpServerRow)),
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getCommandReadModel:listProjectMcpServers:query",
+                "ProjectionSnapshotQuery.getCommandReadModel:listProjectMcpServers:decodeRows",
+              ),
+            ),
+          ),
+          listMcpCatalogDefinitionRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogDefinitions:query",
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogDefinitions:decodeRows",
+              ),
+            ),
+          ),
+          listMcpCatalogOverrideRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogOverrides:query",
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogOverrides:decodeRows",
+              ),
+            ),
+          ),
+          listMcpCatalogSessionRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogSessions:query",
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogSessions:decodeRows",
+              ),
+            ),
+          ),
+          listMcpCatalogRevisionRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogRevisions:query",
+                "ProjectionSnapshotQuery.getCommandReadModel:listMcpCatalogRevisions:decodeRows",
               ),
             ),
           ),
@@ -2366,6 +2774,11 @@ pending_approval_requests AS (
         Effect.flatMap(
           ([
             projectRows,
+            projectMcpServerRows,
+            mcpCatalogDefinitionRows,
+            mcpCatalogOverrideRows,
+            mcpCatalogSessionRows,
+            mcpCatalogRevisionRows,
             threadRows,
             proposedPlanRows,
             pullRequestRows,
@@ -2385,7 +2798,95 @@ pending_approval_requests AS (
               );
               let updatedAt: string | null = null;
               const projects: OrchestrationProject[] = [];
+              const projectMcpServers: Array<
+                NonNullable<OrchestrationReadModel["projectMcpServers"]>[number]
+              > = [];
               const threads: OrchestrationThread[] = [];
+              const globalDefinitions = mcpCatalogDefinitionRows
+                .filter((row) => row.scopeType === "global")
+                .map((row) => ({
+                  definitionId: row.definitionId,
+                  logicalServerId: row.logicalServerId,
+                  scope: row.scopeType,
+                  scopeId: row.scopeId,
+                  name: row.name,
+                  transport: row.transport,
+                  enabled: row.enabled === 1,
+                  providerInstanceIds: row.providerInstanceIds,
+                  revision: row.revision,
+                }));
+              const projectDefinitions = mcpCatalogDefinitionRows
+                .filter((row) => row.scopeType === "project")
+                .map((row) => ({
+                  projectId: ProjectId.make(row.scopeId),
+                  definition: {
+                    definitionId: row.definitionId,
+                    logicalServerId: row.logicalServerId,
+                    scope: row.scopeType,
+                    scopeId: row.scopeId,
+                    name: row.name,
+                    transport: row.transport,
+                    enabled: row.enabled === 1,
+                    providerInstanceIds: row.providerInstanceIds,
+                    revision: row.revision,
+                  },
+                }));
+              const projectRevisions = new Map<string, number>();
+              for (const row of mcpCatalogRevisionRows) {
+                if (row.scopeType === "project") {
+                  projectRevisions.set(row.scopeId, row.revision);
+                }
+              }
+              for (const row of mcpCatalogDefinitionRows) {
+                if (row.scopeType === "project") {
+                  projectRevisions.set(
+                    row.scopeId,
+                    Math.max(projectRevisions.get(row.scopeId) ?? 0, row.revision),
+                  );
+                }
+              }
+              for (const row of mcpCatalogOverrideRows) {
+                projectRevisions.set(
+                  row.projectId,
+                  Math.max(projectRevisions.get(row.projectId) ?? 0, row.revision),
+                );
+              }
+              const sessions = mcpCatalogSessionRows.map((row) => ({
+                catalogSessionId: row.catalogSessionId,
+                threadId: row.threadId,
+                providerInstanceId: row.providerInstanceId,
+                baseline: row.baseline,
+                desired: row.desired,
+                // NULL is the explicit migration residual for pre-048 rows
+                // whose older applied catalog cannot be reconstructed safely.
+                applied: row.applied ?? [],
+                desiredRevision: row.desiredRevision,
+                appliedRevision: row.appliedRevision,
+                ...(row.applicationStatus === "applied" &&
+                row.applicationRevision !== null &&
+                row.applicationAppliedAt !== null
+                  ? {
+                      application: {
+                        status: "applied" as const,
+                        revision: row.applicationRevision,
+                        appliedAt: row.applicationAppliedAt,
+                      },
+                    }
+                  : row.applicationStatus === "failed" &&
+                      row.applicationRevision !== null &&
+                      row.applicationFailedAt !== null &&
+                      row.applicationError !== null
+                    ? {
+                        application: {
+                          status: "failed" as const,
+                          revision: row.applicationRevision,
+                          failedAt: row.applicationFailedAt,
+                          reason: row.applicationError,
+                        },
+                      }
+                    : {}),
+                ...(row.disposedAt === null ? {} : { disposedAt: row.disposedAt }),
+              }));
 
               for (let index = 0; index < projectRows.length; index += 1) {
                 const row = projectRows[index];
@@ -2409,6 +2910,7 @@ pending_approval_requests AS (
                   deletedAt: row.deletedAt,
                 });
               }
+              projectMcpServers.push(...projectMcpServerRows);
               for (let index = 0; index < threadRows.length; index += 1) {
                 const row = threadRows[index];
                 if (!row) {
@@ -2527,6 +3029,40 @@ pending_approval_requests AS (
               return {
                 snapshotSequence: computeSnapshotSequence(stateRows),
                 projects,
+                projectMcpServers,
+                ...(mcpCatalogDefinitionRows.length === 0 &&
+                mcpCatalogOverrideRows.length === 0 &&
+                mcpCatalogSessionRows.length === 0 &&
+                mcpCatalogRevisionRows.length === 0
+                  ? {}
+                  : {
+                      mcpCatalog: {
+                        environmentId: EnvironmentId.make(
+                          mcpCatalogRevisionRows.find((row) => row.scopeType === "global")
+                            ?.scopeId ??
+                            globalDefinitions[0]?.scopeId ??
+                            "unknown",
+                        ),
+                        globalRevision:
+                          mcpCatalogRevisionRows.find((row) => row.scopeType === "global")
+                            ?.revision ??
+                          globalDefinitions.reduce(
+                            (revision, definition) => Math.max(revision, definition.revision),
+                            0,
+                          ),
+                        globalDefinitions,
+                        projectRevisions: [...projectRevisions].map(([projectId, revision]) => ({
+                          projectId: ProjectId.make(projectId),
+                          revision,
+                        })),
+                        projectDefinitions,
+                        projectOverrides: mcpCatalogOverrideRows.map((row) => ({
+                          projectId: row.projectId,
+                          override: row.override,
+                        })),
+                        sessions,
+                      },
+                    }),
                 threads,
                 updatedAt: updatedAt ?? "1970-01-01T00:00:00.000Z",
               } satisfies OrchestrationReadModel;
@@ -3318,7 +3854,20 @@ pending_approval_requests AS (
       }
     }
 
-    return activities.toSorted(
+    const sortedActivities = activities.toSorted(
+      (left, right) =>
+        (left.sequence ?? -1) - (right.sequence ?? -1) ||
+        left.createdAt.localeCompare(right.createdAt) ||
+        left.id.localeCompare(right.id),
+    );
+    const pinnedIds = new Set(pinnedActivityIdRows.map(({ activityId }) => activityId));
+    const pinned = sortedActivities.filter((activity) => pinnedIds.has(activity.id));
+    const retainedPinned = pinned.slice(-THREAD_DETAIL_ACTIVITY_LIMIT);
+    const remaining = THREAD_DETAIL_ACTIVITY_LIMIT - retainedPinned.length;
+    return [
+      ...sortedActivities.filter((activity) => !pinnedIds.has(activity.id)).slice(-remaining),
+      ...retainedPinned,
+    ].toSorted(
       (left, right) =>
         (left.sequence ?? -1) - (right.sequence ?? -1) ||
         left.createdAt.localeCompare(right.createdAt) ||
@@ -3365,22 +3914,29 @@ pending_approval_requests AS (
                   )
                 : Effect.succeed([]),
             ]).pipe(
-              Effect.map(([activityRows, pinnedActivityRows]) =>
-                [
+              Effect.map(([activityRows, pinnedActivityRows]) => {
+                const compare = (left: (typeof activityRows)[number], right: typeof left) =>
+                  (left.sequence ?? -1) - (right.sequence ?? -1) ||
+                  left.createdAt.localeCompare(right.createdAt) ||
+                  left.activityId.localeCompare(right.activityId);
+                const pinnedIds = new Set(pinnedActivityRows.map((row) => row.activityId));
+                const merged = [
                   ...new Map(
                     [...activityRows, ...pinnedActivityRows].map(
                       (row) => [row.activityId, row] as const,
                     ),
                   ).values(),
+                ].toSorted(compare);
+                const pinned = merged.filter((row) => pinnedIds.has(row.activityId));
+                const retainedPinned = pinned.slice(-THREAD_DETAIL_ACTIVITY_LIMIT);
+                const remaining = THREAD_DETAIL_ACTIVITY_LIMIT - retainedPinned.length;
+                return [
+                  ...merged.filter((row) => !pinnedIds.has(row.activityId)).slice(-remaining),
+                  ...retainedPinned,
                 ]
-                  .toSorted(
-                    (left, right) =>
-                      (left.sequence ?? -1) - (right.sequence ?? -1) ||
-                      left.createdAt.localeCompare(right.createdAt) ||
-                      left.activityId.localeCompare(right.activityId),
-                  )
-                  .map(mapThreadActivityRow),
-              ),
+                  .toSorted(compare)
+                  .map(mapThreadActivityRow);
+              }),
             );
 
       const [
@@ -3389,7 +3945,9 @@ pending_approval_requests AS (
         proposedPlanRows,
         pullRequestRows,
         activities,
+        activityCountRows,
         checkpointRows,
+        turnRows,
         latestTurnRow,
         sessionRow,
       ] = yield* Effect.all([
@@ -3429,11 +3987,27 @@ pending_approval_requests AS (
           ),
         ),
         activitiesEffect,
+        countActivityRowsByTurn({ threadId }).pipe(
+          Effect.mapError(
+            toPersistenceSqlOrDecodeError(
+              "ProjectionSnapshotQuery.getThreadDetailById:countActivitiesByTurn:query",
+              "ProjectionSnapshotQuery.getThreadDetailById:countActivitiesByTurn:decodeRows",
+            ),
+          ),
+        ),
         listCheckpointRowsByThread({ threadId }).pipe(
           Effect.mapError(
             toPersistenceSqlOrDecodeError(
               "ProjectionSnapshotQuery.getThreadDetailById:listCheckpoints:query",
               "ProjectionSnapshotQuery.getThreadDetailById:listCheckpoints:decodeRows",
+            ),
+          ),
+        ),
+        listTurnRowsByThread({ threadId }).pipe(
+          Effect.mapError(
+            toPersistenceSqlOrDecodeError(
+              "ProjectionSnapshotQuery.getThreadDetailById:listTurns:query",
+              "ProjectionSnapshotQuery.getThreadDetailById:listTurns:decodeRows",
             ),
           ),
         ),
@@ -3459,6 +4033,25 @@ pending_approval_requests AS (
         return Option.none<OrchestrationThread>();
       }
 
+      // Compare each turn's retained rows with its projection total. Activity
+      // ordering can interleave turns, so a timestamp boundary cannot identify
+      // which turn was cut. This remains conservative for filtered reads: a
+      // count is only published for the full client activity window.
+      const visibleActivityCountByTurn = new Map<string, number>();
+      for (const activity of activities) {
+        if (activity.turnId !== null) {
+          visibleActivityCountByTurn.set(
+            activity.turnId,
+            (visibleActivityCountByTurn.get(activity.turnId) ?? 0) + 1,
+          );
+        }
+      }
+      const partialTurnIds =
+        activityRead.mode === "client" || activityRead.query?.activityKinds === undefined
+          ? activityCountRows.flatMap(({ turnId, activityCount }) =>
+              (visibleActivityCountByTurn.get(turnId) ?? 0) < activityCount ? [turnId] : [],
+            )
+          : [];
       const thread = {
         id: threadRow.value.threadId,
         projectId: threadRow.value.projectId,
@@ -3521,6 +4114,10 @@ pending_approval_requests AS (
           assistantMessageId: row.assistantMessageId,
           completedAt: row.completedAt,
         })),
+        turns: turnRows.map(mapTurnSummary),
+        // Omitted when nothing was cut, so the field reads as "no turn is
+        // partial" rather than as an empty answer to a question never asked.
+        ...(partialTurnIds.length === 0 ? {} : { partialTurnIds }),
         session: Option.isSome(sessionRow) ? mapSessionRow(sessionRow.value) : null,
       };
 

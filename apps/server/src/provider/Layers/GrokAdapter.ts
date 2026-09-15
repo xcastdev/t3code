@@ -42,6 +42,7 @@ import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import { projectMcpNativeKey } from "../Services/ProviderAdapter.ts";
 import {
   ProviderAdapterProcessError,
   ProviderAdapterRequestError,
@@ -993,6 +994,16 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           });
 
           const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
+          const projectMcpServers = (
+            input.projectMcpServers ??
+            mcpSession?.projectServers ??
+            []
+          ).map((server) => ({
+            type: "http" as const,
+            name: projectMcpNativeKey(server),
+            url: server.endpoint.toString(),
+            headers: [{ name: "Authorization", value: server.authorizationHeader }],
+          }));
           const acp = yield* makeGrokAcpRuntime({
             grokSettings,
             ...(options?.environment || mcpSession?.agentDeviceEnvironment
@@ -1008,20 +1019,25 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             runtimeMode: input.runtimeMode,
             ...(resumeSessionId ? { resumeSessionId } : {}),
             clientInfo: { name: "t3-code", version: "0.0.0" },
-            ...(mcpSession
+            ...(projectMcpServers.length > 0 || mcpSession
               ? {
                   mcpServers: [
-                    {
-                      type: "http" as const,
-                      name: "t3-code",
-                      url: mcpSession.endpoint,
-                      headers: [
-                        {
-                          name: "Authorization",
-                          value: mcpSession.authorizationHeader,
-                        },
-                      ],
-                    },
+                    ...projectMcpServers,
+                    ...(mcpSession
+                      ? [
+                          {
+                            type: "http" as const,
+                            name: "t3-code",
+                            url: mcpSession.endpoint,
+                            headers: [
+                              {
+                                name: "Authorization",
+                                value: mcpSession.authorizationHeader,
+                              },
+                            ],
+                          },
+                        ]
+                      : []),
                   ],
                 }
               : {}),
@@ -2159,7 +2175,14 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
 
     return {
       provider: PROVIDER,
-      capabilities: { sessionModelSwitch: "in-session", supportsConversationRollback: false },
+      capabilities: {
+        sessionModelSwitch: "in-session",
+        supportsConversationRollback: false,
+        remoteHttpMcp: "next-session",
+        projectMcpProxy: "next-session",
+        managedPreviewMcp: "next-session",
+        sessionMcpCatalog: "restart-required",
+      },
       compaction: { type: "slash-command", command: "/compact" },
       startSession,
       sendTurn,

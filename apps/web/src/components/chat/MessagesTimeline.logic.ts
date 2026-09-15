@@ -27,10 +27,16 @@ import {
   type TimelineEntry,
   type WorkLogEntry,
 } from "../../session-logic";
+import {
+  countTurnWork,
+  type TurnWorkActivity,
+  type TurnWorkCounts,
+} from "@t3tools/shared/turnWorkCounts";
 import { type ChatMessage, type ProposedPlan, type TurnDiffSummary } from "../../types";
 import {
   type MessageId,
   type OrchestrationLatestTurn,
+  type OrchestrationTurnSummary,
   type TurnId,
   type WorktreeSetupSnapshot,
 } from "@t3tools/contracts";
@@ -503,6 +509,45 @@ interface TurnFold {
   label: string;
 }
 
+function formatTurnWorkCounts(
+  counts:
+    | (TurnWorkCounts &
+        Partial<Pick<NonNullable<OrchestrationTurnSummary["counts"]>, "changedFileCount">>)
+    | null
+    | undefined,
+): string[] {
+  if (!counts) return [];
+  const label = (count: number, singular: string, plural: string) =>
+    count > 0 ? `${count} ${count === 1 ? singular : plural}` : null;
+  return [
+    label(counts.commandCount, "Command", "Commands"),
+    label(counts.toolCallCount, "Tool Call", "Tool Calls"),
+    label(counts.subagentCount, "Subagent", "Subagents"),
+    label(counts.changedFileCount ?? 0, "Changed File", "Changed Files"),
+  ].filter((value): value is string => value !== null);
+}
+
+/**
+ * Map retained work rows into the shared counting vocabulary. The rows here
+ * have already gone through the timeline's visibility rules, so using the
+ * same classifier as the server keeps a fold aligned with its expanded rows.
+ */
+function collectTurnWorkActivities(entries: ReadonlyArray<TimelineEntry>): TurnWorkActivity[] {
+  const activities: TurnWorkActivity[] = [];
+  for (const entry of entries) {
+    if (entry.kind !== "work") continue;
+    activities.push({
+      tone: entry.entry.tone,
+      itemType: entry.entry.itemType,
+      toolCallId: entry.entry.toolCallId,
+      kind: entry.entry.sourceActivityKind,
+      summary: entry.entry.toolTitle ?? entry.entry.label,
+      detail: entry.entry.detail,
+    });
+  }
+  return activities;
+}
+
 /**
  * The session's running turn is authoritative when latestTurn briefly lags or
  * regresses behind it. Otherwise, the latest turn counts as unsettled while it
@@ -590,7 +635,13 @@ function deriveTurnFolds(input: {
   terminalAssistantMessageIds: ReadonlySet<string>;
   latestTurn: TimelineLatestTurn | null;
   unfoldedTurnIds: ReadonlySet<TurnId>;
+  turns?: ReadonlyArray<OrchestrationTurnSummary> | undefined;
+  /** Named retained-window cuts; callers must not derive counts for these turns. */
+  partialTurnIds?: ReadonlySet<TurnId> | undefined;
+  /** Older hosts omit partial turn ids, so a full window is conservatively partial. */
+  activityWindowMayBeTruncated?: boolean | undefined;
 }): ReadonlyMap<string, TurnFold> {
+  const turnsById = new Map((input.turns ?? []).map((turn) => [turn.turnId, turn]));
   interface TurnGroup {
     entries: Array<TimelineEntry>;
     terminalEntry: Extract<TimelineEntry, { kind: "message" }> | null;
@@ -700,8 +751,12 @@ function deriveTurnFolds(input: {
       continue;
     }
 
+    const turn = turnsById.get(turnId);
     const isLatestInterruptedTurn =
-      input.latestTurn?.turnId === turnId && input.latestTurn.state === "interrupted";
+      turn?.state === "interrupted" ||
+      (turn === undefined &&
+        input.latestTurn?.turnId === turnId &&
+        input.latestTurn.state === "interrupted");
     // A turn cut short by a steer leaves trailing work entries behind its
     // terminal message — take whichever ended last.
     const lastEntryEnd =
@@ -717,13 +772,24 @@ function deriveTurnFolds(input: {
               lastEntryEnd,
           );
     const duration = elapsedMs !== null ? formatDuration(elapsedMs) : null;
-    const label = isLatestInterruptedTurn
+    const durationPhrase = isLatestInterruptedTurn
       ? duration
         ? `You stopped after ${duration}`
         : "You stopped this response"
       : duration
         ? `Worked for ${duration}`
         : "Worked";
+    // A settled turn's persisted count was calculated before the activity
+    // retention window could trim its rows. Older hosts that name a partial
+    // turn must not show a plausible-but-low total from the surviving rows.
+    const activitiesMayHaveAgedOut =
+      input.partialTurnIds === undefined
+        ? input.activityWindowMayBeTruncated === true
+        : input.partialTurnIds.has(turnId);
+    const counts =
+      turn?.counts ??
+      (activitiesMayHaveAgedOut ? null : countTurnWork(collectTurnWorkActivities(group.entries)));
+    const label = [durationPhrase, ...formatTurnWorkCounts(counts)].join(" · ");
 
     foldsByAnchorEntryId.set(firstHiddenEntry.id, {
       turnId,
@@ -807,7 +873,11 @@ function attachTrailingToolGroupsToAssistant(
   const result: MessagesTimelineRow[] = [];
   for (const [index, row] of rows.entries()) {
     if (row.kind === "message" && messageRowsWithoutMeta.has(row.id)) {
-      result.push({ ...row, showAssistantMeta: false, showAssistantCopyButton: false });
+      result.push({
+        ...row,
+        showAssistantMeta: false,
+        showAssistantCopyButton: false,
+      });
     } else {
       result.push(row);
     }
@@ -861,6 +931,9 @@ function buildRevertTurnCountByUserMessageId(input: {
 export function deriveMessagesTimelineRows(input: {
   timelineEntries: ReadonlyArray<TimelineEntry>;
   latestTurn?: TimelineLatestTurn | null;
+  turns?: ReadonlyArray<OrchestrationTurnSummary> | undefined;
+  partialTurnIds?: ReadonlySet<TurnId> | undefined;
+  activityWindowMayBeTruncated?: boolean | undefined;
   runningTurnId?: TurnId | null;
   expandedTurnIds?: ReadonlySet<TurnId>;
   expandedWorkGroupIds?: ReadonlySet<string>;
@@ -906,6 +979,9 @@ export function deriveMessagesTimelineRows(input: {
     terminalAssistantMessageIds,
     latestTurn: input.latestTurn ?? null,
     unfoldedTurnIds: activeVisualResponseTurnIds,
+    turns: input.turns,
+    partialTurnIds: input.partialTurnIds,
+    activityWindowMayBeTruncated: input.activityWindowMayBeTruncated,
   });
   const collapsedEntryIds = new Set<string>();
   for (const fold of foldsByAnchorEntryId.values()) {

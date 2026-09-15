@@ -46,6 +46,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as OrchestrationEngine from "../orchestration/Services/OrchestrationEngine.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import { forkParked } from "../serverActivation.ts";
+import * as ExternalNotificationDispatcher from "../notifications/ExternalNotificationDispatcher.ts";
 
 export class AgentAwarenessRelay extends Context.Service<
   AgentAwarenessRelay,
@@ -294,11 +295,21 @@ export function resolveAgentAwarenessRelayActiveThreadIds(input: {
 export const make = Effect.gen(function* () {
   const secrets = yield* ServerSecretStore.ServerSecretStore;
   const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+  const externalNotifications = Option.getOrElse(
+    yield* Effect.serviceOption(ExternalNotificationDispatcher.ExternalNotificationDispatcher),
+    () =>
+      ({
+        dispatch: () => Effect.void,
+        hasEnabledDestinations: Effect.succeed(false),
+        test: () => Effect.die("external notification test is unavailable"),
+      }) satisfies ExternalNotificationDispatcher.ExternalNotificationDispatcher["Service"],
+  );
   const snapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
   const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
   const crypto = yield* Crypto.Crypto;
   const cloudLinkKeyPair = yield* getOrCreateEnvironmentKeyPairFromSecretStore(secrets);
   const activeSnapshotPublishedRef = yield* Ref.make(false);
+  const externalSnapshotPublishedRef = yield* Ref.make(false);
   const publishedStateByThreadRef = yield* Ref.make(new Map<ThreadId, string>());
 
   const readSecretString = (name: string) =>
@@ -343,24 +354,29 @@ export const make = Effect.gen(function* () {
   let schedulePublishConfirm: (threadId: ThreadId) => Effect.Effect<void> = () => Effect.void;
 
   const publishThreadUnsafe = Effect.fn("publishThreadUnsafe")(function* (threadId: ThreadId) {
+    const environmentId = yield* serverEnvironment.getEnvironmentId;
+    const thread = yield* snapshotQuery.getThreadShellById(threadId);
+    const project = Option.isSome(thread)
+      ? yield* snapshotQuery.getProjectShellById(thread.value.projectId)
+      : Option.none<OrchestrationProjectShell>();
+    const snapshot = resolveAgentAwarenessRelayPublishSnapshot({
+      environmentId,
+      threadId,
+      thread,
+      project,
+    });
     const publishAgentActivity = yield* readPublishAgentActivityEnabled.pipe(
       Effect.orElseSucceed(() => false),
     );
-    if (!publishAgentActivity) {
-      yield* Effect.logDebug("agent activity publish skipped; publication disabled", {
-        threadId,
-      });
-      return;
-    }
     const relayConfig = yield* readRelayConfig.pipe(Effect.orElseSucceed(() => null));
-    if (!relayConfig) {
-      yield* Effect.logDebug("agent activity publish skipped; relay link credentials unavailable", {
+    const relayReady = publishAgentActivity && relayConfig !== null;
+    if (!relayReady) {
+      yield* Effect.logDebug("agent activity relay publish skipped", {
         threadId,
+        publicationEnabled: publishAgentActivity,
+        relayConfigured: relayConfig !== null,
       });
-      return;
     }
-    const relayClient = yield* makeRelayClient(relayConfig);
-    const environmentId = yield* serverEnvironment.getEnvironmentId;
 
     const publishState = (input: {
       readonly projectId: string | null;
@@ -368,6 +384,8 @@ export const make = Effect.gen(function* () {
       readonly reason: string;
     }) =>
       Effect.gen(function* () {
+        if (!relayReady || relayConfig === null) return;
+        const relayClient = yield* makeRelayClient(relayConfig);
         const proof = yield* makePublishProof({
           privateKey: cloudLinkKeyPair.privateKey,
           relayIssuer: relayConfig.issuer,
@@ -405,16 +423,6 @@ export const make = Effect.gen(function* () {
         });
       });
 
-    const thread = yield* snapshotQuery.getThreadShellById(threadId);
-    const project = Option.isSome(thread)
-      ? yield* snapshotQuery.getProjectShellById(thread.value.projectId)
-      : Option.none<OrchestrationProjectShell>();
-    const snapshot = resolveAgentAwarenessRelayPublishSnapshot({
-      environmentId,
-      threadId,
-      thread,
-      project,
-    });
     const publishIdentity = agentAwarenessPublishIdentity(snapshot.state);
     const publishedStateByThread = yield* Ref.get(publishedStateByThreadRef);
     if (publishedStateByThread.get(threadId) === publishIdentity) {
@@ -426,6 +434,12 @@ export const make = Effect.gen(function* () {
       yield* Effect.logDebug("agent activity publish skipped; projected state unchanged", {
         environmentId,
         threadId,
+        reason: snapshot.reason,
+      });
+      yield* externalNotifications.dispatch({
+        environmentId,
+        threadId,
+        state: snapshot.state,
         reason: snapshot.reason,
       });
       return;
@@ -475,6 +489,15 @@ export const make = Effect.gen(function* () {
       publishConfirmDeadlines.delete(threadId);
     }
 
+    yield* externalNotifications.dispatch({
+      environmentId,
+      threadId,
+      state: snapshot.state,
+      reason: snapshot.reason,
+    });
+
+    if (!relayReady) return;
+
     if (snapshot.reason === "thread-not-found") {
       yield* Effect.logDebug("publishing agent activity tombstone; thread not found", {
         environmentId,
@@ -516,15 +539,16 @@ export const make = Effect.gen(function* () {
     const publishAgentActivity = yield* readPublishAgentActivityEnabled.pipe(
       Effect.orElseSucceed(() => false),
     );
-    if (!publishAgentActivity) {
-      yield* Effect.logDebug("agent activity snapshot skipped; publication disabled");
-      return false;
-    }
     const relayConfig = yield* readRelayConfig.pipe(Effect.orElseSucceed(() => null));
-    if (!relayConfig) {
-      yield* Effect.logDebug("agent activity snapshot skipped; relay link credentials unavailable");
+    const externalConfigured = yield* externalNotifications.hasEnabledDestinations;
+    const relayReady = publishAgentActivity && relayConfig !== null;
+    if (!relayReady && !externalConfigured) {
+      yield* Effect.logDebug("agent activity snapshot skipped; no notification sink is ready");
       return false;
     }
+    const shouldPublishExternalSnapshot =
+      externalConfigured && !(yield* Ref.get(externalSnapshotPublishedRef));
+    if (!relayReady && !shouldPublishExternalSnapshot) return false;
     const environmentId = yield* serverEnvironment.getEnvironmentId;
     const snapshot = yield* snapshotQuery.getShellSnapshot();
     const activeThreadIds = resolveAgentAwarenessRelayActiveThreadIds({
@@ -534,13 +558,15 @@ export const make = Effect.gen(function* () {
     });
     if (activeThreadIds.length === 0) {
       yield* Effect.logDebug("agent activity snapshot has no publishable threads");
-      return true;
+      if (shouldPublishExternalSnapshot) yield* Ref.set(externalSnapshotPublishedRef, true);
+      return relayReady;
     }
     yield* Effect.logInfo("publishing active agent activity snapshot", {
       count: activeThreadIds.length,
     });
     yield* Effect.forEach(activeThreadIds, publishThread, { concurrency: 4, discard: true });
-    return true;
+    if (shouldPublishExternalSnapshot) yield* Ref.set(externalSnapshotPublishedRef, true);
+    return relayReady;
   });
 
   const publishActiveThreadsOnceWhenConfigured = (logEnabledWhenReady: boolean) =>

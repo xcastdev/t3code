@@ -1011,6 +1011,12 @@ export function createServerEnvironmentAtoms<R, E>(
       label: "environment-data:provider:install-remove",
       tag: WS_METHODS.providerInstallRemove,
     }),
+    providerCatalog: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:server:provider-catalog",
+      tag: WS_METHODS.serverGetProviderCatalog,
+      staleTimeMs: 2_000,
+      idleTtlMs: 30_000,
+    }),
     traceDiagnostics: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:server:trace-diagnostics",
       tag: WS_METHODS.serverGetTraceDiagnostics,
@@ -1097,6 +1103,14 @@ export function createServerEnvironmentAtoms<R, E>(
       tag: WS_METHODS.serverUpdateSettings,
       scheduler: configScheduler,
       concurrency: configConcurrency,
+    }),
+    testExternalNotification: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:server:test-external-notification",
+      tag: WS_METHODS.serverTestExternalNotification,
+      concurrency: {
+        mode: "singleFlight",
+        key: ({ environmentId }) => environmentId,
+      },
     }),
     signalProcess: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:server:signal-process",

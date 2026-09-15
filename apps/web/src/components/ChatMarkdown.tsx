@@ -159,7 +159,7 @@ import { readLocalApi } from "../localApi";
 import { useAssetUrlRefresh, useAssetUrlState } from "../assets/assetUrls";
 import { cn } from "../lib/utils";
 import { useRemoteOpenResolution, type RemoteOpenMode } from "../remoteOpen";
-import { useRightPanelStore } from "../rightPanelStore";
+import { useSecondaryPaneStore } from "../secondaryPaneStore";
 import { readThreadShell, useProjects } from "../state/entities";
 import { serverEnvironment } from "../state/server";
 import { shellEnvironment } from "../state/shell";
@@ -1620,7 +1620,7 @@ export const ChatMarkdownAssetImage = memo(function ChatMarkdownAssetImage(props
     ...(relativePath && resource._tag !== "attachment"
       ? {
           onOpenFile: () =>
-            useRightPanelStore
+            useSecondaryPaneStore
               .getState()
               .openFile(
                 { environmentId: props.environmentId, threadId: resource.threadId },
@@ -2269,7 +2269,7 @@ function useChatMarkdownState({
           preparedConnection._tag === "Some" ? preparedConnection.value.httpBaseUrl : undefined,
         createAssetUrl,
         onOpenFile: threadRef
-          ? (path) => useRightPanelStore.getState().openFile(threadRef, path)
+          ? (path) => useSecondaryPaneStore.getState().openFile(threadRef, path)
           : undefined,
       }).then(
         (preview) => {
@@ -2510,7 +2510,7 @@ function useChatMarkdownState({
       // in flight.
       const isLatestLookup = claimWorkspaceBasenameLookup();
       const openAt = (path: string) =>
-        useRightPanelStore.getState().openFile(threadRef, path, line);
+        useSecondaryPaneStore.getState().openFile(threadRef, path, line);
       if (!cwd || !needsWorkspaceBasenameLookup(panelPath)) {
         openAt(panelPath);
         return;

@@ -89,7 +89,15 @@ function compile(bindings: TestBinding[]): ResolvedKeybindingsConfig {
 const DEFAULT_BINDINGS = compile([
   { shortcut: modShortcut("b"), command: "sidebar.toggle" },
   { shortcut: modShortcut("j"), command: "terminal.toggle" },
-  { shortcut: modShortcut("b", { altKey: true }), command: "rightPanel.toggle" },
+  {
+    shortcut: modShortcut("b", { altKey: true }),
+    command: "rightPanel.toggle",
+  },
+  {
+    shortcut: modShortcut("g", { altKey: true }),
+    command: "sourceControl.open",
+    whenAst: whenNot(whenIdentifier("terminalFocus")),
+  },
   {
     shortcut: modShortcut("d"),
     command: "terminal.split",
@@ -147,7 +155,10 @@ const DEFAULT_BINDINGS = compile([
   { shortcut: modShortcut("o", { shiftKey: true }), command: "chat.new" },
   { shortcut: modShortcut("n", { shiftKey: true }), command: "chat.newLocal" },
   { shortcut: modShortcut("o"), command: "editor.openFavorite" },
-  { shortcut: modShortcut("[", { shiftKey: true }), command: "thread.previous" },
+  {
+    shortcut: modShortcut("[", { shiftKey: true }),
+    command: "thread.previous",
+  },
   { shortcut: modShortcut("]", { shiftKey: true }), command: "thread.next" },
   {
     shortcut: modShortcut("c", { shiftKey: true }),
@@ -190,7 +201,9 @@ describe("isTerminalToggleShortcut", () => {
 
   it("matches Ctrl+J on non-macOS", () => {
     assert.isTrue(
-      isTerminalToggleShortcut(event({ ctrlKey: true }), DEFAULT_BINDINGS, { platform: "Win32" }),
+      isTerminalToggleShortcut(event({ ctrlKey: true }), DEFAULT_BINDINGS, {
+        platform: "Win32",
+      }),
     );
   });
 
@@ -350,8 +363,16 @@ describe("split/new/close terminal shortcuts", () => {
 
   it("supports when boolean literals", () => {
     const keybindings = compile([
-      { shortcut: modShortcut("n"), command: "terminal.new", whenAst: whenIdentifier("true") },
-      { shortcut: modShortcut("m"), command: "terminal.new", whenAst: whenIdentifier("false") },
+      {
+        shortcut: modShortcut("n"),
+        command: "terminal.new",
+        whenAst: whenIdentifier("true"),
+      },
+      {
+        shortcut: modShortcut("m"),
+        command: "terminal.new",
+        whenAst: whenIdentifier("false"),
+      },
     ]);
 
     assert.isTrue(
@@ -440,8 +461,14 @@ describe("shortcutLabelForCommand", () => {
 
   it("returns null for commands shadowed by a later conflicting shortcut", () => {
     const bindings = compile([
-      { shortcut: modShortcut("1", { shiftKey: true }), command: "thread.jump.1" },
-      { shortcut: modShortcut("1", { shiftKey: true }), command: "thread.jump.7" },
+      {
+        shortcut: modShortcut("1", { shiftKey: true }),
+        command: "thread.jump.1",
+      },
+      {
+        shortcut: modShortcut("1", { shiftKey: true }),
+        command: "thread.jump.7",
+      },
     ]);
 
     assert.isNull(shortcutLabelForCommand(bindings, "thread.jump.1", "MacIntel"));
@@ -675,6 +702,22 @@ describe("chat/editor shortcuts", () => {
       }),
     );
   });
+
+  it("matches sourceControl.open outside terminal focus", () => {
+    assert.strictEqual(
+      resolveShortcutCommand(event({ key: "g", metaKey: true, altKey: true }), DEFAULT_BINDINGS, {
+        platform: "MacIntel",
+        context: { terminalFocus: false },
+      }),
+      "sourceControl.open",
+    );
+    assert.isNull(
+      resolveShortcutCommand(event({ key: "g", metaKey: true, altKey: true }), DEFAULT_BINDINGS, {
+        platform: "MacIntel",
+        context: { terminalFocus: true },
+      }),
+    );
+  });
 });
 
 describe("cross-command precedence", () => {
@@ -837,7 +880,12 @@ describe("resolveShortcutCommand", () => {
     );
     assert.strictEqual(
       resolveShortcutCommand(
-        event({ key: "}", code: "BracketRight", ctrlKey: true, shiftKey: true }),
+        event({
+          key: "}",
+          code: "BracketRight",
+          ctrlKey: true,
+          shiftKey: true,
+        }),
         DEFAULT_BINDINGS,
         {
           platform: "Linux",
@@ -849,7 +897,10 @@ describe("resolveShortcutCommand", () => {
 
   it("matches punctuation shortcuts by physical key across keyboard layouts", () => {
     const keybindings = compile([
-      { shortcut: modShortcut("'", { shiftKey: true }), command: "diff.toggle" },
+      {
+        shortcut: modShortcut("'", { shiftKey: true }),
+        command: "diff.toggle",
+      },
     ]);
 
     assert.strictEqual(
@@ -1072,7 +1123,11 @@ describe("composer and pull request shortcuts", () => {
     const bindings = mergeWithDefaultKeybindings([
       ...olderServerBindings,
       ...compileResolvedKeybindingsConfig([
-        { key: "mod+shift+8", command: "thread.copyReference", when: "!terminalFocus" },
+        {
+          key: "mod+shift+8",
+          command: "thread.copyReference",
+          when: "!terminalFocus",
+        },
       ]),
     ]);
     for (const [key, command] of [
@@ -1094,8 +1149,16 @@ describe("composer and pull request shortcuts", () => {
     "honors custom PR shortcut conditions for %s",
     (condition) => {
       const bindings = compileResolvedKeybindingsConfig([
-        { key: "mod+shift+k", command: "thread.copyReference", when: condition },
-        { key: "mod+shift+k", command: "pullRequest.copyNumber", when: `!${condition}` },
+        {
+          key: "mod+shift+k",
+          command: "thread.copyReference",
+          when: condition,
+        },
+        {
+          key: "mod+shift+k",
+          command: "pullRequest.copyNumber",
+          when: `!${condition}`,
+        },
       ]);
       const input = event({ key: "k", ctrlKey: true, shiftKey: true });
       for (const enabled of [false, true]) {
@@ -1204,7 +1267,13 @@ describe("composer and pull request shortcuts", () => {
     );
     assert.strictEqual(
       resolveShortcutCommand(
-        event({ key: "´", code: "KeyE", metaKey: true, altKey: true, getModifierState }),
+        event({
+          key: "´",
+          code: "KeyE",
+          metaKey: true,
+          altKey: true,
+          getModifierState,
+        }),
         altEffortBindings,
         { platform: "MacIntel" },
       ),

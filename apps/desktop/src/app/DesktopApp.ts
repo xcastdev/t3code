@@ -1,7 +1,9 @@
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
 
@@ -32,6 +34,8 @@ import * as DesktopRemoteUpdates from "../updates/DesktopRemoteUpdates.ts";
 import * as DesktopUpdates from "../updates/DesktopUpdates.ts";
 import * as DesktopSnapShot from "../snapShot/DesktopSnapShot.ts";
 import * as DesktopWslBackend from "../wsl/DesktopWslBackend.ts";
+import * as DesktopAttachedBackend from "../backend/DesktopAttachedBackend.ts";
+import { consumeDesktopLaunchIntent, subscribeDesktopLaunchIntent } from "./DesktopLaunchIntent.ts";
 
 const DEFAULT_DESKTOP_BACKEND_PORT = 3773;
 const MAX_TCP_PORT = 65_535;
@@ -157,11 +161,121 @@ export const stopAllPoolInstances = Effect.fn("desktop.app.stopAllPoolInstances"
   },
 );
 
+const ATTACHED_BACKEND_RECOVERY_DIALOG = {
+  type: "warning" as const,
+  title: "Attached backend unavailable",
+  message: "T3 Code could not connect to the attached primary backend.",
+  detail: "Check that the T3 server is running, then choose Retry, Use desktop backend, or Quit.",
+  buttons: ["Retry", "Use desktop backend", "Quit"],
+  defaultId: 0,
+  cancelId: 2,
+};
+
+/**
+ * An attached server stays independently owned. Recovery can only retry its
+ * credential/probe, switch the selection back to managed, or quit; it never
+ * starts, stops, or otherwise supervises the attached server process.
+ */
+export const awaitAttachedBackend = Effect.fn("desktop.startup.awaitAttachedBackend")(
+  function* (input: {
+    readonly attachedBackend: DesktopAttachedBackend.DesktopAttachedBackend["Service"];
+    readonly dialog: ElectronDialog.ElectronDialog["Service"];
+    readonly lifecycle: DesktopLifecycle.DesktopLifecycle["Service"];
+    readonly shutdown: DesktopShutdown.DesktopShutdown["Service"];
+    readonly electronApp: ElectronApp.ElectronApp["Service"];
+    readonly state: DesktopState.DesktopState["Service"];
+    readonly pairingUrl?: string;
+  }) {
+    let pendingPairingUrl = input.pairingUrl;
+    while (true) {
+      const result = yield* Effect.exit(
+        pendingPairingUrl === undefined
+          ? input.attachedBackend.probe
+          : input.attachedBackend
+              .attach(pendingPairingUrl)
+              .pipe(Effect.andThen(input.attachedBackend.probe)),
+      );
+      pendingPairingUrl = undefined;
+      if (result._tag === "Success") return true;
+
+      const response = yield* input.dialog.showMessageBox(ATTACHED_BACKEND_RECOVERY_DIALOG);
+      if (response.response === 0) continue;
+      if (response.response === 1) {
+        yield* input.attachedBackend.useManagedBackend;
+        yield* input.lifecycle.relaunch("attached-backend-recovery");
+        return false;
+      }
+      yield* Ref.set(input.state.quitting, true);
+      yield* input.shutdown.request;
+      yield* input.electronApp.quit;
+      return false;
+    }
+  },
+);
+
+type AttachedPrimaryRuntime = {
+  readonly attachedBackend: DesktopAttachedBackend.DesktopAttachedBackend["Service"];
+  readonly dialog: ElectronDialog.ElectronDialog["Service"];
+  readonly lifecycle: DesktopLifecycle.DesktopLifecycle["Service"];
+  readonly shutdown: DesktopShutdown.DesktopShutdown["Service"];
+  readonly electronApp: ElectronApp.ElectronApp["Service"];
+  readonly state: DesktopState.DesktopState["Service"];
+  readonly desktopWindow: DesktopWindow.DesktopWindow["Service"];
+};
+
+const activateAttachedPrimary = Effect.fn("desktop.attachedPrimary.activate")(function* (
+  input: AttachedPrimaryRuntime & {
+    readonly pairingUrl?: string;
+    readonly relaunchOnSuccess?: boolean;
+  },
+) {
+  const attachedReady = yield* awaitAttachedBackend(input);
+  if (!attachedReady) return;
+  const attachedState = yield* input.attachedBackend.getState;
+  if (attachedState.mode !== "attached") {
+    return yield* new DesktopAttachedBackend.DesktopAttachedCredentialUnavailableError();
+  }
+  if (yield* Ref.get(input.state.quitting)) return;
+  if (input.relaunchOnSuccess) {
+    yield* input.lifecycle.relaunch("primary-backend-attached");
+    return;
+  }
+  yield* input.desktopWindow.handleBackendReady(new URL(attachedState.httpBaseUrl));
+});
+
+/**
+ * Processes post-start attach-primary URLs through the same serialized
+ * attach/probe/recovery path as bootstrap. The subscription and worker are
+ * scoped to the application lifetime, so neither survives shutdown.
+ */
+export const listenForAttachedPrimaryLaunchIntents = Effect.fn(
+  "desktop.attachedPrimary.listenForLaunchIntents",
+)(function* (input: AttachedPrimaryRuntime) {
+  const intents = yield* Queue.unbounded<string>();
+  const unsubscribe = subscribeDesktopLaunchIntent((pairingUrl) => {
+    Effect.runSyncWith(Context.empty())(Queue.offer(intents, pairingUrl));
+  });
+  yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+  yield* Effect.forkScoped(
+    Queue.take(intents).pipe(
+      Effect.flatMap((pairingUrl) =>
+        activateAttachedPrimary({ ...input, pairingUrl, relaunchOnSuccess: true }),
+      ),
+      Effect.forever,
+    ),
+  );
+});
+
 const bootstrap = Effect.gen(function* () {
   const state = yield* DesktopState.DesktopState;
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
   const desktopSettings = yield* DesktopAppSettings.DesktopAppSettings;
   const desktopWindow = yield* DesktopWindow.DesktopWindow;
+  const attachedBackend = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+  const electronDialog = yield* ElectronDialog.ElectronDialog;
+  const lifecycle = yield* DesktopLifecycle.DesktopLifecycle;
+  const shutdown = yield* DesktopShutdown.DesktopShutdown;
+  const electronApp = yield* ElectronApp.ElectronApp;
   const snapShot = yield* DesktopSnapShot.DesktopSnapShot;
   const appActivation = yield* DesktopAppActivation.DesktopAppActivation;
   yield* logBootstrapInfo("bootstrap start");
@@ -181,6 +295,25 @@ const bootstrap = Effect.gen(function* () {
   yield* logBootstrapInfo("bootstrap ipc handlers registered");
 
   yield* snapShot.initialize;
+
+  // Attached backends are reached through the desktop's sole primary slot.
+  // Do not start or stop a child process in this mode; the CLI server remains
+  // independently owned when Electron exits.
+  const launchPairingUrl = consumeDesktopLaunchIntent();
+  const attachedPrimaryBackend = yield* attachedBackend.getState;
+  if (launchPairingUrl !== null || attachedPrimaryBackend.mode !== "managed") {
+    yield* activateAttachedPrimary({
+      attachedBackend,
+      dialog: electronDialog,
+      lifecycle,
+      shutdown,
+      electronApp,
+      state,
+      desktopWindow,
+      ...(launchPairingUrl === null ? {} : { pairingUrl: launchPairingUrl }),
+    });
+    return;
+  }
 
   if (!settings.localEnvironmentEnabled) {
     yield* logBootstrapInfo("bootstrap skipping local environment (disabled in settings)");
@@ -216,7 +349,9 @@ const bootstrap = Effect.gen(function* () {
       mode: settings.serverExposureMode,
     });
   }
-  const serverExposureState = yield* serverExposure.configureFromSettings({ port: backendPort });
+  const serverExposureState = yield* serverExposure.configureFromSettings({
+    port: backendPort,
+  });
   const backendConfig = yield* serverExposure.backendConfig;
   yield* logBootstrapInfo("bootstrap resolved backend endpoint", {
     baseUrl: backendConfig.httpBaseUrl.href,
@@ -270,6 +405,11 @@ const startup = Effect.gen(function* () {
   const safeStorage = yield* ElectronSafeStorage.ElectronSafeStorage;
   const updates = yield* DesktopUpdates.DesktopUpdates;
   const environment = yield* DesktopEnvironment.DesktopEnvironment;
+  const state = yield* DesktopState.DesktopState;
+  const desktopWindow = yield* DesktopWindow.DesktopWindow;
+  const attachedBackend = yield* DesktopAttachedBackend.DesktopAttachedBackend;
+  const electronDialog = yield* ElectronDialog.ElectronDialog;
+  const shutdown = yield* DesktopShutdown.DesktopShutdown;
 
   yield* shellEnvironment.installIntoProcess;
   const hasCommandLinePasswordStore =
@@ -294,7 +434,9 @@ const startup = Effect.gen(function* () {
   }
   const userDataPath = yield* appIdentity.resolveUserDataPath;
   yield* electronApp.setPath("userData", userDataPath);
-  yield* logStartupInfo("runtime logging configured", { logDir: environment.logDir });
+  yield* logStartupInfo("runtime logging configured", {
+    logDir: environment.logDir,
+  });
   yield* desktopSettings.load;
 
   if (linuxElectronOptions !== null) {
@@ -328,6 +470,17 @@ const startup = Effect.gen(function* () {
   yield* DesktopRemoteUpdates.listen;
   yield* linuxUrlHandler.register;
   yield* bootstrap.pipe(Effect.catchCause((cause) => fatalStartupCause("bootstrap", cause)));
+  if (!(yield* Ref.get(state.quitting))) {
+    yield* listenForAttachedPrimaryLaunchIntents({
+      attachedBackend,
+      dialog: electronDialog,
+      lifecycle,
+      shutdown,
+      electronApp,
+      state,
+      desktopWindow,
+    });
+  }
 }).pipe(Effect.withSpan("desktop.startup"));
 
 const scopedProgram = Effect.scoped(

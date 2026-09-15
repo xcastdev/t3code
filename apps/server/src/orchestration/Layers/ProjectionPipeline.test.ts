@@ -5,6 +5,10 @@ import {
   CorrelationId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
   EventId,
+  McpCatalogSessionId,
+  McpCatalogDefinition,
+  McpDefinitionId,
+  McpServerId,
   MessageId,
   ProjectId,
   ThreadId,
@@ -64,6 +68,9 @@ const exists = (filePath: string) =>
 const BaseTestLayer = makeProjectionPipelinePrefixedTestLayer("t3-projection-pipeline-test-");
 const encodeThreadLinkedPullRequest = Schema.encodeSync(
   Schema.fromJsonString(ThreadLinkedPullRequest),
+);
+const encodeMcpCatalogDefinitions = Schema.encodeSync(
+  Schema.fromJsonString(Schema.Array(McpCatalogDefinition)),
 );
 
 it.layer(Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-cursor-batch-")))(
@@ -614,6 +621,94 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
           settledAt: null,
           unsettledAt: "2026-01-01T00:00:02.000Z",
           activeOrderKey: null,
+        },
+      ]);
+    }),
+  );
+});
+
+it.layer(
+  Layer.fresh(makeProjectionPipelinePrefixedTestLayer("t3-projection-mcp-catalog-initialization-")),
+)("OrchestrationProjectionPipeline MCP catalog", (it) => {
+  it.effect("writes every initial catalog snapshot field to its matching column", () =>
+    Effect.gen(function* () {
+      const projectionPipeline = yield* OrchestrationProjectionPipeline;
+      const eventStore = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("thread-mcp-catalog-initialization");
+      const catalogSessionId = McpCatalogSessionId.make("catalog-session-initialization");
+      const now = "2026-01-01T00:00:00.000Z";
+      const catalog = (suffix: string) => [
+        {
+          definitionId: McpDefinitionId.make(`definition-${suffix}`),
+          logicalServerId: McpServerId.make(`server-${suffix}`),
+          scope: "global" as const,
+          scopeId: "environment-initialization",
+          name: `Server ${suffix}`,
+          transport: {
+            type: "streamable-http" as const,
+            url: `https://${suffix}.example.test/mcp`,
+            headers: [],
+            authorization: { type: "none" as const },
+          },
+          enabled: true,
+          providerInstanceIds: [ProviderInstanceId.make("codex")],
+          revision: 1,
+        },
+      ];
+      const baseline = catalog("baseline");
+      const desired = catalog("desired");
+      const applied = catalog("applied");
+
+      const event = yield* eventStore.append({
+        type: "thread.mcp-catalog.initialized",
+        eventId: EventId.make("event-mcp-catalog-initialization"),
+        aggregateKind: "thread",
+        aggregateId: threadId,
+        occurredAt: now,
+        commandId: CommandId.make("command-mcp-catalog-initialization"),
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        payload: {
+          threadId,
+          snapshot: {
+            catalogSessionId,
+            threadId,
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            baseline,
+            desired,
+            applied,
+            desiredRevision: 3,
+            appliedRevision: 2,
+          },
+        },
+      });
+      yield* projectionPipeline.projectEvent(event);
+
+      const rows = yield* sql<{
+        readonly baseline: string;
+        readonly desired: string;
+        readonly desiredRevision: number;
+        readonly applied: string | null;
+        readonly appliedRevision: number;
+      }>`
+        SELECT
+          baseline_json AS "baseline",
+          desired_catalog_json AS "desired",
+          desired_revision AS "desiredRevision",
+          applied_catalog_json AS "applied",
+          applied_revision AS "appliedRevision"
+        FROM projection_mcp_catalog_sessions
+        WHERE catalog_session_id = ${catalogSessionId}
+      `;
+      assert.deepEqual(rows, [
+        {
+          baseline: encodeMcpCatalogDefinitions(baseline),
+          desired: encodeMcpCatalogDefinitions(desired),
+          desiredRevision: 3,
+          applied: encodeMcpCatalogDefinitions(applied),
+          appliedRevision: 2,
         },
       ]);
     }),

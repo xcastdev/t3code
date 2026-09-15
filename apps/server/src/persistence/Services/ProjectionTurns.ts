@@ -15,6 +15,7 @@ import {
   OrchestrationCheckpointFile,
   OrchestrationCheckpointStatus,
   ThreadId,
+  TrimmedNonEmptyString,
   TurnId,
 } from "@t3tools/contracts";
 import * as Option from "effect/Option";
@@ -48,6 +49,12 @@ export const ProjectionTurn = Schema.Struct({
   checkpointRef: Schema.NullOr(CheckpointRef),
   checkpointStatus: Schema.NullOr(OrchestrationCheckpointStatus),
   checkpointFiles: Schema.Array(OrchestrationCheckpointFile),
+  model: Schema.NullOr(TrimmedNonEmptyString),
+  effort: Schema.NullOr(TrimmedNonEmptyString),
+  commandCount: Schema.NullOr(NonNegativeInt),
+  toolCallCount: Schema.NullOr(NonNegativeInt),
+  subagentCount: Schema.NullOr(NonNegativeInt),
+  changedFileCount: Schema.NullOr(NonNegativeInt),
 });
 export type ProjectionTurn = typeof ProjectionTurn.Type;
 
@@ -66,6 +73,12 @@ export const ProjectionTurnById = Schema.Struct({
   checkpointRef: Schema.NullOr(CheckpointRef),
   checkpointStatus: Schema.NullOr(OrchestrationCheckpointStatus),
   checkpointFiles: Schema.Array(OrchestrationCheckpointFile),
+  model: Schema.NullOr(TrimmedNonEmptyString),
+  effort: Schema.NullOr(TrimmedNonEmptyString),
+  commandCount: Schema.NullOr(NonNegativeInt),
+  toolCallCount: Schema.NullOr(NonNegativeInt),
+  subagentCount: Schema.NullOr(NonNegativeInt),
+  changedFileCount: Schema.NullOr(NonNegativeInt),
 });
 export type ProjectionTurnById = typeof ProjectionTurnById.Type;
 
