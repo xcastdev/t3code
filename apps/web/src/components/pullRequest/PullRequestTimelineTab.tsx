@@ -273,6 +273,10 @@ function ConversationCard({
             threadRef={reactions.threadRef}
             label="Edit comment"
             saving={saving}
+            unavailableReason={
+              approval?.unavailableReason ??
+              "Pull request changes are unavailable. Refresh and try again."
+            }
             onSave={(body) => void save(body)}
             onCancel={() => setEditing(false)}
           />

@@ -11,6 +11,7 @@ vi.mock("./PullRequestMarkdown", () => ({
 }));
 
 import { PullRequestSummaryTab } from "./PullRequestSummaryTab";
+import { PullRequestMutationApprovalContext } from "./pullRequestMutationApproval";
 
 const detail: PullRequestDetailView = {
   provider: "github",
@@ -65,6 +66,16 @@ const detail: PullRequestDetailView = {
 };
 
 let renderer: ReactTestRenderer;
+const testApproval = {
+  available: true,
+  unavailableReason: null,
+  request: async (mutation: {
+    execute: (scope: {
+      environmentId: EnvironmentId;
+      reference: typeof detail;
+    }) => Promise<boolean>;
+  }) => mutation.execute({ environmentId: EnvironmentId.make("environment"), reference: detail }),
+};
 beforeEach(() => vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true));
 afterEach(() => {
   act(() => renderer?.unmount());
@@ -73,15 +84,17 @@ afterEach(() => {
 
 function render(value = detail) {
   return (
-    <PullRequestSummaryTab
-      environmentId={EnvironmentId.make("environment")}
-      threadRef={null}
-      reference={value}
-      detail={value}
-      activityPending={false}
-      activityError={null}
-      onRefresh={() => {}}
-    />
+    <PullRequestMutationApprovalContext.Provider value={testApproval}>
+      <PullRequestSummaryTab
+        environmentId={EnvironmentId.make("environment")}
+        threadRef={null}
+        reference={value}
+        detail={value}
+        activityPending={false}
+        activityError={null}
+        onRefresh={() => {}}
+      />
+    </PullRequestMutationApprovalContext.Provider>
   );
 }
 

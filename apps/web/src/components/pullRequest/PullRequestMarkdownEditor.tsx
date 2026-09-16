@@ -24,6 +24,7 @@ export function PullRequestMarkdownEditor({
   placeholder,
   label,
   saving,
+  unavailableReason = null,
   allowEmpty = false,
   className,
   onSave,
@@ -37,6 +38,8 @@ export function PullRequestMarkdownEditor({
   readonly placeholder?: string | undefined;
   readonly label: string;
   readonly saving: boolean;
+  /** The draft remains editable, while Save explains why the provider write is unavailable. */
+  readonly unavailableReason?: string | null;
   /** A description may be cleared, which is how one is removed; a remark may not be emptied. */
   readonly allowEmpty?: boolean;
   readonly className?: string | undefined;
@@ -55,7 +58,7 @@ export function PullRequestMarkdownEditor({
     setDraft(value);
   }
   const empty = draft.trim().length === 0;
-  const saveDisabled = saving || (empty && !allowEmpty);
+  const saveDisabled = saving || unavailableReason !== null || (empty && !allowEmpty);
 
   return (
     <div
@@ -123,6 +126,11 @@ export function PullRequestMarkdownEditor({
           {saving ? "Saving..." : "Save"}
         </Button>
       </div>
+      {unavailableReason !== null ? (
+        <p className="text-xs text-muted-foreground" role="status" aria-live="polite">
+          {unavailableReason}
+        </p>
+      ) : null}
     </div>
   );
 }

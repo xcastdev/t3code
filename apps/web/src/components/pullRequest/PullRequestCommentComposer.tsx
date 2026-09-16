@@ -15,12 +15,17 @@ import { Textarea } from "../ui/textarea";
 export function PullRequestCommentComposer({
   detail,
   actionPending,
+  mutationAvailable,
+  unavailableReason,
   onComment,
   onCommentAction,
   onCommented,
 }: {
   detail: PullRequestDetailView;
   actionPending: boolean;
+  /** Drafts stay editable while the reviewed provider-write scope is unavailable. */
+  mutationAvailable: boolean;
+  readonly unavailableReason: string | null;
   onComment: (body: string) => Promise<boolean>;
   onCommentAction: (
     body: string,
@@ -45,7 +50,7 @@ export function PullRequestCommentComposer({
 
   const submit = async (action: "comment" | "close" | "reopen") => {
     const trimmed = body.trim();
-    if (trimmed.length === 0 || submitting !== null || actionPending) return;
+    if (trimmed.length === 0 || submitting !== null || actionPending || !mutationAvailable) return;
     setSubmitting(action);
     if (action !== "comment") {
       const result = await onCommentAction(trimmed, action);
@@ -114,7 +119,12 @@ export function PullRequestCommentComposer({
               <Button
                 size="xs"
                 variant={followUpAction === "close" ? "destructive-outline" : "outline"}
-                disabled={body.trim().length === 0 || submitting !== null || actionPending}
+                disabled={
+                  body.trim().length === 0 ||
+                  submitting !== null ||
+                  actionPending ||
+                  !mutationAvailable
+                }
                 onClick={() => void submit(followUpAction)}
               >
                 {followUpAction === "close" ? (
@@ -134,13 +144,23 @@ export function PullRequestCommentComposer({
             <Button
               size="xs"
               variant="outline"
-              disabled={body.trim().length === 0 || submitting !== null || actionPending}
+              disabled={
+                body.trim().length === 0 ||
+                submitting !== null ||
+                actionPending ||
+                !mutationAvailable
+              }
               onClick={() => void submit("comment")}
             >
               <SendIcon className="size-3.5" />
               {submitting === "comment" ? "Posting..." : "Comment"}
             </Button>
           </div>
+          {unavailableReason !== null ? (
+            <p className="text-xs text-muted-foreground" role="status" aria-live="polite">
+              {unavailableReason}
+            </p>
+          ) : null}
         </div>
       </PopoverPopup>
     </Popover>

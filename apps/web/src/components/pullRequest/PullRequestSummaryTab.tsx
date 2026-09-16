@@ -94,6 +94,7 @@ interface CommentEditing {
   readonly canEdit: (comment: PullRequestComment) => boolean;
   readonly editingId: string | null;
   readonly saving: boolean;
+  readonly unavailableReason: string | null;
   readonly onEdit: (comment: PullRequestComment | null) => void;
   readonly onSave: (comment: PullRequestComment, body: string) => void;
 }
@@ -121,6 +122,7 @@ function CommentBody({
         threadRef={editing.threadRef}
         label="Edit comment"
         saving={editing.saving}
+        unavailableReason={editing.unavailableReason}
         onSave={(body) => editing.onSave(comment, body)}
         onCancel={() => editing.onEdit(null)}
       />
@@ -465,6 +467,8 @@ export function PullRequestSummaryTab({
       approval?.available === true && canEditPullRequestComment(detail, comment),
     editingId: editingCommentId,
     saving: commentSaving,
+    unavailableReason:
+      approval?.unavailableReason ?? "Pull request changes are unavailable. Refresh and try again.",
     onEdit: (comment) =>
       setCommentScope(comment === null ? null : { pullRequest: detail.url, commentId: comment.id }),
     onSave: async (comment, body) => {
@@ -641,6 +645,10 @@ export function PullRequestSummaryTab({
               label="Pull request description"
               placeholder="Describe this pull request"
               saving={bodySaving}
+              unavailableReason={
+                approval?.unavailableReason ??
+                "Pull request changes are unavailable. Refresh and try again."
+              }
               onSave={(body) => void saveBody(body)}
               onCancel={() => setBodyScope(null)}
             />

@@ -114,7 +114,12 @@ vi.mock("../ui/tooltip", () => ({
   TooltipProvider: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   TooltipTrigger: ({ render }: { render: React.ReactNode }) => <>{render}</>,
 }));
-vi.mock("./PullRequestSummaryTab", () => ({ PullRequestSummaryTab: () => <div /> }));
+vi.mock("./PullRequestSummaryTab", () => ({
+  PullRequestSummaryTab: () => {
+    capturedApproval = usePullRequestMutationApproval();
+    return <div />;
+  },
+}));
 vi.mock("./PullRequestTimelineTab", () => ({ PullRequestTimelineTab: () => <div /> }));
 vi.mock("./PullRequestCommentComposer", () => ({
   PullRequestCommentComposer: (props: {
@@ -159,6 +164,12 @@ vi.mock("../ui/alert-dialog", () => {
 });
 
 import { PullRequestDetailPanel } from "./PullRequestDetailPanel";
+import {
+  usePullRequestMutationApproval,
+  type PullRequestMutationApproval,
+} from "./pullRequestMutationApproval";
+
+let capturedApproval: PullRequestMutationApproval | null = null;
 
 const environmentId = EnvironmentId.make("environment");
 const projectId = ProjectId.make("project");
@@ -264,6 +275,7 @@ beforeEach(() => {
   projectState.environments = [];
   commentComposer.onComment = null;
   commentComposer.onCommentAction = null;
+  capturedApproval = null;
 });
 
 afterEach(() => {
@@ -610,5 +622,152 @@ describe("PullRequestDetailPanel mutation approval scope", () => {
     await act(async () => resolveComment?.({ _tag: "Success", value: {} }));
     await expect(result).resolves.toEqual({ commentPosted: true });
     expect(providerRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("authorizes a rootless hosted provider mutation without turning it into a local-root request", async () => {
+    detailForQuery = {
+      ...detail,
+      capabilities: { ...detail.capabilities, actions: ["close"] },
+      viewerPermissions: { ...detail.viewerPermissions, actions: ["close"] },
+    };
+    await act(async () => {
+      renderer = create(
+        <PullRequestDetailPanel
+          context="page"
+          environmentId={environmentId}
+          getShortcutContext={() => ({
+            terminalFocus: false,
+            terminalOpen: false,
+            previewFocus: false,
+            previewOpen: false,
+          })}
+          reference={{ projectId, host: "github.com", repository: "owner/repo", number: 7 }}
+          shortcutsEnabled={false}
+        />,
+      );
+    });
+    expect(buttonWithText("Close pull request")?.props.disabled).toBe(false);
+    await act(async () => buttonWithText("Close pull request")?.props.onClick());
+    expect(renderedText(renderer.root)).toContain("hosted repository github.com/owner/repo");
+    await act(async () => buttonWithText("Close")?.props.onClick());
+    expect(providerRun).toHaveBeenCalledWith({
+      environmentId,
+      input: {
+        projectId,
+        host: "github.com",
+        repository: "owner/repo",
+        number: 7,
+        action: "close",
+      },
+    });
+  });
+
+  it("explains unavailable parent and composer mutations while preserving the draft surface", async () => {
+    detailForQuery = {
+      ...detail,
+      capabilities: { ...detail.capabilities, comment: true, actions: ["close"] },
+      viewerPermissions: { ...detail.viewerPermissions, comment: true, actions: ["close"] },
+    };
+    detailQueryState = { isSuccess: false, isPending: true, error: null };
+    await act(async () => {
+      renderer = create(panel());
+    });
+    expect(buttonWithText("Close pull request")?.props.disabled).toBe(true);
+    expect(renderedText(renderer.root)).toContain(
+      "Pull request details are loading or unavailable",
+    );
+  });
+
+  it("settles the first comment after rejecting an overlapping comment request", async () => {
+    detailForQuery = {
+      ...detail,
+      capabilities: { ...detail.capabilities, comment: true },
+      viewerPermissions: { ...detail.viewerPermissions, comment: true },
+    };
+    await act(async () => {
+      renderer = create(panel());
+    });
+    let first: Promise<boolean> | undefined;
+    let second: Promise<boolean> | undefined;
+    await act(async () => {
+      first = commentComposer.onComment?.("first");
+      second = commentComposer.onComment?.("second");
+    });
+    await expect(second).resolves.toBe(false);
+    await act(async () => buttonWithText("Post comment")?.props.onClick());
+    await expect(first).resolves.toBe(true);
+    expect(providerRun).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an approved comment's result through a rejected descendant request and unmount", async () => {
+    detailForQuery = {
+      ...detail,
+      capabilities: { ...detail.capabilities, comment: true },
+      viewerPermissions: { ...detail.viewerPermissions, comment: true },
+    };
+    let release: ((value: { _tag: "Success"; value: object }) => void) | null = null;
+    providerRun.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+    );
+    await act(async () => {
+      renderer = create(panel());
+    });
+    let outcome: Promise<boolean> | undefined;
+    await act(async () => {
+      outcome = commentComposer.onComment?.("durable");
+    });
+    await act(async () => buttonWithText("Post comment")?.props.onClick());
+    let overlap: Promise<boolean> | undefined;
+    await act(async () => {
+      overlap = capturedApproval?.request({ description: "later", execute: async () => true });
+    });
+    await expect(overlap).resolves.toBe(false);
+    await act(async () => renderer.unmount());
+    await act(async () => release?.({ _tag: "Success", value: {} }));
+    await expect(outcome).resolves.toBe(true);
+  });
+
+  it("does not reopen the synchronous lane or let a cancelled retained confirmation approve later work", async () => {
+    await act(async () => {
+      renderer = create(panel());
+    });
+    const first = vi.fn(() => new Promise<boolean>(() => {}));
+    const second = vi.fn(async () => true);
+    const approval = capturedApproval!;
+    await act(async () => {
+      void approval.request({ description: "first", execute: first });
+    });
+    const retainedConfirm = buttonWithText("Apply change")?.props.onClick as
+      | (() => void)
+      | undefined;
+    await act(async () => retainedConfirm?.());
+    await expect(approval.request({ description: "second", execute: second })).resolves.toBe(false);
+    expect(second).not.toHaveBeenCalled();
+    // The first request is still executing, so this stale click cannot create or consume another.
+    await act(async () => retainedConfirm?.());
+    expect(second).not.toHaveBeenCalled();
+  });
+
+  it("makes a retained cancelled confirmation inert after a later request opens", async () => {
+    await act(async () => {
+      renderer = create(panel());
+    });
+    const first = vi.fn(async () => true);
+    const second = vi.fn(async () => true);
+    const approval = capturedApproval!;
+    await act(async () => {
+      void approval.request({ description: "first", execute: first });
+    });
+    const oldConfirm = buttonWithText("Apply change")?.props.onClick as (() => void) | undefined;
+    await act(async () => buttonWithText("Dismiss confirmation")?.props.onClick());
+    await act(async () => {
+      void approval.request({ description: "second", execute: second });
+    });
+    await act(async () => oldConfirm?.());
+    expect(first).not.toHaveBeenCalled();
+    expect(second).not.toHaveBeenCalled();
   });
 });

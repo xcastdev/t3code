@@ -196,12 +196,16 @@ type PullRequestMutationScope = {
   readonly environmentId: EnvironmentId;
   readonly reference: PullRequestRef;
   readonly detail: PullRequestDetailView;
-  /** The local checkout snapshot reviewed alongside the host detail. */
+  /**
+   * The local checkout snapshot reviewed alongside a local Git operation. A hosted reference
+   * may intentionally have no checkout in this environment: provider-only changes are still
+   * scoped by the authoritative host identity and detail revision.
+   */
   readonly source: {
     readonly refName: string | null;
     readonly headCommit: string | null;
     readonly indexTree: string;
-  };
+  } | null;
 };
 
 type PullRequestConfirmation = {
@@ -218,8 +222,8 @@ type PullRequestConfirmation = {
   readonly title: string | null;
   /** Detail descendants can only write through this captured approval. */
   readonly providerMutation: PullRequestProviderMutation | null;
-  /** This belongs to the specific descendant request, never to panel-global mutable state. */
-  readonly providerMutationResolver: ((succeeded: boolean) => void) | null;
+  /** Settles only the promise owned by this exact approval request. */
+  readonly settle: ((succeeded: boolean) => void) | null;
 };
 
 function clonePullRequestReference(reference: PullRequestRef): PullRequestRef {
@@ -233,10 +237,16 @@ function pullRequestMutationScopeKey(scope: PullRequestMutationScope): string {
 }
 
 function pullRequestMutationTargetDescription(scope: PullRequestMutationScope): string {
+  const hostedRepository = scope.reference.host
+    ? `${scope.reference.host}/${scope.reference.repository}`
+    : scope.reference.repository;
+  if (scope.source === null) {
+    return `Environment ${scope.environmentId}; hosted repository ${hostedRepository}; pull request #${scope.reference.number}.`;
+  }
   const source = `${scope.source.refName ?? "detached HEAD"} at ${
     scope.source.headCommit ?? "no commit"
   }, index ${scope.source.indexTree}`;
-  return `Environment ${scope.environmentId}; repository ${scope.reference.repository} (${scope.reference.repositoryRoot}); source ${source}.`;
+  return `Environment ${scope.environmentId}; repository ${hostedRepository} (${scope.reference.repositoryRoot}); source ${source}.`;
 }
 
 function pullRequestConfirmationTitle(action: ConfirmationAction): string {
@@ -756,6 +766,9 @@ export function PullRequestDetailPanel({
   };
   const [confirmation, setConfirmation] = useState<PullRequestConfirmation | null>(null);
   const confirmationRef = useRef<PullRequestConfirmation | null>(null);
+  // This is the synchronous source of truth for the one approval lane. React state paints it,
+  // but cannot protect a re-entrant callback between an event handler and the next render.
+  const executingConfirmationRef = useRef<PullRequestConfirmation | null>(null);
   // Provider writes do not use `actionPending`, but they still share this one approval lane.
   // Keeping its state visible prevents a second descendant from looking enabled while the first
   // approved request is executing.
@@ -766,10 +779,13 @@ export function PullRequestDetailPanel({
   const [handoff, setHandoff] = useState<string | null>(null);
   // Cached host detail remains useful to read while recovering a connection, but never grants a
   // provider write. The PR and its checkout must both have a complete, current reviewed value.
+  const localStatusCwd =
+    reference.repositoryRoot ??
+    (reference.host === undefined ? undefined : detailQuery.data?.workspaceRoot);
   const localStatusQuery = useEnvironmentQuery(
-    reference.repositoryRoot === undefined
+    localStatusCwd === undefined
       ? null
-      : vcsEnvironment.status({ environmentId, input: { cwd: reference.repositoryRoot } }),
+      : vcsEnvironment.status({ environmentId, input: { cwd: localStatusCwd } }),
   );
   const reviewedLocalSnapshot = useMemo(
     () =>
@@ -874,20 +890,25 @@ export function PullRequestDetailPanel({
   const currentMutationScope = useMemo<PullRequestMutationScope | null>(
     () =>
       detail === null ||
-      reference.repositoryRoot === undefined ||
-      localStatusQuery.data === null ||
       !detailApprovalAvailable ||
-      !reviewedLocalSnapshot.available
+      // A rootless hosted reference is a provider-routed identity. Its mutations must retain
+      // that identity rather than manufacture a strict local-root request from a credential
+      // checkout. Hostless and explicitly rooted references retain the local Git guard.
+      (!(reference.host !== undefined && reference.repositoryRoot === undefined) &&
+        !reviewedLocalSnapshot.available)
         ? null
         : {
             environmentId,
             reference: clonePullRequestReference(reference),
             detail,
-            source: {
-              refName: localStatusQuery.data.refName ?? null,
-              headCommit: localStatusQuery.data.headCommit ?? null,
-              indexTree: localStatusQuery.data.indexTree ?? "",
-            },
+            source:
+              reference.host !== undefined && reference.repositoryRoot === undefined
+                ? null
+                : {
+                    refName: localStatusQuery.data?.refName ?? null,
+                    headCommit: localStatusQuery.data?.headCommit ?? null,
+                    indexTree: localStatusQuery.data?.indexTree ?? "",
+                  },
           },
     [
       detail,
@@ -911,9 +932,6 @@ export function PullRequestDetailPanel({
     confirmation !== null &&
     currentMutationScopeKey !== null &&
     confirmation.scopeKey === currentMutationScopeKey;
-  useLayoutEffect(() => {
-    confirmationRef.current = confirmation;
-  }, [confirmation]);
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const { copyToClipboard: copyReference } = useCopyToClipboard<string>({
     target: "pull request reference",
@@ -1156,20 +1174,12 @@ export function PullRequestDetailPanel({
     cwd: acting?.workspaceRoot ?? detail?.workspaceRoot ?? null,
   });
 
-  const pendingCommentResolver = useRef<
-    ((result: { readonly commentPosted: boolean }) => void) | null
-  >(null);
-  const dismissConfirmation = useCallback(() => {
+  const dismissConfirmation = useCallback((expected?: PullRequestConfirmation | null) => {
     const pending = confirmationRef.current;
+    if (pending === null || (expected !== undefined && pending !== expected)) return;
     confirmationRef.current = null;
     setConfirmation(null);
-    if (pending?.commentBody !== null && pending !== null) {
-      pendingCommentResolver.current?.({ commentPosted: false });
-      pendingCommentResolver.current = null;
-    }
-    if (pending?.providerMutation !== null && pending !== null) {
-      pending.providerMutationResolver?.(false);
-    }
+    pending.settle?.(false);
   }, []);
 
   // A detached dialog callback can outlive this panel (and React's identity key deliberately
@@ -1185,9 +1195,7 @@ export function PullRequestDetailPanel({
       // provider request owns its result: reporting a successful durable comment as false just
       // because this view disappeared loses the caller's draft/transition contract.
       if (pending !== null) {
-        pendingCommentResolver.current?.({ commentPosted: false });
-        pendingCommentResolver.current = null;
-        pending.providerMutationResolver?.(false);
+        pending.settle?.(false);
       }
     };
   }, []);
@@ -1207,15 +1215,15 @@ export function PullRequestDetailPanel({
         readonly updateMethod?: PullRequestUpdateMethod;
         readonly title?: string;
         readonly providerMutation?: PullRequestProviderMutation;
-        readonly providerMutationResolver?: (succeeded: boolean) => void;
+        readonly settle?: (succeeded: boolean) => void;
       } = {},
     ) => {
       if (
-        actionPending ||
-        providerMutationPending ||
         confirmationRef.current !== null ||
+        executingConfirmationRef.current !== null ||
         currentMutationScope === null ||
-        currentMutationScopeKey === null
+        currentMutationScopeKey === null ||
+        currentMutationScopeKeyRef.current !== currentMutationScopeKey
       ) {
         return false;
       }
@@ -1228,13 +1236,13 @@ export function PullRequestDetailPanel({
         commentBody: options.commentBody ?? null,
         title: options.title ?? null,
         providerMutation: options.providerMutation ?? null,
-        providerMutationResolver: options.providerMutationResolver ?? null,
+        settle: options.settle ?? null,
       };
       confirmationRef.current = next;
       setConfirmation(next);
       return true;
     },
-    [actionPending, currentMutationScope, currentMutationScopeKey, providerMutationPending],
+    [currentMutationScope, currentMutationScopeKey],
   );
 
   const requestProviderMutation = useCallback(
@@ -1243,7 +1251,7 @@ export function PullRequestDetailPanel({
         if (
           !requestConfirmation("provider-mutation", {
             providerMutation: mutation,
-            providerMutationResolver: resolve,
+            settle: resolve,
           })
         ) {
           resolve(false);
@@ -1344,7 +1352,7 @@ export function PullRequestDetailPanel({
 
   const performConfirmedAction = async (pending: PullRequestConfirmation) => {
     if (
-      pendingAction !== null ||
+      executingConfirmationRef.current !== pending ||
       currentMutationScopeKeyRef.current === null ||
       pending.scopeKey !== currentMutationScopeKeyRef.current
     ) {
@@ -1388,7 +1396,7 @@ export function PullRequestDetailPanel({
     if (action === "comment" || action === "update-title" || action === "provider-mutation")
       return false;
     if (
-      pendingAction !== null ||
+      executingConfirmationRef.current !== pending ||
       currentMutationScopeKeyRef.current === null ||
       pending.scopeKey !== currentMutationScopeKeyRef.current
     ) {
@@ -1415,7 +1423,7 @@ export function PullRequestDetailPanel({
   const performConfirmedComment = async (pending: PullRequestConfirmation) => {
     if (
       pending.commentBody === null ||
-      pendingAction !== null ||
+      executingConfirmationRef.current !== pending ||
       !mountedRef.current ||
       pending.scopeKey !== currentMutationScopeKeyRef.current
     ) {
@@ -1427,7 +1435,7 @@ export function PullRequestDetailPanel({
   const performConfirmedTitleUpdate = async (pending: PullRequestConfirmation) => {
     if (
       pending.title === null ||
-      titleSaving ||
+      executingConfirmationRef.current !== pending ||
       !mountedRef.current ||
       pending.scopeKey !== currentMutationScopeKeyRef.current
     ) {
@@ -1457,24 +1465,22 @@ export function PullRequestDetailPanel({
   };
 
   const performCommentAction = (body: string, action: "close" | "reopen") => {
-    if (pendingAction !== null) return Promise.resolve({ commentPosted: false });
     return new Promise<{ readonly commentPosted: boolean }>((resolve) => {
-      pendingCommentResolver.current = resolve;
-      if (!requestConfirmation(action, { commentBody: body })) {
-        pendingCommentResolver.current = null;
+      if (
+        !requestConfirmation(action, {
+          commentBody: body,
+          // This result describes durable work, so a completed post stays true even if the
+          // follow-up state action is refused after the async boundary.
+          settle: (commentPosted) => resolve({ commentPosted }),
+        })
+      )
         resolve({ commentPosted: false });
-      }
     });
   };
 
   const performComment = (body: string) => {
-    if (pendingAction !== null) return Promise.resolve(false);
     return new Promise<boolean>((resolve) => {
-      pendingCommentResolver.current = ({ commentPosted }) => resolve(commentPosted);
-      if (!requestConfirmation("comment", { commentBody: body })) {
-        pendingCommentResolver.current = null;
-        resolve(false);
-      }
+      if (!requestConfirmation("comment", { commentBody: body, settle: resolve })) resolve(false);
     });
   };
 
@@ -2825,7 +2831,11 @@ export function PullRequestDetailPanel({
                         <Button
                           size="xs"
                           variant="outline"
-                          disabled={titleSaving || titleDraft.trim().length === 0}
+                          disabled={
+                            titleSaving ||
+                            !mutationApproval.available ||
+                            titleDraft.trim().length === 0
+                          }
                           onClick={() => void saveTitle(titleDraft)}
                         >
                           {titleSaving ? "Saving..." : "Save"}
@@ -2833,6 +2843,15 @@ export function PullRequestDetailPanel({
                       </div>
                     </div>
                   )}
+                  {mutationApproval.unavailableReason !== null ? (
+                    <p
+                      className="mt-2 text-xs text-muted-foreground"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      {mutationApproval.unavailableReason}
+                    </p>
+                  ) : null}
                   <div className="mt-2 flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
                     <PullRequestMetaLine className="min-w-0 whitespace-nowrap">
                       <PullRequestActorLabel
@@ -3194,6 +3213,8 @@ export function PullRequestDetailPanel({
               ])}
               detail={detail}
               actionPending={actionPending}
+              mutationAvailable={mutationApproval.available}
+              unavailableReason={mutationApproval.unavailableReason}
               onComment={(body) => {
                 return performComment(body);
               }}
@@ -3206,10 +3227,10 @@ export function PullRequestDetailPanel({
         <AlertDialog
           open={confirmationIsCurrent}
           onOpenChange={(open) => {
-            if (!open) dismissConfirmation();
+            if (!open) dismissConfirmation(confirmation);
           }}
           onOpenChangeComplete={(open) => {
-            if (!open) dismissConfirmation();
+            if (!open) dismissConfirmation(confirmation);
           }}
         >
           <AlertDialogPopup>
@@ -3263,42 +3284,47 @@ export function PullRequestDetailPanel({
                 variant={confirmAction === "close" ? "destructive" : "default"}
                 disabled={actionPending || !confirmationIsCurrent}
                 onClick={() => {
-                  const pending = confirmationRef.current;
-                  if (pending === null) return;
-                  confirmationRef.current = null;
-                  setConfirmation(null);
-                  if (pending.providerMutation !== null) {
-                    setProviderMutationPending(true);
-                    void pending.providerMutation
-                      .execute({
-                        environmentId: pending.scope.environmentId,
-                        reference: pending.scope.reference,
-                      })
-                      .then((succeeded) => {
-                        pending.providerMutationResolver?.(succeeded);
-                      })
-                      .catch(() => {
-                        pending.providerMutationResolver?.(false);
-                      })
-                      .finally(() => {
-                        if (mountedRef.current) setProviderMutationPending(false);
-                      });
+                  // `confirmation` is captured by this rendered button. A retained handler must
+                  // never consume whichever request happened to open later.
+                  const pending = confirmation;
+                  if (
+                    pending === null ||
+                    confirmationRef.current !== pending ||
+                    pending.scopeKey !== currentMutationScopeKeyRef.current
+                  )
                     return;
-                  }
-                  void (
-                    pending.action === "comment"
-                      ? performConfirmedComment(pending)
-                      : pending.action === "update-title"
-                        ? performConfirmedTitleUpdate(pending)
-                        : pending.commentBody === null
-                          ? performConfirmedAction(pending)
-                          : performConfirmedCommentAction(pending)
-                  ).then((commentPosted) => {
-                    if (pending.commentBody !== null) {
-                      pendingCommentResolver.current?.({ commentPosted });
-                      pendingCommentResolver.current = null;
-                    }
-                  });
+                  confirmationRef.current = null;
+                  executingConfirmationRef.current = pending;
+                  setConfirmation(null);
+                  setProviderMutationPending(true);
+                  void Promise.resolve()
+                    .then(() => {
+                      if (
+                        !mountedRef.current ||
+                        executingConfirmationRef.current !== pending ||
+                        currentMutationScopeKeyRef.current !== pending.scopeKey
+                      )
+                        return false;
+                      return pending.providerMutation !== null
+                        ? pending.providerMutation.execute({
+                            environmentId: pending.scope.environmentId,
+                            reference: pending.scope.reference,
+                          })
+                        : pending.action === "comment"
+                          ? performConfirmedComment(pending)
+                          : pending.action === "update-title"
+                            ? performConfirmedTitleUpdate(pending)
+                            : pending.commentBody === null
+                              ? performConfirmedAction(pending)
+                              : performConfirmedCommentAction(pending);
+                    })
+                    .then((succeeded) => pending.settle?.(succeeded))
+                    .catch(() => pending.settle?.(false))
+                    .finally(() => {
+                      if (executingConfirmationRef.current === pending)
+                        executingConfirmationRef.current = null;
+                      if (mountedRef.current) setProviderMutationPending(false);
+                    });
                 }}
               >
                 {confirmAction === "merge"
