@@ -56,6 +56,7 @@ export function PullRequestReviewerPicker({
     reportFailure: false,
   });
   const approval = usePullRequestMutationApproval();
+  const mutationAvailable = approval?.available === true;
 
   const candidates = useMemo(
     () => (candidatesQuery.data?.candidates ?? []).filter((entry) => matches(entry, query)),
@@ -107,8 +108,12 @@ export function PullRequestReviewerPicker({
     <PullRequestCandidatePicker
       icon={<UserPlusIcon className="size-3.5" />}
       label="Request a review"
-      allowed={allowed}
-      disabledReason="Asking someone to review needs write access on this repository"
+      allowed={allowed && mutationAvailable}
+      disabledReason={
+        !allowed
+          ? "Asking someone to review needs write access on this repository"
+          : (approval?.unavailableReason ?? "Pull request changes are unavailable.")
+      }
       open={open}
       onOpenChange={setOpen}
       query={query}
@@ -123,7 +128,7 @@ export function PullRequestReviewerPicker({
       truncated={candidatesQuery.data?.truncated === true}
       truncatedLabel="This repository has more people with access than are listed here. Ask for the rest on the host."
       candidateKey={(candidate) => `${candidate.kind}:${candidate.id}`}
-      disabled={pending !== null}
+      disabled={pending !== null || !mutationAvailable}
       onSelect={(candidate) => void toggle(candidate)}
     >
       {(candidate) => (

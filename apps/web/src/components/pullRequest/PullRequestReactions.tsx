@@ -69,6 +69,7 @@ export function PullRequestReactionBar({
   }>({ signature: "", values: EMPTY_PENDING });
   const setReaction = useAtomCommand(pullRequestEnvironment.setReaction, { reportFailure: false });
   const approval = usePullRequestMutationApproval();
+  const mutationAvailable = approval?.available === true;
 
   const signature = reactionsSignature(reactions);
   const values = pending.signature === signature ? pending.values : EMPTY_PENDING;
@@ -79,7 +80,7 @@ export function PullRequestReactionBar({
     setPending({ signature, values: new Map([...values, [content, reacted]]) });
     let failure = false;
     const completed = await approval.request({
-      description: `${reacted ? "Adds" : "Removes"} a reaction on #${reference.number}.`,
+      description: `${reacted ? "Adds" : "Removes"} the ${pullRequestReactionName(content)} reaction ${subjectId === undefined ? "on the pull request" : `on comment ${subjectId}`} in #${reference.number}.`,
       execute: async (scope) => {
         const result = await setReaction({
           environmentId: scope.environmentId,
@@ -118,13 +119,13 @@ export function PullRequestReactionBar({
                 type="button"
                 aria-pressed={reaction.viewerHasReacted}
                 aria-label={`${pullRequestReactionName(reaction.content)}, ${reaction.count}`}
-                disabled={!canReact}
+                disabled={!canReact || !mutationAvailable}
                 className={cn(
                   PILL_CLASS,
                   reaction.viewerHasReacted
                     ? "border-primary/60 bg-primary/10 text-foreground"
                     : "border-border/70 bg-muted/40 text-muted-foreground",
-                  canReact ? "hover:border-primary/60" : "cursor-default",
+                  canReact && mutationAvailable ? "hover:border-primary/60" : "cursor-default",
                 )}
                 onClick={() => void toggle(reaction.content, !reaction.viewerHasReacted)}
               />
@@ -144,6 +145,7 @@ export function PullRequestReactionBar({
               <button
                 type="button"
                 aria-label="Add a reaction"
+                disabled={!mutationAvailable}
                 className={cn(
                   PILL_CLASS,
                   "border-border/70 px-1.5 text-muted-foreground hover:border-primary/60 hover:text-foreground",
@@ -167,6 +169,7 @@ export function PullRequestReactionBar({
                     type="button"
                     aria-pressed={reacted}
                     aria-label={pullRequestReactionName(content)}
+                    disabled={!mutationAvailable}
                     className={cn(
                       "flex size-7 items-center justify-center rounded-md text-base outline-none hover:bg-accent focus-visible:ring-2 focus-visible:ring-ring",
                       reacted && "bg-primary/10",

@@ -218,6 +218,8 @@ type PullRequestConfirmation = {
   readonly title: string | null;
   /** Detail descendants can only write through this captured approval. */
   readonly providerMutation: PullRequestProviderMutation | null;
+  /** This belongs to the specific descendant request, never to panel-global mutable state. */
+  readonly providerMutationResolver: ((succeeded: boolean) => void) | null;
 };
 
 function clonePullRequestReference(reference: PullRequestRef): PullRequestRef {
@@ -657,7 +659,13 @@ export function PullRequestDetailPanel({
   );
   const reference = useMemo<PullRequestRef>(
     () =>
-      requestedReference.repositoryRoot === undefined && detailQuery.data?.workspaceRoot
+      // A rootless hosted reference can intentionally route through credentials in another
+      // checkout. Only the legacy hostless form means "this project's local repository";
+      // hydrating a hosted cross-repository link would turn later writes into a mismatched,
+      // strict repository-root request.
+      requestedReference.repositoryRoot === undefined &&
+      requestedReference.host === undefined &&
+      detailQuery.data?.workspaceRoot
         ? { ...requestedReference, repositoryRoot: detailQuery.data.workspaceRoot }
         : requestedReference,
     [detailQuery.data?.workspaceRoot, requestedReference],
@@ -748,6 +756,10 @@ export function PullRequestDetailPanel({
   };
   const [confirmation, setConfirmation] = useState<PullRequestConfirmation | null>(null);
   const confirmationRef = useRef<PullRequestConfirmation | null>(null);
+  // Provider writes do not use `actionPending`, but they still share this one approval lane.
+  // Keeping its state visible prevents a second descendant from looking enabled while the first
+  // approved request is executing.
+  const [providerMutationPending, setProviderMutationPending] = useState(false);
   const confirmAction = confirmation?.action ?? "merge";
   // Which handoff is preparing, keyed so a per-finding button can say "Preparing..." on itself
   // alone. One at a time whatever the key: they all check the same pull request out.
@@ -1147,7 +1159,6 @@ export function PullRequestDetailPanel({
   const pendingCommentResolver = useRef<
     ((result: { readonly commentPosted: boolean }) => void) | null
   >(null);
-  const pendingProviderMutationResolver = useRef<((succeeded: boolean) => void) | null>(null);
   const dismissConfirmation = useCallback(() => {
     const pending = confirmationRef.current;
     confirmationRef.current = null;
@@ -1157,8 +1168,7 @@ export function PullRequestDetailPanel({
       pendingCommentResolver.current = null;
     }
     if (pending?.providerMutation !== null && pending !== null) {
-      pendingProviderMutationResolver.current?.(false);
-      pendingProviderMutationResolver.current = null;
+      pending.providerMutationResolver?.(false);
     }
   }, []);
 
@@ -1177,8 +1187,7 @@ export function PullRequestDetailPanel({
       if (pending !== null) {
         pendingCommentResolver.current?.({ commentPosted: false });
         pendingCommentResolver.current = null;
-        pendingProviderMutationResolver.current?.(false);
-        pendingProviderMutationResolver.current = null;
+        pending.providerMutationResolver?.(false);
       }
     };
   }, []);
@@ -1198,9 +1207,16 @@ export function PullRequestDetailPanel({
         readonly updateMethod?: PullRequestUpdateMethod;
         readonly title?: string;
         readonly providerMutation?: PullRequestProviderMutation;
+        readonly providerMutationResolver?: (succeeded: boolean) => void;
       } = {},
     ) => {
-      if (actionPending || currentMutationScope === null || currentMutationScopeKey === null) {
+      if (
+        actionPending ||
+        providerMutationPending ||
+        confirmationRef.current !== null ||
+        currentMutationScope === null ||
+        currentMutationScopeKey === null
+      ) {
         return false;
       }
       const next: PullRequestConfirmation = {
@@ -1212,31 +1228,60 @@ export function PullRequestDetailPanel({
         commentBody: options.commentBody ?? null,
         title: options.title ?? null,
         providerMutation: options.providerMutation ?? null,
+        providerMutationResolver: options.providerMutationResolver ?? null,
       };
       confirmationRef.current = next;
       setConfirmation(next);
       return true;
     },
-    [actionPending, currentMutationScope, currentMutationScopeKey],
+    [actionPending, currentMutationScope, currentMutationScopeKey, providerMutationPending],
   );
 
   const requestProviderMutation = useCallback(
     (mutation: PullRequestProviderMutation): Promise<boolean> =>
       new Promise((resolve) => {
-        if (!requestConfirmation("provider-mutation", { providerMutation: mutation })) {
+        if (
+          !requestConfirmation("provider-mutation", {
+            providerMutation: mutation,
+            providerMutationResolver: resolve,
+          })
+        ) {
           resolve(false);
-          return;
         }
-        pendingProviderMutationResolver.current = resolve;
       }),
     [requestConfirmation],
   );
   const mutationApproval = useMemo(
     () => ({
-      available: currentMutationScope !== null && !actionPending,
+      available:
+        currentMutationScope !== null &&
+        !actionPending &&
+        !providerMutationPending &&
+        confirmation === null,
+      unavailableReason:
+        currentMutationScope !== null
+          ? actionPending || providerMutationPending || confirmation !== null
+            ? "Another pull request change is awaiting approval or completion."
+            : null
+          : reference.repositoryRoot === undefined
+            ? "This pull request has no local checkout available for a reviewed change."
+            : !detailApprovalAvailable
+              ? "Pull request details are loading or unavailable. Refresh and try again."
+              : !reviewedLocalSnapshot.available
+                ? reviewedLocalSnapshot.reason
+                : "Pull request changes are unavailable. Refresh and try again.",
       request: requestProviderMutation,
     }),
-    [actionPending, currentMutationScope, requestProviderMutation],
+    [
+      actionPending,
+      confirmation,
+      currentMutationScope,
+      detailApprovalAvailable,
+      providerMutationPending,
+      reference.repositoryRoot,
+      requestProviderMutation,
+      reviewedLocalSnapshot,
+    ],
   );
 
   const finishAction = async (
@@ -2247,7 +2292,7 @@ export function PullRequestDetailPanel({
                           <Button
                             size="xs"
                             variant="default"
-                            disabled={actionPending}
+                            disabled={actionPending || !mutationApproval.available}
                             onClick={() => requestConfirmation("ready")}
                             aria-label="Ready for review"
                           >
@@ -2267,7 +2312,7 @@ export function PullRequestDetailPanel({
                           <Button
                             size="xs"
                             variant="default"
-                            disabled={actionPending}
+                            disabled={actionPending || !mutationApproval.available}
                             onClick={() =>
                               requestConfirmation("enable-auto-merge", {
                                 mergeMethod: selectedMergeMethod,
@@ -2325,7 +2370,7 @@ export function PullRequestDetailPanel({
                           <Button
                             size="xs"
                             variant="default"
-                            disabled={actionPending}
+                            disabled={actionPending || !mutationApproval.available}
                             onClick={() =>
                               requestConfirmation("merge", { mergeMethod: selectedMergeMethod })
                             }
@@ -2438,7 +2483,7 @@ export function PullRequestDetailPanel({
                           show the same action twice. */}
                         {showsDraftToggle ? (
                           <MenuItem
-                            disabled={actionPending}
+                            disabled={actionPending || !mutationApproval.available}
                             onClick={() => requestConfirmation(detail.isDraft ? "ready" : "draft")}
                           >
                             {detail.isDraft ? (
@@ -2451,7 +2496,7 @@ export function PullRequestDetailPanel({
                         ) : null}
                         {showsMergeNow ? (
                           <MenuItem
-                            disabled={actionPending}
+                            disabled={actionPending || !mutationApproval.available}
                             onClick={() =>
                               requestConfirmation("merge", { mergeMethod: selectedMergeMethod })
                             }
@@ -2465,7 +2510,7 @@ export function PullRequestDetailPanel({
                           waits for will clear the conflict. */}
                         {autoMergeArmed && can("disable-auto-merge") ? (
                           <MenuItem
-                            disabled={actionPending}
+                            disabled={actionPending || !mutationApproval.available}
                             onClick={() => requestConfirmation("disable-auto-merge")}
                           >
                             <GitMergeIcon className="size-3.5" />
@@ -2473,7 +2518,7 @@ export function PullRequestDetailPanel({
                           </MenuItem>
                         ) : showsAutoMerge ? (
                           <MenuItem
-                            disabled={actionPending}
+                            disabled={actionPending || !mutationApproval.available}
                             onClick={() =>
                               requestConfirmation("enable-auto-merge", {
                                 mergeMethod: selectedMergeMethod,
@@ -2509,7 +2554,7 @@ export function PullRequestDetailPanel({
                                 <MenuRadioItem
                                   key={method}
                                   value={method}
-                                  disabled={actionPending}
+                                  disabled={actionPending || !mutationApproval.available}
                                   closeOnClick
                                 >
                                   {/* The radio item lays its children out as one block, so the
@@ -2555,7 +2600,7 @@ export function PullRequestDetailPanel({
                         <MenuSeparator />
                         <MenuItem
                           variant="destructive"
-                          disabled={actionPending}
+                          disabled={actionPending || !mutationApproval.available}
                           onClick={() => requestConfirmation("close")}
                         >
                           <GitPullRequestClosedIcon className="size-3.5" />
@@ -2566,7 +2611,7 @@ export function PullRequestDetailPanel({
                       <>
                         <MenuSeparator />
                         <MenuItem
-                          disabled={actionPending}
+                          disabled={actionPending || !mutationApproval.available}
                           onClick={() => requestConfirmation("reopen")}
                         >
                           <GitPullRequestIcon className="size-3.5" />
@@ -2577,7 +2622,7 @@ export function PullRequestDetailPanel({
                       <>
                         <MenuSeparator />
                         <MenuItem
-                          disabled={actionPending}
+                          disabled={actionPending || !mutationApproval.available}
                           onClick={() => requestConfirmation("revert")}
                         >
                           <RotateCcwIcon className="size-3.5" />
@@ -2733,7 +2778,7 @@ export function PullRequestDetailPanel({
                         />
                         <TooltipPopup side="top">{detail.title}</TooltipPopup>
                       </Tooltip>
-                      {canEditPullRequestChangeRequest(detail) ? (
+                      {canEditPullRequestChangeRequest(detail) && mutationApproval.available ? (
                         <Button
                           size="icon-xs"
                           variant="ghost"
@@ -2914,7 +2959,7 @@ export function PullRequestDetailPanel({
                             <Button
                               size="xs"
                               variant="warning-outline"
-                              disabled={actionPending}
+                              disabled={actionPending || !mutationApproval.available}
                               onClick={() => requestConfirmation("approve-workflows")}
                               aria-label={
                                 pendingAction === "approve-workflows"
@@ -3223,14 +3268,20 @@ export function PullRequestDetailPanel({
                   confirmationRef.current = null;
                   setConfirmation(null);
                   if (pending.providerMutation !== null) {
+                    setProviderMutationPending(true);
                     void pending.providerMutation
                       .execute({
                         environmentId: pending.scope.environmentId,
                         reference: pending.scope.reference,
                       })
                       .then((succeeded) => {
-                        pendingProviderMutationResolver.current?.(succeeded);
-                        pendingProviderMutationResolver.current = null;
+                        pending.providerMutationResolver?.(succeeded);
+                      })
+                      .catch(() => {
+                        pending.providerMutationResolver?.(false);
+                      })
+                      .finally(() => {
+                        if (mountedRef.current) setProviderMutationPending(false);
                       });
                     return;
                   }

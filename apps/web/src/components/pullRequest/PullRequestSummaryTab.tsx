@@ -461,7 +461,8 @@ export function PullRequestSummaryTab({
     cwd: detail.workspaceRoot,
     environmentId,
     threadRef,
-    canEdit: (comment) => canEditPullRequestComment(detail, comment),
+    canEdit: (comment) =>
+      approval?.available === true && canEditPullRequestComment(detail, comment),
     editingId: editingCommentId,
     saving: commentSaving,
     onEdit: (comment) =>
@@ -652,7 +653,7 @@ export function PullRequestSummaryTab({
                 environmentId={environmentId}
                 threadRef={threadRef}
               />
-              {canEditPullRequestChangeRequest(detail) ? (
+              {canEditPullRequestChangeRequest(detail) && approval?.available === true ? (
                 <Button
                   size="icon-xs"
                   variant="ghost"

@@ -925,6 +925,7 @@ function PullRequestCodeTab({
   const runThreadCommand = useCallback(
     async (
       label: string,
+      description: string,
       run: (scope: {
         readonly environmentId: EnvironmentId;
         readonly reference: PullRequestRef;
@@ -933,7 +934,7 @@ function PullRequestCodeTab({
       if (threadPending || approval === null || !approval.available) return false;
       let failed = false;
       const completed = await approval.request({
-        description: `${label.replace(/ could not be .*/, "")} on #${reference.number}.`,
+        description,
         execute: async (scope) => {
           setThreadPending(true);
           const result = await run(scope);
@@ -965,7 +966,7 @@ function PullRequestCodeTab({
         canReact={detail.capabilities.reactions === true}
         environmentId={environmentId}
         reference={reference}
-        pending={threadPending}
+        pending={threadPending || approval?.available !== true}
         fixPending={pendingFinding === pullRequestFindingKey({ kind: "thread", thread })}
         fixLabel={fixFindingLabel}
         {...(onFixFinding ? { onFix: () => onFixFinding({ kind: "thread", thread }) } : {})}
@@ -984,11 +985,14 @@ function PullRequestCodeTab({
           return result.value;
         }}
         onReply={(body) =>
-          runThreadCommand("Reply could not be posted", (scope) =>
-            replyToThread({
-              environmentId: scope.environmentId,
-              input: { ...scope.reference, threadId: thread.id, body },
-            }),
+          runThreadCommand(
+            `Reply could not be posted`,
+            `Posts a reply on conversation ${thread.id} in #${reference.number}.`,
+            (scope) =>
+              replyToThread({
+                environmentId: scope.environmentId,
+                input: { ...scope.reference, threadId: thread.id, body },
+              }),
           )
         }
         // A conversation on a line is made of review comments, whatever the host filed them as.
@@ -996,19 +1000,25 @@ function PullRequestCodeTab({
           canEditPullRequestComment(detail, { author: comment.author, kind: "review-comment" })
         }
         onEditComment={(commentId, body) =>
-          runThreadCommand("The comment could not be saved", (scope) =>
-            updateComment({
-              environmentId: scope.environmentId,
-              input: { ...scope.reference, commentId, kind: "review-comment", body },
-            }),
+          runThreadCommand(
+            `The comment could not be saved`,
+            `Edits comment ${commentId} in conversation ${thread.id} on #${reference.number}.`,
+            (scope) =>
+              updateComment({
+                environmentId: scope.environmentId,
+                input: { ...scope.reference, commentId, kind: "review-comment", body },
+              }),
           )
         }
         onToggleResolved={() =>
-          void runThreadCommand("The conversation could not be updated", (scope) =>
-            setThreadResolution({
-              environmentId: scope.environmentId,
-              input: { ...scope.reference, threadId: thread.id, resolved: !thread.isResolved },
-            }),
+          void runThreadCommand(
+            "The conversation could not be updated",
+            `${thread.isResolved ? "Reopens" : "Resolves"} conversation ${thread.id} on #${reference.number}.`,
+            (scope) =>
+              setThreadResolution({
+                environmentId: scope.environmentId,
+                input: { ...scope.reference, threadId: thread.id, resolved: !thread.isResolved },
+              }),
           )
         }
         onReacted={onRefresh}

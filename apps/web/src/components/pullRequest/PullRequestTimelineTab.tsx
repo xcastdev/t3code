@@ -250,7 +250,7 @@ function ConversationCard({
               ) : null}
             </PullRequestMetaLine>
           </div>
-          {editable !== null && !editing ? (
+          {editable !== null && !editing && approval?.available === true ? (
             <Button
               size="icon-xs"
               variant="ghost"

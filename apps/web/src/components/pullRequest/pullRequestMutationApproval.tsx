@@ -18,6 +18,8 @@ export type PullRequestProviderMutation = {
 
 export type PullRequestMutationApproval = {
   readonly available: boolean;
+  /** Why writes are unavailable while cached detail remains readable. */
+  readonly unavailableReason: string | null;
   readonly request: (mutation: PullRequestProviderMutation) => Promise<boolean>;
 };
 

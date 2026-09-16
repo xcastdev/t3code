@@ -8931,7 +8931,11 @@ export default function ChatView(props: ChatViewProps) {
           ...(renderedRightPanelSurface.host ? { host: renderedRightPanelSurface.host } : {}),
           repository: renderedRightPanelSurface.repository,
           number: renderedRightPanelSurface.number,
-          ...((gitStatusCwd ?? activeProject?.workspaceRoot)
+          // A host-qualified link may deliberately name a different repository. Supplying this
+          // thread's checkout makes the server treat it as a strict selected-repository request
+          // and rejects supported cross-repository hosted links.
+          ...(renderedRightPanelSurface.host === undefined &&
+          (gitStatusCwd ?? activeProject?.workspaceRoot)
             ? { repositoryRoot: gitStatusCwd ?? activeProject?.workspaceRoot }
             : {}),
         }}

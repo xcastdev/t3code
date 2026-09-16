@@ -56,12 +56,14 @@ export function PullRequestStackMenu({
   const hasUnknownHead = expectedStackHeads.length !== unmerged.length;
   const mergeDisabled =
     pending ||
+    approval?.available !== true ||
     selectedLayer?.state !== "open" ||
     mergeLayers.some((layer) => !layer.headSha) ||
     mergeHasClosed ||
     mergeLayers.length === 0 ||
     mergeLayers.some((layer) => layer.isDraft);
-  const rebaseDisabled = pending || hasUnknownHead || hasClosed || unmerged.length === 0;
+  const rebaseDisabled =
+    pending || approval?.available !== true || hasUnknownHead || hasClosed || unmerged.length === 0;
   const run = async (action: "merge" | "update-branch") => {
     if (
       pending ||

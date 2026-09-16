@@ -157,7 +157,7 @@ export function PullRequestReviewBar({
             key={verdict.value}
             size="xs"
             variant={verdict.value === "comment" ? "outline" : "default"}
-            disabled={pending || !canSubmit(verdict.value)}
+            disabled={pending || approval?.available !== true || !canSubmit(verdict.value)}
             onClick={() => void submit(verdict)}
           >
             <span className="flex items-center gap-1.5">

@@ -49,6 +49,7 @@ export function PullRequestLabelPicker({
   );
   const setLabels = useAtomCommand(pullRequestEnvironment.setLabels, { reportFailure: false });
   const approval = usePullRequestMutationApproval();
+  const mutationAvailable = approval?.available === true;
 
   const candidates = useMemo(
     () => (candidatesQuery.data?.candidates ?? []).filter((entry) => matches(entry, query)),
@@ -92,8 +93,12 @@ export function PullRequestLabelPicker({
     <PullRequestCandidatePicker
       icon={<TagIcon className="size-3.5" />}
       label="Change labels"
-      allowed={allowed}
-      disabledReason="Changing labels needs triage access on this repository"
+      allowed={allowed && mutationAvailable}
+      disabledReason={
+        !allowed
+          ? "Changing labels needs triage access on this repository"
+          : (approval?.unavailableReason ?? "Pull request changes are unavailable.")
+      }
       open={open}
       onOpenChange={setOpen}
       query={query}
@@ -108,7 +113,7 @@ export function PullRequestLabelPicker({
       truncated={candidatesQuery.data?.truncated === true}
       truncatedLabel="This repository has more labels than are listed here. Apply the rest on the host."
       candidateKey={(candidate) => candidate.name}
-      disabled={pending !== null}
+      disabled={pending !== null || !mutationAvailable}
       onSelect={(candidate) => void toggle(candidate)}
     >
       {(candidate) => {
