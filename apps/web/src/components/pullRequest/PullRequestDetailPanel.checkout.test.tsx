@@ -9,6 +9,12 @@ const atoms = vi.hoisted(() => ({ prepare: Symbol("prepare-pull-request-thread")
 const preparePullRequestThread = vi.hoisted(() => vi.fn());
 const providerRun = vi.hoisted(() => vi.fn().mockResolvedValue({ _tag: "Success", value: {} }));
 const newThread = vi.hoisted(() => vi.fn());
+const commentComposer = vi.hoisted(() => ({
+  onComment: null as ((body: string) => Promise<boolean>) | null,
+  onCommentAction: null as
+    | ((body: string, action: "close" | "reopen") => Promise<{ readonly commentPosted: boolean }>)
+    | null,
+}));
 const atomValue = vi.hoisted(() => ({
   environment: { capabilities: { sourceControlWorkspace: true } },
   error: null,
@@ -37,14 +43,21 @@ vi.mock("~/state/vcs", () => ({
     track: (_registry: unknown, _scope: unknown, _action: unknown, execute: () => unknown) =>
       execute(),
   },
-  vcsEnvironment: { listRefs: () => null },
+  vcsEnvironment: { listRefs: () => null, status: () => ({ kind: "status" }) },
 }));
 vi.mock("~/state/query", () => ({
   useEnvironmentQuery: (target: { kind?: string } | null) => ({
     data:
-      target?.kind === "detail" ? detailForQuery : target?.kind === "activity" ? activity : null,
-    error: null,
-    isPending: false,
+      target?.kind === "detail"
+        ? detailForQuery
+        : target?.kind === "activity"
+          ? activity
+          : target?.kind === "status"
+            ? localStatusForQuery
+            : null,
+    error: target?.kind === "detail" ? detailQueryState.error : null,
+    isPending: target?.kind === "detail" ? detailQueryState.isPending : false,
+    isSuccess: target?.kind === "detail" ? detailQueryState.isSuccess : true,
     isFetching: false,
     refresh: vi.fn(),
   }),
@@ -103,6 +116,19 @@ vi.mock("../ui/tooltip", () => ({
 }));
 vi.mock("./PullRequestSummaryTab", () => ({ PullRequestSummaryTab: () => <div /> }));
 vi.mock("./PullRequestTimelineTab", () => ({ PullRequestTimelineTab: () => <div /> }));
+vi.mock("./PullRequestCommentComposer", () => ({
+  PullRequestCommentComposer: (props: {
+    onComment: (body: string) => Promise<boolean>;
+    onCommentAction: (
+      body: string,
+      action: "close" | "reopen",
+    ) => Promise<{ readonly commentPosted: boolean }>;
+  }) => {
+    commentComposer.onComment = props.onComment;
+    commentComposer.onCommentAction = props.onCommentAction;
+    return null;
+  },
+}));
 vi.mock("./PullRequestThreadLinks", () => ({ PullRequestThreadLinks: () => null }));
 vi.mock("./PullRequestStackMenu", () => ({ PullRequestStackMenu: () => null }));
 vi.mock("../ui/alert-dialog", () => {
@@ -197,6 +223,26 @@ const detail: PullRequestDetailView = {
   },
 };
 let detailForQuery = detail;
+let detailQueryState: { isSuccess: boolean; isPending: boolean; error: Error | null } = {
+  isSuccess: true,
+  isPending: false,
+  error: null,
+};
+const localStatus = {
+  isRepo: true,
+  hasPrimaryRemote: true,
+  isDefaultRef: false,
+  refName: "feature/scoped",
+  headCommit: "0123456789abcdef",
+  indexTree: "fedcba9876543210",
+  hasWorkingTreeChanges: false,
+  workingTree: { files: [], insertions: 0, deletions: 0 },
+  hasUpstream: true,
+  aheadCount: 0,
+  behindCount: 0,
+  pr: null,
+};
+let localStatusForQuery: typeof localStatus | null = localStatus;
 
 let renderer: ReactTestRenderer;
 
@@ -212,8 +258,12 @@ beforeEach(() => {
   newThread.mockReset().mockResolvedValue({ threadId: "checkout-thread" });
   providerRun.mockReset().mockResolvedValue({ _tag: "Success", value: {} });
   detailForQuery = detail;
+  detailQueryState = { isSuccess: true, isPending: false, error: null };
+  localStatusForQuery = localStatus;
   projectState.projects = [];
   projectState.environments = [];
+  commentComposer.onComment = null;
+  commentComposer.onCommentAction = null;
 });
 
 afterEach(() => {
@@ -468,5 +518,97 @@ describe("PullRequestDetailPanel mutation approval scope", () => {
     });
     await act(async () => onConfirm?.());
     expect(providerRun).not.toHaveBeenCalled();
+  });
+
+  it("revokes detail approval while its current query is pending or failed, and after unmount", async () => {
+    detailForQuery = {
+      ...detail,
+      capabilities: { ...detail.capabilities, actions: ["close"] },
+      viewerPermissions: { ...detail.viewerPermissions, actions: ["close"] },
+    };
+    await act(async () => {
+      renderer = create(panel());
+    });
+    await act(async () => buttonWithText("Close pull request")?.props.onClick());
+    const pendingConfirm = buttonWithText("Close")?.props.onClick as (() => void) | undefined;
+    detailQueryState = { isSuccess: false, isPending: true, error: null };
+    await act(async () => renderer.update(panel()));
+    await act(async () => pendingConfirm?.());
+    expect(providerRun).not.toHaveBeenCalled();
+
+    detailQueryState = { isSuccess: true, isPending: false, error: null };
+    await act(async () => renderer.update(panel()));
+    await act(async () => buttonWithText("Close pull request")?.props.onClick());
+    const failedConfirm = buttonWithText("Close")?.props.onClick as (() => void) | undefined;
+    detailQueryState = { isSuccess: true, isPending: false, error: new Error("offline") };
+    await act(async () => renderer.update(panel()));
+    await act(async () => failedConfirm?.());
+    expect(providerRun).not.toHaveBeenCalled();
+
+    detailQueryState = { isSuccess: true, isPending: false, error: null };
+    await act(async () => renderer.update(panel()));
+    await act(async () => buttonWithText("Close pull request")?.props.onClick());
+    const detachedConfirm = buttonWithText("Close")?.props.onClick as (() => void) | undefined;
+    await act(async () => renderer.unmount());
+    await act(async () => detachedConfirm?.());
+    expect(providerRun).not.toHaveBeenCalled();
+  });
+
+  it("requires confirmation for ready and identifies the reviewed repository and source", async () => {
+    detailForQuery = {
+      ...detail,
+      isDraft: true,
+      capabilities: { ...detail.capabilities, actions: ["ready"] },
+      viewerPermissions: { ...detail.viewerPermissions, actions: ["ready"] },
+    };
+    await act(async () => {
+      renderer = create(panel());
+    });
+    await act(async () => buttonWithText("Ready for review")?.props.onClick());
+    expect(providerRun).not.toHaveBeenCalled();
+    expect(renderedText(renderer.root)).toContain("owner/repo (/repo)");
+    expect(renderedText(renderer.root)).toContain("feature/scoped at 0123456789abcdef");
+    await act(async () => buttonWithText("Mark ready")?.props.onClick());
+    expect(providerRun).toHaveBeenCalledWith({
+      environmentId,
+      input: {
+        projectId,
+        repository: "owner/repo",
+        repositoryRoot: "/repo",
+        number: 7,
+        action: "ready",
+      },
+    });
+  });
+
+  it("never performs the approved close after its comment posts against a changed PR snapshot", async () => {
+    detailForQuery = {
+      ...detail,
+      capabilities: { ...detail.capabilities, comment: true, actions: ["close"] },
+      viewerPermissions: { ...detail.viewerPermissions, comment: true, actions: ["close"] },
+    };
+    let resolveComment: ((value: { _tag: "Success"; value: object }) => void) | null = null;
+    providerRun.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveComment = resolve;
+        }),
+    );
+    await act(async () => {
+      renderer = create(panel());
+    });
+    expect(commentComposer.onCommentAction).not.toBeNull();
+    let result: Promise<{ readonly commentPosted: boolean }> | null = null;
+    await act(async () => {
+      result = commentComposer.onCommentAction?.("A durable comment", "close") ?? null;
+    });
+    await act(async () => buttonWithText("Close")?.props.onClick());
+    expect(providerRun).toHaveBeenCalledTimes(1);
+
+    detailForQuery = { ...detailForQuery, headBranch: "feature/moved-after-comment" };
+    await act(async () => renderer.update(panel()));
+    await act(async () => resolveComment?.({ _tag: "Success", value: {} }));
+    await expect(result).resolves.toEqual({ commentPosted: true });
+    expect(providerRun).toHaveBeenCalledTimes(1);
   });
 });
