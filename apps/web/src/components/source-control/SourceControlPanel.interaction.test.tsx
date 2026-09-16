@@ -405,6 +405,21 @@ describe("SourceControlPanel guarded commit interaction", () => {
     expect(target?.parentElement?.classList.contains("w-full")).toBe(true);
   });
 
+  it("constrains the Graph viewport through its active repository wrapper", async () => {
+    await renderPanel({ view: "graph" });
+    await settle();
+
+    const history = document.querySelector<HTMLElement>('[aria-label="Git history"]')!;
+    const scrollArea = history.closest<HTMLElement>("[data-scroll-area]")!;
+    const graphView = scrollArea.parentElement!;
+    const repositoryView = graphView.parentElement!;
+
+    expect(repositoryView.classList.contains("flex")).toBe(true);
+    expect(repositoryView.classList.contains("min-h-0")).toBe(true);
+    expect(repositoryView.classList.contains("flex-1")).toBe(true);
+    expect(repositoryView.classList.contains("flex-col")).toBe(true);
+  });
+
   it("renders connected graph columns without a visible SHA and pages from an observer", async () => {
     const sha = "a".repeat(40);
     const parent = "b".repeat(40);

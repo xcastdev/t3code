@@ -2918,6 +2918,7 @@ export function SourceControlPanel(props: SourceControlPanelProps) {
                 <div
                   key={repository.rootPath}
                   hidden={props.view !== "graph" || repository.rootPath !== activeCwd}
+                  className="flex min-h-0 flex-1 flex-col"
                 >
                   <GraphView
                     environmentId={props.environmentId}
