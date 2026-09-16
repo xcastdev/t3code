@@ -1150,8 +1150,8 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       yield* runGit(repoDir, ["push", "-u", "origin", "feature/local-only-pr"]);
       const { manager, ghCalls } = yield* makeManager({
         ghScenario: {
-          // @effect-diagnostics-next-line preferSchemaOverJson:off
           prListSequence: [
+            // @effect-diagnostics-next-line preferSchemaOverJson:off
             JSON.stringify([
               {
                 number: 432,
