@@ -432,7 +432,9 @@ function ChangesView(
     publishRepositorySource.indexTree === currentPublishRepositorySource.indexTree;
   const openPublishRepositoryDialog = useCallback(() => {
     if (currentPrimaryActionScope === null) return;
-    setPublishApprovalToken(publishConfirmationLease.issue());
+    const approvalToken = publishConfirmationLease.issue();
+    if (approvalToken === null) return;
+    setPublishApprovalToken(approvalToken);
     setPublishRepositorySource({
       environmentId: currentPrimaryActionScope.environmentId,
       cwd: currentPrimaryActionScope.cwd,
@@ -453,6 +455,25 @@ function ChangesView(
       }
     },
     [publishApprovalToken, publishConfirmationLease],
+  );
+  const renewPublishRepositoryApproval = useCallback(
+    (token: number) => {
+      const approvalToken = publishConfirmationLease.replace(token);
+      if (approvalToken !== null) {
+        setPublishApprovalToken((current) => (current === token ? approvalToken : current));
+      }
+    },
+    [publishConfirmationLease],
+  );
+  const retryPublishRepositoryApproval = useCallback(
+    (token: number) => {
+      publishConfirmationLease.settle(token);
+      const approvalToken = publishConfirmationLease.issue();
+      if (approvalToken !== null) {
+        setPublishApprovalToken((current) => (current === token ? approvalToken : current));
+      }
+    },
+    [publishConfirmationLease],
   );
   useEffect(() => {
     if (publishRepositoryOpen && !isPublishRepositorySourceCurrent) {
@@ -1764,6 +1785,9 @@ function ChangesView(
           approvalToken={publishApprovalToken}
           onConsumeApproval={publishConfirmationLease.consume}
           onRevokeApproval={publishConfirmationLease.revoke}
+          onRenewApproval={renewPublishRepositoryApproval}
+          onSettleApproval={publishConfirmationLease.settle}
+          onRetryApproval={retryPublishRepositoryApproval}
           environmentId={props.environmentId}
           threadRef={props.threadRef}
           gitCwd={props.cwd}

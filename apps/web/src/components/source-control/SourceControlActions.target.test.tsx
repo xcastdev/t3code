@@ -56,6 +56,7 @@ const pullRequestDetail = vi.hoisted(() => Symbol("pull-request-detail"));
 const pullRequestRun = vi.hoisted(() => vi.fn());
 const preparePullRequestRun = vi.hoisted(() => vi.fn());
 const retainedHeaderConfirm = vi.hoisted(() => ({ current: null as (() => void) | null }));
+const retainedPublish = vi.hoisted(() => ({ current: null as (() => void) | null }));
 const pullRequestInvalidateRun = vi.hoisted(() => vi.fn());
 const pullRequestDetailQuery = vi.hoisted(() => ({
   data: null as unknown,
@@ -209,6 +210,8 @@ vi.mock("../ui/button", () => ({
   }: React.ComponentProps<"button"> & { size?: unknown; variant?: unknown }) => {
     if (props.children === "Confirm")
       retainedHeaderConfirm.current = props.onClick as (() => void) | null;
+    if (props.children === "Publish")
+      retainedPublish.current = props.onClick as (() => void) | null;
     return <button {...props} />;
   },
 }));
@@ -389,6 +392,7 @@ beforeEach(() => {
   pullRequestRun.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
   preparePullRequestRun.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
   retainedHeaderConfirm.current = null;
+  retainedPublish.current = null;
   pullRequestInvalidateRun.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
   pullRequestDetailQuery.data = null;
   pullRequestDetailQuery.error = null;
@@ -513,6 +517,37 @@ describe("SourceControlActions target lifetime", () => {
     } else {
       expect(pullRequestRun).toHaveBeenCalledTimes(calls);
     }
+  });
+
+  it("holds the provider-mutation lane until the approved request settles", async () => {
+    openPullRequest();
+    let resolveMerge: ((value: { _tag: "Success"; value: undefined }) => void) | null = null;
+    pullRequestRun.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolveMerge = resolve;
+        }),
+    );
+    const host = document.createElement("div");
+    const target = document.createElement("div");
+    document.body.append(host, target);
+    const root = createRoot(host);
+    roots.push(root);
+    await render(root, target);
+
+    await clickButton("Merge Pull Request");
+    await clickButton("Confirm");
+    await clickButton("Close Pull Request");
+    expect(pullRequestRun).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      resolveMerge?.({ _tag: "Success", value: undefined });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await clickButton("Close Pull Request");
+    await clickButton("Confirm");
+    expect(pullRequestRun).toHaveBeenCalledTimes(2);
   });
 
   it("sends the reviewed snapshot through the header pull-request checkout", async () => {
@@ -900,6 +935,51 @@ describe("SourceControlActions target lifetime", () => {
         },
       }),
     );
+    expect(document.querySelector("#publish-repository-path")).toBeNull();
+  });
+
+  it("revokes a retained Publish callback when the destination form changes", async () => {
+    const host = document.createElement("div");
+    const target = document.createElement("div");
+    document.body.append(host, target);
+    const root = createRoot(host);
+    roots.push(root);
+
+    await render(root, target);
+    await clickButton("Publish repository...");
+    await clickButton("Next");
+    const repository = document.querySelector<HTMLInputElement>("#publish-repository-path")!;
+    await typeInput(repository, "octo/old");
+    const oldPublish = retainedPublish.current;
+    await typeInput(repository, "octo/new");
+    await act(async () => oldPublish?.());
+
+    expect(publishRepositoryRun).not.toHaveBeenCalled();
+  });
+
+  it("arms exactly one fresh Publish retry after a failed publication", async () => {
+    publishRepositoryRun.mockResolvedValueOnce({ _tag: "Failure", cause: "failed" });
+    const host = document.createElement("div");
+    const target = document.createElement("div");
+    document.body.append(host, target);
+    const root = createRoot(host);
+    roots.push(root);
+
+    await render(root, target);
+    await clickButton("Publish repository...");
+    await clickButton("Next");
+    await typeInput(
+      document.querySelector<HTMLInputElement>("#publish-repository-path")!,
+      "octo/retry",
+    );
+    await clickButton("Publish");
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await clickButton("Publish");
+
+    expect(publishRepositoryRun).toHaveBeenCalledTimes(2);
   });
 
   it("creates a worktree from the workflow menu using typed inputs", async () => {

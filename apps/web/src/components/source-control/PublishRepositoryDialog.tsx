@@ -139,6 +139,12 @@ export interface PublishRepositoryDialogProps {
   readonly approvalToken: number | null;
   readonly onConsumeApproval: (token: number) => boolean;
   readonly onRevokeApproval: (token: number) => void;
+  /** Replaces the exact rendered approval after a destination edit. */
+  readonly onRenewApproval: (token: number) => void;
+  /** Releases the exact async publication operation. */
+  readonly onSettleApproval: (token: number) => void;
+  /** Settles a failed publication and arms the current visible form for retry. */
+  readonly onRetryApproval: (token: number) => void;
   readonly environmentId: ScopedThreadRef["environmentId"] | null;
   /** Thread the dialog was opened from, so the new repository can open beside it. */
   readonly threadRef: ScopedThreadRef | null;
@@ -279,6 +285,12 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
     selectedPublishProviderReadiness,
   ]);
 
+  const renewPublishApproval = useCallback(() => {
+    if (props.open && props.approvalToken !== null) {
+      props.onRenewApproval(props.approvalToken);
+    }
+  }, [props]);
+
   const submitPublishRepository = useCallback(() => {
     const reviewedSourceIndexTree = props.reviewedSourceIndexTree;
     const approvalToken = props.approvalToken;
@@ -316,6 +328,10 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
           const error = squashAtomCommandFailure(result);
           setPublishError(error instanceof Error ? error.message : "An error occurred.");
         }
+        // A failed request keeps the reviewed form visible. The completed
+        // token remains consumed, while the current rendered form gets a
+        // distinct retry token; retained callbacks keep neither authority.
+        props.onRetryApproval(approvalToken);
         return;
       }
 
@@ -323,6 +339,8 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
         setPublishResult(result.value);
         setPublishWizardStep(2);
       });
+      props.onSettleApproval(approvalToken);
+      props.onOpenChange(false);
     })();
   }, [
     canSubmitPublishRepository,
@@ -330,6 +348,9 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
     props.open,
     props.approvalToken,
     props.onConsumeApproval,
+    props.onRetryApproval,
+    props.onOpenChange,
+    props.onSettleApproval,
     publishProtocol,
     publishProvider,
     publishRemoteName,
@@ -413,6 +434,7 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
             <RadioGroup
               value={publishProvider}
               onValueChange={(value) => {
+                renewPublishApproval();
                 setSelectedPublishProvider(value as PublishProviderKind);
                 setPublishRepositoryOverride(null);
               }}
@@ -498,6 +520,7 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
                   name="publish-repository-path"
                   value={publishRepository}
                   onChange={(event) => {
+                    renewPublishApproval();
                     setPublishRepositoryOverride(event.target.value);
                   }}
                   onKeyDown={(event) => {
@@ -522,9 +545,10 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
               </span>
               <RadioGroup
                 value={publishVisibility}
-                onValueChange={(value) =>
-                  setPublishVisibility(value as SourceControlRepositoryVisibility)
-                }
+                onValueChange={(value) => {
+                  renewPublishApproval();
+                  setPublishVisibility(value as SourceControlRepositoryVisibility);
+                }}
                 aria-labelledby="publish-visibility-cards-label"
                 disabled={publishRepositoryAction.isPending}
                 className="grid grid-cols-2 gap-2.5"
@@ -593,7 +617,10 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
                     <Input
                       id="publish-remote-name"
                       value={publishRemoteName}
-                      onChange={(event) => setPublishRemoteName(event.target.value)}
+                      onChange={(event) => {
+                        renewPublishApproval();
+                        setPublishRemoteName(event.target.value);
+                      }}
                       placeholder="origin"
                       disabled={publishRepositoryAction.isPending}
                     />
@@ -610,6 +637,7 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
                       value={publishProtocol}
                       onValueChange={(protocol) => {
                         if (protocol === "ssh" || protocol === "https") {
+                          renewPublishApproval();
                           setPublishProtocol(protocol);
                         }
                       }}

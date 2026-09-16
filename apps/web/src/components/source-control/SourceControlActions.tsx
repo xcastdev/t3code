@@ -624,7 +624,12 @@ export default function SourceControlActions({
   const updateWorkflowInput = useCallback(
     (update: (current: WorkflowInputState) => WorkflowInputState) => {
       setWorkflowInput((current) =>
-        current ? { ...update(current), approvalToken: confirmationLease.issue() } : current,
+        current
+          ? (() => {
+              const approvalToken = confirmationLease.replace(current.approvalToken);
+              return approvalToken === null ? current : { ...update(current), approvalToken };
+            })()
+          : current,
       );
     },
     [confirmationLease],
@@ -632,7 +637,12 @@ export default function SourceControlActions({
   const updateWorktreeInput = useCallback(
     (update: (current: WorktreeInputState) => WorktreeInputState) => {
       setWorktreeInput((current) =>
-        current ? { ...update(current), approvalToken: confirmationLease.issue() } : current,
+        current
+          ? (() => {
+              const approvalToken = confirmationLease.replace(current.approvalToken);
+              return approvalToken === null ? current : { ...update(current), approvalToken };
+            })()
+          : current,
       );
     },
     [confirmationLease],
@@ -971,13 +981,15 @@ export default function SourceControlActions({
   const openPublishRepositoryDialog = useCallback(() => {
     const scope = sourceScopeFromStatus(activeEnvironmentId, gitCwd, gitStatusForActions);
     if (scope === null) return;
+    const approvalToken = confirmationLease.issue();
+    if (approvalToken === null) return;
     setPublishRepositoryScope({
       ...scope,
-      approvalToken: confirmationLease.issue(),
+      approvalToken,
       threadRef: activeThreadRef,
     });
     setIsPublishDialogOpen(true);
-  }, [activeEnvironmentId, activeThreadRef, gitCwd, gitStatusForActions]);
+  }, [activeEnvironmentId, activeThreadRef, confirmationLease, gitCwd, gitStatusForActions]);
   const setPublishRepositoryDialogOpen = useCallback(
     (open: boolean) => {
       if (!open && publishRepositoryScope) {
@@ -987,6 +999,27 @@ export default function SourceControlActions({
       if (!open) setPublishRepositoryScope(null);
     },
     [confirmationLease, publishRepositoryScope],
+  );
+  const renewPublishRepositoryApproval = useCallback(
+    (token: number) => {
+      const approvalToken = confirmationLease.replace(token);
+      if (approvalToken === null) return;
+      setPublishRepositoryScope((current) =>
+        current?.approvalToken === token ? { ...current, approvalToken } : current,
+      );
+    },
+    [confirmationLease],
+  );
+  const retryPublishRepositoryApproval = useCallback(
+    (token: number) => {
+      confirmationLease.settle(token);
+      const approvalToken = confirmationLease.issue();
+      if (approvalToken === null) return;
+      setPublishRepositoryScope((current) =>
+        current?.approvalToken === token ? { ...current, approvalToken } : current,
+      );
+    },
+    [confirmationLease],
   );
   useEffect(() => {
     setPendingDefaultBranchAction((current) => {
@@ -1374,8 +1407,10 @@ export default function SourceControlActions({
       const action = id === "pr-checkout" ? "checkout" : id === "pr-merge" ? "merge" : "close";
       const approvalScope = currentPullRequestMutationApprovalScope;
       if (approvalScope === null) return;
+      const approvalToken = confirmationLease.issue();
+      if (approvalToken === null) return;
       const pending: PendingPullRequestAction = {
-        approvalToken: confirmationLease.issue(),
+        approvalToken,
         action,
         ...approvalScope,
         repositoryLabel: approvalScope.reference.repository,
@@ -1403,40 +1438,44 @@ export default function SourceControlActions({
       current?.approvalToken === pending.approvalToken ? null : current,
     );
     pendingPullRequestActionRef.current = null;
-    const result =
-      pending.action === "checkout"
-        ? await preparePullRequest.run({
-            reference: pending.url,
-            mode: "local",
-            ...(activeThreadRef ? { threadId: activeThreadRef.threadId } : {}),
-            // Checkout is a local Git mutation. Do not let this older header entry point
-            // bypass the exact repository snapshot that its confirmation displayed.
-            precondition: sourceScopePrecondition(pending.reviewedSourceScope),
-          })
-        : await runPullRequestAction({
-            environmentId: pending.reviewedSourceScope.environmentId,
-            input: { ...pending.reference, action: pending.action satisfies PullRequestAction },
+    try {
+      const result =
+        pending.action === "checkout"
+          ? await preparePullRequest.run({
+              reference: pending.url,
+              mode: "local",
+              ...(activeThreadRef ? { threadId: activeThreadRef.threadId } : {}),
+              // Checkout is a local Git mutation. Do not let this older header entry point
+              // bypass the exact repository snapshot that its confirmation displayed.
+              precondition: sourceScopePrecondition(pending.reviewedSourceScope),
+            })
+          : await runPullRequestAction({
+              environmentId: pending.reviewedSourceScope.environmentId,
+              input: { ...pending.reference, action: pending.action satisfies PullRequestAction },
+            });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          toastManager.add({
+            type: "error",
+            title: `Pull request ${pending.action} failed`,
+            description:
+              error instanceof Error
+                ? error.message
+                : "The pull request provider refused the action.",
+            data: threadToastData,
           });
-    if (result._tag === "Failure") {
-      if (!isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        toastManager.add({
-          type: "error",
-          title: `Pull request ${pending.action} failed`,
-          description:
-            error instanceof Error
-              ? error.message
-              : "The pull request provider refused the action.",
-          data: threadToastData,
-        });
+        }
+        return;
       }
-      return;
+      requestVcsStatusRefresh(
+        refreshVcsStatus,
+        pending.reviewedSourceScope.environmentId,
+        pending.reference.repositoryRoot ?? null,
+      );
+    } finally {
+      confirmationLease.settle(pending.approvalToken);
     }
-    requestVcsStatusRefresh(
-      refreshVcsStatus,
-      pending.reviewedSourceScope.environmentId,
-      pending.reference.repositoryRoot ?? null,
-    );
   };
 
   runGitActionWithToast = useEffectEvent(
@@ -1496,8 +1535,10 @@ export default function SourceControlActions({
           actionStatus,
         );
         if (approvalScope === null) return;
+        const approvalToken = confirmationLease.issue();
+        if (approvalToken === null) return;
         setPendingDefaultBranchAction({
-          approvalToken: confirmationLease.issue(),
+          approvalToken,
           ...approvalScope,
           action,
           includesCommit,
@@ -1514,8 +1555,10 @@ export default function SourceControlActions({
           actionStatus,
         );
         if (approvalScope === null) return;
+        const approvalToken = confirmationLease.issue();
+        if (approvalToken === null) return;
         setPendingGitConfirmation({
-          approvalToken: confirmationLease.issue(),
+          approvalToken,
           scope: approvalScope,
           input: {
             action,
@@ -1754,8 +1797,10 @@ export default function SourceControlActions({
         environmentId,
         cwd,
       }) !== gitActionApprovalScopeKey(currentGitActionApprovalScope)
-    )
+    ) {
+      confirmationLease.settle(pendingDefaultBranchAction.approvalToken);
       return;
+    }
     void runGitActionWithToast({
       action,
       ...(commitMessage ? { commitMessage } : {}),
@@ -1768,7 +1813,7 @@ export default function SourceControlActions({
         expectedIndexTree: sourceIndexTree,
         expectedRefName: sourceRef,
       },
-    });
+    }).finally(() => confirmationLease.settle(pendingDefaultBranchAction.approvalToken));
   };
 
   const continuePendingGitConfirmation = (pendingGitConfirmation: PendingGitConfirmation) => {
@@ -1780,15 +1825,17 @@ export default function SourceControlActions({
     if (
       currentGitActionApprovalScope === null ||
       gitActionApprovalScopeKey(scope) !== gitActionApprovalScopeKey(currentGitActionApprovalScope)
-    )
+    ) {
+      confirmationLease.settle(pendingGitConfirmation.approvalToken);
       return;
+    }
     const precondition = sourceScopePrecondition(scope);
     void runGitActionWithToast({
       ...input,
       skipDefaultBranchPrompt: true,
       skipConfirmation: true,
       precondition,
-    });
+    }).finally(() => confirmationLease.settle(pendingGitConfirmation.approvalToken));
   };
 
   const checkoutFeatureBranchAndContinuePendingAction = (
@@ -1824,8 +1871,10 @@ export default function SourceControlActions({
         environmentId,
         cwd,
       }) !== gitActionApprovalScopeKey(currentGitActionApprovalScope)
-    )
+    ) {
+      confirmationLease.settle(pendingDefaultBranchAction.approvalToken);
       return;
+    }
     void runGitActionWithToast({
       action,
       ...(commitMessage ? { commitMessage } : {}),
@@ -1839,7 +1888,7 @@ export default function SourceControlActions({
         expectedIndexTree: sourceIndexTree,
         expectedRefName: sourceRef,
       },
-    });
+    }).finally(() => confirmationLease.settle(pendingDefaultBranchAction.approvalToken));
   };
 
   const runDialogActionOnNewBranch = () => {
@@ -1878,8 +1927,10 @@ export default function SourceControlActions({
     }
     if (quickAction.kind === "run_pull") {
       if (currentHeaderActionScope) {
+        const approvalToken = confirmationLease.issue();
+        if (approvalToken === null) return;
         setPendingHeaderAction({
-          approvalToken: confirmationLease.issue(),
+          approvalToken,
           action: "pull",
           scope: currentHeaderActionScope,
         });
@@ -1944,8 +1995,10 @@ export default function SourceControlActions({
     if (!safeActions.has(id as GitActionOperation)) return;
     if (id !== "fetch") {
       if (currentHeaderActionScope) {
+        const approvalToken = confirmationLease.issue();
+        if (approvalToken === null) return;
         setPendingHeaderAction({
-          approvalToken: confirmationLease.issue(),
+          approvalToken,
           action: id as "pull" | "push" | "sync" | "publish",
           scope: currentHeaderActionScope,
         });
@@ -1993,34 +2046,38 @@ export default function SourceControlActions({
     setPendingHeaderAction((current) =>
       current?.approvalToken === pendingHeaderAction.approvalToken ? null : current,
     );
-    const result = await runWorkflowAction({
-      environmentId: activeEnvironmentId,
-      input: {
-        cwd: scope.cwd,
-        action,
-        confirm: true,
-        ...(remoteName ? { remoteName } : {}),
-        ...(refName ? { refName } : {}),
-        ...(continuation?.sourceRef ? { sourceRef: continuation.sourceRef } : {}),
-        precondition: sourceScopePrecondition(scope),
-        ...(pullRemoteName ? { pullRemoteName } : {}),
-        ...(pullRefName ? { pullRefName } : {}),
-        ...(continuation?.strategy ? { strategy: continuation.strategy } : {}),
-      },
-    });
-    if (result._tag === "Failure") {
-      if (!isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        toastManager.add({
-          type: "error",
-          title: `${action} failed`,
-          description: error instanceof Error ? error.message : "The Git operation failed.",
-          data: threadToastData,
-        });
+    try {
+      const result = await runWorkflowAction({
+        environmentId: activeEnvironmentId,
+        input: {
+          cwd: scope.cwd,
+          action,
+          confirm: true,
+          ...(remoteName ? { remoteName } : {}),
+          ...(refName ? { refName } : {}),
+          ...(continuation?.sourceRef ? { sourceRef: continuation.sourceRef } : {}),
+          precondition: sourceScopePrecondition(scope),
+          ...(pullRemoteName ? { pullRemoteName } : {}),
+          ...(pullRefName ? { pullRefName } : {}),
+          ...(continuation?.strategy ? { strategy: continuation.strategy } : {}),
+        },
+      });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          toastManager.add({
+            type: "error",
+            title: `${action} failed`,
+            description: error instanceof Error ? error.message : "The Git operation failed.",
+            data: threadToastData,
+          });
+        }
+        return;
       }
-      return;
+      requestVcsStatusRefresh(refreshVcsStatus, activeEnvironmentId, gitCwd);
+    } finally {
+      confirmationLease.settle(pendingHeaderAction.approvalToken);
     }
-    requestVcsStatusRefresh(refreshVcsStatus, activeEnvironmentId, gitCwd);
   };
 
   const openWorkflowInput = (id: GitWorkflowMenuId) => {
@@ -2067,8 +2124,10 @@ export default function SourceControlActions({
         gitStatusForActions,
       );
       if (reviewedSourceScope === null) return;
+      const approvalToken = confirmationLease.issue();
+      if (approvalToken === null) return;
       setWorktreeInput({
-        approvalToken: confirmationLease.issue(),
+        approvalToken,
         reviewedSourceScope,
         refName: gitStatusForActions?.refName ?? "",
         newRefName: "",
@@ -2210,8 +2269,10 @@ export default function SourceControlActions({
       gitStatusForActions,
     );
     if (reviewedSourceScope === null) return;
+    const approvalToken = confirmationLease.issue();
+    if (approvalToken === null) return;
     setWorkflowInput({
-      approvalToken: confirmationLease.issue(),
+      approvalToken,
       reviewedSourceScope,
       reviewedRemoteName: gitStatusForActions?.remoteName ?? null,
       reviewedRemoteRefName: gitStatusForActions?.remoteRefName ?? null,
@@ -2283,29 +2344,33 @@ export default function SourceControlActions({
     // The completed form is the Worktree confirmation surface. The shared
     // workspace adapter deliberately refuses branch mutations unless that
     // acknowledgement is carried through to its two-phase runner.
-    const result = await createWorktree({
-      environmentId: worktreeInput.reviewedSourceScope.environmentId,
-      input: { ...input, confirmation: "approved" },
-    });
-    if (result._tag === "Failure") {
-      if (!isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        toastManager.add({
-          type: "error",
-          title: "Worktree creation failed",
-          description: error instanceof Error ? error.message : "The Git operation failed.",
-          data: threadToastData,
-        });
+    try {
+      const result = await createWorktree({
+        environmentId: worktreeInput.reviewedSourceScope.environmentId,
+        input: { ...input, confirmation: "approved" },
+      });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          toastManager.add({
+            type: "error",
+            title: "Worktree creation failed",
+            description: error instanceof Error ? error.message : "The Git operation failed.",
+            data: threadToastData,
+          });
+        }
+        return;
       }
-      return;
+      requestVcsStatusRefresh(refreshVcsStatus, activeEnvironmentId, gitCwd);
+      toastManager.add({
+        type: "success",
+        title: "Worktree created",
+        description: result.value.worktree.path,
+        data: threadToastData,
+      });
+    } finally {
+      confirmationLease.settle(worktreeInput.approvalToken);
     }
-    requestVcsStatusRefresh(refreshVcsStatus, activeEnvironmentId, gitCwd);
-    toastManager.add({
-      type: "success",
-      title: "Worktree created",
-      description: result.value.worktree.path,
-      data: threadToastData,
-    });
   };
 
   const executeWorkflowInput = async (workflowInput: WorkflowInputState) => {
@@ -2423,31 +2488,35 @@ export default function SourceControlActions({
     setWorkflowInput((current) =>
       current?.approvalToken === workflowInput.approvalToken ? null : current,
     );
-    const result = await runWorkflowAction({
-      environmentId: workflowInput.reviewedSourceScope.environmentId,
-      input,
-    });
-    if (result._tag === "Failure") {
-      if (!isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        toastManager.add({
-          type: "error",
-          title: `${action} failed`,
-          description: error instanceof Error ? error.message : "The Git operation failed.",
-          data: threadToastData,
-        });
+    try {
+      const result = await runWorkflowAction({
+        environmentId: workflowInput.reviewedSourceScope.environmentId,
+        input,
+      });
+      if (result._tag === "Failure") {
+        if (!isAtomCommandInterrupted(result)) {
+          const error = squashAtomCommandFailure(result);
+          toastManager.add({
+            type: "error",
+            title: `${action} failed`,
+            description: error instanceof Error ? error.message : "The Git operation failed.",
+            data: threadToastData,
+          });
+        }
+        return;
       }
-      return;
+      requestVcsStatusRefresh(refreshVcsStatus, activeEnvironmentId, gitCwd);
+      toastManager.add({
+        type: result.value.failedStep ? "error" : "success",
+        title: result.value.failedStep ? `${action} partially completed` : `${action} complete`,
+        description: result.value.failedStep
+          ? `${result.value.completed.join(" then ")} completed, but ${result.value.failedStep} failed.`
+          : result.value.completed.join(" then "),
+        data: threadToastData,
+      });
+    } finally {
+      confirmationLease.settle(workflowInput.approvalToken);
     }
-    requestVcsStatusRefresh(refreshVcsStatus, activeEnvironmentId, gitCwd);
-    toastManager.add({
-      type: result.value.failedStep ? "error" : "success",
-      title: result.value.failedStep ? `${action} partially completed` : `${action} complete`,
-      description: result.value.failedStep
-        ? `${result.value.completed.join(" then ")} completed, but ${result.value.failedStep} failed.`
-        : result.value.completed.join(" then "),
-      data: threadToastData,
-    });
   };
 
   const runDialogAction = () => {
@@ -2541,8 +2610,10 @@ export default function SourceControlActions({
       !currentHeaderActionScope
     )
       return;
+    const approvalToken = confirmationLease.issue();
+    if (approvalToken === null) return;
     setPendingHeaderAction({
-      approvalToken: confirmationLease.issue(),
+      approvalToken,
       action: workspaceProgress.continuation.action,
       continuation: workspaceProgress.continuation,
       scope: currentHeaderActionScope,
@@ -2575,8 +2646,10 @@ export default function SourceControlActions({
                   size="xs"
                   onClick={() => {
                     if (activeEnvironmentId && gitCwd) {
+                      const approvalToken = confirmationLease.issue();
+                      if (approvalToken === null) return;
                       setInitConfirmationScope({
-                        approvalToken: confirmationLease.issue(),
+                        approvalToken,
                         environmentId: activeEnvironmentId,
                         cwd: gitCwd,
                       });
@@ -2869,18 +2942,20 @@ export default function SourceControlActions({
                 void initializeRepository({
                   environmentId: scope.environmentId,
                   input: { cwd: scope.cwd, confirmation: "approved" },
-                }).then((result) => {
-                  if (result._tag === "Success" || isAtomCommandInterrupted(result)) return;
-                  const error = squashAtomCommandFailure(result);
-                  toastManager.add(
-                    stackedThreadToast({
-                      type: "error",
-                      title: "Git initialization failed",
-                      description: error instanceof Error ? error.message : "An error occurred.",
-                      ...(threadToastData !== undefined ? { data: threadToastData } : {}),
-                    }),
-                  );
-                });
+                })
+                  .then((result) => {
+                    if (result._tag === "Success" || isAtomCommandInterrupted(result)) return;
+                    const error = squashAtomCommandFailure(result);
+                    toastManager.add(
+                      stackedThreadToast({
+                        type: "error",
+                        title: "Git initialization failed",
+                        description: error instanceof Error ? error.message : "An error occurred.",
+                        ...(threadToastData !== undefined ? { data: threadToastData } : {}),
+                      }),
+                    );
+                  })
+                  .finally(() => confirmationLease.settle(scope.approvalToken));
               }}
             >
               Initialize Git
@@ -3512,6 +3587,9 @@ export default function SourceControlActions({
         approvalToken={publishRepositoryScope?.approvalToken ?? null}
         onConsumeApproval={confirmationLease.consume}
         onRevokeApproval={confirmationLease.revoke}
+        onRenewApproval={renewPublishRepositoryApproval}
+        onSettleApproval={confirmationLease.settle}
+        onRetryApproval={retryPublishRepositoryApproval}
         environmentId={publishRepositoryScope?.environmentId ?? null}
         threadRef={publishRepositoryScope?.threadRef ?? null}
         gitCwd={publishRepositoryScope?.cwd ?? ""}

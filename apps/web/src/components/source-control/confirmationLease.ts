@@ -9,45 +9,85 @@ import { useCallback, useEffect, useMemo, useRef } from "react";
 export function useConfirmationLease() {
   const nextTokenRef = useRef(0);
   const activeTokenRef = useRef<number | null>(null);
-  const executingRef = useRef(false);
+  const executingTokenRef = useRef<number | null>(null);
+  // The lease is intentionally a tiny synchronous state machine rather than
+  // React state. A confirmation callback can outlive the element that
+  // rendered it, so the authority must survive (and reject) stale closures.
+  //
+  // idle -> pending -> executing -> settled -> idle
+  //          ^              |
+  //          |--------------+ (only after settlement)
+  // A new pending approval may replace another pending approval, but it may
+  // never replace an executing approval. That keeps a lane exclusively owned
+  // by the promise that consumed it.
+  const stateRef = useRef<"idle" | "pending" | "executing" | "settled">("idle");
+
+  const nextToken = useCallback(() => ++nextTokenRef.current, []);
 
   const issue = useCallback(() => {
-    const token = ++nextTokenRef.current;
+    if (stateRef.current === "executing") return null;
+    const token = nextToken();
     activeTokenRef.current = token;
-    executingRef.current = false;
+    stateRef.current = "pending";
     return token;
-  }, []);
+  }, [nextToken]);
+
+  /** Replaces this exact pending approval; executing owners are never replaced. */
+  const replace = useCallback(
+    (token: number) => {
+      if (stateRef.current !== "pending" || activeTokenRef.current !== token) return null;
+      const replacement = nextToken();
+      activeTokenRef.current = replacement;
+      return replacement;
+    },
+    [nextToken],
+  );
 
   const isCurrent = useCallback(
-    (token: number) => activeTokenRef.current === token && !executingRef.current,
+    (token: number) => activeTokenRef.current === token && stateRef.current === "pending",
     [],
   );
 
   const revoke = useCallback((token: number) => {
-    if (activeTokenRef.current === token) {
+    // Dismissing a stale/pending dialog must not release another callback's
+    // in-flight execution ownership.
+    if (stateRef.current === "pending" && activeTokenRef.current === token) {
       activeTokenRef.current = null;
-      executingRef.current = false;
+      stateRef.current = "idle";
     }
   }, []);
 
   /** Returns false for a cancelled, replaced, duplicate, or unmounted approval. */
   const consume = useCallback((token: number) => {
-    if (activeTokenRef.current !== token || executingRef.current) return false;
-    executingRef.current = true;
+    if (stateRef.current !== "pending" || activeTokenRef.current !== token) return false;
+    stateRef.current = "executing";
     activeTokenRef.current = null;
+    executingTokenRef.current = token;
     return true;
+  }, []);
+
+  /** Releases the exact async operation that consumed this token. */
+  const settle = useCallback((token: number) => {
+    if (stateRef.current !== "executing") return;
+    // An executing lease has no active token by design; its consumed token is
+    // the owner identity, carried by the caller until its promise settles.
+    // Keep it in a ref without making a new approval current.
+    if (executingTokenRef.current !== token) return;
+    stateRef.current = "settled";
+    executingTokenRef.current = null;
   }, []);
 
   useEffect(
     () => () => {
       activeTokenRef.current = null;
-      executingRef.current = false;
+      executingTokenRef.current = null;
+      stateRef.current = "idle";
     },
     [],
   );
 
   return useMemo(
-    () => ({ issue, isCurrent, revoke, consume }),
-    [consume, isCurrent, issue, revoke],
+    () => ({ issue, replace, isCurrent, revoke, consume, settle }),
+    [consume, isCurrent, issue, replace, revoke, settle],
   );
 }
