@@ -9,6 +9,7 @@ import { useRightPanelStore } from "~/rightPanelStore";
 
 const atoms = vi.hoisted(() => ({ prepare: Symbol("prepare-pull-request-thread") }));
 const preparePullRequestThread = vi.hoisted(() => vi.fn());
+const retainedActions = vi.hoisted(() => ({ confirmWorktree: null as (() => void) | null }));
 
 vi.mock("@effect/atom-react", () => ({
   useAtomValue: () => ({
@@ -91,9 +92,12 @@ vi.mock("./ui/button", () => ({
     size: _size,
     variant: _variant,
     ...props
-  }: React.ComponentProps<"button"> & { size?: unknown; variant?: unknown }) => (
-    <button {...props} />
-  ),
+  }: React.ComponentProps<"button"> & { size?: unknown; variant?: unknown }) => {
+    if (props.children === "Confirm worktree") {
+      retainedActions.confirmWorktree = props.onClick as (() => void) | null;
+    }
+    return <button {...props} />;
+  },
 }));
 vi.mock("./ui/dialog", () => ({
   Dialog: ({ children }: { children: React.ReactNode }) => <>{children}</>,
@@ -118,7 +122,7 @@ const threadId = ThreadId.make("thread");
 const threadRef = scopeThreadRef(environmentId, threadId);
 const roots: Root[] = [];
 
-async function render(projectRoot: string, reference: string): Promise<void> {
+async function render(projectRoot: string, reference: string): Promise<Root> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
@@ -137,6 +141,7 @@ async function render(projectRoot: string, reference: string): Promise<void> {
       />,
     );
   });
+  return root;
 }
 
 beforeEach(() => {
@@ -146,6 +151,7 @@ beforeEach(() => {
     _tag: "Success",
     value: { branch: "feature/scoped", worktreePath: "/repo/.t3/worktrees/scoped" },
   });
+  retainedActions.confirmWorktree = null;
 });
 
 afterEach(async () => {
@@ -157,6 +163,33 @@ afterEach(async () => {
 });
 
 describe("PullRequestThreadDialog checkout scope", () => {
+  it("revokes a checkout approval on cancel before a retained confirm can submit", async () => {
+    await render("/repo", "#7");
+    const worktree = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "Worktree",
+    );
+    act(() => worktree!.click());
+    const retainedConfirm = retainedActions.confirmWorktree;
+    const cancel = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "Cancel",
+    )!;
+    act(() => cancel.click());
+    await act(async () => retainedConfirm?.());
+    expect(preparePullRequestThread).not.toHaveBeenCalled();
+  });
+
+  it("revokes a checkout approval on unmount before a retained confirm can submit", async () => {
+    const root = await render("/repo", "#7");
+    const worktree = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "Worktree",
+    );
+    act(() => worktree!.click());
+    const retainedConfirm = retainedActions.confirmWorktree;
+    await act(async () => root.unmount());
+    await act(async () => retainedConfirm?.());
+    expect(preparePullRequestThread).not.toHaveBeenCalled();
+  });
+
   it.each([
     [
       "the selected nested repository",

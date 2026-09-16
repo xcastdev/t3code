@@ -1,7 +1,7 @@
 /* @vitest-environment happy-dom */
 
 import { EnvironmentId, ProjectId, type PullRequestDetailView } from "@t3tools/contracts";
-import { act } from "react";
+import { act, Children, cloneElement, isValidElement } from "react";
 import { create, type ReactTestInstance, type ReactTestRenderer } from "react-test-renderer";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -102,8 +102,24 @@ vi.mock("../ui/menu", () => ({
   Menu: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   MenuItem: (props: React.ComponentProps<"button">) => <button {...props} />,
   MenuPopup: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-  MenuRadioGroup: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-  MenuRadioItem: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  MenuRadioGroup: ({
+    children,
+    onValueChange,
+  }: {
+    children: React.ReactNode;
+    onValueChange: (value: string) => void;
+  }) => (
+    <>
+      {Children.map(children, (child) =>
+        isValidElement<{ value: string; onClick?: () => void }>(child)
+          ? cloneElement(child, { onClick: () => onValueChange(child.props.value) })
+          : child,
+      )}
+    </>
+  ),
+  MenuRadioItem: ({ children, ...props }: React.ComponentProps<"button">) => (
+    <button {...props}>{children}</button>
+  ),
   MenuSeparator: () => null,
   MenuShortcut: ({ children }: { children: React.ReactNode }) => <>{children}</>,
   MenuTrigger: ({ render }: { render: React.ReactNode }) => <>{render}</>,
@@ -364,8 +380,76 @@ describe("PullRequestDetailPanel checkout scope", () => {
           },
         },
       });
+      expect(newThread).toHaveBeenCalledWith({
+        environmentId,
+        projectId,
+      });
     },
   );
+
+  it("uses the selected environment's project when preparing its checkout thread", async () => {
+    projectState.projects = [
+      {
+        id: projectId,
+        environmentId,
+        workspaceRoot: "/repo",
+        repositoryIdentity: { canonicalKey: "github.com/owner/repo" },
+      },
+      {
+        id: alternateProjectId,
+        environmentId: alternateEnvironmentId,
+        workspaceRoot: "/repo",
+        repositoryIdentity: { canonicalKey: "github.com/owner/repo" },
+      },
+    ];
+    projectState.environments = [
+      { environmentId, label: "Environment A", serverConfig: null },
+      { environmentId: alternateEnvironmentId, label: "Environment B", serverConfig: null },
+    ];
+    const reference = { projectId, repository: "owner/repo", repositoryRoot: "/repo", number: 7 };
+    await act(async () => {
+      renderer = create(
+        <PullRequestDetailPanel
+          context="page"
+          environmentId={environmentId}
+          getShortcutContext={() => ({
+            terminalFocus: false,
+            terminalOpen: false,
+            previewFocus: false,
+            previewOpen: false,
+          })}
+          reference={reference}
+          shortcutsEnabled={false}
+        />,
+      );
+    });
+    const alternateEnvironment = renderer.root
+      .findAllByType("button")
+      .find((button) => renderedText(button) === "Environment B");
+    expect(alternateEnvironment).toBeDefined();
+    act(() => alternateEnvironment?.props.onClick());
+    const worktree = renderer.root
+      .findAllByType("button")
+      .find((button) => renderedText(button).includes("In a separate worktree"));
+    act(() => worktree?.props.onClick());
+    const confirm = renderer.root
+      .findAllByType("button")
+      .find((button) => renderedText(button) === "Prepare checkout");
+    await act(async () => {
+      confirm?.props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(newThread).toHaveBeenNthCalledWith(1, {
+      environmentId: alternateEnvironmentId,
+      projectId: alternateProjectId,
+    });
+    expect(preparePullRequestThread).toHaveBeenCalledWith({
+      environmentId: alternateEnvironmentId,
+      input: expect.objectContaining({ cwd: "/repo" }),
+    });
+  });
 
   it("keeps an explicitly selected nested repository on this environment when another environment has only the outer project", async () => {
     projectState.projects = [

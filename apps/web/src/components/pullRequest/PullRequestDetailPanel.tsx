@@ -204,6 +204,8 @@ type ThreadTask = {
  */
 type PullRequestMutationScope = {
   readonly environmentId: EnvironmentId;
+  /** The exact project owning the selected environment/root checkout. */
+  readonly projectId: PullRequestRef["projectId"];
   readonly reference: PullRequestRef;
   readonly detail: PullRequestDetailView;
   /**
@@ -249,7 +251,13 @@ function clonePullRequestReference(reference: PullRequestRef): PullRequestRef {
 function pullRequestMutationScopeKey(scope: PullRequestMutationScope): string {
   // Detail is a wire shape with no functions. Encoding its complete reviewed value is intentional:
   // a target, provider capability, state, branch, or host revision change revokes the approval.
-  return JSON.stringify([scope.environmentId, scope.reference, scope.detail, scope.source]);
+  return JSON.stringify([
+    scope.environmentId,
+    scope.projectId,
+    scope.reference,
+    scope.detail,
+    scope.source,
+  ]);
 }
 
 function pullRequestMutationTargetDescription(scope: PullRequestMutationScope): string {
@@ -919,6 +927,7 @@ export function PullRequestDetailPanel({
         ? null
         : {
             environmentId,
+            projectId: reference.projectId,
             reference: clonePullRequestReference(reference),
             detail,
             source:
@@ -1212,6 +1221,10 @@ export function PullRequestDetailPanel({
         ? null
         : {
             environmentId: actingEnvironmentId,
+            // The selected server can host a different physical project record for this same
+            // repository. Bind it here so a later handoff never opens a thread with the page's
+            // original project ID.
+            projectId: acting?.projectId ?? reference.projectId,
             // A rootless hosted reference must become rooted before it can enter a local Git
             // mutation. The provider-only approval scope deliberately does not do this.
             reference: { ...clonePullRequestReference(reference), repositoryRoot: checkoutCwd },
@@ -1224,6 +1237,7 @@ export function PullRequestDetailPanel({
           },
     [
       actingEnvironmentId,
+      acting?.projectId,
       checkoutCwd,
       checkoutStatusQuery.data,
       detail,
@@ -1770,10 +1784,7 @@ export function PullRequestDetailPanel({
     });
     // Wherever the reader chose to act: the thread, the checkout it is pointed at and the composer
     // the task lands in are all one server's, and picking another one moves all three.
-    const projectRef = scopeProjectRef(
-      reviewedScope.environmentId,
-      reviewedScope.reference.projectId,
-    );
+    const projectRef = scopeProjectRef(reviewedScope.environmentId, reviewedScope.projectId);
     // The thread is opened before the checkout rather than after it, because the project's setup
     // script only runs for a checkout that knows which thread it is for — and a worktree with no
     // dependencies installed is not something anyone can test.

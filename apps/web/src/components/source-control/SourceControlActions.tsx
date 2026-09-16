@@ -1280,6 +1280,9 @@ export default function SourceControlActions({
             reference: pending.url,
             mode: "local",
             ...(activeThreadRef ? { threadId: activeThreadRef.threadId } : {}),
+            // Checkout is a local Git mutation. Do not let this older header entry point
+            // bypass the exact repository snapshot that its confirmation displayed.
+            precondition: sourceScopePrecondition(pending.reviewedSourceScope),
           })
         : await runPullRequestAction({
             environmentId: pending.reviewedSourceScope.environmentId,

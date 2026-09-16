@@ -54,6 +54,7 @@ const pullRequestRunAction = vi.hoisted(() => Symbol("pull-request-run-action"))
 const pullRequestInvalidate = vi.hoisted(() => Symbol("pull-request-invalidate"));
 const pullRequestDetail = vi.hoisted(() => Symbol("pull-request-detail"));
 const pullRequestRun = vi.hoisted(() => vi.fn());
+const preparePullRequestRun = vi.hoisted(() => vi.fn());
 const pullRequestInvalidateRun = vi.hoisted(() => vi.fn());
 const pullRequestDetailQuery = vi.hoisted(() => ({
   data: null as unknown,
@@ -176,7 +177,7 @@ vi.mock("~/sourceControlPresentation", () => ({
 }));
 vi.mock("~/lib/sourceControlActions", () => ({
   useGitStackedAction: () => ({ run: gitActionRun }),
-  usePreparePullRequestThreadAction: () => ({ run: vi.fn() }),
+  usePreparePullRequestThreadAction: () => ({ run: preparePullRequestRun }),
   useSourceControlActionRunning: () => false,
   useVcsInitAction: () => ({ isPending: false, run: vi.fn() }),
   useVcsPullAction: () => ({ run: vi.fn() }),
@@ -383,6 +384,7 @@ beforeEach(() => {
   workspaceInitRun.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
   workspaceProgress.value = { isRunning: false, currentStep: null, completed: [] };
   pullRequestRun.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
+  preparePullRequestRun.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
   pullRequestInvalidateRun.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
   pullRequestDetailQuery.data = null;
   pullRequestDetailQuery.error = null;
@@ -432,6 +434,55 @@ async function clickButton(text: string) {
 }
 
 describe("SourceControlActions target lifetime", () => {
+  it("sends the reviewed snapshot through the header pull-request checkout", async () => {
+    statusQuery.data = {
+      ...statusQuery.data,
+      sourceControlProvider: { kind: "github", name: "GitHub", baseUrl: "https://github.com" },
+      pr: {
+        number: 7,
+        state: "open",
+        title: "Header checkout",
+        url: "https://github.com/owner/repo/pull/7",
+        baseRef: "main",
+        headRef: "feature/header",
+      },
+    } as VcsStatusResult;
+    projects.current = [
+      {
+        id: "project",
+        environmentId: "environment",
+        workspaceRoot: "/repo",
+        repositoryIdentity: {
+          canonicalKey: "github.com/owner/repo",
+          provider: "github",
+          owner: "owner",
+          name: "repo",
+          displayName: "owner/repo",
+        },
+      },
+    ];
+    const host = document.createElement("div");
+    const target = document.createElement("div");
+    document.body.append(host, target);
+    const root = createRoot(host);
+    roots.push(root);
+    await render(root, target);
+
+    await clickButton("Check Out Pull Request");
+    await clickButton("Confirm");
+
+    expect(preparePullRequestRun).toHaveBeenCalledWith({
+      reference: "https://github.com/owner/repo/pull/7",
+      mode: "local",
+      threadId: "thread",
+      precondition: {
+        expectedHeadCommit: "reviewed-head",
+        expectedIndexTree: "reviewed-index",
+        expectedRefName: "feature/test",
+      },
+    });
+  });
+
   it("keeps mutation controls disabled through incomplete, pending, and failed snapshots", async () => {
     workspaceDiscoverRun.mockResolvedValue({
       _tag: "Success",

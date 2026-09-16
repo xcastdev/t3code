@@ -60,6 +60,12 @@ export function PullRequestThreadDialog({
     };
     readonly scopeKey: string;
   } | null>(null);
+  // React can retain a button callback for an event turn after its dialog has gone away.
+  // State controls what is visible; this lease controls whether that exact callback is still
+  // authorized to prepare a checkout.
+  const checkoutApprovalRef = useRef<typeof checkoutApproval>(null);
+  const dialogOpenRef = useRef(open);
+  const mountedRef = useRef(true);
   const [debouncedReference, referenceDebouncer] = useDebouncedValue(
     reference,
     { wait: 450 },
@@ -153,7 +159,27 @@ export function PullRequestThreadDialog({
   const checkoutScopeKeyRef = useRef<string | null>(checkoutScope?.scopeKey ?? null);
   useLayoutEffect(() => {
     checkoutScopeKeyRef.current = checkoutScope?.scopeKey ?? null;
+    const pending = checkoutApprovalRef.current;
+    if (pending !== null && pending.scopeKey !== checkoutScope?.scopeKey) {
+      checkoutApprovalRef.current = null;
+      setCheckoutApproval(null);
+    }
   }, [checkoutScope?.scopeKey]);
+  useLayoutEffect(() => {
+    dialogOpenRef.current = open;
+    if (!open && checkoutApprovalRef.current !== null) {
+      checkoutApprovalRef.current = null;
+      setCheckoutApproval(null);
+    }
+  }, [open]);
+  useLayoutEffect(
+    () => () => {
+      mountedRef.current = false;
+      dialogOpenRef.current = false;
+      checkoutApprovalRef.current = null;
+    },
+    [],
+  );
   // A stale retained approval stays inert in state but is never displayed or reusable. This
   // avoids a reset render while a status query is settling and makes the next press a fresh review.
   const activeCheckoutApproval =
@@ -181,8 +207,11 @@ export function PullRequestThreadDialog({
 
   const requestCheckout = useCallback(
     (mode: "local" | "worktree") => {
-      if (checkoutScope === null) return;
-      setCheckoutApproval({ mode, ...checkoutScope });
+      if (!dialogOpenRef.current || checkoutScope === null || checkoutApprovalRef.current !== null)
+        return;
+      const approval = { mode, ...checkoutScope };
+      checkoutApprovalRef.current = approval;
+      setCheckoutApproval(approval);
     },
     [checkoutScope],
   );
@@ -194,16 +223,23 @@ export function PullRequestThreadDialog({
         return;
       }
       if (
+        !mountedRef.current ||
+        !dialogOpenRef.current ||
         !parsedReference ||
         !resolvedPullRequest ||
         !cwd ||
         activeCheckoutApproval === null ||
         activeCheckoutApproval.mode !== mode ||
         activeCheckoutApproval.reference !== parsedReference ||
+        checkoutApprovalRef.current !== activeCheckoutApproval ||
         activeCheckoutApproval.scopeKey !== checkoutScopeKeyRef.current
       ) {
         return;
       }
+      // Consume this exact lease before awaiting. Cancel, close, unmount, duplicate confirms,
+      // and callbacks retained from a replaced dialog therefore have no authority to start RPC.
+      checkoutApprovalRef.current = null;
+      setCheckoutApproval(null);
       setPreparingMode(mode);
       const result = await preparePullRequestThreadAction.run({
         reference: activeCheckoutApproval.reference,
@@ -222,6 +258,7 @@ export function PullRequestThreadDialog({
         }
         return;
       }
+      if (!mountedRef.current || !dialogOpenRef.current) return;
       await onPrepared({
         branch: result.value.branch,
         worktreePath: result.value.worktreePath,
@@ -262,6 +299,10 @@ export function PullRequestThreadDialog({
       open={open}
       onOpenChange={(nextOpen) => {
         if (!preparePullRequestThreadAction.isPending) {
+          if (!nextOpen) {
+            checkoutApprovalRef.current = null;
+            setCheckoutApproval(null);
+          }
           onOpenChange(nextOpen);
         }
       }}
@@ -343,9 +384,16 @@ export function PullRequestThreadDialog({
             type="button"
             variant="outline"
             size="sm"
-            onClick={() =>
-              activeCheckoutApproval === null ? onOpenChange(false) : setCheckoutApproval(null)
-            }
+            onClick={() => {
+              if (activeCheckoutApproval === null) {
+                checkoutApprovalRef.current = null;
+                onOpenChange(false);
+                return;
+              }
+              if (checkoutApprovalRef.current === activeCheckoutApproval)
+                checkoutApprovalRef.current = null;
+              setCheckoutApproval(null);
+            }}
             disabled={preparePullRequestThreadAction.isPending}
           >
             Cancel

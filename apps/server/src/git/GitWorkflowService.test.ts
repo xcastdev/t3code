@@ -228,7 +228,9 @@ describe("GitWorkflowService", () => {
               },
             })
             .pipe(Effect.flip);
-          assert.equal(error._tag, "GitCommandError");
+          if (error._tag !== "GitCommandError") {
+            throw new Error(`Expected GitCommandError, received ${error._tag}`);
+          }
           assert.equal(error.code, "stale_git_state");
           assert.equal(preparePullRequestThread.mock.calls.length, 0);
         }).pipe(
