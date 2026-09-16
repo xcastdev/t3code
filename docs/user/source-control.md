@@ -96,10 +96,19 @@ descriptions from your changes.
 Choose the writing style and model in **Settings → Source Control**. **Repository conventions**
 uses the project's instructions and recent commit subjects.
 
+Use **Generate** to draft a message from the reviewed changes. The Generate menu also offers
+**Generate with instructions**: enter temporary guidance, then choose **Generate**. Instructions
+append to the configured writing prompt by default; select **Replace prompt** when they should
+replace it. Closing the popover without generating keeps the text for the next open. Generation
+does not change the index and does not require confirmation.
+
 ## Stage and commit selected changes
 
 Open **Source Control** from the right sidebar, the command palette, or
-`mod+alt+g`. It applies to the active thread's project and checkout.
+`mod+alt+g`. It applies to the active thread's project and checkout. If the project contains
+more than one Git repository, choose the repository in the Source Control header; the selection
+is remembered for that thread and falls back to the project repository if it disappears. Use
+**Refresh repositories** after adding or removing a nested repository.
 
 In **Changes**, stage modified or untracked files before entering a commit message.
 The panel commits only staged changes. Use **Unstage** to remove a staged file
@@ -117,6 +126,19 @@ a commit when the reviewed branch, index, or merge state changed in the meantime
 If that happens, refresh and review the staged changes again. Older environments
 may show the repository status but not support staging or committing from this
 panel; update the environment to use those actions.
+
+The commit menu also supports amend, push, pull, and sync where the repository allows them.
+Plain Commit, Generate, stage/unstage, view, sort, refresh, and Fetch do not ask for confirmation.
+Amend and operations that rewrite, publish, or otherwise mutate the repository ask once before
+starting. If a compound action stops partway through, the completed step is shown so you can
+continue without repeating a commit.
+
+## History and diffs
+
+The **Graph** tab loads repository history as you scroll. Expand a commit to load its changed
+files, then select a file to open its single-file comparison in the secondary pane. The right
+sidebar **Diff** surface remains an aggregate view of the selected repository and scope (branch,
+working tree, or turn/checkpoint); opening a file does not replace that aggregate view.
 
 ## Review and merge
 

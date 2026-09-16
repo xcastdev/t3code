@@ -21,6 +21,35 @@ describe("getPreviewPanelMaxWidth", () => {
     expect(markup).toContain("max-w-full");
   });
 
+  it("hides an explicitly closed stacked panel", () => {
+    const markup = renderToStaticMarkup(
+      jsx(PreviewPanelShell, { mode: "embedded", open: false, children: "Panel" }),
+    );
+
+    expect(markup).toContain("hidden");
+  });
+
+  it("lets a maximized stacked secondary pane occupy the recovered workspace height", () => {
+    const markup = renderToStaticMarkup(
+      jsx(PreviewPanelShell, { mode: "embedded", maximized: true, children: "Panel" }),
+    );
+
+    expect(markup).toContain("flex-1");
+  });
+
+  it("does not apply the remembered inline width to stacked content", () => {
+    const markup = renderToStaticMarkup(
+      jsx(PreviewPanelShell, {
+        mode: "embedded",
+        open: true,
+        defaultWidth: 560,
+        children: "Panel",
+      }),
+    );
+
+    expect(markup).not.toContain("width:calc(560px - 1px)");
+  });
+
   it("reserves the sibling column minimum when the flex row is known", () => {
     // Fullscreen 14" MacBook: viewport 1512, sidebar ~256 → row of 1256.
     // The 70% fraction (1058) would leave the chat column only ~198px;

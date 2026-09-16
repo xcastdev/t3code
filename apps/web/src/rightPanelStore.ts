@@ -31,7 +31,7 @@ const RIGHT_PANEL_KINDS = [
   "agents",
 ] as const;
 export type RightPanelKind = (typeof RIGHT_PANEL_KINDS)[number];
-export type SourceControlPanelView = "changes" | "pull-requests";
+export type SourceControlPanelView = "changes" | "graph" | "pull-requests";
 
 export interface DeviceTabTarget {
   hostId: string;
@@ -101,7 +101,7 @@ const RIGHT_PANEL_STORAGE_KEY = "t3code:right-panel-state:v2";
 // stay alive; only their obsolete right-panel presentation is discarded.
 // v17 retains a one-shot terminal-id handoff until the drawer can reconcile
 // the matching server sessions, then discards it with the old presentation.
-const RIGHT_PANEL_STORAGE_VERSION = 17;
+const RIGHT_PANEL_STORAGE_VERSION = 18;
 
 /** A fixed workspace-level ref: each PR surface carries its own real environment. */
 export const PULL_REQUESTS_PANEL_REF = scopeThreadRef(
@@ -132,6 +132,7 @@ interface RightPanelStoreState {
   legacyTerminalIdsByThreadKey: Record<string, string[]>;
   /** Session-only count of user panel choices per thread. Automatic updates do not advance it. */
   userActionRevisionByThreadKey: Record<string, number>;
+  sourceControlRepositoryRootByThreadKey: Record<string, string>;
   getUserActionRevision: (ref: ScopedThreadRef) => number;
   /**
    * Open a surface on behalf of the app, not the user. Refused when the user
@@ -148,6 +149,8 @@ interface RightPanelStoreState {
   ) => void;
   openSourceControl: (ref: ScopedThreadRef, view?: SourceControlPanelView) => void;
   setSourceControlView: (ref: ScopedThreadRef, view: SourceControlPanelView) => void;
+  setSourceControlRepositoryRoot: (ref: ScopedThreadRef, root: string | null) => void;
+  getSourceControlRepositoryRoot: (ref: ScopedThreadRef) => string | null;
   openDevice: (ref: ScopedThreadRef, target: DeviceTabTarget, automatic?: boolean) => void;
   renameDevice: (ref: ScopedThreadRef, surfaceId: string, title: string) => void;
   openBrowser: (ref: ScopedThreadRef, tabId: string | null) => void;
@@ -361,10 +364,23 @@ function normalizeRevealLine(line: number | undefined): number | null {
 export function migratePersistedRightPanelState(persistedState: unknown): {
   byThreadKey: Record<string, ThreadRightPanelState>;
   legacyTerminalIdsByThreadKey?: Record<string, string[]>;
+  sourceControlRepositoryRootByThreadKey?: Record<string, string>;
 } {
   if (!persistedState || typeof persistedState !== "object") {
     return { byThreadKey: {} };
   }
+  const persistedRepositoryRoots =
+    "sourceControlRepositoryRootByThreadKey" in persistedState &&
+    persistedState.sourceControlRepositoryRootByThreadKey &&
+    typeof persistedState.sourceControlRepositoryRootByThreadKey === "object"
+      ? Object.fromEntries(
+          Object.entries(
+            persistedState.sourceControlRepositoryRootByThreadKey as Record<string, unknown>,
+          ).flatMap(([threadKey, root]) =>
+            typeof root === "string" && root.trim().length > 0 ? [[threadKey, root]] : [],
+          ),
+        )
+      : {};
   const legacyTerminalIdsByThreadKey: Record<string, string[]> = {};
   const byThreadKey =
     "byThreadKey" in persistedState &&
@@ -445,7 +461,11 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
                     if (surface.kind === "source-control") {
                       return [
                         sourceControlSurface(
-                          surface.view === "pull-requests" ? "pull-requests" : "changes",
+                          surface.view === "pull-requests"
+                            ? "pull-requests"
+                            : surface.view === "graph"
+                              ? "graph"
+                              : "changes",
                         ),
                       ];
                     }
@@ -492,9 +512,15 @@ export function migratePersistedRightPanelState(persistedState: unknown): {
             }),
         )
       : {};
-  return Object.keys(legacyTerminalIdsByThreadKey).length > 0
-    ? { byThreadKey, legacyTerminalIdsByThreadKey }
-    : { byThreadKey };
+  return {
+    byThreadKey,
+    ...(Object.keys(legacyTerminalIdsByThreadKey).length > 0
+      ? { legacyTerminalIdsByThreadKey }
+      : {}),
+    ...(Object.keys(persistedRepositoryRoots).length > 0
+      ? { sourceControlRepositoryRootByThreadKey: persistedRepositoryRoots }
+      : {}),
+  };
 }
 
 export const useRightPanelStore = create<RightPanelStoreState>()(
@@ -502,6 +528,7 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
     (set, get) => ({
       byThreadKey: {},
       legacyTerminalIdsByThreadKey: {},
+      sourceControlRepositoryRootByThreadKey: {},
       userActionRevisionByThreadKey: {},
       getUserActionRevision: (ref) =>
         get().userActionRevisionByThreadKey[scopedThreadKey(ref)] ?? 0,
@@ -571,6 +598,17 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             };
           }),
         ),
+      setSourceControlRepositoryRoot: (ref, root) =>
+        set((state) => {
+          const threadKey = scopedThreadKey(ref);
+          const trimmed = root?.trim() ?? "";
+          const next = { ...state.sourceControlRepositoryRootByThreadKey };
+          if (trimmed.length === 0) delete next[threadKey];
+          else next[threadKey] = trimmed;
+          return { sourceControlRepositoryRootByThreadKey: next };
+        }),
+      getSourceControlRepositoryRoot: (ref) =>
+        get().sourceControlRepositoryRootByThreadKey[scopedThreadKey(ref)] ?? null,
       openDevice: (ref, target, automatic = false) =>
         set((state) =>
           (automatic ? automaticUpdate : userAction)(state, scopedThreadKey(ref), (current) => {
@@ -887,7 +925,8 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
           if (
             !(threadKey in state.byThreadKey) &&
             !(threadKey in state.userActionRevisionByThreadKey) &&
-            !(threadKey in state.legacyTerminalIdsByThreadKey)
+            !(threadKey in state.legacyTerminalIdsByThreadKey) &&
+            !(threadKey in state.sourceControlRepositoryRootByThreadKey)
           ) {
             return state;
           }
@@ -896,10 +935,13 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             state.userActionRevisionByThreadKey;
           const { [threadKey]: _legacyTerminalIds, ...legacyTerminalIdsByThreadKey } =
             state.legacyTerminalIdsByThreadKey;
+          const { [threadKey]: _repositoryRoot, ...sourceControlRepositoryRootByThreadKey } =
+            state.sourceControlRepositoryRootByThreadKey;
           return {
             byThreadKey: rest,
             userActionRevisionByThreadKey,
             legacyTerminalIdsByThreadKey,
+            sourceControlRepositoryRootByThreadKey,
           };
         }),
     }),
@@ -917,6 +959,11 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
         ),
         legacyTerminalIdsByThreadKey: Object.fromEntries(
           Object.entries(state.legacyTerminalIdsByThreadKey).filter(
+            ([threadKey]) => !isPullRequestsPanelKey(threadKey),
+          ),
+        ),
+        sourceControlRepositoryRootByThreadKey: Object.fromEntries(
+          Object.entries(state.sourceControlRepositoryRootByThreadKey).filter(
             ([threadKey]) => !isPullRequestsPanelKey(threadKey),
           ),
         ),

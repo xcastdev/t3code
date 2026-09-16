@@ -26,7 +26,8 @@ import {
   type AtomCommandResult,
 } from "./runtime.ts";
 import { vcsCommandScheduler } from "./vcsCommandScheduler.ts";
-import { invalidateCachedVcsRefs } from "./vcsRefInvalidation.ts";
+import { invalidateCachedVcsRefs, normalizeVcsRepositoryRoot } from "./vcsRefInvalidation.ts";
+import { invalidateSourceControlWorkspace } from "./sourceControlWorkspace.ts";
 
 export const VcsActionOperation = Schema.Literals([
   "refresh_status",
@@ -79,6 +80,7 @@ export interface RunVcsStackedActionInput {
   readonly filePaths?: ReadonlyArray<string>;
   /** The thread the action runs beside; the server links a pull request it creates to it. */
   readonly threadId?: ThreadId;
+  readonly precondition?: GitRunStackedActionInput["precondition"];
   readonly onProgress?: (event: GitActionProgressEvent) => void;
 }
 
@@ -182,7 +184,8 @@ export function getVcsActionTargetKey(target: VcsActionTarget): string | null {
   if (target.environmentId === null || target.cwd === null) {
     return null;
   }
-  return JSON.stringify([target.environmentId, target.cwd]);
+  const repositoryRoot = normalizeVcsRepositoryRoot(target.cwd);
+  return JSON.stringify([target.environmentId, repositoryRoot]);
 }
 
 export function parseVcsActionTargetKey(key: string): ResolvedVcsActionTarget {
@@ -467,6 +470,7 @@ export function createVcsActionManager<R, E>(
           ...(input.featureBranch ? { featureBranch: true } : {}),
           ...(input.filePaths?.length ? { filePaths: [...input.filePaths] } : {}),
           ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
+          ...(input.precondition !== undefined ? { precondition: input.precondition } : {}),
         };
         return consumeVcsActionProgress(
           runStreamInEnvironment(
@@ -495,6 +499,14 @@ export function createVcsActionManager<R, E>(
               }),
           },
         ).pipe(
+          Effect.ensuring(
+            Effect.sync(() =>
+              invalidateSourceControlWorkspace(registry, {
+                environmentId: target.environmentId,
+                repositoryRoot: target.cwd,
+              }),
+            ),
+          ),
           Effect.ensuring(invalidateCachedVcsRefs(registry, target)),
           Effect.tapError((error) =>
             Effect.sync(() => {

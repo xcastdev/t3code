@@ -31,9 +31,17 @@ import { followStreamInEnvironment } from "./runtime.ts";
 import { vcsCommandConcurrency, vcsCommandScheduler } from "./vcsCommandScheduler.ts";
 import {
   invalidateCachedVcsRefs,
+  normalizeVcsRepositoryRoot,
   vcsRefsCacheStateAtom,
   withVcsRefsPersistenceLock,
+  withCanonicalVcsRepository,
 } from "./vcsRefInvalidation.ts";
+import {
+  createSourceControlWorkspaceEnvironmentAtoms,
+  invalidateSourceControlWorkspace,
+  publishSourceControlStatus,
+  sourceControlWorkspaceStatusRefreshAtom,
+} from "./sourceControlWorkspace.ts";
 
 const OFFLINE_BRANCH_LIST_LIMIT = 100;
 const VCS_REFS_IDLE_TTL_MS = 30_000;
@@ -93,10 +101,14 @@ export const commitVcsRefsRefresh = Effect.fn("CachedVcsRefsState.commitRefresh"
     readonly persist: boolean;
   },
 ) {
+  const repositoryRoot = normalizeVcsRepositoryRoot(input.cwd);
   return yield* withVcsRefsPersistenceLock(
-    input.environmentId,
+    { environmentId: input.environmentId, cwd: repositoryRoot },
     Effect.gen(function* () {
-      const stateAtom = vcsRefsCacheStateAtom({ environmentId: input.environmentId });
+      const stateAtom = vcsRefsCacheStateAtom({
+        environmentId: input.environmentId,
+        cwd: repositoryRoot,
+      });
       const state = registry.get(stateAtom);
       if (state.revision !== input.expectedRevision) {
         return false;
@@ -104,26 +116,28 @@ export const commitVcsRefsRefresh = Effect.fn("CachedVcsRefsState.commitRefresh"
       let persistedCacheReadable = state.persistedCacheReadable;
       if (input.persist) {
         if (!persistedCacheReadable) {
-          persistedCacheReadable = yield* cache.clearVcsRefs(input.environmentId).pipe(
-            Effect.as(true),
-            Effect.catch((error) =>
-              Effect.logWarning("Could not recover invalidated cached Git refs.").pipe(
-                Effect.annotateLogs({
-                  environmentId: input.environmentId,
-                  cwd: input.cwd,
-                  ...safeErrorLogAttributes(error),
-                }),
-                Effect.as(false),
+          persistedCacheReadable = yield* cache
+            .removeVcsRefs(input.environmentId, repositoryRoot)
+            .pipe(
+              Effect.as(true),
+              Effect.catch((error) =>
+                Effect.logWarning("Could not recover invalidated cached Git refs.").pipe(
+                  Effect.annotateLogs({
+                    environmentId: input.environmentId,
+                    cwd: repositoryRoot,
+                    ...safeErrorLogAttributes(error),
+                  }),
+                  Effect.as(false),
+                ),
               ),
-            ),
-          );
+            );
         }
-        yield* cache.saveVcsRefs(input.environmentId, input.cwd, input.refs).pipe(
+        yield* cache.saveVcsRefs(input.environmentId, repositoryRoot, input.refs).pipe(
           Effect.catch((error) =>
             Effect.logWarning("Could not persist cached Git refs.").pipe(
               Effect.annotateLogs({
                 environmentId: input.environmentId,
-                cwd: input.cwd,
+                cwd: repositoryRoot,
                 ...safeErrorLogAttributes(error),
               }),
             ),
@@ -157,15 +171,16 @@ export const makeCachedVcsRefsChanges = Effect.fn("CachedVcsRefsState.makeChange
   const supervisor = yield* EnvironmentSupervisor;
   const cache = yield* EnvironmentCacheStore;
   const environmentId = supervisor.target.environmentId;
+  const repositoryRoot = normalizeVcsRepositoryRoot(input.cwd);
   const useCache = canUseVcsRefsCache(input);
   const cached =
     useCache && persistedCacheReadable
-      ? yield* cache.loadVcsRefs(environmentId, input.cwd).pipe(
+      ? yield* cache.loadVcsRefs(environmentId, repositoryRoot).pipe(
           Effect.catch((error) =>
             Effect.logWarning("Could not load cached Git refs.").pipe(
               Effect.annotateLogs({
                 environmentId,
-                cwd: input.cwd,
+                cwd: repositoryRoot,
                 ...safeErrorLogAttributes(error),
               }),
               Effect.as(Option.none<VcsListRefsResult>()),
@@ -174,15 +189,16 @@ export const makeCachedVcsRefsChanges = Effect.fn("CachedVcsRefsState.makeChange
         )
       : Option.none<VcsListRefsResult>();
   const refresh = Effect.fn("CachedVcsRefsState.refresh")(function* () {
-    const refs = yield* request(WS_METHODS.vcsListRefs, input).pipe(
+    const requestInput = { ...input, cwd: repositoryRoot };
+    const refs = yield* request(WS_METHODS.vcsListRefs, requestInput).pipe(
       Effect.provideService(EnvironmentSupervisor, supervisor),
     );
-    const persist = cache.saveVcsRefs(environmentId, input.cwd, refs).pipe(
+    const persist = cache.saveVcsRefs(environmentId, repositoryRoot, refs).pipe(
       Effect.catch((error) =>
         Effect.logWarning("Could not persist cached Git refs.").pipe(
           Effect.annotateLogs({
             environmentId,
-            cwd: input.cwd,
+            cwd: repositoryRoot,
             ...safeErrorLogAttributes(error),
           }),
         ),
@@ -194,7 +210,7 @@ export const makeCachedVcsRefsChanges = Effect.fn("CachedVcsRefsState.makeChange
     }
     const committed = yield* commitVcsRefsRefresh(registry, cache, {
       environmentId,
-      cwd: input.cwd,
+      cwd: repositoryRoot,
       refs,
       expectedRevision,
       persist: useCache,
@@ -270,7 +286,9 @@ function cachedVcsRefsChanges(
 
 export function createVcsEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | EnvironmentCacheStore | R, E>,
+  workspaceOptions?: Parameters<typeof createSourceControlWorkspaceEnvironmentAtoms>[1],
 ) {
+  const workspace = createSourceControlWorkspaceEnvironmentAtoms(runtime, workspaceOptions);
   /**
    * One flat family on purpose: families hold entries via WeakRef, so a nested
    * per-environment family can be collected between lookups, dropping every
@@ -280,7 +298,9 @@ export function createVcsEnvironmentAtoms<R, E>(
     const [environmentId, input] = JSON.parse(key) as [EnvironmentId, VcsListRefsInput];
     return runtime
       .atom((get) => {
-        const state = get(vcsRefsCacheStateAtom({ environmentId }));
+        const state = get(
+          vcsRefsCacheStateAtom({ environmentId, cwd: normalizeVcsRepositoryRoot(input.cwd) }),
+        );
         return cachedVcsRefsChanges(
           environmentId,
           input,
@@ -296,32 +316,48 @@ export function createVcsEnvironmentAtoms<R, E>(
   const listRefs = (target: {
     readonly environmentId: EnvironmentId;
     readonly input: VcsListRefsInput;
-  }) => listRefsFamily(JSON.stringify([target.environmentId, target.input]));
+  }) =>
+    listRefsFamily(
+      JSON.stringify([
+        target.environmentId,
+        { ...target.input, cwd: normalizeVcsRepositoryRoot(target.input.cwd) },
+      ]),
+    );
   const invalidateRefs = (
     target: { readonly environmentId: EnvironmentId; readonly input: { readonly cwd: string } },
     registry: AtomRegistry.AtomRegistry,
-  ) =>
-    invalidateCachedVcsRefs(registry, {
+  ) => {
+    invalidateSourceControlWorkspace(registry, {
+      environmentId: target.environmentId,
+      repositoryRoot: target.input.cwd,
+    });
+    return invalidateCachedVcsRefs(registry, {
       environmentId: target.environmentId,
       cwd: target.input.cwd,
     });
+  };
 
   return {
     listRefs,
-    status: createEnvironmentSubscriptionAtomFamily(runtime, {
-      label: "environment-data:vcs:status",
-      idleTtlMs: VCS_STATUS_IDLE_TTL_MS,
-      subscribe: (input: EnvironmentRpcInput<typeof WS_METHODS.subscribeVcsStatus>) =>
-        subscribe(WS_METHODS.subscribeVcsStatus, input).pipe(
-          Stream.mapAccum(
-            () => null as VcsStatusResult | null,
-            (current, event) => {
-              const next = applyGitStatusStreamEvent(current, event);
-              return [next, [next]] as const;
-            },
+    status: withCanonicalVcsRepository(
+      createEnvironmentSubscriptionAtomFamily(runtime, {
+        label: "environment-data:vcs:status",
+        idleTtlMs: VCS_STATUS_IDLE_TTL_MS,
+        onValue: (target, _value, registry) => publishSourceControlStatus(target, registry),
+        refreshTrigger: ({ environmentId, input }) =>
+          sourceControlWorkspaceStatusRefreshAtom({ environmentId, repositoryRoot: input.cwd }),
+        subscribe: (input: EnvironmentRpcInput<typeof WS_METHODS.subscribeVcsStatus>) =>
+          subscribe(WS_METHODS.subscribeVcsStatus, input).pipe(
+            Stream.mapAccum(
+              () => null as VcsStatusResult | null,
+              (current, event) => {
+                const next = applyGitStatusStreamEvent(current, event);
+                return [next, [next]] as const;
+              },
+            ),
           ),
-        ),
-    }),
+      }),
+    ),
     pull: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:vcs:pull",
       tag: WS_METHODS.vcsPull,
@@ -362,6 +398,11 @@ export function createVcsEnvironmentAtoms<R, E>(
       scheduler: vcsCommandScheduler,
       concurrency: vcsCommandConcurrency,
     }),
+    discoverRepositories: workspace.discoverRepositories,
+    commitGraphPage: workspace.commitGraphPage,
+    commitFiles: workspace.commitFiles,
+    compareRepositoryFile: workspace.compareRepositoryFile,
+    runGitAction: workspace.runAction,
     commitIndex: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:git:commit-index",
       tag: WS_METHODS.gitCommitIndex,

@@ -2105,6 +2105,8 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
 
         const status = yield* manager.status({ cwd: repoDir });
         expect(status.refName).toBe("upstream/effect-atom");
+        expect(status.remoteName).toBe("origin");
+        expect(status.remoteRefName).toBe("upstream/effect-atom");
         expect(status.pr).toEqual({
           number: 1618,
           title: "Correct PR",
@@ -3002,6 +3004,76 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
           Effect.map((result) => result.stdout.trim()),
         ),
       ).toContain("- details from user");
+    }),
+  );
+
+  it.effect("generates a repository-scoped message with temporary instructions", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      NodeFS.writeFileSync(NodePath.join(repoDir, "README.md"), "hello\nchanged\n");
+      yield* runGit(repoDir, ["add", "README.md"]);
+      let generatedPolicy: TextGeneration.CommitMessageGenerationInput["policy"] = undefined;
+
+      const { manager } = yield* makeManager({
+        serverSettings: {
+          sourceControlWritingStyle: {
+            mode: "custom" as const,
+            customInstructions: "Use concise imperative summaries.",
+          },
+        },
+        textGeneration: {
+          generateCommitMessage: (input) => {
+            generatedPolicy = input.policy;
+            return Effect.succeed({ subject: "Scoped generated message", body: "" });
+          },
+        },
+      });
+
+      const result = yield* manager.generateCommitMessage({
+        cwd: repoDir,
+        paths: ["README.md"],
+        instructions: "Mention the changed file.",
+      });
+      expect(result.message).toBe("Scoped generated message");
+      expect(generatedPolicy).toMatchObject({
+        commitInstructions: "Use concise imperative summaries.\n\nMention the changed file.",
+      });
+
+      yield* manager.generateCommitMessage({
+        cwd: repoDir,
+        paths: ["README.md"],
+        instructions: "Only describe behavior.",
+        replacePrompt: true,
+      });
+      expect(generatedPolicy).toMatchObject({ commitInstructions: "Only describe behavior." });
+    }),
+  );
+
+  it.effect("appends transient commit guidance to the effective conventional policy", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      NodeFS.writeFileSync(NodePath.join(repoDir, "README.md"), "guided\n");
+      yield* runGit(repoDir, ["add", "README.md"]);
+      let generatedPolicy: TextGeneration.CommitMessageGenerationInput["policy"] = undefined;
+      const { manager } = yield* makeManager({
+        serverSettings: { sourceControlWritingStyle: { mode: "conventional_commits" as const } },
+        textGeneration: {
+          generateCommitMessage: (input) => {
+            generatedPolicy = input.policy;
+            return Effect.succeed({ subject: "fix: guide", body: "" });
+          },
+        },
+      });
+      yield* manager.generateCommitMessage({
+        cwd: repoDir,
+        instructions: "Mention the migration.",
+      });
+      expect(generatedPolicy).toMatchObject({
+        kind: "conventional_commits",
+        commitInstructions: expect.stringContaining("Mention the migration."),
+      });
     }),
   );
 

@@ -1,9 +1,17 @@
+// @effect-diagnostics nodeBuiltinImport:off - this fixture verifies Git's on-disk linked-worktree format with a real Git process.
+import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeFileSystem from "@effect/platform-node/NodeFileSystem";
+import * as PlatformPath from "@effect/platform-node/NodePath";
 import * as KeyValueStore from "effect/unstable/persistence/KeyValueStore";
 import * as Persistence from "effect/unstable/persistence/Persistence";
 import { assert, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -184,7 +192,16 @@ function makeService(input: {
   readonly projects: ReadonlyArray<OrchestrationProjectShell>;
   readonly providers: ReadonlyArray<PullRequestProviderApi>;
   readonly resolveHandle?: SourceControlProviderRegistry.SourceControlProviderRegistry["Service"]["resolveHandle"];
+  readonly realPath?: (path: string) => Effect.Effect<string>;
+  readonly readFileString?: (path: string) => Effect.Effect<string>;
+  readonly useRealFileSystem?: boolean;
 }) {
+  const fileSystem = input.useRealFileSystem
+    ? NodeFileSystem.layer
+    : Layer.mock(FileSystem.FileSystem)({
+        realPath: input.realPath ?? ((candidate) => Effect.succeed(candidate)),
+        readFileString: input.readFileString ?? (() => Effect.succeed("")),
+      } as unknown as FileSystem.FileSystem);
   return PullRequestService.make.pipe(
     Effect.provide(
       Layer.mergeAll(
@@ -208,10 +225,87 @@ function makeService(input: {
           Layer.provide(KeyValueStore.layerMemory),
           Layer.provide(NodeServices.layer),
         ),
+        fileSystem,
+        PlatformPath.layer,
       ),
     ),
   );
 }
+
+it.effect("keeps host-authoritative comparison object ids on the PR detail", () =>
+  Effect.gen(function* () {
+    const service = yield* makeService({
+      projects: [
+        project({ id: "p1", title: "web", workspaceRoot: "/repo", repository: "acme/web" }),
+      ],
+      providers: [
+        fakeProvider("github", {
+          getChangeRequest: () =>
+            Effect.succeed({
+              ...hostedChangeRequest("Comparison authority"),
+              baseRevision: "a".repeat(40),
+              headRevision: "b".repeat(40),
+            }),
+        }),
+      ],
+    });
+
+    const detail = yield* service.detail({
+      projectId: "p1" as ProjectId,
+      repository: "acme/web",
+      number: 1,
+    });
+    assert.strictEqual(detail.baseRevision, "a".repeat(40));
+    assert.strictEqual(detail.headRevision, "b".repeat(40));
+  }),
+);
+
+it.effect("binds an aggregate diff slice to one stable host revision pair", () =>
+  Effect.gen(function* () {
+    let detailReads = 0;
+    let diffReads = 0;
+    const revision = (value: string) => ({
+      ...hostedChangeRequest("Comparison authority"),
+      baseRevision: value.repeat(40),
+      headRevision: value.toUpperCase().repeat(40),
+    });
+    const service = yield* makeService({
+      projects: [
+        project({ id: "p1", title: "web", workspaceRoot: "/repo", repository: "acme/web" }),
+      ],
+      providers: [
+        fakeProvider("github", {
+          getChangeRequest: () =>
+            Effect.sync(() => {
+              detailReads += 1;
+              // The PR moves during the first patch read. The service must
+              // retry instead of attaching A's patch to B's detail.
+              return detailReads < 2 ? revision("a") : revision("b");
+            }),
+          getDiff: () =>
+            Effect.sync(() => {
+              diffReads += 1;
+              return {
+                patch: diffReads === 1 ? "patch A" : "patch B",
+                truncated: false,
+                nextCursor: null,
+              };
+            }),
+        }),
+      ],
+    });
+    const diff = yield* service.diff({
+      projectId: "p1" as ProjectId,
+      repository: "acme/web",
+      number: 1,
+    });
+    assert.strictEqual(diff.patch, "patch B");
+    assert.strictEqual(diff.baseRevision, "b".repeat(40));
+    assert.strictEqual(diff.headRevision, "B".repeat(40));
+    assert.strictEqual(diffReads, 2);
+    assert.strictEqual(detailReads, 4);
+  }),
+);
 
 it.effect("refines unknown self-hosted GitLab projects before listing merge requests", () =>
   Effect.gen(function* () {
@@ -4825,6 +4919,460 @@ it.effect("names the signed-in account in the detail, and says nothing where the
     assert.strictEqual(named.viewer, "bilal");
     assert.strictEqual(unnamed.viewer, undefined);
   }),
+);
+
+it.effect("lists a selected nested repository with that repository's remote and checkout", () =>
+  Effect.gen(function* () {
+    const reads: Array<{ cwd: string; repository: string }> = [];
+    const service = yield* makeService({
+      projects: [
+        project({ id: "p1", title: "workspace", workspaceRoot: "/repo", repository: "outer/web" }),
+      ],
+      providers: [
+        fakeProvider("github", {
+          listChangeRequests: (input) =>
+            Effect.sync(() => {
+              reads.push({ cwd: input.cwd, repository: input.repository });
+              return { items: [], truncated: false, continues: false };
+            }),
+        }),
+      ],
+      resolveHandle: () =>
+        Effect.succeed({
+          context: {
+            provider: { kind: "github", name: "github.com", baseUrl: "https://github.com" },
+            remoteName: "origin",
+            remoteUrl: "https://github.com/nested/api.git",
+          },
+          provider: undefined as never,
+        }),
+    });
+
+    yield* service.list({
+      state: "open",
+      projectId: "p1" as ProjectId,
+      repositoryRoot: "/repo/packages/api",
+    });
+
+    assert.deepStrictEqual(reads, [{ cwd: "/repo/packages/api", repository: "nested/api" }]);
+  }),
+);
+
+it.effect(
+  "lists a canonical linked checkout outside the project when its gitdir belongs to the project",
+  () =>
+    Effect.gen(function* () {
+      const reads: string[] = [];
+      const service = yield* makeService({
+        projects: [
+          project({
+            id: "p1",
+            title: "workspace",
+            workspaceRoot: "/repo",
+            repository: "outer/web",
+          }),
+        ],
+        providers: [
+          fakeProvider("github", {
+            listChangeRequests: (input) =>
+              Effect.sync(() => {
+                reads.push(input.cwd);
+                return { items: [], truncated: false, continues: false };
+              }),
+          }),
+        ],
+        resolveHandle: () =>
+          Effect.succeed({
+            context: {
+              provider: { kind: "github", name: "github.com", baseUrl: "https://github.com" },
+              remoteName: "origin",
+              remoteUrl: "https://github.com/outer/web.git",
+            },
+            provider: undefined as never,
+          }),
+        readFileString: (filePath) =>
+          Effect.succeed(
+            filePath === "/worktrees/task/.git"
+              ? "gitdir: /repo/.git/worktrees/task\n"
+              : filePath === "/repo/.git/worktrees/task/gitdir"
+                ? "/worktrees/task/.git\n"
+                : "",
+          ),
+      });
+
+      yield* service.list({
+        state: "open",
+        projectId: "p1" as ProjectId,
+        repositoryRoot: "/worktrees/task",
+      });
+      assert.deepStrictEqual(reads, ["/worktrees/task"]);
+    }),
+);
+
+it.effect("lists a real registered linked worktree outside its project", () =>
+  Effect.gen(function* () {
+    const temporaryDirectory = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-pull-request-linked-worktree-"),
+    );
+    const projectRoot = NodePath.join(temporaryDirectory, "project");
+    const linkedRoot = NodePath.join(temporaryDirectory, "linked");
+    try {
+      NodeChildProcess.execFileSync("git", ["init", "--initial-branch=main", projectRoot]);
+      NodeChildProcess.execFileSync("git", [
+        "-C",
+        projectRoot,
+        "config",
+        "user.email",
+        "test@example.com",
+      ]);
+      NodeChildProcess.execFileSync("git", ["-C", projectRoot, "config", "user.name", "Test User"]);
+      NodeFS.writeFileSync(NodePath.join(projectRoot, "README.md"), "fixture\n");
+      NodeChildProcess.execFileSync("git", ["-C", projectRoot, "add", "README.md"]);
+      NodeChildProcess.execFileSync("git", ["-C", projectRoot, "commit", "-m", "fixture"]);
+      NodeChildProcess.execFileSync("git", [
+        "-C",
+        projectRoot,
+        "worktree",
+        "add",
+        "-b",
+        "linked",
+        linkedRoot,
+      ]);
+
+      const reads: string[] = [];
+      const service = yield* makeService({
+        projects: [
+          project({
+            id: "p1",
+            title: "workspace",
+            workspaceRoot: projectRoot,
+            repository: "outer/web",
+          }),
+        ],
+        providers: [
+          fakeProvider("github", {
+            listChangeRequests: (input) =>
+              Effect.sync(() => {
+                reads.push(input.cwd);
+                return { items: [], truncated: false, continues: false };
+              }),
+          }),
+        ],
+        resolveHandle: () =>
+          Effect.succeed({
+            context: {
+              provider: { kind: "github", name: "github.com", baseUrl: "https://github.com" },
+              remoteName: "origin",
+              remoteUrl: "https://github.com/outer/web.git",
+            },
+            provider: undefined as never,
+          }),
+        useRealFileSystem: true,
+      });
+
+      const canonicalLinkedRoot = NodeFS.realpathSync(linkedRoot);
+      yield* service.list({
+        state: "open",
+        projectId: "p1" as ProjectId,
+        repositoryRoot: canonicalLinkedRoot,
+      });
+      assert.deepStrictEqual(reads, [canonicalLinkedRoot]);
+    } finally {
+      NodeFS.rmSync(temporaryDirectory, { recursive: true, force: true });
+    }
+  }),
+);
+
+it.effect("rejects an external gitdir pointer without its registered worktree backlink", () =>
+  Effect.gen(function* () {
+    let resolved = 0;
+    const service = yield* makeService({
+      projects: [
+        project({ id: "p1", title: "workspace", workspaceRoot: "/repo", repository: "outer/web" }),
+      ],
+      providers: [fakeProvider("github")],
+      resolveHandle: () =>
+        Effect.sync(() => {
+          resolved += 1;
+          return {
+            context: {
+              provider: { kind: "github", name: "github.com", baseUrl: "https://github.com" },
+              remoteName: "origin",
+              remoteUrl: "https://github.com/outer/web.git",
+            },
+            provider: undefined as never,
+          };
+        }),
+      readFileString: (filePath) =>
+        Effect.succeed(filePath === "/forged/.git" ? "gitdir: /repo/.git/worktrees/linked\n" : ""),
+    });
+
+    const result = yield* Effect.result(
+      service.list({ state: "open", projectId: "p1" as ProjectId, repositoryRoot: "/forged" }),
+    );
+
+    assert.strictEqual(result._tag, "Failure");
+    assert.strictEqual(resolved, 0);
+  }),
+);
+
+it.effect("rejects an unrelated external checkout before asking its provider", () =>
+  Effect.gen(function* () {
+    let resolved = 0;
+    const service = yield* makeService({
+      projects: [
+        project({ id: "p1", title: "workspace", workspaceRoot: "/repo", repository: "outer/web" }),
+      ],
+      providers: [fakeProvider("github")],
+      resolveHandle: () =>
+        Effect.sync(() => {
+          resolved += 1;
+          return { context: null, provider: undefined as never };
+        }),
+      readFileString: () => Effect.succeed(""),
+    });
+    const result = yield* Effect.result(
+      service.list({
+        state: "open",
+        projectId: "p1" as ProjectId,
+        repositoryRoot: "/unrelated/checkout",
+      }),
+    );
+    assert.strictEqual(result._tag, "Failure");
+    assert.strictEqual(resolved, 0);
+  }),
+);
+
+it.effect("lists a selected nested repository when the project root has no provider", () =>
+  Effect.gen(function* () {
+    const reads: Array<{ cwd: string; repository: string }> = [];
+    const service = yield* makeService({
+      projects: [project({ id: "p1", title: "directory", workspaceRoot: "/repo" })],
+      providers: [
+        fakeProvider("github", {
+          listChangeRequests: (input) =>
+            Effect.sync(() => {
+              reads.push({ cwd: input.cwd, repository: input.repository });
+              return { items: [], truncated: false, continues: false };
+            }),
+        }),
+      ],
+      resolveHandle: () =>
+        Effect.succeed({
+          context: {
+            provider: { kind: "github", name: "github.com", baseUrl: "https://github.com" },
+            remoteName: "origin",
+            remoteUrl: "https://github.com/nested/api.git",
+          },
+          provider: undefined as never,
+        }),
+    });
+
+    yield* service.list({
+      state: "open",
+      projectId: "p1" as ProjectId,
+      repositoryRoot: "/repo/packages/api",
+    });
+
+    assert.deepStrictEqual(reads, [{ cwd: "/repo/packages/api", repository: "nested/api" }]);
+  }),
+);
+
+it.effect("reads an explicit nested repository when the outer project has no provider", () =>
+  Effect.gen(function* () {
+    const reads: string[] = [];
+    const service = yield* makeService({
+      projects: [project({ id: "p1", title: "directory", workspaceRoot: "/repo" })],
+      providers: [
+        fakeProvider("github", {
+          getChangeRequest: (input) =>
+            Effect.sync(() => {
+              reads.push(input.cwd);
+              return {
+                ...changeRequest(7, "2026-07-02T00:00:00Z"),
+                body: "",
+                changedFiles: 0,
+                mergedAt: null,
+                closedAt: null,
+                reviewers: [],
+                checks: [],
+                mergeCapabilities: { merge: true, squash: true, rebase: true },
+                viewerPermissions: {
+                  actions: [],
+                  comment: false,
+                  resolve: false,
+                  verdicts: [],
+                  requestReviewers: false,
+                },
+              };
+            }),
+        }),
+      ],
+      resolveHandle: () =>
+        Effect.succeed({
+          context: {
+            provider: { kind: "github", name: "github.com", baseUrl: "https://github.com" },
+            remoteName: "origin",
+            remoteUrl: "https://github.com/nested/api.git",
+          },
+          provider: undefined as never,
+        }),
+    });
+
+    yield* service.detail({
+      projectId: "p1" as ProjectId,
+      repositoryRoot: "/repo/packages/api",
+      repository: "nested/api",
+      number: 7,
+    });
+
+    assert.deepStrictEqual(reads, ["/repo/packages/api"]);
+  }),
+);
+
+for (const scope of [
+  { name: "an explicit outer repository", repositoryRoot: "/repo", repository: "outer/web" },
+  {
+    name: "an explicit nested repository",
+    repositoryRoot: "/repo/packages/api",
+    repository: "nested/api",
+  },
+  { name: "a rootless legacy reference", repositoryRoot: undefined, repository: "outer/web" },
+] as const) {
+  it.effect(
+    `keeps ${scope.name} on one repository for list, detail, refresh, merge, and close`,
+    () =>
+      Effect.gen(function* () {
+        const calls: Array<{ operation: string; cwd: string; repository: string }> = [];
+        const service = yield* makeService({
+          projects: [
+            project({
+              id: "p1",
+              title: "workspace",
+              workspaceRoot: "/repo",
+              repository: "outer/web",
+            }),
+          ],
+          providers: [
+            fakeProvider("github", {
+              listChangeRequests: (input) =>
+                Effect.sync(() => {
+                  calls.push({ operation: "list", cwd: input.cwd, repository: input.repository });
+                  return { items: [], truncated: false, continues: false };
+                }),
+              getChangeRequest: (input) =>
+                Effect.sync(() => {
+                  calls.push({ operation: "detail", cwd: input.cwd, repository: input.repository });
+                  return hostedChangeRequest("body");
+                }),
+              runAction: (input) =>
+                Effect.sync(() => {
+                  calls.push({
+                    operation: input.action,
+                    cwd: input.cwd,
+                    repository: input.repository,
+                  });
+                }),
+            }),
+          ],
+          resolveHandle: ({ cwd }) =>
+            Effect.succeed({
+              context: {
+                provider: { kind: "github", name: "github.com", baseUrl: "https://github.com" },
+                remoteName: "origin",
+                remoteUrl:
+                  cwd === "/repo/packages/api"
+                    ? "https://github.com/nested/api.git"
+                    : "https://github.com/outer/web.git",
+              },
+              provider: undefined as never,
+            }),
+        });
+        const reference = {
+          projectId: "p1" as ProjectId,
+          ...(scope.repositoryRoot === undefined ? {} : { repositoryRoot: scope.repositoryRoot }),
+          host: "github.com",
+          repository: scope.repository,
+          number: 7,
+        };
+
+        yield* service.list({
+          state: "open",
+          projectId: reference.projectId,
+          ...(scope.repositoryRoot === undefined ? {} : { repositoryRoot: scope.repositoryRoot }),
+        });
+        yield* service.detail(reference);
+        const detailReadsBeforeInvalidate = calls.filter(
+          (call) => call.operation === "detail",
+        ).length;
+        yield* service.invalidate({ reference });
+        assert.strictEqual(
+          calls.filter((call) => call.operation === "detail").length,
+          detailReadsBeforeInvalidate,
+          "invalidation itself must not stand in for the caller's refresh read",
+        );
+        yield* service.detail(reference);
+        assert.strictEqual(
+          calls.filter((call) => call.operation === "detail").length,
+          detailReadsBeforeInvalidate + 1,
+          "the first detail read immediately after invalidation must reach the selected repository",
+        );
+        yield* service.runAction({ ...reference, action: "merge" });
+        yield* service.runAction({ ...reference, action: "close" });
+
+        assert.isTrue(calls.some((call) => call.operation === "list"));
+        assert.lengthOf(
+          calls.filter((call) => call.operation === "merge" || call.operation === "close"),
+          2,
+        );
+        assert.isTrue(calls.every((call) => call.cwd === (scope.repositoryRoot ?? "/repo")));
+        assert.isTrue(calls.every((call) => call.repository === scope.repository));
+      }),
+  );
+}
+
+it.effect("rejects a selected repository root that traverses outside its project", () =>
+  Effect.gen(function* () {
+    const service = yield* makeService({
+      projects: [project({ id: "p1", title: "directory", workspaceRoot: "/repo" })],
+      providers: [
+        fakeProvider("github", { listChangeRequests: () => Effect.die("must not list") }),
+      ],
+      resolveHandle: () => Effect.die("must not resolve"),
+    });
+
+    const error = yield* Effect.flip(
+      service.list({
+        state: "open",
+        projectId: "p1" as ProjectId,
+        repositoryRoot: "/repo/../outside",
+      }),
+    );
+
+    assert.include(error.message, "canonical");
+  }),
+);
+
+it.effect(
+  "rejects a selected repository symlink alias even when it resolves inside the project",
+  () =>
+    Effect.gen(function* () {
+      const service = yield* makeService({
+        projects: [project({ id: "p1", title: "directory", workspaceRoot: "/repo" })],
+        providers: [
+          fakeProvider("github", { listChangeRequests: () => Effect.die("must not list") }),
+        ],
+        realPath: (candidate) =>
+          Effect.succeed(candidate === "/repo/link" ? "/repo/packages/api" : candidate),
+        resolveHandle: () => Effect.die("must not resolve"),
+      });
+
+      const error = yield* Effect.flip(
+        service.list({ state: "open", projectId: "p1" as ProjectId, repositoryRoot: "/repo/link" }),
+      );
+
+      assert.include(error.message, "canonical");
+    }),
 );
 
 it.effect("keeps Azure continuation cursors separate for repositories with the same name", () =>

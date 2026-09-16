@@ -5,7 +5,7 @@ import type {
   ResolvedKeybindingsConfig,
 } from "@t3tools/contracts";
 import { FileCode2 } from "lucide-react";
-import { useCallback, type MouseEvent as ReactMouseEvent, type ReactNode } from "react";
+import { useCallback, type MouseEvent as ReactMouseEvent } from "react";
 
 import { isElectron } from "~/env";
 import { readLocalApi } from "~/localApi";
@@ -21,7 +21,15 @@ import { OpenInPicker } from "../chat/OpenInPicker";
 import type { SecondaryPaneSurface } from "../../secondaryPaneStore";
 
 function title(surface: SecondaryPaneSurface) {
-  return surface.relativePath.split("/").at(-1) ?? surface.relativePath;
+  const path =
+    surface.kind === "file" ? surface.relativePath : (surface.newPath ?? surface.oldPath ?? "Diff");
+  return path.split("/").at(-1) ?? path;
+}
+
+function surfacePath(surface: SecondaryPaneSurface): string {
+  return surface.kind === "file"
+    ? surface.relativePath
+    : (surface.newPath ?? surface.oldPath ?? "Diff");
 }
 
 type TabContextMenuAction = "copy-path" | "close" | "close-others" | "close-to-right" | "close-all";
@@ -61,12 +69,13 @@ export function SecondaryPaneTabs(props: {
   onCloseOtherSurfaces: (surfaceId: string) => void;
   onCloseSurfacesToRight: (surfaceId: string) => void;
   onCloseAllSurfaces: () => void;
-  workspaceFile?: WorkspaceFileHeader;
-  headerControls?: ReactNode;
+  workspaceFile?: WorkspaceFileHeader | undefined;
   layout?: "inline" | "stack";
   maximized?: boolean;
+  /** Fixed global controls sit over the viewport header, so tabs reserve their footprint. */
+  reserveGlobalControls?: boolean;
 }) {
-  const ownsDesktopTitlebar = isElectron && props.layout !== "stack";
+  const ownsDesktopTitlebar = isElectron && (props.layout !== "stack" || props.maximized);
   const handleTabContextMenu = useCallback(
     async (event: ReactMouseEvent, surface: SecondaryPaneSurface) => {
       event.preventDefault();
@@ -89,7 +98,7 @@ export function SecondaryPaneTabs(props: {
       const action = await api.contextMenu.show(items, { x: event.clientX, y: event.clientY });
       switch (action) {
         case "copy-path":
-          props.onCopyFilePath(surface.relativePath);
+          props.onCopyFilePath(surfacePath(surface));
           break;
         case "close":
           props.onClose(surface.id);
@@ -114,7 +123,11 @@ export function SecondaryPaneTabs(props: {
     <div
       className={cn(
         "flex h-[var(--workspace-topbar-height)] min-h-[var(--workspace-topbar-height)] min-w-0 shrink-0 items-center border-b border-border/60 px-2",
-        ownsDesktopTitlebar && "drag-region wco:pr-[var(--workspace-native-controls-inset)]",
+        props.reserveGlobalControls && "pr-[var(--workspace-global-controls-width)]",
+        ownsDesktopTitlebar &&
+          (props.reserveGlobalControls
+            ? "drag-region"
+            : "drag-region wco:pr-[var(--workspace-native-controls-inset)]"),
         props.maximized && COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
       )}
       data-secondary-pane-tabbar
@@ -144,7 +157,7 @@ export function SecondaryPaneTabs(props: {
                 )}
               >
                 <PanelTabCloseButton
-                  label={`Close ${surface.relativePath}`}
+                  label={`Close ${surfacePath(surface)}`}
                   onClick={() => props.onClose(surface.id)}
                 >
                   <span className="flex size-3 items-center justify-center text-[10px]" aria-hidden>
@@ -159,7 +172,7 @@ export function SecondaryPaneTabs(props: {
                         className="flex min-w-0 cursor-pointer items-center"
                         role="tab"
                         aria-selected={active}
-                        aria-label={surface.relativePath}
+                        aria-label={surfacePath(surface)}
                         onClick={() => props.onActivate(surface.id)}
                       />
                     }
@@ -167,7 +180,7 @@ export function SecondaryPaneTabs(props: {
                     <FileCode2 className="mr-1 size-3 shrink-0" aria-hidden />
                     <span className="truncate">{title(surface)}</span>
                   </TooltipTrigger>
-                  <TooltipPopup>{surface.relativePath}</TooltipPopup>
+                  <TooltipPopup>{surfacePath(surface)}</TooltipPopup>
                 </Tooltip>
               </div>
             );
@@ -179,15 +192,10 @@ export function SecondaryPaneTabs(props: {
           <SecondaryPaneOpenInPicker {...props.workspaceFile} />
         </div>
       ) : null}
-      {props.headerControls ? (
-        <div className="ml-1 flex h-full shrink-0 items-center [-webkit-app-region:no-drag]">
-          {props.headerControls}
-        </div>
-      ) : null}
       {ownsDesktopTitlebar ? (
         <span
           aria-hidden
-          className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]"
+          className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[calc(var(--workspace-controls-right)+1px)] h-[var(--workspace-topbar-height)] w-[var(--workspace-global-controls-cluster-width)] [-webkit-app-region:no-drag]"
         />
       ) : null}
     </div>

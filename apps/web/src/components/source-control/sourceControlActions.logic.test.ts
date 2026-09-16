@@ -1,10 +1,16 @@
-import type { VcsStatusResult } from "@t3tools/contracts";
+import type {
+  GitActionOperation,
+  GitRepositoryCapabilities,
+  VcsStatusResult,
+} from "@t3tools/contracts";
 import { assert, describe, it } from "vite-plus/test";
 import {
+  destructiveWorkflowCopy,
   buildGitCommitFilePaths,
   workingTreeSnapshotScope,
   buildGitActionProgressStages,
   buildMenuItems,
+  buildWorkflowMenuItems,
   requiresDefaultBranchConfirmation,
   resolveAutoFeatureBranchName,
   resolveDefaultBranchActionDialogCopy,
@@ -12,7 +18,332 @@ import {
   resolveQuickAction,
   resolveThreadBranchUpdate,
   resolveThreadBranchMetadataPatch,
+  reviewedGitSnapshotAvailability,
+  workflowApprovalDescription,
+  workflowInputFieldVisibility,
+  workflowInputFields,
+  workflowRequiredFields,
+  isWorkflowViewChecked,
 } from "./sourceControlActions.logic";
+
+describe("repository workflow menu", () => {
+  it("describes distinct reviewed pull and publication targets for rebase and sync", () => {
+    const description = workflowApprovalDescription({
+      label: "Commit & Sync",
+      environmentId: "env" as never,
+      repositoryRoot: "/repo",
+      sourceRef: "feature/reviewed",
+      sourceHead: "reviewed-head",
+      refName: "",
+      sourceRefInput: "",
+      targetRef: "",
+      oldRefName: "",
+      newRefName: "",
+      remoteName: "publication",
+      pullRemoteName: "upstream",
+      pullRefName: "pull-target",
+      publicationRemoteName: "publication",
+      publicationRefName: "publish-target",
+      compoundOperation: "commit-sync",
+    });
+    assert.include(description, "pull upstream/pull-target");
+    assert.include(description, "publish publication/publish-target");
+    assert.include(description, "commit, pull, then push");
+  });
+
+  it("requires source and old ref fields for create-from and rename", () => {
+    assert.deepEqual(workflowInputFieldVisibility("branch", "create"), {
+      sourceRef: true,
+      oldRefName: false,
+    });
+    assert.deepEqual(workflowInputFieldVisibility("branch", "rename"), {
+      sourceRef: false,
+      oldRefName: true,
+    });
+  });
+
+  it("makes fixed leaves name their non-negotiable inputs", () => {
+    assert.deepEqual(workflowRequiredFields("branch-create-from"), ["refName", "sourceRef"]);
+    assert.deepEqual(workflowRequiredFields("pull-from"), ["remoteName", "refName"]);
+    assert.deepEqual(workflowRequiredFields("push-to"), ["remoteName", "refName"]);
+    assert.deepEqual(workflowRequiredFields("stash-apply-latest"), []);
+    assert.deepEqual(workflowRequiredFields("stash-pop-latest"), []);
+  });
+
+  it("renders a ref input for a typed checkout", () => {
+    assert.isTrue(workflowInputFields("checkout").has("refName"));
+    assert.deepEqual(workflowRequiredFields("checkout"), ["refName"]);
+  });
+
+  it("gives the retained Commit submenu a message field and keeps empty plain commits disabled", () => {
+    assert.isTrue(workflowInputFields("commit").has("message"));
+    assert.isTrue(workflowInputFields("amend").has("message"));
+    assert.deepEqual(workflowRequiredFields("commit"), ["message"]);
+    assert.deepEqual(workflowRequiredFields("amend"), []);
+  });
+
+  it("disables PR mutations that have no repository-scoped reference", () => {
+    const items = buildWorkflowMenuItems(status(), capabilities([]), false, {
+      providerAvailable: true,
+      authenticated: true,
+      hasPullRequest: true,
+      hasReference: false,
+    });
+    assert.include(
+      items.find((item) => item.id === "pr-merge")?.disabledReason ?? "",
+      "repository identity",
+    );
+    assert.include(
+      items.find((item) => item.id === "pr-refresh")?.disabledReason ?? "",
+      "repository identity",
+    );
+  });
+
+  it("fails closed for mutations until the reviewed ref, HEAD, and index snapshot is complete", () => {
+    const unavailable = reviewedGitSnapshotAvailability({
+      status: incompleteStatus("indexTree"),
+      isPending: false,
+      hasError: false,
+    });
+    assert.isFalse(unavailable.available);
+    if (unavailable.available) throw new Error("expected an unavailable reviewed snapshot");
+    assert.include(unavailable.reason, "index");
+
+    const items = buildWorkflowMenuItems(
+      incompleteStatus("indexTree"),
+      capabilities(["commit", "fetch", "pull", "push", "sync", "publish", "branch"]),
+      false,
+      undefined,
+      unavailable,
+    );
+    assert.include(items.find((item) => item.id === "push")?.disabledReason ?? "", "index");
+    assert.include(items.find((item) => item.id === "checkout")?.disabledReason ?? "", "index");
+    assert.include(items.find((item) => item.id === "pr-create")?.disabledReason ?? "", "index");
+    assert.isUndefined(items.find((item) => item.id === "view-tree")?.disabledReason);
+  });
+
+  it("names pending, failed, ref, HEAD, and index snapshot failures", () => {
+    const cases = [
+      [{ status: status(), isPending: true, hasError: false }, "loading"],
+      [{ status: status(), isPending: false, hasError: true }, "failed"],
+      [{ status: incompleteStatus("refName"), isPending: false, hasError: false }, "ref"],
+      [{ status: incompleteStatus("headCommit"), isPending: false, hasError: false }, "HEAD"],
+      [{ status: incompleteStatus("indexTree"), isPending: false, hasError: false }, "index"],
+    ] as const;
+
+    for (const [input, reason] of cases) {
+      const availability = reviewedGitSnapshotAvailability(input);
+      assert.isFalse(availability.available);
+      if (availability.available) throw new Error("expected an unavailable reviewed snapshot");
+      assert.include(availability.reason, reason);
+    }
+  });
+
+  it("keeps presentation and sort checks independent", () => {
+    assert.isTrue(isWorkflowViewChecked("view-tree", "view-tree", "view-sort-name"));
+    assert.isTrue(isWorkflowViewChecked("view-sort-name", "view-tree", "view-sort-name"));
+    assert.isFalse(isWorkflowViewChecked("view-list", "view-tree", "view-sort-name"));
+    assert.isFalse(isWorkflowViewChecked("view-sort-path", "view-tree", "view-sort-name"));
+  });
+
+  it("exposes the full typed matrix with capability-gated reasons", () => {
+    const items = buildWorkflowMenuItems(
+      status({
+        hasWorkingTreeChanges: true,
+        workingTree: { files: [], insertions: 0, deletions: 0, stagedCount: 1 },
+      }),
+      capabilities(["commit", "amend", "fetch", "pull", "push", "sync", "publish", "branch"]),
+      false,
+    );
+    assert.deepEqual(
+      [
+        "View as Tree",
+        "Sort by Path",
+        "Commit & Push",
+        "Undo Last Commit",
+        "Stage All",
+        "Unstage All",
+        "Discard All",
+        "Pull From...",
+        "Force Push",
+        "Fetch Prune",
+        "Create Branch From...",
+        "Delete Remote Branch",
+        "Add Remote",
+        "Remove Remote",
+        "Stash Staged",
+        "Drop All",
+        "Push All Tags",
+        "Create Pull Request",
+        "Close Pull Request",
+      ].every((label) => items.some((item) => item.label === label)),
+      true,
+    );
+    assert.include(items.find((item) => item.id === "merge")?.disabledReason ?? "", "unavailable");
+    assert.isFalse(items.find((item) => item.id === "commit")?.requiresConfirmation);
+    assert.isTrue(items.find((item) => item.id === "push")?.requiresConfirmation);
+  });
+
+  it("derives direct sync and conflict availability from real repository preconditions", () => {
+    const items = buildWorkflowMenuItems(
+      status({
+        refName: null,
+        hasPrimaryRemote: false,
+        hasUpstream: false,
+        aheadCount: 0,
+        pendingMergeHeads: [],
+      }),
+      capabilities(["fetch", "pull", "push", "sync", "publish", "conflict"]),
+      false,
+    );
+    assert.include(items.find((item) => item.id === "fetch")?.disabledReason ?? "", "remote");
+    assert.include(items.find((item) => item.id === "pull")?.disabledReason ?? "", "Detached HEAD");
+    assert.include(items.find((item) => item.id === "push")?.disabledReason ?? "", "Detached HEAD");
+    assert.include(items.find((item) => item.id === "sync")?.disabledReason ?? "", "Detached HEAD");
+    assert.include(
+      items.find((item) => item.id === "publish")?.disabledReason ?? "",
+      "Detached HEAD",
+    );
+    assert.include(
+      items.find((item) => item.id === "conflict-continue")?.disabledReason ?? "",
+      "No active conflict",
+    );
+    assert.include(
+      items.find((item) => item.id === "conflict-abort")?.disabledReason ?? "",
+      "No active conflict",
+    );
+  });
+
+  it("enables conflict continuation from the server-reported cherry-pick state", () => {
+    const activeStatus = status() as VcsStatusResult & {
+      readonly activeConflictOperation: "cherry-pick";
+    };
+    const items = buildWorkflowMenuItems(
+      { ...activeStatus, activeConflictOperation: "cherry-pick" },
+      capabilities(["conflict"]),
+      false,
+    );
+    assert.isFalse(items.find((item) => item.id === "conflict-continue")?.disabled ?? true);
+    assert.isFalse(items.find((item) => item.id === "conflict-abort")?.disabled ?? true);
+  });
+
+  it("gates every remote and index-specific variant on its real prerequisite", () => {
+    const items = buildWorkflowMenuItems(
+      status({
+        hasPrimaryRemote: false,
+        hasUpstream: false,
+        workingTree: { files: [], insertions: 0, deletions: 0, stagedCount: 0 },
+      }),
+      capabilities(["fetch", "pull", "push", "branch", "stash", "tag"]),
+      false,
+    );
+    for (const id of [
+      "fetch-all",
+      "fetch-prune",
+      "push-to",
+      "force-push",
+      "branch-publish",
+      "branch-delete-remote",
+      "tag-push",
+      "tag-push-all",
+    ] as const) {
+      assert.include(items.find((item) => item.id === id)?.disabledReason ?? "", "remote");
+    }
+    assert.include(
+      items.find((item) => item.id === "pull-rebase")?.disabledReason ?? "",
+      "upstream",
+    );
+    assert.include(
+      items.find((item) => item.id === "stash-staged")?.disabledReason ?? "",
+      "Stage changes",
+    );
+  });
+
+  it("disables undo on a root commit because HEAD~1 does not exist", () => {
+    const items = buildWorkflowMenuItems(
+      status({ headCommit: "root", headHasParent: false }),
+      capabilities(["reset"]),
+      false,
+    );
+    assert.include(items.find((item) => item.id === "undo-commit")?.disabledReason ?? "", "parent");
+  });
+
+  it("does not offer Stash Staged to an installed Git that cannot execute it", () => {
+    const items = buildWorkflowMenuItems(
+      status({
+        hasWorkingTreeChanges: true,
+        workingTree: { files: [], insertions: 0, deletions: 0, stagedCount: 1 },
+      }),
+      { actions: ["stash"], supportsIndexWorkflow: true, supportsStashStaged: false },
+      false,
+    );
+    assert.include(
+      items.find((item) => item.id === "stash-staged")?.disabledReason ?? "",
+      "Git 2.35",
+    );
+  });
+
+  it("uses provider capabilities and viewer permissions for PR mutation reasons", () => {
+    const items = buildWorkflowMenuItems(status(), capabilities([]), false, {
+      providerAvailable: true,
+      authenticated: true,
+      hasPullRequest: true,
+      hasReference: true,
+      detailStatus: "ready",
+      actions: new Set(["close"]),
+      viewerActions: new Set(),
+    });
+    assert.include(
+      items.find((item) => item.id === "pr-merge")?.disabledReason ?? "",
+      "provider cannot merge",
+    );
+    assert.include(
+      items.find((item) => item.id === "pr-close")?.disabledReason ?? "",
+      "signed-in account cannot close",
+    );
+  });
+
+  it("fails closed for pull-request mutations until typed detail has loaded", () => {
+    const items = buildWorkflowMenuItems(status(), capabilities([]), false, {
+      providerAvailable: true,
+      authenticated: true,
+      hasPullRequest: true,
+      hasReference: true,
+    });
+
+    for (const id of ["pr-merge", "pr-close"] as const) {
+      assert.include(items.find((item) => item.id === id)?.disabledReason ?? "", "Loading");
+    }
+    for (const id of ["pr-open", "pr-checkout", "pr-refresh"] as const) {
+      assert.isUndefined(items.find((item) => item.id === id)?.disabledReason);
+    }
+  });
+
+  it("keeps mutations fail-closed but leaves reference-based recovery actions available when typed detail failed", () => {
+    const items = buildWorkflowMenuItems(status(), capabilities([]), false, {
+      providerAvailable: true,
+      authenticated: true,
+      hasPullRequest: true,
+      hasReference: true,
+      detailStatus: "failed",
+    });
+
+    assert.include(
+      items.find((item) => item.id === "pr-merge")?.disabledReason ?? "",
+      "failed to load",
+    );
+    assert.include(
+      items.find((item) => item.id === "pr-close")?.disabledReason ?? "",
+      "failed to load",
+    );
+    assert.isUndefined(items.find((item) => item.id === "pr-refresh")?.disabledReason);
+    assert.isUndefined(items.find((item) => item.id === "pr-open")?.disabledReason);
+  });
+});
+
+function capabilities(actions: readonly GitActionOperation[]): GitRepositoryCapabilities {
+  return { actions, supportsIndexWorkflow: true, supportsStashStaged: true };
+}
 
 function status(overrides: Partial<VcsStatusResult> = {}): VcsStatusResult {
   return {
@@ -20,6 +351,8 @@ function status(overrides: Partial<VcsStatusResult> = {}): VcsStatusResult {
     hasPrimaryRemote: true,
     isDefaultRef: false,
     refName: "feature/test",
+    headCommit: "head",
+    indexTree: "index",
     hasWorkingTreeChanges: false,
     workingTree: {
       files: [],
@@ -32,6 +365,12 @@ function status(overrides: Partial<VcsStatusResult> = {}): VcsStatusResult {
     pr: null,
     ...overrides,
   };
+}
+
+function incompleteStatus(field: "refName" | "headCommit" | "indexTree"): VcsStatusResult {
+  const incomplete = { ...status() } as Record<string, unknown>;
+  delete incomplete[field];
+  return incomplete as VcsStatusResult;
 }
 
 describe("when: ref is clean and has an open PR", () => {
@@ -392,12 +731,12 @@ describe("when: ref has diverged from upstream", () => {
 });
 
 describe("when: working tree has local changes", () => {
-  it("resolveQuickAction returns commit, push, and create PR", () => {
+  it("resolveQuickAction keeps commit and push on the staged workflow", () => {
     const quick = resolveQuickAction(status({ hasWorkingTreeChanges: true }), false);
     assert.deepInclude(quick, {
       kind: "run_action",
-      action: "commit_push_pr",
-      label: "Commit, push & PR",
+      action: "commit_push",
+      label: "Commit & push",
     });
   });
 
@@ -542,15 +881,15 @@ describe("when: on default ref without open PR", () => {
 });
 
 describe("when: working tree has local changes and ref is behind upstream", () => {
-  it("resolveQuickAction still prefers commit, push, and create PR", () => {
+  it("resolveQuickAction still prefers the staged commit and push workflow", () => {
     const quick = resolveQuickAction(
       status({ hasWorkingTreeChanges: true, behindCount: 1 }),
       false,
     );
     assert.deepInclude(quick, {
       kind: "run_action",
-      action: "commit_push_pr",
-      label: "Commit, push & PR",
+      action: "commit_push",
+      label: "Commit & push",
     });
   });
 
@@ -889,6 +1228,17 @@ describe("requiresDefaultBranchConfirmation", () => {
 });
 
 describe("resolveDefaultBranchActionDialogCopy", () => {
+  it("identifies the selected repository in the default-ref confirmation", () => {
+    const copy = resolveDefaultBranchActionDialogCopy({
+      action: "create_pr",
+      branchName: "main",
+      includesCommit: false,
+      repositoryRoot: "/workspace/api",
+    });
+
+    assert.include(copy.description, 'repository "/workspace/api"');
+  });
+
   it("uses push-only copy when pushing without a commit", () => {
     const copy = resolveDefaultBranchActionDialogCopy({
       action: "commit_push",
@@ -1175,5 +1525,23 @@ describe("workingTreeSnapshotScope", () => {
       workingTreeSnapshotScope("environment-a", "/repo-a", "wt-1"),
       workingTreeSnapshotScope("environment-b", "/repo-b", "wt-1"),
     );
+  });
+});
+
+describe("destructive workflow confirmation", () => {
+  it("names the ref at risk and uses destructive action copy", () => {
+    assert.deepEqual(destructiveWorkflowCopy({ id: "force-push", remoteName: "upstream" }), {
+      description:
+        "force-pushing the selected ref to upstream can overwrite that remote branch's history.",
+      confirmLabel: "Force push",
+    });
+    assert.deepEqual(destructiveWorkflowCopy({ id: "stash-drop", refName: "stash@{2}" }), {
+      description: "dropping stash stash@{2} permanently removes its saved changes.",
+      confirmLabel: "Drop stash",
+    });
+    assert.deepEqual(destructiveWorkflowCopy({ id: "tag-delete", refName: "v2.0.0" }), {
+      description: "deleting tag v2.0.0 removes that local tag ref.",
+      confirmLabel: "Delete tag",
+    });
   });
 });

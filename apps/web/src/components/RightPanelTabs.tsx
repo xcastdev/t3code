@@ -83,6 +83,8 @@ interface RightPanelTabsProps {
   /** Forwarded to PreviewPanelShell as the initial width before a user resize. */
   defaultWidth?: number;
   layoutControls?: ReactNode;
+  /** Fixed workspace controls cover this titlebar rather than a sheet row. */
+  reserveGlobalControls?: boolean;
   surfaces: readonly RightPanelSurface[];
   /** Fallback environment for surfaces that do not carry their own. */
   environmentId: EnvironmentId | null;
@@ -797,12 +799,12 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
             // The sheet overlays from the viewport top, so its tab bar keeps
             // the titlebar's height: a compact row re-centers the layout
             // controls a few pixels higher and the cluster jumps on open.
-            props.mode === "inline" && !props.layoutControls ? "pr-28" : "pr-3",
+            props.reserveGlobalControls ? "pr-[var(--workspace-global-controls-width)]" : "pr-3",
             ownsDesktopTitleBar && "drag-region",
             ownsDesktopTitleBar &&
-              (props.layoutControls
-                ? "wco:pr-[var(--workspace-native-controls-inset)]"
-                : "wco:pr-[calc(var(--workspace-native-controls-inset)+6rem)]"),
+              (props.reserveGlobalControls
+                ? undefined
+                : "wco:pr-[var(--workspace-native-controls-inset)]"),
             props.mode === "inline" && props.maximized && COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
           )}
           data-right-panel-tabbar
@@ -1073,7 +1075,7 @@ export function RightPanelTabs(props: RightPanelTabsProps) {
           {ownsDesktopTitleBar ? (
             <span
               aria-hidden
-              className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]"
+              className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[calc(var(--workspace-controls-right)+1px)] h-[var(--workspace-topbar-height)] w-[var(--workspace-global-controls-cluster-width)] [-webkit-app-region:no-drag]"
             />
           ) : null}
         </div>

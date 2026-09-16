@@ -799,6 +799,90 @@ it.effect("keeps concurrent diff file reads on different hosts separate", () =>
   ),
 );
 
+it.effect("keeps concurrent diff file reads from nested and outer repositories separate", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const release = yield* Latch.make();
+      const started = yield* Latch.make();
+      const calls: string[] = [];
+      const client = {
+        [WS_METHODS.pullRequestsDiffFileContents]: (input: { readonly repositoryRoot?: string }) =>
+          Effect.gen(function* () {
+            calls.push(input.repositoryRoot ?? "/repo");
+            yield* started.open;
+            yield* release.await;
+            return { oldContents: "", newContents: input.repositoryRoot ?? "/repo" };
+          }),
+      } as unknown as WsRpcProtocolClient;
+      const { atoms, registry } = yield* makeTestRuntime(client);
+      const input = {
+        projectId: ProjectId.make("project-1"),
+        host: "github.com",
+        repository: "acme/web",
+        number: 1,
+        changeType: "change",
+        oldPath: "src/app.ts",
+        newPath: "src/app.ts",
+      } as const;
+      const outer = atoms.diffFileContents.run(registry, {
+        environmentId: TARGET.environmentId,
+        input: { ...input, repositoryRoot: "/repo" },
+      });
+      yield* started.await;
+      const nested = atoms.diffFileContents.run(registry, {
+        environmentId: TARGET.environmentId,
+        input: { ...input, repositoryRoot: "/repo/packages/api" },
+      });
+      yield* release.open;
+
+      expect(yield* Effect.promise(() => Promise.all([outer, nested]))).toMatchObject([
+        { _tag: "Success", value: { newContents: "/repo" } },
+        { _tag: "Success", value: { newContents: "/repo/packages/api" } },
+      ]);
+      expect(calls).toEqual(["/repo", "/repo/packages/api"]);
+    }),
+  ),
+);
+
+it.effect("keeps nested repository identity on targeted pull request invalidation", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const invalidated: unknown[] = [];
+      const client = {
+        [WS_METHODS.pullRequestsInvalidate]: (input: unknown) =>
+          Effect.sync(() => {
+            invalidated.push(input);
+          }),
+      } as unknown as WsRpcProtocolClient;
+      const { atoms, registry } = yield* makeTestRuntime(client);
+      const reference = {
+        projectId: ProjectId.make("project-1"),
+        host: "github.com",
+        repository: "acme/web",
+        number: 1,
+      } as const;
+
+      yield* Effect.promise(() =>
+        Promise.all([
+          atoms.invalidate.run(registry, {
+            environmentId: TARGET.environmentId,
+            input: { reference: { ...reference, repositoryRoot: "/repo" } },
+          }),
+          atoms.invalidate.run(registry, {
+            environmentId: TARGET.environmentId,
+            input: { reference: { ...reference, repositoryRoot: "/repo/packages/api" } },
+          }),
+        ]),
+      );
+
+      expect(invalidated).toEqual([
+        { reference: { ...reference, repositoryRoot: "/repo" } },
+        { reference: { ...reference, repositoryRoot: "/repo/packages/api" } },
+      ]);
+    }),
+  ),
+);
+
 it.effect("refreshes pull request activity after a comment is updated", () =>
   Effect.scoped(
     Effect.gen(function* () {

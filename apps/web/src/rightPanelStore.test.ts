@@ -37,6 +37,20 @@ describe("rightPanelStore", () => {
     ]);
   });
 
+  it("retains the active repository through Source Control tab switches without leaking it to another thread", () => {
+    const store = useRightPanelStore.getState();
+
+    store.openSourceControl(refA);
+    store.setSourceControlRepositoryRoot(refA, "/repo/packages/api");
+    store.setSourceControlView(refA, "graph");
+    store.setSourceControlView(refA, "changes");
+
+    expect(store.getSourceControlRepositoryRoot(refA)).toBe("/repo/packages/api");
+    expect(store.getSourceControlRepositoryRoot(refB)).toBeNull();
+    store.setSourceControlRepositoryRoot(refA, "/repo");
+    expect(store.getSourceControlRepositoryRoot(refA)).toBe("/repo");
+  });
+
   it("gives each host/device its own tab and preserves renamed tabs", () => {
     const store = useRightPanelStore.getState();
     const android = {

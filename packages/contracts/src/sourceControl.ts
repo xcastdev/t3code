@@ -92,6 +92,18 @@ export const SourceControlPublishRepositoryInput = Schema.Struct({
   visibility: SourceControlRepositoryVisibility,
   remoteName: Schema.optional(TrimmedNonEmptyString),
   protocol: Schema.optional(SourceControlCloneProtocol),
+  /**
+   * Snapshot reviewed before provider creation and Git publication. Kept local
+   * to this contract because git.ts already imports provider metadata here.
+   */
+  precondition: Schema.optional(
+    Schema.Struct({
+      expectedHeadCommit: Schema.NullOr(Schema.String),
+      expectedIndexTree: Schema.String,
+      expectedRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+      expectedMergeHeads: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+    }),
+  ),
 });
 export type SourceControlPublishRepositoryInput = typeof SourceControlPublishRepositoryInput.Type;
 

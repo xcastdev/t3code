@@ -8,6 +8,7 @@ import type {
   PullRequestRef,
   PullRequestReviewPosition,
   PullRequestReviewThread,
+  ScopedThreadRef,
   PullRequestThreadCommentsResult,
 } from "@t3tools/contracts";
 import {
@@ -56,6 +57,7 @@ import {
 import { pullRequestEnvironment } from "~/state/pullRequests";
 import { useEnvironmentQuery } from "~/state/query";
 import { useAtomCommand } from "~/state/use-atom-command";
+import { openRepositoryComparison } from "~/secondaryPaneStore";
 
 import { DiffPanelLoadingState } from "../DiffPanelShell";
 import { DiffCommentAnnotation } from "../diffs/DiffCommentAnnotation";
@@ -90,6 +92,45 @@ import {
   type PendingReviewComment,
 } from "./pullRequestReviewStore";
 
+export function buildPullRequestFileComparison(input: {
+  readonly detail: Pick<PullRequestDetailView, "workspaceRoot" | "baseRevision" | "headRevision"> &
+    Partial<Pick<PullRequestDetailView, "baseBranch">>;
+  readonly reference: Pick<PullRequestRef, "host" | "repository" | "number">;
+  readonly oldPath: string | null;
+  readonly newPath: string | null;
+  readonly selectedCommitOid: string | null;
+  /** Snapshot carried by the aggregate patch slice, if the host supplied one. */
+  readonly aggregateRevisions?:
+    | { readonly baseRevision?: string | undefined; readonly headRevision?: string | undefined }
+    | undefined;
+}) {
+  const headRevision =
+    input.selectedCommitOid ??
+    input.aggregateRevisions?.headRevision ??
+    input.detail.headRevision ??
+    null;
+  const baseRevision = input.aggregateRevisions?.baseRevision ?? input.detail.baseRevision;
+  return {
+    repositoryRoot: input.detail.workspaceRoot,
+    comparison: "pull-request" as const,
+    oldPath: input.oldPath,
+    newPath: input.newPath,
+    ...(input.selectedCommitOid || !baseRevision ? {} : { baseRevision }),
+    // The pinned object is the authority.  The branch is acquisition-only:
+    // a checkout missing the host base object may fetch this advertised ref
+    // into FETCH_HEAD without updating a user branch.
+    ...(input.selectedCommitOid || !input.detail.baseBranch
+      ? {}
+      : { baseRef: input.detail.baseBranch }),
+    ...(headRevision ? { headRevision, headRef: headRevision } : {}),
+    ...(input.selectedCommitOid ? { commitSha: input.selectedCommitOid } : {}),
+    // GitHub is the host behind a hostless GitHub reference. Keep this
+    // authority in the descriptor so acquisition can select `upstream` over
+    // an unrelated fork `origin`.
+    pullRequestId: `${input.reference.host ?? "github.com"}:${input.reference.repository}#${input.reference.number}`,
+  };
+}
+
 /** Everything pinned to one line of one file: what is already there, and what is being added. */
 interface ReviewAnnotationGroup {
   readonly threads: ReadonlyArray<PullRequestReviewThread>;
@@ -111,6 +152,8 @@ interface DiffSlice {
   readonly patch: string;
   readonly truncated: boolean;
   readonly nextCursor: string | null;
+  readonly baseRevision?: string | undefined;
+  readonly headRevision?: string | undefined;
   readonly omittedFileStats: ReadonlyArray<PullRequestOmittedFileStat>;
 }
 
@@ -199,6 +242,7 @@ function PullRequestCodeTab({
   onAddToAgentSelection,
   onRefresh,
   refreshToken = 0,
+  threadRef = null,
 }: {
   environmentId: EnvironmentId;
   reference: PullRequestRef;
@@ -215,6 +259,8 @@ function PullRequestCodeTab({
   onRefresh: () => void;
   /** Bumped by the panel's refresh button: drop the accumulated pages and re-read the diff. */
   refreshToken?: number;
+  /** A PR opened beside a thread can promote a file into that thread's diff pane. */
+  threadRef?: ScopedThreadRef | null;
 }) {
   const { resolvedTheme } = useTheme();
   const settings = useClientSettings();
@@ -294,6 +340,8 @@ function PullRequestCodeTab({
         patch: data.patch,
         truncated: data.truncated,
         nextCursor: data.nextCursor,
+        ...(data.baseRevision === undefined ? {} : { baseRevision: data.baseRevision }),
+        ...(data.headRevision === undefined ? {} : { headRevision: data.headRevision }),
         omittedFileStats: data.omittedFileStats ?? [],
       };
       const index = slices.findIndex((slice) => slice.cursor === cursor);
@@ -306,6 +354,8 @@ function PullRequestCodeTab({
         existing.patch === next.patch &&
         existing.truncated === next.truncated &&
         existing.nextCursor === next.nextCursor &&
+        existing.baseRevision === next.baseRevision &&
+        existing.headRevision === next.headRevision &&
         existing.omittedFileStats.length === next.omittedFileStats.length &&
         existing.omittedFileStats.every((file, index) => {
           const refreshed = next.omittedFileStats[index];
@@ -356,16 +406,6 @@ function PullRequestCodeTab({
     reportFailure: false,
   });
   const getDiffFileContents = useAtomCommand(pullRequestEnvironment.diffFileContents);
-  const loadDiffFiles = useMemo(
-    () =>
-      createPullRequestDiffFileContentsLoader(getDiffFileContents, {
-        environmentId,
-        reference,
-        commit,
-        cacheKey: `pull-request:${referenceKey}:${detail.updatedAt}:${commit ?? "all"}`,
-      }),
-    [commit, detail.updatedAt, environmentId, getDiffFileContents, reference, referenceKey],
-  );
 
   // What is offered is the intersection of two different questions: what this host can do at
   // all, and what this account may do on this repository. Either one saying no means a control
@@ -410,6 +450,61 @@ function PullRequestCodeTab({
         parsed?.kind === "files" ? orderDiffFiles(parsed.files) : [],
       ),
     [parsedSlices],
+  );
+  // Keep the host snapshot on the parsed file rather than consulting the
+  // independently cached detail during a click. A detail refresh may happen
+  // while this aggregate remains on screen; the rendered patch wins.
+  const aggregateRevisionsByFile = useMemo(() => {
+    const revisions = new Map<
+      string,
+      { readonly baseRevision?: string; readonly headRevision?: string }
+    >();
+    parsedSlices.forEach((parsed, index) => {
+      const slice = loadedSlices[index];
+      if (parsed?.kind !== "files" || slice === undefined) return;
+      for (const file of parsed.files) {
+        revisions.set(buildFileDiffRenderKey(file), {
+          ...(slice.baseRevision === undefined ? {} : { baseRevision: slice.baseRevision }),
+          ...(slice.headRevision === undefined ? {} : { headRevision: slice.headRevision }),
+        });
+      }
+    });
+    return revisions;
+  }, [loadedSlices, parsedSlices]);
+  const aggregateRevisionsByPath = useMemo(() => {
+    const revisions = new Map<
+      string,
+      { readonly baseRevision?: string; readonly headRevision?: string }
+    >();
+    parsedSlices.forEach((parsed, index) => {
+      const slice = loadedSlices[index];
+      if (parsed?.kind !== "files" || slice === undefined) return;
+      for (const file of parsed.files) {
+        revisions.set(resolveFileDiffPath(file), {
+          ...(slice.baseRevision === undefined ? {} : { baseRevision: slice.baseRevision }),
+          ...(slice.headRevision === undefined ? {} : { headRevision: slice.headRevision }),
+        });
+      }
+    });
+    return revisions;
+  }, [loadedSlices, parsedSlices]);
+  const loadDiffFiles = useMemo(
+    () =>
+      createPullRequestDiffFileContentsLoader(getDiffFileContents, {
+        environmentId,
+        reference,
+        commit,
+        aggregateRevisionsByPath,
+        cacheKey: `pull-request:${referenceKey}:${commit ?? "all"}:${[
+          ...aggregateRevisionsByPath.values(),
+        ]
+          .map(
+            (revisions) =>
+              `${revisions.baseRevision ?? "live"}:${revisions.headRevision ?? "live"}`,
+          )
+          .join(",")}`,
+      }),
+    [aggregateRevisionsByPath, commit, environmentId, getDiffFileContents, reference, referenceKey],
   );
   const nextCursor = loadedSlices.at(-1)?.nextCursor ?? null;
   // What a slice withheld: the host declining to inline part of it, or a patch the viewer could
@@ -613,10 +708,44 @@ function PullRequestCodeTab({
     (path: string) => {
       const item = items.find((candidate) => resolveFileDiffPath(candidate.fileDiff) === path);
       if (item === undefined) return;
+      if (threadRef) {
+        const oldPath =
+          item.fileDiff.type === "new" ? null : resolveFileDiffPreviousPath(item.fileDiff);
+        const newPath =
+          item.fileDiff.type === "deleted" ? null : resolveFileDiffPath(item.fileDiff);
+        // The aggregate is attached to these host-supplied object ids. Branch
+        // names and commit dates are presentation data and cannot identify a
+        // fork or survive a later branch movement.
+        openRepositoryComparison(
+          threadRef,
+          buildPullRequestFileComparison({
+            detail,
+            reference,
+            oldPath,
+            newPath,
+            selectedCommitOid,
+            aggregateRevisions: aggregateRevisionsByFile.get(item.id),
+          }),
+        );
+      }
       if (item.collapsed === true) toggleFile(item.id);
       requestTreeReveal(item.id);
     },
-    [items, requestTreeReveal, toggleFile],
+    [
+      aggregateRevisionsByFile,
+      detail.baseRevision,
+      detail.baseBranch,
+      detail.headRevision,
+      detail.workspaceRoot,
+      items,
+      reference.host,
+      reference.number,
+      reference.repository,
+      requestTreeReveal,
+      selectedCommitOid,
+      threadRef,
+      toggleFile,
+    ],
   );
 
   const toggleAllFiles = () => {

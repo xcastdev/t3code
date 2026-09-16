@@ -17,6 +17,8 @@ import {
   GitActionProgressEvent,
   GitActionProgressPhase,
   GitCommandError,
+  type GitGenerateCommitMessageInput,
+  type GitGenerateCommitMessageResult,
   GitPreparePullRequestThreadInput,
   GitPreparePullRequestThreadResult,
   GitPullRequestRefInput,
@@ -97,6 +99,9 @@ export type GitBranchPullRequest = NonNullable<VcsStatusResult["pr"]> & {
 interface SourceControlTextGenerationSettings {
   readonly modelSelection: ModelSelection;
   readonly style: SourceControlWritingStyleSettings;
+  /** Per-request guidance is applied after the configured/repository policy resolves. */
+  readonly transientInstructions?: string;
+  readonly replaceGenerationPrompt?: boolean;
 }
 
 interface WorkingTreeSnapshot {
@@ -144,6 +149,9 @@ export class GitManager extends Context.Service<
       input: GitRunStackedActionInput,
       options?: GitRunStackedActionOptions,
     ) => Effect.Effect<GitRunStackedActionResult, GitManagerServiceError>;
+    readonly generateCommitMessage: (
+      input: GitGenerateCommitMessageInput,
+    ) => Effect.Effect<GitGenerateCommitMessageResult, GitManagerServiceError>;
   }
 >()("t3/git/GitManager") {}
 
@@ -756,48 +764,63 @@ export const make = Effect.gen(function* () {
 
   const resolveStylePolicy = (cwd: string, settings: SourceControlTextGenerationSettings) =>
     Effect.gen(function* () {
-      switch (settings.style.mode) {
-        case "conventional_commits":
-          return conventionalCommitsTextGenerationPolicy;
-        case "custom":
-          return customTextGenerationPolicy(
-            settings.style.customInstructions
-              ? {
-                  commitInstructions: settings.style.customInstructions,
-                  changeRequestInstructions: settings.style.customInstructions,
-                }
-              : {},
-          );
-        case "repo_conventions": {
-          const subjects = yield* readRecentCommitSubjects(cwd);
-          const agentInstructions = yield* readRepositoryInstructions(cwd, "AGENTS.md");
-          const isClaudeWriter =
-            settings.modelSelection.instanceId === "claudeAgent" ||
-            (yield* providerRegistry.getProviders).some(
-              (provider) =>
-                provider.instanceId === settings.modelSelection.instanceId &&
-                provider.driver === "claudeAgent",
+      const policy = yield* Effect.gen(function* () {
+        switch (settings.style.mode) {
+          case "conventional_commits":
+            return conventionalCommitsTextGenerationPolicy;
+          case "custom":
+            return customTextGenerationPolicy(
+              settings.style.customInstructions
+                ? {
+                    commitInstructions: settings.style.customInstructions,
+                    changeRequestInstructions: settings.style.customInstructions,
+                  }
+                : {},
             );
-          const claudeInstructions = isClaudeWriter
-            ? yield* readRepositoryInstructions(cwd, "CLAUDE.md")
-            : "";
-          const examples = [
-            ...(subjects.length > 0
-              ? [["Recent commit subjects from this repository:", ...subjects].join("\n")]
-              : []),
-            ...(agentInstructions ? [`Local AGENTS.md:\n${agentInstructions}`] : []),
-            ...(claudeInstructions ? [`Local CLAUDE.md:\n${claudeInstructions}`] : []),
-          ].join("\n\n");
-          if (!examples) {
-            return repositoryConventionsTextGenerationPolicy;
+          case "repo_conventions": {
+            const subjects = yield* readRecentCommitSubjects(cwd);
+            const agentInstructions = yield* readRepositoryInstructions(cwd, "AGENTS.md");
+            const isClaudeWriter =
+              settings.modelSelection.instanceId === "claudeAgent" ||
+              (yield* providerRegistry.getProviders).some(
+                (provider) =>
+                  provider.instanceId === settings.modelSelection.instanceId &&
+                  provider.driver === "claudeAgent",
+              );
+            const claudeInstructions = isClaudeWriter
+              ? yield* readRepositoryInstructions(cwd, "CLAUDE.md")
+              : "";
+            const examples = [
+              ...(subjects.length > 0
+                ? [["Recent commit subjects from this repository:", ...subjects].join("\n")]
+                : []),
+              ...(agentInstructions ? [`Local AGENTS.md:\n${agentInstructions}`] : []),
+              ...(claudeInstructions ? [`Local CLAUDE.md:\n${claudeInstructions}`] : []),
+            ].join("\n\n");
+            if (!examples) {
+              return repositoryConventionsTextGenerationPolicy;
+            }
+            return {
+              ...repositoryConventionsTextGenerationPolicy,
+              commitInstructions: `${repositoryConventionsTextGenerationPolicy.commitInstructions}\n\n${examples}`,
+              changeRequestInstructions: `${repositoryConventionsTextGenerationPolicy.changeRequestInstructions}\n\n${examples}`,
+            };
           }
-          return {
-            ...repositoryConventionsTextGenerationPolicy,
-            commitInstructions: `${repositoryConventionsTextGenerationPolicy.commitInstructions}\n\n${examples}`,
-            changeRequestInstructions: `${repositoryConventionsTextGenerationPolicy.changeRequestInstructions}\n\n${examples}`,
-          };
         }
-      }
+      });
+      const transientInstructions = settings.transientInstructions?.trim() ?? "";
+      if (!transientInstructions) return policy;
+      const append = (instructions: string | undefined) =>
+        settings.replaceGenerationPrompt
+          ? transientInstructions
+          : [instructions, transientInstructions].filter(Boolean).join("\n\n");
+      // Keep the effective policy kind and repository convention context. Replace
+      // changes only the configurable instruction text for this request.
+      return {
+        ...policy,
+        commitInstructions: append(policy.commitInstructions),
+        changeRequestInstructions: append(policy.changeRequestInstructions),
+      };
     });
   const randomUUIDv4 = (cwd: string) =>
     crypto.randomUUIDv4.pipe(
@@ -1042,6 +1065,118 @@ export const make = Effect.gen(function* () {
     behindCount: 0,
     aheadOfDefaultCount: 0,
   };
+  const readConfigValueNullable = (cwd: string, key: string) =>
+    gitCore.readConfigValue(cwd, key).pipe(Effect.orElseSucceed(() => null));
+  const resolveHostingProvider = Effect.fn("resolveHostingProvider")(function* (
+    cwd: string,
+    branch: string | null,
+    remoteNameOverride?: string,
+  ) {
+    const preferredRemoteName =
+      remoteNameOverride ??
+      (branch === null
+        ? "origin"
+        : ((yield* readConfigValueNullable(cwd, `branch.${branch}.remote`)) ?? "origin"));
+    const remoteUrl =
+      (yield* readConfigValueNullable(cwd, `remote.${preferredRemoteName}.url`)) ??
+      (yield* readConfigValueNullable(cwd, "remote.origin.url"));
+
+    const provider = remoteUrl ? detectSourceControlProviderFromGitRemoteUrl(remoteUrl) : null;
+    if (!remoteUrl || provider?.kind !== "unknown") return provider;
+    const handle = yield* sourceControlProviders
+      .resolveHandle({
+        cwd,
+        context: { provider, remoteName: preferredRemoteName, remoteUrl },
+      })
+      .pipe(Effect.orElseSucceed(() => null));
+    return handle?.context?.provider ?? provider;
+  });
+  /**
+   * Keep the pull upstream separate from the publication target. A branch cut
+   * from origin/main must pull main but publish HEAD to its own feature ref.
+   */
+  const resolveRemotePublicationTarget = Effect.fn("resolveRemotePublicationTarget")(function* (
+    cwd: string,
+    branch: string | null,
+  ) {
+    const upstreamRemote =
+      branch === null ? null : yield* readConfigValueNullable(cwd, `branch.${branch}.remote`);
+    const pullRemoteName = upstreamRemote && upstreamRemote !== "." ? upstreamRemote : null;
+    const configuredRef =
+      branch === null ? null : yield* readConfigValueNullable(cwd, `branch.${branch}.merge`);
+    const pullRefName = configuredRef?.replace(/^refs\/heads\//u, "") || null;
+    // The confirmation target must be the same target the driver will publish.
+    // In particular, a local alias such as upstream/effect-atom publishes the
+    // stripped effect-atom ref rather than its local branch spelling.
+    const publication = yield* gitCore
+      .resolvePublicationTarget(cwd, branch)
+      .pipe(Effect.orElseSucceed(() => ({ remoteName: null, refName: null })));
+    const remoteName = publication.remoteName;
+    const remoteRefName = publication.refName;
+    const provider = remoteName ? yield* resolveHostingProvider(cwd, branch, remoteName) : null;
+    if (!provider || provider.kind === "unknown") {
+      return {
+        remoteName,
+        remoteRefName,
+        pullRemoteName,
+        pullRefName,
+        credentialReady: undefined,
+        credentialReason: undefined,
+      };
+    }
+    const discovered = yield* sourceControlProviders.discover.pipe(Effect.orElseSucceed(() => []));
+    const credential = discovered.find((candidate) => candidate.kind === provider.kind);
+    // Discovery reports `auth: unknown` when an integration is missing. Check
+    // integration availability first so that shape is still a hard prerequisite.
+    if (!credential) {
+      return {
+        remoteName,
+        remoteRefName,
+        pullRemoteName,
+        pullRefName,
+        credentialReady: undefined,
+        credentialReason: undefined,
+      };
+    }
+    if (credential.status === "missing") {
+      return {
+        remoteName,
+        remoteRefName,
+        pullRemoteName,
+        pullRefName,
+        credentialReady: false,
+        credentialReason: `${provider.name} integration for remote ${remoteName} is unavailable. Install it or configure credentials before publishing.`,
+      };
+    }
+    if (credential.auth.status === "unknown") {
+      return {
+        remoteName,
+        remoteRefName,
+        pullRemoteName,
+        pullRefName,
+        credentialReady: undefined,
+        credentialReason: undefined,
+      };
+    }
+    if (credential.auth.status === "authenticated") {
+      return {
+        remoteName,
+        remoteRefName,
+        pullRemoteName,
+        pullRefName,
+        credentialReady: true,
+        credentialReason: undefined,
+      };
+    }
+    return {
+      remoteName,
+      remoteRefName,
+      pullRemoteName,
+      pullRefName,
+      credentialReady: false,
+      credentialReason: `Authenticate ${provider.name} for remote ${remoteName} before publishing.`,
+    };
+  });
   const readLocalStatus = Effect.fn("readLocalStatus")(function* (cwd: string) {
     const details = yield* gitCore
       .statusDetailsLocal(cwd)
@@ -1050,6 +1185,9 @@ export const make = Effect.gen(function* () {
       );
     const hostingProvider = details.isRepo
       ? yield* resolveHostingProvider(cwd, details.branch)
+      : null;
+    const remoteTarget = details.isRepo
+      ? yield* resolveRemotePublicationTarget(cwd, details.branch)
       : null;
 
     const snapshot = details.isRepo
@@ -1098,14 +1236,31 @@ export const make = Effect.gen(function* () {
       isRepo: details.isRepo,
       ...(details.repositoryRoot ? { repositoryRoot: details.repositoryRoot } : {}),
       ...(hostingProvider ? { sourceControlProvider: hostingProvider } : {}),
-      hasPrimaryRemote: details.hasOriginRemote,
+      hasPrimaryRemote: details.hasOriginRemote || remoteTarget?.remoteName != null,
+      ...(remoteTarget?.remoteName ? { remoteName: remoteTarget.remoteName } : {}),
+      ...(remoteTarget?.remoteRefName ? { remoteRefName: remoteTarget.remoteRefName } : {}),
+      ...(remoteTarget?.pullRemoteName ? { pullRemoteName: remoteTarget.pullRemoteName } : {}),
+      ...(remoteTarget?.pullRefName ? { pullRefName: remoteTarget.pullRefName } : {}),
+      ...(remoteTarget?.credentialReady !== undefined
+        ? { remoteCredentialReady: remoteTarget.credentialReady }
+        : {}),
+      ...(remoteTarget?.credentialReason
+        ? { remoteCredentialReason: remoteTarget.credentialReason }
+        : {}),
       isDefaultRef: details.isDefaultBranch,
       refName: details.branch,
       ...(details.localRevision !== undefined ? { localRevision: details.localRevision } : {}),
       ...(details.headCommit !== undefined ? { headCommit: details.headCommit } : {}),
+      ...(details.headHasParent !== undefined ? { headHasParent: details.headHasParent } : {}),
       ...(details.indexTree !== undefined ? { indexTree: details.indexTree } : {}),
       ...(details.pendingMergeHeads !== undefined
         ? { pendingMergeHeads: [...details.pendingMergeHeads] }
+        : {}),
+      ...(details.activeConflictOperation !== undefined
+        ? { activeConflictOperation: details.activeConflictOperation }
+        : {}),
+      ...(details.commitIdentityReady !== undefined
+        ? { commitIdentityReady: details.commitIdentityReady }
         : {}),
       hasWorkingTreeChanges: details.hasWorkingTreeChanges,
       workingTree,
@@ -1395,32 +1550,6 @@ export const make = Effect.gen(function* () {
     normalizeStatusCacheKey(cwd).pipe(
       Effect.flatMap((cacheKey) => Cache.invalidate(remoteStatusResultCache, cacheKey)),
     );
-
-  const readConfigValueNullable = (cwd: string, key: string) =>
-    gitCore.readConfigValue(cwd, key).pipe(Effect.orElseSucceed(() => null));
-
-  const resolveHostingProvider = Effect.fn("resolveHostingProvider")(function* (
-    cwd: string,
-    branch: string | null,
-  ) {
-    const preferredRemoteName =
-      branch === null
-        ? "origin"
-        : ((yield* readConfigValueNullable(cwd, `branch.${branch}.remote`)) ?? "origin");
-    const remoteUrl =
-      (yield* readConfigValueNullable(cwd, `remote.${preferredRemoteName}.url`)) ??
-      (yield* readConfigValueNullable(cwd, "remote.origin.url"));
-
-    const provider = remoteUrl ? detectSourceControlProviderFromGitRemoteUrl(remoteUrl) : null;
-    if (!remoteUrl || provider?.kind !== "unknown") return provider;
-    const handle = yield* sourceControlProviders
-      .resolveHandle({
-        cwd,
-        context: { provider, remoteName: preferredRemoteName, remoteUrl },
-      })
-      .pipe(Effect.orElseSucceed(() => null));
-    return handle?.context?.provider ?? provider;
-  });
 
   const resolveRemoteRepositoryContext = Effect.fn("resolveRemoteRepositoryContext")(function* (
     cwd: string,
@@ -2782,6 +2911,30 @@ export const make = Effect.gen(function* () {
         GitManagerServiceError
       > {
         const initialStatus = yield* gitCore.statusDetails(input.cwd);
+        // This legacy compound path can be entered from confirmations which
+        // were approved before it reached the repository queue. Validate the
+        // displayed source before any staging, branch, commit, push, or PR
+        // side effect. Old clients intentionally omit this additive field.
+        if (input.precondition !== undefined) {
+          const expected = input.precondition;
+          if (
+            initialStatus.headCommit !== expected.expectedHeadCommit ||
+            initialStatus.indexTree !== expected.expectedIndexTree ||
+            (expected.expectedRefName !== undefined &&
+              initialStatus.branch !== expected.expectedRefName) ||
+            (expected.expectedMergeHeads !== undefined &&
+              (initialStatus.pendingMergeHeads ?? []).join("\0") !==
+                expected.expectedMergeHeads.join("\0"))
+          ) {
+            return yield* new GitCommandError({
+              operation: "GitManager.runStackedAction.precondition",
+              command: "git",
+              cwd: input.cwd,
+              detail: "Repository changed after the action was reviewed.",
+              code: "stale_git_state",
+            });
+          }
+        }
         const wantsCommit = isCommitAction(input.action);
         const wantsPush =
           input.action === "push" ||
@@ -2804,6 +2957,17 @@ export const make = Effect.gen(function* () {
             cwd: input.cwd,
             detail: "Commit local changes before creating a PR.",
           });
+        }
+
+        // Generate reads the index without changing it. Stacked actions are
+        // mutations, so stage their intended files before resolving either a
+        // custom message or a generated branch/message suggestion. An existing
+        // partial index remains exactly as the user staged it.
+        if (wantsCommit && (initialStatus.workingTree.stagedCount ?? 0) === 0) {
+          const paths = input.filePaths ?? initialStatus.workingTree.files.map((file) => file.path);
+          if (paths.length > 0) {
+            yield* gitCore.stageFiles({ cwd: input.cwd, paths });
+          }
         }
 
         const phases: GitActionProgressPhase[] = [
@@ -2979,6 +3143,56 @@ export const make = Effect.gen(function* () {
     },
   );
 
+  const generateCommitMessage: GitManager["Service"]["generateCommitMessage"] = Effect.fn(
+    "GitManager.generateCommitMessage",
+  )(function* (input) {
+    const settings = yield* projectSettingsFor(input).pipe(
+      Effect.mapError(
+        (cause) =>
+          new GitManagerError({
+            operation: "generateCommitMessage",
+            cwd: input.cwd,
+            detail: "Failed to get Source Control writer settings.",
+            cause,
+          }),
+      ),
+    );
+    const writerSettings: SourceControlTextGenerationSettings = {
+      modelSelection:
+        settings.sourceControlWriterModelSelection === null
+          ? settings.textGenerationModelSelection
+          : ServerSettings.resolveSourceControlWriterModelSelection(
+              settings,
+              yield* providerRegistry.getProviders,
+            ),
+      style: settings.sourceControlWritingStyle,
+    };
+    const effectiveSettings: SourceControlTextGenerationSettings = {
+      ...writerSettings,
+      ...(input.instructions?.trim()
+        ? {
+            transientInstructions: input.instructions,
+            replaceGenerationPrompt: input.replacePrompt === true,
+          }
+        : {}),
+    };
+    const status = yield* gitCore.statusDetails(input.cwd);
+    const suggestion = yield* resolveCommitAndBranchSuggestion({
+      cwd: input.cwd,
+      branch: status.branch,
+      ...(input.paths !== undefined ? { filePaths: input.paths } : {}),
+      settings: effectiveSettings,
+    });
+    if (!suggestion) {
+      return yield* new GitManagerError({
+        operation: "generateCommitMessage",
+        cwd: input.cwd,
+        detail: "Stage at least one change before generating a commit message.",
+      });
+    }
+    return { message: suggestion.commitMessage };
+  });
+
   return GitManager.of({
     localStatus,
     workingTreePage,
@@ -2991,6 +3205,7 @@ export const make = Effect.gen(function* () {
     resolvePullRequest,
     preparePullRequestThread,
     runStackedAction,
+    generateCommitMessage,
   });
 });
 

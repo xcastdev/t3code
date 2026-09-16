@@ -8,8 +8,13 @@ import {
   VcsActionUnavailableError,
   type VcsActionOperation,
 } from "@t3tools/client-runtime/state/vcs";
+import {
+  SourceControlWorkspaceUnavailableError,
+  isSourceControlWorkspaceSupported,
+} from "@t3tools/client-runtime/state/sourceControlWorkspace";
 import type {
   EnvironmentId,
+  ExecutionEnvironmentCapabilities,
   GitActionProgressEvent,
   GitResolvePullRequestResult,
   GitStackedAction,
@@ -23,9 +28,10 @@ import { AsyncResult } from "effect/unstable/reactivity";
 import { useCallback } from "react";
 
 import { appAtomRegistry } from "../rpc/atomRegistry";
+import { serverEnvironment } from "./server";
 import { gitEnvironment } from "./git";
 import { useEnvironmentQuery } from "./query";
-import { sourceControlEnvironment } from "./sourceControl";
+import { sourceControlEnvironment, sourceControlWorkspaceEnvironment } from "./sourceControl";
 import { useAtomCommand } from "./use-atom-command";
 import { vcsActionManager, vcsEnvironment } from "./vcs";
 
@@ -41,6 +47,31 @@ export interface SourceControlActionScope {
   readonly cwd: string | null;
 }
 
+export async function runSourceControlWorkspaceAdapter<R>(
+  capabilities: Pick<ExecutionEnvironmentCapabilities, "sourceControlWorkspace"> | null | undefined,
+  run: () => Promise<R>,
+  unavailable: () => R,
+): Promise<R> {
+  return isSourceControlWorkspaceSupported(capabilities) ? run() : unavailable();
+}
+
+function useSourceControlWorkspaceCapabilities(scope: SourceControlActionScope) {
+  return useAtomValue(serverEnvironment.configValueAtom(scope.environmentId))?.environment
+    .capabilities;
+}
+
+function unavailableWorkspaceAction<R>(scope: SourceControlActionScope): R {
+  return AsyncResult.failure<never, SourceControlWorkspaceUnavailableError>(
+    Cause.fail(
+      new SourceControlWorkspaceUnavailableError({
+        environmentId: scope.environmentId!,
+        repositoryRoot: scope.cwd!,
+        reason: "source-control-workspace-not-advertised",
+      }),
+    ),
+  ) as R;
+}
+
 interface SourceControlActionState<
   TArgs extends ReadonlyArray<unknown>,
   R extends AtomCommandResult<unknown, unknown>,
@@ -50,7 +81,10 @@ interface SourceControlActionState<
   readonly run: (
     ...args: TArgs
   ) => Promise<
-    AtomCommandResult<AtomCommandSuccess<R>, AtomCommandFailure<R> | VcsActionUnavailableError>
+    AtomCommandResult<
+      AtomCommandSuccess<R>,
+      AtomCommandFailure<R> | VcsActionUnavailableError | SourceControlWorkspaceUnavailableError
+    >
   >;
   readonly resetError: () => void;
 }
@@ -139,7 +173,8 @@ export function useSourceControlActionRunning(
 }
 
 export function useVcsInitAction(scope: SourceControlActionScope) {
-  const init = useAtomCommand(vcsEnvironment.init, { reportFailure: false });
+  const init = useAtomCommand(sourceControlWorkspaceEnvironment.init, { reportFailure: false });
+  const capabilities = useSourceControlWorkspaceCapabilities(scope);
   const action = useCallback(async () => {
     const target = resolveScope(scope);
     if (target === null) {
@@ -153,19 +188,21 @@ export function useVcsInitAction(scope: SourceControlActionScope) {
         ),
       );
     }
-    return init({
-      environmentId: target.environmentId,
-      input: { cwd: target.cwd },
-    });
-  }, [init, scope]);
+    return runSourceControlWorkspaceAdapter(
+      capabilities,
+      () => init({ environmentId: target.environmentId, input: { cwd: target.cwd } }),
+      () => unavailableWorkspaceAction(scope),
+    );
+  }, [capabilities, init, scope]);
   return useAction({ kind: "init", label: "Initializing repository", scope, action });
 }
 
 export function useVcsPullAction(scope: SourceControlActionScope) {
   const pull = useAtomCommand(vcsEnvironment.pull, { reportFailure: false });
+  const capabilities = useSourceControlWorkspaceCapabilities(scope);
   const status = useEnvironmentQuery(
     scope.environmentId !== null && scope.cwd !== null
-      ? vcsEnvironment.status({
+      ? sourceControlWorkspaceEnvironment.status({
           environmentId: scope.environmentId,
           input: { cwd: scope.cwd },
         })
@@ -184,11 +221,12 @@ export function useVcsPullAction(scope: SourceControlActionScope) {
         ),
       );
     }
-    return pull({
-      environmentId: target.environmentId,
-      input: { cwd: target.cwd },
-    });
-  }, [pull, scope]);
+    return runSourceControlWorkspaceAdapter(
+      capabilities,
+      () => pull({ environmentId: target.environmentId, input: { cwd: target.cwd } }),
+      () => unavailableWorkspaceAction(scope),
+    );
+  }, [capabilities, pull, scope]);
   return useAction({
     kind: "pull",
     label: "Pulling latest changes",
@@ -202,9 +240,10 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
   const runStackedAction = useAtomCommand(vcsActionManager.runStackedAction(scope), {
     reportFailure: false,
   });
+  const capabilities = useSourceControlWorkspaceCapabilities(scope);
   const status = useEnvironmentQuery(
     scope.environmentId !== null && scope.cwd !== null
-      ? vcsEnvironment.status({
+      ? sourceControlWorkspaceEnvironment.status({
           environmentId: scope.environmentId,
           input: { cwd: scope.cwd },
         })
@@ -219,6 +258,7 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
       featureBranch?: boolean;
       filePaths?: string[];
       threadId?: ThreadId;
+      precondition?: import("@t3tools/contracts").GitMutationPrecondition;
       onProgress?: (event: GitActionProgressEvent) => void;
     }) => {
       if (resolveScope(scope) === null) {
@@ -232,17 +272,23 @@ export function useGitStackedAction(scope: SourceControlActionScope) {
           ),
         );
       }
-      return runStackedAction({
-        actionId: input.actionId,
-        action: input.action,
-        ...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
-        ...(input.featureBranch ? { featureBranch: true } : {}),
-        ...(input.filePaths?.length ? { filePaths: input.filePaths } : {}),
-        ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
-        ...(input.onProgress ? { onProgress: input.onProgress } : {}),
-      });
+      return runSourceControlWorkspaceAdapter(
+        capabilities,
+        () =>
+          runStackedAction({
+            actionId: input.actionId,
+            action: input.action,
+            ...(input.commitMessage ? { commitMessage: input.commitMessage } : {}),
+            ...(input.featureBranch ? { featureBranch: true } : {}),
+            ...(input.filePaths?.length ? { filePaths: input.filePaths } : {}),
+            ...(input.threadId !== undefined ? { threadId: input.threadId } : {}),
+            ...(input.precondition !== undefined ? { precondition: input.precondition } : {}),
+            ...(input.onProgress ? { onProgress: input.onProgress } : {}),
+          }),
+        () => unavailableWorkspaceAction(scope),
+      );
     },
-    [runStackedAction, scope],
+    [capabilities, runStackedAction, scope],
   );
 
   return useAction({
@@ -259,9 +305,10 @@ export function useSourceControlPublishRepositoryAction(scope: SourceControlActi
   const publishRepository = useAtomCommand(sourceControlEnvironment.publishRepository, {
     reportFailure: false,
   });
+  const capabilities = useSourceControlWorkspaceCapabilities(scope);
   const status = useEnvironmentQuery(
     scope.environmentId !== null && scope.cwd !== null
-      ? vcsEnvironment.status({
+      ? sourceControlWorkspaceEnvironment.status({
           environmentId: scope.environmentId,
           input: { cwd: scope.cwd },
         })
@@ -274,6 +321,7 @@ export function useSourceControlPublishRepositoryAction(scope: SourceControlActi
       visibility: SourceControlRepositoryVisibility;
       remoteName: string;
       protocol: SourceControlCloneProtocol;
+      precondition?: import("@t3tools/contracts").GitMutationPrecondition;
     }) => {
       const target = resolveScope(scope);
       if (target === null) {
@@ -287,15 +335,20 @@ export function useSourceControlPublishRepositoryAction(scope: SourceControlActi
           ),
         );
       }
-      return publishRepository({
-        environmentId: target.environmentId,
-        input: {
-          cwd: target.cwd,
-          ...input,
-        },
-      });
+      return runSourceControlWorkspaceAdapter(
+        capabilities,
+        () =>
+          publishRepository({
+            environmentId: target.environmentId,
+            input: {
+              cwd: target.cwd,
+              ...input,
+            },
+          }),
+        () => unavailableWorkspaceAction(scope),
+      );
     },
-    [publishRepository, scope],
+    [capabilities, publishRepository, scope],
   );
   return useAction({
     kind: "publishRepository",
@@ -310,6 +363,7 @@ export function usePreparePullRequestThreadAction(scope: SourceControlActionScop
   const preparePullRequestThread = useAtomCommand(gitEnvironment.preparePullRequestThread, {
     reportFailure: false,
   });
+  const capabilities = useSourceControlWorkspaceCapabilities(scope);
   const action = useCallback(
     async (input: { reference: string; mode: "local" | "worktree"; threadId?: ThreadId }) => {
       const target = resolveScope(scope);
@@ -324,17 +378,22 @@ export function usePreparePullRequestThreadAction(scope: SourceControlActionScop
           ),
         );
       }
-      return preparePullRequestThread({
-        environmentId: target.environmentId,
-        input: {
-          cwd: target.cwd,
-          reference: input.reference,
-          mode: input.mode,
-          ...(input.threadId ? { threadId: input.threadId } : {}),
-        },
-      });
+      return runSourceControlWorkspaceAdapter(
+        capabilities,
+        () =>
+          preparePullRequestThread({
+            environmentId: target.environmentId,
+            input: {
+              cwd: target.cwd,
+              reference: input.reference,
+              mode: input.mode,
+              ...(input.threadId ? { threadId: input.threadId } : {}),
+            },
+          }),
+        () => unavailableWorkspaceAction(scope),
+      );
     },
-    [preparePullRequestThread, scope],
+    [capabilities, preparePullRequestThread, scope],
   );
   return useAction({
     kind: "preparePullRequestThread",

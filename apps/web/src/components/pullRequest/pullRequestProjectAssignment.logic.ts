@@ -91,11 +91,23 @@ export function resolvePickableEnvironments(
     readonly label: string;
     readonly machine?: EnvironmentMachineKind;
   }>,
+  selectedRepositoryRoot?: string,
 ): ReadonlyArray<PickableEnvironment> {
-  const own = projects.find(
+  const project = projects.find(
     (project) =>
       project.environmentId === current.environmentId && project.id === current.projectId,
   );
+  // An explicit selected root may be a nested repository inside the project named by the PR
+  // row. The outer project's identity proves nothing about a copy of that nested repository on
+  // another server, so only a project which directly represents that root may populate the picker.
+  const own =
+    selectedRepositoryRoot === undefined
+      ? project
+      : projects.find(
+          (candidate) =>
+            candidate.environmentId === current.environmentId &&
+            candidate.workspaceRoot === selectedRepositoryRoot,
+        );
   const key = own === undefined ? undefined : repositoryKey(own);
   const ownEnvironment = environments.find(
     (environment) => environment.environmentId === current.environmentId,

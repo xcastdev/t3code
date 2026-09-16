@@ -10,9 +10,11 @@ import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as PubSub from "effect/PubSub";
 import * as Option from "effect/Option";
+import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -283,6 +285,35 @@ interface SupportedProject {
   readonly repository: string;
   /** The host the repository lives on, which is the account boundary rather than the kind. */
   readonly host: string;
+}
+
+function repositoryFromRemoteUrl(
+  remoteUrl: string,
+  kind: SourceControlProviderKind,
+): string | null {
+  const fromPath = (path: string) => path.replace(/^\/+|\/+$/gu, "").replace(/\.git$/u, "");
+  try {
+    const parsed = new URL(remoteUrl);
+    const path = fromPath(parsed.pathname);
+    if (!path) return null;
+    return kind === "azure-devops" ? (path.split("/").at(-1) ?? null) : path;
+  } catch {
+    const match = /^[^@/:]+@([^:]+):(.+)$/u.exec(remoteUrl);
+    if (match === null) return null;
+    const path = fromPath(match[2]!);
+    return kind === "azure-devops" ? (path.split("/").at(-1) ?? null) : path || null;
+  }
+}
+
+function canonicalKeyFromRemoteUrl(remoteUrl: string): string | null {
+  try {
+    const parsed = new URL(remoteUrl);
+    const path = parsed.pathname.replace(/^\/+|\/+$/gu, "").replace(/\.git$/u, "");
+    return path ? `${parsed.host}/${path}` : null;
+  } catch {
+    const match = /^[^@/:]+@([^:]+):(.+)$/u.exec(remoteUrl);
+    return match === null ? null : `${match[1]}/${match[2]!.replace(/\.git$/u, "")}`;
+  }
 }
 
 /**
@@ -556,6 +587,8 @@ function withRateLimitBackoff(
 }
 
 export const make = Effect.gen(function* () {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
   const mergedPullRequests = yield* PubSub.sliding<PullRequestMergeEvent>(64);
   const pullRequestRefreshes = yield* SubscriptionRef.make(0);
   const registry = yield* PullRequestProviderRegistry;
@@ -727,6 +760,186 @@ export const make = Effect.gen(function* () {
       }),
     );
 
+  const resolveRepositoryRoot = (
+    project: OrchestrationProjectShell,
+    repositoryRoot: string,
+  ): Effect.Effect<SupportedProject, PullRequestError> =>
+    Effect.gen(function* () {
+      const normalizedRoot = path.normalize(path.resolve(repositoryRoot));
+      // Discovery gives clients canonical roots. Do not turn a client-controlled
+      // alias into authority for a different checkout.
+      if (normalizedRoot !== repositoryRoot) {
+        return yield* new PullRequestOperationError({
+          operation: "resolveRepository",
+          detail: "The selected repository root must be canonical.",
+        });
+      }
+      const canonical = (candidate: string) =>
+        fileSystem.realPath(candidate).pipe(
+          Effect.mapError(
+            (cause) =>
+              new PullRequestOperationError({
+                operation: "resolveRepository",
+                detail: "The selected repository root could not be canonicalized.",
+                cause,
+              }),
+          ),
+        );
+      const [projectRoot, selectedRoot] = yield* Effect.all([
+        canonical(path.resolve(project.workspaceRoot)),
+        canonical(normalizedRoot),
+      ]);
+      if (selectedRoot !== normalizedRoot) {
+        return yield* new PullRequestOperationError({
+          operation: "resolveRepository",
+          detail: "The selected repository root must be canonical.",
+        });
+      }
+      const relative = path.relative(projectRoot, selectedRoot);
+      const outsideProject =
+        relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative);
+      // An external selected repository is valid only when it is a Git linked
+      // worktree owned by this project. Remote equality proves neither
+      // ownership nor authority: a completely unrelated clone may use the
+      // same origin. Walk parents so a nested repository inside an authorized
+      // linked checkout remains usable with its own remote/provider.
+      const isOwnedExternalWorktree = Effect.gen(function* () {
+        if (!outsideProject) return true;
+        const readGitdirPointer = (gitFile: string) =>
+          fileSystem.readFileString(gitFile).pipe(
+            Effect.map((contents) => {
+              const match = contents.match(/^gitdir:[ \t]*([^\r\n]+?)(?:\r?\n)?$/u);
+              return match?.[1] ? path.resolve(path.dirname(gitFile), match[1]) : null;
+            }),
+            Effect.orElseSucceed(() => null),
+          );
+        // A checkout's .git is a `gitdir: <administration-dir>` pointer,
+        // while its registered worktrees/<id>/gitdir backlink is the bare
+        // checkout .git path with an optional final newline. Keep these
+        // formats distinct: treating the backlink as a pointer denies every
+        // real linked worktree, while accepting a copied pointer as a
+        // backlink weakens the reciprocal ownership check below.
+        const readWorktreeBacklink = (gitFile: string) =>
+          fileSystem.readFileString(gitFile).pipe(
+            Effect.map((contents) => {
+              const match = contents.match(/^([^\r\n]+)(?:\r?\n)?$/u);
+              const backlink = match?.[1];
+              return backlink && !backlink.startsWith("gitdir:")
+                ? path.resolve(path.dirname(gitFile), backlink)
+                : null;
+            }),
+            Effect.orElseSucceed(() => null),
+          );
+        const canonicalOrNull = (candidate: string) =>
+          fileSystem.realPath(candidate).pipe(Effect.orElseSucceed(() => null));
+        const projectGitDir = yield* fileSystem
+          .realPath(path.join(projectRoot, ".git"))
+          .pipe(Effect.orElseSucceed(() => null));
+        if (projectGitDir === null) return false;
+        // The project itself may already be a linked checkout. Resolve its
+        // pointer back to the shared common directory before comparing a
+        // second worktree's pointer.
+        const projectPointer = yield* readGitdirPointer(projectGitDir);
+        const pointedProjectGitDir = projectPointer
+          ? ((yield* canonicalOrNull(projectPointer)) ?? projectGitDir)
+          : projectGitDir;
+        const projectCommonDir =
+          path.basename(path.dirname(pointedProjectGitDir)) === "worktrees"
+            ? path.dirname(path.dirname(pointedProjectGitDir))
+            : pointedProjectGitDir;
+        const worktreeAdminRoot = yield* canonicalOrNull(path.join(projectCommonDir, "worktrees"));
+        if (worktreeAdminRoot === null) return false;
+        let candidate = selectedRoot;
+        while (true) {
+          const candidateGitFile = path.join(candidate, ".git");
+          const pointer = yield* readGitdirPointer(candidateGitFile);
+          if (pointer !== null) {
+            const [target, candidateGitFileCanonical] = yield* Effect.all([
+              canonicalOrNull(pointer),
+              canonicalOrNull(candidateGitFile),
+            ]);
+            // A worktree pointer is authority only when Git's registered administration
+            // directory points back to this exact canonical checkout. The reciprocal check
+            // rejects copied/stale pointers and aliases before a provider can observe them.
+            if (
+              target !== null &&
+              candidateGitFileCanonical !== null &&
+              path.dirname(target) === worktreeAdminRoot
+            ) {
+              const backlink = yield* readWorktreeBacklink(path.join(target, "gitdir"));
+              const backlinkCanonical = backlink === null ? null : yield* canonicalOrNull(backlink);
+              if (backlinkCanonical === candidateGitFileCanonical) {
+                return true;
+              }
+            }
+          }
+          const parent = path.dirname(candidate);
+          if (parent === candidate) return false;
+          candidate = parent;
+        }
+      });
+      if (!(yield* isOwnedExternalWorktree)) {
+        return yield* new PullRequestOperationError({
+          operation: "resolveRepository",
+          detail: "The selected repository is outside the selected project worktree.",
+        });
+      }
+      return yield* sourceControlProviders.resolveHandle({ cwd: selectedRoot }).pipe(
+        Effect.mapError(
+          (cause) =>
+            new PullRequestOperationError({
+              operation: "resolveRepository",
+              detail: "The selected repository could not be resolved.",
+              cause,
+            }),
+        ),
+        Effect.flatMap((handle): Effect.Effect<SupportedProject, PullRequestError> => {
+          const context = handle.context;
+          const remoteUrl = context?.remoteUrl;
+          const kind = context?.provider.kind;
+          if (remoteUrl === undefined || kind === undefined) {
+            return Effect.fail(new PullRequestUnavailableError({ reason: "provider-unsupported" }));
+          }
+          const repository = repositoryFromRemoteUrl(remoteUrl, kind);
+          const canonicalKey = canonicalKeyFromRemoteUrl(remoteUrl);
+          const api = registry.get(kind);
+          if (repository === null || canonicalKey === null || api === null) {
+            return Effect.fail(new PullRequestUnavailableError({ reason: "provider-unsupported" }));
+          }
+          // This branch has concrete provider context; unsupported/missing
+          // context returned above instead of leaking optional identity below.
+          const host = pullRequestHostOf({ canonicalKey, locator: { remoteUrl } }, kind);
+          return Effect.succeed({
+            ...project,
+            cursorKey: listCursorKey(host, kind === "azure-devops" ? canonicalKey : repository),
+            project: { ...project, workspaceRoot: selectedRoot },
+            api: withRateLimitBackoff(api, host, rateLimits),
+            repository,
+            host,
+          });
+        }),
+      );
+    });
+
+  const loadProject = (projectId: PullRequestRef["projectId"]) =>
+    projections.getProjectShellById(projectId).pipe(
+      Effect.mapError(
+        (cause) =>
+          new PullRequestOperationError({
+            operation: "listProjects",
+            detail: "The project could not be read.",
+            cause,
+          }),
+      ),
+      Effect.flatMap((project) =>
+        Option.match(project, {
+          onNone: () =>
+            Effect.fail(new PullRequestUnavailableError({ reason: "provider-unsupported" })),
+          onSome: Effect.succeed,
+        }),
+      ),
+    );
+
   /**
    * The project whose checkout and credentials serve a reference. The project's own
    * repository is the default; a reference that names a `host` may instead point at any
@@ -734,8 +947,32 @@ export const make = Effect.gen(function* () {
    * targeting can fall back to another checkout on the host. Azure derives its organization
    * from the checkout, so it requires a matching repository.
    */
-  const requireProject = (ref: PullRequestRef): Effect.Effect<SupportedProject, PullRequestError> =>
-    listWorkspaceProjects({ projectId: ref.projectId }).pipe(
+  const requireProject = (
+    ref: PullRequestRef,
+  ): Effect.Effect<SupportedProject, PullRequestError> => {
+    const repositoryRoot = ref.repositoryRoot;
+    if (repositoryRoot !== undefined) {
+      const repository = ref.repository.trim();
+      const host = ref.host?.trim().toLowerCase();
+      return loadProject(ref.projectId).pipe(
+        Effect.flatMap((project) => resolveRepositoryRoot(project, repositoryRoot)),
+        Effect.flatMap((selected) => {
+          if (
+            selected.repository.toLowerCase() !== repository.toLowerCase() ||
+            (host !== undefined && selected.host !== host)
+          ) {
+            return Effect.fail(
+              new PullRequestOperationError({
+                operation: "resolveRepository",
+                detail: "The change request does not belong to the selected repository.",
+              }),
+            );
+          }
+          return Effect.succeed(selected);
+        }),
+      );
+    }
+    return listWorkspaceProjects({ projectId: ref.projectId }).pipe(
       Effect.flatMap(({ supported }): Effect.Effect<SupportedProject, PullRequestError> => {
         const own = supported[0];
         const repository = ref.repository.trim();
@@ -793,6 +1030,7 @@ export const make = Effect.gen(function* () {
         );
       }),
     );
+  };
 
   /**
    * What the signed-in account may do with this change request, asked of the host itself. Every
@@ -1016,17 +1254,33 @@ export const make = Effect.gen(function* () {
       // issued, so one that does not read as one means the page is sending something it made up,
       // and reading part of the listing under that assumption would quietly lose rows.
       const continuation = yield* decodeCursors(input.cursors);
-      const {
-        supported: projects,
-        unimplemented,
-        viewerRoots,
-      } = yield* listWorkspaceProjects(input);
+      const workspace =
+        input.repositoryRoot === undefined ? yield* listWorkspaceProjects(input) : null;
+      // A selected root is authorized by its project shell, not by the outer
+      // checkout's remote/provider. A directory project can therefore contain
+      // an independently configured GitHub, GitLab, or other supported repo.
+      const resolvedProjects =
+        input.repositoryRoot === undefined
+          ? workspace!.supported
+          : [
+              yield* resolveRepositoryRoot(
+                yield* loadProject(input.projectId!),
+                input.repositoryRoot,
+              ),
+            ];
+      const unimplemented = workspace?.unimplemented ?? new Map();
       const projectCounts = new Map<string, number>();
-      for (const { host } of projects) {
+      for (const { host } of resolvedProjects) {
         projectCounts.set(host, (projectCounts.get(host) ?? 0) + 1);
       }
 
-      const viewerResults = yield* resolveViewers(projects, viewerRoots);
+      const resolvedViewerRoots =
+        input.repositoryRoot === undefined
+          ? workspace!.viewerRoots
+          : new Map(
+              resolvedProjects.map((project) => [project.host, [project.project.workspaceRoot]]),
+            );
+      const viewerResults = yield* resolveViewers(resolvedProjects, resolvedViewerRoots);
       const viewers: Record<string, string> = {};
       for (const result of viewerResults) {
         if (result.viewer !== null) viewers[result.host] = result.viewer;
@@ -1039,8 +1293,8 @@ export const make = Effect.gen(function* () {
           host: result.host,
           kind: result.kind,
           searchesOnHost:
-            projects.find((project) => project.host === result.host)?.api.capabilities.search ??
-            false,
+            resolvedProjects.find((project) => project.host === result.host)?.api.capabilities
+              .search ?? false,
           projectCount: projectCounts.get(result.host) ?? 1,
           configured: result.viewer !== null,
           detail: result.error === null ? null : providerDetail(result.error),
@@ -1061,8 +1315,8 @@ export const make = Effect.gen(function* () {
       // fill is about the workspace rather than about this slice.
       const selected =
         continuation === null
-          ? projects
-          : projects.filter(({ cursorKey }) => continuation.has(cursorKey));
+          ? resolvedProjects
+          : resolvedProjects.filter(({ cursorKey }) => continuation.has(cursorKey));
       const readable = selected.filter(({ host }) => viewers[host] !== undefined);
       // A host that could not be read still has projects, and they are absent from the list.
       // Reporting them keeps "N repositories were unavailable" honest instead of dropping them.
@@ -1553,6 +1807,15 @@ export const make = Effect.gen(function* () {
               ? {}
               : { headRepositoryNameWithOwner: changeRequest.headRepositoryNameWithOwner }),
             baseBranch: changeRequest.baseBranch,
+            // These are detail-only host object ids.  In particular they are
+            // the authority for a file tab opened from the aggregate patch;
+            // summary providers deliberately do not promise them.
+            ...(changeRequest.baseRevision === undefined
+              ? {}
+              : { baseRevision: changeRequest.baseRevision }),
+            ...(changeRequest.headRevision === undefined
+              ? {}
+              : { headRevision: changeRequest.headRevision }),
             createdAt: changeRequest.createdAt,
             updatedAt: changeRequest.updatedAt,
             mergedAt: changeRequest.mergedAt,
@@ -1634,25 +1897,78 @@ export const make = Effect.gen(function* () {
 
   const diffUncached: PullRequestService["Service"]["diff"] = (input) =>
     requireProject(input).pipe(
-      Effect.flatMap((project) =>
-        project.api.capabilities.diff
-          ? project.api
-              .getDiff({
-                cwd: project.project.workspaceRoot,
-                repository: project.repository,
-                host: project.host,
-                number: input.number,
-                ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
-                ...(input.commit === undefined ? {} : { commit: input.commit }),
-              })
-              .pipe(Effect.mapError(toPullRequestError("diff")))
-          : Effect.fail(
-              new PullRequestOperationError({
-                operation: "diff",
-                detail: "This host cannot provide a diff for a change request.",
-              }),
-            ),
-      ),
+      Effect.flatMap((project) => {
+        if (!project.api.capabilities.diff) {
+          return Effect.fail(
+            new PullRequestOperationError({
+              operation: "diff",
+              detail: "This host cannot provide a diff for a change request.",
+            }),
+          );
+        }
+        const providerInput = {
+          cwd: project.project.workspaceRoot,
+          repository: project.repository,
+          host: project.host,
+          number: input.number,
+        };
+        const readDiff = () =>
+          project.api
+            .getDiff({
+              ...providerInput,
+              ...(input.cursor === undefined ? {} : { cursor: input.cursor }),
+              ...(input.commit === undefined ? {} : { commit: input.commit }),
+            })
+            .pipe(Effect.mapError(toPullRequestError("diff")));
+        // A commit slice already names its immutable head.  Whole-PR slices
+        // need a host snapshot taken around the patch read: retry once if the
+        // PR moved while it was read instead of attaching a patch from A to
+        // detail OIDs from B.
+        if (input.commit !== undefined) {
+          return readDiff().pipe(Effect.map((diff) => ({ ...diff, headRevision: input.commit })));
+        }
+        const readStableSlice = (
+          retry: boolean,
+        ): Effect.Effect<PullRequestDiffResult, PullRequestError> =>
+          Effect.gen(function* () {
+            const before = yield* project.api
+              .getChangeRequest(providerInput)
+              .pipe(Effect.mapError(toPullRequestError("diff")));
+            const diff = yield* readDiff();
+            const after = yield* project.api
+              .getChangeRequest(providerInput)
+              .pipe(Effect.mapError(toPullRequestError("diff")));
+            // Providers without object-id detail retain their existing patch
+            // behavior; only a complete host pair can be used as immutable
+            // file-comparison authority.
+            if (
+              before.baseRevision === undefined ||
+              before.headRevision === undefined ||
+              after.baseRevision === undefined ||
+              after.headRevision === undefined
+            ) {
+              return diff;
+            }
+            const stable =
+              before.baseRevision === after.baseRevision &&
+              before.headRevision === after.headRevision;
+            if (stable) {
+              return {
+                ...diff,
+                baseRevision: before.baseRevision,
+                headRevision: before.headRevision,
+              };
+            }
+            if (retry) {
+              return yield* readStableSlice(false);
+            }
+            return yield* new PullRequestOperationError({
+              operation: "diff",
+              detail: "The pull request changed while its diff was loading. Refresh and try again.",
+            });
+          });
+        return readStableSlice(true);
+      }),
     );
 
   const diffFileContents: PullRequestService["Service"]["diffFileContents"] = (input) =>
@@ -1666,6 +1982,8 @@ export const make = Effect.gen(function* () {
               host: project.host,
               number: input.number,
               ...(input.commit === undefined ? {} : { commit: input.commit }),
+              ...(input.baseRevision === undefined ? {} : { baseRevision: input.baseRevision }),
+              ...(input.headRevision === undefined ? {} : { headRevision: input.headRevision }),
               changeType: input.changeType,
               oldPath: input.oldPath,
               newPath: input.newPath,
@@ -2420,7 +2738,7 @@ export const make = Effect.gen(function* () {
   const refEpochs = new Map<string, number>();
   const REF_EPOCH_CAPACITY = 2_048;
   const refScope = (ref: PullRequestRef) =>
-    `${ref.projectId} ${ref.host?.toLowerCase() ?? ""} ${ref.repository.toLowerCase()} ${ref.number}`;
+    `${ref.projectId} ${ref.repositoryRoot ?? ""} ${ref.host?.toLowerCase() ?? ""} ${ref.repository.toLowerCase()} ${ref.number}`;
   const refEpoch = (ref: PullRequestRef) =>
     Math.max(turnRefreshEpoch, refEpochs.get(refScope(ref)) ?? 0);
   // Keys carry the reference back out of the cache loader, so the slot layout is shared with
@@ -2429,6 +2747,7 @@ export const make = Effect.gen(function* () {
     JSON.stringify([
       refEpoch(ref),
       ref.projectId,
+      ref.repositoryRoot ?? null,
       ref.host?.toLowerCase() ?? null,
       ref.repository.toLowerCase(),
       ref.number,
@@ -2436,11 +2755,20 @@ export const make = Effect.gen(function* () {
       ref[credentialNamespace] ?? null,
     ]);
   const refOfCacheKey = (key: string): PullRequestRef => {
-    const [, projectId, host, repository, number, expectedAccountId, fingerprint] = JSON.parse(
-      key,
-    ) as [number, string, string | null, string, number, string | null, string | null];
+    const [, projectId, repositoryRoot, host, repository, number, expectedAccountId, fingerprint] =
+      JSON.parse(key) as [
+        number,
+        string,
+        string | null,
+        string | null,
+        string,
+        number,
+        string | null,
+        string | null,
+      ];
     return {
       projectId,
+      ...(repositoryRoot === null ? {} : { repositoryRoot }),
       ...(host === null ? {} : { host }),
       ...(expectedAccountId === null ? {} : { expectedAccountId }),
       ...(fingerprint === null ? {} : { [credentialNamespace]: fingerprint }),
@@ -2568,6 +2896,7 @@ export const make = Effect.gen(function* () {
         involvement,
         filters,
         projectId,
+        repositoryRoot,
         projectIds,
         host,
         limit,
@@ -2578,6 +2907,7 @@ export const make = Effect.gen(function* () {
         string,
         string | null,
         ReadonlyArray<string | ReadonlyArray<string> | null> | null,
+        string | null,
         string | null,
         ReadonlyArray<string> | null,
         string | null,
@@ -2590,6 +2920,7 @@ export const make = Effect.gen(function* () {
         ...(involvement === null ? {} : { involvement }),
         ...(filters === null ? {} : { filters: filtersOfKey(filters) }),
         ...(projectId === null ? {} : { projectId }),
+        ...(repositoryRoot === null ? {} : { repositoryRoot }),
         ...(projectIds === null ? {} : { projectIds }),
         ...(host === null ? {} : { host }),
         ...(limit === null ? {} : { limit }),
@@ -2619,6 +2950,7 @@ export const make = Effect.gen(function* () {
             input.filters.excludedLabels ?? null,
           ],
       input.projectId ?? null,
+      input.repositoryRoot ?? null,
       // Sorted so the same narrowing keys alike however the caller ordered it.
       input.projectIds === undefined ? null : [...input.projectIds].sort(),
       input.host ?? null,
@@ -2723,9 +3055,12 @@ export const make = Effect.gen(function* () {
 
   const diffCache = yield* Cache.makeWith(
     (key: string) => {
-      const [, projectId, host, repository, number, cursor, commit] = JSON.parse(key) as [
+      const [, projectId, repositoryRoot, host, repository, number, cursor, commit] = JSON.parse(
+        key,
+      ) as [
         number,
         string,
+        string | null,
         string | null,
         string,
         number,
@@ -2734,6 +3069,7 @@ export const make = Effect.gen(function* () {
       ];
       return diffUncached({
         projectId,
+        ...(repositoryRoot === null ? {} : { repositoryRoot }),
         ...(host === null ? {} : { host }),
         repository,
         number,
@@ -2745,7 +3081,7 @@ export const make = Effect.gen(function* () {
       capacity: DIFF_CACHE_CAPACITY,
       timeToLive: (exit, key) => {
         if (!Exit.isSuccess(exit)) return Duration.zero;
-        const commit = (JSON.parse(key) as ReadonlyArray<unknown>)[6];
+        const commit = (JSON.parse(key) as ReadonlyArray<unknown>)[7];
         return commit === null ? DIFF_CACHE_TTL : COMMIT_DIFF_CACHE_TTL;
       },
     },
@@ -2754,6 +3090,7 @@ export const make = Effect.gen(function* () {
     const key = JSON.stringify([
       refEpoch(input),
       input.projectId,
+      input.repositoryRoot ?? null,
       input.host?.toLowerCase() ?? null,
       input.repository.toLowerCase(),
       input.number,
@@ -2768,9 +3105,18 @@ export const make = Effect.gen(function* () {
 
   const listStatsCache = yield* Cache.makeWith(
     (key: string) => {
-      const [, refs] = JSON.parse(key) as [number, ReadonlyArray<[string, string, number, number]>];
+      const [, refs] = JSON.parse(key) as [
+        number,
+        ReadonlyArray<[string, string | null, string | null, string, number, number]>,
+      ];
       return listStatsUncached({
-        refs: refs.map(([projectId, repository, number]) => ({ projectId, repository, number })),
+        refs: refs.map(([projectId, repositoryRoot, host, repository, number]) => ({
+          projectId,
+          ...(repositoryRoot === null ? {} : { repositoryRoot }),
+          ...(host === null ? {} : { host }),
+          repository,
+          number,
+        })),
       } as unknown as PullRequestListStatsInput).pipe(
         Effect.flatMap((result) =>
           Clock.currentTimeMillis.pipe(Effect.map((at) => ({ result, at }))),
@@ -2786,9 +3132,21 @@ export const make = Effect.gen(function* () {
     JSON.stringify([
       listingsEpoch,
       [...refs]
-        .map((ref) => [ref.projectId, ref.repository, ref.number, refEpoch(ref)] as const)
+        .map(
+          (ref) =>
+            [
+              ref.projectId,
+              ref.repositoryRoot ?? null,
+              ref.host?.toLowerCase() ?? null,
+              ref.repository,
+              ref.number,
+              refEpoch(ref),
+            ] as const,
+        )
         .toSorted((left, right) =>
-          `${left[0]} ${left[1]} ${left[2]}`.localeCompare(`${right[0]} ${right[1]} ${right[2]}`),
+          `${left[0]} ${left[1] ?? ""} ${left[2] ?? ""} ${left[3]} ${left[4]}`.localeCompare(
+            `${right[0]} ${right[1] ?? ""} ${right[2] ?? ""} ${right[3]} ${right[4]}`,
+          ),
         ),
     ]);
   // Exact batches share in-flight reads; overlapping pages reuse each row already fetched.

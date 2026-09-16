@@ -130,7 +130,7 @@ describe("source control environment atoms", () => {
         const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (registry) =>
           Effect.sync(() => registry.dispose()),
         );
-        const state = vcsRefsCacheStateAtom({ environmentId: TARGET.environmentId });
+        const state = vcsRefsCacheStateAtom({ environmentId: TARGET.environmentId, cwd: "/repo" });
 
         expect(registry.get(state).revision).toBe(0);
         const publishResult = yield* Effect.promise(() =>
@@ -147,7 +147,7 @@ describe("source control environment atoms", () => {
 
         expect(AsyncResult.isSuccess(publishResult)).toBe(true);
         expect(registry.get(state).revision).toBe(1);
-        expect(removed).toEqual([`${TARGET.environmentId}:*`]);
+        expect(removed).toEqual([`${TARGET.environmentId}:/repo`]);
 
         const failedPublish = yield* Effect.promise(() =>
           atoms.publishRepository.run(registry, {
@@ -163,7 +163,7 @@ describe("source control environment atoms", () => {
 
         expect(AsyncResult.isFailure(failedPublish)).toBe(true);
         expect(registry.get(state).revision).toBe(2);
-        expect(removed).toEqual([`${TARGET.environmentId}:*`, `${TARGET.environmentId}:*`]);
+        expect(removed).toEqual([`${TARGET.environmentId}:/repo`, `${TARGET.environmentId}:/repo`]);
       }),
     ),
   );

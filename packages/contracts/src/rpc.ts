@@ -83,6 +83,18 @@ import {
   VcsStageFilesInput,
   VcsWorkingTreeDiffInput,
   VcsWorkingTreeDiffResult,
+  GitRepositoryDiscoveryInput,
+  GitRepositoryDiscoveryResult,
+  GitCommitGraphPageInput,
+  GitCommitGraphPageResult,
+  GitCommitFilesInput,
+  GitCommitFilesResult,
+  GitRepositoryComparisonInput,
+  GitRepositoryComparisonResult,
+  GitActionRequest,
+  GitActionResult,
+  GitGenerateCommitMessageInput,
+  GitGenerateCommitMessageResult,
 } from "./git.ts";
 import {
   ReviewDiffFileContentsInput,
@@ -405,6 +417,12 @@ export const WS_METHODS = {
   vcsStageFiles: "vcs.stageFiles",
   vcsUnstageFiles: "vcs.unstageFiles",
   vcsGetWorkingTreeDiff: "vcs.getWorkingTreeDiff",
+  gitDiscoverRepositories: "git.discoverRepositories",
+  gitCommitGraphPage: "git.commitGraphPage",
+  gitCommitFiles: "git.commitFiles",
+  gitCompareRepositoryFile: "git.compareRepositoryFile",
+  gitRunAction: "git.runAction",
+  gitGenerateCommitMessage: "git.generateCommitMessage",
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
@@ -1003,7 +1021,11 @@ const WsSubscribeProjectClonesRpc = Rpc.make(WS_METHODS.subscribeProjectClones, 
 const WsSourceControlPublishRepositoryRpc = Rpc.make(WS_METHODS.sourceControlPublishRepository, {
   payload: SourceControlPublishRepositoryInput,
   success: SourceControlPublishRepositoryResult,
-  error: Schema.Union([SourceControlRepositoryError, EnvironmentAuthorizationError]),
+  error: Schema.Union([
+    GitCommandError,
+    SourceControlRepositoryError,
+    EnvironmentAuthorizationError,
+  ]),
 });
 
 const WsProjectsSearchEntriesRpc = Rpc.make(WS_METHODS.projectsSearchEntries, {
@@ -1285,6 +1307,42 @@ const WsVcsRefreshStatusRpc = Rpc.make(WS_METHODS.vcsRefreshStatus, {
 const WsVcsWorkingTreePageRpc = Rpc.make(WS_METHODS.vcsWorkingTreePage, {
   payload: VcsWorkingTreePageInput,
   success: VcsWorkingTreePageResult,
+  error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
+});
+
+const WsGitDiscoverRepositoriesRpc = Rpc.make(WS_METHODS.gitDiscoverRepositories, {
+  payload: GitRepositoryDiscoveryInput,
+  success: GitRepositoryDiscoveryResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitCommitGraphPageRpc = Rpc.make(WS_METHODS.gitCommitGraphPage, {
+  payload: GitCommitGraphPageInput,
+  success: GitCommitGraphPageResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitCommitFilesRpc = Rpc.make(WS_METHODS.gitCommitFiles, {
+  payload: GitCommitFilesInput,
+  success: GitCommitFilesResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitCompareRepositoryFileRpc = Rpc.make(WS_METHODS.gitCompareRepositoryFile, {
+  payload: GitRepositoryComparisonInput,
+  success: GitRepositoryComparisonResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitRunActionRpc = Rpc.make(WS_METHODS.gitRunAction, {
+  payload: GitActionRequest,
+  success: GitActionResult,
+  error: Schema.Union([GitCommandError, EnvironmentAuthorizationError]),
+});
+
+const WsGitGenerateCommitMessageRpc = Rpc.make(WS_METHODS.gitGenerateCommitMessage, {
+  payload: GitGenerateCommitMessageInput,
+  success: GitGenerateCommitMessageResult,
   error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
 });
 
@@ -1794,6 +1852,12 @@ export const WsRpcGroup = RpcGroup.make(
   WsVcsPullRpc,
   WsVcsRefreshStatusRpc,
   WsVcsWorkingTreePageRpc,
+  WsGitDiscoverRepositoriesRpc,
+  WsGitCommitGraphPageRpc,
+  WsGitCommitFilesRpc,
+  WsGitCompareRepositoryFileRpc,
+  WsGitRunActionRpc,
+  WsGitGenerateCommitMessageRpc,
   WsGitRunStackedActionRpc,
   WsGitResolvePullRequestRpc,
   WsGitPreparePullRequestThreadRpc,

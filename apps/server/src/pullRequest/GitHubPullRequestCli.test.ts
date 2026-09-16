@@ -2379,6 +2379,45 @@ layer("GitHubPullRequestCli.layer", (it) => {
     }),
   );
 
+  it.effect(
+    "hydrates a rendered PR aggregate from its pinned merge-base and head after the PR moves",
+    () =>
+      Effect.gen(function* () {
+        const baseTip = "a".repeat(40);
+        const pinnedHead = "b".repeat(40);
+        const mergeBase = "c".repeat(40);
+        // The first request resolves exactly the immutable aggregate pair. A
+        // current pull detail is intentionally never requested by this path.
+        mockedExecute.mockReturnValueOnce(Effect.succeed(output(`${mergeBase}\n`)));
+        mockedExecute.mockReturnValueOnce(Effect.succeed(output("before at aggregate\n")));
+        mockedExecute.mockReturnValueOnce(Effect.succeed(output("after at aggregate\n")));
+        const cli = yield* GitHubPullRequestCli.GitHubPullRequestCli;
+
+        const contents = yield* cli.getPullRequestDiffFileContents({
+          cwd: "/w",
+          repository: "acme/web",
+          host: "github.com",
+          number: 7,
+          baseRevision: baseTip,
+          headRevision: pinnedHead,
+          changeType: "change",
+          oldPath: "src/file.ts",
+          newPath: "src/file.ts",
+        });
+
+        expect(contents).toEqual({
+          oldContents: "before at aggregate\n",
+          newContents: "after at aggregate\n",
+        });
+        expect(callAt(0).args.join(" ")).toContain(
+          `repos/acme/web/compare/${baseTip}...${pinnedHead}`,
+        );
+        expect(callAt(0).args.join(" ")).not.toContain("/pulls/7");
+        expect(callAt(1).args.join(" ")).toContain(`?ref=${mergeBase}`);
+        expect(callAt(2).args.join(" ")).toContain(`?ref=${pinnedHead}`);
+      }),
+  );
+
   it.effect("reports unusable diff revisions as a structured error", () =>
     Effect.gen(function* () {
       mockedExecute.mockReturnValueOnce(Effect.succeed(output("not-a-sha\tstill-not-a-sha\n")));
@@ -3081,7 +3120,7 @@ layer("GitHubPullRequestCli.layer", (it) => {
       expect(detail.body).toBe("Core body");
       expect(activity.author?.login).toBe("octocat");
       expect(callAt(0).args.at(-1)).toBe(
-        "number,title,url,author,headRefName,baseRefName,state,isDraft,mergeable,reviewDecision,additions,deletions,createdAt,updatedAt,mergedAt,reviewRequests,labels,statusCheckRollup,body,changedFiles,closedAt,isCrossRepository,headRepositoryOwner,headRefOid,autoMergeRequest",
+        "number,title,url,author,headRefName,baseRefName,state,isDraft,mergeable,reviewDecision,additions,deletions,createdAt,updatedAt,mergedAt,reviewRequests,labels,statusCheckRollup,body,changedFiles,closedAt,isCrossRepository,headRepositoryOwner,headRefOid,baseRefOid,autoMergeRequest",
       );
       expect(callAt(1).args.at(-1)).toBe("author,comments,reviews,commits");
     }),

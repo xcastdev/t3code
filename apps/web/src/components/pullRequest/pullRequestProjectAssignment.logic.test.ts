@@ -256,4 +256,48 @@ describe("where a pull request can be acted on", () => {
       label: "Server env-1",
     });
   });
+
+  it("does not offer an outer-project copy for an explicit nested repository", () => {
+    expect(
+      resolvePickableEnvironments(
+        on("env-1", "a1"),
+        [
+          project("a1", "env-1", "github.com/acme/outer"),
+          project("a2", "env-2", "github.com/acme/outer"),
+        ],
+        connected("env-1", "env-2"),
+        "/srv/env-1/a1/packages/api",
+      ),
+    ).toEqual([]);
+  });
+
+  it("offers alternate environments only when the selected nested repository has its own identity", () => {
+    const nestedA = project("nested-a", "env-1", "github.com/acme/api");
+    const nestedB = project("nested-b", "env-2", "github.com/acme/api");
+    const pickable = resolvePickableEnvironments(
+      on("env-1", "a1"),
+      [
+        project("a1", "env-1", "github.com/acme/outer"),
+        nestedA,
+        project("a2", "env-2", "github.com/acme/outer"),
+        nestedB,
+      ],
+      connected("env-1", "env-2"),
+      nestedA.workspaceRoot,
+    );
+    expect(pickable).toEqual([
+      {
+        environmentId: "env-1",
+        projectId: "nested-a",
+        workspaceRoot: nestedA.workspaceRoot,
+        label: "Server env-1",
+      },
+      {
+        environmentId: "env-2",
+        projectId: "nested-b",
+        workspaceRoot: nestedB.workspaceRoot,
+        label: "Server env-2",
+      },
+    ]);
+  });
 });

@@ -75,6 +75,9 @@ export interface ProviderChangeRequest {
   readonly headBranch: string;
   readonly headRepositoryNameWithOwner?: string | null;
   readonly baseBranch: string;
+  /** Exact host revisions for a detail diff, when the provider exposes them. */
+  readonly baseRevision?: string;
+  readonly headRevision?: string;
   readonly state: PullRequestState;
   readonly isDraft: boolean;
   readonly mergeability: PullRequestMergeability;
@@ -442,6 +445,8 @@ export interface PullRequestProviderApi {
     input: ProviderRepositoryRef & {
       readonly number: number;
       readonly commit?: string | undefined;
+      readonly baseRevision?: string | undefined;
+      readonly headRevision?: string | undefined;
       readonly changeType: "change" | "rename-pure" | "rename-changed" | "new" | "deleted";
       readonly oldPath: string;
       readonly newPath: string;

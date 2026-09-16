@@ -29,6 +29,14 @@ interface PullRequestDiffFileContentsSource {
   readonly environmentId: EnvironmentId;
   readonly reference: PullRequestRef;
   readonly commit: string | null;
+  /** The aggregate patch snapshot owning this rendered file. */
+  readonly baseRevision?: string | undefined;
+  readonly headRevision?: string | undefined;
+  /** Per-file aggregate ownership; pages can have different pinned snapshots. */
+  readonly aggregateRevisionsByPath?: ReadonlyMap<
+    string,
+    { readonly baseRevision?: string | undefined; readonly headRevision?: string | undefined }
+  >;
   readonly cacheKey: string;
 }
 
@@ -106,11 +114,20 @@ export function createPullRequestDiffFileContentsLoader<E>(
   source: PullRequestDiffFileContentsSource,
 ): FileDiffContentsLoader {
   return createDiffFileContentsLoader(async ({ changeType, oldPath, newPath }) => {
+    const aggregateRevisions =
+      source.aggregateRevisionsByPath?.get(newPath) ??
+      source.aggregateRevisionsByPath?.get(oldPath);
     const result = await getDiffFileContents({
       environmentId: source.environmentId,
       input: {
         ...source.reference,
         ...(source.commit === null ? {} : { commit: source.commit }),
+        ...((aggregateRevisions?.baseRevision ?? source.baseRevision)
+          ? { baseRevision: aggregateRevisions?.baseRevision ?? source.baseRevision }
+          : {}),
+        ...((aggregateRevisions?.headRevision ?? source.headRevision)
+          ? { headRevision: aggregateRevisions?.headRevision ?? source.headRevision }
+          : {}),
         changeType,
         oldPath,
         newPath,

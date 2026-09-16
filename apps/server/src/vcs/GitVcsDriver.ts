@@ -13,6 +13,14 @@ import {
   GitCommandError,
   type GitCommitIndexInput,
   type GitCommitIndexResult,
+  type GitCommitFilesInput,
+  type GitCommitFilesResult,
+  type GitCommitGraphPageInput,
+  type GitCommitGraphPageResult,
+  type GitRepositoryComparisonInput,
+  type GitRepositoryComparisonResult,
+  type GitRepositoryDiscoveryInput,
+  type GitRepositoryDiscoveryResult,
   VcsProcessExitError,
   type VcsSwitchRefInput,
   type VcsSwitchRefResult,
@@ -75,12 +83,15 @@ export interface GitStatusDetails {
   repositoryRoot?: string;
   sourceControlProvider?: VcsStatusResult["sourceControlProvider"];
   hasOriginRemote: boolean;
+  commitIdentityReady?: boolean;
   isDefaultBranch: boolean;
   branch: string | null;
   localRevision?: string;
   headCommit?: string | null;
+  headHasParent?: boolean;
   indexTree?: string;
   pendingMergeHeads?: readonly string[];
+  activeConflictOperation?: "merge" | "rebase" | "cherry-pick" | "revert";
   upstreamRef: string | null;
   hasWorkingTreeChanges: boolean;
   workingTree: VcsStatusResult["workingTree"];
@@ -171,6 +182,11 @@ export interface GitPushResult {
   branch: string;
   upstreamBranch?: string | undefined;
   setUpstream?: boolean | undefined;
+}
+
+export interface GitPublicationTarget {
+  remoteName: string | null;
+  refName: string | null;
 }
 
 export interface GitRangeContext {
@@ -291,6 +307,18 @@ export class GitVcsDriver extends Context.Service<
       cwd: string,
       options?: GitRemoteStatusOptions,
     ) => Effect.Effect<GitRemoteStatusDetails, GitCommandError>;
+    readonly discoverRepositories: (
+      input: GitRepositoryDiscoveryInput,
+    ) => Effect.Effect<GitRepositoryDiscoveryResult, GitCommandError>;
+    readonly commitGraphPage: (
+      input: GitCommitGraphPageInput,
+    ) => Effect.Effect<GitCommitGraphPageResult, GitCommandError>;
+    readonly commitFiles: (
+      input: GitCommitFilesInput,
+    ) => Effect.Effect<GitCommitFilesResult, GitCommandError>;
+    readonly compareRepositoryFile: (
+      input: GitRepositoryComparisonInput,
+    ) => Effect.Effect<GitRepositoryComparisonResult, GitCommandError>;
     readonly stageFiles: (input: VcsStageFilesInput) => Effect.Effect<void, GitCommandError>;
     readonly unstageFiles: (input: VcsStageFilesInput) => Effect.Effect<void, GitCommandError>;
     readonly getWorkingTreeDiff: (
@@ -312,7 +340,7 @@ export class GitVcsDriver extends Context.Service<
     readonly pushCurrentBranch: (
       cwd: string,
       fallbackBranch: string | null,
-      options?: { readonly remoteName?: string | null },
+      options?: { readonly remoteName?: string | null; readonly refName?: string | null },
     ) => Effect.Effect<GitPushResult, GitCommandError>;
     readonly readRangeContext: (
       cwd: string,
@@ -331,7 +359,10 @@ export class GitVcsDriver extends Context.Service<
     readonly listRefs: (
       input: VcsListRefsInput,
     ) => Effect.Effect<VcsListRefsResult, GitCommandError>;
-    readonly pullCurrentBranch: (cwd: string) => Effect.Effect<VcsPullResult, GitCommandError>;
+    readonly pullCurrentBranch: (
+      cwd: string,
+      strategy?: "merge" | "rebase" | "ff-only",
+    ) => Effect.Effect<VcsPullResult, GitCommandError>;
     readonly createWorktree: (
       input: VcsCreateWorktreeInput,
       options?: CreateWorktreeOptions,
@@ -352,6 +383,11 @@ export class GitVcsDriver extends Context.Service<
     ) => Effect.Effect<GitRefreshCheckedOutBranchResult, GitCommandError>;
     readonly ensureRemote: (input: GitEnsureRemoteInput) => Effect.Effect<string, GitCommandError>;
     readonly resolvePrimaryRemoteName: (cwd: string) => Effect.Effect<string, GitCommandError>;
+    /** Resolve the exact remote/ref that an explicit publication will use. */
+    readonly resolvePublicationTarget: (
+      cwd: string,
+      branch: string | null,
+    ) => Effect.Effect<GitPublicationTarget, GitCommandError>;
     readonly resolveDefaultBranchName: (
       cwd: string,
       remoteName: string,

@@ -10,6 +10,7 @@ import { PreviewPanelShell } from "../preview/PreviewPanelShell";
 export function SecondaryPaneShell(props: {
   layout?: SecondaryPaneLayoutMode;
   maximized?: boolean;
+  open?: boolean;
   children: ReactNode;
 }) {
   const stacked = props.layout === "stack";
@@ -17,6 +18,7 @@ export function SecondaryPaneShell(props: {
     <PreviewPanelShell
       mode={stacked ? "embedded" : "inline"}
       {...(props.maximized === undefined ? {} : { maximized: props.maximized })}
+      {...(props.open === undefined ? {} : { open: props.open })}
       widthStorageKey="t3code:secondary-pane-width"
       defaultWidth={SECONDARY_PANE_DEFAULT_WIDTH}
     >

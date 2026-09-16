@@ -85,6 +85,7 @@ interface BranchToolbarProps {
   onEnvironmentChange?: (environmentId: EnvironmentId) => void;
   composerControlsHostRef?: (element: HTMLDivElement | null) => void;
   contextStripVisible?: boolean;
+  selectedRepositoryRoot?: string | null;
 }
 
 interface MobileRunContextSelectorProps {
@@ -481,6 +482,7 @@ export const BranchToolbar = memo(function BranchToolbar({
   onEnvironmentChange,
   composerControlsHostRef,
   contextStripVisible = true,
+  selectedRepositoryRoot,
 }: BranchToolbarProps) {
   const branchSelectorRef = useRef<BranchToolbarBranchSelectorHandle>(null);
   const threadRef = useMemo(
@@ -675,6 +677,7 @@ export const BranchToolbar = memo(function BranchToolbar({
           onStartFromOriginChange={onStartFromOriginChange}
           {...(onCheckoutPullRequestRequest ? { onCheckoutPullRequestRequest } : {})}
           {...(onComposerFocusRequest ? { onComposerFocusRequest } : {})}
+          {...(selectedRepositoryRoot !== undefined ? { selectedRepositoryRoot } : {})}
         />
       ) : null}
     </ComposerSurface.ContextStrip>

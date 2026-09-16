@@ -386,6 +386,8 @@ const RawDetailSchema = Schema.Struct({
   headRepositoryOwner: Schema.optional(Schema.NullOr(Schema.Struct({ login: Schema.String }))),
   /** The exact head revision, used to find workflow runs that GitHub has not started yet. */
   headRefOid: Schema.optional(Schema.NullOr(Schema.String)),
+  /** The exact base revision paired with this head by GitHub. */
+  baseRefOid: Schema.optional(Schema.NullOr(Schema.String)),
   body: Schema.optional(Schema.String),
   changedFiles: Schema.optional(Schema.Int),
   closedAt: Schema.optional(Schema.NullOr(Schema.String)),
@@ -638,7 +640,7 @@ export function decodeActorAvatarsJson(
 export const PULL_REQUEST_LIST_JSON_FIELDS =
   "number,title,url,author,headRefName,baseRefName,state,isDraft,mergeable,reviewDecision,additions,deletions,createdAt,updatedAt,mergedAt,reviewRequests,labels,statusCheckRollup";
 
-export const PULL_REQUEST_DETAIL_JSON_FIELDS = `${PULL_REQUEST_LIST_JSON_FIELDS},body,changedFiles,closedAt,isCrossRepository,headRepositoryOwner,headRefOid,autoMergeRequest`;
+export const PULL_REQUEST_DETAIL_JSON_FIELDS = `${PULL_REQUEST_LIST_JSON_FIELDS},body,changedFiles,closedAt,isCrossRepository,headRepositoryOwner,headRefOid,baseRefOid,autoMergeRequest`;
 export const PULL_REQUEST_ACTIVITY_JSON_FIELDS = "author,comments,reviews,commits";
 
 /** GitHub's own ceiling on a connection page, which is what both thread reads ask for. */
@@ -1070,6 +1072,7 @@ export interface GitHubPullRequestDetail extends GitHubPullRequestListItem {
   /** The owner of the head branch's repository; null where `gh` did not say. */
   readonly headRepositoryOwner: string | null;
   readonly headSha?: string | null;
+  readonly baseSha?: string | null;
   readonly body: string;
   readonly changedFiles: number;
   readonly mergedAt: string | null;
@@ -1447,6 +1450,7 @@ function toDetail(raw: Schema.Schema.Type<typeof RawDetailSchema>): GitHubPullRe
       : {}),
     headRepositoryOwner: trimmed(raw.headRepositoryOwner?.login),
     headSha: trimmed(raw.headRefOid),
+    baseSha: trimmed(raw.baseRefOid),
     body: raw.body ?? "",
     changedFiles: raw.changedFiles ?? 0,
     mergedAt: trimmed(raw.mergedAt),

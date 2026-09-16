@@ -561,6 +561,8 @@ export class GitHubPullRequestCli extends Context.Service<
       readonly host: string;
       readonly number: number;
       readonly commit?: string | undefined;
+      readonly baseRevision?: string | undefined;
+      readonly headRevision?: string | undefined;
       readonly changeType: "change" | "rename-pure" | "rename-changed" | "new" | "deleted";
       readonly oldPath: string;
       readonly newPath: string;
@@ -1355,31 +1357,58 @@ export const make = Effect.gen(function* () {
   const getPullRequestDiffFileContents: GitHubPullRequestCli["Service"]["getPullRequestDiffFileContents"] =
     (input) =>
       Effect.gen(function* () {
-        if (input.commit !== undefined && !isCommitSha(input.commit)) {
+        if (
+          (input.commit !== undefined && !isCommitSha(input.commit)) ||
+          (input.baseRevision !== undefined && !isCommitSha(input.baseRevision)) ||
+          (input.headRevision !== undefined && !isCommitSha(input.headRevision))
+        ) {
           return yield* new GitHubDiffCommitError({ command: "gh", cwd: input.cwd });
         }
         const { owner, name } = parseRepositorySelector(input.repository);
-        const refsResult = yield* github.execute({
-          cwd: input.cwd,
-          args: [
-            "api",
-            "--hostname",
-            input.host,
-            input.commit === undefined
-              ? `repos/${owner}/${name}/pulls/${input.number}`
-              : `repos/${owner}/${name}/commits/${input.commit}`,
-            "--jq",
-            input.commit === undefined
-              ? "[.base.sha, .head.sha] | @tsv"
-              : "[.parents[0].sha, .sha] | @tsv",
-          ],
-          maxOutputBytes: 1024,
-          timeoutMs: DIFF_TIMEOUT_MS,
-        });
+        // A file expansion belongs to its rendered aggregate snapshot. Do
+        // not reread mutable PR detail here; resolve the aggregate's base tip
+        // and head to the merge base GitHub used for the pull-request patch.
+        const pinnedAggregate =
+          input.commit === undefined &&
+          input.baseRevision !== undefined &&
+          input.headRevision !== undefined;
+        const refsResult = pinnedAggregate
+          ? yield* github.execute({
+              cwd: input.cwd,
+              args: [
+                "api",
+                "--hostname",
+                input.host,
+                `repos/${owner}/${name}/compare/${input.baseRevision}...${input.headRevision}`,
+                "--jq",
+                ".merge_base_commit.sha",
+              ],
+              maxOutputBytes: 1024,
+              timeoutMs: DIFF_TIMEOUT_MS,
+            })
+          : yield* github.execute({
+              cwd: input.cwd,
+              args: [
+                "api",
+                "--hostname",
+                input.host,
+                input.commit === undefined
+                  ? `repos/${owner}/${name}/pulls/${input.number}`
+                  : `repos/${owner}/${name}/commits/${input.commit}`,
+                "--jq",
+                input.commit === undefined
+                  ? "[.base.sha, .head.sha] | @tsv"
+                  : "[.parents[0].sha, .sha] | @tsv",
+              ],
+              maxOutputBytes: 1024,
+              timeoutMs: DIFF_TIMEOUT_MS,
+            });
         // Keep a leading tab: a root commit has no parent, and jq represents that absent old
         // revision as the empty field before the tab. Every file in it is new, so that is a
         // usable answer whenever the caller does not need the old side.
-        const [baseRef, headRef, ...extraRefs] = refsResult.stdout.trimEnd().split("\t");
+        const [baseRef, headRef, ...extraRefs] = pinnedAggregate
+          ? [refsResult.stdout.trim(), input.headRevision]
+          : refsResult.stdout.trimEnd().split("\t");
         const rootCommitNewFile =
           input.commit !== undefined && input.changeType === "new" && baseRef === "";
         if (

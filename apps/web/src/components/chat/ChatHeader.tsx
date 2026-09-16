@@ -61,6 +61,10 @@ interface ChatHeaderProps {
   rightPanelOpen: boolean;
   /** A populated inline panel owns the titlebar controls; an empty rail does not. */
   rightPanelHasActiveSurface: boolean;
+  /** The chat header owns the viewport-fixed workspace controls in this layout. */
+  reserveGlobalControls?: boolean;
+  /** An enclosing titlebar already reserves the fixed controls for this header. */
+  parentReservesGlobalControls?: boolean;
   onNewThreadInProject: () => void;
   onOpenProjectSettings?: (() => void) | undefined;
   onRunProjectScript: (script: ProjectScript) => void;
@@ -138,6 +142,8 @@ export const ChatHeader = memo(function ChatHeader({
   availableEditors,
   rightPanelOpen,
   rightPanelHasActiveSurface,
+  reserveGlobalControls = false,
+  parentReservesGlobalControls = false,
   onNewThreadInProject,
   onOpenProjectSettings,
   onRunProjectScript,
@@ -414,7 +420,13 @@ export const ChatHeader = memo(function ChatHeader({
         data-chat-header-actions
         className={cn(
           "flex shrink-0 items-center justify-end gap-2 @3xl/header-actions:gap-3",
-          rightPanelOpen && rightPanelHasActiveSurface ? "pr-0" : "pr-16",
+          parentReservesGlobalControls
+            ? "pr-0"
+            : reserveGlobalControls
+              ? "pr-[var(--workspace-global-controls-width)]"
+              : rightPanelOpen && rightPanelHasActiveSurface
+                ? "pr-0"
+                : "pr-16",
           "[[data-panel-animations=true]_&]:motion-safe:transition-[padding-right] [[data-panel-animations=true]_&]:motion-safe:[transition-duration:var(--panel-animation-duration)] [[data-panel-animations=true]_&]:motion-safe:ease-out",
         )}
       >

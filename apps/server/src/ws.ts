@@ -4874,8 +4874,22 @@ const makeWsRpcLayer = (
         [WS_METHODS.sourceControlPublishRepository]: (input) =>
           observeRpcEffect(
             WS_METHODS.sourceControlPublishRepository,
-            sourceControlRepositories
-              .publishRepository(input)
+            gitWorkflow
+              .withRepositoryPermit(
+                "sourceControl.publishRepository",
+                input.cwd,
+                Effect.gen(function* () {
+                  // Provider creation is already an external mutation. Recheck the
+                  // reviewed state after joining the same per-repository lane as Git.
+                  if (input.precondition !== undefined) {
+                    yield* gitWorkflow.validateMutationPrecondition({
+                      cwd: input.cwd,
+                      precondition: input.precondition,
+                    });
+                  }
+                  return yield* sourceControlRepositories.publishRepository(input);
+                }),
+              )
               .pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
             {
               "rpc.aggregate": "source-control",
@@ -5135,10 +5149,42 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.vcsWorkingTreePage, gitWorkflow.workingTreePage(input), {
             "rpc.aggregate": "vcs",
           }),
+        [WS_METHODS.gitDiscoverRepositories]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.gitDiscoverRepositories,
+            gitWorkflow.discoverRepositories(input),
+            { "rpc.aggregate": "vcs" },
+          ),
+        [WS_METHODS.gitCommitGraphPage]: (input) =>
+          observeRpcEffect(WS_METHODS.gitCommitGraphPage, gitWorkflow.commitGraphPage(input), {
+            "rpc.aggregate": "vcs",
+          }),
+        [WS_METHODS.gitCommitFiles]: (input) =>
+          observeRpcEffect(WS_METHODS.gitCommitFiles, gitWorkflow.commitFiles(input), {
+            "rpc.aggregate": "vcs",
+          }),
+        [WS_METHODS.gitCompareRepositoryFile]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.gitCompareRepositoryFile,
+            gitWorkflow.compareRepositoryFile(input),
+            { "rpc.aggregate": "vcs" },
+          ),
+        [WS_METHODS.gitRunAction]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.gitRunAction,
+            gitWorkflow.runAction(input).pipe(Effect.tap(() => refreshGitStatus(input.cwd))),
+            { "rpc.aggregate": "git" },
+          ),
+        [WS_METHODS.gitGenerateCommitMessage]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.gitGenerateCommitMessage,
+            gitWorkflow.generateCommitMessage(input),
+            { "rpc.aggregate": "git" },
+          ),
         [WS_METHODS.vcsPull]: (input) =>
           observeRpcEffect(
             WS_METHODS.vcsPull,
-            gitWorkflow.pullCurrentBranch(input.cwd).pipe(
+            gitWorkflow.pullCurrentBranch(input.cwd, input.strategy).pipe(
               Effect.matchCauseEffect({
                 onFailure: (cause) => Effect.failCause(cause),
                 onSuccess: (result) =>

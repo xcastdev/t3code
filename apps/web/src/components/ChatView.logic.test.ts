@@ -35,6 +35,7 @@ import {
   MAX_HIDDEN_MOUNTED_PREVIEW_THREADS,
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
   agentControlledBrowserCloseConfirmation,
+  branchRestoreMutationPrecondition,
   branchMismatchKey,
   buildExpiredTerminalContextToastCopy,
   buildLoadingThreadFromShell,
@@ -1884,6 +1885,36 @@ describe("session branch mismatch dismissal", () => {
     expect(isBranchMismatchDismissedForSession("t1:a:b")).toBe(true);
     expect(isBranchMismatchDismissedForSession("t1:a:c")).toBe(false);
     expect(isBranchMismatchDismissedForSession(null)).toBe(false);
+  });
+});
+
+describe("branch restoration reviewed state", () => {
+  const status = {
+    refName: "feature/current",
+    headCommit: "reviewed-head",
+    indexTree: "reviewed-index",
+  };
+
+  it.each([
+    { isPending: true, error: null },
+    { isPending: false, error: "status unavailable" },
+    { isPending: false, error: null, status: null },
+    { isPending: false, error: null, status: { ...status, indexTree: undefined } },
+  ])("does not make a branch restoration executable without a complete current status", (query) => {
+    expect(
+      branchRestoreMutationPrecondition({
+        status: "status" in query ? query.status : status,
+        ...query,
+      }),
+    ).toBeNull();
+  });
+
+  it("captures a complete current status as the branch restoration precondition", () => {
+    expect(branchRestoreMutationPrecondition({ status, isPending: false, error: null })).toEqual({
+      expectedHeadCommit: "reviewed-head",
+      expectedIndexTree: "reviewed-index",
+      expectedRefName: "feature/current",
+    });
   });
 });
 

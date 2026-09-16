@@ -1,5 +1,5 @@
 /* @vitest-environment happy-dom */
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -8,7 +8,8 @@ import { DEFAULT_RESOLVED_KEYBINDINGS } from "@t3tools/shared/keybindings";
 
 import { SecondaryPaneTabs } from "./SecondaryPaneTabs";
 import { selectThreadSecondaryPaneState, useSecondaryPaneStore } from "~/secondaryPaneStore";
-import { PanelLayoutControls, RightPanelMaximizeControl } from "../chat/PanelLayoutControls";
+import { PanelLayoutControls } from "../chat/PanelLayoutControls";
+import { SecondaryPaneShell } from "./SecondaryPaneShell";
 
 const showContextMenu =
   vi.fn<
@@ -75,6 +76,34 @@ function StoredTabs({ onCopyFilePath }: { onCopyFilePath: (relativePath: string)
       }
       onCloseAllSurfaces={() => useSecondaryPaneStore.getState().closeAllSurfaces(threadRef)}
     />
+  );
+}
+
+function RetainedEditor() {
+  const [draft, setDraft] = useState("original");
+  return (
+    <button
+      type="button"
+      aria-label="Unsaved file draft"
+      onClick={() => setDraft("unsaved change")}
+    >
+      {draft}
+    </button>
+  );
+}
+
+function RetainedEditorSurface({ layout }: { layout: "inline" | "stack" }) {
+  const pane = useSecondaryPaneStore((store) =>
+    selectThreadSecondaryPaneState(store.byThreadKey, threadRef),
+  );
+  return (
+    <SecondaryPaneShell
+      layout={layout}
+      maximized={pane.presentation === "maximized"}
+      open={pane.presentation !== "minimized"}
+    >
+      <RetainedEditor />
+    </SecondaryPaneShell>
   );
 }
 
@@ -170,8 +199,7 @@ describe("SecondaryPaneTabs", () => {
     ]);
   });
 
-  it("gives the inline file header the Electron titlebar and keeps stacked controls out of it", async () => {
-    const togglePanel = vi.fn();
+  it("gives the inline file header the Electron titlebar and keeps stacked headers out of it", async () => {
     await act(async () =>
       root.render(
         <SecondaryPaneTabs
@@ -184,11 +212,6 @@ describe("SecondaryPaneTabs", () => {
           onCloseOtherSurfaces={() => undefined}
           onCloseSurfacesToRight={() => undefined}
           onCloseAllSurfaces={() => undefined}
-          headerControls={
-            <button type="button" aria-label="Toggle panel" onClick={togglePanel}>
-              Toggle panel
-            </button>
-          }
         />,
       ),
     );
@@ -197,11 +220,6 @@ describe("SecondaryPaneTabs", () => {
     expect(inlineHeader.dataset.secondaryPaneTitlebarOwner).toBe("true");
     expect(inlineHeader.className).toContain("drag-region");
     expect(inlineHeader.className).toContain("workspace-native-controls-inset");
-    await act(async () =>
-      host.querySelector<HTMLButtonElement>('[aria-label="Toggle panel"]')!.click(),
-    );
-    expect(togglePanel).toHaveBeenCalledOnce();
-
     await act(async () =>
       root.render(
         <SecondaryPaneTabs
@@ -214,17 +232,45 @@ describe("SecondaryPaneTabs", () => {
           onCloseOtherSurfaces={() => undefined}
           onCloseSurfacesToRight={() => undefined}
           onCloseAllSurfaces={() => undefined}
-          headerControls={
-            <button type="button" aria-label="Toggle panel">
-              Toggle panel
-            </button>
-          }
         />,
       ),
     );
     const stackedHeader = host.querySelector<HTMLElement>("[data-secondary-pane-tabbar]")!;
     expect(stackedHeader.dataset.secondaryPaneTitlebarOwner).toBe("false");
     expect(stackedHeader.className).not.toContain("drag-region");
+  });
+
+  it("gives a maximized stacked pane the Electron titlebar and reserves the global controls", async () => {
+    await act(async () =>
+      root.render(
+        <SecondaryPaneTabs
+          surfaces={surfaces}
+          activeSurfaceId={surfaces[0]!.id}
+          layout="stack"
+          maximized
+          reserveGlobalControls
+          onActivate={() => undefined}
+          onClose={() => undefined}
+          onCopyFilePath={() => undefined}
+          onCloseOtherSurfaces={() => undefined}
+          onCloseSurfacesToRight={() => undefined}
+          onCloseAllSurfaces={() => undefined}
+        />,
+      ),
+    );
+
+    const header = host.querySelector<HTMLElement>("[data-secondary-pane-tabbar]")!;
+    expect(header.dataset.secondaryPaneTitlebarOwner).toBe("true");
+    expect(header.className).toContain("drag-region");
+    expect(header.className).toContain("pr-[var(--workspace-global-controls-width)]");
+    expect(header.className).not.toContain(
+      "calc(var(--workspace-native-controls-inset)+var(--workspace-global-controls-width))",
+    );
+    expect(
+      Array.from(header.querySelectorAll<HTMLElement>("span")).find((element) =>
+        element.className.includes("workspace-global-controls-cluster-width"),
+      )?.className,
+    ).toContain("right-[calc(var(--workspace-controls-right)+1px)]");
   });
 
   it("keeps blank inline titlebar space draggable while tabs stay interactive and applies the collapsed-sidebar inset when maximized", async () => {
@@ -253,61 +299,103 @@ describe("SecondaryPaneTabs", () => {
     expect(tab.parentElement!.className).toContain("-webkit-app-region:no-drag");
   });
 
-  it("mounts the workspace Open With, maximize, and panel toggles in the inline header", async () => {
-    const maximize = vi.fn();
+  it("keeps global pane controls outside the secondary tab bar", async () => {
     const terminal = vi.fn();
     const rightPanel = vi.fn();
     await act(async () =>
       root.render(
-        <SecondaryPaneTabs
-          surfaces={surfaces}
-          activeSurfaceId={surfaces[0]!.id}
-          layout="inline"
-          workspaceFile={{
-            environmentId: threadRef.environmentId,
-            cwd: "/repo",
-            relativePath: "src/one.ts",
-            keybindings: DEFAULT_RESOLVED_KEYBINDINGS,
-            availableEditors: [],
-          }}
-          onActivate={() => undefined}
-          onClose={() => undefined}
-          onCopyFilePath={() => undefined}
-          onCloseOtherSurfaces={() => undefined}
-          onCloseSurfacesToRight={() => undefined}
-          onCloseAllSurfaces={() => undefined}
-          headerControls={
-            <>
-              <RightPanelMaximizeControl maximized={false} onToggle={maximize} />
-              <PanelLayoutControls
-                terminalAvailable
-                terminalOpen={false}
-                terminalShortcutLabel={null}
-                rightPanelAvailable
-                rightPanelOpen={false}
-                rightPanelShortcutLabel={null}
-                liveAgentCount={0}
-                onToggleTerminal={terminal}
-                onToggleRightPanel={rightPanel}
-              />
-            </>
-          }
-        />,
+        <>
+          <PanelLayoutControls
+            terminalAvailable
+            terminalOpen={false}
+            terminalShortcutLabel={null}
+            rightPanelAvailable
+            rightPanelOpen={false}
+            rightPanelShortcutLabel={null}
+            liveAgentCount={0}
+            secondaryPane={{
+              presentation: "expanded",
+              canMaximize: true,
+              onMinimize: () => undefined,
+              onRestore: () => undefined,
+              onToggleMaximize: () => undefined,
+            }}
+            onToggleTerminal={terminal}
+            onToggleRightPanel={rightPanel}
+          />
+          <SecondaryPaneTabs
+            surfaces={surfaces}
+            activeSurfaceId={surfaces[0]!.id}
+            layout="inline"
+            workspaceFile={{
+              environmentId: threadRef.environmentId,
+              cwd: "/repo",
+              relativePath: "src/one.ts",
+              keybindings: DEFAULT_RESOLVED_KEYBINDINGS,
+              availableEditors: [],
+            }}
+            onActivate={() => undefined}
+            onClose={() => undefined}
+            onCopyFilePath={() => undefined}
+            onCloseOtherSurfaces={() => undefined}
+            onCloseSurfacesToRight={() => undefined}
+            onCloseAllSurfaces={() => undefined}
+          />
+        </>,
       ),
     );
 
     expect(host.querySelector('[aria-label="Open in editor"]')).not.toBeNull();
-    await act(async () =>
-      host.querySelector<HTMLButtonElement>('[aria-label="Maximize panel"]')!.click(),
-    );
+    const tabbar = host.querySelector<HTMLElement>("[data-secondary-pane-tabbar]")!;
+    expect(tabbar.querySelector('[aria-label="Minimize secondary pane"]')).toBeNull();
+    expect(tabbar.querySelector('[aria-label="Maximize secondary pane"]')).toBeNull();
     await act(async () =>
       host.querySelector<HTMLButtonElement>('[aria-label="Toggle terminal drawer"]')!.click(),
     );
     await act(async () =>
       host.querySelector<HTMLButtonElement>('[aria-label="Toggle right panel"]')!.click(),
     );
-    expect(maximize).toHaveBeenCalledOnce();
     expect(terminal).toHaveBeenCalledOnce();
     expect(rightPanel).toHaveBeenCalledOnce();
   });
+
+  it.each(["inline", "stack"] as const)(
+    "retains a child-owned unsaved draft through every flushed %s presentation transition",
+    async (layout) => {
+      await act(async () => root.render(<RetainedEditorSurface layout={layout} />));
+
+      const editor = host.querySelector<HTMLButtonElement>('[aria-label="Unsaved file draft"]')!;
+      await act(async () => editor.click());
+      expect(editor.textContent).toBe("unsaved change");
+
+      await act(async () =>
+        useSecondaryPaneStore.getState().setPresentation(threadRef, "maximized"),
+      );
+      expect(host.querySelector("[data-preview-panel-maximized='true']")).not.toBeNull();
+      expect(host.querySelector('[aria-label="Unsaved file draft"]')).toBe(editor);
+
+      await act(async () =>
+        useSecondaryPaneStore.getState().setPresentation(threadRef, "minimized"),
+      );
+      expect(host.querySelector("[data-preview-panel-mode]")!.classList.contains("hidden")).toBe(
+        true,
+      );
+      expect(host.querySelector('[aria-label="Unsaved file draft"]')).toBe(editor);
+
+      await act(async () =>
+        useSecondaryPaneStore.getState().setPresentation(threadRef, "maximized"),
+      );
+      expect(host.querySelector("[data-preview-panel-mode]")!.classList.contains("hidden")).toBe(
+        false,
+      );
+      expect(host.querySelector('[aria-label="Unsaved file draft"]')).toBe(editor);
+      expect(editor.textContent).toBe("unsaved change");
+
+      await act(async () =>
+        useSecondaryPaneStore.getState().setPresentation(threadRef, "expanded"),
+      );
+      expect(host.querySelector('[aria-label="Unsaved file draft"]')).toBe(editor);
+      expect(editor.textContent).toBe("unsaved change");
+    },
+  );
 });

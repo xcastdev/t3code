@@ -23,8 +23,15 @@ Its tabs are independent from the right sidebar, so you can change files without
 selected project tool. Closing its last tab closes the pane and leaves the sidebar unchanged.
 
 In an inline secondary pane, use its editor control to open the active file in your preferred
-editor, or **Choose editor** to pick another. Its header also includes controls for maximizing or
-managing the panel.
+editor, or **Choose editor** to pick another. Its header includes icon controls for minimizing and
+maximizing the panel. Minimize hides the pane while retaining its tabs; opening a file or diff
+restores it and activates that tab. Maximize/Restore keeps the selected file, diff comparison, and
+editor location intact.
+
+Diff tabs are tied to their environment, repository, comparison, and file paths. A file with the
+same name in another repository or revision therefore opens as a separate tab. The Files surface
+in the right sidebar remains the workspace tree; the secondary file view does not contain another
+explorer.
 
 Both panes remember their widths independently. On narrower windows, the right sidebar becomes a
 sheet so the chat remains usable; the same workspace and tab relationships are preserved.

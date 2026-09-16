@@ -1,4 +1,10 @@
-import { Maximize2Icon, Minimize2Icon, PanelBottomIcon, PanelRightIcon } from "lucide-react";
+import {
+  Maximize2Icon,
+  Minimize2Icon,
+  PanelBottomIcon,
+  PanelRightCloseIcon,
+  PanelRightIcon,
+} from "lucide-react";
 import { memo } from "react";
 
 import { Toggle } from "../ui/toggle";
@@ -15,6 +21,14 @@ interface PanelLayoutControlsProps {
   rightPanelUnavailableLabel?: string;
   /** Running + waiting subagents in this thread; badges the right panel toggle. */
   liveAgentCount: number;
+  /** Secondary-pane presentation is owned by the thread-scoped pane store. */
+  secondaryPane?: {
+    presentation: "expanded" | "minimized" | "maximized";
+    canMaximize: boolean;
+    onMinimize: () => void;
+    onRestore: () => void;
+    onToggleMaximize: () => void;
+  };
   onToggleTerminal: () => void;
   onToggleRightPanel: () => void;
 }
@@ -29,6 +43,7 @@ export const PanelLayoutControls = memo(function PanelLayoutControls({
   rightPanelShortcutLabel,
   rightPanelUnavailableLabel = "Right panel is unavailable",
   liveAgentCount,
+  secondaryPane,
   onToggleTerminal,
   onToggleRightPanel,
 }: PanelLayoutControlsProps) {
@@ -37,6 +52,18 @@ export const PanelLayoutControls = memo(function PanelLayoutControls({
       className="flex h-full shrink-0 items-center gap-1 [-webkit-app-region:no-drag]"
       data-panel-layout-controls
     >
+      {secondaryPane?.presentation === "minimized" ? (
+        <SecondaryPaneRestoreControl onRestore={secondaryPane.onRestore} />
+      ) : secondaryPane ? (
+        <>
+          <SecondaryPaneMinimizeControl onMinimize={secondaryPane.onMinimize} />
+          <SecondaryPaneMaximizeControl
+            available={secondaryPane.canMaximize}
+            maximized={secondaryPane.presentation === "maximized"}
+            onToggle={secondaryPane.onToggleMaximize}
+          />
+        </>
+      ) : null}
       {showTerminalControl ? (
         <Tooltip>
           <TooltipTrigger render={<span className="flex shrink-0" />}>
@@ -110,6 +137,100 @@ export const RightPanelMaximizeControl = memo(function RightPanelMaximizeControl
 }) {
   if (!available) return null;
   const label = maximized ? "Restore panel size" : "Maximize panel";
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Toggle
+            className="shrink-0 [-webkit-app-region:no-drag]"
+            pressed={maximized}
+            onPressedChange={onToggle}
+            aria-label={label}
+            variant="ghost"
+            size="sm"
+          >
+            {maximized ? (
+              <Minimize2Icon className="size-4" />
+            ) : (
+              <Maximize2Icon className="size-4" />
+            )}
+          </Toggle>
+        }
+      />
+      <TooltipPopup side="bottom">{label}</TooltipPopup>
+    </Tooltip>
+  );
+});
+
+export const SecondaryPaneMinimizeControl = memo(function SecondaryPaneMinimizeControl({
+  available = true,
+  onMinimize,
+}: {
+  available?: boolean;
+  onMinimize: () => void;
+}) {
+  if (!available) return null;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Toggle
+            className="shrink-0 [-webkit-app-region:no-drag]"
+            pressed={false}
+            onPressedChange={onMinimize}
+            aria-label="Minimize secondary pane"
+            variant="ghost"
+            size="sm"
+          >
+            <PanelRightCloseIcon className="size-4" />
+          </Toggle>
+        }
+      />
+      <TooltipPopup side="bottom">Minimize secondary pane</TooltipPopup>
+    </Tooltip>
+  );
+});
+
+export const SecondaryPaneRestoreControl = memo(function SecondaryPaneRestoreControl({
+  available = true,
+  onRestore,
+}: {
+  available?: boolean;
+  onRestore: () => void;
+}) {
+  if (!available) return null;
+  return (
+    <Tooltip>
+      <TooltipTrigger
+        render={
+          <Toggle
+            className="shrink-0 [-webkit-app-region:no-drag]"
+            pressed
+            onPressedChange={onRestore}
+            aria-label="Restore secondary pane"
+            variant="ghost"
+            size="sm"
+          >
+            <PanelRightIcon className="size-4" />
+          </Toggle>
+        }
+      />
+      <TooltipPopup side="bottom">Restore secondary pane</TooltipPopup>
+    </Tooltip>
+  );
+});
+
+export const SecondaryPaneMaximizeControl = memo(function SecondaryPaneMaximizeControl({
+  available = true,
+  maximized,
+  onToggle,
+}: {
+  available?: boolean;
+  maximized: boolean;
+  onToggle: () => void;
+}) {
+  if (!available) return null;
+  const label = maximized ? "Restore secondary pane size" : "Maximize secondary pane";
   return (
     <Tooltip>
       <TooltipTrigger

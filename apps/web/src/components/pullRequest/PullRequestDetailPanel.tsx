@@ -529,18 +529,8 @@ export function PullRequestDetailPanel({
   const environmentConfigs = useServerConfigs();
   const supportsThreadPullRequests =
     environmentConfigs.get(environmentId)?.environment.capabilities.threadPullRequests === true;
-  const reference = useMemo(
-    () =>
-      supportsThreadPullRequests
-        ? requestedReference
-        : {
-            projectId: requestedReference.projectId,
-            repository: requestedReference.repository,
-            number: requestedReference.number,
-          },
-    [requestedReference, supportsThreadPullRequests],
-  );
-  const pullRequestKey = `${reference.projectId}:${reference.host ?? ""}:${reference.repository}#${reference.number}`;
+  const reference = requestedReference;
+  const pullRequestKey = `${reference.projectId}:${reference.repositoryRoot ?? ""}:${reference.host ?? ""}:${reference.repository}#${reference.number}`;
   const matchingListEntry =
     listEntry?.projectId === reference.projectId &&
     listEntry.repository.toLowerCase() === reference.repository.toLowerCase() &&
@@ -931,9 +921,20 @@ export function PullRequestDetailPanel({
               label: environment.label,
               machine: resolveEnvironmentMachineKind(environment.serverConfig),
             })),
+            reference.repositoryRoot === undefined
+              ? undefined
+              : (detail?.workspaceRoot ?? reference.repositoryRoot),
           )
         : [],
-    [context, environmentId, environments, projects, reference.projectId],
+    [
+      context,
+      detail?.workspaceRoot,
+      environmentId,
+      environments,
+      projects,
+      reference.projectId,
+      reference.repositoryRoot,
+    ],
   );
   // Which server the reader chose, and only for the pull request they chose it on: this one panel
   // shows a different pull request every time it is opened, and the choice does not follow.
@@ -2705,6 +2706,7 @@ export function PullRequestDetailPanel({
                     onFixFinding={startFixFinding}
                     onRefresh={refreshDetail}
                     refreshToken={codeRefreshToken}
+                    threadRef={threadRef}
                   />
                 </Suspense>
               </div>

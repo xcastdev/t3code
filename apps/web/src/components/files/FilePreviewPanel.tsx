@@ -97,6 +97,8 @@ interface FilePreviewPanelProps {
   onPendingChange: (relativePath: string, pending: boolean) => void;
   selectedFilePending: boolean;
   workspaceMutationId: string | null;
+  /** Secondary-pane file tabs are editor surfaces; the Files rail owns the tree. */
+  showWorkspaceExplorer?: boolean;
 }
 
 const FILE_EXPLORER_STORAGE_KEY = "t3code.fileExplorerOpen";
@@ -907,6 +909,7 @@ export default function FilePreviewPanel({
   onPendingChange,
   selectedFilePending,
   workspaceMutationId,
+  showWorkspaceExplorer = true,
 }: FilePreviewPanelProps) {
   const { resolvedTheme } = useTheme();
   const wordWrap = useClientSettings((settings) => settings.wordWrap);
@@ -938,6 +941,7 @@ export default function FilePreviewPanel({
     relativePath,
     explorerOpen,
     attachmentOpen: attachment !== undefined,
+    workspaceExplorerEnabled: showWorkspaceExplorer,
   });
   // Reading markdown rendered is a preference, not a property of one file. Keeping
   // it on the panel meant a thread switch dropped it and forced source back.
@@ -1120,7 +1124,7 @@ export default function FilePreviewPanel({
               <Globe2 className="size-3.5" />
             </FileSurfaceAction>
           ) : null}
-          {!isHostFile ? (
+          {showWorkspaceExplorer && !isHostFile ? (
             <FileSurfaceAction
               label={explorerOpen ? "Hide file explorer" : "Show file explorer"}
               pressed={explorerOpen}

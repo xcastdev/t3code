@@ -5,6 +5,7 @@ import type {
   SourceControlProviderKind,
   SourceControlPublishRepositoryResult,
   SourceControlRepositoryVisibility,
+  GitMutationPrecondition,
 } from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
@@ -12,7 +13,7 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import { useNavigate } from "@tanstack/react-router";
 import * as Option from "effect/Option";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { flushSync } from "react-dom";
 import { CheckIcon, ChevronDownIcon, GlobeIcon, LockIcon } from "lucide-react";
 import { Radio as RadioPrimitive } from "@base-ui/react/radio";
@@ -28,15 +29,7 @@ import { Spinner } from "~/components/ui/spinner";
 import { toggleVariants } from "~/components/ui/toggle";
 import { cn } from "~/lib/utils";
 import { Button } from "~/components/ui/button";
-import {
-  Dialog,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogPanel,
-  DialogPopup,
-  DialogTitle,
-} from "~/components/ui/dialog";
+import { Dialog } from "~/components/ui/dialog";
 import { Input } from "~/components/ui/input";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { WizardFooter, WizardHeader, WizardPanel, WizardPopup, WizardSteps } from "../ui/wizard";
@@ -146,6 +139,14 @@ export interface PublishRepositoryDialogProps {
   /** Thread the dialog was opened from, so the new repository can open beside it. */
   readonly threadRef: ScopedThreadRef | null;
   readonly gitCwd: string;
+  /** Immutable local Git source reviewed before creating and pushing the remote. */
+  readonly reviewedSourceRef: string | null;
+  readonly reviewedSourceHead: string | null;
+  readonly reviewedSourceIndexTree: string | null;
+  /** Live source facts supplied by the owner of this repository-scoped dialog. */
+  readonly currentSourceRef: string | null;
+  readonly currentSourceHead: string | null;
+  readonly currentSourceIndexTree: string | null;
 }
 
 export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
@@ -179,6 +180,11 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
     }),
     [props.environmentId, props.gitCwd],
   );
+  const isReviewedSourceCurrent =
+    props.reviewedSourceIndexTree !== null &&
+    props.reviewedSourceRef === props.currentSourceRef &&
+    props.reviewedSourceHead === props.currentSourceHead &&
+    props.reviewedSourceIndexTree === props.currentSourceIndexTree;
   const publishRepositoryAction = useSourceControlPublishRepositoryAction(sourceControlScope);
   const publishAccountByProvider = useMemo(() => {
     const accounts: Record<PublishProviderKind, string | null> = {
@@ -254,6 +260,7 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
   ] as const;
 
   const canSubmitPublishRepository = useMemo(() => {
+    if (!isReviewedSourceCurrent) return false;
     if (!selectedPublishProviderReadiness.ready) return false;
     if (publishRepositoryAction.isPending) return false;
     const repositoryParts = publishRepository.trim().split("/");
@@ -261,10 +268,21 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
     const rest = repositoryParts.slice(1);
     const name = rest.join("/").trim();
     return owner.length > 0 && name.length > 0;
-  }, [publishRepository, publishRepositoryAction.isPending, selectedPublishProviderReadiness]);
+  }, [
+    isReviewedSourceCurrent,
+    publishRepository,
+    publishRepositoryAction.isPending,
+    selectedPublishProviderReadiness,
+  ]);
 
   const submitPublishRepository = useCallback(() => {
-    if (!canSubmitPublishRepository) {
+    const reviewedSourceIndexTree = props.reviewedSourceIndexTree;
+    if (
+      !props.open ||
+      !isReviewedSourceCurrent ||
+      !canSubmitPublishRepository ||
+      reviewedSourceIndexTree === null
+    ) {
       return;
     }
 
@@ -277,6 +295,11 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
         visibility: publishVisibility,
         remoteName: publishRemoteName.trim() || "origin",
         protocol: publishProtocol,
+        precondition: {
+          expectedHeadCommit: props.reviewedSourceHead,
+          expectedIndexTree: reviewedSourceIndexTree,
+          expectedRefName: props.reviewedSourceRef,
+        } satisfies GitMutationPrecondition,
       });
 
       if (result._tag === "Failure") {
@@ -294,24 +317,38 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
     })();
   }, [
     canSubmitPublishRepository,
-    props.environmentId,
-    props.gitCwd,
+    isReviewedSourceCurrent,
+    props.open,
     publishProtocol,
     publishProvider,
     publishRemoteName,
     publishRepository,
     publishRepositoryAction,
     publishVisibility,
+    props.reviewedSourceHead,
+    props.reviewedSourceIndexTree,
+    props.reviewedSourceRef,
   ]);
 
   const resetState = useCallback(() => {
+    setSelectedPublishProvider(null);
+    setPublishVisibility("private");
     setPublishRemoteName("origin");
+    setPublishProtocol("ssh");
     setPublishRepositoryOverride(null);
     setPublishWizardStep(0);
     setPublishAdvancedOpen(false);
     setPublishError(null);
     setPublishResult(null);
   }, []);
+
+  // The parent captures the repository source at open. On any scope drift,
+  // clear every retained publication choice before a later checkout can reuse it.
+  useEffect(() => {
+    if (!props.open || !isReviewedSourceCurrent) {
+      resetState();
+    }
+  }, [isReviewedSourceCurrent, props.open, resetState]);
 
   const handleOpenChange = useCallback(
     (open: boolean) => {
@@ -333,7 +370,7 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
       <WizardPopup>
         <WizardHeader
           title="Publish repository"
-          description="Pick where to host it, then point us at a repo to push to."
+          description={`Pick where to host ${props.gitCwd} from ${props.reviewedSourceRef ?? "detached HEAD"}${props.reviewedSourceHead ? ` at ${props.reviewedSourceHead.slice(0, 12)}` : ""}, then point us at a repo to push to.`}
         >
           <WizardSteps
             steps={publishWizardSteps}

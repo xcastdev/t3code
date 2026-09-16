@@ -63,6 +63,15 @@ interface EnvironmentSubscriptionAtomOptions<Input, A, E, R> {
   readonly label: string;
   readonly subscribe: (input: Input) => Stream.Stream<A, E, R>;
   readonly idleTtlMs?: number;
+  readonly refreshTrigger?: (target: {
+    readonly environmentId: EnvironmentIdType;
+    readonly input: Input;
+  }) => Atom.Atom<unknown>;
+  readonly onValue?: (
+    target: { readonly environmentId: EnvironmentIdType; readonly input: Input },
+    value: A,
+    registry: AtomRegistry.AtomRegistry,
+  ) => Effect.Effect<void, never, R>;
 }
 
 export type SettledAsyncResult<A, E> = AsyncResult.Success<A, E> | AsyncResult.Failure<A, E>;
@@ -577,12 +586,31 @@ export function createEnvironmentSubscriptionAtomFamily<R, ER, Input, A, E>(
 ) {
   const family = Atom.family((key: string) => {
     const target = parseEnvironmentRpcKey<Input>(key);
-    return runtime
-      .atom(followStreamInEnvironment(target.environmentId, options.subscribe(target.input)))
+    const subscription = runtime
+      .atom(
+        followStreamInEnvironment(
+          target.environmentId,
+          options
+            .subscribe(target.input)
+            .pipe(
+              Stream.tap((value) =>
+                options.onValue === undefined
+                  ? Effect.void
+                  : Effect.flatMap(AtomRegistry.AtomRegistry, (registry) =>
+                      options.onValue!(target, value, registry),
+                    ),
+              ),
+            ),
+        ),
+      )
       .pipe(
         Atom.setIdleTTL(options.idleTtlMs ?? 5 * 60_000),
         Atom.withLabel(`${options.label}:${key}`),
       );
+    const trigger = options.refreshTrigger?.(target);
+    return trigger === undefined
+      ? subscription
+      : subscription.pipe(Atom.makeRefreshOnSignal(trigger));
   });
   return (target: { readonly environmentId: EnvironmentIdType; readonly input: Input }) =>
     family(environmentRpcKey(target));
@@ -675,7 +703,12 @@ export function createEnvironmentRpcSubscriptionAtomFamily<
   });
 }
 
-export function createEnvironmentRpcCommand<R, ER, TTag extends EnvironmentUnaryRpcTag>(
+export function createEnvironmentRpcCommand<
+  R,
+  ER,
+  TTag extends EnvironmentUnaryRpcTag,
+  GuardError = never,
+>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, ER>,
   options: {
     readonly label: string;
@@ -706,6 +739,13 @@ export function createEnvironmentRpcCommand<R, ER, TTag extends EnvironmentUnary
       },
       registry: AtomRegistry.AtomRegistry,
     ) => Effect.Effect<void, never, R>;
+    readonly guard?: (
+      target: {
+        readonly environmentId: EnvironmentIdType;
+        readonly input: EnvironmentRpcInput<TTag>;
+      },
+      registry: AtomRegistry.AtomRegistry,
+    ) => Effect.Effect<void, GuardError, R>;
   },
 ) {
   return createEnvironmentCommand(runtime, {
@@ -717,7 +757,8 @@ export function createEnvironmentRpcCommand<R, ER, TTag extends EnvironmentUnary
         environmentId,
         input,
       };
-      return (options.execute?.(input) ?? request(options.tag, input)).pipe(
+      return (options.guard?.(target, registry) ?? Effect.void).pipe(
+        Effect.andThen(options.execute?.(input) ?? request(options.tag, input)),
         Effect.tap(() => options.onSuccess?.(target, registry) ?? Effect.void),
         Effect.ensuring(options.onSettled?.(target, registry) ?? Effect.void),
       );

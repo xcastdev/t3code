@@ -135,7 +135,7 @@ describe("mounted right-panel consumer", () => {
     expect(profile.mock.calls).toEqual([["work"]]);
   });
   it("reserves the topbar above the inline rail and restores native control spacing for tabs", async () => {
-    await act(async () => root.render(<RightPanelTabs {...base} />));
+    await act(async () => root.render(<RightPanelTabs {...base} reserveGlobalControls />));
     expect(host.querySelector("[data-right-panel-tabbar]")).toBeNull();
     expect(host.querySelector("[data-right-panel-rail]")!.className).toContain(
       "pt-[calc(var(--workspace-topbar-height)",
@@ -144,6 +144,7 @@ describe("mounted right-panel consumer", () => {
       root.render(
         <RightPanelTabs
           {...base}
+          reserveGlobalControls
           surfaces={[{ id: "files", kind: "files" }]}
           activeSurfaceId="files"
         />,
@@ -151,7 +152,32 @@ describe("mounted right-panel consumer", () => {
     );
     const bar = host.querySelector("[data-right-panel-tabbar]")!;
     expect(bar.className).toContain("drag-region");
-    expect(bar.className).toContain("wco:pr-[calc(var(--workspace-native-controls-inset)+6rem)]");
+    expect(bar.className).toContain("pr-[var(--workspace-global-controls-width)]");
+    expect(bar.className).not.toContain(
+      "calc(var(--workspace-native-controls-inset)+var(--workspace-global-controls-width))",
+    );
+    expect(
+      Array.from(bar.querySelectorAll<HTMLElement>("span")).find((element) =>
+        element.className.includes("workspace-global-controls-cluster-width"),
+      )?.className,
+    ).toContain("right-[calc(var(--workspace-controls-right)+1px)]");
+  });
+
+  it("reserves the same global-control footprint for populated inline Files tabs", async () => {
+    await act(async () =>
+      root.render(
+        <RightPanelTabs
+          {...base}
+          reserveGlobalControls
+          surfaces={[{ id: "files", kind: "files" }]}
+          activeSurfaceId="files"
+        />,
+      ),
+    );
+
+    expect(host.querySelector("[data-right-panel-tabbar]")!.className).toContain(
+      "pr-[var(--workspace-global-controls-width)]",
+    );
   });
   it("keeps the empty sheet full width with its controls and dismisses through onClose", async () => {
     const close = vi.fn();

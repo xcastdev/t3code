@@ -11,6 +11,7 @@ import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentCacheStore } from "../platform/persistence.ts";
 import { vcsCommandConcurrency, vcsCommandScheduler } from "./vcsCommandScheduler.ts";
 import { invalidateCachedVcsRefs } from "./vcsRefInvalidation.ts";
+import { invalidateSourceControlWorkspace } from "./sourceControlWorkspace.ts";
 
 export function createSourceControlEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | EnvironmentCacheStore | R, E>,
@@ -76,11 +77,16 @@ export function createSourceControlEnvironmentAtoms<R, E>(
       tag: WS_METHODS.sourceControlPublishRepository,
       scheduler: vcsCommandScheduler,
       concurrency: vcsCommandConcurrency,
-      onSettled: (target, registry) =>
-        invalidateCachedVcsRefs(registry, {
+      onSettled: (target, registry) => {
+        invalidateSourceControlWorkspace(registry, {
+          environmentId: target.environmentId,
+          repositoryRoot: target.input.cwd,
+        });
+        return invalidateCachedVcsRefs(registry, {
           environmentId: target.environmentId,
           cwd: target.input.cwd,
-        }),
+        });
+      },
     }),
   };
 }

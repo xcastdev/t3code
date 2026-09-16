@@ -20,9 +20,62 @@ import {
   shouldIncludeBranchPickerItem,
   shouldShowComposerContextStrip,
   shouldShowEnvironmentIndicator,
+  resolveSourceControlBranchCwd,
+  shouldUpdateThreadForBranchSelection,
 } from "./BranchToolbar.logic";
 
 const localEnvironmentId = EnvironmentId.make("environment-local");
+
+describe("source-control branch scope", () => {
+  it("prefers the selected repository root for branch reads and mutations", () => {
+    expect(
+      resolveSourceControlBranchCwd({
+        selectedRepositoryRoot: "/workspace/packages/app",
+        activeWorktreePath: "/workspace/.worktrees/feature",
+        projectRoot: "/workspace",
+      }),
+    ).toBe("/workspace/packages/app");
+  });
+
+  it("does not let a nested checkout rewrite the outer thread lifecycle", () => {
+    expect(
+      shouldUpdateThreadForBranchSelection({
+        activeProjectCwd: "/workspace",
+        selectedRepositoryRoot: "/workspace/packages/app",
+      }),
+    ).toBe(false);
+    expect(
+      shouldUpdateThreadForBranchSelection({
+        activeProjectCwd: "/workspace",
+        selectedRepositoryRoot: "/workspace",
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps thread lifecycle ownership when Source Control selects its active worktree", () => {
+    expect(
+      shouldUpdateThreadForBranchSelection({
+        activeProjectCwd: "/workspace",
+        activeWorktreePath: "/workspace/.t3/worktrees/feature-a",
+        selectedRepositoryRoot: "/workspace/.t3/worktrees/feature-a",
+      }),
+    ).toBe(true);
+  });
+
+  it("keeps thread lifecycle ownership for another worktree recorded by the project", () => {
+    expect(
+      shouldUpdateThreadForBranchSelection({
+        activeProjectCwd: "/workspace",
+        activeWorktreePath: "/workspace/.t3/worktrees/feature-a",
+        ownedWorktreePaths: [
+          "/workspace/.t3/worktrees/feature-a",
+          "/workspace/.t3/worktrees/feature-b",
+        ],
+        selectedRepositoryRoot: "/workspace/.t3/worktrees/feature-b",
+      }),
+    ).toBe(true);
+  });
+});
 const remoteEnvironmentId = EnvironmentId.make("environment-remote");
 
 describe("resolvePreviousWorktreeSeed", () => {
@@ -642,6 +695,36 @@ describe("dedupeRemoteBranchesWithLocalMatches", () => {
 });
 
 describe("resolveBranchSelectionTarget", () => {
+  it("checks out an ordinary branch in the selected nested repository", () => {
+    expect(
+      resolveBranchSelectionTarget({
+        activeProjectCwd: "/workspace",
+        activeWorktreePath: null,
+        selectedRepositoryRoot: "/workspace/packages/app",
+        refName: { isDefault: false, worktreePath: null },
+      }),
+    ).toEqual({
+      checkoutCwd: "/workspace/packages/app",
+      nextWorktreePath: null,
+      reuseExistingWorktree: false,
+    });
+  });
+
+  it("keeps an ordinary checkout in the selected nested repository while an outer worktree is active", () => {
+    expect(
+      resolveBranchSelectionTarget({
+        activeProjectCwd: "/workspace",
+        activeWorktreePath: "/workspace/.t3/worktrees/feature-a",
+        selectedRepositoryRoot: "/workspace/packages/app",
+        refName: { isDefault: false, worktreePath: null },
+      }),
+    ).toEqual({
+      checkoutCwd: "/workspace/packages/app",
+      nextWorktreePath: "/workspace/.t3/worktrees/feature-a",
+      reuseExistingWorktree: false,
+    });
+  });
+
   it("reuses an existing secondary worktree for the selected ref", () => {
     expect(
       resolveBranchSelectionTarget({

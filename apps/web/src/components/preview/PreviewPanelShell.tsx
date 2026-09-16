@@ -67,7 +67,10 @@ export function PreviewPanelShell(props: {
 }) {
   const useDragRegion = isElectron && props.mode !== "sheet" && props.mode !== "embedded";
   const isInline = props.mode === "inline";
-  const collapsible = isInline && props.open !== undefined;
+  // Stacked secondary panes use the embedded shell, but still need the same
+  // hidden closed state as inline panes. The parent keeps the tab state alive;
+  // this shell only controls whether its content participates in layout.
+  const collapsible = props.open !== undefined && (isInline || props.mode === "embedded");
   const open = props.open ?? true;
   const rail = isInline && props.rail === true;
   const maximized = !rail && (props.maximized ?? false);
@@ -128,11 +131,13 @@ export function PreviewPanelShell(props: {
           ? maximized
             ? "flex-1 border-l border-border"
             : "shrink-0 border-l border-border"
-          : "w-full",
+          : props.mode === "embedded" && maximized
+            ? "w-full flex-1"
+            : "w-full",
         collapsible &&
           "[[data-panel-animations=true]_&]:transition-[width] [[data-panel-animations=true]_&]:[transition-duration:var(--panel-animation-duration)] [[data-panel-animations=true]_&]:ease-out",
         collapsible && open && "[[data-panel-animations=true]_&]:starting:w-0!",
-        collapsible && !open && "pointer-events-none",
+        collapsible && !open && "pointer-events-none hidden",
       )}
       style={
         isInline
@@ -156,7 +161,7 @@ export function PreviewPanelShell(props: {
         <div
           className="flex h-full min-h-0 min-w-0 flex-col"
           style={
-            collapsible && !maximized
+            isInline && collapsible && !maximized
               ? { width: rail ? "47px" : `calc(${width}px - 1px)` }
               : undefined
           }

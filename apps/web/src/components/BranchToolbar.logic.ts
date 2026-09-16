@@ -14,6 +14,14 @@ export interface EnvironmentOption {
   machine: EnvironmentMachineKind;
 }
 
+export function resolveSourceControlBranchCwd(input: {
+  selectedRepositoryRoot: string | null | undefined;
+  activeWorktreePath: string | null;
+  projectRoot: string | null;
+}): string | null {
+  return input.selectedRepositoryRoot ?? input.activeWorktreePath ?? input.projectRoot;
+}
+
 export const EnvMode = Schema.Literals(["local", "worktree"]);
 export type EnvMode = typeof EnvMode.Type;
 
@@ -237,13 +245,14 @@ export function resolveLocalCheckoutBranchMismatch(input: {
 export function resolveBranchSelectionTarget(input: {
   activeProjectCwd: string;
   activeWorktreePath: string | null;
+  selectedRepositoryRoot?: string | null;
   refName: Pick<VcsRef, "isDefault" | "worktreePath">;
 }): {
   checkoutCwd: string;
   nextWorktreePath: string | null;
   reuseExistingWorktree: boolean;
 } {
-  const { activeProjectCwd, activeWorktreePath, refName } = input;
+  const { activeProjectCwd, activeWorktreePath, selectedRepositoryRoot, refName } = input;
 
   if (refName.worktreePath) {
     return {
@@ -257,10 +266,34 @@ export function resolveBranchSelectionTarget(input: {
     activeWorktreePath !== null && refName.isDefault ? null : activeWorktreePath;
 
   return {
-    checkoutCwd: nextWorktreePath ?? activeProjectCwd,
+    // An existing worktree belongs only to its explicit ref. For an ordinary
+    // checkout, the repository selected in Source Control remains authoritative.
+    checkoutCwd: selectedRepositoryRoot ?? nextWorktreePath ?? activeProjectCwd,
     nextWorktreePath,
     reuseExistingWorktree: false,
   };
+}
+
+/**
+ * A thread owns the project's checkout/worktree lifecycle. A nested repository can
+ * be checked out from its selector, but it must not rewrite or stop that outer
+ * thread just because its own branch changed.
+ */
+export function shouldUpdateThreadForBranchSelection(input: {
+  activeProjectCwd: string;
+  activeWorktreePath?: string | null;
+  ownedWorktreePaths?: ReadonlyArray<string>;
+  selectedRepositoryRoot?: string | null;
+}): boolean {
+  const { activeProjectCwd, activeWorktreePath, ownedWorktreePaths, selectedRepositoryRoot } =
+    input;
+  return (
+    selectedRepositoryRoot === undefined ||
+    selectedRepositoryRoot === null ||
+    selectedRepositoryRoot === activeProjectCwd ||
+    selectedRepositoryRoot === activeWorktreePath ||
+    ownedWorktreePaths?.includes(selectedRepositoryRoot) === true
+  );
 }
 
 // Git rejects ASCII space and the ASCII control characters (tab, newline and

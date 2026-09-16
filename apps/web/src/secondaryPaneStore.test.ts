@@ -3,9 +3,12 @@ import { type EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
 
 import {
+  EMPTY_SECONDARY_PANE_STATE,
   migratePersistedSecondaryPaneState,
   selectThreadSecondaryPaneState,
   useSecondaryPaneStore,
+  selectActiveSecondaryPaneSurface,
+  openRepositoryComparison,
 } from "./secondaryPaneStore";
 
 const refA = scopeThreadRef("env-1" as EnvironmentId, ThreadId.make("thread-A"));
@@ -17,6 +20,350 @@ beforeEach(() => {
 });
 
 describe("secondaryPaneStore", () => {
+  it("keeps diff tabs distinct by repository and comparison identity", () => {
+    useSecondaryPaneStore.getState().openDiff(refA, {
+      repositoryRoot: "/repo-a",
+      comparison: "working-tree",
+      oldPath: "src/index.ts",
+      newPath: "src/index.ts",
+    });
+    useSecondaryPaneStore.getState().openDiff(refA, {
+      repositoryRoot: "/repo-b",
+      comparison: "working-tree",
+      oldPath: "src/index.ts",
+      newPath: "src/index.ts",
+    });
+    const state = selectThreadSecondaryPaneState(
+      useSecondaryPaneStore.getState().byThreadKey,
+      refA,
+    );
+    expect(state.surfaces).toHaveLength(2);
+    expect(state.surfaces[0]?.id).not.toBe(state.surfaces[1]?.id);
+  });
+
+  it("keeps staged comparison tabs distinct across index snapshots", () => {
+    useSecondaryPaneStore.getState().openDiff(refA, {
+      repositoryRoot: "/repo-a",
+      comparison: "index",
+      oldPath: "src/index.ts",
+      newPath: "src/index.ts",
+      indexTree: "tree-a",
+    });
+    useSecondaryPaneStore.getState().openDiff(refA, {
+      repositoryRoot: "/repo-a",
+      comparison: "index",
+      oldPath: "src/index.ts",
+      newPath: "src/index.ts",
+      indexTree: "tree-b",
+    });
+    const state = selectThreadSecondaryPaneState(
+      useSecondaryPaneStore.getState().byThreadKey,
+      refA,
+    );
+    expect(state.surfaces).toHaveLength(2);
+    expect(state.surfaces[0]?.id).not.toBe(state.surfaces[1]?.id);
+  });
+
+  it("resolves a branch tab without changing its key or duplicating a reopened comparison", () => {
+    openRepositoryComparison(refA, {
+      repositoryRoot: "/repo-a",
+      comparison: "branch",
+      oldPath: "README.md",
+      newPath: "README.md",
+      baseRef: "origin/main",
+      headRef: "feature",
+    });
+    const initial = selectActiveSecondaryPaneSurface(
+      useSecondaryPaneStore.getState().byThreadKey,
+      refA,
+    );
+    if (!initial || initial.kind !== "diff") throw new Error("Expected an opened diff.");
+    const initialId = initial.id;
+    useSecondaryPaneStore.getState().resolveDiffDescriptor(refA, initial.id, {
+      version: 1,
+      environmentId: "env-1",
+      repositoryRoot: "/repo-a",
+      kind: "branch",
+      oldPath: "README.md",
+      newPath: "README.md",
+      baseRevision: "a".repeat(40),
+      headRevision: "b".repeat(40),
+      liveSnapshotId: null,
+      turnId: null,
+      checkpointId: null,
+      pullRequestId: null,
+      mergeParent: null,
+    });
+    expect(
+      selectActiveSecondaryPaneSurface(useSecondaryPaneStore.getState().byThreadKey, refA),
+    ).toMatchObject({
+      kind: "diff",
+      id: initialId,
+      descriptor: { baseRevision: "a".repeat(40), headRevision: "b".repeat(40) },
+    });
+    openRepositoryComparison(refA, {
+      repositoryRoot: "/repo-a",
+      comparison: "branch",
+      oldPath: "README.md",
+      newPath: "README.md",
+      baseRef: "origin/main",
+      headRef: "feature",
+    });
+    const state = selectThreadSecondaryPaneState(
+      useSecondaryPaneStore.getState().byThreadKey,
+      refA,
+    );
+    expect(state.surfaces).toHaveLength(1);
+    expect(state.activeSurfaceId).toBe(initialId);
+  });
+
+  it("keeps distinct pinned branch revisions while an unresolved reopen preserves its resolved tab", () => {
+    const input = {
+      repositoryRoot: "/repo-a",
+      comparison: "branch" as const,
+      oldPath: "README.md",
+      newPath: "README.md",
+      baseRef: "origin/main",
+      headRef: "feature",
+    };
+    openRepositoryComparison(refA, {
+      ...input,
+      baseRevision: "a".repeat(40),
+      headRevision: "b".repeat(40),
+    });
+    openRepositoryComparison(refA, {
+      ...input,
+      baseRevision: "a".repeat(40),
+      headRevision: "c".repeat(40),
+    });
+    expect(
+      selectThreadSecondaryPaneState(useSecondaryPaneStore.getState().byThreadKey, refA).surfaces,
+    ).toHaveLength(2);
+
+    openRepositoryComparison(refA, input);
+    const state = selectThreadSecondaryPaneState(
+      useSecondaryPaneStore.getState().byThreadKey,
+      refA,
+    );
+    expect(state.surfaces).toHaveLength(2);
+    expect(state.surfaces[1]).toMatchObject({
+      descriptor: { headRevision: "c".repeat(40) },
+    });
+  });
+
+  it("keeps a resolved tab active after persistence and deduplicates its immutable snapshot", () => {
+    const unresolved = {
+      repositoryRoot: "/repo-a",
+      comparison: "branch" as const,
+      oldPath: "README.md",
+      newPath: "README.md",
+      baseRef: "origin/main",
+      headRef: "feature",
+    };
+    openRepositoryComparison(refA, { ...unresolved, newPath: "first.md" });
+    openRepositoryComparison(refA, unresolved);
+    const selected = selectActiveSecondaryPaneSurface(
+      useSecondaryPaneStore.getState().byThreadKey,
+      refA,
+    );
+    if (!selected || selected.kind !== "diff" || !selected.descriptor)
+      throw new Error("Expected diff tab");
+    useSecondaryPaneStore.getState().resolveDiffDescriptor(refA, selected.id, {
+      ...selected.descriptor,
+      baseRevision: "a".repeat(40),
+      headRevision: "b".repeat(40),
+    });
+
+    const restored = migratePersistedSecondaryPaneState({
+      byThreadKey: useSecondaryPaneStore.getState().byThreadKey,
+    });
+    expect(selectActiveSecondaryPaneSurface(restored.byThreadKey, refA)).toMatchObject({
+      newPath: "README.md",
+      descriptor: { baseRevision: "a".repeat(40), headRevision: "b".repeat(40) },
+    });
+
+    openRepositoryComparison(refA, {
+      ...unresolved,
+      baseRevision: "a".repeat(40),
+      headRevision: "b".repeat(40),
+    });
+    expect(
+      selectThreadSecondaryPaneState(useSecondaryPaneStore.getState().byThreadKey, refA).surfaces,
+    ).toHaveLength(2);
+  });
+
+  it("minimizes without dropping tabs and restores when opening a surface", () => {
+    useSecondaryPaneStore.getState().openFile(refA, "README.md");
+    useSecondaryPaneStore.getState().setPresentation(refA, "minimized");
+    expect(
+      selectActiveSecondaryPaneSurface(useSecondaryPaneStore.getState().byThreadKey, refA),
+    ).toMatchObject({
+      relativePath: "README.md",
+    });
+    useSecondaryPaneStore.getState().openFile(refA, "src/index.ts");
+    const state = selectThreadSecondaryPaneState(
+      useSecondaryPaneStore.getState().byThreadKey,
+      refA,
+    );
+    expect(state.presentation).toBe("expanded");
+    expect(state.surfaces).toHaveLength(2);
+  });
+
+  it("restores the saved maximized presentation when opening while minimized", () => {
+    useSecondaryPaneStore.getState().openFile(refA, "README.md");
+    useSecondaryPaneStore.getState().setPresentation(refA, "maximized");
+    useSecondaryPaneStore.getState().setPresentation(refA, "minimized");
+    useSecondaryPaneStore.getState().openFile(refA, "src/index.ts");
+
+    const state = selectThreadSecondaryPaneState(
+      useSecondaryPaneStore.getState().byThreadKey,
+      refA,
+    );
+    expect(state).toMatchObject({ isOpen: true, presentation: "maximized" });
+    expect(state.presentationBeforeMinimize).toBeUndefined();
+  });
+
+  it("preserves a maximized presentation when opening another file or diff", () => {
+    useSecondaryPaneStore.getState().openFile(refA, "README.md");
+    useSecondaryPaneStore.getState().setPresentation(refA, "maximized");
+
+    useSecondaryPaneStore.getState().openFile(refA, "src/index.ts");
+    expect(
+      selectThreadSecondaryPaneState(useSecondaryPaneStore.getState().byThreadKey, refA)
+        .presentation,
+    ).toBe("maximized");
+
+    useSecondaryPaneStore.getState().openDiff(refA, {
+      repositoryRoot: "/repo-a",
+      comparison: "working-tree",
+      oldPath: "src/index.ts",
+      newPath: "src/index.ts",
+    });
+    expect(
+      selectThreadSecondaryPaneState(useSecondaryPaneStore.getState().byThreadKey, refA)
+        .presentation,
+    ).toBe("maximized");
+  });
+
+  it("keeps a minimized pane minimized while closing retained tabs", () => {
+    useSecondaryPaneStore.getState().openFile(refA, "one.ts");
+    useSecondaryPaneStore.getState().openFile(refA, "two.ts");
+    useSecondaryPaneStore.getState().setPresentation(refA, "minimized");
+
+    useSecondaryPaneStore.getState().closeOtherSurfaces(refA, "file:one.ts");
+    const afterClosingOthers = selectThreadSecondaryPaneState(
+      useSecondaryPaneStore.getState().byThreadKey,
+      refA,
+    );
+    expect(afterClosingOthers).toMatchObject({
+      isOpen: false,
+      presentation: "minimized",
+      activeSurfaceId: "file:one.ts",
+      surfaces: [{ id: "file:one.ts" }],
+    });
+
+    useSecondaryPaneStore.getState().closeSurface(refA, "file:one.ts");
+    expect(
+      selectThreadSecondaryPaneState(useSecondaryPaneStore.getState().byThreadKey, refA),
+    ).toEqual(EMPTY_SECONDARY_PANE_STATE);
+  });
+
+  it("preserves a minimized diff tab identity until it is restored", () => {
+    openRepositoryComparison(refA, {
+      repositoryRoot: "/repo-a",
+      comparison: "commit",
+      oldPath: "src/old.ts",
+      newPath: "src/new.ts",
+      baseRevision: "a".repeat(40),
+      headRevision: "b".repeat(40),
+    });
+    const beforeMinimize = selectActiveSecondaryPaneSurface(
+      useSecondaryPaneStore.getState().byThreadKey,
+      refA,
+    );
+    useSecondaryPaneStore.getState().setPresentation(refA, "minimized");
+    useSecondaryPaneStore.getState().activateSurface(refA, beforeMinimize!.id);
+
+    expect(
+      selectActiveSecondaryPaneSurface(useSecondaryPaneStore.getState().byThreadKey, refA),
+    ).toEqual(beforeMinimize);
+    expect(
+      selectThreadSecondaryPaneState(useSecondaryPaneStore.getState().byThreadKey, refA),
+    ).toMatchObject({
+      isOpen: true,
+      presentation: "expanded",
+    });
+  });
+
+  it("preserves the active surface through a minimized persisted migration", () => {
+    expect(
+      migratePersistedSecondaryPaneState({
+        byThreadKey: {
+          "env-1:thread-A": {
+            isOpen: false,
+            presentation: "minimized",
+            activeSurfaceId: "file:README.md",
+            surfaces: [
+              {
+                kind: "file",
+                relativePath: "README.md",
+                revealLine: null,
+                revealRequestId: 2,
+              },
+            ],
+          },
+        },
+      }),
+    ).toEqual({
+      byThreadKey: {
+        "env-1:thread-A": {
+          isOpen: false,
+          activeSurfaceId: "file:README.md",
+          presentation: "minimized",
+          surfaces: [
+            {
+              id: "file:README.md",
+              kind: "file",
+              relativePath: "README.md",
+              revealLine: null,
+              revealRequestId: 2,
+            },
+          ],
+        },
+      },
+    });
+  });
+
+  it("migrates legacy retained tabs to the expanded presentation", () => {
+    expect(
+      migratePersistedSecondaryPaneState({
+        byThreadKey: {
+          "env-1:thread-A": {
+            isOpen: false,
+            activeSurfaceId: "file:README.md",
+            surfaces: [
+              {
+                kind: "file",
+                relativePath: "README.md",
+                revealLine: 12,
+                revealRequestId: 4,
+              },
+            ],
+          },
+        },
+      }),
+    ).toMatchObject({
+      byThreadKey: {
+        "env-1:thread-A": {
+          isOpen: true,
+          presentation: "expanded",
+          activeSurfaceId: "file:README.md",
+          surfaces: [{ relativePath: "README.md", revealLine: 12, revealRequestId: 4 }],
+        },
+      },
+    });
+  });
+
   it("opens files as deduplicated tabs and activates the latest file", () => {
     useSecondaryPaneStore.getState().openFile(refA, "src/index.ts");
     useSecondaryPaneStore.getState().openFile(refA, "src/index.ts");
@@ -127,6 +474,7 @@ describe("secondaryPaneStore", () => {
       byThreadKey: {
         "env-1:thread-A": {
           isOpen: true,
+          presentation: "expanded",
           activeSurfaceId: "file:src/index.ts",
           surfaces: [
             {

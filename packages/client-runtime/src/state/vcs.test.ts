@@ -34,6 +34,7 @@ import {
   createVcsEnvironmentAtoms,
   makeCachedVcsRefsChanges,
 } from "./vcs.ts";
+import { sourceControlWorkspaceRevisionAtom } from "./sourceControlWorkspace.ts";
 
 describe("working-tree pagination", () => {
   it("appends a matching snapshot and ignores late or stale pages", () => {
@@ -142,16 +143,26 @@ function cacheWithRefs(
 }
 
 describe("cached VCS refs", () => {
-  it("invalidates all ref streams in the mutated environment", () => {
+  it("invalidates refs only for the repository whose mutation settled", () => {
     const registry = AtomRegistry.make();
-    const environment = {
+    const repository = {
       environmentId: TARGET.environmentId,
+      cwd: "/repo",
+    };
+    const nestedRepository = {
+      environmentId: TARGET.environmentId,
+      cwd: "/repo/packages/plugin",
     };
     const otherEnvironment = {
       environmentId: EnvironmentId.make("environment-2"),
+      cwd: "/repo",
     };
 
-    expect(registry.get(vcsRefsCacheStateAtom(environment))).toEqual({
+    expect(registry.get(vcsRefsCacheStateAtom(repository))).toEqual({
+      revision: 0,
+      persistedCacheReadable: true,
+    });
+    expect(registry.get(vcsRefsCacheStateAtom(nestedRepository))).toEqual({
       revision: 0,
       persistedCacheReadable: true,
     });
@@ -160,10 +171,14 @@ describe("cached VCS refs", () => {
       persistedCacheReadable: true,
     });
 
-    invalidateVcsRefs(registry, environment);
+    invalidateVcsRefs(registry, repository);
 
-    expect(registry.get(vcsRefsCacheStateAtom(environment))).toEqual({
+    expect(registry.get(vcsRefsCacheStateAtom(repository))).toEqual({
       revision: 1,
+      persistedCacheReadable: true,
+    });
+    expect(registry.get(vcsRefsCacheStateAtom(nestedRepository))).toEqual({
+      revision: 0,
       persistedCacheReadable: true,
     });
     expect(registry.get(vcsRefsCacheStateAtom(otherEnvironment))).toEqual({
@@ -251,24 +266,26 @@ describe("cached VCS refs", () => {
           Effect.sync(() => registry.dispose()),
         );
         const saved = yield* Ref.make<ReadonlyArray<VcsListRefsResult>>([]);
-        const clears = yield* Ref.make(0);
-        const revisionsObservedDuringClear = yield* Ref.make<ReadonlyArray<number>>([]);
+        const removals = yield* Ref.make(0);
+        const revisionsObservedDuringRemoval = yield* Ref.make<ReadonlyArray<number>>([]);
         const cache = cacheWithRefs(Option.none(), {
           saveVcsRefs: (_environmentId, _cwd, refs) =>
             Ref.update(saved, (current) => [...current, refs]),
-          clearVcsRefs: () =>
+          removeVcsRefs: () =>
             Effect.all([
-              Ref.update(clears, (count) => count + 1),
-              Ref.update(revisionsObservedDuringClear, (current) => [
+              Ref.update(removals, (count) => count + 1),
+              Ref.update(revisionsObservedDuringRemoval, (current) => [
                 ...current,
-                registry.get(vcsRefsCacheStateAtom(TARGET)).revision,
+                registry.get(
+                  vcsRefsCacheStateAtom({ environmentId: TARGET.environmentId, cwd: "/repo" }),
+                ).revision,
               ]),
             ]).pipe(Effect.asVoid),
         });
 
         yield* invalidateCachedVcsRefs(registry, {
           environmentId: TARGET.environmentId,
-          cwd: "/repo-worktree",
+          cwd: "/repo",
         }).pipe(Effect.provideService(Persistence.EnvironmentCacheStore, cache));
 
         expect(
@@ -282,9 +299,13 @@ describe("cached VCS refs", () => {
         ).toBe(false);
 
         expect(yield* Ref.get(saved)).toEqual([]);
-        expect(yield* Ref.get(clears)).toBe(1);
-        expect(yield* Ref.get(revisionsObservedDuringClear)).toEqual([0]);
-        expect(registry.get(vcsRefsCacheStateAtom(TARGET))).toEqual({
+        expect(yield* Ref.get(removals)).toBe(1);
+        expect(yield* Ref.get(revisionsObservedDuringRemoval)).toEqual([0]);
+        expect(
+          registry.get(
+            vcsRefsCacheStateAtom({ environmentId: TARGET.environmentId, cwd: "/repo" }),
+          ),
+        ).toEqual({
           revision: 1,
           persistedCacheReadable: true,
         });
@@ -299,6 +320,39 @@ describe("cached VCS refs", () => {
           }),
         ).toBe(true);
         expect(yield* Ref.get(saved)).toEqual([LIVE_REFS]);
+      }),
+    ),
+  );
+
+  it.effect("removes a persisted trailing-slash repository alias after mutation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (registry) =>
+          Effect.sync(() => registry.dispose()),
+        );
+        const snapshots = new Map<string, VcsListRefsResult>();
+        const cache = cacheWithRefs(Option.none(), {
+          saveVcsRefs: (_environmentId, cwd, refs) => Effect.sync(() => snapshots.set(cwd, refs)),
+          removeVcsRefs: (_environmentId, cwd) => Effect.sync(() => snapshots.delete(cwd)),
+        });
+
+        expect(
+          yield* commitVcsRefsRefresh(registry, cache, {
+            environmentId: TARGET.environmentId,
+            cwd: "/repo/",
+            refs: CACHED_REFS,
+            expectedRevision: 0,
+            persist: true,
+          }),
+        ).toBe(true);
+        expect([...snapshots.keys()]).toEqual(["/repo"]);
+
+        yield* invalidateCachedVcsRefs(registry, {
+          environmentId: TARGET.environmentId,
+          cwd: "/repo",
+        }).pipe(Effect.provideService(Persistence.EnvironmentCacheStore, cache));
+
+        expect(snapshots.size).toBe(0);
       }),
     ),
   );
@@ -337,7 +391,7 @@ describe("cached VCS refs", () => {
             Layer.succeed(
               Persistence.EnvironmentCacheStore,
               cacheWithRefs(Option.none(), {
-                clearVcsRefs: () => Ref.update(clears, (count) => count + 1),
+                removeVcsRefs: () => Ref.update(clears, (count) => count + 1),
               }),
             ),
           ),
@@ -356,7 +410,18 @@ describe("cached VCS refs", () => {
 
         expect(AsyncResult.isFailure(result)).toBe(true);
         expect(yield* Ref.get(clears)).toBe(1);
-        expect(registry.get(vcsRefsCacheStateAtom(TARGET)).revision).toBe(1);
+        expect(
+          registry.get(vcsRefsCacheStateAtom({ environmentId: TARGET.environmentId, cwd: "/repo" }))
+            .revision,
+        ).toBe(1);
+        expect(
+          registry.get(
+            sourceControlWorkspaceRevisionAtom({
+              environmentId: TARGET.environmentId,
+              repositoryRoot: "/repo",
+            }),
+          ),
+        ).toBe(1);
 
         const refreshResult = yield* Effect.promise(() =>
           atoms.refreshStatus.run(registry, {
@@ -367,12 +432,23 @@ describe("cached VCS refs", () => {
 
         expect(AsyncResult.isSuccess(refreshResult)).toBe(true);
         expect(yield* Ref.get(clears)).toBe(2);
-        expect(registry.get(vcsRefsCacheStateAtom(TARGET)).revision).toBe(2);
+        expect(
+          registry.get(vcsRefsCacheStateAtom({ environmentId: TARGET.environmentId, cwd: "/repo" }))
+            .revision,
+        ).toBe(2);
+        expect(
+          registry.get(
+            sourceControlWorkspaceRevisionAtom({
+              environmentId: TARGET.environmentId,
+              repositoryRoot: "/repo",
+            }),
+          ),
+        ).toBe(2);
       }),
     ),
   );
 
-  it.effect("suppresses persisted snapshots after an environment-wide clear fails", () =>
+  it.effect("suppresses persisted snapshots after a repository cache removal fails", () =>
     Effect.scoped(
       Effect.gen(function* () {
         const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (registry) =>
@@ -387,7 +463,7 @@ describe("cached VCS refs", () => {
           loadVcsRefs: () =>
             Ref.update(loads, (count) => count + 1).pipe(Effect.andThen(Ref.get(persisted))),
           saveVcsRefs: (_environmentId, _cwd, refs) => Ref.set(persisted, Option.some(refs)),
-          clearVcsRefs: () =>
+          removeVcsRefs: () =>
             Ref.updateAndGet(clearAttempts, (count) => count + 1).pipe(
               Effect.flatMap((attempt) =>
                 attempt === 1
@@ -407,7 +483,9 @@ describe("cached VCS refs", () => {
           cwd: "/repo",
         }).pipe(Effect.provideService(Persistence.EnvironmentCacheStore, cache));
 
-        const state = registry.get(vcsRefsCacheStateAtom(TARGET));
+        const state = registry.get(
+          vcsRefsCacheStateAtom({ environmentId: TARGET.environmentId, cwd: "/repo" }),
+        );
         expect(state).toEqual({
           revision: 1,
           persistedCacheReadable: false,
@@ -437,7 +515,11 @@ describe("cached VCS refs", () => {
         yield* Effect.yieldNow;
         expect(yield* Ref.get(loads)).toBe(0);
         yield* Fiber.interrupt(refs);
-        expect(registry.get(vcsRefsCacheStateAtom(TARGET))).toEqual(state);
+        expect(
+          registry.get(
+            vcsRefsCacheStateAtom({ environmentId: TARGET.environmentId, cwd: "/repo" }),
+          ),
+        ).toEqual(state);
 
         expect(
           yield* commitVcsRefsRefresh(registry, cache, {
@@ -448,7 +530,9 @@ describe("cached VCS refs", () => {
             persist: true,
           }),
         ).toBe(true);
-        const recoveredState = registry.get(vcsRefsCacheStateAtom(TARGET));
+        const recoveredState = registry.get(
+          vcsRefsCacheStateAtom({ environmentId: TARGET.environmentId, cwd: "/repo" }),
+        );
         expect(recoveredState).toEqual({
           revision: 1,
           persistedCacheReadable: true,

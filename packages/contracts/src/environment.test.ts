@@ -18,6 +18,16 @@ describe("ExecutionEnvironmentDescriptor", () => {
     expect(decodeDescriptor(descriptor).capabilities.pullRequests).toBeUndefined();
   });
 
+  it("treats the Source Control workspace capability as absent under version skew", () => {
+    expect(decodeDescriptor(descriptor).capabilities.sourceControlWorkspace).toBeUndefined();
+    expect(
+      decodeDescriptor({
+        ...descriptor,
+        capabilities: { ...descriptor.capabilities, sourceControlWorkspace: true },
+      }).capabilities.sourceControlWorkspace,
+    ).toBe(true);
+  });
+
   it("preserves an advertised pull-request capability", () => {
     expect(
       decodeDescriptor({

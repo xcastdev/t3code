@@ -19,6 +19,9 @@ export const ReviewDiffPreviewSource = Schema.Struct({
   title: TrimmedNonEmptyString,
   baseRef: Schema.NullOr(TrimmedNonEmptyString),
   headRef: Schema.NullOr(TrimmedNonEmptyString),
+  /** The exact merge base and head whose patch this aggregate preview rendered. */
+  baseRevision: Schema.optional(TrimmedNonEmptyString),
+  headRevision: Schema.optional(TrimmedNonEmptyString),
   diff: Schema.String,
   diffHash: TrimmedNonEmptyString,
   truncated: Schema.Boolean,

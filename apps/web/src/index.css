@@ -108,6 +108,16 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
   --workspace-controls-top: 0px;
   --workspace-controls-left: calc(env(safe-area-inset-left) + 0.75rem);
   --workspace-controls-right: calc(env(safe-area-inset-right) + 0.75rem);
+  /*
+   * ChatView sets the visible-button count. These fallbacks retain enough
+   * room for the five-button desktop group outside that workspace.
+   */
+  --workspace-global-controls-count: 5;
+  --workspace-global-controls-gap: 0.25rem;
+  --workspace-global-controls-cluster-width: 9.75rem;
+  --workspace-global-controls-width: calc(
+    var(--workspace-global-controls-cluster-width) + var(--workspace-controls-right) + 1px
+  );
   --workspace-native-controls-inset: 0px;
   --workspace-titlebar-control-size: 1.75rem;
   --workspace-titlebar-control-gap: 0.75rem;
@@ -119,6 +129,76 @@ html[data-mobile-composer-route-transition="true"]::view-transition-old(t3-mobil
     --app-scrollbar-thumb-hover: rgb(255 255 255 / 12%);
     --glass-blur: 16px;
     --glass-saturation: 1.08;
+  }
+}
+
+/*
+ * The fixed group is offset from the viewport edge. Its own width deliberately
+ * excludes that offset; only the titlebar reservation includes it. Keeping the
+ * two values on the ChatView owner lets the fixed controls and no-drag masks
+ * cover the button cluster exactly once while covered headers reserve the
+ * complete viewport footprint.
+ */
+[data-workspace-global-controls-count="1"] {
+  --workspace-global-controls-cluster-width: var(--workspace-titlebar-control-size);
+  --workspace-global-controls-width: calc(
+    var(--workspace-global-controls-cluster-width) + var(--workspace-controls-right) + 1px
+  );
+}
+
+[data-workspace-global-controls-count="2"] {
+  --workspace-global-controls-cluster-width: calc(
+    var(--workspace-titlebar-control-size) + var(--workspace-titlebar-control-size) +
+      var(--workspace-global-controls-gap)
+  );
+  --workspace-global-controls-width: calc(
+    var(--workspace-global-controls-cluster-width) + var(--workspace-controls-right) + 1px
+  );
+}
+
+[data-workspace-global-controls-count="3"] {
+  --workspace-global-controls-cluster-width: calc(
+    var(--workspace-titlebar-control-size) + var(--workspace-titlebar-control-size) +
+      var(--workspace-titlebar-control-size) + var(--workspace-global-controls-gap) +
+      var(--workspace-global-controls-gap)
+  );
+  --workspace-global-controls-width: calc(
+    var(--workspace-global-controls-cluster-width) + var(--workspace-controls-right) + 1px
+  );
+}
+
+[data-workspace-global-controls-count="4"] {
+  --workspace-global-controls-cluster-width: calc(
+    var(--workspace-titlebar-control-size) + var(--workspace-titlebar-control-size) +
+      var(--workspace-titlebar-control-size) + var(--workspace-titlebar-control-size) +
+      var(--workspace-global-controls-gap) + var(--workspace-global-controls-gap) +
+      var(--workspace-global-controls-gap)
+  );
+  --workspace-global-controls-width: calc(
+    var(--workspace-global-controls-cluster-width) + var(--workspace-controls-right) + 1px
+  );
+}
+
+[data-workspace-global-controls-count="5"] {
+  --workspace-global-controls-cluster-width: calc(
+    var(--workspace-titlebar-control-size) + var(--workspace-titlebar-control-size) +
+      var(--workspace-titlebar-control-size) + var(--workspace-titlebar-control-size) +
+      var(--workspace-titlebar-control-size) + var(--workspace-global-controls-gap) +
+      var(--workspace-global-controls-gap) + var(--workspace-global-controls-gap) +
+      var(--workspace-global-controls-gap)
+  );
+  --workspace-global-controls-width: calc(
+    var(--workspace-global-controls-cluster-width) + var(--workspace-controls-right) + 1px
+  );
+}
+
+/* `Toggle size="sm"` is 32px before Tailwind's 40rem `sm` boundary and 28px
+ * at and after it. Use the same max-exclusive boundary so fractional viewport
+ * widths cannot place the controls and their reservation on opposite sides. */
+@media (width < 40rem) {
+  :root {
+    --workspace-titlebar-control-size: 2rem;
+    --workspace-global-controls-cluster-width: 11rem;
   }
 }
 

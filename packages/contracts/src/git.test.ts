@@ -12,6 +12,17 @@ import {
   VcsWorkingTreePageInput,
   VcsWorkingTreePageResult,
   VcsStatusResult,
+  GitRepositoryDiscoveryInput,
+  GitRepositoryDiscoveryResult,
+  GitCommitGraphPageInput,
+  GitCommitGraphPageResult,
+  GitCommitFilesInput,
+  GitCommitFilesResult,
+  GitRepositoryComparisonInput,
+  GitRepositoryComparisonResult,
+  GitRepositoryComparisonDescriptor,
+  GitActionRequest,
+  GitCommitIndexInput,
 } from "./git.ts";
 
 const decodeCreateWorktreeInput = Schema.decodeUnknownSync(VcsCreateWorktreeInput);
@@ -28,6 +39,205 @@ const decodeWorkingTreeDiffInput = Schema.decodeUnknownSync(VcsWorkingTreeDiffIn
 const decodeWorkingTreePageInput = Schema.decodeUnknownSync(VcsWorkingTreePageInput);
 const decodeWorkingTreePageResult = Schema.decodeUnknownSync(VcsWorkingTreePageResult);
 const decodeStatus = Schema.decodeUnknownSync(VcsStatusResult);
+const decodeRepositoryDiscoveryInput = Schema.decodeUnknownSync(GitRepositoryDiscoveryInput);
+const decodeRepositoryDiscoveryResult = Schema.decodeUnknownSync(GitRepositoryDiscoveryResult);
+const decodeCommitGraphPageInput = Schema.decodeUnknownSync(GitCommitGraphPageInput);
+const decodeCommitGraphPageResult = Schema.decodeUnknownSync(GitCommitGraphPageResult);
+const decodeCommitFilesInput = Schema.decodeUnknownSync(GitCommitFilesInput);
+const decodeCommitFilesResult = Schema.decodeUnknownSync(GitCommitFilesResult);
+const decodeRepositoryComparisonInput = Schema.decodeUnknownSync(GitRepositoryComparisonInput);
+const decodeRepositoryComparisonResult = Schema.decodeUnknownSync(GitRepositoryComparisonResult);
+const decodeRepositoryComparisonDescriptor = Schema.decodeUnknownSync(
+  GitRepositoryComparisonDescriptor,
+);
+const decodeActionRequest = Schema.decodeUnknownSync(GitActionRequest);
+const decodeCommitIndexInput = Schema.decodeUnknownSync(GitCommitIndexInput);
+
+describe("repository-scoped Git contracts", () => {
+  it("decodes bounded repository discovery metadata", () => {
+    const input = decodeRepositoryDiscoveryInput({
+      cwd: "/workspace",
+      maxRepositories: 8,
+    });
+    expect(input.maxRepositories).toBe(8);
+
+    const result = decodeRepositoryDiscoveryResult({
+      projectRoot: "/workspace",
+      repositories: [
+        {
+          rootPath: "/workspace",
+          worktreePath: "/workspace",
+          commonDir: "/workspace/.git",
+          isSubmodule: false,
+          provider: null,
+        },
+      ],
+      truncated: false,
+    });
+    expect(result.repositories[0]?.rootPath).toBe("/workspace");
+  });
+
+  it("keeps graph cursors and commit-file loading additive", () => {
+    const input = decodeCommitGraphPageInput({
+      cwd: "/repo",
+      cursor: null,
+      limit: 25,
+    });
+    expect(input.cursor).toBeNull();
+    const page = decodeCommitGraphPageResult({
+      commits: [
+        {
+          sha: "a".repeat(40),
+          parents: ["b".repeat(40)],
+          authorTimestamp: 1,
+          subject: "initial",
+          refs: [{ kind: "local", name: "main" }],
+        },
+      ],
+      nextCursor: 1,
+      hasMore: true,
+    });
+    expect(page.commits[0]?.parents).toEqual(["b".repeat(40)]);
+
+    const filesInput = decodeCommitFilesInput({ cwd: "/repo", commitSha: "a".repeat(40) });
+    expect(filesInput.commitSha).toBe("a".repeat(40));
+    const files = decodeCommitFilesResult({
+      commitSha: "a".repeat(40),
+      files: [{ oldPath: null, newPath: "README.md", status: "added" }],
+    });
+    expect(files.files[0]?.status).toBe("added");
+  });
+
+  it("accepts only full Git object ids in graph rows", () => {
+    expect(() =>
+      decodeCommitGraphPageResult({
+        commits: [
+          {
+            sha: "not-a-sha",
+            parents: [],
+            authorTimestamp: 1,
+            subject: "bad row",
+            refs: [],
+          },
+        ],
+        nextCursor: null,
+        hasMore: false,
+      }),
+    ).toThrow();
+  });
+
+  it("carries hover metadata and distinct graph-ref decorations without eager file lists", () => {
+    const sha = "a".repeat(40);
+    const page = decodeCommitGraphPageResult({
+      commits: [
+        {
+          sha,
+          parents: ["b".repeat(40)],
+          authorTimestamp: 1,
+          authorName: "Ada Lovelace",
+          authorEmail: "ada@example.test",
+          subject: "Short summary",
+          message: "Short summary\n\nComplete message.",
+          changeSummary: "1 file changed, 2 insertions(+)",
+          refs: [
+            { kind: "head", name: "HEAD" },
+            { kind: "current", name: "main" },
+            { kind: "upstream", name: "origin/main" },
+          ],
+        },
+      ],
+      nextCursor: null,
+      hasMore: false,
+    });
+    expect(page.commits[0]).toMatchObject({
+      authorName: "Ada Lovelace",
+      message: "Short summary\n\nComplete message.",
+    });
+  });
+
+  it("identifies repository comparisons independently from route state", () => {
+    const input = decodeRepositoryComparisonInput({
+      cwd: "/repo",
+      comparison: "working-tree",
+      oldPath: "README.md",
+      newPath: "README.md",
+    });
+    expect(input.comparison).toBe("working-tree");
+    const result = decodeRepositoryComparisonResult({
+      repositoryRoot: "/repo",
+      comparison: "working-tree",
+      oldPath: "README.md",
+      newPath: "README.md",
+      oldContents: "before\n",
+      newContents: "after\n",
+      binary: false,
+      available: true,
+    });
+    expect(result.available).toBe(true);
+  });
+
+  it("keeps a complete versioned comparison identity when a live branch moves", () => {
+    const descriptor = decodeRepositoryComparisonDescriptor({
+      version: 1,
+      environmentId: "environment-a",
+      repositoryRoot: "/repo-a",
+      kind: "branch",
+      oldPath: "src/old-name.ts",
+      newPath: "src/new-name.ts",
+      baseRevision: "a".repeat(40),
+      headRevision: "b".repeat(40),
+      liveSnapshotId: null,
+      turnId: null,
+      checkpointId: null,
+      pullRequestId: null,
+      mergeParent: "c".repeat(40),
+    });
+    expect(descriptor).toMatchObject({
+      repositoryRoot: "/repo-a",
+      oldPath: "src/old-name.ts",
+      newPath: "src/new-name.ts",
+      headRevision: "b".repeat(40),
+      mergeParent: "c".repeat(40),
+    });
+  });
+
+  it("makes action confirmation explicit at the typed seam", () => {
+    const action = decodeActionRequest({
+      cwd: "/repo",
+      action: "commit",
+      confirm: false,
+      precondition: { expectedHeadCommit: null, expectedIndexTree: "tree" },
+    });
+    expect(action.confirm).toBe(false);
+  });
+
+  it("carries typed inputs for every repository workflow family", () => {
+    const action = decodeActionRequest({
+      cwd: "/repo",
+      action: "branch",
+      confirm: true,
+      refName: "feature/new",
+      sourceRef: "main",
+      newRefName: "feature/renamed",
+      paths: ["src/index.ts"],
+      strategy: "rebase",
+    });
+    expect(action).toMatchObject({
+      action: "branch",
+      refName: "feature/new",
+      sourceRef: "main",
+      newRefName: "feature/renamed",
+      paths: ["src/index.ts"],
+      strategy: "rebase",
+    });
+  });
+
+  it("accepts an empty message for an explicit amend request", () => {
+    const input = decodeCommitIndexInput({ cwd: "/repo", message: "", amend: true });
+    expect(input.message).toBe("");
+    expect(input.amend).toBe(true);
+  });
+});
 
 describe("bounded working-tree status", () => {
   it("keeps legacy status payloads decodable while accepting bounded metadata", () => {
@@ -115,6 +325,20 @@ describe("VcsCreateWorktreeInput", () => {
 
     expect(parsed.baseRefName).toBe("origin/main");
   });
+
+  it("carries an additive reviewed-state guard for confirmed worktree creation", () => {
+    const parsed = decodeCreateWorktreeInput({
+      cwd: "/repo",
+      refName: "main",
+      path: "/tmp/worktree",
+      precondition: {
+        expectedHeadCommit: "a".repeat(40),
+        expectedIndexTree: "b".repeat(40),
+        expectedRefName: "main",
+      },
+    });
+    expect(parsed.precondition).toMatchObject({ expectedRefName: "main" });
+  });
 });
 
 describe("GitPreparePullRequestThreadInput", () => {
@@ -195,6 +419,20 @@ describe("GitRunStackedActionInput", () => {
 
     expect(parsed.actionId).toBe("action-1");
     expect(parsed.action).toBe("create_pr");
+  });
+
+  it("accepts an additive reviewed-state guard for approved stacked actions", () => {
+    const parsed = decodeRunStackedActionInput({
+      actionId: "action-1",
+      cwd: "/repo",
+      action: "push",
+      precondition: {
+        expectedHeadCommit: "a".repeat(40),
+        expectedIndexTree: "b".repeat(40),
+        expectedRefName: "main",
+      },
+    });
+    expect(parsed.precondition).toMatchObject({ expectedRefName: "main" });
   });
 });
 

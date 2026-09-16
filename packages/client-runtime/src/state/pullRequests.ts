@@ -65,12 +65,18 @@ function writableQueryFamily<A, E>(
   );
   return ({
     environmentId,
-    input: { projectId, host, repository, number },
+    input: { projectId, repositoryRoot, host, repository, number },
   }: Parameters<typeof family>[0]) =>
     writable(
       family({
         environmentId,
-        input: { projectId, ...(host === undefined ? {} : { host }), repository, number },
+        input: {
+          projectId,
+          ...(repositoryRoot === undefined ? {} : { repositoryRoot }),
+          ...(host === undefined ? {} : { host }),
+          repository,
+          number,
+        },
       }),
     );
 }
@@ -260,6 +266,7 @@ export function createPullRequestEnvironmentAtoms<R, E>(
           JSON.stringify([
             environmentId,
             input.projectId,
+            input.repositoryRoot ?? null,
             input.host?.toLowerCase() ?? null,
             input.repository,
             input.number,
@@ -297,12 +304,21 @@ export function createPullRequestEnvironmentAtoms<R, E>(
       execute: (input) => routedRequest(WS_METHODS.pullRequestsUpdateComment, input),
       scheduler: commandScheduler,
       concurrency: serialPerEnvironment,
-      onSuccess: ({ environmentId, input: { projectId, host, repository, number } }, registry) =>
+      onSuccess: (
+        { environmentId, input: { projectId, repositoryRoot, host, repository, number } },
+        registry,
+      ) =>
         Effect.sync(() =>
           registry.refresh(
             activity({
               environmentId,
-              input: { projectId, ...(host === undefined ? {} : { host }), repository, number },
+              input: {
+                projectId,
+                ...(repositoryRoot === undefined ? {} : { repositoryRoot }),
+                ...(host === undefined ? {} : { host }),
+                repository,
+                number,
+              },
             }),
           ),
         ),

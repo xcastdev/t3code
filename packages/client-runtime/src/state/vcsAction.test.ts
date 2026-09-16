@@ -97,7 +97,7 @@ function progress<T extends GitActionProgressEvent>(event: T): T {
   return event;
 }
 
-function cacheStore(onClearVcsRefs: (environmentId: EnvironmentId) => void) {
+function cacheStore(onRemoveVcsRefs: (environmentId: EnvironmentId, cwd: string) => void) {
   return Persistence.EnvironmentCacheStore.of({
     loadShell: () => Effect.succeed(Option.none()),
     saveShell: () => Effect.void,
@@ -108,8 +108,8 @@ function cacheStore(onClearVcsRefs: (environmentId: EnvironmentId) => void) {
     saveServerConfig: () => Effect.void,
     loadVcsRefs: () => Effect.succeed(Option.none()),
     saveVcsRefs: () => Effect.void,
-    removeVcsRefs: () => Effect.void,
-    clearVcsRefs: (environmentId) => Effect.sync(() => onClearVcsRefs(environmentId)),
+    removeVcsRefs: (environmentId, cwd) => Effect.sync(() => onRemoveVcsRefs(environmentId, cwd)),
+    clearVcsRefs: () => Effect.void,
     clear: () => Effect.void,
   });
 }
@@ -302,6 +302,9 @@ describe("vcsActionState", () => {
         cwd,
       }),
     ).toBe(JSON.stringify([environmentId, cwd]));
+    expect(getVcsActionTargetKey({ environmentId, cwd: `${cwd}/` })).toBe(
+      JSON.stringify([environmentId, cwd]),
+    );
     expect(getVcsActionTargetKey({ environmentId: null, cwd })).toBeNull();
     expect(
       getVcsActionTargetKey({
@@ -642,8 +645,8 @@ describe("vcsActionState", () => {
             Layer.succeed(EnvironmentRegistry.EnvironmentRegistry, environmentRegistry),
             Layer.succeed(
               Persistence.EnvironmentCacheStore,
-              cacheStore((removedEnvironmentId) => {
-                removed.push(`${removedEnvironmentId}:*`);
+              cacheStore((removedEnvironmentId, removedCwd) => {
+                removed.push(`${removedEnvironmentId}:${removedCwd}`);
               }),
             ),
           ),
@@ -652,7 +655,7 @@ describe("vcsActionState", () => {
         const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (registry) =>
           Effect.sync(() => registry.dispose()),
         );
-        const state = vcsRefsCacheStateAtom({ environmentId });
+        const state = vcsRefsCacheStateAtom({ environmentId, cwd });
 
         expect(registry.get(state).revision).toBe(0);
         const threadId = ThreadId.make("thread-stacked-action");
@@ -666,7 +669,7 @@ describe("vcsActionState", () => {
 
         expect(AsyncResult.isSuccess(successfulResult)).toBe(true);
         expect(registry.get(state).revision).toBe(1);
-        expect(removed).toEqual([`${environmentId}:*`]);
+        expect(removed).toEqual([`${environmentId}:${cwd}`]);
         // The server links a created pull request to this thread, so the id must ride along.
         expect(rpcInputs).toEqual([
           { actionId: successfulTransportActionId, cwd, action, threadId },
@@ -681,7 +684,7 @@ describe("vcsActionState", () => {
 
         expect(AsyncResult.isFailure(failedResult)).toBe(true);
         expect(registry.get(state).revision).toBe(2);
-        expect(removed).toEqual([`${environmentId}:*`, `${environmentId}:*`]);
+        expect(removed).toEqual([`${environmentId}:${cwd}`, `${environmentId}:${cwd}`]);
       }),
     ),
   );

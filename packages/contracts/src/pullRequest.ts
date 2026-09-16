@@ -540,6 +540,11 @@ export const PullRequestListInput = Schema.Struct({
   filters: Schema.optional(PullRequestListFilters),
   projectId: Schema.optional(ProjectId),
   /**
+   * The canonical repository selected inside `projectId`. Absent retains the project's original
+   * checkout for clients and servers that predate repository-scoped Source Control.
+   */
+  repositoryRoot: Schema.optional(TrimmedNonEmptyString),
+  /**
    * Only these projects, for a client that assigns each shared repository to one of its
    * connections and asks the others to stay quiet about it. Absent means every project, which
    * is what every listing asked for before there were several connections to spread across.
@@ -642,6 +647,8 @@ export type PullRequestListResult = typeof PullRequestListResult.Type;
  */
 export const PullRequestRef = Schema.Struct({
   projectId: ProjectId,
+  /** See `PullRequestListInput.repositoryRoot`; every detail read and mutation keeps its scope. */
+  repositoryRoot: Schema.optional(TrimmedNonEmptyString),
   host: Schema.optional(TrimmedNonEmptyString),
   /** Refuse a routed operation unless this GitHub account still owns the active credential. */
   expectedAccountId: Schema.optional(TrimmedNonEmptyString),
@@ -808,6 +815,9 @@ export const PullRequestDetail = Schema.Struct({
   headBranch: TrimmedNonEmptyString,
   headRepositoryNameWithOwner: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   baseBranch: TrimmedNonEmptyString,
+  /** Host-authoritative object ids for the diff currently being viewed. */
+  baseRevision: Schema.optional(TrimmedNonEmptyString),
+  headRevision: Schema.optional(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   mergedAt: Schema.NullOr(IsoDateTime),
@@ -920,6 +930,13 @@ export type PullRequestOmittedFileStat = typeof PullRequestOmittedFileStat.Type;
 export const PullRequestDiffResult = Schema.Struct({
   patch: Schema.String,
   /**
+   * The immutable host pair that produced this slice.  A file selected from
+   * the aggregate must use this pair rather than whichever PR detail happens
+   * to have refreshed most recently.
+   */
+  baseRevision: Schema.optional(TrimmedNonEmptyString),
+  headRevision: Schema.optional(TrimmedNonEmptyString),
+  /**
    * Something inside this slice could not be shown — a binary file, or a hunk the host declined
    * to inline. Not the same as there being more slices, which `nextCursor` answers.
    */
@@ -939,6 +956,13 @@ export const PullRequestDiffFileContentsInput = Schema.Struct({
   ...PullRequestRef.fields,
   /** One commit's own comparison; absent means the whole change request. */
   commit: Schema.optional(TrimmedNonEmptyString),
+  /**
+   * The immutable aggregate snapshot that asked to hydrate this file.  These
+   * are deliberately separate from the current PR detail: a rendered patch
+   * can outlive a force-push or base-branch movement.
+   */
+  baseRevision: Schema.optional(TrimmedNonEmptyString),
+  headRevision: Schema.optional(TrimmedNonEmptyString),
   changeType: Schema.Literals(["change", "rename-pure", "rename-changed", "new", "deleted"]),
   oldPath: TrimmedNonEmptyString,
   newPath: TrimmedNonEmptyString,

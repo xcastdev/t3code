@@ -401,6 +401,12 @@ export const make = Effect.gen(function* () {
         Effect.mapError(fail("getChangeRequest")),
         Effect.map(([detail, repository, viewerAccess]): ProviderChangeRequestDetail => ({
           ...detail.pullRequest,
+          ...(detail.pullRequest.baseSha == null
+            ? {}
+            : { baseRevision: detail.pullRequest.baseSha }),
+          ...(detail.pullRequest.headSha == null
+            ? {}
+            : { headRevision: detail.pullRequest.headSha }),
           checks: withWorkflowApprovals(
             detail.pullRequest.checks,
             detail.workflowApprovals.runs,

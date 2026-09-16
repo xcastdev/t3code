@@ -6,9 +6,15 @@ import { createJSONStorage, persist } from "zustand/middleware";
 import { resolveStorage } from "./lib/storage";
 
 export type DiffPanelSelection =
-  | { kind: "branch"; baseRef: string | null }
-  | { kind: "unstaged" }
-  | { kind: "turn"; turnId: TurnId; filePath: string | null; revealRequestId: number };
+  | { kind: "branch"; baseRef: string | null; repositoryRoot?: string }
+  | { kind: "unstaged"; repositoryRoot?: string }
+  | {
+      kind: "turn";
+      turnId: TurnId;
+      filePath: string | null;
+      revealRequestId: number;
+      repositoryRoot?: string;
+    };
 
 const DEFAULT_SELECTION: DiffPanelSelection = { kind: "branch", baseRef: null };
 const DEFAULT_WORKING_TREE_SELECTION: DiffPanelSelection = { kind: "unstaged" };
@@ -16,9 +22,22 @@ const DEFAULT_WORKING_TREE_SELECTION: DiffPanelSelection = { kind: "unstaged" };
 interface DiffPanelStoreState {
   byThreadKey: Record<string, DiffPanelSelection>;
   branchBaseRefByThreadKey: Record<string, string | null>;
-  selectGitScope: (ref: ScopedThreadRef, scope: "branch" | "unstaged") => void;
-  selectBranchBaseRef: (ref: ScopedThreadRef, baseRef: string | null) => void;
-  selectTurn: (ref: ScopedThreadRef, turnId: TurnId, filePath?: string) => void;
+  selectGitScope: (
+    ref: ScopedThreadRef,
+    scope: "branch" | "unstaged",
+    repositoryRoot?: string,
+  ) => void;
+  selectBranchBaseRef: (
+    ref: ScopedThreadRef,
+    baseRef: string | null,
+    repositoryRoot?: string,
+  ) => void;
+  selectTurn: (
+    ref: ScopedThreadRef,
+    turnId: TurnId,
+    filePath?: string,
+    repositoryRoot?: string,
+  ) => void;
   reconcileTurnSelection: (ref: ScopedThreadRef, availableTurnIds: ReadonlyArray<TurnId>) => void;
   removeThread: (ref: ScopedThreadRef) => void;
 }
@@ -33,7 +52,7 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
     (set) => ({
       byThreadKey: {},
       branchBaseRefByThreadKey: {},
-      selectGitScope: (ref, scope) =>
+      selectGitScope: (ref, scope, repositoryRoot) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
           const previous = state.byThreadKey[threadKey];
@@ -41,13 +60,19 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
             previous?.kind === "branch"
               ? previous.baseRef
               : (state.branchBaseRefByThreadKey[threadKey] ?? null);
+          const nextRepositoryRoot = repositoryRoot ?? previous?.repositoryRoot;
+          const nextSelection: DiffPanelSelection =
+            scope === "branch"
+              ? nextRepositoryRoot
+                ? { kind: "branch", baseRef: previousBaseRef, repositoryRoot: nextRepositoryRoot }
+                : { kind: "branch", baseRef: previousBaseRef }
+              : nextRepositoryRoot
+                ? { kind: "unstaged", repositoryRoot: nextRepositoryRoot }
+                : { kind: "unstaged" };
           return {
             byThreadKey: {
               ...state.byThreadKey,
-              [threadKey]:
-                scope === "branch"
-                  ? { kind: "branch", baseRef: previousBaseRef }
-                  : { kind: "unstaged" },
+              [threadKey]: nextSelection,
             },
             branchBaseRefByThreadKey:
               previous?.kind === "branch"
@@ -55,14 +80,19 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
                 : state.branchBaseRefByThreadKey,
           };
         }),
-      selectBranchBaseRef: (ref, baseRef) =>
+      selectBranchBaseRef: (ref, baseRef, repositoryRoot) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
           const normalizedBaseRef = normalizeBaseRef(baseRef);
+          const previousRoot = state.byThreadKey[threadKey]?.repositoryRoot;
+          const nextRoot = repositoryRoot ?? previousRoot;
+          const nextSelection: DiffPanelSelection = nextRoot
+            ? { kind: "branch", baseRef: normalizedBaseRef, repositoryRoot: nextRoot }
+            : { kind: "branch", baseRef: normalizedBaseRef };
           return {
             byThreadKey: {
               ...state.byThreadKey,
-              [threadKey]: { kind: "branch", baseRef: normalizedBaseRef },
+              [threadKey]: nextSelection,
             },
             branchBaseRefByThreadKey: {
               ...state.branchBaseRefByThreadKey,
@@ -70,19 +100,32 @@ export const useDiffPanelStore = create<DiffPanelStoreState>()(
             },
           };
         }),
-      selectTurn: (ref, turnId, filePath) =>
+      selectTurn: (ref, turnId, filePath, repositoryRoot) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
           const previous = state.byThreadKey[threadKey];
-          return {
-            byThreadKey: {
-              ...state.byThreadKey,
-              [threadKey]: {
+          // A checkpoint belongs to the thread workspace, not to the last
+          // repository selected for an aggregate Git diff. Do not inherit a
+          // nested Source Control repository into a turn selection.
+          const nextRepositoryRoot = repositoryRoot;
+          const nextSelection: DiffPanelSelection = nextRepositoryRoot
+            ? {
                 kind: "turn",
                 turnId,
                 filePath: filePath?.trim() || null,
                 revealRequestId: previous?.kind === "turn" ? previous.revealRequestId + 1 : 1,
-              },
+                repositoryRoot: nextRepositoryRoot,
+              }
+            : {
+                kind: "turn",
+                turnId,
+                filePath: filePath?.trim() || null,
+                revealRequestId: previous?.kind === "turn" ? previous.revealRequestId + 1 : 1,
+              };
+          return {
+            byThreadKey: {
+              ...state.byThreadKey,
+              [threadKey]: nextSelection,
             },
           };
         }),
@@ -135,10 +178,34 @@ export function selectThreadDiffPanelSelection(
   byThreadKey: Record<string, DiffPanelSelection>,
   ref: ScopedThreadRef | null | undefined,
   hasWorkingTreeChanges = false,
+  repositoryRoot?: string,
 ): DiffPanelSelection {
   if (!ref) return DEFAULT_SELECTION;
-  return (
+  const selection =
     byThreadKey[scopedThreadKey(ref)] ??
-    (hasWorkingTreeChanges ? DEFAULT_WORKING_TREE_SELECTION : DEFAULT_SELECTION)
-  );
+    (hasWorkingTreeChanges ? DEFAULT_WORKING_TREE_SELECTION : DEFAULT_SELECTION);
+  if (repositoryRoot && selection.repositoryRoot === undefined) {
+    return { ...selection, repositoryRoot };
+  }
+  return selection;
+}
+
+/** Stable identity for aggregate diff data and collapsed-file state. */
+export function diffPanelScopeKey(selection: DiffPanelSelection): string {
+  switch (selection.kind) {
+    case "branch":
+      return `branch:${selection.repositoryRoot ?? ""}:${selection.baseRef ?? ""}`;
+    case "unstaged":
+      return `unstaged:${selection.repositoryRoot ?? ""}`;
+    case "turn":
+      return `turn:${selection.repositoryRoot ?? ""}:${selection.turnId}:${selection.filePath ?? ""}`;
+  }
+}
+
+/** The aggregate selection owns routing even if a later status read resolves another root. */
+export function resolveDiffRepositoryRoot(
+  selectedRoot: string | undefined,
+  activeRoot: string | undefined,
+): string | undefined {
+  return selectedRoot ?? activeRoot;
 }

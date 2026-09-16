@@ -175,38 +175,65 @@ afterEach(async () => {
 });
 
 describe("ChatHeader rendered action controls", () => {
-  it("keeps fixed panel-control clearance while the open sidebar is only the rail", async () => {
-    await mountHeader({ rightPanelOpen: true });
+  it("reserves the shared global-control footprint when chat owns the controls", async () => {
+    await mountHeader({ rightPanelOpen: true, reserveGlobalControls: true });
 
-    expect(document.querySelector("[data-chat-header-actions]")!.className).toContain("pr-16");
+    expect(document.querySelector("[data-chat-header-actions]")!.className).toContain(
+      "pr-[var(--workspace-global-controls-width)]",
+    );
   });
 
   it("releases the control clearance only for an active panel surface", async () => {
-    await mountHeader({ rightPanelOpen: true, rightPanelHasActiveSurface: true });
+    await mountHeader({
+      rightPanelOpen: true,
+      rightPanelHasActiveSurface: true,
+      reserveGlobalControls: false,
+    });
 
     expect(document.querySelector("[data-chat-header-actions]")!.className).toContain("pr-0");
   });
 
-  it("keeps rail control clearance alongside the native titlebar inset", async () => {
-    const container = document.createElement("div");
-    document.body.append(container);
-    const root = createRoot(container);
-    headerRoots.push(root);
-    await act(async () =>
-      root.render(
-        createElement(
-          WorkspacePageHeader,
-          { electron: true },
-          header({ rightPanelOpen: true, rightPanelHasActiveSurface: false }),
+  it.each([
+    ["non-Electron desktop two-control", false, 2, 28, 13, 73],
+    ["Electron desktop two-control", true, 2, 28, 113, 173],
+    ["non-Electron desktop four-control", false, 4, 28, 13, 137],
+    ["Electron desktop four-control", true, 4, 28, 113, 237],
+    ["non-Electron compact two-control", false, 2, 32, 13, 81],
+    ["Electron compact two-control", true, 2, 32, 113, 181],
+    ["non-Electron compact four-control", false, 4, 32, 13, 153],
+    ["Electron compact four-control", true, 4, 32, 113, 253],
+  ] as const)(
+    "keeps one %s reservation across the chat composition",
+    async (_viewport, electron, controls, controlSize, edgeInset, expectedReservation) => {
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      headerRoots.push(root);
+      await act(async () =>
+        root.render(
+          createElement(
+            WorkspacePageHeader,
+            { electron, reserveGlobalControls: true },
+            header({
+              rightPanelOpen: true,
+              rightPanelHasActiveSurface: false,
+              parentReservesGlobalControls: true,
+            }),
+          ),
         ),
-      ),
-    );
+      );
 
-    expect(container.querySelector("header")!.className).toContain(
-      "wco:pr-[var(--workspace-native-controls-inset)]",
-    );
-    expect(container.querySelector("[data-chat-header-actions]")!.className).toContain("pr-16");
-  });
+      const pageHeader = container.querySelector("header")!;
+      const actions = container.querySelector("[data-chat-header-actions]")!;
+      expect(pageHeader.className).toContain("pr-[var(--workspace-global-controls-width)]");
+      expect(pageHeader.className).not.toContain("wco:pr-[var(--workspace-native-controls-inset)]");
+      // The page header owns the full edge-inclusive footprint. The nested actions
+      // must add no fallback or duplicate global padding inside that content box.
+      expect(actions.className).toContain("pr-0");
+      expect(actions.className).not.toContain("workspace-global-controls-width");
+      expect(controls * controlSize + (controls - 1) * 4 + edgeInset).toBe(expectedReservation);
+    },
+  );
 
   it("does not render the Git workflow control", async () => {
     await mountHeader();

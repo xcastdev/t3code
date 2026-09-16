@@ -1,10 +1,13 @@
 import type { FileDiffMetadata } from "@pierre/diffs";
-import { EnvironmentId, type ReviewDiffFileContentsResult } from "@t3tools/contracts";
+import { EnvironmentId, ProjectId, type ReviewDiffFileContentsResult } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { AsyncResult } from "effect/unstable/reactivity";
 import { describe, expect, it, vi } from "vite-plus/test";
 
-import { createGitDiffFileContentsLoader } from "./diffFileContents";
+import {
+  createGitDiffFileContentsLoader,
+  createPullRequestDiffFileContentsLoader,
+} from "./diffFileContents";
 
 const SOURCE = {
   environmentId: EnvironmentId.make("environment-1"),
@@ -76,5 +79,38 @@ describe("createGitDiffFileContentsLoader", () => {
     const load = createGitDiffFileContentsLoader(getDiffFileContents, SOURCE);
 
     await expect(load(fileDiff())).rejects.toBe(failure);
+  });
+});
+
+describe("createPullRequestDiffFileContentsLoader", () => {
+  it("hydrates a later aggregate page from that file's pinned snapshot rather than current detail", async () => {
+    const aggregateBase = "a".repeat(40);
+    const aggregateHead = "b".repeat(40);
+    const getDiffFileContents = vi.fn(async () =>
+      AsyncResult.success({ oldContents: "before aggregate", newContents: "after aggregate" }),
+    );
+    const load = createPullRequestDiffFileContentsLoader(getDiffFileContents, {
+      environmentId: EnvironmentId.make("environment-1"),
+      reference: { projectId: ProjectId.make("project-1"), repository: "acme/web", number: 7 },
+      commit: null,
+      aggregateRevisionsByPath: new Map([
+        ["src/new-name.ts", { baseRevision: aggregateBase, headRevision: aggregateHead }],
+      ]),
+      cacheKey: "pr-aggregate-a",
+    });
+
+    await load(fileDiff());
+
+    expect(getDiffFileContents).toHaveBeenCalledWith({
+      environmentId: "environment-1",
+      input: expect.objectContaining({
+        repository: "acme/web",
+        number: 7,
+        oldPath: "src/old-name.ts",
+        newPath: "src/new-name.ts",
+        baseRevision: aggregateBase,
+        headRevision: aggregateHead,
+      }),
+    });
   });
 });

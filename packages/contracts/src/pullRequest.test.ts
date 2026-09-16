@@ -105,6 +105,15 @@ describe("PullRequestListResult", () => {
 });
 
 describe("PullRequestListInput", () => {
+  it("accepts an optional repository root without changing older project-root requests", () => {
+    expect(
+      decodeListInput({ state: "open", projectId: "project-1", repositoryRoot: " /repo/nested " }),
+    ).toMatchObject({ repositoryRoot: "/repo/nested" });
+    expect(
+      decodeListInput({ state: "open", projectId: "project-1" }).repositoryRoot,
+    ).toBeUndefined();
+  });
+
   it("trims a search, so what is sent is what was typed", () => {
     expect(decodeListInput({ state: "open", query: "  page  " }).query).toBe("page");
   });

@@ -59,6 +59,7 @@ export function useSharedPullRequestSummary(
       : JSON.stringify([
           environmentId,
           reference.projectId,
+          reference.repositoryRoot ?? null,
           reference.host?.toLowerCase() ?? null,
           reference.repository.toLowerCase(),
           reference.number,

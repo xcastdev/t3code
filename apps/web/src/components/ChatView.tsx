@@ -176,7 +176,9 @@ import { RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY } from "../rightPanelLayout";
 import {
   resolveWorkspacePanelControlsOwner,
   resolveWorkspaceTitlebarOwner,
+  resolveWorkspaceGlobalControlsButtonCount,
   SECONDARY_PANE_COMPACT_MEDIA_QUERY,
+  shouldReserveWorkspaceGlobalControls,
 } from "../workspacePaneLayout";
 import {
   pullRequestSurface,
@@ -215,6 +217,7 @@ import { PullRequestDetailPanel } from "./pullRequest/PullRequestDetailPanel";
 import { PullRequestDetailGhost } from "./pullRequest/PullRequestGhosts";
 import { PullRequestsUnavailableState } from "./pullRequest/PullRequestsUnavailableState";
 import { SourceControlPanel } from "./source-control/SourceControlPanel";
+import { resolveSourceControlWriterAvailability } from "./source-control/sourceControlPanel.logic";
 import SourceControlActions from "./source-control/SourceControlActions";
 import { RightPanelTabs } from "./RightPanelTabs";
 import { dispatchRightPanelOpenCommand } from "./right-panel/rightPanelOpenCommands";
@@ -226,9 +229,9 @@ import {
   pasteTextToFocusComposer,
   redirectTypedKeyToComposer,
 } from "./chat/composerInputRouting";
-import { getSourceControlPresentation } from "../sourceControlPresentation";
 import { SecondaryPaneShell } from "./workspace/SecondaryPaneShell";
 import { SecondaryPaneTabs } from "./workspace/SecondaryPaneTabs";
+import { SecondaryPaneDiffPanel } from "./workspace/SecondaryPaneDiffPanel";
 import { AgentsPanel } from "./AgentsPanel";
 import { LinkPullRequestDialogHost } from "./pullRequest/LinkPullRequestDialog";
 import { ThreadPullRequestsPanel } from "./pullRequest/ThreadPullRequestsPanel";
@@ -352,6 +355,7 @@ import {
 } from "@t3tools/client-runtime/state/threads";
 import { resolveProviderSkillsForCwd } from "@t3tools/client-runtime/providerSkills";
 import { vcsEnvironment } from "../state/vcs";
+import { sourceControlWorkspaceEnvironment } from "../state/sourceControl";
 import { sourceControlEnvironment } from "../state/sourceControl";
 import { useProjectClone } from "../state/projectClones";
 import { projectCloneDisplayName, projectCloneProgressSummary } from "@t3tools/contracts";
@@ -368,7 +372,8 @@ import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { createPageScrollController, type PageScrollKey } from "./chat/pageScrollController";
 import { DraftHeroHeadline } from "./chat/DraftHeroHeadline";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
-import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
+import { PullRequestThreadDialogHost } from "./PullRequestThreadDialogHost";
+import { useChatViewSourceControlScope } from "./chatViewSourceControlScope";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
 import type { AssistantCitationRequest } from "./chat/AssistantCitationSource";
 import { resolveTimelineIsAtEnd, worktreeSetupAgentStarted } from "./chat/MessagesTimeline.logic";
@@ -416,6 +421,7 @@ import {
 import {
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
   agentControlledBrowserCloseConfirmation,
+  branchRestoreMutationPrecondition,
   branchMismatchKey,
   buildExpiredTerminalContextToastCopy,
   buildLocalDraftThread,
@@ -1238,7 +1244,7 @@ export default function ChatView(props: ChatViewProps) {
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
-  const switchGitRef = useAtomCommand(vcsEnvironment.switchRef, {
+  const restoreThreadBranch = useAtomCommand(sourceControlWorkspaceEnvironment.runAction, {
     reportFailure: false,
   });
   const setThreadRuntimeMode = useAtomCommand(threadEnvironment.setRuntimeMode, {
@@ -1481,9 +1487,6 @@ export default function ChatView(props: ChatViewProps) {
   const [maximizedRightPanelThreadKey, setMaximizedRightPanelThreadKey] = useState<string | null>(
     null,
   );
-  const [maximizedSecondaryPaneThreadKey, setMaximizedSecondaryPaneThreadKey] = useState<
-    string | null
-  >(null);
   const [respondingRequestIds, setRespondingRequestIds] = useState<ApprovalRequestId[]>([]);
   const userInputResponsesInFlight = useRef(new Set<string>());
   const [respondingUserInputRequestIds, setRespondingUserInputRequestIds] = useState<
@@ -1830,12 +1833,16 @@ export default function ChatView(props: ChatViewProps) {
     canMaximizeRightPanel && maximizedRightPanelThreadKey === routeThreadKey;
   const secondaryPaneOpen =
     activeSecondaryPaneState.isOpen && activeSecondaryPaneState.activeSurfaceId !== null;
-  const canMaximizeSecondaryPane = secondaryPaneOpen && !secondaryPaneIsStacked;
+  const secondaryPaneMinimized =
+    activeSecondaryPaneState.presentation === "minimized" &&
+    activeSecondaryPaneState.surfaces.length > 0;
+  const canMaximizeSecondaryPane = secondaryPaneOpen;
   const secondaryPaneMaximized =
-    canMaximizeSecondaryPane && maximizedSecondaryPaneThreadKey === routeThreadKey;
+    canMaximizeSecondaryPane && activeSecondaryPaneState.presentation === "maximized";
   const workspaceTitlebarOwner = resolveWorkspaceTitlebarOwner({
     secondaryPaneOpen,
     secondaryPaneLayout: secondaryPaneIsStacked ? "stack" : "inline",
+    secondaryPaneMaximized,
     rightPanelOpen,
     rightPanelHasActiveSurface: activeRightPanelSurface !== null,
     rightPanelUsesSheet: shouldUseRightPanelSheet,
@@ -1846,6 +1853,22 @@ export default function ChatView(props: ChatViewProps) {
     titlebarOwner: workspaceTitlebarOwner,
     rightPanelControlsAtRoot,
     rightPanelControlsInPanel,
+  });
+  const chatReservesGlobalControls = shouldReserveWorkspaceGlobalControls({
+    titlebarOwner: workspaceTitlebarOwner,
+    controlsOwner: panelControlsOwner,
+    owner: "chat",
+  });
+  const workspaceGlobalControlsButtonCount = resolveWorkspaceGlobalControlsButtonCount({
+    showTerminalControl: true,
+    secondaryPanePresentation: secondaryPaneOpen
+      ? secondaryPaneMaximized
+        ? "maximized"
+        : "expanded"
+      : secondaryPaneMinimized
+        ? "minimized"
+        : null,
+    rightPanelMaximizeVisible: !shouldUseRightPanelSheet && canMaximizeRightPanel,
   });
 
   useEffect(() => {
@@ -2385,6 +2408,11 @@ export default function ChatView(props: ChatViewProps) {
     ? (activeEnvironment?.serverConfig ?? null)
     : (primaryEnvironment?.serverConfig ?? null);
   const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
+  const sourceControlWriterAvailability = resolveSourceControlWriterAvailability({
+    textGenerationModelSelection: settings.textGenerationModelSelection,
+    sourceControlWriterModelSelection: settings.sourceControlWriterModelSelection,
+    providers: providerStatuses,
+  });
   const selectedProviderByThreadId = composerActiveProvider ?? null;
   const threadProvider =
     activeThread?.modelSelection.instanceId ??
@@ -2400,6 +2428,9 @@ export default function ChatView(props: ChatViewProps) {
   const supportsPullRequests = serverConfig?.environment.capabilities.pullRequests === true;
   const gitIndexWorkflowCapabilityKnown = serverConfig !== null;
   const supportsGitIndexWorkflow = serverConfig?.environment.capabilities.gitIndexWorkflow === true;
+  const sourceControlWorkspaceCapabilityKnown = serverConfig !== null;
+  const supportsSourceControlWorkspace =
+    serverConfig?.environment.capabilities.sourceControlWorkspace === true;
   const attachmentEnvironmentConfig = environmentById.get(environmentId)?.serverConfig ?? null;
   const attachmentUploadsCapabilityKnown = attachmentEnvironmentConfig !== null;
   const supportsQuestionAttachments =
@@ -3494,6 +3525,19 @@ export default function ChatView(props: ChatViewProps) {
       })
     : null;
   const gitStatusCwd = activeThread?.worktreePath ?? gitCwd;
+  // Source Control may select a nested repository (or submodule) independently
+  // of the thread's working-tree root. Keep the chat header actions on that
+  // same persisted repository so provider labels and mutations cannot drift.
+  const { cwd: sourceControlHeaderCwd, presentation: rightPanelSourceControlPresentation } =
+    useChatViewSourceControlScope({
+      environmentId,
+      threadRef: activeThreadRef,
+      projectRoot: gitCwd,
+      hasProject: activeProject !== null,
+    });
+  const selectedSourceControlRepositoryRoot = useRightPanelStore((state) =>
+    activeThreadRef ? state.getSourceControlRepositoryRoot(activeThreadRef) : null,
+  );
   const [sourceControlActionsTarget, setSourceControlActionsTarget] =
     useState<HTMLDivElement | null>(null);
   const gitStatusQuery = useEnvironmentQuery(
@@ -3504,10 +3548,6 @@ export default function ChatView(props: ChatViewProps) {
           input: { cwd: gitStatusCwd },
         }),
   );
-  const rightPanelSourceControlPresentation =
-    activeProject && gitStatusQuery.data?.sourceControlProvider
-      ? getSourceControlPresentation(gitStatusQuery.data.sourceControlProvider)
-      : null;
   useWorkspaceMutationRefresh({
     enabled: gitStatusCwd !== null,
     mutationId: workspaceMutationId,
@@ -4749,10 +4789,29 @@ export default function ChatView(props: ChatViewProps) {
   }, [canMaximizeRightPanel, routeThreadKey]);
   const toggleSecondaryPaneMaximized = useCallback(() => {
     if (!canMaximizeSecondaryPane) return;
-    setMaximizedSecondaryPaneThreadKey((threadKey) =>
-      threadKey === routeThreadKey ? null : routeThreadKey,
-    );
-  }, [canMaximizeSecondaryPane, routeThreadKey]);
+    if (activeThreadRef) {
+      useSecondaryPaneStore
+        .getState()
+        .setPresentation(activeThreadRef, secondaryPaneMaximized ? "expanded" : "maximized");
+    }
+  }, [activeThreadRef, canMaximizeSecondaryPane, secondaryPaneMaximized]);
+  const minimizeSecondaryPane = useCallback(() => {
+    if (!activeThreadRef || !secondaryPaneOpen) return;
+    useSecondaryPaneStore.getState().setPresentation(activeThreadRef, "minimized");
+  }, [activeThreadRef, secondaryPaneOpen]);
+  const restoreSecondaryPane = useCallback(() => {
+    if (!activeThreadRef || !secondaryPaneMinimized) return;
+    useSecondaryPaneStore
+      .getState()
+      .setPresentation(
+        activeThreadRef,
+        activeSecondaryPaneState.presentationBeforeMinimize ?? "expanded",
+      );
+  }, [
+    activeSecondaryPaneState.presentationBeforeMinimize,
+    activeThreadRef,
+    secondaryPaneMinimized,
+  ]);
   const cleanupRightPanelSurfaces = useCallback(
     (surfaces: readonly RightPanelSurface[]) => {
       if (!activeThreadRef) return;
@@ -5812,7 +5871,35 @@ export default function ChatView(props: ChatViewProps) {
     }
   }, [activeThreadRef, unsnoozeThreadMutation]);
   const [isRestoringThreadBranch, setIsRestoringThreadBranch] = useState(false);
-  const [branchRestoreConfirmOpen, setBranchRestoreConfirmOpen] = useState(false);
+  // Restoring a thread branch mutates the project checkout, which can differ
+  // from an active thread worktree. Review the exact checkout that will move.
+  const branchRestoreStatusQuery = useEnvironmentQuery(
+    activeProjectCwd === null
+      ? null
+      : vcsEnvironment.status({ environmentId, input: { cwd: activeProjectCwd } }),
+  );
+  const branchRestorePrecondition = useMemo(
+    () =>
+      branchRestoreMutationPrecondition({
+        status: branchRestoreStatusQuery.data,
+        isPending: branchRestoreStatusQuery.isPending,
+        error: branchRestoreStatusQuery.error,
+      }),
+    [
+      branchRestoreStatusQuery.data,
+      branchRestoreStatusQuery.error,
+      branchRestoreStatusQuery.isPending,
+    ],
+  );
+  const [branchRestoreConfirmation, setBranchRestoreConfirmation] = useState<{
+    readonly environmentId: typeof environmentId;
+    readonly cwd: string;
+    readonly threadId: string;
+    readonly branch: string;
+    readonly sourceRef: string | null;
+    readonly sourceHead: string | null;
+    readonly sourceIndexTree: string;
+  } | null>(null);
   // Once revealed for a given mismatch, the banner stays mounted until the
   // mismatch changes or resolves, so clearing the draft doesn't flicker it.
   const [revealedBranchMismatchKey, setRevealedBranchMismatchKey] = useState<string | null>(null);
@@ -5840,76 +5927,120 @@ export default function ChatView(props: ChatViewProps) {
       return revealed !== null && revealed !== activeBranchMismatchKey ? null : revealed;
     });
   }, [activeBranchMismatchKey, showBranchMismatchBanner]);
-  const handleSwitchCheckoutToThread = useCallback(async () => {
-    if (
-      !activeProjectCwd ||
-      !activeThread ||
-      !localCheckoutBranchMismatch ||
-      isRestoringThreadBranch
-    ) {
-      return;
-    }
-    setIsRestoringThreadBranch(true);
-    const checkoutResult = await switchGitRef({
-      environmentId,
-      input: {
-        cwd: activeProjectCwd,
-        refName: localCheckoutBranchMismatch.threadBranch,
-      },
-    });
-    if (checkoutResult._tag === "Failure") {
-      setIsRestoringThreadBranch(false);
-      if (!isAtomCommandInterrupted(checkoutResult)) {
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Failed to switch checkout",
-            description: chatActionErrorMessage(squashAtomCommandFailure(checkoutResult)),
-          }),
-        );
+  useEffect(() => {
+    setBranchRestoreConfirmation((current) =>
+      current &&
+      current.environmentId === environmentId &&
+      current.cwd === activeProjectCwd &&
+      current.threadId === activeThread?.id &&
+      current.branch === localCheckoutBranchMismatch?.threadBranch &&
+      branchRestorePrecondition !== null &&
+      current.sourceRef === branchRestorePrecondition.expectedRefName &&
+      current.sourceHead === branchRestorePrecondition.expectedHeadCommit &&
+      current.sourceIndexTree === branchRestorePrecondition.expectedIndexTree
+        ? current
+        : null,
+    );
+  }, [
+    activeProjectCwd,
+    activeThread?.id,
+    branchRestorePrecondition,
+    environmentId,
+    localCheckoutBranchMismatch?.threadBranch,
+  ]);
+  const handleSwitchCheckoutToThread = useCallback(
+    async (confirmation: NonNullable<typeof branchRestoreConfirmation>) => {
+      if (
+        !activeProjectCwd ||
+        !activeThread ||
+        !localCheckoutBranchMismatch ||
+        isRestoringThreadBranch ||
+        confirmation.environmentId !== environmentId ||
+        confirmation.cwd !== activeProjectCwd ||
+        confirmation.threadId !== activeThread.id ||
+        confirmation.branch !== localCheckoutBranchMismatch.threadBranch ||
+        branchRestorePrecondition === null ||
+        confirmation.sourceRef !== branchRestorePrecondition.expectedRefName ||
+        confirmation.sourceHead !== branchRestorePrecondition.expectedHeadCommit ||
+        confirmation.sourceIndexTree !== branchRestorePrecondition.expectedIndexTree
+      ) {
+        return;
       }
-      return;
-    }
-
-    const nextBranch = checkoutResult.value.refName ?? localCheckoutBranchMismatch.threadBranch;
-    if (nextBranch !== activeThread.branch) {
-      const updateResult = await updateThreadMetadata({
-        environmentId,
+      setIsRestoringThreadBranch(true);
+      const checkoutResult = await restoreThreadBranch({
+        environmentId: confirmation.environmentId,
         input: {
-          threadId: activeThread.id,
-          branch: nextBranch,
-          worktreePath: null,
+          cwd: confirmation.cwd,
+          action: "branch",
+          branchOperation: "checkout",
+          refName: confirmation.branch,
+          // The shared mutation controller derives the RPC confirm bit only from
+          // this reviewed approval; callers never manufacture an approval flag.
+          confirm: false,
+          confirmation: "approved",
+          precondition: {
+            expectedHeadCommit: confirmation.sourceHead,
+            expectedIndexTree: confirmation.sourceIndexTree,
+            expectedRefName: confirmation.sourceRef,
+          },
         },
       });
-      if (updateResult._tag === "Failure") {
+      if (checkoutResult._tag === "Failure") {
         setIsRestoringThreadBranch(false);
-        if (!isAtomCommandInterrupted(updateResult)) {
+        if (!isAtomCommandInterrupted(checkoutResult)) {
           toastManager.add(
             stackedThreadToast({
               type: "error",
-              title: "Checkout switched, but the thread could not be updated",
-              description: chatActionErrorMessage(squashAtomCommandFailure(updateResult)),
+              title: "Failed to switch checkout",
+              description: chatActionErrorMessage(squashAtomCommandFailure(checkoutResult)),
             }),
           );
         }
-        gitStatusQuery.refresh();
         return;
       }
-    }
-    gitStatusQuery.refresh();
-    setIsRestoringThreadBranch(false);
-    scheduleComposerFocus();
-  }, [
-    activeProjectCwd,
-    activeThread,
-    environmentId,
-    gitStatusQuery,
-    isRestoringThreadBranch,
-    localCheckoutBranchMismatch,
-    scheduleComposerFocus,
-    switchGitRef,
-    updateThreadMetadata,
-  ]);
+
+      const nextBranch = confirmation.branch;
+      if (nextBranch !== activeThread.branch) {
+        const updateResult = await updateThreadMetadata({
+          environmentId: confirmation.environmentId,
+          input: {
+            threadId: activeThread.id,
+            branch: nextBranch,
+            worktreePath: null,
+          },
+        });
+        if (updateResult._tag === "Failure") {
+          setIsRestoringThreadBranch(false);
+          if (!isAtomCommandInterrupted(updateResult)) {
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: "Checkout switched, but the thread could not be updated",
+                description: chatActionErrorMessage(squashAtomCommandFailure(updateResult)),
+              }),
+            );
+          }
+          gitStatusQuery.refresh();
+          return;
+        }
+      }
+      gitStatusQuery.refresh();
+      setIsRestoringThreadBranch(false);
+      scheduleComposerFocus();
+    },
+    [
+      activeProjectCwd,
+      activeThread,
+      branchRestorePrecondition,
+      environmentId,
+      gitStatusQuery,
+      isRestoringThreadBranch,
+      localCheckoutBranchMismatch,
+      scheduleComposerFocus,
+      restoreThreadBranch,
+      updateThreadMetadata,
+    ],
+  );
   // Background work (subagent fleets, workflow runs, watch loops) can outlive
   // the turn; once it settles, the composer stop button is gone, so this
   // banner is the only visible stop affordance. Stop routes through the
@@ -6150,12 +6281,30 @@ export default function ChatView(props: ChatViewProps) {
     selectedProvider,
   ]);
   const handleRestoreThreadBranch = useCallback(() => {
-    if (gitStatusQuery.data?.hasWorkingTreeChanges) {
-      setBranchRestoreConfirmOpen(true);
+    if (
+      !activeProjectCwd ||
+      !activeThread ||
+      !localCheckoutBranchMismatch ||
+      branchRestorePrecondition === null
+    ) {
       return;
     }
-    void handleSwitchCheckoutToThread();
-  }, [gitStatusQuery.data?.hasWorkingTreeChanges, handleSwitchCheckoutToThread]);
+    setBranchRestoreConfirmation({
+      environmentId,
+      cwd: activeProjectCwd,
+      threadId: activeThread.id,
+      branch: localCheckoutBranchMismatch.threadBranch,
+      sourceRef: branchRestorePrecondition.expectedRefName,
+      sourceHead: branchRestorePrecondition.expectedHeadCommit,
+      sourceIndexTree: branchRestorePrecondition.expectedIndexTree,
+    });
+  }, [
+    activeProjectCwd,
+    activeThread,
+    branchRestorePrecondition,
+    environmentId,
+    localCheckoutBranchMismatch,
+  ]);
   const feedbackBannerItems = useMemo(
     () =>
       feedbackSubmissions.flatMap((submission) => {
@@ -6227,7 +6376,7 @@ export default function ChatView(props: ChatViewProps) {
           <Button
             size="xs"
             variant="ghost"
-            disabled={isRestoringThreadBranch}
+            disabled={isRestoringThreadBranch || branchRestorePrecondition === null}
             onClick={handleRestoreThreadBranch}
           >
             {isRestoringThreadBranch ? "Restoring..." : "Restore branch"}
@@ -6244,6 +6393,7 @@ export default function ChatView(props: ChatViewProps) {
   }, [
     activeBranchMismatchKey,
     backgroundLivenessBannerItem,
+    branchRestorePrecondition,
     feedbackBannerItems,
     handleRestoreThreadBranch,
     isRestoringThreadBranch,
@@ -8662,6 +8812,21 @@ export default function ChatView(props: ChatViewProps) {
       liveAgentCount={
         rightPanelOpen && activeRightPanelSurface?.kind === "agents" ? 0 : agentPanelModel.liveCount
       }
+      {...(secondaryPaneOpen || secondaryPaneMinimized
+        ? {
+            secondaryPane: {
+              presentation: secondaryPaneMinimized
+                ? "minimized"
+                : secondaryPaneMaximized
+                  ? "maximized"
+                  : "expanded",
+              canMaximize: canMaximizeSecondaryPane,
+              onMinimize: minimizeSecondaryPane,
+              onRestore: restoreSecondaryPane,
+              onToggleMaximize: toggleSecondaryPaneMaximized,
+            },
+          }
+        : {})}
       onToggleTerminal={toggleTerminalVisibility}
       onToggleRightPanel={toggleRightPanel}
     />
@@ -8671,7 +8836,7 @@ export default function ChatView(props: ChatViewProps) {
       className={cn(
         // Keep one viewport anchor inside the header's no-drag region. The
         // header can shrink behind the right panel without moving the controls.
-        "pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] z-50 mr-px flex h-[var(--workspace-topbar-height)] items-center gap-1 [-webkit-app-region:no-drag]",
+        "pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] z-50 mr-px flex h-[var(--workspace-topbar-height)] w-[var(--workspace-global-controls-cluster-width)] items-center justify-end gap-1 [-webkit-app-region:no-drag]",
       )}
       data-workspace-titlebar-controls
     >
@@ -8684,16 +8849,6 @@ export default function ChatView(props: ChatViewProps) {
       ) : null}
       <div className="pointer-events-auto flex h-full items-center">{panelToggleControls}</div>
     </div>
-  );
-  const secondaryPaneHeaderControls = (
-    <>
-      <RightPanelMaximizeControl
-        available={canMaximizeSecondaryPane}
-        maximized={secondaryPaneMaximized}
-        onToggle={toggleSecondaryPaneMaximized}
-      />
-      {panelToggleControls}
-    </>
   );
   const rightPanelContent = activeThreadRef ? (
     renderedRightPanelSurface?.kind === "preview" ? (
@@ -8735,6 +8890,10 @@ export default function ChatView(props: ChatViewProps) {
         pullRequestsCapabilityKnown={pullRequestsCapabilityKnown}
         gitIndexWorkflowCapabilityKnown={gitIndexWorkflowCapabilityKnown}
         supportsGitIndexWorkflow={supportsGitIndexWorkflow}
+        sourceControlWorkspaceCapabilityKnown={sourceControlWorkspaceCapabilityKnown}
+        supportsSourceControlWorkspace={supportsSourceControlWorkspace}
+        providerPresentation={rightPanelSourceControlPresentation}
+        writerAvailability={sourceControlWriterAvailability}
         actionsTargetRef={setSourceControlActionsTarget}
       />
     ) : renderedRightPanelSurface?.kind === "pull-request" && !pullRequestsCapabilityKnown ? (
@@ -8875,6 +9034,7 @@ export default function ChatView(props: ChatViewProps) {
         "relative flex min-h-0 min-w-0 flex-1 overflow-hidden bg-background",
         secondaryPaneIsStacked ? "flex-col" : "flex-row",
       )}
+      data-workspace-global-controls-count={workspaceGlobalControlsButtonCount}
     >
       <Dialog
         open={
@@ -8899,11 +9059,15 @@ export default function ChatView(props: ChatViewProps) {
           ) : null}
         </WizardPopup>
       </Dialog>
-      {panelControlsOwner === "right-panel" ? panelLayoutControls : null}
+      {panelControlsOwner !== "sheet" ? panelLayoutControls : null}
       <div
         className={cn(
           "flex min-h-0 min-w-0 flex-col overflow-x-hidden",
-          rightPanelMaximized || secondaryPaneMaximized ? "w-0 flex-none" : "flex-1",
+          rightPanelMaximized || secondaryPaneMaximized
+            ? secondaryPaneMaximized && secondaryPaneIsStacked
+              ? "h-0 flex-none overflow-hidden"
+              : "w-0 flex-none"
+            : "flex-1",
         )}
         data-chat-column-maximized-away={
           rightPanelMaximized || secondaryPaneMaximized ? "true" : "false"
@@ -8918,12 +9082,13 @@ export default function ChatView(props: ChatViewProps) {
             !inlineRightPanelOwnsTitleBar &&
             !inlineSecondaryPaneOwnsTitleBar
           }
+          reserveGlobalControls={chatReservesGlobalControls}
           className="relative bg-background"
         >
           {activeProject ? (
             <SourceControlActions
               target={sourceControlActionsTarget}
-              gitCwd={gitCwd}
+              gitCwd={sourceControlHeaderCwd}
               activeThreadRef={activeThreadRef}
               {...(!supportsPullRequests || activeProjectRepository === null
                 ? {}
@@ -8934,10 +9099,9 @@ export default function ChatView(props: ChatViewProps) {
           {isElectron && panelControlsOwner === "right-panel" ? (
             <span
               aria-hidden
-              className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[var(--workspace-controls-right)] h-[var(--workspace-topbar-height)] w-28 [-webkit-app-region:no-drag]"
+              className="pointer-events-none fixed top-[var(--workspace-controls-top)] right-[calc(var(--workspace-controls-right)+1px)] h-[var(--workspace-topbar-height)] w-[var(--workspace-global-controls-cluster-width)] [-webkit-app-region:no-drag]"
             />
           ) : null}
-          {panelControlsOwner === "chat" ? panelLayoutControls : null}
           <ChatHeader
             activeThreadEnvironmentId={activeThread.environmentId}
             activeThreadId={activeThread.id}
@@ -8953,6 +9117,7 @@ export default function ChatView(props: ChatViewProps) {
             availableEditors={availableEditors}
             rightPanelOpen={rightPanelOpen}
             rightPanelHasActiveSurface={activeRightPanelSurface !== null}
+            parentReservesGlobalControls={chatReservesGlobalControls}
             onNewThreadInProject={handleNewThreadInActiveProject}
             {...(activeDraftLogicalProjectKey
               ? { onOpenProjectSettings: handleOpenDraftProjectSettings }
@@ -9312,6 +9477,7 @@ export default function ChatView(props: ChatViewProps) {
                                 ref={branchToolbarRef}
                                 environmentId={activeThread.environmentId}
                                 threadId={activeThread.id}
+                                selectedRepositoryRoot={selectedSourceControlRepositoryRoot}
                                 showGitControls={isGitRepo}
                                 {...(routeKind === "draft" && draftId ? { draftId } : {})}
                                 onEnvModeChange={onEnvModeChange}
@@ -9371,19 +9537,24 @@ export default function ChatView(props: ChatViewProps) {
               />
             ) : null}
 
-            <AlertDialog open={branchRestoreConfirmOpen} onOpenChange={setBranchRestoreConfirmOpen}>
+            <AlertDialog
+              open={branchRestoreConfirmation !== null}
+              onOpenChange={(open) => {
+                if (!open) setBranchRestoreConfirmation(null);
+              }}
+            >
               <AlertDialogPopup>
                 <AlertDialogHeader>
                   <AlertDialogTitle>
                     Switch to{" "}
-                    <code className="font-medium">
-                      {localCheckoutBranchMismatch?.threadBranch ?? ""}
-                    </code>
-                    ?
+                    <code className="font-medium">{branchRestoreConfirmation?.branch ?? ""}</code>?
                   </AlertDialogTitle>
                   <AlertDialogDescription>
-                    You have uncommitted changes. They'll carry over to the other branch, or block
-                    the switch if they conflict.
+                    Switch the project checkout at {branchRestoreConfirmation?.cwd ?? ""} to this
+                    thread branch.
+                    {gitStatusQuery.data?.hasWorkingTreeChanges
+                      ? " Uncommitted changes can carry over or block the switch if they conflict."
+                      : ""}
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <AlertDialogFooter>
@@ -9391,8 +9562,9 @@ export default function ChatView(props: ChatViewProps) {
                   <Button
                     variant="default"
                     onClick={() => {
-                      setBranchRestoreConfirmOpen(false);
-                      void handleSwitchCheckoutToThread();
+                      const confirmation = branchRestoreConfirmation;
+                      setBranchRestoreConfirmation(null);
+                      if (confirmation) void handleSwitchCheckoutToThread(confirmation);
                     }}
                   >
                     Switch branch
@@ -9402,12 +9574,13 @@ export default function ChatView(props: ChatViewProps) {
             </AlertDialog>
 
             {pullRequestDialogState ? (
-              <PullRequestThreadDialog
+              <PullRequestThreadDialogHost
                 key={pullRequestDialogState.key}
                 open
                 environmentId={activeThread.environmentId}
                 threadId={activeThread.id}
-                cwd={activeProject?.workspaceRoot ?? null}
+                threadRef={activeThreadRef}
+                projectRoot={activeProject?.workspaceRoot ?? null}
                 initialReference={pullRequestDialogState.initialReference}
                 onOpenChange={(open) => {
                   if (!open) {
@@ -9445,30 +9618,37 @@ export default function ChatView(props: ChatViewProps) {
       {activeThreadRef &&
       activeProject &&
       activeWorkspaceRoot &&
-      activeSecondaryPaneState.isOpen &&
+      activeSecondaryPaneState.surfaces.length > 0 &&
       activeSecondaryPaneState.activeSurfaceId ? (
         <SecondaryPaneShell
           layout={secondaryPaneIsStacked ? "stack" : "inline"}
           maximized={secondaryPaneMaximized}
+          open={!secondaryPaneMinimized}
         >
           <SecondaryPaneTabs
             surfaces={activeSecondaryPaneState.surfaces}
             activeSurfaceId={activeSecondaryPaneState.activeSurfaceId}
             layout={secondaryPaneIsStacked ? "stack" : "inline"}
             maximized={secondaryPaneMaximized}
-            workspaceFile={{
-              environmentId: activeThread.environmentId,
-              cwd: activeWorkspaceRoot,
-              relativePath:
-                activeSecondaryPaneState.surfaces.find(
-                  (surface) => surface.id === activeSecondaryPaneState.activeSurfaceId,
-                )?.relativePath ?? "",
-              keybindings,
-              availableEditors,
-            }}
-            headerControls={
-              panelControlsOwner === "secondary" ? secondaryPaneHeaderControls : undefined
-            }
+            reserveGlobalControls={shouldReserveWorkspaceGlobalControls({
+              titlebarOwner: workspaceTitlebarOwner,
+              controlsOwner: panelControlsOwner,
+              owner: "secondary",
+            })}
+            workspaceFile={(() => {
+              const surface = activeSecondaryPaneState.surfaces.find(
+                (entry) => entry.id === activeSecondaryPaneState.activeSurfaceId,
+              );
+              return surface?.kind === "file"
+                ? {
+                    environmentId: activeThread.environmentId,
+                    cwd: activeWorkspaceRoot,
+                    relativePath: surface.relativePath,
+                    keybindings,
+                    availableEditors,
+                  }
+                : undefined;
+            })()}
             onActivate={(surfaceId) =>
               useSecondaryPaneStore.getState().activateSurface(activeThreadRef, surfaceId)
             }
@@ -9488,24 +9668,36 @@ export default function ChatView(props: ChatViewProps) {
           />
           <Suspense fallback={null}>
             {activeSecondaryPaneState.surfaces
-              .filter((surface) => surface.id === activeSecondaryPaneState.activeSurfaceId)
-              .map((surface) => (
-                <FilePreviewPanel
-                  key={surface.id}
-                  environmentId={activeThread.environmentId}
-                  cwd={activeWorkspaceRoot}
-                  projectName={activeProject.title}
-                  threadRef={activeThreadRef}
-                  composerDraftTarget={composerDraftTarget}
-                  relativePath={surface.relativePath}
-                  revealLine={surface.revealLine}
-                  revealRequestId={surface.revealRequestId}
-                  onOpenFile={openFileSurface}
-                  onPendingChange={handleFilePendingChange}
-                  selectedFilePending={pendingFileSurfaceIds.has(surface.id)}
-                  workspaceMutationId={workspaceMutationId}
-                />
-              ))}
+              .flatMap((surface) =>
+                surface.id === activeSecondaryPaneState.activeSurfaceId ? [surface] : [],
+              )
+              .map((surface) =>
+                surface.kind === "file" ? (
+                  <FilePreviewPanel
+                    key={surface.id}
+                    environmentId={activeThread.environmentId}
+                    cwd={activeWorkspaceRoot}
+                    projectName={activeProject.title}
+                    threadRef={activeThreadRef}
+                    composerDraftTarget={composerDraftTarget}
+                    relativePath={surface.relativePath}
+                    revealLine={surface.revealLine}
+                    revealRequestId={surface.revealRequestId}
+                    onOpenFile={openFileSurface}
+                    onPendingChange={handleFilePendingChange}
+                    selectedFilePending={pendingFileSurfaceIds.has(surface.id)}
+                    workspaceMutationId={workspaceMutationId}
+                    showWorkspaceExplorer={false}
+                  />
+                ) : (
+                  <SecondaryPaneDiffPanel
+                    key={surface.id}
+                    environmentId={activeThread.environmentId}
+                    cwd={activeWorkspaceRoot}
+                    surface={surface}
+                  />
+                ),
+              )}
           </Suspense>
         </SecondaryPaneShell>
       ) : null}
@@ -9516,6 +9708,11 @@ export default function ChatView(props: ChatViewProps) {
           widthStorageKey={`t3code:preview-panel-width:${activeThreadKey}`}
           open={rightPanelOpen}
           maximized={rightPanelMaximized}
+          reserveGlobalControls={shouldReserveWorkspaceGlobalControls({
+            titlebarOwner: workspaceTitlebarOwner,
+            controlsOwner: panelControlsOwner,
+            owner: "right-panel",
+          })}
           surfaces={renderedRightPanelSurfaces}
           environmentId={activeThreadRef.environmentId}
           activeSurfaceId={renderedRightPanelSurface?.id ?? null}

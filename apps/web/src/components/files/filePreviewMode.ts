@@ -6,7 +6,9 @@ export function shouldShowFileExplorer(input: {
   readonly relativePath: string | null;
   readonly explorerOpen: boolean;
   readonly attachmentOpen: boolean;
+  readonly workspaceExplorerEnabled?: boolean;
 }): boolean {
+  if (input.workspaceExplorerEnabled === false) return false;
   if (input.attachmentOpen || (input.relativePath && isAbsolutePath(input.relativePath))) {
     return false;
   }

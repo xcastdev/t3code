@@ -2,7 +2,12 @@ import { scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { EnvironmentId, ThreadId, TurnId } from "@t3tools/contracts";
 import { beforeEach, describe, expect, it } from "vite-plus/test";
 
-import { selectThreadDiffPanelSelection, useDiffPanelStore } from "./diffPanelStore";
+import {
+  diffPanelScopeKey,
+  resolveDiffRepositoryRoot,
+  selectThreadDiffPanelSelection,
+  useDiffPanelStore,
+} from "./diffPanelStore";
 
 const THREAD_REF = scopeThreadRef(EnvironmentId.make("environment-1"), ThreadId.make("thread-1"));
 
@@ -83,5 +88,39 @@ describe("diffPanelStore", () => {
       filePath: "src/app.ts",
       revealRequestId: 1,
     });
+  });
+
+  it("keeps aggregate diff scope tied to the selected repository", () => {
+    useDiffPanelStore.getState().selectGitScope(THREAD_REF, "branch", "/workspace/repo-a");
+
+    expect(
+      selectThreadDiffPanelSelection(useDiffPanelStore.getState().byThreadKey, THREAD_REF),
+    ).toEqual({ kind: "branch", baseRef: null, repositoryRoot: "/workspace/repo-a" });
+    expect(
+      diffPanelScopeKey(
+        selectThreadDiffPanelSelection(useDiffPanelStore.getState().byThreadKey, THREAD_REF),
+      ),
+    ).toBe("branch:/workspace/repo-a:");
+  });
+
+  it("does not carry a selected nested repository into a checkpoint turn", () => {
+    useDiffPanelStore.getState().selectGitScope(THREAD_REF, "branch", "/workspace/nested-repo");
+    useDiffPanelStore.getState().selectTurn(THREAD_REF, TurnId.make("turn-1"), "src/app.ts");
+
+    expect(
+      selectThreadDiffPanelSelection(useDiffPanelStore.getState().byThreadKey, THREAD_REF),
+    ).toEqual({
+      kind: "turn",
+      turnId: TurnId.make("turn-1"),
+      filePath: "src/app.ts",
+      revealRequestId: 1,
+    });
+  });
+
+  it("keeps file routing on the aggregate repository after status changes", () => {
+    expect(resolveDiffRepositoryRoot("/workspace/repo-a", "/workspace/repo-b")).toBe(
+      "/workspace/repo-a",
+    );
+    expect(resolveDiffRepositoryRoot(undefined, "/workspace/repo-b")).toBe("/workspace/repo-b");
   });
 });
