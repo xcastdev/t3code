@@ -547,6 +547,11 @@ export default function SourceControlActions({
   const [workflowInput, setWorkflowInput] = useState<WorkflowInputState | null>(null);
   const [pendingPullRequestAction, setPendingPullRequestAction] =
     useState<PendingPullRequestAction | null>(null);
+  // State owns presentation. This ref is the one-shot authorization for the
+  // exact callback React rendered: a handler retained through cancellation,
+  // unmount, or a replacement dialog must not be able to mutate a PR later.
+  const pendingPullRequestActionRef = useRef<PendingPullRequestAction | null>(null);
+  const sourceControlActionsMountedRef = useRef(false);
   const [sourceControlPresentationChoice, setSourceControlPresentationChoice] =
     useState<SourceControlPresentationChoice>("view-list");
   const [sourceControlSortChoice, setSourceControlSortChoice] =
@@ -572,6 +577,17 @@ export default function SourceControlActions({
     [activeEnvironmentId, gitCwd],
   );
   const pendingScope = `${activeEnvironmentId ?? ""}\0${gitCwd ?? ""}`;
+  const revokePendingPullRequestAction = useCallback(() => {
+    pendingPullRequestActionRef.current = null;
+    setPendingPullRequestAction(null);
+  }, []);
+  useLayoutEffect(() => {
+    sourceControlActionsMountedRef.current = true;
+    return () => {
+      sourceControlActionsMountedRef.current = false;
+      pendingPullRequestActionRef.current = null;
+    };
+  }, []);
   useEffect(() => {
     setPendingHeaderAction(null);
     // A form is an approval/review of one immutable target. Never quietly
@@ -921,7 +937,15 @@ export default function SourceControlActions({
   useLayoutEffect(() => {
     currentPullRequestMutationApprovalScopeKeyRef.current =
       currentPullRequestMutationApprovalScopeKey;
-  }, [currentPullRequestMutationApprovalScopeKey]);
+    const pending = pendingPullRequestActionRef.current;
+    if (
+      pending !== null &&
+      (currentPullRequestMutationApprovalScopeKey === null ||
+        pullRequestMutationApprovalScopeKey(pending) !== currentPullRequestMutationApprovalScopeKey)
+    ) {
+      revokePendingPullRequestAction();
+    }
+  }, [currentPullRequestMutationApprovalScopeKey, revokePendingPullRequestAction]);
   const isPendingPullRequestActionCurrent =
     pendingPullRequestAction !== null &&
     currentPullRequestMutationApprovalScopeKey !== null &&
@@ -1122,15 +1146,6 @@ export default function SourceControlActions({
     ],
   );
 
-  useEffect(() => {
-    setPendingPullRequestAction((current) =>
-      current !== null &&
-      currentPullRequestMutationApprovalScopeKey !== null &&
-      pullRequestMutationApprovalScopeKey(current) === currentPullRequestMutationApprovalScopeKey
-        ? current
-        : null,
-    );
-  }, [currentPullRequestMutationApprovalScopeKey]);
   const quickAction = useMemo(
     () =>
       resolveQuickAction(
@@ -1254,26 +1269,31 @@ export default function SourceControlActions({
       const action = id === "pr-checkout" ? "checkout" : id === "pr-merge" ? "merge" : "close";
       const approvalScope = currentPullRequestMutationApprovalScope;
       if (approvalScope === null) return;
-      setPendingPullRequestAction({
+      const pending: PendingPullRequestAction = {
         action,
         ...approvalScope,
         repositoryLabel: approvalScope.reference.repository,
-      });
+      };
+      pendingPullRequestActionRef.current = pending;
+      setPendingPullRequestAction(pending);
     }
   };
 
   const executePullRequestAction = async () => {
-    const pending = pendingPullRequestAction;
+    const pending = pendingPullRequestActionRef.current;
     if (
+      !sourceControlActionsMountedRef.current ||
       !pending ||
       currentPullRequestMutationApprovalScopeKeyRef.current === null ||
       pullRequestMutationApprovalScopeKey(pending) !==
         currentPullRequestMutationApprovalScopeKeyRef.current
     ) {
-      setPendingPullRequestAction(null);
+      revokePendingPullRequestAction();
       return;
     }
-    setPendingPullRequestAction(null);
+    // Consume before awaiting, so a duplicate or retained callback cannot
+    // execute this reviewed request a second time.
+    revokePendingPullRequestAction();
     const result =
       pending.action === "checkout"
         ? await preparePullRequest.run({
@@ -3077,7 +3097,7 @@ export default function SourceControlActions({
       <Dialog
         open={pendingPullRequestAction !== null && isPendingPullRequestActionCurrent}
         onOpenChange={(open) => {
-          if (!open) setPendingPullRequestAction(null);
+          if (!open) revokePendingPullRequestAction();
         }}
       >
         <DialogPopup>
@@ -3095,7 +3115,7 @@ export default function SourceControlActions({
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setPendingPullRequestAction(null)}>
+            <Button variant="outline" onClick={revokePendingPullRequestAction}>
               Cancel
             </Button>
             <Button

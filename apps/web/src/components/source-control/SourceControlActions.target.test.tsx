@@ -55,6 +55,7 @@ const pullRequestInvalidate = vi.hoisted(() => Symbol("pull-request-invalidate")
 const pullRequestDetail = vi.hoisted(() => Symbol("pull-request-detail"));
 const pullRequestRun = vi.hoisted(() => vi.fn());
 const preparePullRequestRun = vi.hoisted(() => vi.fn());
+const retainedHeaderConfirm = vi.hoisted(() => ({ current: null as (() => void) | null }));
 const pullRequestInvalidateRun = vi.hoisted(() => vi.fn());
 const pullRequestDetailQuery = vi.hoisted(() => ({
   data: null as unknown,
@@ -205,9 +206,11 @@ vi.mock("../ui/button", () => ({
     size: _size,
     variant: _variant,
     ...props
-  }: React.ComponentProps<"button"> & { size?: unknown; variant?: unknown }) => (
-    <button {...props} />
-  ),
+  }: React.ComponentProps<"button"> & { size?: unknown; variant?: unknown }) => {
+    if (props.children === "Confirm")
+      retainedHeaderConfirm.current = props.onClick as (() => void) | null;
+    return <button {...props} />;
+  },
 }));
 vi.mock("../ui/checkbox", () => ({
   Checkbox: ({
@@ -385,6 +388,7 @@ beforeEach(() => {
   workspaceProgress.value = { isRunning: false, currentStep: null, completed: [] };
   pullRequestRun.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
   preparePullRequestRun.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
+  retainedHeaderConfirm.current = null;
   pullRequestInvalidateRun.mockReset().mockResolvedValue({ _tag: "Success", value: undefined });
   pullRequestDetailQuery.data = null;
   pullRequestDetailQuery.error = null;
@@ -434,6 +438,83 @@ async function clickButton(text: string) {
 }
 
 describe("SourceControlActions target lifetime", () => {
+  const openPullRequest = () => {
+    projects.current = [
+      {
+        id: "project",
+        environmentId: "environment",
+        workspaceRoot: "/repo",
+        repositoryIdentity: {
+          canonicalKey: "github.com/owner/repo",
+          provider: "github",
+          owner: "owner",
+          name: "repo",
+          displayName: "owner/repo",
+        },
+      },
+    ];
+    statusQuery.data = {
+      ...statusQuery.data,
+      sourceControlProvider: { kind: "github", name: "GitHub", baseUrl: "https://github.com" },
+      pr: {
+        number: 7,
+        state: "open",
+        title: "Header approval",
+        url: "https://github.com/owner/repo/pull/7",
+        baseRef: "main",
+        headRef: "feature/header",
+      },
+    } as VcsStatusResult;
+    pullRequestDetailQuery.data = {
+      capabilities: { actions: ["merge", "close"] },
+      viewerPermissions: { actions: ["merge", "close"] },
+    };
+  };
+
+  it.each([
+    ["Check Out Pull Request", "checkout", "cancel"],
+    ["Merge Pull Request", "merge", "unmount"],
+    ["Close Pull Request", "close", "cancel"],
+    ["Check Out Pull Request", "checkout", "duplicate"],
+    ["Merge Pull Request", "merge", "duplicate"],
+    ["Close Pull Request", "close", "duplicate"],
+  ] as const)("revokes or consumes the header %s approval on %s", async (label, action, mode) => {
+    openPullRequest();
+    const host = document.createElement("div");
+    const target = document.createElement("div");
+    document.body.append(host, target);
+    const root = createRoot(host);
+    roots.push(root);
+    await render(root, target);
+
+    await clickButton(label);
+    const retained = retainedHeaderConfirm.current;
+    expect(retained).not.toBeNull();
+    if (mode === "cancel") {
+      await clickButton("Cancel");
+    } else if (mode === "unmount") {
+      await act(async () => root.unmount());
+    } else {
+      await act(async () => {
+        retained?.();
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+    }
+    await act(async () => {
+      retained?.();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const calls = mode === "duplicate" ? 1 : 0;
+    if (action === "checkout") {
+      expect(preparePullRequestRun).toHaveBeenCalledTimes(calls);
+    } else {
+      expect(pullRequestRun).toHaveBeenCalledTimes(calls);
+    }
+  });
+
   it("sends the reviewed snapshot through the header pull-request checkout", async () => {
     statusQuery.data = {
       ...statusQuery.data,

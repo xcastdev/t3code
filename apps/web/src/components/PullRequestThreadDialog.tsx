@@ -172,14 +172,17 @@ export function PullRequestThreadDialog({
       setCheckoutApproval(null);
     }
   }, [open]);
-  useLayoutEffect(
-    () => () => {
+  useLayoutEffect(() => {
+    // StrictMode deliberately runs setup, cleanup, then setup again in development.
+    // This is a lease for the currently mounted dialog instance, so every setup
+    // must restore it before a user can approve a checkout.
+    mountedRef.current = true;
+    return () => {
       mountedRef.current = false;
       dialogOpenRef.current = false;
       checkoutApprovalRef.current = null;
-    },
-    [],
-  );
+    };
+  }, []);
   // A stale retained approval stays inert in state but is never displayed or reusable. This
   // avoids a reset render while a status query is settling and makes the next press a fresh review.
   const activeCheckoutApproval =

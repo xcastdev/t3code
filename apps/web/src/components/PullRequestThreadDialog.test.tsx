@@ -1,6 +1,6 @@
 /* @vitest-environment happy-dom */
 
-import { act, forwardRef } from "react";
+import { act, forwardRef, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId, ThreadId } from "@t3tools/contracts";
@@ -122,13 +122,13 @@ const threadId = ThreadId.make("thread");
 const threadRef = scopeThreadRef(environmentId, threadId);
 const roots: Root[] = [];
 
-async function render(projectRoot: string, reference: string): Promise<Root> {
+async function render(projectRoot: string, reference: string, strictMode = false): Promise<Root> {
   const container = document.createElement("div");
   document.body.append(container);
   const root = createRoot(container);
   roots.push(root);
   await act(async () => {
-    root.render(
+    const dialog = (
       <PullRequestThreadDialogHost
         open
         environmentId={environmentId}
@@ -138,8 +138,9 @@ async function render(projectRoot: string, reference: string): Promise<Root> {
         initialReference={reference}
         onOpenChange={() => undefined}
         onPrepared={() => undefined}
-      />,
+      />
     );
+    root.render(strictMode ? <StrictMode>{dialog}</StrictMode> : dialog);
   });
   return root;
 }
@@ -237,4 +238,18 @@ describe("PullRequestThreadDialog checkout scope", () => {
       });
     },
   );
+
+  it("keeps a fresh checkout approval usable through StrictMode's setup-cleanup-setup cycle", async () => {
+    await render("/repo", "#7", true);
+    const worktree = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+      (button) => button.textContent === "Worktree",
+    );
+    act(() => worktree!.click());
+    await act(async () => {
+      retainedActions.confirmWorktree?.();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(preparePullRequestThread).toHaveBeenCalledTimes(1);
+  });
 });
