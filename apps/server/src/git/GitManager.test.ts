@@ -1126,6 +1126,57 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
     }),
   );
 
+  it.effect("status skips the provider lookup for a repository without remotes", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      const { manager, ghCalls } = yield* makeManager();
+
+      const status = yield* manager.status({ cwd: repoDir });
+
+      expect(status.refName).toBe("main");
+      expect(status.pr).toBeNull();
+      expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(0);
+    }),
+  );
+
+  it.effect("status keeps the last known PR when a repository becomes local-only", () =>
+    Effect.gen(function* () {
+      const repoDir = yield* makeTempDir("t3code-git-manager-");
+      yield* initRepo(repoDir);
+      yield* runGit(repoDir, ["checkout", "-b", "feature/local-only-pr"]);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/local-only-pr"]);
+      const { manager, ghCalls } = yield* makeManager({
+        ghScenario: {
+          // @effect-diagnostics-next-line preferSchemaOverJson:off
+          prListSequence: [
+            JSON.stringify([
+              {
+                number: 432,
+                title: "Remembered PR",
+                url: "https://github.com/pingdotgg/t3code/pull/432",
+                baseRefName: "main",
+                headRefName: "feature/local-only-pr",
+                state: "OPEN",
+              },
+            ]),
+          ],
+        },
+      });
+
+      expect((yield* manager.status({ cwd: repoDir })).pr?.number).toBe(432);
+      yield* runGit(repoDir, ["remote", "remove", "origin"]);
+      yield* manager.invalidateStatus(repoDir);
+
+      const status = yield* manager.status({ cwd: repoDir });
+
+      expect(status.pr?.number).toBe(432);
+      expect(ghCalls.filter((call) => call.startsWith("pr list "))).toHaveLength(1);
+    }),
+  );
+
   it.effect("branch PR lookup returns null when the repository has no remotes", () =>
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");

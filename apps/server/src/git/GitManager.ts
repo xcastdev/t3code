@@ -1350,7 +1350,7 @@ export const make = Effect.gen(function* () {
       return Effect.gen(function* () {
         const { headContext, lookup } = yield* resolveLookupHeadContext(cwd, details);
         if (!lookup) {
-          return { latest: null, headContext };
+          return { latest: null, headContext, skipped: true };
         }
         // Only skip when the branch is untracked as well: anything carrying an
         // upstream keeps the old behaviour.
@@ -1359,10 +1359,10 @@ export const make = Effect.gen(function* () {
           details.upstreamRef === null &&
           (yield* isUnpublishedBranch(cwd, headContext))
         ) {
-          return { latest: null, headContext };
+          return { latest: null, headContext, skipped: true };
         }
         const latest = yield* findLatestPrForHeadContext(cwd, headContext);
-        return { latest, headContext };
+        return { latest, headContext, skipped: false };
       });
     },
     {
@@ -1457,27 +1457,38 @@ export const make = Effect.gen(function* () {
       }
     }
     return yield* Cache.get(prLookupCache, cacheKey).pipe(
-      Effect.map(({ latest, headContext }) => {
-        if (!latest) return { pr: null, headContext };
+      Effect.map(({ latest, headContext, skipped }) => {
+        if (!latest) return { pr: null, headContext, skipped };
         // On the default branch, only surface open PRs.
         // Merged/closed matches are usually reverse-merge history, not the thread's PR context.
         if (details.isDefaultBranch && latest.state !== "open") {
-          return { pr: null, headContext };
+          return { pr: null, headContext, skipped };
         }
-        return { pr: toStatusPr(latest), headContext };
+        return { pr: toStatusPr(latest), headContext, skipped };
       }),
-      Effect.tap(({ pr, headContext }) =>
-        Effect.sync(() =>
-          rememberLastKnownPr(branchKey, {
-            pr,
-            upstreamRef: details.upstreamRef,
-            headBranch: headContext.headBranch,
-            remoteName: headContext.remoteName,
-            headRemoteUrlKey: headContext.headRemoteUrlKey,
-          }),
-        ),
+      Effect.tap(({ pr, headContext, skipped }) =>
+        skipped
+          ? Effect.void
+          : Effect.sync(() =>
+              rememberLastKnownPr(branchKey, {
+                pr,
+                upstreamRef: details.upstreamRef,
+                headBranch: headContext.headBranch,
+                remoteName: headContext.remoteName,
+                headRemoteUrlKey: headContext.headRemoteUrlKey,
+              }),
+            ),
       ),
-      Effect.map(({ pr }) => pr),
+      Effect.map(({ pr, headContext, skipped }) =>
+        skipped
+          ? resolveLastKnownPr(branchKey, {
+              upstreamRef: details.upstreamRef,
+              headBranch: headContext.headBranch,
+              remoteName: headContext.remoteName,
+              headRemoteUrlKey: headContext.headRemoteUrlKey,
+            })
+          : pr,
+      ),
       Effect.catch((error) =>
         Effect.logWarning("PR lookup failed; keeping last known PR state.").pipe(
           Effect.annotateLogs({
@@ -1783,9 +1794,8 @@ export const make = Effect.gen(function* () {
    * when a merged change request's remote branch is deleted. Together they
    * distinguish branches known to have reached a host from genuinely local
    * branches. The ref glob spans every remote so a fork branch still counts. A
-   * repository that tracks no remotes at all cannot answer the question,
-   * because then every branch looks unpublished; it, and any failed probe,
-   * keeps the lookup.
+   * repository that tracks no remotes at all is local-only, so it cannot have
+   * a hosted change request. Any failed probe keeps the lookup.
    */
   const isUnpublishedBranch = Effect.fn("isUnpublishedBranch")(function* (
     cwd: string,
@@ -1816,11 +1826,8 @@ export const make = Effect.gen(function* () {
         return false;
       }
 
-      const [tracksAnyRemote, tracksThisBranch] = yield* Effect.all(
-        [matchesRef("refs/remotes"), matchesRef(`refs/remotes/*/${headContext.headBranch}`)],
-        { concurrency: "unbounded" },
-      );
-      return tracksAnyRemote && !tracksThisBranch;
+      const tracksThisBranch = yield* matchesRef(`refs/remotes/*/${headContext.headBranch}`);
+      return !tracksThisBranch;
     }).pipe(Effect.orElseSucceed(() => false));
   });
 
