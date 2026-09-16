@@ -135,6 +135,10 @@ function getPublishProviderReadiness(input: {
 export interface PublishRepositoryDialogProps {
   readonly open: boolean;
   readonly onOpenChange: (open: boolean) => void;
+  /** Parent-owned one-shot authorization for this rendered Publish button. */
+  readonly approvalToken: number | null;
+  readonly onConsumeApproval: (token: number) => boolean;
+  readonly onRevokeApproval: (token: number) => void;
   readonly environmentId: ScopedThreadRef["environmentId"] | null;
   /** Thread the dialog was opened from, so the new repository can open beside it. */
   readonly threadRef: ScopedThreadRef | null;
@@ -277,14 +281,19 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
 
   const submitPublishRepository = useCallback(() => {
     const reviewedSourceIndexTree = props.reviewedSourceIndexTree;
+    const approvalToken = props.approvalToken;
     if (
       !props.open ||
+      approvalToken === null ||
       !isReviewedSourceCurrent ||
       !canSubmitPublishRepository ||
       reviewedSourceIndexTree === null
     ) {
       return;
     }
+    // Consume synchronously before starting the promise. A retained Publish
+    // callback cannot approve a replacement wizard or run twice.
+    if (!props.onConsumeApproval(approvalToken)) return;
 
     setPublishError(null);
 
@@ -319,6 +328,8 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
     canSubmitPublishRepository,
     isReviewedSourceCurrent,
     props.open,
+    props.approvalToken,
+    props.onConsumeApproval,
     publishProtocol,
     publishProvider,
     publishRemoteName,
@@ -346,14 +357,22 @@ export function PublishRepositoryDialog(props: PublishRepositoryDialogProps) {
   // clear every retained publication choice before a later checkout can reuse it.
   useEffect(() => {
     if (!props.open || !isReviewedSourceCurrent) {
+      if (props.approvalToken !== null) props.onRevokeApproval(props.approvalToken);
       resetState();
     }
-  }, [isReviewedSourceCurrent, props.open, resetState]);
+  }, [
+    isReviewedSourceCurrent,
+    props.approvalToken,
+    props.onRevokeApproval,
+    props.open,
+    resetState,
+  ]);
 
   const handleOpenChange = useCallback(
     (open: boolean) => {
       props.onOpenChange(open);
       if (!open) {
+        if (props.approvalToken !== null) props.onRevokeApproval(props.approvalToken);
         resetState();
       }
     },

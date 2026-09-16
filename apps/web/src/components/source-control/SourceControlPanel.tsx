@@ -77,6 +77,7 @@ import {
   type SourceControlPanelView,
 } from "./sourceControlPanel.logic";
 import { PublishRepositoryDialog } from "./PublishRepositoryDialog";
+import { useConfirmationLease } from "./confirmationLease";
 import {
   getSourceControlPresentation,
   type SourceControlPresentation,
@@ -370,6 +371,8 @@ function ChangesView(
   >(null);
   const [pendingActionScope, setPendingActionScope] = useState<PrimaryActionScope | null>(null);
   const [publishRepositoryOpen, setPublishRepositoryOpen] = useState(false);
+  const publishConfirmationLease = useConfirmationLease();
+  const [publishApprovalToken, setPublishApprovalToken] = useState<number | null>(null);
   const [publishRepositorySource, setPublishRepositorySource] = useState<{
     readonly environmentId: EnvironmentId;
     readonly cwd: string;
@@ -429,6 +432,7 @@ function ChangesView(
     publishRepositorySource.indexTree === currentPublishRepositorySource.indexTree;
   const openPublishRepositoryDialog = useCallback(() => {
     if (currentPrimaryActionScope === null) return;
+    setPublishApprovalToken(publishConfirmationLease.issue());
     setPublishRepositorySource({
       environmentId: currentPrimaryActionScope.environmentId,
       cwd: currentPrimaryActionScope.cwd,
@@ -437,17 +441,32 @@ function ChangesView(
       indexTree: currentPrimaryActionScope.sourceIndexTree,
     });
     setPublishRepositoryOpen(true);
-  }, [currentPrimaryActionScope]);
-  const setPublishRepositoryDialogOpen = useCallback((open: boolean) => {
-    setPublishRepositoryOpen(open);
-    if (!open) setPublishRepositorySource(null);
-  }, []);
+  }, [currentPrimaryActionScope, publishConfirmationLease]);
+  const setPublishRepositoryDialogOpen = useCallback(
+    (open: boolean) => {
+      if (!open && publishApprovalToken !== null)
+        publishConfirmationLease.revoke(publishApprovalToken);
+      setPublishRepositoryOpen(open);
+      if (!open) {
+        setPublishRepositorySource(null);
+        setPublishApprovalToken(null);
+      }
+    },
+    [publishApprovalToken, publishConfirmationLease],
+  );
   useEffect(() => {
     if (publishRepositoryOpen && !isPublishRepositorySourceCurrent) {
+      if (publishApprovalToken !== null) publishConfirmationLease.revoke(publishApprovalToken);
       setPublishRepositoryOpen(false);
       setPublishRepositorySource(null);
+      setPublishApprovalToken(null);
     }
-  }, [isPublishRepositorySourceCurrent, publishRepositoryOpen]);
+  }, [
+    isPublishRepositorySourceCurrent,
+    publishApprovalToken,
+    publishConfirmationLease,
+    publishRepositoryOpen,
+  ]);
   const [pendingPath, setPendingPath] = useState<string | null>(null);
   const [workingTreePages, setWorkingTreePages] = useState<WorkingTreePageState>(() => ({
     snapshotId: status?.workingTree.snapshotId ?? null,
@@ -1742,6 +1761,9 @@ function ChangesView(
         <PublishRepositoryDialog
           open={publishRepositoryOpen && isPublishRepositorySourceCurrent}
           onOpenChange={setPublishRepositoryDialogOpen}
+          approvalToken={publishApprovalToken}
+          onConsumeApproval={publishConfirmationLease.consume}
+          onRevokeApproval={publishConfirmationLease.revoke}
           environmentId={props.environmentId}
           threadRef={props.threadRef}
           gitCwd={props.cwd}

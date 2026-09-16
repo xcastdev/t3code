@@ -115,6 +115,7 @@ import { getSourceControlPresentation } from "~/sourceControlPresentation";
 import { useOpenLink } from "~/browser/useOpenLink";
 import { useOpenPrLink } from "~/lib/openPullRequestLink";
 import { PublishRepositoryDialog } from "./PublishRepositoryDialog";
+import { useConfirmationLease } from "./confirmationLease";
 
 interface SourceControlActionsProps {
   gitCwd: string | null;
@@ -154,6 +155,7 @@ interface HeaderActionScope extends RepositorySourceScope {
 }
 
 interface PendingDefaultBranchAction extends GitActionApprovalScope {
+  readonly approvalToken: number;
   action: DefaultBranchConfirmableAction;
   includesCommit: boolean;
   commitMessage?: string;
@@ -163,12 +165,21 @@ interface PendingDefaultBranchAction extends GitActionApprovalScope {
 
 /** Publication is reviewed against one local checkout, never the next selected repository. */
 interface PublishRepositoryScope extends RepositorySourceScope {
+  readonly approvalToken: number;
   readonly threadRef: ScopedThreadRef | null;
 }
 
 interface PendingGitConfirmation {
+  readonly approvalToken: number;
   readonly input: RunGitActionWithToastInput;
   readonly scope: GitActionApprovalScope;
+}
+
+interface PendingHeaderAction {
+  readonly approvalToken: number;
+  readonly action: "pull" | "push" | "sync" | "publish";
+  readonly continuation?: GitActionContinuation;
+  readonly scope: HeaderActionScope;
 }
 
 type GitActionToastId = ReturnType<typeof toastManager.add>;
@@ -203,11 +214,13 @@ type PullRequestMutationApprovalScope = {
 
 /** A confirmation is bound to the reviewed repository snapshot and PR target. */
 type PendingPullRequestAction = PullRequestMutationApprovalScope & {
+  readonly approvalToken: number;
   readonly action: PullRequestMenuAction;
   readonly repositoryLabel: string;
 };
 
 type WorkflowInputState = {
+  readonly approvalToken: number;
   /** The exact repository/source reviewed when this form was opened. */
   readonly reviewedSourceScope: RepositorySourceScope;
   readonly reviewedPrecondition?: GitMutationPrecondition;
@@ -234,6 +247,7 @@ type SourceControlPresentationChoice = "view-tree" | "view-list";
 type SourceControlSortChoice = "view-sort-path" | "view-sort-name" | "view-sort-status";
 
 type WorktreeInputState = {
+  readonly approvalToken: number;
   readonly reviewedSourceScope: RepositorySourceScope;
   readonly refName: string;
   readonly newRefName: string;
@@ -559,16 +573,16 @@ export default function SourceControlActions({
   const [stashOutput, setStashOutput] = useState<string | null>(null);
   const [worktreeInput, setWorktreeInput] = useState<WorktreeInputState | null>(null);
   const [initConfirmationScope, setInitConfirmationScope] = useState<{
+    readonly approvalToken: number;
     readonly environmentId: EnvironmentId;
     readonly cwd: string;
   } | null>(null);
-  const [pendingHeaderAction, setPendingHeaderAction] = useState<{
-    readonly action: "pull" | "push" | "sync" | "publish";
-    readonly continuation?: GitActionContinuation;
-    readonly scope: HeaderActionScope;
-  } | null>(null);
+  const [pendingHeaderAction, setPendingHeaderAction] = useState<PendingHeaderAction | null>(null);
   const [pendingGitConfirmation, setPendingGitConfirmation] =
     useState<PendingGitConfirmation | null>(null);
+  // All confirmation surfaces in this host share one revocable, one-shot
+  // authority. Rendering state supplies copy; this lease supplies permission.
+  const confirmationLease = useConfirmationLease();
   const activeGitActionProgressRef = useRef<ActiveGitActionProgress | null>(null);
   const workingTreeLoadRequestId = useRef(0);
   const workingTreeScopeRef = useRef("");
@@ -577,42 +591,117 @@ export default function SourceControlActions({
     [activeEnvironmentId, gitCwd],
   );
   const pendingScope = `${activeEnvironmentId ?? ""}\0${gitCwd ?? ""}`;
-  const revokePendingPullRequestAction = useCallback(() => {
-    pendingPullRequestActionRef.current = null;
-    setPendingPullRequestAction(null);
-  }, []);
+  const clearPendingGitConfirmation = useCallback(
+    (token: number) => {
+      confirmationLease.revoke(token);
+      setPendingGitConfirmation((current) => (current?.approvalToken === token ? null : current));
+    },
+    [confirmationLease],
+  );
+  const clearPendingDefaultBranchAction = useCallback(
+    (token: number) => {
+      confirmationLease.revoke(token);
+      setPendingDefaultBranchAction((current) =>
+        current?.approvalToken === token ? null : current,
+      );
+    },
+    [confirmationLease],
+  );
+  const clearWorkflowInput = useCallback(
+    (token: number) => {
+      confirmationLease.revoke(token);
+      setWorkflowInput((current) => (current?.approvalToken === token ? null : current));
+    },
+    [confirmationLease],
+  );
+  const clearWorktreeInput = useCallback(
+    (token: number) => {
+      confirmationLease.revoke(token);
+      setWorktreeInput((current) => (current?.approvalToken === token ? null : current));
+    },
+    [confirmationLease],
+  );
+  const updateWorkflowInput = useCallback(
+    (update: (current: WorkflowInputState) => WorkflowInputState) => {
+      setWorkflowInput((current) =>
+        current ? { ...update(current), approvalToken: confirmationLease.issue() } : current,
+      );
+    },
+    [confirmationLease],
+  );
+  const updateWorktreeInput = useCallback(
+    (update: (current: WorktreeInputState) => WorktreeInputState) => {
+      setWorktreeInput((current) =>
+        current ? { ...update(current), approvalToken: confirmationLease.issue() } : current,
+      );
+    },
+    [confirmationLease],
+  );
+  const clearPendingHeaderAction = useCallback(
+    (token: number) => {
+      confirmationLease.revoke(token);
+      setPendingHeaderAction((current) => (current?.approvalToken === token ? null : current));
+    },
+    [confirmationLease],
+  );
+  const clearInitConfirmation = useCallback(
+    (token: number) => {
+      confirmationLease.revoke(token);
+      setInitConfirmationScope((current) => (current?.approvalToken === token ? null : current));
+    },
+    [confirmationLease],
+  );
+  const revokePendingPullRequestAction = useCallback(
+    (token: number) => {
+      confirmationLease.revoke(token);
+      if (pendingPullRequestActionRef.current?.approvalToken === token) {
+        pendingPullRequestActionRef.current = null;
+      }
+      setPendingPullRequestAction((current) => (current?.approvalToken === token ? null : current));
+    },
+    [confirmationLease],
+  );
   useLayoutEffect(() => {
     sourceControlActionsMountedRef.current = true;
     return () => {
       sourceControlActionsMountedRef.current = false;
+      const pending = pendingPullRequestActionRef.current;
+      if (pending) confirmationLease.revoke(pending.approvalToken);
       pendingPullRequestActionRef.current = null;
     };
-  }, []);
+  }, [confirmationLease]);
   useEffect(() => {
-    setPendingHeaderAction(null);
+    setPendingHeaderAction((current) => {
+      if (current) confirmationLease.revoke(current.approvalToken);
+      return null;
+    });
     // A form is an approval/review of one immutable target. Never quietly
     // carry it into a newly selected nested repository.
     setWorkflowInput((current) =>
       current &&
       `${current.reviewedSourceScope.environmentId}\0${current.reviewedSourceScope.cwd}` !==
         pendingScope
-        ? null
+        ? (confirmationLease.revoke(current.approvalToken), null)
         : current,
     );
     setWorktreeInput((current) =>
       current &&
       `${current.reviewedSourceScope.environmentId}\0${current.reviewedSourceScope.cwd}` !==
         pendingScope
-        ? null
+        ? (confirmationLease.revoke(current.approvalToken), null)
         : current,
     );
     setInitConfirmationScope((current) =>
-      current && `${current.environmentId}\0${current.cwd}` !== pendingScope ? null : current,
+      current && `${current.environmentId}\0${current.cwd}` !== pendingScope
+        ? (confirmationLease.revoke(current.approvalToken), null)
+        : current,
     );
     setPendingDefaultBranchAction((current) =>
-      current && `${current.environmentId}\0${current.cwd}` !== pendingScope ? null : current,
+      current && `${current.environmentId}\0${current.cwd}` !== pendingScope
+        ? (confirmationLease.revoke(current.approvalToken), null)
+        : current,
     );
-  }, [pendingScope]);
+  }, [confirmationLease, pendingScope]);
   let runGitActionWithToast: (input: RunGitActionWithToastInput) => Promise<void>;
 
   const updateActiveProgressToast = useCallback(() => {
@@ -835,9 +924,9 @@ export default function SourceControlActions({
       currentGitActionApprovalScopeKey !== null &&
       gitActionApprovalScopeKey(current.scope) === currentGitActionApprovalScopeKey
         ? current
-        : null,
+        : (current && confirmationLease.revoke(current.approvalToken), null),
     );
-  }, [currentGitActionApprovalScopeKey]);
+  }, [confirmationLease, currentGitActionApprovalScopeKey]);
   useEffect(() => {
     // Typed workflow forms are approvals of the source checkout they opened
     // against. Do not reuse them after a checkout, ref move, or HEAD move.
@@ -846,52 +935,68 @@ export default function SourceControlActions({
       currentWorkflowApprovalScopeKey !== null &&
       workflowApprovalScopeKey(current) === currentWorkflowApprovalScopeKey
         ? current
-        : null,
+        : (current && confirmationLease.revoke(current.approvalToken), null),
     );
-  }, [currentWorkflowApprovalScopeKey]);
+  }, [confirmationLease, currentWorkflowApprovalScopeKey]);
   useEffect(() => {
     setPendingHeaderAction((current) =>
       current !== null &&
       currentHeaderActionScopeKey !== null &&
       headerActionScopeKey(current.scope) === currentHeaderActionScopeKey
         ? current
-        : null,
+        : (current && confirmationLease.revoke(current.approvalToken), null),
     );
-  }, [currentHeaderActionScopeKey]);
+  }, [confirmationLease, currentHeaderActionScopeKey]);
   useEffect(() => {
     setWorktreeInput((current) =>
       current !== null &&
       currentRepositorySourceScopeKey !== null &&
       repositorySourceScopeKey(current.reviewedSourceScope) === currentRepositorySourceScopeKey
         ? current
-        : null,
+        : (current && confirmationLease.revoke(current.approvalToken), null),
     );
-  }, [currentRepositorySourceScopeKey]);
+  }, [confirmationLease, currentRepositorySourceScopeKey]);
   useEffect(() => {
     if (isPublishDialogOpen && !isPublishRepositoryScopeCurrent) {
+      if (publishRepositoryScope) confirmationLease.revoke(publishRepositoryScope.approvalToken);
       setIsPublishDialogOpen(false);
       setPublishRepositoryScope(null);
     }
-  }, [isPublishDialogOpen, isPublishRepositoryScopeCurrent]);
+  }, [
+    confirmationLease,
+    isPublishDialogOpen,
+    isPublishRepositoryScopeCurrent,
+    publishRepositoryScope,
+  ]);
   const openPublishRepositoryDialog = useCallback(() => {
     const scope = sourceScopeFromStatus(activeEnvironmentId, gitCwd, gitStatusForActions);
     if (scope === null) return;
-    setPublishRepositoryScope({ ...scope, threadRef: activeThreadRef });
+    setPublishRepositoryScope({
+      ...scope,
+      approvalToken: confirmationLease.issue(),
+      threadRef: activeThreadRef,
+    });
     setIsPublishDialogOpen(true);
   }, [activeEnvironmentId, activeThreadRef, gitCwd, gitStatusForActions]);
-  const setPublishRepositoryDialogOpen = useCallback((open: boolean) => {
-    setIsPublishDialogOpen(open);
-    if (!open) setPublishRepositoryScope(null);
-  }, []);
+  const setPublishRepositoryDialogOpen = useCallback(
+    (open: boolean) => {
+      if (!open && publishRepositoryScope) {
+        confirmationLease.revoke(publishRepositoryScope.approvalToken);
+      }
+      setIsPublishDialogOpen(open);
+      if (!open) setPublishRepositoryScope(null);
+    },
+    [confirmationLease, publishRepositoryScope],
+  );
   useEffect(() => {
     setPendingDefaultBranchAction((current) => {
       if (!current) return current;
       return currentGitActionApprovalScopeKey !== null &&
         gitActionApprovalScopeKey(current) === currentGitActionApprovalScopeKey
         ? current
-        : null;
+        : (confirmationLease.revoke(current.approvalToken), null);
     });
-  }, [currentGitActionApprovalScopeKey]);
+  }, [confirmationLease, currentGitActionApprovalScopeKey]);
   const providerDiscovery = sourceControlDiscoveryQuery.data?.sourceControlProviders.find(
     (provider) => provider.kind === gitStatus?.sourceControlProvider?.kind,
   );
@@ -943,7 +1048,7 @@ export default function SourceControlActions({
       (currentPullRequestMutationApprovalScopeKey === null ||
         pullRequestMutationApprovalScopeKey(pending) !== currentPullRequestMutationApprovalScopeKey)
     ) {
-      revokePendingPullRequestAction();
+      revokePendingPullRequestAction(pending.approvalToken);
     }
   }, [currentPullRequestMutationApprovalScopeKey, revokePendingPullRequestAction]);
   const isPendingPullRequestActionCurrent =
@@ -1270,6 +1375,7 @@ export default function SourceControlActions({
       const approvalScope = currentPullRequestMutationApprovalScope;
       if (approvalScope === null) return;
       const pending: PendingPullRequestAction = {
+        approvalToken: confirmationLease.issue(),
         action,
         ...approvalScope,
         repositoryLabel: approvalScope.reference.repository,
@@ -1279,21 +1385,24 @@ export default function SourceControlActions({
     }
   };
 
-  const executePullRequestAction = async () => {
-    const pending = pendingPullRequestActionRef.current;
+  const executePullRequestAction = async (pending: PendingPullRequestAction) => {
     if (
       !sourceControlActionsMountedRef.current ||
-      !pending ||
+      !confirmationLease.consume(pending.approvalToken) ||
+      pendingPullRequestActionRef.current?.approvalToken !== pending.approvalToken ||
       currentPullRequestMutationApprovalScopeKeyRef.current === null ||
       pullRequestMutationApprovalScopeKey(pending) !==
         currentPullRequestMutationApprovalScopeKeyRef.current
     ) {
-      revokePendingPullRequestAction();
+      revokePendingPullRequestAction(pending.approvalToken);
       return;
     }
     // Consume before awaiting, so a duplicate or retained callback cannot
     // execute this reviewed request a second time.
-    revokePendingPullRequestAction();
+    setPendingPullRequestAction((current) =>
+      current?.approvalToken === pending.approvalToken ? null : current,
+    );
+    pendingPullRequestActionRef.current = null;
     const result =
       pending.action === "checkout"
         ? await preparePullRequest.run({
@@ -1388,6 +1497,7 @@ export default function SourceControlActions({
         );
         if (approvalScope === null) return;
         setPendingDefaultBranchAction({
+          approvalToken: confirmationLease.issue(),
           ...approvalScope,
           action,
           includesCommit,
@@ -1405,6 +1515,7 @@ export default function SourceControlActions({
         );
         if (approvalScope === null) return;
         setPendingGitConfirmation({
+          approvalToken: confirmationLease.issue(),
           scope: approvalScope,
           input: {
             action,
@@ -1610,8 +1721,10 @@ export default function SourceControlActions({
     },
   );
 
-  const continuePendingDefaultBranchAction = () => {
-    if (!pendingDefaultBranchAction) return;
+  const continuePendingDefaultBranchAction = (
+    pendingDefaultBranchAction: PendingDefaultBranchAction,
+  ) => {
+    if (!confirmationLease.consume(pendingDefaultBranchAction.approvalToken)) return;
     const {
       action,
       sourceRef,
@@ -1625,7 +1738,9 @@ export default function SourceControlActions({
       environmentId,
       cwd,
     } = pendingDefaultBranchAction;
-    setPendingDefaultBranchAction(null);
+    setPendingDefaultBranchAction((current) =>
+      current?.approvalToken === pendingDefaultBranchAction.approvalToken ? null : current,
+    );
     if (
       environmentId !== activeEnvironmentId ||
       cwd !== gitCwd ||
@@ -1656,10 +1771,12 @@ export default function SourceControlActions({
     });
   };
 
-  const continuePendingGitConfirmation = () => {
-    if (!pendingGitConfirmation) return;
+  const continuePendingGitConfirmation = (pendingGitConfirmation: PendingGitConfirmation) => {
+    if (!confirmationLease.consume(pendingGitConfirmation.approvalToken)) return;
     const { input, scope } = pendingGitConfirmation;
-    setPendingGitConfirmation(null);
+    setPendingGitConfirmation((current) =>
+      current?.approvalToken === pendingGitConfirmation.approvalToken ? null : current,
+    );
     if (
       currentGitActionApprovalScope === null ||
       gitActionApprovalScopeKey(scope) !== gitActionApprovalScopeKey(currentGitActionApprovalScope)
@@ -1674,8 +1791,10 @@ export default function SourceControlActions({
     });
   };
 
-  const checkoutFeatureBranchAndContinuePendingAction = () => {
-    if (!pendingDefaultBranchAction) return;
+  const checkoutFeatureBranchAndContinuePendingAction = (
+    pendingDefaultBranchAction: PendingDefaultBranchAction,
+  ) => {
+    if (!confirmationLease.consume(pendingDefaultBranchAction.approvalToken)) return;
     const {
       action,
       sourceRef,
@@ -1689,7 +1808,9 @@ export default function SourceControlActions({
       environmentId,
       cwd,
     } = pendingDefaultBranchAction;
-    setPendingDefaultBranchAction(null);
+    setPendingDefaultBranchAction((current) =>
+      current?.approvalToken === pendingDefaultBranchAction.approvalToken ? null : current,
+    );
     if (
       environmentId !== activeEnvironmentId ||
       cwd !== gitCwd ||
@@ -1757,7 +1878,11 @@ export default function SourceControlActions({
     }
     if (quickAction.kind === "run_pull") {
       if (currentHeaderActionScope) {
-        setPendingHeaderAction({ action: "pull", scope: currentHeaderActionScope });
+        setPendingHeaderAction({
+          approvalToken: confirmationLease.issue(),
+          action: "pull",
+          scope: currentHeaderActionScope,
+        });
       }
       return;
     }
@@ -1820,6 +1945,7 @@ export default function SourceControlActions({
     if (id !== "fetch") {
       if (currentHeaderActionScope) {
         setPendingHeaderAction({
+          approvalToken: confirmationLease.issue(),
           action: id as "pull" | "push" | "sync" | "publish",
           scope: currentHeaderActionScope,
         });
@@ -1848,10 +1974,10 @@ export default function SourceControlActions({
     });
   };
 
-  const executePendingHeaderAction = async () => {
+  const executePendingHeaderAction = async (pendingHeaderAction: PendingHeaderAction) => {
     if (
       !sourceControlWorkspaceSupported ||
-      !pendingHeaderAction ||
+      !confirmationLease.isCurrent(pendingHeaderAction.approvalToken) ||
       !activeEnvironmentId ||
       !gitCwd ||
       currentHeaderActionScopeKey === null ||
@@ -1863,7 +1989,10 @@ export default function SourceControlActions({
     const refName = continuation?.refName ?? scope.remoteRefName;
     const pullRemoteName = continuation?.pullRemoteName ?? scope.pullRemoteName;
     const pullRefName = continuation?.pullRefName ?? scope.pullRefName;
-    setPendingHeaderAction(null);
+    if (!confirmationLease.consume(pendingHeaderAction.approvalToken)) return;
+    setPendingHeaderAction((current) =>
+      current?.approvalToken === pendingHeaderAction.approvalToken ? null : current,
+    );
     const result = await runWorkflowAction({
       environmentId: activeEnvironmentId,
       input: {
@@ -1939,6 +2068,7 @@ export default function SourceControlActions({
       );
       if (reviewedSourceScope === null) return;
       setWorktreeInput({
+        approvalToken: confirmationLease.issue(),
         reviewedSourceScope,
         refName: gitStatusForActions?.refName ?? "",
         newRefName: "",
@@ -2081,6 +2211,7 @@ export default function SourceControlActions({
     );
     if (reviewedSourceScope === null) return;
     setWorkflowInput({
+      approvalToken: confirmationLease.issue(),
       reviewedSourceScope,
       reviewedRemoteName: gitStatusForActions?.remoteName ?? null,
       reviewedRemoteRefName: gitStatusForActions?.remoteRefName ?? null,
@@ -2116,14 +2247,14 @@ export default function SourceControlActions({
     });
   };
 
-  const executeWorktreeInput = async () => {
-    if (!worktreeInput || !activeEnvironmentId || !gitCwd) return;
+  const executeWorktreeInput = async (worktreeInput: WorktreeInputState) => {
+    if (!activeEnvironmentId || !gitCwd) return;
     if (
       !isWorktreeInputCurrent ||
       worktreeInput.reviewedSourceScope.environmentId !== activeEnvironmentId ||
       worktreeInput.reviewedSourceScope.cwd !== gitCwd
     ) {
-      setWorktreeInput(null);
+      clearWorktreeInput(worktreeInput.approvalToken);
       return;
     }
     if (!worktreeInput.refName.trim() || !worktreeInput.newRefName.trim()) {
@@ -2135,6 +2266,7 @@ export default function SourceControlActions({
       });
       return;
     }
+    if (!confirmationLease.consume(worktreeInput.approvalToken)) return;
     const input = {
       cwd: worktreeInput.reviewedSourceScope.cwd,
       refName: worktreeInput.refName.trim(),
@@ -2145,7 +2277,9 @@ export default function SourceControlActions({
       path: worktreeInput.path.trim() || null,
       precondition: sourceScopePrecondition(worktreeInput.reviewedSourceScope),
     };
-    setWorktreeInput(null);
+    setWorktreeInput((current) =>
+      current?.approvalToken === worktreeInput.approvalToken ? null : current,
+    );
     // The completed form is the Worktree confirmation surface. The shared
     // workspace adapter deliberately refuses branch mutations unless that
     // acknowledgement is carried through to its two-phase runner.
@@ -2174,15 +2308,14 @@ export default function SourceControlActions({
     });
   };
 
-  const executeWorkflowInput = async () => {
-    if (!sourceControlWorkspaceSupported || !workflowInput || !activeEnvironmentId || !gitCwd)
-      return;
+  const executeWorkflowInput = async (workflowInput: WorkflowInputState) => {
+    if (!sourceControlWorkspaceSupported || !activeEnvironmentId || !gitCwd) return;
     if (
       !isWorkflowInputCurrent ||
       workflowInput.reviewedSourceScope.environmentId !== activeEnvironmentId ||
       workflowInput.reviewedSourceScope.cwd !== gitCwd
     ) {
-      setWorkflowInput(null);
+      clearWorkflowInput(workflowInput.approvalToken);
       return;
     }
     const paths = workflowInput.paths
@@ -2201,6 +2334,7 @@ export default function SourceControlActions({
       });
       return;
     }
+    if (!confirmationLease.consume(workflowInput.approvalToken)) return;
     const action = workflowInput.action === "checkout" ? "branch" : workflowInput.action;
     const operationInput: Partial<GitActionRequest> =
       action === "branch"
@@ -2286,7 +2420,9 @@ export default function SourceControlActions({
       ...operationInput,
       ...(precondition !== undefined ? { precondition } : {}),
     };
-    setWorkflowInput(null);
+    setWorkflowInput((current) =>
+      current?.approvalToken === workflowInput.approvalToken ? null : current,
+    );
     const result = await runWorkflowAction({
       environmentId: workflowInput.reviewedSourceScope.environmentId,
       input,
@@ -2406,6 +2542,7 @@ export default function SourceControlActions({
     )
       return;
     setPendingHeaderAction({
+      approvalToken: confirmationLease.issue(),
       action: workspaceProgress.continuation.action,
       continuation: workspaceProgress.continuation,
       scope: currentHeaderActionScope,
@@ -2438,7 +2575,11 @@ export default function SourceControlActions({
                   size="xs"
                   onClick={() => {
                     if (activeEnvironmentId && gitCwd) {
-                      setInitConfirmationScope({ environmentId: activeEnvironmentId, cwd: gitCwd });
+                      setInitConfirmationScope({
+                        approvalToken: confirmationLease.issue(),
+                        environmentId: activeEnvironmentId,
+                        cwd: gitCwd,
+                      });
                     }
                   }}
                 >
@@ -2693,7 +2834,9 @@ export default function SourceControlActions({
       <Dialog
         open={initConfirmationScope !== null}
         onOpenChange={(open) => {
-          if (!open) setInitConfirmationScope(null);
+          if (!open && initConfirmationScope) {
+            clearInitConfirmation(initConfirmationScope.approvalToken);
+          }
         }}
       >
         <DialogPopup>
@@ -2706,14 +2849,23 @@ export default function SourceControlActions({
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setInitConfirmationScope(null)}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                if (initConfirmationScope)
+                  clearInitConfirmation(initConfirmationScope.approvalToken);
+              }}
+            >
               Cancel
             </Button>
             <Button
               onClick={() => {
                 if (!initConfirmationScope) return;
                 const scope = initConfirmationScope;
-                setInitConfirmationScope(null);
+                if (!confirmationLease.consume(scope.approvalToken)) return;
+                setInitConfirmationScope((current) =>
+                  current?.approvalToken === scope.approvalToken ? null : current,
+                );
                 void initializeRepository({
                   environmentId: scope.environmentId,
                   input: { cwd: scope.cwd, confirmation: "approved" },
@@ -2929,7 +3081,7 @@ export default function SourceControlActions({
       <Dialog
         open={workflowInput !== null && isWorkflowInputCurrent}
         onOpenChange={(open) => {
-          if (!open) setWorkflowInput(null);
+          if (!open && workflowInput) clearWorkflowInput(workflowInput.approvalToken);
         }}
       >
         <DialogPopup>
@@ -2953,7 +3105,7 @@ export default function SourceControlActions({
                 placeholder="Ref, branch, tag, or stash name"
                 value={workflowInput?.refName ?? ""}
                 onChange={(event) =>
-                  setWorkflowInput((current) =>
+                  updateWorkflowInput((current) =>
                     current ? { ...current, refName: event.target.value } : current,
                   )
                 }
@@ -2965,7 +3117,7 @@ export default function SourceControlActions({
                 placeholder="Create from source ref (optional)"
                 value={workflowInput.sourceRef}
                 onChange={(event) =>
-                  setWorkflowInput((current) =>
+                  updateWorkflowInput((current) =>
                     current ? { ...current, sourceRef: event.target.value } : current,
                   )
                 }
@@ -2977,7 +3129,7 @@ export default function SourceControlActions({
                 placeholder="Existing branch name"
                 value={workflowInput.oldRefName}
                 onChange={(event) =>
-                  setWorkflowInput((current) =>
+                  updateWorkflowInput((current) =>
                     current ? { ...current, oldRefName: event.target.value } : current,
                   )
                 }
@@ -2989,7 +3141,7 @@ export default function SourceControlActions({
                 placeholder="Target or source ref"
                 value={workflowInput?.targetRef ?? ""}
                 onChange={(event) =>
-                  setWorkflowInput((current) =>
+                  updateWorkflowInput((current) =>
                     current ? { ...current, targetRef: event.target.value } : current,
                   )
                 }
@@ -3001,7 +3153,7 @@ export default function SourceControlActions({
                 placeholder="New name (rename/create)"
                 value={workflowInput?.newRefName ?? ""}
                 onChange={(event) =>
-                  setWorkflowInput((current) =>
+                  updateWorkflowInput((current) =>
                     current ? { ...current, newRefName: event.target.value } : current,
                   )
                 }
@@ -3013,7 +3165,7 @@ export default function SourceControlActions({
                 placeholder="Remote name"
                 value={workflowInput?.remoteName ?? ""}
                 onChange={(event) =>
-                  setWorkflowInput((current) =>
+                  updateWorkflowInput((current) =>
                     current ? { ...current, remoteName: event.target.value } : current,
                   )
                 }
@@ -3025,7 +3177,7 @@ export default function SourceControlActions({
                 placeholder="Message (stash/tag/amend)"
                 value={workflowInput?.message ?? ""}
                 onChange={(event) =>
-                  setWorkflowInput((current) =>
+                  updateWorkflowInput((current) =>
                     current ? { ...current, message: event.target.value } : current,
                   )
                 }
@@ -3037,7 +3189,7 @@ export default function SourceControlActions({
                 placeholder="Paths, one per line (discard/stash)"
                 value={workflowInput?.paths ?? ""}
                 onChange={(event) =>
-                  setWorkflowInput((current) =>
+                  updateWorkflowInput((current) =>
                     current ? { ...current, paths: event.target.value } : current,
                   )
                 }
@@ -3051,7 +3203,7 @@ export default function SourceControlActions({
                   className="h-8 w-full rounded border border-border bg-background px-2"
                   value={workflowInput?.strategy ?? "merge"}
                   onChange={(event) =>
-                    setWorkflowInput((current) =>
+                    updateWorkflowInput((current) =>
                       current
                         ? {
                             ...current,
@@ -3078,12 +3230,19 @@ export default function SourceControlActions({
             ) : null}
           </DialogPanel>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setWorkflowInput(null)}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                if (workflowInput) clearWorkflowInput(workflowInput.approvalToken);
+              }}
+            >
               Cancel
             </Button>
             <Button
               variant={destructiveWorkflow ? "destructive" : undefined}
-              onClick={() => void executeWorkflowInput()}
+              onClick={() => {
+                if (workflowInput) void executeWorkflowInput(workflowInput);
+              }}
             >
               {destructiveWorkflow?.confirmLabel ??
                 (workflowInput?.action === "reset" && workflowInput.strategy === "hard"
@@ -3097,7 +3256,9 @@ export default function SourceControlActions({
       <Dialog
         open={pendingPullRequestAction !== null && isPendingPullRequestActionCurrent}
         onOpenChange={(open) => {
-          if (!open) revokePendingPullRequestAction();
+          if (!open && pendingPullRequestAction) {
+            revokePendingPullRequestAction(pendingPullRequestAction.approvalToken);
+          }
         }}
       >
         <DialogPopup>
@@ -3115,12 +3276,22 @@ export default function SourceControlActions({
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={revokePendingPullRequestAction}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                if (pendingPullRequestAction) {
+                  revokePendingPullRequestAction(pendingPullRequestAction.approvalToken);
+                }
+              }}
+            >
               Cancel
             </Button>
             <Button
               disabled={!isPendingPullRequestActionCurrent}
-              onClick={() => void executePullRequestAction()}
+              onClick={() => {
+                if (pendingPullRequestAction)
+                  void executePullRequestAction(pendingPullRequestAction);
+              }}
             >
               Confirm
             </Button>
@@ -3155,7 +3326,7 @@ export default function SourceControlActions({
       <Dialog
         open={worktreeInput !== null && isWorktreeInputCurrent}
         onOpenChange={(open) => {
-          if (!open) setWorktreeInput(null);
+          if (!open && worktreeInput) clearWorktreeInput(worktreeInput.approvalToken);
         }}
       >
         <DialogPopup>
@@ -3179,7 +3350,7 @@ export default function SourceControlActions({
               placeholder="Base ref"
               value={worktreeInput?.refName ?? ""}
               onChange={(event) =>
-                setWorktreeInput((current) =>
+                updateWorktreeInput((current) =>
                   current ? { ...current, refName: event.target.value } : current,
                 )
               }
@@ -3189,7 +3360,7 @@ export default function SourceControlActions({
               placeholder="New branch name"
               value={worktreeInput?.newRefName ?? ""}
               onChange={(event) =>
-                setWorktreeInput((current) =>
+                updateWorktreeInput((current) =>
                   current ? { ...current, newRefName: event.target.value } : current,
                 )
               }
@@ -3199,7 +3370,7 @@ export default function SourceControlActions({
               placeholder="Merge-base ref (optional)"
               value={worktreeInput?.baseRefName ?? ""}
               onChange={(event) =>
-                setWorktreeInput((current) =>
+                updateWorktreeInput((current) =>
                   current ? { ...current, baseRefName: event.target.value } : current,
                 )
               }
@@ -3209,17 +3380,28 @@ export default function SourceControlActions({
               placeholder="Path (optional)"
               value={worktreeInput?.path ?? ""}
               onChange={(event) =>
-                setWorktreeInput((current) =>
+                updateWorktreeInput((current) =>
                   current ? { ...current, path: event.target.value } : current,
                 )
               }
             />
           </DialogPanel>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setWorktreeInput(null)}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                if (worktreeInput) clearWorktreeInput(worktreeInput.approvalToken);
+              }}
+            >
               Cancel
             </Button>
-            <Button onClick={() => void executeWorktreeInput()}>Create worktree</Button>
+            <Button
+              onClick={() => {
+                if (worktreeInput) void executeWorktreeInput(worktreeInput);
+              }}
+            >
+              Create worktree
+            </Button>
           </DialogFooter>
         </DialogPopup>
       </Dialog>
@@ -3231,7 +3413,9 @@ export default function SourceControlActions({
           headerActionScopeKey(pendingHeaderAction.scope) === currentHeaderActionScopeKey
         }
         onOpenChange={(open) => {
-          if (!open) setPendingHeaderAction(null);
+          if (!open && pendingHeaderAction) {
+            clearPendingHeaderAction(pendingHeaderAction.approvalToken);
+          }
         }}
       >
         <DialogPopup>
@@ -3259,10 +3443,22 @@ export default function SourceControlActions({
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setPendingHeaderAction(null)}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                if (pendingHeaderAction)
+                  clearPendingHeaderAction(pendingHeaderAction.approvalToken);
+              }}
+            >
               Cancel
             </Button>
-            <Button onClick={() => void executePendingHeaderAction()}>Continue</Button>
+            <Button
+              onClick={() => {
+                if (pendingHeaderAction) void executePendingHeaderAction(pendingHeaderAction);
+              }}
+            >
+              Continue
+            </Button>
           </DialogFooter>
         </DialogPopup>
       </Dialog>
@@ -3270,7 +3466,9 @@ export default function SourceControlActions({
       <Dialog
         open={isPendingGitConfirmationCurrent}
         onOpenChange={(open) => {
-          if (!open) setPendingGitConfirmation(null);
+          if (!open && pendingGitConfirmation) {
+            clearPendingGitConfirmation(pendingGitConfirmation.approvalToken);
+          }
         }}
       >
         <DialogPopup>
@@ -3287,10 +3485,23 @@ export default function SourceControlActions({
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setPendingGitConfirmation(null)}>
+            <Button
+              variant="outline"
+              onClick={() => {
+                if (pendingGitConfirmation) {
+                  clearPendingGitConfirmation(pendingGitConfirmation.approvalToken);
+                }
+              }}
+            >
               Cancel
             </Button>
-            <Button onClick={continuePendingGitConfirmation}>Continue</Button>
+            <Button
+              onClick={() => {
+                if (pendingGitConfirmation) continuePendingGitConfirmation(pendingGitConfirmation);
+              }}
+            >
+              Continue
+            </Button>
           </DialogFooter>
         </DialogPopup>
       </Dialog>
@@ -3298,6 +3509,9 @@ export default function SourceControlActions({
       <PublishRepositoryDialog
         open={isPublishDialogOpen && isPublishRepositoryScopeCurrent}
         onOpenChange={setPublishRepositoryDialogOpen}
+        approvalToken={publishRepositoryScope?.approvalToken ?? null}
+        onConsumeApproval={confirmationLease.consume}
+        onRevokeApproval={confirmationLease.revoke}
         environmentId={publishRepositoryScope?.environmentId ?? null}
         threadRef={publishRepositoryScope?.threadRef ?? null}
         gitCwd={publishRepositoryScope?.cwd ?? ""}
@@ -3312,8 +3526,8 @@ export default function SourceControlActions({
       <Dialog
         open={pendingDefaultBranchAction !== null}
         onOpenChange={(open) => {
-          if (!open) {
-            setPendingDefaultBranchAction(null);
+          if (!open && pendingDefaultBranchAction) {
+            clearPendingDefaultBranchAction(pendingDefaultBranchAction.approvalToken);
           }
         }}
       >
@@ -3329,7 +3543,11 @@ export default function SourceControlActions({
               className="w-full sm:mr-auto sm:w-auto"
               variant="outline"
               size="sm"
-              onClick={() => setPendingDefaultBranchAction(null)}
+              onClick={() => {
+                if (pendingDefaultBranchAction) {
+                  clearPendingDefaultBranchAction(pendingDefaultBranchAction.approvalToken);
+                }
+              }}
             >
               Abort
             </Button>
@@ -3337,14 +3555,22 @@ export default function SourceControlActions({
               className="min-h-8 w-full max-w-full whitespace-normal py-1.5 leading-snug sm:min-h-7 sm:w-auto"
               variant="outline"
               size="sm"
-              onClick={continuePendingDefaultBranchAction}
+              onClick={() => {
+                if (pendingDefaultBranchAction) {
+                  continuePendingDefaultBranchAction(pendingDefaultBranchAction);
+                }
+              }}
             >
               {pendingDefaultBranchActionCopy?.continueLabel ?? "Continue"}
             </Button>
             <Button
               className="min-h-8 w-full max-w-full whitespace-normal py-1.5 leading-snug sm:min-h-7 sm:w-auto"
               size="sm"
-              onClick={checkoutFeatureBranchAndContinuePendingAction}
+              onClick={() => {
+                if (pendingDefaultBranchAction) {
+                  checkoutFeatureBranchAndContinuePendingAction(pendingDefaultBranchAction);
+                }
+              }}
             >
               Check out feature branch & continue
             </Button>
