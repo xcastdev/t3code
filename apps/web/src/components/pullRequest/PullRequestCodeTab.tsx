@@ -78,6 +78,7 @@ import { Toggle, ToggleGroup } from "../ui/toggle-group";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { PendingReviewCommentCard, ReviewThreadCard } from "./PullRequestReviewAnnotation";
 import { PullRequestReviewBar } from "./PullRequestReviewBar";
+import { usePullRequestMutationApproval } from "./pullRequestMutationApproval";
 import {
   isFileDiffCollapsed,
   isLineInFileDiff,
@@ -406,6 +407,7 @@ function PullRequestCodeTab({
     reportFailure: false,
   });
   const getDiffFileContents = useAtomCommand(pullRequestEnvironment.diffFileContents);
+  const approval = usePullRequestMutationApproval();
 
   // What is offered is the intersection of two different questions: what this host can do at
   // all, and what this account may do on this repository. Either one saying no means a control
@@ -921,19 +923,30 @@ function PullRequestCodeTab({
   );
 
   const runThreadCommand = useCallback(
-    async (label: string, run: () => Promise<{ readonly _tag: string }>): Promise<boolean> => {
-      if (threadPending) return false;
-      setThreadPending(true);
-      const result = await run();
-      setThreadPending(false);
-      if (result._tag === "Failure") {
-        toastManager.add({ type: "error", title: label });
-        return false;
-      }
-      onRefresh();
-      return true;
+    async (
+      label: string,
+      run: (scope: {
+        readonly environmentId: EnvironmentId;
+        readonly reference: PullRequestRef;
+      }) => Promise<{ readonly _tag: string }>,
+    ): Promise<boolean> => {
+      if (threadPending || approval === null || !approval.available) return false;
+      let failed = false;
+      const completed = await approval.request({
+        description: `${label.replace(/ could not be .*/, "")} on #${reference.number}.`,
+        execute: async (scope) => {
+          setThreadPending(true);
+          const result = await run(scope);
+          setThreadPending(false);
+          failed = result._tag === "Failure";
+          return !failed;
+        },
+      });
+      if (!completed && failed) toastManager.add({ type: "error", title: label });
+      if (completed) onRefresh();
+      return completed;
     },
-    [onRefresh, threadPending],
+    [approval, onRefresh, reference.number, threadPending],
   );
 
   // A conversation is the same card wired to the same commands whether it sits on its line or
@@ -971,10 +984,10 @@ function PullRequestCodeTab({
           return result.value;
         }}
         onReply={(body) =>
-          runThreadCommand("Reply could not be posted", () =>
+          runThreadCommand("Reply could not be posted", (scope) =>
             replyToThread({
-              environmentId,
-              input: { ...reference, threadId: thread.id, body },
+              environmentId: scope.environmentId,
+              input: { ...scope.reference, threadId: thread.id, body },
             }),
           )
         }
@@ -983,18 +996,18 @@ function PullRequestCodeTab({
           canEditPullRequestComment(detail, { author: comment.author, kind: "review-comment" })
         }
         onEditComment={(commentId, body) =>
-          runThreadCommand("The comment could not be saved", () =>
+          runThreadCommand("The comment could not be saved", (scope) =>
             updateComment({
-              environmentId,
-              input: { ...reference, commentId, kind: "review-comment", body },
+              environmentId: scope.environmentId,
+              input: { ...scope.reference, commentId, kind: "review-comment", body },
             }),
           )
         }
         onToggleResolved={() =>
-          void runThreadCommand("The conversation could not be updated", () =>
+          void runThreadCommand("The conversation could not be updated", (scope) =>
             setThreadResolution({
-              environmentId,
-              input: { ...reference, threadId: thread.id, resolved: !thread.isResolved },
+              environmentId: scope.environmentId,
+              input: { ...scope.reference, threadId: thread.id, resolved: !thread.isResolved },
             }),
           )
         }

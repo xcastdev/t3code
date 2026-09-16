@@ -16,12 +16,11 @@ import { useMemo, useState } from "react";
 import { pullRequestEnvironment } from "~/state/pullRequests";
 import { useEnvironmentQuery } from "~/state/query";
 import { useAtomCommand } from "~/state/use-atom-command";
-import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 
 import { toastManager } from "../ui/toast";
 import { PullRequestCandidatePicker } from "./PullRequestCandidatePicker";
 import { PullRequestActorLabel } from "./pullRequestPresentation";
-import { readableFailure } from "./pullRequestDetail.logic";
+import { usePullRequestMutationApproval } from "./pullRequestMutationApproval";
 
 /** Long lists are common — an organisation repository lists everyone — so what arrived can be
  * narrowed here. It narrows only what arrived: the host is asked once, when the menu opens. */
@@ -56,6 +55,7 @@ export function PullRequestReviewerPicker({
   const requestReviewers = useAtomCommand(pullRequestEnvironment.requestReviewers, {
     reportFailure: false,
   });
+  const approval = usePullRequestMutationApproval();
 
   const candidates = useMemo(
     () => (candidatesQuery.data?.candidates ?? []).filter((entry) => matches(entry, query)),
@@ -64,29 +64,37 @@ export function PullRequestReviewerPicker({
 
   const toggle = async (candidate: PullRequestReviewerCandidate) => {
     if (pending !== null) return;
+    if (approval === null || !approval.available) return;
     setPending(candidate.id);
-    const result = await requestReviewers({
-      environmentId,
-      input: {
-        ...reference,
-        reviewers: [{ id: candidate.id, kind: candidate.kind }],
-        requested: !candidate.isRequested,
+    let failure = false;
+    const completed = await approval.request({
+      description: `${candidate.isRequested ? "Takes back" : "Requests"} review from ${candidate.login} on #${reference.number}.`,
+      execute: async (scope) => {
+        const result = await requestReviewers({
+          environmentId: scope.environmentId,
+          input: {
+            ...scope.reference,
+            reviewers: [{ id: candidate.id, kind: candidate.kind }],
+            requested: !candidate.isRequested,
+          },
+        });
+        failure = result._tag === "Failure";
+        return !failure;
       },
     });
     setPending(null);
-    if (result._tag === "Failure") {
+    if (failure) {
       toastManager.add({
         type: "error",
         title: candidate.isRequested
           ? `Could not take back the review request to ${candidate.login}`
           : `Could not ask ${candidate.login} for a review`,
-        description: readableFailure(
-          squashAtomCommandFailure(result),
+        description:
           "The host refused it. Check that you have write access on this repository, and that they still have access to it.",
-        ),
       });
       return;
     }
+    if (!completed) return;
     toastManager.add({
       type: "success",
       title: candidate.isRequested

@@ -5,31 +5,21 @@ import type {
   PullRequestStack,
   PullRequestMergeMethod,
 } from "@t3tools/contracts";
-import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { GitMergeIcon, LayersIcon, RefreshCwIcon, TriangleAlertIcon } from "lucide-react";
 import { useState } from "react";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { pullRequestEnvironment } from "~/state/pullRequests";
 import { Button } from "../ui/button";
 import { Menu, MenuPopup, MenuTrigger, MenuItem, MenuGroup, MenuSeparator } from "../ui/menu";
-import {
-  Dialog,
-  DialogPopup,
-  DialogTitle,
-  DialogDescription,
-  DialogHeader,
-  DialogPanel,
-  DialogFooter,
-} from "../ui/dialog";
 import { toastManager } from "../ui/toast";
 import { PullRequestStackLayers } from "./PullRequestStackLayers";
 import { PullRequestStackHeader } from "./PullRequestStackHeader";
-import { PullRequestStackLayerContent } from "./PullRequestStackLayerContent";
+import { usePullRequestMutationApproval } from "./pullRequestMutationApproval";
 
 export function PullRequestStackMenu({
   stack,
   reference,
-  environmentId,
+  environmentId: _environmentId,
   canMerge,
   canRebase,
   mergeMethod,
@@ -50,9 +40,9 @@ export function PullRequestStackMenu({
   onActed: () => void;
 }) {
   const [open, setOpen] = useState(false);
-  const [confirmation, setConfirmation] = useState<"merge" | "update-branch" | null>(null);
   const [pending, setPending] = useState(false);
   const runAction = useAtomCommand(pullRequestEnvironment.runAction, { reportFailure: false });
+  const approval = usePullRequestMutationApproval();
   const top = stack.layers.at(-1);
   const unmerged = stack.layers.filter((layer) => layer.state !== "merged");
   const hasClosed = unmerged.some((layer) => layer.state !== "open");
@@ -72,40 +62,52 @@ export function PullRequestStackMenu({
     mergeLayers.length === 0 ||
     mergeLayers.some((layer) => layer.isDraft);
   const rebaseDisabled = pending || hasUnknownHead || hasClosed || unmerged.length === 0;
-  const run = async () => {
+  const run = async (action: "merge" | "update-branch") => {
     if (
       pending ||
-      !confirmation ||
-      (confirmation === "merge" ? !canMerge || mergeDisabled : !canRebase || rebaseDisabled)
+      approval === null ||
+      !approval.available ||
+      (action === "merge" ? !canMerge || mergeDisabled : !canRebase || rebaseDisabled)
     )
       return;
-    const action = confirmation;
     const target = action === "merge" ? selectedLayer : top;
     if (!target?.headSha) return;
     const actionHeads = (action === "merge" ? mergeLayers : unmerged).flatMap((layer) =>
       layer.headSha ? [{ number: layer.number, headSha: layer.headSha }] : [],
     );
-    setPending(true);
-    const result = await runAction({
-      environmentId,
-      input: {
-        ...reference,
-        number: target.number,
-        stackNumber: stack.number,
-        expectedStackHeads: actionHeads,
-        action,
-        ...(action === "merge" ? { mergeMethod } : { updateMethod: "rebase" }),
+    let failure = false;
+    const completed = await approval.request({
+      description:
+        action === "merge"
+          ? `Merges stack #${stack.number} through #${target.number} using ${mergeMethod}.`
+          : `Rebases stack #${stack.number} through #${target.number}; this rewrites branch history.`,
+      execute: async (scope) => {
+        setPending(true);
+        const result = await runAction({
+          environmentId: scope.environmentId,
+          input: {
+            ...scope.reference,
+            number: target.number,
+            stackNumber: stack.number,
+            expectedStackHeads: actionHeads,
+            action,
+            ...(action === "merge" ? { mergeMethod } : { updateMethod: "rebase" }),
+          },
+        });
+        setPending(false);
+        failure = result._tag === "Failure";
+        return !failure;
       },
     });
-    setPending(false);
-    setConfirmation(null);
-    onActed();
-    if (result._tag === "Failure") {
+    if (completed) onActed();
+    if (failure) {
       toastManager.add({
         type: "error",
         title: "Stack operation did not complete",
-        description: String(squashAtomCommandFailure(result)),
+        description: "The host refused the captured stack operation.",
       });
+    } else if (!completed) {
+      return;
     } else {
       toastManager.add({
         type: "success",
@@ -117,7 +119,6 @@ export function PullRequestStackMenu({
       });
     }
   };
-  const confirmationLayers = confirmation === "merge" ? mergeLayers : unmerged;
   return (
     <>
       <Menu open={open} onOpenChange={setOpen}>
@@ -165,16 +166,13 @@ export function PullRequestStackMenu({
             <>
               <MenuSeparator />
               {canMerge ? (
-                <MenuItem disabled={mergeDisabled} onClick={() => setConfirmation("merge")}>
+                <MenuItem disabled={mergeDisabled} onClick={() => void run("merge")}>
                   <GitMergeIcon aria-hidden />
                   Merge stack ({mergeLayers.length})
                 </MenuItem>
               ) : null}
               {canRebase ? (
-                <MenuItem
-                  disabled={rebaseDisabled}
-                  onClick={() => setConfirmation("update-branch")}
-                >
+                <MenuItem disabled={rebaseDisabled} onClick={() => void run("update-branch")}>
                   <RefreshCwIcon aria-hidden />
                   Rebase stack
                 </MenuItem>
@@ -197,7 +195,7 @@ export function PullRequestStackMenu({
                   variant="default"
                   size="xs"
                   disabled={mergeDisabled}
-                  onClick={() => setConfirmation("merge")}
+                  onClick={() => void run("merge")}
                 >
                   <GitMergeIcon aria-hidden className="size-3.5" />
                   Merge stack
@@ -211,47 +209,6 @@ export function PullRequestStackMenu({
           </TooltipPopup>
         </Tooltip>
       ) : null}
-      <Dialog
-        open={confirmation !== null}
-        onOpenChange={(value) => {
-          if (!value && !pending) setConfirmation(null);
-        }}
-      >
-        <DialogPopup className="max-w-md" showCloseButton={!pending}>
-          <DialogHeader>
-            <DialogTitle>
-              {confirmation === "merge"
-                ? `Merge ${mergeLayers.length} pull requests?`
-                : `Rebase ${unmerged.length} pull requests?`}
-            </DialogTitle>
-            <DialogDescription>
-              {confirmation === "merge"
-                ? `Merge #${reference.number} and its unmerged layers below into ${stack.base} using ${mergeMethod}. GitHub checks their rules before merging or queueing them and rebases the remaining stack after merging.`
-                : `Rebase the remote branches from bottom to top onto ${stack.base}. This rewrites branch history and may restart checks. If a layer fails, earlier updates remain.`}
-            </DialogDescription>
-          </DialogHeader>
-          <DialogPanel>
-            <ul className="max-h-48 space-y-1 overflow-y-auto text-sm">
-              {confirmationLayers.map((layer) => (
-                <li
-                  key={layer.number}
-                  className="flex items-center gap-2 rounded-md bg-muted/50 px-3 py-2"
-                >
-                  <PullRequestStackLayerContent layer={layer} compact />
-                </li>
-              ))}
-            </ul>
-          </DialogPanel>
-          <DialogFooter>
-            <Button variant="outline" disabled={pending} onClick={() => setConfirmation(null)}>
-              Cancel
-            </Button>
-            <Button disabled={pending} onClick={() => void run()}>
-              {pending ? "Working…" : confirmation === "merge" ? "Merge stack" : "Rebase stack"}
-            </Button>
-          </DialogFooter>
-        </DialogPopup>
-      </Dialog>
     </>
   );
 }

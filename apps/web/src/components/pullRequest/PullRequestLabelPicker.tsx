@@ -12,12 +12,11 @@ import { useMemo, useState } from "react";
 import { pullRequestEnvironment } from "~/state/pullRequests";
 import { useEnvironmentQuery } from "~/state/query";
 import { useAtomCommand } from "~/state/use-atom-command";
-import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 
 import { toastManager } from "../ui/toast";
 import { PullRequestCandidatePicker } from "./PullRequestCandidatePicker";
-import { readableFailure } from "./pullRequestDetail.logic";
 import { pullRequestLabelColor } from "./pullRequestList.logic";
+import { usePullRequestMutationApproval } from "./pullRequestMutationApproval";
 
 /** Narrows only what arrived: the host is asked once, when the menu opens. */
 function matches(candidate: PullRequestLabelCandidate, query: string): boolean {
@@ -49,6 +48,7 @@ export function PullRequestLabelPicker({
     open ? pullRequestEnvironment.labelCandidates({ environmentId, input: reference }) : null,
   );
   const setLabels = useAtomCommand(pullRequestEnvironment.setLabels, { reportFailure: false });
+  const approval = usePullRequestMutationApproval();
 
   const candidates = useMemo(
     () => (candidatesQuery.data?.candidates ?? []).filter((entry) => matches(entry, query)),
@@ -57,22 +57,32 @@ export function PullRequestLabelPicker({
 
   const toggle = async (candidate: PullRequestLabelCandidate) => {
     if (pending !== null) return;
+    if (approval === null || !approval.available) return;
     setPending(candidate.name);
-    const result = await setLabels({
-      environmentId,
-      input: { ...reference, labels: [candidate.name], applied: !candidate.isApplied },
+    let failure = false;
+    await approval.request({
+      description: `${candidate.isApplied ? "Removes" : "Applies"} label “${candidate.name}” on #${reference.number}.`,
+      execute: async (scope) => {
+        const result = await setLabels({
+          environmentId: scope.environmentId,
+          input: {
+            ...scope.reference,
+            labels: [candidate.name],
+            applied: !candidate.isApplied,
+          },
+        });
+        failure = result._tag === "Failure";
+        return !failure;
+      },
     });
     setPending(null);
-    if (result._tag === "Failure") {
+    if (failure) {
       toastManager.add({
         type: "error",
         title: candidate.isApplied
           ? `Could not take ${candidate.name} off`
           : `Could not put ${candidate.name} on`,
-        description: readableFailure(
-          squashAtomCommandFailure(result),
-          "The host refused it. Check that you have triage access on this repository.",
-        ),
+        description: "The host refused it. Check that you have triage access on this repository.",
       });
       return;
     }

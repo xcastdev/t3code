@@ -8931,6 +8931,9 @@ export default function ChatView(props: ChatViewProps) {
           ...(renderedRightPanelSurface.host ? { host: renderedRightPanelSurface.host } : {}),
           repository: renderedRightPanelSurface.repository,
           number: renderedRightPanelSurface.number,
+          ...((gitStatusCwd ?? activeProject?.workspaceRoot)
+            ? { repositoryRoot: gitStatusCwd ?? activeProject?.workspaceRoot }
+            : {}),
         }}
         context={
           isThreadOwnPullRequest(

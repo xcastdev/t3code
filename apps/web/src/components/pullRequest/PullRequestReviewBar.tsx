@@ -19,6 +19,7 @@ import {
   usePendingReviewComments,
   usePullRequestReviewStore,
 } from "./pullRequestReviewStore";
+import { usePullRequestMutationApproval } from "./pullRequestMutationApproval";
 
 const VERDICTS: ReadonlyArray<{
   readonly value: PullRequestReviewVerdict;
@@ -47,7 +48,7 @@ const VERDICTS: ReadonlyArray<{
 ];
 
 export function PullRequestReviewBar({
-  environmentId,
+  environmentId: _environmentId,
   reference,
   verdicts,
   requestChangesSummaryRequired,
@@ -73,26 +74,36 @@ export function PullRequestReviewBar({
   const submitReview = useAtomCommand(pullRequestEnvironment.submitReview, {
     reportFailure: false,
   });
+  const approval = usePullRequestMutationApproval();
 
   const offered = VERDICTS.filter((verdict) => verdicts.includes(verdict.value));
   if (offered.length === 0) return null;
 
   const submit = async (verdict: (typeof VERDICTS)[number]) => {
     if (pending) return;
+    if (approval === null || !approval.available) return;
     const submittedBody = body;
     const submittedComments = comments;
     setPending(true);
-    const result = await submitReview({
-      environmentId,
-      input: {
-        ...reference,
-        verdict: verdict.value,
-        body: submittedBody,
-        comments: submittedComments,
+    let failure = false;
+    const completed = await approval.request({
+      description: `Submits a ${verdict.label.toLowerCase()} review on #${reference.number}.`,
+      execute: async (scope) => {
+        const result = await submitReview({
+          environmentId: scope.environmentId,
+          input: {
+            ...scope.reference,
+            verdict: verdict.value,
+            body: submittedBody,
+            comments: submittedComments,
+          },
+        });
+        failure = result._tag === "Failure";
+        return !failure;
       },
     });
     setPending(false);
-    if (result._tag === "Failure") {
+    if (!completed || failure) {
       // The draft is kept: whatever went wrong, retyping the review is not the answer.
       toastManager.add({ type: "error", title: "The review could not be submitted" });
       return;

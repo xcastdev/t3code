@@ -42,6 +42,7 @@ import { canEditPullRequestComment } from "./pullRequestEditing.logic";
 import { PullRequestMarkdown } from "./PullRequestMarkdown";
 import { PullRequestMarkdownEditor } from "./PullRequestMarkdownEditor";
 import { PullRequestReactionBar } from "./PullRequestReactions";
+import { usePullRequestMutationApproval } from "./pullRequestMutationApproval";
 import {
   PullRequestActorAvatar,
   PullRequestDiffStat,
@@ -197,21 +198,34 @@ function ConversationCard({
   const updateComment = useAtomCommand(pullRequestEnvironment.updateComment, {
     reportFailure: false,
   });
+  const approval = usePullRequestMutationApproval();
 
   const save = async (body: string) => {
     // A review's own summary is not a kind any host rewrites, which is why `editable` is never
     // one; the check is here because the comment's own type still allows it.
-    if (editable === null || saving || editable.kind === "review") return;
+    if (editable === null || saving) return;
+    const kind = editable.kind;
+    if (kind === "review") return;
+    if (approval === null || !approval.available) return;
     setSaving(true);
-    const result = await updateComment({
-      environmentId: reactions.environmentId,
-      input: { ...reactions.reference, commentId: editable.id, kind: editable.kind, body },
+    let failure = false;
+    const completed = await approval.request({
+      description: `Edits a comment on #${reactions.reference.number}.`,
+      execute: async (scope) => {
+        const result = await updateComment({
+          environmentId: scope.environmentId,
+          input: { ...scope.reference, commentId: editable.id, kind, body },
+        });
+        failure = result._tag === "Failure";
+        return !failure;
+      },
     });
     setSaving(false);
-    if (result._tag === "Failure") {
+    if (failure) {
       toastManager.add({ type: "error", title: "Could not save the comment" });
       return;
     }
+    if (!completed) return;
     setEditing(false);
     reactions.onRefresh();
   };

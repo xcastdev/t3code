@@ -21,6 +21,7 @@ import {
   pullRequestReactionName,
   pullRequestReactionTooltip,
 } from "./pullRequestReactions.logic";
+import { usePullRequestMutationApproval } from "./pullRequestMutationApproval";
 
 const PILL_CLASS =
   "inline-flex h-6 shrink-0 items-center gap-1 rounded-full border px-2 text-xs outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring";
@@ -47,7 +48,7 @@ export function PullRequestReactionBar({
   reactions,
   canReact,
   subjectId,
-  environmentId,
+  environmentId: _environmentId,
   reference,
   onRefresh,
   className,
@@ -67,23 +68,33 @@ export function PullRequestReactionBar({
     readonly values: ReadonlyMap<PullRequestReactionContent, boolean>;
   }>({ signature: "", values: EMPTY_PENDING });
   const setReaction = useAtomCommand(pullRequestEnvironment.setReaction, { reportFailure: false });
+  const approval = usePullRequestMutationApproval();
 
   const signature = reactionsSignature(reactions);
   const values = pending.signature === signature ? pending.values : EMPTY_PENDING;
   const shown = applyPendingPullRequestReactions(reactions, values);
 
   const toggle = async (content: PullRequestReactionContent, reacted: boolean) => {
+    if (approval === null || !approval.available) return;
     setPending({ signature, values: new Map([...values, [content, reacted]]) });
-    const result = await setReaction({
-      environmentId,
-      input: {
-        ...reference,
-        ...(subjectId === undefined ? {} : { subjectId }),
-        content,
-        reacted,
+    let failure = false;
+    const completed = await approval.request({
+      description: `${reacted ? "Adds" : "Removes"} a reaction on #${reference.number}.`,
+      execute: async (scope) => {
+        const result = await setReaction({
+          environmentId: scope.environmentId,
+          input: {
+            ...scope.reference,
+            ...(subjectId === undefined ? {} : { subjectId }),
+            content,
+            reacted,
+          },
+        });
+        failure = result._tag === "Failure";
+        return !failure;
       },
     });
-    if (result._tag === "Failure") {
+    if (!completed || failure) {
       setPending((current) => {
         const next = new Map(current.values);
         next.delete(content);

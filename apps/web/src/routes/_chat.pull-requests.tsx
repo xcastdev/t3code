@@ -2046,6 +2046,9 @@ function PullRequestsRouteView() {
                   ...(renderedPullRequestSurface.host
                     ? { host: renderedPullRequestSurface.host }
                     : {}),
+                  ...(selectedProject?.workspaceRoot
+                    ? { repositoryRoot: selectedProject.workspaceRoot }
+                    : {}),
                 }}
                 listEntry={
                   listedPullRequestsBySurface.get(

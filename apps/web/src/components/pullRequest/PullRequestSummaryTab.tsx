@@ -55,6 +55,7 @@ import {
 import { PullRequestMarkdown } from "./PullRequestMarkdown";
 import { PullRequestMarkdownEditor } from "./PullRequestMarkdownEditor";
 import { PullRequestReactionBar } from "./PullRequestReactions";
+import { usePullRequestMutationApproval } from "./pullRequestMutationApproval";
 import { PullRequestConversationGhost } from "./PullRequestGhosts";
 import { pullRequestLabelColor } from "./pullRequestList.logic";
 import { sectionCollapseAnchorScrollTop } from "./pullRequestSummaryScroll.logic";
@@ -414,6 +415,7 @@ export function PullRequestSummaryTab({
   const updateComment = useAtomCommand(pullRequestEnvironment.updateComment, {
     reportFailure: false,
   });
+  const approval = usePullRequestMutationApproval();
   // Keyed by the pull request, like the comment window above it, so an editor left open never
   // reappears over the next pull request's description.
   const [bodyScope, setBodyScope] = useState<string | null>(null);
@@ -431,13 +433,26 @@ export function PullRequestSummaryTab({
 
   const saveBody = async (body: string) => {
     if (bodySaving) return;
+    if (approval === null || !approval.available) return;
     setBodySaving(true);
-    const result = await update({ environmentId, input: { ...reference, body } });
+    let failure = false;
+    const completed = await approval.request({
+      description: `Updates the description on #${reference.number}.`,
+      execute: async (scope) => {
+        const result = await update({
+          environmentId: scope.environmentId,
+          input: { ...scope.reference, body },
+        });
+        failure = result._tag === "Failure";
+        return !failure;
+      },
+    });
     setBodySaving(false);
-    if (result._tag === "Failure") {
+    if (failure) {
       toastManager.add({ type: "error", title: "Could not save the description" });
       return;
     }
+    if (!completed) return;
     setBodyScope(null);
     onRefresh();
   };
@@ -454,17 +469,28 @@ export function PullRequestSummaryTab({
     onSave: async (comment, body) => {
       // A review's own summary is not a kind any host rewrites, which is why no pencil is ever
       // offered on one; the check is here because the comment's own type still allows it.
-      if (commentSaving || comment.kind === "review") return;
+      const kind = comment.kind;
+      if (commentSaving || kind === "review") return;
+      if (approval === null || !approval.available) return;
       setCommentSaving(true);
-      const result = await updateComment({
-        environmentId,
-        input: { ...reference, commentId: comment.id, kind: comment.kind, body },
+      let failure = false;
+      const completed = await approval.request({
+        description: `Edits a comment on #${reference.number}.`,
+        execute: async (scope) => {
+          const result = await updateComment({
+            environmentId: scope.environmentId,
+            input: { ...scope.reference, commentId: comment.id, kind, body },
+          });
+          failure = result._tag === "Failure";
+          return !failure;
+        },
       });
       setCommentSaving(false);
-      if (result._tag === "Failure") {
+      if (failure) {
         toastManager.add({ type: "error", title: "Could not save the comment" });
         return;
       }
+      if (!completed) return;
       setCommentScope(null);
       onRefresh();
     },
