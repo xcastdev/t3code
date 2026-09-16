@@ -43,7 +43,12 @@ vi.mock("~/state/query", () => ({
   useEnvironmentQuery: () => ({
     data: {
       sourceControlProvider: { kind: "github", name: "GitHub", baseUrl: "https://github.com" },
+      refName: "main",
+      headCommit: "a".repeat(40),
+      indexTree: "b".repeat(40),
     },
+    error: null,
+    isPending: false,
   }),
 }));
 vi.mock("~/lib/sourceControlActions", async (importOriginal) => {
@@ -170,8 +175,16 @@ describe("PullRequestThreadDialog checkout scope", () => {
       );
       expect(worktree).toBeDefined();
 
-      await act(async () => {
+      act(() => {
         worktree!.click();
+      });
+      const confirm = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+        (button) => button.textContent === "Confirm worktree",
+      );
+      expect(confirm).toBeDefined();
+      await act(async () => {
+        confirm!.click();
+        await Promise.resolve();
         await Promise.resolve();
       });
 
@@ -182,6 +195,11 @@ describe("PullRequestThreadDialog checkout scope", () => {
           reference,
           mode: "worktree",
           threadId,
+          precondition: {
+            expectedHeadCommit: "a".repeat(40),
+            expectedIndexTree: "b".repeat(40),
+            expectedRefName: "main",
+          },
         },
       });
     },

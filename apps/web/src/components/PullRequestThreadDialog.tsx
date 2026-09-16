@@ -1,7 +1,7 @@
 import type { EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { isAtomCommandInterrupted } from "@t3tools/client-runtime/state/runtime";
 import { useDebouncedValue } from "@tanstack/react-pacer";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import {
   readCachedPullRequestResolution,
@@ -13,6 +13,7 @@ import { parsePullRequestReference } from "~/pullRequestReference";
 import { getSourceControlPresentation } from "~/sourceControlPresentation";
 import { useEnvironmentQuery } from "~/state/query";
 import { vcsEnvironment } from "~/state/vcs";
+import { reviewedGitSnapshotAvailability } from "./source-control/sourceControlActions.logic";
 import { Button } from "./ui/button";
 import {
   Dialog,
@@ -49,12 +50,22 @@ export function PullRequestThreadDialog({
   const [reference, setReference] = useState(initialReference ?? "");
   const [referenceDirty, setReferenceDirty] = useState(false);
   const [preparingMode, setPreparingMode] = useState<"local" | "worktree" | null>(null);
+  const [checkoutApproval, setCheckoutApproval] = useState<{
+    readonly mode: "local" | "worktree";
+    readonly reference: string;
+    readonly source: {
+      readonly refName: string | null;
+      readonly headCommit: string | null;
+      readonly indexTree: string;
+    };
+    readonly scopeKey: string;
+  } | null>(null);
   const [debouncedReference, referenceDebouncer] = useDebouncedValue(
     reference,
     { wait: 450 },
     (debouncerState) => ({ isPending: debouncerState.isPending }),
   );
-  const { data: gitStatus } = useEnvironmentQuery(
+  const gitStatusQuery = useEnvironmentQuery(
     cwd === null
       ? null
       : vcsEnvironment.status({
@@ -62,6 +73,7 @@ export function PullRequestThreadDialog({
           input: { cwd },
         }),
   );
+  const gitStatus = gitStatusQuery.data;
   const sourceControlPresentation = useMemo(
     () => getSourceControlPresentation(gitStatus?.sourceControlProvider),
     [gitStatus?.sourceControlProvider],
@@ -108,6 +120,44 @@ export function PullRequestThreadDialog({
       ? (pullRequestResolution.data?.pullRequest ?? null)
       : null;
   const resolvedPullRequest = liveResolvedPullRequest ?? cachedPullRequest;
+  const reviewedSnapshot = useMemo(
+    () =>
+      reviewedGitSnapshotAvailability({
+        status: gitStatus,
+        isPending: gitStatusQuery.isPending,
+        hasError: gitStatusQuery.error !== null,
+      }),
+    [gitStatus, gitStatusQuery.error, gitStatusQuery.isPending],
+  );
+  const checkoutScope = useMemo(() => {
+    if (!cwd || !parsedReference || !resolvedPullRequest || !reviewedSnapshot.available)
+      return null;
+    const source = {
+      refName: gitStatus?.refName ?? null,
+      headCommit: gitStatus?.headCommit ?? null,
+      indexTree: gitStatus?.indexTree ?? "",
+    };
+    return {
+      reference: parsedReference,
+      source,
+      scopeKey: JSON.stringify([environmentId, cwd, parsedReference, resolvedPullRequest, source]),
+    };
+  }, [
+    cwd,
+    environmentId,
+    gitStatus,
+    parsedReference,
+    resolvedPullRequest,
+    reviewedSnapshot.available,
+  ]);
+  const checkoutScopeKeyRef = useRef<string | null>(checkoutScope?.scopeKey ?? null);
+  useLayoutEffect(() => {
+    checkoutScopeKeyRef.current = checkoutScope?.scopeKey ?? null;
+  }, [checkoutScope?.scopeKey]);
+  // A stale retained approval stays inert in state but is never displayed or reusable. This
+  // avoids a reset render while a status query is settling and makes the next press a fresh review.
+  const activeCheckoutApproval =
+    checkoutApproval?.scopeKey === checkoutScope?.scopeKey ? checkoutApproval : null;
   const isResolving =
     open &&
     parsedReference !== null &&
@@ -129,20 +179,41 @@ export function PullRequestThreadDialog({
     }
   }, [resolvedPullRequest?.state]);
 
+  const requestCheckout = useCallback(
+    (mode: "local" | "worktree") => {
+      if (checkoutScope === null) return;
+      setCheckoutApproval({ mode, ...checkoutScope });
+    },
+    [checkoutScope],
+  );
+
   const handleConfirm = useCallback(
     async (mode: "local" | "worktree") => {
       if (!parsedReference) {
         setReferenceDirty(true);
         return;
       }
-      if (!parsedReference || !resolvedPullRequest || !cwd) {
+      if (
+        !parsedReference ||
+        !resolvedPullRequest ||
+        !cwd ||
+        activeCheckoutApproval === null ||
+        activeCheckoutApproval.mode !== mode ||
+        activeCheckoutApproval.reference !== parsedReference ||
+        activeCheckoutApproval.scopeKey !== checkoutScopeKeyRef.current
+      ) {
         return;
       }
       setPreparingMode(mode);
       const result = await preparePullRequestThreadAction.run({
-        reference: parsedReference,
+        reference: activeCheckoutApproval.reference,
         mode,
         ...(mode === "worktree" ? { threadId } : {}),
+        precondition: {
+          expectedHeadCommit: activeCheckoutApproval.source.headCommit,
+          expectedIndexTree: activeCheckoutApproval.source.indexTree,
+          expectedRefName: activeCheckoutApproval.source.refName,
+        },
       });
       setPreparingMode(null);
       if (result._tag === "Failure") {
@@ -158,6 +229,7 @@ export function PullRequestThreadDialog({
       onOpenChange(false);
     },
     [
+      activeCheckoutApproval,
       cwd,
       onOpenChange,
       onPrepared,
@@ -224,7 +296,7 @@ export function PullRequestThreadDialog({
                 }
                 event.preventDefault();
                 if (!isResolving && !preparePullRequestThreadAction.isPending) {
-                  void handleConfirm("local");
+                  requestCheckout("local");
                 }
               }}
             />
@@ -255,13 +327,25 @@ export function PullRequestThreadDialog({
           ) : null}
 
           {errorMessage ? <p className="text-destructive text-xs">{errorMessage}</p> : null}
+          {activeCheckoutApproval ? (
+            <p className="rounded-lg border border-border/70 bg-muted/24 p-2 text-muted-foreground text-xs">
+              Review checkout: environment {environmentId}; repository {cwd}; source{" "}
+              {activeCheckoutApproval.source.refName ?? "detached HEAD"} at{" "}
+              {activeCheckoutApproval.source.headCommit ?? "no commit"}; index{" "}
+              {activeCheckoutApproval.source.indexTree};{" "}
+              {activeCheckoutApproval.mode === "local" ? "local repository" : "separate worktree"};{" "}
+              {activeCheckoutApproval.reference}.
+            </p>
+          ) : null}
         </DialogPanel>
         <DialogFooter>
           <Button
             type="button"
             variant="outline"
             size="sm"
-            onClick={() => onOpenChange(false)}
+            onClick={() =>
+              activeCheckoutApproval === null ? onOpenChange(false) : setCheckoutApproval(null)
+            }
             disabled={preparePullRequestThreadAction.isPending}
           >
             Cancel
@@ -271,31 +355,43 @@ export function PullRequestThreadDialog({
             size="sm"
             variant="outline"
             onClick={() => {
-              void handleConfirm("local");
+              if (activeCheckoutApproval?.mode === "local") void handleConfirm("local");
+              else requestCheckout("local");
             }}
             disabled={
               !cwd ||
               !resolvedPullRequest ||
               isResolving ||
-              preparePullRequestThreadAction.isPending
+              preparePullRequestThreadAction.isPending ||
+              !reviewedSnapshot.available
             }
           >
-            {preparingMode === "local" ? "Preparing local..." : "Local"}
+            {preparingMode === "local"
+              ? "Preparing local..."
+              : activeCheckoutApproval?.mode === "local"
+                ? "Confirm local"
+                : "Local"}
           </Button>
           <Button
             type="button"
             size="sm"
             onClick={() => {
-              void handleConfirm("worktree");
+              if (activeCheckoutApproval?.mode === "worktree") void handleConfirm("worktree");
+              else requestCheckout("worktree");
             }}
             disabled={
               !cwd ||
               !resolvedPullRequest ||
               isResolving ||
-              preparePullRequestThreadAction.isPending
+              preparePullRequestThreadAction.isPending ||
+              !reviewedSnapshot.available
             }
           >
-            {preparingMode === "worktree" ? "Preparing worktree..." : "Worktree"}
+            {preparingMode === "worktree"
+              ? "Preparing worktree..."
+              : activeCheckoutApproval?.mode === "worktree"
+                ? "Confirm worktree"
+                : "Worktree"}
           </Button>
         </DialogFooter>
       </DialogPopup>

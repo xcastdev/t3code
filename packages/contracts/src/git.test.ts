@@ -342,15 +342,21 @@ describe("VcsCreateWorktreeInput", () => {
 });
 
 describe("GitPreparePullRequestThreadInput", () => {
-  it("accepts pull request references and mode", () => {
+  it("accepts pull request references, mode, and a reviewed checkout precondition", () => {
     const parsed = decodePreparePullRequestThreadInput({
       cwd: "/repo",
       reference: "#42",
       mode: "worktree",
+      precondition: {
+        expectedHeadCommit: "a".repeat(40),
+        expectedIndexTree: "b".repeat(40),
+        expectedRefName: "main",
+      },
     });
 
     expect(parsed.reference).toBe("#42");
     expect(parsed.mode).toBe("worktree");
+    expect(parsed.precondition).toMatchObject({ expectedRefName: "main" });
   });
 });
 

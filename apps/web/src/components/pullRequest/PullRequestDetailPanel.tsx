@@ -185,7 +185,17 @@ import {
 
 type DetailTab = "summary" | "timeline" | "code";
 
-type ConfirmationAction = PullRequestAction | "comment" | "update-title" | "provider-mutation";
+type ConfirmationAction =
+  | PullRequestAction
+  | "comment"
+  | "update-title"
+  | "provider-mutation"
+  | "prepare-checkout";
+
+type ThreadTask = {
+  readonly prompt: string;
+  readonly reviewComments?: ReadonlyArray<ReviewCommentContext>;
+};
 
 /**
  * The detail panel is deliberately reusable: Source Control replaces its reference in place
@@ -222,6 +232,12 @@ type PullRequestConfirmation = {
   readonly title: string | null;
   /** Detail descendants can only write through this captured approval. */
   readonly providerMutation: PullRequestProviderMutation | null;
+  /** The checkout mode and task are both reviewed, never rediscovered after a thread opens. */
+  readonly checkout: {
+    readonly kind: string;
+    readonly mode: "local" | "worktree";
+    readonly task: ThreadTask | null;
+  } | null;
   /** Settles only the promise owned by this exact approval request. */
   readonly settle: ((succeeded: boolean) => void) | null;
 };
@@ -277,6 +293,8 @@ function pullRequestConfirmationTitle(action: ConfirmationAction): string {
       return "Update pull request title?";
     case "provider-mutation":
       return "Apply pull request change?";
+    case "prepare-checkout":
+      return "Prepare pull request checkout?";
   }
 }
 
@@ -308,6 +326,8 @@ function pullRequestConfirmationButton(action: ConfirmationAction): string {
       return "Update title";
     case "provider-mutation":
       return "Apply change";
+    case "prepare-checkout":
+      return "Prepare checkout";
   }
 }
 
@@ -928,10 +948,6 @@ export function PullRequestDetailPanel({
   useLayoutEffect(() => {
     currentMutationScopeKeyRef.current = currentMutationScopeKey;
   }, [currentMutationScopeKey]);
-  const confirmationIsCurrent =
-    confirmation !== null &&
-    currentMutationScopeKey !== null &&
-    confirmation.scopeKey === currentMutationScopeKey;
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const { copyToClipboard: copyReference } = useCopyToClipboard<string>({
     target: "pull request reference",
@@ -1169,9 +1185,82 @@ export function PullRequestDetailPanel({
   const acting =
     pickableEnvironments.find((entry) => entry.environmentId === chosenEnvironmentId) ?? null;
   const actingEnvironmentId = acting?.environmentId ?? environmentId;
+  // A hosted PR can be read through credentials with no local checkout, but checking it out
+  // always mutates a real repository. Resolve that repository on the environment the reader
+  // chose and require its own complete, reviewed snapshot.
+  const checkoutCwd = acting?.workspaceRoot ?? detail?.workspaceRoot ?? null;
+  const checkoutStatusQuery = useEnvironmentQuery(
+    checkoutCwd === null
+      ? null
+      : vcsEnvironment.status({ environmentId: actingEnvironmentId, input: { cwd: checkoutCwd } }),
+  );
+  const reviewedCheckoutSnapshot = useMemo(
+    () =>
+      reviewedGitSnapshotAvailability({
+        status: checkoutStatusQuery.data,
+        isPending: checkoutStatusQuery.isPending,
+        hasError: checkoutStatusQuery.error !== null,
+      }),
+    [checkoutStatusQuery.data, checkoutStatusQuery.error, checkoutStatusQuery.isPending],
+  );
+  const currentCheckoutScope = useMemo<PullRequestMutationScope | null>(
+    () =>
+      detail === null ||
+      !detailApprovalAvailable ||
+      checkoutCwd === null ||
+      !reviewedCheckoutSnapshot.available
+        ? null
+        : {
+            environmentId: actingEnvironmentId,
+            // A rootless hosted reference must become rooted before it can enter a local Git
+            // mutation. The provider-only approval scope deliberately does not do this.
+            reference: { ...clonePullRequestReference(reference), repositoryRoot: checkoutCwd },
+            detail,
+            source: {
+              refName: checkoutStatusQuery.data?.refName ?? null,
+              headCommit: checkoutStatusQuery.data?.headCommit ?? null,
+              indexTree: checkoutStatusQuery.data?.indexTree ?? "",
+            },
+          },
+    [
+      actingEnvironmentId,
+      checkoutCwd,
+      checkoutStatusQuery.data,
+      detail,
+      detailApprovalAvailable,
+      reference,
+      reviewedCheckoutSnapshot.available,
+    ],
+  );
+  const currentCheckoutScopeKey =
+    currentCheckoutScope === null ? null : pullRequestMutationScopeKey(currentCheckoutScope);
+  const currentCheckoutScopeKeyRef = useRef<string | null>(currentCheckoutScopeKey);
+  useLayoutEffect(() => {
+    currentCheckoutScopeKeyRef.current = currentCheckoutScopeKey;
+  }, [currentCheckoutScopeKey]);
+  const confirmationIsCurrent =
+    confirmation !== null &&
+    confirmation.scopeKey ===
+      (confirmation.action === "prepare-checkout"
+        ? currentCheckoutScopeKey
+        : currentMutationScopeKey);
+  const checkoutApprovalAvailable =
+    currentCheckoutScope !== null &&
+    confirmation === null &&
+    !providerMutationPending &&
+    handoff === null;
+  const checkoutUnavailableReason = checkoutApprovalAvailable
+    ? null
+    : checkoutCwd === null
+      ? "This pull request has no local repository checkout available."
+      : !detailApprovalAvailable
+        ? "Pull request details are loading or unavailable. Refresh and try again."
+        : !reviewedCheckoutSnapshot.available
+          ? reviewedCheckoutSnapshot.reason
+          : "Another pull request change is awaiting approval or completion.";
   const prepareThread = usePreparePullRequestThreadAction({
     environmentId: actingEnvironmentId,
-    cwd: acting?.workspaceRoot ?? detail?.workspaceRoot ?? null,
+    cwd: checkoutCwd,
   });
 
   const dismissConfirmation = useCallback((expected?: PullRequestConfirmation | null) => {
@@ -1189,6 +1278,7 @@ export function PullRequestDetailPanel({
     return () => {
       mountedRef.current = false;
       currentMutationScopeKeyRef.current = null;
+      currentCheckoutScopeKeyRef.current = null;
       const pending = confirmationRef.current;
       confirmationRef.current = null;
       // An unapproved dialog is cancelled on removal. Once confirmation consumed it, the
@@ -1236,6 +1326,7 @@ export function PullRequestDetailPanel({
         commentBody: options.commentBody ?? null,
         title: options.title ?? null,
         providerMutation: options.providerMutation ?? null,
+        checkout: null,
         settle: options.settle ?? null,
       };
       confirmationRef.current = next;
@@ -1243,6 +1334,39 @@ export function PullRequestDetailPanel({
       return true;
     },
     [currentMutationScope, currentMutationScopeKey],
+  );
+
+  const requestCheckoutConfirmation = useCallback(
+    (input: {
+      readonly kind: string;
+      readonly mode: "local" | "worktree";
+      readonly task: ThreadTask | null;
+    }) => {
+      if (
+        confirmationRef.current !== null ||
+        executingConfirmationRef.current !== null ||
+        currentCheckoutScope === null ||
+        currentCheckoutScopeKey === null
+      ) {
+        return false;
+      }
+      const next: PullRequestConfirmation = {
+        action: "prepare-checkout",
+        scope: currentCheckoutScope,
+        scopeKey: currentCheckoutScopeKey,
+        mergeMethod: null,
+        updateMethod: null,
+        commentBody: null,
+        title: null,
+        providerMutation: null,
+        checkout: input,
+        settle: null,
+      };
+      confirmationRef.current = next;
+      setConfirmation(next);
+      return true;
+    },
+    [currentCheckoutScope, currentCheckoutScopeKey],
   );
 
   const requestProviderMutation = useCallback(
@@ -1361,7 +1485,8 @@ export function PullRequestDetailPanel({
     if (
       pending.action === "comment" ||
       pending.action === "update-title" ||
-      pending.action === "provider-mutation"
+      pending.action === "provider-mutation" ||
+      pending.action === "prepare-checkout"
     )
       return false;
     setPendingAction(pending.action);
@@ -1393,7 +1518,12 @@ export function PullRequestDetailPanel({
   const performConfirmedCommentAction = async (pending: PullRequestConfirmation) => {
     if (pending.commentBody === null) return false;
     const action = pending.action;
-    if (action === "comment" || action === "update-title" || action === "provider-mutation")
+    if (
+      action === "comment" ||
+      action === "update-title" ||
+      action === "provider-mutation" ||
+      action === "prepare-checkout"
+    )
       return false;
     if (
       executingConfirmationRef.current !== pending ||
@@ -1499,11 +1629,6 @@ export function PullRequestDetailPanel({
       return;
     }
     requestConfirmation("update-title", { title });
-  };
-
-  type ThreadTask = {
-    prompt: string;
-    reviewComments?: ReadonlyArray<ReviewCommentContext>;
   };
 
   // Beside the thread whose own pull request this is, a task belongs in that thread's composer:
@@ -1619,24 +1744,22 @@ export function PullRequestDetailPanel({
   // Every handoff works the same way: check the pull request out into its own worktree, open a
   // thread there, and — when it carries a task — put that in the composer for the user to read
   // before sending. Checking out is the whole point of the ones that carry nothing.
-  const startHandoff = async (
+  const executeCheckoutHandoff = async (
     kind: string,
-    task: { prompt: string; reviewComments?: ReadonlyArray<ReviewCommentContext> } | null,
+    task: ThreadTask | null,
     // A worktree leaves whatever is open alone, which is why it is the default. Checking out in
     // the repository itself is what you want when the point is to run the thing where you
     // already work — and it moves the branch under everything else that is open there.
     mode: "worktree" | "local" = "worktree",
+    reviewedScope: PullRequestMutationScope,
   ) => {
-    if (!detail || handoff !== null) return;
-    if (attachTarget !== null && task !== null) {
-      writeTaskToComposer(attachTarget, task);
-      toastManager.add({
-        type: "success",
-        title: "Added to the composer",
-        description: "The task is in the composer — read it over, then send.",
-      });
+    if (
+      !detail ||
+      handoff !== null ||
+      reviewedScope.source === null ||
+      currentCheckoutScopeKeyRef.current !== pullRequestMutationScopeKey(reviewedScope)
+    )
       return;
-    }
     setHandoff(kind);
     // The menu closes on the press and takes its "Preparing..." label with it, so this is the
     // only thing answering for the checkout. It carries no timeout of its own: a loading toast
@@ -1647,7 +1770,10 @@ export function PullRequestDetailPanel({
     });
     // Wherever the reader chose to act: the thread, the checkout it is pointed at and the composer
     // the task lands in are all one server's, and picking another one moves all three.
-    const projectRef = scopeProjectRef(actingEnvironmentId, acting?.projectId ?? detail.projectId);
+    const projectRef = scopeProjectRef(
+      reviewedScope.environmentId,
+      reviewedScope.reference.projectId,
+    );
     // The thread is opened before the checkout rather than after it, because the project's setup
     // script only runs for a checkout that knows which thread it is for — and a worktree with no
     // dependencies installed is not something anyone can test.
@@ -1667,10 +1793,29 @@ export function PullRequestDetailPanel({
       });
       return;
     }
+    // Opening a thread is asynchronous. It must not turn a stale approval into a checkout of a
+    // different environment, repository, branch, or index once that thread returns.
+    if (
+      !mountedRef.current ||
+      currentCheckoutScopeKeyRef.current !== pullRequestMutationScopeKey(reviewedScope)
+    ) {
+      setHandoff(null);
+      toastManager.update(toastId, {
+        type: "error",
+        title: "Checkout needs review again",
+        description: "The repository changed while the thread was opening.",
+      });
+      return;
+    }
     const prepared = await prepareThread.run({
-      reference: detail.url,
+      reference: reviewedScope.detail.url,
       mode,
       threadId: opened.threadId,
+      precondition: {
+        expectedHeadCommit: reviewedScope.source.headCommit,
+        expectedIndexTree: reviewedScope.source.indexTree,
+        expectedRefName: reviewedScope.source.refName,
+      },
     });
     if (prepared._tag === "Failure") {
       setHandoff(null);
@@ -1746,6 +1891,26 @@ export function PullRequestDetailPanel({
           }
         : staleCheckoutToast,
     );
+  };
+
+  const startHandoff = (
+    kind: string,
+    task: ThreadTask | null,
+    mode: "worktree" | "local" = "worktree",
+  ) => {
+    if (!detail || handoff !== null) return;
+    // Attaching a task to the already-open composer is provider/UI-only. Every path that
+    // prepares Local or Worktree checkout instead enters the reviewed Git mutation lane.
+    if (attachTarget !== null && task !== null) {
+      writeTaskToComposer(attachTarget, task);
+      toastManager.add({
+        type: "success",
+        title: "Added to the composer",
+        description: "The task is in the composer — read it over, then send.",
+      });
+      return;
+    }
+    requestCheckoutConfirmation({ kind, task, mode });
   };
 
   const askAboutPullRequest = () => {
@@ -2186,6 +2351,7 @@ export function PullRequestDetailPanel({
                               <Button
                                 size="xs"
                                 variant="outline"
+                                disabled={!checkoutApprovalAvailable}
                                 aria-label={
                                   handoff?.startsWith("checkout") ? "Checking out..." : "Check out"
                                 }
@@ -2205,24 +2371,34 @@ export function PullRequestDetailPanel({
                           />
                         }
                       />
-                      <TooltipPopup>Check out this pull request</TooltipPopup>
+                      <TooltipPopup>
+                        {checkoutUnavailableReason ?? "Check out this pull request"}
+                      </TooltipPopup>
                     </Tooltip>
                     <MenuPopup align="end" side="bottom" className="min-w-72">
-                      <MenuItem onClick={() => startCheckout("worktree")}>
+                      <MenuItem
+                        disabled={!checkoutApprovalAvailable}
+                        onClick={() => startCheckout("worktree")}
+                      >
                         <GitBranchIcon className="mt-0.5 size-3.5 shrink-0 self-start" />
                         <span className="flex min-w-0 flex-col">
                           <span>In a separate worktree</span>
                           <span className="text-xs text-muted-foreground">
-                            Its own folder and thread. Nothing you have open moves.
+                            {checkoutUnavailableReason ??
+                              "Its own folder and thread. Nothing you have open moves."}
                           </span>
                         </span>
                       </MenuItem>
-                      <MenuItem onClick={() => startCheckout("local")}>
+                      <MenuItem
+                        disabled={!checkoutApprovalAvailable}
+                        onClick={() => startCheckout("local")}
+                      >
                         <FolderGit2Icon className="mt-0.5 size-3.5 shrink-0 self-start" />
                         <span className="flex min-w-0 flex-col">
                           <span>In this repository</span>
                           <span className="text-xs text-muted-foreground">
-                            Switches the branch you are working in, like `gh pr checkout`.
+                            {checkoutUnavailableReason ??
+                              "Switches the branch you are working in, like `gh pr checkout`."}
                           </span>
                         </span>
                       </MenuItem>
@@ -3239,37 +3415,41 @@ export function PullRequestDetailPanel({
               <AlertDialogDescription>
                 {confirmAction === "merge"
                   ? `This merges #${confirmation?.scope.reference.number ?? reference.number} using ${confirmation?.mergeMethod ?? selectedMergeMethod}.`
-                  : confirmAction === "ready"
-                    ? `This marks #${confirmation?.scope.reference.number ?? reference.number} ready for review.`
-                    : confirmAction === "draft"
-                      ? `This converts #${confirmation?.scope.reference.number ?? reference.number} to a draft.`
-                      : confirmAction === "reopen"
-                        ? confirmation?.commentBody !== null
-                          ? `This posts your comment on #${confirmation?.scope.reference.number ?? reference.number}, then reopens it.`
-                          : `This reopens #${confirmation?.scope.reference.number ?? reference.number}.`
-                        : confirmAction === "enable-auto-merge"
-                          ? // The host merges this as soon as it considers the pull request ready, which
-                            // may be immediately — there is no telling from here whether anything is
-                            // still outstanding.
-                            `This merges #${confirmation?.scope.reference.number ?? reference.number} using ${confirmation?.mergeMethod ?? selectedMergeMethod} as soon as the host considers it ready, which may be immediately.`
-                          : confirmAction === "revert"
-                            ? `This opens a new pull request that reverses the changes merged by #${confirmation?.scope.reference.number ?? reference.number}.`
-                            : confirmAction === "disable-auto-merge"
-                              ? `This turns off auto-merge for #${confirmation?.scope.reference.number ?? reference.number}.`
-                              : confirmAction === "update-branch"
-                                ? `This updates #${confirmation?.scope.reference.number ?? reference.number} with its base branch using ${confirmation?.updateMethod ?? "merge"}.`
-                                : confirmAction === "approve-workflows"
-                                  ? `This allows ${confirmation?.scope.detail.workflowApprovalsRequired ?? workflowApprovalsRequired} ${(confirmation?.scope.detail.workflowApprovalsRequired ?? workflowApprovalsRequired) === 1 ? "workflow" : "workflows"} from #${confirmation?.scope.reference.number ?? reference.number} to run. Review the code and workflow changes first.`
-                                  : confirmAction === "comment"
-                                    ? `This posts your comment on #${confirmation?.scope.reference.number ?? reference.number}.`
-                                    : confirmAction === "update-title"
-                                      ? `This changes #${confirmation?.scope.reference.number ?? reference.number} to “${confirmation?.title ?? ""}”.`
-                                      : confirmAction === "provider-mutation"
-                                        ? (confirmation?.providerMutation?.description ??
-                                          "This changes this pull request.")
-                                        : confirmation?.commentBody !== null
-                                          ? `This posts your comment on #${confirmation?.scope.reference.number ?? reference.number}, then closes it without merging.`
-                                          : `This closes #${confirmation?.scope.reference.number ?? reference.number} without merging it.`}{" "}
+                  : confirmAction === "prepare-checkout"
+                    ? confirmation?.checkout === null || confirmation === null
+                      ? "This prepares a pull request checkout."
+                      : `This prepares pull request #${confirmation.scope.reference.number} ${confirmation.checkout.mode === "local" ? "in this repository" : "in a separate worktree"}.`
+                    : confirmAction === "ready"
+                      ? `This marks #${confirmation?.scope.reference.number ?? reference.number} ready for review.`
+                      : confirmAction === "draft"
+                        ? `This converts #${confirmation?.scope.reference.number ?? reference.number} to a draft.`
+                        : confirmAction === "reopen"
+                          ? confirmation?.commentBody !== null
+                            ? `This posts your comment on #${confirmation?.scope.reference.number ?? reference.number}, then reopens it.`
+                            : `This reopens #${confirmation?.scope.reference.number ?? reference.number}.`
+                          : confirmAction === "enable-auto-merge"
+                            ? // The host merges this as soon as it considers the pull request ready, which
+                              // may be immediately — there is no telling from here whether anything is
+                              // still outstanding.
+                              `This merges #${confirmation?.scope.reference.number ?? reference.number} using ${confirmation?.mergeMethod ?? selectedMergeMethod} as soon as the host considers it ready, which may be immediately.`
+                            : confirmAction === "revert"
+                              ? `This opens a new pull request that reverses the changes merged by #${confirmation?.scope.reference.number ?? reference.number}.`
+                              : confirmAction === "disable-auto-merge"
+                                ? `This turns off auto-merge for #${confirmation?.scope.reference.number ?? reference.number}.`
+                                : confirmAction === "update-branch"
+                                  ? `This updates #${confirmation?.scope.reference.number ?? reference.number} with its base branch using ${confirmation?.updateMethod ?? "merge"}.`
+                                  : confirmAction === "approve-workflows"
+                                    ? `This allows ${confirmation?.scope.detail.workflowApprovalsRequired ?? workflowApprovalsRequired} ${(confirmation?.scope.detail.workflowApprovalsRequired ?? workflowApprovalsRequired) === 1 ? "workflow" : "workflows"} from #${confirmation?.scope.reference.number ?? reference.number} to run. Review the code and workflow changes first.`
+                                    : confirmAction === "comment"
+                                      ? `This posts your comment on #${confirmation?.scope.reference.number ?? reference.number}.`
+                                      : confirmAction === "update-title"
+                                        ? `This changes #${confirmation?.scope.reference.number ?? reference.number} to “${confirmation?.title ?? ""}”.`
+                                        : confirmAction === "provider-mutation"
+                                          ? (confirmation?.providerMutation?.description ??
+                                            "This changes this pull request.")
+                                          : confirmation?.commentBody !== null
+                                            ? `This posts your comment on #${confirmation?.scope.reference.number ?? reference.number}, then closes it without merging.`
+                                            : `This closes #${confirmation?.scope.reference.number ?? reference.number} without merging it.`}{" "}
                 {confirmation === null
                   ? null
                   : pullRequestMutationTargetDescription(confirmation.scope)}
@@ -3290,7 +3470,10 @@ export function PullRequestDetailPanel({
                   if (
                     pending === null ||
                     confirmationRef.current !== pending ||
-                    pending.scopeKey !== currentMutationScopeKeyRef.current
+                    pending.scopeKey !==
+                      (pending.action === "prepare-checkout"
+                        ? currentCheckoutScopeKeyRef.current
+                        : currentMutationScopeKeyRef.current)
                   )
                     return;
                   confirmationRef.current = null;
@@ -3302,21 +3485,32 @@ export function PullRequestDetailPanel({
                       if (
                         !mountedRef.current ||
                         executingConfirmationRef.current !== pending ||
-                        currentMutationScopeKeyRef.current !== pending.scopeKey
+                        (pending.action === "prepare-checkout"
+                          ? currentCheckoutScopeKeyRef.current
+                          : currentMutationScopeKeyRef.current) !== pending.scopeKey
                       )
                         return false;
-                      return pending.providerMutation !== null
-                        ? pending.providerMutation.execute({
-                            environmentId: pending.scope.environmentId,
-                            reference: pending.scope.reference,
-                          })
-                        : pending.action === "comment"
-                          ? performConfirmedComment(pending)
-                          : pending.action === "update-title"
-                            ? performConfirmedTitleUpdate(pending)
-                            : pending.commentBody === null
-                              ? performConfirmedAction(pending)
-                              : performConfirmedCommentAction(pending);
+                      return pending.action === "prepare-checkout"
+                        ? pending.checkout === null
+                          ? false
+                          : executeCheckoutHandoff(
+                              pending.checkout.kind,
+                              pending.checkout.task,
+                              pending.checkout.mode,
+                              pending.scope,
+                            ).then(() => true)
+                        : pending.providerMutation !== null
+                          ? pending.providerMutation.execute({
+                              environmentId: pending.scope.environmentId,
+                              reference: pending.scope.reference,
+                            })
+                          : pending.action === "comment"
+                            ? performConfirmedComment(pending)
+                            : pending.action === "update-title"
+                              ? performConfirmedTitleUpdate(pending)
+                              : pending.commentBody === null
+                                ? performConfirmedAction(pending)
+                                : performConfirmedCommentAction(pending);
                     })
                     .then((succeeded) => pending.settle?.(succeeded))
                     .catch(() => pending.settle?.(false))

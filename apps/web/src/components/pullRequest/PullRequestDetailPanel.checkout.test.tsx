@@ -329,14 +329,24 @@ describe("PullRequestDetailPanel checkout scope", () => {
             .some((span) => span.children.includes("In a separate worktree")),
         );
       expect(worktree).toBeDefined();
+      expect(worktree?.props.disabled).not.toBe(true);
       expect(
         renderer.root
           .findAllByType("button")
           .find((button) => renderedText(button).includes("Environment B")),
       ).toBeUndefined();
 
-      await act(async () => {
+      act(() => {
         worktree!.props.onClick();
+      });
+      const confirm = renderer.root
+        .findAllByType("button")
+        .find((button) => renderedText(button) === "Prepare checkout");
+      expect(confirm).toBeDefined();
+      await act(async () => {
+        confirm?.props.onClick();
+        await Promise.resolve();
+        await Promise.resolve();
         await Promise.resolve();
       });
 
@@ -347,6 +357,11 @@ describe("PullRequestDetailPanel checkout scope", () => {
           reference: referenceUrl,
           mode: "worktree",
           threadId: "checkout-thread",
+          precondition: {
+            expectedHeadCommit: localStatus.headCommit,
+            expectedIndexTree: localStatus.indexTree,
+            expectedRefName: localStatus.refName,
+          },
         },
       });
     },
@@ -408,9 +423,19 @@ describe("PullRequestDetailPanel checkout scope", () => {
           .some((span) => span.children.includes("In a separate worktree")),
       );
     expect(worktree).toBeDefined();
+    expect(worktree?.props.disabled).not.toBe(true);
 
-    await act(async () => {
+    act(() => {
       worktree!.props.onClick();
+    });
+    const confirm = renderer.root
+      .findAllByType("button")
+      .find((button) => renderedText(button) === "Prepare checkout");
+    expect(confirm).toBeDefined();
+    await act(async () => {
+      confirm?.props.onClick();
+      await Promise.resolve();
+      await Promise.resolve();
       await Promise.resolve();
     });
 
@@ -421,8 +446,88 @@ describe("PullRequestDetailPanel checkout scope", () => {
         reference: "https://github.com/acme/api/pull/7",
         mode: "worktree",
         threadId: "checkout-thread",
+        precondition: {
+          expectedHeadCommit: localStatus.headCommit,
+          expectedIndexTree: localStatus.indexTree,
+          expectedRefName: localStatus.refName,
+        },
       },
     });
+  });
+
+  it("keeps a rootless hosted pull request readable but refuses its local checkout without a current checkout snapshot", async () => {
+    localStatusForQuery = null;
+    await act(async () => {
+      renderer = create(
+        <PullRequestDetailPanel
+          context="page"
+          environmentId={environmentId}
+          getShortcutContext={() => ({
+            terminalFocus: false,
+            terminalOpen: false,
+            previewFocus: false,
+            previewOpen: false,
+          })}
+          reference={{ projectId, host: "github.com", repository: "owner/repo", number: 7 }}
+          shortcutsEnabled={false}
+        />,
+      );
+    });
+    const local = renderer.root
+      .findAllByType("button")
+      .find((button) => renderedText(button).includes("In this repository"));
+    expect(local?.props.disabled).toBe(true);
+    await act(async () => local?.props.onClick());
+    expect(preparePullRequestThread).not.toHaveBeenCalled();
+    expect(renderedText(renderer.root)).toContain("Repository status is unavailable");
+  });
+
+  it("makes a retained checkout confirmation inert when its reviewed source moves", async () => {
+    const reference = { projectId, repository: "owner/repo", repositoryRoot: "/repo", number: 7 };
+    await act(async () => {
+      renderer = create(
+        <PullRequestDetailPanel
+          context="page"
+          environmentId={environmentId}
+          getShortcutContext={() => ({
+            terminalFocus: false,
+            terminalOpen: false,
+            previewFocus: false,
+            previewOpen: false,
+          })}
+          reference={reference}
+          shortcutsEnabled={false}
+        />,
+      );
+    });
+    const local = renderer.root
+      .findAllByType("button")
+      .find((button) => renderedText(button).includes("In this repository"));
+    act(() => local?.props.onClick());
+    const retainedConfirm = renderer.root
+      .findAllByType("button")
+      .find((button) => renderedText(button) === "Prepare checkout")?.props.onClick as
+      | (() => void)
+      | undefined;
+    localStatusForQuery = { ...localStatus, headCommit: "f".repeat(40) };
+    await act(async () =>
+      renderer.update(
+        <PullRequestDetailPanel
+          context="page"
+          environmentId={environmentId}
+          getShortcutContext={() => ({
+            terminalFocus: false,
+            terminalOpen: false,
+            previewFocus: false,
+            previewOpen: false,
+          })}
+          reference={reference}
+          shortcutsEnabled={false}
+        />,
+      ),
+    );
+    await act(async () => retainedConfirm?.());
+    expect(preparePullRequestThread).not.toHaveBeenCalled();
   });
 });
 

@@ -550,6 +550,8 @@ export const GitPreparePullRequestThreadInput = Schema.Struct({
   reference: GitPullRequestReference,
   mode: GitPreparePullRequestThreadMode,
   threadId: Schema.optional(ThreadId),
+  /** Reviewed checkout identity for a local PR checkout or worktree preparation. */
+  precondition: Schema.optional(GitMutationPrecondition),
 });
 export type GitPreparePullRequestThreadInput = typeof GitPreparePullRequestThreadInput.Type;
 

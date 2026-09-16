@@ -17,6 +17,7 @@ import type {
   ExecutionEnvironmentCapabilities,
   GitActionProgressEvent,
   GitResolvePullRequestResult,
+  GitMutationPrecondition,
   GitStackedAction,
   SourceControlCloneProtocol,
   SourceControlRepositoryVisibility,
@@ -365,7 +366,12 @@ export function usePreparePullRequestThreadAction(scope: SourceControlActionScop
   });
   const capabilities = useSourceControlWorkspaceCapabilities(scope);
   const action = useCallback(
-    async (input: { reference: string; mode: "local" | "worktree"; threadId?: ThreadId }) => {
+    async (input: {
+      reference: string;
+      mode: "local" | "worktree";
+      threadId?: ThreadId;
+      precondition?: GitMutationPrecondition;
+    }) => {
       const target = resolveScope(scope);
       if (target === null) {
         return AsyncResult.failure<never, VcsActionUnavailableError>(
@@ -388,6 +394,7 @@ export function usePreparePullRequestThreadAction(scope: SourceControlActionScop
               reference: input.reference,
               mode: input.mode,
               ...(input.threadId ? { threadId: input.threadId } : {}),
+              ...(input.precondition ? { precondition: input.precondition } : {}),
             },
           }),
         () => unavailableWorkspaceAction(scope),

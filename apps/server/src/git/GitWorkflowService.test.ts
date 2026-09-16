@@ -126,6 +126,7 @@ const makeClientWorkspaceHarness = Effect.fn(function* (client: Readonly<Record<
 const makeRealGitWorkflowLayer = (
   driver: GitVcsDriver.GitVcsDriver["Service"],
   vcsDriver: VcsDriverRegistry.VcsDriverHandle["driver"],
+  gitManager: Partial<GitManager.GitManager["Service"]> = {},
 ) =>
   GitWorkflowService.layer.pipe(
     Layer.provide(
@@ -157,7 +158,7 @@ const makeRealGitWorkflowLayer = (
       ),
     ),
     Layer.provide(Layer.succeed(GitVcsDriver.GitVcsDriver, driver)),
-    Layer.provide(Layer.mock(GitManager.GitManager)({})),
+    Layer.provide(Layer.mock(GitManager.GitManager)(gitManager)),
   );
 
 const makeRealGitDir = (): Effect.Effect<
@@ -205,6 +206,37 @@ function makeLayer(input: {
 }
 
 describe("GitWorkflowService", () => {
+  it.effect("rejects a stale reviewed pull-request checkout before it reaches GitManager", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const vcsDriver = yield* GitVcsDriver.makeVcsDriver;
+        const preparePullRequestThread = vi.fn(() => Effect.die("must not prepare"));
+        yield* Effect.gen(function* () {
+          const cwd = yield* makeRealGitDir();
+          yield* initRealGitRepo(driver, cwd);
+          const workflow = yield* GitWorkflowService.GitWorkflowService;
+          const error = yield* workflow
+            .preparePullRequestThread({
+              cwd,
+              reference: "#7",
+              mode: "local",
+              precondition: {
+                expectedHeadCommit: "f".repeat(40),
+                expectedIndexTree: "e".repeat(40),
+                expectedRefName: "main",
+              },
+            })
+            .pipe(Effect.flip);
+          assert.equal(error._tag, "GitCommandError");
+          assert.equal(error.code, "stale_git_state");
+          assert.equal(preparePullRequestThread.mock.calls.length, 0);
+        }).pipe(
+          Effect.provide(makeRealGitWorkflowLayer(driver, vcsDriver, { preparePullRequestThread })),
+        );
+      }),
+    ).pipe(Effect.provide(RealGitLayer)),
+  );
   it.effect(
     "refreshes a mounted real parent after a selected child client commit changes its gitlink",
     () =>

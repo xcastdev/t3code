@@ -1138,10 +1138,28 @@ export const make = Effect.gen(function* () {
       "GitWorkflowService.resolvePullRequest",
       gitManager.resolvePullRequest,
     ),
-    preparePullRequestThread: routeGitManager(
-      "GitWorkflowService.preparePullRequestThread",
-      gitManager.preparePullRequestThread,
-    ),
+    preparePullRequestThread: (input) =>
+      // Preparing either checkout mode changes the repository: Local switches its current
+      // branch and Worktree can create/fetch refs. Keep both behind the same per-repository
+      // permit used by the other reviewed mutations, and validate after entering that queue.
+      serializedMutation(
+        "GitWorkflowService.preparePullRequestThread",
+        input.cwd,
+        ensureGit("GitWorkflowService.preparePullRequestThread", input.cwd).pipe(
+          Effect.andThen(
+            input.precondition === undefined
+              ? Effect.suspend(() => gitManager.preparePullRequestThread(input))
+              : validateMutationPrecondition({
+                  cwd: input.cwd,
+                  precondition: input.precondition,
+                }).pipe(
+                  Effect.andThen(() =>
+                    Effect.suspend(() => gitManager.preparePullRequestThread(input)),
+                  ),
+                ),
+          ),
+        ),
+      ),
     listRefs: (input) =>
       detectGitRepositoryForCommand("GitWorkflowService.listRefs", input.cwd).pipe(
         Effect.flatMap((isGitRepository) =>
