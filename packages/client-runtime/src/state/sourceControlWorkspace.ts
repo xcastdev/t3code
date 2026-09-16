@@ -190,7 +190,7 @@ export function invalidateSourceControlWorkspace(
   })) {
     const affected = { environmentId: target.environmentId, repositoryRoot: target.cwd };
     registry.update(sourceControlWorkspaceRevisionAtom(affected), (revision) => revision + 1);
-    if (refreshStatus || target.cwd !== normalizeVcsRepositoryRoot(scope.repositoryRoot)) {
+    if (refreshStatus) {
       registry.update(
         sourceControlWorkspaceStatusRefreshAtom(affected),
         (revision) => revision + 1,

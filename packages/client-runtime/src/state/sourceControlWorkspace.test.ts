@@ -26,7 +26,11 @@ import { EnvironmentCacheStore } from "../platform/persistence.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import { EnvironmentRpcUnavailableError } from "../rpc/client.ts";
-import { normalizeVcsRepositoryRoot, vcsRefsCacheStateAtom } from "./vcsRefInvalidation.ts";
+import {
+  normalizeVcsRepositoryRoot,
+  registerVcsRepositories,
+  vcsRefsCacheStateAtom,
+} from "./vcsRefInvalidation.ts";
 import { createVcsEnvironmentAtoms } from "./vcs.ts";
 import { createGitEnvironmentAtoms } from "./git.ts";
 
@@ -42,8 +46,10 @@ import {
   updateSourceControlComposerSessionDraft,
   type SourceControlRepository,
   createSourceControlWorkspaceEnvironmentAtoms,
+  publishSourceControlStatus,
   sourceControlWorkspaceProgressAtom,
   sourceControlWorkspaceRevisionAtom,
+  sourceControlWorkspaceStatusRefreshAtom,
 } from "./sourceControlWorkspace.ts";
 
 const environmentId = EnvironmentId.make("workspace-test");
@@ -84,33 +90,29 @@ const makeHarness = Effect.fn(function* (
   const followStream: EnvironmentRegistry["Service"]["followStream"] = (_id, stream) =>
     Stream.provideService(stream, EnvironmentSupervisor, supervisor);
   const removed: string[] = [];
+  const cache = EnvironmentCacheStore.of({
+    loadShell: () => Effect.succeed(Option.none()),
+    saveShell: () => Effect.void,
+    loadThread: () => Effect.succeed(Option.none()),
+    saveThread: () => Effect.void,
+    removeThread: () => Effect.void,
+    loadServerConfig: () => Effect.succeed(Option.none()),
+    saveServerConfig: () => Effect.void,
+    loadVcsRefs: () => Effect.succeed(Option.none()),
+    saveVcsRefs: () => Effect.void,
+    removeVcsRefs: (_id, cwd) =>
+      Effect.sync(() => {
+        removed.push(cwd);
+      }).pipe(
+        Effect.andThen(Effect.suspend(() => (removed.length > 1 ? persistenceGate : Effect.void))),
+      ),
+    clearVcsRefs: () => Effect.void,
+    clear: () => Effect.void,
+  });
   const runtime = Atom.runtime(
     Layer.merge(
       Layer.succeed(EnvironmentRegistry, { run, followStream } as EnvironmentRegistry["Service"]),
-      Layer.succeed(
-        EnvironmentCacheStore,
-        EnvironmentCacheStore.of({
-          loadShell: () => Effect.succeed(Option.none()),
-          saveShell: () => Effect.void,
-          loadThread: () => Effect.succeed(Option.none()),
-          saveThread: () => Effect.void,
-          removeThread: () => Effect.void,
-          loadServerConfig: () => Effect.succeed(Option.none()),
-          saveServerConfig: () => Effect.void,
-          loadVcsRefs: () => Effect.succeed(Option.none()),
-          saveVcsRefs: () => Effect.void,
-          removeVcsRefs: (_id, cwd) =>
-            Effect.sync(() => {
-              removed.push(cwd);
-            }).pipe(
-              Effect.andThen(
-                Effect.suspend(() => (removed.length > 1 ? persistenceGate : Effect.void)),
-              ),
-            ),
-          clearVcsRefs: () => Effect.void,
-          clear: () => Effect.void,
-        }),
-      ),
+      Layer.succeed(EnvironmentCacheStore, cache),
     ),
   );
   const registry = yield* Effect.acquireRelease(Effect.sync(AtomRegistry.make), (value) =>
@@ -123,6 +125,7 @@ const makeHarness = Effect.fn(function* (
     registry,
     runtime,
     removed,
+    cache,
     capabilities,
     atoms: createSourceControlWorkspaceEnvironmentAtoms(runtime, {
       capabilities: (registry) => registry.get(capabilities),
@@ -1262,6 +1265,43 @@ it.effect("publishes a new scoped revision before persisted status becomes obser
         Stream.runDrain,
       );
       expect(registry.get(revision)).toBe(2);
+    }),
+  ),
+);
+
+it.effect("does not refresh related status subscriptions for streamed status snapshots", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const { registry, removed, cache } = yield* makeHarness({});
+      const parent = { environmentId, repositoryRoot: "/workspace" };
+      const child = { environmentId, repositoryRoot: "/workspace/modules/sub" };
+      registerVcsRepositories(registry, environmentId, "/workspace", [
+        {
+          rootPath: parent.repositoryRoot,
+          worktreePath: parent.repositoryRoot,
+          commonDir: "/workspace/.git",
+          isSubmodule: false,
+          provider: null,
+        },
+        {
+          rootPath: child.repositoryRoot,
+          worktreePath: child.repositoryRoot,
+          commonDir: "/workspace/modules/sub/.git",
+          isSubmodule: true,
+          provider: null,
+        },
+      ]);
+
+      yield* publishSourceControlStatus(
+        { environmentId, input: { cwd: child.repositoryRoot } },
+        registry,
+      ).pipe(Effect.provideService(EnvironmentCacheStore, cache));
+
+      expect(registry.get(sourceControlWorkspaceRevisionAtom(parent))).toBe(1);
+      expect(registry.get(sourceControlWorkspaceRevisionAtom(child))).toBe(1);
+      expect(registry.get(sourceControlWorkspaceStatusRefreshAtom(parent))).toBe(0);
+      expect(registry.get(sourceControlWorkspaceStatusRefreshAtom(child))).toBe(0);
+      expect(removed).toEqual([child.repositoryRoot, parent.repositoryRoot]);
     }),
   ),
 );
