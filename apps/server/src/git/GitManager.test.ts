@@ -2187,6 +2187,9 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
       yield* initRepo(repoDir);
       yield* runGit(repoDir, ["checkout", "-b", "feature/status-merged-pr"]);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/status-merged-pr"]);
 
       const { manager } = yield* makeManager({
         ghScenario: {
@@ -2226,8 +2229,12 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
     Effect.gen(function* () {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
       yield* initRepo(repoDir);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "main"]);
+      yield* runGit(repoDir, ["remote", "set-head", "origin", "main"]);
 
-      const { manager } = yield* makeManager({
+      const { manager, ghCalls } = yield* makeManager({
         ghScenario: {
           prListSequence: [
             // @effect-diagnostics-next-line preferSchemaOverJson:off
@@ -2250,6 +2257,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       const status = yield* manager.status({ cwd: repoDir });
       expect(status.refName).toBe("main");
       expect(status.pr).toBeNull();
+      expect(ghCalls.some((call) => call.includes("pr list --head main "))).toBe(true);
     }),
   );
 
@@ -2502,6 +2510,9 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       const repoDir = yield* makeTempDir("t3code-git-manager-");
       yield* initRepo(repoDir);
       yield* runGit(repoDir, ["checkout", "-b", "feature/status-open-over-merged"]);
+      const remoteDir = yield* createBareRemote();
+      yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "-u", "origin", "feature/status-open-over-merged"]);
 
       const { manager } = yield* makeManager({
         ghScenario: {
@@ -2724,6 +2735,7 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       yield* runGit(repoDir, ["checkout", "-b", "feature/pr-sticky-first-push"]);
       const remoteDir = yield* createBareRemote();
       yield* runGit(repoDir, ["remote", "add", "origin", remoteDir]);
+      yield* runGit(repoDir, ["push", "origin", "feature/pr-sticky-first-push"]);
 
       const existingPr = {
         number: 215,
@@ -2748,7 +2760,11 @@ it.layer(GitManagerTestLayer)("GitManager", (it) => {
       const first = yield* manager.status({ cwd: repoDir });
       expect(first.pr?.number).toBe(215);
 
-      yield* runGit(repoDir, ["push", "-u", "origin", "feature/pr-sticky-first-push"]);
+      yield* runGit(repoDir, [
+        "branch",
+        "--set-upstream-to=origin/feature/pr-sticky-first-push",
+        "feature/pr-sticky-first-push",
+      ]);
       yield* manager.invalidateStatus(repoDir);
 
       const second = yield* manager.status({ cwd: repoDir });
