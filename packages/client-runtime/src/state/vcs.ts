@@ -21,6 +21,7 @@ import {
   createEnvironmentRpcCommand,
   createEnvironmentRpcSubscriptionAtomFamily,
   createEnvironmentSubscriptionAtomFamily,
+  type EnvironmentSubscriptionSnapshot,
 } from "./runtime.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
@@ -48,6 +49,24 @@ const VCS_REFS_IDLE_TTL_MS = 30_000;
 // Rows keep the last status they rendered, so the live stream only needs a
 // short grace period when virtualization or scrolling releases its consumer.
 const VCS_STATUS_IDLE_TTL_MS = 10_000;
+
+const statusSubscriptionStateByScope = Atom.family((scope: string) =>
+  Atom.make<EnvironmentSubscriptionSnapshot<VcsStatusResult>>({
+    generation: 0,
+    snapshotGeneration: null,
+    value: null,
+  }).pipe(Atom.keepAlive, Atom.withLabel(`environment-data:vcs:status-subscription:${scope}`)),
+);
+
+/** The reviewed status value from the currently connected legacy VCS subscription. */
+export function vcsStatusSubscriptionStateAtom(target: {
+  readonly environmentId: EnvironmentId;
+  readonly cwd: string;
+}) {
+  return statusSubscriptionStateByScope(
+    `${target.environmentId}:${normalizeVcsRepositoryRoot(target.cwd)}`,
+  );
+}
 
 export interface WorkingTreePageState {
   readonly snapshotId: string | null;
@@ -343,6 +362,8 @@ export function createVcsEnvironmentAtoms<R, E>(
       createEnvironmentSubscriptionAtomFamily(runtime, {
         label: "environment-data:vcs:status",
         idleTtlMs: VCS_STATUS_IDLE_TTL_MS,
+        snapshotState: ({ environmentId, input }) =>
+          vcsStatusSubscriptionStateAtom({ environmentId, cwd: input.cwd }),
         onValue: (target, _value, registry) => publishSourceControlStatus(target, registry),
         refreshTrigger: ({ environmentId, input }) =>
           sourceControlWorkspaceStatusRefreshAtom({ environmentId, repositoryRoot: input.cwd }),

@@ -13,6 +13,7 @@ import { parsePullRequestReference } from "~/pullRequestReference";
 import { getSourceControlPresentation } from "~/sourceControlPresentation";
 import { useEnvironmentQuery } from "~/state/query";
 import { vcsEnvironment } from "~/state/vcs";
+import { vcsStatusSubscriptionStateAtom } from "@t3tools/client-runtime/state/vcs";
 import { reviewedGitSnapshotAvailability } from "./source-control/sourceControlActions.logic";
 import { Button } from "./ui/button";
 import {
@@ -78,6 +79,7 @@ export function PullRequestThreadDialog({
           environmentId,
           input: { cwd },
         }),
+    cwd === null ? null : vcsStatusSubscriptionStateAtom({ environmentId, cwd }),
   );
   const gitStatus = gitStatusQuery.data;
   const sourceControlPresentation = useMemo(

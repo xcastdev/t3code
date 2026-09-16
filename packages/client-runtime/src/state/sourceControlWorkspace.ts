@@ -35,6 +35,7 @@ import {
   createEnvironmentSubscriptionAtomFamily,
   type AtomCommandResult,
   type AtomCommandFailure,
+  type EnvironmentSubscriptionSnapshot,
 } from "./runtime.ts";
 import { vcsCommandConcurrency, vcsCommandScheduler } from "./vcsCommandScheduler.ts";
 import {
@@ -166,9 +167,25 @@ const statusRefreshByScope = Atom.family((scope: string) =>
     Atom.withLabel(`source-control-workspace:status-refresh:${scope}`),
   ),
 );
+const statusSubscriptionStateByScope = Atom.family((scope: string) =>
+  Atom.make<EnvironmentSubscriptionSnapshot<VcsStatusResult>>({
+    generation: 0,
+    snapshotGeneration: null,
+    value: null,
+  }).pipe(Atom.keepAlive, Atom.withLabel(`source-control-workspace:status-subscription:${scope}`)),
+);
 
 export function sourceControlWorkspaceStatusRefreshAtom(scope: SourceControlWorkspaceScope) {
   return statusRefreshByScope(
+    buildRepositoryScopeKey(scope.environmentId, { rootPath: scope.repositoryRoot }),
+  );
+}
+
+/** The reviewed status value from the currently connected subscription generation. */
+export function sourceControlWorkspaceStatusSubscriptionStateAtom(
+  scope: SourceControlWorkspaceScope,
+) {
+  return statusSubscriptionStateByScope(
     buildRepositoryScopeKey(scope.environmentId, { rootPath: scope.repositoryRoot }),
   );
 }
@@ -640,6 +657,11 @@ export function createSourceControlWorkspaceEnvironmentAtoms<R, E>(
       createEnvironmentSubscriptionAtomFamily(runtime, {
         label: "environment-data:source-control:status",
         idleTtlMs: 10_000,
+        snapshotState: ({ environmentId, input }) =>
+          sourceControlWorkspaceStatusSubscriptionStateAtom({
+            environmentId,
+            repositoryRoot: input.cwd,
+          }),
         onValue: (target, _value, registry) => publishSourceControlStatus(target, registry),
         refreshTrigger: ({ environmentId, input }) =>
           sourceControlWorkspaceStatusRefreshAtom({ environmentId, repositoryRoot: input.cwd }),

@@ -46,9 +46,11 @@ import {
   updateSourceControlComposerSessionDraft,
   type SourceControlRepository,
   createSourceControlWorkspaceEnvironmentAtoms,
+  invalidateSourceControlWorkspace,
   publishSourceControlStatus,
   sourceControlWorkspaceProgressAtom,
   sourceControlWorkspaceRevisionAtom,
+  sourceControlWorkspaceStatusSubscriptionStateAtom,
   sourceControlWorkspaceStatusRefreshAtom,
 } from "./sourceControlWorkspace.ts";
 
@@ -1302,6 +1304,129 @@ it.effect("does not refresh related status subscriptions for streamed status sna
       expect(registry.get(sourceControlWorkspaceStatusRefreshAtom(parent))).toBe(0);
       expect(registry.get(sourceControlWorkspaceStatusRefreshAtom(child))).toBe(0);
       expect(removed).toEqual([child.repositoryRoot, parent.repositoryRoot]);
+    }),
+  ),
+);
+
+it.effect("keeps only current-generation parent and nested status snapshots available", () =>
+  Effect.scoped(
+    Effect.gen(function* () {
+      const parent = { environmentId, repositoryRoot: "/workspace" };
+      const child = { environmentId, repositoryRoot: "/workspace/modules/sub" };
+      const initial = (headCommit: string, indexTree: string): VcsStatusStreamEvent => ({
+        _tag: "snapshot" as const,
+        local: {
+          isRepo: true,
+          hasPrimaryRemote: false,
+          isDefaultRef: true,
+          refName: "main",
+          headCommit,
+          indexTree,
+          hasWorkingTreeChanges: false,
+          workingTree: { files: [], insertions: 0, deletions: 0 },
+        },
+        remote: null,
+      });
+      const events = new Map<string, SubscriptionRef.SubscriptionRef<VcsStatusStreamEvent>>([
+        [
+          parent.repositoryRoot,
+          yield* SubscriptionRef.make(initial("parent-before", "parent-index")),
+        ],
+        [child.repositoryRoot, yield* SubscriptionRef.make(initial("child-before", "child-index"))],
+      ]);
+      const refreshGate = yield* Deferred.make<void>();
+      const subscriptions = new Map<string, number>();
+      const { atoms, registry } = yield* makeHarness({
+        [WS_METHODS.subscribeVcsStatus]: ({ cwd }: { readonly cwd: string }) =>
+          Stream.suspend(() => {
+            const subscription = (subscriptions.get(cwd) ?? 0) + 1;
+            subscriptions.set(cwd, subscription);
+            const stream = SubscriptionRef.changes(events.get(cwd)!);
+            return subscription === 1
+              ? stream
+              : Stream.fromEffect(Deferred.await(refreshGate)).pipe(Stream.flatMap(() => stream));
+          }),
+      });
+      registerVcsRepositories(registry, environmentId, parent.repositoryRoot, [
+        {
+          rootPath: parent.repositoryRoot,
+          worktreePath: parent.repositoryRoot,
+          commonDir: "/workspace/.git",
+          isSubmodule: false,
+          provider: null,
+        },
+        {
+          rootPath: child.repositoryRoot,
+          worktreePath: child.repositoryRoot,
+          commonDir: "/workspace/modules/sub/.git",
+          isSubmodule: true,
+          provider: null,
+        },
+      ]);
+      const parentStatus = atoms.status({ environmentId, input: { cwd: parent.repositoryRoot } });
+      const childStatus = atoms.status({ environmentId, input: { cwd: child.repositoryRoot } });
+      yield* AtomRegistry.mount(registry, parentStatus);
+      yield* AtomRegistry.mount(registry, childStatus);
+      yield* AtomRegistry.getResult(registry, parentStatus);
+      yield* AtomRegistry.getResult(registry, childStatus);
+      expect(registry.get(sourceControlWorkspaceStatusSubscriptionStateAtom(parent))).toMatchObject(
+        {
+          generation: 1,
+          snapshotGeneration: 1,
+          value: { headCommit: "parent-before", indexTree: "parent-index" },
+        },
+      );
+      expect(registry.get(sourceControlWorkspaceStatusSubscriptionStateAtom(child))).toMatchObject({
+        generation: 1,
+        snapshotGeneration: 1,
+        value: { headCommit: "child-before", indexTree: "child-index" },
+      });
+
+      invalidateSourceControlWorkspace(registry, child);
+      yield* AtomRegistry.toStream(
+        registry,
+        sourceControlWorkspaceStatusSubscriptionStateAtom(parent),
+      ).pipe(
+        Stream.filter((state) => state.generation === 2 && state.snapshotGeneration === null),
+        Stream.take(1),
+        Stream.runDrain,
+      );
+      expect(registry.get(sourceControlWorkspaceStatusSubscriptionStateAtom(child))).toMatchObject({
+        generation: 2,
+        snapshotGeneration: null,
+        value: null,
+      });
+      // The Effect atom still retains the old Success while its replacement
+      // stream is open. The sidecar, rather than that retained value, is the
+      // authorization source for a reviewed mutation.
+      expect(AsyncResult.isSuccess(registry.get(parentStatus))).toBe(true);
+
+      yield* SubscriptionRef.set(
+        events.get(parent.repositoryRoot)!,
+        initial("parent-after", "parent-next"),
+      );
+      yield* SubscriptionRef.set(
+        events.get(child.repositoryRoot)!,
+        initial("child-after", "child-next"),
+      );
+      yield* Deferred.succeed(refreshGate, undefined);
+      yield* AtomRegistry.toStream(
+        registry,
+        sourceControlWorkspaceStatusSubscriptionStateAtom(parent),
+      ).pipe(
+        Stream.filter(
+          (state) =>
+            state.snapshotGeneration === state.generation &&
+            state.value?.headCommit === "parent-after",
+        ),
+        Stream.take(1),
+        Stream.runDrain,
+      );
+      expect(registry.get(sourceControlWorkspaceStatusSubscriptionStateAtom(child))).toMatchObject({
+        generation: 2,
+        snapshotGeneration: 2,
+        value: { headCommit: "child-after", indexTree: "child-next" },
+      });
     }),
   ),
 );

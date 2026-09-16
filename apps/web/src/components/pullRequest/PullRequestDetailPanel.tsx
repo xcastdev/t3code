@@ -4,6 +4,7 @@ import { usePullRequestStack } from "~/state/usePullRequestStack";
 import { RefreshIcon } from "~/components/ui/refresh-icon";
 import { scopedThreadKey, scopeProjectRef } from "@t3tools/client-runtime/environment";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
+import { vcsStatusSubscriptionStateAtom } from "@t3tools/client-runtime/state/vcs";
 import {
   type EnvironmentId,
   DEFAULT_SERVER_SETTINGS,
@@ -814,6 +815,9 @@ export function PullRequestDetailPanel({
     localStatusCwd === undefined
       ? null
       : vcsEnvironment.status({ environmentId, input: { cwd: localStatusCwd } }),
+    localStatusCwd === undefined
+      ? null
+      : vcsStatusSubscriptionStateAtom({ environmentId, cwd: localStatusCwd }),
   );
   const reviewedLocalSnapshot = useMemo(
     () =>
@@ -1202,6 +1206,9 @@ export function PullRequestDetailPanel({
     checkoutCwd === null
       ? null
       : vcsEnvironment.status({ environmentId: actingEnvironmentId, input: { cwd: checkoutCwd } }),
+    checkoutCwd === null
+      ? null
+      : vcsStatusSubscriptionStateAtom({ environmentId: actingEnvironmentId, cwd: checkoutCwd }),
   );
   const reviewedCheckoutSnapshot = useMemo(
     () =>

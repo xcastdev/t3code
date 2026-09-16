@@ -106,7 +106,10 @@ import { serverEnvironment } from "~/state/server";
 import { threadEnvironment } from "~/state/threads";
 import { useAtomCommand } from "~/state/use-atom-command";
 import { sourceControlEnvironment, sourceControlWorkspaceEnvironment } from "~/state/sourceControl";
-import { sourceControlWorkspaceProgressAtom } from "@t3tools/client-runtime/state/sourceControlWorkspace";
+import {
+  sourceControlWorkspaceProgressAtom,
+  sourceControlWorkspaceStatusSubscriptionStateAtom,
+} from "@t3tools/client-runtime/state/sourceControlWorkspace";
 import { pullRequestEnvironment } from "~/state/pullRequests";
 import { randomUUID } from "~/lib/utils";
 import { resolvePathLinkTarget } from "~/terminal-links";
@@ -817,6 +820,12 @@ export default function SourceControlActions({
       ? sourceControlWorkspaceEnvironment.status({
           environmentId: activeEnvironmentId,
           input: { cwd: gitCwd },
+        })
+      : null,
+    sourceControlWorkspaceSupported && activeEnvironmentId !== null && gitCwd !== null
+      ? sourceControlWorkspaceStatusSubscriptionStateAtom({
+          environmentId: activeEnvironmentId,
+          repositoryRoot: gitCwd,
         })
       : null,
   );

@@ -26,6 +26,7 @@ import {
   readSourceControlComposerSessionDraft,
   sourceControlWorkspaceProgressAtom,
   sourceControlWorkspaceRevisionAtom,
+  sourceControlWorkspaceStatusSubscriptionStateAtom,
   updateSourceControlComposerSessionDraft,
 } from "@t3tools/client-runtime/state/sourceControlWorkspace";
 import { usePullRequestList, type EnvironmentQueryTarget } from "~/state/pullRequests";
@@ -254,6 +255,12 @@ function ChangesView(
       : sourceControlWorkspaceEnvironment.status({
           environmentId: props.environmentId,
           input: { cwd: props.cwd },
+        }),
+    props.cwd === null
+      ? null
+      : sourceControlWorkspaceStatusSubscriptionStateAtom({
+          environmentId: props.environmentId,
+          repositoryRoot: props.cwd,
         }),
   );
   const status = statusQuery.data;

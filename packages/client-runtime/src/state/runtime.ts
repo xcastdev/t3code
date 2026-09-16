@@ -63,6 +63,15 @@ interface EnvironmentSubscriptionAtomOptions<Input, A, E, R> {
   readonly label: string;
   readonly subscribe: (input: Input) => Stream.Stream<A, E, R>;
   readonly idleTtlMs?: number;
+  /**
+   * Streams never settle, so Effect keeps their last Success marked waiting.
+   * A caller that must distinguish a retained value from the current stream
+   * generation can supply this sidecar state.
+   */
+  readonly snapshotState?: (target: {
+    readonly environmentId: EnvironmentIdType;
+    readonly input: Input;
+  }) => Atom.Writable<EnvironmentSubscriptionSnapshot<A>>;
   readonly refreshTrigger?: (target: {
     readonly environmentId: EnvironmentIdType;
     readonly input: Input;
@@ -72,6 +81,21 @@ interface EnvironmentSubscriptionAtomOptions<Input, A, E, R> {
     value: A,
     registry: AtomRegistry.AtomRegistry,
   ) => Effect.Effect<void, never, R>;
+}
+
+export interface EnvironmentSubscriptionSnapshot<A> {
+  /** Increments before every fresh stream subscription, including reconnects. */
+  readonly generation: number;
+  /** The generation that supplied `value`, or null while its first value is pending. */
+  readonly snapshotGeneration: number | null;
+  /** Never retain a value across subscription generations. */
+  readonly value: A | null;
+}
+
+export function isEnvironmentSubscriptionSnapshotCurrent<A>(
+  state: EnvironmentSubscriptionSnapshot<A>,
+): state is EnvironmentSubscriptionSnapshot<A> & { readonly snapshotGeneration: number } {
+  return state.snapshotGeneration === state.generation && state.value !== null;
 }
 
 export type SettledAsyncResult<A, E> = AsyncResult.Success<A, E> | AsyncResult.Failure<A, E>;
@@ -586,23 +610,78 @@ export function createEnvironmentSubscriptionAtomFamily<R, ER, Input, A, E>(
 ) {
   const family = Atom.family((key: string) => {
     const target = parseEnvironmentRpcKey<Input>(key);
-    const subscription = runtime
-      .atom(
-        followStreamInEnvironment(
-          target.environmentId,
-          options
-            .subscribe(target.input)
-            .pipe(
-              Stream.tap((value) =>
-                options.onValue === undefined
-                  ? Effect.void
-                  : Effect.flatMap(AtomRegistry.AtomRegistry, (registry) =>
-                      options.onValue!(target, value, registry),
-                    ),
+    const stream =
+      options.snapshotState === undefined
+        ? followStreamInEnvironment(
+            target.environmentId,
+            options
+              .subscribe(target.input)
+              .pipe(
+                Stream.tap((value) =>
+                  options.onValue === undefined
+                    ? Effect.void
+                    : Effect.flatMap(AtomRegistry.AtomRegistry, (registry) =>
+                        options.onValue!(target, value, registry),
+                      ),
+                ),
               ),
-            ),
-        ),
-      )
+          )
+        : Stream.unwrap(
+            Effect.flatMap(AtomRegistry.AtomRegistry, (registry) => {
+              const snapshotState = options.snapshotState!(target);
+              const beginGeneration = () => {
+                const generation = registry.get(snapshotState).generation + 1;
+                registry.set(snapshotState, {
+                  generation,
+                  snapshotGeneration: null,
+                  value: null,
+                });
+                return generation;
+              };
+              let generation = beginGeneration();
+              return Effect.succeed(
+                followStreamInEnvironment(
+                  target.environmentId,
+                  Stream.unwrap(
+                    EnvironmentSupervisor.pipe(
+                      Effect.map((supervisor) =>
+                        Stream.merge(
+                          SubscriptionRef.changes(supervisor.session).pipe(
+                            Stream.drop(1),
+                            Stream.tap(() =>
+                              Effect.sync(() => {
+                                generation = beginGeneration();
+                              }),
+                            ),
+                            Stream.drain,
+                          ),
+                          options.subscribe(target.input).pipe(
+                            Stream.tap((value) =>
+                              Effect.sync(() => {
+                                registry.update(snapshotState, (current) =>
+                                  current.generation === generation
+                                    ? { generation, snapshotGeneration: generation, value }
+                                    : current,
+                                );
+                              }).pipe(
+                                Effect.andThen(
+                                  options.onValue === undefined
+                                    ? Effect.void
+                                    : options.onValue(target, value, registry),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              );
+            }),
+          );
+    const subscription = runtime
+      .atom(stream)
       .pipe(
         Atom.setIdleTTL(options.idleTtlMs ?? 5 * 60_000),
         Atom.withLabel(`${options.label}:${key}`),

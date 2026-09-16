@@ -102,6 +102,7 @@ vi.mock("@effect/atom-react", () => ({
 }));
 vi.mock("@t3tools/client-runtime/state/sourceControlWorkspace", () => ({
   sourceControlWorkspaceProgressAtom: () => "workspace-progress",
+  sourceControlWorkspaceStatusSubscriptionStateAtom: () => "workspace-status-subscription",
 }));
 vi.mock("@t3tools/client-runtime/state/runtime", () => ({
   isAtomCommandInterrupted: () => false,
