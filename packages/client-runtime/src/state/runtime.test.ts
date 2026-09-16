@@ -1,5 +1,5 @@
 import { describe, expect, it } from "@effect/vitest";
-import { EnvironmentId } from "@t3tools/contracts";
+import { EnvironmentId, type ServerLifecycleStreamEvent, WS_METHODS } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -12,6 +12,7 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import * as TestClock from "effect/testing/TestClock";
 import { AsyncResult, Atom, AtomRegistry } from "effect/unstable/reactivity";
 
 import {
@@ -24,16 +25,19 @@ import {
 } from "../connection/model.ts";
 import * as EnvironmentRegistry from "../connection/registry.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
-import { EnvironmentRpcUnavailableError } from "../rpc/client.ts";
+import { EnvironmentRpcUnavailableError, subscribe } from "../rpc/client.ts";
+import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import type * as RpcSession from "../rpc/session.ts";
 import {
   environmentRpcKey,
   createAtomCommandScheduler,
   createEnvironmentQueryAtomFamily,
+  createEnvironmentSubscriptionAtomFamily,
   createRuntimeCommand,
   scheduleAtomCommandEffect,
   executeAtomCommand,
   executeAtomQuery,
+  type EnvironmentSubscriptionSnapshot,
   isAtomCommandInterrupted,
   mapAtomCommandResult,
   runAtomCommand,
@@ -115,6 +119,7 @@ const makeEnvironmentQueryHarness = Effect.fn("TestEnvironmentQuery.makeHarness"
 
   return {
     atom: family({ environmentId: QUERY_ENVIRONMENT.environmentId, input: undefined }),
+    runtime,
     supervisorSession,
     supervisorState,
   };
@@ -545,6 +550,155 @@ describe("environment query lifecycle", () => {
             suspendOnWaiting: true,
           }),
         ).toBe("updated");
+      }),
+    ),
+  );
+});
+
+describe("environment subscription lifecycle", () => {
+  it.effect("does not restore a buffered value from a replaced RPC session", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const awaitDeferred = <A>(name: string, deferred: Deferred.Deferred<A>) =>
+          Deferred.await(deferred).pipe(
+            Effect.timeout("5 seconds"),
+            TestClock.withLive,
+            Effect.flatMap(
+              Option.match({
+                onNone: () => Effect.die(new Error(`Timed out waiting for ${name}.`)),
+                onSome: Effect.succeed,
+              }),
+            ),
+          );
+        const firstSubscribed = yield* Deferred.make<void>();
+        const secondSubscribed = yield* Deferred.make<void>();
+        const oldFirstEntered = yield* Deferred.make<void>();
+        const releaseOldFirst = yield* Deferred.make<void>();
+        const firstSubscriptionClosed = yield* Deferred.make<void>();
+        const oldFirst = { source: "old", index: 1 } as unknown as ServerLifecycleStreamEvent;
+        const oldBuffered = {
+          source: "old",
+          index: 2,
+        } as unknown as ServerLifecycleStreamEvent;
+        const newFirst = { source: "new", index: 1 } as unknown as ServerLifecycleStreamEvent;
+        const secondEvents = yield* Queue.unbounded<ServerLifecycleStreamEvent>();
+        const firstClient = {
+          [WS_METHODS.subscribeServerLifecycle]: () =>
+            Stream.fromEffect(Deferred.succeed(firstSubscribed, undefined)).pipe(
+              Stream.drain,
+              Stream.concat(Stream.fromIterable([oldFirst, oldBuffered])),
+              Stream.concat(Stream.never),
+              Stream.ensuring(Deferred.succeed(firstSubscriptionClosed, undefined)),
+            ),
+        } as unknown as WsRpcProtocolClient;
+        const secondClient = {
+          [WS_METHODS.subscribeServerLifecycle]: () =>
+            Stream.fromEffect(Deferred.succeed(secondSubscribed, undefined)).pipe(
+              Stream.drain,
+              Stream.concat(Stream.fromQueue(secondEvents)),
+            ),
+        } as unknown as WsRpcProtocolClient;
+        const session = (client: WsRpcProtocolClient): RpcSession.RpcSession => ({
+          client,
+          initialConfig: Effect.never,
+          subscribeServerConfig: (input) => client.subscribeServerConfig(input),
+          ready: Effect.void,
+          probe: Effect.void,
+          closed: Effect.never,
+        });
+        const firstSession = session(firstClient);
+        const secondSession = session(secondClient);
+        const harness = yield* makeEnvironmentQueryHarness(Effect.never);
+        const snapshotState = Atom.make<
+          EnvironmentSubscriptionSnapshot<ServerLifecycleStreamEvent>
+        >({
+          generation: 0,
+          snapshotGeneration: null,
+          value: null,
+        });
+        const family = createEnvironmentSubscriptionAtomFamily(harness.runtime, {
+          label: "test.environment-subscription",
+          snapshotState: () => snapshotState,
+          subscribe: () => subscribe(WS_METHODS.subscribeServerLifecycle, {}),
+          onValue: (_target, value) =>
+            value === oldFirst
+              ? Deferred.succeed(oldFirstEntered, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseOldFirst)),
+                )
+              : Effect.void,
+        });
+        const atom = family({ environmentId: QUERY_ENVIRONMENT.environmentId, input: undefined });
+        const registry = AtomRegistry.make();
+        yield* SubscriptionRef.set(harness.supervisorSession, Option.some(firstSession));
+        const unmount = registry.mount(atom);
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            unmount();
+            registry.dispose();
+          }),
+        );
+
+        yield* awaitDeferred("the old RPC subscription", firstSubscribed);
+        yield* awaitDeferred("the old first value", oldFirstEntered);
+        expect(registry.get(snapshotState)).toEqual({
+          generation: 1,
+          snapshotGeneration: 1,
+          value: oldFirst,
+        });
+
+        const generationTwo =
+          yield* Deferred.make<EnvironmentSubscriptionSnapshot<ServerLifecycleStreamEvent>>();
+        yield* AtomRegistry.toStream(registry, snapshotState).pipe(
+          Stream.filter((snapshot) => snapshot.generation === 2),
+          Stream.take(1),
+          Stream.runForEach((snapshot) => Deferred.succeed(generationTwo, snapshot)),
+          Effect.forkScoped,
+        );
+        yield* SubscriptionRef.set(harness.supervisorSession, Option.none());
+        expect(yield* awaitDeferred("generation two", generationTwo)).toEqual({
+          generation: 2,
+          snapshotGeneration: null,
+          value: null,
+        });
+
+        const generationThree =
+          yield* Deferred.make<EnvironmentSubscriptionSnapshot<ServerLifecycleStreamEvent>>();
+        yield* AtomRegistry.toStream(registry, snapshotState).pipe(
+          Stream.filter((snapshot) => snapshot.generation === 3),
+          Stream.take(1),
+          Stream.runForEach((snapshot) => Deferred.succeed(generationThree, snapshot)),
+          Effect.forkScoped,
+        );
+        yield* SubscriptionRef.set(harness.supervisorSession, Option.some(secondSession));
+        expect(yield* awaitDeferred("generation three", generationThree)).toEqual({
+          generation: 3,
+          snapshotGeneration: null,
+          value: null,
+        });
+        yield* awaitDeferred("the new RPC subscription", secondSubscribed);
+
+        yield* Deferred.succeed(releaseOldFirst, undefined);
+        yield* awaitDeferred("the old RPC subscription to close", firstSubscriptionClosed);
+        expect(registry.get(snapshotState)).toEqual({
+          generation: 3,
+          snapshotGeneration: null,
+          value: null,
+        });
+
+        const newSnapshot =
+          yield* Deferred.make<EnvironmentSubscriptionSnapshot<ServerLifecycleStreamEvent>>();
+        yield* AtomRegistry.toStream(registry, snapshotState).pipe(
+          Stream.filter((snapshot) => snapshot.value === newFirst),
+          Stream.take(1),
+          Stream.runForEach((snapshot) => Deferred.succeed(newSnapshot, snapshot)),
+          Effect.forkScoped,
+        );
+        yield* Queue.offer(secondEvents, newFirst);
+        expect(yield* awaitDeferred("the new first value", newSnapshot)).toEqual({
+          generation: 3,
+          snapshotGeneration: 3,
+          value: newFirst,
+        });
       }),
     ),
   );
