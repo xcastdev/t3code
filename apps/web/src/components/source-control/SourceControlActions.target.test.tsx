@@ -1,6 +1,6 @@
 /* @vitest-environment happy-dom */
 
-import { act, Children, cloneElement, isValidElement, type ReactElement } from "react";
+import { act, Children, cloneElement, isValidElement, StrictMode, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import type { VcsStatusResult } from "@t3tools/contracts";
@@ -356,15 +356,17 @@ async function render(
   target: HTMLElement | null,
   environmentId = "environment",
   cwd = "/repo",
+  strictMode = false,
 ): Promise<void> {
+  const actions = (
+    <ActionsWithTarget
+      activeThreadRef={{ environmentId, threadId: "thread" }}
+      gitCwd={cwd}
+      target={target}
+    />
+  );
   await act(async () => {
-    root.render(
-      <ActionsWithTarget
-        activeThreadRef={{ environmentId, threadId: "thread" }}
-        gitCwd={cwd}
-        target={target}
-      />,
-    );
+    root.render(strictMode ? <StrictMode>{actions}</StrictMode> : actions);
   });
 }
 
@@ -1004,7 +1006,7 @@ describe("SourceControlActions target lifetime", () => {
     const root = createRoot(host);
     roots.push(root);
 
-    await render(root, target);
+    await render(root, target, "environment", "/repo", true);
     await clickButton("Worktree");
     expect(document.querySelector('input[aria-label="Worktree ref"]')).not.toBeNull();
     const branch = document.querySelector<HTMLInputElement>('input[aria-label="Worktree branch"]')!;
@@ -1044,7 +1046,7 @@ describe("SourceControlActions target lifetime", () => {
     const root = createRoot(host);
     roots.push(root);
 
-    await render(root, target);
+    await render(root, target, "environment", "/repo", true);
     await clickButton("Create Branch From...");
     const source = document.querySelector<HTMLInputElement>('input[aria-label="Source ref"]');
     expect(source).not.toBeNull();
@@ -1079,7 +1081,7 @@ describe("SourceControlActions target lifetime", () => {
     const root = createRoot(host);
     roots.push(root);
 
-    await render(root, target);
+    await render(root, target, "environment", "/repo", true);
     await clickButton("Checkout");
     await typeInput(
       document.querySelector<HTMLInputElement>('input[aria-label="Ref name"]')!,

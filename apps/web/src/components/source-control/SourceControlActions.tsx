@@ -115,7 +115,7 @@ import { getSourceControlPresentation } from "~/sourceControlPresentation";
 import { useOpenLink } from "~/browser/useOpenLink";
 import { useOpenPrLink } from "~/lib/openPullRequestLink";
 import { PublishRepositoryDialog } from "./PublishRepositoryDialog";
-import { useConfirmationLease } from "./confirmationLease";
+import { updateConfirmationForm, useConfirmationLease } from "./confirmationLease";
 
 interface SourceControlActionsProps {
   gitCwd: string | null;
@@ -591,6 +591,7 @@ export default function SourceControlActions({
     [activeEnvironmentId, gitCwd],
   );
   const pendingScope = `${activeEnvironmentId ?? ""}\0${gitCwd ?? ""}`;
+  const pendingScopeRef = useRef(pendingScope);
   const clearPendingGitConfirmation = useCallback(
     (token: number) => {
       confirmationLease.revoke(token);
@@ -623,29 +624,27 @@ export default function SourceControlActions({
   );
   const updateWorkflowInput = useCallback(
     (update: (current: WorkflowInputState) => WorkflowInputState) => {
+      if (workflowInput === null) return;
+      const approvalToken = confirmationLease.replace(workflowInput.approvalToken);
+      if (approvalToken === null) return;
+      const next = updateConfirmationForm(workflowInput, approvalToken, update);
       setWorkflowInput((current) =>
-        current
-          ? (() => {
-              const approvalToken = confirmationLease.replace(current.approvalToken);
-              return approvalToken === null ? current : { ...update(current), approvalToken };
-            })()
-          : current,
+        current?.approvalToken === workflowInput.approvalToken ? next : current,
       );
     },
-    [confirmationLease],
+    [confirmationLease, workflowInput],
   );
   const updateWorktreeInput = useCallback(
     (update: (current: WorktreeInputState) => WorktreeInputState) => {
+      if (worktreeInput === null) return;
+      const approvalToken = confirmationLease.replace(worktreeInput.approvalToken);
+      if (approvalToken === null) return;
+      const next = updateConfirmationForm(worktreeInput, approvalToken, update);
       setWorktreeInput((current) =>
-        current
-          ? (() => {
-              const approvalToken = confirmationLease.replace(current.approvalToken);
-              return approvalToken === null ? current : { ...update(current), approvalToken };
-            })()
-          : current,
+        current?.approvalToken === worktreeInput.approvalToken ? next : current,
       );
     },
-    [confirmationLease],
+    [confirmationLease, worktreeInput],
   );
   const clearPendingHeaderAction = useCallback(
     (token: number) => {
@@ -681,37 +680,65 @@ export default function SourceControlActions({
     };
   }, [confirmationLease]);
   useEffect(() => {
-    setPendingHeaderAction((current) => {
-      if (current) confirmationLease.revoke(current.approvalToken);
-      return null;
-    });
+    if (pendingScopeRef.current === pendingScope) return;
+    pendingScopeRef.current = pendingScope;
+    if (pendingHeaderAction) {
+      const approvalToken = pendingHeaderAction.approvalToken;
+      confirmationLease.revoke(approvalToken);
+      setPendingHeaderAction((current) =>
+        current?.approvalToken === approvalToken ? null : current,
+      );
+    }
     // A form is an approval/review of one immutable target. Never quietly
     // carry it into a newly selected nested repository.
-    setWorkflowInput((current) =>
-      current &&
-      `${current.reviewedSourceScope.environmentId}\0${current.reviewedSourceScope.cwd}` !==
+    if (
+      workflowInput &&
+      `${workflowInput.reviewedSourceScope.environmentId}\0${workflowInput.reviewedSourceScope.cwd}` !==
         pendingScope
-        ? (confirmationLease.revoke(current.approvalToken), null)
-        : current,
-    );
-    setWorktreeInput((current) =>
-      current &&
-      `${current.reviewedSourceScope.environmentId}\0${current.reviewedSourceScope.cwd}` !==
+    ) {
+      const approvalToken = workflowInput.approvalToken;
+      confirmationLease.revoke(approvalToken);
+      setWorkflowInput((current) => (current?.approvalToken === approvalToken ? null : current));
+    }
+    if (
+      worktreeInput &&
+      `${worktreeInput.reviewedSourceScope.environmentId}\0${worktreeInput.reviewedSourceScope.cwd}` !==
         pendingScope
-        ? (confirmationLease.revoke(current.approvalToken), null)
-        : current,
-    );
-    setInitConfirmationScope((current) =>
-      current && `${current.environmentId}\0${current.cwd}` !== pendingScope
-        ? (confirmationLease.revoke(current.approvalToken), null)
-        : current,
-    );
-    setPendingDefaultBranchAction((current) =>
-      current && `${current.environmentId}\0${current.cwd}` !== pendingScope
-        ? (confirmationLease.revoke(current.approvalToken), null)
-        : current,
-    );
-  }, [confirmationLease, pendingScope]);
+    ) {
+      const approvalToken = worktreeInput.approvalToken;
+      confirmationLease.revoke(approvalToken);
+      setWorktreeInput((current) => (current?.approvalToken === approvalToken ? null : current));
+    }
+    if (
+      initConfirmationScope &&
+      `${initConfirmationScope.environmentId}\0${initConfirmationScope.cwd}` !== pendingScope
+    ) {
+      const approvalToken = initConfirmationScope.approvalToken;
+      confirmationLease.revoke(approvalToken);
+      setInitConfirmationScope((current) =>
+        current?.approvalToken === approvalToken ? null : current,
+      );
+    }
+    if (
+      pendingDefaultBranchAction &&
+      `${pendingDefaultBranchAction.environmentId}\0${pendingDefaultBranchAction.cwd}` !==
+        pendingScope
+    ) {
+      const approvalToken = pendingDefaultBranchAction.approvalToken;
+      confirmationLease.revoke(approvalToken);
+      setPendingDefaultBranchAction((current) =>
+        current?.approvalToken === approvalToken ? null : current,
+      );
+    }
+  }, [
+    confirmationLease,
+    initConfirmationScope,
+    pendingDefaultBranchAction,
+    pendingHeaderAction,
+    pendingScope,
+    workflowInput,
+    worktreeInput,
+  ]);
   let runGitActionWithToast: (input: RunGitActionWithToastInput) => Promise<void>;
 
   const updateActiveProgressToast = useCallback(() => {
@@ -929,43 +956,45 @@ export default function SourceControlActions({
     currentRepositorySourceScopeKey !== null &&
     repositorySourceScopeKey(worktreeInput.reviewedSourceScope) === currentRepositorySourceScopeKey;
   useEffect(() => {
-    setPendingGitConfirmation((current) =>
-      current !== null &&
-      currentGitActionApprovalScopeKey !== null &&
-      gitActionApprovalScopeKey(current.scope) === currentGitActionApprovalScopeKey
-        ? current
-        : (current && confirmationLease.revoke(current.approvalToken), null),
-    );
-  }, [confirmationLease, currentGitActionApprovalScopeKey]);
+    if (
+      pendingGitConfirmation !== null &&
+      (currentGitActionApprovalScopeKey === null ||
+        gitActionApprovalScopeKey(pendingGitConfirmation.scope) !==
+          currentGitActionApprovalScopeKey)
+    ) {
+      clearPendingGitConfirmation(pendingGitConfirmation.approvalToken);
+    }
+  }, [clearPendingGitConfirmation, currentGitActionApprovalScopeKey, pendingGitConfirmation]);
   useEffect(() => {
     // Typed workflow forms are approvals of the source checkout they opened
     // against. Do not reuse them after a checkout, ref move, or HEAD move.
-    setWorkflowInput((current) =>
-      current !== null &&
-      currentWorkflowApprovalScopeKey !== null &&
-      workflowApprovalScopeKey(current) === currentWorkflowApprovalScopeKey
-        ? current
-        : (current && confirmationLease.revoke(current.approvalToken), null),
-    );
-  }, [confirmationLease, currentWorkflowApprovalScopeKey]);
+    if (
+      workflowInput !== null &&
+      (currentWorkflowApprovalScopeKey === null ||
+        workflowApprovalScopeKey(workflowInput) !== currentWorkflowApprovalScopeKey)
+    ) {
+      clearWorkflowInput(workflowInput.approvalToken);
+    }
+  }, [clearWorkflowInput, currentWorkflowApprovalScopeKey, workflowInput]);
   useEffect(() => {
-    setPendingHeaderAction((current) =>
-      current !== null &&
-      currentHeaderActionScopeKey !== null &&
-      headerActionScopeKey(current.scope) === currentHeaderActionScopeKey
-        ? current
-        : (current && confirmationLease.revoke(current.approvalToken), null),
-    );
-  }, [confirmationLease, currentHeaderActionScopeKey]);
+    if (
+      pendingHeaderAction !== null &&
+      (currentHeaderActionScopeKey === null ||
+        headerActionScopeKey(pendingHeaderAction.scope) !== currentHeaderActionScopeKey)
+    ) {
+      clearPendingHeaderAction(pendingHeaderAction.approvalToken);
+    }
+  }, [clearPendingHeaderAction, currentHeaderActionScopeKey, pendingHeaderAction]);
   useEffect(() => {
-    setWorktreeInput((current) =>
-      current !== null &&
-      currentRepositorySourceScopeKey !== null &&
-      repositorySourceScopeKey(current.reviewedSourceScope) === currentRepositorySourceScopeKey
-        ? current
-        : (current && confirmationLease.revoke(current.approvalToken), null),
-    );
-  }, [confirmationLease, currentRepositorySourceScopeKey]);
+    if (
+      worktreeInput !== null &&
+      (currentRepositorySourceScopeKey === null ||
+        repositorySourceScopeKey(worktreeInput.reviewedSourceScope) !==
+          currentRepositorySourceScopeKey)
+    ) {
+      clearWorktreeInput(worktreeInput.approvalToken);
+    }
+  }, [clearWorktreeInput, currentRepositorySourceScopeKey, worktreeInput]);
   useEffect(() => {
     if (isPublishDialogOpen && !isPublishRepositoryScopeCurrent) {
       if (publishRepositoryScope) confirmationLease.revoke(publishRepositoryScope.approvalToken);
@@ -1022,14 +1051,18 @@ export default function SourceControlActions({
     [confirmationLease],
   );
   useEffect(() => {
-    setPendingDefaultBranchAction((current) => {
-      if (!current) return current;
-      return currentGitActionApprovalScopeKey !== null &&
-        gitActionApprovalScopeKey(current) === currentGitActionApprovalScopeKey
-        ? current
-        : (confirmationLease.revoke(current.approvalToken), null);
-    });
-  }, [confirmationLease, currentGitActionApprovalScopeKey]);
+    if (
+      pendingDefaultBranchAction !== null &&
+      (currentGitActionApprovalScopeKey === null ||
+        gitActionApprovalScopeKey(pendingDefaultBranchAction) !== currentGitActionApprovalScopeKey)
+    ) {
+      clearPendingDefaultBranchAction(pendingDefaultBranchAction.approvalToken);
+    }
+  }, [
+    clearPendingDefaultBranchAction,
+    currentGitActionApprovalScopeKey,
+    pendingDefaultBranchAction,
+  ]);
   const providerDiscovery = sourceControlDiscoveryQuery.data?.sourceControlProviders.find(
     (provider) => provider.kind === gitStatus?.sourceControlProvider?.kind,
   );

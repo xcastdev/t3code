@@ -1,6 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef } from "react";
 
 /**
+ * Applies an already-authorized replacement token to form state. This is
+ * deliberately pure so React may replay a state updater without changing the
+ * confirmation lease a second time.
+ */
+export function updateConfirmationForm<Input extends { readonly approvalToken: number }>(
+  current: Input,
+  approvalToken: number,
+  update: (current: Input) => Input,
+): Input {
+  return { ...update(current), approvalToken };
+}
+
+/**
  * Owns the one-shot authorization represented by a rendered confirmation
  * control. State is deliberately not the authority: React can retain a
  * handler after its dialog has disappeared. A later approval receives a new

@@ -3,7 +3,7 @@
 import { act, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
-import { useConfirmationLease } from "./confirmationLease";
+import { updateConfirmationForm, useConfirmationLease } from "./confirmationLease";
 
 type Lease = ReturnType<typeof useConfirmationLease>;
 
@@ -41,6 +41,18 @@ afterEach(async () => {
 });
 
 describe("useConfirmationLease", () => {
+  it("keeps replayed form state updates pure after the event replaced its token", () => {
+    const current = { approvalToken: 7, refName: "before" };
+    const update = (form: typeof current) => ({ ...form, refName: "after" });
+
+    const first = updateConfirmationForm(current, 8, update);
+    const replay = updateConfirmationForm(current, 8, update);
+
+    expect(current).toEqual({ approvalToken: 7, refName: "before" });
+    expect(first).toEqual({ approvalToken: 8, refName: "after" });
+    expect(replay).toEqual(first);
+  });
+
   it("keeps an executing owner exclusive until that exact token settles", () => {
     const first = lease!.issue();
     expect(first).not.toBeNull();
