@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 
 const atoms = vi.hoisted(() => ({ prepare: Symbol("prepare-pull-request-thread") }));
 const preparePullRequestThread = vi.hoisted(() => vi.fn());
+const providerRun = vi.hoisted(() => vi.fn().mockResolvedValue({ _tag: "Success", value: {} }));
 const newThread = vi.hoisted(() => vi.fn());
 const atomValue = vi.hoisted(() => ({
   environment: { capabilities: { sourceControlWorkspace: true } },
@@ -26,7 +27,8 @@ vi.mock("~/state/server", () => ({
   serverEnvironment: { configValueAtom: () => Symbol("server-config") },
 }));
 vi.mock("~/state/use-atom-command", () => ({
-  useAtomCommand: (atom: symbol) => (atom === atoms.prepare ? preparePullRequestThread : vi.fn()),
+  useAtomCommand: (atom: symbol) =>
+    atom === atoms.prepare ? preparePullRequestThread : providerRun,
 }));
 vi.mock("~/state/vcs", () => ({
   vcsActionManager: {
@@ -68,7 +70,9 @@ vi.mock("~/state/environments", () => ({
   useEnvironments: () => ({ environments: projectState.environments }),
   usePrimaryEnvironmentId: () => null,
 }));
-vi.mock("~/state/usePullRequestStack", () => ({ usePullRequestStack: () => ({ data: null }) }));
+vi.mock("~/state/usePullRequestStack", () => ({
+  usePullRequestStack: () => ({ data: null, refresh: vi.fn() }),
+}));
 vi.mock("~/hooks/useHandleNewThread", () => ({ useNewThreadHandler: () => newThread }));
 vi.mock("~/hooks/useLiveRefresh", () => ({ useLiveRefresh: () => undefined }));
 vi.mock("~/hooks/useSettings", () => ({ useClientSettings: () => ({}) }));
@@ -101,6 +105,32 @@ vi.mock("./PullRequestSummaryTab", () => ({ PullRequestSummaryTab: () => <div />
 vi.mock("./PullRequestTimelineTab", () => ({ PullRequestTimelineTab: () => <div /> }));
 vi.mock("./PullRequestThreadLinks", () => ({ PullRequestThreadLinks: () => null }));
 vi.mock("./PullRequestStackMenu", () => ({ PullRequestStackMenu: () => null }));
+vi.mock("../ui/alert-dialog", () => {
+  const Wrap = ({ children }: { children: React.ReactNode }) => <div>{children}</div>;
+  return {
+    AlertDialog: ({
+      open,
+      onOpenChange,
+      children,
+    }: {
+      open: boolean;
+      onOpenChange: (open: boolean) => void;
+      children: React.ReactNode;
+    }) =>
+      open ? (
+        <div>
+          <button onClick={() => onOpenChange(false)}>Dismiss confirmation</button>
+          {children}
+        </div>
+      ) : null,
+    AlertDialogPopup: Wrap,
+    AlertDialogHeader: Wrap,
+    AlertDialogTitle: Wrap,
+    AlertDialogDescription: Wrap,
+    AlertDialogFooter: Wrap,
+    AlertDialogClose: Wrap,
+  };
+});
 
 import { PullRequestDetailPanel } from "./PullRequestDetailPanel";
 
@@ -180,6 +210,7 @@ beforeEach(() => {
     value: { branch: "feature/scoped", worktreePath: "/repo/.t3/worktrees/scoped" },
   });
   newThread.mockReset().mockResolvedValue({ threadId: "checkout-thread" });
+  providerRun.mockReset().mockResolvedValue({ _tag: "Success", value: {} });
   detailForQuery = detail;
   projectState.projects = [];
   projectState.environments = [];
@@ -330,5 +361,112 @@ describe("PullRequestDetailPanel checkout scope", () => {
         threadId: "checkout-thread",
       },
     });
+  });
+});
+
+describe("PullRequestDetailPanel mutation approval scope", () => {
+  const panel = (number = 7) => (
+    <PullRequestDetailPanel
+      context="page"
+      environmentId={environmentId}
+      getShortcutContext={() => ({
+        terminalFocus: false,
+        terminalOpen: false,
+        previewFocus: false,
+        previewOpen: false,
+      })}
+      reference={{ projectId, repository: "owner/repo", repositoryRoot: "/repo", number }}
+      shortcutsEnabled={false}
+    />
+  );
+  const buttonWithText = (text: string) =>
+    renderer.root.findAllByType("button").find((button) => renderedText(button) === text);
+
+  it("revokes a retained Close approval when the mounted PR target changes", async () => {
+    detailForQuery = {
+      ...detail,
+      capabilities: { ...detail.capabilities, actions: ["close"] },
+      viewerPermissions: { ...detail.viewerPermissions, actions: ["close"] },
+    };
+    await act(async () => {
+      renderer = create(panel());
+    });
+    const close = buttonWithText("Close pull request");
+    expect(close).toBeDefined();
+    await act(async () => close?.props.onClick());
+    const confirm = buttonWithText("Close");
+    expect(confirm).toBeDefined();
+    const onConfirm = confirm?.props.onClick as (() => void) | undefined;
+
+    detailForQuery = {
+      ...detailForQuery,
+      number: 8,
+      url: "https://github.com/owner/repo/pull/8",
+    };
+    await act(async () => {
+      renderer.update(panel(8));
+    });
+    // Keep the old detached Confirm event as the browser can deliver it after React has closed
+    // the dialog. It may not call the provider for whichever PR now occupies the panel.
+    await act(async () => onConfirm?.());
+    expect(providerRun).not.toHaveBeenCalled();
+  });
+
+  it("requires a fresh Reopen approval and keeps cancellation mutation-free", async () => {
+    detailForQuery = {
+      ...detail,
+      state: "closed",
+      capabilities: { ...detail.capabilities, actions: ["reopen"] },
+      viewerPermissions: { ...detail.viewerPermissions, actions: ["reopen"] },
+    };
+    await act(async () => {
+      renderer = create(panel());
+    });
+    const reopen = buttonWithText("Reopen pull request");
+    expect(reopen).toBeDefined();
+    await act(async () => reopen?.props.onClick());
+    expect(providerRun).not.toHaveBeenCalled();
+    await act(async () => buttonWithText("Dismiss confirmation")?.props.onClick());
+    expect(providerRun).not.toHaveBeenCalled();
+
+    await act(async () => reopen?.props.onClick());
+    await act(async () => buttonWithText("Reopen")?.props.onClick());
+    expect(providerRun).toHaveBeenCalledWith({
+      environmentId,
+      input: {
+        projectId,
+        repository: "owner/repo",
+        repositoryRoot: "/repo",
+        number: 7,
+        action: "reopen",
+      },
+    });
+  });
+
+  it("revokes a retained Merge approval when its reviewed provider snapshot changes", async () => {
+    detailForQuery = {
+      ...detail,
+      capabilities: { ...detail.capabilities, actions: ["merge"], mergeMethods: ["squash"] },
+      mergeCapabilities: { merge: false, squash: true, rebase: false },
+      viewerPermissions: { ...detail.viewerPermissions, actions: ["merge"] },
+    };
+    await act(async () => {
+      renderer = create(panel());
+    });
+    const merge = buttonWithText("Squash and merge");
+    expect(merge).toBeDefined();
+    await act(async () => merge?.props.onClick());
+    const confirm = renderer.root
+      .findAllByType("button")
+      .findLast((button) => renderedText(button) === "Squash and merge");
+    expect(confirm).toBeDefined();
+    const onConfirm = confirm?.props.onClick as (() => void) | undefined;
+
+    detailForQuery = { ...detailForQuery, headBranch: "feature/moved" };
+    await act(async () => {
+      renderer.update(panel());
+    });
+    await act(async () => onConfirm?.());
+    expect(providerRun).not.toHaveBeenCalled();
   });
 });

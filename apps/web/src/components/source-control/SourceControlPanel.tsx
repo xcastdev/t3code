@@ -1839,6 +1839,7 @@ function PullRequestsView(
       <div className="min-h-0 flex-1">
         {selectedForScope ? (
           <PullRequestDetailPanel
+            key={`${selectedForScope.environmentId}:${selectedForScope.projectId}:${props.cwd ?? ""}:${selectedForScope.host ?? ""}:${selectedForScope.repository}#${selectedForScope.number}`}
             environmentId={selectedForScope.environmentId}
             shortcutsEnabled={false}
             getShortcutContext={() => SOURCE_CONTROL_SHORTCUT_CONTEXT}

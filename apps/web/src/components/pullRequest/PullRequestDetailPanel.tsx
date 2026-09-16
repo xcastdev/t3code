@@ -8,6 +8,7 @@ import {
   type EnvironmentId,
   DEFAULT_SERVER_SETTINGS,
   type PullRequestAction,
+  type PullRequestDetailView,
   type PullRequestMergeMethod,
   type PullRequestListEntry,
   type PullRequestUpdateMethod,
@@ -178,6 +179,45 @@ import {
 } from "./pullRequestPresentation";
 
 type DetailTab = "summary" | "timeline" | "code";
+
+type ConfirmationAction =
+  | "merge"
+  | "close"
+  | "reopen"
+  | "enable-auto-merge"
+  | "revert"
+  | "approve-workflows";
+
+/**
+ * The detail panel is deliberately reusable: Source Control replaces its reference in place
+ * while a reader moves through a list. An approval must therefore keep both the exact target
+ * and the complete host snapshot it was displayed against, never rediscover either on Confirm.
+ */
+type PullRequestMutationScope = {
+  readonly environmentId: EnvironmentId;
+  readonly reference: PullRequestRef;
+  readonly detail: PullRequestDetailView;
+};
+
+type PullRequestConfirmation = {
+  readonly action: ConfirmationAction;
+  readonly scope: PullRequestMutationScope;
+  readonly scopeKey: string;
+  /** Merge choice is part of the approved operation, not a live menu preference. */
+  readonly mergeMethod: PullRequestMergeMethod | null;
+  /** A comment is posted only after the associated state mutation is approved. */
+  readonly commentBody: string | null;
+};
+
+function clonePullRequestReference(reference: PullRequestRef): PullRequestRef {
+  return { ...reference };
+}
+
+function pullRequestMutationScopeKey(scope: PullRequestMutationScope): string {
+  // Detail is a wire shape with no functions. Encoding its complete reviewed value is intentional:
+  // a target, provider capability, state, branch, or host revision change revokes the approval.
+  return JSON.stringify([scope.environmentId, scope.reference, scope.detail]);
+}
 
 const ACTION_SUCCESS_LABELS: Record<PullRequestAction, string> = {
   merge: "Pull request merged",
@@ -614,11 +654,9 @@ export function PullRequestDetailPanel({
   const setMergeMethod = (method: PullRequestMergeMethod) => {
     setMergeMethodSelection({ pullRequestKey, method });
   };
-  const [confirmation, setConfirmation] = useState<{
-    readonly open: boolean;
-    readonly action: "merge" | "close" | "enable-auto-merge" | "revert" | "approve-workflows";
-  }>({ open: false, action: "merge" });
-  const confirmAction = confirmation.action;
+  const [confirmation, setConfirmation] = useState<PullRequestConfirmation | null>(null);
+  const confirmationRef = useRef<PullRequestConfirmation | null>(null);
+  const confirmAction = confirmation?.action ?? "merge";
   // Which handoff is preparing, keyed so a per-finding button can say "Preparing..." on itself
   // alone. One at a time whatever the key: they all check the same pull request out.
   const [handoff, setHandoff] = useState<string | null>(null);
@@ -712,6 +750,32 @@ export function PullRequestDetailPanel({
           },
     [activity, coreDetail],
   );
+  const currentMutationScope = useMemo<PullRequestMutationScope | null>(
+    () =>
+      detail === null
+        ? null
+        : {
+            environmentId,
+            reference: clonePullRequestReference(reference),
+            detail,
+          },
+    [detail, environmentId, reference],
+  );
+  const currentMutationScopeKey =
+    currentMutationScope === null ? null : pullRequestMutationScopeKey(currentMutationScope);
+  // A retained dialog callback may run one event turn after React removed the dialog. Keep the
+  // comparison in layout state so it cannot issue a provider mutation through that stale handle.
+  const currentMutationScopeKeyRef = useRef<string | null>(currentMutationScopeKey);
+  useLayoutEffect(() => {
+    currentMutationScopeKeyRef.current = currentMutationScopeKey;
+  }, [currentMutationScopeKey]);
+  const confirmationIsCurrent =
+    confirmation !== null &&
+    currentMutationScopeKey !== null &&
+    confirmation.scopeKey === currentMutationScopeKey;
+  useLayoutEffect(() => {
+    confirmationRef.current = confirmation;
+  }, [confirmation]);
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const { copyToClipboard: copyReference } = useCopyToClipboard<string>({
     target: "pull request reference",
@@ -954,15 +1018,60 @@ export function PullRequestDetailPanel({
     cwd: acting?.workspaceRoot ?? detail?.workspaceRoot ?? null,
   });
 
+  const pendingCommentResolver = useRef<
+    ((result: { readonly commentPosted: boolean }) => void) | null
+  >(null);
+  const dismissConfirmation = useCallback(() => {
+    const pending = confirmationRef.current;
+    confirmationRef.current = null;
+    setConfirmation(null);
+    if (pending?.commentBody !== null && pending !== null) {
+      pendingCommentResolver.current?.({ commentPosted: false });
+      pendingCommentResolver.current = null;
+    }
+  }, []);
+
+  // Do not leave an approval visibly attached to a later detail response. The submission guard
+  // below remains necessary because an old Confirm callback can outlive this layout effect.
+  useEffect(() => {
+    if (confirmation !== null && !confirmationIsCurrent) dismissConfirmation();
+  }, [confirmation, confirmationIsCurrent, dismissConfirmation]);
+
+  const requestConfirmation = useCallback(
+    (
+      action: ConfirmationAction,
+      options: {
+        readonly commentBody?: string;
+        readonly mergeMethod?: PullRequestMergeMethod;
+      } = {},
+    ) => {
+      if (actionPending || currentMutationScope === null || currentMutationScopeKey === null) {
+        return false;
+      }
+      const next: PullRequestConfirmation = {
+        action,
+        scope: currentMutationScope,
+        scopeKey: currentMutationScopeKey,
+        mergeMethod: options.mergeMethod ?? null,
+        commentBody: options.commentBody ?? null,
+      };
+      confirmationRef.current = next;
+      setConfirmation(next);
+      return true;
+    },
+    [actionPending, currentMutationScope, currentMutationScopeKey],
+  );
+
   const finishAction = async (
     action: PullRequestAction,
+    scope: PullRequestMutationScope,
     method?: PullRequestMergeMethod,
     updateMethod?: PullRequestUpdateMethod,
   ) => {
     const result = await runAction({
-      environmentId,
+      environmentId: scope.environmentId,
       input: {
-        ...reference,
+        ...scope.reference,
         action,
         ...(method ? { mergeMethod: method } : {}),
         ...(updateMethod ? { updateMethod } : {}),
@@ -1008,39 +1117,101 @@ export function PullRequestDetailPanel({
     method?: PullRequestMergeMethod,
     updateMethod?: PullRequestUpdateMethod,
   ) => {
-    if (pendingAction !== null) return false;
+    // Non-confirmed controls still bind the click to the exact mounted detail. They do not
+    // retain an approval, but an event from a just-replaced panel must not mutate its successor.
+    const scope = currentMutationScope;
+    if (
+      pendingAction !== null ||
+      scope === null ||
+      currentMutationScopeKeyRef.current !== pullRequestMutationScopeKey(scope)
+    ) {
+      return false;
+    }
     setPendingAction(action);
-    return finishAction(action, method, updateMethod);
+    return finishAction(action, scope, method, updateMethod);
   };
 
-  const performCommentAction = async (body: string, action: "close" | "reopen") => {
-    if (pendingAction !== null) return { commentPosted: false };
-    setPendingAction(action);
+  const performConfirmedAction = async (pending: PullRequestConfirmation) => {
+    if (
+      pendingAction !== null ||
+      currentMutationScopeKeyRef.current === null ||
+      pending.scopeKey !== currentMutationScopeKeyRef.current
+    ) {
+      return false;
+    }
+    setPendingAction(pending.action);
+    return finishAction(pending.action, pending.scope, pending.mergeMethod ?? undefined);
+  };
+
+  const postCommentForScope = async (scope: PullRequestMutationScope, body: string) => {
+    if (currentMutationScopeKeyRef.current !== pullRequestMutationScopeKey(scope)) return false;
     const commentResult = await postComment({
-      environmentId,
-      input: { ...reference, body },
+      environmentId: scope.environmentId,
+      input: { ...scope.reference, body },
     });
     if (commentResult._tag === "Failure") {
-      setPendingAction(null);
       toastManager.add({ type: "error", title: "Could not post the comment" });
-      return { commentPosted: false };
+      return false;
     }
-    const actionSucceeded = await finishAction(action);
+    return true;
+  };
+
+  const performConfirmedCommentAction = async (pending: PullRequestConfirmation) => {
+    if (pending.commentBody === null) return false;
+    if (
+      pendingAction !== null ||
+      currentMutationScopeKeyRef.current === null ||
+      pending.scopeKey !== currentMutationScopeKeyRef.current
+    ) {
+      return false;
+    }
+    setPendingAction(pending.action);
+    const commentPosted = await postCommentForScope(pending.scope, pending.commentBody);
+    if (!commentPosted) {
+      setPendingAction(null);
+      return false;
+    }
+    const actionSucceeded = await finishAction(
+      pending.action,
+      pending.scope,
+      pending.mergeMethod ?? undefined,
+    );
     // The comment is durable even if the state change was refused, so make it visible while the
     // shared action failure explains why the pull request stayed where it was.
     if (!actionSucceeded) refreshDetail();
-    return { commentPosted: true };
+    return true;
+  };
+
+  const performCommentAction = (body: string, action: "close" | "reopen") => {
+    if (pendingAction !== null) return Promise.resolve({ commentPosted: false });
+    return new Promise<{ readonly commentPosted: boolean }>((resolve) => {
+      pendingCommentResolver.current = resolve;
+      if (!requestConfirmation(action, { commentBody: body })) {
+        pendingCommentResolver.current = null;
+        resolve({ commentPosted: false });
+      }
+    });
   };
 
   const saveTitle = async (next: string) => {
     const title = next.trim();
-    if (detail === null || titleSaving) return;
+    const scope = currentMutationScope;
+    if (
+      detail === null ||
+      titleSaving ||
+      scope === null ||
+      currentMutationScopeKeyRef.current !== pullRequestMutationScopeKey(scope)
+    )
+      return;
     if (title.length === 0 || title === detail.title) {
       setTitleScope(null);
       return;
     }
     setTitleSaving(true);
-    const result = await update({ environmentId, input: { ...reference, title } });
+    const result = await update({
+      environmentId: scope.environmentId,
+      input: { ...scope.reference, title },
+    });
     setTitleSaving(false);
     if (result._tag === "Failure") {
       // The draft stays open with the words still in it: retyping a title somebody has just
@@ -1871,7 +2042,9 @@ export function PullRequestDetailPanel({
                           variant="default"
                           disabled={actionPending}
                           onClick={() =>
-                            setConfirmation({ open: true, action: "enable-auto-merge" })
+                            requestConfirmation("enable-auto-merge", {
+                              mergeMethod: selectedMergeMethod,
+                            })
                           }
                           aria-label={
                             pendingAction === "enable-auto-merge"
@@ -1922,7 +2095,9 @@ export function PullRequestDetailPanel({
                           size="xs"
                           variant="default"
                           disabled={actionPending}
-                          onClick={() => setConfirmation({ open: true, action: "merge" })}
+                          onClick={() =>
+                            requestConfirmation("merge", { mergeMethod: selectedMergeMethod })
+                          }
                           aria-label={
                             pendingAction === "merge" ? "Merging..." : selectedMergeMethodLabel
                           }
@@ -2042,7 +2217,9 @@ export function PullRequestDetailPanel({
                       {showsMergeNow ? (
                         <MenuItem
                           disabled={actionPending}
-                          onClick={() => setConfirmation({ open: true, action: "merge" })}
+                          onClick={() =>
+                            requestConfirmation("merge", { mergeMethod: selectedMergeMethod })
+                          }
                         >
                           <GitMergeIcon className="size-3.5" />
                           Merge now
@@ -2063,7 +2240,9 @@ export function PullRequestDetailPanel({
                         <MenuItem
                           disabled={actionPending}
                           onClick={() =>
-                            setConfirmation({ open: true, action: "enable-auto-merge" })
+                            requestConfirmation("enable-auto-merge", {
+                              mergeMethod: selectedMergeMethod,
+                            })
                           }
                         >
                           <GitMergeIcon className="size-3.5" />
@@ -2142,7 +2321,7 @@ export function PullRequestDetailPanel({
                       <MenuItem
                         variant="destructive"
                         disabled={actionPending}
-                        onClick={() => setConfirmation({ open: true, action: "close" })}
+                        onClick={() => requestConfirmation("close")}
                       >
                         <GitPullRequestClosedIcon className="size-3.5" />
                         Close pull request
@@ -2151,7 +2330,10 @@ export function PullRequestDetailPanel({
                   ) : detail.state === "closed" && can("reopen") ? (
                     <>
                       <MenuSeparator />
-                      <MenuItem disabled={actionPending} onClick={() => void perform("reopen")}>
+                      <MenuItem
+                        disabled={actionPending}
+                        onClick={() => requestConfirmation("reopen")}
+                      >
                         <GitPullRequestIcon className="size-3.5" />
                         Reopen pull request
                       </MenuItem>
@@ -2161,7 +2343,7 @@ export function PullRequestDetailPanel({
                       <MenuSeparator />
                       <MenuItem
                         disabled={actionPending}
-                        onClick={() => setConfirmation({ open: true, action: "revert" })}
+                        onClick={() => requestConfirmation("revert")}
                       >
                         <RotateCcwIcon className="size-3.5" />
                         Revert changes
@@ -2494,9 +2676,7 @@ export function PullRequestDetailPanel({
                             size="xs"
                             variant="warning-outline"
                             disabled={actionPending}
-                            onClick={() =>
-                              setConfirmation({ open: true, action: "approve-workflows" })
-                            }
+                            onClick={() => requestConfirmation("approve-workflows")}
                             aria-label={
                               pendingAction === "approve-workflows"
                                 ? "Approving..."
@@ -2726,10 +2906,12 @@ export function PullRequestDetailPanel({
               reference.repository,
               reference.number,
             ])}
-            environmentId={environmentId}
-            reference={reference}
             detail={detail}
             actionPending={actionPending}
+            onComment={(body) => {
+              const scope = currentMutationScope;
+              return scope === null ? Promise.resolve(false) : postCommentForScope(scope, body);
+            }}
             onCommentAction={performCommentAction}
             onCommented={refreshDetail}
           />
@@ -2737,10 +2919,12 @@ export function PullRequestDetailPanel({
       ) : null}
 
       <AlertDialog
-        open={confirmation.open}
-        onOpenChange={(open) => setConfirmation((current) => ({ ...current, open }))}
+        open={confirmationIsCurrent}
+        onOpenChange={(open) => {
+          if (!open) dismissConfirmation();
+        }}
         onOpenChangeComplete={(open) => {
-          if (!open) setConfirmation({ open: false, action: "merge" });
+          if (!open) dismissConfirmation();
         }}
       >
         <AlertDialogPopup>
@@ -2748,27 +2932,31 @@ export function PullRequestDetailPanel({
             <AlertDialogTitle>
               {confirmAction === "merge"
                 ? "Merge pull request?"
-                : confirmAction === "enable-auto-merge"
-                  ? "Enable auto-merge?"
-                  : confirmAction === "revert"
-                    ? "Revert these changes?"
-                    : confirmAction === "approve-workflows"
-                      ? "Approve workflows to run?"
-                      : "Close pull request?"}
+                : confirmAction === "reopen"
+                  ? "Reopen pull request?"
+                  : confirmAction === "enable-auto-merge"
+                    ? "Enable auto-merge?"
+                    : confirmAction === "revert"
+                      ? "Revert these changes?"
+                      : confirmAction === "approve-workflows"
+                        ? "Approve workflows to run?"
+                        : "Close pull request?"}
             </AlertDialogTitle>
             <AlertDialogDescription>
               {confirmAction === "merge"
-                ? `This merges #${reference.number} using ${selectedMergeMethod}.`
-                : confirmAction === "enable-auto-merge"
-                  ? // The host merges this as soon as it considers the pull request ready, which
-                    // may be immediately — there is no telling from here whether anything is
-                    // still outstanding.
-                    `This merges #${reference.number} using ${selectedMergeMethod} as soon as the host considers it ready, which may be immediately.`
-                  : confirmAction === "revert"
-                    ? `This opens a new pull request that reverses the changes merged by #${reference.number}.`
-                    : confirmAction === "approve-workflows"
-                      ? `This allows ${workflowApprovalsRequired} ${workflowApprovalsRequired === 1 ? "workflow" : "workflows"} from #${reference.number} to run. Review the code and workflow changes first.`
-                      : `This closes #${reference.number} without merging it.`}
+                ? `This merges #${confirmation?.scope.reference.number ?? reference.number} using ${confirmation?.mergeMethod ?? selectedMergeMethod}.`
+                : confirmAction === "reopen"
+                  ? `This reopens #${confirmation?.scope.reference.number ?? reference.number}.`
+                  : confirmAction === "enable-auto-merge"
+                    ? // The host merges this as soon as it considers the pull request ready, which
+                      // may be immediately — there is no telling from here whether anything is
+                      // still outstanding.
+                      `This merges #${confirmation?.scope.reference.number ?? reference.number} using ${confirmation?.mergeMethod ?? selectedMergeMethod} as soon as the host considers it ready, which may be immediately.`
+                    : confirmAction === "revert"
+                      ? `This opens a new pull request that reverses the changes merged by #${confirmation?.scope.reference.number ?? reference.number}.`
+                      : confirmAction === "approve-workflows"
+                        ? `This allows ${confirmation?.scope.detail.workflowApprovalsRequired ?? workflowApprovalsRequired} ${(confirmation?.scope.detail.workflowApprovalsRequired ?? workflowApprovalsRequired) === 1 ? "workflow" : "workflows"} from #${confirmation?.scope.reference.number ?? reference.number} to run. Review the code and workflow changes first.`
+                        : `This closes #${confirmation?.scope.reference.number ?? reference.number} without merging it.`}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
@@ -2778,27 +2966,35 @@ export function PullRequestDetailPanel({
             <Button
               size="sm"
               variant={confirmAction === "close" ? "destructive" : "default"}
-              disabled={actionPending}
+              disabled={actionPending || !confirmationIsCurrent}
               onClick={() => {
-                const action = confirmAction;
-                setConfirmation((current) => ({ ...current, open: false }));
-                if (action === "merge") void perform("merge", selectedMergeMethod);
-                if (action === "enable-auto-merge")
-                  void perform("enable-auto-merge", selectedMergeMethod);
-                if (action === "revert") void perform("revert");
-                if (action === "approve-workflows") void perform("approve-workflows");
-                if (action === "close") void perform("close");
+                const pending = confirmationRef.current;
+                if (pending === null) return;
+                confirmationRef.current = null;
+                setConfirmation(null);
+                void (
+                  pending.commentBody === null
+                    ? performConfirmedAction(pending)
+                    : performConfirmedCommentAction(pending)
+                ).then((commentPosted) => {
+                  if (pending.commentBody !== null) {
+                    pendingCommentResolver.current?.({ commentPosted });
+                    pendingCommentResolver.current = null;
+                  }
+                });
               }}
             >
               {confirmAction === "merge"
-                ? selectedMergeMethodLabel
-                : confirmAction === "enable-auto-merge"
-                  ? "Enable auto-merge"
-                  : confirmAction === "revert"
-                    ? "Create revert PR"
-                    : confirmAction === "approve-workflows"
-                      ? "Approve and run"
-                      : "Close"}
+                ? PULL_REQUEST_MERGE_METHOD_LABELS[confirmation?.mergeMethod ?? selectedMergeMethod]
+                : confirmAction === "reopen"
+                  ? "Reopen"
+                  : confirmAction === "enable-auto-merge"
+                    ? "Enable auto-merge"
+                    : confirmAction === "revert"
+                      ? "Create revert PR"
+                      : confirmAction === "approve-workflows"
+                        ? "Approve and run"
+                        : "Close"}
             </Button>
           </AlertDialogFooter>
         </AlertDialogPopup>

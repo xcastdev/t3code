@@ -1,4 +1,4 @@
-import type { EnvironmentId, PullRequestDetailView, PullRequestRef } from "@t3tools/contracts";
+import type { PullRequestDetailView } from "@t3tools/contracts";
 import {
   GitPullRequestClosedIcon,
   MessageSquareIcon,
@@ -8,26 +8,20 @@ import {
 } from "lucide-react";
 import { useRef, useState } from "react";
 
-import { useAtomCommand } from "~/state/use-atom-command";
-import { pullRequestEnvironment } from "~/state/pullRequests";
-
 import { Button } from "../ui/button";
 import { Popover, PopoverClose, PopoverPopup, PopoverTitle, PopoverTrigger } from "../ui/popover";
 import { Textarea } from "../ui/textarea";
-import { toastManager } from "../ui/toast";
 
 export function PullRequestCommentComposer({
-  environmentId,
-  reference,
   detail,
   actionPending,
+  onComment,
   onCommentAction,
   onCommented,
 }: {
-  environmentId: EnvironmentId;
-  reference: PullRequestRef;
   detail: PullRequestDetailView;
   actionPending: boolean;
+  onComment: (body: string) => Promise<boolean>;
   onCommentAction: (
     body: string,
     action: "close" | "reopen",
@@ -38,7 +32,6 @@ export function PullRequestCommentComposer({
   const [body, setBody] = useState("");
   const [submitting, setSubmitting] = useState<"comment" | "close" | "reopen" | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const postComment = useAtomCommand(pullRequestEnvironment.comment, { reportFailure: false });
   const followUpAction =
     detail.state === "open" &&
     detail.capabilities.actions.includes("close") &&
@@ -63,16 +56,8 @@ export function PullRequestCommentComposer({
       setSubmitting(null);
       return;
     }
-    const result = await postComment({
-      environmentId,
-      input: {
-        ...reference,
-        body: trimmed,
-      },
-    });
-    if (result._tag === "Failure") {
+    if (!(await onComment(trimmed))) {
       setSubmitting(null);
-      toastManager.add({ type: "error", title: "Could not post the comment" });
       return;
     }
     setBody("");
