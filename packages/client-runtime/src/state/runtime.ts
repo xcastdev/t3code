@@ -638,40 +638,33 @@ export function createEnvironmentSubscriptionAtomFamily<R, ER, Input, A, E>(
                 });
                 return generation;
               };
-              let generation = beginGeneration();
               return Effect.succeed(
                 followStreamInEnvironment(
                   target.environmentId,
                   Stream.unwrap(
                     EnvironmentSupervisor.pipe(
                       Effect.map((supervisor) =>
-                        Stream.merge(
-                          SubscriptionRef.changes(supervisor.session).pipe(
-                            Stream.drop(1),
-                            Stream.tap(() =>
-                              Effect.sync(() => {
-                                generation = beginGeneration();
-                              }),
-                            ),
-                            Stream.drain,
-                          ),
-                          options.subscribe(target.input).pipe(
-                            Stream.tap((value) =>
-                              Effect.sync(() => {
-                                registry.update(snapshotState, (current) =>
-                                  current.generation === generation
-                                    ? { generation, snapshotGeneration: generation, value }
-                                    : current,
-                                );
-                              }).pipe(
-                                Effect.andThen(
-                                  options.onValue === undefined
-                                    ? Effect.void
-                                    : options.onValue(target, value, registry),
+                        SubscriptionRef.changes(supervisor.session).pipe(
+                          Stream.switchMap(() => {
+                            const generation = beginGeneration();
+                            return options.subscribe(target.input).pipe(
+                              Stream.tap((value) =>
+                                Effect.sync(() => {
+                                  registry.update(snapshotState, (current) =>
+                                    current.generation === generation
+                                      ? { generation, snapshotGeneration: generation, value }
+                                      : current,
+                                  );
+                                }).pipe(
+                                  Effect.andThen(
+                                    options.onValue === undefined
+                                      ? Effect.void
+                                      : options.onValue(target, value, registry),
+                                  ),
                                 ),
                               ),
-                            ),
-                          ),
+                            );
+                          }),
                         ),
                       ),
                     ),
