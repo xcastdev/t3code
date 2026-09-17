@@ -561,7 +561,7 @@ describe("environment subscription lifecycle", () => {
       Effect.gen(function* () {
         const awaitDeferred = <A>(name: string, deferred: Deferred.Deferred<A>) =>
           Deferred.await(deferred).pipe(
-            Effect.timeout("5 seconds"),
+            Effect.timeoutOption("5 seconds"),
             TestClock.withLive,
             Effect.flatMap(
               Option.match({
@@ -574,34 +574,51 @@ describe("environment subscription lifecycle", () => {
         const secondSubscribed = yield* Deferred.make<void>();
         const oldFirstEntered = yield* Deferred.make<void>();
         const releaseOldFirst = yield* Deferred.make<void>();
-        const firstSubscriptionClosed = yield* Deferred.make<void>();
-        const oldFirst = { source: "old", index: 1 } as unknown as ServerLifecycleStreamEvent;
-        const oldBuffered = {
-          source: "old",
-          index: 2,
-        } as unknown as ServerLifecycleStreamEvent;
-        const newFirst = { source: "new", index: 1 } as unknown as ServerLifecycleStreamEvent;
+        const lifecycleEvent = (sequence: number): ServerLifecycleStreamEvent => ({
+          version: 1,
+          sequence,
+          type: "welcome",
+          payload: {
+            environment: {
+              environmentId: QUERY_ENVIRONMENT.environmentId,
+              label: "Query environment",
+              platform: { os: "linux", arch: "x64" },
+              serverVersion: "0.0.0-test",
+              capabilities: { repositoryIdentity: false },
+            },
+            cwd: "/repo",
+            projectName: "project",
+          },
+        });
+        const oldFirst = lifecycleEvent(1);
+        const oldBuffered = lifecycleEvent(2);
+        const newFirst = lifecycleEvent(3);
         const secondEvents = yield* Queue.unbounded<ServerLifecycleStreamEvent>();
-        const firstClient = {
-          [WS_METHODS.subscribeServerLifecycle]: () =>
+        type LifecycleClientFixture = {
+          readonly [WS_METHODS.subscribeServerLifecycle]: (
+            input: Parameters<WsRpcProtocolClient[typeof WS_METHODS.subscribeServerLifecycle]>[0],
+          ) => Stream.Stream<ServerLifecycleStreamEvent>;
+        };
+        const firstClient: LifecycleClientFixture = {
+          [WS_METHODS.subscribeServerLifecycle]: (_input) =>
             Stream.fromEffect(Deferred.succeed(firstSubscribed, undefined)).pipe(
               Stream.drain,
               Stream.concat(Stream.fromIterable([oldFirst, oldBuffered])),
               Stream.concat(Stream.never),
-              Stream.ensuring(Deferred.succeed(firstSubscriptionClosed, undefined)),
             ),
-        } as unknown as WsRpcProtocolClient;
-        const secondClient = {
-          [WS_METHODS.subscribeServerLifecycle]: () =>
+        };
+        const secondClient: LifecycleClientFixture = {
+          [WS_METHODS.subscribeServerLifecycle]: (_input) =>
             Stream.fromEffect(Deferred.succeed(secondSubscribed, undefined)).pipe(
               Stream.drain,
               Stream.concat(Stream.fromQueue(secondEvents)),
             ),
-        } as unknown as WsRpcProtocolClient;
-        const session = (client: WsRpcProtocolClient): RpcSession.RpcSession => ({
-          client,
+        };
+        const session = (lifecycleClient: LifecycleClientFixture): RpcSession.RpcSession => ({
+          ...QUERY_RPC_SESSION,
+          client: Object.assign({}, QUERY_RPC_SESSION.client, lifecycleClient),
           initialConfig: Effect.never,
-          subscribeServerConfig: (input) => client.subscribeServerConfig(input),
+          subscribeServerConfig: (input) => QUERY_RPC_SESSION.client.subscribeServerConfig(input),
           ready: Effect.void,
           probe: Effect.void,
           closed: Effect.never,
@@ -629,6 +646,44 @@ describe("environment subscription lifecycle", () => {
         });
         const atom = family({ environmentId: QUERY_ENVIRONMENT.environmentId, input: undefined });
         const registry = AtomRegistry.make();
+        const sidecarTransitions: Array<
+          EnvironmentSubscriptionSnapshot<ServerLifecycleStreamEvent>
+        > = [];
+        const initialSidecarSnapshot =
+          yield* Deferred.make<EnvironmentSubscriptionSnapshot<ServerLifecycleStreamEvent>>();
+        const generationTwo =
+          yield* Deferred.make<EnvironmentSubscriptionSnapshot<ServerLifecycleStreamEvent>>();
+        const generationThree =
+          yield* Deferred.make<EnvironmentSubscriptionSnapshot<ServerLifecycleStreamEvent>>();
+        const newFirstSidecarSnapshot =
+          yield* Deferred.make<EnvironmentSubscriptionSnapshot<ServerLifecycleStreamEvent>>();
+        yield* AtomRegistry.toStream(registry, snapshotState).pipe(
+          Stream.runForEach((snapshot) =>
+            Effect.gen(function* () {
+              sidecarTransitions.push(snapshot);
+              if (snapshot.generation === 0) {
+                yield* Deferred.succeed(initialSidecarSnapshot, snapshot);
+              }
+              if (snapshot.generation === 2) {
+                yield* Deferred.succeed(generationTwo, snapshot);
+              }
+              if (snapshot.generation === 3 && snapshot.snapshotGeneration === null) {
+                yield* Deferred.succeed(generationThree, snapshot);
+              }
+              if (snapshot.value === newFirst) {
+                yield* Deferred.succeed(newFirstSidecarSnapshot, snapshot);
+              }
+            }),
+          ),
+          Effect.forkScoped,
+        );
+        expect(
+          yield* awaitDeferred("the initial sidecar snapshot", initialSidecarSnapshot),
+        ).toEqual({
+          generation: 0,
+          snapshotGeneration: null,
+          value: null,
+        });
         yield* SubscriptionRef.set(harness.supervisorSession, Option.some(firstSession));
         const unmount = registry.mount(atom);
         yield* Effect.addFinalizer(() =>
@@ -646,14 +701,6 @@ describe("environment subscription lifecycle", () => {
           value: oldFirst,
         });
 
-        const generationTwo =
-          yield* Deferred.make<EnvironmentSubscriptionSnapshot<ServerLifecycleStreamEvent>>();
-        yield* AtomRegistry.toStream(registry, snapshotState).pipe(
-          Stream.filter((snapshot) => snapshot.generation === 2),
-          Stream.take(1),
-          Stream.runForEach((snapshot) => Deferred.succeed(generationTwo, snapshot)),
-          Effect.forkScoped,
-        );
         yield* SubscriptionRef.set(harness.supervisorSession, Option.none());
         expect(yield* awaitDeferred("generation two", generationTwo)).toEqual({
           generation: 2,
@@ -661,14 +708,6 @@ describe("environment subscription lifecycle", () => {
           value: null,
         });
 
-        const generationThree =
-          yield* Deferred.make<EnvironmentSubscriptionSnapshot<ServerLifecycleStreamEvent>>();
-        yield* AtomRegistry.toStream(registry, snapshotState).pipe(
-          Stream.filter((snapshot) => snapshot.generation === 3),
-          Stream.take(1),
-          Stream.runForEach((snapshot) => Deferred.succeed(generationThree, snapshot)),
-          Effect.forkScoped,
-        );
         yield* SubscriptionRef.set(harness.supervisorSession, Option.some(secondSession));
         expect(yield* awaitDeferred("generation three", generationThree)).toEqual({
           generation: 3,
@@ -678,27 +717,23 @@ describe("environment subscription lifecycle", () => {
         yield* awaitDeferred("the new RPC subscription", secondSubscribed);
 
         yield* Deferred.succeed(releaseOldFirst, undefined);
-        yield* awaitDeferred("the old RPC subscription to close", firstSubscriptionClosed);
-        expect(registry.get(snapshotState)).toEqual({
-          generation: 3,
-          snapshotGeneration: null,
-          value: null,
-        });
-
-        const newSnapshot =
-          yield* Deferred.make<EnvironmentSubscriptionSnapshot<ServerLifecycleStreamEvent>>();
-        yield* AtomRegistry.toStream(registry, snapshotState).pipe(
-          Stream.filter((snapshot) => snapshot.value === newFirst),
-          Stream.take(1),
-          Stream.runForEach((snapshot) => Deferred.succeed(newSnapshot, snapshot)),
-          Effect.forkScoped,
-        );
         yield* Queue.offer(secondEvents, newFirst);
-        expect(yield* awaitDeferred("the new first value", newSnapshot)).toEqual({
+        expect(
+          yield* awaitDeferred("the new first sidecar snapshot", newFirstSidecarSnapshot),
+        ).toEqual({
           generation: 3,
           snapshotGeneration: 3,
           value: newFirst,
         });
+        expect(sidecarTransitions).toEqual([
+          { generation: 0, snapshotGeneration: null, value: null },
+          { generation: 1, snapshotGeneration: null, value: null },
+          { generation: 1, snapshotGeneration: 1, value: oldFirst },
+          { generation: 2, snapshotGeneration: null, value: null },
+          { generation: 3, snapshotGeneration: null, value: null },
+          { generation: 3, snapshotGeneration: 3, value: newFirst },
+        ]);
+        expect(sidecarTransitions.some((snapshot) => snapshot.value === oldBuffered)).toBe(false);
       }),
     ),
   );
