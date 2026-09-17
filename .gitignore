@@ -36,6 +36,7 @@ apps/mobile/.generated/
 artifacts/app-store/screenshots/
 .github/pr-assets/
 native/**/target/
+**/.gradle/
 node_modules/
 .alchemy/
 *.log
