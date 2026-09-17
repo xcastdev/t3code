@@ -762,8 +762,9 @@ export function EnvironmentExternalNotificationsSettings(props: {
   const environment = environments.environments.find(
     (item) => item.environmentId === props.environmentId,
   );
+  const scopedSettings = useScopedSettings();
   const settings =
-    environment?.serverConfig?.settings ?? useScopedSettings() ?? DEFAULT_UNIFIED_SETTINGS;
+    environment?.serverConfig?.settings ?? scopedSettings ?? DEFAULT_UNIFIED_SETTINGS;
   const update = useAtomCommand(serverEnvironment.updateSettings, "update notifications");
   const test = useAtomCommand(serverEnvironment.testExternalNotification, "test notification");
   const destinations = settings.externalNotifications.destinations;

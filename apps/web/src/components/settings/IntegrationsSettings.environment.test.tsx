@@ -24,6 +24,7 @@ const commands = vi.hoisted(() => ({
   updateSettings: vi.fn(),
   testExternalNotification: vi.fn(),
   updatePrimarySettings: vi.fn(),
+  readScopedSettings: vi.fn(),
 }));
 
 const state = vi.hoisted(() => ({
@@ -79,6 +80,11 @@ vi.mock("~/hooks/useSettings", () => ({
   useEnvironmentSettings: () => settingsValue,
   usePrimarySettings: () => DEFAULT_UNIFIED_SETTINGS,
   useUpdatePrimarySettings: () => commands.updatePrimarySettings,
+}));
+
+vi.mock("./useScopedSettings", () => ({
+  useScopedSettings: () => commands.readScopedSettings(),
+  useUpdateScopedSettings: () => commands.updateSettings,
 }));
 
 vi.mock("~/state/environments", () => ({
@@ -151,7 +157,7 @@ const makeEnvironment = (
   serverConfig: { settings: settingsValue } as unknown as ServerConfig,
 });
 
-const environments = [makeEnvironment(remoteTarget), makeEnvironment(primaryTarget)];
+let environments = [makeEnvironment(remoteTarget), makeEnvironment(primaryTarget)];
 
 function isEnvironmentWithId(
   value: unknown,
@@ -212,6 +218,18 @@ describe("external notification settings boundary", () => {
     commands.updateSettings.mockReset().mockResolvedValue({ _tag: "Success" });
     commands.testExternalNotification.mockReset().mockResolvedValue({ _tag: "Success" });
     commands.updatePrimarySettings.mockReset();
+    commands.readScopedSettings.mockReset().mockReturnValue(settingsValue);
+    environments = [makeEnvironment(remoteTarget), makeEnvironment(primaryTarget)];
+  });
+
+  it("keeps its settings hooks stable when an environment connects", () => {
+    environments = [];
+    renderEnvironmentSettings(false);
+
+    environments = [makeEnvironment(primaryTarget)];
+    renderEnvironmentSettings(false);
+
+    expect(commands.readScopedSettings).toHaveBeenCalledTimes(2);
   });
 
   it("renders device tabs and keeps the saved webhook secret out of client elements", () => {
