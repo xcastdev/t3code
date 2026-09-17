@@ -148,7 +148,7 @@ review than the final tree.
 | Workspace pane redesign      | Client state only             | Full                                              | Full through web shell    | Not implemented           | None                                                               |
 | Source Control panel         | Full                          | Full                                              | Full through web shell    | Not implemented           | None                                                               |
 | Project-local MCP editor     | Full                          | Full                                              | Full through web shell    | Consume only              | Codex, Claude, Cursor, Grok, OpenCode                              |
-| Scoped MCP catalogs          | Full RPC/backend              | No editor                                         | No editor                 | No editor                 | All current adapters require restart; external OpenCode can opt in |
+| Scoped MCP catalogs          | Full RPC/backend              | Global/project/session editors                    | Uses web editor           | Consume only              | All current adapters require restart; external OpenCode can opt in |
 | Attached primary backend     | Server CLI plus IPC contracts | Recovery/settings surface inside desktop renderer | Full                      | Not applicable            | Provider-neutral once attached                                     |
 | Per-turn activity visibility | Full                          | Full                                              | Full through web shell    | Work-count subset         | Provenance from all adapters; effort varies by provider            |
 
@@ -433,10 +433,10 @@ Codex, Claude, Cursor, Grok, and managed or opted-in OpenCode all declare
 management declares it unsupported. The live gateway is infrastructure for a future
 provider capability, not a currently exposed live-reload feature.
 
-The scoped global, project-override, and session editors are also not exposed in web,
-desktop, or mobile. They exist as capability-gated RPCs. The visible editor remains
-the legacy project-local editor. Mobile can consume configured catalogs but cannot
-edit them.
+The scoped global, project-override, and session editors are exposed in web and
+desktop through capability-gated RPCs. Mobile can consume configured catalogs and
+view thread state but cannot edit catalog definitions. The legacy project-local
+editor remains available for compatibility.
 
 ### External OpenCode MCP management
 
@@ -608,8 +608,8 @@ In particular:
   direction, not implementation in this fork range.
 - [`2026-09-08-durable-project-knowledge-mcp.md`](../research/2026-09-08-durable-project-knowledge-mcp.md)
   is research, not a delivered project-knowledge service.
-- The scoped MCP editor is explicitly absent even though its server RPCs and design
-  records exist.
+- The scoped MCP editor is exposed on the web/desktop surfaces; mobile remains
+  read-only for catalog editing.
 
 The current repository instructions say not to commit implementation plans or agent
 scratch records. The 24 committed plan/research files predate or conflict with that
@@ -649,10 +649,10 @@ this as part of a feature commit.
 
 Severity: medium.
 
-Global, project-override, and session catalog mutations exist as durable RPCs, but no
-client editor exposes them. Every current provider adapter is restart-required, so
-the live gateway has no provider consumer advertising live application. The visible
-MCP editor covers only project-local definitions.
+Global, project-override, and session catalog mutations are exposed through the
+capability-gated web/desktop editors. Every current provider adapter is
+restart-required, so the live gateway has no provider consumer advertising live
+application. The legacy project-local editor remains available for compatibility.
 
 Recommended treatment: describe this as infrastructure until one provider has a
 tested live capability and the intended scope editors ship. Keep capability-gating

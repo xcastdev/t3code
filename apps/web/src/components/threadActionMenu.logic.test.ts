@@ -47,6 +47,15 @@ describe("buildThreadActionMenuItems", () => {
     expect(items[copyIndex + 2]?.id).toBe("archive");
   });
 
+  it("exposes session MCP catalog editing only when supported", () => {
+    const withCatalog = ids({
+      ...baseState,
+      supports: { ...baseState.supports, mcpCatalog: true },
+    });
+    expect(withCatalog).toContain("mcp-catalog");
+    expect(ids(baseState)).not.toContain("mcp-catalog");
+  });
+
   it("includes branch items only for threads with a branch", () => {
     const withBranch = allIds({ ...baseState, branch: "feat/menu" });
     expect(withBranch).toContain("new-thread-on-branch");

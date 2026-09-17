@@ -84,8 +84,9 @@ The effective `mcpCatalog.project.list` view is provider-specific and requires
 provider-independent raw editor state and accepts only the project scope and
 project id.
 
-The scoped catalog editor is not yet exposed in the web or desktop clients;
-desktop shares the web surface. Mobile can consume configured catalogs and view
-thread state but does not edit catalogs. The legacy project panel remains the
-only client editor during this compatibility window. Catalog subscriptions are
-opt-in and carry only scope id and revision notices.
+The scoped catalog editor is exposed in the web and desktop clients under
+Integrations and project settings; desktop shares the web surface. Mobile can
+consume configured catalogs and view thread state but does not edit catalogs.
+The legacy project panel remains available during the compatibility window.
+Catalog subscriptions are opt-in and carry only scope id and revision notices;
+the client invalidates the matching scope query when a notice arrives.

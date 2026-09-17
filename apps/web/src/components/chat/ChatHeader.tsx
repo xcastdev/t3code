@@ -67,6 +67,7 @@ interface ChatHeaderProps {
   parentReservesGlobalControls?: boolean;
   onNewThreadInProject: () => void;
   onOpenProjectSettings?: (() => void) | undefined;
+  onOpenMcpCatalog?: (() => void) | undefined;
   onRunProjectScript: (script: ProjectScript) => void;
   onAddProjectScript: (input: NewProjectScriptInput) => Promise<ProjectScriptActionResult>;
   onUpdateProjectScript: (
@@ -146,6 +147,7 @@ export const ChatHeader = memo(function ChatHeader({
   parentReservesGlobalControls = false,
   onNewThreadInProject,
   onOpenProjectSettings,
+  onOpenMcpCatalog,
   onRunProjectScript,
   onAddProjectScript,
   onUpdateProjectScript,
@@ -233,6 +235,7 @@ export const ChatHeader = memo(function ChatHeader({
     threadRef: isServerThread ? activeThreadRef : null,
     projectCwd: activeProjectCwd,
     onStartRename: startRename,
+    ...(onOpenMcpCatalog ? { onOpenMcpCatalog } : {}),
   });
   const titleButtonRef = useRef<HTMLButtonElement | null>(null);
   const titleMenuTimerRef = useRef<number | null>(null);

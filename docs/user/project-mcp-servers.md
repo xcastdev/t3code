@@ -3,6 +3,13 @@
 Add MCP servers for a project checkout in **Settings → Integrations → MCP servers** on web or
 desktop. Configured servers run through the selected environment.
 
+For environments that advertise the scoped catalog, the **MCP catalog** section is also
+available in Integrations and project settings. Global definitions are inherited by projects;
+project-local definitions and overrides are shown separately. A running thread exposes its
+session catalog from the thread action menu, where you can review desired/applied revisions and
+reset to the current project baseline. Unsaved editor drafts stay local while another device
+changes the saved revision.
+
 ## Add a server
 
 1. Select the environment, project, and checkout.
@@ -55,6 +62,10 @@ The server list reports how each selected provider applies the configuration:
 - **Applies to this session** means the running provider can apply it without a restart.
 - **Not supported by this provider** means that provider cannot receive it.
 - **Provider unavailable** means the selected provider instance is not currently available.
+
+When a provider supports live catalogs, additions, edits, removals, and list changes arrive through
+one authenticated aggregate MCP endpoint without reconnecting. Providers that require a restart
+continue to use per-server proxy entries and apply catalog changes on their next session.
 
 If no providers are selected, the configuration is saved but is not attached to a provider
 session. T3-managed entries, including the `t3-code` preview server, are read-only.

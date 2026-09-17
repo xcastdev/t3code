@@ -482,6 +482,15 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["allow disable enable open drive preview tools sessions project override"],
   },
   {
+    id: "mcp-catalog",
+    title: "MCP catalog",
+    to: "/settings/integrations",
+    scope: "environment-defaults",
+    searchTerms: [
+      "model context protocol servers global project inherited override session live reload oauth",
+    ],
+  },
+  {
     id: "device-hosts",
     title: "Device hosts",
     to: "/settings/integrations",

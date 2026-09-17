@@ -52,6 +52,7 @@ describe("ProviderSettingsForm helpers", () => {
       label: "Manage MCP servers on external OpenCode",
       control: "switch",
       defaultBooleanValue: false,
+      targetable: true,
     });
     expect(
       deriveProviderSettingsFields(opencode!).find((field) => field.key === "externalMcpBaseUrl"),

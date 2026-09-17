@@ -1265,6 +1265,9 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       remoteHttpMcp: "next-session",
       projectMcpProxy: "next-session",
       managedPreviewMcp: "next-session",
+      // Antigravity's native MCP client has not been proven to observe
+      // list-change notifications. Keep session edits restart-required until
+      // an integration test exercises that real client path.
       sessionMcpCatalog: "restart-required",
     },
     compaction: { type: "slash-command", command: "/compact" },

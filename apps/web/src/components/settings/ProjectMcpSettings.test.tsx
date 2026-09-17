@@ -195,7 +195,12 @@ vi.mock("./settingsLayout", () => ({
   ),
 }));
 
-import { applicationLabel, canEdit, ProjectMcpCatalogSettings } from "./ProjectMcpSettings";
+import {
+  applicationLabel,
+  canEdit,
+  ProjectMcpCatalogSettings,
+  projectMcpSettingsMode,
+} from "./ProjectMcpSettings";
 
 const environmentId = EnvironmentId.make("environment");
 const projectId = ProjectId.make("project");
@@ -374,6 +379,16 @@ describe("ProjectMcpSettings", () => {
       },
     });
     commands.oauthDisconnect.mockReset().mockResolvedValue({ _tag: "Success" });
+  });
+
+  it.each([
+    [{ projectMcpOverrides: true, projectMcpCatalog: true }, "scoped"],
+    [{ projectMcpOverrides: true, projectMcpCatalog: false }, "scoped"],
+    [{ projectMcpOverrides: false, projectMcpCatalog: true }, "legacy"],
+    [{ projectMcpOverrides: false, projectMcpCatalog: false }, null],
+    [{}, null],
+  ] as const)("routes capability set %j without probing another editor", (capabilities, mode) => {
+    expect(projectMcpSettingsMode(capabilities)).toBe(mode);
   });
 
   afterEach(async () => {

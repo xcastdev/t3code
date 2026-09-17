@@ -75,6 +75,7 @@ const startupDependencies = Layer.mergeAll(
   ServerSettings.layerTest(),
   Layer.succeed(OrchestrationReactor.OrchestrationReactor, {
     start: () => Effect.void,
+    drain: Effect.void,
   }),
   Layer.succeed(ProviderSessionReaper.ProviderSessionReaper, {
     start: () => Effect.void,

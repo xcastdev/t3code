@@ -30,9 +30,11 @@ import {
   scopedThreadKey,
 } from "@t3tools/client-runtime/environment";
 import {
+  type McpCatalogSessionId,
   resolveEnvironmentMachineKind,
   type EnvironmentMachineKind,
   type ProjectIconOverride,
+  type ProjectId,
   type ScopedThreadRef,
   type ThreadId,
 } from "@t3tools/contracts";
@@ -211,6 +213,7 @@ import {
 import { ProjectFavicon, type ProjectFaviconProject } from "./ProjectFavicon";
 import { makeWorkspaceFileDropHandlers } from "./chat/workspaceFileDrop";
 import { ProviderInstanceIcon } from "./chat/ProviderInstanceIcon";
+import { ThreadMcpCatalogDialog } from "./ThreadMcpCatalogDialog";
 import { getTriggerDisplayModelLabel } from "./chat/providerIconUtils";
 import {
   deriveProviderEntriesByEnvironment,
@@ -2304,6 +2307,12 @@ export default function Sidebar() {
   const projectGroupsRef = useRef(projectGroups);
   projectGroupsRef.current = projectGroups;
   const serverConfigs = useAtomValue(environmentServerConfigsAtom);
+  const [mcpCatalogDialogTarget, setMcpCatalogDialogTarget] = useState<{
+    readonly environmentId: ScopedThreadRef["environmentId"];
+    readonly projectId: ProjectId;
+    readonly threadId: ThreadId;
+    readonly catalogSessionId: McpCatalogSessionId;
+  } | null>(null);
   // Threads on non-primary environments (T3 Connect, hosted) resolve their
   // provider entry from their own environment's config: default instance ids
   // are driver slugs, so a flat map would collide across environments.
@@ -4007,6 +4016,9 @@ export default function Sidebar() {
         const supportsTitleRegeneration =
           serverConfigs.get(thread.environmentId)?.environment.capabilities
             .threadTitleRegeneration === true;
+        const supportsMcpCatalog =
+          serverConfigs.get(thread.environmentId)?.environment.capabilities.sessionMcpCatalog ===
+            true && thread.session?.mcpCatalogSessionId !== undefined;
         const isRegeneratingTitle = thread.titleRegeneration != null;
         const isSettled = settledThreadKeysRef.current.has(threadKey);
         const isSnoozed = snoozedThreadKeysRef.current.has(threadKey);
@@ -4029,6 +4041,7 @@ export default function Sidebar() {
                 snooze: supportsSnooze,
                 pinning: supportsPinning,
                 titleRegeneration: supportsTitleRegeneration,
+                mcpCatalog: supportsMcpCatalog,
               },
               snoozePresets,
             }),
@@ -4045,6 +4058,17 @@ export default function Sidebar() {
           return;
         }
         switch (clicked.value) {
+          case "mcp-catalog": {
+            const catalogSessionId = thread.session?.mcpCatalogSessionId;
+            if (catalogSessionId === undefined) return;
+            setMcpCatalogDialogTarget({
+              environmentId: thread.environmentId,
+              projectId: thread.projectId,
+              threadId: thread.id,
+              catalogSessionId,
+            });
+            return;
+          }
           case "project-settings": {
             const projectGroup = projectGroupsRef.current.find((group) =>
               group.memberProjectRefs.some(
@@ -4884,6 +4908,16 @@ export default function Sidebar() {
         </SidebarGroup>
       </SidebarContent>
       <SidebarChromeFooter />
+      <ThreadMcpCatalogDialog
+        open={mcpCatalogDialogTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setMcpCatalogDialogTarget(null);
+        }}
+        environmentId={mcpCatalogDialogTarget?.environmentId ?? null}
+        projectId={mcpCatalogDialogTarget?.projectId ?? null}
+        threadId={mcpCatalogDialogTarget?.threadId ?? null}
+        mcpCatalogSessionId={mcpCatalogDialogTarget?.catalogSessionId ?? null}
+      />
     </>
   );
 }

@@ -13,7 +13,8 @@ import * as ThreadSettlementReactor from "../ThreadSettlementReactor.ts";
 import * as PullRequestSyncReactor from "../PullRequestSyncReactor.ts";
 import * as ThreadPullRequestReactor from "../ThreadPullRequestReactor.ts";
 import { OrchestrationReactor } from "../Services/OrchestrationReactor.ts";
-import { makeOrchestrationReactor } from "./OrchestrationReactor.ts";
+import { McpCatalogReactor } from "../Services/McpCatalogReactor.ts";
+import { makeRequiredOrchestrationReactor } from "./OrchestrationReactor.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
 
 describe("OrchestrationReactor", () => {
@@ -30,7 +31,7 @@ describe("OrchestrationReactor", () => {
     const started: string[] = [];
 
     runtime = ManagedRuntime.make(
-      Layer.effect(OrchestrationReactor, makeOrchestrationReactor).pipe(
+      Layer.effect(OrchestrationReactor, makeRequiredOrchestrationReactor).pipe(
         Layer.provideMerge(
           Layer.succeed(ProviderRuntimeIngestionService, {
             start: () => {
@@ -104,6 +105,15 @@ describe("OrchestrationReactor", () => {
             },
           }),
         ),
+        Layer.provideMerge(
+          Layer.succeed(McpCatalogReactor, {
+            start: () => {
+              started.push("mcp-catalog-reactor");
+              return Effect.void;
+            },
+            drain: Effect.void,
+          }),
+        ),
       ),
     );
 
@@ -120,6 +130,7 @@ describe("OrchestrationReactor", () => {
       "thread-settlement-reactor",
       "pull-request-sync-reactor",
       "agent-awareness-relay",
+      "mcp-catalog-reactor",
     ]);
 
     await Effect.runPromise(Scope.close(scope, Exit.void));

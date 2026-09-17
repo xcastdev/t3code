@@ -21,6 +21,15 @@ export interface OrchestrationReactorShape {
    * finalized on shutdown.
    */
   readonly start: () => Effect.Effect<void, never, Scope.Scope>;
+
+  /**
+   * Wait for queued orchestration side effects before the owning scope closes.
+   *
+   * The MCP catalog reactor is fed by the domain-event stream, so closing its
+   * scope immediately would otherwise drop an update that was accepted just
+   * before shutdown.
+   */
+  readonly drain: Effect.Effect<void>;
 }
 
 /**

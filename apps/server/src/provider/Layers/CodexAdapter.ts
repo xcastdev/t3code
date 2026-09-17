@@ -2805,6 +2805,9 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       remoteHttpMcp: "next-session",
       projectMcpProxy: "next-session",
       managedPreviewMcp: "next-session",
+      // Codex's native MCP client has not been proven to observe
+      // list-change notifications. Keep session edits restart-required until
+      // an integration test exercises that real client path.
       sessionMcpCatalog: "restart-required",
     },
     startSession,

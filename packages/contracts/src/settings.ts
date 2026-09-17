@@ -532,6 +532,8 @@ export interface ProviderSettingsFormAnnotation {
   readonly control?: ProviderSettingsFormControl | undefined;
   readonly placeholder?: string | undefined;
   readonly hidden?: boolean | undefined;
+  /** Whether the rendered field gets a stable settings-navigation target. */
+  readonly targetable?: boolean | undefined;
   readonly clearWhenEmpty?: "omit" | "persist" | undefined;
   /** Choices for a `select` control. The first entry is the default. */
   readonly options?: ReadonlyArray<ProviderSettingsFormOption> | undefined;
@@ -893,7 +895,7 @@ export const OpenCodeSettings = makeProviderSettingsSchema(
         title: "Manage MCP servers on external OpenCode",
         description:
           "T3 changes directory-scoped MCP entries on the configured OpenCode server while a T3 session runs.",
-        providerSettingsForm: { control: "switch", clearWhenEmpty: "omit" },
+        providerSettingsForm: { control: "switch", clearWhenEmpty: "omit", targetable: true },
       }),
     ),
     externalMcpBaseUrl: TrimmedString.pipe(
