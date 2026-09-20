@@ -48,3 +48,5 @@ export * from "./resourceTelemetry.ts";
 export * from "./usage.ts";
 export * from "./rpc.ts";
 export * from "./worktreeSetup.ts";
+export * from "./projectWork.ts";
+export * from "./projectLifecycle.ts";

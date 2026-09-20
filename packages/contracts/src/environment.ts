@@ -103,6 +103,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   globalMcpCatalog: Schema.optionalKey(Schema.Boolean),
   /** Server exposes project inheritance and override RPCs. */
   projectMcpOverrides: Schema.optionalKey(Schema.Boolean),
+  /** Server exposes the bounded project-work delta stream. */
+  projectWorkStream: Schema.optionalKey(Schema.Boolean),
   /** Server exposes active logical-session MCP catalog RPCs. */
   sessionMcpCatalog: Schema.optionalKey(Schema.Boolean),
   /** Server understands canonical inline context links plus their message context records.

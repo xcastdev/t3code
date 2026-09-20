@@ -55,6 +55,12 @@ export function createProjectEnvironmentAtoms<R, E>(
       JSON.stringify([environmentId, input.projectId]),
   };
   return {
+    lifecycle: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:projects:lifecycle",
+      tag: WS_METHODS.projectLifecycleGet,
+      staleTimeMs: 10_000,
+      idleTtlMs: 60_000,
+    }),
     searchEntries: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:projects:search-entries",
       tag: WS_METHODS.projectsSearchEntries,
@@ -89,6 +95,31 @@ export function createProjectEnvironmentAtoms<R, E>(
     delete: createEnvironmentCommand(runtime, {
       label: "environment-data:commands:project:delete",
       execute: (input: DeleteProjectInput) => deleteProject(input),
+      scheduler: projectScheduler,
+      concurrency: projectConcurrency,
+    }),
+    /** Project lifecycle writes are separate from legacy project.delete. */
+    lifecycleArchive: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:project:archive",
+      tag: WS_METHODS.projectLifecycleArchive,
+      scheduler: projectScheduler,
+      concurrency: projectConcurrency,
+    }),
+    lifecycleRestore: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:project:restore",
+      tag: WS_METHODS.projectLifecycleRestore,
+      scheduler: projectScheduler,
+      concurrency: projectConcurrency,
+    }),
+    lifecycleRelocationCheck: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:project:relocation-check",
+      tag: WS_METHODS.projectLifecycleRelocationCheck,
+      scheduler: projectScheduler,
+      concurrency: projectConcurrency,
+    }),
+    lifecyclePermanentDelete: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:commands:project:permanent-delete",
+      tag: WS_METHODS.projectLifecyclePermanentDelete,
       scheduler: projectScheduler,
       concurrency: projectConcurrency,
     }),

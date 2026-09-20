@@ -23,6 +23,7 @@ export const DEFAULT_KEYBINDINGS: ReadonlyArray<KeybindingRule> = [
   { key: "mod+j", command: "terminal.toggle" },
   { key: "mod+alt+b", command: "rightPanel.toggle" },
   { key: "mod+alt+g", command: "sourceControl.open", when: "!terminalFocus" },
+  { key: "mod+shift+w", command: "projectWork.open", when: "!terminalFocus" },
   { key: "mod+d", command: "terminal.split", when: "terminalFocus" },
   {
     key: "mod+shift+d",

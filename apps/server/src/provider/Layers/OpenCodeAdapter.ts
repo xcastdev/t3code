@@ -347,6 +347,7 @@ type OpenCodeStepUsage = Pick<Extract<Part, { readonly type: "step-finish" }>, "
 
 interface OpenCodeSessionContext {
   session: ProviderSession;
+  readonly projectWork?: Parameters<typeof buildRuntimeInstructions>[0]["projectWork"];
   closing: boolean;
   readonly client: OpencodeClient;
   readonly server: OpenCodeServerConnection;
@@ -3583,6 +3584,7 @@ export function makeOpenCodeAdapter(
 
         const context: OpenCodeSessionContext = {
           session,
+          projectWork: input.projectWork,
           closing: false,
           client: started.client,
           server: started.server,
@@ -3844,6 +3846,7 @@ export function makeOpenCodeAdapter(
                 system: buildRuntimeInstructions({
                   harness: "OpenCode",
                   model: `${parsedModel.providerID}/${parsedModel.modelID}`,
+                  projectWork: context.projectWork,
                 }),
                 parts: [...(text ? [{ type: "text" as const, text }] : []), ...fileParts],
               },

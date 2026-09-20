@@ -59,3 +59,26 @@ with its configured upstream. Choose an environment to set the default or a proj
 T3 Code only pulls when it can fast-forward and the checkout has no changed files, untracked files,
 or local commits. It skips checkouts on another branch or without an upstream. If a checkout has
 local work, resolve it yourself before automatic pulls can resume.
+
+## Durable project work and lifecycle
+
+When **Project Work** is enabled, the Project category also offers bounded Work exports and a
+workspace-path check for moved checkouts. Relinking changes the server's path reference; it does
+not move or delete files, change the project ID, or discard tasks and knowledge. The server checks
+that the new path exists, is a directory, and still identifies the same repository when an
+identity is available.
+
+Use **Archive** to mark a project inactive while keeping its history and identity. Lifecycle-aware
+views can omit archived projects; the Project settings row changes to **Restore** so the state can
+be reversed. Archive and restore are explicit operations and can be safely retried after a
+reconnect.
+
+JSON export is a versioned backup that retains IDs, revisions, relationships, provenance, and
+selected history. Markdown export is a human-readable brief only; it is marked non-authoritative
+and cannot be imported as state.
+
+**Permanently delete project locally** is a separate, confirmed action. It removes this server's
+local project-work records while retaining a tombstone so stale clients cannot recreate the same
+identity. The normal Project removal flow also removes the legacy project shell and conversations.
+Files on disk, Git remotes, pull requests, and other external data are never deleted by this
+action.

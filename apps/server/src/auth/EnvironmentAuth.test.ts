@@ -11,6 +11,7 @@ import * as ServerConfig from "../config.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as PersistenceErrors from "../persistence/Errors.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
+import { runForkMigrations, runMigrations } from "../persistence/Migrations.ts";
 import * as PairingGrantStore from "./PairingGrantStore.ts";
 import * as EnvironmentAuth from "./EnvironmentAuth.ts";
 
@@ -78,6 +79,71 @@ const requestMetadata = {
 };
 
 it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
+  it.effect("binds protected project-work approvals to a human and consumes them once", () =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      yield* runMigrations();
+      yield* runForkMigrations(12);
+      yield* sql`
+        INSERT INTO projection_projects
+          (project_id, title, workspace_root, scripts_json, created_at, updated_at)
+        VALUES ('project-approval', 'Approval project', '/workspace/approval', '[]',
+          '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z')
+      `;
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const grant = yield* serverAuth.issueProjectWorkApproval({
+        projectId: "project-approval",
+        taskId: "task-approval",
+        specRevision: 4,
+        payloadFingerprint: "payload-approval",
+        agentId: "agent:mcp:provider:session",
+        approvedBy: { kind: "user", id: "user:reviewer", displayName: "Reviewer" },
+      });
+      const consumed = yield* serverAuth.consumeProjectWorkApproval({
+        token: grant.token,
+        projectId: "project-approval",
+        taskId: "task-approval",
+        specRevision: 4,
+        payloadFingerprint: "payload-approval",
+        agentId: "agent:mcp:provider:session",
+      });
+      const replay = yield* serverAuth
+        .consumeProjectWorkApproval({
+          token: grant.token,
+          projectId: "project-approval",
+          taskId: "task-approval",
+          specRevision: 4,
+          payloadFingerprint: "payload-approval",
+          agentId: "agent:mcp:provider:session",
+        })
+        .pipe(
+          Effect.as("ok" as const),
+          Effect.catch(() => Effect.succeed("failed" as const)),
+        );
+      const agentIssue = yield* serverAuth
+        .issueProjectWorkApproval({
+          projectId: "project-approval",
+          taskId: "task-approval",
+          specRevision: 4,
+          payloadFingerprint: "payload-approval",
+          agentId: "agent:mcp:provider:session",
+          approvedBy: { kind: "agent", id: "agent:mcp:provider:session" },
+        })
+        .pipe(
+          Effect.as("ok" as const),
+          Effect.catch(() => Effect.succeed("failed" as const)),
+        );
+
+      expect(consumed.approvalId).toBe(grant.approval.approvalId);
+      expect(consumed.attribution.actor).toMatchObject({
+        kind: "human",
+        id: "user:reviewer",
+      });
+      expect(replay).toBe("failed");
+      expect(agentIssue).toBe("failed");
+    }).pipe(Effect.provide(makeEnvironmentAuthLayer())),
+  );
+
   it.effect("uses the reusable dev cookie without overriding a normal scoped cookie", () =>
     Effect.gen(function* () {
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;

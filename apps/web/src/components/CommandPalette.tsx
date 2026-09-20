@@ -49,6 +49,7 @@ import {
   GitBranchIcon,
   GitPullRequestArrowIcon,
   LinkIcon,
+  ListTodoIcon,
   MessageSquareIcon,
   PaletteIcon,
   SettingsIcon,
@@ -1862,6 +1863,34 @@ function OpenCommandPaletteDialog(props: {
     projectGroups[0] ??
     null;
   if (contextualProjectGroup) {
+    const workProject =
+      (contextualProjectRef &&
+        contextualProjectGroup.memberProjects.find(
+          (member) =>
+            member.environmentId === contextualProjectRef.environmentId &&
+            member.id === contextualProjectRef.projectId,
+        )) ??
+      contextualProjectGroup.memberProjects[0];
+    if (workProject) {
+      actionItems.push({
+        kind: "action",
+        value: "action:project-work",
+        searchTerms: ["work", "tasks", "knowledge", "durable", "project"],
+        title: "Open Work",
+        description: contextualProjectGroup.displayName,
+        icon: <ListTodoIcon className={ITEM_ICON_CLASS} />,
+        shortcutCommand: "projectWork.open",
+        run: async () => {
+          await navigate({
+            to: "/work/$environmentId/$projectId",
+            params: {
+              environmentId: workProject.environmentId,
+              projectId: workProject.id,
+            },
+          });
+        },
+      });
+    }
     actionItems.push({
       kind: "action",
       value: "action:project-settings",

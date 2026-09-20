@@ -239,9 +239,18 @@ export const AuthClientMetadata = Schema.Struct({
 });
 export type AuthClientMetadata = typeof AuthClientMetadata.Type;
 
+/** Stable principal attached to a session, independent of its credential. */
+export const AuthIdentity = Schema.Struct({
+  kind: Schema.Literals(["user", "agent"]),
+  id: TrimmedNonEmptyString,
+  displayName: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type AuthIdentity = typeof AuthIdentity.Type;
+
 export const AuthClientSession = Schema.Struct({
   sessionId: AuthSessionId,
   subject: TrimmedNonEmptyString,
+  identity: Schema.optionalKey(AuthIdentity),
   scopes: AuthEnvironmentScopes,
   method: ServerAuthSessionMethod,
   client: AuthClientMetadata,
@@ -351,5 +360,6 @@ export const AuthSessionState = Schema.Struct({
   scopes: Schema.optionalKey(AuthEnvironmentScopes),
   sessionMethod: Schema.optionalKey(ServerAuthSessionMethod),
   expiresAt: Schema.optionalKey(Schema.DateTimeUtc),
+  identity: Schema.optionalKey(AuthIdentity),
 });
 export type AuthSessionState = typeof AuthSessionState.Type;

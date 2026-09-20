@@ -2784,6 +2784,23 @@ export function GeneralSettingsPanel() {
         />
         <SettingsRow
           serverScoped
+          settingKeys={["projectWorkEnabled"]}
+          {...searchableSetting("project-work")}
+          title="Project Work"
+          description="Opt in to durable tasks, knowledge, and project briefings for this environment."
+          control={
+            <ScopedSwitch
+              settingKeys={["projectWorkEnabled"]}
+              checked={settings.projectWorkEnabled}
+              onCheckedChange={(checked) =>
+                updateSettings({ projectWorkEnabled: Boolean(checked) })
+              }
+              aria-label="Project Work"
+            />
+          }
+        />
+        <SettingsRow
+          serverScoped
           settingKeys={["addProjectBaseDirectory"]}
           {...searchableSetting("add-project-starts-in")}
           description='Leave empty to use "~/" when the Add Project browser opens.'

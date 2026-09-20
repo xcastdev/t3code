@@ -99,6 +99,11 @@ const DEFAULT_BINDINGS = compile([
     whenAst: whenNot(whenIdentifier("terminalFocus")),
   },
   {
+    shortcut: modShortcut("w", { shiftKey: true }),
+    command: "projectWork.open",
+    whenAst: whenNot(whenIdentifier("terminalFocus")),
+  },
+  {
     shortcut: modShortcut("d"),
     command: "terminal.split",
     whenAst: whenIdentifier("terminalFocus"),
@@ -232,6 +237,27 @@ describe("settle thread shortcut", () => {
     assert.isNull(
       resolveShortcutCommand(event({ key: "s", ctrlKey: true, shiftKey: true }), DEFAULT_BINDINGS, {
         platform: "Win32",
+        context: { terminalFocus: true },
+      }),
+    );
+  });
+});
+
+describe("project work shortcut", () => {
+  it("resolves Cmd+Shift+W outside the terminal", () => {
+    assert.equal(
+      resolveShortcutCommand(event({ key: "w", metaKey: true, shiftKey: true }), DEFAULT_BINDINGS, {
+        platform: "MacIntel",
+        context: { terminalFocus: false },
+      }),
+      "projectWork.open",
+    );
+  });
+
+  it("does not intercept the terminal", () => {
+    assert.isNull(
+      resolveShortcutCommand(event({ key: "w", ctrlKey: true, shiftKey: true }), DEFAULT_BINDINGS, {
+        platform: "Linux",
         context: { terminalFocus: true },
       }),
     );

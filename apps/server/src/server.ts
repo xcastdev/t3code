@@ -104,6 +104,17 @@ import * as RepositoryIdentityResolver from "./project/RepositoryIdentityResolve
 import * as WorkspaceEntries from "./workspace/WorkspaceEntries.ts";
 import * as WorkspaceFileSystem from "./workspace/WorkspaceFileSystem.ts";
 import * as WorkspacePaths from "./workspace/WorkspacePaths.ts";
+import * as ProjectWorkProjection from "./projectWork/ProjectWorkProjection.ts";
+import * as ProjectWorkQuery from "./projectWork/ProjectWorkQuery.ts";
+import * as ProjectWorkSearch from "./projectWork/ProjectWorkSearch.ts";
+import * as ProjectWorkBriefing from "./projectWork/ProjectWorkBriefing.ts";
+import * as ProjectWorkNarrative from "./projectWork/ProjectWorkNarrative.ts";
+import * as ProjectWorkGateway from "./projectWork/ProjectWorkGateway.ts";
+import * as ProjectWorkAttentionReactor from "./projectWork/ProjectWorkAttentionReactor.ts";
+import * as ProjectWorkContentGuard from "./projectWork/ProjectWorkContentGuard.ts";
+import * as ProjectWorkExport from "./projectWork/ProjectWorkExport.ts";
+import * as ProjectWorkRuntime from "./projectWork/ProjectWorkRuntime.ts";
+import * as ProjectLifecycle from "./project/ProjectLifecycle.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "./vcs/VcsDriverRegistry.ts";
 import * as VcsProjectConfig from "./vcs/VcsProjectConfig.ts";
@@ -164,6 +175,8 @@ import * as NetService from "@t3tools/shared/Net";
 import * as RelayClient from "@t3tools/shared/relayClient";
 import { disableTailscaleServe, ensureTailscaleServe } from "@t3tools/tailscale";
 import { forkParked, ServerActivation } from "./serverActivation.ts";
+
+const ProjectWorkContentGuardLive = ProjectWorkContentGuard.layer;
 
 // MCP handoff thread IDs include escaped provenance and can exceed find-my-way's
 // 100-character default for one path segment.
@@ -267,6 +280,7 @@ const ReactorLayerLive = Layer.empty.pipe(
         ExternalNotificationDispatcher.layer.pipe(
           Layer.provide(HomeAssistantWebhookAdapter.layer),
           Layer.provide(ServerEnvironment.layer),
+          Layer.provide(ProjectWorkContentGuardLive),
         ),
       ),
     ),
@@ -497,6 +511,31 @@ const AuthLayerLive = EnvironmentAuth.layer.pipe(
   Layer.provide(ServerSecretStore.layer),
 );
 
+const ProjectWorkServicesLive = Layer.mergeAll(
+  ProjectWorkRuntime.coreLayer,
+  ProjectWorkRuntime.leaseLayer,
+  ProjectWorkRuntime.leaseWorkerLayer,
+  ProjectWorkProjection.ProjectWorkProjectionLive,
+  ProjectWorkQuery.ProjectWorkQueryLive,
+  ProjectWorkSearch.ProjectWorkSearchLive,
+  ProjectWorkNarrative.ProjectWorkNarrativeLive.pipe(Layer.provide(ProjectWorkContentGuardLive)),
+  ProjectWorkAttentionReactor.layer,
+  ProjectWorkExport.layer,
+  ProjectWorkBriefing.ProjectWorkBriefingLive.pipe(
+    Layer.provide(ProjectWorkQuery.ProjectWorkQueryLive),
+  ),
+).pipe(Layer.provideMerge(ProjectWorkContentGuardLive), Layer.provideMerge(PersistenceLayerLive));
+
+const ProjectLifecycleLive = ProjectLifecycle.ProjectLifecycleLive.pipe(
+  Layer.provideMerge(PersistenceLayerLive),
+  Layer.provideMerge(ServerEnvironmentLayerLive),
+);
+
+const ProjectWorkGatewayLive = ProjectWorkGateway.ProjectWorkGatewayLive.pipe(
+  Layer.provideMerge(ProjectWorkServicesLive),
+  Layer.provideMerge(ProjectLifecycleLive),
+);
+
 const CloudManagedEndpointRuntimeLive = Layer.mergeAll(
   RelayClientLive,
   CloudManagedEndpointRuntime.layer.pipe(
@@ -510,6 +549,10 @@ const ProviderRuntimeLayerLive = ProviderSessionReaperLive.pipe(
   // telemetry instead of waiting for the next status probe.
   Layer.provideMerge(ProviderUsageLimitsIngestionLive),
   Layer.provideMerge(ProviderLayerLive),
+  Layer.provideMerge(ProjectWorkServicesLive),
+  Layer.provideMerge(
+    TextGeneration.layer.pipe(Layer.provide(SourceControlProviderRegistryLayerLive)),
+  ),
   Layer.provideMerge(OrchestrationLayerLive),
 );
 
@@ -653,6 +696,8 @@ export const makeRoutesLayer = Layer.mergeAll(
   Layer.provide(httpCompressionLayer),
   Layer.provide(ProjectMcpRouteServicesLive),
   Layer.provide(ProjectMcpServiceLayerLive),
+  Layer.provideMerge(ProjectWorkGatewayLive),
+  Layer.provide(ProjectLifecycleLive),
 );
 
 const makeServerLayer = Layer.unwrap(
@@ -863,6 +908,18 @@ const makeServerLayer = Layer.unwrap(
       Layer.provideMerge(HttpServerLive),
       Layer.provide(ApplicationObservabilityLive),
       Layer.provideMerge(FetchHttpClient.layer),
+      // Project-work attention uses the same best-effort external notification
+      // adapter as agent awareness. Keep it additive: notification setup or
+      // delivery must never be required for authoritative work writes.
+      Layer.provideMerge(
+        ExternalNotificationDispatcher.layer.pipe(
+          Layer.provide(HomeAssistantWebhookAdapter.layer),
+          Layer.provide(ServerEnvironmentLayerLive),
+          Layer.provide(ServerSettingsLayerLive),
+          Layer.provide(FetchHttpClient.layer),
+          Layer.provide(ProjectWorkContentGuardLive),
+        ),
+      ),
       // PR reads, Git operations, and WebSocket discovery share one process limiter.
       Layer.provide(VcsProcess.layer),
       Layer.provideMerge(PlatformServicesLive),

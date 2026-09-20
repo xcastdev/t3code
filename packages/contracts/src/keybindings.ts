@@ -71,6 +71,7 @@ export const STATIC_KEYBINDING_COMMANDS = [
   "rightPanel.openLinkedPullRequests",
   "rightPanel.openDevice",
   "sourceControl.open",
+  "projectWork.open",
   "pullRequest.copyNumber",
   "diff.toggle",
   "preview.toggle",

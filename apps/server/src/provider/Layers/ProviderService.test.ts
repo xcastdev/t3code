@@ -78,6 +78,9 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ProjectWorkBriefing from "../../projectWork/ProjectWorkBriefing.ts";
+import * as ProjectWorkNarrative from "../../projectWork/ProjectWorkNarrative.ts";
+import * as TextGeneration from "../../textGeneration/TextGeneration.ts";
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
@@ -4945,7 +4948,7 @@ describe("agent browser access", () => {
     access: boolean | { readonly browser: boolean; readonly device: boolean },
     threadId: ThreadId,
     projectOverride?: boolean | { readonly browser?: boolean; readonly device?: boolean },
-    options?: { readonly withoutOrchestration?: boolean },
+    options?: { readonly withoutOrchestration?: boolean; readonly projectWorkEnabled?: boolean },
   ) =>
     Effect.gen(function* () {
       const enableAgentBrowserAccess = typeof access === "boolean" ? access : access.browser;
@@ -5024,6 +5027,9 @@ describe("agent browser access", () => {
           ServerSettings.ServerSettingsService.layerTest({
             enableAgentBrowserAccess,
             enableAgentDeviceAccess,
+            ...(options?.projectWorkEnabled === undefined
+              ? {}
+              : { projectWorkEnabled: options.projectWorkEnabled }),
             projectSettingsOverrides:
               projectOverride === undefined
                 ? {}
@@ -5146,5 +5152,279 @@ describe("agent browser access", () => {
       );
       assert.deepEqual(issued, [{ threadId, capabilities: ["preview", "pull-requests"] }]);
     }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("grants project work without external MCP endpoints when enabled", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-project-work-enabled");
+      const issued = yield* startSessionWith(false, threadId, undefined, {
+        projectWorkEnabled: true,
+      });
+      assert.deepEqual(issued, [{ threadId, capabilities: ["project", "pull-requests"] }]);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+});
+
+describe("durable project-work provider envelope", () => {
+  const makeFixture = (input: {
+    readonly name: string;
+    readonly environmentModel: string;
+    readonly activeThreadModel: string;
+    readonly projectModel?: {
+      readonly instanceId: ProviderInstanceId;
+      readonly model: string;
+    };
+    readonly blockGeneration?: boolean;
+  }) =>
+    Effect.gen(function* () {
+      const threadId = asThreadId(`thread-project-work-${input.name}`);
+      const projectId = ProjectId.make(`project-project-work-${input.name}`);
+      const gate = yield* Deferred.make<TextGeneration.ProjectWorkNarrativeGenerationResult>();
+      const generationInputs: Array<TextGeneration.ProjectWorkNarrativeGenerationInput> = [];
+      const codex = makeFakeCodexAdapter();
+      const briefing = {
+        projectId,
+        kind: "compact" as const,
+        generatedAt: "2026-01-01T00:00:00.000Z",
+        sourceRevision: 17,
+        text: "Project work (compact); source revision 17\nTasks\n- [ready] Ship the release",
+        includedTaskIds: [],
+        includedKnowledgeIds: [],
+        omittedReasons: [],
+      };
+      const briefingService: ProjectWorkBriefing.ProjectWorkBriefing["Service"] = {
+        generate: () => Effect.succeed(briefing),
+        create: () => Effect.succeed(briefing),
+        brief: () => Effect.succeed(briefing),
+        fromSnapshot: () => briefing,
+      };
+      const narrativeCore = ProjectWorkNarrative.makeProjectWorkNarrative();
+      const narrativeLookups: Array<ProjectWorkNarrative.ProjectWorkNarrativeLookupInput> = [];
+      const narrativeRequests: Array<ProjectWorkNarrative.ProjectWorkNarrativeGenerateInput> = [];
+      const narrativeService: ProjectWorkNarrative.ProjectWorkNarrative["Service"] = {
+        ...narrativeCore,
+        get: (lookup) => {
+          narrativeLookups.push(lookup);
+          return narrativeCore.get(lookup);
+        },
+        request: (request) => {
+          narrativeRequests.push(request);
+          return narrativeCore.request(request);
+        },
+      };
+      const textGeneration = TextGeneration.TextGeneration.of({
+        generateCommitMessage: () => Effect.die("unused"),
+        generatePrContent: () => Effect.die("unused"),
+        generateBranchName: () => Effect.die("unused"),
+        generateThreadTitle: () => Effect.die("unused"),
+        generateProjectWorkNarrative: (generationInput) => {
+          generationInputs.push(generationInput);
+          return input.blockGeneration
+            ? Deferred.await(gate)
+            : Effect.succeed({ narrative: "Derived release narrative" });
+        },
+      });
+      const shell = yield* decodeBrowserAccessThreadShell({
+        id: threadId,
+        projectId,
+        title: "Project work envelope test",
+        modelSelection: createModelSelection(codexInstanceId, input.activeThreadModel),
+        runtimeMode: "full-access",
+        branch: null,
+        worktreePath: null,
+        latestTurn: null,
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+        session: null,
+        latestUserMessageAt: null,
+        hasPendingApprovals: false,
+        hasPendingUserInput: false,
+        hasActionableProposedPlan: false,
+      });
+      const projection = {
+        getThreadShellById: () => Effect.succeed(Option.some(shell)),
+      } as unknown as ProjectionSnapshotQuery.ProjectionSnapshotQuery["Service"];
+      const providerAdapterLayer = Layer.succeed(
+        ProviderAdapterRegistry.ProviderAdapterRegistry,
+        makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter }),
+      );
+      const bindings = new Map<ThreadId, ProviderSessionDirectory.ProviderRuntimeBinding>();
+      const directory = {
+        getBinding: (requestedThreadId: ThreadId) =>
+          Effect.succeed(
+            bindings.has(requestedThreadId)
+              ? Option.some(bindings.get(requestedThreadId)!)
+              : Option.none(),
+          ),
+        upsert: (binding: ProviderSessionDirectory.ProviderRuntimeBinding) =>
+          Effect.sync(() => {
+            bindings.set(binding.threadId, binding);
+          }),
+        getProvider: () => Effect.succeed(CODEX_DRIVER),
+        listThreadIds: () => Effect.succeed([...bindings.keys()]),
+        listBindings: () => Effect.succeed([]),
+        recordImportedTranscript: () => Effect.void,
+      } satisfies ProviderSessionDirectory.ProviderSessionDirectory["Service"];
+      const directoryLayer = Layer.succeed(
+        ProviderSessionDirectory.ProviderSessionDirectory,
+        directory,
+      );
+      const projectSettingsOverrides = input.projectModel
+        ? {
+            [String(projectId)]: {
+              textGenerationModelSelection: createModelSelection(
+                input.projectModel.instanceId,
+                input.projectModel.model,
+              ),
+            },
+          }
+        : {};
+      const providerLayer = makeProviderServiceLive().pipe(
+        Layer.provide(NodeServices.layer),
+        Layer.provide(providerAdapterLayer),
+        Layer.provide(directoryLayer),
+        Layer.provide(Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, projection)),
+        Layer.provide(Layer.succeed(ProjectWorkBriefing.ProjectWorkBriefing, briefingService)),
+        Layer.provide(Layer.succeed(ProjectWorkNarrative.ProjectWorkNarrative, narrativeService)),
+        Layer.provide(Layer.succeed(TextGeneration.TextGeneration, textGeneration)),
+        Layer.provide(
+          ServerSettings.ServerSettingsService.layerTest({
+            projectWorkEnabled: true,
+            textGenerationModelSelection: createModelSelection(
+              codexInstanceId,
+              input.environmentModel,
+            ),
+            projectSettingsOverrides,
+          }),
+        ),
+        Layer.provide(serverConfigTestLayer),
+        Layer.provide(AnalyticsService.layerTest),
+        Layer.provide(
+          Layer.succeed(
+            ProviderEventLoggers.ProviderEventLoggers,
+            ProviderEventLoggers.NoOpProviderEventLoggers,
+          ),
+        ),
+      );
+
+      const provider = yield* ProviderService.ProviderService.pipe(Effect.provide(providerLayer));
+      const session = yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        modelSelection: createModelSelection(codexInstanceId, input.activeThreadModel),
+        cwd: fixtureCwd(`project-work-${input.name}`),
+        runtimeMode: "full-access",
+      });
+
+      return {
+        session,
+        threadId,
+        projectId,
+        briefing,
+        codex,
+        gate,
+        generationInputs,
+        narrativeLookups,
+        narrativeRequests,
+      };
+    });
+
+  it.effect(
+    "uses the environment text-generation selection instead of the active thread model",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* makeFixture({
+          name: "environment-selection",
+          environmentModel: "environment-model",
+          activeThreadModel: "active-thread-model",
+        });
+
+        assert.equal(fixture.session.threadId, fixture.threadId);
+        assert.equal(fixture.narrativeLookups[0]?.model, "environment-model");
+        assert.equal(fixture.narrativeRequests[0]?.model, "environment-model");
+        assert.deepEqual(
+          fixture.narrativeLookups[0]?.modelSelection,
+          fixture.narrativeRequests[0]?.modelSelection,
+        );
+        yield* Effect.yieldNow;
+        assert.equal(fixture.generationInputs[0]?.modelSelection.instanceId, codexInstanceId);
+        assert.equal(fixture.generationInputs[0]?.modelSelection.model, "environment-model");
+        assert.deepEqual(
+          fixture.generationInputs[0]?.modelSelection,
+          fixture.narrativeRequests[0]?.modelSelection,
+        );
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("uses a valid project text-generation override", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture({
+        name: "project-selection",
+        environmentModel: "environment-model",
+        activeThreadModel: "active-thread-model",
+        projectModel: { instanceId: claudeAgentInstanceId, model: "project-model" },
+      });
+
+      assert.equal(fixture.narrativeLookups[0]?.model, "project-model");
+      assert.equal(fixture.narrativeRequests[0]?.model, "project-model");
+      assert.deepEqual(
+        fixture.narrativeLookups[0]?.modelSelection,
+        fixture.narrativeRequests[0]?.modelSelection,
+      );
+      yield* Effect.yieldNow;
+      assert.equal(fixture.generationInputs[0]?.modelSelection.instanceId, claudeAgentInstanceId);
+      assert.equal(fixture.generationInputs[0]?.modelSelection.model, "project-model");
+      assert.deepEqual(
+        fixture.generationInputs[0]?.modelSelection,
+        fixture.narrativeRequests[0]?.modelSelection,
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("falls back to the environment selection for a disabled project override", () =>
+    Effect.gen(function* () {
+      const fixture = yield* makeFixture({
+        name: "disabled-project-selection",
+        environmentModel: "environment-model",
+        activeThreadModel: "active-thread-model",
+        projectModel: { instanceId: ProviderInstanceId.make("cursor"), model: "disabled-model" },
+      });
+
+      assert.equal(fixture.narrativeLookups[0]?.model, "environment-model");
+      assert.equal(fixture.narrativeRequests[0]?.model, "environment-model");
+      yield* Effect.yieldNow;
+      assert.equal(fixture.generationInputs[0]?.modelSelection.instanceId, codexInstanceId);
+      assert.equal(fixture.generationInputs[0]?.modelSelection.model, "environment-model");
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "injects structured context while detached narrative generation cannot delay startup",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* makeFixture({
+          name: "nonblocking",
+          environmentModel: "environment-model",
+          activeThreadModel: "active-thread-model",
+          blockGeneration: true,
+        });
+
+        const adapterInput = fixture.codex.startSession.mock.calls.at(-1)?.[0] as unknown as {
+          readonly projectWork?: {
+            readonly projectId: string;
+            readonly sourceRevision: number;
+            readonly briefing: string;
+          };
+        };
+        assert.deepEqual(adapterInput.projectWork, {
+          projectId: String(fixture.projectId),
+          sourceRevision: 17,
+          briefing: fixture.briefing.text,
+        });
+        yield* Effect.yieldNow;
+        assert.equal(fixture.generationInputs.length, 1);
+        yield* Deferred.succeed(fixture.gate, { narrative: "Derived release narrative" });
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 });

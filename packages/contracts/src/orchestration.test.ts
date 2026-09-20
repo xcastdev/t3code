@@ -70,6 +70,25 @@ const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpda
 const decodeDispatchCommandError = Schema.decodeUnknownEffect(OrchestrationDispatchCommandError);
 const decodeSnapShotAccessibility = Schema.decodeUnknownEffect(SnapShotAccessibility);
 
+it.effect("keeps durable project-work commands out of legacy orchestration unions", () =>
+  Effect.gen(function* () {
+    const projectWorkCommand = {
+      type: "project-work.task.create",
+      commandId: "command-project-work",
+      projectId: "project-1",
+      taskId: "task-1",
+      title: "Create a durable task",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+
+    const clientResult = yield* Effect.exit(decodeClientOrchestrationCommand(projectWorkCommand));
+    assert.strictEqual(clientResult._tag, "Failure");
+
+    const serverResult = yield* Effect.exit(decodeOrchestrationCommand(projectWorkCommand));
+    assert.strictEqual(serverResult._tag, "Failure");
+  }),
+);
+
 it.effect("decodes a dispatch error after its bootstrap thread was deleted", () =>
   Effect.gen(function* () {
     const error = yield* decodeDispatchCommandError({

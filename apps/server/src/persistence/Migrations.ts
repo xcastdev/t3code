@@ -75,6 +75,12 @@ import ForkMigration0005 from "./Migrations/fork/005_McpCatalogRevisions.ts";
 import ForkMigration0006 from "./Migrations/fork/006_McpCatalogAppliedCatalog.ts";
 import ForkMigration0007 from "./Migrations/fork/007_RepairMcpCatalogInitialization.ts";
 import ForkMigration0008 from "./Migrations/fork/008_RepairTextMcpCatalogInitialization.ts";
+import ForkMigration0009 from "./Migrations/fork/009_ProjectWork.ts";
+import ForkMigration0010 from "./Migrations/fork/010_ProjectWorkCommandReceipts.ts";
+import ForkMigration0011 from "./Migrations/fork/011_ProjectWorkAttentionNotifications.ts";
+import ForkMigration0012 from "./Migrations/fork/012_ProjectLifecycle.ts";
+import ForkMigration0013 from "./Migrations/fork/013_ProjectWorkReducerCheckpoints.ts";
+import ForkMigration0014 from "./Migrations/fork/014_ProjectWorkActiveLeaseDueIndex.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -150,6 +156,12 @@ export const forkMigrationEntries = [
   [6, "McpCatalogAppliedCatalog", ForkMigration0006],
   [7, "RepairMcpCatalogInitialization", ForkMigration0007],
   [8, "RepairTextMcpCatalogInitialization", ForkMigration0008],
+  [9, "ProjectWork", ForkMigration0009],
+  [10, "ProjectWorkCommandReceipts", ForkMigration0010],
+  [11, "ProjectWorkAttentionNotifications", ForkMigration0011],
+  [12, "ProjectLifecycle", ForkMigration0012],
+  [13, "ProjectWorkReducerCheckpoints", ForkMigration0013],
+  [14, "ProjectWorkActiveLeaseDueIndex", ForkMigration0014],
 ] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";

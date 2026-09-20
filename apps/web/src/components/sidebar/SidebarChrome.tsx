@@ -2,6 +2,7 @@ import {
   ArrowLeftIcon,
   ChartNoAxesColumnIcon,
   GitPullRequestIcon,
+  ListTodoIcon,
   SettingsIcon,
 } from "lucide-react";
 import type { ReactNode } from "react";
@@ -131,7 +132,16 @@ function SidebarUtilityItem({
   );
 }
 
-export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
+export interface SidebarWorkTarget {
+  readonly environmentId: string;
+  readonly projectId: string;
+}
+
+export const SidebarUtilityMenu = memo(function SidebarUtilityMenu({
+  workTarget,
+}: {
+  readonly workTarget?: SidebarWorkTarget | null;
+} = {}) {
   const navigate = useNavigate();
   const canGoBack = useCanGoBack();
   const { isMobile, setOpenMobile } = useSidebar();
@@ -141,11 +151,13 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
         ? "settings"
         : /^\/projects\/[^/]+\/?$/.test(location.pathname)
           ? "project-settings"
-          : location.pathname === "/usage"
-            ? "usage"
-            : location.pathname === "/pull-requests"
-              ? "pull-requests"
-              : null,
+          : /^\/work\/[^/]+\/[^/]+\/?$/.test(location.pathname)
+            ? "work"
+            : location.pathname === "/usage"
+              ? "usage"
+              : location.pathname === "/pull-requests"
+                ? "pull-requests"
+                : null,
   });
   const { environments } = useEnvironments();
   // The page reads every connected server, so one of them offering pull requests is enough for
@@ -177,6 +189,15 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
     void navigate({ to: "/usage" });
   }, [isMobile, navigate, setOpenMobile]);
 
+  const handleWorkClick = useCallback(() => {
+    closeMobileSidebar();
+    if (!workTarget) return;
+    void navigate({
+      to: "/work/$environmentId/$projectId",
+      params: workTarget,
+    });
+  }, [closeMobileSidebar, navigate, workTarget]);
+
   const handleBackClick = useCallback(() => {
     closeMobileSidebar();
     if (canGoBack) {
@@ -197,6 +218,9 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
         </SidebarMenuItem>
       ) : (
         <>
+          {workTarget ? (
+            <SidebarUtilityItem icon={<ListTodoIcon />} label="Work" onClick={handleWorkClick} />
+          ) : null}
           <SidebarUtilityItem
             icon={<SettingsIcon />}
             label="Settings"
@@ -221,12 +245,16 @@ export const SidebarUtilityMenu = memo(function SidebarUtilityMenu() {
   );
 });
 
-export const SidebarChromeFooter = memo(function SidebarChromeFooter() {
+export const SidebarChromeFooter = memo(function SidebarChromeFooter({
+  workTarget = null,
+}: {
+  readonly workTarget?: SidebarWorkTarget | null;
+}) {
   return (
     <SidebarFooter className="px-[var(--sidebar-content-inset)] py-1">
       <SidebarProviderUpdatePill />
       <SidebarUpdateArchitectureWarning />
-      <SidebarUtilityMenu />
+      <SidebarUtilityMenu workTarget={workTarget} />
     </SidebarFooter>
   );
 });

@@ -235,6 +235,10 @@
       "types": "./src/state/vcs.ts",
       "default": "./src/state/vcs.ts"
     },
+    "./project-work": {
+      "types": "./src/project-work/index.ts",
+      "default": "./src/project-work/index.ts"
+    },
     "./work-log/user-input": {
       "types": "./src/work-log/userInput.ts",
       "default": "./src/work-log/userInput.ts"

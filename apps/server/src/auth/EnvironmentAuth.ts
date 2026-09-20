@@ -4,6 +4,7 @@ import {
   AuthAdministrativeScopes,
   AuthStandardClientScopes,
   type AuthAccessTokenResult,
+  type AuthIdentity,
   type AuthBrowserSessionResult,
   type AuthClientMetadata,
   type AuthClientSession,
@@ -17,6 +18,10 @@ import {
   type ServerAuthSessionMethod,
   type AuthWebSocketTicketResult,
   DpopFailureReason,
+  ProjectWorkApprovalId,
+  type ProjectWorkApprovalGrant,
+  type ProjectWorkProtectedSpecificationApproval,
+  type ProjectWorkSourceKind,
   type DpopFailureReason as DpopFailureReasonType,
 } from "@t3tools/contracts";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
@@ -29,6 +34,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as HttpServerRequest from "effect/unstable/http/HttpServerRequest";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as ServerConfig from "../config.ts";
@@ -39,6 +45,7 @@ import * as SessionStore from "./SessionStore.ts";
 import { REUSABLE_DEV_SESSION_EXPIRES_AT, resolveReusableDevAuth } from "./ReusableDevAuth.ts";
 import { verifyRequestDpopProof } from "./dpop.ts";
 import { layerConfig as SqlitePersistenceLayer } from "../persistence/Layers/Sqlite.ts";
+import { assertProjectAcceptsMutations } from "../project/ProjectMutationFence.ts";
 
 const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
 export const INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT = "administrative-bootstrap";
@@ -59,6 +66,8 @@ export interface IssuedBearerSession {
   readonly method: "bearer-access-token";
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
   readonly subject: string;
+  /** Older CLI fixtures may omit this field; issued sessions always derive it. */
+  readonly identity?: AuthIdentity;
   readonly client: AuthClientMetadata;
   readonly expiresAt: DateTime.Utc;
 }
@@ -68,8 +77,30 @@ export interface AuthenticatedSession {
   readonly subject: string;
   readonly method: ServerAuthSessionMethod;
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
+  /** Stable principal derived from the session subject, not the credential. */
+  readonly identity: AuthIdentity;
   readonly proofKeyThumbprint?: string;
   readonly expiresAt?: DateTime.DateTime;
+}
+
+export function authIdentityForSession(input: {
+  readonly subject: string;
+  readonly client?: Pick<AuthClientMetadata, "deviceType" | "label">;
+}): AuthIdentity {
+  const explicitKind = input.subject.startsWith("user:")
+    ? "user"
+    : input.subject.startsWith("agent:")
+      ? "agent"
+      : undefined;
+  const isAgent =
+    explicitKind === "agent" || (explicitKind === undefined && input.client?.deviceType === "bot");
+  const stableId =
+    explicitKind === undefined ? `${isAgent ? "agent" : "user"}:${input.subject}` : input.subject;
+  return {
+    kind: isAgent ? "agent" : "user",
+    id: stableId,
+    ...(input.client?.label ? { displayName: input.client.label } : {}),
+  };
 }
 
 const serverAuthInternalErrorContext = {
@@ -312,6 +343,21 @@ export class ServerAuthCloudMintJwtSigningError extends Schema.TaggedError<Serve
   }
 }
 
+export class ServerAuthProjectWorkApprovalError extends Schema.TaggedError<ServerAuthProjectWorkApprovalError>()(
+  "ServerAuthProjectWorkApprovalError",
+  {
+    operation: Schema.Literals(["issue", "consume"]),
+    reason: Schema.Literals(["not-human", "invalid", "expired", "replayed", "storage"]),
+    cause: Schema.optional(Schema.Defect()),
+  },
+) {
+  override get message(): string {
+    return this.reason === "not-human"
+      ? "Only a human identity may approve a protected project-work intent."
+      : "The project-work approval is invalid, expired, or has already been consumed.";
+  }
+}
+
 export const ServerAuthInternalError = Schema.Union([
   ServerAuthBootstrapCredentialValidationError,
   ServerAuthSessionCredentialValidationError,
@@ -335,6 +381,7 @@ export const ServerAuthInternalError = Schema.Union([
   ServerAuthCloudRelayIssuerMissingError,
   ServerAuthCloudHealthJwtSigningError,
   ServerAuthCloudMintJwtSigningError,
+  ServerAuthProjectWorkApprovalError,
 ]);
 export type ServerAuthInternalError = typeof ServerAuthInternalError.Type;
 export const isServerAuthInternalError = Schema.is(ServerAuthInternalError);
@@ -415,6 +462,25 @@ export class ServerAuthForbiddenOperationError extends Schema.TaggedError<Server
   }
 }
 
+type ProjectWorkApprovalIssue = (input: {
+  readonly projectId: string;
+  readonly taskId: string;
+  readonly specRevision: number;
+  readonly payloadFingerprint: string;
+  readonly agentId: string;
+  readonly approvedBy: AuthIdentity;
+  readonly sourceKind?: ProjectWorkSourceKind;
+}) => Effect.Effect<ProjectWorkApprovalGrant, ServerAuthInternalError>;
+
+type ProjectWorkApprovalConsume = (input: {
+  readonly token: string;
+  readonly projectId: string;
+  readonly taskId: string;
+  readonly specRevision: number;
+  readonly payloadFingerprint: string;
+  readonly agentId: string;
+}) => Effect.Effect<ProjectWorkProtectedSpecificationApproval, ServerAuthInternalError>;
+
 export class EnvironmentAuth extends Context.Service<
   EnvironmentAuth,
   {
@@ -469,7 +535,29 @@ export class EnvironmentAuth extends Context.Service<
       readonly subject?: string;
       readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
       readonly label?: string;
+      readonly identity?: AuthIdentity;
     }) => Effect.Effect<IssuedBearerSession, ServerAuthInternalError>;
+    /** Issue a short-lived, durable, single-use approval for an agent intent. */
+    readonly issueProjectWorkApproval: (input: {
+      readonly projectId: string;
+      readonly taskId: string;
+      readonly specRevision: number;
+      readonly payloadFingerprint: string;
+      readonly agentId: string;
+      readonly approvedBy: AuthIdentity;
+      readonly sourceKind?: ProjectWorkSourceKind;
+    }) => Effect.Effect<ProjectWorkApprovalGrant, ServerAuthInternalError>;
+    readonly issueHumanApproval: ProjectWorkApprovalIssue;
+    /** Atomically consume an approval and return the bound approval record. */
+    readonly consumeProjectWorkApproval: (input: {
+      readonly token: string;
+      readonly projectId: string;
+      readonly taskId: string;
+      readonly specRevision: number;
+      readonly payloadFingerprint: string;
+      readonly agentId: string;
+    }) => Effect.Effect<ProjectWorkProtectedSpecificationApproval, ServerAuthInternalError>;
+    readonly consumeHumanApproval: ProjectWorkApprovalConsume;
     readonly listSessions: () => Effect.Effect<
       ReadonlyArray<AuthClientSession>,
       ServerAuthInternalError
@@ -604,6 +692,7 @@ export const make = Effect.gen(function* () {
   const sessions = yield* SessionStore.SessionStore;
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
   const crypto = yield* Crypto.Crypto;
+  const sql = yield* SqlClient.SqlClient;
   const descriptor = yield* policy.getDescriptor();
   const config = yield* ServerConfig.ServerConfig;
   const devAuth = resolveReusableDevAuth(config);
@@ -629,6 +718,7 @@ export const make = Effect.gen(function* () {
         subject: session.subject,
         method: session.method,
         scopes: session.scopes,
+        identity: authIdentityForSession(session),
         ...(session.proofKeyThumbprint ? { proofKeyThumbprint: session.proofKeyThumbprint } : {}),
         ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
       })),
@@ -697,6 +787,7 @@ export const make = Effect.gen(function* () {
             auth: descriptor,
             scopes: session.scopes,
             sessionMethod: session.method,
+            identity: session.identity,
             ...(session.expiresAt ? { expiresAt: DateTime.toUtc(session.expiresAt) } : {}),
           }) satisfies AuthSessionState,
       ),
@@ -930,37 +1021,299 @@ export const make = Effect.gen(function* () {
     );
 
   const issueSession: EnvironmentAuth["Service"]["issueSession"] = (input) =>
-    sessions
-      .issue({
-        subject: input?.subject ?? DEFAULT_SESSION_SUBJECT,
-        method: "bearer-access-token",
-        scopes: input?.scopes ?? AuthAdministrativeScopes,
-        client: {
-          ...(input?.label ? { label: input.label } : {}),
-          deviceType: "bot",
-        },
-        ...(input?.ttl ? { ttl: input.ttl } : {}),
-      })
+    (() => {
+      const sessionIdentity = input?.identity;
+      const identitySubject =
+        sessionIdentity === undefined
+          ? undefined
+          : sessionIdentity.id.startsWith(`${sessionIdentity.kind}:`)
+            ? sessionIdentity.id
+            : `${sessionIdentity.kind}:${sessionIdentity.id}`;
+      const subject = identitySubject ?? input?.subject ?? DEFAULT_SESSION_SUBJECT;
+      return sessions
+        .issue({
+          subject,
+          method: "bearer-access-token",
+          scopes: input?.scopes ?? AuthAdministrativeScopes,
+          client: {
+            ...(input?.label ? { label: input.label } : {}),
+            deviceType: "bot",
+          },
+          ...(input?.ttl ? { ttl: input.ttl } : {}),
+        })
+        .pipe(
+          Effect.map(
+            (issued) =>
+              ({
+                sessionId: issued.sessionId,
+                token: issued.token,
+                method: "bearer-access-token",
+                scopes: issued.scopes,
+                subject,
+                identity:
+                  input?.identity ??
+                  authIdentityForSession({
+                    subject,
+                    client: issued.client,
+                  }),
+                client: issued.client,
+                expiresAt: DateTime.toUtc(issued.expiresAt),
+              }) satisfies IssuedBearerSession,
+          ),
+          Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
+          Effect.withSpan("EnvironmentAuth.issueSession"),
+        );
+    })();
+
+  const ensureApprovalTable = (operation: "issue" | "consume") =>
+    sql`
+      CREATE TABLE IF NOT EXISTS project_work_approvals (
+        approval_id TEXT PRIMARY KEY,
+        token_hash TEXT NOT NULL UNIQUE,
+        project_id TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        spec_revision INTEGER NOT NULL,
+        payload_fingerprint TEXT NOT NULL,
+        agent_id TEXT NOT NULL,
+        approved_by_id TEXT NOT NULL,
+        approved_by_display_name TEXT,
+        source_kind TEXT NOT NULL,
+        approved_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        consumed_at TEXT
+      )
+    `.pipe(
+      Effect.mapError(
+        (cause) =>
+          new ServerAuthProjectWorkApprovalError({
+            operation,
+            reason: "storage",
+            cause,
+          }),
+      ),
+    );
+
+  const digestApprovalToken = (token: string) =>
+    crypto.digest("SHA-256", new TextEncoder().encode(token)).pipe(
+      Effect.map((bytes) =>
+        Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+      ),
+      Effect.orDie,
+    );
+
+  const issueProjectWorkApproval: EnvironmentAuth["Service"]["issueProjectWorkApproval"] = (
+    input,
+  ) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          if (input.approvedBy.kind !== "user") {
+            return yield* new ServerAuthProjectWorkApprovalError({
+              operation: "issue",
+              reason: "not-human",
+            });
+          }
+          yield* assertProjectAcceptsMutations(sql, input.projectId).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ServerAuthProjectWorkApprovalError({
+                  operation: "issue",
+                  reason: "invalid",
+                  cause,
+                }),
+            ),
+          );
+          const approvedAt = yield* DateTime.now;
+          const expiresAt = DateTime.add(approvedAt, { minutes: 5 });
+          const token = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
+          const tokenHash = yield* digestApprovalToken(token);
+          const approvalId = ProjectWorkApprovalId.make(`approval:${tokenHash.slice(0, 24)}`);
+          const sourceKind = input.sourceKind ?? "web";
+          yield* ensureApprovalTable("issue");
+          yield* sql`
+        INSERT INTO project_work_approvals (
+          approval_id, token_hash, project_id, task_id, spec_revision,
+          payload_fingerprint, agent_id, approved_by_id, approved_by_display_name,
+          source_kind, approved_at, expires_at
+        ) VALUES (
+          ${approvalId}, ${tokenHash}, ${input.projectId}, ${input.taskId}, ${input.specRevision},
+          ${input.payloadFingerprint}, ${input.agentId}, ${input.approvedBy.id},
+          ${input.approvedBy.displayName ?? null}, ${sourceKind},
+          ${DateTime.formatIso(approvedAt)}, ${DateTime.formatIso(expiresAt)}
+        )
+      `.pipe(
+            Effect.mapError(
+              (cause) =>
+                new ServerAuthProjectWorkApprovalError({
+                  operation: "issue",
+                  reason: "storage",
+                  cause,
+                }),
+            ),
+          );
+          const approval: ProjectWorkProtectedSpecificationApproval = {
+            approvalId,
+            taskId: input.taskId as ProjectWorkProtectedSpecificationApproval["taskId"],
+            specRevision: input.specRevision,
+            payloadFingerprint: input.payloadFingerprint,
+            approvedAt: DateTime.formatIso(approvedAt),
+            attribution: {
+              actor: {
+                kind: "human",
+                id: input.approvedBy.id,
+                ...(input.approvedBy.displayName
+                  ? { displayName: input.approvedBy.displayName }
+                  : {}),
+              },
+              source: { kind: sourceKind, id: "project-work-approval" },
+              recordedAt: DateTime.formatIso(approvedAt),
+            },
+          };
+          return {
+            approval,
+            token,
+            expiresAt: DateTime.formatIso(expiresAt),
+          } satisfies ProjectWorkApprovalGrant;
+        }),
+      )
       .pipe(
-        Effect.map(
-          (issued) =>
-            ({
-              sessionId: issued.sessionId,
-              token: issued.token,
-              method: "bearer-access-token",
-              scopes: issued.scopes,
-              subject: input?.subject ?? DEFAULT_SESSION_SUBJECT,
-              client: issued.client,
-              expiresAt: DateTime.toUtc(issued.expiresAt),
-            }) satisfies IssuedBearerSession,
+        Effect.mapError((cause) =>
+          Schema.is(ServerAuthProjectWorkApprovalError)(cause)
+            ? cause
+            : new ServerAuthProjectWorkApprovalError({
+                operation: "issue",
+                reason: "storage",
+                cause,
+              }),
         ),
-        Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
-        Effect.withSpan("EnvironmentAuth.issueSession"),
+        Effect.withSpan("EnvironmentAuth.issueProjectWorkApproval"),
+      );
+
+  const consumeProjectWorkApproval: EnvironmentAuth["Service"]["consumeProjectWorkApproval"] = (
+    input,
+  ) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          yield* assertProjectAcceptsMutations(sql, input.projectId).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ServerAuthProjectWorkApprovalError({
+                  operation: "consume",
+                  reason: "invalid",
+                  cause,
+                }),
+            ),
+          );
+          const now = yield* DateTime.now;
+          const tokenHash = yield* digestApprovalToken(input.token);
+          yield* ensureApprovalTable("consume");
+          const rows = yield* sql<Record<string, unknown>>`
+        UPDATE project_work_approvals
+        SET consumed_at = ${DateTime.formatIso(now)}
+        WHERE token_hash = ${tokenHash}
+          AND project_id = ${input.projectId}
+          AND task_id = ${input.taskId}
+          AND spec_revision = ${input.specRevision}
+          AND payload_fingerprint = ${input.payloadFingerprint}
+          AND agent_id = ${input.agentId}
+          AND consumed_at IS NULL
+          AND expires_at > ${DateTime.formatIso(now)}
+        RETURNING approval_id, task_id, spec_revision, payload_fingerprint,
+          approved_at, approved_by_id, approved_by_display_name, source_kind
+      `.pipe(
+            Effect.mapError(
+              (cause) =>
+                new ServerAuthProjectWorkApprovalError({
+                  operation: "consume",
+                  reason: "storage",
+                  cause,
+                }),
+            ),
+          );
+          const row = rows[0];
+          if (row === undefined) {
+            const matchingRows = yield* sql<Record<string, unknown>>`
+          SELECT consumed_at, expires_at
+          FROM project_work_approvals
+          WHERE token_hash = ${tokenHash}
+            AND project_id = ${input.projectId}
+            AND task_id = ${input.taskId}
+            AND spec_revision = ${input.specRevision}
+            AND payload_fingerprint = ${input.payloadFingerprint}
+            AND agent_id = ${input.agentId}
+        `.pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ServerAuthProjectWorkApprovalError({
+                    operation: "consume",
+                    reason: "storage",
+                    cause,
+                  }),
+              ),
+            );
+            const matching = matchingRows[0];
+            const matchingExpiry = matching?.expires_at;
+            const reason =
+              matching === undefined
+                ? "invalid"
+                : matching.consumed_at !== null && matching.consumed_at !== undefined
+                  ? "replayed"
+                  : matchingExpiry !== undefined &&
+                      Date.parse(String(matchingExpiry)) <= now.epochMilliseconds
+                    ? "expired"
+                    : "invalid";
+            return yield* new ServerAuthProjectWorkApprovalError({
+              operation: "consume",
+              reason,
+            });
+          }
+          return {
+            approvalId: ProjectWorkApprovalId.make(String(row.approval_id)),
+            taskId: String(row.task_id) as ProjectWorkProtectedSpecificationApproval["taskId"],
+            specRevision: Number(row.spec_revision),
+            payloadFingerprint: String(row.payload_fingerprint),
+            approvedAt: String(row.approved_at),
+            attribution: {
+              actor: {
+                kind: "human",
+                id: String(row.approved_by_id),
+                ...(row.approved_by_display_name
+                  ? { displayName: String(row.approved_by_display_name) }
+                  : {}),
+              },
+              source: {
+                kind: String(row.source_kind) as ProjectWorkSourceKind,
+                id: "project-work-approval",
+              },
+              recordedAt: String(row.approved_at),
+            },
+          } satisfies ProjectWorkProtectedSpecificationApproval;
+        }),
+      )
+      .pipe(
+        Effect.mapError((cause) =>
+          Schema.is(ServerAuthProjectWorkApprovalError)(cause)
+            ? cause
+            : new ServerAuthProjectWorkApprovalError({
+                operation: "consume",
+                reason: "storage",
+                cause,
+              }),
+        ),
+        Effect.withSpan("EnvironmentAuth.consumeProjectWorkApproval"),
       );
 
   const listSessions: EnvironmentAuth["Service"]["listSessions"] = () =>
     sessions.listActive().pipe(
-      Effect.map((activeSessions) => activeSessions.toSorted(bySessionPriority)),
+      Effect.map((activeSessions) =>
+        activeSessions
+          .map((session) => ({
+            ...session,
+            identity: authIdentityForSession({ subject: session.subject, client: session.client }),
+          }))
+          .toSorted(bySessionPriority),
+      ),
       Effect.mapError((cause) => new ServerAuthSessionsListError({ cause })),
       Effect.withSpan("EnvironmentAuth.listSessions"),
     );
@@ -1084,6 +1437,7 @@ export const make = Effect.gen(function* () {
               subject: session.subject,
               method: session.method,
               scopes: session.scopes,
+              identity: authIdentityForSession(session),
               ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
             })),
             mapSessionVerificationErrors,
@@ -1106,6 +1460,10 @@ export const make = Effect.gen(function* () {
     listPairingLinks,
     revokePairingLink,
     issueSession,
+    issueProjectWorkApproval,
+    issueHumanApproval: issueProjectWorkApproval,
+    consumeProjectWorkApproval,
+    consumeHumanApproval: consumeProjectWorkApproval,
     listSessions,
     revokeSession,
     revokeOtherSessionsExcept,

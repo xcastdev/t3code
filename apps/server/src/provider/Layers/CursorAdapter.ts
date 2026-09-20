@@ -135,6 +135,7 @@ interface CursorSessionContext {
   session: ProviderSession;
   readonly scope: Scope.Closeable;
   readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
+  readonly projectWork?: Parameters<typeof buildRuntimeInstructions>[0]["projectWork"];
   notificationFiber: Fiber.Fiber<void, never> | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
@@ -805,6 +806,7 @@ export function makeCursorAdapter(
             session,
             scope: sessionScope,
             acp,
+            projectWork: input.projectWork,
             notificationFiber: undefined,
             pendingApprovals,
             pendingUserInputs,
@@ -1080,7 +1082,11 @@ export function makeCursorAdapter(
                 ...promptParts,
                 {
                   type: "text",
-                  text: buildRuntimeInstructions({ harness: "Cursor", model: resolvedModel }),
+                  text: buildRuntimeInstructions({
+                    harness: "Cursor",
+                    model: resolvedModel,
+                    projectWork: ctx.projectWork,
+                  }),
                 },
               ],
             })

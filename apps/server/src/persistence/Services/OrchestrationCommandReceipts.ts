@@ -31,6 +31,15 @@ export const OrchestrationCommandReceipt = Schema.Struct({
   resultSequence: NonNegativeInt,
   status: OrchestrationCommandReceiptStatus,
   error: Schema.NullOr(Schema.String),
+  /** Stable command content digest used to reject mutated idempotency retries. */
+  fingerprint: Schema.optionalKey(Schema.String),
+  /** Durable actor/source attribution for audit and replay tooling. */
+  actorKind: Schema.optionalKey(Schema.String),
+  actorId: Schema.optionalKey(Schema.String),
+  sourceKind: Schema.optionalKey(Schema.String),
+  sourceId: Schema.optionalKey(Schema.String),
+  /** The command result, when one exists, retained independently of events. */
+  result: Schema.optionalKey(Schema.Unknown),
 });
 export type OrchestrationCommandReceipt = typeof OrchestrationCommandReceipt.Type;
 

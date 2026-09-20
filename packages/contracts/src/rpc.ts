@@ -310,6 +310,25 @@ import {
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
 import {
+  ProjectWorkApprovalGrant,
+  ProjectWorkApprovalRequest,
+  ProjectWorkReadIntent,
+  ProjectWorkStreamInput,
+  ProjectWorkStreamItem,
+  ProjectWorkWriteIntent,
+  ProjectWorkWriteResult,
+} from "./projectWork.ts";
+import {
+  ProjectLifecycleArchiveInput,
+  ProjectLifecycleGetInput,
+  ProjectLifecycleMutationResult,
+  ProjectLifecycleRecord,
+  ProjectLifecyclePermanentDeleteInput,
+  ProjectLifecycleRelocationCheckInput,
+  ProjectLifecycleRelocationCheckResult,
+  ProjectLifecycleRestoreInput,
+} from "./projectLifecycle.ts";
+import {
   McpCatalogChanged,
   McpCatalogDefinition,
   McpCatalogGlobalState,
@@ -348,6 +367,15 @@ export const WS_METHODS = {
   projectsSearchContents: "projects.searchContents",
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
+  projectWorkRead: "projectWork.read",
+  projectWorkWrite: "projectWork.write",
+  projectWorkRequestApproval: "projectWork.requestApproval",
+  projectWorkSubscribe: "projectWork.subscribe",
+  projectLifecycleArchive: "projectLifecycle.archive",
+  projectLifecycleGet: "projectLifecycle.get",
+  projectLifecycleRestore: "projectLifecycle.restore",
+  projectLifecycleRelocationCheck: "projectLifecycle.relocationCheck",
+  projectLifecyclePermanentDelete: "projectLifecycle.permanentDelete",
   projectMcpList: "projectMcp.list",
   projectMcpCreate: "projectMcp.create",
   projectMcpUpdate: "projectMcp.update",
@@ -1056,6 +1084,57 @@ const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   payload: ProjectWriteFileInput,
   success: ProjectWriteFileResult,
   error: Schema.Union([ProjectWriteFileError, EnvironmentAuthorizationError]),
+});
+
+const WsProjectWorkReadRpc = Rpc.make(WS_METHODS.projectWorkRead, {
+  payload: ProjectWorkReadIntent,
+  success: Schema.Unknown,
+  error: Schema.Unknown,
+});
+
+const WsProjectWorkWriteRpc = Rpc.make(WS_METHODS.projectWorkWrite, {
+  payload: ProjectWorkWriteIntent,
+  success: ProjectWorkWriteResult,
+  error: Schema.Unknown,
+});
+
+const WsProjectWorkRequestApprovalRpc = Rpc.make(WS_METHODS.projectWorkRequestApproval, {
+  payload: ProjectWorkApprovalRequest,
+  success: ProjectWorkApprovalGrant,
+  error: Schema.Unknown,
+});
+
+const WsProjectWorkSubscribeRpc = Rpc.make(WS_METHODS.projectWorkSubscribe, {
+  payload: ProjectWorkStreamInput,
+  success: ProjectWorkStreamItem,
+  error: Schema.Unknown,
+  stream: true,
+});
+
+const WsProjectLifecycleArchiveRpc = Rpc.make(WS_METHODS.projectLifecycleArchive, {
+  payload: ProjectLifecycleArchiveInput,
+  success: ProjectLifecycleMutationResult,
+  error: Schema.Unknown,
+});
+const WsProjectLifecycleGetRpc = Rpc.make(WS_METHODS.projectLifecycleGet, {
+  payload: ProjectLifecycleGetInput,
+  success: Schema.NullOr(ProjectLifecycleRecord),
+  error: Schema.Unknown,
+});
+const WsProjectLifecycleRestoreRpc = Rpc.make(WS_METHODS.projectLifecycleRestore, {
+  payload: ProjectLifecycleRestoreInput,
+  success: ProjectLifecycleMutationResult,
+  error: Schema.Unknown,
+});
+const WsProjectLifecycleRelocationCheckRpc = Rpc.make(WS_METHODS.projectLifecycleRelocationCheck, {
+  payload: ProjectLifecycleRelocationCheckInput,
+  success: ProjectLifecycleRelocationCheckResult,
+  error: Schema.Unknown,
+});
+const WsProjectLifecyclePermanentDeleteRpc = Rpc.make(WS_METHODS.projectLifecyclePermanentDelete, {
+  payload: ProjectLifecyclePermanentDeleteInput,
+  success: ProjectLifecycleMutationResult,
+  error: Schema.Unknown,
 });
 
 export const WsProjectMcpListRpc = Rpc.make(WS_METHODS.projectMcpList, {
@@ -1810,6 +1889,15 @@ export const WsRpcGroup = RpcGroup.make(
   WsProjectsSearchContentsRpc,
   WsProjectsSearchEntriesRpc,
   WsProjectsWriteFileRpc,
+  WsProjectWorkReadRpc,
+  WsProjectWorkWriteRpc,
+  WsProjectWorkRequestApprovalRpc,
+  WsProjectWorkSubscribeRpc,
+  WsProjectLifecycleArchiveRpc,
+  WsProjectLifecycleGetRpc,
+  WsProjectLifecycleRestoreRpc,
+  WsProjectLifecycleRelocationCheckRpc,
+  WsProjectLifecyclePermanentDeleteRpc,
   WsProjectMcpListRpc,
   WsProjectMcpCreateRpc,
   WsProjectMcpUpdateRpc,

@@ -1,7 +1,12 @@
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import type { ChatAttachment, ModelSelection, ProviderInstanceId } from "@t3tools/contracts";
+import type {
+  ChatAttachment,
+  ModelSelection,
+  ProjectWorkBriefing,
+  ProviderInstanceId,
+} from "@t3tools/contracts";
 import { TextGenerationError } from "@t3tools/contracts";
 
 import * as ProviderInstanceRegistry from "../provider/Services/ProviderInstanceRegistry.ts";
@@ -77,6 +82,23 @@ export interface ThreadTitleGenerationResult {
   needsRefinement?: boolean | undefined;
 }
 
+export interface ProjectWorkNarrativeCitation {
+  readonly recordKind: "task" | "knowledge";
+  readonly recordId: string;
+  readonly revision: number;
+}
+
+export interface ProjectWorkNarrativeGenerationInput {
+  readonly cwd: string;
+  readonly briefing: ProjectWorkBriefing;
+  readonly citations: ReadonlyArray<ProjectWorkNarrativeCitation>;
+  readonly modelSelection: ModelSelection;
+}
+
+export interface ProjectWorkNarrativeGenerationResult {
+  readonly narrative: string;
+}
+
 /**
  * TextGeneration - Service tag for commit and change request text generation.
  */
@@ -108,6 +130,11 @@ export class TextGeneration extends Context.Service<
     readonly generateThreadTitle: (
       input: ThreadTitleGenerationInput,
     ) => Effect.Effect<ThreadTitleGenerationResult, TextGenerationError>;
+
+    /** Generate optional, non-authoritative prose from a structured project briefing. */
+    readonly generateProjectWorkNarrative?: (
+      input: ProjectWorkNarrativeGenerationInput,
+    ) => Effect.Effect<ProjectWorkNarrativeGenerationResult, TextGenerationError>;
   }
 >()("t3/textGeneration/TextGeneration") {}
 
@@ -115,7 +142,8 @@ type TextGenerationOp =
   | "generateCommitMessage"
   | "generatePrContent"
   | "generateBranchName"
-  | "generateThreadTitle";
+  | "generateThreadTitle"
+  | "generateProjectWorkNarrative";
 
 const resolveInstance = (
   registry: ProviderInstanceRegistry.ProviderInstanceRegistry["Service"],
@@ -166,6 +194,23 @@ export const make = Effect.gen(function* () {
               ));
             return yield* textGeneration.generateThreadTitle({ ...input, linkedContext });
           }),
+        ),
+      ),
+    generateProjectWorkNarrative: (input) =>
+      resolveInstance(
+        registry,
+        "generateProjectWorkNarrative",
+        input.modelSelection.instanceId,
+      ).pipe(
+        Effect.flatMap((textGeneration) =>
+          textGeneration.generateProjectWorkNarrative
+            ? textGeneration.generateProjectWorkNarrative(input)
+            : Effect.fail(
+                new TextGenerationError({
+                  operation: "generateProjectWorkNarrative",
+                  detail: "The selected provider does not support project-work narratives.",
+                }),
+              ),
         ),
       ),
   });

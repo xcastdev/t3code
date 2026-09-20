@@ -196,6 +196,7 @@ interface SessionContext {
   readonly nativeSessionId: string;
   readonly scope: Scope.Closeable;
   readonly runtime: Runtime;
+  readonly projectWork?: Parameters<typeof buildRuntimeInstructions>[0]["projectWork"];
   readonly promptLock: Semaphore.Semaphore;
   readonly stopLock: Semaphore.Semaphore;
   readonly commandLock: Semaphore.Semaphore;
@@ -880,6 +881,7 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                 nativeSessionId: started.sessionId,
                 scope: sessionScope,
                 runtime,
+                projectWork: input.projectWork,
                 promptLock: yield* Semaphore.make(1),
                 stopLock: yield* Semaphore.make(1),
                 commandLock: yield* Semaphore.make(1),
@@ -1097,7 +1099,11 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                   ...prompt,
                   {
                     type: "text",
-                    text: buildRuntimeInstructions({ harness: "Antigravity", model }),
+                    text: buildRuntimeInstructions({
+                      harness: "Antigravity",
+                      model,
+                      projectWork: context.projectWork,
+                    }),
                   },
                 ],
               },

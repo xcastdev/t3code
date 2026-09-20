@@ -225,6 +225,7 @@ export const make = Effect.gen(function* () {
       projectMcpCatalog: true,
       globalMcpCatalog: true,
       projectMcpOverrides: true,
+      projectWorkStream: true,
       sessionMcpCatalog: true,
       inlineMessageContext: true,
       threadSettlement: true,

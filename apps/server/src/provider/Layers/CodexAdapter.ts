@@ -2321,6 +2321,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? { model: input.modelSelection.model }
             : {}),
           ...(serviceTier ? { serviceTier } : {}),
+          ...(input.projectWork ? { projectWork: input.projectWork } : {}),
           ...(projectMcpArgs.length > 0 || mcpSession
             ? {
                 environment: {

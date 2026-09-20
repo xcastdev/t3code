@@ -26,6 +26,7 @@ import {
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
   buildPrContentPrompt,
+  buildProjectWorkNarrativePrompt,
   buildThreadTitlePrompt,
 } from "./TextGenerationPrompts.ts";
 import {
@@ -103,7 +104,8 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle",
+      | "generateThreadTitle"
+      | "generateProjectWorkNarrative",
     value: unknown,
   ): Effect.Effect<string, TextGenerationError> =>
     encodeJsonString(value).pipe(
@@ -164,7 +166,8 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       | "generateCommitMessage"
       | "generatePrContent"
       | "generateBranchName"
-      | "generateThreadTitle";
+      | "generateThreadTitle"
+      | "generateProjectWorkNarrative";
     cwd: string;
     prompt: string;
     outputSchemaJson: S;
@@ -417,10 +420,24 @@ export const makeCodexTextGeneration = Effect.fn("makeCodexTextGeneration")(func
       } satisfies TextGeneration.ThreadTitleGenerationResult;
     });
 
+  const generateProjectWorkNarrative: TextGeneration.TextGeneration["Service"]["generateProjectWorkNarrative"] =
+    Effect.fn("CodexTextGeneration.generateProjectWorkNarrative")(function* (input) {
+      const { prompt, outputSchema } = buildProjectWorkNarrativePrompt(input);
+      const generated = yield* runCodexJson({
+        operation: "generateProjectWorkNarrative",
+        cwd: input.cwd,
+        prompt,
+        outputSchemaJson: outputSchema,
+        modelSelection: input.modelSelection,
+      });
+      return { narrative: generated.narrative.trim() };
+    });
+
   return {
     generateCommitMessage,
     generatePrContent,
     generateBranchName,
     generateThreadTitle,
+    generateProjectWorkNarrative,
   } satisfies TextGeneration.TextGeneration["Service"];
 });

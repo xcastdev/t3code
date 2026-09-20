@@ -299,7 +299,20 @@ export const make = Effect.gen(function* () {
     yield* Effect.serviceOption(ExternalNotificationDispatcher.ExternalNotificationDispatcher),
     () =>
       ({
-        dispatch: () => Effect.void,
+        dispatch: () =>
+          Effect.succeed({
+            attemptedDestinationIds: [],
+            deliveredDestinationIds: [],
+            failedDestinationIds: [],
+            outcomes: [],
+          }),
+        dispatchDetailed: () =>
+          Effect.succeed({
+            attemptedDestinationIds: [],
+            deliveredDestinationIds: [],
+            failedDestinationIds: [],
+            outcomes: [],
+          }),
         hasEnabledDestinations: Effect.succeed(false),
         test: () => Effect.die("external notification test is unavailable"),
       }) satisfies ExternalNotificationDispatcher.ExternalNotificationDispatcher["Service"],

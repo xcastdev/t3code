@@ -346,6 +346,14 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
                 : []),
               ...(projectEndpoints.length > 0 ? ["project" as const] : []),
             ]),
+            identity: {
+              kind: "agent",
+              // The bearer credential is renewable. Durable attribution must
+              // survive that renewal, so identity is scoped to provider and
+              // thread while the session id remains transport provenance.
+              id: `agent:mcp:${request.providerInstanceId}:${request.threadId}`,
+              displayName: "MCP agent",
+            },
             issuedAt,
           };
           const expiredProviderSessionIds = yield* SynchronizedRef.modify(

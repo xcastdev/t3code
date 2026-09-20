@@ -95,3 +95,98 @@ it.effect("ExternalNotificationDispatcher rejects tests for an unconfigured dest
     assert.equal(error.reason, "not-configured");
   }).pipe(Effect.provide(layer));
 });
+
+it.effect("ExternalNotificationDispatcher deduplicates durable project-work attention", () => {
+  const sent: unknown[] = [];
+  const layer = ExternalNotificationDispatcher.layer.pipe(
+    Layer.provide(
+      Layer.succeed(HomeAssistantWebhookAdapter.HomeAssistantWebhookAdapter, {
+        send: ({ payload }) => Effect.sync(() => sent.push(payload)),
+      }),
+    ),
+    Layer.provide(
+      ServerSettings.layerTest({ externalNotifications: { destinations: [destination] } }),
+    ),
+    Layer.provide(
+      Layer.succeed(ServerEnvironment.ServerEnvironment, {
+        getEnvironmentId: Effect.succeed(environmentId),
+        getDescriptor: Effect.die("unused"),
+      }),
+    ),
+  );
+  return Effect.gen(function* () {
+    const dispatcher = yield* ExternalNotificationDispatcher.ExternalNotificationDispatcher;
+    const projectWork = {
+      projectId: "project-1",
+      taskId: "task-1",
+      state: "blocked",
+      reason: "blocked",
+      revision: 2,
+    };
+    yield* dispatcher.dispatch({
+      environmentId,
+      threadId,
+      state: null,
+      reason: "project-work:blocked",
+      projectWork,
+    });
+    yield* dispatcher.dispatch({
+      environmentId,
+      threadId,
+      state: null,
+      reason: "project-work:blocked",
+      projectWork,
+    });
+    yield* dispatcher.dispatch({
+      environmentId,
+      threadId,
+      state: null,
+      reason: "project-work:blocked",
+      projectWork: { ...projectWork, revision: 3 },
+    });
+    assert.lengthOf(sent, 2);
+    assert.equal(
+      (sent[0] as { projectWork: { taskId: string; revision: number } }).projectWork.taskId,
+      "task-1",
+    );
+    assert.equal(
+      (sent[0] as { projectWork: { taskId: string; revision: number } }).projectWork.revision,
+      2,
+    );
+    assert.equal(
+      (sent[1] as { projectWork: { taskId: string; revision: number } }).projectWork.revision,
+      3,
+    );
+  }).pipe(Effect.provide(layer));
+});
+
+it.effect("ExternalNotificationDispatcher treats delivery failures as best effort", () => {
+  const layer = ExternalNotificationDispatcher.layer.pipe(
+    Layer.provide(
+      Layer.succeed(HomeAssistantWebhookAdapter.HomeAssistantWebhookAdapter, {
+        send: () =>
+          Effect.fail(
+            new ExternalNotificationError({ destinationId: "home", reason: "transport" }),
+          ),
+      }),
+    ),
+    Layer.provide(
+      ServerSettings.layerTest({ externalNotifications: { destinations: [destination] } }),
+    ),
+    Layer.provide(
+      Layer.succeed(ServerEnvironment.ServerEnvironment, {
+        getEnvironmentId: Effect.succeed(environmentId),
+        getDescriptor: Effect.die("unused"),
+      }),
+    ),
+  );
+  return Effect.gen(function* () {
+    const dispatcher = yield* ExternalNotificationDispatcher.ExternalNotificationDispatcher;
+    yield* dispatcher.dispatch({
+      environmentId,
+      threadId,
+      state: null,
+      reason: "project-work:failed",
+    });
+  }).pipe(Effect.provide(layer));
+});

@@ -18,6 +18,7 @@ import {
   buildBranchNamePrompt,
   buildCommitMessagePrompt,
   buildPrContentPrompt,
+  buildProjectWorkNarrativePrompt,
   buildThreadTitlePrompt,
 } from "./TextGenerationPrompts.ts";
 import * as TextGeneration from "./TextGeneration.ts";
@@ -34,6 +35,7 @@ const OpenCodeTextGenerationOperation = Schema.Literals([
   "generatePrContent",
   "generateBranchName",
   "generateThreadTitle",
+  "generateProjectWorkNarrative",
 ]);
 
 type OpenCodeTextGenerationOperation = typeof OpenCodeTextGenerationOperation.Type;
@@ -453,10 +455,24 @@ export const makeOpenCodeTextGeneration = Effect.fn("makeOpenCodeTextGeneration"
       };
     });
 
+  const generateProjectWorkNarrative: TextGeneration.TextGeneration["Service"]["generateProjectWorkNarrative"] =
+    Effect.fn("OpenCodeTextGeneration.generateProjectWorkNarrative")(function* (input) {
+      const { prompt, outputSchema } = buildProjectWorkNarrativePrompt(input);
+      const generated = yield* runOpenCodeJson({
+        operation: "generateProjectWorkNarrative",
+        cwd: input.cwd,
+        prompt,
+        outputSchemaJson: outputSchema,
+        modelSelection: input.modelSelection,
+      });
+      return { narrative: generated.narrative.trim() };
+    });
+
   return {
     generateCommitMessage,
     generatePrContent,
     generateBranchName,
     generateThreadTitle,
+    generateProjectWorkNarrative,
   } satisfies TextGeneration.TextGeneration["Service"];
 });

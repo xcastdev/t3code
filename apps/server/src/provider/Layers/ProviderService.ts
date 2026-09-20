@@ -102,6 +102,10 @@ import * as ProjectMcpService from "../../project/ProjectMcpService.ts";
 import * as OrchestrationEngine from "../../orchestration/Services/OrchestrationEngine.ts";
 import * as ServerSettings from "../../serverSettings.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import * as ProjectWorkBriefing from "../../projectWork/ProjectWorkBriefing.ts";
+import * as ProjectWorkNarrative from "../../projectWork/ProjectWorkNarrative.ts";
+import * as TextGeneration from "../../textGeneration/TextGeneration.ts";
+import type { ProjectWorkRuntimeContext } from "../RuntimeInstructions.ts";
 const isModelSelection = Schema.is(ModelSelection);
 const encodePromptJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -537,6 +541,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   const orchestrationEngine = yield* Effect.serviceOption(
     OrchestrationEngine.OrchestrationEngineService,
   );
+  const projectWorkBriefing = yield* Effect.serviceOption(ProjectWorkBriefing.ProjectWorkBriefing);
+  const projectWorkNarrative = yield* Effect.serviceOption(
+    ProjectWorkNarrative.ProjectWorkNarrative,
+  );
+  const textGeneration = yield* Effect.serviceOption(TextGeneration.TextGeneration);
   const issueMcpCredential =
     options?.issueMcpCredential ?? McpSessionRegistry.issueActiveMcpCredential;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -570,6 +579,84 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   });
   let turnAnalyticsRequestId = 0;
   const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+
+  /**
+   * Read only the compact structured briefing on the startup path. Narrative
+   * generation is always scheduled through the detached narrative cache so a
+   * disabled, stale, unavailable, or slow text provider cannot hold up the
+   * native provider session.
+   */
+  const projectWorkForSession = (
+    input: ProviderAdapterSessionStartInput,
+  ): Effect.Effect<ProjectWorkRuntimeContext | undefined, never> =>
+    Effect.gen(function* () {
+      const settings = yield* serverSettings.getSettings;
+      if (!settings.projectWorkEnabled || Option.isNone(projectWorkBriefing)) return undefined;
+      if (Option.isNone(projectionQuery)) return undefined;
+
+      const thread = yield* projectionQuery.value.getThreadShellById(input.threadId);
+      if (Option.isNone(thread)) return undefined;
+      const projectId = String(thread.value.projectId);
+      const briefing = yield* projectWorkBriefing.value.generate({
+        projectId,
+        kind: "compact",
+      });
+      const modelSelection = resolveProjectSettings(settings, thread.value.projectId).settings
+        .textGenerationModelSelection;
+      let narrative: ProjectWorkNarrative.ProjectWorkNarrativeResult | undefined;
+      if (Option.isSome(projectWorkNarrative)) {
+        narrative = yield* projectWorkNarrative.value.get({
+          projectId,
+          kind: briefing.kind,
+          model: modelSelection.model,
+          modelSelection,
+          sourceRevision: briefing.sourceRevision,
+        });
+        if (narrative === undefined && Option.isSome(textGeneration)) {
+          const generator: ProjectWorkNarrative.ProjectWorkNarrativeGenerator = (generated) => {
+            const generate = textGeneration.value.generateProjectWorkNarrative;
+            if (!generate) return Effect.die("project-work narrative generation is unavailable");
+            return generate({
+              cwd: input.cwd ?? process.cwd(),
+              briefing: generated.briefing,
+              citations: generated.citations,
+              modelSelection,
+            }).pipe(
+              Effect.map((result) => result.narrative),
+              // Let the detached request discard failures instead of caching
+              // an empty narrative as if generation had succeeded.
+              Effect.catchCause((cause) => Effect.die(cause)),
+            );
+          };
+          yield* projectWorkNarrative.value.request({
+            projectId,
+            kind: briefing.kind,
+            briefing,
+            model: modelSelection.model,
+            modelSelection,
+            generator,
+          });
+        }
+      }
+      return {
+        projectId,
+        sourceRevision: briefing.sourceRevision,
+        briefing: briefing.text,
+        ...(narrative
+          ? {
+              narrative: narrative.narrative,
+              narrativeModel: narrative.model,
+              narrativeGeneratedAt: narrative.generatedAt,
+            }
+          : {}),
+      };
+    }).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("provider.project-work-envelope-unavailable", { cause }).pipe(
+          Effect.as(undefined),
+        ),
+      ),
+    );
 
   const finishTurnAnalytics = (
     state: TurnAnalyticsState,
@@ -964,6 +1051,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const environment = {
         browser: settings.enableAgentBrowserAccess,
         device: settings.enableAgentDeviceAccess,
+        project: settings.projectWorkEnabled,
       };
       if (!browserOverridden && !deviceOverridden) return environment;
       // Provider-only runtimes may omit orchestration. An unresolved project
@@ -972,6 +1060,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const denied = {
         browser: browserOverridden ? false : environment.browser,
         device: deviceOverridden ? false : environment.device,
+        project: environment.project,
       };
       if (Option.isNone(projectionQuery)) return denied;
       const thread = yield* projectionQuery.value.getThreadShellById(threadId);
@@ -980,13 +1069,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       return {
         browser: resolved.enableAgentBrowserAccess,
         device: resolved.enableAgentDeviceAccess,
+        project: settings.projectWorkEnabled,
       };
     },
     Effect.catch((cause) =>
       Effect.logWarning(
         "Could not read server settings; withholding agent browser and device access for this session.",
         { cause },
-      ).pipe(Effect.as({ browser: false, device: false })),
+      ).pipe(Effect.as({ browser: false, device: false, project: false })),
     ),
   );
 
@@ -997,6 +1087,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     const access = yield* agentAccessSettings(threadId);
     if (access.browser) capabilities.add("preview");
     if (access.device) capabilities.add("device");
+    if (access.project) capabilities.add("project");
     return capabilities;
   });
 
@@ -1798,6 +1889,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           }),
         );
         const session = yield* Effect.gen(function* () {
+          const projectWork = yield* projectWorkForSession(input.sessionInput);
           replacement = yield* prepareMcpSession(
             threadId,
             input.providerInstanceId,
@@ -1809,6 +1901,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           owner.mcpProviderSessionId = replacement.candidate?.providerSessionId;
           const started = yield* input.adapter.startSession({
             ...input.sessionInput,
+            ...(projectWork ? { projectWork } : {}),
             ...(replacement.candidate?.projectServers?.length
               ? { projectMcpServers: replacement.candidate.projectServers }
               : {}),

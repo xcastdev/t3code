@@ -79,6 +79,7 @@ const AggregateReplayRequestSchema = Schema.Struct({
   fromSequenceExclusive: NonNegativeInt,
   toSequenceInclusive: NonNegativeInt,
   limit: Schema.Number,
+  eventTypes: Schema.optional(Schema.Array(OrchestrationEventType)),
 });
 const AggregateReplayStatsRowSchema = Schema.Struct({
   eventCount: Schema.Number,
@@ -224,6 +225,7 @@ const makeEventStore = Effect.gen(function* () {
           AND stream_id = ${request.aggregateId}
           AND sequence > ${request.fromSequenceExclusive}
           AND sequence <= ${request.toSequenceInclusive}
+          AND ${request.eventTypes === undefined ? sql`1 = 1` : sql.in("event_type", request.eventTypes)}
         ORDER BY sequence ASC
         LIMIT ${request.limit}
       `,
@@ -247,6 +249,7 @@ const makeEventStore = Effect.gen(function* () {
             AND stream_id = ${request.aggregateId}
             AND sequence > ${request.fromSequenceExclusive}
             AND sequence <= ${request.toSequenceInclusive}
+            AND ${request.eventTypes === undefined ? sql`1 = 1` : sql.in("event_type", request.eventTypes)}
           ORDER BY sequence ASC
           LIMIT ${request.limit}
         )

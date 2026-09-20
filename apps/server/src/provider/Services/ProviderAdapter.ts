@@ -25,6 +25,7 @@ import type {
 import type { McpIssuedProjectServer } from "../../mcp/McpProviderSession.ts";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
+import type { ProjectWorkRuntimeContext } from "../RuntimeInstructions.ts";
 
 export type ProviderSessionModelSwitchMode = "in-session" | "unsupported";
 export type ProviderRemoteHttpMcpMode = "active-session" | "next-session" | "unsupported";
@@ -33,6 +34,8 @@ export type ProviderSessionMcpCatalogMode = "live" | "restart-required" | "unsup
 export type ProviderAdapterSessionStartInput = ProviderSessionStartInput & {
   /** T3-issued proxy records only; upstream transport details stay server-side. */
   readonly projectMcpServers?: ReadonlyArray<McpIssuedProjectServer>;
+  /** Bounded durable project-work context prepared by ProviderService. */
+  readonly projectWork?: ProjectWorkRuntimeContext;
 };
 
 const encodeProjectMcpId = (id: Pick<McpIssuedProjectServer, "id">["id"]): string =>

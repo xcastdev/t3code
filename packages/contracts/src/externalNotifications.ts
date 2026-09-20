@@ -1,6 +1,11 @@
 import * as Schema from "effect/Schema";
 
-import { EnvironmentId, ThreadId } from "./baseSchemas.ts";
+import { EnvironmentId, ProjectId, ThreadId } from "./baseSchemas.ts";
+import {
+  ProjectWorkAttentionReasonRead,
+  ProjectWorkTaskId,
+  ProjectWorkTaskStateRead,
+} from "./projectWork.ts";
 import type { ExternalNotificationAppScheme } from "./settings.ts";
 import { RelayAgentActivityState, RelayAgentAwarenessPhase } from "./relay.ts";
 
@@ -18,8 +23,21 @@ export const ExternalNotificationPayload = Schema.Struct({
   detail: Schema.optionalKey(Schema.String),
   relativeRoute: Schema.String,
   deepLink: Schema.String,
+  /** Optional durable-work context. Older clients ignore this additive field. */
+  projectWork: Schema.optionalKey(
+    Schema.Struct({
+      projectId: ProjectId,
+      taskId: ProjectWorkTaskId,
+      state: ProjectWorkTaskStateRead,
+      reason: Schema.optionalKey(ProjectWorkAttentionReasonRead),
+      revision: Schema.Number,
+    }),
+  ),
 });
 export type ExternalNotificationPayload = typeof ExternalNotificationPayload.Type;
+
+export const ExternalNotificationProjectWorkPayload =
+  ExternalNotificationPayload.fields.projectWork;
 
 export const ExternalNotificationTestInput = Schema.Struct({ destinationId: Schema.String });
 export type ExternalNotificationTestInput = typeof ExternalNotificationTestInput.Type;

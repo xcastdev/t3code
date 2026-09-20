@@ -139,6 +139,7 @@ interface GrokSessionContext {
   session: ProviderSession;
   readonly scope: Scope.Closeable;
   readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
+  readonly projectWork?: Parameters<typeof buildRuntimeInstructions>[0]["projectWork"];
   notificationFiber: Fiber.Fiber<void, never> | undefined;
   readonly pendingApprovals: Map<ApprovalRequestId, PendingApproval>;
   readonly pendingUserInputs: Map<ApprovalRequestId, PendingUserInput>;
@@ -1305,6 +1306,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             session,
             scope: sessionScope,
             acp,
+            projectWork: input.projectWork,
             notificationFiber: undefined,
             pendingApprovals,
             pendingUserInputs,
@@ -1636,6 +1638,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 harness: "Grok",
                 model: displayModel,
                 reasoningEffort: normalizeGrokReasoningEffort(requestedTurnReasoningEffort),
+                projectWork: ctx.projectWork,
               });
               for (let yieldAttempt = 0; yieldAttempt < 8; yieldAttempt += 1) {
                 yield* Effect.yieldNow;

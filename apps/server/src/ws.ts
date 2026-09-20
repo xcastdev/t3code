@@ -98,6 +98,9 @@ import {
   type TerminalEvent,
   type TerminalMetadataStreamEvent,
   type PullRequestRef,
+  type ProjectWorkApprovalRequest,
+  type ProjectWorkReadIntent,
+  type ProjectWorkWriteIntent,
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
@@ -185,6 +188,9 @@ import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as ProjectMcpProxyRegistry from "./mcp/ProjectMcpProxyRegistry.ts";
 import * as ProjectMcpOAuth from "./mcp/ProjectMcpOAuth.ts";
 import * as ProjectMcpSecretStore from "./mcp/ProjectMcpSecretStore.ts";
+import * as ProjectWorkGateway from "./projectWork/ProjectWorkGateway.ts";
+import * as ProjectWorkStream from "./projectWork/ProjectWorkStream.ts";
+import * as ProjectLifecycle from "./project/ProjectLifecycle.ts";
 import { hasCatalogTransportIdentityChange } from "./mcp/McpCatalogDefinitionIdentity.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
@@ -669,7 +675,20 @@ const makeWsRpcLayer = (
         yield* Effect.serviceOption(ExternalNotificationDispatcher.ExternalNotificationDispatcher),
         () =>
           ({
-            dispatch: () => Effect.void,
+            dispatch: () =>
+              Effect.succeed({
+                attemptedDestinationIds: [],
+                deliveredDestinationIds: [],
+                failedDestinationIds: [],
+                outcomes: [],
+              }),
+            dispatchDetailed: () =>
+              Effect.succeed({
+                attemptedDestinationIds: [],
+                deliveredDestinationIds: [],
+                failedDestinationIds: [],
+                outcomes: [],
+              }),
             hasEnabledDestinations: Effect.succeed(false),
             test: (destinationId: string) =>
               Effect.fail(
@@ -773,6 +792,12 @@ const makeWsRpcLayer = (
         ),
       );
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      // Kept optional so lightweight router/test compositions do not have to
+      // construct the SQL-backed project-work services. Production routes
+      // provide it through makeRoutesLayer.
+      const projectWorkGateway = yield* Effect.serviceOption(ProjectWorkGateway.ProjectWorkGateway);
+      const projectWorkStream = yield* Effect.serviceOption(ProjectWorkStream.ProjectWorkStream);
+      const projectLifecycle = yield* Effect.serviceOption(ProjectLifecycle.ProjectLifecycle);
       const sourceControlDiscovery = yield* SourceControlDiscovery.SourceControlDiscovery;
       const automaticGitFetchInterval = serverSettings.getSettings.pipe(
         Effect.map(
@@ -4974,6 +4999,138 @@ const makeWsRpcLayer = (
               ),
             ),
             { "rpc.aggregate": "workspace" },
+          ),
+        [WS_METHODS.projectWorkRead]: (input: ProjectWorkReadIntent) =>
+          observeRpcEffect(
+            WS_METHODS.projectWorkRead,
+            Option.isSome(projectWorkGateway)
+              ? projectWorkGateway.value.read(input)
+              : Effect.die(new ProjectWorkGateway.ProjectWorkGatewayUnavailableError({})),
+            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectWorkWrite]: (input: ProjectWorkWriteIntent) =>
+          observeRpcEffect(
+            WS_METHODS.projectWorkWrite,
+            Option.isSome(projectWorkGateway)
+              ? projectWorkGateway.value.write(
+                  input,
+                  {
+                    kind: currentSession.identity.kind === "agent" ? "agent" : "human",
+                    id: currentSession.identity.id,
+                    ...(currentSession.identity.displayName
+                      ? { displayName: currentSession.identity.displayName }
+                      : {}),
+                  },
+                  {
+                    kind:
+                      clientOrigin.surface === "mobile"
+                        ? "mobile"
+                        : clientOrigin.surface === "desktop"
+                          ? "desktop"
+                          : "web",
+                    id: currentSession.identity.id,
+                  },
+                )
+              : Effect.die(new ProjectWorkGateway.ProjectWorkGatewayUnavailableError({})),
+            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectWorkRequestApproval]: (input: ProjectWorkApprovalRequest) =>
+          observeRpcEffect(
+            WS_METHODS.projectWorkRequestApproval,
+            Effect.gen(function* () {
+              const settings = yield* serverSettings.getSettings;
+              if (!settings.projectWorkEnabled) {
+                return yield* new ProjectWorkGateway.ProjectWorkAuthorizationError({
+                  reason: "project-work-disabled",
+                });
+              }
+              return yield* serverAuth.issueProjectWorkApproval({
+                ...input,
+                approvedBy: currentSession.identity,
+                sourceKind:
+                  clientOrigin.surface === "mobile"
+                    ? "mobile"
+                    : clientOrigin.surface === "desktop"
+                      ? "desktop"
+                      : "web",
+              });
+            }),
+            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectWorkSubscribe]: (input) =>
+          observeRpcStreamEffect(
+            WS_METHODS.projectWorkSubscribe,
+            Option.isSome(projectWorkStream)
+              ? projectWorkStream.value.stream(input)
+              : Effect.die(
+                  new ProjectWorkStream.ProjectWorkStreamError({
+                    reason: "read-failed",
+                    detail: "The project-work stream is unavailable.",
+                  }),
+                ),
+            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectLifecycleArchive]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectLifecycleArchive,
+            Option.isSome(projectLifecycle)
+              ? projectLifecycle.value.archive(input)
+              : Effect.die(
+                  new ProjectLifecycle.ProjectLifecycleError({
+                    reason: "unknown-project",
+                    projectId: input.projectId,
+                  }),
+                ),
+            { "rpc.aggregate": "project-lifecycle", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectLifecycleGet]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectLifecycleGet,
+            Option.isSome(projectLifecycle)
+              ? projectLifecycle.value
+                  .get(input.projectId)
+                  .pipe(Effect.map((record) => record ?? null))
+              : Effect.succeed(null),
+            { "rpc.aggregate": "project-lifecycle", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectLifecycleRestore]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectLifecycleRestore,
+            Option.isSome(projectLifecycle)
+              ? projectLifecycle.value.restore(input)
+              : Effect.die(
+                  new ProjectLifecycle.ProjectLifecycleError({
+                    reason: "unknown-project",
+                    projectId: input.projectId,
+                  }),
+                ),
+            { "rpc.aggregate": "project-lifecycle", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectLifecycleRelocationCheck]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectLifecycleRelocationCheck,
+            Option.isSome(projectLifecycle)
+              ? projectLifecycle.value.checkRelocation(input)
+              : Effect.succeed({
+                  projectId: input.projectId,
+                  allowed: false,
+                  reason: "missing-path" as const,
+                  candidateWorkspaceRoot: input.candidateWorkspaceRoot,
+                }),
+            { "rpc.aggregate": "project-lifecycle", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectLifecyclePermanentDelete]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectLifecyclePermanentDelete,
+            Option.isSome(projectLifecycle)
+              ? projectLifecycle.value.permanentDelete(input)
+              : Effect.die(
+                  new ProjectLifecycle.ProjectLifecycleError({
+                    reason: "unknown-project",
+                    projectId: input.projectId,
+                  }),
+                ),
+            { "rpc.aggregate": "project-lifecycle", "project.id": String(input.projectId) },
           ),
         [WS_METHODS.shellOpenInEditor]: (input) =>
           observeRpcEffect(WS_METHODS.shellOpenInEditor, externalLauncher.launchEditor(input), {

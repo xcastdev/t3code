@@ -221,6 +221,39 @@ layer("OrchestrationEventStore", (it) => {
     }),
   );
 
+  it.effect("filters aggregate replay before decoding unrelated event payloads", () =>
+    Effect.gen(function* () {
+      const store = yield* OrchestrationEventStore;
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("filtered-thread");
+      const first = yield* store.append(messageEvent(threadId, "filtered-first"));
+      yield* sql`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+          actor_kind, payload_json, metadata_json
+        ) VALUES (
+          'filtered-unrequested', 'thread', ${threadId}, 1, 'thread.activity-appended',
+          '2026-01-01T00:00:00.000Z', 'server', '{', '{}'
+        )
+      `;
+      const third = yield* store.append(messageEvent(threadId, "filtered-third"));
+
+      const events = yield* store
+        .readAggregateRange({
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          fromSequenceExclusive: 0,
+          toSequenceInclusive: third.sequence,
+          eventTypes: ["thread.message-sent"],
+        })
+        .pipe(Stream.runCollect);
+      assert.deepEqual(
+        events.map((event) => event.sequence),
+        [first.sequence, third.sequence],
+      );
+    }),
+  );
+
   it.effect("bounds thread replay metadata and counts UTF-8 bytes without decoding payloads", () =>
     Effect.gen(function* () {
       const store = yield* OrchestrationEventStore;

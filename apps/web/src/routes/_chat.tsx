@@ -1,4 +1,4 @@
-import { Outlet, createFileRoute, redirect } from "@tanstack/react-router";
+import { Outlet, createFileRoute, redirect, useNavigate } from "@tanstack/react-router";
 import { useAtomValue } from "@effect/atom-react";
 import { useEffect, useMemo } from "react";
 
@@ -27,6 +27,7 @@ function ChatRouteGlobalShortcuts() {
   const selectedThreadKeysSize = useThreadSelectionStore((state) => state.selectedThreadKeys.size);
   const { activeDraftThread, activeThread, defaultProjectRef, handleNewThread, routeThreadRef } =
     useHandleNewThread();
+  const navigate = useNavigate();
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const legacySidebarEnabled = useLegacySidebarEnabled();
   const projectGroupingSettings = useClientSettings(selectProjectGroupingSettings);
@@ -108,6 +109,25 @@ function ChatRouteGlobalShortcuts() {
         return;
       }
 
+      if (command === "projectWork.open") {
+        event.preventDefault();
+        event.stopPropagation();
+        const projectRef = activeThread
+          ? { environmentId: activeThread.environmentId, projectId: activeThread.projectId }
+          : activeDraftThread
+            ? {
+                environmentId: activeDraftThread.environmentId,
+                projectId: activeDraftThread.projectId,
+              }
+            : defaultProjectRef;
+        if (projectRef === null) return;
+        void navigate({
+          to: "/work/$environmentId/$projectId",
+          params: projectRef,
+        });
+        return;
+      }
+
       if (command === "preview.toggle") {
         event.preventDefault();
         event.stopPropagation();
@@ -161,6 +181,7 @@ function ChatRouteGlobalShortcuts() {
     activeThread,
     clearSelection,
     handleNewThread,
+    navigate,
     keybindings,
     defaultProjectRef,
     previewOpen,

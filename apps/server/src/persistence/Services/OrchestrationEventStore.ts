@@ -21,6 +21,8 @@ export interface OrchestrationAggregateReplayRange {
   readonly aggregateId: string;
   readonly fromSequenceExclusive: number;
   readonly toSequenceInclusive: number;
+  /** Restrict replay to event kinds needed by one projector. */
+  readonly eventTypes?: ReadonlyArray<OrchestrationEvent["type"]>;
 }
 
 export interface OrchestrationAggregateReplayStats {

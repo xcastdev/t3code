@@ -17,6 +17,12 @@ export interface McpInvocationScope {
   readonly providerInstanceId: ProviderInstanceId;
   readonly capabilities: ReadonlySet<McpCapability>;
   readonly issuedAt: number;
+  /** Stable agent identity; old test and plugin scopes may omit this field. */
+  readonly identity?: {
+    readonly kind: "agent";
+    readonly id: string;
+    readonly displayName?: string;
+  };
 }
 
 export class McpInvocationContext extends Context.Service<
@@ -53,3 +59,29 @@ export const requireMcpCapability = <const C extends McpCapability>(
       : // The conditional type narrows what the literal argument decided at runtime.
         Effect.fail(missingCapability(invocation, capability) as McpCapabilityError<C>),
   ).pipe(Effect.withSpan("mcp.requireCapability"));
+
+export const projectWorkActorForInvocation = (
+  invocation: McpInvocationScope,
+): { readonly kind: "agent"; readonly id: string; readonly displayName?: string } => ({
+  kind: "agent",
+  // Provider sessions are renewable credentials. Bind durable project-work
+  // attribution to the provider/thread pair so reconnects remain the same
+  // agent and command retries can still deduplicate.
+  id: `agent:mcp:${invocation.providerInstanceId}:${invocation.threadId}`,
+  ...(invocation.identity?.displayName === undefined
+    ? {}
+    : { displayName: invocation.identity.displayName }),
+});
+
+/** Stable source identity plus session-only provenance for audit navigation. */
+export const projectWorkSourceForInvocation = (
+  invocation: McpInvocationScope,
+): {
+  readonly kind: "mcp";
+  readonly id: string;
+  readonly uri: string;
+} => ({
+  kind: "mcp",
+  id: `mcp:${invocation.providerInstanceId}:${invocation.threadId}`,
+  uri: `mcp://provider/${encodeURIComponent(String(invocation.providerInstanceId))}/${encodeURIComponent(String(invocation.threadId))}?session=${encodeURIComponent(invocation.providerSessionId)}`,
+});

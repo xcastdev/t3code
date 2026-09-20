@@ -4,7 +4,6 @@ import {
 } from "@t3tools/client-runtime/platform";
 import {
   type EnvironmentId,
-  OrchestrationShellSnapshot,
   OrchestrationThreadDetailSnapshot,
   ServerConfig,
   VcsListRefsResult,
@@ -16,6 +15,7 @@ import * as Schema from "effect/Schema";
 
 import * as MobileDatabase from "../persistence/mobile-database";
 import { attachProjectFaviconDatabase, projectFaviconCache } from "../lib/projectFaviconCache";
+import { MobileOrchestrationShellSnapshot } from "../state/projectWorkCompatibility";
 
 const SHELL_SNAPSHOT_CACHE_SCHEMA_VERSION = 1;
 // v3 adds windowed (paginated) snapshots carrying `page` metadata; the bump
@@ -28,7 +28,7 @@ const VCS_REFS_CACHE_SCHEMA_VERSION = 1;
 const StoredShellSnapshot = Schema.Struct({
   schemaVersion: Schema.Literal(SHELL_SNAPSHOT_CACHE_SCHEMA_VERSION),
   environmentId: Schema.String,
-  snapshot: OrchestrationShellSnapshot,
+  snapshot: MobileOrchestrationShellSnapshot,
 });
 const StoredThreadSnapshot = Schema.Struct({
   schemaVersion: Schema.Literal(THREAD_SNAPSHOT_CACHE_SCHEMA_VERSION),

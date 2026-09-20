@@ -7,14 +7,24 @@ import {
 } from "@t3tools/client-runtime/state/runtime";
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import { AsyncResult } from "effect/unstable/reactivity";
-import { type EnvironmentId, type ProjectIconOverride } from "@t3tools/contracts";
+import {
+  type DesktopWslState,
+  type EnvironmentId,
+  type ProjectIconOverride,
+  CommandId,
+} from "@t3tools/contracts";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import * as Cause from "effect/Cause";
-import { Trash2Icon } from "lucide-react";
+import * as Option from "effect/Option";
+import { DownloadIcon, FolderSyncIcon, ListTodoIcon, Trash2Icon } from "lucide-react";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { useComposerDraftStore } from "../../composerDraftStore";
+import { useAtomValue } from "@effect/atom-react";
+import { isDesktopLocalConnectionTarget } from "../../connection/desktopLocal";
+import { useDesktopLocalBootstraps } from "../../connection/useDesktopLocalBootstraps";
 import { releaseProjectDraftUploads } from "../../lib/composerDraftUploads";
+import { randomUUID } from "../../lib/utils";
 import { readLocalApi } from "../../localApi";
 import {
   type SidebarProjectGroupMember,
@@ -24,6 +34,8 @@ import { useEnvironments, usePrimaryEnvironmentId } from "../../state/environmen
 import { useThreadShells } from "../../state/entities";
 import { projectEnvironment } from "../../state/projects";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { useAtomQueryRunner } from "../../state/use-atom-query-runner";
+import { projectWorkEnvironment } from "../../state/projectWork";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { Button } from "../ui/button";
 import { Input } from "../ui/input";
@@ -40,8 +52,13 @@ import {
 } from "./ProjectFaviconPickerDialog";
 import { ProjectActionsSettings } from "./ProjectActionsSettings";
 import { ProjectMcpSettings } from "./ProjectMcpSettings";
-import { projectGroupTitleNeedsUpdate } from "./ProjectSettingsPanel.logic";
+import {
+  projectGroupTitleNeedsUpdate,
+  resolveProjectPickerRouting,
+  type ProjectPickerEnvironmentKind,
+} from "./ProjectSettingsPanel.logic";
 import { useSettingsProjectGroups } from "./useSettingsProjectGroups";
+import { useScopedSettings } from "./useScopedSettings";
 
 const ProjectIconPickerDialog = lazy(() =>
   import("./ProjectIconPickerDialog").then((module) => ({
@@ -51,6 +68,21 @@ const ProjectIconPickerDialog = lazy(() =>
 
 function memberKey(member: { environmentId: string; id: string }): string {
   return `${member.environmentId}:${member.id}`;
+}
+
+function safeDownloadName(value: string): string {
+  const normalized = value.trim().replace(/[^a-z0-9._-]+/gi, "-");
+  return normalized.length > 0 ? normalized.slice(0, 80) : "project-work";
+}
+
+function downloadTextFile(filename: string, contents: string, type: string): void {
+  if (typeof document === "undefined") return;
+  const url = URL.createObjectURL(new Blob([contents], { type }));
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  anchor.click();
+  URL.revokeObjectURL(url);
 }
 
 export type ProjectSettingsCategory = "general" | "integrations" | "source-control";
@@ -173,10 +205,88 @@ function ProjectDetail({
     group.memberProjects.find(
       (member) => environmentById.get(member.environmentId)?.serverConfig != null,
     ) ?? group.memberProjects[0]!;
+  const representativeEnvironment = environmentById.get(representative.environmentId);
+  const desktopLocalBootstraps = useDesktopLocalBootstraps();
+  const representativeEnvironmentKind: ProjectPickerEnvironmentKind =
+    representativeEnvironment?.environmentId === primaryEnvironmentId &&
+    representativeEnvironment.entry.target._tag === "PrimaryConnectionTarget"
+      ? "primary"
+      : representativeEnvironment &&
+          isDesktopLocalConnectionTarget(representativeEnvironment.entry.target)
+        ? "desktop-local"
+        : "remote";
+  const canUseDesktopFolderPicker =
+    typeof window !== "undefined" && window.desktopBridge !== undefined;
+  const pickerRouting = useMemo(
+    () =>
+      resolveProjectPickerRouting({
+        hasDesktopBridge: canUseDesktopFolderPicker,
+        environmentId: representative.environmentId,
+        primaryEnvironmentId,
+        environmentKind: representativeEnvironmentKind,
+        displayUrl: representativeEnvironment?.displayUrl ?? null,
+        desktopLocalBootstraps,
+        wslConfiguration: null,
+      }),
+    [
+      canUseDesktopFolderPicker,
+      desktopLocalBootstraps,
+      primaryEnvironmentId,
+      representative.environmentId,
+      representativeEnvironment?.displayUrl,
+      representativeEnvironmentKind,
+    ],
+  );
   const threads = useThreadShells();
   const updateProject = useAtomCommand(projectEnvironment.update, { reportFailure: false });
   const deleteProject = useAtomCommand(projectEnvironment.delete, { reportFailure: false });
+  const lifecycleArchive = useAtomCommand(projectEnvironment.lifecycleArchive, {
+    reportFailure: false,
+  });
+  const lifecycleRestore = useAtomCommand(projectEnvironment.lifecycleRestore, {
+    reportFailure: false,
+  });
+  const lifecycleRelocationCheck = useAtomCommand(projectEnvironment.lifecycleRelocationCheck, {
+    reportFailure: false,
+  });
+  const lifecyclePermanentDelete = useAtomCommand(projectEnvironment.lifecyclePermanentDelete, {
+    reportFailure: false,
+  });
+  const lifecycleTarget = {
+    environmentId: representative.environmentId,
+    input: { projectId: representative.id },
+  };
+  const lifecycleRecord = Option.getOrNull(
+    AsyncResult.value(useAtomValue(projectEnvironment.lifecycle(lifecycleTarget))),
+  );
+  const refreshLifecycle = useAtomQueryRunner(projectEnvironment.lifecycle, {
+    refresh: true,
+    reportFailure: false,
+    reportDefect: false,
+  });
+  const workSettings = useScopedSettings((settings) => settings.projectWorkEnabled);
+  const exportJson = useAtomQueryRunner(projectWorkEnvironment.exportJson, {
+    refresh: true,
+    reportFailure: false,
+    reportDefect: false,
+  });
+  const exportMarkdown = useAtomQueryRunner(projectWorkEnvironment.exportMarkdown, {
+    refresh: true,
+    reportFailure: false,
+    reportDefect: false,
+  });
+  const [relinkPath, setRelinkPath] = useState(representative.workspaceRoot);
+  const [relinking, setRelinking] = useState(false);
+  const [exporting, setExporting] = useState<"json" | "markdown" | null>(null);
+  const [lifecycleState, setLifecycleState] = useState<"active" | "archived">("active");
+  const [lifecycleBusy, setLifecycleBusy] = useState(false);
   const projectNameEditedRef = useRef(false);
+
+  useEffect(() => {
+    if (lifecycleRecord?.state === "active" || lifecycleRecord?.state === "archived") {
+      setLifecycleState(lifecycleRecord.state);
+    }
+  }, [lifecycleRecord?.state]);
 
   const faviconPath = representative.faviconPath ?? null;
   const projectIcon = representative.projectIcon ?? null;
@@ -190,7 +300,7 @@ function ProjectDetail({
       ? window.desktopBridge?.pickProjectFavicon
       : undefined;
 
-  const reportFailure = useCallback((title: string, result: AtomCommandResult<void, unknown>) => {
+  const reportFailure = useCallback(<A, E>(title: string, result: AtomCommandResult<A, E>) => {
     if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) return;
     const error = squashAtomCommandFailure(result);
     toastManager.add(
@@ -293,6 +403,163 @@ function ProjectDetail({
 
   const hasMultipleCheckouts = group.memberProjects.length > 1;
 
+  const relink = useCallback(async () => {
+    const workspaceRoot = relinkPath.trim();
+    if (!workspaceRoot || workspaceRoot === representative.workspaceRoot) return;
+    if (representativeEnvironment?.connection.phase !== "connected") {
+      toastManager.add({
+        type: "warning",
+        title: "Project not relinked",
+        description: "Connect this environment before changing its workspace path.",
+      });
+      return;
+    }
+    setRelinking(true);
+    try {
+      const relocation = mapAtomCommandResult(
+        await lifecycleRelocationCheck({
+          environmentId: representative.environmentId,
+          input: {
+            projectId: representative.id,
+            currentWorkspaceRoot: representative.workspaceRoot,
+            candidateWorkspaceRoot: workspaceRoot,
+          },
+        }),
+        (value) => value,
+      );
+      if (relocation._tag === "Failure") {
+        reportFailure("Failed to check the new project path", relocation);
+        return;
+      }
+      if (relocation.value === undefined || !relocation.value.allowed) {
+        toastManager.add({
+          type: "warning",
+          title: "Project not relinked",
+          description:
+            relocation.value?.reason === "repository-mismatch"
+              ? "The selected folder is a different repository."
+              : "The selected folder must exist as a different directory.",
+        });
+        return;
+      }
+      const result = mapAtomCommandResult(
+        await updateProject({
+          environmentId: representative.environmentId,
+          input: { projectId: representative.id, workspaceRoot },
+        }),
+        () => undefined,
+      );
+      if (result._tag === "Failure") {
+        reportFailure("Failed to relink project", result);
+        return;
+      }
+      setRelinkPath(workspaceRoot);
+    } finally {
+      setRelinking(false);
+    }
+  }, [
+    lifecycleRelocationCheck,
+    relinkPath,
+    representative,
+    representativeEnvironment,
+    reportFailure,
+    updateProject,
+  ]);
+
+  const pickRelinkFolder = useCallback(async () => {
+    if (!pickerRouting.canBrowse) return;
+    const api = readLocalApi();
+    if (!api) return;
+    let wslConfiguration: DesktopWslState | null = null;
+    const bridge = typeof window !== "undefined" ? window.desktopBridge : undefined;
+    if (
+      bridge &&
+      representativeEnvironmentKind === "primary" &&
+      representativeEnvironment?.serverConfig?.environment.platform.os === "linux"
+    ) {
+      try {
+        wslConfiguration = await bridge.getWslState();
+      } catch {
+        // Keep the native primary picker fallback used by CommandPalette.
+      }
+    }
+    const routing = resolveProjectPickerRouting({
+      hasDesktopBridge: bridge !== undefined,
+      environmentId: representative.environmentId,
+      primaryEnvironmentId,
+      environmentKind: representativeEnvironmentKind,
+      displayUrl: representativeEnvironment?.displayUrl ?? null,
+      desktopLocalBootstraps,
+      wslConfiguration,
+    });
+    if (!routing.canBrowse) return;
+    const picked = await api.dialogs.pickFolder({
+      ...(relinkPath.trim().length > 0 ? { initialPath: relinkPath } : {}),
+      ...(routing.targetEnvironmentId ? { targetEnvironmentId: routing.targetEnvironmentId } : {}),
+    });
+    if (picked) setRelinkPath(picked);
+  }, [
+    desktopLocalBootstraps,
+    pickerRouting.canBrowse,
+    primaryEnvironmentId,
+    relinkPath,
+    representative.environmentId,
+    representativeEnvironment,
+    representativeEnvironmentKind,
+  ]);
+
+  const runExport = useCallback(
+    async (format: "json" | "markdown") => {
+      if (representativeEnvironment?.connection.phase !== "connected") {
+        toastManager.add({
+          type: "warning",
+          title: "Export unavailable",
+          description: "Connect this environment before exporting project work.",
+        });
+        return;
+      }
+      setExporting(format);
+      try {
+        const target = {
+          environmentId: representative.environmentId,
+          projectId: representative.id,
+        };
+        const result = await (format === "json" ? exportJson(target) : exportMarkdown(target));
+        if (result._tag === "Failure") {
+          reportFailure(`Failed to export ${format}`, result);
+          return;
+        }
+        const value = result.value;
+        if (format === "markdown" && typeof value === "object" && value !== null) {
+          const contents = (value as { contents?: unknown }).contents;
+          if (typeof contents === "string") {
+            downloadTextFile(
+              `${safeDownloadName(group.displayName)}-work.md`,
+              contents,
+              "text/markdown;charset=utf-8",
+            );
+            return;
+          }
+        }
+        downloadTextFile(
+          `${safeDownloadName(group.displayName)}-work.json`,
+          JSON.stringify(value, null, 2),
+          "application/json;charset=utf-8",
+        );
+      } finally {
+        setExporting(null);
+      }
+    },
+    [
+      exportJson,
+      exportMarkdown,
+      group.displayName,
+      representative,
+      representativeEnvironment,
+      reportFailure,
+    ],
+  );
+
   const removeMembers = useCallback(
     async (members: ReadonlyArray<SidebarProjectGroupMember>) => {
       const api = readLocalApi();
@@ -310,8 +577,8 @@ function ProjectDetail({
         api.dialogs.confirm(
           [
             projectThreads.length > 0
-              ? `Remove ${targetKind} "${targetLabel}" and delete its ${projectThreads.length} thread${projectThreads.length === 1 ? "" : "s"}?`
-              : `Remove ${targetKind} "${targetLabel}"?`,
+              ? `Permanently delete ${targetKind} "${targetLabel}" and delete its ${projectThreads.length} thread${projectThreads.length === 1 ? "" : "s"}?`
+              : `Permanently delete ${targetKind} "${targetLabel}"?`,
             ...(singleMember
               ? [
                   `Path: ${singleMember.workspaceRoot}`,
@@ -341,6 +608,25 @@ function ProjectDetail({
           (thread) =>
             thread.environmentId === member.environmentId && thread.projectId === member.id,
         );
+        const lifecycleResult = mapAtomCommandResult(
+          await lifecyclePermanentDelete({
+            environmentId: member.environmentId,
+            input: {
+              commandId: CommandId.make(`project-delete-${randomUUID()}`),
+              projectId: member.id,
+              workspaceRoot: member.workspaceRoot,
+              confirmation: "permanent-local-delete",
+            },
+          }),
+          () => undefined,
+        );
+        if (lifecycleResult._tag === "Failure") {
+          reportFailure(`Failed to clear local work for "${member.title}"`, lifecycleResult);
+          return;
+        }
+        // Keep the legacy project tombstone in sync after the lifecycle
+        // tombstone is committed. The projection still exists at this point,
+        // so old clients continue to receive their expected delete event.
         const result = mapAtomCommandResult(
           await deleteProject({
             environmentId: member.environmentId,
@@ -373,6 +659,7 @@ function ProjectDetail({
     },
     [
       deleteProject,
+      lifecyclePermanentDelete,
       group.displayName,
       group.memberProjects.length,
       hasOtherMembers,
@@ -403,6 +690,48 @@ function ProjectDetail({
       ))}
     </SettingsSection>
   );
+
+  const canExportWork = workSettings && representativeEnvironment?.connection.phase === "connected";
+
+  const changeLifecycleState = useCallback(async () => {
+    if (representativeEnvironment?.connection.phase !== "connected" || lifecycleBusy) return;
+    setLifecycleBusy(true);
+    try {
+      const commandId = CommandId.make(`project-lifecycle-${randomUUID()}`);
+      const result =
+        lifecycleState === "active"
+          ? await lifecycleArchive({
+              environmentId: representative.environmentId,
+              input: { commandId, projectId: representative.id },
+            })
+          : await lifecycleRestore({
+              environmentId: representative.environmentId,
+              input: { commandId, projectId: representative.id },
+            });
+      const mapped = mapAtomCommandResult(result, () => undefined);
+      if (mapped._tag === "Failure") {
+        reportFailure(
+          lifecycleState === "active" ? "Failed to archive project" : "Failed to restore project",
+          mapped,
+        );
+        return;
+      }
+      setLifecycleState(lifecycleState === "active" ? "archived" : "active");
+      void refreshLifecycle(lifecycleTarget);
+    } finally {
+      setLifecycleBusy(false);
+    }
+  }, [
+    lifecycleArchive,
+    lifecycleBusy,
+    lifecycleRestore,
+    lifecycleState,
+    lifecycleTarget,
+    representative,
+    representativeEnvironment,
+    reportFailure,
+    refreshLifecycle,
+  ]);
 
   return (
     <>
@@ -480,6 +809,96 @@ function ProjectDetail({
           />
         </SettingsSection>
         <ProjectActionsSettings />
+        <SettingsSection id="project-work" title="Work" icon={<ListTodoIcon className="size-4" />}>
+          <SettingsRow
+            title={lifecycleState === "active" ? "Archive project" : "Restore project"}
+            description={
+              lifecycleState === "active"
+                ? "Hide this project from active work while retaining its history and identity."
+                : "Return this archived project to active work."
+            }
+            control={
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => void changeLifecycleState()}
+                disabled={
+                  lifecycleBusy || representativeEnvironment?.connection.phase !== "connected"
+                }
+              >
+                {lifecycleState === "active" ? "Archive" : "Restore"}
+              </Button>
+            }
+          />
+          <SettingsRow
+            title="Workspace path"
+            description="Relink this project when its checkout moved. This updates the project entry, not files on disk."
+            control={
+              <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto sm:max-w-[34rem] sm:flex-nowrap">
+                <Input
+                  size="sm"
+                  className="min-w-48 flex-1 sm:w-64"
+                  value={relinkPath}
+                  onChange={(event) => setRelinkPath(event.currentTarget.value)}
+                  aria-label="Project workspace path"
+                />
+                {pickerRouting.canBrowse ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => void pickRelinkFolder()}
+                    disabled={relinking}
+                  >
+                    <FolderSyncIcon />
+                    Browse
+                  </Button>
+                ) : null}
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void relink()}
+                  disabled={
+                    relinking ||
+                    relinkPath.trim().length === 0 ||
+                    relinkPath.trim() === representative.workspaceRoot
+                  }
+                >
+                  Relink
+                </Button>
+              </div>
+            }
+          />
+          <SettingsRow
+            title="Export project work"
+            description={
+              workSettings
+                ? "Download a JSON backup or a non-authoritative Markdown brief of this project's durable work."
+                : "Enable Project Work in General settings before exporting durable tasks and knowledge."
+            }
+            control={
+              <div className="flex items-center gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void runExport("json")}
+                  disabled={!canExportWork || exporting !== null}
+                >
+                  <DownloadIcon />
+                  JSON
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={() => void runExport("markdown")}
+                  disabled={!canExportWork || exporting !== null}
+                >
+                  <DownloadIcon />
+                  Markdown
+                </Button>
+              </div>
+            }
+          />
+        </SettingsSection>
         {hasMultipleCheckouts ? checkoutChoices : null}
         <ProjectMcpSettings
           environmentId={representative.environmentId}
@@ -489,10 +908,10 @@ function ProjectDetail({
           <SettingsRow
             title={
               hasOtherMembers
-                ? "Remove checkout"
+                ? "Permanently delete checkout"
                 : group.memberProjects.length > 1
-                  ? "Remove this project everywhere"
-                  : "Remove project"
+                  ? "Permanently delete this project everywhere"
+                  : "Permanently delete project"
             }
             description={
               hasOtherMembers
@@ -509,10 +928,10 @@ function ProjectDetail({
               >
                 <Trash2Icon />
                 {hasOtherMembers
-                  ? "Remove checkout"
+                  ? "Delete checkout permanently"
                   : group.memberProjects.length > 1
-                    ? "Remove all entries"
-                    : "Remove project"}
+                    ? "Delete all entries permanently"
+                    : "Delete project permanently"}
               </Button>
             }
           />

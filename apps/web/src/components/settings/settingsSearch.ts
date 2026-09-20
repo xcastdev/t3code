@@ -338,6 +338,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     searchTerms: ["new worktrees latest matching remote branch local"],
   },
   {
+    id: "project-work",
+    title: "Project Work",
+    to: "/settings/general",
+    scope: "environment-defaults",
+    searchTerms: ["durable tasks knowledge project briefing work workspace"],
+  },
+  {
     id: "add-project-starts-in",
     title: "Add project starts in",
     to: "/settings/general",
