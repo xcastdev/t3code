@@ -838,7 +838,14 @@ export const make = (options?: StartupOptions) =>
       ),
     );
 
-    yield* Effect.addFinalizer(() => Scope.close(reactorScope, Exit.void));
+    yield* Effect.addFinalizer(() =>
+      orchestrationReactor.drain.pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("failed to drain orchestration reactors", { cause }),
+        ),
+        Effect.andThen(Scope.close(reactorScope, Exit.void)),
+      ),
+    );
 
     const startup = Effect.gen(function* () {
       yield* Effect.logDebug("startup phase: starting keybindings runtime");

@@ -97,6 +97,7 @@ import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as McpSessionRegistry from "../../mcp/McpSessionRegistry.ts";
+import * as McpCatalogGateway from "../../mcp/McpCatalogGateway.ts";
 import { catalogBaselineForProject, resolveSessionCatalog } from "../../mcp/McpCatalogResolver.ts";
 import * as ProjectMcpService from "../../project/ProjectMcpService.ts";
 import * as OrchestrationEngine from "../../orchestration/Services/OrchestrationEngine.ts";
@@ -272,6 +273,21 @@ interface ProjectMcpLeaseOwner {
   readonly instanceId: ProviderInstanceId;
   readonly generation: number;
   mcpProviderSessionId: string | undefined;
+  catalogSessionId: McpCatalogSessionId | undefined;
+  catalogResolveSecret:
+    | ((
+        serverId: import("@t3tools/contracts").McpServerId,
+        credentialId: string,
+      ) => string | undefined)
+    | undefined;
+  /** Stable resolver chain for catalog generations; never points at itself. */
+  catalogSecretResolvers: ReadonlyArray<NonNullable<ProjectMcpLeaseOwner["catalogResolveSecret"]>>;
+  catalogOauthStateLeases:
+    | ReadonlyMap<
+        import("@t3tools/contracts").McpServerId,
+        import("../../mcp/ProjectMcpSecretStore.ts").ProjectMcpOAuthStateLease
+      >
+    | undefined;
   nativeSessionId: string | undefined;
   resourcesReleased: boolean;
 }
@@ -538,6 +554,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     ProjectionSnapshotQuery.ProjectionSnapshotQuery,
   );
   const projectMcpService = yield* Effect.serviceOption(ProjectMcpService.ProjectMcpService);
+  const mcpCatalogGateway = yield* Effect.serviceOption(McpCatalogGateway.McpCatalogGateway);
   const orchestrationEngine = yield* Effect.serviceOption(
     OrchestrationEngine.OrchestrationEngineService,
   );
@@ -1165,6 +1182,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     oauthStateLeases: NonNullable<
       Parameters<typeof McpSessionRegistry.issueActiveMcpCredential>[0]["oauthStateLeases"]
     > = new Map(),
+    catalog?: {
+      readonly catalogSessionId: McpCatalogSessionId;
+      readonly revision: number;
+      readonly entries: ReadonlyArray<import("@t3tools/contracts").ResolvedMcpCatalogEntry>;
+    },
   ) =>
     Effect.gen(function* () {
       const previous = McpProviderSession.readMcpProviderSession(threadId);
@@ -1187,37 +1209,123 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         ...(resolveProjectMcpSecret ? { resolveProjectMcpSecret } : {}),
         ...(oauthStateLeases.size > 0 ? { oauthStateLeases } : {}),
       });
-      const deviceEnvironment = capabilities.has("device")
-        ? yield* agentDeviceEnvironment
-        : undefined;
-      const candidate = credential
-        ? {
-            ...credential.config,
-            ...(deviceEnvironment ? { agentDeviceEnvironment: deviceEnvironment } : {}),
-          }
-        : undefined;
-      const replacement = {
-        previous,
-        candidate,
-        accessWasDisabled: !includePreview,
-      } satisfies McpProviderSession.McpProviderSessionReplacement;
-      yield* Effect.sync(() => {
-        McpProviderSession.beginMcpProviderSessionReplacement(threadId, replacement);
-        // The native preview endpoint remains the adapter's shared session config.
-        // Project endpoints are passed only through the start input below.
-        if (includePreview && candidate) McpProviderSession.setMcpProviderSession(candidate);
-        else McpProviderSession.clearMcpProviderSession(threadId);
-      });
-      return replacement;
+      let prepared = false;
+      return yield* Effect.gen(function* () {
+        const deviceEnvironment = capabilities.has("device")
+          ? yield* agentDeviceEnvironment
+          : undefined;
+        const candidate = credential
+          ? {
+              ...credential.config,
+              ...(deviceEnvironment ? { agentDeviceEnvironment: deviceEnvironment } : {}),
+            }
+          : undefined;
+        // Do not register or attach an aggregate endpoint unless this adapter's
+        // real native client has been proven to observe catalog notifications.
+        // Every current adapter uses the per-server project proxy fallback.
+        const catalogEndpoint =
+          adapterCapabilities.sessionMcpCatalog === "live" &&
+          credential &&
+          catalog &&
+          Option.isSome(mcpCatalogGateway)
+            ? yield* mcpCatalogGateway.value
+                .registerCatalogSession({
+                  catalogSessionId: catalog.catalogSessionId,
+                  providerSessionId: credential.config.providerSessionId,
+                  threadId,
+                  providerInstanceId,
+                  revision: catalog.revision,
+                  entries: catalog.entries,
+                  ...(resolveProjectMcpSecret ? { resolveSecret: resolveProjectMcpSecret } : {}),
+                  ...(oauthStateLeases.size > 0 ? { oauthStateLeases } : {}),
+                })
+                .pipe(
+                  Effect.map((session) => session.endpoint),
+                  Effect.mapError((cause) =>
+                    toValidationError(
+                      "prepareMcpSession",
+                      "Could not register the provider-facing MCP catalog.",
+                      cause,
+                    ),
+                  ),
+                )
+            : undefined;
+        const replacement = {
+          previous,
+          candidate: candidate
+            ? { ...candidate, ...(catalogEndpoint ? { catalogEndpoint } : {}) }
+            : undefined,
+          accessWasDisabled: !includePreview,
+        } satisfies McpProviderSession.McpProviderSessionReplacement;
+        yield* Effect.sync(() => {
+          McpProviderSession.beginMcpProviderSessionReplacement(threadId, replacement);
+          // The native preview endpoint remains the adapter's shared session config.
+          // Project endpoints are passed only through the start input below.
+          if ((includePreview || candidate?.catalogEndpoint !== undefined) && candidate)
+            McpProviderSession.setMcpProviderSession(candidate);
+          else McpProviderSession.clearMcpProviderSession(threadId);
+        });
+        prepared = true;
+        return replacement;
+      }).pipe(
+        Effect.ensuring(
+          Effect.suspend(() =>
+            prepared || credential === undefined
+              ? Effect.void
+              : McpSessionRegistry.revokeActiveMcpProviderSession(
+                  credential.config.providerSessionId,
+                ),
+          ),
+        ),
+      );
     });
 
   const rollbackMcpSession = (
     threadId: ThreadId,
     replacement: McpProviderSession.McpProviderSessionReplacement,
+    catalogSessionId?: McpCatalogSessionId,
+    restoreCatalog?: {
+      readonly providerInstanceId: ProviderInstanceId;
+      readonly revision: number;
+      readonly entries: ReadonlyArray<import("@t3tools/contracts").ResolvedMcpCatalogEntry>;
+      readonly resolveSecret?: Parameters<
+        typeof McpSessionRegistry.issueActiveMcpCredential
+      >[0]["resolveProjectMcpSecret"];
+      readonly oauthStateLeases?: NonNullable<
+        Parameters<typeof McpSessionRegistry.issueActiveMcpCredential>[0]["oauthStateLeases"]
+      >;
+    },
   ) =>
     Effect.gen(function* () {
       yield* Effect.sync(() => McpProviderSession.rollbackMcpProviderSessionReplacement(threadId));
       if (replacement.candidate) {
+        if (catalogSessionId !== undefined && Option.isSome(mcpCatalogGateway)) {
+          // Preparing a replacement stages a new gateway generation before the
+          // native process starts. Revoke that candidate generation first, then
+          // restore the previously applied generation when one existed; a
+          // failed native start must not strand the committed provider.
+          yield* mcpCatalogGateway.value
+            .revokeRuntime(replacement.candidate.providerSessionId)
+            .pipe(Effect.ignore);
+          if (replacement.previous?.catalogEndpoint !== undefined && restoreCatalog !== undefined) {
+            yield* mcpCatalogGateway.value
+              .registerCatalogSession({
+                catalogSessionId,
+                providerSessionId: replacement.previous.providerSessionId,
+                threadId,
+                providerInstanceId: restoreCatalog.providerInstanceId,
+                revision: restoreCatalog.revision,
+                entries: restoreCatalog.entries,
+                ...(restoreCatalog.resolveSecret === undefined
+                  ? {}
+                  : { resolveSecret: restoreCatalog.resolveSecret }),
+                ...(restoreCatalog.oauthStateLeases === undefined
+                  ? {}
+                  : { oauthStateLeases: restoreCatalog.oauthStateLeases }),
+              })
+              .pipe(Effect.ignore);
+          }
+        }
         yield* McpSessionRegistry.revokeActiveMcpProviderSession(
           replacement.candidate.providerSessionId,
         );
@@ -1236,6 +1344,11 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             McpProviderSession.clearMcpProviderSessionIf(threadId, owner.mcpProviderSessionId!),
           );
           yield* McpSessionRegistry.revokeActiveMcpProviderSession(owner.mcpProviderSessionId!);
+          if (Option.isSome(mcpCatalogGateway)) {
+            yield* mcpCatalogGateway.value
+              .revokeRuntime(owner.mcpProviderSessionId!)
+              .pipe(Effect.ignore);
+          }
         });
   const closeProjectMcpLeaseScope = (scope: Scope.Scope) =>
     Effect.uninterruptible(Scope.close(scope, Exit.void));
@@ -1644,6 +1757,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       Effect.gen(function* () {
         const threadId = input.sessionInput.threadId;
         const previousOwner = (yield* Ref.get(projectMcpLeaseScopes)).get(threadId);
+        const previousMcpSession = McpProviderSession.readMcpProviderSession(threadId);
         const scope = yield* Scope.make("sequential");
         const projection = Option.getOrUndefined(projectionQuery);
         const projectMcp = Option.getOrUndefined(projectMcpService);
@@ -1662,7 +1776,13 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
               )
           : Option.none();
         let catalogSnapshot: McpCatalogSnapshot | undefined;
+        let resolvedCatalogEntries:
+          | ReadonlyArray<import("@t3tools/contracts").ResolvedMcpCatalogEntry>
+          | undefined;
         let resolvedCatalogServers: ReadonlyArray<ResolvedProjectMcpServer> | undefined;
+        let rollbackCatalogEntries:
+          | ReadonlyArray<import("@t3tools/contracts").ResolvedMcpCatalogEntry>
+          | undefined;
         if (
           Option.isSome(thread) &&
           projection !== undefined &&
@@ -1806,18 +1926,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             }),
           );
           resolvedCatalogServers = yield* Effect.try({
-            try: () =>
-              resolveSessionCatalog({
+            try: () => {
+              resolvedCatalogEntries = resolveSessionCatalog({
                 desired: catalogSnapshot!.desired,
                 providerInstanceId: input.providerInstanceId,
                 providerCapability:
                   input.adapter.capabilities.sessionMcpCatalog ?? "restart-required",
-              }).map((entry) => ({
+              });
+              return resolvedCatalogEntries.map((entry) => ({
                 id: entry.logicalServerId,
                 name: entry.name,
                 transport: entry.transport,
                 transportDefinitionId: entry.transportDefinitionId,
-              })),
+              }));
+            },
             catch: (cause) =>
               toValidationError(
                 input.operation,
@@ -1825,6 +1947,27 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
                 cause,
               ),
           });
+          // A live replacement stages its gateway before the native process
+          // starts. Keep the last applied snapshot available so rollback can
+          // recreate the old provider-facing generation if startup fails.
+          const snapshotForRollback = catalogSnapshot;
+          if (
+            snapshotForRollback !== undefined &&
+            previousOwner?.catalogSessionId === snapshotForRollback.catalogSessionId &&
+            previousMcpSession?.catalogEndpoint !== undefined
+          ) {
+            rollbackCatalogEntries = yield* Effect.sync(() => {
+              try {
+                return resolveSessionCatalog({
+                  desired: snapshotForRollback.applied,
+                  providerInstanceId: previousOwner.instanceId,
+                  providerCapability: "live",
+                });
+              } catch {
+                return [] as ReadonlyArray<import("@t3tools/contracts").ResolvedMcpCatalogEntry>;
+              }
+            });
+          }
         }
         const leased =
           input.adapter.capabilities.projectMcpProxy === "unsupported" ||
@@ -1856,6 +1999,10 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           instanceId: input.providerInstanceId,
           generation: ++mcpOwnerGeneration,
           mcpProviderSessionId: undefined,
+          catalogSessionId: catalogSnapshot?.catalogSessionId,
+          catalogResolveSecret: undefined,
+          catalogSecretResolvers: [],
+          catalogOauthStateLeases: undefined,
           nativeSessionId: undefined,
           resourcesReleased: false,
         };
@@ -1879,7 +2026,24 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           Effect.gen(function* () {
             yield* removePending;
             if (replacement)
-              yield* rollbackMcpSession(threadId, replacement).pipe(Effect.ignoreCause);
+              yield* rollbackMcpSession(
+                threadId,
+                replacement,
+                catalogSnapshot?.catalogSessionId,
+                rollbackCatalogEntries === undefined
+                  ? undefined
+                  : {
+                      providerInstanceId: previousOwner?.instanceId ?? input.providerInstanceId,
+                      revision: catalogSnapshot?.appliedRevision ?? 0,
+                      entries: rollbackCatalogEntries,
+                      ...(previousOwner?.catalogResolveSecret === undefined
+                        ? {}
+                        : { resolveSecret: previousOwner.catalogResolveSecret }),
+                      ...(previousOwner?.catalogOauthStateLeases === undefined
+                        ? {}
+                        : { oauthStateLeases: previousOwner.catalogOauthStateLeases }),
+                    },
+              ).pipe(Effect.ignoreCause);
             yield* closeProjectMcpLeaseScope(scope);
             // A same-adapter replacement may have already replaced the old
             // native slot. Fail closed instead of retaining stale MCP access.
@@ -1897,8 +2061,18 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             leased.servers,
             leased.resolveSecret,
             leased.oauthStateLeases,
+            catalogSnapshot && resolvedCatalogEntries
+              ? {
+                  catalogSessionId: catalogSnapshot.catalogSessionId,
+                  revision: catalogSnapshot.desiredRevision,
+                  entries: resolvedCatalogEntries,
+                }
+              : undefined,
           );
           owner.mcpProviderSessionId = replacement.candidate?.providerSessionId;
+          owner.catalogResolveSecret = leased.resolveSecret;
+          owner.catalogSecretResolvers = [leased.resolveSecret];
+          owner.catalogOauthStateLeases = leased.oauthStateLeases;
           const started = yield* input.adapter.startSession({
             ...input.sessionInput,
             ...(projectWork ? { projectWork } : {}),
@@ -1944,42 +2118,151 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             });
           }
         }
-        if (catalogSnapshot && engine !== undefined) {
-          const capability = input.adapter.capabilities.sessionMcpCatalog ?? "restart-required";
-          const command: Extract<
-            OrchestrationCommand,
-            {
-              readonly type: "thread.mcp-catalog.applied" | "thread.mcp-catalog.apply-failed";
-            }
-          > =
-            capability === "unsupported"
-              ? {
-                  type: "thread.mcp-catalog.apply-failed",
-                  commandId: CommandId.make(
-                    `server:mcp-catalog-unsupported:${threadId}:${catalogSnapshot.catalogSessionId}:${catalogSnapshot.desiredRevision}`,
-                  ),
+        // A live aggregate is already staged before native startup. Record
+        // that initial revision only after the native session commits; a
+        // restart-required adapter deliberately takes the fallback path and
+        // must not emit a false applied receipt.
+        if (
+          catalogSnapshot !== undefined &&
+          replacement?.candidate?.catalogEndpoint !== undefined &&
+          engine !== undefined &&
+          (catalogSnapshot.desiredRevision > catalogSnapshot.appliedRevision ||
+            catalogSnapshot.application === undefined)
+        ) {
+          const appliedAt = yield* nowIso;
+          yield* engine
+            .dispatch({
+              type: "thread.mcp-catalog.applied",
+              commandId: CommandId.make(
+                `server:mcp-catalog-started:${threadId}:${catalogSnapshot.catalogSessionId}:${catalogSnapshot.desiredRevision}`,
+              ),
+              threadId,
+              mcpCatalogSessionId: catalogSnapshot.catalogSessionId,
+              revision: catalogSnapshot.desiredRevision,
+              appliedCatalog: catalogSnapshot.desired,
+              appliedAt,
+            })
+            .pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("provider.mcp.startup-receipt-failed", {
                   threadId,
-                  mcpCatalogSessionId: catalogSnapshot.catalogSessionId,
-                  revision: catalogSnapshot.desiredRevision,
-                  reason: "Provider does not support session MCP catalog configuration.",
-                  failedAt: yield* nowIso,
-                }
-              : {
-                  type: "thread.mcp-catalog.applied",
-                  commandId: CommandId.make(
-                    `server:mcp-catalog-applied:${threadId}:${catalogSnapshot.catalogSessionId}:${catalogSnapshot.desiredRevision}`,
-                  ),
-                  threadId,
-                  mcpCatalogSessionId: catalogSnapshot.catalogSessionId,
-                  revision: catalogSnapshot.desiredRevision,
-                  appliedCatalog: catalogSnapshot.desired,
-                  appliedAt: yield* nowIso,
-                };
-          yield* engine.dispatch(command).pipe(Effect.ignoreCause({ log: true }));
+                  catalogSessionId: catalogSnapshot.catalogSessionId,
+                  cause,
+                }),
+              ),
+            );
         }
         return session;
       }),
     );
+
+  const applyMcpCatalog: ProviderService.ProviderService["Service"]["applyMcpCatalog"] = (input) =>
+    withMcpTransaction(
+      input.threadId,
+      Effect.gen(function* () {
+        const owner = (yield* Ref.get(projectMcpLeaseScopes)).get(input.threadId);
+        if (!owner || owner.resourcesReleased || owner.mcpProviderSessionId === undefined)
+          return "inactive" as const;
+        if (owner.catalogSessionId !== input.catalogSessionId) return "inactive" as const;
+        if (owner.adapter.capabilities.sessionMcpCatalog !== "live")
+          return "restart-required" as const;
+        if (Option.isNone(mcpCatalogGateway)) return "inactive" as const;
+
+        const resolved = yield* Effect.try({
+          try: () =>
+            resolveSessionCatalog({
+              desired: input.desiredCatalog,
+              providerInstanceId: owner.instanceId,
+              providerCapability: "live",
+            }),
+          catch: (cause) =>
+            toValidationError(
+              "applyMcpCatalog",
+              "Could not resolve the requested MCP catalog.",
+              cause,
+            ),
+        });
+        const projectMcp = Option.getOrUndefined(projectMcpService);
+        const newlyLeased =
+          projectMcp === undefined
+            ? undefined
+            : yield* projectMcp
+                .acquireResolvedSessionLease(
+                  resolved.map((entry) => ({
+                    id: entry.logicalServerId,
+                    name: entry.name,
+                    transport: entry.transport,
+                    transportDefinitionId: entry.transportDefinitionId,
+                  })),
+                )
+                .pipe(
+                  Effect.provideService(Scope.Scope, owner.scope),
+                  Effect.mapError((cause) =>
+                    toValidationError(
+                      "applyMcpCatalog",
+                      "Could not lease MCP catalog credentials.",
+                      cause,
+                    ),
+                  ),
+                );
+        // Keep resolver functions as a flat chain. Assigning this closure back
+        // to `catalogResolveSecret` would make the next update call the previous
+        // closure, creating an unbounded recursive chain after repeated edits.
+        const secretResolvers = [
+          ...(newlyLeased === undefined ? [] : [newlyLeased.resolveSecret]),
+          ...owner.catalogSecretResolvers,
+        ];
+        const resolveSecret = (
+          serverId: import("@t3tools/contracts").McpServerId,
+          credentialId: string,
+        ) => {
+          for (const resolver of secretResolvers) {
+            const value = resolver(serverId, credentialId);
+            if (value !== undefined) return value;
+          }
+          return undefined;
+        };
+        const oauthStateLeases = new Map([
+          ...(owner.catalogOauthStateLeases ?? new Map()),
+          ...(newlyLeased?.oauthStateLeases ?? new Map()),
+        ]);
+        yield* mcpCatalogGateway.value
+          .applyCatalogRevision({
+            catalogSessionId: input.catalogSessionId,
+            providerSessionId: owner.mcpProviderSessionId,
+            threadId: input.threadId,
+            providerInstanceId: owner.instanceId,
+            revision: input.revision,
+            entries: resolved,
+            resolveSecret,
+            oauthStateLeases,
+          })
+          .pipe(
+            Effect.mapError((cause) =>
+              toValidationError(
+                "applyMcpCatalog",
+                "Could not apply the MCP catalog revision.",
+                cause,
+              ),
+            ),
+          );
+        owner.catalogResolveSecret = newlyLeased?.resolveSecret ?? owner.catalogResolveSecret;
+        owner.catalogSecretResolvers = secretResolvers;
+        owner.catalogOauthStateLeases = oauthStateLeases;
+        return "applied" as const;
+      }),
+    );
+
+  const disposeMcpCatalog: ProviderService.ProviderService["Service"]["disposeMcpCatalog"] = (
+    input,
+  ) =>
+    Effect.gen(function* () {
+      const owner = (yield* Ref.get(projectMcpLeaseScopes)).get(input.threadId);
+      if (!owner || owner.catalogSessionId !== input.catalogSessionId) return;
+      if (owner.mcpProviderSessionId !== undefined && Option.isSome(mcpCatalogGateway)) {
+        yield* mcpCatalogGateway.value.disposeCatalogSession(input.catalogSessionId);
+      }
+    });
 
   const recoverSessionForThread = Effect.fn("recoverSessionForThread")(function* (input: {
     readonly binding: ProviderSessionDirectory.ProviderRuntimeBinding;
@@ -3198,6 +3481,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     respondToRequest,
     respondToUserInput,
     stopSession,
+    applyMcpCatalog,
+    disposeMcpCatalog,
     listSessions,
     getCapabilities,
     getInstanceInfo,

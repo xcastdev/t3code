@@ -67,6 +67,8 @@ import * as TextGeneration from "./textGeneration/TextGeneration.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./provider/Layers/ProviderInstanceRegistryHydration.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
+import * as McpCatalogGateway from "./mcp/McpCatalogGateway.ts";
+import * as McpCatalogGatewayHttpServer from "./mcp/McpCatalogGatewayHttpServer.ts";
 import * as McpSessionRegistry from "./mcp/McpSessionRegistry.ts";
 import * as ProjectMcpProxyHttpServer from "./mcp/ProjectMcpProxyHttpServer.ts";
 import * as ProjectMcpProxyRegistry from "./mcp/ProjectMcpProxyRegistry.ts";
@@ -82,7 +84,8 @@ import * as GitManager from "./git/GitManager.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
 import * as Keybindings from "./keybindings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
-import { OrchestrationReactorLive } from "./orchestration/Layers/OrchestrationReactor.ts";
+import { OrchestrationReactorRequiredLive } from "./orchestration/Layers/OrchestrationReactor.ts";
+import { McpCatalogReactorLive } from "./orchestration/Layers/McpCatalogReactor.ts";
 import * as ExternalNotificationDispatcher from "./notifications/ExternalNotificationDispatcher.ts";
 import * as HomeAssistantWebhookAdapter from "./notifications/HomeAssistantWebhookAdapter.ts";
 import { RuntimeReceiptBusLive } from "./orchestration/Layers/RuntimeReceiptBus.ts";
@@ -264,8 +267,15 @@ const HttpServerLive = Layer.unwrap(
 
 const PlatformServicesLive = NodeServices.layer;
 
+// Keep the production dependency explicit: the composite cannot be built
+// without the catalog reactor. This layer is supplied by the catalog reactor
+// below, while the lightweight optional layer remains available to CLI tests.
+const ProductionOrchestrationReactorLive = OrchestrationReactorRequiredLive.pipe(
+  Layer.provide(McpCatalogReactorLive),
+);
+
 const ReactorLayerLive = Layer.empty.pipe(
-  Layer.provideMerge(OrchestrationReactorLive),
+  Layer.provideMerge(ProductionOrchestrationReactorLive),
   Layer.provideMerge(ProviderRuntimeIngestionLive),
   Layer.provideMerge(ProviderCommandReactorLive),
   Layer.provideMerge(CheckpointReactorLive),
@@ -309,6 +319,10 @@ const ProjectMcpProxyRegistryLayerLive = ProjectMcpProxyRegistry.layer.pipe(
   Layer.provide(ProjectMcpOAuthLayerLive),
 );
 
+const McpCatalogGatewayLayerLive = McpCatalogGateway.layer.pipe(
+  Layer.provide(ProjectMcpProxyRegistryLayerLive),
+);
+
 const McpSessionRegistryLayerLive = McpSessionRegistry.layer.pipe(
   Layer.provide(ProjectMcpProxyRegistryLayerLive),
 );
@@ -316,12 +330,14 @@ const McpSessionRegistryLayerLive = McpSessionRegistry.layer.pipe(
 const ProjectMcpRouteServicesLive = Layer.mergeAll(
   McpSessionRegistryLayerLive,
   ProjectMcpProxyRegistryLayerLive,
+  McpCatalogGatewayLayerLive,
   ProjectMcpOAuthLayerLive,
 ).pipe(Layer.provideMerge(ProjectMcpSecretStoreLayerLive));
 
 const ProjectMcpHttpRoutesLive = Layer.mergeAll(
   McpHttpServer.layer.pipe(Layer.provide(ProjectMcpRouteServicesLive)),
   ProjectMcpProxyHttpServer.layer.pipe(Layer.provide(ProjectMcpRouteServicesLive)),
+  McpCatalogGatewayHttpServer.layer.pipe(Layer.provide(ProjectMcpRouteServicesLive)),
   ProjectMcpOAuthHttp.layer.pipe(Layer.provide(ProjectMcpOAuthLayerLive)),
 ).pipe(Layer.provide(ProjectMcpSecretStoreLayerLive));
 
@@ -341,6 +357,7 @@ const ProviderLayerLive = ProviderServiceLive.pipe(
   Layer.provide(ProviderAdapterRegistryLive),
   Layer.provideMerge(ProviderSessionDirectoryLayerLive),
   Layer.provideMerge(ProjectMcpServiceLayerLive),
+  Layer.provideMerge(McpCatalogGatewayLayerLive),
   Layer.provide(OrchestrationLayerLive),
 );
 

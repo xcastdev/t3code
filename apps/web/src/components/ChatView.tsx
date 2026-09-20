@@ -234,6 +234,7 @@ import { SecondaryPaneTabs } from "./workspace/SecondaryPaneTabs";
 import { SecondaryPaneDiffPanel } from "./workspace/SecondaryPaneDiffPanel";
 import { AgentsPanel } from "./AgentsPanel";
 import { LinkPullRequestDialogHost } from "./pullRequest/LinkPullRequestDialog";
+import { ThreadMcpCatalogDialog } from "./ThreadMcpCatalogDialog";
 import { ThreadPullRequestsPanel } from "./pullRequest/ThreadPullRequestsPanel";
 import { useDeviceState } from "~/state/device";
 import { DeviceSetup } from "./device/DeviceSetup";
@@ -1514,6 +1515,8 @@ export default function ChatView(props: ChatViewProps) {
   const [terminalFocusRequestId, setTerminalFocusRequestId] = useState(0);
   const [pullRequestDialogState, setPullRequestDialogState] =
     useState<PullRequestDialogState | null>(null);
+  const [mcpCatalogDialogOpen, setMcpCatalogDialogOpen] = useState(false);
+  const openMcpCatalogDialog = useCallback(() => setMcpCatalogDialogOpen(true), []);
   const [terminalUiLaunchContext, setTerminalUiLaunchContext] =
     useState<TerminalLaunchContext | null>(null);
   const [attachmentPreviewHandoffByMessageId, setAttachmentPreviewHandoffByMessageId] = useState<
@@ -1660,6 +1663,11 @@ export default function ChatView(props: ChatViewProps) {
   // depend on which route is mounted.
   const isServerThread = activeServerThread !== null;
   const activeThread = activeServerThread ?? localDraftThread;
+  const activeThreadServerConfig = useAtomValue(
+    serverEnvironment.configValueAtom(activeThread?.environmentId ?? null),
+  );
+  const canEditMcpCatalog =
+    activeThreadServerConfig?.environment.capabilities.sessionMcpCatalog === true;
   const threadError = isServerThread
     ? (localServerError ?? activeServerThread?.session?.lastError ?? null)
     : localDraftError;
@@ -9126,6 +9134,7 @@ export default function ChatView(props: ChatViewProps) {
             rightPanelHasActiveSurface={activeRightPanelSurface !== null}
             parentReservesGlobalControls={chatReservesGlobalControls}
             onNewThreadInProject={handleNewThreadInActiveProject}
+            {...(canEditMcpCatalog ? { onOpenMcpCatalog: openMcpCatalogDialog } : {})}
             {...(activeDraftLogicalProjectKey
               ? { onOpenProjectSettings: handleOpenDraftProjectSettings }
               : {})}
@@ -9861,6 +9870,14 @@ export default function ChatView(props: ChatViewProps) {
         </AlertDialogPopup>
       </AlertDialog>
       <LinkPullRequestDialogHost />
+      <ThreadMcpCatalogDialog
+        open={mcpCatalogDialogOpen && canEditMcpCatalog}
+        onOpenChange={setMcpCatalogDialogOpen}
+        environmentId={activeThread.environmentId}
+        projectId={activeThread.projectId}
+        threadId={activeThread.id}
+        mcpCatalogSessionId={activeThread.session?.mcpCatalogSessionId ?? null}
+      />
       {expandedImage && (
         <ExpandedImageDialog
           key={expandedImageKey(expandedImage)}

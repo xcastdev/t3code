@@ -66,8 +66,9 @@ export function useThreadActionMenu(input: {
   /** Fallback for "Copy path" when the thread has no worktree. */
   readonly projectCwd: string | null;
   readonly onStartRename: () => void;
+  readonly onOpenMcpCatalog?: () => void;
 }) {
-  const { threadRef, projectCwd, onStartRename } = input;
+  const { threadRef, projectCwd, onStartRename, onOpenMcpCatalog } = input;
   const router = useRouter();
   const projects = useProjects();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
@@ -135,6 +136,8 @@ export function useThreadActionMenu(input: {
           snooze: readEnvironmentSupportsSnooze(threadRef.environmentId),
           pinning: readEnvironmentSupportsPinning(threadRef.environmentId),
           titleRegeneration: readEnvironmentSupportsTitleRegeneration(threadRef.environmentId),
+          mcpCatalog:
+            thread.session?.mcpCatalogSessionId !== undefined && onOpenMcpCatalog !== undefined,
         };
         const isRegeneratingTitle = thread.titleRegeneration != null;
         const snoozePresets = resolveSnoozePresets(now, timestampFormat);
@@ -194,6 +197,9 @@ export function useThreadActionMenu(input: {
           }
         };
         switch (action) {
+          case "mcp-catalog":
+            onOpenMcpCatalog?.();
+            return;
           case "project-settings": {
             const project = projects.find(
               (candidate) =>
@@ -345,6 +351,7 @@ export function useThreadActionMenu(input: {
       logicalProjectKeyByPhysicalKey,
       markThreadUnread,
       onStartRename,
+      onOpenMcpCatalog,
       pinThread,
       projectCwd,
       projectGroupingSettings,

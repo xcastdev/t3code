@@ -2039,12 +2039,13 @@ const makeWsRpcLayer = (
         Effect.uninterruptibleMask((restore) =>
           restore(dispatch).pipe(
             Effect.catch((error) =>
-              (isOrchestrationCommandInvariantError(error) ||
-              isOrchestrationCommandPreviouslyRejectedError(error) ||
-              isOrchestrationCommandIdConflictError(error)
-                ? (prepared?.rollback ?? Effect.void)
-                : Effect.void
-              ).pipe(Effect.andThen(Effect.fail(toCatalogMutationError(error)))),
+              // A prepared credential is not durable configuration until its
+              // command is accepted. Roll it back for every ordinary dispatch
+              // failure, not only invariant failures, so storage errors cannot
+              // leave an unreachable secret behind.
+              (prepared?.rollback ?? Effect.void).pipe(
+                Effect.andThen(Effect.fail(toCatalogMutationError(error))),
+              ),
             ),
             Effect.andThen(prepared?.commit ?? Effect.void),
             Effect.catch((error) => Effect.fail(toCatalogMutationError(error))),

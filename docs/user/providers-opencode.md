@@ -46,6 +46,11 @@ to the HTTPS origin OpenCode can reach. A loopback HTTP origin works only when b
 processes run on the same machine. See [project MCP servers](./project-mcp-servers.md)
 for transport, credentials, and OAuth rules.
 
+Scoped catalog changes are restart-required for OpenCode. T3 attaches selected servers through
+per-server authenticated proxies when the next provider session starts; it does not claim that
+OpenCode refreshes a catalog in place or consume the live aggregate endpoint. Live list-change
+updates are reserved for provider adapters that have been verified to refresh in place.
+
 ## Approvals
 
 OpenCode follows the shared [permission modes](./permission-modes.md). **Auto** has

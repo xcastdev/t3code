@@ -15,6 +15,7 @@ import {
   ProjectMcpServer,
   ProviderInstanceId,
   ServerProvider,
+  type ServerSettings,
   parseProjectMcpOAuthAuthorizationUrl,
 } from "@t3tools/contracts";
 import type { ProjectMcpTransportDraft } from "@t3tools/contracts";
@@ -28,6 +29,13 @@ import { usePrimarySessionState } from "../../environments/primary";
 import { deriveProviderInstanceEntries } from "../../providerInstances";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { projectMcpEnvironment } from "../../state/projects";
+import {
+  CatalogCredentialFields,
+  McpCatalogProjectSettings,
+  newCatalogCredential,
+  retainedCatalogCredential,
+  type CatalogCredentialDraft,
+} from "./McpCatalogSettings";
 import { useEnvironmentQuery } from "../../state/query";
 import { serverEnvironment } from "../../state/server";
 import { useEnvironmentSessionState } from "../../state/session";
@@ -1248,10 +1256,16 @@ function PrimarySessionProjectMcpSettings({
   environmentId,
   projectId,
   providers,
+  settings,
+  scoped = false,
+  canOverride = true,
 }: {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
   readonly providers: ReadonlyArray<ServerProvider>;
+  readonly settings?: Pick<ServerSettings, "providers" | "providerInstances"> | undefined;
+  readonly scoped?: boolean;
+  readonly canOverride?: boolean;
 }) {
   const session = usePrimarySessionState();
   const operateAccess = resolvePrimaryOperateAccess({
@@ -1261,6 +1275,19 @@ function PrimarySessionProjectMcpSettings({
     isPending: session.isPending,
     hasError: session.error !== null,
   });
+  if (scoped) {
+    return (
+      <McpCatalogProjectSettings
+        key={`${environmentId}:${projectId}`}
+        environmentId={environmentId}
+        projectId={projectId}
+        providers={providers}
+        settings={settings}
+        canOverride={canOverride}
+        canMutate={operateAccess === "granted"}
+      />
+    );
+  }
   return (
     <ProjectMcpCatalogSettings
       environmentId={environmentId}
@@ -1275,10 +1302,16 @@ function RemoteSessionProjectMcpSettings({
   environmentId,
   projectId,
   providers,
+  settings,
+  scoped = false,
+  canOverride = true,
 }: {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
   readonly providers: ReadonlyArray<ServerProvider>;
+  readonly settings?: Pick<ServerSettings, "providers" | "providerInstances"> | undefined;
+  readonly scoped?: boolean;
+  readonly canOverride?: boolean;
 }) {
   const session = useEnvironmentSessionState(environmentId);
   const operateAccess = resolveRemoteOperateAccess({
@@ -1286,6 +1319,19 @@ function RemoteSessionProjectMcpSettings({
     isPending: session.isPending,
     hasError: session.hasError,
   });
+  if (scoped) {
+    return (
+      <McpCatalogProjectSettings
+        key={`${environmentId}:${projectId}`}
+        environmentId={environmentId}
+        projectId={projectId}
+        providers={providers}
+        settings={settings}
+        canOverride={canOverride}
+        canMutate={operateAccess === "granted"}
+      />
+    );
+  }
   return (
     <ProjectMcpCatalogSettings
       environmentId={environmentId}
@@ -1297,6 +1343,19 @@ function RemoteSessionProjectMcpSettings({
 }
 
 /** MCP settings for one physical project, omitted for older environments. */
+export type ProjectMcpSettingsMode = "scoped" | "legacy" | null;
+
+/** Capability routing is intentionally strict so a stale client never probes an
+ * RPC family the connected environment did not advertise. */
+export function projectMcpSettingsMode(capabilities: {
+  readonly projectMcpCatalog?: boolean;
+  readonly projectMcpOverrides?: boolean;
+}): ProjectMcpSettingsMode {
+  if (capabilities.projectMcpOverrides === true) return "scoped";
+  if (capabilities.projectMcpCatalog === true) return "legacy";
+  return null;
+}
+
 export function ProjectMcpSettings({
   environmentId,
   projectId,
@@ -1306,21 +1365,50 @@ export function ProjectMcpSettings({
 }) {
   const config = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const primaryEnvironmentId = usePrimaryEnvironmentId();
-  if (config?.environment.capabilities.projectMcpCatalog !== true) return null;
-  if (environmentId === primaryEnvironmentId) {
-    return (
+  if (!config) return null;
+  const mode = projectMcpSettingsMode(config.environment.capabilities);
+  if (mode === null) return null;
+  if (mode === "legacy") {
+    return environmentId === primaryEnvironmentId ? (
       <PrimarySessionProjectMcpSettings
+        key={`${environmentId}:${projectId}:legacy`}
         environmentId={environmentId}
         projectId={projectId}
         providers={config.providers}
+        settings={config.settings}
+      />
+    ) : (
+      <RemoteSessionProjectMcpSettings
+        key={`${environmentId}:${projectId}:legacy`}
+        environmentId={environmentId}
+        projectId={projectId}
+        providers={config.providers}
+        settings={config.settings}
+      />
+    );
+  }
+  if (environmentId === primaryEnvironmentId) {
+    return (
+      <PrimarySessionProjectMcpSettings
+        key={`${environmentId}:${projectId}:scoped`}
+        environmentId={environmentId}
+        projectId={projectId}
+        providers={config.providers}
+        settings={config.settings}
+        scoped
+        canOverride={config.environment.capabilities.projectMcpOverrides === true}
       />
     );
   }
   return (
     <RemoteSessionProjectMcpSettings
+      key={`${environmentId}:${projectId}:scoped`}
       environmentId={environmentId}
       projectId={projectId}
       providers={config.providers}
+      settings={config.settings}
+      scoped
+      canOverride={config.environment.capabilities.projectMcpOverrides === true}
     />
   );
 }

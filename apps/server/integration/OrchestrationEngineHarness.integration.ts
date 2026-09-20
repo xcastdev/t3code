@@ -70,6 +70,7 @@ import * as ThreadSettlementReactor from "../src/orchestration/ThreadSettlementR
 import * as PullRequestSyncReactor from "../src/orchestration/PullRequestSyncReactor.ts";
 import * as ThreadPullRequestReactor from "../src/orchestration/ThreadPullRequestReactor.ts";
 import { OrchestrationReactor } from "../src/orchestration/Services/OrchestrationReactor.ts";
+import { McpCatalogReactor } from "../src/orchestration/Services/McpCatalogReactor.ts";
 import { ProjectionSnapshotQuery } from "../src/orchestration/Services/ProjectionSnapshotQuery.ts";
 import {
   RuntimeReceiptBus,
@@ -416,6 +417,12 @@ export const makeOrchestrationIntegrationHarness = (
         Layer.succeed(AgentAwarenessRelay.AgentAwarenessRelay, {
           publishThread: () => Effect.void,
           start: () => Effect.void,
+        }),
+      ),
+      Layer.provideMerge(
+        Layer.succeed(McpCatalogReactor, {
+          start: () => Effect.void,
+          drain: Effect.void,
         }),
       ),
     );

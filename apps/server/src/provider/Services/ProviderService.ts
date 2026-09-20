@@ -88,6 +88,18 @@ export interface ProviderServiceShape {
     input: ProviderStopSessionInput,
   ) => Effect.Effect<void, ProviderServiceError>;
 
+  /** Apply a durable catalog revision to a live provider-facing MCP session. */
+  readonly applyMcpCatalog?: (input: {
+    readonly threadId: ThreadId;
+    readonly catalogSessionId: import("@t3tools/contracts").McpCatalogSessionId;
+    readonly revision: number;
+    readonly desiredCatalog: import("@t3tools/contracts").McpCatalogSnapshot["desired"];
+  }) => Effect.Effect<"applied" | "restart-required" | "inactive", ProviderServiceError>;
+  readonly disposeMcpCatalog?: (input: {
+    readonly threadId: ThreadId;
+    readonly catalogSessionId: import("@t3tools/contracts").McpCatalogSessionId;
+  }) => Effect.Effect<void, ProviderServiceError>;
+
   /**
    * List active provider sessions.
    *

@@ -155,6 +155,10 @@
       "types": "./src/state/projects.ts",
       "default": "./src/state/projects.ts"
     },
+    "./state/mcpCatalog": {
+      "types": "./src/state/mcpCatalog.ts",
+      "default": "./src/state/mcpCatalog.ts"
+    },
     "./state/provider-instance-display": {
       "types": "./src/state/providerInstanceDisplay.ts",
       "default": "./src/state/providerInstanceDisplay.ts"

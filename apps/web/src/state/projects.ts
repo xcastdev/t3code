@@ -1,5 +1,6 @@
 import { createEnvironmentProjectAtoms } from "@t3tools/client-runtime/state/projects";
 import { createProjectEnvironmentAtoms } from "@t3tools/client-runtime/state/projects";
+import { createMcpCatalogEnvironmentAtoms } from "@t3tools/client-runtime/state/mcpCatalog";
 import {
   createEnvironmentRpcCommand,
   createEnvironmentRpcQueryAtomFamily,
@@ -11,6 +12,7 @@ import { connectionAtomRuntime } from "../connection/runtime";
 import { environmentSnapshotAtom } from "./shell";
 
 export const projectEnvironment = createProjectEnvironmentAtoms(connectionAtomRuntime);
+export const mcpCatalogEnvironment = createMcpCatalogEnvironmentAtoms(connectionAtomRuntime);
 /**
  * Web-only: project content search backs the ⇧⌘F dialog, which has no mobile
  * surface, so the atom family lives here instead of the shared client-runtime

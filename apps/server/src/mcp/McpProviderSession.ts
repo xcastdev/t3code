@@ -14,6 +14,8 @@ export interface McpProviderSessionConfig {
   readonly providerInstanceId: ProviderInstanceId;
   readonly endpoint: string;
   readonly authorizationHeader: string;
+  /** Provider-facing aggregate catalog endpoint, when live catalog updates are enabled. */
+  readonly catalogEndpoint?: string;
   /** Capabilities the credential grants ("preview", "device"). */
   readonly capabilities: ReadonlySet<string>;
   /**

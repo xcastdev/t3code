@@ -9,6 +9,7 @@ import type { SnoozePreset } from "@t3tools/client-runtime/state/thread-settled"
 export type ThreadActionMenuId =
   | "new-thread-on-branch"
   | "project-settings"
+  | "mcp-catalog"
   | "pin"
   | "unpin"
   | "settle"
@@ -40,6 +41,7 @@ export interface ThreadActionMenuState {
     readonly snooze: boolean;
     readonly pinning: boolean;
     readonly titleRegeneration: boolean;
+    readonly mcpCatalog?: boolean;
   };
   readonly snoozePresets: ReadonlyArray<SnoozePreset>;
 }
@@ -97,6 +99,9 @@ export function buildThreadActionMenuItems(
                 ],
               },
         ]
+      : []),
+    ...(state.supports.mcpCatalog
+      ? [{ id: "mcp-catalog" as const, label: "MCP catalog", icon: "plug", separatorBefore: true }]
       : []),
     { id: "rename", label: "Rename thread", icon: "pencil", separatorBefore: true },
     ...(state.supports.titleRegeneration

@@ -17,7 +17,7 @@ import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../
 import { Switch } from "../ui/switch";
 import { Textarea } from "../ui/textarea";
 import type { ProviderClientDefinition } from "./providerDriverMeta";
-import { SettingsRow } from "./settingsLayout";
+import { SettingsRow, SettingsSearchTarget } from "./settingsLayout";
 
 export interface ProviderSettingsFieldModel {
   readonly key: string;
@@ -25,6 +25,7 @@ export interface ProviderSettingsFieldModel {
   readonly label: string;
   readonly description?: string | undefined;
   readonly placeholder?: string | undefined;
+  readonly targetable?: boolean | undefined;
   readonly clearWhenEmpty: "omit" | "persist";
   readonly defaultBooleanValue?: boolean | undefined;
   /** Choices for a `select` control. The first entry is the default. */
@@ -104,6 +105,7 @@ export function deriveProviderSettingsFields(
           control: formAnnotation.control ?? "text",
           label: annotatedTitle ?? titleizeFieldKey(key),
           ...(annotatedDescription !== undefined ? { description: annotatedDescription } : {}),
+          targetable: formAnnotation.targetable ?? false,
           ...(formAnnotation.placeholder !== undefined
             ? { placeholder: formAnnotation.placeholder }
             : {}),
@@ -117,6 +119,11 @@ export function deriveProviderSettingsFields(
         } satisfies ProviderSettingsFieldModel,
       ];
     });
+}
+
+/** Stable DOM id used by settings links to focus a provider field. */
+export function providerSettingsFieldTargetId(idPrefix: string, fieldKey: string): string {
+  return `${idPrefix}-${fieldKey}`;
 }
 
 function readProviderConfigString(config: unknown, key: string): string {
@@ -214,12 +221,22 @@ function ProviderSettingsSelect({
 
 function FieldFrame(props: {
   readonly variant: ProviderSettingsFormProps["variant"];
+  readonly targetId?: string | undefined;
   readonly children: ReactNode;
 }) {
+  const frame = <div className="grid gap-1.5">{props.children}</div>;
   if (props.variant === "card") {
-    return <div>{props.children}</div>;
+    return props.targetId ? (
+      <SettingsSearchTarget id={props.targetId}>{props.children}</SettingsSearchTarget>
+    ) : (
+      <div>{props.children}</div>
+    );
   }
-  return <div className="grid gap-1.5">{props.children}</div>;
+  return props.targetId ? (
+    <SettingsSearchTarget id={props.targetId}>{frame}</SettingsSearchTarget>
+  ) : (
+    frame
+  );
 }
 
 interface ProviderSettingsFieldRowProps {
@@ -237,7 +254,7 @@ function ProviderSettingsFieldRow({
   variant,
   onChange,
 }: ProviderSettingsFieldRowProps) {
-  const inputId = `${idPrefix}-${field.key}`;
+  const inputId = providerSettingsFieldTargetId(idPrefix, field.key);
   const descriptionClassName =
     variant === "dialog"
       ? "text-[11px] text-muted-foreground"
@@ -297,6 +314,7 @@ function ProviderSettingsFieldRow({
 
     return (
       <SettingsRow
+        id={field.targetable ? inputId : undefined}
         title={
           field.control === "switch" ? field.label : <label htmlFor={inputId}>{field.label}</label>
         }
@@ -310,7 +328,7 @@ function ProviderSettingsFieldRow({
 
   if (field.control === "switch") {
     return (
-      <FieldFrame variant={variant}>
+      <FieldFrame variant={variant} targetId={field.targetable ? inputId : undefined}>
         <div className="flex items-center justify-between gap-3">
           <div className="min-w-0">
             {label}
@@ -330,7 +348,7 @@ function ProviderSettingsFieldRow({
 
   if (field.control === "select") {
     return (
-      <FieldFrame variant={variant}>
+      <FieldFrame variant={variant} targetId={field.targetable ? inputId : undefined}>
         <label htmlFor={inputId} className={cn(variant === "card" && "block")}>
           {label}
           <ProviderSettingsSelect
@@ -349,7 +367,7 @@ function ProviderSettingsFieldRow({
 
   if (field.control === "textarea") {
     return (
-      <FieldFrame variant={variant}>
+      <FieldFrame variant={variant} targetId={field.targetable ? inputId : undefined}>
         <label htmlFor={inputId} className={cn(variant === "card" && "block")}>
           {label}
           <Textarea
@@ -370,7 +388,7 @@ function ProviderSettingsFieldRow({
 
   const type = field.control === "password" ? "password" : undefined;
   return (
-    <FieldFrame variant={variant}>
+    <FieldFrame variant={variant} targetId={field.targetable ? inputId : undefined}>
       <label htmlFor={inputId} className={cn(variant === "card" && "block")}>
         {label}
         {variant === "card" ? (

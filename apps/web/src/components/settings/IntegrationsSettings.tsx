@@ -41,6 +41,7 @@ import {
 import { PREVIEW_VIEWPORT_PRESETS } from "@t3tools/shared/previewViewport";
 import { MoreVertical, Plus as PlusIcon } from "lucide-react";
 import { useCallback, useRef, useState } from "react";
+import { useAtomValue } from "@effect/atom-react";
 
 import { ScreenRotationIcon } from "~/browser/ScreenRotationIcon";
 import { AnimatedHeight } from "~/components/AnimatedHeight";
@@ -64,6 +65,7 @@ import {
   agentDeviceDescription,
 } from "~/components/device/DeviceSetup";
 import { isElectron } from "../../env";
+import { McpCatalogSettings } from "./McpCatalogSettings";
 
 import { Badge } from "../ui/badge";
 import {
@@ -1643,12 +1645,53 @@ export function IntegrationsSettingsPanel() {
       <BrowserAutoShowFloatingPreviewSetting disabled={previewDefaultsDisabled} />
     </>
   );
+  const { environments } = useEnvironments();
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const [selectedCatalogEnvironment, setSelectedCatalogEnvironment] =
+    useState<EnvironmentId | null>(primaryEnvironmentId);
+  const catalogEnvironmentId =
+    (selectedCatalogEnvironment &&
+      environments.some((entry) => entry.environmentId === selectedCatalogEnvironment) &&
+      selectedCatalogEnvironment) ||
+    environments[0]?.environmentId ||
+    null;
+  const catalogConfig = useAtomValue(
+    serverEnvironment.configValueAtom(catalogEnvironmentId ?? ("" as EnvironmentId)),
+  );
 
   return (
     <SettingsPageContainer>
       {/* Server-authoritative agent access is scoped by the header selection;
           the preview defaults below are device-local and ignore it. */}
       <ProjectDefaultsSettings category="integrations" />
+      {catalogEnvironmentId ? (
+        <>
+          {environments.length > 1 ? (
+            <div className="flex flex-wrap gap-1" role="tablist" aria-label="MCP environment">
+              {environments.map((entry) => (
+                <button
+                  key={entry.environmentId}
+                  type="button"
+                  role="tab"
+                  aria-selected={entry.environmentId === catalogEnvironmentId}
+                  onClick={() => setSelectedCatalogEnvironment(entry.environmentId)}
+                  className="rounded px-2 py-1 text-xs text-muted-foreground data-[selected=true]:text-foreground"
+                  data-selected={entry.environmentId === catalogEnvironmentId}
+                >
+                  {entry.label}
+                </button>
+              ))}
+            </div>
+          ) : null}
+          {catalogConfig?.environment.capabilities.globalMcpCatalog === true ? (
+            <McpCatalogSettings
+              key={catalogEnvironmentId}
+              environmentId={catalogEnvironmentId}
+              providers={catalogConfig.providers}
+            />
+          ) : null}
+        </>
+      ) : null}
       <SettingsSection id="browser" title="Browser">
         {previewDefaultsDisabled ? (
           <SettingsUnavailableGroup message="Only available in the desktop app.">
