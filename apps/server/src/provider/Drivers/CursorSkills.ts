@@ -39,6 +39,7 @@ interface CursorSkillScanBudget {
   remainingEntries: number;
   remainingBytes: bigint;
   exhausted: boolean;
+  byteLimitExceeded: boolean;
   incomplete: boolean;
 }
 
@@ -164,11 +165,13 @@ const discoverSkillsInRoot = Effect.fn("discoverCursorSkillsInRoot")(function* (
     if (skillInfo?.type === "File") {
       let frontmatter: CursorSkillFrontmatter | undefined = { cliVisible: true };
       if (skillInfo.size <= MAX_SKILL_BYTES && skillInfo.size <= input.budget.remainingBytes) {
-        const contents = yield* orUndefined(fileSystem.readFileString(skillPath));
+        const contents = yield* orUndefined(fileSystem.readFileString(skillPath), input.budget);
         if (contents !== undefined) {
           input.budget.remainingBytes -= skillInfo.size;
           frontmatter = parseSkillFrontmatter(contents);
         }
+      } else {
+        input.budget.byteLimitExceeded = true;
       }
       const name = path.basename(directory).trim();
       if (frontmatter?.cliVisible && name) {
@@ -229,27 +232,29 @@ const inspectCursorSkills = Effect.fn("inspectCursorSkills")(function* (
   ];
   const roots = [...(cwd ? rootsBelow(cwd, "project") : []), ...rootsBelow(userHome, "user")];
 
-  const skillsByName = new Map<string, ServerProviderSkill>();
+  const discovered: Array<ServerProviderSkill> = [];
   const budget: CursorSkillScanBudget = {
     remainingEntries: MAX_SKILL_SCAN_ENTRIES,
     remainingBytes: MAX_SKILL_SCAN_BYTES,
     exhausted: false,
+    byteLimitExceeded: false,
     incomplete: false,
   };
   for (const root of roots) {
     if (budget.exhausted) break;
     const skills = yield* discoverSkillsInRoot({ ...root, budget });
-    for (const skill of skills) {
-      if (!skillsByName.has(skill.name)) skillsByName.set(skill.name, skill);
-    }
+    discovered.push(...skills);
   }
   return {
-    skills: [...skillsByName.values()].sort((left, right) => left.name.localeCompare(right.name)),
-    failureReason: budget.exhausted
-      ? ("scan-budget-exhausted" as const)
-      : budget.incomplete
-        ? ("filesystem-error" as const)
-        : undefined,
+    skills: discovered.sort(
+      (left, right) => left.name.localeCompare(right.name) || left.path.localeCompare(right.path),
+    ),
+    failureReason:
+      budget.exhausted || budget.byteLimitExceeded
+        ? ("scan-budget-exhausted" as const)
+        : budget.incomplete
+          ? ("filesystem-error" as const)
+          : undefined,
   };
 });
 

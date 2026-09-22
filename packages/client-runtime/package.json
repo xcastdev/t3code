@@ -87,6 +87,10 @@
       "types": "./src/providerCatalog.ts",
       "default": "./src/providerCatalog.ts"
     },
+    "./skills": {
+      "types": "./src/skills/skillCatalog.ts",
+      "default": "./src/skills/skillCatalog.ts"
+    },
     "./voice-input": {
       "types": "./src/voice-input/index.ts",
       "default": "./src/voice-input/index.ts"
@@ -158,6 +162,10 @@
     "./state/mcpCatalog": {
       "types": "./src/state/mcpCatalog.ts",
       "default": "./src/state/mcpCatalog.ts"
+    },
+    "./state/skills": {
+      "types": "./src/state/skills.ts",
+      "default": "./src/state/skills.ts"
     },
     "./state/provider-instance-display": {
       "types": "./src/state/providerInstanceDisplay.ts",

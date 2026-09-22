@@ -20,6 +20,7 @@ import {
   Link2Icon,
   PaletteIcon,
   SearchIcon,
+  SparklesIcon,
   Settings2Icon,
   XIcon,
 } from "lucide-react";
@@ -81,6 +82,7 @@ const SETTINGS_SECTION_ICONS: Readonly<
   "/settings/keybindings": KeyboardIcon,
   "/settings/snap-shot": SnapShotIcon,
   "/settings/providers": BotIcon,
+  "/settings/skills": SparklesIcon,
   "/settings/integrations": BlocksIcon,
   "/settings/source-control": GitBranchIcon,
   "/settings/connections": Link2Icon,

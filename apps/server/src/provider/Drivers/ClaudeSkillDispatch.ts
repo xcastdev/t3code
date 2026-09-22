@@ -49,6 +49,7 @@ export interface ClaudeSkillDispatch {
 export function planClaudeSkillDispatch(
   prompt: string,
   skillNames: ReadonlySet<string>,
+  invocationNames: ReadonlyMap<string, string> = new Map(),
 ): ClaudeSkillDispatch | undefined {
   const mentions = [...prompt.matchAll(SKILL_MENTION_PATTERN)].flatMap((match) => {
     const name = match[2] ?? "";
@@ -66,14 +67,15 @@ export function planClaudeSkillDispatch(
   const leadingWithInlineSlashes = mentions
     .slice(0, -1)
     .reduceRight(
-      (text, mention) => `${text.slice(0, mention.start)}/${text.slice(mention.start + 1)}`,
+      (text, mention) =>
+        `${text.slice(0, mention.start)}/${invocationNames.get(mention.name) ?? mention.name}${text.slice(mention.end)}`,
       leading,
     )
     .trimEnd();
 
   return {
     leadingText: leadingWithInlineSlashes.length > 0 ? leadingWithInlineSlashes : undefined,
-    commandText: `/${last.name}${trailing}`.trimEnd(),
+    commandText: `/${invocationNames.get(last.name) ?? last.name}${trailing}`.trimEnd(),
     skillName: last.name,
   };
 }

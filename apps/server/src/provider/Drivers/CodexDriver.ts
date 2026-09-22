@@ -35,6 +35,9 @@ import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { serverProviderSkillsToNativeCandidates } from "../../skills/NativeSkillObservationService.ts";
+import { makeCodexSkillAdapter } from "../../skills/ProviderSkillAdapters.ts";
+import { make as makeSkillMaterialization } from "../../skills/SkillMaterializationService.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeCodexAdapter } from "../Layers/CodexAdapter.ts";
 import {
@@ -130,6 +133,7 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
       const resetCreditCoordinator = yield* CodexResetCreditCoordinator;
       const fileSystem = yield* FileSystem.FileSystem;
       const pathService = yield* Path.Path;
+      const skillMaterialization = yield* makeSkillMaterialization;
       const httpClient = yield* HttpClient.HttpClient;
       const serverSettings = yield* ServerSettingsService;
       const eventLoggers = yield* ProviderEventLoggers;
@@ -265,23 +269,22 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         processEnv,
         snapshot.getSnapshot.pipe(Effect.map((value) => value.models)),
       );
+      const probeSkillsForCwd = (cwd: string) =>
+        probeCodexSkillsForCwd({
+          binaryPath: effectiveConfig.binaryPath,
+          homePath: effectiveConfig.homePath,
+          launchArgs: resolveCodexLaunchArgs(effectiveConfig.launchArgs, processEnv),
+          cwd,
+          environment: processEnv,
+        }).pipe(
+          Effect.scoped,
+          Effect.timeout("20 seconds"),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        );
       const snapshotForCwd = (cwd: string) =>
         !effectiveConfig.enabled
           ? snapshot.getSnapshot
-          : Effect.all([
-              snapshot.getSnapshot,
-              probeCodexSkillsForCwd({
-                binaryPath: effectiveConfig.binaryPath,
-                homePath: effectiveConfig.homePath,
-                launchArgs: resolveCodexLaunchArgs(effectiveConfig.launchArgs, processEnv),
-                cwd,
-                environment: processEnv,
-              }).pipe(
-                Effect.scoped,
-                Effect.timeout("20 seconds"),
-                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-              ),
-            ]).pipe(
+          : Effect.all([snapshot.getSnapshot, probeSkillsForCwd(cwd)]).pipe(
               Effect.map(([machineSnapshot, skills]) => ({
                 ...machineSnapshot,
                 skills,
@@ -296,6 +299,24 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
                   }),
               ),
             );
+      const discoverNativeSkills = (cwd: string) =>
+        probeSkillsForCwd(cwd).pipe(
+          Effect.map((skills) => serverProviderSkillsToNativeCandidates(DRIVER_KIND, skills)),
+          Effect.mapError(
+            (cause) =>
+              new ProviderDriverError({
+                driver: DRIVER_KIND,
+                instanceId,
+                detail: `Failed to probe Codex skills for '${cwd}'`,
+                cause,
+              }),
+          ),
+        );
+      const skillAdapter = makeCodexSkillAdapter({
+        providerInstanceId: instanceId,
+        discoverCandidates: discoverNativeSkills,
+        materialization: skillMaterialization,
+      });
 
       // Redemption spends something on the user's account. It serialises on
       // the account (instances sharing a Codex home share the credit), keeps
@@ -368,6 +389,8 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         enabled,
         snapshot,
         snapshotForCwd,
+        discoverNativeSkills,
+        skillAdapter,
         consumeResetCredit,
         adapter,
         textGeneration,

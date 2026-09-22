@@ -8,6 +8,7 @@ import {
   ProjectMcpTransport,
   getProjectMcpTransport,
   ProviderInstanceId,
+  SkillApplicationDetail,
   type ChatAttachment,
   type OrchestrationEvent,
   type OrchestrationSessionStatus,
@@ -84,6 +85,7 @@ export const ORCHESTRATION_PROJECTOR_NAMES = {
   checkpoints: "projection.checkpoints",
   pendingApprovals: "projection.pending-approvals",
   mcpCatalog: "projection.mcp-catalog",
+  skillApplications: "projection.skill-applications",
 } as const;
 
 const encodeProviderInstanceIds = Schema.encodeSync(
@@ -94,6 +96,9 @@ const encodeMcpCatalogDefinitionArray = Schema.encodeSync(
   Schema.fromJsonString(Schema.Array(McpCatalogDefinition)),
 );
 const encodeMcpCatalogOverride = Schema.encodeSync(Schema.fromJsonString(McpCatalogOverride));
+const encodeSkillApplicationDetail = Schema.encodeSync(
+  Schema.fromJsonString(SkillApplicationDetail),
+);
 
 type ProjectorName =
   (typeof ORCHESTRATION_PROJECTOR_NAMES)[keyof typeof ORCHESTRATION_PROJECTOR_NAMES];
@@ -1011,6 +1016,34 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             return;
         }
       }).pipe(Effect.mapError(toPersistenceSqlError("ProjectionPipeline.mcpCatalog:query")));
+
+    const applySkillApplicationsProjection: ProjectorDefinition["apply"] = (event) =>
+      Effect.gen(function* () {
+        switch (event.type) {
+          case "thread.skill-application.desired":
+          case "thread.skill-application.received":
+            yield* sql`
+              INSERT INTO projection_skill_applications (
+                thread_id, provider_instance_id, application_json, updated_at
+              ) VALUES (
+                ${event.payload.threadId}, ${event.payload.application.providerInstanceId},
+                ${encodeSkillApplicationDetail(event.payload.application)}, ${event.occurredAt}
+              )
+              ON CONFLICT (thread_id, provider_instance_id) DO UPDATE SET
+                application_json = excluded.application_json,
+                updated_at = excluded.updated_at
+            `;
+            return;
+          case "thread.deleted":
+            yield* sql`
+              DELETE FROM projection_skill_applications
+              WHERE thread_id = ${event.payload.threadId}
+            `;
+            return;
+          default:
+            return;
+        }
+      }).pipe(Effect.mapError(toPersistenceSqlError("ProjectionPipeline.skillApplications:query")));
 
     const refreshThreadShellSummary = Effect.fn("refreshThreadShellSummary")(function* (
       threadId: ThreadId,
@@ -2601,6 +2634,10 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
       {
         name: ORCHESTRATION_PROJECTOR_NAMES.mcpCatalog,
         apply: applyMcpCatalogProjection,
+      },
+      {
+        name: ORCHESTRATION_PROJECTOR_NAMES.skillApplications,
+        apply: applySkillApplicationsProjection,
       },
       {
         name: ORCHESTRATION_PROJECTOR_NAMES.threadMessages,

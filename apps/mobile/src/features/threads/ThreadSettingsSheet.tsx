@@ -5,7 +5,10 @@ import type {
   ProviderOptionDescriptor,
   ProviderOptionSelection,
   RuntimeMode,
+  ThreadId,
 } from "@t3tools/contracts";
+import { useAtomValue } from "@effect/atom-react";
+import { SkillCatalogRevision } from "@t3tools/contracts";
 import type { LegendListRenderItemProps } from "@legendapp/list/react-native";
 import { AnimatedLegendList } from "@legendapp/list/reanimated";
 import { HeaderHeightContext } from "@react-navigation/elements";
@@ -50,7 +53,10 @@ import {
 } from "../../native/StackHeader";
 import { NATIVE_LIQUID_GLASS_SUPPORTED } from "../../native/native-glass";
 import { serverEnvironment } from "../../state/server";
+import { skillsEnvironment } from "../../state/skills";
+import { sessionSkillDeliveryLabel, sessionSkillEntries } from "@t3tools/client-runtime/skills";
 import { useAtomCommand } from "../../state/use-atom-command";
+import { useEnvironmentQuery } from "../../state/query";
 import { useNewTaskFlow } from "./new-task-flow-provider";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 import {
@@ -318,6 +324,7 @@ type ThreadSettingsSubmenuPage =
 
 type ThreadSettingsSessionProps = {
   readonly environmentId: EnvironmentId | null;
+  readonly threadId?: ThreadId;
   readonly providerInstanceId?: ProviderInstanceId;
   readonly providerGroups: ReadonlyArray<ProviderGroup>;
   readonly selectedModel: ModelSelection | null;
@@ -371,6 +378,7 @@ export function useExistingThreadSettingsRoutePresentation() {
 
 type ThreadSettingsSessionValue = {
   readonly environmentId: EnvironmentId | null;
+  readonly threadId?: ThreadId;
   readonly providerInstanceId?: ProviderInstanceId;
   readonly providerGroups: ReadonlyArray<ProviderGroup>;
   readonly runtimeMode: RuntimeMode;
@@ -499,6 +507,7 @@ function ThreadSettingsSessionProvider(
   const value = useMemo<ThreadSettingsSessionValue>(
     () => ({
       environmentId: props.environmentId,
+      threadId: props.threadId,
       providerInstanceId: props.providerInstanceId,
       providerGroups: props.providerGroups,
       runtimeMode: props.runtimeMode,
@@ -529,6 +538,7 @@ function ThreadSettingsSessionProvider(
       isApplied,
       isDisplayed,
       props.environmentId,
+      props.threadId,
       props.providerInstanceId,
       pendingModel,
       pressModel,
@@ -786,6 +796,97 @@ function ThreadSettingsOptionsItem(props: {
   );
 }
 
+function ThreadSessionSkillChanges(props: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly providerInstanceId: ProviderInstanceId;
+}) {
+  useAtomValue(
+    skillsEnvironment.changes({
+      environmentId: props.environmentId,
+      input: { threadId: props.threadId, providerInstanceId: props.providerInstanceId },
+    }),
+  );
+  return null;
+}
+
+function ThreadSessionSkills() {
+  const session = useThreadSettingsSession();
+  const catalog = useEnvironmentQuery(
+    session.environmentId && session.providerInstanceId && session.threadId
+      ? skillsEnvironment.catalog({
+          environmentId: session.environmentId,
+          input: {
+            threadId: session.threadId,
+            providerInstanceId: session.providerInstanceId,
+          },
+        })
+      : null,
+  );
+  const setEnabled = useAtomCommand(skillsEnvironment.sessionSetEnabled, {
+    reportFailure: true,
+  });
+  const reset = useAtomCommand(skillsEnvironment.sessionReset, { reportFailure: true });
+  const managed = sessionSkillEntries(catalog.data?.entries ?? []);
+  if (!session.environmentId || !session.providerInstanceId || !session.threadId) return null;
+  return (
+    <View className="pb-8 pt-5">
+      <ThreadSessionSkillChanges
+        environmentId={session.environmentId}
+        threadId={session.threadId}
+        providerInstanceId={session.providerInstanceId}
+      />
+      <Text className="px-5 pb-2 text-sm font-t3-medium text-foreground-muted">Session skills</Text>
+      <View className="mx-4 overflow-hidden rounded-2xl bg-card">
+        {managed.map((entry, index) => (
+          <SwitchRow
+            key={entry.id}
+            isLast={index === managed.length - 1}
+            label={`${entry.name} · ${sessionSkillDeliveryLabel(entry)}`}
+            value={entry.effective}
+            onValueChange={(enabled) =>
+              void setEnabled({
+                environmentId: session.environmentId!,
+                input: {
+                  threadId: session.threadId!,
+                  providerInstanceId: session.providerInstanceId!,
+                  expectedRevision: catalog.data?.catalogRevision ?? SkillCatalogRevision.make(0),
+                  key: entry.key,
+                  enabled,
+                },
+              }).then(catalog.refresh)
+            }
+          />
+        ))}
+        {managed.length === 0 ? (
+          <Text className="px-4 py-3 text-sm text-foreground-muted">
+            No managed skills are available for this thread.
+          </Text>
+        ) : null}
+      </View>
+      <Text className="px-5 pt-2 text-xs text-foreground-muted">
+        Changes take effect when the provider starts a new session.
+      </Text>
+      <Pressable
+        accessibilityRole="button"
+        className="mx-5 mt-3 self-start rounded-lg px-2 py-1"
+        onPress={() =>
+          void reset({
+            environmentId: session.environmentId!,
+            input: {
+              threadId: session.threadId!,
+              providerInstanceId: session.providerInstanceId!,
+              expectedRevision: catalog.data?.catalogRevision ?? SkillCatalogRevision.make(0),
+            },
+          }).then(catalog.refresh)
+        }
+      >
+        <Text className="text-sm text-accent">Follow project defaults</Text>
+      </Pressable>
+    </View>
+  );
+}
+
 /** One native scroll owner for the model catalog and its related settings. */
 function ThreadSettingsMainContent(props: {
   readonly onOpenSubmenu: (submenu: ThreadSettingsSubmenuPage) => void;
@@ -883,6 +984,7 @@ function ThreadSettingsMainContent(props: {
           ) : null}
         </>
       }
+      ListFooterComponent={<ThreadSessionSkills />}
       recycleItems
       onLoad={() => setAnimationsReady(true)}
       renderItem={renderCatalogItem}

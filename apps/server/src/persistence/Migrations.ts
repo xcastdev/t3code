@@ -75,6 +75,8 @@ import ForkMigration0005 from "./Migrations/fork/005_McpCatalogRevisions.ts";
 import ForkMigration0006 from "./Migrations/fork/006_McpCatalogAppliedCatalog.ts";
 import ForkMigration0007 from "./Migrations/fork/007_RepairMcpCatalogInitialization.ts";
 import ForkMigration0008 from "./Migrations/fork/008_RepairTextMcpCatalogInitialization.ts";
+import ForkMigration0009 from "./Migrations/fork/009_SkillApplications.ts";
+import ForkMigration0010 from "./Migrations/fork/010_SkillSessionOverlays.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -150,6 +152,8 @@ export const forkMigrationEntries = [
   [6, "McpCatalogAppliedCatalog", ForkMigration0006],
   [7, "RepairMcpCatalogInitialization", ForkMigration0007],
   [8, "RepairTextMcpCatalogInitialization", ForkMigration0008],
+  [9, "SkillApplications", ForkMigration0009],
+  [10, "SkillSessionOverlays", ForkMigration0010],
 ] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";

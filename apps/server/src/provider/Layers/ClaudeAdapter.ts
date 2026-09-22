@@ -92,6 +92,11 @@ import { projectMcpNativeKey } from "../Services/ProviderAdapter.ts";
 import { resolveClaudeSdkExecutablePath } from "../Drivers/ClaudeExecutable.ts";
 import { claudeSignedOutMessage, makeClaudeEnvironment } from "../Drivers/ClaudeHome.ts";
 import { planClaudeSkillDispatch } from "../Drivers/ClaudeSkillDispatch.ts";
+import {
+  buildClaudeManagedSkillSessionOptions,
+  isClaudeManagedSkillPlanPayload,
+  managedClaudeSkillInvocationNames,
+} from "../Drivers/ClaudeManagedSkills.ts";
 import { discoverClaudeSkills } from "../Drivers/ClaudeSkills.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
 import {
@@ -319,6 +324,8 @@ interface ClaudeSessionContext {
   readonly turnStartMessageIds: Array<string | null>;
   readonly promptQueue: Queue.Queue<PromptQueueItem>;
   readonly query: ClaudeQueryRuntime;
+  readonly managedSkillNames: ReadonlySet<string>;
+  readonly managedSkillInvocationNames: ReadonlyMap<string, string>;
   streamFiber: Fiber.Fiber<void, Error> | undefined;
   readonly startedAt: string;
   readonly basePermissionMode: PermissionMode | undefined;
@@ -1521,6 +1528,7 @@ const buildUserMessageEffect = Effect.fn("buildUserMessageEffect")(function* (
     readonly modelCatalog: ClaudeModelCatalog;
     /** Names of the skills Claude Code can run for this session's cwd. */
     readonly skillNames: ReadonlySet<string>;
+    readonly invocationNames?: ReadonlyMap<string, string>;
   },
 ) {
   const text = buildPromptText(input, dependencies.boundInstanceId, dependencies.modelCatalog);
@@ -1530,7 +1538,11 @@ const buildUserMessageEffect = Effect.fn("buildUserMessageEffect")(function* (
   // `/name` is its first character. A `$skill` chip anywhere in the prompt is
   // therefore split into [leading text, "/name trailing text"] so the CLI
   // runs it natively and the prose around it survives. See ClaudeSkillDispatch.
-  const dispatch = planClaudeSkillDispatch(text, dependencies.skillNames);
+  const dispatch = planClaudeSkillDispatch(
+    text,
+    dependencies.skillNames,
+    dependencies.invocationNames,
+  );
   if (dispatch?.leadingText !== undefined) {
     sdkContent.push({ type: "text", text: dispatch.leadingText });
   }
@@ -4721,6 +4733,16 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           ? { autoCompactWindow: Number(claudeSettings.autoCompactWindow) }
           : {}),
       };
+      const managedSkillPlan =
+        input.skillPlan !== undefined &&
+        input.skillPlan.providerInstanceId === boundInstanceId &&
+        isClaudeManagedSkillPlanPayload(input.skillPlan.payload)
+          ? input.skillPlan.payload
+          : undefined;
+      const managedSkillOptions =
+        managedSkillPlan === undefined
+          ? undefined
+          : buildClaudeManagedSkillSessionOptions(managedSkillPlan);
       const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
       const projectMcpServers = Object.fromEntries(
         (input.projectMcpServers ?? mcpSession?.projectServers ?? []).map((server) => [
@@ -4762,7 +4784,17 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(permissionMode === "bypassPermissions"
           ? { allowDangerouslySkipPermissions: true }
           : {}),
-        ...(Object.keys(settings).length > 0 ? { settings } : {}),
+        ...(Object.keys(settings).length > 0 || managedSkillOptions?.settings !== undefined
+          ? {
+              settings: {
+                ...settings,
+                ...managedSkillOptions?.settings,
+              },
+            }
+          : {}),
+        ...(managedSkillOptions?.plugins === undefined
+          ? {}
+          : { plugins: managedSkillOptions.plugins }),
         ...(existingResumeSessionId ? { resume: existingResumeSessionId } : {}),
         ...(newSessionId ? { sessionId: newSessionId } : {}),
         includePartialMessages: true,
@@ -4862,6 +4894,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           : Array.from({ length: resumeState?.turnCount ?? 0 }, () => null),
         promptQueue,
         query: queryRuntime,
+        managedSkillNames: new Set(managedSkillPlan?.skillKeys ?? []),
+        managedSkillInvocationNames: managedClaudeSkillInvocationNames(
+          managedSkillPlan?.skillKeys ?? [],
+        ),
         streamFiber: undefined,
         startedAt,
         basePermissionMode: permissionMode,
@@ -5090,11 +5126,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       attachmentsDir: serverConfig.attachmentsDir,
       boundInstanceId,
       modelCatalog,
-      skillNames: new Set(
-        skills
+      skillNames: new Set([
+        ...skills
           .filter((skill) => skill.enabled && skill.userInvocable !== false)
           .map((skill) => skill.name),
-      ),
+        ...context.managedSkillNames,
+      ]),
+      invocationNames: context.managedSkillInvocationNames,
     });
 
     if (steeringTurnState === null) context.turnStartMessageIds.push(turnId);

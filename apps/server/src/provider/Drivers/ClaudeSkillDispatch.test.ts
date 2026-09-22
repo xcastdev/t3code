@@ -2,7 +2,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import { planClaudeSkillDispatch } from "./ClaudeSkillDispatch.ts";
 
-const SKILLS = new Set(["2spec", "implement", "review", "re-release-version"]);
+const SKILLS = new Set(["2spec", "deploy", "implement", "review", "re-release-version"]);
 
 describe("planClaudeSkillDispatch", () => {
   it("leaves a prompt without a known skill untouched", () => {
@@ -40,6 +40,20 @@ describe("planClaudeSkillDispatch", () => {
       leadingText: "/review the diff, then",
       commandText: "/implement the fixes",
       skillName: "implement",
+    });
+  });
+
+  it("keeps a managed earlier mention qualified while dispatching the last mention", () => {
+    expect(
+      planClaudeSkillDispatch(
+        "$deploy then $review",
+        SKILLS,
+        new Map([["deploy", "t3-managed:deploy"]]),
+      ),
+    ).toEqual({
+      leadingText: "/t3-managed:deploy then",
+      commandText: "/review",
+      skillName: "review",
     });
   });
 

@@ -47,6 +47,8 @@ import {
   ThreadMcpCatalogDisposedPayload as ContractsThreadMcpCatalogDisposedPayloadSchema,
   ThreadMcpCatalogAppliedPayload as ContractsThreadMcpCatalogAppliedPayloadSchema,
   ThreadMcpCatalogApplyFailedPayload as ContractsThreadMcpCatalogApplyFailedPayloadSchema,
+  ThreadSkillApplicationDesiredPayload as ContractsThreadSkillApplicationDesiredPayloadSchema,
+  ThreadSkillApplicationReceivedPayload as ContractsThreadSkillApplicationReceivedPayloadSchema,
 } from "@t3tools/contracts";
 
 // Server-internal alias surface, backed by contract schemas as the source of truth.
@@ -107,3 +109,7 @@ export const ThreadMcpCatalogResetPayload = ContractsThreadMcpCatalogResetPayloa
 export const ThreadMcpCatalogDisposedPayload = ContractsThreadMcpCatalogDisposedPayloadSchema;
 export const ThreadMcpCatalogAppliedPayload = ContractsThreadMcpCatalogAppliedPayloadSchema;
 export const ThreadMcpCatalogApplyFailedPayload = ContractsThreadMcpCatalogApplyFailedPayloadSchema;
+export const ThreadSkillApplicationDesiredPayload =
+  ContractsThreadSkillApplicationDesiredPayloadSchema;
+export const ThreadSkillApplicationReceivedPayload =
+  ContractsThreadSkillApplicationReceivedPayloadSchema;

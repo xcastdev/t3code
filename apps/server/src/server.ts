@@ -86,6 +86,9 @@ import * as Keybindings from "./keybindings.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import { OrchestrationReactorRequiredLive } from "./orchestration/Layers/OrchestrationReactor.ts";
 import { McpCatalogReactorLive } from "./orchestration/Layers/McpCatalogReactor.ts";
+import { SkillApplicationReactorLive } from "./orchestration/Layers/SkillApplicationReactor.ts";
+import { SkillCatalogApplicationReactorLive } from "./orchestration/Layers/SkillCatalogApplicationReactor.ts";
+import { SkillApplicationExecutorLive } from "./skills/SkillApplicationExecutor.ts";
 import * as ExternalNotificationDispatcher from "./notifications/ExternalNotificationDispatcher.ts";
 import * as HomeAssistantWebhookAdapter from "./notifications/HomeAssistantWebhookAdapter.ts";
 import { RuntimeReceiptBusLive } from "./orchestration/Layers/RuntimeReceiptBus.ts";
@@ -99,6 +102,12 @@ import * as ThreadPullRequestReactor from "./orchestration/ThreadPullRequestReac
 import * as AgentAwarenessRelay from "./relay/AgentAwarenessRelay.ts";
 import { hasCloudPublicConfig } from "./cloud/publicConfig.ts";
 import { ProviderRegistryLive } from "./provider/Layers/ProviderRegistry.ts";
+import * as ManagedSkillRepository from "./skills/ManagedSkillRepository.ts";
+import * as NativeSkillObservationService from "./skills/NativeSkillObservationService.ts";
+import * as SkillCatalogIndex from "./skills/SkillCatalogIndex.ts";
+import * as SkillCatalogService from "./skills/SkillCatalogService.ts";
+import * as SkillMaterializationService from "./skills/SkillMaterializationService.ts";
+import * as SkillWatchService from "./skills/SkillWatchService.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as NativeAppIconResolver from "./assets/NativeAppIconResolver.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
@@ -254,11 +263,35 @@ const HttpServerLive = Layer.unwrap(
 
 const PlatformServicesLive = NodeServices.layer;
 
+const SkillCatalogIndexLayerLive = SkillCatalogIndex.layer.pipe(
+  Layer.provide(ManagedSkillRepository.layer),
+);
+const SkillWatchLayerLive = SkillWatchService.layer.pipe(
+  Layer.provideMerge(ManagedSkillRepository.layer),
+  Layer.provide(SkillCatalogIndexLayerLive),
+);
+const SkillCatalogLayerLive = SkillCatalogService.layer.pipe(
+  Layer.provideMerge(ManagedSkillRepository.layer),
+  Layer.provideMerge(NativeSkillObservationService.layer),
+  Layer.provideMerge(SkillCatalogIndexLayerLive),
+  Layer.provideMerge(SkillWatchLayerLive),
+  Layer.provide(ProviderInstanceRegistryHydrationLive),
+);
+
 // Keep the production dependency explicit: the composite cannot be built
 // without the catalog reactor. This layer is supplied by the catalog reactor
 // below, while the lightweight optional layer remains available to CLI tests.
+const SkillApplicationReactorLayerLive = SkillApplicationReactorLive.pipe(
+  Layer.provide(SkillApplicationExecutorLive),
+);
+const SkillCatalogApplicationReactorLayerLive = SkillCatalogApplicationReactorLive.pipe(
+  Layer.provide(SkillCatalogLayerLive),
+  Layer.provide(OrchestrationLayerLive),
+);
 const ProductionOrchestrationReactorLive = OrchestrationReactorRequiredLive.pipe(
-  Layer.provide(McpCatalogReactorLive),
+  Layer.provideMerge(McpCatalogReactorLive),
+  Layer.provideMerge(SkillApplicationReactorLayerLive),
+  Layer.provideMerge(SkillCatalogApplicationReactorLayerLive),
 );
 
 const ReactorLayerLive = Layer.empty.pipe(
@@ -267,6 +300,8 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ProviderCommandReactorLive),
   Layer.provideMerge(CheckpointReactorLive),
   Layer.provideMerge(ThreadDeletionReactorLive),
+  Layer.provideMerge(SkillApplicationReactorLayerLive),
+  Layer.provideMerge(SkillCatalogApplicationReactorLayerLive),
   Layer.provideMerge(ThreadSettlementReactor.layer),
   Layer.provideMerge(PullRequestSyncReactor.layer),
   Layer.provideMerge(ThreadPullRequestReactor.layer),
@@ -344,6 +379,8 @@ const ProviderLayerLive = ProviderServiceLive.pipe(
   Layer.provideMerge(ProviderSessionDirectoryLayerLive),
   Layer.provideMerge(ProjectMcpServiceLayerLive),
   Layer.provideMerge(McpCatalogGatewayLayerLive),
+  Layer.provideMerge(SkillCatalogLayerLive),
+  Layer.provideMerge(SkillApplicationReactorLayerLive),
   Layer.provide(OrchestrationLayerLive),
 );
 
@@ -583,6 +620,8 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // `providerInstances` hydration merges `settings.providers.<kind>`
   // with explicit `providerInstances` entries on boot.
   Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
+  Layer.provideMerge(SkillCatalogLayerLive),
+  Layer.provideMerge(SkillMaterializationService.layer),
 ).pipe(
   Layer.provideMerge(AntigravityInstallation.layer),
   // Shared native/canonical NDJSON writers used by both the per-instance

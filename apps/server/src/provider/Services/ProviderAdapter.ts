@@ -23,6 +23,7 @@ import type {
   TurnId,
 } from "@t3tools/contracts";
 import type { McpIssuedProjectServer } from "../../mcp/McpProviderSession.ts";
+import type { ProviderSkillPlan } from "../../skills/ProviderSkillAdapter.ts";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
@@ -33,6 +34,8 @@ export type ProviderSessionMcpCatalogMode = "live" | "restart-required" | "unsup
 export type ProviderAdapterSessionStartInput = ProviderSessionStartInput & {
   /** T3-issued proxy records only; upstream transport details stay server-side. */
   readonly projectMcpServers?: ReadonlyArray<McpIssuedProjectServer>;
+  /** Opaque to orchestration; only the selected provider may decode this session-local plan. */
+  readonly skillPlan?: ProviderSkillPlan;
 };
 
 const encodeProjectMcpId = (id: Pick<McpIssuedProjectServer, "id">["id"]): string =>

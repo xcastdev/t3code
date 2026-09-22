@@ -44,8 +44,8 @@ class GrokSkillsProbeError extends Schema.TaggedError<GrokSkillsProbeError>()(
 
 /**
  * Map `grok inspect --json` output onto provider skills. Entries without a
- * name or a filesystem path are skipped; `userInvocable: false` skills are
- * kept but disabled so pickers that filter on `enabled` hide them.
+ * name or a filesystem path are skipped. Provider enablement and user
+ * invocability remain separate so downstream projections can explain both.
  */
 function decodeGrokInspectSkills(stdout: string): ReadonlyArray<ServerProviderSkill> | undefined {
   let parsed: unknown;
@@ -62,7 +62,7 @@ function decodeGrokInspectSkills(stdout: string): ReadonlyArray<ServerProviderSk
     return undefined;
   }
 
-  const skillsByName = new Map<string, ServerProviderSkill>();
+  const skills: Array<ServerProviderSkill> = [];
   for (const entry of entries) {
     if (typeof entry !== "object" || entry === null) {
       continue;
@@ -79,16 +79,19 @@ function decodeGrokInspectSkills(stdout: string): ReadonlyArray<ServerProviderSk
     }
     const scope = typeof source?.type === "string" ? source.type.trim() : "";
     const description = typeof record.description === "string" ? record.description.trim() : "";
-    skillsByName.set(name, {
+    skills.push({
       name,
       path,
-      enabled: record.userInvocable !== false,
+      enabled: true,
       ...(scope ? { scope } : {}),
       ...(description ? { description } : {}),
+      ...(record.userInvocable === false ? { userInvocable: false } : {}),
     });
   }
 
-  return [...skillsByName.values()].sort((left, right) => left.name.localeCompare(right.name));
+  return skills.sort(
+    (left, right) => left.name.localeCompare(right.name) || left.path.localeCompare(right.path),
+  );
 }
 
 /**

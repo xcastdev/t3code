@@ -316,7 +316,7 @@ const cursorCliCommandMissingMessage = [
 ].join(" ");
 
 describe("Cursor skills", () => {
-  it("discovers recursive project skills with project precedence", async () =>
+  it("discovers recursive project skills and preserves same-name native identities", async () =>
     await runNode(
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
@@ -378,6 +378,13 @@ describe("Cursor skills", () => {
             name: "oversized",
             path: path.join(workspace, ".cursor", "skills", "oversized", "SKILL.md"),
             scope: "project",
+            enabled: true,
+          },
+          {
+            name: "review",
+            description: "user review",
+            path: path.join(userHome, ".cursor", "skills", "review", "SKILL.md"),
+            scope: "user",
             enabled: true,
           },
           {

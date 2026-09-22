@@ -75,7 +75,7 @@ describe("discoverGrokSkills", () => {
     ),
   );
 
-  it.effect("disables skills the CLI marks as not user-invocable", () =>
+  it.effect("keeps provider enablement separate from user invocability", () =>
     Effect.gen(function* () {
       const skills = yield* discoverGrokSkills({ binaryPath: "grok" }, {});
 
@@ -84,7 +84,8 @@ describe("discoverGrokSkills", () => {
           name: "internal-helper",
           path: "/opt/grok/bundled/skills/internal-helper/SKILL.md",
           scope: "bundled",
-          enabled: false,
+          enabled: true,
+          userInvocable: false,
         },
       ]);
     }).pipe(
@@ -99,6 +100,32 @@ describe("discoverGrokSkills", () => {
                 path: "/opt/grok/bundled/skills/internal-helper/SKILL.md",
               },
               userInvocable: false,
+            },
+          ]),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("preserves same-name skills from distinct native identities", () =>
+    Effect.gen(function* () {
+      const skills = yield* discoverGrokSkills({ binaryPath: "grok" }, {});
+      expect(skills.map((skill) => skill.path)).toEqual([
+        "/repo/.grok/skills/deploy/SKILL.md",
+        "/user/.grok/skills/deploy/SKILL.md",
+      ]);
+    }).pipe(
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        makeInspectSpawner(
+          inspectPayload([
+            {
+              name: "deploy",
+              source: { type: "user", path: "/user/.grok/skills/deploy/SKILL.md" },
+            },
+            {
+              name: "deploy",
+              source: { type: "project", path: "/repo/.grok/skills/deploy/SKILL.md" },
             },
           ]),
         ),

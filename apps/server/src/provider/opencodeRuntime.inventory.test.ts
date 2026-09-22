@@ -20,6 +20,27 @@ import { OpenCodeRuntime, OpenCodeRuntimeLive } from "./opencodeRuntime.ts";
 const testLayer = OpenCodeRuntimeLive.pipe(Layer.provideMerge(NodeServices.layer));
 
 it.layer(testLayer)("OpenCodeRuntime inventory", (it) => {
+  it.effect("native skills distinguish an empty catalog from an SDK error response", () =>
+    Effect.gen(function* () {
+      const runtime = yield* OpenCodeRuntime;
+      const clientFor = (status: number) =>
+        createOpencodeClient({
+          baseUrl: "http://opencode.test",
+          fetch: Object.assign(
+            () =>
+              Promise.resolve(
+                Response.json(status === 200 ? [] : { error: "unavailable" }, { status }),
+              ),
+            { preconnect: () => undefined },
+          ),
+        });
+      NodeAssert.deepStrictEqual(yield* runtime.loadOpenCodeSkills(clientFor(200)), []);
+      const error = yield* runtime.loadOpenCodeSkills(clientFor(503)).pipe(Effect.flip);
+      NodeAssert.equal(error._tag, "OpenCodeRuntimeError");
+      NodeAssert.equal(error.operation, "app.skills");
+    }),
+  );
+
   it.effect("aborts pending SDK requests when inventory loading is interrupted", () =>
     Effect.gen(function* () {
       const runtime = yield* OpenCodeRuntime;

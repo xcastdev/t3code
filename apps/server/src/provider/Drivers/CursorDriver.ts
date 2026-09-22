@@ -23,6 +23,8 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { serverProviderSkillsToNativeCandidates } from "../../skills/NativeSkillObservationService.ts";
+import { makeDiscoveryOnlySkillAdapter } from "../../skills/ProviderSkillAdapters.ts";
 import { makeCursorTextGeneration } from "../../textGeneration/CursorTextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeCursorAdapter } from "../Layers/CursorAdapter.ts";
@@ -188,6 +190,27 @@ export const CursorDriver: ProviderDriver<CursorSettings, CursorDriverEnv> = {
         ),
       );
 
+      const discoverNativeSkills = (cwd: string) =>
+        probeCursorSkills(cwd, processEnv).pipe(
+          Effect.map((skills) => serverProviderSkillsToNativeCandidates(DRIVER_KIND, skills)),
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+          Effect.mapError(
+            (cause) =>
+              new ProviderDriverError({
+                driver: DRIVER_KIND,
+                instanceId,
+                detail: `Failed to discover Cursor skills for '${cwd}'`,
+                cause,
+              }),
+          ),
+        );
+      const skillAdapter = makeDiscoveryOnlySkillAdapter({
+        providerInstanceId: instanceId,
+        driverKind: DRIVER_KIND,
+        discoverCandidates: discoverNativeSkills,
+      });
+
       return {
         instanceId,
         driverKind: DRIVER_KIND,
@@ -196,6 +219,8 @@ export const CursorDriver: ProviderDriver<CursorSettings, CursorDriverEnv> = {
         accentColor,
         enabled,
         snapshot,
+        discoverNativeSkills,
+        skillAdapter,
         snapshotForCwd: (cwd) =>
           !effectiveConfig.enabled
             ? snapshot.getSnapshot

@@ -10,6 +10,8 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { serverProviderSkillsToNativeCandidates } from "../../skills/NativeSkillObservationService.ts";
+import { makeDiscoveryOnlySkillAdapter } from "../../skills/ProviderSkillAdapters.ts";
 import { makeGrokTextGeneration } from "../../textGeneration/GrokTextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeGrokAdapter } from "../Layers/GrokAdapter.ts";
@@ -141,6 +143,25 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv> = {
                 ),
               ),
             ]).pipe(Effect.map(([machineSnapshot, skills]) => ({ ...machineSnapshot, skills })));
+      const discoverNativeSkills = (workspaceCwd: string) =>
+        discoverGrokSkills(effectiveConfig, processEnv, workspaceCwd).pipe(
+          Effect.map((skills) => serverProviderSkillsToNativeCandidates(DRIVER_KIND, skills)),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.mapError(
+            (cause) =>
+              new ProviderDriverError({
+                driver: DRIVER_KIND,
+                instanceId,
+                detail: `Failed to discover Grok skills for '${workspaceCwd}'`,
+                cause,
+              }),
+          ),
+        );
+      const skillAdapter = makeDiscoveryOnlySkillAdapter({
+        providerInstanceId: instanceId,
+        driverKind: DRIVER_KIND,
+        discoverCandidates: discoverNativeSkills,
+      });
 
       return {
         instanceId,
@@ -151,6 +172,8 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv> = {
         enabled,
         snapshot,
         snapshotForCwd,
+        discoverNativeSkills,
+        skillAdapter,
         adapter,
         textGeneration,
       } satisfies ProviderInstance;

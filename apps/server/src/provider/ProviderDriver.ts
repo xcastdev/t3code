@@ -33,6 +33,8 @@ import type * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
 import type * as TextGeneration from "../textGeneration/TextGeneration.ts";
+import type { NativeSkillCandidate } from "../skills/NativeSkillObservationService.ts";
+import type { ProviderSkillAdapter } from "../skills/ProviderSkillAdapter.ts";
 import type { ProviderAdapterError, ProviderDriverError } from "./Errors.ts";
 import type { ProviderAdapterShape } from "./Services/ProviderAdapter.ts";
 import type { ServerProviderShape } from "./Services/ServerProvider.ts";
@@ -73,6 +75,10 @@ export interface ProviderInstance {
   readonly enabled: boolean;
   readonly snapshot: ServerProviderShape;
   readonly snapshotForCwd?: (cwd: string) => Effect.Effect<ServerProvider, ProviderDriverError>;
+  readonly discoverNativeSkills?: (
+    cwd: string,
+  ) => Effect.Effect<ReadonlyArray<NativeSkillCandidate>, ProviderDriverError>;
+  readonly skillAdapter?: ProviderSkillAdapter;
   readonly refreshModels?: () => Effect.Effect<void, ProviderDriverError>;
   /**
    * Redeem one banked rate-limit reset credit on the signed-in account, then

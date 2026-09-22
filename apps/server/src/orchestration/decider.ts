@@ -1,5 +1,6 @@
 import {
   EventId,
+  SkillCatalogRevision,
   MAX_SCRIPT_ID_LENGTH,
   SCRIPT_RUN_COMMAND_PATTERN,
   MessageId,
@@ -1211,6 +1212,76 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
                   reason: command.reason,
                   failedAt: command.failedAt,
                 },
+      } as PlannedOrchestrationEvent;
+    }
+
+    case "thread.skill-application.desire":
+    case "thread.skill-application.receipt": {
+      yield* requireThread({ readModel, command, threadId: command.threadId });
+      let application = command.application;
+      if (application.threadId !== command.threadId) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Skill application thread does not match the command thread.",
+        });
+      }
+      const current = (readModel.skillApplications ?? []).find(
+        (entry) =>
+          entry.threadId === command.threadId &&
+          entry.providerInstanceId === application.providerInstanceId,
+      );
+      if (command.type === "thread.skill-application.desire") {
+        const expectedDesired = (current?.desiredRevision ?? 0) + 1;
+        const expectedApplied = current?.appliedRevision ?? 0;
+        if (
+          application.desiredRevision !== expectedDesired ||
+          application.appliedRevision !== expectedApplied ||
+          application.status === "applied"
+        ) {
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: "Skill desired state must advance once without changing applied state.",
+          });
+        }
+      } else if (
+        current === undefined ||
+        application.desiredRevision > current.desiredRevision ||
+        (application.status === "applied"
+          ? application.appliedRevision !== application.desiredRevision
+          : application.appliedRevision > current.appliedRevision)
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Skill application receipt does not match the current desired revision.",
+        });
+      }
+      if (command.type === "thread.skill-application.receipt" && current !== undefined) {
+        if (application.desiredRevision < current.desiredRevision) {
+          // A session can finish starting after a newer catalog edit. Preserve the
+          // newer desired state while recording what that running session received.
+          application = {
+            ...current,
+            appliedRevision: SkillCatalogRevision.make(
+              Math.max(current.appliedRevision, application.appliedRevision),
+            ),
+            ...(application.appliedAt === undefined ? {} : { appliedAt: application.appliedAt }),
+          };
+        } else if (application.appliedRevision < current.appliedRevision) {
+          application = current;
+        }
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.updatedAt,
+          commandId: command.commandId,
+        })),
+        type:
+          command.type === "thread.skill-application.desire"
+            ? "thread.skill-application.desired"
+            : "thread.skill-application.received",
+        payload: { threadId: command.threadId, application },
       } as PlannedOrchestrationEvent;
     }
 

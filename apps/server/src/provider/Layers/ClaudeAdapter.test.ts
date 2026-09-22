@@ -1109,6 +1109,51 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("applies a managed plugin plan and dispatches its qualified skill identity", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+        skillPlan: {
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+          desiredRevision: 1 as never,
+          applicationMode: "new_session_required",
+          skillKeys: ["deploy" as never],
+          payload: {
+            kind: "claude-managed-skills",
+            pluginPath: "/tmp/t3-runtime/session/claude/plugin",
+            collidingNativeKeys: ["deploy"],
+            skillKeys: ["deploy"],
+          },
+        },
+      });
+
+      const options = harness.getLastCreateQueryInput()?.options;
+      assert.deepEqual(options?.plugins, [
+        { type: "local", path: "/tmp/t3-runtime/session/claude/plugin" },
+      ]);
+      assert.deepInclude(options?.settings, { skillOverrides: { deploy: "off" } });
+
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "$deploy now",
+        attachments: [],
+      });
+      const promptMessage = yield* Effect.promise(() =>
+        readFirstPromptMessage(harness.getLastCreateQueryInput()),
+      );
+      assert.deepEqual(promptMessage?.message.content, [
+        { type: "text", text: "/t3-managed:deploy now" },
+      ]);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("keeps the skill command block after image attachments", () => {
     // A command block followed by an image is not expanded by the CLI; the
     // image must come first.

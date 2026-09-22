@@ -40,6 +40,7 @@ import {
   McpCatalogSnapshot,
   McpDefinitionId,
 } from "./mcpCatalog.ts";
+import { SkillApplicationDetail } from "./skills.ts";
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
@@ -862,6 +863,8 @@ export const OrchestrationReadModel = Schema.Struct({
       sessions: Schema.Array(McpCatalogSnapshot),
     }),
   ),
+  /** Compact desired/applied provider skill state; package bodies remain filesystem-owned. */
+  skillApplications: Schema.optional(Schema.Array(SkillApplicationDetail)),
   threads: Schema.Array(OrchestrationThread),
   updatedAt: IsoDateTime,
 });
@@ -1299,6 +1302,22 @@ const ThreadMcpCatalogApplyFailedCommand = Schema.Struct({
   revision: NonNegativeInt,
   reason: TrimmedNonEmptyString,
   failedAt: IsoDateTime,
+});
+
+const ThreadSkillApplicationDesireCommand = Schema.Struct({
+  type: Schema.Literal("thread.skill-application.desire"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  application: SkillApplicationDetail,
+  updatedAt: IsoDateTime,
+});
+
+const ThreadSkillApplicationReceiptCommand = Schema.Struct({
+  type: Schema.Literal("thread.skill-application.receipt"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  application: SkillApplicationDetail,
+  updatedAt: IsoDateTime,
 });
 
 const ThreadCreateCommand = Schema.Struct({
@@ -1826,6 +1845,8 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadMcpCatalogDisposeCommand,
   ThreadMcpCatalogAppliedCommand,
   ThreadMcpCatalogApplyFailedCommand,
+  ThreadSkillApplicationDesireCommand,
+  ThreadSkillApplicationReceiptCommand,
   ProjectMcpServerCreateCommand,
   ProjectMcpServerUpdateCommand,
   ProjectMcpServerRemoveCommand,
@@ -1898,6 +1919,8 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.mcp-catalog.disposed",
   "thread.mcp-catalog.applied",
   "thread.mcp-catalog.apply-failed",
+  "thread.skill-application.desired",
+  "thread.skill-application.received",
   "thread.proposed-plan-upserted",
   "thread.turn-diff-completed",
   "thread.activity-appended",
@@ -2057,6 +2080,16 @@ export const ThreadMcpCatalogApplyFailedPayload = Schema.Struct({
   revision: NonNegativeInt,
   reason: TrimmedNonEmptyString,
   failedAt: IsoDateTime,
+});
+
+export const ThreadSkillApplicationDesiredPayload = Schema.Struct({
+  threadId: ThreadId,
+  application: SkillApplicationDetail,
+});
+
+export const ThreadSkillApplicationReceivedPayload = Schema.Struct({
+  threadId: ThreadId,
+  application: SkillApplicationDetail,
 });
 
 export const ThreadCreatedPayload = Schema.Struct({
@@ -2564,6 +2597,16 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.mcp-catalog.apply-failed"),
     payload: ThreadMcpCatalogApplyFailedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.skill-application.desired"),
+    payload: ThreadSkillApplicationDesiredPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.skill-application.received"),
+    payload: ThreadSkillApplicationReceivedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,

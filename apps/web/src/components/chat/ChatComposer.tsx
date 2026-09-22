@@ -1,4 +1,5 @@
 import { DESKTOP_PASTE_AS_TEXT_EVENT } from "../../lib/desktopPasteAsText";
+import { useAtomValue } from "@effect/atom-react";
 import { runtimeModeConfig, runtimeModeOptions } from "./runtimeModeConfig";
 import { useSecondaryPaneStore } from "~/secondaryPaneStore";
 import { AttachmentFilePreview } from "../files/AttachmentFilePreview";
@@ -36,6 +37,7 @@ import type {
 import {
   ProviderDriverKind,
   ProviderInstanceId,
+  SkillCatalogRevision,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
@@ -922,10 +924,12 @@ function ComposerCommandMenuLayer(props: { anchor: HTMLElement | null; children:
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectValue } from "../ui/select";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { toastManager } from "../ui/toast";
 import {
   FileIcon,
   BotIcon,
+  BookOpenIcon,
   CircleAlertIcon,
   PaperclipIcon,
   PencilRulerIcon,
@@ -970,9 +974,115 @@ import { searchProviderSkills } from "../../providerSkillSearch";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { serverEnvironment } from "../../state/server";
+import { skillsEnvironment } from "../../state/skills";
+import { sessionSkillDeliveryLabel, sessionSkillEntries } from "@t3tools/client-runtime/skills";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
 
 const WORKSPACE_SNAPSHOT_RETRY_COOLDOWN_MS = 10_000;
+
+function SessionSkillsControl(props: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly providerInstanceId: ProviderInstanceId;
+}) {
+  useAtomValue(
+    skillsEnvironment.changes({
+      environmentId: props.environmentId,
+      input: { threadId: props.threadId, providerInstanceId: props.providerInstanceId },
+    }),
+  );
+  const catalog = useEnvironmentQuery(
+    skillsEnvironment.catalog({
+      environmentId: props.environmentId,
+      input: {
+        threadId: props.threadId,
+        providerInstanceId: props.providerInstanceId,
+      },
+    }),
+  );
+  const setEnabled = useAtomCommand(skillsEnvironment.sessionSetEnabled, {
+    reportFailure: true,
+  });
+  const reset = useAtomCommand(skillsEnvironment.sessionReset, { reportFailure: true });
+  const managed = sessionSkillEntries(catalog.data?.entries ?? []);
+  return (
+    <Popover>
+      <PopoverTrigger
+        render={
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Session skills"
+            title="Session skills"
+          >
+            <BookOpenIcon />
+          </Button>
+        }
+      />
+      <PopoverPopup align="start" side="top" className="w-72">
+        <div className="grid gap-2">
+          <div>
+            <p className="text-sm font-medium">Skills for this session</p>
+            <p className="text-xs text-muted-foreground">
+              Changes apply when the provider starts a new session.
+            </p>
+          </div>
+          {managed.map((entry) => (
+            <button
+              key={entry.id}
+              type="button"
+              className="flex items-center justify-between gap-3 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent"
+              onClick={() =>
+                void setEnabled({
+                  environmentId: props.environmentId,
+                  input: {
+                    threadId: props.threadId,
+                    providerInstanceId: props.providerInstanceId,
+                    expectedRevision: catalog.data?.catalogRevision ?? SkillCatalogRevision.make(0),
+                    key: entry.key,
+                    enabled: !entry.effective,
+                  },
+                }).then(catalog.refresh)
+              }
+            >
+              <span className="grid min-w-0 gap-1">
+                <span className="truncate">{entry.name}</span>
+                <span className="text-xs text-muted-foreground">
+                  {sessionSkillDeliveryLabel(entry)}
+                </span>
+              </span>
+              <span className="text-xs text-muted-foreground">
+                {entry.effective ? "Enabled" : "Disabled"}
+              </span>
+            </button>
+          ))}
+          {managed.length === 0 ? (
+            <p className="py-2 text-xs text-muted-foreground">No managed skills are available.</p>
+          ) : null}
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            className="justify-self-start"
+            onClick={() =>
+              void reset({
+                environmentId: props.environmentId,
+                input: {
+                  threadId: props.threadId,
+                  providerInstanceId: props.providerInstanceId,
+                  expectedRevision: catalog.data?.catalogRevision ?? SkillCatalogRevision.make(0),
+                },
+              }).then(catalog.refresh)
+            }
+          >
+            Follow project defaults
+          </Button>
+        </div>
+      </PopoverPopup>
+    </Popover>
+  );
+}
 
 const extendReplacementRangeForTrailingSpace = (
   text: string,
@@ -4949,6 +5059,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         onInstanceModelChange={onProviderModelSelect}
         onOpenProviderSetup={onOpenProviderSetup}
       />
+
+      {activeThreadId && selectedProviderEntry ? (
+        <SessionSkillsControl
+          environmentId={environmentId}
+          threadId={activeThreadId}
+          providerInstanceId={selectedProviderEntry.instanceId}
+        />
+      ) : null}
 
       {composerControlsCompact ? (
         <CompactComposerControlsMenu

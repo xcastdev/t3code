@@ -27,6 +27,8 @@ import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { serverProviderSkillsToNativeCandidates } from "../../skills/NativeSkillObservationService.ts";
+import { makeDiscoveryOnlySkillAdapter } from "../../skills/ProviderSkillAdapters.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeOpenCodeAdapter } from "../Layers/OpenCodeAdapter.ts";
 import {
@@ -247,6 +249,35 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         ),
       );
 
+      const discoverNativeSkills = (cwd: string) =>
+        loadSkillsForCwd(cwd).pipe(
+          Effect.timeout("20 seconds"),
+          Effect.map(openCodeSkillsToServerProviderSkills),
+          Effect.map((skills) =>
+            serverProviderSkillsToNativeCandidates(DRIVER_KIND, skills).map((candidate) => ({
+              ...candidate,
+              contentAccess:
+                effectiveConfig.serverUrl.trim().length > 0
+                  ? ("external" as const)
+                  : ("local" as const),
+            })),
+          ),
+          Effect.mapError(
+            (cause) =>
+              new ProviderDriverError({
+                driver: DRIVER_KIND,
+                instanceId,
+                detail: `Failed to probe OpenCode skills for '${cwd}'`,
+                cause,
+              }),
+          ),
+        );
+      const skillAdapter = makeDiscoveryOnlySkillAdapter({
+        providerInstanceId: instanceId,
+        driverKind: DRIVER_KIND,
+        discoverCandidates: discoverNativeSkills,
+      });
+
       return {
         instanceId,
         driverKind: DRIVER_KIND,
@@ -255,6 +286,8 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         accentColor,
         enabled,
         snapshot,
+        discoverNativeSkills,
+        skillAdapter,
         snapshotForCwd: (cwd) =>
           !effectiveConfig.enabled
             ? snapshot.getSnapshot

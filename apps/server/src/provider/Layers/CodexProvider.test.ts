@@ -1,6 +1,73 @@
 import { assert, it } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import type * as CodexSchema from "effect-codex-app-server/schema";
 
-import { applyPreferredCodexDefaultModel, mapCodexModelCapabilities } from "./CodexProvider.ts";
+import {
+  applyPreferredCodexDefaultModel,
+  mapCodexModelCapabilities,
+  parseCodexSkillsListResponse,
+} from "./CodexProvider.ts";
+
+it.effect(
+  "native skills distinguish valid empty discovery from missing, ambiguous, and failed cwd results",
+  () =>
+    Effect.gen(function* () {
+      const empty = { cwd: "/project", skills: [], errors: [] };
+      assert.deepStrictEqual(
+        yield* parseCodexSkillsListResponse({ data: [empty] }, "/project"),
+        [],
+      );
+      const invalid: CodexSchema.V2SkillsListResponse[] = [
+        { data: [] },
+        { data: [{ ...empty, cwd: "/other" }] },
+        { data: [empty, empty] },
+        {
+          data: [
+            { ...empty, errors: [{ path: "/project/broken/SKILL.md", message: "Invalid YAML" }] },
+          ],
+        },
+      ];
+      for (const response of invalid) {
+        const error = yield* parseCodexSkillsListResponse(response, "/project").pipe(Effect.flip);
+        assert.equal(error._tag, "CodexAppServerRequestError");
+      }
+    }),
+);
+
+it.effect("native discovery preserves colliding identities and ignores other cwd failures", () =>
+  Effect.gen(function* () {
+    const skills = [
+      {
+        name: "deploy",
+        path: "/user/deploy/SKILL.md",
+        enabled: false,
+        scope: "user" as const,
+        description: "User deploy",
+      },
+      {
+        name: "deploy",
+        path: "/project/deploy/SKILL.md",
+        enabled: true,
+        scope: "repo" as const,
+        description: "Project deploy",
+      },
+    ];
+    const parsed = yield* parseCodexSkillsListResponse(
+      {
+        data: [
+          {
+            cwd: "/other",
+            skills: [],
+            errors: [{ path: "/other/broken/SKILL.md", message: "Invalid YAML" }],
+          },
+          { cwd: "/project", skills, errors: [] },
+        ],
+      },
+      "/project",
+    );
+    assert.deepStrictEqual(parsed, skills);
+  }),
+);
 
 it("maps current Codex model capability fields", () => {
   const capabilities = mapCodexModelCapabilities({

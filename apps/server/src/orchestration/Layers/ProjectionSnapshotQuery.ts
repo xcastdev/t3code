@@ -27,6 +27,7 @@ import {
   McpDefinitionId,
   ProjectMcpUrl,
   ProviderInstanceId,
+  SkillApplicationDetail,
   TurnId,
   type OrchestrationCheckpointSummary,
   type OrchestrationLatestTurn,
@@ -327,6 +328,9 @@ const ProjectionMcpCatalogSessionDbRowSchema = Schema.Struct({
   applicationFailedAt: Schema.NullOr(IsoDateTime),
   disposedAt: Schema.NullOr(IsoDateTime),
 });
+const ProjectionSkillApplicationDbRowSchema = Schema.Struct({
+  application: Schema.fromJsonString(SkillApplicationDetail),
+});
 const ProjectionThreadIdLookupRowSchema = Schema.Struct({
   threadId: ThreadId,
 });
@@ -380,6 +384,7 @@ const REQUIRED_SNAPSHOT_PROJECTORS = [
   ORCHESTRATION_PROJECTOR_NAMES.threadActivities,
   ORCHESTRATION_PROJECTOR_NAMES.threadSessions,
   ORCHESTRATION_PROJECTOR_NAMES.checkpoints,
+  ORCHESTRATION_PROJECTOR_NAMES.skillApplications,
 ] as const;
 
 function maxIso(left: string | null, right: string): string {
@@ -1070,6 +1075,17 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           revision
         FROM projection_mcp_catalog_revisions
         ORDER BY scope_type ASC, scope_id ASC
+      `,
+  });
+
+  const listSkillApplicationRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionSkillApplicationDbRowSchema,
+    execute: () =>
+      sql`
+        SELECT application_json AS "application"
+        FROM projection_skill_applications
+        ORDER BY thread_id ASC, provider_instance_id ASC
       `,
   });
 
@@ -2415,6 +2431,14 @@ pending_approval_requests AS (
               ),
             ),
           ),
+          listSkillApplicationRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getSnapshot:listSkillApplications:query",
+                "ProjectionSnapshotQuery.getSnapshot:listSkillApplications:decodeRows",
+              ),
+            ),
+          ),
           listProjectionStateRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
@@ -2438,6 +2462,7 @@ pending_approval_requests AS (
             checkpointRows,
             latestTurnRows,
             turnRows,
+            skillApplicationRows,
             stateRows,
           ]) =>
             Effect.gen(function* () {
@@ -2649,6 +2674,7 @@ pending_approval_requests AS (
                 snapshotSequence: computeSnapshotSequence(stateRows),
                 projects,
                 threads,
+                skillApplications: skillApplicationRows.map((row) => row.application),
                 updatedAt: updatedAt ?? "1970-01-01T00:00:00.000Z",
               };
 
@@ -2760,6 +2786,14 @@ pending_approval_requests AS (
               ),
             ),
           ),
+          listSkillApplicationRows(undefined).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getCommandReadModel:listSkillApplications:query",
+                "ProjectionSnapshotQuery.getCommandReadModel:listSkillApplications:decodeRows",
+              ),
+            ),
+          ),
           listProjectionStateRows(undefined).pipe(
             Effect.mapError(
               toPersistenceSqlOrDecodeError(
@@ -2784,6 +2818,7 @@ pending_approval_requests AS (
             pullRequestRows,
             sessionRows,
             latestTurnRows,
+            skillApplicationRows,
             stateRows,
           ]) =>
             Effect.gen(function* () {
@@ -3064,6 +3099,7 @@ pending_approval_requests AS (
                       },
                     }),
                 threads,
+                skillApplications: skillApplicationRows.map((row) => row.application),
                 updatedAt: updatedAt ?? "1970-01-01T00:00:00.000Z",
               } satisfies OrchestrationReadModel;
             }),

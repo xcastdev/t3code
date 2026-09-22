@@ -62,6 +62,7 @@ import {
   type ProjectMcpTransport,
   type ProjectMcpTransportDraft,
   ProviderInstanceId,
+  SkillRpcError,
   ProjectMcpCreateError,
   ProjectMcpCatalogCommittedCleanupPendingError,
   type ProjectMcpMutationError,
@@ -138,6 +139,8 @@ import * as ProviderRegistry from "./provider/Services/ProviderRegistry.ts";
 import * as ProviderService from "./provider/Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "./provider/Services/ProviderSessionDirectory.ts";
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
+import * as SkillCatalogService from "./skills/SkillCatalogService.ts";
+import { resolveAuthoritativeSkillScope, skillChangeAffectsScope } from "./skills/SkillRpcScope.ts";
 import { ProviderAuthService } from "./provider/Services/ProviderAuthService.ts";
 import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
 import { makeProviderInstallation } from "./provider/providerInstallation.ts";
@@ -226,6 +229,7 @@ const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
   OrchestrationCommandPreviouslyRejectedError,
 );
 const isEnvironmentAuthorizationError = Schema.is(EnvironmentAuthorizationError);
+const isSkillRpcError = Schema.is(SkillRpcError);
 const isProjectMcpCreateError = Schema.is(ProjectMcpCreateError);
 const isProjectMcpUpdateError = Schema.is(ProjectMcpUpdateError);
 const isProjectMcpRemoveError = Schema.is(ProjectMcpRemoveError);
@@ -660,6 +664,7 @@ const makeWsRpcLayer = (
       const providerMaintenanceRunner = yield* ProviderMaintenanceRunner.ProviderMaintenanceRunner;
       const providerAuth = yield* ProviderAuthService;
       const providerInstances = yield* ProviderInstanceRegistry;
+      const skillCatalog = yield* SkillCatalogService.SkillCatalogService;
       const providerInstallation = yield* makeProviderInstallation();
       const serverUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
       const config = yield* ServerConfig.ServerConfig;
@@ -1925,6 +1930,22 @@ const makeWsRpcLayer = (
           Effect.orElseSucceed(() => ({ providers: [] }) as const),
         );
 
+      const resolveSkillContext = (input: {
+        readonly threadId?: ThreadId | undefined;
+        readonly projectId?: ProjectId | undefined;
+        readonly providerInstanceId?: ProviderInstanceId | undefined;
+      }) =>
+        resolveAuthoritativeSkillScope(projectionSnapshotQuery, input).pipe(
+          Effect.mapError((cause) =>
+            isSkillRpcError(cause)
+              ? cause
+              : new SkillRpcError({
+                  code: "scope_resolution_failed",
+                  message: "The authoritative skill scope could not be resolved.",
+                }),
+          ),
+        );
+
       const requireOwnedProject = (method: string, projectId: ProjectId) =>
         projectionSnapshotQuery.getProjectShellById(projectId).pipe(
           Effect.orDie,
@@ -2803,6 +2824,224 @@ const makeWsRpcLayer = (
         [WS_METHODS.serverGetProviderCatalog]: (input) =>
           observeRpcEffect(WS_METHODS.serverGetProviderCatalog, loadServerProviderCatalog(input), {
             "rpc.aggregate": "server",
+          }),
+        [WS_METHODS.skillsCatalogList]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsCatalogList,
+            resolveSkillContext(input).pipe(
+              Effect.flatMap(skillCatalog.list),
+              Effect.flatMap((catalog) =>
+                input.providerInstanceId === undefined || input.threadId === undefined
+                  ? Effect.succeed(catalog)
+                  : projectionSnapshotQuery.getCommandReadModel().pipe(
+                      Effect.orDie,
+                      Effect.map((model) => {
+                        const application = (model.skillApplications ?? []).find(
+                          (candidate) =>
+                            candidate.providerInstanceId === input.providerInstanceId &&
+                            candidate.threadId === input.threadId,
+                        );
+                        if (application === undefined) return catalog;
+                        const summary = {
+                          desiredRevision: application.desiredRevision,
+                          appliedRevision: application.appliedRevision,
+                          status: application.status,
+                          ...(application.failure === undefined
+                            ? {}
+                            : { failure: application.failure }),
+                        };
+                        return {
+                          ...catalog,
+                          entries: catalog.entries.map((entry) =>
+                            entry.origin === "managed" ? { ...entry, application: summary } : entry,
+                          ),
+                        };
+                      }),
+                    ),
+              ),
+            ),
+            { "rpc.aggregate": "skills" },
+          ),
+        [WS_METHODS.skillsCatalogSubscribe]: (input) =>
+          observeRpcStreamEffect(
+            WS_METHODS.skillsCatalogSubscribe,
+            resolveSkillContext(input).pipe(
+              Effect.map((scope) =>
+                Stream.merge(
+                  skillCatalog.changes,
+                  orchestrationEngine.streamDomainEvents.pipe(
+                    Stream.filter(
+                      (event) =>
+                        event.type === "thread.skill-application.desired" ||
+                        event.type === "thread.skill-application.received",
+                    ),
+                    Stream.mapEffect((event) =>
+                      skillCatalog.currentRevision.pipe(
+                        Effect.map((catalogRevision) => ({
+                          scope: "session" as const,
+                          scopeId: event.payload.threadId,
+                          eventId: event.eventId,
+                          catalogRevision,
+                          changedKeys: event.payload.application.outcomes.map(
+                            (outcome) => outcome.key,
+                          ),
+                        })),
+                      ),
+                    ),
+                  ),
+                ).pipe(Stream.filter((change) => skillChangeAffectsScope(scope, change))),
+              ),
+            ),
+            { "rpc.aggregate": "skills" },
+          ),
+        [WS_METHODS.skillsContentGet]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsContentGet,
+            resolveSkillContext(input).pipe(
+              Effect.flatMap((context) => skillCatalog.content(input.skillId, context.projectRoot)),
+            ),
+            { "rpc.aggregate": "skills" },
+          ),
+        [WS_METHODS.skillsHistoryList]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsHistoryList, skillCatalog.history(input.skillId), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsNativeContentGet]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsNativeContentGet, skillCatalog.nativeContent(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsApplicationGet]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsApplicationGet,
+            projectionSnapshotQuery.getCommandReadModel().pipe(
+              Effect.orDie,
+              Effect.flatMap((model) => {
+                const application = (model.skillApplications ?? []).find(
+                  (candidate) =>
+                    candidate.providerInstanceId === input.providerInstanceId &&
+                    (input.threadId === undefined || candidate.threadId === input.threadId),
+                );
+                return application === undefined
+                  ? Effect.fail(
+                      new SkillRpcError({
+                        code: "application_not_found",
+                        message: "No managed skill application exists for this provider.",
+                      }),
+                    )
+                  : Effect.succeed(application);
+              }),
+            ),
+            { "rpc.aggregate": "skills" },
+          ),
+        [WS_METHODS.skillsGlobalCreate]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsGlobalCreate, skillCatalog.createGlobal(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsGlobalUpdate]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsGlobalUpdate, skillCatalog.updateGlobal(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsGlobalDelete]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsGlobalDelete, skillCatalog.deleteGlobal(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsGlobalRename]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsGlobalRename, skillCatalog.renameGlobal(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsGlobalRollback]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsGlobalRollback, skillCatalog.rollbackGlobal(input), {
+            "rpc.aggregate": "skills",
+          }),
+        [WS_METHODS.skillsProjectSetOverride]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsProjectSetOverride,
+            resolveSkillContext({ projectId: input.projectId }).pipe(
+              Effect.flatMap((context) =>
+                !("projectRoot" in context)
+                  ? Effect.fail(
+                      new SkillRpcError({
+                        code: "workspace_unavailable",
+                        message: "The project workspace is unavailable.",
+                      }),
+                    )
+                  : skillCatalog.setProjectOverride({ ...input, projectRoot: context.projectRoot }),
+              ),
+            ),
+            { "rpc.aggregate": "skills" },
+          ),
+        [WS_METHODS.skillsProjectSetDisabled]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsProjectSetDisabled,
+            resolveSkillContext({ projectId: input.projectId }).pipe(
+              Effect.flatMap((context) =>
+                !("projectRoot" in context)
+                  ? Effect.fail(
+                      new SkillRpcError({
+                        code: "workspace_unavailable",
+                        message: "The project workspace is unavailable.",
+                      }),
+                    )
+                  : skillCatalog.setProjectDisabled({ ...input, projectRoot: context.projectRoot }),
+              ),
+            ),
+            { "rpc.aggregate": "skills" },
+          ),
+        [WS_METHODS.skillsProjectDeleteState]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsProjectDeleteState,
+            resolveSkillContext({ projectId: input.projectId }).pipe(
+              Effect.flatMap((context) =>
+                !("projectRoot" in context)
+                  ? Effect.fail(
+                      new SkillRpcError({
+                        code: "workspace_unavailable",
+                        message: "The project workspace is unavailable.",
+                      }),
+                    )
+                  : skillCatalog.deleteProjectState({ ...input, projectRoot: context.projectRoot }),
+              ),
+            ),
+            { "rpc.aggregate": "skills" },
+          ),
+        [WS_METHODS.skillsProjectRename]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsProjectRename,
+            resolveSkillContext({ projectId: input.projectId }).pipe(
+              Effect.flatMap((context) =>
+                !("projectRoot" in context)
+                  ? Effect.fail(
+                      new SkillRpcError({
+                        code: "workspace_unavailable",
+                        message: "The project workspace is unavailable.",
+                      }),
+                    )
+                  : skillCatalog.renameProject({ ...input, projectRoot: context.projectRoot }),
+              ),
+            ),
+            { "rpc.aggregate": "skills" },
+          ),
+        [WS_METHODS.skillsSessionSetEnabled]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsSessionSetEnabled,
+            resolveSkillContext({
+              threadId: input.threadId,
+              providerInstanceId: input.providerInstanceId,
+            }).pipe(Effect.andThen(skillCatalog.setSessionEnabled(input))),
+            { "rpc.aggregate": "skills" },
+          ),
+        [WS_METHODS.skillsSessionReset]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsSessionReset,
+            resolveSkillContext({
+              threadId: input.threadId,
+              providerInstanceId: input.providerInstanceId,
+            }).pipe(Effect.andThen(skillCatalog.resetSession(input))),
+            { "rpc.aggregate": "skills" },
+          ),
+        [WS_METHODS.skillsNativeImport]: (input) =>
+          observeRpcEffect(WS_METHODS.skillsNativeImport, skillCatalog.importNative(input), {
+            "rpc.aggregate": "skills",
           }),
         [WS_METHODS.serverRefreshProviders]: (input) =>
           observeRpcEffect(

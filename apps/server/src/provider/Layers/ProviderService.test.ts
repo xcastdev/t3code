@@ -27,6 +27,10 @@ import {
   ProviderSessionStartInput,
   ThreadId,
   TurnId,
+  CommandId,
+  SkillCatalogRevision,
+  SkillRpcError,
+  type SkillApplicationDetail,
 } from "@t3tools/contracts";
 import {
   expandAssistantCitationsForProvider,
@@ -60,7 +64,10 @@ import {
   ProviderWorkspaceMissingError,
   type ProviderAdapterError,
 } from "../Errors.ts";
-import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+import type {
+  ProviderAdapterShape,
+  ProviderAdapterSessionStartInput,
+} from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
 import * as ProviderSessionDirectory from "../Services/ProviderSessionDirectory.ts";
@@ -78,6 +85,19 @@ import * as ServerSettings from "../../serverSettings.ts";
 import * as AnalyticsService from "../../telemetry/AnalyticsService.ts";
 import { makeAdapterRegistryMock } from "../testUtils/providerAdapterRegistryMock.ts";
 import * as ProjectionSnapshotQuery from "../../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { OrchestrationEngineLive } from "../../orchestration/Layers/OrchestrationEngine.ts";
+import { OrchestrationProjectionPipelineLive } from "../../orchestration/Layers/ProjectionPipeline.ts";
+import { OrchestrationProjectionSnapshotQueryLive } from "../../orchestration/Layers/ProjectionSnapshotQuery.ts";
+import { OrchestrationEngineService } from "../../orchestration/Services/OrchestrationEngine.ts";
+import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
+import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
+import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
+import * as ThreadBackgroundLiveness from "../../orchestration/ThreadBackgroundLiveness.ts";
+import * as ThreadPlanProgress from "../../orchestration/ThreadPlanProgress.ts";
+import {
+  SkillCatalogService,
+  type SkillCatalogServiceShape,
+} from "../../skills/SkillCatalogService.ts";
 
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const defaultServerSettingsLayer = ServerSettings.ServerSettingsService.layerTest();
@@ -143,7 +163,7 @@ function makeFakeCodexAdapter(
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
 
-  const startSession = vi.fn((input: ProviderSessionStartInput) =>
+  const startSession = vi.fn((input: ProviderAdapterSessionStartInput) =>
     Effect.sync(() => {
       const now = "2026-01-01T00:00:00.000Z";
       const session: ProviderSession = {
@@ -412,6 +432,242 @@ const hasMetricSnapshot = (
       snapshot.id === id &&
       Object.entries(attributes).every(([key, value]) => snapshot.attributes?.[key] === value),
   );
+
+function makeManagedSkillLifecycleFixture(databasePath?: string) {
+  const codex = makeFakeCodexAdapter();
+  const dispose = vi.fn(
+    (_input: Parameters<SkillCatalogServiceShape["disposeSession"]>[0]) => Effect.void,
+  );
+  const describe: SkillCatalogServiceShape["describeSession"] = (input) =>
+    Effect.succeed({
+      threadId: ThreadId.make(input.threadId),
+      providerInstanceId: input.providerInstanceId,
+      desiredRevision: input.desiredRevision,
+      appliedRevision: input.appliedRevision,
+      status: "pending_new_session",
+      outcomes: [],
+    });
+  const prepare = vi.fn(
+    (
+      input: Parameters<SkillCatalogServiceShape["prepareSession"]>[0],
+    ): ReturnType<SkillCatalogServiceShape["prepareSession"]> =>
+      describe(input).pipe(
+        Effect.map((application) => ({
+          application,
+          plan: {
+            providerInstanceId: input.providerInstanceId,
+            desiredRevision: input.desiredRevision,
+            applicationMode: "new_session_required",
+            skillKeys: [],
+            payload: { kind: "test-managed-skills" },
+          },
+        })),
+      ),
+  );
+  const unused = () => Effect.die("Unexpected catalog operation in provider lifecycle fixture");
+  const skills = SkillCatalogService.of({
+    currentRevision: Effect.succeed(SkillCatalogRevision.make(0)),
+    list: unused,
+    content: unused,
+    nativeContent: unused,
+    history: unused,
+    createGlobal: unused,
+    updateGlobal: unused,
+    deleteGlobal: unused,
+    renameGlobal: unused,
+    rollbackGlobal: unused,
+    importNative: unused,
+    setProjectOverride: unused,
+    setProjectDisabled: unused,
+    deleteProjectState: unused,
+    renameProject: unused,
+    setSessionEnabled: unused,
+    resetSession: unused,
+    describeSession: describe,
+    prepareSession: prepare,
+    disposeSession: dispose,
+    changes: Stream.empty,
+  });
+  const orchestration = Layer.mergeAll(
+    OrchestrationEngineLive.pipe(
+      Layer.provide(OrchestrationProjectionPipelineLive),
+      Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+    ),
+    OrchestrationProjectionSnapshotQueryLive,
+  ).pipe(
+    Layer.provide(ThreadBackgroundLiveness.layer),
+    Layer.provide(ThreadPlanProgress.layer),
+    Layer.provide(OrchestrationEventStoreLive),
+    Layer.provide(OrchestrationCommandReceiptRepositoryLive),
+    Layer.provide(RepositoryIdentityResolver.layer),
+  );
+  const provider = makeProviderServiceLive().pipe(
+    Layer.provide(
+      Layer.succeed(
+        ProviderAdapterRegistry.ProviderAdapterRegistry,
+        makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter }),
+      ),
+    ),
+    Layer.provide(ProviderSessionDirectoryLive.pipe(Layer.provide(ProviderSessionRuntime.layer))),
+    Layer.provide(Layer.succeed(SkillCatalogService, skills)),
+    Layer.provide(defaultServerSettingsLayer),
+    Layer.provide(AnalyticsService.layerTest),
+    Layer.provide(
+      Layer.succeed(
+        ProviderEventLoggers.ProviderEventLoggers,
+        ProviderEventLoggers.NoOpProviderEventLoggers,
+      ),
+    ),
+    Layer.provideMerge(orchestration),
+    Layer.provide(databasePath ? makeSqlitePersistenceLive(databasePath) : SqlitePersistenceMemory),
+    Layer.provide(serverConfigTestLayer),
+    Layer.provide(NodeServices.layer),
+  );
+  return { codex, dispose, prepare, layer: provider };
+}
+
+const createManagedSkillThread = Effect.gen(function* () {
+  const engine = yield* OrchestrationEngineService;
+  const threadId = asThreadId("managed-lifecycle-thread");
+  const projectId = ProjectId.make("managed-lifecycle-project");
+  const cwd = fixtureCwd("managed-lifecycle");
+  const createdAt = "2026-01-01T00:00:00.000Z";
+  yield* engine.dispatch({
+    type: "project.create",
+    commandId: CommandId.make("managed-project-create"),
+    projectId,
+    title: "Managed lifecycle",
+    workspaceRoot: cwd,
+    createdAt,
+  });
+  yield* engine.dispatch({
+    type: "thread.create",
+    commandId: CommandId.make("managed-thread-create"),
+    threadId,
+    projectId,
+    title: "Managed lifecycle",
+    modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    branch: null,
+    worktreePath: null,
+    createdAt,
+  });
+  return {
+    threadId,
+    cwd,
+    provider: CODEX_DRIVER,
+    providerInstanceId: codexInstanceId,
+    runtimeMode: "full-access" as const,
+  };
+});
+
+describe("ProviderService managed skill lifecycle", () => {
+  it.effect("reapplies the managed plan during lazy recovery after a server restart", () =>
+    Effect.gen(function* () {
+      const databasePath = NodePath.join(fixtureCwd("managed-restart"), "state.sqlite");
+      const first = makeManagedSkillLifecycleFixture(databasePath);
+      const input = yield* Effect.gen(function* () {
+        const input = yield* createManagedSkillThread;
+        const provider = yield* ProviderService.ProviderService;
+        yield* provider.startSession(input.threadId, input);
+        return input;
+      }).pipe(Effect.provide(first.layer));
+      const second = makeManagedSkillLifecycleFixture(databasePath);
+      yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        const query = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+        yield* provider.rollbackConversation({ threadId: input.threadId, numTurns: 1 });
+        const startup = second.codex.startSession.mock.calls[0]?.[0];
+        assert.equal(startup?.skillPlan?.desiredRevision, 2);
+        assert.isDefined(startup?.resumeCursor);
+        const application = (yield* query.getCommandReadModel()).skillApplications?.[0];
+        assert.equal(application?.desiredRevision, 2);
+        assert.equal(application?.appliedRevision, 2);
+        assert.equal(application?.status, "applied");
+      }).pipe(Effect.provide(second.layer));
+    }),
+  );
+
+  it.effect("delivers the plan, persists applied state, and disposes on stop", () => {
+    const fixture = makeManagedSkillLifecycleFixture();
+    return Effect.gen(function* () {
+      const input = yield* createManagedSkillThread;
+      const provider = yield* ProviderService.ProviderService;
+      const query = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+      yield* provider.startSession(input.threadId, input);
+      assert.equal(fixture.codex.startSession.mock.calls[0]?.[0].skillPlan?.desiredRevision, 1);
+      const application = (yield* query.getCommandReadModel()).skillApplications?.[0];
+      assert.equal(application?.status, "applied");
+      assert.equal(application?.appliedRevision, 1);
+      yield* provider.stopSession({ threadId: input.threadId });
+      assert.equal(fixture.dispose.mock.calls.length, 1);
+      assert.equal(fixture.dispose.mock.calls[0]?.[0].cwd, input.cwd);
+    }).pipe(Effect.provide(fixture.layer));
+  });
+
+  it.effect(
+    "retains last applied revision and records desired failure when preparation fails",
+    () => {
+      const fixture = makeManagedSkillLifecycleFixture();
+      return Effect.gen(function* () {
+        const input = yield* createManagedSkillThread;
+        const provider = yield* ProviderService.ProviderService;
+        const query = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+        yield* provider.startSession(input.threadId, input);
+        yield* provider.stopSession({ threadId: input.threadId });
+        fixture.dispose.mockClear();
+        fixture.prepare.mockImplementationOnce(() =>
+          Effect.fail(
+            new SkillRpcError({ code: "prepare_failed", message: "Fixture preparation failed" }),
+          ),
+        );
+        const failure = yield* provider.startSession(input.threadId, input).pipe(Effect.exit);
+        assert.isTrue(Exit.isFailure(failure));
+        const application = (yield* query.getCommandReadModel()).skillApplications?.[0];
+        assert.equal(application?.desiredRevision, 2);
+        assert.equal(application?.appliedRevision, 1);
+        assert.equal(application?.status, "failed");
+        assert.equal(fixture.codex.startSession.mock.calls.length, 1);
+        assert.equal(fixture.dispose.mock.calls.length, 1);
+      }).pipe(Effect.provide(fixture.layer));
+    },
+  );
+
+  it.effect("preserves a newer pending revision when an older startup completes", () => {
+    const fixture = makeManagedSkillLifecycleFixture();
+    return Effect.gen(function* () {
+      const input = yield* createManagedSkillThread;
+      const engine = yield* OrchestrationEngineService;
+      const query = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+      const provider = yield* ProviderService.ProviderService;
+      const originalStart = fixture.codex.startSession.getMockImplementation()!;
+      fixture.codex.startSession.mockImplementationOnce((startInput) =>
+        Effect.gen(function* () {
+          const current = (yield* query.getCommandReadModel()).skillApplications![0]!;
+          const next: SkillApplicationDetail = {
+            ...current,
+            desiredRevision: SkillCatalogRevision.make(2),
+            status: "pending_new_session",
+          };
+          yield* engine.dispatch({
+            type: "thread.skill-application.desire",
+            commandId: CommandId.make("managed-concurrent-edit"),
+            threadId: input.threadId,
+            application: next,
+            updatedAt: "2026-01-01T00:00:01.000Z",
+          });
+          return yield* originalStart(startInput);
+        }).pipe(Effect.orDie),
+      );
+      yield* provider.startSession(input.threadId, input);
+      const application = (yield* query.getCommandReadModel()).skillApplications?.[0];
+      assert.equal(application?.desiredRevision, 2);
+      assert.equal(application?.appliedRevision, 1);
+      assert.equal(application?.status, "pending_new_session");
+    }).pipe(Effect.provide(fixture.layer));
+  });
+});
 
 function makeProviderServiceLayer(
   input: {

@@ -71,6 +71,7 @@ import {
   type CodexSessionRuntimeOptions,
   type CodexSessionRuntimeShape,
 } from "./CodexSessionRuntime.ts";
+import { isCodexManagedSkillPlanPayload } from "./CodexManagedSkills.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import { resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
 import {
@@ -2321,6 +2322,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             ? { model: input.modelSelection.model }
             : {}),
           ...(serviceTier ? { serviceTier } : {}),
+          ...(input.skillPlan !== undefined &&
+          input.skillPlan.providerInstanceId === boundInstanceId &&
+          isCodexManagedSkillPlanPayload(input.skillPlan.payload)
+            ? { managedSkills: input.skillPlan.payload }
+            : {}),
           ...(projectMcpArgs.length > 0 || mcpSession
             ? {
                 environment: {

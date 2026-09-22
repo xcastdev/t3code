@@ -4,7 +4,11 @@ import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
-import { discoverAntigravitySkills, resolveAntigravityUserHome } from "./AntigravitySkills.ts";
+import {
+  discoverAntigravityNativeSkills,
+  discoverAntigravitySkills,
+  resolveAntigravityUserHome,
+} from "./AntigravitySkills.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 
 const writeSkill = Effect.fn("writeSkill")(function* (directory: string, contents: string) {
@@ -29,6 +33,31 @@ const makeWorkspace = Effect.fn("makeWorkspace")(function* () {
 });
 
 it.layer(NodeServices.layer)("discoverAntigravitySkills", (it) => {
+  it.effect("native observations retain collisions while the composer selects the first root", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const input = yield* makeWorkspace();
+      const expected = [];
+      for (const directory of [
+        path.join(input.userHome, ".gemini", "config", "skills"),
+        path.join(input.cwd, ".gemini", "skills"),
+        path.join(input.userHome, ".gemini", "antigravity-cli", "skills"),
+        path.join(input.cwd, ".agents", "skills"),
+        path.join(input.cwd, ".agent", "skills"),
+      ]) {
+        expected.push(
+          yield* writeSkill(path.join(directory, "review"), "---\nname: review\n---\n"),
+        );
+      }
+      const native = yield* discoverAntigravityNativeSkills(input);
+      assert.deepStrictEqual(
+        native.map((skill) => skill.path),
+        expected,
+      );
+      assert.deepStrictEqual(yield* discoverAntigravitySkills(input), [native[0]]);
+    }),
+  );
+
   it.effect("does not read user skills from a nested project or from ~/.agents", () =>
     Effect.gen(function* () {
       const path = yield* Path.Path;
