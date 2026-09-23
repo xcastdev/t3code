@@ -20,6 +20,11 @@ import type {
   AssistantCitation,
   ChatFileAttachment,
   EnvironmentId,
+  ManagedTextResourceCatalogListInput,
+  ManagedTextResourceCatalogListResult,
+  ManagedTextResourceId,
+  ManagedTextResourceKind,
+  ManagedTextResourceRevision,
   ModelSelection,
   ProjectId,
   PullRequestListInput,
@@ -50,6 +55,12 @@ import {
   wouldTextPasteExceedLimit,
 } from "@t3tools/client-runtime/text-paste";
 import {
+  insertManagedCommand,
+  insertManagedSnippet,
+  managedTextResourceMenuItemId,
+  parseManagedCommandInvocation,
+} from "@t3tools/client-runtime/managedTextResources";
+import {
   findRawNativeSkillMention,
   parseComposerHashQuery,
   serializeComposerFileLink,
@@ -78,9 +89,13 @@ import {
   collapseExpandedComposerCursor,
   composerSkillCatalogInput,
   composerSubmissionIntentForEnter,
-  detectComposerTrigger,
+  detectManagedCommandTrigger,
+  detectComposerTriggerWithManagedCommands,
   expandCollapsedComposerCursor,
   formatAssistantCitationForComposer,
+  managedCommandArgumentForSelection,
+  managedCommandNeedsExplicitSelection,
+  managedCommandSubmissionBlockReason,
   replaceTextRange,
 } from "../../composer-logic";
 import { DISCONNECTED_COMPOSER_PLACEHOLDER } from "../../composerPlaceholder";
@@ -938,6 +953,7 @@ import {
   BotIcon,
   BookOpenIcon,
   CircleAlertIcon,
+  FileTextIcon,
   PaperclipIcon,
   PencilRulerIcon,
   PlayIcon,
@@ -981,10 +997,34 @@ import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { serverEnvironment } from "../../state/server";
 import { skillsEnvironment } from "../../state/skills";
+import { managedTextResourcesEnvironment } from "../../state/managedTextResources";
+import { resolveManagedTextResourceState } from "../../features/managedTextResources/managedTextResources.logic";
 import { sessionSkillDeliveryLabel, sessionSkillEntries } from "@t3tools/client-runtime/skills";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
 
 const WORKSPACE_SNAPSHOT_RETRY_COOLDOWN_MS = 10_000;
+
+type PendingManagedTextResourceInsertion = {
+  readonly token: number;
+  readonly itemId: string;
+  readonly kind: ManagedTextResourceKind;
+  readonly id: ManagedTextResourceId;
+  readonly key: string;
+  readonly revision: ManagedTextResourceRevision;
+  readonly rangeStart: number;
+  readonly rangeEnd: number;
+  readonly expectedText: string;
+  readonly argument: string;
+  readonly catalogInput: ManagedTextResourceCatalogListInput;
+};
+
+type ExplicitComposerMenuChoice = {
+  readonly itemId: string;
+  readonly searchKey: string;
+  readonly prompt: string;
+  readonly rangeStart: number;
+  readonly rangeEnd: number;
+};
 
 function SessionSkillsControl(props: {
   readonly environmentId: EnvironmentId;
@@ -1091,6 +1131,191 @@ function SessionSkillsControl(props: {
           >
             Follow project defaults
           </Button>
+        </div>
+      </PopoverPopup>
+    </Popover>
+  );
+}
+
+function SessionManagedTextResourcesControl(props: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly catalogData: ManagedTextResourceCatalogListResult | null;
+  readonly catalogPending: boolean;
+  readonly catalogError: boolean;
+  readonly refresh: () => void;
+}) {
+  const setEnabled = useAtomCommand(managedTextResourcesEnvironment.threadSetEnabled, {
+    reportFailure: true,
+  });
+  const reset = useAtomCommand(managedTextResourcesEnvironment.threadReset, {
+    reportFailure: true,
+  });
+  const entries = props.catalogData?.entries ?? [];
+  const overlays = props.catalogData?.threadOverlays ?? [];
+  return (
+    <Popover>
+      <PopoverTrigger
+        render={
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Commands and snippets for this thread"
+            title="Commands and snippets for this thread"
+          >
+            <FileTextIcon />
+          </Button>
+        }
+      />
+      <PopoverPopup align="start" side="top" className="w-80">
+        <div className="grid gap-2">
+          <div>
+            <p className="text-sm font-medium">Commands and snippets for this thread</p>
+            <p className="text-xs text-muted-foreground">
+              Choose which project resources are available in this thread.
+            </p>
+          </div>
+          {props.catalogPending ? (
+            <p className="py-2 text-xs text-muted-foreground">Reading command catalog…</p>
+          ) : null}
+          {props.catalogError ? (
+            <p className="py-2 text-xs text-destructive">
+              Commands and snippets could not be read for this environment.
+            </p>
+          ) : null}
+          {entries.map((entry) => {
+            const overlay = overlays.find(
+              (candidate) => candidate.kind === entry.kind && candidate.key === entry.key,
+            );
+            const resourceState = resolveManagedTextResourceState(entry);
+            const unavailable = resourceState.unavailable;
+            const enabled = resourceState.effective && (overlay?.enabled ?? entry.effective);
+            const canToggle =
+              Boolean(entry.id) &&
+              entry.projectState !== "invalid" &&
+              entry.projectState !== "orphan" &&
+              entry.projectState !== "disabled" &&
+              (entry.environmentState !== "disabled" || entry.projectState === "override");
+            return (
+              <div key={`${entry.kind}:${entry.key}`} className="grid gap-1">
+                <button
+                  type="button"
+                  disabled={
+                    !canToggle || props.catalogPending || props.catalogError || !props.catalogData
+                  }
+                  className="flex min-h-10 items-center justify-between gap-3 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60"
+                  onClick={() => {
+                    const catalogRevision = props.catalogData?.catalogRevision;
+                    if (catalogRevision === undefined || !canToggle) return;
+                    void setEnabled({
+                      environmentId: props.environmentId,
+                      input: {
+                        threadId: props.threadId,
+                        kind: entry.kind,
+                        key: entry.key,
+                        expectedCatalogRevision: catalogRevision,
+                        enabled: !enabled,
+                      },
+                    }).then(props.refresh);
+                  }}
+                >
+                  <span className="grid min-w-0 gap-1">
+                    <span className="truncate font-medium">
+                      {entry.kind === "command" ? "/" : ":"}
+                      {entry.key}
+                      {entry.name && entry.name !== entry.key ? ` · ${entry.name}` : ""}
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      {entry.kind === "command" ? "Command" : "Snippet"} · {entry.scope}
+                      {entry.projectState !== "inherit" ? ` · ${entry.projectState}` : ""}
+                      {entry.environmentState === "disabled" ? " · environment disabled" : ""}
+                      {unavailable ? " · unavailable" : ""}
+                    </span>
+                  </span>
+                  <span className="shrink-0 text-xs text-muted-foreground">
+                    {unavailable ? "Unavailable" : enabled ? "Enabled" : "Disabled"}
+                  </span>
+                </button>
+                {overlay ? (
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="xs"
+                    className="justify-self-start"
+                    disabled={props.catalogPending || props.catalogError || !props.catalogData}
+                    onClick={() => {
+                      const catalogRevision = props.catalogData?.catalogRevision;
+                      if (catalogRevision === undefined) return;
+                      void reset({
+                        environmentId: props.environmentId,
+                        input: {
+                          threadId: props.threadId,
+                          kind: entry.kind,
+                          key: entry.key,
+                          expectedCatalogRevision: catalogRevision,
+                        },
+                      }).then(props.refresh);
+                    }}
+                  >
+                    Follow project state
+                  </Button>
+                ) : null}
+              </div>
+            );
+          })}
+          {overlays
+            .filter(
+              (overlay) =>
+                !entries.some((entry) => entry.kind === overlay.kind && entry.key === overlay.key),
+            )
+            .map((overlay) => (
+              <div key={`orphan:${overlay.kind}:${overlay.key}`} className="grid gap-1">
+                <div className="flex min-h-10 items-center justify-between gap-3 rounded-md px-2 py-1.5 text-sm">
+                  <span className="grid min-w-0 gap-1">
+                    <span className="truncate font-medium">
+                      {overlay.kind === "command" ? "/" : ":"}
+                      {overlay.key}
+                    </span>
+                    <span className="text-xs text-muted-foreground">
+                      {overlay.kind === "command" ? "Command" : "Snippet"} · Thread override ·
+                      {overlay.enabled ? "enabled" : "disabled"} · orphan · unavailable
+                    </span>
+                  </span>
+                  <span className="shrink-0 text-xs text-muted-foreground">Unavailable</span>
+                </div>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="xs"
+                  className="justify-self-start"
+                  disabled={props.catalogPending || props.catalogError || !props.catalogData}
+                  onClick={() => {
+                    const catalogRevision = props.catalogData?.catalogRevision;
+                    if (catalogRevision === undefined) return;
+                    void reset({
+                      environmentId: props.environmentId,
+                      input: {
+                        threadId: props.threadId,
+                        kind: overlay.kind,
+                        key: overlay.key,
+                        expectedCatalogRevision: catalogRevision,
+                      },
+                    }).then(props.refresh);
+                  }}
+                >
+                  Remove unavailable override
+                </Button>
+              </div>
+            ))}
+          {!props.catalogPending &&
+          !props.catalogError &&
+          entries.length === 0 &&
+          overlays.length === 0 ? (
+            <p className="py-2 text-xs text-muted-foreground">
+              No managed commands or snippets are available for this project.
+            </p>
+          ) : null}
         </div>
       </PopoverPopup>
     </Popover>
@@ -2029,6 +2254,45 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }),
     }),
   );
+  const managedTextResourceCatalogInput = useMemo<ManagedTextResourceCatalogListInput>(
+    () =>
+      sessionSkillThreadId
+        ? { threadId: sessionSkillThreadId }
+        : skillProjectId
+          ? { projectId: skillProjectId }
+          : {},
+    [sessionSkillThreadId, skillProjectId],
+  );
+  useAtomValue(
+    managedTextResourcesEnvironment.changes({
+      environmentId,
+      input: managedTextResourceCatalogInput,
+    }),
+  );
+  const managedTextResourceCatalog = useEnvironmentQuery(
+    managedTextResourcesEnvironment.catalog({
+      environmentId,
+      input: managedTextResourceCatalogInput,
+    }),
+  );
+  const effectiveManagedTextResources = useMemo(
+    () => managedTextResourceCatalog.data?.entries.filter((entry) => entry.effective) ?? [],
+    [managedTextResourceCatalog.data?.entries],
+  );
+  const effectiveManagedCommandKeys = useMemo(
+    () =>
+      new Set(
+        effectiveManagedTextResources
+          .filter((entry) => entry.kind === "command")
+          .map((entry) => entry.key),
+      ),
+    [effectiveManagedTextResources],
+  );
+  const detectCurrentComposerTrigger = useCallback(
+    (text: string, cursor: number) =>
+      detectComposerTriggerWithManagedCommands(text, cursor, effectiveManagedCommandKeys),
+    [effectiveManagedCommandKeys],
+  );
   const nativeProviderSkills = selectedProviderStatus
     ? resolveProviderSkillsForCwd(selectedProviderStatus, gitCwd)
     : [];
@@ -2051,6 +2315,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const selectedProviderSlashCommands = selectedProviderStatus
     ? resolveProviderSlashCommandsForCwd(selectedProviderStatus, gitCwd)
     : [];
+  const nativeProviderSlashCommands = useMemo(
+    () =>
+      getProviderSlashCommandsForSlashMenu(
+        selectedProviderSlashCommands,
+        selectedProviderSkills.filter((skill) => skill.enabled && skill.userInvocable !== false),
+      ),
+    [selectedProviderSkills, selectedProviderSlashCommands],
+  );
   const refreshProviders = useAtomCommand(serverEnvironment.refreshProviders, {
     reportFailure: false,
   });
@@ -2142,6 +2414,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     provider: selectedProviderStatus,
     interactionMode: requestedInteractionMode,
   });
+  const nativeSlashCommandKeys = useMemo(
+    () =>
+      new Set([
+        "model",
+        ...(planModeUiEnabled ? ["plan", "default"] : []),
+        ...nativeProviderSlashCommands.map((command) => command.name),
+      ]),
+    [nativeProviderSlashCommands, planModeUiEnabled],
+  );
   const selectedModelSelection = useMemo<ModelSelection>(
     () => createModelSelection(selectedInstanceId, selectedModel, selectedModelOptionsForDispatch),
     [selectedInstanceId, selectedModel, selectedModelOptionsForDispatch],
@@ -2197,9 +2478,37 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const [composerCursor, setComposerCursor] = useState(() =>
     collapseExpandedComposerCursor(prompt, prompt.length),
   );
-  const [composerTrigger, setComposerTrigger] = useState<ComposerTrigger | null>(() =>
-    detectComposerTrigger(prompt, prompt.length),
+  const [pendingManagedTextResourceInsertion, setPendingManagedTextResourceInsertion] =
+    useState<PendingManagedTextResourceInsertion | null>(null);
+  const explicitComposerMenuChoiceRef = useRef<ExplicitComposerMenuChoice | null>(null);
+  const managedInsertionTokenRef = useRef(0);
+  const handledManagedInsertionTokenRef = useRef<number | null>(null);
+  const resolvedManagedNativeCommandTextRef = useRef<string | null>(null);
+  const pendingManagedTextResourceContent = useEnvironmentQuery(
+    pendingManagedTextResourceInsertion
+      ? managedTextResourcesEnvironment.content({
+          environmentId,
+          input: {
+            ...pendingManagedTextResourceInsertion.catalogInput,
+            kind: pendingManagedTextResourceInsertion.kind,
+            id: pendingManagedTextResourceInsertion.id,
+            expectedRevision: pendingManagedTextResourceInsertion.revision,
+          },
+        })
+      : null,
   );
+  const [composerTrigger, setComposerTrigger] = useState<ComposerTrigger | null>(() =>
+    detectCurrentComposerTrigger(prompt, prompt.length),
+  );
+  useEffect(() => {
+    if (composerTrigger !== null) return;
+    const trigger = detectManagedCommandTrigger(
+      prompt,
+      expandCollapsedComposerCursor(prompt, composerCursor),
+      effectiveManagedCommandKeys,
+    );
+    if (trigger) setComposerTrigger(trigger);
+  }, [composerCursor, composerTrigger, effectiveManagedCommandKeys, prompt]);
   const [composerHighlightedItemId, setComposerHighlightedItemId] = useState<string | null>(null);
   // Active ArrowUp recall. Cleared on edit and on thread switch.
   const promptHistoryPositionRef = useRef<ComposerPromptHistoryPosition | null>(null);
@@ -2469,6 +2778,18 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }));
     }
     if (composerTrigger.kind === "slash-command") {
+      const managedCommandItems = effectiveManagedTextResources.flatMap((resource) => {
+        if (resource.kind !== "command" || !resource.id) return [];
+        return [
+          {
+            id: managedTextResourceMenuItemId("managed", `${resource.kind}:${resource.key}`),
+            type: "managed-command" as const,
+            resource: { ...resource, kind: "command" as const },
+            label: `/${resource.key}`,
+            description: resource.name ?? "T3 managed command",
+          },
+        ];
+      });
       const builtInSlashCommandItems = [
         {
           id: "slash:model",
@@ -2496,10 +2817,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             ] as const)
           : []),
       ] satisfies ReadonlyArray<Extract<ComposerCommandItem, { type: "slash-command" }>>;
-      const providerSlashCommandItems = getProviderSlashCommandsForSlashMenu(
-        selectedProviderSlashCommands,
-        selectedProviderSkills.filter((skill) => skill.enabled && skill.userInvocable !== false),
-      ).map((command) => ({
+      const providerSlashCommandItems = nativeProviderSlashCommands.map((command) => ({
         id: `provider-slash-command:${selectedProvider}:${command.name}`,
         type: "provider-slash-command" as const,
         provider: selectedProvider,
@@ -2511,11 +2829,54 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       const visibleProviderSlashCommandItems = providerSlashCommandItems.filter(
         (item) => item.command.name !== "compact" || compactSlashCommandAvailable,
       );
+      const invocationText = prompt.slice(composerTrigger.rangeStart, composerTrigger.rangeEnd);
+      const managedInvocation = parseManagedCommandInvocation(invocationText);
+      const hasArgumentSeparator = /^\/[a-z0-9]+(?:-[a-z0-9]+)*[ \t]+/u.test(invocationText);
+      if (managedInvocation && hasArgumentSeparator) {
+        const exactManagedItems = managedCommandItems.filter(
+          (item) => item.resource.key === managedInvocation.key,
+        );
+        const exactBuiltInItems = builtInSlashCommandItems.filter(
+          (item) => item.command === managedInvocation.key,
+        );
+        const exactProviderItems = visibleProviderSlashCommandItems.filter(
+          (item) => item.command.name === managedInvocation.key,
+        );
+        return searchSlashCommandItems(
+          slashCommandItemsForPromptPosition(
+            [...exactManagedItems, ...exactBuiltInItems, ...exactProviderItems],
+            composerTrigger.rangeStart === 0,
+          ),
+          managedInvocation.key,
+        );
+      }
       const slashCommandItems = slashCommandItemsForPromptPosition(
-        [...builtInSlashCommandItems, ...visibleProviderSlashCommandItems],
+        [...builtInSlashCommandItems, ...visibleProviderSlashCommandItems, ...managedCommandItems],
         composerTrigger.rangeStart === 0,
       );
       return searchSlashCommandItems(slashCommandItems, query);
+    }
+    if (composerTrigger.kind === "snippet") {
+      const query = composerTrigger.query.trim().toLowerCase();
+      return effectiveManagedTextResources.flatMap((resource) => {
+        if (resource.kind !== "snippet" || !resource.id) return [];
+        if (
+          query &&
+          !resource.key.includes(query) &&
+          !(resource.name?.toLowerCase().includes(query) ?? false)
+        ) {
+          return [];
+        }
+        return [
+          {
+            id: managedTextResourceMenuItemId("managed", `${resource.kind}:${resource.key}`),
+            type: "managed-snippet" as const,
+            resource: { ...resource, kind: "snippet" as const },
+            label: `:${resource.key}`,
+            description: resource.name ?? "T3 managed snippet",
+          },
+        ];
+      });
     }
     if (composerTrigger.kind === "skill") {
       return searchProviderSkills(selectedProviderSkills, composerTrigger.query).map((skill) => ({
@@ -2606,9 +2967,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     pullRequestProjectId,
     pullRequestRepository,
     pullRequestTriggerNumber,
+    effectiveManagedTextResources,
+    prompt,
     selectedProvider,
     selectedProviderSkills,
-    selectedProviderSlashCommands,
+    nativeProviderSlashCommands,
     selectedProviderStatus,
     workspaceEntries.entries,
   ]);
@@ -2682,6 +3045,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   const isComposerMenuLoading =
     (composerTriggerKind === "path" && pathTriggerQuery.length > 0 && workspaceEntries.isPending) ||
+    ((composerTriggerKind === "slash-command" || composerTriggerKind === "snippet") &&
+      managedTextResourceCatalog.isPending) ||
     (composerTriggerKind === "pull-request" &&
       pullRequestProjectId !== null &&
       pullRequestRepository !== null &&
@@ -2692,6 +3057,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         pullRequestTriggerNumber !== debouncedPullRequestNumber ||
         exactPullRequestLookup.isPending));
   const composerMenuEmptyState = useMemo(() => {
+    if (composerTriggerKind === "snippet") {
+      return managedTextResourceCatalog.error
+        ? "Managed snippets could not be read for this environment."
+        : "No matching snippets.";
+    }
     if (composerTriggerKind === "skill") {
       return "No skills found. Try / to browse provider commands.";
     }
@@ -2716,12 +3086,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           ? `No issue or pull request matches ${composerTrigger.query}.`
           : "No issues or pull requests found in this repository.";
     }
-    return composerTriggerKind === "path"
-      ? "No matching files or folders."
+    if (composerTriggerKind === "path") return "No matching files or folders.";
+    return managedTextResourceCatalog.error
+      ? "Managed commands could not be read for this environment."
       : "No matching command.";
   }, [
     composerTrigger,
     composerTriggerKind,
+    managedTextResourceCatalog.error,
     hashReferenceQuery.kind,
     issueLookup.error,
     pullRequestLookup.data?.errors,
@@ -2740,13 +3112,21 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         return;
       }
       promptRef.current = nextPrompt;
+      resolvedManagedNativeCommandTextRef.current = null;
+      explicitComposerMenuChoiceRef.current = null;
       setComposerDraftPrompt(composerDraftTarget, nextPrompt);
       const nextCursor = collapseExpandedComposerCursor(nextPrompt, nextPrompt.length);
       setComposerCursor(nextCursor);
-      setComposerTrigger(detectComposerTrigger(nextPrompt, nextPrompt.length));
+      setComposerTrigger(detectCurrentComposerTrigger(nextPrompt, nextPrompt.length));
       scheduleComposerFocus();
     },
-    [composerDraftTarget, promptRef, scheduleComposerFocus, setComposerDraftPrompt],
+    [
+      composerDraftTarget,
+      detectCurrentComposerTrigger,
+      promptRef,
+      scheduleComposerFocus,
+      setComposerDraftPrompt,
+    ],
   );
 
   const providerTraitsMenuContent = renderProviderTraitsMenuContent({
@@ -3267,7 +3647,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     const nextCursor = collapseExpandedComposerCursor(nextCustomAnswer, nextCustomAnswer.length);
     setComposerCursor(nextCursor);
     setComposerTrigger(
-      detectComposerTrigger(
+      detectCurrentComposerTrigger(
         nextCustomAnswer,
         expandCollapsedComposerCursor(nextCustomAnswer, nextCursor),
       ),
@@ -3277,6 +3657,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     activePendingProgress?.customAnswer,
     activePendingProgress?.activeQuestion?.id,
     activePendingUserInput?.requestId,
+    detectCurrentComposerTrigger,
     promptRef,
   ]);
 
@@ -3288,10 +3669,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     setComposerSubmissionError(null);
     setProviderInputSubmissionError(null);
     setComposerCursor(collapseExpandedComposerCursor(promptRef.current, promptRef.current.length));
-    setComposerTrigger(detectComposerTrigger(promptRef.current, promptRef.current.length));
+    setComposerTrigger(detectCurrentComposerTrigger(promptRef.current, promptRef.current.length));
     setIsDragOverComposer(false);
     setIsComposerScrollCollapsed(false);
-  }, [draftId, activeThreadId, promptRef, setIsComposerScrollCollapsed]);
+  }, [
+    draftId,
+    activeThreadId,
+    detectCurrentComposerTrigger,
+    promptRef,
+    setIsComposerScrollCollapsed,
+  ]);
 
   // ------------------------------------------------------------------
   // Footer compact layout observation
@@ -3468,11 +3855,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       contextIds: string[],
     ) => {
       expandComposerForEditorChange();
+      if (resolvedManagedNativeCommandTextRef.current !== nextPrompt) {
+        resolvedManagedNativeCommandTextRef.current = null;
+      }
+      explicitComposerMenuChoiceRef.current = null;
       if (activePendingProgress?.activeQuestion && pendingUserInputs.length > 0) {
         if (activePendingProgress.activeQuestion.allowCustomAnswer === false) return;
         setComposerCursor(nextCursor);
         setComposerTrigger(
-          cursorAdjacentToMention ? null : detectComposerTrigger(nextPrompt, expandedCursor),
+          cursorAdjacentToMention ? null : detectCurrentComposerTrigger(nextPrompt, expandedCursor),
         );
         onChangeActivePendingUserInputCustomAnswer(
           activePendingProgress.activeQuestion.id,
@@ -3564,12 +3955,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       }
       setComposerCursor(nextCursor);
       setComposerTrigger(
-        cursorAdjacentToMention ? null : detectComposerTrigger(nextPrompt, expandedCursor),
+        cursorAdjacentToMention ? null : detectCurrentComposerTrigger(nextPrompt, expandedCursor),
       );
     },
     [
       activePendingProgress?.activeQuestion,
       expandComposerForEditorChange,
+      detectCurrentComposerTrigger,
       pendingUserInputs.length,
       onChangeActivePendingUserInputCustomAnswer,
       promptRef,
@@ -3633,6 +4025,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         });
       }
       promptRef.current = next.text;
+      if (resolvedManagedNativeCommandTextRef.current !== next.text) {
+        resolvedManagedNativeCommandTextRef.current = null;
+      }
+      explicitComposerMenuChoiceRef.current = null;
       const activePendingQuestion = activePendingProgress?.activeQuestion;
       if (activePendingQuestion && activePendingUserInput) {
         onChangeActivePendingUserInputCustomAnswer(
@@ -3646,7 +4042,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         setPrompt(next.text);
       }
       setComposerCursor(nextCursor);
-      setComposerTrigger(detectComposerTrigger(next.text, nextExpandedCursor));
+      setComposerTrigger(detectCurrentComposerTrigger(next.text, nextExpandedCursor));
       if (options?.focusEditorAfterReplace !== false) {
         window.requestAnimationFrame(() => {
           // Type-to-focus routes only the first key through here; once the
@@ -3662,11 +4058,86 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [
       activePendingProgress?.activeQuestion,
       activePendingUserInput,
+      detectCurrentComposerTrigger,
       onChangeActivePendingUserInputCustomAnswer,
       promptRef,
       setPrompt,
     ],
   );
+
+  useEffect(() => {
+    const selection = pendingManagedTextResourceInsertion;
+    if (!selection || handledManagedInsertionTokenRef.current === selection.token) return;
+    const rejectSelection = (description: string) => {
+      handledManagedInsertionTokenRef.current = selection.token;
+      setPendingManagedTextResourceInsertion(null);
+      toastManager.add({
+        type: "error",
+        title: "Select this command or snippet again.",
+        description,
+      });
+    };
+    if (pendingManagedTextResourceContent.error) {
+      rejectSelection(pendingManagedTextResourceContent.error);
+      return;
+    }
+    const content = pendingManagedTextResourceContent.data;
+    if (!content) return;
+    const currentSummary = managedTextResourceCatalog.data?.entries.find(
+      (entry) =>
+        entry.id === selection.id &&
+        entry.kind === selection.kind &&
+        entry.key === selection.key &&
+        entry.revision === selection.revision &&
+        entry.effective,
+    );
+    if (
+      !currentSummary ||
+      content.id !== selection.id ||
+      content.kind !== selection.kind ||
+      content.revision !== selection.revision
+    ) {
+      rejectSelection("Its definition or thread state changed before the text was loaded.");
+      return;
+    }
+    const insertion =
+      selection.kind === "command"
+        ? insertManagedCommand(
+            promptRef.current,
+            selection.rangeStart,
+            selection.rangeEnd,
+            content.body,
+            selection.argument,
+          )
+        : insertManagedSnippet(
+            promptRef.current,
+            selection.rangeStart,
+            selection.rangeEnd,
+            content.body,
+          );
+    const replacement = insertion.text.slice(selection.rangeStart, insertion.cursor);
+    handledManagedInsertionTokenRef.current = selection.token;
+    setPendingManagedTextResourceInsertion(null);
+    const applied = applyPromptReplacement(selection.rangeStart, selection.rangeEnd, replacement, {
+      expectedText: selection.expectedText,
+    });
+    if (!applied) {
+      toastManager.add({
+        type: "info",
+        title: "The draft changed while this text was loading.",
+        description: "Select the command or snippet again to insert it at the current caret.",
+      });
+      return;
+    }
+    setComposerHighlightedItemId(null);
+  }, [
+    applyPromptReplacement,
+    managedTextResourceCatalog.data,
+    pendingManagedTextResourceContent.data,
+    pendingManagedTextResourceContent.error,
+    pendingManagedTextResourceInsertion,
+    promptRef,
+  ]);
 
   const readComposerSnapshot = useCallback((): {
     value: string;
@@ -3693,9 +4164,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     const snapshot = readComposerSnapshot();
     return {
       snapshot,
-      trigger: detectComposerTrigger(snapshot.value, snapshot.expandedCursor),
+      trigger: detectCurrentComposerTrigger(snapshot.value, snapshot.expandedCursor),
     };
-  }, [readComposerSnapshot]);
+  }, [detectCurrentComposerTrigger, readComposerSnapshot]);
 
   const { onUsageLimitsCommand } = props;
   const onSelectComposerItem = useCallback(
@@ -3723,6 +4194,46 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         if (applied) {
           setComposerHighlightedItemId(null);
         }
+        return;
+      }
+      if (item.type === "managed-command" || item.type === "managed-snippet") {
+        if (
+          !item.resource.id ||
+          !composerMenuItemsRef.current.some((candidate) => candidate.id === item.id)
+        ) {
+          return;
+        }
+        const currentSummary = managedTextResourceCatalog.data?.entries.find(
+          (entry) =>
+            entry.id === item.resource.id &&
+            entry.kind === item.resource.kind &&
+            entry.key === item.resource.key &&
+            entry.revision === item.resource.revision &&
+            entry.effective,
+        );
+        if (!currentSummary) return;
+        const invocationText = snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd);
+        const argument =
+          item.type === "managed-command"
+            ? managedCommandArgumentForSelection(invocationText, item.resource.key)
+            : "";
+        const token = ++managedInsertionTokenRef.current;
+        setPendingManagedTextResourceInsertion({
+          token,
+          itemId: item.id,
+          kind: item.resource.kind,
+          id: item.resource.id,
+          key: item.resource.key,
+          revision: item.resource.revision,
+          rangeStart: trigger.rangeStart,
+          rangeEnd: trigger.rangeEnd,
+          expectedText: invocationText,
+          argument,
+          catalogInput: managedTextResourceCatalogInput,
+        });
+        setComposerTrigger(null);
+        setComposerHighlightedItemId(null);
+        explicitComposerMenuChoiceRef.current = null;
         return;
       }
       if (item.type === "slash-command") {
@@ -3759,7 +4270,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           }
           return;
         }
-        const replacement = `/${item.command.name} `;
+        const invocationText = snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd);
+        const invocation = parseManagedCommandInvocation(invocationText);
+        const exactInvocation = invocation?.key === item.command.name ? invocation : null;
+        const hasArgumentSeparator =
+          exactInvocation !== null && /^\/[a-z0-9]+(?:-[a-z0-9]+)*[ \t]+/u.test(invocationText);
+        const replacement = hasArgumentSeparator
+          ? `/${item.command.name}${exactInvocation?.argument ? ` ${exactInvocation.argument}` : " "}`
+          : `/${item.command.name} `;
         const replacementRangeEnd = extendReplacementRangeForTrailingSpace(
           snapshot.value,
           trigger.rangeEnd,
@@ -3773,6 +4291,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         );
         if (applied) {
           setComposerHighlightedItemId(null);
+          explicitComposerMenuChoiceRef.current = null;
+          resolvedManagedNativeCommandTextRef.current = promptRef.current;
+          setComposerTrigger(null);
         }
         return;
       }
@@ -3854,6 +4375,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       handleInteractionModeChange,
       planModeUiEnabled,
       onUsageLimitsCommand,
+      managedTextResourceCatalog.data?.entries,
+      managedTextResourceCatalogInput,
+      promptRef,
       resolveActiveComposerTrigger,
     ],
   );
@@ -3862,8 +4386,19 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     (itemId: string | null) => {
       setComposerHighlightedItemId(itemId);
       setComposerHighlightedSearchKey(composerMenuSearchKey);
+      const { snapshot, trigger } = resolveActiveComposerTrigger();
+      explicitComposerMenuChoiceRef.current =
+        itemId && composerMenuSearchKey && trigger
+          ? {
+              itemId,
+              searchKey: composerMenuSearchKey,
+              prompt: snapshot.value,
+              rangeStart: trigger.rangeStart,
+              rangeEnd: trigger.rangeEnd,
+            }
+          : null;
     },
-    [composerMenuSearchKey],
+    [composerMenuSearchKey, resolveActiveComposerTrigger],
   );
 
   const nudgeComposerMenuHighlight = useCallback(
@@ -3879,8 +4414,24 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         (normalizedIndex + offset + composerMenuItems.length) % composerMenuItems.length;
       const nextItem = composerMenuItems[nextIndex];
       setComposerHighlightedItemId(nextItem?.id ?? null);
+      const { snapshot, trigger } = resolveActiveComposerTrigger();
+      explicitComposerMenuChoiceRef.current =
+        nextItem && composerMenuSearchKey && trigger
+          ? {
+              itemId: nextItem.id,
+              searchKey: composerMenuSearchKey,
+              prompt: snapshot.value,
+              rangeStart: trigger.rangeStart,
+              rangeEnd: trigger.rangeEnd,
+            }
+          : null;
     },
-    [composerHighlightedItemId, composerMenuItems],
+    [
+      composerHighlightedItemId,
+      composerMenuItems,
+      composerMenuSearchKey,
+      resolveActiveComposerTrigger,
+    ],
   );
 
   const blurMobileComposerAfterSend = useCallback(() => {
@@ -3930,6 +4481,44 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     (event?: { preventDefault: () => void }, intent: ComposerSubmissionIntent = "foreground") => {
       if (noProviderAvailable || isSendDisabled) {
         event?.preventDefault();
+        return;
+      }
+      if (pendingManagedTextResourceInsertion) {
+        event?.preventDefault();
+        toastManager.add({
+          type: "info",
+          title: "Loading the selected T3 command or snippet.",
+          description: "Send again after its text has been inserted into the draft.",
+        });
+        return;
+      }
+      const managedCommandBlockReason = managedCommandSubmissionBlockReason({
+        text: promptRef.current,
+        managedKeys: effectiveManagedCommandKeys,
+        nativeKeys: nativeSlashCommandKeys,
+        catalogReady:
+          managedTextResourceCatalog.data !== undefined &&
+          !managedTextResourceCatalog.isPending &&
+          !managedTextResourceCatalog.error,
+        resolvedNativeText: resolvedManagedNativeCommandTextRef.current,
+      });
+      if (managedCommandBlockReason) {
+        event?.preventDefault();
+        toastManager.add({
+          type: "info",
+          title:
+            managedCommandBlockReason === "catalog-pending"
+              ? "Checking available commands."
+              : "Choose a command from the menu.",
+          description:
+            managedCommandBlockReason === "catalog-pending"
+              ? managedTextResourceCatalog.error
+                ? "T3 could not confirm whether this provider command has a managed match. Retry after the command list reconnects."
+                : "Wait for the T3 command list to finish loading, then send again."
+              : managedCommandBlockReason === "source-ambiguous"
+                ? "Choose the T3 command or provider command so the draft expands as intended."
+                : "Select the managed command to expand its template before sending.",
+        });
         return;
       }
       if (selectedProvider === "codex") {
@@ -3993,9 +4582,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       activePendingProgress,
       attachmentTargetKey,
       blurMobileComposerAfterSend,
+      effectiveManagedCommandKeys,
       isSendDisabled,
+      managedTextResourceCatalog.data,
+      managedTextResourceCatalog.error,
+      managedTextResourceCatalog.isPending,
+      nativeSlashCommandKeys,
       noProviderAvailable,
       onSend,
+      pendingManagedTextResourceInsertion,
       promptRef,
       selectedProvider,
       selectedProviderSkills,
@@ -4150,7 +4745,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       toggleInteractionMode();
       return true;
     }
-    const { trigger } = resolveActiveComposerTrigger();
+    const { snapshot, trigger } = resolveActiveComposerTrigger();
     const menuIsActive = composerMenuOpenRef.current || trigger !== null;
     if (menuIsActive) {
       const currentItems = composerMenuItemsRef.current;
@@ -4164,6 +4759,34 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         return true;
       }
       if ((key === "Enter" || key === "Tab") && selectedItem) {
+        const invocationText =
+          trigger?.kind === "slash-command"
+            ? snapshot.value.slice(trigger.rangeStart, trigger.rangeEnd)
+            : "";
+        if (
+          managedCommandNeedsExplicitSelection({
+            text: invocationText,
+            managedKeys: effectiveManagedCommandKeys,
+            nativeKeys: nativeSlashCommandKeys,
+          })
+        ) {
+          const choice = explicitComposerMenuChoiceRef.current;
+          const hasExplicitChoice =
+            choice?.itemId === selectedItem.id &&
+            choice.searchKey === composerMenuSearchKey &&
+            choice.prompt === snapshot.value &&
+            choice.rangeStart === trigger?.rangeStart &&
+            choice.rangeEnd === trigger?.rangeEnd;
+          if (!hasExplicitChoice) {
+            event.preventDefault();
+            toastManager.add({
+              type: "info",
+              title: "Choose a command source first.",
+              description: "Select the T3 command or the provider command from the menu.",
+            });
+            return true;
+          }
+        }
         onSelectComposerItem(selectedItem);
         return true;
       }
@@ -5177,6 +5800,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           providerInstanceId={selectedProviderEntry.instanceId}
         />
       ) : null}
+      {sessionSkillThreadId ? (
+        <SessionManagedTextResourcesControl
+          environmentId={environmentId}
+          threadId={sessionSkillThreadId}
+          catalogData={managedTextResourceCatalog.data ?? null}
+          catalogPending={managedTextResourceCatalog.isPending}
+          catalogError={Boolean(managedTextResourceCatalog.error)}
+          refresh={managedTextResourceCatalog.refresh}
+        />
+      ) : null}
 
       {composerControlsCompact ? (
         <CompactComposerControlsMenu
@@ -6015,7 +6648,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         setComposerCursor(cursor);
         setComposerTrigger(
           options?.detectTrigger
-            ? detectComposerTrigger(
+            ? detectCurrentComposerTrigger(
                 promptForState,
                 expandCollapsedComposerCursor(promptForState, cursor),
               )
@@ -6049,7 +6682,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         if (!inserted) return;
         promptRef.current = insertion.prompt;
         setComposerCursor(nextCollapsedCursor);
-        setComposerTrigger(detectComposerTrigger(insertion.prompt, insertion.cursor));
+        setComposerTrigger(detectCurrentComposerTrigger(insertion.prompt, insertion.cursor));
         window.requestAnimationFrame(() => {
           composerEditorRef.current?.focusAt(nextCollapsedCursor);
         });
@@ -6125,6 +6758,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       getTimelineScrollableNode,
       isTimelineAtLogicalEnd,
       setIsComposerScrollCollapsed,
+      detectCurrentComposerTrigger,
     ],
   );
 

@@ -16,6 +16,7 @@ export type SettingsPath =
   | "/settings/snap-shot"
   | "/settings/providers"
   | "/settings/skills"
+  | "/settings/commands"
   | "/settings/integrations"
   | "/settings/source-control"
   | "/settings/connections"
@@ -80,6 +81,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/snap-shot": "SnapShots",
   "/settings/providers": "Providers",
   "/settings/skills": "Skills",
+  "/settings/commands": "Commands",
   "/settings/integrations": "Integrations",
   "/settings/source-control": "Source Control",
   "/settings/connections": "Connections",
@@ -98,6 +100,13 @@ export const SETTINGS_SEARCH_ITEMS = [
     to: "/settings/skills",
     scope: "environment",
     searchTerms: ["managed native provider import override inheritance session capability"],
+  },
+  {
+    id: "managed-text-resources",
+    title: "Commands and snippets",
+    to: "/settings/commands",
+    scope: "project-defaults",
+    searchTerms: ["managed prompt templates slash commands colon snippets text insertion"],
   },
   {
     id: "project-defaults",
@@ -753,6 +762,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   "/settings/keybindings": null,
   "/settings/providers": null,
   "/settings/skills": "environment",
+  "/settings/commands": "project-defaults",
   "/settings/integrations": null,
   "/settings/source-control": "environment-defaults",
   "/settings/connections": "connections",

@@ -9,7 +9,7 @@ import { scoreProviderSkill } from "../../providerSkillSearch";
 
 type SlashSearchItem = Extract<
   ComposerCommandItem,
-  { type: "slash-command" | "provider-slash-command" | "skill" }
+  { type: "managed-command" | "slash-command" | "provider-slash-command" | "skill" }
 >;
 
 /**
@@ -39,6 +39,30 @@ function scoreSlashCommandItem(item: SlashSearchItem, query: string): number | n
       return skillScore;
     }
     return "skill".startsWith(query) ? Number.MAX_SAFE_INTEGER : null;
+  }
+
+  if (item.type === "managed-command") {
+    const scores = [
+      scoreQueryMatch({
+        value: item.resource.key.toLowerCase(),
+        query,
+        exactBase: 0,
+        prefixBase: 2,
+        boundaryBase: 4,
+        includesBase: 6,
+        fuzzyBase: 100,
+        boundaryMarkers: ["-", "_", "/"],
+      }),
+      scoreQueryMatch({
+        value: item.description.toLowerCase(),
+        query,
+        exactBase: 20,
+        prefixBase: 22,
+        boundaryBase: 24,
+        includesBase: 26,
+      }),
+    ].filter((score): score is number => score !== null);
+    return scores.length > 0 ? Math.min(...scores) : null;
   }
 
   const primaryValue =
@@ -104,7 +128,9 @@ export function searchSlashCommandItems(
             ? `0\u0000${item.command}`
             : item.type === "provider-slash-command"
               ? `1\u0000${item.command.name}\u0000${item.provider}`
-              : `2\u0000${item.skill.name}\u0000${item.provider}`,
+              : item.type === "managed-command"
+                ? `1\u0000${item.resource.key}`
+                : `2\u0000${item.skill.name}\u0000${item.provider}`,
       },
       Number.POSITIVE_INFINITY,
     );

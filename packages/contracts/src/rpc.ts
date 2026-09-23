@@ -168,6 +168,24 @@ import {
   SkillSessionSetEnabledResult,
 } from "./skills.ts";
 import {
+  ManagedTextResourceCatalogListInput,
+  ManagedTextResourceCatalogListResult,
+  ManagedTextResourceChanged,
+  ManagedTextResourceContentGetInput,
+  ManagedTextResourceContentGetResult,
+  ManagedTextResourceEnvironmentCreateInput,
+  ManagedTextResourceEnvironmentDeleteInput,
+  ManagedTextResourceEnvironmentSetEnabledInput,
+  ManagedTextResourceEnvironmentUpdateInput,
+  ManagedTextResourceMutationResult,
+  ManagedTextResourceProjectDeleteStateInput,
+  ManagedTextResourceProjectSetDisabledInput,
+  ManagedTextResourceProjectSetOverrideInput,
+  ManagedTextResourceRpcError,
+  ManagedTextResourceThreadResetInput,
+  ManagedTextResourceThreadSetEnabledInput,
+} from "./managedTextResources.ts";
+import {
   IssueSearchInput,
   IssueSearchResult,
   PullRequestActionInput,
@@ -561,6 +579,18 @@ export const WS_METHODS = {
   skillsSessionSetEnabled: "skills.session.setEnabled",
   skillsSessionReset: "skills.session.reset",
   skillsNativeImport: "skills.native.import",
+  managedTextResourcesCatalogList: "managedTextResources.catalog.list",
+  managedTextResourcesCatalogSubscribe: "managedTextResources.catalog.subscribe",
+  managedTextResourcesContentGet: "managedTextResources.content.get",
+  managedTextResourcesEnvironmentCreate: "managedTextResources.environment.create",
+  managedTextResourcesEnvironmentUpdate: "managedTextResources.environment.update",
+  managedTextResourcesEnvironmentDelete: "managedTextResources.environment.delete",
+  managedTextResourcesEnvironmentSetEnabled: "managedTextResources.environment.setEnabled",
+  managedTextResourcesProjectSetOverride: "managedTextResources.project.setOverride",
+  managedTextResourcesProjectSetDisabled: "managedTextResources.project.setDisabled",
+  managedTextResourcesProjectDeleteState: "managedTextResources.project.deleteState",
+  managedTextResourcesThreadSetEnabled: "managedTextResources.thread.setEnabled",
+  managedTextResourcesThreadReset: "managedTextResources.thread.reset",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
   serverUpdateServer: "server.updateServer",
@@ -779,6 +809,108 @@ export const WsSkillsNativeImportRpc = Rpc.make(WS_METHODS.skillsNativeImport, {
   success: SkillNativeImportResult,
   error: skillRpcError,
 });
+
+const managedTextResourceRpcError = Schema.Union([
+  ManagedTextResourceRpcError,
+  EnvironmentAuthorizationError,
+]);
+export const WsManagedTextResourcesCatalogListRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesCatalogList,
+  {
+    payload: ManagedTextResourceCatalogListInput,
+    success: ManagedTextResourceCatalogListResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesCatalogSubscribeRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesCatalogSubscribe,
+  {
+    payload: ManagedTextResourceCatalogListInput,
+    success: ManagedTextResourceChanged,
+    error: managedTextResourceRpcError,
+    stream: true,
+  },
+);
+export const WsManagedTextResourcesContentGetRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesContentGet,
+  {
+    payload: ManagedTextResourceContentGetInput,
+    success: ManagedTextResourceContentGetResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesEnvironmentCreateRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesEnvironmentCreate,
+  {
+    payload: ManagedTextResourceEnvironmentCreateInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesEnvironmentUpdateRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesEnvironmentUpdate,
+  {
+    payload: ManagedTextResourceEnvironmentUpdateInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesEnvironmentDeleteRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesEnvironmentDelete,
+  {
+    payload: ManagedTextResourceEnvironmentDeleteInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesEnvironmentSetEnabledRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesEnvironmentSetEnabled,
+  {
+    payload: ManagedTextResourceEnvironmentSetEnabledInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesProjectSetOverrideRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesProjectSetOverride,
+  {
+    payload: ManagedTextResourceProjectSetOverrideInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesProjectSetDisabledRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesProjectSetDisabled,
+  {
+    payload: ManagedTextResourceProjectSetDisabledInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesProjectDeleteStateRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesProjectDeleteState,
+  {
+    payload: ManagedTextResourceProjectDeleteStateInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesThreadSetEnabledRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesThreadSetEnabled,
+  {
+    payload: ManagedTextResourceThreadSetEnabledInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
+export const WsManagedTextResourcesThreadResetRpc = Rpc.make(
+  WS_METHODS.managedTextResourcesThreadReset,
+  {
+    payload: ManagedTextResourceThreadResetInput,
+    success: ManagedTextResourceMutationResult,
+    error: managedTextResourceRpcError,
+  },
+);
 
 const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
   payload: Schema.Struct({
@@ -2011,6 +2143,18 @@ export const WsRpcGroup = RpcGroup.make(
   WsSkillsSessionSetEnabledRpc,
   WsSkillsSessionResetRpc,
   WsSkillsNativeImportRpc,
+  WsManagedTextResourcesCatalogListRpc,
+  WsManagedTextResourcesCatalogSubscribeRpc,
+  WsManagedTextResourcesContentGetRpc,
+  WsManagedTextResourcesEnvironmentCreateRpc,
+  WsManagedTextResourcesEnvironmentUpdateRpc,
+  WsManagedTextResourcesEnvironmentDeleteRpc,
+  WsManagedTextResourcesEnvironmentSetEnabledRpc,
+  WsManagedTextResourcesProjectSetOverrideRpc,
+  WsManagedTextResourcesProjectSetDisabledRpc,
+  WsManagedTextResourcesProjectDeleteStateRpc,
+  WsManagedTextResourcesThreadSetEnabledRpc,
+  WsManagedTextResourcesThreadResetRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,

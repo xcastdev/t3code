@@ -9,6 +9,7 @@ import {
   isSettingsSearchScopeAvailable,
   searchableSetting,
   searchSettings,
+  SETTINGS_SECTION_LABELS,
   SETTINGS_SEARCH_ITEMS,
   type SettingsSearchItem,
 } from "./settingsSearch";
@@ -215,6 +216,26 @@ describe("searchSettings", () => {
   it("keeps catalog result ids unique", () => {
     const ids = SETTINGS_SEARCH_ITEMS.map((item) => item.id);
     expect(new Set(ids).size).toBe(ids.length);
+  });
+
+  it("exposes managed commands and snippets in every server settings scope", () => {
+    const item = SETTINGS_SEARCH_ITEMS.find(
+      (candidate) => candidate.id === "managed-text-resources",
+    );
+    expect(item).toMatchObject({
+      title: "Commands and snippets",
+      to: "/settings/commands",
+      scope: "project-defaults",
+    });
+    expect(SETTINGS_SECTION_LABELS["/settings/commands"]).toBe("Commands");
+    expect(searchSettings("slash commands").map((candidate) => candidate.id)).toContain(
+      "managed-text-resources",
+    );
+    expect(
+      (["all", "environment", "project", "checkout"] as const).every((scope) =>
+        isSettingsSearchScopeAvailable("project-defaults", scope),
+      ),
+    ).toBe(true);
   });
 
   it("serves anchor props to panels from the catalog", () => {

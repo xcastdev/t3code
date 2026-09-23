@@ -449,6 +449,7 @@ export function NewTaskDraftScreen(props: {
     draftMessage: flow.prompt,
     ownerKey: flow.draftKey,
     environmentId: selectedProject?.environmentId ?? null,
+    projectId: selectedProject?.id ?? null,
     pullRequestProjectId: selectedEnvironmentServerConfig?.environment.capabilities.pullRequests
       ? (selectedProject?.id ?? null)
       : null,
@@ -1173,6 +1174,20 @@ export function NewTaskDraftScreen(props: {
 
   async function handleStart(): Promise<void> {
     if (voiceInput.blocksSubmission || pendingPastedTextAttachmentCountRef.current > 0) return;
+    if (composerMenu.isManagedInsertionPending) {
+      Alert.alert(
+        "Command still loading",
+        "Wait for the selected command or snippet to be inserted.",
+      );
+      return;
+    }
+    if (composerMenu.mustResolveManagedCommandSelection) {
+      Alert.alert(
+        "Choose a command source",
+        composerMenu.managedCommandBlockReason ?? "Select a command from the list.",
+      );
+      return;
+    }
     const selectedProject = flow.selectedProject;
     const draftKey = flow.draftKey;
     if (!selectedProject || !draftKey) {
@@ -1345,6 +1360,8 @@ export function NewTaskDraftScreen(props: {
     !flow.submitting &&
     pendingPastedTextAttachmentCount === 0 &&
     !voiceInput.blocksSubmission &&
+    !composerMenu.mustResolveManagedCommandSelection &&
+    !composerMenu.isManagedInsertionPending &&
     !(flow.workspaceMode === "worktree" && !flow.selectedBranchName);
   const openDraftDocument = (attachment: ComposerDocumentAttachment) => {
     // A draft attachment lives only in the draft. Without its key the screen would fall through
@@ -1540,7 +1557,11 @@ export function NewTaskDraftScreen(props: {
     <View className="bg-sheet px-[12px] pt-1" style={{ paddingBottom: controlsBottomPadding }}>
       {!voiceInput.isBusy &&
       composerMenu.trigger &&
-      (composerMenu.items.length > 0 || composerMenu.trigger.kind === "pull-request") ? (
+      (composerMenu.items.length > 0 ||
+        composerMenu.isLoading ||
+        composerMenu.error !== null ||
+        composerMenu.trigger.kind === "pull-request" ||
+        composerMenu.trigger.kind === "snippet") ? (
         <View className="mb-2">
           <ComposerCommandPopover
             items={composerMenu.items}
@@ -1718,6 +1739,9 @@ export function NewTaskDraftScreen(props: {
                 <ComposerActionButton
                   accessibilityLabel={
                     attachmentBlockReason ??
+                    (composerMenu.isManagedInsertionPending
+                      ? "Inserting command or snippet"
+                      : composerMenu.managedCommandBlockReason) ??
                     (cloneBlocksStart
                       ? projectClone === null || projectClone.phase === "running"
                         ? "Cloning repository"

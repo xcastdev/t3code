@@ -1,8 +1,11 @@
 import type {
   EnvironmentId,
+  ManagedTextResourceCatalogListInput,
+  ManagedTextResourceSummary,
   ProjectId,
   ProviderInteractionMode,
   ServerProvider,
+  ThreadId,
 } from "@t3tools/contracts";
 import { COMPOSER_CONTEXT_MAX_RECORDS } from "@t3tools/contracts";
 import { Alert } from "react-native";
@@ -19,9 +22,9 @@ import {
   detectComposerTrigger,
   parseComposerHashQuery,
   replaceTextRange,
-  serializeComposerFileLink,
   type ComposerTrigger,
 } from "@t3tools/shared/composerTrigger";
+import { parseManagedCommandInvocation } from "@t3tools/client-runtime/managedTextResources";
 import {
   insertRankedSearchResult,
   normalizeSearchQuery,
@@ -32,6 +35,8 @@ import {
   isProviderSkillUserInvocable,
   resolveProviderSkillsForCwd,
 } from "@t3tools/client-runtime/providerSkills";
+import { useAtomValue } from "@effect/atom-react";
+import { Atom } from "effect/unstable/reactivity";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { ComposerEditorSelection } from "../../components/ComposerEditor";
@@ -43,125 +48,33 @@ import {
   useDebouncedValue,
 } from "../../state/queries";
 import { composerPullRequests } from "../../state/pull-requests";
+import { managedTextResourcesEnvironment } from "../../state/managedTextResources";
 import { useEnvironmentQuery } from "../../state/query";
-import type { ComposerCommandItem } from "./ComposerCommandPopover";
+import { resolveManagedTextResourceInsertion } from "../managedTextResources/managedTextResourceInsertion";
+import {
+  buildComposerSlashCommandItems,
+  buildManagedTextResourceMenuItems,
+  managedCommandInvocationNeedsChoice,
+  resolveComposerCommandSelection,
+  type ComposerCommandItem,
+} from "./composer-command-menu-model";
 
 const WORKSPACE_SNAPSHOT_RETRY_COOLDOWN_MS = 10_000;
+const EMPTY_MANAGED_TEXT_RESOURCE_CHANGES = Atom.make(null).pipe(
+  Atom.withLabel("mobile:managed-text-resources:changes:empty"),
+);
+
+type PendingManagedInsertion = {
+  readonly requestId: number;
+  readonly resource: ManagedTextResourceSummary;
+  readonly rangeStart: number;
+  readonly rangeEnd: number;
+  readonly expectedDraft: string;
+  readonly argument: string;
+};
 
 function composerSelectionAtEnd(draftMessage: string): ComposerEditorSelection {
   return { start: draftMessage.length, end: draftMessage.length };
-}
-
-export function buildComposerSlashCommandItems(input: {
-  readonly query: string;
-  readonly atMessageStart: boolean;
-  readonly hasThread: boolean;
-  readonly hasCompactableConversation?: boolean;
-  /** Whether T3 itself offers /usage-limits for the selected provider. */
-  readonly offersUsageLimits?: boolean;
-  readonly allowInteractionMode: boolean;
-  readonly visibleSkillNames?: ReadonlySet<string>;
-  readonly selectedProviderStatus: Pick<
-    ServerProvider,
-    "driver" | "slashCommands" | "showInteractionModeToggle"
-  > | null;
-}): ComposerCommandItem[] {
-  const query = input.query.toLowerCase();
-  const allowInteractionMode =
-    input.allowInteractionMode && input.selectedProviderStatus?.showInteractionModeToggle !== false;
-  const builtIn = [
-    {
-      id: "cmd:model",
-      type: "slash-command",
-      command: "model",
-      label: "/model",
-      description: "Switch model",
-    },
-    {
-      id: "cmd:plan",
-      type: "slash-command",
-      command: "plan",
-      label: "/plan",
-      description: "Switch to plan mode",
-    },
-    {
-      id: "cmd:default",
-      type: "slash-command",
-      command: "default",
-      label: "/default",
-      description: "Switch to default mode",
-    },
-  ] satisfies ComposerCommandItem[];
-  const items: ComposerCommandItem[] = builtIn.filter(
-    (item) => item.command.includes(query) && (item.command === "model" || allowInteractionMode),
-  );
-
-  // Providers expand commands only at the start of a message. T3 commands
-  // change local state and do not have this restriction.
-  if (!input.atMessageStart) return items;
-  for (const command of input.selectedProviderStatus?.slashCommands ?? []) {
-    if (input.visibleSkillNames?.has(command.name.trim().toLowerCase())) continue;
-    if (!command.name.toLowerCase().includes(query)) continue;
-    if (command.name === "compact" && !input.hasCompactableConversation) continue;
-    // T3's own limits command is answered by the thread composer; New Task has
-    // nowhere to show it. A provider's same-named command is left alone.
-    if (command.name === USAGE_LIMITS_COMMAND.name && input.offersUsageLimits && !input.hasThread) {
-      continue;
-    }
-    if (
-      !input.hasThread &&
-      input.selectedProviderStatus?.driver === "codex" &&
-      command.name === "feedback"
-    ) {
-      continue;
-    }
-    items.push({
-      id: `pcmd:${command.name}`,
-      type: "provider-slash-command",
-      command,
-      label: `/${command.name}`,
-      description: command.description ?? "",
-    });
-  }
-  return items;
-}
-
-export function resolveComposerCommandSelection(input: {
-  readonly draftMessage: string;
-  readonly trigger: Pick<ComposerTrigger, "rangeStart" | "rangeEnd">;
-  readonly item: ComposerCommandItem;
-  readonly allowInteractionMode: boolean;
-}): {
-  readonly text: string;
-  readonly cursor: number;
-  readonly interactionMode: ProviderInteractionMode | null;
-} {
-  const { draftMessage, trigger, item } = input;
-  if (
-    input.allowInteractionMode &&
-    item.type === "slash-command" &&
-    (item.command === "plan" || item.command === "default")
-  ) {
-    return {
-      ...replaceTextRange(draftMessage, trigger.rangeStart, trigger.rangeEnd, ""),
-      interactionMode: item.command,
-    };
-  }
-
-  let replacement = "";
-  if (item.type === "path") {
-    replacement = `${serializeComposerFileLink(item.path)} `;
-  } else if (item.type === "skill") {
-    replacement = `!${item.skill.name} `;
-  } else if (item.type === "slash-command") {
-    replacement = `/${item.command} `;
-  } else if (item.type === "provider-slash-command") {
-    replacement = `/${item.command.name} `;
-  }
-  return {
-    ...replaceTextRange(draftMessage, trigger.rangeStart, trigger.rangeEnd, replacement),
-    interactionMode: null,
-  };
 }
 
 /** Shared autocomplete for thread composers and unsent new-task drafts. */
@@ -169,6 +82,8 @@ export function useComposerCommandMenu({
   draftMessage,
   ownerKey,
   environmentId,
+  projectId = null,
+  threadId = null,
   projectCwd,
   pullRequestProjectId = null,
   pullRequestRepository = null,
@@ -184,6 +99,8 @@ export function useComposerCommandMenu({
   readonly draftMessage: string;
   readonly ownerKey: string | null;
   readonly environmentId: EnvironmentId | null;
+  readonly projectId?: ProjectId | null;
+  readonly threadId?: ThreadId | null;
   readonly projectCwd: string | null;
   readonly pullRequestProjectId?: ProjectId | null;
   readonly pullRequestRepository?: string | null;
@@ -199,6 +116,14 @@ export function useComposerCommandMenu({
   readonly onUsageLimits?: () => void;
 }) {
   const [selection, setSelection] = useState(() => composerSelectionAtEnd(draftMessage));
+  const [pendingManagedInsertion, setPendingManagedInsertion] =
+    useState<PendingManagedInsertion | null>(null);
+  const [nativeChoice, setNativeChoice] = useState<{
+    readonly key: string;
+    readonly scope: string;
+  } | null>(null);
+  const insertionRequestIdRef = useRef(0);
+  const handledInsertionRequestRef = useRef(0);
   const previousOwnerKeyRef = useRef(ownerKey);
   const onSelectionChange = useCallback((nextSelection: ComposerEditorSelection) => {
     setSelection(nextSelection);
@@ -230,6 +155,207 @@ export function useComposerCommandMenu({
     setSelection(composerSelectionAtEnd(draftMessage));
   }, [draftMessage, ownerKey]);
 
+  const managedInvocationPrefix = useMemo(() => {
+    if (selection.start !== selection.end || selection.end === 0) return null;
+    return parseManagedCommandInvocation(draftMessage.slice(0, selection.end));
+  }, [draftMessage, selection]);
+  const hasManagedInvocationSeparator = useMemo(
+    () => /^\/[a-z0-9]+(?:-[a-z0-9]+)*[ \t]/.test(draftMessage.slice(0, selection.end)),
+    [draftMessage, selection.end],
+  );
+  const isArgumentInvocation = managedInvocationPrefix !== null && hasManagedInvocationSeparator;
+  const sendInvocation = useMemo(() => parseManagedCommandInvocation(draftMessage), [draftMessage]);
+  const detectedTriggerForCatalog =
+    enabled && selection.start === selection.end
+      ? detectComposerTrigger(draftMessage, selection.end)
+      : null;
+  const shouldLoadManagedCatalog =
+    draftMessage.startsWith("/") ||
+    sendInvocation !== null ||
+    detectedTriggerForCatalog?.kind === "snippet";
+  const managedCatalogScopeKey = `${environmentId ?? ""}:${projectId ?? ""}:${threadId ?? ""}`;
+  const nativeChoiceKey = nativeChoice?.scope === managedCatalogScopeKey ? nativeChoice.key : null;
+
+  const managedCatalogTarget = useMemo(
+    () =>
+      environmentId && shouldLoadManagedCatalog
+        ? {
+            environmentId,
+            input: {
+              ...(projectId ? { projectId } : {}),
+              ...(threadId ? { threadId } : {}),
+            } satisfies ManagedTextResourceCatalogListInput,
+          }
+        : null,
+    [environmentId, projectId, shouldLoadManagedCatalog, threadId],
+  );
+  const managedCatalog = useEnvironmentQuery(
+    useMemo(
+      () =>
+        managedCatalogTarget ? managedTextResourcesEnvironment.catalog(managedCatalogTarget) : null,
+      [managedCatalogTarget],
+    ),
+  );
+  const managedCatalogChangesAtom = useMemo(
+    () =>
+      managedCatalogTarget
+        ? managedTextResourcesEnvironment.changes(managedCatalogTarget)
+        : EMPTY_MANAGED_TEXT_RESOURCE_CHANGES,
+    [managedCatalogTarget],
+  );
+  useAtomValue(managedCatalogChangesAtom);
+  const managedEntries = managedCatalog.data?.entries ?? [];
+  const exactNativeInvocationItems = useMemo(() => {
+    if (!managedInvocationPrefix) return [];
+    const query = managedInvocationPrefix.key.toLowerCase();
+    return buildComposerSlashCommandItems({
+      query,
+      atMessageStart: true,
+      hasThread,
+      hasCompactableConversation,
+      offersUsageLimits,
+      allowInteractionMode: onUpdateInteractionMode !== undefined,
+      selectedProviderStatus,
+      managedEntries: [],
+    }).filter((item) =>
+      item.type === "slash-command"
+        ? item.command.toLowerCase() === query
+        : item.type === "provider-slash-command"
+          ? item.command.name.toLowerCase() === query
+          : false,
+    );
+  }, [
+    hasThread,
+    hasCompactableConversation,
+    managedInvocationPrefix,
+    onUpdateInteractionMode,
+    offersUsageLimits,
+    selectedProviderStatus,
+  ]);
+  const sendNativeInvocationItems = useMemo(() => {
+    if (!sendInvocation) return [];
+    const query = sendInvocation.key.toLowerCase();
+    return buildComposerSlashCommandItems({
+      query,
+      atMessageStart: true,
+      hasThread,
+      hasCompactableConversation,
+      offersUsageLimits,
+      allowInteractionMode: onUpdateInteractionMode !== undefined,
+      selectedProviderStatus,
+      managedEntries: [],
+    }).filter((item) =>
+      item.type === "slash-command"
+        ? item.command.toLowerCase() === query
+        : item.type === "provider-slash-command"
+          ? item.command.name.toLowerCase() === query
+          : false,
+    );
+  }, [
+    hasThread,
+    hasCompactableConversation,
+    onUpdateInteractionMode,
+    offersUsageLimits,
+    selectedProviderStatus,
+    sendInvocation,
+  ]);
+  const unresolvedNativeManagedCollision = Boolean(
+    sendInvocation &&
+    managedCommandInvocationNeedsChoice({
+      key: sendInvocation.key,
+      catalogResolved: managedCatalog.data !== null,
+      entries: managedEntries,
+      nativeItems: sendNativeInvocationItems,
+      nativeChoiceKey,
+    }),
+  );
+  const mustResolveManagedCommandSelection = Boolean(
+    sendInvocation && environmentId && (!managedCatalog.data || unresolvedNativeManagedCollision),
+  );
+  const managedCommandBlockReason = !mustResolveManagedCommandSelection
+    ? null
+    : !managedCatalog.data
+      ? managedCatalog.error
+        ? "Managed commands could not be checked. Retry before sending this slash command."
+        : "Checking managed commands. Wait a moment, then send again."
+      : "Choose Managed or Provider native from the command list before sending.";
+  const managedContentTarget = useMemo(() => {
+    if (!pendingManagedInsertion || !environmentId || !pendingManagedInsertion.resource.id) {
+      return null;
+    }
+    return {
+      environmentId,
+      input: {
+        kind: pendingManagedInsertion.resource.kind,
+        id: pendingManagedInsertion.resource.id,
+        expectedRevision: pendingManagedInsertion.resource.revision,
+        ...(projectId ? { projectId } : {}),
+        ...(threadId ? { threadId } : {}),
+      },
+    };
+  }, [environmentId, pendingManagedInsertion, projectId, threadId]);
+  const managedContent = useEnvironmentQuery(
+    useMemo(
+      () =>
+        managedContentTarget ? managedTextResourcesEnvironment.content(managedContentTarget) : null,
+      [managedContentTarget],
+    ),
+  );
+  useEffect(() => {
+    const pending = pendingManagedInsertion;
+    if (!pending || handledInsertionRequestRef.current === pending.requestId) return;
+    if (managedContent.error) {
+      handledInsertionRequestRef.current = pending.requestId;
+      setPendingManagedInsertion(null);
+      Alert.alert(
+        "Could not insert",
+        "The selected command or snippet could not be loaded. Select it again.",
+      );
+      return;
+    }
+    if (managedCatalog.error && !managedCatalog.data) {
+      handledInsertionRequestRef.current = pending.requestId;
+      setPendingManagedInsertion(null);
+      Alert.alert(
+        "Could not verify selection",
+        "The catalog changed while loading. Select it again.",
+      );
+      return;
+    }
+    if (!managedContent.data || !managedCatalog.data) return;
+
+    handledInsertionRequestRef.current = pending.requestId;
+    const result = resolveManagedTextResourceInsertion({
+      selected: pending.resource,
+      content: managedContent.data,
+      currentEntries: managedCatalog.data.entries,
+      draft: draftMessage,
+      expectedDraft: pending.expectedDraft,
+      rangeStart: pending.rangeStart,
+      rangeEnd: pending.rangeEnd,
+      argument: pending.argument,
+    });
+    setPendingManagedInsertion(null);
+    if (result.status === "draft-changed") {
+      Alert.alert("Draft changed", "The draft changed while loading. Select the command again.");
+      return;
+    }
+    if (result.status === "stale-resource") {
+      Alert.alert("Definition changed", "The selected definition changed. Select it again.");
+      return;
+    }
+    setNativeChoice(null);
+    onChangeDraftMessage(result.text);
+    setSelection({ start: result.cursor, end: result.cursor });
+  }, [
+    draftMessage,
+    managedCatalog.data,
+    managedCatalog.error,
+    managedContent.data,
+    managedContent.error,
+    onChangeDraftMessage,
+    pendingManagedInsertion,
+  ]);
   const skills = useMemo(
     () =>
       selectedProviderStatus ? resolveProviderSkillsForCwd(selectedProviderStatus, projectCwd) : [],
@@ -299,8 +425,16 @@ export function useComposerCommandMenu({
     if (!enabled || selection.start !== selection.end) {
       return null;
     }
+    if (isArgumentInvocation && managedInvocationPrefix) {
+      return {
+        kind: "slash-command",
+        query: managedInvocationPrefix.key,
+        rangeStart: 0,
+        rangeEnd: selection.end,
+      } satisfies ComposerTrigger;
+    }
     return detectComposerTrigger(draftMessage, selection.end);
-  }, [draftMessage, enabled, selection]);
+  }, [draftMessage, enabled, isArgumentInvocation, managedInvocationPrefix, selection]);
   const pathSearch = useComposerPathSearch({
     environmentId,
     cwd: trigger?.kind === "path" ? projectCwd : null,
@@ -363,6 +497,21 @@ export function useComposerCommandMenu({
     }
 
     if (trigger.kind === "slash-command") {
+      if (environmentId && !managedCatalog.data) return [];
+      if (isArgumentInvocation && managedInvocationPrefix) {
+        if (nativeChoiceKey?.toLowerCase() === managedInvocationPrefix.key.toLowerCase()) {
+          return [];
+        }
+        return [
+          ...buildManagedTextResourceMenuItems({
+            entries: managedEntries,
+            kind: "command",
+            query: managedInvocationPrefix.key,
+            exactKey: true,
+          }),
+          ...exactNativeInvocationItems,
+        ];
+      }
       const q = trigger.query.toLowerCase();
       const commandItems = buildComposerSlashCommandItems({
         visibleSkillNames: new Set(
@@ -377,9 +526,19 @@ export function useComposerCommandMenu({
         offersUsageLimits,
         allowInteractionMode: onUpdateInteractionMode !== undefined,
         selectedProviderStatus,
+        managedEntries,
       });
 
       return commandItems;
+    }
+
+    if (trigger.kind === "snippet") {
+      if (environmentId && !managedCatalog.data) return [];
+      return buildManagedTextResourceMenuItems({
+        entries: managedEntries,
+        kind: "snippet",
+        query: trigger.query,
+      });
     }
 
     if (trigger.kind === "skill") {
@@ -483,8 +642,15 @@ export function useComposerCommandMenu({
   }, [
     hasThread,
     hasCompactableConversation,
+    environmentId,
+    exactNativeInvocationItems,
     hashQuery.kind,
     issueSearch.data?.entries,
+    isArgumentInvocation,
+    managedCatalog.data,
+    managedEntries,
+    managedInvocationPrefix,
+    nativeChoiceKey,
     onUpdateInteractionMode,
     pathSearch.entries,
     pullRequestSearch.entries,
@@ -546,6 +712,47 @@ export function useComposerCommandMenu({
         return;
       }
 
+      if (item.type === "managed-text-resource") {
+        if (
+          !environmentId ||
+          !item.resource.id ||
+          !items.some((candidate) => candidate.id === item.id)
+        ) {
+          return;
+        }
+        const argument =
+          item.resource.kind === "command" &&
+          isArgumentInvocation &&
+          managedInvocationPrefix?.key.toLowerCase() === item.resource.key.toLowerCase()
+            ? managedInvocationPrefix.argument
+            : "";
+        setNativeChoice(null);
+        setPendingManagedInsertion({
+          requestId: ++insertionRequestIdRef.current,
+          resource: item.resource,
+          rangeStart: trigger.rangeStart,
+          rangeEnd: trigger.rangeEnd,
+          expectedDraft: draftMessage,
+          argument,
+        });
+        return;
+      }
+
+      if (item.type === "slash-command" || item.type === "provider-slash-command") {
+        const selectedKey = item.type === "slash-command" ? item.command : item.command.name;
+        setNativeChoice({ key: selectedKey, scope: managedCatalogScopeKey });
+        if (
+          isArgumentInvocation &&
+          managedInvocationPrefix?.key.toLowerCase() === selectedKey.toLowerCase() &&
+          !(
+            item.type === "slash-command" &&
+            (item.command === "plan" || item.command === "default")
+          )
+        ) {
+          return;
+        }
+      }
+
       const result = resolveComposerCommandSelection({
         draftMessage,
         trigger,
@@ -562,8 +769,12 @@ export function useComposerCommandMenu({
     },
     [
       draftMessage,
+      environmentId,
       ownerKey,
       items,
+      managedCatalogScopeKey,
+      isArgumentInvocation,
+      managedInvocationPrefix,
       onChangeDraftMessage,
       onUpdateInteractionMode,
       onUsageLimits,
@@ -578,16 +789,25 @@ export function useComposerCommandMenu({
     trigger,
     items,
     skills,
+    mustResolveManagedCommandSelection,
+    managedCommandBlockReason,
+    isManagedInsertionPending: pendingManagedInsertion !== null,
     isLoading:
       trigger?.kind === "pull-request"
         ? pullRequestSearch.isPending || issueSearch.isPending
-        : pathSearch.isPending,
+        : trigger?.kind === "path"
+          ? pathSearch.isPending
+          : (trigger?.kind === "slash-command" || trigger?.kind === "snippet") &&
+            environmentId !== null &&
+            managedCatalog.isPending,
     error:
       trigger?.kind === "pull-request"
         ? pullRequestProjectId === null || pullRequestRepository === null
           ? "Issues and pull requests are unavailable for this project."
           : (pullRequestSearch.error ?? issueSearch.error ?? null)
-        : null,
+        : trigger?.kind === "slash-command" || trigger?.kind === "snippet"
+          ? managedCatalog.error
+          : null,
     onSelect,
   };
 }

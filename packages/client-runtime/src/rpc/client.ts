@@ -61,7 +61,8 @@ export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.projectWorkSubscribe
   | typeof WS_METHODS.terminalAttach
   | typeof WS_METHODS.mcpCatalogSubscribe
-  | typeof WS_METHODS.skillsCatalogSubscribe;
+  | typeof WS_METHODS.skillsCatalogSubscribe
+  | typeof WS_METHODS.managedTextResourcesCatalogSubscribe;
 
 export type EnvironmentStreamCommandRpcTag =
   | typeof WS_METHODS.cloudInstallRelayClient

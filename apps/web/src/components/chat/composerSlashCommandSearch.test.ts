@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
-import { ProviderDriverKind } from "@t3tools/contracts";
+import {
+  ManagedTextResourceId,
+  ManagedTextResourceKey,
+  ManagedTextResourceRevision,
+  ProviderDriverKind,
+} from "@t3tools/contracts";
 
 import type { ComposerCommandItem } from "./ComposerCommandMenu";
 import {
@@ -9,6 +14,42 @@ import {
 
 describe("searchSlashCommandItems", () => {
   const claudeDriver = ProviderDriverKind.make("claudeAgent");
+
+  it("keeps managed and provider commands with the same name as separate matches", () => {
+    const items = [
+      {
+        id: "managed:command:review",
+        type: "managed-command",
+        resource: {
+          id: ManagedTextResourceId.make("managed-review"),
+          kind: "command" as const,
+          key: ManagedTextResourceKey.make("review"),
+          scope: "environment" as const,
+          scopeId: "env-1",
+          projectState: "inherit" as const,
+          revision: ManagedTextResourceRevision.make("rev-1"),
+          effective: true,
+        },
+        label: "/review",
+        description: "Review changes",
+      },
+      {
+        id: "provider-slash-command:claudeAgent:review",
+        type: "provider-slash-command",
+        provider: claudeDriver,
+        command: { name: "review" },
+        label: "/review",
+        description: "Review this change",
+      },
+    ] satisfies Array<
+      Extract<ComposerCommandItem, { type: "managed-command" | "provider-slash-command" }>
+    >;
+
+    expect(searchSlashCommandItems(items, "review").map((item) => item.id)).toEqual([
+      "managed:command:review",
+      "provider-slash-command:claudeAgent:review",
+    ]);
+  });
 
   it("moves exact provider command matches ahead of broader description matches", () => {
     const items = [

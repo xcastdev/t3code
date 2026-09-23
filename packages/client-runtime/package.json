@@ -91,6 +91,14 @@
       "types": "./src/skills/skillCatalog.ts",
       "default": "./src/skills/skillCatalog.ts"
     },
+    "./managedTextResources": {
+      "types": "./src/managedTextResources/managedTextResources.ts",
+      "default": "./src/managedTextResources/managedTextResources.ts"
+    },
+    "./state/managed-text-resources": {
+      "types": "./src/state/managedTextResources.ts",
+      "default": "./src/state/managedTextResources.ts"
+    },
     "./voice-input": {
       "types": "./src/voice-input/index.ts",
       "default": "./src/voice-input/index.ts"

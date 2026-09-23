@@ -2,12 +2,6 @@ import {
   resolveProviderSkillSourceKind,
   type ProviderSkillSourceKind,
 } from "@t3tools/client-runtime/providerSkills";
-import type {
-  IssueContextMetadata,
-  PullRequestContextMetadata,
-  ServerProviderSkill,
-  ServerProviderSlashCommand,
-} from "@t3tools/contracts";
 import type { ComposerTriggerKind } from "@t3tools/shared/composerTrigger";
 import { memo } from "react";
 import { Pressable, ScrollView, StyleSheet, View, type ViewStyle } from "react-native";
@@ -16,50 +10,7 @@ import { SymbolView, type AppSymbolName } from "../../components/AppSymbol";
 import { AppText as Text } from "../../components/AppText";
 import { GlassSurface } from "../../components/GlassSurface";
 import { PierreEntryIcon } from "../../components/PierreEntryIcon";
-export type ComposerCommandItem =
-  | {
-      readonly id: string;
-      readonly type: "issue";
-      readonly issue: IssueContextMetadata;
-      readonly label: string;
-      readonly description: string;
-    }
-  | {
-      readonly id: string;
-      readonly type: "pull-request";
-      readonly pullRequest: PullRequestContextMetadata;
-      readonly label: string;
-      readonly description: string;
-    }
-  | {
-      readonly id: string;
-      readonly type: "path";
-      readonly path: string;
-      readonly kind: "file" | "directory";
-      readonly label: string;
-      readonly description: string;
-    }
-  | {
-      readonly id: string;
-      readonly type: "slash-command";
-      readonly command: string;
-      readonly label: string;
-      readonly description: string;
-    }
-  | {
-      readonly id: string;
-      readonly type: "provider-slash-command";
-      readonly command: ServerProviderSlashCommand;
-      readonly label: string;
-      readonly description: string;
-    }
-  | {
-      readonly id: string;
-      readonly type: "skill";
-      readonly skill: ServerProviderSkill;
-      readonly label: string;
-      readonly description: string;
-    };
+import type { ComposerCommandItem } from "./composer-command-menu-model";
 
 interface ComposerCommandPopoverProps {
   readonly items: ReadonlyArray<ComposerCommandItem>;
@@ -107,6 +58,8 @@ function itemIcon(item: ComposerCommandItem): AppSymbolName | null {
       return "terminal";
     case "skill":
       return SKILL_SOURCE_SYMBOL_BY_KIND[resolveProviderSkillSourceKind(item.skill)];
+    case "managed-text-resource":
+      return "text.alignleft";
     case "path":
       return null;
   }
@@ -118,6 +71,8 @@ function groupLabel(triggerKind: ComposerTriggerKind | null): string | null {
       return "Issues and pull requests";
     case "slash-command":
       return "Commands";
+    case "snippet":
+      return "Snippets";
     case "skill":
       return "Skills";
     case "path":
@@ -140,6 +95,8 @@ function emptyText(triggerKind: ComposerTriggerKind | null, isLoading: boolean):
       return "No skills found.";
     case "slash-command":
       return "No matching commands.";
+    case "snippet":
+      return "No snippets found.";
     default:
       return "No results.";
   }
@@ -180,6 +137,11 @@ const CommandRow = memo(function CommandRow(props: {
           props.item.label
         )}
       </Text>
+      {"sourceLabel" in props.item && props.item.sourceLabel ? (
+        <Text className="shrink-0 text-3xs text-foreground-tertiary" numberOfLines={1}>
+          {props.item.sourceLabel}
+        </Text>
+      ) : null}
       {props.item.description ? (
         <Text className="min-w-0 flex-1 text-xs text-foreground-muted" numberOfLines={1}>
           {props.item.description}

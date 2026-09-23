@@ -63,6 +63,7 @@ import {
   type ProjectMcpTransport,
   type ProjectMcpTransportDraft,
   ProviderInstanceId,
+  ManagedTextResourceRpcError,
   SkillRpcError,
   ProjectMcpCreateError,
   ProjectMcpCatalogCommittedCleanupPendingError,
@@ -104,11 +105,23 @@ import {
   type ProjectWorkReadIntent,
   type ProjectWorkWriteIntent,
   WS_METHODS,
+  WsManagedTextResourcesCatalogListRpc,
+  WsManagedTextResourcesCatalogSubscribeRpc,
+  WsManagedTextResourcesContentGetRpc,
+  WsManagedTextResourcesEnvironmentCreateRpc,
+  WsManagedTextResourcesEnvironmentDeleteRpc,
+  WsManagedTextResourcesEnvironmentSetEnabledRpc,
+  WsManagedTextResourcesEnvironmentUpdateRpc,
+  WsManagedTextResourcesProjectDeleteStateRpc,
+  WsManagedTextResourcesProjectSetDisabledRpc,
+  WsManagedTextResourcesProjectSetOverrideRpc,
+  WsManagedTextResourcesThreadResetRpc,
+  WsManagedTextResourcesThreadSetEnabledRpc,
   WsRpcGroup,
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
 import { HttpRouter, HttpServerRequest, HttpServerRespondable } from "effect/unstable/http";
-import { RpcSerialization, RpcServer } from "effect/unstable/rpc";
+import { RpcGroup, RpcSerialization, RpcServer } from "effect/unstable/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
 import { resolveThreadWorkspaceCwd } from "./checkpointing/Utils.ts";
@@ -145,6 +158,11 @@ import * as ProviderSessionDirectory from "./provider/Services/ProviderSessionDi
 import * as ProviderMaintenanceRunner from "./provider/providerMaintenanceRunner.ts";
 import * as SkillCatalogService from "./skills/SkillCatalogService.ts";
 import { resolveAuthoritativeSkillScope, skillChangeAffectsScope } from "./skills/SkillRpcScope.ts";
+import * as ManagedTextResourceCatalogService from "./managedTextResources/ManagedTextResourceCatalogService.ts";
+import {
+  managedTextResourceChangeAffectsScope,
+  resolveAuthoritativeManagedTextResourceScope,
+} from "./managedTextResources/ManagedTextResourceRpc.ts";
 import { ProviderAuthService } from "./provider/Services/ProviderAuthService.ts";
 import { ProviderInstanceRegistry } from "./provider/Services/ProviderInstanceRegistry.ts";
 import { makeProviderInstallation } from "./provider/providerInstallation.ts";
@@ -156,6 +174,7 @@ import { makeSkillDeploymentService } from "./skills/SkillDeploymentService.ts";
 import { selectSkillDeploymentChange } from "./skills/SkillDeploymentRpc.ts";
 import * as ExternalNotificationDispatcher from "./notifications/ExternalNotificationDispatcher.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
+
 import { withTerminalOutputWindow } from "./terminal/OutputProtocol.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
 import * as DeviceService from "./device/DeviceService.ts";
@@ -232,6 +251,36 @@ import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
 import * as RelayClient from "@t3tools/shared/relayClient";
+
+const ManagedTextResourceWsRpcGroup = RpcGroup.make(
+  WsManagedTextResourcesCatalogListRpc,
+  WsManagedTextResourcesCatalogSubscribeRpc,
+  WsManagedTextResourcesContentGetRpc,
+  WsManagedTextResourcesEnvironmentCreateRpc,
+  WsManagedTextResourcesEnvironmentUpdateRpc,
+  WsManagedTextResourcesEnvironmentDeleteRpc,
+  WsManagedTextResourcesEnvironmentSetEnabledRpc,
+  WsManagedTextResourcesProjectSetOverrideRpc,
+  WsManagedTextResourcesProjectSetDisabledRpc,
+  WsManagedTextResourcesProjectDeleteStateRpc,
+  WsManagedTextResourcesThreadSetEnabledRpc,
+  WsManagedTextResourcesThreadResetRpc,
+);
+const WsCoreRpcGroup = WsRpcGroup.omit(
+  WS_METHODS.managedTextResourcesCatalogList,
+  WS_METHODS.managedTextResourcesCatalogSubscribe,
+  WS_METHODS.managedTextResourcesContentGet,
+  WS_METHODS.managedTextResourcesEnvironmentCreate,
+  WS_METHODS.managedTextResourcesEnvironmentUpdate,
+  WS_METHODS.managedTextResourcesEnvironmentDelete,
+  WS_METHODS.managedTextResourcesEnvironmentSetEnabled,
+  WS_METHODS.managedTextResourcesProjectSetOverride,
+  WS_METHODS.managedTextResourcesProjectSetDisabled,
+  WS_METHODS.managedTextResourcesProjectDeleteState,
+  WS_METHODS.managedTextResourcesThreadSetEnabled,
+  WS_METHODS.managedTextResourcesThreadReset,
+);
+
 const isOrchestrationDispatchCommandError = Schema.is(OrchestrationDispatchCommandError);
 const isOrchestrationCommandInvariantError = Schema.is(OrchestrationCommandInvariantError);
 const isOrchestrationCommandIdConflictError = Schema.is(OrchestrationCommandIdConflictError);
@@ -240,6 +289,7 @@ const isOrchestrationCommandPreviouslyRejectedError = Schema.is(
 );
 const isEnvironmentAuthorizationError = Schema.is(EnvironmentAuthorizationError);
 const isSkillRpcError = Schema.is(SkillRpcError);
+const isManagedTextResourceRpcError = Schema.is(ManagedTextResourceRpcError);
 const isProjectMcpCreateError = Schema.is(ProjectMcpCreateError);
 const isProjectMcpUpdateError = Schema.is(ProjectMcpUpdateError);
 const isProjectMcpRemoveError = Schema.is(ProjectMcpRemoveError);
@@ -599,6 +649,233 @@ function readClientAnalyticsProps(request: HttpServerRequest.HttpServerRequest) 
   };
 }
 
+const makeWsManagedTextResourceRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
+  ManagedTextResourceWsRpcGroup.toLayer(
+    Effect.gen(function* () {
+      const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+      const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
+      const managedTextResources =
+        yield* ManagedTextResourceCatalogService.ManagedTextResourceCatalogService;
+      const authorizationError = (requiredScope: AuthEnvironmentScope) =>
+        new EnvironmentAuthorizationError({
+          message: `The authenticated token is missing required scope: ${requiredScope}.`,
+          requiredScope,
+        });
+      const authorizeEffect = <A, E, R>(
+        method: string,
+        effect: Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E | EnvironmentAuthorizationError, R> => {
+        const requiredScope = requiredScopeForRpcMethod(method);
+        return currentSession.scopes.includes(requiredScope)
+          ? effect
+          : Effect.fail(authorizationError(requiredScope));
+      };
+      const observeRpcEffect = <A, E, R>(
+        method: string,
+        effect: Effect.Effect<A, E, R>,
+        traceAttributes?: Readonly<Record<string, unknown>>,
+      ) => instrumentRpcEffect(method, authorizeEffect(method, effect), traceAttributes);
+      const observeRpcStreamEffect = <A, StreamError, StreamContext, EffectError, EffectContext>(
+        method: string,
+        effect: Effect.Effect<
+          Stream.Stream<A, StreamError, StreamContext>,
+          EffectError,
+          EffectContext
+        >,
+        traceAttributes?: Readonly<Record<string, unknown>>,
+      ) => instrumentRpcStreamEffect(method, authorizeEffect(method, effect), traceAttributes);
+      const resolveContext = (input: {
+        readonly threadId?: ThreadId | undefined;
+        readonly projectId?: ProjectId | undefined;
+      }) =>
+        resolveAuthoritativeManagedTextResourceScope(projectionSnapshotQuery, input).pipe(
+          Effect.mapError((cause) =>
+            isManagedTextResourceRpcError(cause)
+              ? cause
+              : new ManagedTextResourceRpcError({
+                  code: "invalid-override",
+                  message: "The authoritative managed text resource scope could not be resolved.",
+                }),
+          ),
+        );
+      const resolveRpcScope = (input: {
+        readonly threadId?: ThreadId | undefined;
+        readonly projectId?: ProjectId | undefined;
+      }) =>
+        resolveContext(input).pipe(
+          Effect.flatMap((scope) =>
+            serverEnvironment.getEnvironmentId.pipe(
+              Effect.map((environmentId) => ({ ...scope, environmentId })),
+            ),
+          ),
+        );
+      const requireEnvironmentCatalogScope = (method: string, requestedId: string) =>
+        Effect.gen(function* () {
+          const environmentId = yield* serverEnvironment.getEnvironmentId;
+          if (String(environmentId) !== requestedId) {
+            return yield* new EnvironmentAuthorizationError({
+              message: `Environment '${requestedId}' does not belong to this server.`,
+              requiredScope: requiredScopeForRpcMethod(method),
+            });
+          }
+          return environmentId;
+        });
+      const invalidWorkspace = (message: string) =>
+        new ManagedTextResourceRpcError({ code: "invalid-override", message });
+
+      return ManagedTextResourceWsRpcGroup.of({
+        [WS_METHODS.managedTextResourcesCatalogList]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.managedTextResourcesCatalogList,
+            resolveRpcScope(input).pipe(
+              Effect.flatMap((scope) => managedTextResources.list(scope)),
+            ),
+            { "rpc.aggregate": "managed-text-resources" },
+          ),
+        [WS_METHODS.managedTextResourcesCatalogSubscribe]: (input) =>
+          observeRpcStreamEffect(
+            WS_METHODS.managedTextResourcesCatalogSubscribe,
+            resolveRpcScope(input).pipe(
+              Effect.map((scope) =>
+                managedTextResources
+                  .subscribe(scope)
+                  .pipe(
+                    Stream.filter((change) => managedTextResourceChangeAffectsScope(scope, change)),
+                  ),
+              ),
+            ),
+            { "rpc.aggregate": "managed-text-resources" },
+          ),
+        [WS_METHODS.managedTextResourcesContentGet]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.managedTextResourcesContentGet,
+            resolveRpcScope(input).pipe(
+              Effect.flatMap((scope) => managedTextResources.content({ ...input, ...scope })),
+            ),
+            { "rpc.aggregate": "managed-text-resources" },
+          ),
+        [WS_METHODS.managedTextResourcesEnvironmentCreate]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.managedTextResourcesEnvironmentCreate,
+            requireEnvironmentCatalogScope(
+              WS_METHODS.managedTextResourcesEnvironmentCreate,
+              String(input.environmentId),
+            ).pipe(Effect.andThen(managedTextResources.createEnvironment(input))),
+            { "rpc.aggregate": "managed-text-resources" },
+          ),
+        [WS_METHODS.managedTextResourcesEnvironmentUpdate]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.managedTextResourcesEnvironmentUpdate,
+            requireEnvironmentCatalogScope(
+              WS_METHODS.managedTextResourcesEnvironmentUpdate,
+              String(input.environmentId),
+            ).pipe(Effect.andThen(managedTextResources.updateEnvironment(input))),
+            { "rpc.aggregate": "managed-text-resources" },
+          ),
+        [WS_METHODS.managedTextResourcesEnvironmentDelete]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.managedTextResourcesEnvironmentDelete,
+            requireEnvironmentCatalogScope(
+              WS_METHODS.managedTextResourcesEnvironmentDelete,
+              String(input.environmentId),
+            ).pipe(Effect.andThen(managedTextResources.deleteEnvironment(input))),
+            { "rpc.aggregate": "managed-text-resources" },
+          ),
+        [WS_METHODS.managedTextResourcesEnvironmentSetEnabled]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.managedTextResourcesEnvironmentSetEnabled,
+            requireEnvironmentCatalogScope(
+              WS_METHODS.managedTextResourcesEnvironmentSetEnabled,
+              String(input.environmentId),
+            ).pipe(Effect.andThen(managedTextResources.setEnvironmentEnabled(input))),
+            { "rpc.aggregate": "managed-text-resources" },
+          ),
+        [WS_METHODS.managedTextResourcesProjectSetOverride]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.managedTextResourcesProjectSetOverride,
+            resolveRpcScope({ projectId: input.projectId }).pipe(
+              Effect.flatMap((scope) =>
+                scope.projectRoot === undefined
+                  ? Effect.fail(
+                      invalidWorkspace("The authoritative project workspace is unavailable."),
+                    )
+                  : managedTextResources.setProjectOverride({
+                      ...input,
+                      environmentId: scope.environmentId,
+                      projectRoot: scope.projectRoot,
+                    }),
+              ),
+            ),
+            { "rpc.aggregate": "managed-text-resources" },
+          ),
+        [WS_METHODS.managedTextResourcesProjectSetDisabled]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.managedTextResourcesProjectSetDisabled,
+            resolveRpcScope({ projectId: input.projectId }).pipe(
+              Effect.flatMap((scope) =>
+                scope.projectRoot === undefined
+                  ? Effect.fail(
+                      invalidWorkspace("The authoritative project workspace is unavailable."),
+                    )
+                  : managedTextResources.setProjectDisabled({
+                      ...input,
+                      environmentId: scope.environmentId,
+                      projectRoot: scope.projectRoot,
+                    }),
+              ),
+            ),
+            { "rpc.aggregate": "managed-text-resources" },
+          ),
+        [WS_METHODS.managedTextResourcesProjectDeleteState]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.managedTextResourcesProjectDeleteState,
+            resolveRpcScope({ projectId: input.projectId }).pipe(
+              Effect.flatMap((scope) =>
+                scope.projectRoot === undefined
+                  ? Effect.fail(
+                      invalidWorkspace("The authoritative project workspace is unavailable."),
+                    )
+                  : managedTextResources.deleteProjectState({
+                      ...input,
+                      environmentId: scope.environmentId,
+                      projectRoot: scope.projectRoot,
+                    }),
+              ),
+            ),
+            { "rpc.aggregate": "managed-text-resources" },
+          ),
+        [WS_METHODS.managedTextResourcesThreadSetEnabled]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.managedTextResourcesThreadSetEnabled,
+            resolveRpcScope({ threadId: input.threadId }).pipe(
+              Effect.flatMap((scope) =>
+                scope.projectId === undefined || scope.projectRoot === undefined
+                  ? Effect.fail(
+                      invalidWorkspace("The authoritative thread workspace is unavailable."),
+                    )
+                  : managedTextResources.setThreadEnabled({ ...input, ...scope }),
+              ),
+            ),
+            { "rpc.aggregate": "managed-text-resources" },
+          ),
+        [WS_METHODS.managedTextResourcesThreadReset]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.managedTextResourcesThreadReset,
+            resolveRpcScope({ threadId: input.threadId }).pipe(
+              Effect.flatMap((scope) =>
+                scope.projectId === undefined || scope.projectRoot === undefined
+                  ? Effect.fail(
+                      invalidWorkspace("The authoritative thread workspace is unavailable."),
+                    )
+                  : managedTextResources.resetThread({ ...input, ...scope }),
+              ),
+            ),
+            { "rpc.aggregate": "managed-text-resources" },
+          ),
+      });
+    }),
+  );
+
 const makeWsRpcLayer = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   clientOrigin: OrchestrationClientOrigin,
@@ -606,7 +883,7 @@ const makeWsRpcLayer = (
   previewAutomationBroker: PreviewAutomationBroker.PreviewAutomationBroker["Service"],
   requestOrigin: string | undefined,
 ) =>
-  WsRpcGroup.toLayer(
+  WsCoreRpcGroup.toLayer(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
       const crypto = yield* Crypto.Crypto;
@@ -2434,7 +2711,7 @@ const makeWsRpcLayer = (
           .refreshLocalStatus(cwd)
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
 
-      return WsRpcGroup.of({
+      return WsCoreRpcGroup.of({
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,
@@ -6298,12 +6575,15 @@ export const websocketRpcRouteLayer = Layer.unwrap(
           return httpEffect;
         }).pipe(
           Effect.provide(
-            makeWsRpcLayer(
-              session,
-              clientOrigin,
-              clientAnalyticsProps,
-              previewAutomationBroker,
-              requestOrigin,
+            Layer.merge(
+              makeWsRpcLayer(
+                session,
+                clientOrigin,
+                clientAnalyticsProps,
+                previewAutomationBroker,
+                requestOrigin,
+              ),
+              makeWsManagedTextResourceRpcLayer(session),
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),

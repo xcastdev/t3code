@@ -19,6 +19,10 @@ import {
   collapseExpandedComposerCursor,
   composerSubmissionIntentForEnter,
   detectComposerTrigger,
+  detectManagedCommandTrigger,
+  managedCommandArgumentForSelection,
+  managedCommandNeedsExplicitSelection,
+  managedCommandSubmissionBlockReason,
   expandCollapsedComposerCursor,
   formatAssistantCitationForComposer,
   isCollapsedCursorAdjacentToInlineToken,
@@ -227,6 +231,21 @@ describe("detectComposerTrigger", () => {
     });
   });
 
+  it("detects a single-colon snippet trigger at the caret", () => {
+    const text = "Use :fix-bug after this";
+    expect(detectComposerTrigger(text, "Use :fix-bug".length)).toEqual({
+      kind: "snippet",
+      query: "fix-bug",
+      rangeStart: "Use ".length,
+      rangeEnd: "Use :fix-bug".length,
+    });
+  });
+
+  it("does not open the snippet picker for double or embedded colons", () => {
+    expect(detectComposerTrigger("::fix-bug", "::fix-bug".length)).toBeNull();
+    expect(detectComposerTrigger("word:fix-bug", "word:fix-bug".length)).toBeNull();
+  });
+
   it("detects a pull request number at a token boundary", () => {
     const text = "Compare this with #8737";
 
@@ -328,6 +347,114 @@ describe("detectComposerTrigger", () => {
     expect(trigger).not.toBeNull();
     expect(trigger?.kind).toBe("path");
     expect(trigger?.query).toBe("");
+  });
+});
+
+describe("detectManagedCommandTrigger", () => {
+  it("keeps a managed command selectable after a trailing argument without changing native parsing", () => {
+    const text = "/review file.ts and tests";
+    expect(detectComposerTrigger(text, text.length)).toBeNull();
+    expect(detectManagedCommandTrigger(text, text.length, new Set(["review"]))).toEqual({
+      kind: "slash-command",
+      query: "review",
+      rangeStart: 0,
+      rangeEnd: text.length,
+    });
+    expect(detectManagedCommandTrigger(text, text.length, new Set(["other"]))).toBeNull();
+  });
+});
+
+describe("managedCommandArgumentForSelection", () => {
+  it("inserts a partial or bare slash selection without borrowing typed text as arguments", () => {
+    expect(managedCommandArgumentForSelection("/rev", "review")).toBe("");
+    expect(managedCommandArgumentForSelection("/", "review")).toBe("");
+  });
+
+  it("uses trailing text only when the slash key exactly matches the selected command", () => {
+    expect(managedCommandArgumentForSelection("/review src/file.ts", "review")).toBe("src/file.ts");
+    expect(managedCommandArgumentForSelection("/rev src/file.ts", "review")).toBe("");
+  });
+});
+
+describe("managedCommandNeedsExplicitSelection", () => {
+  it("blocks native submission only when a typed argument collides with an effective managed key", () => {
+    expect(
+      managedCommandNeedsExplicitSelection({
+        text: "/review source.ts",
+        managedKeys: new Set(["review"]),
+        nativeKeys: new Set(["review"]),
+      }),
+    ).toBe(true);
+    expect(
+      managedCommandNeedsExplicitSelection({
+        text: "/review",
+        managedKeys: new Set(["review"]),
+        nativeKeys: new Set(["review"]),
+      }),
+    ).toBe(false);
+    expect(
+      managedCommandNeedsExplicitSelection({
+        text: "/review source.ts",
+        managedKeys: new Set(["review"]),
+        nativeKeys: new Set(["other"]),
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("managedCommandSubmissionBlockReason", () => {
+  it("waits for the catalog before sending a native command with arguments", () => {
+    expect(
+      managedCommandSubmissionBlockReason({
+        text: "/review src/a.ts",
+        managedKeys: new Set(),
+        nativeKeys: new Set(["review"]),
+        catalogReady: false,
+        resolvedNativeText: null,
+      }),
+    ).toBe("catalog-pending");
+  });
+
+  it("requires an explicit source choice when the loaded catalog has a collision", () => {
+    expect(
+      managedCommandSubmissionBlockReason({
+        text: "/review src/a.ts",
+        managedKeys: new Set(["review"]),
+        nativeKeys: new Set(["review"]),
+        catalogReady: true,
+        resolvedNativeText: null,
+      }),
+    ).toBe("source-ambiguous");
+  });
+
+  it("keeps a managed-only command from being sent before it is expanded", () => {
+    expect(
+      managedCommandSubmissionBlockReason({
+        text: "/review src/a.ts",
+        managedKeys: new Set(["review"]),
+        nativeKeys: new Set(),
+        catalogReady: true,
+        resolvedNativeText: null,
+      }),
+    ).toBe("managed-selection-required");
+  });
+
+  it("preserves native submission when no managed collision exists or native choice was explicit", () => {
+    const base = {
+      text: "/review src/a.ts",
+      managedKeys: new Set(["other"]),
+      nativeKeys: new Set(["review"]),
+      catalogReady: true,
+      resolvedNativeText: null,
+    };
+    expect(managedCommandSubmissionBlockReason(base)).toBeNull();
+    expect(
+      managedCommandSubmissionBlockReason({
+        ...base,
+        managedKeys: new Set(["review"]),
+        resolvedNativeText: base.text,
+      }),
+    ).toBeNull();
   });
 });
 

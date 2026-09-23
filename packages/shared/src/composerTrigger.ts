@@ -1,6 +1,7 @@
 export type ComposerTriggerKind =
   | "path"
   | "pull-request"
+  | "snippet"
   | "slash-command"
   | "slash-model"
   | "skill";
@@ -121,6 +122,15 @@ export function detectComposerTrigger(
     return {
       kind: "skill",
       query: token.slice(1),
+      rangeStart: tokenStart,
+      rangeEnd: cursor,
+    };
+  }
+  const snippetMatch = /^:([A-Za-z0-9_-]*)$/.exec(token);
+  if (snippetMatch) {
+    return {
+      kind: "snippet",
+      query: snippetMatch[1] ?? "",
       rangeStart: tokenStart,
       rangeEnd: cursor,
     };

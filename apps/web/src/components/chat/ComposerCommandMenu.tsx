@@ -8,6 +8,7 @@ import {
   type ProviderDriverKind,
   type PullRequestContextMetadata,
   type IssueContextMetadata,
+  type ManagedTextResourceSummary,
   type ServerProviderSkill,
   type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
@@ -51,6 +52,20 @@ export type ComposerCommandItem =
       type: "provider-slash-command";
       provider: ProviderDriverKind;
       command: ServerProviderSlashCommand;
+      label: string;
+      description: string;
+    }
+  | {
+      id: string;
+      type: "managed-command";
+      resource: ManagedTextResourceSummary & { readonly kind: "command" };
+      label: string;
+      description: string;
+    }
+  | {
+      id: string;
+      type: "managed-snippet";
+      resource: ManagedTextResourceSummary & { readonly kind: "snippet" };
       label: string;
       description: string;
     }
@@ -136,7 +151,9 @@ export const ComposerCommandMenu = memo(function ComposerCommandMenu(props: {
                   ? "Searching workspace skills..."
                   : props.triggerKind === "pull-request"
                     ? "Finding pull request..."
-                    : "Searching workspace files..."
+                    : props.triggerKind === "slash-command" || props.triggerKind === "snippet"
+                      ? "Reading managed commands and snippets..."
+                      : "Searching workspace files..."
                 : (props.emptyStateText ??
                   (props.triggerKind === "skill"
                     ? "No skills found. Try / to browse provider commands."
@@ -163,6 +180,14 @@ const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
     props.item.type === "skill" ? resolveProviderSkillSourceKind(props.item.skill) : null;
   const isSlashSkill =
     props.triggerKind === "slash-command" && props.item.type === "skill" ? props.item.skill : null;
+  const commandSourceLabel =
+    props.item.type === "managed-command" || props.item.type === "managed-snippet"
+      ? `Managed · ${props.item.resource.scope === "environment" ? "Environment" : "Project"}`
+      : props.item.type === "provider-slash-command"
+        ? providerCommandSourceLabel(props.item.provider)
+        : props.item.type === "slash-command"
+          ? "T3 · Built-in"
+          : null;
   const pullRequestPresentation =
     props.item.type === "pull-request" ? resolvePullRequestState(props.item.pullRequest) : null;
 
@@ -213,6 +238,18 @@ const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
         <span className="min-w-0 max-w-[48ch] flex-1 truncate text-left text-secondary-label text-xs">
           {props.item.description}
         </span>
+        {commandSourceLabel ? (
+          <Badge
+            variant={
+              props.item.type === "managed-command" || props.item.type === "managed-snippet"
+                ? "info"
+                : "outline"
+            }
+            size="sm"
+          >
+            {commandSourceLabel}
+          </Badge>
+        ) : null}
         {skillSourceKind ? (
           <SkillSourceBadge
             kind={skillSourceKind}
@@ -223,6 +260,25 @@ const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
     </CommandItem>
   );
 });
+
+function providerCommandSourceLabel(provider: ProviderDriverKind): string {
+  switch (provider) {
+    case "claudeAgent":
+      return "Claude";
+    case "codex":
+      return "Codex";
+    case "cursor":
+      return "Cursor";
+    case "grok":
+      return "Grok";
+    case "opencode":
+      return "OpenCode";
+    case "antigravity":
+      return "Antigravity";
+    default:
+      return String(provider);
+  }
+}
 
 const SKILL_SOURCE_ICON_BY_KIND: Record<ProviderSkillSourceKind, LucideIcon> = {
   app: BlocksIcon,

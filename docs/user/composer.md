@@ -119,7 +119,20 @@ recording and preserves your existing draft.
 Transcription runs on your device. T3 Code deletes the temporary audio after
 transcription or cancellation; only the message text is sent when you submit.
 
-## Commands and skills
+## Commands, snippets, and skills
+
+Create reusable commands and snippets in **Settings → Commands** on web and desktop, or
+**Settings → Configuration → Commands & snippets** on mobile. Environment entries are
+available to every project. A project can replace or disable an inherited entry;
+thread settings can enable or disable the resulting entry for that thread.
+
+Type `/` at the start of a message to choose a managed command. If its template contains
+`$ARGUMENTS`, the text after the command name replaces each placeholder; otherwise that text
+is appended. Choosing a command inserts editable text without sending it. Provider commands
+appear separately with their source shown when they share a name with a managed command.
+
+Type `:snippet` to insert a snippet at the caret. The inserted text remains editable and is
+sent only when you send the message.
 
 Type `/` for commands or `!` to add a skill from the selected environment and
 provider. On mobile, both are also available before starting a thread on
@@ -129,6 +142,7 @@ The composer prefixes are:
 
 - `@` to find files and folders.
 - `/` to find commands. MCP tools may later use the `/mcp:` command namespace.
+- `:` to find managed text snippets.
 - `!` to find skills enabled for the provider.
 - `#` to find issues and pull requests. Use `#iss:` or `#pr:` to narrow the search.
 - `$` is reserved for future agent selection.

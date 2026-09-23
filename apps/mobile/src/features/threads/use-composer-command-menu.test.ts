@@ -1,5 +1,10 @@
 import { describe, expect, it, vi } from "vite-plus/test";
-import { ProviderDriverKind } from "@t3tools/contracts";
+import {
+  ManagedTextResourceId,
+  ManagedTextResourceKey,
+  ManagedTextResourceRevision,
+  ProviderDriverKind,
+} from "@t3tools/contracts";
 vi.mock("react-native", () => ({ Alert: { alert: vi.fn() } }));
 
 vi.mock("../../state/queries", () => ({
@@ -19,9 +24,11 @@ vi.mock("../../state/use-atom-command", () => ({
 }));
 
 import {
+  buildManagedTextResourceMenuItems,
   buildComposerSlashCommandItems,
+  managedCommandInvocationNeedsChoice,
   resolveComposerCommandSelection,
-} from "./use-composer-command-menu";
+} from "./composer-command-menu-model";
 
 describe("mobile slash commands", () => {
   const antigravity = {
@@ -115,5 +122,121 @@ describe("mobile slash commands", () => {
         allowInteractionMode: false,
       }),
     ).toEqual({ text: "/plan ", cursor: 6, interactionMode: null });
+  });
+
+  it("keeps managed and provider-native slash commands as source-labeled choices on collisions", () => {
+    const managedEntry = {
+      kind: "command" as const,
+      id: ManagedTextResourceId.make("resource-review"),
+      key: ManagedTextResourceKey.make("review"),
+      name: "Review changes",
+      scope: "project" as const,
+      scopeId: "project-1",
+      projectState: "override" as const,
+      revision: ManagedTextResourceRevision.make("revision-1"),
+      effective: true,
+    };
+    const input = {
+      query: "rev",
+      atMessageStart: true,
+      hasThread: true,
+      allowInteractionMode: false,
+      selectedProviderStatus: {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        slashCommands: [{ name: "review", description: "Open provider review" }],
+      },
+      managedEntries: [managedEntry],
+    } satisfies Parameters<typeof buildComposerSlashCommandItems>[0];
+
+    const items = buildComposerSlashCommandItems(input);
+
+    expect(items.map((item) => item.id)).toEqual(["managed:review", "pcmd:review"]);
+    expect(items.map((item) => ("sourceLabel" in item ? item.sourceLabel : undefined))).toEqual([
+      "Managed · Project",
+      "Provider native",
+    ]);
+    const nativeItems = items.filter((item) => item.type !== "managed-text-resource");
+    expect(
+      managedCommandInvocationNeedsChoice({
+        key: "review",
+        catalogResolved: true,
+        entries: [managedEntry],
+        nativeItems,
+        nativeChoiceKey: null,
+      }),
+    ).toBe(true);
+    expect(
+      managedCommandInvocationNeedsChoice({
+        key: "review",
+        catalogResolved: true,
+        entries: [managedEntry],
+        nativeItems,
+        nativeChoiceKey: "review",
+      }),
+    ).toBe(false);
+    expect(
+      managedCommandInvocationNeedsChoice({
+        key: "review",
+        catalogResolved: false,
+        entries: [],
+        nativeItems,
+        nativeChoiceKey: null,
+      }),
+    ).toBe(true);
+  });
+
+  it("offers effective snippets by single-colon key and keeps their source visible", () => {
+    const entries = [
+      {
+        kind: "snippet" as const,
+        id: ManagedTextResourceId.make("resource-fix"),
+        key: ManagedTextResourceKey.make("fix-layout"),
+        name: "Fix layout",
+        scope: "environment" as const,
+        scopeId: "environment-1",
+        projectState: "inherit" as const,
+        revision: ManagedTextResourceRevision.make("revision-1"),
+        effective: true,
+      },
+      {
+        kind: "snippet" as const,
+        id: ManagedTextResourceId.make("resource-private"),
+        key: ManagedTextResourceKey.make("private"),
+        scope: "project" as const,
+        scopeId: "project-1",
+        projectState: "disabled" as const,
+        revision: ManagedTextResourceRevision.make("revision-2"),
+        effective: false,
+      },
+      {
+        kind: "snippet" as const,
+        key: ManagedTextResourceKey.make("invalid"),
+        scope: "project" as const,
+        scopeId: "project-1",
+        projectState: "invalid" as const,
+        revision: ManagedTextResourceRevision.make("revision-3"),
+        effective: false,
+      },
+      {
+        kind: "snippet" as const,
+        key: ManagedTextResourceKey.make("orphan"),
+        scope: "project" as const,
+        scopeId: "project-1",
+        projectState: "orphan" as const,
+        revision: ManagedTextResourceRevision.make("revision-4"),
+        effective: false,
+      },
+    ];
+
+    expect(buildManagedTextResourceMenuItems({ entries, kind: "snippet", query: "fix" })).toEqual([
+      {
+        id: "managed:fix-layout",
+        type: "managed-text-resource",
+        resource: entries[0],
+        label: ":fix-layout",
+        description: "Fix layout",
+        sourceLabel: "Managed · Environment",
+      },
+    ]);
   });
 });

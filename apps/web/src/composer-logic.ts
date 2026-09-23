@@ -12,8 +12,9 @@ import {
   splitPromptIntoComposerSegments,
   type ComposerPromptSegment,
 } from "./composer-editor-mentions";
+import { parseManagedCommandInvocation } from "@t3tools/client-runtime/managedTextResources";
 
-export type ComposerTriggerKind = "path" | "pull-request" | "slash-command" | "skill";
+export type ComposerTriggerKind = "path" | "pull-request" | "snippet" | "slash-command" | "skill";
 export type ComposerSlashCommand = "model" | "plan" | "default";
 export type ComposerSubmissionIntent = "foreground" | "background";
 
@@ -263,6 +264,15 @@ export function detectComposerTrigger(text: string, cursorInput: number): Compos
       rangeEnd: cursor,
     };
   }
+  const snippetMatch = /^:([A-Za-z0-9_-]*)$/.exec(token);
+  if (snippetMatch) {
+    return {
+      kind: "snippet",
+      query: snippetMatch[1] ?? "",
+      rangeStart: tokenStart,
+      rangeEnd: cursor,
+    };
+  }
   if (!token.startsWith("@")) {
     return null;
   }
@@ -273,6 +283,74 @@ export function detectComposerTrigger(text: string, cursorInput: number): Compos
     rangeStart: tokenStart,
     rangeEnd: cursor,
   };
+}
+
+/** Keeps managed commands selectable with an argument while leaving native parsing unchanged. */
+export function detectManagedCommandTrigger(
+  text: string,
+  cursorInput: number,
+  availableKeys: ReadonlySet<string>,
+): ComposerTrigger | null {
+  if (availableKeys.size === 0) return null;
+  const cursor = clampCursor(text, cursorInput);
+  const lineStart = text.lastIndexOf("\n", Math.max(0, cursor - 1)) + 1;
+  const invocation = parseManagedCommandInvocation(text.slice(lineStart, cursor));
+  if (!invocation || !availableKeys.has(invocation.key)) return null;
+  return {
+    kind: "slash-command",
+    query: invocation.key,
+    rangeStart: lineStart,
+    rangeEnd: cursor,
+  };
+}
+
+export function detectComposerTriggerWithManagedCommands(
+  text: string,
+  cursorInput: number,
+  availableKeys: ReadonlySet<string>,
+): ComposerTrigger | null {
+  return (
+    detectComposerTrigger(text, cursorInput) ??
+    detectManagedCommandTrigger(text, cursorInput, availableKeys)
+  );
+}
+
+/** Only an exact slash key can contribute text arguments to an inserted command. */
+export function managedCommandArgumentForSelection(
+  invocationText: string,
+  selectedKey: string,
+): string {
+  const invocation = parseManagedCommandInvocation(invocationText);
+  return invocation?.key === selectedKey ? invocation.argument : "";
+}
+
+export function managedCommandNeedsExplicitSelection(input: {
+  text: string;
+  managedKeys: ReadonlySet<string>;
+  nativeKeys: ReadonlySet<string>;
+}): boolean {
+  const invocation = parseManagedCommandInvocation(input.text);
+  return (
+    invocation !== null &&
+    invocation.argument.trim().length > 0 &&
+    input.managedKeys.has(invocation.key) &&
+    input.nativeKeys.has(invocation.key)
+  );
+}
+
+export function managedCommandSubmissionBlockReason(input: {
+  text: string;
+  managedKeys: ReadonlySet<string>;
+  nativeKeys: ReadonlySet<string>;
+  catalogReady: boolean;
+  resolvedNativeText: string | null;
+}): "catalog-pending" | "source-ambiguous" | "managed-selection-required" | null {
+  const firstLine = input.text.split(/\r?\n/u, 1)[0] ?? "";
+  const invocation = parseManagedCommandInvocation(firstLine);
+  if (!invocation || input.resolvedNativeText === input.text) return null;
+  if (!input.catalogReady) return input.nativeKeys.has(invocation.key) ? "catalog-pending" : null;
+  if (!input.managedKeys.has(invocation.key)) return null;
+  return input.nativeKeys.has(invocation.key) ? "source-ambiguous" : "managed-selection-required";
 }
 
 export function parseStandaloneComposerSlashCommand(

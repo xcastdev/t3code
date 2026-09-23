@@ -137,6 +137,11 @@ function LocalSettingsRouteScreen() {
             target="SettingsEnvironments"
           />
           <SettingsRow icon="sparkles" label="Skills" target="SettingsSkills" />
+          <SettingsRow
+            icon="text.alignleft"
+            label="Commands & snippets"
+            target="SettingsManagedTextResources"
+          />
         </SettingsSection>
 
         <GeneralSettingsSection />
@@ -520,6 +525,11 @@ function ConfiguredSettingsRouteScreen() {
             target="SettingsEnvironments"
           />
           <SettingsRow icon="sparkles" label="Skills" target="SettingsSkills" />
+          <SettingsRow
+            icon="text.alignleft"
+            label="Commands & snippets"
+            target="SettingsManagedTextResources"
+          />
           <SettingsSwitchRow
             icon="bell.badge"
             label="Device Notifications"

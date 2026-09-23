@@ -1,6 +1,7 @@
 import type {
   EnvironmentId,
   ModelSelection,
+  ManagedTextResourceSummary,
   ProviderInstanceId,
   ProviderOptionDescriptor,
   ProviderOptionSelection,
@@ -8,7 +9,7 @@ import type {
   ThreadId,
 } from "@t3tools/contracts";
 import { useAtomValue } from "@effect/atom-react";
-import { SkillCatalogRevision } from "@t3tools/contracts";
+import { ManagedTextResourceCatalogRevision, SkillCatalogRevision } from "@t3tools/contracts";
 import type { LegendListRenderItemProps } from "@legendapp/list/react-native";
 import { AnimatedLegendList } from "@legendapp/list/reanimated";
 import { HeaderHeightContext } from "@react-navigation/elements";
@@ -54,9 +55,11 @@ import {
 import { NATIVE_LIQUID_GLASS_SUPPORTED } from "../../native/native-glass";
 import { serverEnvironment } from "../../state/server";
 import { skillsEnvironment } from "../../state/skills";
+import { managedTextResourcesEnvironment } from "../../state/managedTextResources";
 import { sessionSkillDeliveryLabel, sessionSkillEntries } from "@t3tools/client-runtime/skills";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useEnvironmentQuery } from "../../state/query";
+import { ManagedTextResourceCatalogChanges } from "../managedTextResources/ManagedTextResourceCatalogChanges";
 import { useNewTaskFlow } from "./new-task-flow-provider";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 import {
@@ -300,6 +303,7 @@ function SwitchRow(props: {
   readonly value: boolean;
   readonly onValueChange: (value: boolean) => void;
   readonly isLast?: boolean;
+  readonly disabled?: boolean;
 }) {
   return (
     <View
@@ -311,6 +315,7 @@ function SwitchRow(props: {
       <Text className="text-sm font-t3-medium text-foreground">{props.label}</Text>
       <ThemedSwitch
         accessibilityLabel={props.label}
+        disabled={props.disabled}
         onValueChange={props.onValueChange}
         value={props.value}
       />
@@ -887,6 +892,131 @@ function ThreadSessionSkills() {
   );
 }
 
+function ThreadManagedTextResources() {
+  const session = useThreadSettingsSession();
+  const catalog = useEnvironmentQuery(
+    session.environmentId && session.threadId
+      ? managedTextResourcesEnvironment.catalog({
+          environmentId: session.environmentId,
+          input: { threadId: session.threadId },
+        })
+      : null,
+  );
+  const setEnabled = useAtomCommand(managedTextResourcesEnvironment.threadSetEnabled, {
+    reportFailure: true,
+  });
+  const reset = useAtomCommand(managedTextResourcesEnvironment.threadReset, {
+    reportFailure: true,
+  });
+  if (!session.environmentId || !session.threadId) return null;
+
+  const entries = catalog.data?.entries ?? [];
+  const overlays = catalog.data?.threadOverlays ?? [];
+  return (
+    <View className="pb-8 pt-5">
+      <ManagedTextResourceCatalogChanges
+        environmentId={session.environmentId}
+        input={{ threadId: session.threadId }}
+      />
+      <Text className="px-5 pb-2 text-sm font-t3-medium text-foreground-muted">
+        Commands and snippets
+      </Text>
+      <View className="mx-4 overflow-hidden rounded-2xl bg-card">
+        {catalog.isPending ? (
+          <Text className="px-4 py-3 text-sm text-foreground-muted">
+            Loading commands and snippets…
+          </Text>
+        ) : null}
+        {catalog.error ? (
+          <Text className="px-4 py-3 text-sm text-destructive">{catalog.error}</Text>
+        ) : null}
+        {entries.map((entry: ManagedTextResourceSummary, index) => {
+          const overlay = overlays.find(
+            (candidate) => candidate.kind === entry.kind && candidate.key === entry.key,
+          );
+          const unavailable =
+            !entry.id ||
+            !entry.effective ||
+            entry.projectState === "disabled" ||
+            entry.projectState === "invalid" ||
+            entry.projectState === "orphan";
+          const label = `${entry.kind === "command" ? "/" : ":"}${entry.key}`;
+          const detail =
+            entry.projectState === "invalid"
+              ? "Unavailable · Invalid project state"
+              : entry.projectState === "orphan"
+                ? "Unavailable · Missing source"
+                : entry.projectState === "disabled"
+                  ? "Disabled for project"
+                  : unavailable
+                    ? "Unavailable"
+                    : entry.scope === "project"
+                      ? "Project definition"
+                      : "Environment default";
+          return (
+            <View key={`${entry.kind}:${entry.key}`}>
+              <SwitchRow
+                label={label}
+                value={!unavailable && (overlay?.enabled ?? entry.effective)}
+                disabled={unavailable || !catalog.data}
+                isLast={!overlay && index === entries.length - 1}
+                onValueChange={(enabled) =>
+                  void setEnabled({
+                    environmentId: session.environmentId!,
+                    input: {
+                      threadId: session.threadId!,
+                      kind: entry.kind,
+                      key: entry.key,
+                      enabled,
+                      expectedCatalogRevision:
+                        catalog.data?.catalogRevision ?? ManagedTextResourceCatalogRevision.make(0),
+                    },
+                  }).then(catalog.refresh)
+                }
+              />
+              <View
+                className={`flex-row items-center justify-between px-4 pb-3 ${
+                  index === entries.length - 1 && !overlay ? "" : "border-b border-border-subtle"
+                }`}
+              >
+                <Text className="text-xs text-foreground-muted">{detail}</Text>
+                {overlay ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    onPress={() =>
+                      void reset({
+                        environmentId: session.environmentId!,
+                        input: {
+                          threadId: session.threadId!,
+                          kind: entry.kind,
+                          key: entry.key,
+                          expectedCatalogRevision:
+                            catalog.data?.catalogRevision ??
+                            ManagedTextResourceCatalogRevision.make(0),
+                        },
+                      }).then(catalog.refresh)
+                    }
+                  >
+                    <Text className="text-xs text-accent">Follow defaults</Text>
+                  </Pressable>
+                ) : null}
+              </View>
+            </View>
+          );
+        })}
+        {catalog.data && entries.length === 0 ? (
+          <Text className="px-4 py-3 text-sm text-foreground-muted">
+            No commands or snippets are available for this thread.
+          </Text>
+        ) : null}
+      </View>
+      <Text className="px-5 pt-2 text-xs text-foreground-muted">
+        Thread choices are applied when the provider starts a new session.
+      </Text>
+    </View>
+  );
+}
+
 /** One native scroll owner for the model catalog and its related settings. */
 function ThreadSettingsMainContent(props: {
   readonly onOpenSubmenu: (submenu: ThreadSettingsSubmenuPage) => void;
@@ -984,7 +1114,12 @@ function ThreadSettingsMainContent(props: {
           ) : null}
         </>
       }
-      ListFooterComponent={<ThreadSessionSkills />}
+      ListFooterComponent={
+        <>
+          <ThreadSessionSkills />
+          <ThreadManagedTextResources />
+        </>
+      }
       recycleItems
       onLoad={() => setAnimationsReady(true)}
       renderItem={renderCatalogItem}

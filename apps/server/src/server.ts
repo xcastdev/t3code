@@ -108,6 +108,7 @@ import * as SkillCatalogIndex from "./skills/SkillCatalogIndex.ts";
 import * as SkillCatalogService from "./skills/SkillCatalogService.ts";
 import * as SkillMaterializationService from "./skills/SkillMaterializationService.ts";
 import * as SkillWatchService from "./skills/SkillWatchService.ts";
+import * as ManagedTextResourceCatalogService from "./managedTextResources/ManagedTextResourceCatalogService.ts";
 import * as ServerSettings from "./serverSettings.ts";
 import * as NativeAppIconResolver from "./assets/NativeAppIconResolver.ts";
 import * as ProjectFaviconResolver from "./project/ProjectFaviconResolver.ts";
@@ -664,6 +665,7 @@ const RuntimeCoreDependenciesLive = ReactorLayerLive.pipe(
   // with explicit `providerInstances` entries on boot.
   Layer.provideMerge(ProviderInstanceRegistryHydrationLive),
   Layer.provideMerge(SkillCatalogLayerLive),
+  Layer.provideMerge(ManagedTextResourceCatalogService.layer),
   Layer.provideMerge(SkillMaterializationService.layer),
 ).pipe(
   Layer.provideMerge(AntigravityInstallation.layer),

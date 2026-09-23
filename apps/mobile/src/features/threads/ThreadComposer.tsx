@@ -383,6 +383,8 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     draftMessage: props.draftMessage,
     ownerKey: composerOwnerKey,
     environmentId: props.environmentId,
+    projectId: project?.id ?? null,
+    threadId: props.selectedThread.id,
     projectCwd: props.projectCwd,
     pullRequestProjectId: props.serverConfig?.environment.capabilities.pullRequests
       ? (project?.id ?? null)
@@ -428,7 +430,9 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const sendBlockedReason =
     props.sendBlockedReason ??
     (pendingPastedTextAttachmentCount > 0 ? "Attaching pasted text" : null) ??
-    attachmentBlockReason;
+    attachmentBlockReason ??
+    (composerMenu.isManagedInsertionPending ? "Inserting command or snippet" : null) ??
+    composerMenu.managedCommandBlockReason;
   const canSend =
     hasContent &&
     !contextImports[composerOwnerKey] &&
@@ -485,6 +489,20 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   }, [onEditorFocusChange, onExpandedChange, settingsSheetPresentation.keepsComposerExpanded]);
   const handleSend = useCallback(async () => {
     if (voiceInput.blocksSubmission || pendingPastedTextAttachmentCountRef.current > 0) return;
+    if (composerMenu.isManagedInsertionPending) {
+      Alert.alert(
+        "Command still loading",
+        "Wait for the selected command or snippet to be inserted.",
+      );
+      return;
+    }
+    if (composerMenu.mustResolveManagedCommandSelection) {
+      Alert.alert(
+        "Choose a command source",
+        composerMenu.managedCommandBlockReason ?? "Select a command from the list.",
+      );
+      return;
+    }
     if (selectedProviderStatus?.driver === "codex") {
       const rawSkill = findRawNativeSkillMention(
         props.draftMessage,
@@ -537,6 +555,9 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     openUsageLimits,
     usageLimitsOffered,
     onSendMessage,
+    composerMenu.isManagedInsertionPending,
+    composerMenu.managedCommandBlockReason,
+    composerMenu.mustResolveManagedCommandSelection,
     props.environmentId,
     props.environmentLabel,
     props.selectedThread.id,
@@ -667,7 +688,11 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       >
         {!voiceInput.isBusy &&
         composerMenu.trigger &&
-        (composerMenu.items.length > 0 || composerMenu.trigger.kind === "pull-request") ? (
+        (composerMenu.items.length > 0 ||
+          composerMenu.isLoading ||
+          composerMenu.error !== null ||
+          composerMenu.trigger.kind === "pull-request" ||
+          composerMenu.trigger.kind === "snippet") ? (
           <View className="absolute inset-x-0 bottom-full z-10 mb-2">
             <ComposerCommandPopover
               items={composerMenu.items}

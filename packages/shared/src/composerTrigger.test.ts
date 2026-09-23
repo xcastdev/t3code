@@ -44,4 +44,32 @@ describe("composer prefix routing", () => {
     expect(parseComposerHashQuery("pr:42")).toEqual({ kind: "pull-request", search: "42" });
     expect(parseComposerHashQuery("42")).toEqual({ kind: "all", search: "42" });
   });
+
+  it("detects a single-colon snippet token and returns its replacement range", () => {
+    expect(detectComposerTrigger("Use :fix-bug after this", 12)).toEqual({
+      kind: "snippet",
+      query: "fix-bug",
+      rangeStart: 4,
+      rangeEnd: 12,
+    });
+  });
+
+  it("opens the snippet picker for a single colon but not a double colon", () => {
+    expect(detectComposerTrigger(":", 1)).toEqual({
+      kind: "snippet",
+      query: "",
+      rangeStart: 0,
+      rangeEnd: 1,
+    });
+    expect(detectComposerTrigger("::fix-bug", 9)).toBeNull();
+    expect(detectComposerTrigger("word:fix-bug", 12)).toBeNull();
+  });
+
+  it("keeps existing path, skill, slash, and hash triggers while raw dollar text stays inert", () => {
+    expect(detectComposerTrigger("@src/index.ts", 13)?.kind).toBe("path");
+    expect(detectComposerTrigger("!review", 7)?.kind).toBe("skill");
+    expect(detectComposerTrigger("/fix", 4)?.kind).toBe("slash-command");
+    expect(detectComposerTrigger("#pr:42", 6)?.kind).toBe("pull-request");
+    expect(detectComposerTrigger("$agent", 6)).toBeNull();
+  });
 });
