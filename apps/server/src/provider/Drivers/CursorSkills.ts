@@ -20,7 +20,7 @@ import { parse as parseYamlDocument } from "yaml";
 
 const FRONTMATTER_PATTERN = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/;
 const SKILL_MENTION_PATTERN =
-  /(^|\s)\$(?![0-9][0-9_]*(?:[kKmMbBtT]|[eE][0-9]+)?(?:\s|$))(?=[a-zA-Z0-9:_-]*[a-zA-Z])([a-zA-Z0-9][a-zA-Z0-9:_-]*)(?=\s|$)/g;
+  /(^|\s)!(?=[a-zA-Z0-9:_-]*[a-zA-Z])([a-zA-Z0-9][a-zA-Z0-9:_-]*)(?=\s|$)/g;
 const HAS_SKILL_MENTION_PATTERN = new RegExp(SKILL_MENTION_PATTERN.source);
 const MAX_SKILL_DEPTH = 10;
 const MAX_SKILL_BYTES = FileSystem.Size(1_000_000);
@@ -39,6 +39,7 @@ interface CursorSkillScanBudget {
   remainingEntries: number;
   remainingBytes: bigint;
   exhausted: boolean;
+  byteLimitExceeded: boolean;
   incomplete: boolean;
 }
 
@@ -164,11 +165,13 @@ const discoverSkillsInRoot = Effect.fn("discoverCursorSkillsInRoot")(function* (
     if (skillInfo?.type === "File") {
       let frontmatter: CursorSkillFrontmatter | undefined = { cliVisible: true };
       if (skillInfo.size <= MAX_SKILL_BYTES && skillInfo.size <= input.budget.remainingBytes) {
-        const contents = yield* orUndefined(fileSystem.readFileString(skillPath));
+        const contents = yield* orUndefined(fileSystem.readFileString(skillPath), input.budget);
         if (contents !== undefined) {
           input.budget.remainingBytes -= skillInfo.size;
           frontmatter = parseSkillFrontmatter(contents);
         }
+      } else {
+        input.budget.byteLimitExceeded = true;
       }
       const name = path.basename(directory).trim();
       if (frontmatter?.cliVisible && name) {
@@ -229,27 +232,29 @@ const inspectCursorSkills = Effect.fn("inspectCursorSkills")(function* (
   ];
   const roots = [...(cwd ? rootsBelow(cwd, "project") : []), ...rootsBelow(userHome, "user")];
 
-  const skillsByName = new Map<string, ServerProviderSkill>();
+  const discovered: Array<ServerProviderSkill> = [];
   const budget: CursorSkillScanBudget = {
     remainingEntries: MAX_SKILL_SCAN_ENTRIES,
     remainingBytes: MAX_SKILL_SCAN_BYTES,
     exhausted: false,
+    byteLimitExceeded: false,
     incomplete: false,
   };
   for (const root of roots) {
     if (budget.exhausted) break;
     const skills = yield* discoverSkillsInRoot({ ...root, budget });
-    for (const skill of skills) {
-      if (!skillsByName.has(skill.name)) skillsByName.set(skill.name, skill);
-    }
+    discovered.push(...skills);
   }
   return {
-    skills: [...skillsByName.values()].sort((left, right) => left.name.localeCompare(right.name)),
-    failureReason: budget.exhausted
-      ? ("scan-budget-exhausted" as const)
-      : budget.incomplete
-        ? ("filesystem-error" as const)
-        : undefined,
+    skills: discovered.sort(
+      (left, right) => left.name.localeCompare(right.name) || left.path.localeCompare(right.path),
+    ),
+    failureReason:
+      budget.exhausted || budget.byteLimitExceeded
+        ? ("scan-budget-exhausted" as const)
+        : budget.incomplete
+          ? ("filesystem-error" as const)
+          : undefined,
   };
 });
 
@@ -274,7 +279,7 @@ export const probeCursorSkills = Effect.fn("probeCursorSkills")(function* (
   return inspection.skills;
 });
 
-/** Cursor invokes Agent Skills with `/name`; T3 composers insert `$name`. */
+/** Cursor invokes Agent Skills with `/name`; T3 composers insert `!name`. */
 export function hasCursorSkillMention(prompt: string): boolean {
   return HAS_SKILL_MENTION_PATTERN.test(prompt);
 }

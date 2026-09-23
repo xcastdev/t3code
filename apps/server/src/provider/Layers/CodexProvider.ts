@@ -286,14 +286,17 @@ function appendCustomCodexModels(
   return customEntries.length === 0 ? models : [...models, ...customEntries];
 }
 
-function parseCodexSkillsListResponse(
+export const parseCodexSkillsListResponse = Effect.fn("parseCodexSkillsListResponse")(function* (
   response: CodexSchema.V2SkillsListResponse,
   cwd: string,
-): ReadonlyArray<ServerProviderSkill> {
-  const matchingEntry = response.data.find((entry) => entry.cwd === cwd);
-  const skills = matchingEntry
-    ? matchingEntry.skills
-    : response.data.flatMap((entry) => entry.skills);
+) {
+  const entries = response.data.filter((entry) => entry.cwd === cwd);
+  if (entries.length !== 1 || entries[0]!.errors.length > 0) {
+    return yield* CodexErrors.CodexAppServerRequestError.invalidParams(
+      "Codex did not return one error-free skill catalog for the requested cwd.",
+    );
+  }
+  const skills = entries[0]!.skills;
 
   return skills.map((skill) => {
     const shortDescription =
@@ -320,7 +323,7 @@ function parseCodexSkillsListResponse(
 
     return parsedSkill;
   });
-}
+});
 
 const requestAllCodexModels = Effect.fn("requestAllCodexModels")(function* (
   client: CodexClient.CodexAppServerClient["Service"],
@@ -462,6 +465,7 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
     ],
     { concurrency: "unbounded" },
   );
+  const skills = yield* parseCodexSkillsListResponse(skillsResponse, input.cwd);
 
   return {
     account: accountResponse,
@@ -470,7 +474,7 @@ const probeCodexAppServerProvider = Effect.fn("probeCodexAppServerProvider")(fun
     models: applyPreferredCodexDefaultModel(
       appendCustomCodexModels(models, input.customModels ?? []),
     ),
-    skills: parseCodexSkillsListResponse(skillsResponse, input.cwd),
+    skills,
   } satisfies CodexAppServerProviderSnapshot;
 });
 
@@ -483,7 +487,7 @@ export const probeCodexSkillsForCwd = Effect.fn("probeCodexSkillsForCwd")(functi
 }) {
   const { client } = yield* withCodexAppServerClient(input);
   const skillsResponse = yield* client.request("skills/list", { cwds: [input.cwd] });
-  return parseCodexSkillsListResponse(skillsResponse, input.cwd);
+  return yield* parseCodexSkillsListResponse(skillsResponse, input.cwd);
 });
 
 const emptyCodexModelsFromSettings = (codexSettings: CodexSettings): ServerProvider["models"] =>

@@ -573,6 +573,99 @@ sessionErrorLayer("CodexAdapterLive session errors", (it) => {
   });
 });
 
+const skillDispatchRuntimeFactory = makeRuntimeFactory();
+const skillDispatchLayer = it.layer(
+  Layer.effect(
+    CodexAdapter,
+    Effect.gen(function* () {
+      return yield* makeCodexAdapter(decodeCodexSettings({}), {
+        makeRuntime: skillDispatchRuntimeFactory.factory,
+        resolveSkills: () =>
+          Effect.succeed([{ name: "review", path: "/project/.agents/skills/review/SKILL.md" }]),
+      });
+    }),
+  ).pipe(
+    Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(providerSessionDirectoryTestLayer),
+    Layer.provideMerge(NodeServices.layer),
+  ),
+);
+
+skillDispatchLayer("Codex adapter skill input", (it) => {
+  it.effect("forwards selected T3 skills as structured skill inputs", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-skill-dispatch"),
+        runtimeMode: "full-access",
+      });
+      const runtime = skillDispatchRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+
+      yield* adapter.sendTurn({
+        threadId: asThreadId("thread-skill-dispatch"),
+        input: "Please !review this diff",
+      });
+
+      NodeAssert.deepStrictEqual(runtime.sendTurnImpl.mock.calls[0]?.[0], {
+        input: "Please !review this diff",
+        skills: [{ name: "review", path: "/project/.agents/skills/review/SKILL.md" }],
+      });
+    }),
+  );
+
+  it.effect("rejects raw Codex skill syntax before sending a turn", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-raw-skill"),
+        runtimeMode: "full-access",
+      });
+      const runtime = skillDispatchRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+
+      const result = yield* adapter
+        .sendTurn({
+          threadId: asThreadId("thread-raw-skill"),
+          input: "Use $review on this diff",
+        })
+        .pipe(Effect.result);
+
+      NodeAssert.equal(result._tag, "Failure");
+      if (result._tag === "Failure") {
+        NodeAssert.equal(result.failure._tag, "ProviderAdapterValidationError");
+        NodeAssert.match(result.failure.issue, /select it with '!review'/u);
+      }
+      NodeAssert.equal(runtime.sendTurnImpl.mock.calls.length, 0);
+    }),
+  );
+
+  it.effect("allows shell variables such as $HOME when they are not skill names", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CodexAdapter;
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-shell-variable"),
+        runtimeMode: "full-access",
+      });
+      const runtime = skillDispatchRuntimeFactory.lastRuntime;
+      NodeAssert.ok(runtime);
+
+      yield* adapter.sendTurn({
+        threadId: asThreadId("thread-shell-variable"),
+        input: "Print $HOME and report the result.",
+      });
+
+      NodeAssert.deepStrictEqual(runtime.sendTurnImpl.mock.calls[0]?.[0], {
+        input: "Print $HOME and report the result.",
+      });
+    }),
+  );
+});
+
 const lifecycleRuntimeFactory = makeRuntimeFactory();
 const lifecycleLayer = it.layer(
   Layer.effect(

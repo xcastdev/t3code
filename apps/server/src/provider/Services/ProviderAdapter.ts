@@ -23,6 +23,7 @@ import type {
   TurnId,
 } from "@t3tools/contracts";
 import type { McpIssuedProjectServer } from "../../mcp/McpProviderSession.ts";
+import type { ProviderSkillPlan } from "../../skills/ProviderSkillAdapter.ts";
 import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 import type { ProjectWorkRuntimeContext } from "../RuntimeInstructions.ts";
@@ -36,6 +37,8 @@ export type ProviderAdapterSessionStartInput = ProviderSessionStartInput & {
   readonly projectMcpServers?: ReadonlyArray<McpIssuedProjectServer>;
   /** Bounded durable project-work context prepared by ProviderService. */
   readonly projectWork?: ProjectWorkRuntimeContext;
+  /** Opaque to orchestration; only the selected provider may decode this session-local plan. */
+  readonly skillPlan?: ProviderSkillPlan;
 };
 
 const encodeProjectMcpId = (id: Pick<McpIssuedProjectServer, "id">["id"]): string =>

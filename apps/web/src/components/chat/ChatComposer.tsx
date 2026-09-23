@@ -1,4 +1,5 @@
 import { DESKTOP_PASTE_AS_TEXT_EVENT } from "../../lib/desktopPasteAsText";
+import { useAtomValue } from "@effect/atom-react";
 import { runtimeModeConfig, runtimeModeOptions } from "./runtimeModeConfig";
 import { useSecondaryPaneStore } from "~/secondaryPaneStore";
 import { AttachmentFilePreview } from "../files/AttachmentFilePreview";
@@ -36,6 +37,7 @@ import type {
 import {
   ProviderDriverKind,
   ProviderInstanceId,
+  SkillCatalogRevision,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
@@ -47,7 +49,11 @@ import {
   pastedTextDisposition,
   wouldTextPasteExceedLimit,
 } from "@t3tools/client-runtime/text-paste";
-import { serializeComposerFileLink } from "@t3tools/shared/composerTrigger";
+import {
+  findRawNativeSkillMention,
+  parseComposerHashQuery,
+  serializeComposerFileLink,
+} from "@t3tools/shared/composerTrigger";
 import { createModelSelection, normalizeModelSlug } from "@t3tools/shared/model";
 import { USAGE_LIMITS_COMMAND } from "@t3tools/shared/usageLimits";
 import {
@@ -70,6 +76,7 @@ import {
   type ComposerSubmissionIntent,
   type ComposerTrigger,
   collapseExpandedComposerCursor,
+  composerSkillCatalogInput,
   composerSubmissionIntentForEnter,
   detectComposerTrigger,
   expandCollapsedComposerCursor,
@@ -234,6 +241,7 @@ import { assetEnvironment } from "~/state/assets";
 import { readPreparedConnection } from "~/state/session";
 import { useAtomQueryRunner } from "~/state/use-atom-query-runner";
 import {
+  issueSearchEnvironment,
   pullRequestEnvironment,
   usePullRequestList,
   type EnvironmentQueryTarget,
@@ -257,6 +265,7 @@ import {
 } from "./ComposerControl";
 import { resolveComposerMenuActiveItemId } from "./composerMenuHighlight";
 import { buildPullRequestReferenceContext } from "../pullRequest/pullRequestDetail.logic";
+import { buildIssueReferenceContext } from "./issueReferenceContext";
 import {
   matchesPullRequestQuery,
   rankPullRequestMatches,
@@ -922,10 +931,12 @@ function ComposerCommandMenuLayer(props: { anchor: HTMLElement | null; children:
 import { Button } from "../ui/button";
 import { Select, SelectItem, SelectPopup, SelectValue } from "../ui/select";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
+import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
 import { toastManager } from "../ui/toast";
 import {
   FileIcon,
   BotIcon,
+  BookOpenIcon,
   CircleAlertIcon,
   PaperclipIcon,
   PencilRulerIcon,
@@ -960,9 +971,8 @@ import type { PendingUserInputDraftAnswer } from "../../pendingUserInput";
 import type { PendingApproval, PendingUserInput } from "../../session-logic";
 import type { ContextWindowSnapshot } from "../../lib/contextWindow";
 import {
-  formatProviderSkillDisplayName,
+  dedupeProviderSkillsByName,
   getProviderSlashCommandsForSlashMenu,
-  getProviderSkillsForSlashMenu,
   resolveProviderSkillsForCwd,
   resolveProviderSlashCommandsForCwd,
 } from "@t3tools/client-runtime/providerSkills";
@@ -970,9 +980,122 @@ import { searchProviderSkills } from "../../providerSkillSearch";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { serverEnvironment } from "../../state/server";
+import { skillsEnvironment } from "../../state/skills";
+import { sessionSkillDeliveryLabel, sessionSkillEntries } from "@t3tools/client-runtime/skills";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
 
 const WORKSPACE_SNAPSHOT_RETRY_COOLDOWN_MS = 10_000;
+
+function SessionSkillsControl(props: {
+  readonly environmentId: EnvironmentId;
+  readonly threadId: ThreadId;
+  readonly providerInstanceId: ProviderInstanceId;
+}) {
+  useAtomValue(
+    skillsEnvironment.changes({
+      environmentId: props.environmentId,
+      input: { threadId: props.threadId, providerInstanceId: props.providerInstanceId },
+    }),
+  );
+  const catalog = useEnvironmentQuery(
+    skillsEnvironment.catalog({
+      environmentId: props.environmentId,
+      input: {
+        threadId: props.threadId,
+        providerInstanceId: props.providerInstanceId,
+      },
+    }),
+  );
+  const setEnabled = useAtomCommand(skillsEnvironment.sessionSetEnabled, {
+    reportFailure: true,
+  });
+  const reset = useAtomCommand(skillsEnvironment.sessionReset, { reportFailure: true });
+  const catalogScope = `${props.environmentId}:${props.threadId}:${props.providerInstanceId}`;
+  const lastCatalog = useRef<{ scope: string; data: NonNullable<typeof catalog.data> } | null>(
+    null,
+  );
+  if (catalog.data) lastCatalog.current = { scope: catalogScope, data: catalog.data };
+  const catalogData =
+    catalog.data ?? (lastCatalog.current?.scope === catalogScope ? lastCatalog.current.data : null);
+  const managed = sessionSkillEntries(catalogData?.entries ?? []);
+  return (
+    <Popover>
+      <PopoverTrigger
+        render={
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-sm"
+            aria-label="Session skills"
+            title="Session skills"
+          >
+            <BookOpenIcon />
+          </Button>
+        }
+      />
+      <PopoverPopup align="start" side="top" className="w-72">
+        <div className="grid gap-2">
+          <div>
+            <p className="text-sm font-medium">Skills for this session</p>
+            <p className="text-xs text-muted-foreground">
+              Changes apply when the provider starts a new session.
+            </p>
+          </div>
+          {managed.map((entry) => (
+            <button
+              key={entry.id}
+              type="button"
+              className="flex items-center justify-between gap-3 rounded-md px-2 py-1.5 text-left text-sm hover:bg-accent"
+              onClick={() =>
+                void setEnabled({
+                  environmentId: props.environmentId,
+                  input: {
+                    threadId: props.threadId,
+                    providerInstanceId: props.providerInstanceId,
+                    expectedRevision: catalogData?.catalogRevision ?? SkillCatalogRevision.make(0),
+                    key: entry.key,
+                    enabled: !entry.effective,
+                  },
+                }).then(catalog.refresh)
+              }
+            >
+              <span className="grid min-w-0 gap-1">
+                <span className="truncate">{entry.name}</span>
+                <span className="text-xs text-muted-foreground">
+                  {sessionSkillDeliveryLabel(entry)}
+                </span>
+              </span>
+              <span className="text-xs text-muted-foreground">
+                {entry.effective ? "Enabled" : "Disabled"}
+              </span>
+            </button>
+          ))}
+          {managed.length === 0 ? (
+            <p className="py-2 text-xs text-muted-foreground">No managed skills are available.</p>
+          ) : null}
+          <Button
+            type="button"
+            variant="ghost"
+            size="xs"
+            className="justify-self-start"
+            onClick={() =>
+              void reset({
+                environmentId: props.environmentId,
+                input: {
+                  threadId: props.threadId,
+                  providerInstanceId: props.providerInstanceId,
+                  expectedRevision: catalogData?.catalogRevision ?? SkillCatalogRevision.make(0),
+                },
+              }).then(catalog.refresh)
+            }
+          >
+            Follow project defaults
+          </Button>
+        </div>
+      </PopoverPopup>
+    </Popover>
+  );
+}
 
 const extendReplacementRangeForTrailingSpace = (
   text: string,
@@ -1369,6 +1492,7 @@ export interface ChatComposerProps {
   keybindings: ResolvedKeybindingsConfig;
   terminalOpen: boolean;
   gitCwd: string | null;
+  skillProjectId: ProjectId | null;
   pullRequestProjectId: ProjectId | null;
   pullRequestRepository: string | null;
   restingControlsHost: HTMLDivElement | null;
@@ -1487,6 +1611,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     keybindings,
     terminalOpen,
     gitCwd,
+    skillProjectId,
     pullRequestProjectId,
     pullRequestRepository,
     restingControlsHost,
@@ -1888,9 +2013,41 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [selectedProviderEntry],
   );
   const compactCommandAvailable = providerSupportsManualCompaction(selectedProviderEntry);
-  const selectedProviderSkills = selectedProviderStatus
+  const sessionSkillThreadId =
+    routeKind === "server" && props.activeThreadShell?.id === activeThreadId
+      ? activeThreadId
+      : null;
+  const sessionSkillsCatalog = useEnvironmentQuery(
+    skillsEnvironment.catalog({
+      environmentId,
+      input: composerSkillCatalogInput({
+        routeKind,
+        activeThreadId,
+        activeThreadShellId: props.activeThreadShell?.id ?? null,
+        projectId: skillProjectId,
+        providerInstanceId: selectedInstanceId,
+      }),
+    }),
+  );
+  const nativeProviderSkills = selectedProviderStatus
     ? resolveProviderSkillsForCwd(selectedProviderStatus, gitCwd)
     : [];
+  const managedSessionSkills =
+    (routeKind === "server" && activeThreadId) || skillProjectId
+      ? sessionSkillEntries(sessionSkillsCatalog.data?.entries ?? [])
+          .filter((entry) => entry.effective)
+          .map((entry) => ({
+            name: entry.key,
+            path: `managed:${entry.id}`,
+            scope: entry.scope,
+            enabled: true,
+            displayName: entry.name,
+          }))
+      : [];
+  const selectedProviderSkills = dedupeProviderSkillsByName([
+    ...nativeProviderSkills,
+    ...managedSessionSkills,
+  ]);
   const selectedProviderSlashCommands = selectedProviderStatus
     ? resolveProviderSlashCommandsForCwd(selectedProviderStatus, gitCwd)
     : [];
@@ -2191,10 +2348,13 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   const composerTriggerKind = composerTrigger?.kind ?? null;
   const pathTriggerQuery = composerTrigger?.kind === "path" ? composerTrigger.query : "";
-  const pullRequestTriggerQuery =
-    composerTrigger?.kind === "pull-request" ? composerTrigger.query : "";
+  const hashReferenceQuery = parseComposerHashQuery(
+    composerTrigger?.kind === "pull-request" ? composerTrigger.query : "",
+  );
+  const pullRequestTriggerQuery = hashReferenceQuery.search;
   const pullRequestTextQuery =
     composerTriggerKind === "pull-request" &&
+    hashReferenceQuery.kind !== "issue" &&
     pullRequestTriggerQuery.length > 0 &&
     !/^\d+$/u.test(pullRequestTriggerQuery)
       ? pullRequestTriggerQuery
@@ -2222,6 +2382,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const pullRequestListTargets = useMemo(
     () =>
       composerTriggerKind !== "pull-request" ||
+      hashReferenceQuery.kind === "issue" ||
       pullRequestProjectId === null ||
       (pullRequestTextQuery !== null && settledPullRequestTextQuery === null)
         ? EMPTY_PULL_REQUEST_LIST_TARGETS
@@ -2240,6 +2401,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           ],
     [
       composerTriggerKind,
+      hashReferenceQuery.kind,
       environmentId,
       pullRequestProjectId,
       pullRequestTextQuery,
@@ -2247,13 +2409,25 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     ],
   );
   const pullRequestLookup = usePullRequestList(pullRequestListTargets);
+  const debouncedIssueQuery = useDebouncedValue(hashReferenceQuery.search, 180);
+  const issueLookup = useEnvironmentQuery(
+    composerTriggerKind === "pull-request" &&
+      hashReferenceQuery.kind !== "pull-request" &&
+      hashReferenceQuery.search === debouncedIssueQuery &&
+      pullRequestProjectId
+      ? issueSearchEnvironment({
+          environmentId,
+          input: { projectId: pullRequestProjectId, query: hashReferenceQuery.search },
+        })
+      : null,
+  );
   const pullRequestTriggerNumber = useMemo(() => {
     if (composerTrigger?.kind !== "pull-request" || composerTrigger.query.length === 0) {
       return null;
     }
-    const number = Number(composerTrigger.query);
+    const number = Number(hashReferenceQuery.search);
     return Number.isSafeInteger(number) && number > 0 ? number : null;
-  }, [composerTrigger]);
+  }, [composerTrigger, hashReferenceQuery.search]);
   const debouncedPullRequestNumber = useDebouncedValue(pullRequestTriggerNumber, 180);
   const settledPullRequestNumber =
     pullRequestTriggerNumber === debouncedPullRequestNumber ? pullRequestTriggerNumber : null;
@@ -2266,7 +2440,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         entry.number === settledPullRequestNumber,
     ) === true;
   const exactPullRequestLookup = useEnvironmentQuery(
-    settledPullRequestNumber === null ||
+    hashReferenceQuery.kind === "issue" ||
+      settledPullRequestNumber === null ||
       pullRequestProjectId === null ||
       pullRequestRepository === null ||
       recentHasExactPullRequest
@@ -2321,13 +2496,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
             ] as const)
           : []),
       ] satisfies ReadonlyArray<Extract<ComposerCommandItem, { type: "slash-command" }>>;
-      const slashMenuSkills = getProviderSkillsForSlashMenu(
-        selectedProviderSkills,
-        settings.showSkillsInSlashMenu,
-      );
       const providerSlashCommandItems = getProviderSlashCommandsForSlashMenu(
         selectedProviderSlashCommands,
-        slashMenuSkills,
+        selectedProviderSkills.filter((skill) => skill.enabled && skill.userInvocable !== false),
       ).map((command) => ({
         id: `provider-slash-command:${selectedProvider}:${command.name}`,
         type: "provider-slash-command" as const,
@@ -2337,22 +2508,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         description: command.description ?? command.input?.hint ?? "Run provider command",
       }));
       const query = composerTrigger.query.trim().toLowerCase();
-      const skillItems = slashMenuSkills.map((skill) => ({
-        id: `skill:${selectedProvider}:${skill.name}`,
-        type: "skill" as const,
-        provider: selectedProvider,
-        skill,
-        label: `/skill:${skill.name}`,
-        description:
-          skill.shortDescription ??
-          skill.description ??
-          (skill.scope ? `${skill.scope} skill` : ""),
-      }));
       const visibleProviderSlashCommandItems = providerSlashCommandItems.filter(
         (item) => item.command.name !== "compact" || compactSlashCommandAvailable,
       );
       const slashCommandItems = slashCommandItemsForPromptPosition(
-        [...builtInSlashCommandItems, ...visibleProviderSlashCommandItems, ...skillItems],
+        [...builtInSlashCommandItems, ...visibleProviderSlashCommandItems],
         composerTrigger.rangeStart === 0,
       );
       return searchSlashCommandItems(slashCommandItems, query);
@@ -2363,7 +2523,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         type: "skill" as const,
         provider: selectedProvider,
         skill,
-        label: formatProviderSkillDisplayName(skill),
+        label: `!${skill.name}`,
         description:
           skill.shortDescription ??
           skill.description ??
@@ -2375,16 +2535,27 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       pullRequestProjectId !== null &&
       pullRequestRepository !== null
     ) {
+      const issueItems: ComposerCommandItem[] =
+        hashReferenceQuery.kind === "pull-request"
+          ? []
+          : (issueLookup.data?.entries ?? []).map((issue) => ({
+              id: `issue:${pullRequestProjectId}:${issue.number}`,
+              type: "issue",
+              issue,
+              label: `iss:${issue.number}`,
+              description: issue.title,
+            }));
+      if (hashReferenceQuery.kind === "issue") return issueItems;
       const exactPullRequest =
         exactPullRequestLookup.data?.number === pullRequestTriggerNumber
           ? [exactPullRequestLookup.data]
           : [];
-      const matches = /^\d*$/u.test(composerTrigger.query)
+      const matches = /^\d*$/u.test(hashReferenceQuery.search)
         ? filterComposerPullRequestMatches({
             entries: [...exactPullRequest, ...(pullRequestLookup.data?.entries ?? [])],
             projectId: pullRequestProjectId,
             repository: pullRequestRepository,
-            query: composerTrigger.query,
+            query: hashReferenceQuery.search,
             limit: COMPOSER_PULL_REQUEST_RESULT_LIMIT,
           })
         : rankPullRequestMatches(
@@ -2400,12 +2571,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               );
               return (
                 provider?.searchesOnHost === true ||
-                matchesPullRequestQuery(entry, composerTrigger.query)
+                matchesPullRequestQuery(entry, hashReferenceQuery.search)
               );
             }),
-            composerTrigger.query,
+            hashReferenceQuery.search,
           ).slice(0, COMPOSER_PULL_REQUEST_RESULT_LIMIT);
-      return matches.map((pullRequest) => ({
+      const pullRequestItems: ComposerCommandItem[] = matches.map((pullRequest) => ({
         id: `pull-request:${pullRequest.projectId}:${pullRequest.repository}:${pullRequest.number}`,
         type: "pull-request",
         pullRequest: {
@@ -2417,15 +2588,19 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           state: pullRequest.state,
           isDraft: pullRequest.isDraft,
         },
-        label: `#${pullRequest.number}`,
+        label: `pr:${pullRequest.number}`,
         description: pullRequest.title,
       }));
+      return [...issueItems, ...pullRequestItems];
     }
     return [];
   }, [
     compactSlashCommandAvailable,
     composerTrigger,
     exactPullRequestLookup.data,
+    hashReferenceQuery.kind,
+    hashReferenceQuery.search,
+    issueLookup.data,
     planModeUiEnabled,
     pullRequestLookup.data,
     pullRequestProjectId,
@@ -2435,7 +2610,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     selectedProviderSkills,
     selectedProviderSlashCommands,
     selectedProviderStatus,
-    settings.showSkillsInSlashMenu,
     workspaceEntries.entries,
   ]);
 
@@ -2511,7 +2685,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     (composerTriggerKind === "pull-request" &&
       pullRequestProjectId !== null &&
       pullRequestRepository !== null &&
-      (pullRequestLookup.isPending ||
+      ((hashReferenceQuery.kind !== "pull-request" &&
+        (issueLookup.isPending || hashReferenceQuery.search !== debouncedIssueQuery)) ||
+        (hashReferenceQuery.kind !== "issue" && pullRequestLookup.isPending) ||
         pullRequestTextQuery !== debouncedPullRequestTextQuery ||
         pullRequestTriggerNumber !== debouncedPullRequestNumber ||
         exactPullRequestLookup.isPending));
@@ -2521,7 +2697,12 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     }
     if (composerTriggerKind === "pull-request") {
       if (pullRequestProjectId === null || pullRequestRepository === null) {
-        return "Pull requests are not available for this project.";
+        return "Issues and pull requests are not available for this project.";
+      }
+      if (hashReferenceQuery.kind === "issue") {
+        return issueLookup.error
+          ? "Issues could not be read for this project."
+          : "No matching issues.";
       }
       if (
         pullRequestLookup.error !== null ||
@@ -2529,9 +2710,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       ) {
         return "Pull requests could not be read for this project.";
       }
-      return composerTrigger?.query
-        ? `No pull request matches ${composerTrigger.query}.`
-        : "No pull requests found in this repository.";
+      return issueLookup.error && hashReferenceQuery.kind === "all"
+        ? "Issues could not be read for this project."
+        : composerTrigger?.query
+          ? `No issue or pull request matches ${composerTrigger.query}.`
+          : "No issues or pull requests found in this repository.";
     }
     return composerTriggerKind === "path"
       ? "No matching files or folders."
@@ -2539,6 +2722,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   }, [
     composerTrigger,
     composerTriggerKind,
+    hashReferenceQuery.kind,
+    issueLookup.error,
     pullRequestLookup.data?.errors,
     pullRequestLookup.error,
     pullRequestProjectId,
@@ -3592,7 +3777,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         return;
       }
       if (item.type === "skill") {
-        const replacement = `$${item.skill.name} `;
+        const replacement = `!${item.skill.name} `;
         const replacementRangeEnd = extendReplacementRangeForTrailingSpace(
           snapshot.value,
           trigger.rangeEnd,
@@ -3635,6 +3820,28 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           addComposerDraftReviewComment(composerDraftTarget, comment, {
             appendReference: false,
           });
+          setComposerHighlightedItemId(null);
+        }
+        return;
+      }
+      if (item.type === "issue") {
+        const comment = buildIssueReferenceContext(item.issue);
+        const replacement = `${formatInlineContextReference(
+          reviewCommentContextReference(comment),
+        )} `;
+        const replacementRangeEnd = extendReplacementRangeForTrailingSpace(
+          snapshot.value,
+          trigger.rangeEnd,
+          replacement,
+        );
+        const applied = applyPromptReplacement(
+          trigger.rangeStart,
+          replacementRangeEnd,
+          replacement,
+          { expectedText: snapshot.value.slice(trigger.rangeStart, replacementRangeEnd) },
+        );
+        if (applied) {
+          addComposerDraftReviewComment(composerDraftTarget, comment, { appendReference: false });
           setComposerHighlightedItemId(null);
         }
         return;
@@ -3725,6 +3932,17 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         event?.preventDefault();
         return;
       }
+      if (selectedProvider === "codex") {
+        const rawSkill = findRawNativeSkillMention(
+          promptRef.current,
+          new Set(selectedProviderSkills.map((skill) => skill.name)),
+        );
+        if (rawSkill) {
+          event?.preventDefault();
+          setProviderInputSubmissionError(`Use !${rawSkill} to select this skill.`);
+          return;
+        }
+      }
       // A send while a pasted image is still compressing would strand that
       // image: the turn snapshot wouldn't include it, and it would surface
       // in the *next* draft instead. Only oversized images hit this — small
@@ -3779,6 +3997,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       noProviderAvailable,
       onSend,
       promptRef,
+      selectedProvider,
+      selectedProviderSkills,
       shouldBlurMobileComposerOnSubmit,
     ],
   );
@@ -4949,6 +5169,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         onInstanceModelChange={onProviderModelSelect}
         onOpenProviderSetup={onOpenProviderSetup}
       />
+
+      {sessionSkillThreadId && selectedProviderEntry ? (
+        <SessionSkillsControl
+          environmentId={environmentId}
+          threadId={sessionSkillThreadId}
+          providerInstanceId={selectedProviderEntry.instanceId}
+        />
+      ) : null}
 
       {composerControlsCompact ? (
         <CompactComposerControlsMenu
@@ -6707,7 +6935,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                                 ? "Enable a provider in Settings to send a message"
                                 : phase === "disconnected"
                                   ? DISCONNECTED_COMPOSER_PLACEHOLDER
-                                  : "Ask anything, @tag files/folders, $use skills, or / for commands"
+                                  : "Ask anything, @tag files/folders, / for commands, ! for skills"
                     }
                     disabled={
                       isConnecting ||

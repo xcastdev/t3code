@@ -81,6 +81,8 @@ import ForkMigration0011 from "./Migrations/fork/011_ProjectWorkAttentionNotific
 import ForkMigration0012 from "./Migrations/fork/012_ProjectLifecycle.ts";
 import ForkMigration0013 from "./Migrations/fork/013_ProjectWorkReducerCheckpoints.ts";
 import ForkMigration0014 from "./Migrations/fork/014_ProjectWorkActiveLeaseDueIndex.ts";
+import ForkMigration0015 from "./Migrations/fork/015_SkillApplications.ts";
+import ForkMigration0016 from "./Migrations/fork/016_SkillSessionOverlays.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -162,6 +164,8 @@ export const forkMigrationEntries = [
   [12, "ProjectLifecycle", ForkMigration0012],
   [13, "ProjectWorkReducerCheckpoints", ForkMigration0013],
   [14, "ProjectWorkActiveLeaseDueIndex", ForkMigration0014],
+  [15, "SkillApplications", ForkMigration0015],
+  [16, "SkillSessionOverlays", ForkMigration0016],
 ] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";

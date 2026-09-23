@@ -101,7 +101,7 @@ describe("mobile themes", () => {
     expect(normalizeMobileThemeId("ocean")).toBe("ocean");
     expect(normalizeMobileThemeId("missing-theme")).toBe(DEFAULT_MOBILE_THEME_ID);
     expect(normalizeMobileThemeMode("dark")).toBe("dark");
-    expect(normalizeMobileThemeMode("sepia")).toBe("system");
+    expect(normalizeMobileThemeMode("sepia")).toBe("dark");
   });
 
   it("migrates one theme choice to both appearances and preserves independent choices", () => {

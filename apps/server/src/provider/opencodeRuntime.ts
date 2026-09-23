@@ -911,12 +911,21 @@ const makeOpenCodeRuntime = Effect.gen(function* () {
 
   const loadOpenCodeSkills: OpenCodeRuntimeShape["loadOpenCodeSkills"] = (client) =>
     runOpenCodeSdk("app.skills", (signal) => client.app.skills(undefined, { signal })).pipe(
-      Effect.map((result) =>
-        (result.data ?? []).map((skill) => ({
-          name: skill.name,
-          ...(skill.description === undefined ? {} : { description: skill.description }),
-          location: skill.location,
-        })),
+      Effect.flatMap((result) =>
+        result.data === undefined
+          ? Effect.fail(
+              new OpenCodeRuntimeError({
+                operation: "app.skills",
+                detail: "OpenCode returned no skill catalog.",
+              }),
+            )
+          : Effect.succeed(
+              result.data.map((skill) => ({
+                name: skill.name,
+                ...(skill.description === undefined ? {} : { description: skill.description }),
+                location: skill.location,
+              })),
+            ),
       ),
     );
   const loadSkills = (client: OpencodeClient) =>

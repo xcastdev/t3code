@@ -37,6 +37,12 @@ import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
 
 import { buildCodexInitializeParams } from "./CodexProvider.ts";
+import {
+  prepareCodexManagedSkillThread,
+  startCodexManagedSkillSession,
+  type CodexManagedSkillPlanPayload,
+  type CodexManagedSkillClient,
+} from "./CodexManagedSkills.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import { expandHomePath } from "../../pathExpansion.ts";
 import {
@@ -179,6 +185,7 @@ export interface CodexSessionRuntimeOptions {
   readonly model?: string;
   readonly serviceTier?: CodexServiceTier | undefined;
   readonly resumeCursor?: CodexResumeCursor;
+  readonly managedSkills?: CodexManagedSkillPlanPayload;
   readonly appServerArgs?: ReadonlyArray<string>;
   /** Capabilities the session's `t3-code` MCP credential grants; drives the prompt blocks. */
   readonly mcpCapabilities?: ReadonlySet<string>;
@@ -188,6 +195,10 @@ export interface CodexSessionRuntimeOptions {
 
 export interface CodexSessionRuntimeSendTurnInput {
   readonly input?: string;
+  readonly skills?: ReadonlyArray<{
+    readonly name: string;
+    readonly path: string;
+  }>;
   readonly attachments?: ReadonlyArray<{
     readonly type: "image";
     readonly url: string;
@@ -614,6 +625,10 @@ export function buildTurnStartParams(input: {
   readonly threadId: string;
   readonly runtimeMode: RuntimeMode;
   readonly prompt?: string;
+  readonly skills?: ReadonlyArray<{
+    readonly name: string;
+    readonly path: string;
+  }>;
   readonly attachments?: ReadonlyArray<{
     readonly type: "image";
     readonly url: string;
@@ -634,6 +649,13 @@ export function buildTurnStartParams(input: {
     turnInput.push({
       type: "text",
       text: input.prompt,
+    });
+  }
+  for (const skill of input.skills ?? []) {
+    turnInput.push({
+      type: "skill",
+      name: skill.name,
+      path: skill.path,
     });
   }
   for (const attachment of input.attachments ?? []) {
@@ -731,6 +753,8 @@ export const openCodexThread = (input: {
   readonly requestedModel: string | undefined;
   readonly serviceTier: CodexServiceTier | undefined;
   readonly resumeThreadId: string | undefined;
+  readonly managedSkills?: CodexManagedSkillPlanPayload;
+  readonly managedSkillClient?: CodexManagedSkillClient;
 }): Effect.Effect<typeof CodexThreadResumeMetadata.Type, CodexErrors.CodexAppServerError> => {
   const resumeThreadId = input.resumeThreadId;
   const startParams = buildThreadStartParams({
@@ -741,40 +765,79 @@ export const openCodexThread = (input: {
   });
 
   if (resumeThreadId === undefined) {
-    return input.client.request("thread/start", startParams);
+    return input.managedSkills === undefined
+      ? input.client.request("thread/start", startParams)
+      : input.managedSkillClient === undefined
+        ? Effect.fail(
+            CodexErrors.CodexAppServerRequestError.invalidParams(
+              "Managed skills require a skill-capable app-server client.",
+            ),
+          )
+        : startCodexManagedSkillSession({
+            client: input.managedSkillClient,
+            cwd: input.cwd,
+            extraRoot: input.managedSkills.extraRoot,
+            managedSkills: input.managedSkills.skills,
+            threadStart: startParams,
+          });
   }
+
+  if (input.managedSkills !== undefined && input.managedSkillClient === undefined) {
+    return Effect.fail(
+      CodexErrors.CodexAppServerRequestError.invalidParams(
+        "Managed skills require a skill-capable app-server client.",
+      ),
+    );
+  }
+  const preparedThread: Effect.Effect<
+    CodexRpc.ClientRequestParamsByMethod["thread/start"],
+    CodexErrors.CodexAppServerError
+  > =
+    input.managedSkills === undefined
+      ? Effect.succeed(startParams)
+      : prepareCodexManagedSkillThread({
+          client: input.managedSkillClient!,
+          cwd: input.cwd,
+          extraRoot: input.managedSkills.extraRoot,
+          managedSkills: input.managedSkills.skills,
+          thread: startParams,
+        });
 
   // Older providers may still return history despite excludeTurns. Only the
   // session metadata is needed here, so unrelated historical items cannot
   // prevent resuming a valid provider thread.
-  return input.client.raw
-    .request("thread/resume", {
-      threadId: resumeThreadId,
-      ...startParams,
-      excludeTurns: true,
-    })
-    .pipe(
-      Effect.flatMap((response) =>
-        decodeCodexThreadResumeMetadata(response).pipe(
-          Effect.mapError((error) =>
-            CodexErrors.CodexAppServerRequestError.invalidPayload(
-              "thread/resume",
-              "decode-payload",
-              error,
-            ),
+  return preparedThread.pipe(
+    Effect.flatMap((thread) =>
+      input.client.raw
+        .request("thread/resume", {
+          threadId: resumeThreadId,
+          ...thread,
+          excludeTurns: true,
+        })
+        .pipe(
+          Effect.catchIf(isRecoverableThreadResumeError, (error) =>
+            Effect.logWarning("codex app-server thread resume fell back to fresh start", {
+              threadId: input.threadId,
+              requestedRuntimeMode: input.runtimeMode,
+              resumeThreadId,
+              recoverable: true,
+              cause: error,
+            }).pipe(Effect.andThen(input.client.request("thread/start", thread))),
+          ),
+        ),
+    ),
+    Effect.flatMap((response) =>
+      decodeCodexThreadResumeMetadata(response).pipe(
+        Effect.mapError((error) =>
+          CodexErrors.CodexAppServerRequestError.invalidPayload(
+            "thread/resume",
+            "decode-payload",
+            error,
           ),
         ),
       ),
-      Effect.catchIf(isRecoverableThreadResumeError, (error) =>
-        Effect.logWarning("codex app-server thread resume fell back to fresh start", {
-          threadId: input.threadId,
-          requestedRuntimeMode: input.runtimeMode,
-          resumeThreadId,
-          recoverable: true,
-          cause: error,
-        }).pipe(Effect.andThen(input.client.request("thread/start", startParams))),
-      ),
-    );
+    ),
+  );
 };
 
 function readNotificationThreadId(notification: CodexServerNotification): string | undefined {
@@ -2384,6 +2447,8 @@ export const makeCodexSessionRuntime = (
         requestedModel,
         serviceTier: options.serviceTier,
         resumeThreadId: readResumeCursorThreadId(options.resumeCursor),
+        ...(options.managedSkills === undefined ? {} : { managedSkills: options.managedSkills }),
+        ...(options.managedSkills === undefined ? {} : { managedSkillClient: client }),
       });
 
       const providerThreadId = opened.thread.id;
@@ -2457,6 +2522,7 @@ export const makeCodexSessionRuntime = (
             threadId: providerThreadId,
             runtimeMode: options.runtimeMode,
             ...(input.input ? { prompt: input.input } : {}),
+            ...(input.skills ? { skills: input.skills } : {}),
             ...(input.attachments ? { attachments: input.attachments } : {}),
             ...(normalizedModel ? { model: normalizedModel } : {}),
             ...(input.serviceTier ? { serviceTier: input.serviceTier } : {}),

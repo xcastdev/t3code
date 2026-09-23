@@ -126,6 +126,50 @@ import {
 } from "./provider.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
+  SkillApplicationGetInput,
+  SkillApplicationGetResult,
+  SkillCatalogChanged,
+  SkillCatalogListInput,
+  SkillCatalogListResult,
+  SkillContentGetInput,
+  SkillContentGetResult,
+  SkillDeploymentChangeInput,
+  SkillDeploymentChangeResult,
+  SkillDeploymentListInput,
+  SkillDeploymentListResult,
+  SkillGlobalCreateInput,
+  SkillGlobalCreateResult,
+  SkillGlobalDeleteInput,
+  SkillGlobalDeleteResult,
+  SkillGlobalRenameInput,
+  SkillGlobalRenameResult,
+  SkillGlobalRollbackInput,
+  SkillGlobalRollbackResult,
+  SkillGlobalUpdateInput,
+  SkillGlobalUpdateResult,
+  SkillHistoryListInput,
+  SkillHistoryListResult,
+  SkillNativeContentGetInput,
+  SkillNativeContentGetResult,
+  SkillNativeImportInput,
+  SkillNativeImportResult,
+  SkillProjectDeleteStateInput,
+  SkillProjectDeleteStateResult,
+  SkillProjectRenameInput,
+  SkillProjectRenameResult,
+  SkillProjectSetDisabledInput,
+  SkillProjectSetDisabledResult,
+  SkillProjectSetOverrideInput,
+  SkillProjectSetOverrideResult,
+  SkillRpcError,
+  SkillSessionResetInput,
+  SkillSessionResetResult,
+  SkillSessionSetEnabledInput,
+  SkillSessionSetEnabledResult,
+} from "./skills.ts";
+import {
+  IssueSearchInput,
+  IssueSearchResult,
   PullRequestActionInput,
   PullRequestActivity,
   PullRequestCommentInput,
@@ -497,6 +541,26 @@ export const WS_METHODS = {
   serverProbe: "server.probe",
   serverGetConfig: "server.getConfig",
   serverGetProviderCatalog: "server.getProviderCatalog",
+  skillsCatalogList: "skills.catalog.list",
+  skillsCatalogSubscribe: "skills.catalog.subscribe",
+  skillsContentGet: "skills.content.get",
+  skillsHistoryList: "skills.history.list",
+  skillsNativeContentGet: "skills.native.content.get",
+  skillsApplicationGet: "skills.application.get",
+  skillsDeploymentList: "skills.deployment.list",
+  skillsDeploymentChange: "skills.deployment.change",
+  skillsGlobalCreate: "skills.global.create",
+  skillsGlobalUpdate: "skills.global.update",
+  skillsGlobalDelete: "skills.global.delete",
+  skillsGlobalRename: "skills.global.rename",
+  skillsGlobalRollback: "skills.global.rollback",
+  skillsProjectSetOverride: "skills.project.setOverride",
+  skillsProjectSetDisabled: "skills.project.setDisabled",
+  skillsProjectDeleteState: "skills.project.deleteState",
+  skillsProjectRename: "skills.project.rename",
+  skillsSessionSetEnabled: "skills.session.setEnabled",
+  skillsSessionReset: "skills.session.reset",
+  skillsNativeImport: "skills.native.import",
   serverRefreshProviders: "server.refreshProviders",
   serverUpdateProvider: "server.updateProvider",
   serverUpdateServer: "server.updateServer",
@@ -527,6 +591,7 @@ export const WS_METHODS = {
 
   // Pull request methods
   pullRequestsList: "pullRequests.list",
+  issuesSearch: "issues.search",
   pullRequestsListStats: "pullRequests.listStats",
   pullRequestsSummary: "pullRequests.summary",
   pullRequestsRouting: "pullRequests.routing",
@@ -610,6 +675,109 @@ export const WsServerGetProviderCatalogRpc = Rpc.make(WS_METHODS.serverGetProvid
   }),
   success: ServerProviderCatalogPayload,
   error: EnvironmentAuthorizationError,
+});
+
+const skillRpcError = Schema.Union([SkillRpcError, EnvironmentAuthorizationError]);
+export const WsSkillsCatalogListRpc = Rpc.make(WS_METHODS.skillsCatalogList, {
+  payload: SkillCatalogListInput,
+  success: SkillCatalogListResult,
+  error: skillRpcError,
+});
+export const WsSkillsCatalogSubscribeRpc = Rpc.make(WS_METHODS.skillsCatalogSubscribe, {
+  payload: SkillCatalogListInput,
+  success: SkillCatalogChanged,
+  error: skillRpcError,
+  stream: true,
+});
+export const WsSkillsContentGetRpc = Rpc.make(WS_METHODS.skillsContentGet, {
+  payload: SkillContentGetInput,
+  success: SkillContentGetResult,
+  error: skillRpcError,
+});
+export const WsSkillsHistoryListRpc = Rpc.make(WS_METHODS.skillsHistoryList, {
+  payload: SkillHistoryListInput,
+  success: SkillHistoryListResult,
+  error: skillRpcError,
+});
+export const WsSkillsNativeContentGetRpc = Rpc.make(WS_METHODS.skillsNativeContentGet, {
+  payload: SkillNativeContentGetInput,
+  success: SkillNativeContentGetResult,
+  error: skillRpcError,
+});
+export const WsSkillsApplicationGetRpc = Rpc.make(WS_METHODS.skillsApplicationGet, {
+  payload: SkillApplicationGetInput,
+  success: SkillApplicationGetResult,
+  error: skillRpcError,
+});
+export const WsSkillsDeploymentListRpc = Rpc.make(WS_METHODS.skillsDeploymentList, {
+  payload: SkillDeploymentListInput,
+  success: SkillDeploymentListResult,
+  error: skillRpcError,
+});
+export const WsSkillsDeploymentChangeRpc = Rpc.make(WS_METHODS.skillsDeploymentChange, {
+  payload: SkillDeploymentChangeInput,
+  success: SkillDeploymentChangeResult,
+  error: skillRpcError,
+});
+export const WsSkillsGlobalCreateRpc = Rpc.make(WS_METHODS.skillsGlobalCreate, {
+  payload: SkillGlobalCreateInput,
+  success: SkillGlobalCreateResult,
+  error: skillRpcError,
+});
+export const WsSkillsGlobalUpdateRpc = Rpc.make(WS_METHODS.skillsGlobalUpdate, {
+  payload: SkillGlobalUpdateInput,
+  success: SkillGlobalUpdateResult,
+  error: skillRpcError,
+});
+export const WsSkillsGlobalDeleteRpc = Rpc.make(WS_METHODS.skillsGlobalDelete, {
+  payload: SkillGlobalDeleteInput,
+  success: SkillGlobalDeleteResult,
+  error: skillRpcError,
+});
+export const WsSkillsGlobalRenameRpc = Rpc.make(WS_METHODS.skillsGlobalRename, {
+  payload: SkillGlobalRenameInput,
+  success: SkillGlobalRenameResult,
+  error: skillRpcError,
+});
+export const WsSkillsGlobalRollbackRpc = Rpc.make(WS_METHODS.skillsGlobalRollback, {
+  payload: SkillGlobalRollbackInput,
+  success: SkillGlobalRollbackResult,
+  error: skillRpcError,
+});
+export const WsSkillsProjectSetOverrideRpc = Rpc.make(WS_METHODS.skillsProjectSetOverride, {
+  payload: SkillProjectSetOverrideInput,
+  success: SkillProjectSetOverrideResult,
+  error: skillRpcError,
+});
+export const WsSkillsProjectSetDisabledRpc = Rpc.make(WS_METHODS.skillsProjectSetDisabled, {
+  payload: SkillProjectSetDisabledInput,
+  success: SkillProjectSetDisabledResult,
+  error: skillRpcError,
+});
+export const WsSkillsProjectDeleteStateRpc = Rpc.make(WS_METHODS.skillsProjectDeleteState, {
+  payload: SkillProjectDeleteStateInput,
+  success: SkillProjectDeleteStateResult,
+  error: skillRpcError,
+});
+export const WsSkillsProjectRenameRpc = Rpc.make(WS_METHODS.skillsProjectRename, {
+  payload: SkillProjectRenameInput,
+  success: SkillProjectRenameResult,
+  error: skillRpcError,
+});
+export const WsSkillsSessionSetEnabledRpc = Rpc.make(WS_METHODS.skillsSessionSetEnabled, {
+  payload: SkillSessionSetEnabledInput,
+  success: SkillSessionSetEnabledResult,
+  error: skillRpcError,
+});
+export const WsSkillsSessionResetRpc = Rpc.make(WS_METHODS.skillsSessionReset, {
+  payload: SkillSessionResetInput,
+  success: SkillSessionResetResult,
+  error: skillRpcError,
+});
+export const WsSkillsNativeImportRpc = Rpc.make(WS_METHODS.skillsNativeImport, {
+  payload: SkillNativeImportInput,
+  success: SkillNativeImportResult,
+  error: skillRpcError,
 });
 
 const WsServerRefreshProvidersRpc = Rpc.make(WS_METHODS.serverRefreshProviders, {
@@ -844,6 +1012,12 @@ const PullRequestRpcError = Schema.Union([
 const WsPullRequestsListRpc = Rpc.make(WS_METHODS.pullRequestsList, {
   payload: PullRequestListInput,
   success: PullRequestListResult,
+  error: PullRequestRpcError,
+});
+
+const WsIssuesSearchRpc = Rpc.make(WS_METHODS.issuesSearch, {
+  payload: IssueSearchInput,
+  success: IssueSearchResult,
   error: PullRequestRpcError,
 });
 
@@ -1817,6 +1991,26 @@ export const WsRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerGetProviderCatalogRpc,
+  WsSkillsCatalogListRpc,
+  WsSkillsCatalogSubscribeRpc,
+  WsSkillsContentGetRpc,
+  WsSkillsHistoryListRpc,
+  WsSkillsNativeContentGetRpc,
+  WsSkillsApplicationGetRpc,
+  WsSkillsDeploymentListRpc,
+  WsSkillsDeploymentChangeRpc,
+  WsSkillsGlobalCreateRpc,
+  WsSkillsGlobalUpdateRpc,
+  WsSkillsGlobalDeleteRpc,
+  WsSkillsGlobalRenameRpc,
+  WsSkillsGlobalRollbackRpc,
+  WsSkillsProjectSetOverrideRpc,
+  WsSkillsProjectSetDisabledRpc,
+  WsSkillsProjectDeleteStateRpc,
+  WsSkillsProjectRenameRpc,
+  WsSkillsSessionSetEnabledRpc,
+  WsSkillsSessionResetRpc,
+  WsSkillsNativeImportRpc,
   WsServerRefreshProvidersRpc,
   WsServerUpdateProviderRpc,
   WsProviderConsumeResetCreditRpc,
@@ -1853,6 +2047,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsCloudGetRelayClientStatusRpc,
   WsCloudInstallRelayClientRpc,
   WsPullRequestsListRpc,
+  WsIssuesSearchRpc,
   WsPullRequestsListStatsRpc,
   WsPullRequestsSummaryRpc,
   WsPullRequestsRoutingRpc,

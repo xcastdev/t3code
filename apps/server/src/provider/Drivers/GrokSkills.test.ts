@@ -4,7 +4,9 @@ import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
-import { discoverGrokSkills } from "./GrokSkills.ts";
+import { serverProviderSkillsToNativeCandidates } from "../../skills/NativeSkillObservationService.ts";
+import { dispatchComposerSlashSkill } from "./ComposerSkillDispatch.ts";
+import { discoverGrokSkills, grokSkillsForNativeObservations } from "./GrokSkills.ts";
 
 const inspectPayload = (skills: ReadonlyArray<unknown>) => JSON.stringify({ skills });
 
@@ -75,7 +77,7 @@ describe("discoverGrokSkills", () => {
     ),
   );
 
-  it.effect("disables skills the CLI marks as not user-invocable", () =>
+  it.effect("keeps provider enablement separate from user invocability", () =>
     Effect.gen(function* () {
       const skills = yield* discoverGrokSkills({ binaryPath: "grok" }, {});
 
@@ -84,7 +86,8 @@ describe("discoverGrokSkills", () => {
           name: "internal-helper",
           path: "/opt/grok/bundled/skills/internal-helper/SKILL.md",
           scope: "bundled",
-          enabled: false,
+          enabled: true,
+          userInvocable: false,
         },
       ]);
     }).pipe(
@@ -99,6 +102,81 @@ describe("discoverGrokSkills", () => {
                 path: "/opt/grok/bundled/skills/internal-helper/SKILL.md",
               },
               userInvocable: false,
+            },
+          ]),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("preserves same-name skills from distinct native identities", () =>
+    Effect.gen(function* () {
+      const skills = yield* discoverGrokSkills({ binaryPath: "grok" }, {});
+      expect(skills.map((skill) => skill.path)).toEqual([
+        "/repo/.grok/skills/deploy/SKILL.md",
+        "/user/.grok/skills/deploy/SKILL.md",
+      ]);
+    }).pipe(
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        makeInspectSpawner(
+          inspectPayload([
+            {
+              name: "deploy",
+              source: { type: "user", path: "/user/.grok/skills/deploy/SKILL.md" },
+            },
+            {
+              name: "deploy",
+              source: { type: "project", path: "/repo/.grok/skills/deploy/SKILL.md" },
+            },
+          ]),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("uses Grok's qualified invocation names for colliding skills", () =>
+    Effect.gen(function* () {
+      const skills = yield* discoverGrokSkills({ binaryPath: "grok" }, {});
+      const skillNames = new Set(skills.map((skill) => skill.name));
+
+      expect(skills.map((skill) => skill.name)).toEqual(["acme:login", "local:commit", "safe"]);
+      expect(dispatchComposerSlashSkill("!local:commit for this change", skillNames)).toBe(
+        "/local:commit for this change",
+      );
+      expect(dispatchComposerSlashSkill("Use !commit for this change", skillNames)).toBe(
+        "Use !commit for this change",
+      );
+      expect(
+        serverProviderSkillsToNativeCandidates("grok", grokSkillsForNativeObservations(skills)).map(
+          (candidate) => candidate.key,
+        ),
+      ).toEqual(["login", "commit", "safe"]);
+    }).pipe(
+      Effect.provideService(
+        ChildProcessSpawner.ChildProcessSpawner,
+        makeInspectSpawner(
+          inspectPayload([
+            {
+              name: "commit",
+              description: "Commit changes.",
+              source: { type: "project", path: "/repo/.grok/skills/commit/SKILL.md" },
+              collidesWith: "commit",
+              invocableAs: "/local:commit",
+            },
+            {
+              name: "login",
+              description: "Login skill.",
+              source: {
+                type: "plugin",
+                path: "/home/dev/.grok/installed-plugins/acme/skills/login/SKILL.md",
+              },
+              collidesWith: "login",
+              invocableAs: "/acme:login",
+            },
+            {
+              name: "safe",
+              source: { type: "user", path: "/home/dev/.grok/skills/safe/SKILL.md" },
             },
           ]),
         ),

@@ -77,6 +77,8 @@ import {
   ThreadMcpCatalogDisposedPayload,
   ThreadMcpCatalogAppliedPayload,
   ThreadMcpCatalogApplyFailedPayload,
+  ThreadSkillApplicationDesiredPayload,
+  ThreadSkillApplicationReceivedPayload,
 } from "./Schemas.ts";
 
 type ThreadPatch = Partial<Omit<OrchestrationThread, "id" | "projectId">>;
@@ -470,6 +472,22 @@ export function createEmptyReadModel(nowIso: string): OrchestrationReadModel {
   };
 }
 
+function projectSkillApplication(
+  model: OrchestrationReadModel,
+  application: NonNullable<OrchestrationReadModel["skillApplications"]>[number],
+): OrchestrationReadModel {
+  const current = model.skillApplications ?? [];
+  const matching = (entry: (typeof current)[number]) =>
+    entry.threadId === application.threadId &&
+    entry.providerInstanceId === application.providerInstanceId;
+  return {
+    ...model,
+    skillApplications: current.some(matching)
+      ? current.map((entry) => (matching(entry) ? application : entry))
+      : [...current, application],
+  };
+}
+
 export function projectEvent(
   model: OrchestrationReadModel,
   event: OrchestrationEvent,
@@ -481,6 +499,22 @@ export function projectEvent(
   };
 
   switch (event.type) {
+    case "thread.skill-application.desired":
+      return decodeForEvent(
+        ThreadSkillApplicationDesiredPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(Effect.map((payload) => projectSkillApplication(nextBase, payload.application)));
+
+    case "thread.skill-application.received":
+      return decodeForEvent(
+        ThreadSkillApplicationReceivedPayload,
+        event.payload,
+        event.type,
+        "payload",
+      ).pipe(Effect.map((payload) => projectSkillApplication(nextBase, payload.application)));
+
     case "project.created":
       return decodeForEvent(ProjectCreatedPayload, event.payload, event.type, "payload").pipe(
         Effect.map((payload) => {

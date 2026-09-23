@@ -61,6 +61,10 @@ import {
   makeAcpToolCallEvent,
 } from "../acp/AcpCoreRuntimeEvents.ts";
 import { makeAcpNativeLoggerFactory } from "../acp/AcpNativeLogging.ts";
+import {
+  dispatchComposerSlashSkill,
+  findComposerSkillMentions,
+} from "../Drivers/ComposerSkillDispatch.ts";
 import { parsePermissionRequest, type AcpToolCallState } from "../acp/AcpRuntimeModel.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import {
@@ -145,6 +149,7 @@ export interface AntigravityAdapterOptions {
   /** Model the provider default alias selects, when the account offers it. */
   readonly defaultModel?: Effect.Effect<string | undefined>;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly resolveSkillNames?: (cwd: string) => Effect.Effect<ReadonlySet<string>>;
 }
 
 interface PendingApproval {
@@ -193,6 +198,7 @@ interface TurnIntent {
 interface SessionContext {
   readonly threadId: ThreadId;
   readonly cwd: string;
+  readonly skillNames: ReadonlySet<string>;
   readonly nativeSessionId: string;
   readonly scope: Scope.Closeable;
   readonly runtime: Runtime;
@@ -875,9 +881,13 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
                 createdAt,
                 updatedAt: createdAt,
               };
+              const skillNames = yield* (
+                options.resolveSkillNames?.(cwd) ?? Effect.succeed(new Set<string>())
+              );
               context = {
                 threadId: input.threadId,
                 cwd,
+                skillNames,
                 nativeSessionId: started.sessionId,
                 scope: sessionScope,
                 runtime,
@@ -987,6 +997,18 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
 
   const sendTurn: Adapter["sendTurn"] = Effect.fn("AntigravityAdapter.sendTurn")(function* (input) {
     const context = yield* requireSession(input.threadId);
+    if (
+      input.input &&
+      findComposerSkillMentions(input.input).filter((mention) =>
+        context.skillNames.has(mention.name),
+      ).length > 1
+    ) {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "sendTurn",
+        issue: "Antigravity can run one skill per message. Remove the extra skill references.",
+      });
+    }
     if (input.modelSelection && input.modelSelection.instanceId !== options.instanceId) {
       return yield* new ProviderAdapterValidationError({
         provider: PROVIDER,
@@ -995,7 +1017,10 @@ export const makeAntigravityAdapter = Effect.fn("makeAntigravityAdapter")(functi
       });
     }
     const prompt = yield* buildAntigravityPrompt({
-      input: input.input,
+      input:
+        input.input === undefined
+          ? undefined
+          : dispatchComposerSlashSkill(input.input, context.skillNames),
       attachments: input.attachments,
       attachmentsDir: serverConfig.attachmentsDir,
     }).pipe(

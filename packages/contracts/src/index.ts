@@ -50,3 +50,4 @@ export * from "./rpc.ts";
 export * from "./worktreeSetup.ts";
 export * from "./projectWork.ts";
 export * from "./projectLifecycle.ts";
+export * from "./skills.ts";

@@ -1067,7 +1067,7 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("dispatches a $skill mention as a trailing slash command block", () => {
+  it.effect("dispatches a !skill mention as a trailing slash command block", () => {
     // Claude Code only runs `/name` from the message's last text block, so a
     // chip picked mid-prompt is moved there and the surrounding prose kept.
     const homeDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "claude-skills-home-"));
@@ -1092,7 +1092,7 @@ describe("ClaudeAdapterLive", () => {
 
       yield* adapter.sendTurn({
         threadId: session.threadId,
-        input: "ok, now $implement all the tickets\nstart with auth",
+        input: "ok, now !implement all the tickets\nstart with auth",
         attachments: [],
       });
 
@@ -1102,6 +1102,51 @@ describe("ClaudeAdapterLive", () => {
       assert.deepEqual(promptMessage?.message.content, [
         { type: "text", text: "ok, now" },
         { type: "text", text: "/implement all the tickets\nstart with auth" },
+      ]);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("applies a managed plugin plan and dispatches its qualified skill identity", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+        skillPlan: {
+          providerInstanceId: ProviderInstanceId.make("claudeAgent"),
+          desiredRevision: 1 as never,
+          applicationMode: "new_session_required",
+          skillKeys: ["deploy" as never],
+          payload: {
+            kind: "claude-managed-skills",
+            pluginPath: "/tmp/t3-runtime/session/claude/plugin",
+            collidingNativeKeys: ["deploy"],
+            skillKeys: ["deploy"],
+          },
+        },
+      });
+
+      const options = harness.getLastCreateQueryInput()?.options;
+      assert.deepEqual(options?.plugins, [
+        { type: "local", path: "/tmp/t3-runtime/session/claude/plugin" },
+      ]);
+      assert.deepInclude(options?.settings, { skillOverrides: { deploy: "off" } });
+
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "!deploy now",
+        attachments: [],
+      });
+      const promptMessage = yield* Effect.promise(() =>
+        readFirstPromptMessage(harness.getLastCreateQueryInput()),
+      );
+      assert.deepEqual(promptMessage?.message.content, [
+        { type: "text", text: "/t3-managed:deploy now" },
       ]);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
@@ -1149,7 +1194,7 @@ describe("ClaudeAdapterLive", () => {
       });
       yield* adapter.sendTurn({
         threadId: session.threadId,
-        input: "$review this screenshot",
+        input: "!review this screenshot",
         attachments: [attachment],
       });
 
@@ -1171,7 +1216,7 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("leaves a $ mention of an unknown or disabled skill as prose", () => {
+  it.effect("leaves an unknown or disabled !skill mention as prose", () => {
     const homeDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "claude-skills-off-"));
     NodeFS.mkdirSync(NodePath.join(homeDir, "skills", "deploy"), {
       recursive: true,
@@ -1197,14 +1242,14 @@ describe("ClaudeAdapterLive", () => {
       });
       yield* adapter.sendTurn({
         threadId: session.threadId,
-        input: "run $deploy and echo $HOME",
+        input: "run !deploy and echo $HOME",
         attachments: [],
       });
 
       const promptText = yield* Effect.promise(() =>
         readFirstPromptText(harness.getLastCreateQueryInput()),
       );
-      assert.equal(promptText, "run $deploy and echo $HOME");
+      assert.equal(promptText, "run !deploy and echo $HOME");
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

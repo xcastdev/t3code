@@ -3,6 +3,7 @@ import {
   type ProviderSkillSourceKind,
 } from "@t3tools/client-runtime/providerSkills";
 import type {
+  IssueContextMetadata,
   PullRequestContextMetadata,
   ServerProviderSkill,
   ServerProviderSlashCommand,
@@ -16,6 +17,13 @@ import { AppText as Text } from "../../components/AppText";
 import { GlassSurface } from "../../components/GlassSurface";
 import { PierreEntryIcon } from "../../components/PierreEntryIcon";
 export type ComposerCommandItem =
+  | {
+      readonly id: string;
+      readonly type: "issue";
+      readonly issue: IssueContextMetadata;
+      readonly label: string;
+      readonly description: string;
+    }
   | {
       readonly id: string;
       readonly type: "pull-request";
@@ -92,6 +100,8 @@ function itemIcon(item: ComposerCommandItem): AppSymbolName | null {
   switch (item.type) {
     case "pull-request":
       return { ios: "arrow.triangle.pull", android: "merge" };
+    case "issue":
+      return "circle.dotted";
     case "slash-command":
     case "provider-slash-command":
       return "terminal";
@@ -105,7 +115,7 @@ function itemIcon(item: ComposerCommandItem): AppSymbolName | null {
 function groupLabel(triggerKind: ComposerTriggerKind | null): string | null {
   switch (triggerKind) {
     case "pull-request":
-      return "Pull requests";
+      return "Issues and pull requests";
     case "slash-command":
       return "Commands";
     case "skill":

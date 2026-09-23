@@ -14,6 +14,8 @@ import * as PullRequestSyncReactor from "../PullRequestSyncReactor.ts";
 import * as ThreadPullRequestReactor from "../ThreadPullRequestReactor.ts";
 import * as AgentAwarenessRelay from "../../relay/AgentAwarenessRelay.ts";
 import { McpCatalogReactor } from "../Services/McpCatalogReactor.ts";
+import { SkillApplicationReactor } from "../Services/SkillApplicationReactor.ts";
+import { SkillCatalogApplicationReactor } from "../Services/SkillCatalogApplicationReactor.ts";
 
 export const makeOrchestrationReactor = Effect.gen(function* () {
   const providerRuntimeIngestion = yield* ProviderRuntimeIngestionService;
@@ -28,6 +30,10 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
   // uses the required layer below, which makes the dependency explicit while
   // keeping unrelated command/CLI test environments lightweight.
   const mcpCatalogReactor = yield* Effect.serviceOption(McpCatalogReactor);
+  const skillApplicationReactor = yield* Effect.serviceOption(SkillApplicationReactor);
+  const skillCatalogApplicationReactor = yield* Effect.serviceOption(
+    SkillCatalogApplicationReactor,
+  );
 
   const start: OrchestrationReactorShape["start"] = Effect.fn("start")(function* () {
     yield* providerRuntimeIngestion.start();
@@ -39,11 +45,24 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
     yield* pullRequestSyncReactor.start();
     yield* agentAwarenessRelay.start();
     if (mcpCatalogReactor._tag === "Some") yield* mcpCatalogReactor.value.start();
+    if (skillApplicationReactor._tag === "Some") yield* skillApplicationReactor.value.start();
+    if (skillCatalogApplicationReactor._tag === "Some") {
+      yield* skillCatalogApplicationReactor.value.start();
+    }
   });
 
   return {
     start,
-    drain: mcpCatalogReactor._tag === "Some" ? mcpCatalogReactor.value.drain : Effect.void,
+    drain: Effect.all(
+      [
+        mcpCatalogReactor._tag === "Some" ? mcpCatalogReactor.value.drain : Effect.void,
+        skillApplicationReactor._tag === "Some" ? skillApplicationReactor.value.drain : Effect.void,
+        skillCatalogApplicationReactor._tag === "Some"
+          ? skillCatalogApplicationReactor.value.drain
+          : Effect.void,
+      ],
+      { discard: true },
+    ),
   } satisfies OrchestrationReactorShape;
 });
 

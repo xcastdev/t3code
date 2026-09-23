@@ -16,6 +16,7 @@ import {
   type OrchestrationCommand,
   type OrchestrationEvent,
   ProviderInstanceId,
+  SkillCatalogRevision,
 } from "@t3tools/contracts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it as effectIt } from "@effect/vitest";
@@ -117,6 +118,135 @@ async function createOrchestrationSystem(
 function now() {
   return "2026-01-01T00:00:00.000Z";
 }
+
+it("recovers skill desired and applied revisions from SQL after restart", async () => {
+  const directory = await NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-skill-recovery-"));
+  const databasePath = NodePath.join(directory, "state.sqlite");
+  let system = await createOrchestrationSystem(databasePath);
+  const threadId = ThreadId.make("skill-thread");
+  const projectId = ProjectId.make("skill-project");
+  const providerInstanceId = ProviderInstanceId.make("codex");
+  try {
+    await system.run(
+      system.engine.dispatch({
+        type: "project.create",
+        commandId: CommandId.make("skill-project"),
+        projectId,
+        title: "Skills",
+        workspaceRoot: directory,
+        createdAt: now(),
+      }),
+    );
+    await system.run(
+      system.engine.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("skill-thread"),
+        threadId,
+        projectId,
+        title: "Skills",
+        modelSelection: { instanceId: providerInstanceId, model: "gpt-5.4" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: now(),
+      }),
+    );
+    const desired = {
+      threadId,
+      providerInstanceId,
+      desiredRevision: SkillCatalogRevision.make(1),
+      appliedRevision: SkillCatalogRevision.make(0),
+      status: "pending_new_session" as const,
+      outcomes: [],
+    };
+    await system.run(
+      system.engine.dispatch({
+        type: "thread.skill-application.desire",
+        commandId: CommandId.make("skill-desire-1"),
+        threadId,
+        application: desired,
+        updatedAt: now(),
+      }),
+    );
+    const applied = {
+      ...desired,
+      appliedRevision: SkillCatalogRevision.make(1),
+      status: "applied" as const,
+    };
+    await system.run(
+      system.engine.dispatch({
+        type: "thread.skill-application.receipt",
+        commandId: CommandId.make("skill-receipt-1"),
+        threadId,
+        application: applied,
+        updatedAt: now(),
+      }),
+    );
+    expect((await system.readModel()).skillApplications).toEqual([applied]);
+    await system.dispose();
+    system = await createOrchestrationSystem(databasePath);
+    const pending = {
+      ...applied,
+      desiredRevision: SkillCatalogRevision.make(2),
+      status: "pending_new_session" as const,
+    };
+    await system.run(
+      system.engine.dispatch({
+        type: "thread.skill-application.desire",
+        commandId: CommandId.make("skill-desire-2"),
+        threadId,
+        application: pending,
+        updatedAt: now(),
+      }),
+    );
+    const failed = { ...pending, status: "failed" as const };
+    await system.run(
+      system.engine.dispatch({
+        type: "thread.skill-application.receipt",
+        commandId: CommandId.make("skill-receipt-2"),
+        threadId,
+        application: failed,
+        updatedAt: now(),
+      }),
+    );
+    expect((await system.readModel()).skillApplications).toEqual([failed]);
+    const next = {
+      ...failed,
+      desiredRevision: SkillCatalogRevision.make(3),
+      status: "pending_new_session" as const,
+    };
+    await system.run(
+      system.engine.dispatch({
+        type: "thread.skill-application.desire",
+        commandId: CommandId.make("skill-desire-3"),
+        threadId,
+        application: next,
+        updatedAt: now(),
+      }),
+    );
+    // Revision two finished launching while revision three was being authored.
+    await system.run(
+      system.engine.dispatch({
+        type: "thread.skill-application.receipt",
+        commandId: CommandId.make("skill-late-receipt-2"),
+        threadId,
+        application: {
+          ...pending,
+          status: "applied",
+          appliedRevision: SkillCatalogRevision.make(2),
+        },
+        updatedAt: now(),
+      }),
+    );
+    expect((await system.readModel()).skillApplications).toEqual([
+      { ...next, appliedRevision: SkillCatalogRevision.make(2) },
+    ]);
+  } finally {
+    await system.dispose();
+    await NodeFSP.rm(directory, { recursive: true, force: true });
+  }
+});
 
 const hasMetricSnapshot = (
   snapshots: ReadonlyArray<Metric.Metric.Snapshot>,

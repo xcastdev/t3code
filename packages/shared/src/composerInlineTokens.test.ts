@@ -4,13 +4,13 @@ import { collectComposerInlineTokens } from "./composerInlineTokens.ts";
 
 describe("collectComposerInlineTokens", () => {
   it("collects file links, mentions, and skills with source ranges", () => {
-    const text = "Use $ui and inspect [Chat.tsx](src/Chat.tsx) with @AGENTS.md please";
+    const text = "Use !ui and inspect [Chat.tsx](src/Chat.tsx) with @AGENTS.md please";
 
     expect(collectComposerInlineTokens(text)).toEqual([
       {
         type: "skill",
         value: "ui",
-        source: "$ui",
+        source: "!ui",
         start: 4,
         end: 7,
       },
@@ -32,11 +32,11 @@ describe("collectComposerInlineTokens", () => {
   });
 
   it("collects skill names that begin with a digit", () => {
-    expect(collectComposerInlineTokens("Use $2spec next")).toEqual([
+    expect(collectComposerInlineTokens("Use !2spec next")).toEqual([
       {
         type: "skill",
         value: "2spec",
-        source: "$2spec",
+        source: "!2spec",
         start: 4,
         end: 10,
       },
@@ -51,8 +51,12 @@ describe("collectComposerInlineTokens", () => {
     expect(collectComposerInlineTokens("Limit is $1e6 here")).toEqual([]);
   });
 
+  it("leaves dollar-prefixed agent syntax and shell variables as text", () => {
+    expect(collectComposerInlineTokens("Use $review next and keep $HOME intact")).toEqual([]);
+  });
+
   it("does not convert incomplete trailing tokens", () => {
-    expect(collectComposerInlineTokens("Use $ui")).toEqual([]);
+    expect(collectComposerInlineTokens("Use !ui")).toEqual([]);
     expect(collectComposerInlineTokens("Inspect @AGENTS.md")).toEqual([]);
   });
 

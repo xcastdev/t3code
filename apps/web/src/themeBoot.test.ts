@@ -113,7 +113,7 @@ function runtimeResolvedAppearance(
   invalidateCustomThemes();
   try {
     const raw = storage[THEME_STORAGE_KEY] ?? null;
-    const theme = raw !== null && isKnownThemePreference(raw) ? raw : "system";
+    const theme = raw !== null && isKnownThemePreference(raw) ? raw : "dark";
     const followRaw = storage[THEME_FOLLOW_SYSTEM_STORAGE_KEY] ?? null;
     const appearanceRaw = storage[THEME_APPEARANCE_MODE_STORAGE_KEY] ?? null;
     const appearanceMode =
@@ -155,6 +155,7 @@ describe("index.html boot script", () => {
     prefersDark: boolean;
   }> = [
     { name: "no stored preference on a dark OS", storage: {}, prefersDark: true },
+    { name: "no stored preference on a light OS", storage: {}, prefersDark: false },
     {
       name: "T3 Chat follows a dark OS",
       storage: { [THEME_STORAGE_KEY]: "t3-chat", [THEME_FOLLOW_SYSTEM_STORAGE_KEY]: "true" },
@@ -493,8 +494,8 @@ describe("index.html boot script", () => {
 
     expect(boot.themeId).toBeUndefined();
     expect(boot.themeSelected).toBeUndefined();
-    expect(boot.backgroundColor).toBe("#ffffff");
-    expect(boot.metaContent).toBe("#ffffff");
+    expect(boot.backgroundColor).toBe("#0a0a0a");
+    expect(boot.metaContent).toBe("#0a0a0a");
   });
 
   it("leaves unknown preferences unthemed so the runtime default applies", () => {
@@ -507,9 +508,9 @@ describe("index.html boot script", () => {
     expect(boot.isDark).toBe(true);
   });
 
-  it("follows the OS appearance when storage is unavailable", () => {
+  it("defaults to dark when storage is unavailable", () => {
     const light = runBootScript({ storageThrows: true, prefersDark: false });
-    expect(light.isDark).toBe(false);
+    expect(light.isDark).toBe(true);
     expect(light.themeId).toBeUndefined();
 
     const dark = runBootScript({ storageThrows: true, prefersDark: true });

@@ -3061,7 +3061,7 @@ const userMessageContextPresentationRegistry = createContextPresentationRegistry
             }
             label={record.label || record.name}
             kindLabel="Skill"
-            tooltip={`$${record.name}`}
+            tooltip={`!${record.name}`}
             copyMarkdown={context.copyMarkdown}
             toneClassName={CONTEXT_INLINE_CHIP_TONE_CLASS_NAMES.skill}
           />
@@ -3260,6 +3260,7 @@ const userMessageContextPresentationRegistry = createContextPresentationRegistry
                   ? { fenceLanguage: record.fenceLanguage }
                   : {}),
                 ...(record.pullRequest !== undefined ? { pullRequest: record.pullRequest } : {}),
+                ...(record.issue !== undefined ? { issue: record.issue } : {}),
               }}
             />
           </UserMessageContextPopover>

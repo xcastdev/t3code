@@ -37,6 +37,12 @@ export interface ServerDerivedPaths {
   readonly settingsPath: string;
   /** Palettes this machine publishes for clients to follow, one file per theme. */
   readonly environmentThemesDir: string;
+  /** Filesystem-authoritative environment-global managed skill packages. */
+  readonly managedSkillsDir: string;
+  /** Bounded snapshots of superseded global managed skill packages. */
+  readonly skillHistoryDir: string;
+  /** Generated provider/session skill materializations. */
+  readonly skillRuntimeDir: string;
   readonly providerStatusCacheDir: string;
   readonly worktreesDir: string;
   readonly attachmentsDir: string;
@@ -129,6 +135,9 @@ export const deriveServerPaths = Effect.fn(function* (
     keybindingsConfigPath: join(stateDir, "keybindings.json"),
     settingsPath: join(stateDir, "settings.json"),
     environmentThemesDir: join(stateDir, "themes"),
+    managedSkillsDir: join(stateDir, "skills"),
+    skillHistoryDir: join(stateDir, "skill-history"),
+    skillRuntimeDir: join(stateDir, "skill-runtime"),
     providerStatusCacheDir,
     worktreesDir: join(baseDir, "worktrees"),
     attachmentsDir,
@@ -157,6 +166,9 @@ export const ensureServerDirectories = Effect.fn(function* (derivedPaths: Server
       fs.makeDirectory(derivedPaths.providerLogsDir, { recursive: true }),
       fs.makeDirectory(derivedPaths.terminalLogsDir, { recursive: true }),
       fs.makeDirectory(derivedPaths.attachmentsDir, { recursive: true }),
+      fs.makeDirectory(derivedPaths.managedSkillsDir, { recursive: true }),
+      fs.makeDirectory(derivedPaths.skillHistoryDir, { recursive: true }),
+      fs.makeDirectory(derivedPaths.skillRuntimeDir, { recursive: true }),
       fs.makeDirectory(derivedPaths.worktreesDir, { recursive: true }),
       fs.makeDirectory(path.dirname(derivedPaths.keybindingsConfigPath), { recursive: true }),
       fs.makeDirectory(path.dirname(derivedPaths.settingsPath), { recursive: true }),

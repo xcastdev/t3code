@@ -27,10 +27,12 @@ import type {
 import {
   ApprovalRequestId,
   EnvironmentId,
+  ManagedSkillKey,
   McpServerId,
   OpenCodeSettings,
   ProviderDriverKind,
   ProviderInstanceId,
+  SkillCatalogRevision,
   ThreadId,
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
@@ -71,6 +73,8 @@ type MessageEntry = {
 const runtimeMock = {
   state: {
     startCalls: [] as string[],
+    connectionEnvironments: [] as Array<NodeJS.ProcessEnv | undefined>,
+    skillCatalog: [] as Array<{ name: string; location: string; content?: string }>,
     sessionCreateUrls: [] as string[],
     sessionCreateInputs: [] as Array<Record<string, unknown>>,
     createdSessionIds: [] as string[],
@@ -145,6 +149,8 @@ const runtimeMock = {
   },
   reset() {
     this.state.startCalls.length = 0;
+    this.state.connectionEnvironments.length = 0;
+    this.state.skillCatalog.length = 0;
     this.state.sessionCreateUrls.length = 0;
     this.state.sessionCreateInputs.length = 0;
     this.state.createdSessionIds.length = 0;
@@ -227,8 +233,9 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
         isRunning: Effect.succeed(true),
       };
     }),
-  connectToOpenCodeServer: ({ serverUrl, serverPassword }) =>
+  connectToOpenCodeServer: ({ serverUrl, serverPassword, environment }) =>
     Effect.gen(function* () {
+      runtimeMock.state.connectionEnvironments.push(environment);
       const url = serverUrl ?? "http://127.0.0.1:4301";
       // Always register a finalizer so the closeCalls/closeError probes fire;
       // production attaches none for external servers.
@@ -251,6 +258,9 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
   runOpenCodeCommand: () => Effect.succeed({ stdout: "", stderr: "", code: 0 }),
   createOpenCodeSdkClient: ({ baseUrl, serverPassword }) =>
     ({
+      app: {
+        skills: async () => ({ data: runtimeMock.state.skillCatalog }),
+      },
       session: {
         create: async (input: Record<string, unknown>) => {
           runtimeMock.state.sessionCreateUrls.push(baseUrl);
@@ -639,6 +649,7 @@ const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory
 // the layer graph reach for it — but the routing values the assertions
 // probe (serverUrl, serverPassword) must be threaded directly through the
 // decoded `OpenCodeSettings`.
+const decodeOpenCodeSettingsEffect = Schema.decodeUnknownEffect(OpenCodeSettings);
 const openCodeAdapterTestSettings = Schema.decodeSync(OpenCodeSettings)({
   binaryPath: "fake-opencode",
   serverUrl: "http://127.0.0.1:9999",
@@ -681,6 +692,45 @@ const externalAdapterDependencies = Layer.mergeAll(
 beforeEach(() => {
   runtimeMock.reset();
 });
+
+it.effect(
+  "starts local OpenCode with an isolated managed skill directory and verifies its source",
+  () =>
+    Effect.gen(function* () {
+      const instanceId = ProviderInstanceId.make("opencode");
+      const configDir = "/runtime/session/.opencode-config";
+      const root = `${configDir}/skills`;
+      const key = ManagedSkillKey.make("review");
+      const plan = {
+        providerInstanceId: instanceId,
+        desiredRevision: SkillCatalogRevision.make(1),
+        applicationMode: "new_session_required" as const,
+        skillKeys: [key],
+        payload: { kind: "opencode-managed-skills", root, configDir, skillKeys: ["review"] },
+      };
+      const settings = yield* decodeOpenCodeSettingsEffect({
+        binaryPath: "fake-opencode",
+        serverUrl: "",
+      });
+      const adapter = yield* makeOpenCodeAdapter(settings, {
+        instanceId,
+        environment: { OPENCODE_CONFIG_CONTENT: '{"model":"example/model"}' },
+      });
+      runtimeMock.state.skillCatalog.push({ name: "review", location: `${root}/review/SKILL.md` });
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId: asThreadId("managed-local"),
+        runtimeMode: "full-access",
+        skillPlan: plan,
+      });
+      NodeAssert.equal(runtimeMock.state.connectionEnvironments[0]?.OPENCODE_CONFIG_DIR, configDir);
+      NodeAssert.equal(
+        runtimeMock.state.connectionEnvironments[0]?.OPENCODE_CONFIG_CONTENT,
+        '{"model":"example/model"}',
+      );
+      NodeAssert.equal(runtimeMock.state.sessionCreateUrls.length, 1);
+    }).pipe(Effect.provide(externalAdapterDependencies)),
+);
 
 const advanceTestClock = (ms: number) =>
   TestClock.adjust(`${ms} millis`).pipe(Effect.andThen(Effect.yieldNow));
@@ -1395,6 +1445,80 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         type: "text",
         text: "Review src/a.ts\n\nInspect the changed files.",
       });
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("injects selected native skill content for local OpenCode", () =>
+    Effect.gen(function* () {
+      const settings = yield* decodeOpenCodeSettingsEffect({
+        binaryPath: "fake-opencode",
+        serverUrl: "",
+      });
+      const adapter = yield* makeOpenCodeAdapter(settings);
+      const threadId = asThreadId("thread-opencode-explicit-skill");
+      runtimeMock.state.skillCatalog.push({
+        name: "review",
+        location: "/remote/project/.agents/skills/review/SKILL.md",
+        content: "Check authorization boundaries before editing.",
+      });
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Inspect the auth code with !review",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "anthropic/sonnet",
+        ),
+      });
+
+      const prompt = runtimeMock.state.promptCalls[0] as {
+        system: string;
+        parts: Array<{ text?: string }>;
+      };
+      NodeAssert.ok(prompt.system.includes("Check authorization boundaries before editing."));
+      NodeAssert.equal(prompt.parts[0]?.text, "Inspect the auth code with !review");
+
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("leaves skill references literal on external OpenCode", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-external-skill");
+      runtimeMock.state.skillCatalog.push({
+        name: "review",
+        location: "/remote/project/.agents/skills/review/SKILL.md",
+        content: "Check authorization boundaries before editing.",
+      });
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId,
+        input: "Inspect the auth code with !review",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "anthropic/sonnet",
+        ),
+      });
+
+      const prompt = runtimeMock.state.promptCalls[0] as {
+        system: string;
+        parts: Array<{ text?: string }>;
+      };
+      NodeAssert.ok(!prompt.system.includes("Check authorization boundaries before editing."));
+      NodeAssert.equal(prompt.parts[0]?.text, "Inspect the auth code with !review");
 
       yield* adapter.stopSession(threadId);
     }),

@@ -270,6 +270,22 @@ describe("buildTurnStartParams", () => {
     });
   });
 
+  it("sends selected T3 skills as structured app-server skill inputs", () => {
+    const params = Effect.runSync(
+      buildTurnStartParams({
+        threadId: "provider-thread-1",
+        runtimeMode: "full-access",
+        prompt: "Please !review this diff",
+        skills: [{ name: "review", path: "/project/.agents/skills/review/SKILL.md" }],
+      }),
+    );
+
+    NodeAssert.deepStrictEqual(params.input, [
+      { type: "text", text: "Please !review this diff" },
+      { type: "skill", name: "review", path: "/project/.agents/skills/review/SKILL.md" },
+    ]);
+  });
+
   it("reports the same fallback model and effort in settings and instructions", () => {
     const params = Effect.runSync(
       buildTurnStartParams({

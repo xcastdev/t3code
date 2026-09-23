@@ -74,6 +74,7 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
   readonly holdCancel?: boolean;
   readonly holdClose?: boolean;
   readonly holdDispatch?: boolean;
+  readonly skillNames?: ReadonlySet<string>;
 }) {
   const runtimeEvents = yield* Queue.unbounded<AcpSessionRuntimeEvent>();
   const canonicalEvents = yield* Queue.unbounded<ProviderRuntimeEvent>();
@@ -218,6 +219,7 @@ const makeHarness = Effect.fn("makeAntigravityAdapterHarness")(function* (option
     decodeSettings({ enabled: options?.enabled ?? true }),
     {
       instanceId,
+      resolveSkillNames: () => Effect.succeed(options?.skillNames ?? new Set<string>()),
       makeRuntime: (input) =>
         Effect.gen(function* () {
           launches.push(input);
@@ -302,6 +304,22 @@ const layer = ServerConfig.layerTest(process.cwd(), {
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
 it.layer(layer)("AntigravityAdapter", (it) => {
+  it.effect("rejects multiple selected skills before sending a native prompt", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness({ skillNames: new Set(["review", "implement"]) });
+      yield* h.adapter.startSession({
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "approval-required",
+      });
+      const error = yield* h.adapter
+        .sendTurn({ threadId, input: "Use !review and !implement" })
+        .pipe(Effect.flip);
+      expect(error._tag).toBe("ProviderAdapterValidationError");
+      expect(h.calls).not.toContain("prompt:1");
+    }),
+  );
+
   it.effect(
     "runs native auth, resume, models, commands, and streaming through the ACP transport",
     () =>

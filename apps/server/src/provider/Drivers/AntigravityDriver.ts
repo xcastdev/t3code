@@ -16,6 +16,9 @@ import type { AcpError } from "effect-acp/errors";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { serverProviderSkillsToNativeCandidates } from "../../skills/NativeSkillObservationService.ts";
+import { makeDiscoveryOnlySkillAdapter } from "../../skills/ProviderSkillAdapters.ts";
+import { skillInstallTargets } from "../../skills/SkillInstallTargets.ts";
 import {
   isAntigravityTextGenerationAvailable,
   makeAntigravityTextGeneration,
@@ -51,7 +54,11 @@ import {
 } from "../ProviderDriver.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
-import { discoverAntigravitySkills, resolveAntigravityUserHome } from "./AntigravitySkills.ts";
+import {
+  discoverAntigravityNativeSkills,
+  discoverAntigravitySkills,
+  resolveAntigravityUserHome,
+} from "./AntigravitySkills.ts";
 
 const DRIVER = ProviderDriverKind.make("antigravity");
 const decodeSettings = Schema.decodeSync(AntigravitySettings);
@@ -308,6 +315,13 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
         onSessionStarted: provider.onSessionStarted,
         onConfigOptionsUpdated: provider.onConfigOptionsUpdated,
         onAvailableCommands: provider.onAvailableCommands,
+        resolveSkillNames: (cwd) =>
+          discoverAntigravitySkills({ cwd, userHome }).pipe(
+            Effect.map((skills) => new Set(skills.map((skill) => skill.name))),
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
+            Effect.orElseSucceed(() => new Set<string>()),
+          ),
         onAuthRequired: provider.onAuthRequired,
         ...(loggers.native ? { nativeEventLogger: loggers.native } : {}),
       });
@@ -369,6 +383,27 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
         ),
       );
 
+      const discoverNativeSkills = (cwd: string) =>
+        discoverAntigravityNativeSkills({ cwd, userHome }).pipe(
+          Effect.map((skills) => serverProviderSkillsToNativeCandidates(DRIVER, skills)),
+          Effect.provideService(FileSystem.FileSystem, fileSystem),
+          Effect.provideService(Path.Path, path),
+          Effect.mapError(
+            (cause) =>
+              new ProviderDriverError({
+                driver: DRIVER,
+                instanceId,
+                detail: "Could not read Antigravity workspace skills.",
+                cause,
+              }),
+          ),
+        );
+      const skillAdapter = makeDiscoveryOnlySkillAdapter({
+        providerInstanceId: instanceId,
+        driverKind: DRIVER,
+        discoverCandidates: discoverNativeSkills,
+      });
+
       return {
         instanceId,
         driverKind: DRIVER,
@@ -377,6 +412,14 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
         accentColor,
         enabled,
         snapshot: provider.snapshot,
+        discoverNativeSkills,
+        skillAdapter,
+        skillInstallTargets: (projectRoot) =>
+          skillInstallTargets({
+            driverKind: DRIVER,
+            environment: processEnvironment,
+            ...(projectRoot ? { projectRoot } : {}),
+          }),
         snapshotForCwd: (cwd) =>
           !enabled
             ? provider.snapshot.getSnapshot

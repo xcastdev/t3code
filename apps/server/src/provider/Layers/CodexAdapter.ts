@@ -49,6 +49,10 @@ import * as EffectCodexSchema from "effect-codex-app-server/schema";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import { getCodexServiceTierOptionValue } from "../../codexModelOptions.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
+import {
+  dispatchCodexComposerSkills,
+  type CodexAvailableSkill,
+} from "../Drivers/CodexSkillDispatch.ts";
 
 import {
   ProviderAdapterRequestError,
@@ -71,6 +75,7 @@ import {
   type CodexSessionRuntimeOptions,
   type CodexSessionRuntimeShape,
 } from "./CodexSessionRuntime.ts";
+import { isCodexManagedSkillPlanPayload } from "./CodexManagedSkills.ts";
 import { type EventNdjsonLogger, makeEventNdjsonLogger } from "./EventNdjsonLogger.ts";
 import { resolveCodexLaunchArgs } from "./codexLaunchArgs.ts";
 import {
@@ -101,6 +106,7 @@ export interface CodexAdapterLiveOptions {
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
   readonly resolveDefaultReasoningEffort?: (model: string) => string | undefined;
+  readonly resolveSkills?: (cwd: string) => Effect.Effect<ReadonlyArray<CodexAvailableSkill>>;
 }
 
 interface CodexAdapterSessionContext {
@@ -109,6 +115,7 @@ interface CodexAdapterSessionContext {
   readonly runtime: CodexSessionRuntimeShape;
   readonly eventFiber: Fiber.Fiber<void, never>;
   readonly turnTokenUsage: CodexTurnTokenUsageState;
+  readonly skills: ReadonlyArray<CodexAvailableSkill>;
   turnModel: string | undefined;
   turnEffort: string | undefined;
   stopped: boolean;
@@ -2322,6 +2329,11 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
             : {}),
           ...(serviceTier ? { serviceTier } : {}),
           ...(input.projectWork ? { projectWork: input.projectWork } : {}),
+          ...(input.skillPlan !== undefined &&
+          input.skillPlan.providerInstanceId === boundInstanceId &&
+          isCodexManagedSkillPlanPayload(input.skillPlan.payload)
+            ? { managedSkills: input.skillPlan.payload }
+            : {}),
           ...(projectMcpArgs.length > 0 || mcpSession
             ? {
                 environment: {
@@ -2359,6 +2371,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
               }
             : {}),
         };
+        const skills = yield* options?.resolveSkills?.(runtimeInput.cwd) ?? Effect.succeed([]);
         const turnTokenUsage = makeCodexTurnTokenUsageState();
         const initialTurnProvenance = resolveTurnProvenance(input.modelSelection);
         let sessionContext: CodexAdapterSessionContext | undefined;
@@ -2548,6 +2561,7 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
           runtime,
           eventFiber,
           turnTokenUsage,
+          skills,
           turnModel: initialTurnProvenance.model,
           turnEffort: initialTurnProvenance.effort,
           stopped: false,
@@ -2592,6 +2606,16 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
   });
 
   const sendTurn: CodexAdapterShape["sendTurn"] = Effect.fn("sendTurn")(function* (input) {
+    const session = yield* requireSession(input.threadId);
+    const skillDispatch = dispatchCodexComposerSkills(input.input ?? "", session.skills);
+    if (skillDispatch.rawSkillMention) {
+      return yield* new ProviderAdapterValidationError({
+        provider: PROVIDER,
+        operation: "turn/start",
+        issue: `Codex uses '$${skillDispatch.rawSkillMention}' to invoke a skill. In T3, select it with '!${skillDispatch.rawSkillMention}' instead.`,
+      });
+    }
+
     // Codex ingests images only. Anything else would be base64-encoded as an
     // image and rejected or misread; generic files reach the agent through the
     // path line ProviderService puts in the prompt.
@@ -2601,7 +2625,6 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       { concurrency: 1 },
     );
 
-    const session = yield* requireSession(input.threadId);
     const turnProvenance = resolveTurnProvenance(input.modelSelection);
     if (turnProvenance.model !== undefined) {
       session.turnModel = turnProvenance.model;
@@ -2617,7 +2640,8 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
         : undefined;
     return yield* session.runtime
       .sendTurn({
-        ...(input.input !== undefined ? { input: input.input } : {}),
+        ...(input.input !== undefined ? { input: skillDispatch.prompt } : {}),
+        ...(skillDispatch.skills.length > 0 ? { skills: skillDispatch.skills } : {}),
         ...(input.modelSelection?.instanceId === boundInstanceId
           ? { model: input.modelSelection.model }
           : {}),

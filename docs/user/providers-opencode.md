@@ -27,8 +27,18 @@ switch projects or worktrees, the composer refreshes that catalog for the new
 directory. A command or skill shown in one checkout is not evidence that it is
 available in another.
 
-Use `/` to browse commands. Use `$` to browse skills. Whether skills also appear
-under `/` is controlled by **Settings → General → Show skills in slash menu**.
+Use `/` to browse commands. When T3 starts OpenCode locally, use `!` to browse and load skills in a session.
+
+T3-managed skills are available when T3 starts OpenCode locally. T3 gives each
+session its own skill source and checks that OpenCode loaded the managed version
+before the session starts. Changes to a managed skill take effect in a new
+provider session. If `OPENCODE_CONFIG_DIR` is already set for that provider,
+managed skill delivery is unavailable because T3 cannot replace that directory
+without hiding its contents. External OpenCode servers continue to expose native
+skills but do not receive T3-managed session skills. You can explicitly install
+a managed skill to a native project or user directory when the configured server
+uses a loopback URL and shares T3's checkout path. See [skills](./skills.md)
+for install scopes and the providers that read shared `.agents` installs.
 
 ## Project MCP with an external server
 

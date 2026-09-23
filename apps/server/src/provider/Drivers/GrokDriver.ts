@@ -10,6 +10,9 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import { serverProviderSkillsToNativeCandidates } from "../../skills/NativeSkillObservationService.ts";
+import { makeDiscoveryOnlySkillAdapter } from "../../skills/ProviderSkillAdapters.ts";
+import { skillInstallTargets } from "../../skills/SkillInstallTargets.ts";
 import { makeGrokTextGeneration } from "../../textGeneration/GrokTextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeGrokAdapter } from "../Layers/GrokAdapter.ts";
@@ -27,7 +30,7 @@ import {
 } from "../ProviderDriver.ts";
 import { withInstanceIdentity } from "./instanceIdentity.ts";
 import { mergeProviderInstanceEnvironment } from "../ProviderInstanceEnvironment.ts";
-import { discoverGrokSkills } from "./GrokSkills.ts";
+import { discoverGrokSkills, grokSkillsForNativeObservations } from "./GrokSkills.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "../providerMaintenance.ts";
 import {
   haveProviderSnapshotSettingsChanged,
@@ -86,6 +89,12 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv> = {
         environment: processEnv,
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
         instanceId,
+        resolveSkillNames: (workspaceCwd) =>
+          discoverGrokSkills(effectiveConfig, processEnv, workspaceCwd).pipe(
+            Effect.map((skills) => new Set(skills.map((skill) => skill.name))),
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.orElseSucceed(() => new Set<string>()),
+          ),
       });
       const textGeneration = yield* makeGrokTextGeneration(effectiveConfig, processEnv);
 
@@ -141,6 +150,30 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv> = {
                 ),
               ),
             ]).pipe(Effect.map(([machineSnapshot, skills]) => ({ ...machineSnapshot, skills })));
+      const discoverNativeSkills = (workspaceCwd: string) =>
+        discoverGrokSkills(effectiveConfig, processEnv, workspaceCwd).pipe(
+          Effect.map((skills) =>
+            serverProviderSkillsToNativeCandidates(
+              DRIVER_KIND,
+              grokSkillsForNativeObservations(skills),
+            ),
+          ),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          Effect.mapError(
+            (cause) =>
+              new ProviderDriverError({
+                driver: DRIVER_KIND,
+                instanceId,
+                detail: `Failed to discover Grok skills for '${workspaceCwd}'`,
+                cause,
+              }),
+          ),
+        );
+      const skillAdapter = makeDiscoveryOnlySkillAdapter({
+        providerInstanceId: instanceId,
+        driverKind: DRIVER_KIND,
+        discoverCandidates: discoverNativeSkills,
+      });
 
       return {
         instanceId,
@@ -151,6 +184,14 @@ export const GrokDriver: ProviderDriver<GrokSettings, GrokDriverEnv> = {
         enabled,
         snapshot,
         snapshotForCwd,
+        discoverNativeSkills,
+        skillAdapter,
+        skillInstallTargets: (projectRoot) =>
+          skillInstallTargets({
+            driverKind: DRIVER_KIND,
+            environment: processEnv,
+            ...(projectRoot ? { projectRoot } : {}),
+          }),
         adapter,
         textGeneration,
       } satisfies ProviderInstance;

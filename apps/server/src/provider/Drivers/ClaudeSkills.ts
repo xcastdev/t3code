@@ -1,5 +1,5 @@
 /**
- * ClaudeSkills — filesystem discovery of Claude Code skills for the `$` picker.
+ * ClaudeSkills — filesystem discovery of Claude Code skills for the `!` picker.
  *
  * Claude Code loads skills from `<config dir>/skills` (user scope) and
  * `<cwd>/.claude/skills` (project scope), one directory per skill with a
@@ -159,16 +159,12 @@ export function skillOverrideSettingsPaths(
  * boundary Claude Code walks up to for project settings. `undefined` outside
  * a repository.
  */
-const findRepositoryRoot = Effect.fn("findRepositoryRoot")(function* (
-  cwd: string,
-): Effect.fn.Return<string | undefined, never, FileSystem.FileSystem | Path.Path> {
+const findRepositoryRoot = Effect.fn("findRepositoryRoot")(function* (cwd: string) {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   let current = path.resolve(cwd);
   while (true) {
-    const isRoot = yield* fileSystem
-      .exists(path.join(current, ".git"))
-      .pipe(Effect.orElseSucceed(() => false));
+    const isRoot = yield* fileSystem.exists(path.join(current, ".git"));
     if (isRoot) {
       return current;
     }
@@ -228,7 +224,10 @@ const readSkillOverrides = Effect.fn("readSkillOverrides")(function* (
   const path = yield* Path.Path;
   const platform = yield* HostProcessPlatform;
   const overridesByName = new Map<string, SkillOverride>();
-  const repositoryRoot = cwd === undefined ? undefined : yield* findRepositoryRoot(cwd);
+  const repositoryRoot =
+    cwd === undefined
+      ? undefined
+      : yield* findRepositoryRoot(cwd).pipe(Effect.orElseSucceed(() => undefined));
 
   for (const settingsPath of skillOverrideSettingsPaths(
     path,
@@ -266,6 +265,45 @@ const readSkillOverrides = Effect.fn("readSkillOverrides")(function* (
 
   return overridesByName;
 });
+
+/** Managed delivery must not infer that a skill is enabled when settings could not be read. */
+const readNativeSkillOverrides = Effect.fn("readNativeSkillOverrides")(function* (
+  configDirPath: string,
+  cwd: string | undefined,
+  environment: NodeJS.ProcessEnv,
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const platform = yield* HostProcessPlatform;
+  const overridesByName = new Map<string, SkillOverride>();
+  const repositoryRoot = cwd === undefined ? undefined : yield* findRepositoryRoot(cwd);
+  for (const settingsPath of skillOverrideSettingsPaths(
+    path,
+    configDirPath,
+    cwd,
+    platform,
+    environment,
+    repositoryRoot,
+  )) {
+    const contents = yield* fileSystem.readFileString(settingsPath).pipe(
+      Effect.catchIf(
+        (cause) => cause.reason._tag === "NotFound",
+        () => Effect.succeed(undefined),
+      ),
+    );
+    if (contents === undefined) continue;
+    const parsed = yield* decodeSkillOverrideSettings(contents);
+    for (const [name, value] of Object.entries(parsed.skillOverrides ?? {})) {
+      overridesByName.set(name, parseSkillOverride(value));
+    }
+  }
+  return overridesByName;
+});
+
+export class ClaudeSkillDiscoveryError extends Schema.TaggedError<ClaudeSkillDiscoveryError>()(
+  "ClaudeSkillDiscoveryError",
+  { detail: Schema.String },
+) {}
 
 /**
  * Resolve the Claude config directory the CLI would use, matching the
@@ -381,4 +419,88 @@ export const discoverClaudeSkills = Effect.fn("discoverClaudeSkills")(function* 
   }
 
   return [...skillsByName.values()].sort((left, right) => left.name.localeCompare(right.name));
+});
+
+/**
+ * Native observation keeps every provider identity and fails on non-missing I/O errors.
+ * The pinned SDK's supportedCommands/reloadSkills omit package paths. Installed
+ * plugin and enterprise sources cannot be reconstructed from those lists; their
+ * session-reported source metadata is needed before adding them to this scan.
+ */
+export const discoverClaudeNativeSkills = Effect.fn("discoverClaudeNativeSkills")(function* (
+  config: Pick<ClaudeSettings, "homePath">,
+  cwd?: string,
+  environment?: NodeJS.ProcessEnv,
+) {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const configDirPath = yield* resolveClaudeConfigDirPath(config, environment ?? process.env, cwd);
+  const skillOverrides = yield* readNativeSkillOverrides(
+    configDirPath,
+    cwd,
+    environment ?? process.env,
+  );
+  const projectRoots: string[] = [];
+  if (cwd !== undefined) {
+    const repositoryRoot = yield* findRepositoryRoot(cwd);
+    let current = path.resolve(cwd);
+    while (true) {
+      projectRoots.push(path.join(current, ".claude", "skills"));
+      if (repositoryRoot === undefined || current === repositoryRoot) break;
+      const parent = path.dirname(current);
+      if (parent === current) break;
+      current = parent;
+    }
+  }
+  const roots: ReadonlyArray<{ directory: string; scope: ClaudeSkillScope }> = [
+    { directory: path.join(configDirPath, "skills"), scope: "user" },
+    ...projectRoots.map((directory) => ({ directory, scope: "project" as const })),
+  ];
+  const skills: ServerProviderSkill[] = [];
+  for (const root of roots) {
+    const entries = yield* fileSystem.readDirectory(root.directory).pipe(
+      Effect.catchIf(
+        (cause) => cause.reason._tag === "NotFound",
+        () => Effect.succeed<ReadonlyArray<string>>([]),
+      ),
+    );
+    for (const entry of [...entries].sort()) {
+      const skillPath = path.join(root.directory, entry, "SKILL.md");
+      const contents = yield* fileSystem.readFileString(skillPath).pipe(
+        Effect.map((value) => value as string | undefined),
+        Effect.catchIf(
+          (cause) => cause.reason._tag === "NotFound",
+          () => Effect.succeed(undefined),
+        ),
+      );
+      if (contents === undefined) continue;
+      const frontmatter = parseSkillFrontmatter(contents);
+      if (frontmatter.kind === "malformed") {
+        return yield* new ClaudeSkillDiscoveryError({
+          detail:
+            "A Claude skill package has malformed frontmatter; native discovery is incomplete.",
+        });
+      }
+      const name = entry.trim();
+      if (!name) continue;
+      const override = skillOverrides.get(name);
+      const userInvocationOnly =
+        (frontmatter.kind === "parsed" && frontmatter.userInvocationOnly === true) ||
+        override?.userInvocationOnly === true;
+      skills.push({
+        name,
+        path: skillPath,
+        enabled: override?.enabled ?? true,
+        scope: root.scope,
+        ...(frontmatter.kind === "parsed" && frontmatter.description
+          ? { description: frontmatter.description }
+          : {}),
+        ...(userInvocationOnly ? { userInvocationOnly: true } : {}),
+        ...(frontmatter.kind === "parsed" && frontmatter.userInvocable === false
+          ? { userInvocable: false }
+          : {}),
+      });
+    }
+  }
+  return skills;
 });

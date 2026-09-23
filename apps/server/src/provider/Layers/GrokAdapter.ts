@@ -50,6 +50,10 @@ import {
   ProviderAdapterValidationError,
 } from "../Errors.ts";
 import { mapAcpToAdapterError } from "../acp/AcpAdapterSupport.ts";
+import {
+  dispatchComposerSlashSkill,
+  findComposerSkillMentions,
+} from "../Drivers/ComposerSkillDispatch.ts";
 import type * as AcpSessionRuntime from "../acp/AcpSessionRuntime.ts";
 import {
   makeAcpAssistantItemEvent,
@@ -115,6 +119,7 @@ export interface GrokAdapterLiveOptions {
   readonly turnInactivityTimeoutMs?: number;
   /** Override the longer active-tool liveness timeout in focused tests. */
   readonly activeToolInactivityTimeoutMs?: number;
+  readonly resolveSkillNames?: (cwd: string) => Effect.Effect<ReadonlySet<string>>;
 }
 
 interface PendingApproval {
@@ -138,6 +143,7 @@ interface GrokSessionContext {
   readonly acpSessionId: string;
   session: ProviderSession;
   readonly scope: Scope.Closeable;
+  readonly skillNames: ReadonlySet<string>;
   readonly acp: AcpSessionRuntime.AcpSessionRuntime["Service"];
   readonly projectWork?: Parameters<typeof buildRuntimeInstructions>[0]["projectWork"];
   notificationFiber: Fiber.Fiber<void, never> | undefined;
@@ -971,6 +977,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           }
 
           const cwd = path.resolve(input.cwd.trim());
+          const skillNames = yield* (
+            options?.resolveSkillNames?.(cwd) ?? Effect.succeed(new Set<string>())
+          );
           const grokModelSelection =
             input.modelSelection?.instanceId === boundInstanceId ? input.modelSelection : undefined;
           const existing = sessions.get(input.threadId);
@@ -1305,6 +1314,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
             acpSessionId: started.sessionId,
             session,
             scope: sessionScope,
+            skillNames,
             acp,
             projectWork: input.projectWork,
             notificationFiber: undefined,
@@ -1527,6 +1537,18 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
           input.threadId,
           Effect.gen(function* () {
             const ctx = yield* requireSession(input.threadId);
+            if (
+              input.input &&
+              findComposerSkillMentions(input.input).filter((mention) =>
+                ctx.skillNames.has(mention.name),
+              ).length > 1
+            ) {
+              return yield* new ProviderAdapterValidationError({
+                provider: PROVIDER,
+                operation: "sendTurn",
+                issue: "Grok can run one skill per message. Remove the extra skill references.",
+              });
+            }
             // A sendTurn while a prompt is in flight is a steer: reuse the
             // active turn and cancel the in-flight ACP prompt so Grok takes
             // the new instruction immediately, matching Claude/Codex, instead
@@ -1567,7 +1589,9 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
                 "reasoningEffort",
               );
 
-              const text = input.input?.trim();
+              const text = input.input
+                ? dispatchComposerSlashSkill(input.input, ctx.skillNames).trim()
+                : undefined;
               // Grok ingests images only. Generic files reach the agent
               // through the path line ProviderService puts in the prompt.
               const imagePromptParts = yield* Effect.forEach(

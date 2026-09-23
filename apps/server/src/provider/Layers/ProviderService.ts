@@ -26,6 +26,7 @@ import {
   type SnapShotAccessibilityNode,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   ProviderSessionStartInput,
+  SkillCatalogRevision,
   ProviderStopSessionInput,
   ProviderUploadFeedbackInput,
   ThreadId,
@@ -107,6 +108,8 @@ import * as ProjectWorkBriefing from "../../projectWork/ProjectWorkBriefing.ts";
 import * as ProjectWorkNarrative from "../../projectWork/ProjectWorkNarrative.ts";
 import * as TextGeneration from "../../textGeneration/TextGeneration.ts";
 import type { ProjectWorkRuntimeContext } from "../RuntimeInstructions.ts";
+import { SkillApplicationReactor } from "../../orchestration/Services/SkillApplicationReactor.ts";
+import { SkillCatalogService } from "../../skills/SkillCatalogService.ts";
 const isModelSelection = Schema.is(ModelSelection);
 const encodePromptJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
@@ -563,6 +566,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     ProjectWorkNarrative.ProjectWorkNarrative,
   );
   const textGeneration = yield* Effect.serviceOption(TextGeneration.TextGeneration);
+  const skillCatalog = yield* Effect.serviceOption(SkillCatalogService);
+  const skillApplicationReactor = yield* Effect.serviceOption(SkillApplicationReactor);
   const issueMcpCredential =
     options?.issueMcpCredential ?? McpSessionRegistry.issueActiveMcpCredential;
   const fileSystem = yield* FileSystem.FileSystem;
@@ -2309,19 +2314,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       const persistedCwd = readPersistedCwd(input.binding.runtimePayload);
       const persistedModelSelection = readPersistedModelSelection(input.binding.runtimePayload);
 
-      const resumed = yield* startAdapterSession({
-        adapter,
+      const resumed = yield* startSession(input.binding.threadId, {
+        threadId: input.binding.threadId,
+        provider: input.binding.provider,
         providerInstanceId: bindingInstanceId,
-        operation: input.operation,
-        sessionInput: {
-          threadId: input.binding.threadId,
-          provider: input.binding.provider,
-          providerInstanceId: bindingInstanceId,
-          ...(persistedCwd ? { cwd: persistedCwd } : {}),
-          ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
-          ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
-          runtimeMode: input.binding.runtimeMode ?? "full-access",
-        },
+        ...(persistedCwd ? { cwd: persistedCwd } : {}),
+        ...(persistedModelSelection ? { modelSelection: persistedModelSelection } : {}),
+        ...(hasResumeCursor ? { resumeCursor: input.binding.resumeCursor } : {}),
+        runtimeMode: input.binding.runtimeMode ?? "full-access",
       });
       if (resumed.provider !== adapter.provider) {
         yield* clearMcpSession(input.binding.threadId);
@@ -2544,7 +2544,149 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           }
         }
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
+        const skillPreparation =
+          effectiveCwd === undefined ||
+          Option.isNone(skillCatalog) ||
+          Option.isNone(projectionQuery) ||
+          Option.isNone(orchestrationEngine)
+            ? undefined
+            : yield* Effect.gen(function* () {
+                const readModel = yield* projectionQuery.value.getCommandReadModel().pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new ProviderAdapterRequestError({
+                        provider: resolvedProvider,
+                        method: "skills.prepareSession",
+                        detail: "Could not read the current managed skill application state.",
+                        cause,
+                      }),
+                  ),
+                );
+                const current = (readModel.skillApplications ?? []).find(
+                  (entry) =>
+                    entry.threadId === threadId && entry.providerInstanceId === resolvedInstanceId,
+                );
+                const desiredRevision = SkillCatalogRevision.make(
+                  (current?.desiredRevision ?? 0) + 1,
+                );
+                const appliedRevision = current?.appliedRevision ?? SkillCatalogRevision.make(0);
+                const projectId = readModel.threads.find(
+                  (thread) => thread.id === threadId,
+                )?.projectId;
+                const desired = yield* skillCatalog.value.describeSession({
+                  threadId,
+                  providerInstanceId: resolvedInstanceId,
+                  projectRoot: effectiveCwd,
+                  ...(projectId === undefined ? {} : { projectId }),
+                  cwd: effectiveCwd,
+                  desiredRevision,
+                  appliedRevision,
+                });
+                {
+                  const updatedAt = yield* nowIso;
+                  yield* orchestrationEngine.value.dispatch({
+                    type: "thread.skill-application.desire",
+                    commandId: CommandId.make(
+                      `server:skill-application-desire:${threadId}:${resolvedInstanceId}:${desiredRevision}`,
+                    ),
+                    threadId,
+                    application: desired,
+                    updatedAt,
+                  });
+                  if (Option.isSome(skillApplicationReactor)) {
+                    yield* skillApplicationReactor.value.drain;
+                  }
+                }
+                const prepared = yield* skillCatalog.value
+                  .prepareSession({
+                    threadId,
+                    providerInstanceId: resolvedInstanceId,
+                    projectRoot: effectiveCwd,
+                    ...(projectId === undefined ? {} : { projectId }),
+                    cwd: effectiveCwd,
+                    desiredRevision,
+                    appliedRevision,
+                  })
+                  .pipe(Effect.exit);
+                if (Exit.isFailure(prepared)) {
+                  yield* skillCatalog.value
+                    .disposeSession({
+                      threadId,
+                      providerInstanceId: resolvedInstanceId,
+                      cwd: effectiveCwd,
+                    })
+                    .pipe(Effect.ignore);
+                  const attemptedAt = yield* nowIso;
+                  yield* orchestrationEngine.value
+                    .dispatch({
+                      type: "thread.skill-application.receipt",
+                      commandId: CommandId.make(
+                        `server:skill-application-prepare-failed:${threadId}:${resolvedInstanceId}:${desiredRevision}`,
+                      ),
+                      threadId,
+                      application: {
+                        ...desired,
+                        status: "failed",
+                        attemptedAt,
+                        failure: {
+                          code: "provider_skill_prepare_failed",
+                          message: "The provider could not prepare the managed skill catalog.",
+                        },
+                        outcomes: desired.outcomes.map((outcome) => ({
+                          ...outcome,
+                          status: "failed",
+                        })),
+                      },
+                      updatedAt: attemptedAt,
+                    })
+                    .pipe(Effect.ignore);
+                  return yield* Effect.failCause(prepared.cause);
+                }
+                return prepared.value;
+              }).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new ProviderAdapterRequestError({
+                      provider: resolvedProvider,
+                      method: "skills.prepareSession",
+                      detail:
+                        "message" in Object(cause)
+                          ? String((cause as { message: unknown }).message)
+                          : "Could not prepare the managed skill application.",
+                      cause,
+                    }),
+                ),
+              );
         yield* clearTurnAnalyticsSession(resolvedInstanceId, threadId);
+        const failedApplicationReceipt = () => {
+          if (skillPreparation === undefined || Option.isNone(orchestrationEngine)) {
+            return Effect.void;
+          }
+          return Effect.gen(function* () {
+            const attemptedAt = yield* nowIso;
+            yield* orchestrationEngine.value.dispatch({
+              type: "thread.skill-application.receipt",
+              commandId: CommandId.make(
+                `server:skill-application-failed:${threadId}:${resolvedInstanceId}:${skillPreparation.application.desiredRevision}`,
+              ),
+              threadId,
+              application: {
+                ...skillPreparation.application,
+                status: "failed",
+                attemptedAt,
+                failure: {
+                  code: "provider_session_start_failed",
+                  message: "The provider session could not apply the managed skill catalog.",
+                },
+                outcomes: skillPreparation.application.outcomes.map((outcome) => ({
+                  ...outcome,
+                  status: "failed",
+                })),
+              },
+              updatedAt: attemptedAt,
+            });
+          }).pipe(Effect.ignore);
+        };
         const session = yield* startAdapterSession({
           adapter,
           providerInstanceId: resolvedInstanceId,
@@ -2554,10 +2696,30 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             providerInstanceId: resolvedInstanceId,
             ...(effectiveCwd !== undefined ? { cwd: effectiveCwd } : {}),
             ...(effectiveResumeCursor !== undefined ? { resumeCursor: effectiveResumeCursor } : {}),
+            ...(skillPreparation?.plan === undefined ? {} : { skillPlan: skillPreparation.plan }),
           },
-        });
+        }).pipe(
+          Effect.tapError(() =>
+            Effect.all(
+              [
+                failedApplicationReceipt(),
+                Option.isSome(skillCatalog) && effectiveCwd !== undefined
+                  ? skillCatalog.value
+                      .disposeSession({
+                        threadId,
+                        providerInstanceId: resolvedInstanceId,
+                        cwd: effectiveCwd,
+                      })
+                      .pipe(Effect.ignore)
+                  : Effect.void,
+              ],
+              { discard: true },
+            ),
+          ),
+        );
 
         if (session.provider !== adapter.provider) {
+          yield* failedApplicationReceipt();
           yield* clearMcpSession(threadId);
           return yield* toValidationError(
             "ProviderService.startSession",
@@ -2568,6 +2730,45 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           ...session,
           providerInstanceId: resolvedInstanceId,
         };
+
+        if (skillPreparation !== undefined && Option.isSome(orchestrationEngine)) {
+          const appliedAt = yield* nowIso;
+          const unsupported = skillPreparation.application.status === "unsupported";
+          yield* orchestrationEngine.value
+            .dispatch({
+              type: "thread.skill-application.receipt",
+              commandId: CommandId.make(
+                `server:skill-application-receipt:${threadId}:${resolvedInstanceId}:${skillPreparation.application.desiredRevision}`,
+              ),
+              threadId,
+              application: unsupported
+                ? { ...skillPreparation.application, attemptedAt: appliedAt }
+                : {
+                    ...skillPreparation.application,
+                    status: "applied",
+                    appliedRevision: skillPreparation.application.desiredRevision,
+                    attemptedAt: appliedAt,
+                    appliedAt,
+                    outcomes: skillPreparation.application.outcomes.map((outcome) => ({
+                      ...outcome,
+                      status: "applied",
+                    })),
+                  },
+              updatedAt: appliedAt,
+            })
+            .pipe(
+              Effect.tapError(() => adapter.stopSession(threadId).pipe(Effect.ignore)),
+              Effect.mapError(
+                (cause) =>
+                  new ProviderAdapterRequestError({
+                    provider: resolvedProvider,
+                    method: "skills.applicationReceipt",
+                    detail: "Could not persist the managed skill application receipt.",
+                    cause,
+                  }),
+              ),
+            );
+        }
 
         yield* stopStaleSessionsForThread({
           threadId,
@@ -3085,6 +3286,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       });
       let metricProvider = "unknown";
       return yield* Effect.gen(function* () {
+        const persistedBinding = Option.getOrUndefined(yield* directory.getBinding(input.threadId));
         const routed = yield* resolveRoutableSession({
           threadId: input.threadId,
           operation: "ProviderService.stopSession",
@@ -3107,6 +3309,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             );
           }
           yield* routed.adapter.stopSession(routed.threadId);
+        }
+        const persistedCwd = readPersistedCwd(persistedBinding?.runtimePayload);
+        if (Option.isSome(skillCatalog) && persistedCwd !== undefined) {
+          yield* skillCatalog.value
+            .disposeSession({
+              threadId: input.threadId,
+              providerInstanceId: routed.instanceId,
+              cwd: persistedCwd,
+            })
+            .pipe(Effect.ignore);
         }
         const pendingCompaction = pendingCompactions.get(input.threadId);
         if (pendingCompaction !== undefined) {
@@ -3444,6 +3656,19 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "ProviderService.stopAll",
           binding,
         );
+        const cwd = readPersistedCwd(binding.runtimePayload);
+        if (Option.isSome(skillCatalog) && cwd !== undefined) {
+          yield* skillCatalog.value
+            .disposeSession({ threadId: binding.threadId, providerInstanceId, cwd })
+            .pipe(
+              Effect.catch((cause) =>
+                Effect.logWarning("managed skill cleanup failed", {
+                  threadId: binding.threadId,
+                  cause,
+                }),
+              ),
+            );
+        }
         return yield* directory.upsert({
           threadId: binding.threadId,
           provider: binding.provider,

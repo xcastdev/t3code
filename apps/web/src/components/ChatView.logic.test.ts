@@ -634,7 +634,7 @@ const helloWorldTemplate: CodexArtifactTemplate = {
 
 describe("artifact template composer insertion", () => {
   it("does not insert an already-present prompt", () => {
-    const prompt = "Create a document using this $artifact-template-hello-world about…";
+    const prompt = "Create a document using this !artifact-template-hello-world about…";
 
     expect(codexArtifactTemplatePromptToAppend(prompt, helloWorldTemplate)).toBeNull();
   });

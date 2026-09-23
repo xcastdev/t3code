@@ -316,7 +316,7 @@ const cursorCliCommandMissingMessage = [
 ].join(" ");
 
 describe("Cursor skills", () => {
-  it("discovers recursive project skills with project precedence", async () =>
+  it("discovers recursive project skills and preserves same-name native identities", async () =>
     await runNode(
       Effect.gen(function* () {
         const fileSystem = yield* FileSystem.FileSystem;
@@ -378,6 +378,13 @@ describe("Cursor skills", () => {
             name: "oversized",
             path: path.join(workspace, ".cursor", "skills", "oversized", "SKILL.md"),
             scope: "project",
+            enabled: true,
+          },
+          {
+            name: "review",
+            description: "user review",
+            path: path.join(userHome, ".cursor", "skills", "review", "SKILL.md"),
+            scope: "user",
             enabled: true,
           },
           {
@@ -446,23 +453,27 @@ describe("Cursor skills", () => {
     ));
 
   it("rewrites only discovered skill mentions into Cursor slash invocations", () => {
-    expect(hasCursorSkillMention("use $Review_Pr:V2 here")).toBe(true);
-    expect(hasCursorSkillMention("please $review this")).toBe(true);
+    expect(hasCursorSkillMention("use !Review_Pr:V2 here")).toBe(true);
+    expect(hasCursorSkillMention("please !review this")).toBe(true);
     expect(
-      rewriteCursorSkillMentions("use $review, keep $HOME and 5$review", new Set(["review"])),
-    ).toBe("use $review, keep $HOME and 5$review");
-    expect(rewriteCursorSkillMentions("please $review this", new Set(["review"]))).toBe(
+      rewriteCursorSkillMentions("use !review and keep $HOME and 5!review", new Set(["review"])),
+    ).toBe("use /review and keep $HOME and 5!review");
+    expect(rewriteCursorSkillMentions("please !review this", new Set(["review"]))).toBe(
       "please /review this",
     );
+    expect(hasCursorSkillMention("run $review and keep $HOME intact")).toBe(false);
+    expect(
+      rewriteCursorSkillMentions("run $review and keep $HOME intact", new Set(["review"])),
+    ).toBe("run $review and keep $HOME intact");
   });
 
   it("detects and invokes digit-leading Cursor skills without rewriting money", () => {
     const names = new Set(["2spec", "20k", "100M", "1e6"]);
     // Repeated presence checks must not carry a global-regex cursor.
-    expect(hasCursorSkillMention("use $2spec here")).toBe(true);
-    expect(hasCursorSkillMention("use $2spec here")).toBe(true);
-    expect(rewriteCursorSkillMentions("use $2spec here", names)).toBe("use /2spec here");
-    expect(rewriteCursorSkillMentions("use $2spec here", new Set())).toBe("use $2spec here");
+    expect(hasCursorSkillMention("use !2spec here")).toBe(true);
+    expect(hasCursorSkillMention("use !2spec here")).toBe(true);
+    expect(rewriteCursorSkillMentions("use !2spec here", names)).toBe("use /2spec here");
+    expect(rewriteCursorSkillMentions("use !2spec here", new Set())).toBe("use !2spec here");
     for (const text of [
       "pay $20 tomorrow",
       "budget $20k here",

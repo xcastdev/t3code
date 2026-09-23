@@ -15,6 +15,7 @@ export type SettingsPath =
   | "/settings/keybindings"
   | "/settings/snap-shot"
   | "/settings/providers"
+  | "/settings/skills"
   | "/settings/integrations"
   | "/settings/source-control"
   | "/settings/connections"
@@ -78,6 +79,7 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
   "/settings/keybindings": "Keybindings",
   "/settings/snap-shot": "SnapShots",
   "/settings/providers": "Providers",
+  "/settings/skills": "Skills",
   "/settings/integrations": "Integrations",
   "/settings/source-control": "Source Control",
   "/settings/connections": "Connections",
@@ -90,6 +92,13 @@ export const SETTINGS_SECTION_LABELS: Readonly<Record<SettingsPath, string>> = {
  * that may not be mounted point at their nearest stable section instead.
  */
 export const SETTINGS_SEARCH_ITEMS = [
+  {
+    id: "skills-catalog",
+    title: "Portable skills",
+    to: "/settings/skills",
+    scope: "environment",
+    searchTerms: ["managed native provider import override inheritance session capability"],
+  },
   {
     id: "project-defaults",
     title: "Project defaults and overrides",
@@ -285,12 +294,6 @@ export const SETTINGS_SEARCH_ITEMS = [
     title: "Proactive panels",
     to: "/settings/general",
     searchTerms: ["automatically open diff pull request pr right panel agent completion"],
-  },
-  {
-    id: "skills-in-slash-menu",
-    title: "Show skills in slash menu",
-    to: "/settings/general",
-    searchTerms: ["command menu dollar $ slash /"],
   },
   {
     id: "composer-collapse",
@@ -749,6 +752,7 @@ const SETTINGS_CATEGORY_SCOPES: Readonly<Record<SettingsPath, SettingsSearchScop
   // environment at any selection. Neither needs a particular scope to render.
   "/settings/keybindings": null,
   "/settings/providers": null,
+  "/settings/skills": "environment",
   "/settings/integrations": null,
   "/settings/source-control": "environment-defaults",
   "/settings/connections": "connections",

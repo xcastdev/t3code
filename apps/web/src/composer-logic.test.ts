@@ -1,5 +1,12 @@
 import { filterComposerPullRequestMatches } from "@t3tools/shared/composerPullRequestMatches";
-import { EnvironmentId, MessageId, ThreadId, type AssistantCitation } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  MessageId,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+  type AssistantCitation,
+} from "@t3tools/contracts";
 import {
   collectAssistantCitations,
   expandAssistantCitationsForProvider,
@@ -17,7 +24,27 @@ import {
   isCollapsedCursorAdjacentToInlineToken,
   parseStandaloneComposerSlashCommand,
   replaceTextRange,
+  composerSkillCatalogInput,
 } from "./composer-logic";
+import { skillCatalogQueryKey } from "@t3tools/client-runtime/skills";
+
+it("queries project skills until a promoted thread has a projected shell", () => {
+  const threadId = ThreadId.make("new-thread");
+  const projectId = ProjectId.make("project");
+  const providerInstanceId = ProviderInstanceId.make("codex");
+  const input = {
+    routeKind: "server" as const,
+    activeThreadId: threadId,
+    projectId,
+    providerInstanceId,
+  };
+  const before = composerSkillCatalogInput({ ...input, activeThreadShellId: null });
+  const after = composerSkillCatalogInput({ ...input, activeThreadShellId: threadId });
+
+  expect(before).toEqual({ projectId, providerInstanceId });
+  expect(after).toEqual({ threadId, providerInstanceId });
+  expect(skillCatalogQueryKey(before)).not.toBe(skillCatalogQueryKey(after));
+});
 import { formatTerminalContextReference } from "./lib/terminalContext";
 
 const terminalReference = formatTerminalContextReference({
@@ -185,11 +212,14 @@ describe("detectComposerTrigger", () => {
     });
   });
 
-  it("detects $skill trigger at cursor", () => {
+  it("reserves $ for agents rather than opening skills", () => {
     const text = "Use $gh-fi";
-    const trigger = detectComposerTrigger(text, text.length);
+    expect(detectComposerTrigger(text, text.length)).toBeNull();
+  });
 
-    expect(trigger).toEqual({
+  it("detects !skill trigger at cursor", () => {
+    const text = "Use !gh-fi";
+    expect(detectComposerTrigger(text, text.length)).toEqual({
       kind: "skill",
       query: "gh-fi",
       rangeStart: "Use ".length,
@@ -218,6 +248,20 @@ describe("detectComposerTrigger", () => {
       rangeEnd: text.length,
     });
   });
+
+  it.each(["#iss:42", "#pr:42", "#iss:", "#pr:"])(
+    "accepts namespaced issue and pull request query %s",
+    (token) => {
+      expect(
+        detectComposerTrigger(`Compare with ${token}`, `Compare with ${token}`.length),
+      ).toEqual({
+        kind: "pull-request",
+        query: token.slice(1),
+        rangeStart: "Compare with ".length,
+        rangeEnd: `Compare with ${token}`.length,
+      });
+    },
+  );
 
   it("detects a one-word pull request search", () => {
     const text = "Compare with #composer";
@@ -424,9 +468,9 @@ describe("expandCollapsedComposerCursor", () => {
   });
 
   it("maps collapsed skill cursor to expanded text cursor", () => {
-    const text = "run $review-follow-up then";
+    const text = "run !review-follow-up then";
     const collapsedCursorAfterSkill = "run ".length + 2;
-    const expandedCursorAfterSkill = "run $review-follow-up ".length;
+    const expandedCursorAfterSkill = "run !review-follow-up ".length;
 
     expect(expandCollapsedComposerCursor(text, collapsedCursorAfterSkill)).toBe(
       expandedCursorAfterSkill,
@@ -488,9 +532,9 @@ describe("collapseExpandedComposerCursor", () => {
   });
 
   it("maps expanded skill cursor back to collapsed cursor", () => {
-    const text = "run $review-follow-up then";
+    const text = "run !review-follow-up then";
     const collapsedCursorAfterSkill = "run ".length + 2;
-    const expandedCursorAfterSkill = "run $review-follow-up ".length;
+    const expandedCursorAfterSkill = "run !review-follow-up ".length;
 
     expect(collapseExpandedComposerCursor(text, expandedCursorAfterSkill)).toBe(
       collapsedCursorAfterSkill,
@@ -515,7 +559,7 @@ describe("assistant citation cursor offsets", () => {
   it("roundtrips every collapsed offset across citations, mentions, skills, and Unicode", () => {
     const prefix = "👋(";
     const between = "),雪";
-    const after = " @AGENTS.md $review ";
+    const after = " @AGENTS.md !review ";
     const text = `${prefix}${citationSource}${between}${citationSource}${after}${terminalReference}!`;
     const collapsedLength = `${prefix}□${between}□ □ □ □!`.length;
     const boundaries = [
@@ -629,7 +673,7 @@ describe("isCollapsedCursorAdjacentToInlineToken", () => {
   });
 
   it("treats skill pills as inline tokens for adjacency checks", () => {
-    const text = "run $review-follow-up next";
+    const text = "run !review-follow-up next";
     const tokenStart = "run ".length;
     const tokenEnd = tokenStart + 1;
 

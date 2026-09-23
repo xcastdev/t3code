@@ -17,7 +17,7 @@ import { GhosttyTerminalSurface } from "~/terminal/ghostty/surface";
 
 const EMPTY_SKILLS: ReadonlyArray<never> = [];
 
-// Serialized the way the composer stores inline tokens: the $skill and the
+// Serialized the way the composer stores inline tokens: the !skill and the
 // markdown-style file links render as chips, so the preview shows prompt
 // text and pills exactly as the real composer draws them.
 const PROMPT_PREVIEW_TEXT =

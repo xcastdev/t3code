@@ -3,6 +3,8 @@ import { useAppearancePreferences } from "../settings/appearance/AppearancePrefe
 import { useAtomValue } from "@effect/atom-react";
 import { clampFileAttachmentUploadBytes } from "@t3tools/client-runtime/state/attachments";
 import { pastedTextDisposition, replaceTextSelection } from "@t3tools/client-runtime/text-paste";
+import { resolveProviderSkillsForCwd } from "@t3tools/client-runtime/providerSkills";
+import { findRawNativeSkillMention } from "@t3tools/shared/composerTrigger";
 import {
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
@@ -483,6 +485,20 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   }, [onEditorFocusChange, onExpandedChange, settingsSheetPresentation.keepsComposerExpanded]);
   const handleSend = useCallback(async () => {
     if (voiceInput.blocksSubmission || pendingPastedTextAttachmentCountRef.current > 0) return;
+    if (selectedProviderStatus?.driver === "codex") {
+      const rawSkill = findRawNativeSkillMention(
+        props.draftMessage,
+        new Set(
+          resolveProviderSkillsForCwd(selectedProviderStatus, props.projectCwd).map(
+            (skill) => skill.name,
+          ),
+        ),
+      );
+      if (rawSkill) {
+        Alert.alert("Use the skill picker", `Select !${rawSkill} to use this skill.`);
+        return;
+      }
+    }
     // Typed out in full rather than picked from the menu. Attachments mean the
     // user is sending a prompt, so those go through as usual.
     if (
@@ -515,6 +531,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     }
   }, [
     props.draftMessage,
+    props.projectCwd,
     props.draftAttachments.length,
     onChangeDraftMessage,
     openUsageLimits,
@@ -525,6 +542,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     props.selectedThread.id,
     props.selectedThread.title,
     voiceInput.blocksSubmission,
+    selectedProviderStatus,
   ]);
 
   // ── Model menu ───────────────────────────────────────────
@@ -558,6 +576,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     () => ({
       ownerId: settingsOwnerId,
       environmentId: props.environmentId,
+      threadId: props.selectedThread.id,
       providerInstanceId: currentModelSelection.instanceId,
       providerGroups: threadProviderGroups,
       selectedModel: currentModelSelection,
@@ -571,6 +590,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     [
       currentModelSelection,
       currentRuntimeMode,
+      props.selectedThread.id,
       props.onUpdateModelSelection,
       props.onUpdateRuntimeMode,
       providerOptionDescriptors,
