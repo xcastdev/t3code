@@ -7,7 +7,9 @@ import {
   SkillCatalogRevision,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
+import * as Path from "effect/Path";
 import * as PubSub from "effect/PubSub";
 import * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
@@ -158,6 +160,56 @@ describe("SkillCatalogService", () => {
           .pipe(Effect.flip)).code,
         "external_filesystem",
       );
+      assert.equal((yield* catalog.list()).entries.length, 0);
+    }).pipe(Effect.provide(Layer.merge(registry, dependencies)), Effect.scoped),
+  );
+  it.effect("reports an unsafe native import without hiding the cause", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-skill-import-error-" });
+      const packageRoot = path.join(root, "source");
+      yield* fs.makeDirectory(packageRoot);
+      yield* fs.writeFileString(
+        path.join(packageRoot, "SKILL.md"),
+        "---\nname: deploy\ndescription: Deploy\n---\nBody",
+      );
+      yield* fs.symlink("source", path.join(root, "redirect"));
+      const index = yield* Index.SkillCatalogIndex;
+      const catalog = yield* make.pipe(
+        Effect.provideService(
+          SkillWatchService,
+          SkillWatchService.of({
+            acquireProject: index.acquireProject,
+            releaseProject: index.releaseProject,
+            invalidateGlobal: Effect.void,
+            invalidateProject: () => Effect.void,
+          }),
+        ),
+      );
+      const discovery = yield* (yield* Native.NativeSkillObservationService).discover({
+        providerInstanceId: ProviderInstanceId.make("claude"),
+        scopeId: root,
+        discovery: Effect.succeed([
+          {
+            nativeIdentity: "redirected-deploy",
+            nativePath: path.join(root, "redirect", "SKILL.md"),
+            contentAccess: "local",
+            key: "deploy",
+            displayName: "Deploy",
+            source: "claude",
+            scopeSummary: "user",
+          },
+        ]),
+      });
+      const error = yield* catalog
+        .importNative({
+          observationId: discovery.observations[0]!.observationId,
+          expectedRevision: 0,
+          key: ManagedSkillKey.make("deploy"),
+        })
+        .pipe(Effect.flip);
+      assert.equal(error.code, "unsafe_native_package");
       assert.equal((yield* catalog.list()).entries.length, 0);
     }).pipe(Effect.provide(Layer.merge(registry, dependencies)), Effect.scoped),
   );

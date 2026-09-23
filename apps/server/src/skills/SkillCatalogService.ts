@@ -863,7 +863,7 @@ export const make = Effect.gen(function* () {
         const imported = yield* readNativeSkillForImport({
           nativePath: observation.nativePath,
           key: input.key,
-        });
+        }).pipe(Effect.mapError((error) => rpcError(error.code, error.detail)));
         const created = yield* repository.importGlobal({
           expectedRevision: 0,
           content: imported.content,

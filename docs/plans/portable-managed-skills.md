@@ -308,12 +308,14 @@ Change notices contain scope, scope ID, catalog revision, and changed keys. Clie
 - [x] `vp run --filter @t3tools/mobile typecheck`
 - [x] `git diff --name-only | xargs vp fmt --check` and `git ls-files --others --exclude-standard | xargs vp fmt --check`
 - [x] `git diff --check`
-- [ ] With explicit approval for computer use, run one isolated web/desktop pass through `test-t3-app` covering create, edit, override, disable, import, collision status, application failure, and rollback.
-- [ ] With explicit approval for computer use, run one isolated mobile pass through `test-t3-mobile` covering catalog summaries, session enable/disable, and application status.
-- [ ] Run Claude and Codex integration fixtures with disposable provider homes and same-key native collisions; compare native source hashes before and after to prove AC-14.
-- [ ] Connect through a remote/relay client to an isolated server state directory and verify that all path resolution and provider application remain server-side.
-- [ ] Generate a skill package with large assets and compare ordinary snapshot/catalog payload size before and after; the payload may change only by bounded summary metadata.
-- [ ] Switch the fixture repository between branches with different `.t3code/skills` trees and verify one deterministic rescan and effective-catalog update.
+- [x] Run one isolated `test-t3-app` pass through the shared web/desktop renderer covering create, edit, override, disable, import, collision status, session controls, and rollback; pair a projection-only application-failure UI fixture with the real failure-receipt test.
+- [x] Run Claude and Codex integration fixtures with disposable provider homes and same-key native collisions; compare native source hashes before and after to prove AC-14.
+- [x] Generate a skill package with large assets and compare ordinary snapshot/catalog payload size before and after; the payload may change only by bounded summary metadata.
+- [x] Switch the fixture repository between branches with different `.t3code/skills` trees and verify one deterministic rescan and effective-catalog update.
+- [x] Run the complete desktop test scope with `vp test run apps/desktop/src`; repair stale settings expectations and shell-dependent WSL active-process fixtures, then confirm all 107 files and 1,343 executed tests pass (1 skipped).
+- [x] Run the complete web test scope with `vp test run apps/web/src`; mirror the web app's WASM asset rule in the root test config, then confirm all 422 files and 5,426 tests pass.
+
+Mobile integrated testing and remote/relay testing are excluded from this validation plan by user direction. They remain separate follow-up work; neither was run in this pass.
 
 ## Traceability
 
@@ -327,8 +329,8 @@ Change notices contain scope, scope ID, catalog revision, and changed keys. Clie
 - AC-8: P0, P5, P7; Codex protocol fixture and integration collision tests.
 - AC-9: P1, P6-P8; reactor and provider failure tests.
 - AC-10: P1, P9, P12; contract, WebSocket, invalidation, and payload-size tests.
-- AC-11: P10; focused web/mobile tests and approved integrated client passes.
-- AC-12: P9, P12; authoritative-cwd handler and remote/relay tests.
+- AC-11: P10; focused web/mobile tests, the integrated shared-renderer pass, the complete desktop test scope, and recorded web and Electron UI walkthroughs. Mobile integrated testing is deferred.
+- AC-12: P9, P12; authoritative-cwd handler tests. Remote/relay validation is deferred.
 - AC-13: P2, P4, P12; malformed, concurrency, watcher, resolver, and branch-switch tests.
 - AC-14: P0, P3, P5, P7, P8, P11, P13-P14; source-hash and no-persistent-write assertions.
 - AC-15: P1, P4, P5; dependency and code review plus targeted typechecks.
@@ -347,7 +349,7 @@ Change notices contain scope, scope ID, catalog revision, and changed keys. Clie
 
 ## Outcome
 
-The portable-managed-skills implementation is ready for independent validation. P0-P14 implementation work is present in the dirty candidate; the remaining unchecked validation items are environment-dependent integration/remote/client runs explicitly requiring disposable provider homes, remote connections, or computer-use approval. This record intentionally remains `READY_TO_VALIDATE` rather than completed.
+P0-P14 implementation and the in-scope local validation above are complete. Mobile integrated testing and remote/relay validation are deferred outside this validation plan. The complete desktop test scope passes, and recorded web and Electron walkthroughs exercise the real client pages in dark mode.
 
 Implementation spans the contracts, server package/index/watch/catalog layers, native observations and import, provider adapters/materialization, Claude and Codex session delivery, discovery-only adapters for Cursor/Grok/OpenCode/Antigravity, orchestration desired/applied events and projections, compact RPCs, client runtime state, web/desktop settings and chat controls, mobile catalog/session surfaces, bounded history/rollback, and the ownership-checked persistent deployment service.
 
@@ -373,4 +375,10 @@ Final focused evidence:
 - Scoped typechecks for contracts, server, client-runtime, web, and mobile all exited 0.
 - Tracked and untracked candidate `vp fmt --check` plus `git diff --check` all exited 0.
 
-No browsers, dev servers, live T3 state, commits, pushes, or PRs were used. Residual validation limits are the approved-computer-use web/mobile passes, disposable live Claude/Codex collision fixtures, relay/tunnel coverage, large-payload measurement, and Git branch-switch integration. The Codex delivery proof remains protocol-fixture based rather than a live provider integration.
+September 22 local validation used an isolated server home at `/tmp/t3code-skills-validation-053bc2e7`. Browser evidence for create, edit, project override/disable, native import and same-key collision, session disable, rollback, and failed-application presentation is saved under `/home/user/Projects/t3code/temp/` with a validation report. The failure screenshot uses a projection-only UI fixture; `vp test run apps/server/src/orchestration/Layers/SkillApplicationReactor.test.ts` passed the real failure receipt. Claude and Codex live integration used disposable provider homes, proved same-key collision handling, and preserved native source hashes. The Codex check started an ephemeral thread but no model turn. A 1-MiB asset left ordinary index and catalog payloads unchanged at 324 and 374 bytes; branch switches each caused one targeted project refresh. Exact commands and hashes are in ignored `.t3/evidence/` reports.
+
+The browser exposed a redirected-root native import that correctly refuses the source but had returned only `skill_operation_failed`. `SkillCatalogService.ts` now returns the specific `unsafe_native_package` code and explanation. The service regression failed before the change and passed afterward. Focused import/service tests passed 9/9; adjacent skill/WebSocket tests, server typecheck, lint, formatter, and `git diff --check` passed. Fresh Astra scoped review: PASS, no concrete related defect. The complete desktop run initially reproduced 9 failures: seven stale expectations omitted the normalized `primaryBackend` value, and two WSL fixtures lost their fake runtime path when the shell replaced itself with `sleep`. After correcting those test fixtures, `vp test run apps/desktop/src` passed all 107 files and 1,343 executed tests (1 skipped). Dark-mode before/after videos and raw transcripts are saved in `/home/user/Projects/t3code/temp/`.
+
+The complete web run initially loaded 419 of 422 suites while all 5,350 collected tests passed; three Ghostty suites failed before collection because the root Vite test config did not classify `.wasm` assets used through `?inline`. The root config now mirrors the web app's `assetsInclude: ["**/*.wasm"]`. Focused Ghostty validation passed 3 suites and 76 tests, and two independent complete reruns passed all 422 suites and 5,426 tests. Fresh Astra review found no issue. Dark-mode before/after videos and raw transcripts are saved in `/home/user/Projects/t3code/temp/`.
+
+Actual UI walkthroughs are also saved in `/home/user/Projects/t3code/temp/`: `web-skills-actual-ui-dark.mp4` records page navigation, managed-skill inspection, and return to chat; `electron-skills-actual-ui-dark.mp4` records the built desktop shell creating a managed skill, revisiting it after Settings navigation, and returning to chat with its native bridge active. Contact sheets and screenshots show the checked states. The terminal-replay videos above document suite output, not UI interaction.
