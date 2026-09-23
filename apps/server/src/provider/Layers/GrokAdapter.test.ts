@@ -213,6 +213,26 @@ it("requires a settlement to match the live Grok turn", () => {
 });
 
 it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
+  it.effect("rejects multiple selected skills before starting a prompt", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-multiple-skills");
+      const wrapperPath = yield* Effect.promise(() => makeMockGrokWrapper());
+      const adapter = yield* makeTestAdapter(wrapperPath, {
+        resolveSkillNames: () => Effect.succeed(new Set(["review", "implement"])),
+      });
+      yield* adapter.startSession({
+        threadId,
+        cwd: process.cwd(),
+        runtimeMode: "full-access",
+      });
+      const error = yield* adapter
+        .sendTurn({ threadId, input: "Use !review and !implement" })
+        .pipe(Effect.flip);
+      assert.equal(error._tag, "ProviderAdapterValidationError");
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("rejects rollback without discarding the provider conversation", () =>
     Effect.gen(function* () {
       const threadId = ThreadId.make("grok-unsupported-rollback");

@@ -35,8 +35,14 @@ import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
+import { findComposerSkillMentions } from "../Drivers/ComposerSkillDispatch.ts";
+import { selectedOpenCodeSkillInstructions } from "../Drivers/OpenCodeSkillDispatch.ts";
 import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import * as OpenCodeExternalMcpCoordinator from "../OpenCodeExternalMcpCoordinator.ts";
+import {
+  isOpenCodeManagedSkillPlanPayload,
+  missingOpenCodeManagedSkills,
+} from "../OpenCodeManagedSkills.ts";
 import {
   OpenCodeExternalMcpUrlError,
   rebaseExternalMcpUrl,
@@ -351,6 +357,7 @@ interface OpenCodeSessionContext {
   readonly client: OpencodeClient;
   readonly server: OpenCodeServerConnection;
   readonly directory: string;
+  readonly managedSkillRoot?: string;
   openCodeSessionId: string;
   readonly relatedSessionIds: Set<string>;
   readonly resolvedRequestIds: Set<string>;
@@ -3252,6 +3259,18 @@ export function makeOpenCodeAdapter(
         const serverUrl = openCodeSettings.serverUrl;
         const serverPassword = openCodeSettings.serverPassword;
         const directory = input.cwd ?? serverConfig.cwd;
+        const managedSkillPlan =
+          input.skillPlan?.providerInstanceId === boundInstanceId &&
+          isOpenCodeManagedSkillPlanPayload(input.skillPlan.payload)
+            ? input.skillPlan.payload
+            : undefined;
+        if (managedSkillPlan && serverUrl) {
+          return yield* new ProviderAdapterValidationError({
+            provider: PROVIDER,
+            operation: "startSession",
+            issue: "Managed skills are not available on an external OpenCode server.",
+          });
+        }
         const resumeSessionId = parseOpenCodeResume(input.resumeCursor)?.sessionId;
         const mcpSession = McpProviderSession.readMcpProviderSession(input.threadId);
         const projectMcpServers = input.projectMcpServers ?? mcpSession?.projectServers ?? [];
@@ -3269,6 +3288,7 @@ export function makeOpenCodeAdapter(
         if (existing) {
           if (
             existing.session.status === "connecting" &&
+            existing.managedSkillRoot === managedSkillPlan?.root &&
             !existing.closing &&
             !(yield* Ref.get(existing.stopped))
           ) {
@@ -3276,6 +3296,7 @@ export function makeOpenCodeAdapter(
           }
           const resumesExistingExternalSession =
             existing.server.external &&
+            existing.managedSkillRoot === managedSkillPlan?.root &&
             !existing.closing &&
             resumeSessionId === existing.openCodeSessionId &&
             (yield* sameDirectory(existing.directory, directory));
@@ -3375,16 +3396,39 @@ export function makeOpenCodeAdapter(
                 directory,
                 serverUrl,
                 ...(serverPassword ? { serverPassword } : {}),
-                environment: McpProviderSession.withAgentDeviceEnvironment(
-                  options?.environment ?? process.env,
-                  mcpSession,
-                ),
+                environment: {
+                  ...McpProviderSession.withAgentDeviceEnvironment(
+                    options?.environment ?? process.env,
+                    mcpSession,
+                  ),
+                  ...(!serverUrl && managedSkillPlan
+                    ? {
+                        OPENCODE_CONFIG_DIR: managedSkillPlan.configDir,
+                      }
+                    : {}),
+                },
               });
               const client = openCodeRuntime.createOpenCodeSdkClient({
                 baseUrl: server.url,
                 directory,
                 ...(server.serverPassword ? { serverPassword: server.serverPassword } : {}),
               });
+              if (managedSkillPlan) {
+                const skillResponse = yield* runOpenCodeSdk("app.skills", (signal) =>
+                  client.app.skills(undefined, { signal }),
+                ).pipe(Effect.mapError(toRequestError));
+                const missing = missingOpenCodeManagedSkills(
+                  skillResponse.data ?? [],
+                  managedSkillPlan,
+                );
+                if (missing.length > 0) {
+                  return yield* new ProviderAdapterValidationError({
+                    provider: PROVIDER,
+                    operation: "startSession",
+                    issue: `OpenCode did not load T3-managed skills: ${missing.join(", ")}.`,
+                  });
+                }
+              }
               let externalMcp: OpenCodeExternalMcpState | undefined;
               if (server.external && openCodeSettings.manageExternalMcp && hasExternalMcpWork) {
                 if (externalMcpCoordinator === undefined || externalEnvironmentId === undefined) {
@@ -3587,6 +3631,7 @@ export function makeOpenCodeAdapter(
           client: started.client,
           server: started.server,
           directory,
+          ...(managedSkillPlan === undefined ? {} : { managedSkillRoot: managedSkillPlan.root }),
           openCodeSessionId: started.openCodeSession.id,
           relatedSessionIds: new Set([started.openCodeSession.id]),
           resolvedRequestIds: new Set(),
@@ -3706,6 +3751,23 @@ export function makeOpenCodeAdapter(
       }
 
       const text = input.input?.trim();
+      const selectedSkillInstructions =
+        !context.server.external && text && findComposerSkillMentions(text).length > 0
+          ? yield* runOpenCodeSdk("app.skills", (signal) =>
+              context.client.app.skills({ directory: context.directory }, { signal }),
+            ).pipe(
+              Effect.mapError(toRequestError),
+              Effect.map((response) =>
+                selectedOpenCodeSkillInstructions(
+                  text,
+                  (response.data ?? []).map((skill) => ({
+                    name: skill.name,
+                    content: typeof skill.content === "string" ? skill.content : "",
+                  })),
+                ),
+              ),
+            )
+          : undefined;
       // OpenCode ingests images, text, and PDFs natively; formats its model
       // paths reject ride only as the prompt's file path line.
       const fileParts = toOpenCodeFileParts({
@@ -3841,10 +3903,15 @@ export function makeOpenCodeAdapter(
                 ...(context.activeAgent ? { agent: context.activeAgent } : {}),
                 ...(context.activeVariant ? { variant: context.activeVariant } : {}),
                 // OpenCode appends this after its own agent/provider prompts.
-                system: buildRuntimeInstructions({
-                  harness: "OpenCode",
-                  model: `${parsedModel.providerID}/${parsedModel.modelID}`,
-                }),
+                system: [
+                  buildRuntimeInstructions({
+                    harness: "OpenCode",
+                    model: `${parsedModel.providerID}/${parsedModel.modelID}`,
+                  }),
+                  selectedSkillInstructions,
+                ]
+                  .filter((instruction): instruction is string => instruction !== undefined)
+                  .join("\n\n"),
                 parts: [...(text ? [{ type: "text" as const, text }] : []), ...fileParts],
               },
               { signal },

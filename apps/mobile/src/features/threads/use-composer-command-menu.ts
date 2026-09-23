@@ -7,7 +7,7 @@ import type {
 import { COMPOSER_CONTEXT_MAX_RECORDS } from "@t3tools/contracts";
 import { Alert } from "react-native";
 import { formatComposerContextReference } from "@t3tools/shared/composerContextReferences";
-import { pullRequestComposerContext } from "../../lib/composerContext";
+import { issueComposerContext, pullRequestComposerContext } from "../../lib/composerContext";
 import { uuidv4 } from "../../lib/uuid";
 import {
   getComposerDraftSnapshot,
@@ -17,6 +17,7 @@ import {
 import { USAGE_LIMITS_COMMAND } from "@t3tools/shared/usageLimits";
 import {
   detectComposerTrigger,
+  parseComposerHashQuery,
   replaceTextRange,
   serializeComposerFileLink,
   type ComposerTrigger,
@@ -28,7 +29,6 @@ import {
 } from "@t3tools/shared/searchRanking";
 import {
   dedupeProviderSkillsByName,
-  getProviderSkillsForSlashMenu,
   isProviderSkillUserInvocable,
   resolveProviderSkillsForCwd,
 } from "@t3tools/client-runtime/providerSkills";
@@ -37,9 +37,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ComposerEditorSelection } from "../../components/ComposerEditor";
 import { serverEnvironment } from "../../state/server";
 import { useAtomCommand } from "../../state/use-atom-command";
-import { useComposerPathSearch, useComposerPullRequestSearch } from "../../state/queries";
+import {
+  useComposerPathSearch,
+  useComposerPullRequestSearch,
+  useDebouncedValue,
+} from "../../state/queries";
+import { composerPullRequests } from "../../state/pull-requests";
+import { useEnvironmentQuery } from "../../state/query";
 import type { ComposerCommandItem } from "./ComposerCommandPopover";
-import { matchesSlashSkillQuery } from "./composerSlashSkillSearch";
 
 const WORKSPACE_SNAPSHOT_RETRY_COOLDOWN_MS = 10_000;
 
@@ -55,6 +60,7 @@ export function buildComposerSlashCommandItems(input: {
   /** Whether T3 itself offers /usage-limits for the selected provider. */
   readonly offersUsageLimits?: boolean;
   readonly allowInteractionMode: boolean;
+  readonly visibleSkillNames?: ReadonlySet<string>;
   readonly selectedProviderStatus: Pick<
     ServerProvider,
     "driver" | "slashCommands" | "showInteractionModeToggle"
@@ -94,6 +100,7 @@ export function buildComposerSlashCommandItems(input: {
   // change local state and do not have this restriction.
   if (!input.atMessageStart) return items;
   for (const command of input.selectedProviderStatus?.slashCommands ?? []) {
+    if (input.visibleSkillNames?.has(command.name.trim().toLowerCase())) continue;
     if (!command.name.toLowerCase().includes(query)) continue;
     if (command.name === "compact" && !input.hasCompactableConversation) continue;
     // T3's own limits command is answered by the thread composer; New Task has
@@ -145,7 +152,7 @@ export function resolveComposerCommandSelection(input: {
   if (item.type === "path") {
     replacement = `${serializeComposerFileLink(item.path)} `;
   } else if (item.type === "skill") {
-    replacement = `$${item.skill.name} `;
+    replacement = `!${item.skill.name} `;
   } else if (item.type === "slash-command") {
     replacement = `/${item.command} `;
   } else if (item.type === "provider-slash-command") {
@@ -299,37 +306,70 @@ export function useComposerCommandMenu({
     cwd: trigger?.kind === "path" ? projectCwd : null,
     query: trigger?.kind === "path" ? trigger.query : null,
   });
+  const hashQuery = parseComposerHashQuery(trigger?.kind === "pull-request" ? trigger.query : "");
+  const debouncedIssueQuery = useDebouncedValue(hashQuery.search, 180);
+  const issueSearch = useEnvironmentQuery(
+    trigger?.kind === "pull-request" &&
+      hashQuery.kind !== "pull-request" &&
+      hashQuery.search === debouncedIssueQuery &&
+      environmentId &&
+      pullRequestProjectId
+      ? composerPullRequests.issues({
+          environmentId,
+          input: { projectId: pullRequestProjectId, query: hashQuery.search },
+        })
+      : null,
+  );
   const pullRequestSearch = useComposerPullRequestSearch({
     environmentId,
     projectId: pullRequestProjectId,
     repository: pullRequestRepository,
-    query: trigger?.kind === "pull-request" ? trigger.query : null,
+    query: trigger?.kind === "pull-request" && hashQuery.kind !== "issue" ? hashQuery.search : null,
   });
 
   const items = useMemo<ComposerCommandItem[]>(() => {
     if (!trigger) return [];
 
     if (trigger.kind === "pull-request") {
-      return pullRequestSearch.entries.map((entry) => ({
-        id: `pr:${entry.projectId}:${entry.repository}:${entry.number}`,
-        type: "pull-request",
-        pullRequest: {
-          number: entry.number,
-          title: entry.title,
-          url: entry.url,
-          headBranch: entry.headBranch,
-          baseBranch: entry.baseBranch,
-          state: entry.state,
-          isDraft: entry.isDraft,
-        },
-        label: `#${entry.number}`,
-        description: `${entry.isDraft ? "Draft" : entry.state} · ${entry.title}`,
-      }));
+      const issues: ComposerCommandItem[] =
+        hashQuery.kind === "pull-request"
+          ? []
+          : (issueSearch.data?.entries ?? []).map((issue) => ({
+              id: `iss:${issue.number}`,
+              type: "issue",
+              issue,
+              label: `iss:${issue.number}`,
+              description: issue.title,
+            }));
+      const pullRequests: ComposerCommandItem[] =
+        hashQuery.kind === "issue"
+          ? []
+          : pullRequestSearch.entries.map((entry) => ({
+              id: `pr:${entry.projectId}:${entry.repository}:${entry.number}`,
+              type: "pull-request",
+              pullRequest: {
+                number: entry.number,
+                title: entry.title,
+                url: entry.url,
+                headBranch: entry.headBranch,
+                baseBranch: entry.baseBranch,
+                state: entry.state,
+                isDraft: entry.isDraft,
+              },
+              label: `pr:${entry.number}`,
+              description: `${entry.isDraft ? "Draft" : entry.state} · ${entry.title}`,
+            }));
+      return [...issues, ...pullRequests];
     }
 
     if (trigger.kind === "slash-command") {
       const q = trigger.query.toLowerCase();
       const commandItems = buildComposerSlashCommandItems({
+        visibleSkillNames: new Set(
+          skills
+            .filter(isProviderSkillUserInvocable)
+            .map((skill) => skill.name.trim().toLowerCase()),
+        ),
         query: q,
         atMessageStart: trigger.rangeStart === 0,
         hasThread,
@@ -339,23 +379,13 @@ export function useComposerCommandMenu({
         selectedProviderStatus,
       });
 
-      const skillItems = getProviderSkillsForSlashMenu(skills, true)
-        .filter((skill) => matchesSlashSkillQuery(skill, q))
-        .map((skill) => ({
-          id: `skill:${skill.name}`,
-          type: "skill" as const,
-          skill,
-          label: `skill:${skill.name}`,
-          description: skill.shortDescription ?? skill.description ?? "",
-        }));
-
-      return [...commandItems, ...skillItems];
+      return commandItems;
     }
 
     if (trigger.kind === "skill") {
       const enabledSkills = dedupeProviderSkillsByName(skills.filter(isProviderSkillUserInvocable));
       const normalizedQuery = normalizeSearchQuery(trigger.query, {
-        trimLeadingPattern: /^\$+/,
+        trimLeadingPattern: /^!+/,
       });
 
       if (!normalizedQuery) {
@@ -363,7 +393,7 @@ export function useComposerCommandMenu({
           id: `skill:${skill.name}`,
           type: "skill" as const,
           skill,
-          label: skill.displayName ?? skill.name,
+          label: `!${skill.name}`,
           description: skill.shortDescription ?? skill.description ?? "",
         }));
       }
@@ -430,7 +460,7 @@ export function useComposerCommandMenu({
         id: `skill:${skill.name}`,
         type: "skill" as const,
         skill,
-        label: skill.displayName ?? skill.name,
+        label: `!${skill.name}`,
         description: skill.shortDescription ?? skill.description ?? "",
       }));
     }
@@ -453,6 +483,8 @@ export function useComposerCommandMenu({
   }, [
     hasThread,
     hasCompactableConversation,
+    hashQuery.kind,
+    issueSearch.data?.entries,
     onUpdateInteractionMode,
     pathSearch.entries,
     pullRequestSearch.entries,
@@ -465,14 +497,17 @@ export function useComposerCommandMenu({
   const onSelect = useCallback(
     (item: ComposerCommandItem) => {
       if (!trigger) return;
-      if (item.type === "pull-request") {
+      if (item.type === "pull-request" || item.type === "issue") {
         if (
           !ownerKey ||
           trigger.kind !== "pull-request" ||
           !items.some((candidate) => candidate.id === item.id)
         )
           return;
-        const record = pullRequestComposerContext(item.pullRequest, uuidv4());
+        const record =
+          item.type === "issue"
+            ? issueComposerContext(item.issue, uuidv4())
+            : pullRequestComposerContext(item.pullRequest, uuidv4());
         if (
           (getComposerDraftSnapshot(ownerKey).context?.records.length ?? 0) >=
           COMPOSER_CONTEXT_MAX_RECORDS
@@ -544,12 +579,14 @@ export function useComposerCommandMenu({
     items,
     skills,
     isLoading:
-      trigger?.kind === "pull-request" ? pullRequestSearch.isPending : pathSearch.isPending,
+      trigger?.kind === "pull-request"
+        ? pullRequestSearch.isPending || issueSearch.isPending
+        : pathSearch.isPending,
     error:
       trigger?.kind === "pull-request"
         ? pullRequestProjectId === null || pullRequestRepository === null
-          ? "Pull requests are unavailable for this project."
-          : pullRequestSearch.error
+          ? "Issues and pull requests are unavailable for this project."
+          : (pullRequestSearch.error ?? issueSearch.error ?? null)
         : null,
     onSelect,
   };

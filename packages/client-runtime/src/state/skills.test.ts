@@ -14,6 +14,32 @@ import { describe, expect, it } from "vite-plus/test";
 import { makeSkillInvalidationSignals } from "./skills.ts";
 
 describe("skill query invalidation signals", () => {
+  it("refreshes installed-copy queries on provider changes from another client", () => {
+    const registry = AtomRegistry.make();
+    const signals = makeSkillInvalidationSignals();
+    const environmentId = EnvironmentId.make("environment");
+    const query = signals.refresh(WS_METHODS.skillsDeploymentList, {
+      environmentId,
+      input: { providerInstanceId: ProviderInstanceId.make("codex") },
+    });
+    registry.mount(query);
+    try {
+      const before = registry.get(query);
+      signals.publish(
+        { environmentId, input: {} },
+        {
+          scope: "provider",
+          scopeId: ProviderInstanceId.make("codex"),
+          catalogRevision: SkillCatalogRevision.make(9),
+          changedKeys: [],
+        },
+        registry,
+      );
+      expect(registry.get(query)).not.toBe(before);
+    } finally {
+      registry.dispose();
+    }
+  });
   it("refreshes application state for distinct domain events sharing one catalog revision", () => {
     const registry = AtomRegistry.make();
     const signals = makeSkillInvalidationSignals();

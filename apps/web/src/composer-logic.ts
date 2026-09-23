@@ -1,4 +1,9 @@
-import type { AssistantCitation } from "@t3tools/contracts";
+import type {
+  AssistantCitation,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
+} from "@t3tools/contracts";
 import {
   serializeAssistantCitation,
   withAssistantCitationComment,
@@ -11,6 +16,21 @@ import {
 export type ComposerTriggerKind = "path" | "pull-request" | "slash-command" | "skill";
 export type ComposerSlashCommand = "model" | "plan" | "default";
 export type ComposerSubmissionIntent = "foreground" | "background";
+
+/** A promoted draft may have a route ID before the server projects its thread shell. */
+export function composerSkillCatalogInput(input: {
+  routeKind: "server" | "draft";
+  activeThreadId: ThreadId | null;
+  activeThreadShellId: ThreadId | null;
+  projectId: ProjectId | null;
+  providerInstanceId: ProviderInstanceId;
+}) {
+  const { routeKind, activeThreadId, activeThreadShellId, projectId, providerInstanceId } = input;
+  if (routeKind === "server" && activeThreadId && activeThreadShellId === activeThreadId) {
+    return { threadId: activeThreadId, providerInstanceId };
+  }
+  return { ...(projectId ? { projectId } : {}), providerInstanceId };
+}
 
 export interface ComposerTrigger {
   kind: ComposerTriggerKind;
@@ -226,7 +246,7 @@ export function detectComposerTrigger(text: string, cursorInput: number): Compos
 
   const tokenStart = tokenStartForCursor(text, cursor);
   const token = text.slice(tokenStart, cursor);
-  const pullRequestMatch = /^#([\p{L}\p{N}][\p{L}\p{N}_-]*)?$/u.exec(token);
+  const pullRequestMatch = /^#((?:iss:|pr:)?[\p{L}\p{N}_-]*)$/u.exec(token);
   if (pullRequestMatch) {
     return {
       kind: "pull-request",
@@ -235,7 +255,7 @@ export function detectComposerTrigger(text: string, cursorInput: number): Compos
       rangeEnd: cursor,
     };
   }
-  if (token.startsWith("$")) {
+  if (token.startsWith("!")) {
     return {
       kind: "skill",
       query: token.slice(1),

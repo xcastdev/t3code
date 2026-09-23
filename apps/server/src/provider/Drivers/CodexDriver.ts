@@ -37,6 +37,7 @@ import { expandHomePath } from "../../pathExpansion.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { serverProviderSkillsToNativeCandidates } from "../../skills/NativeSkillObservationService.ts";
 import { makeCodexSkillAdapter } from "../../skills/ProviderSkillAdapters.ts";
+import { skillInstallTargets } from "../../skills/SkillInstallTargets.ts";
 import { make as makeSkillMaterialization } from "../../skills/SkillMaterializationService.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeCodexAdapter } from "../Layers/CodexAdapter.ts";
@@ -195,10 +196,32 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         return descriptor.options.find((option) => option.isDefault)?.id;
       };
 
+      const probeSkillsForCwd = (cwd: string) =>
+        probeCodexSkillsForCwd({
+          binaryPath: effectiveConfig.binaryPath,
+          homePath: effectiveConfig.homePath,
+          launchArgs: resolveCodexLaunchArgs(effectiveConfig.launchArgs, processEnv),
+          cwd,
+          environment: processEnv,
+        }).pipe(
+          Effect.scoped,
+          Effect.timeout("20 seconds"),
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+        );
+
       const adapter = yield* makeCodexAdapter(effectiveConfig, {
         instanceId,
         environment: processEnv,
         resolveDefaultReasoningEffort,
+        resolveSkills: (cwd) =>
+          probeSkillsForCwd(cwd).pipe(
+            Effect.map((skills) =>
+              skills
+                .filter((skill) => skill.enabled && skill.userInvocable !== false)
+                .map((skill) => ({ name: skill.name, path: skill.path })),
+            ),
+            Effect.orElseSucceed(() => []),
+          ),
         ...(eventLoggers.native ? { nativeEventLogger: eventLoggers.native } : {}),
       });
 
@@ -269,18 +292,6 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         processEnv,
         snapshot.getSnapshot.pipe(Effect.map((value) => value.models)),
       );
-      const probeSkillsForCwd = (cwd: string) =>
-        probeCodexSkillsForCwd({
-          binaryPath: effectiveConfig.binaryPath,
-          homePath: effectiveConfig.homePath,
-          launchArgs: resolveCodexLaunchArgs(effectiveConfig.launchArgs, processEnv),
-          cwd,
-          environment: processEnv,
-        }).pipe(
-          Effect.scoped,
-          Effect.timeout("20 seconds"),
-          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-        );
       const snapshotForCwd = (cwd: string) =>
         !effectiveConfig.enabled
           ? snapshot.getSnapshot
@@ -391,6 +402,12 @@ export const CodexDriver: ProviderDriver<CodexSettings, CodexDriverEnv> = {
         snapshotForCwd,
         discoverNativeSkills,
         skillAdapter,
+        skillInstallTargets: (projectRoot) =>
+          skillInstallTargets({
+            driverKind: DRIVER_KIND,
+            environment: processEnv,
+            ...(projectRoot ? { projectRoot } : {}),
+          }),
         consumeResetCredit,
         adapter,
         textGeneration,

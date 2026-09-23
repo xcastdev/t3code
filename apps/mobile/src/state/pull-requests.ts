@@ -3,6 +3,11 @@ import { WS_METHODS } from "@t3tools/contracts";
 import { connectionAtomRuntime } from "../connection/runtime";
 
 export const composerPullRequests = {
+  issues: createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
+    label: "mobile:composer:issues",
+    tag: WS_METHODS.issuesSearch,
+    staleTimeMs: 30_000,
+  }),
   list: createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
     label: "mobile:composer:pull-requests",
     tag: WS_METHODS.pullRequestsList,

@@ -9,6 +9,7 @@ import type {
   ManagedSkillId,
   ProjectId,
   ProviderInstanceId,
+  ProviderDriverKind,
   SkillCatalogChanged,
   SkillCatalogListResult,
   SkillCompatibility,
@@ -73,6 +74,17 @@ export interface SkillCatalogServiceShape {
     skillId: ManagedSkillId,
     projectRoot?: string,
   ) => Effect.Effect<SkillContentDetail, SkillRpcError>;
+  readonly source: (
+    skillId: ManagedSkillId,
+    projectRoot?: string,
+  ) => Effect.Effect<
+    {
+      readonly key: ManagedSkillKey;
+      readonly packagePath: string;
+      readonly hash: SkillContentHash;
+    },
+    SkillRpcError
+  >;
   readonly nativeContent: (input: {
     readonly observationId: SkillNativeObservationId;
     readonly maxBytes: number;
@@ -175,6 +187,10 @@ export interface SkillCatalogServiceShape {
     readonly cwd: string;
   }) => Effect.Effect<void, SkillRpcError>;
   readonly changes: Stream.Stream<SkillCatalogChanged, never, Scope.Scope>;
+  readonly notifyInstalledSkillChanged: (
+    readers: ReadonlyArray<ProviderDriverKind>,
+    key: ManagedSkillKey,
+  ) => Effect.Effect<void>;
 }
 
 export class SkillCatalogService extends Context.Service<
@@ -414,6 +430,9 @@ export const make = Effect.gen(function* () {
         }
         return {
           ...projectSkillCatalog(resolved, { compatibilityByKey }),
+          installProviderInstances: availableInstances
+            .filter((instance) => instance.enabled && instance.skillInstallTargets !== undefined)
+            .map((instance) => instance.instanceId),
           nativeDiscoveries: nativeDiscoveries.map(
             ({ observations: _observations, ...discovery }) => discovery,
           ),
@@ -452,6 +471,29 @@ export const make = Effect.gen(function* () {
           "Disabled project state has no authored content.",
         );
       return packageDetail(project.success);
+    });
+
+  const source: SkillCatalogServiceShape["source"] = (skillId, projectRoot) =>
+    Effect.gen(function* () {
+      const global = yield* repository.readGlobal(skillId).pipe(Effect.result);
+      if (Result.isSuccess(global)) {
+        return {
+          key: global.success.manifest.key,
+          packagePath: global.success.packagePath,
+          hash: global.success.manifest.revision.hash,
+        };
+      }
+      if (projectRoot === undefined)
+        return yield* rpcError("not_found", "Managed skill was not found.");
+      const project = yield* repository.readProject(projectRoot, skillId).pipe(Effect.result);
+      if (Result.isFailure(project) || project.success.content === undefined) {
+        return yield* rpcError("not_found", "Managed skill was not found.");
+      }
+      return {
+        key: project.success.manifest.key,
+        packagePath: project.success.packagePath,
+        hash: project.success.manifest.revision.hash,
+      };
     });
 
   const nativeContent: SkillCatalogServiceShape["nativeContent"] = (input) =>
@@ -894,6 +936,7 @@ export const make = Effect.gen(function* () {
     currentRevision: Ref.get(revision).pipe(Effect.map(SkillCatalogRevision.make)),
     list,
     content,
+    source,
     nativeContent,
     history,
     createGlobal: (input) => mutationLock.withPermits(1)(createGlobal(input)),
@@ -911,6 +954,16 @@ export const make = Effect.gen(function* () {
     describeSession,
     prepareSession,
     disposeSession,
+    notifyInstalledSkillChanged: (readers, key) =>
+      mutationLock.withPermits(1)(
+        Effect.gen(function* () {
+          const available = yield* instances.listInstances;
+          for (const instance of available) {
+            if (readers.includes(instance.driverKind))
+              yield* publish("provider", instance.instanceId, [key]);
+          }
+        }).pipe(Effect.orDie),
+      ),
     changes: Stream.fromPubSub(changes),
   });
 });

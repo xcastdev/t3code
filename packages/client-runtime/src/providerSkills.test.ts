@@ -176,6 +176,15 @@ describe("getProviderSlashCommandsForSlashMenu", () => {
     ).toEqual(["compact"]);
   });
 
+  it("matches skill aliases case-insensitively after trimming command names", () => {
+    expect(
+      getProviderSlashCommandsForSlashMenu(
+        [{ name: " ASK-MATT " }, { name: "compact" }],
+        skills,
+      ).map((command) => command.name),
+    ).toEqual(["compact"]);
+  });
+
   it("keeps the provider command when the matching skill alias is hidden", () => {
     const visibleSkills = getProviderSkillsForSlashMenu(skills, false);
 

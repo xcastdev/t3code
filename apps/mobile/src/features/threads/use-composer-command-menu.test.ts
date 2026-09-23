@@ -68,6 +68,22 @@ describe("mobile slash commands", () => {
     ).toEqual([]);
   });
 
+  it("hides a provider slash command when a visible skill has the same name", () => {
+    const items = buildComposerSlashCommandItems({
+      query: "rev",
+      atMessageStart: true,
+      hasThread: true,
+      allowInteractionMode: false,
+      visibleSkillNames: new Set(["review"]),
+      selectedProviderStatus: {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        slashCommands: [{ name: "review" }, { name: "review-history" }],
+      },
+    });
+
+    expect(items.map((item) => item.id)).toEqual(["pcmd:review-history"]);
+  });
+
   it("still applies the T3 plan command for supported providers", () => {
     const items = buildComposerSlashCommandItems({
       query: "plan",

@@ -332,7 +332,7 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
       });
       yield* adapter.sendTurn({
         threadId,
-        input: "please $review this",
+        input: "please !review this",
         attachments: [],
       });
       const snapshot = yield* adapter.readThread(threadId);

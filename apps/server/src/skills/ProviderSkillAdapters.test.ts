@@ -15,6 +15,7 @@ import {
   makeClaudeSkillAdapter,
   makeCodexSkillAdapter,
   makeDiscoveryOnlySkillAdapter,
+  makeOpenCodeSkillAdapter,
 } from "./ProviderSkillAdapters.ts";
 import { CODEX_MATERIALIZED_EXTENSION_PATH } from "../provider/Drivers/CodexSkillMaterializer.ts";
 
@@ -130,20 +131,118 @@ describe("ProviderSkillAdapters", () => {
 
   it("reports structured discovery-only limitations for unisolated providers", () => {
     const adapter = makeDiscoveryOnlySkillAdapter({
-      providerInstanceId: ProviderInstanceId.make("opencode"),
-      driverKind: ProviderDriverKind.make("opencode"),
+      providerInstanceId: ProviderInstanceId.make("cursor"),
+      driverKind: ProviderDriverKind.make("cursor"),
       discoverCandidates: () => Effect.succeed([]),
     });
     const compatibility = adapter.evaluateCompatibility(
       { key: ManagedSkillKey.make("review"), packagePath: "/canonical/review" },
       {
-        providerInstanceId: ProviderInstanceId.make("opencode"),
+        providerInstanceId: ProviderInstanceId.make("cursor"),
         cwd: "/repo",
         sessionId: "session-1",
       },
     );
     assert.equal(compatibility.support, "unsupported");
     assert.equal(compatibility.applicationMode, "unsupported");
-    assert.equal(compatibility.reasons[0]?.code, "filesystem_boundary_unproven");
+    assert.equal(compatibility.reasons[0]?.code, "session_isolation_unavailable");
   });
+
+  it.effect("prepares isolated OpenCode skill sources and gates external servers", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const root = yield* fs.makeTempDirectoryScoped({ prefix: "t3-opencode-managed-" });
+      const materialization: SkillMaterializationServiceShape = {
+        materialize: (input) =>
+          Effect.gen(function* () {
+            const skillPaths = new Map(
+              input.packages.map((item) => [item.key, path.join(root, item.key)]),
+            );
+            for (const packagePath of skillPaths.values()) {
+              yield* fs.makeDirectory(packagePath).pipe(Effect.orDie);
+              yield* fs
+                .writeFileString(
+                  path.join(packagePath, "SKILL.md"),
+                  "---\nname: review\ndescription: Review\n---\nReview",
+                )
+                .pipe(Effect.orDie);
+            }
+            return { root, skillPaths };
+          }),
+        dispose: () => Effect.void,
+        disposeSession: () => Effect.void,
+      };
+      const key = ManagedSkillKey.make("review");
+      const request = {
+        runtime: {
+          providerInstanceId: ProviderInstanceId.make("opencode"),
+          cwd: "/repo",
+          sessionId: "session-1",
+        },
+        desiredRevision: SkillCatalogRevision.make(2),
+        skills: [{ key, packagePath: "/canonical/review" }],
+      };
+      const local = makeOpenCodeSkillAdapter({
+        providerInstanceId: request.runtime.providerInstanceId,
+        discoverCandidates: () => Effect.succeed([]),
+        materialization,
+        fileSystem: fs,
+        path,
+        external: false,
+        customConfigDir: false,
+      });
+      assert.equal(
+        local.evaluateCompatibility(request.skills[0]!, request.runtime).support,
+        "supported",
+      );
+      const plan = yield* local.prepareSession(request);
+      assert.deepEqual(plan.payload, {
+        kind: "opencode-managed-skills",
+        root: path.join(root, ".opencode-config", "skills"),
+        configDir: path.join(root, ".opencode-config"),
+        skillKeys: ["review"],
+      });
+      assert.equal(
+        yield* fs.readFileString(
+          path.join(root, ".opencode-config", "skills", "review", "SKILL.md"),
+        ),
+        "---\nname: review\ndescription: Review\n---\nReview",
+      );
+      const external = makeOpenCodeSkillAdapter({
+        providerInstanceId: request.runtime.providerInstanceId,
+        discoverCandidates: () => Effect.succeed([]),
+        materialization,
+        fileSystem: fs,
+        path,
+        external: true,
+        customConfigDir: false,
+      });
+      assert.equal(
+        external.evaluateCompatibility(request.skills[0]!, request.runtime).support,
+        "unsupported",
+      );
+      assert.equal(
+        external.evaluateCompatibility(request.skills[0]!, request.runtime).reasons[0]?.code,
+        "external_skill_delivery_unavailable",
+      );
+      const custom = makeOpenCodeSkillAdapter({
+        providerInstanceId: request.runtime.providerInstanceId,
+        discoverCandidates: () => Effect.succeed([]),
+        materialization,
+        fileSystem: fs,
+        path,
+        external: false,
+        customConfigDir: true,
+      });
+      assert.equal(
+        custom.evaluateCompatibility(request.skills[0]!, request.runtime).support,
+        "unsupported",
+      );
+      assert.equal(
+        custom.evaluateCompatibility(request.skills[0]!, request.runtime).reasons[0]?.code,
+        "custom_config_directory_conflict",
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });

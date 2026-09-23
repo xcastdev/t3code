@@ -76,7 +76,7 @@ describe("resolveCodexArtifactTemplate", () => {
 describe("codexArtifactTemplateUsePrompt", () => {
   it("builds the same document follow-up shape as Codex", () => {
     expect(codexArtifactTemplateUsePrompt(HELLO_WORLD_TEMPLATE)).toBe(
-      "Create a document using this $artifact-template-hello-world about…",
+      "Create a document using this !artifact-template-hello-world about…",
     );
   });
 
@@ -86,12 +86,12 @@ describe("codexArtifactTemplateUsePrompt", () => {
         ...HELLO_WORLD_TEMPLATE,
         artifactKind: "image",
       }),
-    ).toBe("Create an image using this $artifact-template-hello-world of…");
+    ).toBe("Create an image using this !artifact-template-hello-world of…");
   });
 });
 
 describe("appendCodexArtifactTemplateUsePrompt", () => {
-  const prompt = "Create a document using this $artifact-template-hello-world about…";
+  const prompt = "Create a document using this !artifact-template-hello-world about…";
 
   it("adds the prompt to an empty draft", () => {
     expect(appendCodexArtifactTemplateUsePrompt("", HELLO_WORLD_TEMPLATE)).toBe(prompt);

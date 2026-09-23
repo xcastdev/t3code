@@ -3,7 +3,12 @@ import { ReadOnlySourcePreview } from "./files/AttachmentFilePreview";
 import type { PreviewAnnotationPayload } from "@t3tools/contracts";
 import { formatAttachmentSize } from "@t3tools/client-runtime/state/attachments";
 import { videoMimeType } from "@t3tools/shared/video";
-import { GitPullRequestIcon, MessageCircleIcon, MousePointerClickIcon } from "lucide-react";
+import {
+  CircleDotIcon,
+  GitPullRequestIcon,
+  MessageCircleIcon,
+  MousePointerClickIcon,
+} from "lucide-react";
 import { createContext, type MouseEvent, type ReactElement, type ReactNode, use } from "react";
 
 import type { ComposerFileAttachment, ComposerImageAttachment } from "~/composerDraftStore";
@@ -379,6 +384,30 @@ const composerContextPresentationRegistry = createContextPresentationRegistry<
           return <UnresolvedContextChip label={context.label} />;
         }
         const isPullRequest = isPullRequestSummaryContext(entry.record);
+        if (entry.record.issue) {
+          return (
+            <ContextChip
+              icon={<CircleDotIcon className={COMPOSER_INLINE_CHIP_ICON_CLASS_NAME} />}
+              label={`iss:${entry.record.issue.number}`}
+              kindLabel="Issue"
+              details={
+                <div className="space-y-2 p-3 text-sm">
+                  <p>{entry.record.issue.title}</p>
+                  <a
+                    href={entry.record.issue.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="underline"
+                  >
+                    Open issue
+                  </a>
+                </div>
+              }
+              detailsMode={definition.capabilities.details}
+              toneClassName={CONTEXT_INLINE_CHIP_TONE_CLASS_NAMES["review-comment"]}
+            />
+          );
+        }
         const pullRequestState = pullRequestContextDisplayState(entry.record) ?? "unknown";
         if (isPullRequest && entry.record.pullRequest !== undefined) {
           return (

@@ -27,7 +27,7 @@ const citation: AssistantCitation = {
   environmentId: EnvironmentId.make("remote/環境"),
   threadId: ThreadId.make("thread-1"),
   messageId: MessageId.make("message-1"),
-  text: 'Use @AGENTS.md, $review and "雪 ❄️" (carefully).',
+  text: 'Use @AGENTS.md, !review and "雪 ❄️" (carefully).',
   start: 4,
   end: 50,
   prefix: "前: ",
@@ -148,7 +148,7 @@ describe("splitPromptIntoComposerSegments", () => {
     });
 
     expect(
-      splitPromptIntoComposerSegments(`@AGENTS.md ${source}\n$review ${reference}${source}`),
+      splitPromptIntoComposerSegments(`@AGENTS.md ${source}\n!review ${reference}${source}`),
     ).toEqual([
       { type: "mention", path: "AGENTS.md", source: "@AGENTS.md" },
       { type: "text", text: " " },
@@ -215,7 +215,7 @@ describe("splitPromptIntoComposerSegments", () => {
   });
 
   it("splits skill tokens followed by whitespace into skill segments", () => {
-    expect(splitPromptIntoComposerSegments("Use $review-follow-up please")).toEqual([
+    expect(splitPromptIntoComposerSegments("Use !review-follow-up please")).toEqual([
       { type: "text", text: "Use " },
       { type: "skill", name: "review-follow-up" },
       { type: "text", text: " please" },
@@ -223,7 +223,7 @@ describe("splitPromptIntoComposerSegments", () => {
   });
 
   it("splits digit-leading skill tokens into skill segments", () => {
-    expect(splitPromptIntoComposerSegments("Use $2spec please")).toEqual([
+    expect(splitPromptIntoComposerSegments("Use !2spec please")).toEqual([
       { type: "text", text: "Use " },
       { type: "skill", name: "2spec" },
       { type: "text", text: " please" },
@@ -246,8 +246,14 @@ describe("splitPromptIntoComposerSegments", () => {
   });
 
   it("does not convert an incomplete trailing skill token", () => {
-    expect(splitPromptIntoComposerSegments("Use $review-follow-up")).toEqual([
-      { type: "text", text: "Use $review-follow-up" },
+    expect(splitPromptIntoComposerSegments("Use !review-follow-up")).toEqual([
+      { type: "text", text: "Use !review-follow-up" },
+    ]);
+  });
+
+  it("keeps dollar-prefixed agent syntax and shell variables as text", () => {
+    expect(splitPromptIntoComposerSegments("Use $review and keep $HOME intact")).toEqual([
+      { type: "text", text: "Use $review and keep $HOME intact" },
     ]);
   });
 
@@ -272,7 +278,7 @@ describe("splitPromptIntoComposerSegments", () => {
   it("keeps skill parsing alongside mentions and context references", () => {
     expect(
       splitPromptIntoComposerSegments(
-        `Inspect ${terminalReference} $review-follow-up after @AGENTS.md `,
+        `Inspect ${terminalReference} !review-follow-up after @AGENTS.md `,
       ),
     ).toEqual([
       { type: "text", text: "Inspect " },

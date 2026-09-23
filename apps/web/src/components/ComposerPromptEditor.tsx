@@ -343,7 +343,7 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
     key?: NodeKey,
   ) {
     super(key);
-    const normalizedSkillName = skillName.startsWith("$") ? skillName.slice(1) : skillName;
+    const normalizedSkillName = /^[!$]/u.test(skillName) ? skillName.slice(1) : skillName;
     this.__skillName = normalizedSkillName;
     this.__skillLabel = skillLabel;
     this.__skillDescription = skillDescription;
@@ -371,7 +371,7 @@ class ComposerSkillNode extends DecoratorNode<React.ReactElement> {
   }
 
   override getTextContent(): string {
-    return `$${this.__skillName}`;
+    return `!${this.__skillName}`;
   }
 
   override isInline(): true {

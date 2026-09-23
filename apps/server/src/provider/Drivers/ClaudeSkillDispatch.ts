@@ -1,8 +1,8 @@
 /**
- * ClaudeSkillDispatch — turns `$skill` mentions in a composer prompt into the
+ * ClaudeSkillDispatch — turns `!skill` mentions in a composer prompt into the
  * slash invocation Claude Code actually runs.
  *
- * The composer inserts `$name` for every provider. Codex parses that natively;
+ * The composer inserts `!name` for every provider. Codex parses that natively;
  * Claude Code does not, and treats it as prose. Claude Code's only user-side
  * invocation is a text block whose first character is `/`: the harness
  * expands `/name args` into the SKILL.md body, and every character after the
@@ -30,7 +30,7 @@
  * dispatched skill are always the same set.
  */
 const SKILL_MENTION_PATTERN =
-  /(^|\s)\$(?![0-9][0-9_]*(?:[kKmMbBtT]|[eE][0-9]+)?(?:\s|$))(?=[a-zA-Z0-9:_-]*[a-zA-Z])([a-zA-Z0-9][a-zA-Z0-9:_-]*)(?=\s|$)/g;
+  /(^|\s)!(?=[a-zA-Z0-9:_-]*[a-zA-Z])([a-zA-Z0-9][a-zA-Z0-9:_-]*)(?=\s|$)/g;
 
 export interface ClaudeSkillDispatch {
   /** Text before the dispatched mention, or `undefined` when it opens the prompt. */
@@ -41,10 +41,10 @@ export interface ClaudeSkillDispatch {
 }
 
 /**
- * Split `prompt` around the last `$skill` mention that names a known skill.
+ * Split `prompt` around the last `!skill` mention that names a known skill.
  * Returns `undefined` when there is nothing to dispatch, in which case the
  * prompt should go out unchanged. Mentions that do not match a discovered
- * skill stay literal: a `$HOME` in prose must not become a command.
+ * skill stay literal: an unknown `!name` in prose remains unchanged.
  */
 export function planClaudeSkillDispatch(
   prompt: string,

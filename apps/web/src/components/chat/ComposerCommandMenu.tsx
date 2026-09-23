@@ -7,12 +7,14 @@ import {
   type ProjectEntry,
   type ProviderDriverKind,
   type PullRequestContextMetadata,
+  type IssueContextMetadata,
   type ServerProviderSkill,
   type ServerProviderSlashCommand,
 } from "@t3tools/contracts";
 import {
   BlocksIcon,
   FolderIcon,
+  CircleDotIcon,
   PackageIcon,
   SettingsIcon,
   UserRoundIcon,
@@ -57,6 +59,13 @@ export type ComposerCommandItem =
       type: "skill";
       provider: ProviderDriverKind;
       skill: ServerProviderSkill;
+      label: string;
+      description: string;
+    }
+  | {
+      id: string;
+      type: "issue";
+      issue: IssueContextMetadata;
       label: string;
       description: string;
     }
@@ -182,6 +191,7 @@ const ComposerCommandMenuItem = memo(function ComposerCommandMenuItem(props: {
           theme={props.resolvedTheme}
         />
       ) : null}
+      {props.item.type === "issue" ? <CircleDotIcon className="size-4 shrink-0" /> : null}
       {pullRequestPresentation ? (
         <pullRequestPresentation.Icon
           role="img"

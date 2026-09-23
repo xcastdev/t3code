@@ -4,12 +4,19 @@ import { Platform, Pressable, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useEffect, useMemo, useState } from "react";
 
-import type { EnvironmentId, ProjectId, SkillCatalogSummary } from "@t3tools/contracts";
+import {
+  ProviderInstanceId,
+  type EnvironmentId,
+  type ProjectId,
+  type SkillCatalogSummary,
+  type SkillManagedCatalogSummary,
+} from "@t3tools/contracts";
 import { AndroidScreenHeader } from "../../components/AndroidScreenHeader";
 import { AppText as Text } from "../../components/AppText";
 import { NativeStackScreenOptions } from "../../native/StackHeader";
 import { useEnvironments } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
+import { useAtomCommand } from "../../state/use-atom-command";
 import { skillsEnvironment } from "../../state/skills";
 import { useProjects } from "../../state/entities";
 import { SettingsSection } from "../settings/components/SettingsSection";
@@ -29,6 +36,211 @@ function SkillChanges({
     }),
   );
   return null;
+}
+
+const readerName = (kind: string) =>
+  (
+    ({
+      claudeAgent: "Claude",
+      codex: "Codex",
+      cursor: "Cursor",
+      grok: "Grok",
+      opencode: "OpenCode",
+      antigravity: "Antigravity",
+    }) as Record<string, string>
+  )[kind] ?? kind;
+
+function SkillInstallControls({
+  entry,
+  environmentId,
+  projectId,
+}: {
+  readonly entry: SkillManagedCatalogSummary;
+  readonly environmentId: EnvironmentId;
+  readonly projectId?: ProjectId;
+}) {
+  const providerIds = entry.compatibility.map((item) => item.providerInstanceId);
+  const [providerId, setProviderId] = useState<ProviderInstanceId | undefined>(providerIds[0]);
+  const selectedProvider = providerIds.includes(providerId!) ? providerId : providerIds[0];
+  const deployment = useEnvironmentQuery(
+    selectedProvider
+      ? skillsEnvironment.deployment({
+          environmentId,
+          input: {
+            skillId: entry.id,
+            providerInstanceId: selectedProvider,
+            ...(projectId ? { projectId } : {}),
+          },
+        })
+      : null,
+  );
+  const change = useAtomCommand(skillsEnvironment.deploymentChange, { reportFailure: true });
+  return (
+    <View className="gap-3 border-t border-border/50 pt-4">
+      <Text className="font-t3-semibold text-foreground">Install in provider</Text>
+      <Text className="text-xs text-foreground-muted">
+        Installed skills remain available to future sessions and other clients using these folders.
+      </Text>
+      <View className="flex-row flex-wrap gap-2">
+        {providerIds.map((id) => (
+          <Pressable
+            key={id}
+            accessibilityRole="button"
+            onPress={() => setProviderId(id)}
+            className={`rounded-lg px-3 py-2 ${id === selectedProvider ? "bg-accent" : "bg-card"}`}
+          >
+            <Text className="text-sm text-foreground">{id}</Text>
+          </Pressable>
+        ))}
+      </View>
+      {deployment.error ? (
+        <Text className="text-xs text-destructive">{deployment.error}</Text>
+      ) : null}
+      {deployment.data?.targets.map((target) => (
+        <View key={target.id} className="gap-1 rounded-xl bg-card p-3">
+          <Text className="font-t3-medium text-foreground">
+            {target.id === "agents-project"
+              ? "Shared project .agents"
+              : target.id === "agents-user"
+                ? "Shared user .agents"
+                : target.id === "provider-project"
+                  ? "Provider project"
+                  : "Provider user"}
+          </Text>
+          <Text className="text-xs text-foreground-muted">{target.path}</Text>
+          <Text className="text-xs text-foreground-muted">
+            Read by: {target.readers.map(readerName).join(", ")}
+          </Text>
+          {target.detail ? <Text className="text-xs text-destructive">{target.detail}</Text> : null}
+          {target.status === "absent" || target.status === "owned" ? (
+            <View className="flex-row gap-3 pt-1">
+              <Pressable
+                accessibilityRole="button"
+                onPress={() =>
+                  void change({
+                    environmentId,
+                    input: {
+                      skillId: entry.id,
+                      providerInstanceId: selectedProvider!,
+                      ...(projectId ? { projectId } : {}),
+                      expectedHash: entry.revision.hash,
+                      target: target.id,
+                      operation: "install",
+                    },
+                  }).then(deployment.refresh)
+                }
+              >
+                <Text className="text-sm text-accent">
+                  {target.status === "owned" ? "Update" : "Install"}
+                </Text>
+              </Pressable>
+              {target.status === "owned" ? (
+                <Pressable
+                  accessibilityRole="button"
+                  onPress={() =>
+                    void change({
+                      environmentId,
+                      input: {
+                        skillId: entry.id,
+                        providerInstanceId: selectedProvider!,
+                        ...(projectId ? { projectId } : {}),
+                        expectedHash: entry.revision.hash,
+                        target: target.id,
+                        operation: "uninstall",
+                      },
+                    }).then(deployment.refresh)
+                  }
+                >
+                  <Text className="text-sm text-accent">Uninstall</Text>
+                </Pressable>
+              ) : null}
+            </View>
+          ) : (
+            <Text className="text-xs text-foreground-muted">{target.status}</Text>
+          )}
+        </View>
+      ))}
+    </View>
+  );
+}
+
+function InstalledCopies({
+  environmentId,
+  projectId,
+  providerIds,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly projectId?: ProjectId;
+  readonly providerIds: ReadonlyArray<ProviderInstanceId>;
+}) {
+  const [chosen, setChosen] = useState<ProviderInstanceId | undefined>(providerIds[0]);
+  const providerId = providerIds.includes(chosen!) ? chosen : providerIds[0];
+  const installed = useEnvironmentQuery(
+    providerId
+      ? skillsEnvironment.deployment({
+          environmentId,
+          input: { providerInstanceId: providerId, ...(projectId ? { projectId } : {}) },
+        })
+      : null,
+  );
+  const change = useAtomCommand(skillsEnvironment.deploymentChange, { reportFailure: true });
+  if (!providerId) return null;
+  return (
+    <SettingsSection title="Installed copies" card>
+      <View className="gap-3 p-4">
+        <View className="flex-row flex-wrap gap-2">
+          {providerIds.map((id) => (
+            <Pressable
+              key={id}
+              accessibilityRole="button"
+              onPress={() => setChosen(id)}
+              className={`rounded-lg px-3 py-2 ${id === providerId ? "bg-accent" : "bg-card"}`}
+            >
+              <Text className="text-sm text-foreground">{id}</Text>
+            </Pressable>
+          ))}
+        </View>
+        {installed.error ? (
+          <Text className="text-xs text-destructive">{installed.error}</Text>
+        ) : null}
+        {installed.data?.targets.length === 0 ? (
+          <Text className="text-sm text-foreground-muted">
+            No T3-installed copies in this scope.
+          </Text>
+        ) : null}
+        {installed.data?.targets.map((target) => (
+          <View key={`${target.id}:${target.key}`} className="gap-1 rounded-lg bg-card p-3">
+            <Text className="text-sm text-foreground">
+              {target.key} · {target.status}
+            </Text>
+            <Text className="text-xs text-foreground-muted">{target.path}</Text>
+            {target.detail ? (
+              <Text className="text-xs text-destructive">{target.detail}</Text>
+            ) : null}
+            {target.status === "owned" && target.key ? (
+              <Pressable
+                accessibilityRole="button"
+                onPress={() =>
+                  void change({
+                    environmentId,
+                    input: {
+                      providerInstanceId: providerId,
+                      ...(projectId ? { projectId } : {}),
+                      key: target.key,
+                      target: target.id,
+                      operation: "uninstall",
+                    },
+                  }).then(installed.refresh)
+                }
+              >
+                <Text className="text-sm text-accent">Uninstall</Text>
+              </Pressable>
+            ) : null}
+          </View>
+        ))}
+      </View>
+    </SettingsSection>
+  );
 }
 
 function SkillDetail({
@@ -83,6 +295,13 @@ function SkillDetail({
           {compatibility.reasons.map((reason) => ` · ${reason.message}`).join("")}
         </Text>
       ))}
+      {entry.origin === "managed" ? (
+        <SkillInstallControls
+          entry={entry}
+          environmentId={environmentId}
+          {...(projectId ? { projectId } : {})}
+        />
+      ) : null}
       {native.data ? (
         <Text className="text-xs text-foreground-muted">
           {native.data.provenance} · {native.data.observation.freshness}
@@ -272,6 +491,13 @@ export function SettingsSkillsRouteScreen() {
               entry={selected}
             />
           </SettingsSection>
+        ) : null}
+        {environment ? (
+          <InstalledCopies
+            environmentId={environment.environmentId}
+            {...(projectId ? { projectId } : {})}
+            providerIds={catalog.data?.installProviderInstances ?? []}
+          />
         ) : null}
       </ScrollView>
     </View>

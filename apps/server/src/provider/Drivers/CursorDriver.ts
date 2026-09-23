@@ -25,6 +25,7 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { serverProviderSkillsToNativeCandidates } from "../../skills/NativeSkillObservationService.ts";
 import { makeDiscoveryOnlySkillAdapter } from "../../skills/ProviderSkillAdapters.ts";
+import { skillInstallTargets } from "../../skills/SkillInstallTargets.ts";
 import { makeCursorTextGeneration } from "../../textGeneration/CursorTextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeCursorAdapter } from "../Layers/CursorAdapter.ts";
@@ -221,6 +222,12 @@ export const CursorDriver: ProviderDriver<CursorSettings, CursorDriverEnv> = {
         snapshot,
         discoverNativeSkills,
         skillAdapter,
+        skillInstallTargets: (projectRoot) =>
+          skillInstallTargets({
+            driverKind: DRIVER_KIND,
+            environment: processEnv,
+            ...(projectRoot ? { projectRoot } : {}),
+          }),
         snapshotForCwd: (cwd) =>
           !effectiveConfig.enabled
             ? snapshot.getSnapshot

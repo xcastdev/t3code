@@ -1,4 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
+import { createEnvironmentRpcQueryAtomFamily } from "@t3tools/client-runtime/state/runtime";
+import { WS_METHODS } from "@t3tools/contracts";
 import {
   createLinkedPullRequestSummaryAtomFamily,
   createPullRequestEnvironmentAtoms,
@@ -25,6 +27,11 @@ import {
 import { formatEnvironmentQueryError } from "./query";
 
 export const pullRequestEnvironment = createPullRequestEnvironmentAtoms(connectionAtomRuntime);
+export const issueSearchEnvironment = createEnvironmentRpcQueryAtomFamily(connectionAtomRuntime, {
+  label: "environment-data:issues:search",
+  tag: WS_METHODS.issuesSearch,
+  staleTimeMs: 30_000,
+});
 export const linkedPullRequestDetailAtom = createLinkedPullRequestSummaryAtomFamily(
   connectionAtomRuntime,
   pullRequestEnvironment.refreshes,

@@ -243,5 +243,28 @@ export const makeSkillDeploymentService = Effect.gen(function* () {
     );
   };
 
-  return { install, uninstall, status };
+  const listOwned = (input: Pick<SkillDeploymentInput, "providerInstanceId" | "targetRoot">) =>
+    Effect.gen(function* () {
+      if (!(yield* fs.exists(input.targetRoot))) return [];
+      const names = yield* fs.readDirectory(input.targetRoot);
+      return yield* Effect.forEach(
+        names.flatMap((name) => {
+          const match = /^\.t3-managed-([a-z0-9]+(?:-[a-z0-9]+)*)\.json$/.exec(name);
+          return match ? [match[1]! as ManagedSkillKey] : [];
+        }),
+        (key) =>
+          status({ ...input, key, sourcePath: "" }).pipe(
+            Effect.map((value) => ({ key, ...value })),
+            Effect.catch((error) =>
+              Effect.succeed({ key, state: "blocked" as const, detail: error.detail }),
+            ),
+          ),
+      );
+    }).pipe(
+      Effect.mapError((cause) =>
+        failure("deployment_failed", "Could not list installed skills.", cause),
+      ),
+    );
+
+  return { install, uninstall, status, listOwned };
 });

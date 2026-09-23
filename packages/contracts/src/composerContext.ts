@@ -86,6 +86,14 @@ export const PullRequestContextMetadata = Schema.Struct({
 });
 export type PullRequestContextMetadata = typeof PullRequestContextMetadata.Type;
 
+export const IssueContextMetadata = Schema.Struct({
+  number: PositiveInt,
+  title: ShortString,
+  url: ShortString,
+  state: Schema.Literals(["open", "closed"]),
+});
+export type IssueContextMetadata = typeof IssueContextMetadata.Type;
+
 const recordBase = {
   version: Schema.Literal(1),
   contextId: ComposerContextId,
@@ -198,6 +206,7 @@ export const ReviewCommentContextRecord = Schema.Struct({
   diff: BoundedString(COMPOSER_CONTEXT_REVIEW_DIFF_MAX_CHARS),
   fenceLanguage: Schema.optional(BoundedString(64)),
   pullRequest: Schema.optional(PullRequestContextMetadata),
+  issue: Schema.optional(IssueContextMetadata),
 }).check(Schema.makeFilter((record) => record.endIndex >= record.startIndex));
 export type ReviewCommentContextRecord = typeof ReviewCommentContextRecord.Type;
 

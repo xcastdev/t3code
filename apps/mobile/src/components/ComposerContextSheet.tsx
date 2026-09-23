@@ -174,9 +174,9 @@ export function ComposerContextSheet(props: {
             (entry) => entry.contextId === record.screenshotContextId && "attachmentId" in entry,
           )
         : undefined;
-  const pullRequestUrl =
-    record?.kind === "review-comment" && "pullRequest" in record
-      ? record.pullRequest?.url
+  const sourceControlUrl =
+    record?.kind === "review-comment" && "issue" in record && "pullRequest" in record
+      ? (record.issue?.url ?? record.pullRequest?.url)
       : undefined;
   const terminal = record?.kind === "terminal" && !("payload" in record) ? record : null;
   return (
@@ -294,7 +294,14 @@ export function ComposerContextSheet(props: {
                         value={`${record.pullRequest.title}\n${record.pullRequest.headBranch} → ${record.pullRequest.baseBranch}`}
                       />
                     ) : null}
-                    {!record.sectionId.startsWith("pull-request:") ? (
+                    {record.issue ? (
+                      <ContextField
+                        label={`iss:${record.issue.number} · ${record.issue.state}`}
+                        value={record.issue.title}
+                      />
+                    ) : null}
+                    {!record.sectionId.startsWith("pull-request:") &&
+                    !record.sectionId.startsWith("issue:") ? (
                       <>
                         <ReviewCommentCard
                           comment={{ ...record, id: record.contextId }}
@@ -387,17 +394,22 @@ export function ComposerContextSheet(props: {
                 )}
               />
             ) : null}
-            {pullRequestUrl && /^https?:\/\//i.test(pullRequestUrl) ? (
+            {sourceControlUrl && /^https?:\/\//i.test(sourceControlUrl) ? (
               <Pressable
                 accessibilityRole="link"
                 onPress={() => {
-                  void Linking.openURL(pullRequestUrl).catch(() =>
-                    Alert.alert("Could not open pull request", "Try again when connected."),
+                  void Linking.openURL(sourceControlUrl).catch(() =>
+                    Alert.alert("Could not open reference", "Try again when connected."),
                   );
                 }}
                 className="rounded-xl bg-subtle p-4"
               >
-                <Text className="text-foreground">Open pull request</Text>
+                <Text className="text-foreground">
+                  Open{" "}
+                  {record?.kind === "review-comment" && "issue" in record && record.issue
+                    ? "issue"
+                    : "pull request"}
+                </Text>
               </Pressable>
             ) : null}
             {props.onOpenAttachment ? (

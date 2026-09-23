@@ -1067,7 +1067,7 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("dispatches a $skill mention as a trailing slash command block", () => {
+  it.effect("dispatches a !skill mention as a trailing slash command block", () => {
     // Claude Code only runs `/name` from the message's last text block, so a
     // chip picked mid-prompt is moved there and the surrounding prose kept.
     const homeDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "claude-skills-home-"));
@@ -1092,7 +1092,7 @@ describe("ClaudeAdapterLive", () => {
 
       yield* adapter.sendTurn({
         threadId: session.threadId,
-        input: "ok, now $implement all the tickets\nstart with auth",
+        input: "ok, now !implement all the tickets\nstart with auth",
         attachments: [],
       });
 
@@ -1139,7 +1139,7 @@ describe("ClaudeAdapterLive", () => {
 
       yield* adapter.sendTurn({
         threadId: session.threadId,
-        input: "$deploy now",
+        input: "!deploy now",
         attachments: [],
       });
       const promptMessage = yield* Effect.promise(() =>
@@ -1194,7 +1194,7 @@ describe("ClaudeAdapterLive", () => {
       });
       yield* adapter.sendTurn({
         threadId: session.threadId,
-        input: "$review this screenshot",
+        input: "!review this screenshot",
         attachments: [attachment],
       });
 
@@ -1216,7 +1216,7 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
-  it.effect("leaves a $ mention of an unknown or disabled skill as prose", () => {
+  it.effect("leaves an unknown or disabled !skill mention as prose", () => {
     const homeDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "claude-skills-off-"));
     NodeFS.mkdirSync(NodePath.join(homeDir, "skills", "deploy"), {
       recursive: true,
@@ -1242,14 +1242,14 @@ describe("ClaudeAdapterLive", () => {
       });
       yield* adapter.sendTurn({
         threadId: session.threadId,
-        input: "run $deploy and echo $HOME",
+        input: "run !deploy and echo $HOME",
         attachments: [],
       });
 
       const promptText = yield* Effect.promise(() =>
         readFirstPromptText(harness.getLastCreateQueryInput()),
       );
-      assert.equal(promptText, "run $deploy and echo $HOME");
+      assert.equal(promptText, "run !deploy and echo $HOME");
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

@@ -59,6 +59,24 @@ describe("SkillCatalogCache", () => {
     expect(sessionSkillEntries([project, global])).toEqual([project]);
     expect(sessionSkillEntries([global, { ...project, effective: false }])).toHaveLength(1);
   });
+  it("does not offer session use when the selected provider cannot deliver a managed skill", () => {
+    const entry = result.entries[0]!;
+    expect(
+      sessionSkillEntries([
+        {
+          ...entry,
+          compatibility: [
+            {
+              providerInstanceId,
+              support: "unsupported",
+              applicationMode: "unsupported",
+              reasons: [],
+            },
+          ],
+        },
+      ]),
+    ).toEqual([]);
+  });
   it("does not confuse desired enablement with provider delivery", () => {
     const entry = result.entries[0]!;
     expect(sessionSkillDeliveryLabel(entry)).toBe("Delivery has not been reported");

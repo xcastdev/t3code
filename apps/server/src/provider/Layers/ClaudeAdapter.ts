@@ -1535,7 +1535,7 @@ const buildUserMessageEffect = Effect.fn("buildUserMessageEffect")(function* (
   const sdkContent: Array<Record<string, unknown>> = [];
 
   // Claude Code expands a skill only from the LAST text block, and only when
-  // `/name` is its first character. A `$skill` chip anywhere in the prompt is
+  // `/name` is its first character. A `!skill` chip anywhere in the prompt is
   // therefore split into [leading text, "/name trailing text"] so the CLI
   // runs it natively and the prose around it survives. See ClaudeSkillDispatch.
   const dispatch = planClaudeSkillDispatch(

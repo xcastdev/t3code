@@ -233,7 +233,7 @@ describe("Claude managed-skill delivery feasibility", () => {
 
         NodeAssert.deepStrictEqual(
           planClaudeSkillDispatch(
-            "$deploy",
+            "!deploy",
             new Set(["deploy"]),
             managedClaudeSkillInvocationNames(["deploy"]),
           ),

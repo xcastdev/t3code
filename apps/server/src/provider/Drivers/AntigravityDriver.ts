@@ -18,6 +18,7 @@ import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { serverProviderSkillsToNativeCandidates } from "../../skills/NativeSkillObservationService.ts";
 import { makeDiscoveryOnlySkillAdapter } from "../../skills/ProviderSkillAdapters.ts";
+import { skillInstallTargets } from "../../skills/SkillInstallTargets.ts";
 import {
   isAntigravityTextGenerationAvailable,
   makeAntigravityTextGeneration,
@@ -314,6 +315,13 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
         onSessionStarted: provider.onSessionStarted,
         onConfigOptionsUpdated: provider.onConfigOptionsUpdated,
         onAvailableCommands: provider.onAvailableCommands,
+        resolveSkillNames: (cwd) =>
+          discoverAntigravitySkills({ cwd, userHome }).pipe(
+            Effect.map((skills) => new Set(skills.map((skill) => skill.name))),
+            Effect.provideService(FileSystem.FileSystem, fileSystem),
+            Effect.provideService(Path.Path, path),
+            Effect.orElseSucceed(() => new Set<string>()),
+          ),
         onAuthRequired: provider.onAuthRequired,
         ...(loggers.native ? { nativeEventLogger: loggers.native } : {}),
       });
@@ -406,6 +414,12 @@ export const AntigravityDriver: ProviderDriver<AntigravitySettings, AntigravityD
         snapshot: provider.snapshot,
         discoverNativeSkills,
         skillAdapter,
+        skillInstallTargets: (projectRoot) =>
+          skillInstallTargets({
+            driverKind: DRIVER,
+            environment: processEnvironment,
+            ...(projectRoot ? { projectRoot } : {}),
+          }),
         snapshotForCwd: (cwd) =>
           !enabled
             ? provider.snapshot.getSnapshot

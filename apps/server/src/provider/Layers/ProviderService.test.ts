@@ -469,6 +469,8 @@ function makeManagedSkillLifecycleFixture(databasePath?: string) {
     currentRevision: Effect.succeed(SkillCatalogRevision.make(0)),
     list: unused,
     content: unused,
+    source: unused,
+    notifyInstalledSkillChanged: unused,
     nativeContent: unused,
     history: unused,
     createGlobal: unused,

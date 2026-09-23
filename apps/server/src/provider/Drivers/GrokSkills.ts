@@ -1,5 +1,5 @@
 /**
- * GrokSkills — skill discovery for the `$` picker via `grok inspect --json`.
+ * GrokSkills — skill discovery for the `!` picker via `grok inspect --json`.
  *
  * Unlike Claude Code, the Grok CLI reports its full skill catalog itself:
  * `grok inspect --json` returns `skills[]` with `name`, `description`,
@@ -68,21 +68,27 @@ function decodeGrokInspectSkills(stdout: string): ReadonlyArray<ServerProviderSk
       continue;
     }
     const record = entry as Record<string, unknown>;
-    const name = typeof record.name === "string" ? record.name.trim() : "";
+    const sourceName = typeof record.name === "string" ? record.name.trim() : "";
     const source =
       typeof record.source === "object" && record.source !== null
         ? (record.source as Record<string, unknown>)
         : undefined;
     const path = typeof source?.path === "string" ? source.path.trim() : "";
-    if (!name || !path) {
+    if (!sourceName || !path) {
       continue;
     }
+    // `grok inspect --json` reports `invocableAs` when a skill's bare slash
+    // name collides with a built-in command or another skill. Keep the
+    // qualification in `name`: this is also the T3 `!name` token and is what
+    // the Grok adapter turns back into a native slash command.
+    const name = decodeGrokInvocationName(record.invocableAs) ?? sourceName;
     const scope = typeof source?.type === "string" ? source.type.trim() : "";
     const description = typeof record.description === "string" ? record.description.trim() : "";
     skills.push({
       name,
       path,
       enabled: true,
+      ...(name !== sourceName ? { displayName: sourceName } : {}),
       ...(scope ? { scope } : {}),
       ...(description ? { description } : {}),
       ...(record.userInvocable === false ? { userInvocable: false } : {}),
@@ -92,6 +98,27 @@ function decodeGrokInspectSkills(stdout: string): ReadonlyArray<ServerProviderSk
   return skills.sort(
     (left, right) => left.name.localeCompare(right.name) || left.path.localeCompare(right.path),
   );
+}
+
+/**
+ * Restore Grok's bare skill key before building native observations. The
+ * snapshot keeps the qualified alias in `name` for `!` dispatch, while the
+ * observation catalog groups collisions by Grok's underlying skill name.
+ */
+export function grokSkillsForNativeObservations(
+  skills: ReadonlyArray<ServerProviderSkill>,
+): ReadonlyArray<ServerProviderSkill> {
+  return skills.map((skill) =>
+    skill.displayName !== undefined && skill.displayName !== skill.name
+      ? { ...skill, name: skill.displayName }
+      : skill,
+  );
+}
+
+function decodeGrokInvocationName(value: unknown): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const name = value.trim().replace(/^\//u, "");
+  return /^[a-zA-Z0-9][a-zA-Z0-9:_-]*$/u.test(name) ? name : undefined;
 }
 
 /**

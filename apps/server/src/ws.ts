@@ -14,6 +14,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Result from "effect/Result";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -148,6 +149,8 @@ import * as ServerSelfUpdate from "./cloud/selfUpdate.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
 import * as ServerSettings from "./serverSettings.ts";
+import { makeSkillDeploymentService } from "./skills/SkillDeploymentService.ts";
+import { selectSkillDeploymentChange } from "./skills/SkillDeploymentRpc.ts";
 import * as ExternalNotificationDispatcher from "./notifications/ExternalNotificationDispatcher.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import { withTerminalOutputWindow } from "./terminal/OutputProtocol.ts";
@@ -203,6 +206,7 @@ import * as UsageLimitSources from "./usage/UsageLimitSources.ts";
 import * as UsageService from "./usage/UsageService.ts";
 import * as TraceDiagnostics from "./diagnostics/TraceDiagnostics.ts";
 import * as PullRequestService from "./pullRequest/PullRequestService.ts";
+import * as IssueSearch from "./pullRequest/IssueSearch.ts";
 import { listLinkedPullRequestThreads } from "./pullRequest/linkedThreads.ts";
 import { pullRequestSyncKey } from "./pullRequest/pullRequestSyncKey.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -665,6 +669,7 @@ const makeWsRpcLayer = (
       const providerAuth = yield* ProviderAuthService;
       const providerInstances = yield* ProviderInstanceRegistry;
       const skillCatalog = yield* SkillCatalogService.SkillCatalogService;
+      const skillDeployment = yield* makeSkillDeploymentService;
       const providerInstallation = yield* makeProviderInstallation();
       const serverUpdate = yield* ServerSelfUpdate.ServerSelfUpdate;
       const config = yield* ServerConfig.ServerConfig;
@@ -1946,6 +1951,71 @@ const makeWsRpcLayer = (
           ),
         );
 
+      const skillDeploymentContext = (input: {
+        readonly skillId?: import("@t3tools/contracts").ManagedSkillId;
+        readonly providerInstanceId: ProviderInstanceId;
+        readonly projectId?: ProjectId;
+      }) =>
+        Effect.gen(function* () {
+          const context = yield* resolveSkillContext({
+            ...(input.projectId ? { projectId: input.projectId } : {}),
+            providerInstanceId: input.providerInstanceId,
+          });
+          const instance = yield* providerInstances.getInstance(input.providerInstanceId);
+          if (!instance?.enabled || !instance.skillInstallTargets) {
+            return yield* new SkillRpcError({
+              code: "provider_unavailable",
+              message: "The selected provider cannot install skills.",
+            });
+          }
+          const source = input.skillId
+            ? yield* skillCatalog.source(input.skillId, context.projectRoot)
+            : undefined;
+          const targets = instance.resolveSkillInstallTargets
+            ? yield* instance.resolveSkillInstallTargets(context.projectRoot).pipe(
+                Effect.mapError(
+                  (cause) =>
+                    new SkillRpcError({
+                      code: "install_location_unverified",
+                      message: cause.detail,
+                    }),
+                ),
+              )
+            : instance.skillInstallTargets(context.projectRoot);
+          if (targets.length === 0) {
+            return yield* new SkillRpcError({
+              code: "install_unavailable",
+              message: "This provider connection has no verified local skill install location.",
+            });
+          }
+          return { source, targets };
+        });
+
+      const skillDeploymentStatus = (
+        target: import("./skills/SkillInstallTargets.ts").SkillInstallTarget,
+        source: {
+          readonly key: import("@t3tools/contracts").ManagedSkillKey;
+          readonly packagePath: string;
+        },
+      ) =>
+        skillDeployment
+          .status({
+            providerInstanceId: ProviderInstanceId.make("t3-install"),
+            targetRoot: target.root,
+            key: source.key,
+            sourcePath: source.packagePath,
+          })
+          .pipe(
+            Effect.result,
+            Effect.map((result) => ({
+              id: target.id,
+              path: target.root,
+              readers: [...target.readers],
+              status: Result.isSuccess(result) ? result.success.state : ("blocked" as const),
+              ...(Result.isFailure(result) ? { detail: result.failure.detail } : {}),
+            })),
+          );
+
       const requireOwnedProject = (method: string, projectId: ProjectId) =>
         projectionSnapshotQuery.getProjectShellById(projectId).pipe(
           Effect.orDie,
@@ -2931,6 +3001,75 @@ const makeWsRpcLayer = (
                   : Effect.succeed(application);
               }),
             ),
+            { "rpc.aggregate": "skills" },
+          ),
+        [WS_METHODS.skillsDeploymentList]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsDeploymentList,
+            skillDeploymentContext(input).pipe(
+              Effect.flatMap(({ source, targets }) =>
+                Effect.forEach(targets, (target) =>
+                  source
+                    ? skillDeploymentStatus(target, source).pipe(Effect.map((status) => [status]))
+                    : skillDeployment
+                        .listOwned({
+                          providerInstanceId: ProviderInstanceId.make("t3-install"),
+                          targetRoot: target.root,
+                        })
+                        .pipe(
+                          Effect.mapError(
+                            (error) =>
+                              new SkillRpcError({ code: error.code, message: error.detail }),
+                          ),
+                          Effect.map((owned) =>
+                            owned.map((item) => ({
+                              id: target.id,
+                              key: item.key,
+                              path: target.root,
+                              readers: [...target.readers],
+                              status: item.state,
+                              ...(item.state === "blocked" ? { detail: item.detail } : {}),
+                            })),
+                          ),
+                        ),
+                ).pipe(Effect.map((summaries) => ({ targets: summaries.flat() }))),
+              ),
+            ),
+            { "rpc.aggregate": "skills" },
+          ),
+        [WS_METHODS.skillsDeploymentChange]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.skillsDeploymentChange,
+            Effect.gen(function* () {
+              const { source, targets } = yield* skillDeploymentContext(input);
+              const { key, target, sourcePath } = yield* selectSkillDeploymentChange(
+                input,
+                source,
+                targets,
+              );
+              const deploymentInput = {
+                providerInstanceId: ProviderInstanceId.make("t3-install"),
+                targetRoot: target.root,
+                key,
+                sourcePath,
+              };
+              yield* (
+                input.operation === "install"
+                  ? skillDeployment.install(deploymentInput)
+                  : skillDeployment.uninstall(deploymentInput)
+              ).pipe(
+                Effect.mapError(
+                  (error) => new SkillRpcError({ code: error.code, message: error.detail }),
+                ),
+              );
+              yield* skillCatalog.notifyInstalledSkillChanged(target.readers, key);
+              return {
+                status: yield* skillDeploymentStatus(target, {
+                  key,
+                  packagePath: source?.packagePath ?? "",
+                }),
+              };
+            }),
             { "rpc.aggregate": "skills" },
           ),
         [WS_METHODS.skillsGlobalCreate]: (input) =>
@@ -4844,6 +4983,14 @@ const makeWsRpcLayer = (
           observeRpcEffect(WS_METHODS.pullRequestsList, pullRequests.list(input), {
             "rpc.aggregate": "pull-requests",
           }),
+        [WS_METHODS.issuesSearch]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.issuesSearch,
+            IssueSearch.searchIssues(input).pipe(
+              Effect.provide(Layer.mergeAll(GitHubCli.layer, GitLabCli.layer)),
+            ),
+            { "rpc.aggregate": "issues" },
+          ),
         [WS_METHODS.pullRequestsListStats]: (input) =>
           observeRpcEffect(WS_METHODS.pullRequestsListStats, pullRequests.listStats(input), {
             "rpc.aggregate": "pull-requests",

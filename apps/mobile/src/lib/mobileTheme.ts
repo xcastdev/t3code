@@ -42,7 +42,7 @@ export function normalizeMobileThemeId(value: unknown): MobileThemeId {
 }
 
 export function normalizeMobileThemeMode(value: unknown): MobileThemeMode {
-  return value === "light" || value === "dark" || value === "system" ? value : "system";
+  return value === "light" || value === "dark" || value === "system" ? value : "dark";
 }
 
 export function resolveMobileThemeIds(preferences: {

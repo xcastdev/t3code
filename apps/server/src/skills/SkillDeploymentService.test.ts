@@ -61,6 +61,25 @@ const makeOwnedFixture = Effect.fn("SkillDeploymentService.test.makeOwnedFixture
 });
 
 describe("SkillDeploymentService", () => {
+  it.effect("finds and removes an owned install after its managed source is deleted", () =>
+    Effect.gen(function* () {
+      const { fs, path, service, input, target } = yield* makeOwnedFixture();
+      yield* fs.remove(path.dirname(input.sourcePath), { recursive: true });
+      const installed = yield* service.listOwned({
+        providerInstanceId: input.providerInstanceId,
+        targetRoot: input.targetRoot,
+      });
+      expect(installed).toMatchObject([{ key: input.key, state: "owned" }]);
+      yield* service.uninstall({ ...input, sourcePath: "" });
+      expect(yield* fs.exists(target)).toBe(false);
+      expect(
+        yield* service.listOwned({
+          providerInstanceId: input.providerInstanceId,
+          targetRoot: input.targetRoot,
+        }),
+      ).toEqual([]);
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
   for (const stage of [
     "copy",
     "staged-validation",

@@ -28,7 +28,13 @@ import { ServerConfig } from "../../config.ts";
 import * as ServerEnvironment from "../../environment/ServerEnvironment.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { serverProviderSkillsToNativeCandidates } from "../../skills/NativeSkillObservationService.ts";
-import { makeDiscoveryOnlySkillAdapter } from "../../skills/ProviderSkillAdapters.ts";
+import { makeOpenCodeSkillAdapter } from "../../skills/ProviderSkillAdapters.ts";
+import {
+  externalOpenCodeInstallTargets,
+  skillInstallTargets,
+  verifyExternalOpenCodeInstallTargets,
+} from "../../skills/SkillInstallTargets.ts";
+import { make as makeSkillMaterialization } from "../../skills/SkillMaterializationService.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeOpenCodeAdapter } from "../Layers/OpenCodeAdapter.ts";
 import {
@@ -106,6 +112,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const fileSystem = yield* FileSystem.FileSystem;
       const pathService = yield* Path.Path;
+      const skillMaterialization = yield* makeSkillMaterialization;
       const openCodeRuntime = yield* OpenCodeRuntime;
       const serverConfig = yield* ServerConfig;
       const httpClient = yield* HttpClient.HttpClient;
@@ -176,7 +183,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
       // its full JSON inventory to stdout, but the Bun-compiled binary does
       // not flush more than one 64KB pipe buffer to a non-TTY stdout, so the
       // piped output arrives truncated and unparseable — which degrades to an
-      // empty skill list and poisons the workspace snapshot the `$` picker
+      // empty skill list and poisons the workspace snapshot the `!` picker
       // reads. The SDK `app.skills` endpoint honors the per-request directory
       // and returns complete results regardless of size.
       const loadSkillsForCwd = (cwd: string) =>
@@ -260,6 +267,7 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
                 effectiveConfig.serverUrl.trim().length > 0
                   ? ("external" as const)
                   : ("local" as const),
+              ...(effectiveConfig.serverUrl.trim().length > 0 ? { userInvocable: false } : {}),
             })),
           ),
           Effect.mapError(
@@ -272,11 +280,78 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
               }),
           ),
         );
-      const skillAdapter = makeDiscoveryOnlySkillAdapter({
+      const skillAdapter = makeOpenCodeSkillAdapter({
         providerInstanceId: instanceId,
-        driverKind: DRIVER_KIND,
         discoverCandidates: discoverNativeSkills,
+        materialization: skillMaterialization,
+        fileSystem,
+        path: pathService,
+        external: effectiveConfig.serverUrl.trim().length > 0,
+        customConfigDir: Boolean(processEnv.OPENCODE_CONFIG_DIR?.trim()),
       });
+      const installTargets = (projectRoot?: string) =>
+        skillInstallTargets({
+          driverKind: DRIVER_KIND,
+          environment: processEnv,
+          ...(projectRoot ? { projectRoot } : {}),
+          ...(effectiveConfig.serverUrl.trim()
+            ? { externalOpenCodeUrl: effectiveConfig.serverUrl.trim() }
+            : {}),
+        });
+      const resolveInstallTargets = (projectRoot?: string) =>
+        effectiveConfig.serverUrl.trim()
+          ? Effect.scoped(
+              Effect.gen(function* () {
+                const targets = installTargets(projectRoot);
+                if (targets.length === 0) return targets;
+                const directory = projectRoot ?? serverConfig.cwd;
+                const server = yield* openCodeRuntime.connectToOpenCodeServer({
+                  binaryPath: effectiveConfig.binaryPath,
+                  directory,
+                  serverUrl: effectiveConfig.serverUrl,
+                  ...(effectiveConfig.serverPassword
+                    ? { serverPassword: effectiveConfig.serverPassword }
+                    : {}),
+                  environment: processEnv,
+                });
+                const client = openCodeRuntime.createOpenCodeSdkClient({
+                  baseUrl: server.url,
+                  directory,
+                  ...(effectiveConfig.serverPassword
+                    ? { serverPassword: effectiveConfig.serverPassword }
+                    : {}),
+                });
+                const response = yield* Effect.tryPromise(() => client.path.get());
+                if (!response.data) return [];
+                const candidates = externalOpenCodeInstallTargets({
+                  targets,
+                  configPath: response.data.config,
+                  directory: response.data.directory,
+                  ...("home" in response.data && typeof response.data.home === "string"
+                    ? { homePath: response.data.home }
+                    : {}),
+                  ...(projectRoot ? { projectRoot } : {}),
+                });
+                return yield* verifyExternalOpenCodeInstallTargets({
+                  targets: candidates,
+                  fileSystem,
+                  path: pathService,
+                  readFile: async (path, directory) =>
+                    (await client.file.read({ directory, path })).data,
+                });
+              }),
+            ).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProviderDriverError({
+                    driver: DRIVER_KIND,
+                    instanceId,
+                    detail: "Could not verify the external OpenCode install paths.",
+                    cause,
+                  }),
+              ),
+            )
+          : Effect.succeed(installTargets(projectRoot));
 
       return {
         instanceId,
@@ -288,6 +363,8 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
         snapshot,
         discoverNativeSkills,
         skillAdapter,
+        skillInstallTargets: installTargets,
+        resolveSkillInstallTargets: resolveInstallTargets,
         snapshotForCwd: (cwd) =>
           !effectiveConfig.enabled
             ? snapshot.getSnapshot
@@ -297,7 +374,9 @@ export const OpenCodeDriver: ProviderDriver<OpenCodeSettings, OpenCodeDriverEnv>
               ]).pipe(
                 Effect.map(([machineSnapshot, skills]) => ({
                   ...machineSnapshot,
-                  skills: openCodeSkillsToServerProviderSkills(skills),
+                  skills: openCodeSkillsToServerProviderSkills(skills).map((skill) =>
+                    effectiveConfig.serverUrl.trim() ? { ...skill, userInvocable: false } : skill,
+                  ),
                 })),
                 Effect.mapError(
                   (cause) =>

@@ -12,6 +12,7 @@ export function sessionSkillEntries(entries: ReadonlyArray<SkillCatalogSummary>)
   const byKey = new Map<string, Extract<SkillCatalogSummary, { readonly origin: "managed" }>>();
   for (const entry of entries) {
     if (entry.origin !== "managed") continue;
+    if (entry.compatibility.some((value) => value.support === "unsupported")) continue;
     const current = byKey.get(entry.key);
     if (!current || entry.effective || (!current.effective && entry.scope === "project")) {
       byKey.set(entry.key, entry);

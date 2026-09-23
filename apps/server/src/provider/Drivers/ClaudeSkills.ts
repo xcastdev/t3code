@@ -1,5 +1,5 @@
 /**
- * ClaudeSkills — filesystem discovery of Claude Code skills for the `$` picker.
+ * ClaudeSkills — filesystem discovery of Claude Code skills for the `!` picker.
  *
  * Claude Code loads skills from `<config dir>/skills` (user scope) and
  * `<cwd>/.claude/skills` (project scope), one directory per skill with a

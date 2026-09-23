@@ -20,7 +20,8 @@ type SkillQueryTag =
   | typeof WS_METHODS.skillsContentGet
   | typeof WS_METHODS.skillsHistoryList
   | typeof WS_METHODS.skillsNativeContentGet
-  | typeof WS_METHODS.skillsApplicationGet;
+  | typeof WS_METHODS.skillsApplicationGet
+  | typeof WS_METHODS.skillsDeploymentList;
 
 /** Scoped signals are shared by real query atoms and deduplicate overlapping subscriptions. */
 export function makeSkillInvalidationSignals() {
@@ -46,10 +47,15 @@ export function makeSkillInvalidationSignals() {
     if (
       tag === WS_METHODS.skillsCatalogList ||
       tag === WS_METHODS.skillsContentGet ||
-      tag === WS_METHODS.skillsHistoryList
+      tag === WS_METHODS.skillsHistoryList ||
+      tag === WS_METHODS.skillsDeploymentList
     )
       watch("global");
-    if (tag === WS_METHODS.skillsCatalogList || tag === WS_METHODS.skillsContentGet) {
+    if (
+      tag === WS_METHODS.skillsCatalogList ||
+      tag === WS_METHODS.skillsContentGet ||
+      tag === WS_METHODS.skillsDeploymentList
+    ) {
       if (projectId) watch("project", projectId);
       if (threadId) watch("thread-project", threadId);
     }
@@ -58,7 +64,8 @@ export function makeSkillInvalidationSignals() {
       else if (tag === WS_METHODS.skillsApplicationGet) watch("sessions");
       watch(providerId ? "provider" : "providers", providerId);
     }
-    if (tag === WS_METHODS.skillsNativeContentGet) watch("providers");
+    if (tag === WS_METHODS.skillsNativeContentGet || tag === WS_METHODS.skillsDeploymentList)
+      watch("providers");
     return Atom.make((get) => watched.map((value) => get(value)).join(":"));
   };
   const publish = (
@@ -92,7 +99,8 @@ export function createSkillsEnvironmentAtoms<R, E>(
       | typeof WS_METHODS.skillsContentGet
       | typeof WS_METHODS.skillsHistoryList
       | typeof WS_METHODS.skillsNativeContentGet
-      | typeof WS_METHODS.skillsApplicationGet,
+      | typeof WS_METHODS.skillsApplicationGet
+      | typeof WS_METHODS.skillsDeploymentList,
   >(
     label: string,
     tag: M,
@@ -115,7 +123,8 @@ export function createSkillsEnvironmentAtoms<R, E>(
       | typeof WS_METHODS.skillsProjectRename
       | typeof WS_METHODS.skillsSessionSetEnabled
       | typeof WS_METHODS.skillsSessionReset
-      | typeof WS_METHODS.skillsNativeImport,
+      | typeof WS_METHODS.skillsNativeImport
+      | typeof WS_METHODS.skillsDeploymentChange,
   >(
     label: string,
     tag: M,
@@ -130,6 +139,7 @@ export function createSkillsEnvironmentAtoms<R, E>(
       WS_METHODS.skillsNativeContentGet,
     ),
     application: query("environment-data:skills:application", WS_METHODS.skillsApplicationGet),
+    deployment: query("environment-data:skills:deployment", WS_METHODS.skillsDeploymentList),
     globalCreate: command(
       "environment-command:skills:global-create",
       WS_METHODS.skillsGlobalCreate,
@@ -177,6 +187,10 @@ export function createSkillsEnvironmentAtoms<R, E>(
     nativeImport: command(
       "environment-command:skills:native-import",
       WS_METHODS.skillsNativeImport,
+    ),
+    deploymentChange: command(
+      "environment-command:skills:deployment",
+      WS_METHODS.skillsDeploymentChange,
     ),
     changes: createEnvironmentSubscriptionAtomFamily(runtime, {
       label: "environment-data:skills:changes",

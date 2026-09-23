@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { serializeComposerFileLink } from "./composerTrigger.ts";
+import {
+  detectComposerTrigger,
+  parseComposerHashQuery,
+  serializeComposerFileLink,
+} from "./composerTrigger.ts";
 
 describe("serializeComposerFileLink", () => {
   it("uses the basename as the markdown label", () => {
@@ -25,5 +29,19 @@ describe("serializeComposerFileLink", () => {
     expect(serializeComposerFileLink("@scope/package.json")).toBe(
       "[package.json](@scope/package.json)",
     );
+  });
+});
+
+describe("composer prefix routing", () => {
+  it("uses ! for skills and leaves $ free for agents", () => {
+    expect(detectComposerTrigger("!review", 7)?.kind).toBe("skill");
+    expect(detectComposerTrigger("$review", 7)).toBeNull();
+  });
+
+  it("keeps the hash namespace while typing and narrows the search", () => {
+    expect(detectComposerTrigger("#iss:42", 7)?.query).toBe("iss:42");
+    expect(parseComposerHashQuery("iss:42")).toEqual({ kind: "issue", search: "42" });
+    expect(parseComposerHashQuery("pr:42")).toEqual({ kind: "pull-request", search: "42" });
+    expect(parseComposerHashQuery("42")).toEqual({ kind: "all", search: "42" });
   });
 });

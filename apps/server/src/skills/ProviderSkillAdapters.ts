@@ -200,6 +200,81 @@ export function makeCodexSkillAdapter(input: {
   };
 }
 
+export function makeOpenCodeSkillAdapter(input: {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly discoverCandidates: CandidateDiscovery;
+  readonly materialization: SkillMaterializationServiceShape;
+  readonly fileSystem: FileSystem.FileSystem;
+  readonly path: Path.Path;
+  readonly external: boolean;
+  readonly customConfigDir: boolean;
+}): ProviderSkillAdapter {
+  return {
+    discoverNative: (cwd) => discover(input.providerInstanceId, cwd, input.discoverCandidates),
+    evaluateCompatibility: () =>
+      input.external || input.customConfigDir
+        ? {
+            providerInstanceId: input.providerInstanceId,
+            support: "unsupported",
+            applicationMode: "unsupported",
+            reasons: [
+              {
+                code: input.external
+                  ? "external_skill_delivery_unavailable"
+                  : "custom_config_directory_conflict",
+                message: input.external
+                  ? "OpenCode does not expose an isolated skill source for an already running server."
+                  : "An existing OPENCODE_CONFIG_DIR prevents isolated managed skill delivery.",
+              },
+            ],
+          }
+        : supportedCompatibility(input.providerInstanceId),
+    prepareSession: (request) =>
+      input.materialization
+        .materialize({
+          sessionId: request.runtime.sessionId,
+          providerInstanceId: input.providerInstanceId,
+          desiredRevision: request.desiredRevision,
+          packages: request.skills.map((skill) => ({
+            key: skill.key,
+            sourcePath: skill.packagePath,
+          })),
+        })
+        .pipe(
+          Effect.flatMap((materialized) =>
+            Effect.gen(function* () {
+              const configDir = input.path.join(materialized.root, ".opencode-config");
+              const skillRoot = input.path.join(configDir, "skills");
+              yield* input.fileSystem.makeDirectory(skillRoot, { recursive: true });
+              for (const [key, packagePath] of materialized.skillPaths) {
+                yield* input.fileSystem.rename(packagePath, input.path.join(skillRoot, key));
+              }
+              return {
+                providerInstanceId: input.providerInstanceId,
+                desiredRevision: request.desiredRevision,
+                applicationMode: "new_session_required" as const,
+                skillKeys: request.skills.map((skill) => skill.key),
+                payload: {
+                  kind: "opencode-managed-skills" as const,
+                  root: skillRoot,
+                  configDir,
+                  skillKeys: request.skills.map((skill) => skill.key),
+                },
+              } satisfies ProviderSkillPlan;
+            }),
+          ),
+          Effect.mapError((cause) => adapterError("materialization_failed", String(cause), cause)),
+        ),
+    disposeSession: (runtime) =>
+      input.materialization
+        .disposeSession({
+          sessionId: runtime.sessionId,
+          providerInstanceId: input.providerInstanceId,
+        })
+        .pipe(Effect.mapError((cause) => adapterError("cleanup_failed", cause.detail, cause))),
+  };
+}
+
 const unsupportedReasons: Readonly<
   Record<string, { readonly code: string; readonly message: string }>
 > = {

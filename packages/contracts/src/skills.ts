@@ -9,7 +9,7 @@ import {
   ThreadId,
   TrimmedNonEmptyString,
 } from "./baseSchemas.ts";
-import { ProviderInstanceId } from "./providerInstance.ts";
+import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 
 const MANAGED_SKILL_KEY_MAX_LENGTH = 64;
 const MANAGED_SKILL_KEY_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
@@ -378,6 +378,7 @@ export type SkillCatalogListInput = typeof SkillCatalogListInput.Type;
 
 export const SkillCatalogListResult = Schema.Struct({
   catalogRevision: SkillCatalogRevision,
+  installProviderInstances: Schema.optionalKey(Schema.Array(ProviderInstanceId)),
   entries: Schema.Array(SkillCatalogSummary),
   diagnostics: Schema.optionalKey(
     Schema.Array(
@@ -566,6 +567,48 @@ export const SkillNativeImportInput = Schema.Struct({
   key: ManagedSkillKey,
 });
 export type SkillNativeImportInput = typeof SkillNativeImportInput.Type;
+
+export const SkillInstallTargetId = Schema.Literals([
+  "provider-project",
+  "provider-user",
+  "agents-project",
+  "agents-user",
+]);
+export type SkillInstallTargetId = typeof SkillInstallTargetId.Type;
+
+export const SkillDeploymentListInput = Schema.Struct({
+  skillId: Schema.optionalKey(ManagedSkillId),
+  providerInstanceId: ProviderInstanceId,
+  projectId: Schema.optionalKey(ProjectId),
+});
+export type SkillDeploymentListInput = typeof SkillDeploymentListInput.Type;
+
+export const SkillDeploymentTargetSummary = Schema.Struct({
+  id: SkillInstallTargetId,
+  key: Schema.optionalKey(ManagedSkillKey),
+  path: TrimmedNonEmptyString,
+  readers: Schema.Array(ProviderDriverKind),
+  status: Schema.Literals(["absent", "owned", "drifted", "blocked"]),
+  detail: Schema.optionalKey(TrimmedNonEmptyString),
+});
+export type SkillDeploymentTargetSummary = typeof SkillDeploymentTargetSummary.Type;
+
+export const SkillDeploymentListResult = Schema.Struct({
+  targets: Schema.Array(SkillDeploymentTargetSummary),
+});
+export type SkillDeploymentListResult = typeof SkillDeploymentListResult.Type;
+
+export const SkillDeploymentChangeInput = Schema.Struct({
+  ...SkillDeploymentListInput.fields,
+  key: Schema.optionalKey(ManagedSkillKey),
+  expectedHash: Schema.optionalKey(SkillContentHash),
+  target: SkillInstallTargetId,
+  operation: Schema.Literals(["install", "uninstall"]),
+});
+export type SkillDeploymentChangeInput = typeof SkillDeploymentChangeInput.Type;
+
+export const SkillDeploymentChangeResult = Schema.Struct({ status: SkillDeploymentTargetSummary });
+export type SkillDeploymentChangeResult = typeof SkillDeploymentChangeResult.Type;
 
 export const SkillMutationResult = Schema.Struct({
   catalogRevision: SkillCatalogRevision,

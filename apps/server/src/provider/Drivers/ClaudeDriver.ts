@@ -30,6 +30,7 @@ import { expandHomePath } from "../../pathExpansion.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { serverProviderSkillsToNativeCandidates } from "../../skills/NativeSkillObservationService.ts";
 import { makeClaudeSkillAdapter } from "../../skills/ProviderSkillAdapters.ts";
+import { skillInstallTargets } from "../../skills/SkillInstallTargets.ts";
 import { make as makeSkillMaterialization } from "../../skills/SkillMaterializationService.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeClaudeAdapter } from "../Layers/ClaudeAdapter.ts";
@@ -283,6 +284,22 @@ export const ClaudeDriver: ProviderDriver<ClaudeSettings, ClaudeDriverEnv> = {
         snapshotForCwd,
         discoverNativeSkills,
         skillAdapter,
+        skillInstallTargets: (projectRoot) =>
+          skillInstallTargets({
+            driverKind: DRIVER_KIND,
+            environment: processEnv,
+            ...(projectRoot ? { projectRoot } : {}),
+            ...(effectiveConfig.homePath.trim()
+              ? { nativeUserRoot: path.resolve(expandHomePath(effectiveConfig.homePath)) }
+              : processEnv.CLAUDE_CONFIG_DIR?.trim()
+                ? {
+                    nativeUserRoot: path.resolve(
+                      projectRoot ?? cwd,
+                      processEnv.CLAUDE_CONFIG_DIR.trim(),
+                    ),
+                  }
+                : {}),
+          }),
         adapter,
         textGeneration,
       } satisfies ProviderInstance;

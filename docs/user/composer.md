@@ -121,15 +121,22 @@ transcription or cancellation; only the message text is sent when you submit.
 
 ## Commands and skills
 
-Type `/` for commands or `$` to add a skill from the selected environment and
+Type `/` for commands or `!` to add a skill from the selected environment and
 provider. On mobile, both are also available before starting a thread on
 **New task**.
 
-The slash menu also includes skills unless you turn off **Settings → General →
-Show skills in slash menu**. Only skills enabled for the provider are listed.
+The composer prefixes are:
+
+- `@` to find files and folders.
+- `/` to find commands. MCP tools may later use the `/mcp:` command namespace.
+- `!` to find skills enabled for the provider.
+- `#` to find issues and pull requests. Use `#iss:` or `#pr:` to narrow the search.
+- `$` is reserved for future agent selection.
 
 Provider commands must start the message to run. T3 Code commands such as
 `/model` and `/plan`, and skill mentions, work on any line.
+Grok and Antigravity can run one selected skill per message.
+In a Codex thread, use `!skill` for skills; a raw `$skill` reference to an available skill is rejected.
 
 Send `/compact` in an existing conversation to reduce context usage when the
 provider supports it. Web and desktop also offer compaction from the context meter.
@@ -145,11 +152,10 @@ excerpt, Terminal 1 lines 3-4" and similar to screen readers.
 
 A pull request appears as its icon and number. Its color reflects whether it was open, draft,
 merged, or closed when it was attached. Select it to inspect the captured title and branches,
-then choose **Open pull request** to visit the pull request. On web and desktop, type `#` to browse the newest
-pull requests in the current project's repository. Continue typing digits to filter the recent list
-by any part of its pull request numbers. A complete number is also resolved directly, even when that
-pull request is older than the recent list. Type a single word after `#` to search pull requests in
-the repository by text. Choose a result to insert it as a chip.
+then choose **Open pull request** to visit the pull request. Type `#` to browse issues and pull
+requests in the current project's repository. Results use `iss:` and `pr:` labels; type
+`#iss:` or `#pr:` to search only one kind. A complete number can resolve an older item directly.
+Choose a result to insert a linked reference.
 
 Images keep their thumbnail shelf above the text and also get a chip at your cursor, so you can
 say exactly which image you mean. Deleting an image chip leaves the image on the shelf; removing

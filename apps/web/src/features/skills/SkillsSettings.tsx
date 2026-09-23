@@ -3,6 +3,7 @@ import {
   ManagedSkillKey,
   type EnvironmentId,
   type ProjectId,
+  ProviderInstanceId,
   SkillCatalogRevision,
   type SkillCatalogSummary,
   type SkillManagedCatalogSummary,
@@ -48,6 +49,211 @@ function SkillRow({
         <span>{entry.effective ? "enabled" : "not effective"}</span>
       </span>
     </button>
+  );
+}
+
+const providerName = (kind: string) =>
+  ({
+    claudeAgent: "Claude",
+    codex: "Codex",
+    cursor: "Cursor",
+    grok: "Grok",
+    opencode: "OpenCode",
+    antigravity: "Antigravity",
+  })[kind] ?? kind;
+
+function SkillInstallControls({
+  entry,
+  environmentId,
+  projectId,
+}: {
+  readonly entry: SkillManagedCatalogSummary;
+  readonly environmentId: EnvironmentId;
+  readonly projectId?: ProjectId;
+}) {
+  const providerIds = entry.compatibility.map((item) => item.providerInstanceId);
+  const [providerId, setProviderId] = useState<ProviderInstanceId | undefined>(providerIds[0]);
+  const selectedProvider = providerIds.includes(providerId!) ? providerId : providerIds[0];
+  const deployment = useEnvironmentQuery(
+    selectedProvider
+      ? skillsEnvironment.deployment({
+          environmentId,
+          input: {
+            skillId: entry.id,
+            providerInstanceId: selectedProvider,
+            ...(projectId ? { projectId } : {}),
+          },
+        })
+      : null,
+  );
+  const change = useAtomCommand(skillsEnvironment.deploymentChange, { reportFailure: true });
+  return (
+    <div className="grid gap-3 border-t border-border/50 pt-4">
+      <h3 className="text-sm font-medium">Install in provider</h3>
+      <p className="text-xs text-muted-foreground">
+        Installed skills remain available to future sessions and other clients using these folders.
+      </p>
+      {providerIds.length ? (
+        <label className="grid gap-1 text-xs text-muted-foreground">
+          Provider instance
+          <select
+            className="h-8 rounded-md border border-input bg-background px-2 text-sm text-foreground"
+            value={selectedProvider}
+            onChange={(event) => setProviderId(ProviderInstanceId.make(event.currentTarget.value))}
+          >
+            {providerIds.map((id) => (
+              <option key={id} value={id}>
+                {id}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : (
+        <p className="text-xs text-muted-foreground">No provider instance is available.</p>
+      )}
+      {deployment.error ? <p className="text-xs text-destructive">{deployment.error}</p> : null}
+      {deployment.data?.targets.map((target) => (
+        <div key={target.id} className="grid gap-1 rounded-md border border-border/50 p-3 text-xs">
+          <div className="flex items-center justify-between gap-2">
+            <span className="font-medium text-foreground">
+              {target.id === "agents-project"
+                ? "Shared project .agents"
+                : target.id === "agents-user"
+                  ? "Shared user .agents"
+                  : target.id === "provider-project"
+                    ? "Provider project"
+                    : "Provider user"}
+            </span>
+            {target.status === "absent" || target.status === "owned" ? (
+              <div className="flex gap-1">
+                <Button
+                  size="xs"
+                  variant="outline"
+                  onClick={() =>
+                    void change({
+                      environmentId,
+                      input: {
+                        skillId: entry.id,
+                        providerInstanceId: selectedProvider!,
+                        ...(projectId ? { projectId } : {}),
+                        expectedHash: entry.revision.hash,
+                        target: target.id,
+                        operation: "install",
+                      },
+                    }).then(deployment.refresh)
+                  }
+                >
+                  {target.status === "owned" ? "Update" : "Install"}
+                </Button>
+                {target.status === "owned" ? (
+                  <Button
+                    size="xs"
+                    variant="ghost"
+                    onClick={() =>
+                      void change({
+                        environmentId,
+                        input: {
+                          skillId: entry.id,
+                          providerInstanceId: selectedProvider!,
+                          ...(projectId ? { projectId } : {}),
+                          expectedHash: entry.revision.hash,
+                          target: target.id,
+                          operation: "uninstall",
+                        },
+                      }).then(deployment.refresh)
+                    }
+                  >
+                    Uninstall
+                  </Button>
+                ) : null}
+              </div>
+            ) : (
+              <span className="text-muted-foreground">{target.status}</span>
+            )}
+          </div>
+          <code className="break-all text-muted-foreground">{target.path}</code>
+          <span className="text-muted-foreground">
+            Read by: {target.readers.map(providerName).join(", ")}
+          </span>
+          {target.detail ? <span className="text-destructive">{target.detail}</span> : null}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function InstalledCopies({
+  environmentId,
+  projectId,
+  providerIds,
+}: {
+  readonly environmentId: EnvironmentId;
+  readonly projectId?: ProjectId;
+  readonly providerIds: ReadonlyArray<ProviderInstanceId>;
+}) {
+  const [chosen, setChosen] = useState<ProviderInstanceId | undefined>(providerIds[0]);
+  const providerId = providerIds.includes(chosen!) ? chosen : providerIds[0];
+  const installed = useEnvironmentQuery(
+    providerId
+      ? skillsEnvironment.deployment({
+          environmentId,
+          input: { providerInstanceId: providerId, ...(projectId ? { projectId } : {}) },
+        })
+      : null,
+  );
+  const change = useAtomCommand(skillsEnvironment.deploymentChange, { reportFailure: true });
+  if (!providerId) return null;
+  return (
+    <SettingsSection title="Installed copies" icon={<BookOpenIcon className="size-4" />}>
+      <div className="grid gap-3 p-4 text-sm">
+        <select
+          className="h-8 rounded-md border border-input bg-background px-2"
+          value={providerId}
+          onChange={(event) => setChosen(ProviderInstanceId.make(event.currentTarget.value))}
+        >
+          {providerIds.map((id) => (
+            <option key={id} value={id}>
+              {id}
+            </option>
+          ))}
+        </select>
+        {installed.error ? <p className="text-destructive">{installed.error}</p> : null}
+        {installed.data?.targets.length === 0 ? (
+          <p className="text-muted-foreground">No T3-installed copies in this scope.</p>
+        ) : null}
+        {installed.data?.targets.map((target) => (
+          <div
+            key={`${target.id}:${target.key}`}
+            className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border/50 p-3"
+          >
+            <span>
+              <strong>{target.key}</strong> · {target.path} · {target.status}
+            </span>
+            {target.status === "owned" && target.key ? (
+              <Button
+                size="xs"
+                variant="ghost"
+                onClick={() =>
+                  void change({
+                    environmentId,
+                    input: {
+                      providerInstanceId: providerId,
+                      ...(projectId ? { projectId } : {}),
+                      key: target.key!,
+                      target: target.id,
+                      operation: "uninstall",
+                    },
+                  }).then(installed.refresh)
+                }
+              >
+                Uninstall
+              </Button>
+            ) : null}
+            {target.detail ? <span className="text-destructive">{target.detail}</span> : null}
+          </div>
+        ))}
+      </div>
+    </SettingsSection>
   );
 }
 
@@ -255,6 +461,11 @@ function ManagedSkillEditor({
           </Button>
         ) : null}
       </div>
+      <SkillInstallControls
+        entry={entry}
+        environmentId={environmentId}
+        {...(projectId ? { projectId } : {})}
+      />
       {historyState.data?.entries.length ? (
         <div className="grid gap-2 border-t border-border/50 pt-4">
           <h3 className="text-xs font-medium text-muted-foreground">Previous versions</h3>
@@ -501,6 +712,12 @@ export function SkillsSettings() {
           )}
         </div>
       </SettingsSection>
+
+      <InstalledCopies
+        environmentId={environmentId}
+        {...(projectId ? { projectId } : {})}
+        providerIds={catalog.data?.installProviderInstances ?? []}
+      />
 
       <SettingsSection title="Create a managed skill" icon={<PlusIcon className="size-4" />}>
         <div className="grid gap-3 p-4">

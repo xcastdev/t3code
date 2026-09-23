@@ -61,6 +61,22 @@ it.effect("skills RPC scope rejects a thread and project mismatch", () =>
   }),
 );
 
+it.effect("skills RPC scope rejects an unknown project for install requests", () =>
+  Effect.gen(function* () {
+    const result = yield* resolveAuthoritativeSkillScope(
+      {
+        getThreadShellById: () => Effect.succeed(Option.none()),
+        getProjectShellById: () => Effect.succeed(Option.none()),
+      },
+      {
+        projectId: ProjectId.make("missing-project"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+      },
+    ).pipe(Effect.flip);
+    assert.strictEqual(result.code, "project_not_found");
+  }),
+);
+
 it.effect("skills RPC scope rejects a provider different from the thread session", () =>
   Effect.gen(function* () {
     const result = yield* resolveAuthoritativeSkillScope(

@@ -13,6 +13,15 @@ export interface ComposerTrigger {
   rangeEnd: number;
 }
 
+export function parseComposerHashQuery(query: string): {
+  kind: "all" | "issue" | "pull-request";
+  search: string;
+} {
+  if (query.startsWith("iss:")) return { kind: "issue", search: query.slice(4) };
+  if (query.startsWith("pr:")) return { kind: "pull-request", search: query.slice(3) };
+  return { kind: "all", search: query };
+}
+
 function composerFileLinkBasename(path: string): string {
   const separatorIndex = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
   return separatorIndex >= 0 ? path.slice(separatorIndex + 1) : path;
@@ -46,7 +55,7 @@ function isWhitespace(char: string): boolean {
 }
 
 /**
- * Detect an active trigger (@path, $skill, /command) at the cursor position.
+ * Detect an active trigger (@path, !skill, /command) at the cursor position.
  *
  * Accepts an optional `isWhitespaceChar` override so callers with inline
  * placeholder characters (e.g. terminal context chips on web) can treat
@@ -100,7 +109,7 @@ export function detectComposerTrigger(
   const tokenStart = tokenIdx + 1;
 
   const token = text.slice(tokenStart, cursor);
-  const pullRequestMatch = /^#([\p{L}\p{N}][\p{L}\p{N}_-]*)?$/u.exec(token);
+  const pullRequestMatch = /^#((?:iss:|pr:)?[\p{L}\p{N}_-]*)$/u.exec(token);
   if (pullRequestMatch)
     return {
       kind: "pull-request",
@@ -108,7 +117,7 @@ export function detectComposerTrigger(
       rangeStart: tokenStart,
       rangeEnd: cursor,
     };
-  if (token.startsWith("$")) {
+  if (token.startsWith("!")) {
     return {
       kind: "skill",
       query: token.slice(1),
@@ -139,3 +148,4 @@ export function replaceTextRange(
   const nextText = `${text.slice(0, safeStart)}${replacement}${text.slice(safeEnd)}`;
   return { text: nextText, cursor: safeStart + replacement.length };
 }
+export { findRawNativeSkillMention } from "./composerNativeSkillMention.ts";

@@ -133,6 +133,10 @@ import {
   SkillCatalogListResult,
   SkillContentGetInput,
   SkillContentGetResult,
+  SkillDeploymentChangeInput,
+  SkillDeploymentChangeResult,
+  SkillDeploymentListInput,
+  SkillDeploymentListResult,
   SkillGlobalCreateInput,
   SkillGlobalCreateResult,
   SkillGlobalDeleteInput,
@@ -164,6 +168,8 @@ import {
   SkillSessionSetEnabledResult,
 } from "./skills.ts";
 import {
+  IssueSearchInput,
+  IssueSearchResult,
   PullRequestActionInput,
   PullRequestActivity,
   PullRequestCommentInput,
@@ -513,6 +519,8 @@ export const WS_METHODS = {
   skillsHistoryList: "skills.history.list",
   skillsNativeContentGet: "skills.native.content.get",
   skillsApplicationGet: "skills.application.get",
+  skillsDeploymentList: "skills.deployment.list",
+  skillsDeploymentChange: "skills.deployment.change",
   skillsGlobalCreate: "skills.global.create",
   skillsGlobalUpdate: "skills.global.update",
   skillsGlobalDelete: "skills.global.delete",
@@ -555,6 +563,7 @@ export const WS_METHODS = {
 
   // Pull request methods
   pullRequestsList: "pullRequests.list",
+  issuesSearch: "issues.search",
   pullRequestsListStats: "pullRequests.listStats",
   pullRequestsSummary: "pullRequests.summary",
   pullRequestsRouting: "pullRequests.routing",
@@ -670,6 +679,16 @@ export const WsSkillsNativeContentGetRpc = Rpc.make(WS_METHODS.skillsNativeConte
 export const WsSkillsApplicationGetRpc = Rpc.make(WS_METHODS.skillsApplicationGet, {
   payload: SkillApplicationGetInput,
   success: SkillApplicationGetResult,
+  error: skillRpcError,
+});
+export const WsSkillsDeploymentListRpc = Rpc.make(WS_METHODS.skillsDeploymentList, {
+  payload: SkillDeploymentListInput,
+  success: SkillDeploymentListResult,
+  error: skillRpcError,
+});
+export const WsSkillsDeploymentChangeRpc = Rpc.make(WS_METHODS.skillsDeploymentChange, {
+  payload: SkillDeploymentChangeInput,
+  success: SkillDeploymentChangeResult,
   error: skillRpcError,
 });
 export const WsSkillsGlobalCreateRpc = Rpc.make(WS_METHODS.skillsGlobalCreate, {
@@ -965,6 +984,12 @@ const PullRequestRpcError = Schema.Union([
 const WsPullRequestsListRpc = Rpc.make(WS_METHODS.pullRequestsList, {
   payload: PullRequestListInput,
   success: PullRequestListResult,
+  error: PullRequestRpcError,
+});
+
+const WsIssuesSearchRpc = Rpc.make(WS_METHODS.issuesSearch, {
+  payload: IssueSearchInput,
+  success: IssueSearchResult,
   error: PullRequestRpcError,
 });
 
@@ -1893,6 +1918,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsSkillsHistoryListRpc,
   WsSkillsNativeContentGetRpc,
   WsSkillsApplicationGetRpc,
+  WsSkillsDeploymentListRpc,
+  WsSkillsDeploymentChangeRpc,
   WsSkillsGlobalCreateRpc,
   WsSkillsGlobalUpdateRpc,
   WsSkillsGlobalDeleteRpc,
@@ -1941,6 +1968,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsCloudGetRelayClientStatusRpc,
   WsCloudInstallRelayClientRpc,
   WsPullRequestsListRpc,
+  WsIssuesSearchRpc,
   WsPullRequestsListStatsRpc,
   WsPullRequestsSummaryRpc,
   WsPullRequestsRoutingRpc,

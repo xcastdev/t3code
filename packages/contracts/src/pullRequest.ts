@@ -519,6 +519,25 @@ export const PullRequestListEntry = Schema.Struct({
 });
 export type PullRequestListEntry = typeof PullRequestListEntry.Type;
 
+export const IssueSearchInput = Schema.Struct({
+  projectId: ProjectId,
+  query: Schema.String.check(Schema.isMaxLength(120)),
+});
+export type IssueSearchInput = typeof IssueSearchInput.Type;
+
+export const IssueSearchEntry = Schema.Struct({
+  number: PositiveInt,
+  title: TrimmedNonEmptyString,
+  url: TrimmedNonEmptyString,
+  state: Schema.Literals(["open", "closed"]),
+});
+export type IssueSearchEntry = typeof IssueSearchEntry.Type;
+
+export const IssueSearchResult = Schema.Struct({
+  entries: Schema.Array(IssueSearchEntry),
+});
+export type IssueSearchResult = typeof IssueSearchResult.Type;
+
 /**
  * Where each repository a listing already reached carries on from, keyed `"<host> <repository>"`
  * — which is how a listing tells two repositories apart, since the same `owner/repo` exists on
