@@ -20,6 +20,10 @@ fail, check the URL, credentials, and OpenCode version, then refresh provider st
 After a lost connection, send another prompt to reconnect to the same OpenCode
 session.
 
+**Fork files too** creates a new Git worktree and moves the forked OpenCode
+session into it. The OpenCode server must support session moves; if it does not,
+T3 cancels the fork instead of letting the agent work in the source checkout.
+
 ## Commands and skills follow the workspace
 
 OpenCode discovers commands and skills for the current project checkout. When you

@@ -90,9 +90,18 @@ leave workspace files as they are, or **Revert files too** to restore them as we
 The selected prompt and its attachments return to the composer for editing and
 resending. Any unsent draft stays above the restored prompt.
 
-This removes the selected message and later conversation from the active thread
-and provider history. It does not undo external actions or separate provider
-memory. The action is available only when the provider supports rewind.
+This removes the selected message and later conversation from the active thread.
+Open **History** in the thread on web, desktop, or mobile to inspect the archived
+path and restore it later.
+Restoring replaces the current thread history and files, while saving the path
+you leave as another archive. Reverting does not undo external actions or
+separate provider memory. The action is available only when the provider
+supports rewind.
+
+Choose a checkpoint in **History** to fork a new thread from it.
+**Fork and keep files** uses the current workspace. **Fork files too** creates
+a separate worktree at that checkpoint, leaving the source thread's files in
+place.
 
 ## Prompt stash
 

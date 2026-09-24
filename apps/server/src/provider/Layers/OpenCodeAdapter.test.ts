@@ -106,6 +106,14 @@ const runtimeMock = {
     messages: [] as MessageEntry[],
     forkMessagesBySession: new Map<string, MessageEntry[]>(),
     forkPreservesBoundary: true,
+    forkDirectoryOverride: null as string | null,
+    moveSessionStatus: 204,
+    moveSessionLeavesDirectory: false,
+    moveSessionRequests: [] as Array<{
+      sessionID: string;
+      directory: string;
+      moveChanges: boolean;
+    }>,
     subscribedEvents: [] as Array<unknown | Promise<unknown>>,
     eventSubscribeObserved: null as (() => void) | null,
     eventStreamError: null as ((cause: unknown) => void) | null,
@@ -178,6 +186,10 @@ const runtimeMock = {
     this.state.messages = [];
     this.state.forkMessagesBySession.clear();
     this.state.forkPreservesBoundary = true;
+    this.state.forkDirectoryOverride = null;
+    this.state.moveSessionStatus = 204;
+    this.state.moveSessionLeavesDirectory = false;
+    this.state.moveSessionRequests.length = 0;
     this.state.subscribedEvents = [];
     this.state.eventSubscribeObserved = null;
     this.state.eventStreamError = null;
@@ -341,11 +353,12 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
                 })),
             );
           }
-          if (directory) {
-            runtimeMock.state.sessionDirectoryById.set(forkedId, directory);
+          const forkDirectory = runtimeMock.state.forkDirectoryOverride ?? directory;
+          if (forkDirectory) {
+            runtimeMock.state.sessionDirectoryById.set(forkedId, forkDirectory);
           }
           return {
-            data: { id: forkedId, ...(directory ? { directory } : {}) },
+            data: { id: forkedId, ...(forkDirectory ? { directory: forkDirectory } : {}) },
           };
         },
         abort: async ({ sessionID }: { sessionID: string }, options?: { signal?: AbortSignal }) => {
@@ -665,7 +678,43 @@ const externalOpenCodeAdapterTestSettings = Schema.decodeSync(OpenCodeSettings)(
 
 const OpenCodeAdapterTestLayer = Layer.effect(
   OpenCodeAdapter,
-  makeOpenCodeAdapter(openCodeAdapterTestSettings),
+  makeOpenCodeAdapter(openCodeAdapterTestSettings, {
+    moveSessionFetch: Object.assign(
+      async (url: string | URL | Request, init?: RequestInit) => {
+        NodeAssert.equal(
+          String(url),
+          "http://127.0.0.1:9999/experimental/control-plane/move-session",
+        );
+        NodeAssert.equal(
+          new Headers(init?.headers).get("Authorization"),
+          `Basic ${Buffer.from("opencode:secret-password").toString("base64")}`,
+        );
+        NodeAssert.ok(init?.body instanceof Uint8Array);
+        const body = Schema.decodeUnknownSync(
+          Schema.fromJsonString(
+            Schema.Struct({
+              sessionID: Schema.String,
+              destination: Schema.Struct({ directory: Schema.String }),
+              moveChanges: Schema.Boolean,
+            }),
+          ),
+        )(new TextDecoder().decode(init.body));
+        runtimeMock.state.moveSessionRequests.push({
+          sessionID: body.sessionID,
+          directory: body.destination.directory,
+          moveChanges: body.moveChanges,
+        });
+        if (
+          runtimeMock.state.moveSessionStatus === 204 &&
+          !runtimeMock.state.moveSessionLeavesDirectory
+        ) {
+          runtimeMock.state.sessionDirectoryById.set(body.sessionID, body.destination.directory);
+        }
+        return new Response(null, { status: runtimeMock.state.moveSessionStatus });
+      },
+      { preconnect: () => undefined },
+    ),
+  }),
 ).pipe(
   Layer.provideMerge(Layer.succeed(OpenCodeRuntime, OpenCodeRuntimeTestDouble)),
   Layer.provideMerge(ServerConfig.layerTest(process.cwd(), process.cwd())),
@@ -1676,7 +1725,10 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
         // A cwd change must not mint an empty session: the adapter forks the
         // persisted session into the requested cwd, carrying history forward.
-        NodeAssert.deepEqual(runtimeMock.state.sessionGetIds, ["ses_otherdir"]);
+        NodeAssert.deepEqual(runtimeMock.state.sessionGetIds, [
+          "ses_otherdir",
+          "ses_otherdir_fork",
+        ]);
         NodeAssert.deepEqual(runtimeMock.state.sessionCreateUrls, []);
         NodeAssert.equal(runtimeMock.state.forkCalls.length, 1);
         NodeAssert.equal(runtimeMock.state.forkCalls[0]?.sessionID, "ses_otherdir");
@@ -1692,6 +1744,82 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
 
         yield* adapter.stopSession(threadId);
       }),
+  );
+
+  it.effect("rejects a resumed OpenCode fork that remains in the source checkout", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-stale-fork-directory");
+      runtimeMock.state.sessionDirectoryById.set("ses_source", "/some/other/worktree");
+      runtimeMock.state.forkDirectoryOverride = "/some/other/worktree";
+      runtimeMock.state.moveSessionStatus = 404;
+
+      const error = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+          resumeCursor: { schemaVersion: 1, sessionId: "ses_source" },
+        })
+        .pipe(Effect.flip);
+
+      NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+      NodeAssert.match(error.issue, /fork.*source checkout/i);
+      NodeAssert.equal(runtimeMock.state.sessionUpdateCalls.length, 0);
+    }),
+  );
+
+  it.effect("moves a forked OpenCode session into the destination worktree", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-moved-fork");
+      runtimeMock.state.sessionDirectoryById.set("ses_source", "/some/other/worktree");
+      runtimeMock.state.forkDirectoryOverride = "/some/other/worktree";
+
+      const session = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: { schemaVersion: 1, sessionId: "ses_source" },
+      });
+      NodeAssert.deepEqual(runtimeMock.state.moveSessionRequests, [
+        {
+          sessionID: "ses_source_fork",
+          directory: process.cwd(),
+          moveChanges: false,
+        },
+      ]);
+
+      NodeAssert.deepEqual(session.resumeCursor, {
+        schemaVersion: 1,
+        sessionId: "ses_source_fork",
+      });
+      NodeAssert.equal(runtimeMock.state.sessionUpdateCalls[0]?.sessionID, "ses_source_fork");
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rejects a move response that leaves the OpenCode session in its source checkout", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-move-ignored");
+      runtimeMock.state.sessionDirectoryById.set("ses_source", "/some/other/worktree");
+      runtimeMock.state.forkDirectoryOverride = "/some/other/worktree";
+      runtimeMock.state.moveSessionLeavesDirectory = true;
+
+      const error = yield* adapter
+        .startSession({
+          provider: ProviderDriverKind.make("opencode"),
+          threadId,
+          runtimeMode: "full-access",
+          resumeCursor: { schemaVersion: 1, sessionId: "ses_source" },
+        })
+        .pipe(Effect.flip);
+
+      NodeAssert.equal(error._tag, "ProviderAdapterValidationError");
+      NodeAssert.match(error.issue, /fork.*source checkout/i);
+      NodeAssert.equal(runtimeMock.state.sessionUpdateCalls.length, 0);
+    }),
   );
 
   it.effect("reuses the resumed session when the stored directory differs only lexically", () =>
@@ -6867,6 +6995,41 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.deepEqual(runtimeMock.state.promptCalls, []);
     }).pipe(Effect.provide(adapterLayer));
   });
+
+  it.effect("forks a full OpenCode conversation without replacing the source session", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-history-fork");
+      const source = yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+      runtimeMock.state.messages = [
+        { info: { id: "user-1", role: "user" }, parts: [] },
+        { info: { id: "assistant-1", role: "assistant" }, parts: [] },
+      ];
+      const forked = yield* adapter.forkThread!(threadId);
+      const sourceId = (source.resumeCursor as { sessionId: string }).sessionId;
+      NodeAssert.deepEqual(runtimeMock.state.forkCalls.at(-1), {
+        sessionID: sourceId,
+        directory: process.cwd(),
+      });
+      NodeAssert.deepEqual(forked, {
+        schemaVersion: 1,
+        sessionId: `${sourceId}_fork`,
+      });
+      NodeAssert.deepEqual(
+        (yield* adapter.listSessions()).find((session) => session.threadId === threadId)
+          ?.resumeCursor,
+        source.resumeCursor,
+      );
+      NodeAssert.deepEqual(
+        runtimeMock.state.messages.map((message) => message.info.id),
+        ["user-1", "assistant-1"],
+      );
+    }),
+  );
 
   it.effect("forks before the removed user prompt and resumes only retained history", () =>
     Effect.gen(function* () {

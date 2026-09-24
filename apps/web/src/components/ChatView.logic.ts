@@ -1180,6 +1180,38 @@ export async function waitForStartedServerThread(
   });
 }
 
+export async function waitForCreatedServerThread(
+  threadRef: ScopedThreadRef,
+  checkpointTurnCount: number,
+  timeoutMs = 120_000,
+): Promise<boolean> {
+  const atom = environmentThreadDetails.detailAtom(threadRef);
+  const hasCheckpoint = (
+    thread: { checkpoints: ReadonlyArray<{ checkpointTurnCount: number }> } | null | undefined,
+  ) =>
+    thread?.checkpoints.some(
+      (checkpoint) => checkpoint.checkpointTurnCount === checkpointTurnCount,
+    ) ?? false;
+  if (hasCheckpoint(appAtomRegistry.get(atom))) return true;
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    let timeout: ReturnType<typeof globalThis.setTimeout> | undefined;
+    let unsubscribe = () => {};
+    const finish = (created: boolean) => {
+      if (settled) return;
+      settled = true;
+      if (timeout) globalThis.clearTimeout(timeout);
+      unsubscribe();
+      resolve(created);
+    };
+    unsubscribe = appAtomRegistry.subscribe(atom, (thread) => {
+      if (hasCheckpoint(thread)) finish(true);
+    });
+    if (hasCheckpoint(appAtomRegistry.get(atom))) finish(true);
+    else timeout = globalThis.setTimeout(() => finish(false), timeoutMs);
+  });
+}
+
 export async function waitForRevertedMessage(
   threadRef: ScopedThreadRef,
   messageId: MessageId,

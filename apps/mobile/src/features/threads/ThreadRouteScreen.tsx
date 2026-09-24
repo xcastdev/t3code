@@ -62,6 +62,7 @@ import {
 } from "../terminal/terminalLaunchContext";
 import { terminalDebugLog } from "../terminal/terminalDebugLog";
 import { ThreadDetailScreen, type ThreadDetailScreenProps } from "./ThreadDetailScreen";
+import { ThreadHistoryDialog } from "./ThreadHistoryDialog";
 import {
   ThreadGitControls,
   useThreadGitCenterHeaderItems,
@@ -855,6 +856,15 @@ function ThreadRouteContent(
             : undefined
         }
       >
+        <ThreadHistoryDialog
+          environmentId={selectedThread.environmentId}
+          threadId={selectedThread.id}
+          currentThread={selectedThreadDetail}
+          running={
+            selectedThread.session?.status === "running" ||
+            selectedThread.session?.status === "starting"
+          }
+        />
         <ThreadDetailScreen
           selectedThread={selectedThreadWithDraftSettings ?? selectedThread}
           turns={selectedThreadDetail?.turns}

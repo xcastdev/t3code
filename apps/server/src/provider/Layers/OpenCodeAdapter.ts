@@ -30,6 +30,7 @@ import * as Schema from "effect/Schema";
 import * as Scope from "effect/Scope";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import { FetchHttpClient, HttpClient, HttpClientRequest } from "effect/unstable/http";
 import type { OpencodeClient, Part, PermissionRequest, QuestionRequest } from "@opencode-ai/sdk/v2";
 import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 
@@ -499,6 +500,7 @@ export interface OpenCodeAdapterLiveOptions {
   readonly environment?: NodeJS.ProcessEnv;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
+  readonly moveSessionFetch?: typeof globalThis.fetch;
 }
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -3542,9 +3544,8 @@ export function makeOpenCodeAdapter(
                 }
 
                 // The session lives under a different cwd (e.g. the thread
-                // moved into a git worktree). Fork it into the requested
-                // directory instead of minting an empty one — the fork carries
-                // the full history, so the follow-up keeps its context (#3604).
+                // moved into a git worktree). Fork its full history, then
+                // ensure the new session runs in the requested directory (#3604).
                 if (adopted) {
                   yield* Effect.logInfo(
                     `OpenCode session '${adopted.id}' was created under a different working directory; forking into '${directory}' to preserve conversation history.`,
@@ -3559,13 +3560,77 @@ export function makeOpenCodeAdapter(
                       detail: "OpenCode session.fork returned no session payload.",
                     });
                   }
+                  if (!forked.directory || !(yield* sameDirectory(forked.directory, directory))) {
+                    // OpenCode's fork endpoint may retain the source directory even
+                    // when its directory query points at a worktree. Move the new
+                    // session without moving files, then verify its actual binding.
+                    const moveRequest = HttpClientRequest.post(
+                      `${server.url.replace(/\/+$/, "")}/experimental/control-plane/move-session`,
+                    ).pipe(
+                      HttpClientRequest.bodyJson({
+                        sessionID: forked.id,
+                        destination: { directory },
+                        moveChanges: false,
+                      }),
+                      Effect.map((request) =>
+                        server.serverPassword
+                          ? HttpClientRequest.setHeader(
+                              request,
+                              "Authorization",
+                              `Basic ${Buffer.from(`opencode:${server.serverPassword}`, "utf8").toString("base64")}`,
+                            )
+                          : request,
+                      ),
+                      Effect.flatMap((request) =>
+                        Effect.flatMap(HttpClient.HttpClient, (client) => client.execute(request)),
+                      ),
+                      Effect.mapError(
+                        (cause) =>
+                          new ProviderAdapterRequestError({
+                            provider: PROVIDER,
+                            method: "experimental.controlPlane.moveSession",
+                            detail:
+                              "OpenCode could not move the forked session into the new worktree.",
+                            cause,
+                          }),
+                      ),
+                      Effect.provide(FetchHttpClient.layer),
+                    );
+                    const moveResponse = yield* options?.moveSessionFetch
+                      ? moveRequest.pipe(
+                          Effect.provideService(FetchHttpClient.Fetch, options.moveSessionFetch),
+                        )
+                      : moveRequest;
+                    if (moveResponse.status !== 204) {
+                      return yield* new ProviderAdapterValidationError({
+                        provider: PROVIDER,
+                        operation: "startSession",
+                        issue:
+                          "OpenCode fork stayed in the source checkout, and this OpenCode server could not move it to the new worktree.",
+                      });
+                    }
+                  }
+                  const moved = yield* runOpenCodeSdk("session.get", (signal) =>
+                    client.session.get({ sessionID: forked.id }, { signal }),
+                  ).pipe(Effect.mapError(toRequestError));
+                  if (
+                    !moved.data?.directory ||
+                    !(yield* sameDirectory(moved.data.directory, directory))
+                  ) {
+                    return yield* new ProviderAdapterValidationError({
+                      provider: PROVIDER,
+                      operation: "startSession",
+                      issue:
+                        "OpenCode fork stayed in the source checkout; it cannot safely continue in the new worktree.",
+                    });
+                  }
                   yield* runOpenCodeSdk("session.update", () =>
                     client.session.update({
                       sessionID: forked.id,
                       permission: buildOpenCodePermissionRules(input.runtimeMode),
                     }),
                   );
-                  return { openCodeSession: forked, created: true };
+                  return { openCodeSession: moved.data, created: true };
                 }
 
                 if (resumeSessionId) {
@@ -3601,7 +3666,10 @@ export function makeOpenCodeAdapter(
           if (Exit.isFailure(startedExit)) {
             yield* Scope.close(sessionScope, Exit.void).pipe(Effect.ignore);
             yield* cleanupExternalMcpForThread(input.threadId);
-            return yield* toProcessError(input.threadId, Cause.squash(startedExit.cause));
+            const cause = Cause.squash(startedExit.cause);
+            return yield* Schema.is(ProviderAdapterValidationError)(cause)
+              ? cause
+              : toProcessError(input.threadId, cause);
           }
           return startedExit.value;
         });
@@ -4615,6 +4683,33 @@ export function makeOpenCodeAdapter(
       },
     );
 
+    const forkThread = Effect.fn("forkThread")(function* (threadId: ThreadId) {
+      const context = yield* ensureSessionContext(sessions, threadId);
+      const forked = yield* runOpenCodeSdk("session.fork", () =>
+        context.client.session.fork({
+          sessionID: context.openCodeSessionId,
+          directory: context.directory,
+        }),
+      ).pipe(Effect.mapError(toRequestError));
+      if (!forked.data) {
+        return yield* toRequestError(
+          new OpenCodeRuntimeError({
+            operation: "session.fork",
+            detail: "OpenCode session.fork returned no session payload.",
+          }),
+        );
+      }
+      if (forked.data.id === context.openCodeSessionId) {
+        return yield* toRequestError(
+          new OpenCodeRuntimeError({
+            operation: "session.fork",
+            detail: "OpenCode session.fork returned the source session id.",
+          }),
+        );
+      }
+      return { schemaVersion: OPENCODE_RESUME_VERSION, sessionId: forked.data.id };
+    });
+
     const stopAll: OpenCodeAdapterShape["stopAll"] = () => closeAllSessions;
 
     return {
@@ -4652,6 +4747,7 @@ export function makeOpenCodeAdapter(
       hasSession,
       readThread,
       rollbackThread,
+      forkThread,
       cleanupSessionMcp: cleanupExternalMcpForThread,
       stopAll,
       get streamEvents() {

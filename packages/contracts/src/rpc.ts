@@ -2039,6 +2039,24 @@ const WsOrchestrationGetArchivedShellSnapshotRpc = Rpc.make(
   },
 );
 
+export const WsOrchestrationListHistoryArchivesRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.listHistoryArchives,
+  {
+    payload: OrchestrationRpcSchemas.listHistoryArchives.input,
+    success: OrchestrationRpcSchemas.listHistoryArchives.output,
+    error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentAuthorizationError]),
+  },
+);
+
+export const WsOrchestrationGetHistoryArchiveRpc = Rpc.make(
+  ORCHESTRATION_WS_METHODS.getHistoryArchive,
+  {
+    payload: OrchestrationRpcSchemas.getHistoryArchive.input,
+    success: OrchestrationRpcSchemas.getHistoryArchive.output,
+    error: Schema.Union([OrchestrationGetSnapshotError, EnvironmentAuthorizationError]),
+  },
+);
+
 const WsOrchestrationSubscribeShellRpc = Rpc.make(ORCHESTRATION_WS_METHODS.subscribeShell, {
   payload: OrchestrationRpcSchemas.subscribeShell.input,
   success: OrchestrationRpcSchemas.subscribeShell.output,
@@ -2341,6 +2359,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationGetFullThreadDiffRpc,
   WsOrchestrationSearchThreadsRpc,
   WsOrchestrationGetArchivedShellSnapshotRpc,
+  WsOrchestrationListHistoryArchivesRpc,
+  WsOrchestrationGetHistoryArchiveRpc,
   WsOrchestrationSubscribeShellRpc,
   WsOrchestrationSubscribeThreadRpc,
 );

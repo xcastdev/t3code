@@ -14,18 +14,23 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Ref from "effect/Ref";
 import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   ProviderService,
   type ProviderServiceShape,
 } from "../../provider/Services/ProviderService.ts";
+import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
+import { checkpointRefForArchivedTurn } from "../../checkpointing/Utils.ts";
+import { ThreadHistoryArchiveRepository } from "../../persistence/ThreadHistoryArchive.ts";
 import * as TerminalManager from "../../terminal/Manager.ts";
 import {
   OrchestrationEngineService,
   type OrchestrationEngineShape,
 } from "../Services/OrchestrationEngine.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
+import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
   logCleanupCauseUnlessInterrupted,
   ThreadDeletionReactorLive,
@@ -109,6 +114,13 @@ describe("ThreadDeletionReactor drain", () => {
         close: () => Effect.void,
       } as unknown as TerminalManager.TerminalManager["Service"];
       const layer = ThreadDeletionReactorLive.pipe(
+        Layer.provide(
+          Layer.mock(ThreadHistoryArchiveRepository)({
+            listByThread: () => Effect.succeed([]),
+          }),
+        ),
+        Layer.provide(Layer.mock(CheckpointStore.CheckpointStore)({})),
+        Layer.provide(Layer.mock(ProjectionSnapshotQuery)({})),
         Layer.provide(Layer.succeed(ProviderService, providerService)),
         Layer.provide(Layer.succeed(TerminalManager.TerminalManager, terminalManager)),
         Layer.provide(Layer.succeed(OrchestrationEngineService, engine)),
@@ -134,6 +146,95 @@ describe("ThreadDeletionReactor drain", () => {
           expect(stops).toEqual([1, 2]);
         }),
       ).pipe(Effect.provide(layer));
+    }),
+  );
+
+  effectIt.effect("removes archived checkpoint refs and archive records on thread deletion", () =>
+    Effect.gen(function* () {
+      const deletedRefs: string[][] = [];
+      const deletedArchives: string[] = [];
+      const archiveId = "archive-1";
+      const snapshotJson = yield* Schema.encodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(
+        {
+          id: threadId,
+          projectId: "project-1",
+          title: "Deleted thread",
+          modelSelection: { instanceId: "codex", model: "gpt-5-codex" },
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: "/tmp/t3-deletion-test",
+          latestTurn: null,
+          createdAt: now,
+          updatedAt: now,
+          deletedAt: null,
+          messages: [],
+          activities: [],
+          checkpoints: [],
+          session: null,
+        },
+      );
+      const engine = {
+        latestSequence: Effect.succeed(0),
+        streamDomainEvents: Stream.make(deletedEvent(1)),
+      } as unknown as OrchestrationEngineShape;
+      const layer = ThreadDeletionReactorLive.pipe(
+        Layer.provide(
+          Layer.mock(ThreadHistoryArchiveRepository)({
+            listByThread: () =>
+              Effect.succeed([{ archiveId, threadId, createdAt: now, turnCount: 0 }]),
+            get: () =>
+              Effect.succeed({
+                archiveId,
+                threadId,
+                createdAt: now,
+                turnCount: 0,
+                snapshotJson,
+                providerBindingJson: "null",
+                projectionRowsJson: "{}",
+              }),
+            deleteByThread: (id) =>
+              Effect.sync(() => {
+                deletedArchives.push(id);
+              }),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(CheckpointStore.CheckpointStore)({
+            deleteCheckpointRefs: ({ checkpointRefs }) =>
+              Effect.sync(() => {
+                deletedRefs.push([...checkpointRefs]);
+              }),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(ProjectionSnapshotQuery)({
+            getSnapshot: () =>
+              Effect.succeed({ snapshotSequence: 0, projects: [], threads: [], updatedAt: now }),
+          }),
+        ),
+        Layer.provide(
+          Layer.succeed(ProviderService, {
+            stopSession: () => Effect.void,
+          } as unknown as ProviderServiceShape),
+        ),
+        Layer.provide(
+          Layer.succeed(TerminalManager.TerminalManager, {
+            close: () => Effect.void,
+          } as unknown as TerminalManager.TerminalManager["Service"]),
+        ),
+        Layer.provide(Layer.succeed(OrchestrationEngineService, engine)),
+      );
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const reactor = yield* ThreadDeletionReactor;
+          yield* reactor.start();
+          yield* reactor.drainThrough(1);
+        }),
+      ).pipe(Effect.provide(layer));
+
+      expect(deletedRefs).toEqual([[checkpointRefForArchivedTurn(threadId, archiveId, 0)]]);
+      expect(deletedArchives).toEqual([threadId]);
     }),
   );
 });

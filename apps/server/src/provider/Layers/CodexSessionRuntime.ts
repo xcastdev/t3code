@@ -228,6 +228,9 @@ export interface CodexSessionRuntimeShape {
   readonly compactThread: Effect.Effect<void, CodexSessionRuntimeError>;
   readonly interruptTurn: (turnId?: TurnId) => Effect.Effect<void, CodexSessionRuntimeError>;
   readonly readThread: Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
+  readonly forkThread: (
+    lastTurnId?: TurnId,
+  ) => Effect.Effect<CodexResumeCursor, CodexSessionRuntimeError>;
   readonly rollbackThread: (
     numTurns: number,
   ) => Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
@@ -1332,6 +1335,38 @@ export const readCodexThread = Effect.fn("readCodexThread")(function* (
     cursor = page.nextCursor;
   } while (cursor !== null);
   return { threadId, turns };
+});
+
+export const forkCodexThread = Effect.fn("forkCodexThread")(function* (
+  client: Pick<CodexHistoryClient, "raw">,
+  threadId: string,
+  lastTurnId?: TurnId,
+): Effect.fn.Return<CodexResumeCursor, CodexErrors.CodexAppServerError> {
+  const response = yield* client.raw.request("thread/fork", {
+    threadId,
+    ...(lastTurnId === undefined ? {} : { lastTurnId }),
+  });
+  const metadata = yield* decodeCodexThreadResumeMetadata(response).pipe(
+    Effect.mapError((error) =>
+      CodexErrors.CodexAppServerRequestError.invalidPayload("thread/fork", "decode-payload", error),
+    ),
+  );
+  return { threadId: metadata.thread.id };
+});
+
+export const branchCodexThread = Effect.fn("branchCodexThread")(function* (
+  client: CodexHistoryClient,
+  threadId: string,
+  numTurns: number,
+  startFresh: () => Effect.Effect<CodexResumeCursor, CodexErrors.CodexAppServerError>,
+) {
+  const snapshot = yield* readCodexThread(client, threadId);
+  const retainedTurns = snapshot.turns.slice(0, Math.max(0, snapshot.turns.length - numTurns));
+  const cursor =
+    retainedTurns.length > 0
+      ? yield* forkCodexThread(client, threadId, retainedTurns.at(-1)!.id)
+      : yield* startFresh();
+  return { cursor, snapshot: { threadId: cursor.threadId, turns: retainedTurns } };
 });
 
 export const rollbackCodexThread = Effect.fn("rollbackCodexThread")(function* (
@@ -2602,15 +2637,34 @@ export const makeCodexSessionRuntime = (
         const providerThreadId = yield* readProviderThreadId;
         return yield* readCodexThread(client, providerThreadId);
       }),
+      forkThread: (lastTurnId) =>
+        Effect.gen(function* () {
+          const providerThreadId = yield* readProviderThreadId;
+          return yield* forkCodexThread(client, providerThreadId, lastTurnId);
+        }),
       rollbackThread: (numTurns) =>
         Effect.gen(function* () {
           const providerThreadId = yield* readProviderThreadId;
-          const snapshot = yield* rollbackCodexThread(client, providerThreadId, numTurns);
+          const branch = yield* branchCodexThread(client, providerThreadId, numTurns, () =>
+            openCodexThread({
+              client,
+              threadId: options.threadId,
+              runtimeMode: options.runtimeMode,
+              cwd: options.cwd,
+              requestedModel: normalizeCodexModelSlug(options.model),
+              serviceTier: options.serviceTier,
+              resumeThreadId: undefined,
+              ...(options.managedSkills === undefined
+                ? {}
+                : { managedSkills: options.managedSkills, managedSkillClient: client }),
+            }).pipe(Effect.map((opened) => ({ threadId: opened.thread.id }))),
+          );
           yield* updateSession(sessionRef, {
             status: "ready",
             activeTurnId: undefined,
+            resumeCursor: branch.cursor,
           });
-          return snapshot;
+          return branch.snapshot;
         }),
       uploadFeedback: (reason) =>
         Effect.gen(function* () {

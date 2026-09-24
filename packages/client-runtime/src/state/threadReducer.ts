@@ -636,6 +636,23 @@ export function applyThreadDetailEvent(
 
     // ── Revert ──────────────────────────────────────────────────────
     case "thread.reverted": {
+      if (event.payload.restoredSnapshot) {
+        const restored = event.payload.restoredSnapshot;
+        return {
+          kind: "updated",
+          thread: {
+            ...thread,
+            messages: restored.messages,
+            proposedPlans: restored.proposedPlans,
+            activities: restored.activities,
+            checkpoints: restored.checkpoints,
+            turns: restored.turns,
+            partialTurnIds: restored.partialTurnIds,
+            latestTurn: restored.latestTurn,
+            updatedAt: event.occurredAt,
+          },
+        };
+      }
       const checkpoints = pipe(
         thread.checkpoints,
         Arr.filter(

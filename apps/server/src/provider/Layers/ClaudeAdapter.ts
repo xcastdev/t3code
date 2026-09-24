@@ -5373,6 +5373,69 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     },
   );
 
+  const forkThread = Effect.fn("forkThread")(function* (threadId: ThreadId) {
+    const context = yield* requireSession(threadId);
+    const sessionId = context.resumeSessionId;
+    if (!sessionId) {
+      return yield* new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method: "thread/fork",
+        detail: "Claude session id is unavailable.",
+      });
+    }
+    const forkOptions = context.session.cwd ? { dir: context.session.cwd } : {};
+    const fork = yield* Effect.tryPromise({
+      try: async () => {
+        if (options?.forkSession) return options.forkSession(sessionId, forkOptions);
+        if (claudeEnvironment.CLAUDE_CONFIG_DIR === process.env.CLAUDE_CONFIG_DIR) {
+          return forkSession(sessionId, forkOptions);
+        }
+        const argumentsPrefix = (await Effect.runPromise(HostProcessIsExecutable))
+          ? ["__claude-history"]
+          : [
+              await Effect.runPromise(
+                path.fromFileUrl(
+                  new URL(
+                    import.meta.url.endsWith(".ts")
+                      ? "../../claude-history-worker.ts"
+                      : "./claude-history-worker.mjs",
+                    import.meta.url,
+                  ),
+                ),
+              ),
+            ];
+        const result = await Effect.runPromise(
+          spawnAndCollect(
+            process.execPath,
+            ChildProcess.make(
+              process.execPath,
+              [...argumentsPrefix, "forkSession", sessionId, encodeHistoryArgs(forkOptions)],
+              { env: { ...claudeEnvironment, ELECTRON_RUN_AS_NODE: "1" } },
+            ),
+          ).pipe(
+            Effect.timeout("30 seconds"),
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          ),
+        );
+        if (result.code !== 0) throw new Error(result.stderr || "Claude history fork failed.");
+        return decodeHistoryFork(result.stdout);
+      },
+      catch: (cause) => toRequestError(threadId, "thread/fork", cause),
+    });
+    if (fork.sessionId === sessionId) {
+      return yield* new ProviderAdapterRequestError({
+        provider: PROVIDER,
+        method: "thread/fork",
+        detail: "Claude history fork returned the source session id.",
+      });
+    }
+    return {
+      resume: fork.sessionId,
+      turnCount: context.turnStartMessageIds.length,
+      // SDK forks replace message UUIDs, so legacy boundary ids cannot be reused.
+    };
+  });
+
   const respondToRequest: ClaudeAdapterShape["respondToRequest"] = Effect.fn("respondToRequest")(
     function* (threadId, requestId, decision) {
       const context = yield* requireSession(threadId);
@@ -5473,6 +5536,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     interruptTurn,
     readThread,
     rollbackThread,
+    forkThread,
     respondToRequest,
     respondToUserInput,
     stopSession,

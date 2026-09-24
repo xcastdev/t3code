@@ -1,14 +1,22 @@
-import type { OrchestrationEvent } from "@t3tools/contracts";
+import { OrchestrationThread, type OrchestrationEvent } from "@t3tools/contracts";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import * as Schema from "effect/Schema";
 
+import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
+import {
+  checkpointRefForArchivedTurn,
+  resolveThreadWorkspaceCwd,
+} from "../../checkpointing/Utils.ts";
+import { ThreadHistoryArchiveRepository } from "../../persistence/ThreadHistoryArchive.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import * as TerminalManager from "../../terminal/Manager.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
+import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import {
   ThreadDeletionReactor,
   type ThreadDeletionReactorShape,
@@ -16,6 +24,7 @@ import {
 import { forkParked } from "../../serverActivation.ts";
 
 type ThreadDeletedEvent = Extract<OrchestrationEvent, { type: "thread.deleted" }>;
+const decodeArchivedThread = Schema.decodeUnknownEffect(Schema.fromJsonString(OrchestrationThread));
 
 export const logCleanupCauseUnlessInterrupted = <R, E>({
   effect,
@@ -42,6 +51,9 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const providerService = yield* ProviderService;
   const terminalManager = yield* TerminalManager.TerminalManager;
+  const historyArchives = yield* ThreadHistoryArchiveRepository;
+  const checkpointStore = yield* CheckpointStore.CheckpointStore;
+  const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
 
   const stopProviderSession = (threadId: ThreadDeletedEvent["payload"]["threadId"]) =>
     logCleanupCauseUnlessInterrupted({
@@ -63,6 +75,33 @@ const make = Effect.gen(function* () {
     const { threadId } = event.payload;
     yield* stopProviderSession(threadId);
     yield* closeThreadTerminals(threadId);
+    const archives = yield* historyArchives.listByThread(threadId);
+    if (archives.length > 0) {
+      const projects = (yield* projectionSnapshotQuery.getSnapshot()).projects;
+      for (const archive of archives) {
+        const record = yield* historyArchives.get(threadId, archive.archiveId);
+        if (!record) continue;
+        const thread = yield* decodeArchivedThread(record.snapshotJson).pipe(Effect.orDie);
+        const cwd = resolveThreadWorkspaceCwd({ thread, projects });
+        if (!cwd) continue;
+        const checkpointRefs = [
+          checkpointRefForArchivedTurn(threadId, archive.archiveId, 0),
+          ...thread.checkpoints.map((checkpoint) =>
+            checkpointRefForArchivedTurn(
+              threadId,
+              archive.archiveId,
+              checkpoint.checkpointTurnCount,
+            ),
+          ),
+        ];
+        yield* logCleanupCauseUnlessInterrupted({
+          effect: checkpointStore.deleteCheckpointRefs({ cwd, checkpointRefs }),
+          message: "thread deletion cleanup skipped history checkpoint refs",
+          threadId,
+        });
+      }
+      yield* historyArchives.deleteByThread(threadId);
+    }
   });
 
   const processThreadDeletedSafely = (event: ThreadDeletedEvent) =>

@@ -132,6 +132,10 @@ export interface ProviderServiceShape {
     readonly threadId: ThreadId;
     readonly numTurns: number;
   }) => Effect.Effect<void, ProviderServiceError>;
+  readonly forkConversation?: (
+    threadId: ThreadId,
+    options?: { readonly preserveSource?: boolean },
+  ) => Effect.Effect<unknown, ProviderServiceError>;
 
   /**
    * Upload a thread and return the provider's shareable feedback identifier.

@@ -7,6 +7,8 @@ import {
   ThreadId,
   TurnId,
   type OrchestrationEvent,
+  OrchestrationThread,
+  ProviderSession,
   type ProviderRuntimeEvent,
   type VcsStatusLocalResult,
 } from "@t3tools/contracts";
@@ -16,21 +18,28 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import type * as PlatformError from "effect/PlatformError";
 import * as Stream from "effect/Stream";
+import { isDeepStrictEqual } from "node:util";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
 
 import { parseTurnDiffFilesFromNumstat } from "../../checkpointing/Diffs.ts";
 import {
+  checkpointRefForArchivedTurn,
   checkpointRefForThreadTurn,
   resolveThreadWorkspaceCwd,
 } from "../../checkpointing/Utils.ts";
 import * as CheckpointStore from "../../checkpointing/CheckpointStore.ts";
+import { ThreadHistoryArchiveRepository } from "../../persistence/ThreadHistoryArchive.ts";
+import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 import { ProviderService } from "../../provider/Services/ProviderService.ts";
+import { ProviderSessionDirectory } from "../../provider/Services/ProviderSessionDirectory.ts";
 import { CheckpointReactor, type CheckpointReactorShape } from "../Services/CheckpointReactor.ts";
 import { forkParked } from "../../serverActivation.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
+import { retainThreadMessagesAfterRevert } from "../projector.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { RuntimeReceiptBus } from "../Services/RuntimeReceiptBus.ts";
 import type { CheckpointStoreError } from "../../checkpointing/Errors.ts";
@@ -40,6 +49,106 @@ import * as WorkspaceEntries from "../../workspace/WorkspaceEntries.ts";
 import * as PullRequestService from "../../pullRequest/PullRequestService.ts";
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
+const encodeArchiveThread = Schema.encodeUnknownSync(Schema.fromJsonString(OrchestrationThread));
+const encodeArchiveSession = Schema.encodeUnknownSync(
+  Schema.fromJsonString(Schema.NullOr(ProviderSession)),
+);
+const decodeArchiveThread = Schema.decodeUnknownSync(Schema.fromJsonString(OrchestrationThread));
+const decodeArchiveSession = Schema.decodeUnknownSync(
+  Schema.fromJsonString(Schema.NullOr(ProviderSession)),
+);
+
+function forkHistorySnapshot(
+  source: OrchestrationThread,
+  forkThreadId: ThreadId,
+  turnCount: number,
+) {
+  const checkpoints = source.checkpoints.filter(
+    (checkpoint) => checkpoint.checkpointTurnCount <= turnCount,
+  );
+  const retainedTurns = new Set(checkpoints.map((checkpoint) => checkpoint.turnId));
+  const firstRemovedCheckpoint = source.checkpoints
+    .filter((checkpoint) => checkpoint.checkpointTurnCount > turnCount)
+    .toSorted((a, b) => a.checkpointTurnCount - b.checkpointTurnCount)
+    .at(0);
+  const firstRemovedAt =
+    source.turns?.find((turn) => turn.turnId === firstRemovedCheckpoint?.turnId)?.requestedAt ??
+    firstRemovedCheckpoint?.completedAt;
+  const retainUnbound = (createdAt: string) =>
+    firstRemovedAt === undefined || createdAt < firstRemovedAt;
+  const turnId = (value: TurnId) => TurnId.make(`${forkThreadId}:${value}`);
+  const messageId = (value: MessageId) => MessageId.make(`${forkThreadId}:${value}`);
+  const latestCheckpoint = checkpoints.at(-1);
+  return {
+    ...source,
+    id: forkThreadId,
+    session: null,
+    messages: retainThreadMessagesAfterRevert(source.messages, retainedTurns, turnCount).map(
+      (message) => ({
+        ...message,
+        id: messageId(message.id),
+        turnId: message.turnId === null ? null : turnId(message.turnId),
+      }),
+    ),
+    proposedPlans: source.proposedPlans
+      .filter(
+        (plan) =>
+          (plan.turnId === null && retainUnbound(plan.createdAt)) ||
+          retainedTurns.has(plan.turnId!),
+      )
+      .map((plan) => ({
+        ...plan,
+        id: `${forkThreadId}:${plan.id}`,
+        turnId: plan.turnId === null ? null : turnId(plan.turnId),
+      })),
+    activities: source.activities
+      .filter(
+        (activity) =>
+          (activity.turnId === null && retainUnbound(activity.createdAt)) ||
+          retainedTurns.has(activity.turnId!),
+      )
+      .map((activity) => ({
+        ...activity,
+        id: EventId.make(`${forkThreadId}:${activity.id}`),
+        turnId: activity.turnId === null ? null : turnId(activity.turnId),
+      })),
+    checkpoints: checkpoints.map((checkpoint) => ({
+      ...checkpoint,
+      turnId: turnId(checkpoint.turnId),
+      assistantMessageId:
+        checkpoint.assistantMessageId === null ? null : messageId(checkpoint.assistantMessageId),
+      checkpointRef: checkpointRefForThreadTurn(forkThreadId, checkpoint.checkpointTurnCount),
+    })),
+    turns: source.turns
+      ?.filter((turn) => retainedTurns.has(turn.turnId))
+      .map((turn) => ({
+        ...turn,
+        turnId: turnId(turn.turnId),
+        assistantMessageId:
+          turn.assistantMessageId === null ? null : messageId(turn.assistantMessageId),
+      })),
+    partialTurnIds: source.partialTurnIds?.filter((id) => retainedTurns.has(id)).map(turnId),
+    latestTurn: latestCheckpoint
+      ? (() => {
+          const retained = source.turns?.find((turn) => turn.turnId === latestCheckpoint.turnId);
+          return {
+            turnId: turnId(latestCheckpoint.turnId),
+            state:
+              retained?.state ??
+              (latestCheckpoint.status === "error" ? ("error" as const) : ("completed" as const)),
+            requestedAt: retained?.requestedAt ?? latestCheckpoint.completedAt,
+            startedAt: retained?.startedAt ?? latestCheckpoint.completedAt,
+            completedAt: retained?.completedAt ?? latestCheckpoint.completedAt,
+            assistantMessageId: retained?.assistantMessageId
+              ? messageId(retained.assistantMessageId)
+              : latestCheckpoint.assistantMessageId === null
+                ? null
+                : messageId(latestCheckpoint.assistantMessageId),
+          };
+        })()
+      : null,
+  } satisfies OrchestrationThread;
+}
 
 type ReactorInput =
   | {
@@ -84,7 +193,10 @@ const make = Effect.gen(function* () {
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
   const providerService = yield* ProviderService;
+  const providerSessionDirectory = yield* ProviderSessionDirectory;
   const checkpointStore = yield* CheckpointStore.CheckpointStore;
+  const historyArchives = yield* ThreadHistoryArchiveRepository;
+  const gitWorkflow = yield* GitWorkflowService;
   const receiptBus = yield* RuntimeReceiptBus;
   const workspaceEntries = yield* WorkspaceEntries.WorkspaceEntries;
   const vcsStatusBroadcaster = yield* VcsStatusBroadcaster;
@@ -683,6 +795,104 @@ const make = Effect.gen(function* () {
     });
   });
 
+  const archiveCurrentPath = Effect.fn("archiveCurrentPath")(function* (input: {
+    readonly thread: OrchestrationThread;
+    readonly checkpointCwd: string | undefined;
+    readonly now: string;
+  }) {
+    const fullThread = Option.getOrUndefined(
+      yield* projectionSnapshotQuery.getThreadDetailById(input.thread.id),
+    );
+    if (!fullThread) {
+      return yield* Effect.die(new Error(`Cannot archive missing thread ${input.thread.id}`));
+    }
+    const archiveId = yield* randomUUID;
+    const copies: Array<{ from: CheckpointRef; to: CheckpointRef }> = [];
+    const checkpointRefMap: Record<string, string> = {};
+    const archivedCheckpoints = [];
+    for (const checkpoint of fullThread.checkpoints) {
+      const archivedRef = checkpointRefForArchivedTurn(
+        input.thread.id,
+        archiveId,
+        checkpoint.checkpointTurnCount,
+      );
+      const present = input.checkpointCwd
+        ? yield* checkpointStore.hasCheckpointRef({
+            cwd: input.checkpointCwd,
+            checkpointRef: checkpoint.checkpointRef,
+          })
+        : false;
+      if (present) {
+        copies.push({ from: checkpoint.checkpointRef, to: archivedRef });
+        checkpointRefMap[checkpoint.checkpointRef] = archivedRef;
+      }
+      archivedCheckpoints.push({
+        ...checkpoint,
+        checkpointRef: present ? archivedRef : checkpoint.checkpointRef,
+      });
+    }
+    if (input.checkpointCwd) {
+      const baselineRef = checkpointRefForThreadTurn(input.thread.id, 0);
+      if (
+        !copies.some(
+          (entry) => entry.to === checkpointRefForArchivedTurn(input.thread.id, archiveId, 0),
+        ) &&
+        (yield* checkpointStore.hasCheckpointRef({
+          cwd: input.checkpointCwd,
+          checkpointRef: baselineRef,
+        }))
+      ) {
+        const archivedBaselineRef = checkpointRefForArchivedTurn(input.thread.id, archiveId, 0);
+        copies.push({ from: baselineRef, to: archivedBaselineRef });
+        checkpointRefMap[baselineRef] = archivedBaselineRef;
+      }
+      yield* checkpointStore.copyCheckpointRefs({ cwd: input.checkpointCwd, copies });
+    }
+    const liveProviderSession = (yield* providerService.listSessions()).find(
+      (session) => session.threadId === input.thread.id,
+    );
+    const persistedBinding = liveProviderSession
+      ? undefined
+      : Option.getOrUndefined(yield* providerSessionDirectory.getBinding(input.thread.id));
+    const providerSession: ProviderSession | null =
+      liveProviderSession ??
+      (persistedBinding
+        ? {
+            threadId: input.thread.id,
+            provider: persistedBinding.provider,
+            ...(persistedBinding.providerInstanceId
+              ? { providerInstanceId: persistedBinding.providerInstanceId }
+              : {}),
+            status: "closed",
+            runtimeMode: persistedBinding.runtimeMode ?? fullThread.runtimeMode,
+            ...(input.checkpointCwd ? { cwd: input.checkpointCwd } : {}),
+            ...(persistedBinding.resumeCursor != null
+              ? { resumeCursor: persistedBinding.resumeCursor }
+              : {}),
+            createdAt: fullThread.createdAt,
+            updatedAt: input.now,
+          }
+        : null);
+    const projectionRowsJson = yield* historyArchives.captureProjectionRows(
+      input.thread.id,
+      checkpointRefMap,
+    );
+    const currentTurnCount = fullThread.checkpoints.reduce(
+      (maxTurnCount, checkpoint) => Math.max(maxTurnCount, checkpoint.checkpointTurnCount),
+      0,
+    );
+    yield* historyArchives.insert({
+      archiveId,
+      threadId: input.thread.id,
+      createdAt: input.now,
+      turnCount: currentTurnCount,
+      snapshotJson: encodeArchiveThread({ ...fullThread, checkpoints: archivedCheckpoints }),
+      providerBindingJson: encodeArchiveSession(providerSession),
+      projectionRowsJson,
+    });
+    return archiveId;
+  });
+
   const handleRevertRequested = Effect.fn("handleRevertRequested")(function* (
     event: Extract<OrchestrationEvent, { type: "thread.checkpoint-revert-requested" }>,
   ) {
@@ -726,6 +936,11 @@ const make = Effect.gen(function* () {
     }
 
     yield* providerService.assertConversationRollbackSupported(event.payload.threadId);
+
+    const archivedPathId =
+      currentTurnCount > event.payload.turnCount
+        ? yield* archiveCurrentPath({ thread, checkpointCwd, now })
+        : undefined;
 
     if (event.payload.restoreFiles !== false) {
       if (!checkpointCwd) {
@@ -803,6 +1018,7 @@ const make = Effect.gen(function* () {
         commandId: yield* serverCommandId("checkpoint-revert-complete"),
         threadId: event.payload.threadId,
         turnCount: event.payload.turnCount,
+        ...(archivedPathId ? { archivedPathId } : {}),
         createdAt: now,
       })
       .pipe(
@@ -816,6 +1032,446 @@ const make = Effect.gen(function* () {
         ),
         Effect.asVoid,
       );
+  });
+
+  const handleHistoryRestoreRequested = Effect.fn("handleHistoryRestoreRequested")(function* (
+    event: Extract<OrchestrationEvent, { type: "thread.history-restore-requested" }>,
+  ) {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const thread = yield* resolveThreadDetail(event.payload.threadId);
+    if (!thread) return;
+    const runtimeSession = (yield* providerService.listSessions()).find(
+      (session) => session.threadId === thread.id,
+    );
+    if (
+      thread.session?.status === "running" ||
+      thread.session?.status === "starting" ||
+      runtimeSession?.status === "running" ||
+      runtimeSession?.status === "connecting"
+    ) {
+      yield* appendRevertFailureActivity({
+        threadId: thread.id,
+        turnCount: 0,
+        detail: "Stop the running session before restoring archived history.",
+        createdAt: now,
+      });
+      return;
+    }
+    const archive = yield* historyArchives.get(event.payload.threadId, event.payload.archiveId);
+    if (!archive) {
+      yield* appendRevertFailureActivity({
+        threadId: event.payload.threadId,
+        turnCount: 0,
+        detail: "History archive was not found.",
+        createdAt: now,
+      });
+      return;
+    }
+    const archivedThread = decodeArchiveThread(archive.snapshotJson);
+    const archivedSession = decodeArchiveSession(archive.providerBindingJson);
+    if (archivedThread.id !== thread.id || archivedThread.projectId !== thread.projectId) {
+      return yield* Effect.die(
+        new Error("History archive belongs to a different thread or project"),
+      );
+    }
+    if (archive.turnCount > 0 && (!archivedSession || archivedSession.resumeCursor === undefined)) {
+      yield* appendRevertFailureActivity({
+        threadId: thread.id,
+        turnCount: archive.turnCount,
+        detail: "Archived provider conversation is unavailable.",
+        createdAt: now,
+      });
+      return;
+    }
+    const checkpointCwd = yield* resolveCheckpointCwd({
+      threadId: thread.id,
+      thread,
+      projects: yield* resolveThreadProjects(thread.projectId),
+      preferSessionRuntime: true,
+    });
+    const targetRef =
+      archivedThread.checkpoints.find(
+        (checkpoint) => checkpoint.checkpointTurnCount === archive.turnCount,
+      )?.checkpointRef ?? checkpointRefForArchivedTurn(thread.id, archive.archiveId, 0);
+    if (event.payload.restoreFiles) {
+      const available =
+        checkpointCwd &&
+        (yield* checkpointStore.hasCheckpointRef({
+          cwd: checkpointCwd,
+          checkpointRef: targetRef,
+        }));
+      if (!available) {
+        yield* appendRevertFailureActivity({
+          threadId: thread.id,
+          turnCount: archive.turnCount,
+          detail: "Archived filesystem checkpoint is unavailable.",
+          createdAt: now,
+        });
+        return;
+      }
+    }
+    if (checkpointCwd) {
+      for (const checkpoint of archivedThread.checkpoints.filter(
+        (entry) => entry.status === "ready",
+      )) {
+        if (
+          !(yield* checkpointStore.hasCheckpointRef({
+            cwd: checkpointCwd,
+            checkpointRef: checkpoint.checkpointRef,
+          }))
+        ) {
+          yield* appendRevertFailureActivity({
+            threadId: thread.id,
+            turnCount: archive.turnCount,
+            detail: "An archived checkpoint ref is unavailable.",
+            createdAt: now,
+          });
+          return;
+        }
+      }
+    }
+    const archivedPathId = yield* archiveCurrentPath({ thread, checkpointCwd, now });
+    if (event.payload.restoreFiles && checkpointCwd) {
+      yield* checkpointStore.restoreCheckpoint({ cwd: checkpointCwd, checkpointRef: targetRef });
+      yield* workspaceEntries.refresh(checkpointCwd);
+    }
+    const currentSession = (yield* providerService.listSessions()).find(
+      (session) => session.threadId === thread.id,
+    );
+    if (currentSession) yield* providerService.stopSession({ threadId: thread.id });
+    const session = archivedSession ?? currentSession;
+    if (session) {
+      yield* providerService.startSession(thread.id, {
+        threadId: thread.id,
+        provider: session.provider,
+        ...(session.providerInstanceId ? { providerInstanceId: session.providerInstanceId } : {}),
+        ...(checkpointCwd ? { cwd: checkpointCwd } : {}),
+        ...(thread.title ? { title: thread.title } : {}),
+        modelSelection: archivedThread.modelSelection,
+        ...(archivedSession?.resumeCursor !== undefined
+          ? { resumeCursor: archivedSession.resumeCursor }
+          : {}),
+        runtimeMode: archivedThread.runtimeMode,
+      });
+    }
+    const replacements = archivedThread.checkpoints.map((checkpoint) => ({
+      from: checkpoint.checkpointRef,
+      to: checkpointRefForThreadTurn(thread.id, checkpoint.checkpointTurnCount),
+    }));
+    const baselineArchivedRef = checkpointRefForArchivedTurn(thread.id, archive.archiveId, 0);
+    if (
+      checkpointCwd &&
+      !replacements.some((entry) => entry.to === checkpointRefForThreadTurn(thread.id, 0)) &&
+      (yield* checkpointStore.hasCheckpointRef({
+        cwd: checkpointCwd,
+        checkpointRef: baselineArchivedRef,
+      }))
+    ) {
+      replacements.push({
+        from: baselineArchivedRef,
+        to: checkpointRefForThreadTurn(thread.id, 0),
+      });
+    }
+    if (checkpointCwd) {
+      yield* checkpointStore.replaceCheckpointRefs({ cwd: checkpointCwd, replacements });
+    }
+    const restoredSnapshot = {
+      ...archivedThread,
+      checkpoints: archivedThread.checkpoints.map((checkpoint) => ({
+        ...checkpoint,
+        checkpointRef: checkpointRefForThreadTurn(thread.id, checkpoint.checkpointTurnCount),
+      })),
+    };
+    yield* orchestrationEngine.dispatch({
+      type: "thread.revert.complete",
+      commandId: yield* serverCommandId("history-restore-complete"),
+      threadId: thread.id,
+      turnCount: archive.turnCount,
+      archivedPathId,
+      restoredArchiveId: archive.archiveId,
+      restoredSnapshot,
+      createdAt: now,
+    });
+  });
+
+  const handleHistoryForkRequested = Effect.fn("handleHistoryForkRequested")(function* (
+    event: Extract<OrchestrationEvent, { type: "thread.history-fork-requested" }>,
+  ) {
+    const now = DateTime.formatIso(yield* DateTime.now);
+    const source = yield* resolveThreadDetail(event.payload.threadId);
+    if (!source) return;
+    const destination = yield* resolveThreadDetail(event.payload.forkThreadId);
+    if (destination) {
+      yield* appendRevertFailureActivity({
+        threadId: source.id,
+        turnCount: event.payload.turnCount,
+        detail: "Fork destination thread already exists.",
+        createdAt: now,
+      });
+      return;
+    }
+    const activeSession = (yield* providerService.listSessions()).find(
+      (session) => session.threadId === source.id,
+    );
+    if (
+      source.session?.status === "running" ||
+      source.session?.status === "starting" ||
+      activeSession?.status === "running" ||
+      activeSession?.status === "connecting"
+    ) {
+      yield* appendRevertFailureActivity({
+        threadId: source.id,
+        turnCount: event.payload.turnCount,
+        detail: "Stop the running session before forking history.",
+        createdAt: now,
+      });
+      return;
+    }
+    const sourceCwd = yield* resolveCheckpointCwd({
+      threadId: source.id,
+      thread: source,
+      projects: yield* resolveThreadProjects(source.projectId),
+      preferSessionRuntime: true,
+    });
+    if (!sourceCwd) {
+      yield* appendRevertFailureActivity({
+        threadId: source.id,
+        turnCount: event.payload.turnCount,
+        detail: "Fork workspace is unavailable or is not a Git repository.",
+        createdAt: now,
+      });
+      return;
+    }
+    const currentTurnCount = source.checkpoints.reduce(
+      (max, checkpoint) => Math.max(max, checkpoint.checkpointTurnCount),
+      0,
+    );
+    if (event.payload.archiveId === undefined && event.payload.turnCount > currentTurnCount) {
+      yield* appendRevertFailureActivity({
+        threadId: source.id,
+        turnCount: event.payload.turnCount,
+        detail: "Fork checkpoint exceeds current thread history.",
+        createdAt: now,
+      });
+      return;
+    }
+    if (
+      event.payload.archiveId === undefined &&
+      event.payload.turnCount > 0 &&
+      event.payload.turnCount < currentTurnCount
+    ) {
+      yield* providerService.assertConversationRollbackSupported(source.id);
+    }
+    const archiveId =
+      event.payload.archiveId ??
+      (yield* archiveCurrentPath({
+        thread: source,
+        checkpointCwd: sourceCwd,
+        now,
+      }));
+    const archive = yield* historyArchives.get(source.id, archiveId);
+    if (!archive) return;
+    const archivedThread = decodeArchiveThread(archive.snapshotJson);
+    const archivedSession = decodeArchiveSession(archive.providerBindingJson);
+    if (archivedThread.id !== source.id || archivedThread.projectId !== source.projectId) {
+      return yield* Effect.die(new Error("Fork archive belongs to a different thread or project"));
+    }
+    const targetCount = event.payload.turnCount;
+    if (targetCount > archive.turnCount) {
+      yield* appendRevertFailureActivity({
+        threadId: source.id,
+        turnCount: targetCount,
+        detail: "Fork checkpoint exceeds archived thread history.",
+        createdAt: now,
+      });
+      return;
+    }
+    if (targetCount > 0 && (!archivedSession || archivedSession.resumeCursor === undefined)) {
+      yield* appendRevertFailureActivity({
+        threadId: source.id,
+        turnCount: targetCount,
+        detail: "Archived provider conversation is unavailable.",
+        createdAt: now,
+      });
+      return;
+    }
+    if (targetCount > 0 && targetCount < archive.turnCount) {
+      yield* providerService.assertConversationRollbackSupported(source.id);
+    }
+    if (!archivedSession) {
+      yield* appendRevertFailureActivity({
+        threadId: source.id,
+        turnCount: targetCount,
+        detail: "Archived provider session is unavailable for the fork.",
+        createdAt: now,
+      });
+      return;
+    }
+    const targetRef =
+      targetCount === 0
+        ? checkpointRefForArchivedTurn(source.id, archiveId, 0)
+        : archivedThread.checkpoints.find(
+            (checkpoint) => checkpoint.checkpointTurnCount === targetCount,
+          )?.checkpointRef;
+    if (
+      !targetRef ||
+      !(yield* checkpointStore.hasCheckpointRef({ cwd: sourceCwd, checkpointRef: targetRef }))
+    ) {
+      yield* appendRevertFailureActivity({
+        threadId: source.id,
+        turnCount: targetCount,
+        detail: "Fork checkpoint is unavailable.",
+        createdAt: now,
+      });
+      return;
+    }
+    const forkThreadId = event.payload.forkThreadId;
+    const restoredSnapshot = forkHistorySnapshot(archivedThread, forkThreadId, targetCount);
+    const checkpoints: Array<{ from: CheckpointRef; to: CheckpointRef }> = [];
+    for (const checkpoint of restoredSnapshot.checkpoints) {
+      const original = archivedThread.checkpoints.find(
+        (entry) => entry.checkpointTurnCount === checkpoint.checkpointTurnCount,
+      );
+      if (!original) continue;
+      const present = yield* checkpointStore.hasCheckpointRef({
+        cwd: sourceCwd,
+        checkpointRef: original.checkpointRef,
+      });
+      if (!present && original.status === "ready") {
+        yield* appendRevertFailureActivity({
+          threadId: source.id,
+          turnCount: targetCount,
+          detail: "A retained checkpoint ref is unavailable.",
+          createdAt: now,
+        });
+        return;
+      }
+      if (present) checkpoints.push({ from: original.checkpointRef, to: checkpoint.checkpointRef });
+    }
+    const archivedBaseline = checkpointRefForArchivedTurn(source.id, archiveId, 0);
+    if (
+      !checkpoints.some((entry) => entry.to === checkpointRefForThreadTurn(forkThreadId, 0)) &&
+      (yield* checkpointStore.hasCheckpointRef({ cwd: sourceCwd, checkpointRef: archivedBaseline }))
+    ) {
+      checkpoints.push({ from: archivedBaseline, to: checkpointRefForThreadTurn(forkThreadId, 0) });
+    }
+    const branch = event.payload.restoreFiles ? `t3/fork/${forkThreadId}` : source.branch;
+    const worktreePath = event.payload.restoreFiles
+      ? (yield* gitWorkflow.createWorktree({
+          cwd: sourceCwd,
+          refName: targetRef,
+          newRefName: branch!,
+          path: null,
+        })).worktree.path
+      : source.worktreePath;
+    const sourceBinding = yield* providerSessionDirectory.getBinding(source.id);
+    const forkFromLiveSource =
+      event.payload.archiveId === undefined ||
+      (Option.isSome(sourceBinding) &&
+        isDeepStrictEqual(sourceBinding.value.resumeCursor, archivedSession.resumeCursor));
+    let created = false;
+    yield* Effect.gen(function* () {
+      if (forkFromLiveSource && targetCount > 0 && !providerService.forkConversation) {
+        return yield* Effect.die(new Error("Provider does not support native conversation forks"));
+      }
+      const nativeCursor =
+        forkFromLiveSource && targetCount > 0
+          ? yield* providerService.forkConversation!(source.id, { preserveSource: true })
+          : undefined;
+      yield* orchestrationEngine.dispatch({
+        type: "thread.create",
+        commandId: yield* serverCommandId("history-fork-create"),
+        threadId: forkThreadId,
+        projectId: source.projectId,
+        title: `Fork of ${source.title}`,
+        modelSelection: source.modelSelection,
+        runtimeMode: source.runtimeMode,
+        interactionMode: source.interactionMode,
+        branch,
+        worktreePath,
+        createdAt: now,
+      });
+      created = true;
+      yield* checkpointStore.copyCheckpointRefs({ cwd: sourceCwd, copies: checkpoints });
+      yield* providerService.startSession(forkThreadId, {
+        threadId: forkThreadId,
+        provider: archivedSession.provider,
+        ...(archivedSession.providerInstanceId
+          ? { providerInstanceId: archivedSession.providerInstanceId }
+          : {}),
+        cwd: worktreePath ?? sourceCwd,
+        title: restoredSnapshot.title,
+        modelSelection: restoredSnapshot.modelSelection,
+        ...(targetCount > 0 && archivedSession.resumeCursor !== undefined
+          ? { resumeCursor: nativeCursor ?? archivedSession.resumeCursor }
+          : {}),
+        runtimeMode: restoredSnapshot.runtimeMode,
+      });
+      if (targetCount > 0) {
+        if (nativeCursor !== undefined) {
+          if (targetCount < archive.turnCount) {
+            yield* providerService.rollbackConversation({
+              threadId: forkThreadId,
+              numTurns: archive.turnCount - targetCount,
+            });
+          }
+        } else if (targetCount === archive.turnCount) {
+          if (!providerService.forkConversation) {
+            return yield* Effect.die(
+              new Error("Provider does not support native conversation forks"),
+            );
+          }
+          const nativeCursor = yield* providerService.forkConversation(forkThreadId);
+          yield* providerService.startSession(forkThreadId, {
+            threadId: forkThreadId,
+            provider: archivedSession.provider,
+            ...(archivedSession.providerInstanceId
+              ? { providerInstanceId: archivedSession.providerInstanceId }
+              : {}),
+            cwd: worktreePath ?? sourceCwd,
+            title: restoredSnapshot.title,
+            modelSelection: restoredSnapshot.modelSelection,
+            resumeCursor: nativeCursor,
+            runtimeMode: restoredSnapshot.runtimeMode,
+          });
+        } else {
+          yield* providerService.rollbackConversation({
+            threadId: forkThreadId,
+            numTurns: archive.turnCount - targetCount,
+          });
+        }
+      }
+      yield* orchestrationEngine.dispatch({
+        type: "thread.revert.complete",
+        commandId: yield* serverCommandId("history-fork-complete"),
+        threadId: forkThreadId,
+        turnCount: targetCount,
+        forkSourceThreadId: source.id,
+        restoredArchiveId: archiveId,
+        restoredSnapshot,
+        createdAt: now,
+      });
+    }).pipe(
+      Effect.onError(() =>
+        Effect.gen(function* () {
+          if (created) {
+            yield* providerService.stopSession({ threadId: forkThreadId }).pipe(Effect.ignore);
+            yield* orchestrationEngine
+              .dispatch({
+                type: "thread.delete",
+                commandId: yield* serverCommandId("history-fork-cleanup"),
+                threadId: forkThreadId,
+              })
+              .pipe(Effect.ignore);
+          }
+          if (event.payload.restoreFiles && worktreePath) {
+            yield* gitWorkflow
+              .removeWorktree({ cwd: sourceCwd, path: worktreePath, force: true })
+              .pipe(Effect.ignore);
+          }
+        }).pipe(Effect.ignore),
+      ),
+    );
   });
 
   const processDomainEvent = Effect.fn("processDomainEvent")(function* (event: OrchestrationEvent) {
@@ -836,6 +1492,32 @@ const make = Effect.gen(function* () {
               createdAt,
             }),
           ),
+        ),
+      );
+      return;
+    }
+    if (event.type === "thread.history-restore-requested") {
+      yield* handleHistoryRestoreRequested(event).pipe(
+        Effect.catch((error) =>
+          appendRevertFailureActivity({
+            threadId: event.payload.threadId,
+            turnCount: 0,
+            detail: error.message,
+            createdAt: event.occurredAt,
+          }),
+        ),
+      );
+      return;
+    }
+    if (event.type === "thread.history-fork-requested") {
+      yield* handleHistoryForkRequested(event).pipe(
+        Effect.catch((error) =>
+          appendRevertFailureActivity({
+            threadId: event.payload.threadId,
+            turnCount: event.payload.turnCount,
+            detail: error.message,
+            createdAt: event.occurredAt,
+          }),
         ),
       );
       return;
@@ -938,7 +1620,9 @@ const make = Effect.gen(function* () {
         if (
           event.type !== "thread.turn-start-requested" &&
           event.type !== "thread.message-sent" &&
-          event.type !== "thread.checkpoint-revert-requested"
+          event.type !== "thread.checkpoint-revert-requested" &&
+          event.type !== "thread.history-restore-requested" &&
+          event.type !== "thread.history-fork-requested"
         ) {
           return Effect.void;
         }

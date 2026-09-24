@@ -3524,6 +3524,40 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
+  const forkConversation = Effect.fn("forkConversation")(function* (
+    threadId: ThreadId,
+    options?: { readonly preserveSource?: boolean },
+  ) {
+    const routed = yield* resolveRoutableSession({
+      threadId,
+      operation: "ProviderService.forkConversation",
+      allowRecovery: true,
+    });
+    if (!routed.adapter.forkThread) {
+      return yield* toValidationError(
+        "ProviderService.forkConversation",
+        `Provider '${routed.adapter.provider}' cannot fork its native conversation.`,
+      );
+    }
+    const cursor = yield* routed.adapter.forkThread(routed.threadId);
+    const session = (yield* routed.adapter.listSessions()).find(
+      (entry) => entry.threadId === routed.threadId,
+    );
+    if (session) {
+      yield* stopSession({ threadId });
+      yield* upsertSessionBinding(
+        {
+          ...session,
+          providerInstanceId: routed.instanceId,
+          status: "closed",
+          resumeCursor: options?.preserveSource ? session.resumeCursor : cursor,
+        },
+        threadId,
+      );
+    }
+    return cursor;
+  });
+
   const uploadFeedback: ProviderServiceMethod<"uploadFeedback"> = Effect.fn("uploadFeedback")(
     function* (rawInput) {
       const input = yield* decodeInputOrValidationError({
@@ -3713,6 +3747,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     getInstanceInfo,
     assertConversationRollbackSupported,
     rollbackConversation,
+    forkConversation,
     uploadFeedback,
     // Each access creates a fresh PubSub subscription so that multiple
     // consumers (ProviderRuntimeIngestion, CheckpointReactor, etc.) each

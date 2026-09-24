@@ -47,6 +47,19 @@ export interface DeleteCheckpointRefsInput {
   readonly checkpointRefs: ReadonlyArray<CheckpointRef>;
 }
 
+export interface CopyCheckpointRefsInput {
+  readonly cwd: string;
+  readonly copies: ReadonlyArray<{ readonly from: CheckpointRef; readonly to: CheckpointRef }>;
+}
+
+export interface ReplaceCheckpointRefsInput {
+  readonly cwd: string;
+  readonly replacements: ReadonlyArray<{
+    readonly from: CheckpointRef;
+    readonly to: CheckpointRef;
+  }>;
+}
+
 /** Service tag for checkpoint persistence and restore operations. */
 export class CheckpointStore extends Context.Service<
   CheckpointStore,
@@ -94,6 +107,14 @@ export class CheckpointStore extends Context.Service<
      */
     readonly deleteCheckpointRefs: (
       input: DeleteCheckpointRefsInput,
+    ) => Effect.Effect<void, CheckpointStoreError>;
+    /** Preserve checkpoint commits under distinct refs in one Git transaction. */
+    readonly copyCheckpointRefs: (
+      input: CopyCheckpointRefsInput,
+    ) => Effect.Effect<void, CheckpointStoreError>;
+    /** Point active refs at archived commits without changing the archive. */
+    readonly replaceCheckpointRefs: (
+      input: ReplaceCheckpointRefsInput,
     ) => Effect.Effect<void, CheckpointStoreError>;
   }
 >()("t3/checkpointing/CheckpointStore") {}
@@ -160,6 +181,23 @@ export const make = Effect.gen(function* () {
     return yield* checkpoints.deleteCheckpointRefs(input);
   });
 
+  const copyCheckpointRefs: CheckpointStore["Service"]["copyCheckpointRefs"] = Effect.fn(
+    "copyCheckpointRefs",
+  )(function* (input) {
+    const checkpoints = yield* resolveCheckpoints("CheckpointStore.copyCheckpointRefs", input.cwd);
+    return yield* checkpoints.copyCheckpointRefs(input);
+  });
+
+  const replaceCheckpointRefs: CheckpointStore["Service"]["replaceCheckpointRefs"] = Effect.fn(
+    "replaceCheckpointRefs",
+  )(function* (input) {
+    const checkpoints = yield* resolveCheckpoints(
+      "CheckpointStore.replaceCheckpointRefs",
+      input.cwd,
+    );
+    return yield* checkpoints.replaceCheckpointRefs(input);
+  });
+
   return CheckpointStore.of({
     isGitRepository,
     captureCheckpoint,
@@ -167,6 +205,8 @@ export const make = Effect.gen(function* () {
     restoreCheckpoint,
     diffCheckpoints,
     deleteCheckpointRefs,
+    copyCheckpointRefs,
+    replaceCheckpointRefs,
   });
 });
 

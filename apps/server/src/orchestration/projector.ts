@@ -226,7 +226,7 @@ function decodeForEvent<A>(
   );
 }
 
-function retainThreadMessagesAfterRevert(
+export function retainThreadMessagesAfterRevert(
   messages: ReadonlyArray<OrchestrationMessage>,
   retainedTurnIds: ReadonlySet<string>,
   turnCount: number,
@@ -1704,6 +1704,23 @@ export function projectEvent(
           const thread = nextBase.threads.find((entry) => entry.id === payload.threadId);
           if (!thread) {
             return nextBase;
+          }
+
+          if (payload.restoredSnapshot) {
+            const restored = payload.restoredSnapshot;
+            return {
+              ...nextBase,
+              threads: updateThread(nextBase.threads, payload.threadId, {
+                messages: restored.messages,
+                proposedPlans: restored.proposedPlans,
+                activities: restored.activities,
+                checkpoints: restored.checkpoints,
+                turns: restored.turns,
+                partialTurnIds: restored.partialTurnIds,
+                latestTurn: restored.latestTurn,
+                updatedAt: event.occurredAt,
+              }),
+            };
           }
 
           const checkpoints = thread.checkpoints

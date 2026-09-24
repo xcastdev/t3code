@@ -176,6 +176,8 @@ export interface ProviderAdapterShape<TError> {
     threadId: ThreadId,
     numTurns: number,
   ) => Effect.Effect<ProviderThreadSnapshot, TError>;
+  /** Clone native conversation history and return a cursor for the independent clone. */
+  readonly forkThread?: (threadId: ThreadId) => Effect.Effect<unknown, TError>;
 
   /**
    * Upload a thread to the provider when the adapter supports feedback.

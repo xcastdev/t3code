@@ -39,6 +39,19 @@ export interface VcsDeleteCheckpointRefsInput {
   readonly checkpointRefs: ReadonlyArray<CheckpointRef>;
 }
 
+export interface VcsCopyCheckpointRefsInput {
+  readonly cwd: string;
+  readonly copies: ReadonlyArray<{ readonly from: CheckpointRef; readonly to: CheckpointRef }>;
+}
+
+export interface VcsReplaceCheckpointRefsInput {
+  readonly cwd: string;
+  readonly replacements: ReadonlyArray<{
+    readonly from: CheckpointRef;
+    readonly to: CheckpointRef;
+  }>;
+}
+
 export interface VcsCheckpointOps {
   readonly captureCheckpoint: (input: VcsCaptureCheckpointInput) => Effect.Effect<void, VcsError>;
   readonly hasCheckpointRef: (
@@ -50,6 +63,10 @@ export interface VcsCheckpointOps {
   readonly diffCheckpoints: (input: VcsDiffCheckpointsInput) => Effect.Effect<string, VcsError>;
   readonly deleteCheckpointRefs: (
     input: VcsDeleteCheckpointRefsInput,
+  ) => Effect.Effect<void, VcsError>;
+  readonly copyCheckpointRefs: (input: VcsCopyCheckpointRefsInput) => Effect.Effect<void, VcsError>;
+  readonly replaceCheckpointRefs: (
+    input: VcsReplaceCheckpointRefsInput,
   ) => Effect.Effect<void, VcsError>;
 }
 

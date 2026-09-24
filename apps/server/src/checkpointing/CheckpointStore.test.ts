@@ -12,7 +12,7 @@ import * as PlatformError from "effect/PlatformError";
 import * as Scope from "effect/Scope";
 import { describe, expect } from "vite-plus/test";
 
-import { checkpointRefForThreadTurn } from "./Utils.ts";
+import { checkpointRefForArchivedTurn, checkpointRefForThreadTurn } from "./Utils.ts";
 import { parseTurnDiffFilesFromNumstat } from "./Diffs.ts";
 import * as CheckpointStore from "./CheckpointStore.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
@@ -95,6 +95,65 @@ function buildLargeText(lineCount = 5_000): string {
 }
 
 it.layer(TestLayer)("CheckpointStore.layer", (it) => {
+  describe("copyCheckpointRefs", () => {
+    it.effect("keeps an archived commit when an active checkpoint is replaced", () =>
+      Effect.gen(function* () {
+        const tmp = yield* makeTmpDir();
+        yield* initRepoWithCommit(tmp);
+        const store = yield* CheckpointStore.CheckpointStore;
+        const activeRef = checkpointRefForThreadTurn(ThreadId.make("thread-history"), 1);
+        const archiveRef = checkpointRefForArchivedTurn(
+          ThreadId.make("thread-history"),
+          "path-a",
+          1,
+        );
+
+        yield* writeTextFile(NodePath.join(tmp, "README.md"), "# original path\n");
+        yield* store.captureCheckpoint({ cwd: tmp, checkpointRef: activeRef });
+        const originalCommit = yield* git(tmp, ["rev-parse", activeRef]);
+        yield* store.copyCheckpointRefs({
+          cwd: tmp,
+          copies: [{ from: activeRef, to: archiveRef }],
+        });
+
+        yield* writeTextFile(NodePath.join(tmp, "README.md"), "# new path\n");
+        yield* store.captureCheckpoint({ cwd: tmp, checkpointRef: activeRef });
+
+        expect(yield* git(tmp, ["rev-parse", archiveRef])).toBe(originalCommit);
+        expect(yield* git(tmp, ["rev-parse", activeRef])).not.toBe(originalCommit);
+      }),
+    );
+  });
+
+  describe("replaceCheckpointRefs", () => {
+    it.effect(
+      "switches the active checkpoint to an archived commit without changing the archive",
+      () =>
+        Effect.gen(function* () {
+          const tmp = yield* makeTmpDir();
+          yield* initRepoWithCommit(tmp);
+          const store = yield* CheckpointStore.CheckpointStore;
+          const threadId = ThreadId.make("thread-swap");
+          const activeRef = checkpointRefForThreadTurn(threadId, 1);
+          const archivedRef = checkpointRefForArchivedTurn(threadId, "old-path", 1);
+
+          yield* writeTextFile(NodePath.join(tmp, "README.md"), "# old path\n");
+          yield* store.captureCheckpoint({ cwd: tmp, checkpointRef: archivedRef });
+          const oldCommit = yield* git(tmp, ["rev-parse", archivedRef]);
+          yield* writeTextFile(NodePath.join(tmp, "README.md"), "# current path\n");
+          yield* store.captureCheckpoint({ cwd: tmp, checkpointRef: activeRef });
+
+          yield* store.replaceCheckpointRefs({
+            cwd: tmp,
+            replacements: [{ from: archivedRef, to: activeRef }],
+          });
+
+          expect(yield* git(tmp, ["rev-parse", activeRef])).toBe(oldCommit);
+          expect(yield* git(tmp, ["rev-parse", archivedRef])).toBe(oldCommit);
+        }),
+    );
+  });
+
   describe("isGitRepository", () => {
     it.effect("returns false when no Git repository is detected", () =>
       Effect.gen(function* () {

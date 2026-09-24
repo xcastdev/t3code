@@ -2938,6 +2938,47 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       };
     }
 
+    case "thread.history.fork": {
+      yield* requireThread({ readModel, command, threadId: command.threadId });
+      yield* requireThreadAbsent({ readModel, command, threadId: command.forkThreadId });
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.history-fork-requested",
+        payload: {
+          threadId: command.threadId,
+          forkThreadId: command.forkThreadId,
+          ...(command.archiveId !== undefined ? { archiveId: command.archiveId } : {}),
+          turnCount: command.turnCount,
+          restoreFiles: command.restoreFiles,
+          createdAt: command.createdAt,
+        },
+      };
+    }
+
+    case "thread.history.restore": {
+      yield* requireThread({ readModel, command, threadId: command.threadId });
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.history-restore-requested",
+        payload: {
+          threadId: command.threadId,
+          archiveId: command.archiveId,
+          restoreFiles: command.restoreFiles,
+          createdAt: command.createdAt,
+        },
+      };
+    }
+
     case "thread.conversation.revert":
     case "thread.checkpoint.revert": {
       yield* requireThread({
@@ -3294,6 +3335,18 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           threadId: command.threadId,
           turnCount: command.turnCount,
+          ...(command.restoredArchiveId !== undefined
+            ? { restoredArchiveId: command.restoredArchiveId }
+            : {}),
+          ...(command.forkSourceThreadId !== undefined
+            ? { forkSourceThreadId: command.forkSourceThreadId }
+            : {}),
+          ...(command.archivedPathId !== undefined
+            ? { archivedPathId: command.archivedPathId }
+            : {}),
+          ...(command.restoredSnapshot !== undefined
+            ? { restoredSnapshot: command.restoredSnapshot }
+            : {}),
         },
       };
     }

@@ -25,6 +25,7 @@ import * as Stream from "effect/Stream";
 import * as Tracer from "effect/Tracer";
 
 import * as CheckpointStore from "../src/checkpointing/CheckpointStore.ts";
+import * as ThreadHistoryArchive from "../src/persistence/ThreadHistoryArchive.ts";
 import { TextGeneration } from "../src/textGeneration/TextGeneration.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../src/persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../src/persistence/Layers/OrchestrationEventStore.ts";
@@ -350,6 +351,9 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(serverSettingsLayer),
     );
     const checkpointReactorLayer = CheckpointReactorLive.pipe(
+      Layer.provide(ThreadHistoryArchive.layer),
+      Layer.provideMerge(providerSessionDirectoryLayer),
+      Layer.provideMerge(gitWorkflowLayer),
       Layer.provideMerge(runtimeServicesLayer),
       Layer.provideMerge(
         Layer.mock(PullRequestService.PullRequestService)({

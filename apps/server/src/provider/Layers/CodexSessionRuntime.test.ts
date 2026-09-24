@@ -4,7 +4,7 @@ import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { describe } from "vite-plus/test";
-import { DEFAULT_MODEL, ThreadId } from "@t3tools/contracts";
+import { DEFAULT_MODEL, ThreadId, TurnId } from "@t3tools/contracts";
 import * as CodexErrors from "effect-codex-app-server/errors";
 import * as CodexRpc from "effect-codex-app-server/rpc";
 import * as EffectCodexSchema from "effect-codex-app-server/schema";
@@ -12,8 +12,10 @@ import * as EffectCodexSchema from "effect-codex-app-server/schema";
 import { buildCodexDeveloperInstructions } from "../CodexDeveloperInstructions.ts";
 import { codexSessionAppServerArgs } from "./codexLaunchArgs.ts";
 import {
+  branchCodexThread,
   buildTurnStartParams,
   describeMcpElicitation,
+  forkCodexThread,
   hasConfiguredMcpServer,
   isRecoverableThreadResumeError,
   makeMemoryConsolidationNotificationFilter,
@@ -25,6 +27,77 @@ import {
 const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequestError);
 
 describe("Codex thread history", () => {
+  for (const numTurns of [1, 3]) {
+    it.effect(`branches after removing ${numTurns} turns and keeps the source`, () =>
+      Effect.gen(function* () {
+        const methods: string[] = [];
+        const client: Parameters<typeof branchCodexThread>[0] = {
+          request: () => Effect.die("Unexpected legacy request"),
+          raw: {
+            request: (method, params) =>
+              Effect.sync(() => {
+                methods.push(method);
+                if (method === "thread/read") return { thread: { historyMode: "paginated" } };
+                if (method === "thread/turns/list")
+                  return {
+                    data: ["turn-1", "turn-2", "turn-3"].map((id) => ({
+                      id,
+                      items: [],
+                      status: "completed",
+                    })),
+                    nextCursor: null,
+                  };
+                NodeAssert.equal(method, "thread/fork");
+                NodeAssert.deepEqual(params, { threadId: "source", lastTurnId: "turn-2" });
+                return { cwd: "/workspace", model: "codex", thread: { id: "fork" } };
+              }),
+          },
+        };
+        const branch = yield* branchCodexThread(client, "source", numTurns, () =>
+          Effect.succeed({ threadId: "fresh" }),
+        );
+        NodeAssert.deepEqual(branch.cursor, { threadId: numTurns === 1 ? "fork" : "fresh" });
+        NodeAssert.deepEqual(
+          branch.snapshot.turns.map((turn) => turn.id),
+          numTurns === 1 ? ["turn-1", "turn-2"] : [],
+        );
+        NodeAssert.deepEqual(
+          methods,
+          numTurns === 1
+            ? ["thread/read", "thread/turns/list", "thread/fork"]
+            : ["thread/read", "thread/turns/list"],
+        );
+      }),
+    );
+  }
+
+  it.effect("forks native history at a retained turn without changing the source", () =>
+    Effect.gen(function* () {
+      const requests: unknown[] = [];
+      const client: Parameters<typeof forkCodexThread>[0] = {
+        raw: {
+          request: (method, params) =>
+            Effect.sync(() => {
+              NodeAssert.equal(method, "thread/fork");
+              requests.push(params);
+              return { cwd: "/workspace", model: "codex", thread: { id: "forked-native" } };
+            }),
+        },
+      };
+      NodeAssert.deepEqual(
+        yield* forkCodexThread(client, "original-native", TurnId.make("turn-2")),
+        {
+          threadId: "forked-native",
+        },
+      );
+      NodeAssert.deepEqual(requests, [{ threadId: "original-native", lastTurnId: "turn-2" }]);
+      NodeAssert.deepEqual(yield* forkCodexThread(client, "original-native"), {
+        threadId: "forked-native",
+      });
+      NodeAssert.deepEqual(requests[1], { threadId: "original-native" });
+    }),
+  );
+
   for (const numTurns of [1, 2, 3, 5]) {
     it.effect(`reverts ${numTurns} paginated turns at the durable boundary`, () =>
       Effect.gen(function* () {

@@ -342,6 +342,7 @@ import { useEnvironmentDisconnectDelay } from "../hooks/useEnvironmentDisconnect
 import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
 import { useKnownTerminalSessions, useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { useEnvironmentQuery } from "../state/query";
+import { orchestrationEnvironment } from "../state/orchestration";
 import {
   environmentServerConfigsAtom,
   primaryServerAvailableEditorsAtom,
@@ -483,6 +484,7 @@ import {
   codexArtifactTemplatePromptToAppend,
   toolGroupConsumesUpwardNavigation,
   waitForStartedServerThread,
+  waitForCreatedServerThread,
   shouldRefocusComposerOnWindowFocus,
 } from "./ChatView.logic";
 import type { ThreadSyncPhase } from "../threadSync";
@@ -1277,6 +1279,12 @@ export default function ChatView(props: ChatViewProps) {
     reportFailure: false,
   });
   const revertThreadCheckpoint = useAtomCommand(threadEnvironment.revertCheckpoint, {
+    reportFailure: false,
+  });
+  const restoreThreadHistory = useAtomCommand(threadEnvironment.restoreHistory, {
+    reportFailure: false,
+  });
+  const forkThreadHistory = useAtomCommand(threadEnvironment.forkHistory, {
     reportFailure: false,
   });
   const openPreview = useAtomCommand(previewEnvironment.open, {
@@ -6835,6 +6843,89 @@ export default function ChatView(props: ChatViewProps) {
     messageId: MessageId;
     routeThreadKey: string;
   } | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [selectedHistoryArchiveId, setSelectedHistoryArchiveId] = useState<string | null>(null);
+  const [restoringHistory, setRestoringHistory] = useState(false);
+  const [forkTurnCount, setForkTurnCount] = useState<number | null>(null);
+  const [forkingHistory, setForkingHistory] = useState(false);
+  const [archiveMessageLimit, setArchiveMessageLimit] = useState(40);
+  const historyArchivesQuery = useEnvironmentQuery(
+    historyOpen && activeThread
+      ? orchestrationEnvironment.historyArchives({
+          environmentId,
+          input: { threadId: activeThread.id },
+        })
+      : null,
+  );
+  const historyArchiveQuery = useEnvironmentQuery(
+    historyOpen && selectedHistoryArchiveId && activeThread
+      ? orchestrationEnvironment.historyArchive({
+          environmentId,
+          input: { threadId: activeThread.id, archiveId: selectedHistoryArchiveId },
+        })
+      : null,
+  );
+  const forkHistorySource = selectedHistoryArchiveId ? historyArchiveQuery.data : activeThread;
+  const restoreSelectedHistory = async (restoreFiles: boolean) => {
+    if (!activeThread || !selectedHistoryArchiveId) return;
+    setRestoringHistory(true);
+    try {
+      const result = await restoreThreadHistory({
+        environmentId,
+        input: {
+          threadId: activeThread.id,
+          archiveId: selectedHistoryArchiveId,
+          restoreFiles,
+        },
+      });
+      if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+      historyArchivesQuery.refresh();
+      setHistoryOpen(false);
+      setSelectedHistoryArchiveId(null);
+    } catch (error) {
+      setThreadError(
+        activeThread.id,
+        error instanceof Error ? error.message : "Could not restore history.",
+      );
+    } finally {
+      setRestoringHistory(false);
+    }
+  };
+  const forkSelectedHistory = async (restoreFiles: boolean) => {
+    if (!activeThread || forkTurnCount === null) return;
+    const forkThreadId = newThreadId();
+    setForkingHistory(true);
+    try {
+      const result = await forkThreadHistory({
+        environmentId,
+        input: {
+          threadId: activeThread.id,
+          forkThreadId,
+          ...(selectedHistoryArchiveId ? { archiveId: selectedHistoryArchiveId } : {}),
+          turnCount: forkTurnCount,
+          restoreFiles,
+        },
+      });
+      if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+      const created = await waitForCreatedServerThread(
+        scopeThreadRef(environmentId, forkThreadId),
+        forkTurnCount,
+      );
+      if (!created) throw new Error("Timed out waiting for the forked thread.");
+      setHistoryOpen(false);
+      await navigate({
+        to: "/$environmentId/$threadId",
+        params: { environmentId, threadId: forkThreadId },
+      });
+    } catch (error) {
+      setThreadError(
+        activeThread.id,
+        error instanceof Error ? error.message : "Could not fork history.",
+      );
+    } finally {
+      setForkingHistory(false);
+    }
+  };
 
   if (pendingRevert && pendingRevert.routeThreadKey !== routeThreadKey) {
     setPendingRevert(null);
@@ -9188,6 +9279,20 @@ export default function ChatView(props: ChatViewProps) {
             </div>
             {/* Messages Wrapper */}
             <div className="relative flex min-h-0 flex-1 flex-col bg-background">
+              {!paintOnlyDisplayedTimeline ? (
+                <div className="flex justify-end px-3 py-1">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => {
+                      historyArchivesQuery.refresh();
+                      setHistoryOpen(true);
+                    }}
+                  >
+                    History
+                  </Button>
+                </div>
+              ) : null}
               {/* Messages — LegendList handles virtualization and scrolling internally */}
               <MessagesTimeline
                 citationRequest={paintOnlyDisplayedTimeline ? null : citationRequest}
@@ -9833,6 +9938,116 @@ export default function ChatView(props: ChatViewProps) {
       ) : null}
 
       <AlertDialog
+        open={historyOpen}
+        onOpenChange={(open) => {
+          setHistoryOpen(open);
+          if (!open) setSelectedHistoryArchiveId(null);
+        }}
+      >
+        <AlertDialogPopup>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Thread history</AlertDialogTitle>
+            <AlertDialogDescription>
+              Reverted paths stay here. Restoring one replaces this thread and archives its current
+              path.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          {historyArchivesQuery.error ? <p role="alert">{historyArchivesQuery.error}</p> : null}
+          {historyArchivesQuery.isPending ? <p>Loading history…</p> : null}
+          <div className="max-h-64 space-y-2 overflow-y-auto">
+            <Button
+              variant={selectedHistoryArchiveId === null ? "secondary" : "outline"}
+              className="w-full justify-start"
+              onClick={() => {
+                setSelectedHistoryArchiveId(null);
+                setForkTurnCount(null);
+                setArchiveMessageLimit(40);
+              }}
+            >
+              Current path
+            </Button>
+            {historyArchivesQuery.data?.map((archive) => (
+              <Button
+                key={archive.archiveId}
+                variant={selectedHistoryArchiveId === archive.archiveId ? "secondary" : "outline"}
+                className="w-full justify-start"
+                onClick={() => {
+                  setSelectedHistoryArchiveId(archive.archiveId);
+                  setForkTurnCount(null);
+                  setArchiveMessageLimit(40);
+                }}
+              >
+                {new Date(archive.createdAt).toLocaleString()} · {archive.turnCount} turns
+              </Button>
+            ))}
+            {historyArchivesQuery.data?.length === 0 ? <p>No archived paths yet.</p> : null}
+          </div>
+          {selectedHistoryArchiveId && historyArchiveQuery.data ? (
+            <div className="max-h-48 overflow-y-auto rounded border p-2 text-sm">
+              {historyArchiveQuery.data.messages.length > archiveMessageLimit ? (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => setArchiveMessageLimit((limit) => limit + 40)}
+                >
+                  Show older messages
+                </Button>
+              ) : null}
+              {historyArchiveQuery.data.messages.slice(-archiveMessageLimit).map((message) => (
+                <p key={message.id} className="mb-2">
+                  <strong>{message.role}:</strong> {message.text}
+                </p>
+              ))}
+            </div>
+          ) : null}
+          {forkHistorySource && forkHistorySource.checkpoints.length > 0 ? (
+            <div className="space-y-1">
+              <p className="text-sm font-medium">Fork from a checkpoint</p>
+              {forkHistorySource.checkpoints
+                .map((checkpoint) => checkpoint.checkpointTurnCount)
+                .filter((count, index, values) => values.indexOf(count) === index)
+                .map((count) => (
+                  <Button
+                    key={count}
+                    size="sm"
+                    variant={forkTurnCount === count ? "secondary" : "outline"}
+                    onClick={() => setForkTurnCount(count)}
+                  >
+                    {count === 0 ? "Before first turn" : `After turn ${count}`}
+                  </Button>
+                ))}
+            </div>
+          ) : null}
+          <AlertDialogFooter>
+            <AlertDialogClose render={<Button variant="outline" />}>Close</AlertDialogClose>
+            <Button
+              disabled={forkTurnCount === null || forkingHistory || phase === "running"}
+              onClick={() => void forkSelectedHistory(false)}
+            >
+              Fork and keep files
+            </Button>
+            <Button
+              disabled={forkTurnCount === null || forkingHistory || phase === "running"}
+              onClick={() => void forkSelectedHistory(true)}
+            >
+              Fork files too
+            </Button>
+            <Button
+              disabled={!selectedHistoryArchiveId || restoringHistory || phase === "running"}
+              onClick={() => void restoreSelectedHistory(false)}
+            >
+              Restore and keep files
+            </Button>
+            <Button
+              disabled={!selectedHistoryArchiveId || restoringHistory || phase === "running"}
+              onClick={() => void restoreSelectedHistory(true)}
+            >
+              Restore files too
+            </Button>
+          </AlertDialogFooter>
+        </AlertDialogPopup>
+      </AlertDialog>
+      <AlertDialog
         open={pendingRevert !== null && pendingRevert.routeThreadKey === routeThreadKey}
         onOpenChange={(open) => {
           if (!open) setPendingRevert(null);
@@ -9843,7 +10058,7 @@ export default function ChatView(props: ChatViewProps) {
             <AlertDialogTitle>Edit from here?</AlertDialogTitle>
             <AlertDialogDescription>
               Rewind chat to before this message. Your prompt and attachments return to the
-              composer.
+              composer. The later messages stay available in History.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

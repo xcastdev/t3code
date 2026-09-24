@@ -11,6 +11,7 @@ import {
   SkillApplicationDetail,
   type ChatAttachment,
   type OrchestrationEvent,
+  OrchestrationThread,
   type OrchestrationSessionStatus,
   ThreadId,
   TurnId,
@@ -31,6 +32,7 @@ import {
 } from "@t3tools/shared/threadPullRequests";
 
 import { toPersistenceSqlError, type ProjectionRepositoryError } from "../../persistence/Errors.ts";
+import * as ThreadHistoryArchive from "../../persistence/ThreadHistoryArchive.ts";
 import { OrchestrationEventStore } from "../../persistence/Services/OrchestrationEventStore.ts";
 import { ProjectionPendingApprovalRepository } from "../../persistence/Services/ProjectionPendingApprovals.ts";
 import { ProjectionProjectRepository } from "../../persistence/Services/ProjectionProjects.ts";
@@ -99,6 +101,7 @@ const encodeMcpCatalogOverride = Schema.encodeSync(Schema.fromJsonString(McpCata
 const encodeSkillApplicationDetail = Schema.encodeSync(
   Schema.fromJsonString(SkillApplicationDetail),
 );
+const decodeArchivedThread = Schema.decodeUnknownEffect(Schema.fromJsonString(OrchestrationThread));
 
 type ProjectorName =
   (typeof ORCHESTRATION_PROJECTOR_NAMES)[keyof typeof ORCHESTRATION_PROJECTOR_NAMES];
@@ -1658,6 +1661,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         }
 
         case "thread.reverted": {
+          if (event.payload.restoredArchiveId) return;
           const existingRows = yield* projectionThreadMessageRepository.listByThreadId({
             threadId: event.payload.threadId,
           });
@@ -1683,10 +1687,12 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           yield* Effect.forEach(keptRows, projectionThreadMessageRepository.upsert, {
             concurrency: 1,
           }).pipe(Effect.asVoid);
-          attachmentSideEffects.prunedThreadRelativePaths.set(
-            event.payload.threadId,
-            collectThreadAttachmentRelativePaths(event.payload.threadId, keptRows),
-          );
+          if (!event.payload.archivedPathId) {
+            attachmentSideEffects.prunedThreadRelativePaths.set(
+              event.payload.threadId,
+              collectThreadAttachmentRelativePaths(event.payload.threadId, keptRows),
+            );
+          }
           return;
         }
 
@@ -1719,6 +1725,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           return;
 
         case "thread.reverted": {
+          if (event.payload.restoredArchiveId) return;
           const existingRows = yield* projectionThreadProposedPlanRepository.listByThreadId({
             threadId: event.payload.threadId,
           });
@@ -1779,6 +1786,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           return;
 
         case "thread.reverted": {
+          if (event.payload.restoredArchiveId) return;
           const existingRows = yield* projectionThreadActivityRepository.listByThreadId({
             threadId: event.payload.threadId,
           });
@@ -1802,7 +1810,9 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           yield* Effect.forEach(keptRows, projectionThreadActivityRepository.upsert, {
             concurrency: 1,
           }).pipe(Effect.asVoid);
-          attachmentSideEffects.prunedThreadRelativePaths.set(event.payload.threadId, new Set());
+          if (!event.payload.archivedPathId) {
+            attachmentSideEffects.prunedThreadRelativePaths.set(event.payload.threadId, new Set());
+          }
           return;
         }
 
@@ -2420,6 +2430,44 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         }
 
         case "thread.reverted": {
+          if (event.payload.restoredArchiveId) {
+            const archives = yield* ThreadHistoryArchive.make.pipe(
+              Effect.provideService(SqlClient.SqlClient, sql),
+            );
+            const archive = yield* archives.get(
+              event.payload.forkSourceThreadId ?? event.payload.threadId,
+              event.payload.restoredArchiveId,
+            );
+            if (!archive)
+              return yield* Effect.die(new Error("History archive is missing during restore"));
+            const archived = yield* decodeArchivedThread(archive.snapshotJson).pipe(Effect.orDie);
+            const active = event.payload.restoredSnapshot;
+            if (!active) return yield* Effect.die(new Error("Restored snapshot is missing"));
+            const checkpointRefMap = Object.fromEntries(
+              archived.checkpoints.flatMap((checkpoint) => {
+                const restored = active.checkpoints.find(
+                  (candidate) => candidate.checkpointTurnCount === checkpoint.checkpointTurnCount,
+                );
+                return restored ? [[checkpoint.checkpointRef, restored.checkpointRef]] : [];
+              }),
+            );
+            if (event.payload.forkSourceThreadId) {
+              yield* archives.restoreForkProjectionRows(
+                event.payload.forkSourceThreadId,
+                event.payload.threadId,
+                archive.projectionRowsJson,
+                event.payload.turnCount,
+                checkpointRefMap,
+              );
+            } else {
+              yield* archives.restoreProjectionRows(
+                event.payload.threadId,
+                archive.projectionRowsJson,
+                checkpointRefMap,
+              );
+            }
+            return;
+          }
           const existingTurns = yield* projectionTurnRepository.listByThreadId({
             threadId: event.payload.threadId,
           });
@@ -2843,7 +2891,10 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         (event) =>
           Effect.sync(() => {
             lastEvent = event;
-            if (event.type === "thread.reverted" || event.type === "thread.deleted") {
+            if (
+              (event.type === "thread.reverted" && !event.payload.archivedPathId) ||
+              event.type === "thread.deleted"
+            ) {
               pendingCleanup.set(`${event.type}:${event.payload.threadId}`, event);
             }
           }),

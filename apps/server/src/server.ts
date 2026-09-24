@@ -95,6 +95,7 @@ import { RuntimeReceiptBusLive } from "./orchestration/Layers/RuntimeReceiptBus.
 import { ProviderRuntimeIngestionLive } from "./orchestration/Layers/ProviderRuntimeIngestion.ts";
 import { ProviderCommandReactorLive } from "./orchestration/Layers/ProviderCommandReactor.ts";
 import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.ts";
+import * as ThreadHistoryArchive from "./persistence/ThreadHistoryArchive.ts";
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
 import * as ThreadSettlementReactor from "./orchestration/ThreadSettlementReactor.ts";
 import * as PullRequestSyncReactor from "./orchestration/PullRequestSyncReactor.ts";
@@ -312,8 +313,8 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ProductionOrchestrationReactorLive),
   Layer.provideMerge(ProviderRuntimeIngestionLive),
   Layer.provideMerge(ProviderCommandReactorLive),
-  Layer.provideMerge(CheckpointReactorLive),
-  Layer.provideMerge(ThreadDeletionReactorLive),
+  Layer.provideMerge(CheckpointReactorLive.pipe(Layer.provide(ThreadHistoryArchive.layer))),
+  Layer.provideMerge(ThreadDeletionReactorLive.pipe(Layer.provide(ThreadHistoryArchive.layer))),
   Layer.provideMerge(SkillApplicationReactorLayerLive),
   Layer.provideMerge(SkillCatalogApplicationReactorLayerLive),
   Layer.provideMerge(ThreadSettlementReactor.layer),

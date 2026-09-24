@@ -15,7 +15,7 @@ import { Atom } from "effect/unstable/reactivity";
 
 import { environmentProjects } from "./projects";
 import { environmentServerConfigsAtom, serverEnvironment } from "./server";
-import { environmentThreadShells } from "./threads";
+import { environmentThreadDetails, environmentThreadShells } from "./threads";
 
 const EMPTY_PROJECT_ATOM = Atom.make<EnvironmentProject | null>(null).pipe(
   Atom.withLabel("mobile-project:empty"),
@@ -46,6 +46,39 @@ export function waitForProject(
       clearTimeout(timeout);
       unsubscribe?.();
       resolve(project);
+    };
+    unsubscribe = appAtomRegistry.subscribe(atom, finish);
+    finish(appAtomRegistry.get(atom));
+  });
+}
+
+/** Resolves after a fork's history reaches the live thread store. */
+export function waitForThreadCheckpoint(
+  ref: ScopedThreadRef,
+  checkpointTurnCount: number,
+  timeoutMs = 120_000,
+): Promise<boolean> {
+  const atom = environmentThreadDetails.detailAtom(ref);
+  const hasCheckpoint = (
+    thread: { checkpoints: ReadonlyArray<{ checkpointTurnCount: number }> } | null,
+  ) =>
+    thread?.checkpoints.some(
+      (checkpoint) => checkpoint.checkpointTurnCount === checkpointTurnCount,
+    ) ?? false;
+  if (hasCheckpoint(appAtomRegistry.get(atom))) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    let unsubscribe: (() => void) | null = null;
+    const timeout = setTimeout(() => {
+      unsubscribe?.();
+      resolve(false);
+    }, timeoutMs);
+    const finish = (
+      thread: { checkpoints: ReadonlyArray<{ checkpointTurnCount: number }> } | null,
+    ) => {
+      if (!hasCheckpoint(thread)) return;
+      clearTimeout(timeout);
+      unsubscribe?.();
+      resolve(true);
     };
     unsubscribe = appAtomRegistry.subscribe(atom, finish);
     finish(appAtomRegistry.get(atom));

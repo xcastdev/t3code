@@ -33,5 +33,14 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
       label: "environment-data:orchestration:archived-shell-snapshot",
       tag: ORCHESTRATION_WS_METHODS.getArchivedShellSnapshot,
     }),
+    historyArchives: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:orchestration:history-archives",
+      tag: ORCHESTRATION_WS_METHODS.listHistoryArchives,
+      staleTimeMs: 0,
+    }),
+    historyArchive: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:orchestration:history-archive",
+      tag: ORCHESTRATION_WS_METHODS.getHistoryArchive,
+    }),
   };
 }

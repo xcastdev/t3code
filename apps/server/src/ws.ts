@@ -37,6 +37,7 @@ import {
   type OrchestrationClientOrigin,
   type OrchestrationCommand,
   type OrchestrationReadModel,
+  OrchestrationThread,
   type GitActionProgressEvent,
   type GitManagerServiceError,
   OrchestrationDispatchCommandError,
@@ -106,6 +107,8 @@ import {
   type ProjectWorkWriteIntent,
   WS_METHODS,
   WsManagedTextResourcesCatalogListRpc,
+  WsOrchestrationListHistoryArchivesRpc,
+  WsOrchestrationGetHistoryArchiveRpc,
   WsManagedTextResourcesCatalogSubscribeRpc,
   WsManagedTextResourcesContentGetRpc,
   WsManagedTextResourcesEnvironmentCreateRpc,
@@ -124,6 +127,7 @@ import { HttpRouter, HttpServerRequest, HttpServerRespondable } from "effect/uns
 import { RpcGroup, RpcSerialization, RpcServer } from "effect/unstable/rpc";
 
 import * as CheckpointDiffQuery from "./checkpointing/CheckpointDiffQuery.ts";
+import * as ThreadHistoryArchive from "./persistence/ThreadHistoryArchive.ts";
 import { resolveThreadWorkspaceCwd } from "./checkpointing/Utils.ts";
 import * as ServerConfig from "./config.ts";
 import * as EnvironmentTheme from "./environmentTheme.ts";
@@ -266,7 +270,13 @@ const ManagedTextResourceWsRpcGroup = RpcGroup.make(
   WsManagedTextResourcesThreadSetEnabledRpc,
   WsManagedTextResourcesThreadResetRpc,
 );
+const HistoryArchiveWsRpcGroup = RpcGroup.make(
+  WsOrchestrationListHistoryArchivesRpc,
+  WsOrchestrationGetHistoryArchiveRpc,
+);
 const WsCoreRpcGroup = WsRpcGroup.omit(
+  ORCHESTRATION_WS_METHODS.listHistoryArchives,
+  ORCHESTRATION_WS_METHODS.getHistoryArchive,
   WS_METHODS.managedTextResourcesCatalogList,
   WS_METHODS.managedTextResourcesCatalogSubscribe,
   WS_METHODS.managedTextResourcesContentGet,
@@ -6505,6 +6515,50 @@ const makeWsRpcLayer = (
     }),
   );
 
+const decodeHistoryArchiveThread = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(OrchestrationThread),
+);
+
+const makeWsHistoryArchiveRpcLayer = () =>
+  HistoryArchiveWsRpcGroup.toLayer(
+    Effect.gen(function* () {
+      const historyArchives = yield* ThreadHistoryArchive.make;
+      return HistoryArchiveWsRpcGroup.of({
+        [ORCHESTRATION_WS_METHODS.listHistoryArchives]: ({ threadId }) =>
+          historyArchives.listByThread(threadId).pipe(
+            Effect.map((archives) =>
+              archives.map((archive) => ({
+                ...archive,
+                threadId: ThreadId.make(archive.threadId),
+              })),
+            ),
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationGetSnapshotError({
+                  message: "Failed to list thread history archives",
+                  cause,
+                }),
+            ),
+          ),
+        [ORCHESTRATION_WS_METHODS.getHistoryArchive]: ({ threadId, archiveId }) =>
+          historyArchives.get(threadId, archiveId).pipe(
+            Effect.flatMap((record) =>
+              record === undefined
+                ? Effect.succeed(null)
+                : decodeHistoryArchiveThread(record.snapshotJson),
+            ),
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationGetSnapshotError({
+                  message: "Failed to load thread history archive",
+                  cause,
+                }),
+            ),
+          ),
+      });
+    }),
+  );
+
 export const websocketRpcRouteLayer = Layer.unwrap(
   Effect.gen(function* () {
     const previewAutomationBroker = yield* PreviewAutomationBroker.PreviewAutomationBroker;
@@ -6583,7 +6637,10 @@ export const websocketRpcRouteLayer = Layer.unwrap(
                 previewAutomationBroker,
                 requestOrigin,
               ),
-              makeWsManagedTextResourceRpcLayer(session),
+              Layer.merge(
+                makeWsManagedTextResourceRpcLayer(session),
+                makeWsHistoryArchiveRpcLayer(),
+              ),
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),
               Layer.provide(Layer.succeed(SqlClient.SqlClient, sql)),

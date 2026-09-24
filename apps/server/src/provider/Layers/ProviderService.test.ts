@@ -279,6 +279,7 @@ function makeFakeCodexAdapter(
     ): Effect.Effect<{ threadId: ThreadId; turns: readonly [] }, ProviderAdapterError> =>
       Effect.succeed({ threadId, turns: [] }),
   );
+  const forkThread = vi.fn((_threadId: ThreadId) => Effect.succeed({ threadId: "forked-native" }));
 
   const uploadFeedback = vi.fn(
     (
@@ -317,6 +318,7 @@ function makeFakeCodexAdapter(
     hasSession,
     readThread,
     rollbackThread,
+    forkThread,
     ...(provider === CODEX_DRIVER ? { uploadFeedback } : {}),
     stopAll,
     get streamEvents() {
@@ -354,6 +356,7 @@ function makeFakeCodexAdapter(
     hasSession,
     readThread,
     rollbackThread,
+    forkThread,
     uploadFeedback,
     stopAll,
   };
@@ -1988,6 +1991,12 @@ routing.layer("ProviderServiceLive routing", (it) => {
         modelSelection,
       );
 
+      const forkedCursor = yield* provider.forkConversation!(session.threadId);
+      assert.deepEqual(forkedCursor, { threadId: "forked-native" });
+      const forkedBinding = yield* directory.getBinding(session.threadId);
+      assert(Option.isSome(forkedBinding));
+      assert.deepEqual(forkedBinding.value.resumeCursor, forkedCursor);
+
       yield* provider.stopSession({ threadId: session.threadId });
       routing.codex.startSession.mockClear();
       routing.codex.sendTurn.mockClear();
@@ -2011,11 +2020,23 @@ routing.layer("ProviderServiceLive routing", (it) => {
         };
         assert.equal(startPayload.provider, "codex");
         assert.equal(startPayload.cwd, fixtureCwd("project"));
-        assert.deepEqual(startPayload.resumeCursor, rewindCursor);
+        assert.deepEqual(startPayload.resumeCursor, forkedCursor);
         assert.deepEqual(startPayload.modelSelection, modelSelection);
         assert.equal(startPayload.threadId, session.threadId);
       }
       assert.equal(routing.codex.sendTurn.mock.calls.length, 1);
+      const sourceCursor = { threadId: "source-after-resume" };
+      routing.codex.updateSession(session.threadId, (active) => ({
+        ...active,
+        resumeCursor: sourceCursor,
+      }));
+      const detachedFork = yield* provider.forkConversation!(session.threadId, {
+        preserveSource: true,
+      });
+      assert.deepEqual(detachedFork, { threadId: "forked-native" });
+      const preservedSource = yield* directory.getBinding(session.threadId);
+      assert(Option.isSome(preservedSource));
+      assert.deepEqual(preservedSource.value.resumeCursor, sourceCursor);
     }),
   );
 

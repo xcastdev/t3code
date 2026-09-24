@@ -49,6 +49,8 @@ export const ORCHESTRATION_WS_METHODS = {
   getFullThreadDiff: "orchestration.getFullThreadDiff",
   searchThreads: "orchestration.searchThreads",
   getArchivedShellSnapshot: "orchestration.getArchivedShellSnapshot",
+  listHistoryArchives: "orchestration.listHistoryArchives",
+  getHistoryArchive: "orchestration.getHistoryArchive",
   subscribeShell: "orchestration.subscribeShell",
   subscribeThread: "orchestration.subscribeThread",
 } as const;
@@ -1608,6 +1610,26 @@ const ThreadConversationRevertCommand = Schema.Struct({
   type: Schema.Literal("thread.conversation.revert"),
 });
 
+const ThreadHistoryRestoreCommand = Schema.Struct({
+  type: Schema.Literal("thread.history.restore"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  archiveId: Schema.String,
+  restoreFiles: Schema.Boolean,
+  createdAt: IsoDateTime,
+});
+
+const ThreadHistoryForkCommand = Schema.Struct({
+  type: Schema.Literal("thread.history.fork"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  forkThreadId: ThreadId,
+  archiveId: Schema.optional(Schema.String),
+  turnCount: NonNegativeInt,
+  restoreFiles: Schema.Boolean,
+  createdAt: IsoDateTime,
+});
+
 const ThreadSessionStopCommand = Schema.Struct({
   type: Schema.Literal("thread.session.stop"),
   commandId: CommandId,
@@ -1649,6 +1671,8 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadUserInputDismissCommand,
   ThreadCheckpointRevertCommand,
   ThreadConversationRevertCommand,
+  ThreadHistoryRestoreCommand,
+  ThreadHistoryForkCommand,
   ThreadSessionStopCommand,
 ]);
 export type DispatchableClientOrchestrationCommand =
@@ -1682,6 +1706,8 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadUserInputDismissCommand,
   ThreadCheckpointRevertCommand,
   ThreadConversationRevertCommand,
+  ThreadHistoryRestoreCommand,
+  ThreadHistoryForkCommand,
   ThreadSessionStopCommand,
 ]);
 export type ClientOrchestrationCommand = typeof ClientOrchestrationCommand.Type;
@@ -1775,6 +1801,10 @@ const ThreadRevertCompleteCommand = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
   turnCount: NonNegativeInt,
+  restoredArchiveId: Schema.optional(Schema.String),
+  forkSourceThreadId: Schema.optional(ThreadId),
+  archivedPathId: Schema.optional(Schema.String),
+  restoredSnapshot: Schema.optional(OrchestrationThread),
   createdAt: IsoDateTime,
 });
 
@@ -1910,6 +1940,8 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.approval-response-requested",
   "thread.user-input-response-requested",
   "thread.checkpoint-revert-requested",
+  "thread.history-restore-requested",
+  "thread.history-fork-requested",
   "thread.reverted",
   "thread.session-stop-requested",
   "thread.session-set",
@@ -2291,6 +2323,26 @@ export const ThreadCheckpointRevertRequestedPayload = Schema.Struct({
 export const ThreadRevertedPayload = Schema.Struct({
   threadId: ThreadId,
   turnCount: NonNegativeInt,
+  restoredArchiveId: Schema.optional(Schema.String),
+  forkSourceThreadId: Schema.optional(ThreadId),
+  archivedPathId: Schema.optional(Schema.String),
+  restoredSnapshot: Schema.optional(OrchestrationThread),
+});
+
+export const ThreadHistoryRestoreRequestedPayload = Schema.Struct({
+  threadId: ThreadId,
+  archiveId: Schema.String,
+  restoreFiles: Schema.Boolean,
+  createdAt: IsoDateTime,
+});
+
+export const ThreadHistoryForkRequestedPayload = Schema.Struct({
+  threadId: ThreadId,
+  forkThreadId: ThreadId,
+  archiveId: Schema.optional(Schema.String),
+  turnCount: NonNegativeInt,
+  restoreFiles: Schema.Boolean,
+  createdAt: IsoDateTime,
 });
 
 export const ThreadSessionStopRequestedPayload = Schema.Struct({
@@ -2552,6 +2604,16 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.checkpoint-revert-requested"),
     payload: ThreadCheckpointRevertRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.history-restore-requested"),
+    payload: ThreadHistoryRestoreRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.history-fork-requested"),
+    payload: ThreadHistoryForkRequestedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,
@@ -2824,6 +2886,21 @@ export const OrchestrationRpcSchemas = {
   getArchivedShellSnapshot: {
     input: Schema.Struct({}),
     output: OrchestrationShellSnapshot,
+  },
+  listHistoryArchives: {
+    input: Schema.Struct({ threadId: ThreadId }),
+    output: Schema.Array(
+      Schema.Struct({
+        archiveId: Schema.String,
+        threadId: ThreadId,
+        createdAt: IsoDateTime,
+        turnCount: NonNegativeInt,
+      }),
+    ),
+  },
+  getHistoryArchive: {
+    input: Schema.Struct({ threadId: ThreadId, archiveId: Schema.String }),
+    output: Schema.NullOr(OrchestrationThread),
   },
   subscribeThread: {
     input: OrchestrationSubscribeThreadInput,

@@ -1046,6 +1046,60 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         );
       },
     ),
+
+    copyCheckpointRefs: Effect.fn("GitVcsDriver.checkpoints.copyCheckpointRefs")(function* (input) {
+      if (input.copies.length === 0) return;
+      const copies = yield* Effect.forEach(input.copies, (copy) =>
+        execute({
+          operation: "GitVcsDriver.checkpoints.copyCheckpointRefs",
+          cwd: input.cwd,
+          args: ["rev-parse", "--verify", "--end-of-options", `${copy.from}^{commit}`],
+        }).pipe(Effect.map((result) => ({ ...copy, oid: result.stdout.trim() }))),
+      );
+      yield* execute({
+        operation: "GitVcsDriver.checkpoints.copyCheckpointRefs",
+        cwd: input.cwd,
+        args: ["update-ref", "--stdin"],
+        stdin: [
+          "start",
+          ...copies.flatMap((copy) => [
+            `verify ${copy.from} ${copy.oid}`,
+            `create ${copy.to} ${copy.oid}`,
+          ]),
+          "prepare",
+          "commit",
+          "",
+        ].join("\n"),
+      });
+    }),
+
+    replaceCheckpointRefs: Effect.fn("GitVcsDriver.checkpoints.replaceCheckpointRefs")(
+      function* (input) {
+        if (input.replacements.length === 0) return;
+        const replacements = yield* Effect.forEach(input.replacements, (replacement) =>
+          execute({
+            operation: "GitVcsDriver.checkpoints.replaceCheckpointRefs",
+            cwd: input.cwd,
+            args: ["rev-parse", "--verify", "--end-of-options", `${replacement.from}^{commit}`],
+          }).pipe(Effect.map((result) => ({ ...replacement, oid: result.stdout.trim() }))),
+        );
+        yield* execute({
+          operation: "GitVcsDriver.checkpoints.replaceCheckpointRefs",
+          cwd: input.cwd,
+          args: ["update-ref", "--stdin"],
+          stdin: [
+            "start",
+            ...replacements.flatMap((replacement) => [
+              `verify ${replacement.from} ${replacement.oid}`,
+              `update ${replacement.to} ${replacement.oid}`,
+            ]),
+            "prepare",
+            "commit",
+            "",
+          ].join("\n"),
+        });
+      },
+    ),
   };
 
   return {
