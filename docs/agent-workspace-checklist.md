@@ -26,7 +26,7 @@ Status at the current checkout. This tracks the [workspace direction](https://gi
 
 6. **Provider usage monitoring**
    - [x] Show token history, estimated cost, and model breakdowns for Codex, Claude Code, and Grok Build; show available Codex and Claude subscription limits and reset times. See [Usage and limits](user/usage.md), the [Usage service](../apps/server/src/usage/UsageService.ts), and [provider limit contracts](../packages/contracts/src/providerUsageLimits.ts).
-   - [ ] Complete the provider-by-provider coverage described in the direction document. Other providers do not yet have the same history and limit coverage.
+   - [ ] Deferred until needed: complete provider-by-provider coverage. Other providers do not yet have the same history and limit coverage.
 
 7. **Per-subagent controls**
    - [x] Show native subagent status in the [Agents panel](../apps/web/src/components/AgentsPanel.tsx).
