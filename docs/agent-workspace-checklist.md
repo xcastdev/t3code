@@ -13,7 +13,8 @@ Status at the current checkout. This tracks the [workspace direction](https://gi
 
 3. **Skills, commands, agents, and snippets**
    - [x] Create, import, scope, deliver, and install [managed skills](../apps/server/src/skills/SkillCatalogService.ts); see the [user guide](user/skills.md).
-   - [ ] Add managed commands, agent definitions, and text snippets with scope, compatibility, enablement, and audit history. Existing provider commands and the subagent panel do not provide this resource catalog.
+   - [x] Add managed commands and text snippets with environment and project scopes, thread enablement, compatibility with provider-native commands, and mutation audit history. See the [user guide](user/composer.md#commands-snippets-and-skills).
+   - [ ] Add managed agent definitions. The current subagent panel shows provider-native agents; named agent launch remains deferred until providers expose a reliable way to start one.
 
 4. **Git workflow controls**
    - [x] Provide status, staging, diffs, commits, branches, history, and remote actions through [Source Control](user/source-control.md) and the [Git workflow service](../apps/server/src/git/GitWorkflowService.ts).
