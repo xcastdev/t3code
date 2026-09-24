@@ -21,8 +21,8 @@ Status at the current checkout. This tracks the [workspace direction](https://gi
 
 5. **Durable chat forks and reverts**
    - [x] Revert a thread conversation, optionally restoring its [workspace checkpoint](../apps/server/src/orchestration/Layers/CheckpointReactor.ts). The [projector](../apps/server/src/orchestration/projector.ts) trims the active thread's later messages and checkpoints.
-   - [ ] Preserve reverted turns and checkpoints as a recoverable branch or archive. The current reactor deletes later checkpoint refs.
-   - [ ] Add a T3 thread fork that retains parent context and a reproducible starting checkpoint. The Claude adapter's provider `forkSession` call is an implementation detail of conversation rollback, not that product feature.
+   - [x] Preserve reverted turns and checkpoints in recoverable [history archives](../apps/server/src/persistence/ThreadHistoryArchive.ts). Users can inspect and restore an archived path from History; restoring also archives the path they leave.
+   - [x] Fork a new T3 thread from a checkpoint in History, retaining the earlier conversation and starting checkpoint. Users can keep the current workspace files or create a separate worktree at that checkpoint; see the [user guide](user/composer.md#edit-an-earlier-prompt).
 
 6. **Provider usage monitoring**
    - [x] Show token history, estimated cost, and model breakdowns for Codex, Claude Code, and Grok Build; show available Codex and Claude subscription limits and reset times. See [Usage and limits](user/usage.md), the [Usage service](../apps/server/src/usage/UsageService.ts), and [provider limit contracts](../packages/contracts/src/providerUsageLimits.ts).
