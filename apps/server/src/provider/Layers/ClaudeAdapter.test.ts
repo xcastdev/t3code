@@ -39,6 +39,7 @@ import * as TestClock from "effect/testing/TestClock";
 
 import { attachmentRelativePath } from "../../attachmentStore.ts";
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import {
   SYNTHETIC_CLAUDE_CAPABLE_MODEL,
@@ -48,6 +49,11 @@ import {
   SYNTHETIC_CLAUDE_THINKING_MODEL,
 } from "../ClaudeModelCatalog.testFixtures.ts";
 import { ProviderAdapterProcessError, ProviderAdapterValidationError } from "../Errors.ts";
+import {
+  installTerminalOnlyMcpSession,
+  terminalOnlyMcpAuthorization,
+  terminalOnlyMcpEndpoint,
+} from "../testUtils/managedMcpSession.ts";
 import type { ClaudeAdapterShape } from "../Services/ClaudeAdapter.ts";
 import type { ClaudeScopedLimitNames } from "./claudeUsageLimits.ts";
 import { makeClaudeAdapter, type ClaudeAdapterLiveOptions } from "./ClaudeAdapter.ts";
@@ -414,6 +420,32 @@ describe("ClaudeAdapterLive", () => {
       });
       assert.equal(createInput?.options.permissionMode, "bypassPermissions");
       assert.equal(createInput?.options.allowDangerouslySkipPermissions, true);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("configures the managed MCP endpoint for a terminal-only credential", () => {
+    const harness = makeHarness();
+    const threadId = ThreadId.make("thread-claude-terminal-only");
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      installTerminalOnlyMcpSession(threadId, ProviderInstanceId.make("claudeAgent"));
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+
+      const config = harness.getLastCreateQueryInput()?.options.mcpServers?.["t3-code"];
+      assert.deepEqual(config, {
+        type: "http",
+        url: terminalOnlyMcpEndpoint,
+        headers: { Authorization: terminalOnlyMcpAuthorization },
+      });
+      yield* adapter.stopSession(threadId);
+      McpProviderSession.clearMcpProviderSession(threadId);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

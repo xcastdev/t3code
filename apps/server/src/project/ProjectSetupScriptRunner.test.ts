@@ -67,6 +67,15 @@ const makeTerminalManagerLayer = (overrides: TerminalOverrides) =>
     close: () => Effect.void,
     subscribe: () => Effect.succeed(() => undefined),
     subscribeMetadata: () => Effect.succeed(() => undefined),
+    createProject: () => Effect.die(new Error("unused")),
+    listProject: () => Effect.succeed([]),
+    readProject: () => Effect.die(new Error("unused")),
+    writeProject: () => Effect.die(new Error("unused")),
+    resizeProject: () => Effect.die(new Error("unused")),
+    killProjectTerminal: () => Effect.die(new Error("unused")),
+    closeProject: () => Effect.void,
+    subscribeProjectEvents: () => Effect.succeed(() => undefined),
+    subscribeProjectTerminal: () => Effect.succeed(() => undefined),
     ...overrides,
   });
 

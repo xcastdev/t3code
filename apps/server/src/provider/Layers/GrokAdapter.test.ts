@@ -27,7 +27,13 @@ import {
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { execScriptSource, writeFakeCli } from "../../testUtils/fakeCli.ts";
+import {
+  installTerminalOnlyMcpSession,
+  terminalOnlyMcpAuthorization,
+  terminalOnlyMcpEndpoint,
+} from "../testUtils/managedMcpSession.ts";
 import {
   grokPromptSettlementBelongsToContext,
   isGrokEnterPlanModeToolCall,
@@ -371,6 +377,35 @@ it.layer(grokAdapterTestLayer)("GrokAdapterLive", (it) => {
       assert.include(prompts[1]?.[1]?.text, "Grok harness, as grok-4.6");
       assert.include(prompts[1]?.[1]?.text, "with low reasoning effort");
       assert.include(prompts[1]?.[1]?.text, "embed images and videos");
+    }),
+  );
+
+  it.effect("configures the managed MCP endpoint for a terminal-only credential", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("grok-terminal-only-mcp");
+      const tempDir = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "grok-terminal-only-mcp-")),
+      );
+      const requestLogPath = NodePath.join(tempDir, "requests.ndjson");
+      const wrapperPath = yield* Effect.promise(() =>
+        makeMockGrokWrapper({ T3_ACP_REQUEST_LOG_PATH: requestLogPath }),
+      );
+      const adapter = yield* makeTestAdapter(wrapperPath);
+      installTerminalOnlyMcpSession(threadId, ProviderInstanceId.make("grok"));
+      yield* adapter.startSession({ threadId, cwd: tempDir, runtimeMode: "full-access" });
+      yield* adapter.stopSession(threadId);
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const sessionStart = requests.find((entry) => entry.method === "session/new");
+      const params = sessionStart?.params as
+        | { readonly mcpServers?: ReadonlyArray<Record<string, unknown>> }
+        | undefined;
+      const server = params?.mcpServers?.find((entry) => entry.name === "t3-code");
+      assert.equal(server?.url, terminalOnlyMcpEndpoint);
+      assert.deepEqual(server?.headers, [
+        { name: "Authorization", value: terminalOnlyMcpAuthorization },
+      ]);
+      McpProviderSession.clearMcpProviderSession(threadId);
     }),
   );
 

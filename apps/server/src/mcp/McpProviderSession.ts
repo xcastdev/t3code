@@ -16,7 +16,7 @@ export interface McpProviderSessionConfig {
   readonly authorizationHeader: string;
   /** Provider-facing aggregate catalog endpoint, when live catalog updates are enabled. */
   readonly catalogEndpoint?: string;
-  /** Capabilities the credential grants ("preview", "device"). */
+  /** Capabilities the credential grants to the managed MCP endpoint. */
   readonly capabilities: ReadonlySet<string>;
   /**
    * Set when the session may drive devices. Adapters spread this into the
@@ -47,7 +47,7 @@ export function withAgentDeviceEnvironment(
 export interface McpProviderSessionReplacement {
   readonly previous: McpProviderSessionConfig | undefined;
   readonly candidate: McpProviderSessionConfig | undefined;
-  readonly accessWasDisabled: boolean;
+  readonly previewWasRevoked: boolean;
 }
 
 const sessionsByThread = new Map<ThreadId, McpProviderSessionConfig>();
@@ -100,7 +100,7 @@ export function rollbackMcpProviderSessionReplacement(threadId: ThreadId): void 
     current === undefined ||
     current.providerSessionId === candidateId
   ) {
-    if (replacement.accessWasDisabled || replacement.previous === undefined) {
+    if (replacement.previewWasRevoked || replacement.previous === undefined) {
       sessionsByThread.delete(threadId);
     } else {
       sessionsByThread.set(threadId, replacement.previous);

@@ -64,6 +64,30 @@ it.effect("reports other missing capabilities with the neutral error", () => {
   });
 });
 
+it.effect("allows terminal calls while browser preview remains unavailable", () => {
+  const invocation: McpInvocationContext.McpInvocationScope = {
+    environmentId: EnvironmentId.make("environment-1"),
+    threadId: ThreadId.make("thread-terminal-only"),
+    providerSessionId: "provider-session-terminal-only",
+    providerInstanceId: ProviderInstanceId.make("codex"),
+    capabilities: new Set(["terminal"]),
+    issuedAt: 1,
+  };
+
+  return Effect.gen(function* () {
+    const terminalScope = yield* McpInvocationContext.requireMcpCapability("terminal").pipe(
+      Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+    );
+    const previewError = yield* McpInvocationContext.requireMcpCapability("preview").pipe(
+      Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+      Effect.flip,
+    );
+
+    expect(terminalScope).toBe(invocation);
+    expect(previewError).toBeInstanceOf(PreviewAutomationUnavailableError);
+  });
+});
+
 it("binds project-work attribution to provider and thread, not a renewed session", () => {
   const base: McpInvocationContext.McpInvocationScope = {
     environmentId: EnvironmentId.make("environment-1"),

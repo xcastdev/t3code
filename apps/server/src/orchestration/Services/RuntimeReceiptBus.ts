@@ -14,7 +14,14 @@
  *
  * @module RuntimeReceiptBus
  */
-import { CheckpointRef, IsoDateTime, NonNegativeInt, ThreadId, TurnId } from "@t3tools/contracts";
+import {
+  CheckpointRef,
+  IsoDateTime,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
@@ -49,10 +56,18 @@ export const TurnProcessingQuiescedReceipt = Schema.Struct({
 });
 export type TurnProcessingQuiescedReceipt = typeof TurnProcessingQuiescedReceipt.Type;
 
+export const ProjectTerminalsClosedReceipt = Schema.Struct({
+  type: Schema.Literal("project.terminals.closed"),
+  projectId: ProjectId,
+  sequence: NonNegativeInt,
+});
+export type ProjectTerminalsClosedReceipt = typeof ProjectTerminalsClosedReceipt.Type;
+
 export const OrchestrationRuntimeReceipt = Schema.Union([
   CheckpointBaselineCapturedReceipt,
   CheckpointDiffFinalizedReceipt,
   TurnProcessingQuiescedReceipt,
+  ProjectTerminalsClosedReceipt,
 ]);
 export type OrchestrationRuntimeReceipt = typeof OrchestrationRuntimeReceipt.Type;
 

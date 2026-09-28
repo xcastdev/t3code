@@ -26,12 +26,18 @@ import {
 } from "@t3tools/contracts";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import type { CursorAdapterShape } from "../Services/CursorAdapter.ts";
 import { makeCursorAdapter } from "./CursorAdapter.ts";
 import { execScriptSource, writeFakeCli } from "../../testUtils/fakeCli.ts";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import {
+  installTerminalOnlyMcpSession,
+  terminalOnlyMcpAuthorization,
+  terminalOnlyMcpEndpoint,
+} from "../testUtils/managedMcpSession.ts";
 const decodeCursorSettings = Schema.decodeSync(CursorSettings);
 
 // Test-local service tag so the rest of the file can keep using `yield* CursorAdapter`.
@@ -362,6 +368,45 @@ cursorAdapterTestLayer("CursorAdapterLive", (it) => {
           ],
         ],
       );
+    }),
+  );
+
+  it.effect("configures the managed MCP endpoint for a terminal-only credential", () =>
+    Effect.gen(function* () {
+      const adapter = yield* CursorAdapter;
+      const settings = yield* ServerSettingsService;
+      const threadId = ThreadId.make("cursor-terminal-only-mcp");
+      const workspace = yield* Effect.promise(() =>
+        NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "cursor-terminal-only-mcp-")),
+      );
+      const requestLogPath = NodePath.join(workspace, "requests.ndjson");
+      const argvLogPath = NodePath.join(workspace, "argv.txt");
+      yield* Effect.promise(() => NodeFSP.writeFile(requestLogPath, "", "utf8"));
+      const wrapperPath = yield* Effect.promise(() =>
+        makeProbeWrapper(requestLogPath, argvLogPath),
+      );
+      installTerminalOnlyMcpSession(threadId, ProviderInstanceId.make("cursor"));
+      yield* settings.updateSettings({ providers: { cursor: { binaryPath: wrapperPath } } });
+
+      yield* adapter.startSession({
+        threadId,
+        provider: ProviderDriverKind.make("cursor"),
+        cwd: workspace,
+        runtimeMode: "full-access",
+      });
+      yield* adapter.stopSession(threadId);
+
+      const requests = yield* Effect.promise(() => readJsonLines(requestLogPath));
+      const sessionStart = requests.find((entry) => entry.method === "session/new");
+      const params = sessionStart?.params as
+        | { readonly mcpServers?: ReadonlyArray<Record<string, unknown>> }
+        | undefined;
+      const server = params?.mcpServers?.find((entry) => entry.name === "t3-code");
+      assert.equal(server?.url, terminalOnlyMcpEndpoint);
+      assert.deepEqual(server?.headers, [
+        { name: "Authorization", value: terminalOnlyMcpAuthorization },
+      ]);
+      McpProviderSession.clearMcpProviderSession(threadId);
     }),
   );
 

@@ -5,9 +5,15 @@ client, including the desktop renderer, attaches through the environment connect
 This lets clients reconnect or share a running session. Renderer choices stay local
 to each client and do not change terminal contracts.
 
+Dock terminals belong to a thread; toolkit terminals belong to a project. Keep the
+owner kind explicit in lookup, history, and cleanup because a project ID and thread
+ID can have the same value. Thread archive or deletion closes only that thread's
+dock terminals. Project deletion closes its toolkit terminals, while deleting any
+thread leaves them available to the project.
+
 ## Output and retention
 
-[Terminal history](../../apps/server/src/terminal/Manager.ts) is incremental.
+[Terminal history](../../apps/server/src/terminal/History.ts) is incremental.
 PTY callbacks append new chunks; live events carry only those chunks. Materializing
 or copying full scrollback on every callback makes output cost grow with retained
 history, so snapshots and coalesced persistence are the materialization boundaries.
@@ -21,6 +27,11 @@ without splitting Unicode code points; live output is not truncated. Release
 discarded chunk references immediately, even if array compaction happens later.
 Client buffers have a separate 512 KiB cap. Measure throughput with full scrollback
 when changing this path.
+
+Toolkit readers hold independent cursors; a read cannot advance another reader's
+position. Read and search only bounded slices of retained chunks instead of
+materializing full history for each request. If retention passes a reader's cursor,
+resume from the oldest retained output and report that earlier output was lost.
 
 Restoration must read only the bounded tail of current or legacy history files,
 skip any incomplete UTF-8 prefix, and apply the line limit. Close the read handle

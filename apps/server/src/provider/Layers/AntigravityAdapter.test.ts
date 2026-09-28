@@ -23,7 +23,13 @@ import * as AcpErrors from "effect-acp/errors";
 import type * as AcpSchema from "effect-acp/schema";
 
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ANTIGRAVITY_SIGN_IN_REQUIRED_MESSAGE } from "../antigravityAuthSupport.ts";
+import {
+  installTerminalOnlyMcpSession,
+  terminalOnlyMcpAuthorization,
+  terminalOnlyMcpEndpoint,
+} from "../testUtils/managedMcpSession.ts";
 import type { AcpSessionRuntimeEvent } from "../acp/AcpSessionRuntime.ts";
 import { makeAntigravityAcpRuntime } from "../acp/AntigravityAcpSupport.ts";
 import {
@@ -304,6 +310,24 @@ const layer = ServerConfig.layerTest(process.cwd(), {
 }).pipe(Layer.provideMerge(NodeServices.layer));
 
 it.layer(layer)("AntigravityAdapter", (it) => {
+  it.effect("configures the managed MCP endpoint for a terminal-only credential", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      const terminalSession = installTerminalOnlyMcpSession(threadId, instanceId);
+      yield* h.adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
+
+      const server = h.launches[0]?.mcpServers?.find((entry) => entry.name === "t3-code");
+      expect(server).toMatchObject({
+        name: "t3-code",
+        url: terminalOnlyMcpEndpoint,
+        headers: [{ name: "Authorization", value: terminalOnlyMcpAuthorization }],
+      });
+      expect(terminalSession.capabilities.has("preview")).toBe(false);
+      yield* h.adapter.stopSession(threadId);
+      McpProviderSession.clearMcpProviderSession(threadId);
+    }),
+  );
+
   it.effect("rejects multiple selected skills before sending a native prompt", () =>
     Effect.gen(function* () {
       const h = yield* makeHarness({ skillNames: new Set(["review", "implement"]) });

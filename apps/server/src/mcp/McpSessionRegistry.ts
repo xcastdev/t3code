@@ -340,6 +340,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
             providerInstanceId: ProviderInstanceId.make(request.providerInstanceId),
             capabilities: new Set<McpInvocationContext.McpCapability>([
               "pull-requests",
+              "terminal",
               ...(request.capabilities ?? []),
               ...((request.includePreview ?? request.capabilities?.has("preview") ?? true)
                 ? ["preview" as const]

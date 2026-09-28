@@ -38,6 +38,7 @@ import {
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { ServerConfig } from "../../config.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import * as OpenCodeExternalMcpCoordinator from "../OpenCodeExternalMcpCoordinator.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
@@ -55,6 +56,11 @@ import {
   mergeOpenCodeAssistantText,
 } from "./OpenCodeAdapter.ts";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
+import {
+  installTerminalOnlyMcpSession,
+  terminalOnlyMcpAuthorization,
+  terminalOnlyMcpEndpoint,
+} from "../testUtils/managedMcpSession.ts";
 
 // Test-local service tag so the rest of the file can keep using `yield* OpenCodeAdapter`.
 class OpenCodeAdapter extends Context.Service<OpenCodeAdapter, OpenCodeAdapterShape>()(
@@ -851,6 +857,32 @@ it.effect(
       );
       NodeAssert.equal(runtimeMock.state.sessionCreateUrls.length, 1);
     }).pipe(Effect.provide(externalAdapterDependencies)),
+);
+
+it.effect("configures the managed MCP endpoint for a terminal-only credential", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("opencode-terminal-only-mcp");
+    const settings = yield* decodeOpenCodeSettingsEffect({
+      binaryPath: "fake-opencode",
+      serverUrl: "",
+    });
+    const adapter = yield* makeOpenCodeAdapter(settings);
+    installTerminalOnlyMcpSession(threadId, ProviderInstanceId.make("opencode"));
+
+    yield* adapter.startSession({
+      provider: ProviderDriverKind.make("opencode"),
+      threadId,
+      runtimeMode: "full-access",
+    });
+
+    const config = runtimeMock.state.mcpConfig["t3-code"] as
+      | { readonly url?: string; readonly headers?: Readonly<Record<string, string>> }
+      | undefined;
+    NodeAssert.equal(config?.url, terminalOnlyMcpEndpoint);
+    NodeAssert.equal(config?.headers?.Authorization, terminalOnlyMcpAuthorization);
+    yield* adapter.stopSession(threadId);
+    McpProviderSession.clearMcpProviderSession(threadId);
+  }).pipe(Effect.provide(externalAdapterDependencies)),
 );
 
 const advanceTestClock = (ms: number) =>
