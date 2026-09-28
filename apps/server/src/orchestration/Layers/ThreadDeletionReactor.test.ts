@@ -87,6 +87,7 @@ describe("ThreadDeletionReactor drain", () => {
   effectIt.effect("waits for a published deletion the subscriber has not consumed yet", () =>
     Effect.gen(function* () {
       const stops: Array<number> = [];
+      const projectTerminals = new Set(["project-terminal-survives-thread-deletion"]);
       const firstCleanupDone = yield* Deferred.make<void>();
       // The engine has already committed and published sequence 2, but the
       // subscriber has not received it yet: the stream releases it on demand.
@@ -112,6 +113,10 @@ describe("ThreadDeletionReactor drain", () => {
       } as unknown as ProviderServiceShape;
       const terminalManager = {
         close: () => Effect.void,
+        closeProject: () =>
+          Effect.sync(() => {
+            projectTerminals.clear();
+          }),
       } as unknown as TerminalManager.TerminalManager["Service"];
       const layer = ThreadDeletionReactorLive.pipe(
         Layer.provide(
@@ -144,6 +149,7 @@ describe("ThreadDeletionReactor drain", () => {
           yield* Deferred.succeed(releaseSecondEvent, undefined);
           yield* Fiber.join(drained);
           expect(stops).toEqual([1, 2]);
+          expect(projectTerminals).toEqual(new Set(["project-terminal-survives-thread-deletion"]));
         }),
       ).pipe(Effect.provide(layer));
     }),

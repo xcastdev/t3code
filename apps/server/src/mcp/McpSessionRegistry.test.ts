@@ -55,33 +55,81 @@ it.effect("stores only a token hash, resolves the bearer token, and revokes by t
   }),
 );
 
-it.effect("always grants pull-requests and gates browser and device access independently", () =>
+it.effect(
+  "always grants terminal and pull-requests while gating browser and device independently",
+  () =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry(() => 1_000);
+      const withPreview = yield* registry.issue({
+        threadId: ThreadId.make("thread-preview"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        capabilities: new Set(["preview"]),
+      });
+      const withoutPreview = yield* registry.issue({
+        threadId: ThreadId.make("thread-no-preview"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        capabilities: new Set(),
+      });
+      const withDevice = yield* registry.issue({
+        threadId: ThreadId.make("thread-device"),
+        providerInstanceId: ProviderInstanceId.make("codex"),
+        capabilities: new Set(["device"]),
+      });
+      const capabilitiesOf = (issued: typeof withPreview) =>
+        registry
+          .resolve(issued.config.authorizationHeader.replace(/^Bearer\s+/, ""))
+          .pipe(Effect.map((scope) => [...(scope?.capabilities ?? [])].sort()));
+
+      expect(yield* capabilitiesOf(withPreview)).toEqual(["preview", "pull-requests", "terminal"]);
+      expect(yield* capabilitiesOf(withoutPreview)).toEqual(["pull-requests", "terminal"]);
+      expect(yield* capabilitiesOf(withDevice)).toEqual(["device", "pull-requests", "terminal"]);
+    }),
+);
+
+it.effect("grants terminal access when preview is disabled", () =>
   Effect.gen(function* () {
     const registry = yield* makeRegistry(() => 1_000);
-    const withPreview = yield* registry.issue({
-      threadId: ThreadId.make("thread-preview"),
-      providerInstanceId: ProviderInstanceId.make("codex"),
-      capabilities: new Set(["preview"]),
-    });
-    const withoutPreview = yield* registry.issue({
-      threadId: ThreadId.make("thread-no-preview"),
+    const issued = yield* registry.issue({
+      threadId: ThreadId.make("thread-terminal-only"),
       providerInstanceId: ProviderInstanceId.make("codex"),
       capabilities: new Set(),
+      includePreview: false,
     });
-    const withDevice = yield* registry.issue({
-      threadId: ThreadId.make("thread-device"),
-      providerInstanceId: ProviderInstanceId.make("codex"),
-      capabilities: new Set(["device"]),
-    });
-    const capabilitiesOf = (issued: typeof withPreview) =>
-      registry
-        .resolve(issued.config.authorizationHeader.replace(/^Bearer\s+/, ""))
-        .pipe(Effect.map((scope) => [...(scope?.capabilities ?? [])].sort()));
+    const token = issued.config.authorizationHeader.replace(/^Bearer\s+/, "");
+    const scope = yield* registry.resolve(token);
 
-    expect(yield* capabilitiesOf(withPreview)).toEqual(["preview", "pull-requests"]);
-    expect(yield* capabilitiesOf(withoutPreview)).toEqual(["pull-requests"]);
-    expect(yield* capabilitiesOf(withDevice)).toEqual(["device", "pull-requests"]);
+    expect(scope?.capabilities.has("terminal")).toBe(true);
+    expect(scope?.capabilities.has("preview")).toBe(false);
+    expect(issued.config.capabilities.has("terminal")).toBe(true);
+    expect(issued.config.capabilities.has("preview")).toBe(false);
   }),
+);
+
+it.effect(
+  "keeps terminal access on a replacement credential after the previous one is revoked",
+  () =>
+    Effect.gen(function* () {
+      const registry = yield* makeRegistry(() => 1_000);
+      const threadId = ThreadId.make("thread-terminal-renewal");
+      const request = {
+        threadId,
+        providerInstanceId: ProviderInstanceId.make("claude"),
+        includePreview: false,
+      };
+      const previous = yield* registry.issue(request);
+      const previousToken = previous.config.authorizationHeader.replace(/^Bearer\s+/, "");
+
+      yield* registry.revokeProviderSession(previous.config.providerSessionId);
+      const replacement = yield* registry.issue(request);
+      const replacementToken = replacement.config.authorizationHeader.replace(/^Bearer\s+/, "");
+      const resolvedReplacement = yield* registry.resolve(replacementToken);
+
+      expect(replacement.config.providerSessionId).not.toBe(previous.config.providerSessionId);
+      expect(yield* registry.resolve(previousToken)).toBeUndefined();
+      expect(resolvedReplacement?.threadId).toBe(threadId);
+      expect(resolvedReplacement?.capabilities.has("terminal")).toBe(true);
+      expect(resolvedReplacement?.capabilities.has("preview")).toBe(false);
+    }),
 );
 
 it.effect("builds MCP endpoints from the bound server host", () =>

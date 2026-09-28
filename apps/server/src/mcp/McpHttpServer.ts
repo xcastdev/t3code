@@ -42,6 +42,8 @@ import {
   DeviceScreenshotToolkit,
   DeviceStandardToolkit,
 } from "./toolkits/device/tools.ts";
+import { TerminalToolkitHandlersLive } from "./toolkits/terminal/handlers.ts";
+import { TerminalToolkit } from "./toolkits/terminal/tools.ts";
 
 const unauthorized = HttpServerResponse.jsonUnsafe(
   {
@@ -627,7 +629,11 @@ export const DeviceToolkitRegistrationLive = Layer.mergeAll(
   DeviceScreenshotRegistrationLive,
 );
 
-const McpTransportLive = McpServer.layerHttp({
+export const TerminalToolkitRegistrationLive = McpServer.toolkit(TerminalToolkit).pipe(
+  Layer.provide(TerminalToolkitHandlersLive),
+);
+
+export const McpTransportLive = McpServer.layerHttp({
   name: "T3 Code",
   version: packageJson.version,
   path: "/mcp",
@@ -639,4 +645,5 @@ export const layer = Layer.mergeAll(
   PullRequestsToolkitRegistrationLive,
   ProjectWorkToolkitRegistrationLive,
   DeviceToolkitRegistrationLive,
+  TerminalToolkitRegistrationLive,
 ).pipe(Layer.provideMerge(McpTransportLive));

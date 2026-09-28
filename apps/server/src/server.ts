@@ -66,6 +66,7 @@ import * as ForgejoCli from "./sourceControl/ForgejoCli.ts";
 import * as TextGeneration from "./textGeneration/TextGeneration.ts";
 import { ProviderInstanceRegistryHydrationLive } from "./provider/Layers/ProviderInstanceRegistryHydration.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
+import { ProjectTerminalServiceLive } from "./terminal/ProjectTerminalService.ts";
 import * as McpHttpServer from "./mcp/McpHttpServer.ts";
 import * as McpCatalogGateway from "./mcp/McpCatalogGateway.ts";
 import * as McpCatalogGatewayHttpServer from "./mcp/McpCatalogGatewayHttpServer.ts";
@@ -97,6 +98,7 @@ import { ProviderCommandReactorLive } from "./orchestration/Layers/ProviderComma
 import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.ts";
 import * as ThreadHistoryArchive from "./persistence/ThreadHistoryArchive.ts";
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
+import { ProjectTerminalReactorLive } from "./orchestration/Layers/ProjectTerminalReactor.ts";
 import * as ThreadSettlementReactor from "./orchestration/ThreadSettlementReactor.ts";
 import * as PullRequestSyncReactor from "./orchestration/PullRequestSyncReactor.ts";
 import * as ThreadPullRequestReactor from "./orchestration/ThreadPullRequestReactor.ts";
@@ -315,6 +317,9 @@ const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ProviderCommandReactorLive),
   Layer.provideMerge(CheckpointReactorLive.pipe(Layer.provide(ThreadHistoryArchive.layer))),
   Layer.provideMerge(ThreadDeletionReactorLive.pipe(Layer.provide(ThreadHistoryArchive.layer))),
+  Layer.provideMerge(
+    ProjectTerminalReactorLive.pipe(Layer.provideMerge(ProjectTerminalServiceLive)),
+  ),
   Layer.provideMerge(SkillApplicationReactorLayerLive),
   Layer.provideMerge(SkillCatalogApplicationReactorLayerLive),
   Layer.provideMerge(ThreadSettlementReactor.layer),

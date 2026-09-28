@@ -1201,9 +1201,8 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         adapterCapabilities.managedPreviewMcp !== "unsupported" && capabilities.has("preview");
       const managedProjectServers =
         adapterCapabilities.projectMcpProxy === "unsupported" ? undefined : projectMcpServers;
-      // Even without preview or project MCP, preserve the existing managed
-      // credential path: it carries pull-request/device capabilities and is
-      // intentionally observable by adapters and browser-access policy tests.
+      // Issue managed credentials independently of preview and project MCP so
+      // their capabilities remain available to the shared native endpoint.
       const credential = yield* issueMcpCredential({
         threadId,
         providerInstanceId,
@@ -1261,13 +1260,20 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           candidate: candidate
             ? { ...candidate, ...(catalogEndpoint ? { catalogEndpoint } : {}) }
             : undefined,
-          accessWasDisabled: !includePreview,
+          previewWasRevoked:
+            previous?.capabilities.has("preview") === true &&
+            candidate?.capabilities.has("preview") !== true,
         } satisfies McpProviderSession.McpProviderSessionReplacement;
         yield* Effect.sync(() => {
           McpProviderSession.beginMcpProviderSessionReplacement(threadId, replacement);
-          // The native preview endpoint remains the adapter's shared session config.
-          // Project endpoints are passed only through the start input below.
-          if ((includePreview || candidate?.catalogEndpoint !== undefined) && candidate)
+          // Keep the shared managed endpoint available for its independently
+          // checked toolkits, even when browser preview is disabled. Project
+          // endpoints are passed only through the start input below.
+          if (
+            (adapterCapabilities.managedPreviewMcp !== "unsupported" ||
+              candidate?.catalogEndpoint !== undefined) &&
+            candidate
+          )
             McpProviderSession.setMcpProviderSession(candidate);
           else McpProviderSession.clearMcpProviderSession(threadId);
         });

@@ -9,6 +9,7 @@
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import type * as Scope from "effect/Scope";
+import type { TerminalToolError } from "@t3tools/contracts";
 
 /**
  * OrchestrationReactorShape - Service API for orchestration reactor lifecycle.
@@ -29,7 +30,7 @@ export interface OrchestrationReactorShape {
    * scope immediately would otherwise drop an update that was accepted just
    * before shutdown.
    */
-  readonly drain: Effect.Effect<void>;
+  readonly drain: Effect.Effect<void, TerminalToolError>;
 }
 
 /**

@@ -40,7 +40,12 @@ import * as CodexErrors from "effect-codex-app-server/errors";
 
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import { ProviderAdapterValidationError } from "../Errors.ts";
+import {
+  installTerminalOnlyMcpSession,
+  terminalOnlyMcpEndpoint,
+} from "../testUtils/managedMcpSession.ts";
 import type { CodexAdapterShape } from "../Services/CodexAdapter.ts";
 import { ProviderSessionDirectory } from "../Services/ProviderSessionDirectory.ts";
 import {
@@ -303,6 +308,35 @@ validationLayer("CodexAdapterLive validation", (it) => {
         threadId: asThreadId("thread-1"),
         runtimeMode: "full-access",
       });
+    }),
+  );
+  it.effect("configures the managed MCP endpoint for a terminal-only credential", () =>
+    Effect.gen(function* () {
+      validationRuntimeFactory.factory.mockClear();
+      const threadId = asThreadId("thread-codex-terminal-only");
+      const terminalSession = installTerminalOnlyMcpSession(
+        threadId,
+        ProviderInstanceId.make("codex"),
+      );
+      const adapter = yield* CodexAdapter;
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("codex"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const runtimeOptions = validationRuntimeFactory.factory.mock.calls[0]?.[0];
+      NodeAssert.ok(
+        runtimeOptions?.appServerArgs?.includes(
+          `mcp_servers.t3-code.url=${terminalOnlyMcpEndpoint}`,
+        ),
+      );
+      NodeAssert.equal(runtimeOptions?.mcpCapabilities?.has("terminal"), true);
+      NodeAssert.equal(runtimeOptions?.mcpCapabilities?.has("preview"), false);
+      NodeAssert.equal(terminalSession.capabilities.has("preview"), false);
+      yield* adapter.stopSession(threadId);
+      McpProviderSession.clearMcpProviderSession(threadId);
     }),
   );
 });

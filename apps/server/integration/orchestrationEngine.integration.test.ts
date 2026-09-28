@@ -10,6 +10,7 @@ import {
   DEFAULT_MODEL,
   DEFAULT_MODEL_BY_PROVIDER,
   EventId,
+  EnvironmentId,
   MessageId,
   ProjectId,
   ProviderDriverKind,
@@ -19,9 +20,12 @@ import {
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as Clock from "effect/Clock";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import type { TestTurnResponse } from "./TestProviderAdapter.integration.ts";
 import {
@@ -33,9 +37,11 @@ import {
 import { checkpointRefForThreadTurn } from "../src/checkpointing/Utils.ts";
 import type {
   CheckpointDiffFinalizedReceipt,
+  ProjectTerminalsClosedReceipt,
   TurnProcessingQuiescedReceipt,
 } from "../src/orchestration/Services/RuntimeReceiptBus.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as McpInvocationContext from "../src/mcp/McpInvocationContext.ts";
 
 const asMessageId = (value: string): MessageId => MessageId.make(value);
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
@@ -264,6 +270,268 @@ it.live("runs a single turn end-to-end and persists checkpoint state in sqlite +
       assert.equal(gitShowFileAtRef(harness.workspaceDir, ref1, "README.md"), "v1\n");
     }),
   ),
+);
+
+it.live(
+  "keeps a project PTY usable after its last thread is deleted and a new one is created",
+  () =>
+    Effect.acquireUseRelease(
+      makeOrchestrationIntegrationHarness({
+        provider: CODEX_PROVIDER,
+        projectTerminals: true,
+      }),
+      (harness) =>
+        Effect.gen(function* () {
+          const projectId = asProjectId("project-terminal-last-thread-delete");
+          const firstThreadId = ThreadId.make("thread-terminal-last-thread-delete-first");
+          const secondThreadId = ThreadId.make("thread-terminal-last-thread-delete-second");
+          const providerInstanceId = defaultInstanceIdForDriver(CODEX_PROVIDER);
+          const model = DEFAULT_MODEL_BY_PROVIDER[CODEX_PROVIDER] ?? DEFAULT_MODEL;
+          const createdAt = nowIso();
+          const service = harness.projectTerminalService;
+          const manager = harness.projectTerminalManager;
+          assert.ok(service);
+          assert.ok(manager);
+
+          yield* harness.engine.dispatch({
+            type: "project.create",
+            commandId: CommandId.make("cmd-project-terminal-last-thread"),
+            projectId,
+            title: "Project terminal integration",
+            workspaceRoot: harness.workspaceDir,
+            createdAt,
+          });
+          const firstCreate = yield* harness.engine.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("cmd-thread-terminal-last-thread-first"),
+            threadId: firstThreadId,
+            projectId,
+            title: "First thread",
+            modelSelection: { instanceId: providerInstanceId, model },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            branch: null,
+            worktreePath: harness.workspaceDir,
+            createdAt,
+          });
+          yield* harness.drainThreadDeletionThrough(firstCreate.sequence);
+
+          const invocation = (threadId: ThreadId): McpInvocationContext.McpInvocationScope => ({
+            environmentId: EnvironmentId.make("environment-project-terminal-integration"),
+            threadId,
+            providerSessionId: `provider-session-${threadId}`,
+            providerInstanceId,
+            capabilities: new Set(["terminal"]),
+            issuedAt: 1,
+          });
+          const terminal = yield* service
+            .spawn({ title: "shared project shell" })
+            .pipe(
+              Effect.provideService(
+                McpInvocationContext.McpInvocationContext,
+                invocation(firstThreadId),
+              ),
+            );
+          const [process] = harness.projectTerminalPtyProcesses;
+          assert.ok(process);
+
+          const deletion = yield* harness.engine.dispatch({
+            type: "thread.delete",
+            commandId: CommandId.make("cmd-thread-terminal-last-thread-delete"),
+            threadId: firstThreadId,
+          });
+          assert.equal(
+            Option.isNone(yield* harness.snapshotQuery.getThreadShellById(firstThreadId)),
+            true,
+          );
+          yield* harness.drainThreadDeletionThrough(deletion.sequence);
+          assert.equal(
+            Option.isNone(yield* harness.snapshotQuery.getThreadShellById(firstThreadId)),
+            true,
+          );
+          assert.deepEqual(yield* manager.listProject(projectId), [terminal]);
+
+          const secondCreate = yield* harness.engine.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("cmd-thread-terminal-last-thread-second"),
+            threadId: secondThreadId,
+            projectId,
+            title: "Second thread",
+            modelSelection: { instanceId: providerInstanceId, model },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            branch: null,
+            worktreePath: harness.workspaceDir,
+            createdAt,
+          });
+          yield* harness.drainThreadDeletionThrough(secondCreate.sequence);
+
+          const listed = yield* service
+            .list({})
+            .pipe(
+              Effect.provideService(
+                McpInvocationContext.McpInvocationContext,
+                invocation(secondThreadId),
+              ),
+            );
+          yield* service
+            .write({ terminalId: terminal.terminalId, data: "echo from the new thread\n" })
+            .pipe(
+              Effect.provideService(
+                McpInvocationContext.McpInvocationContext,
+                invocation(secondThreadId),
+              ),
+            );
+          yield* service
+            .resize({ terminalId: terminal.terminalId, cols: 111, rows: 37 })
+            .pipe(
+              Effect.provideService(
+                McpInvocationContext.McpInvocationContext,
+                invocation(secondThreadId),
+              ),
+            );
+          yield* service
+            .kill({ terminalId: terminal.terminalId, cleanup: false })
+            .pipe(
+              Effect.provideService(
+                McpInvocationContext.McpInvocationContext,
+                invocation(secondThreadId),
+              ),
+            );
+
+          assert.deepEqual(listed.terminals, [terminal]);
+          assert.equal(harness.projectTerminalPtyProcesses.length, 1);
+          assert.deepEqual(process.writes, ["echo from the new thread\n"]);
+          assert.deepEqual(process.resizeCalls, [{ cols: 111, rows: 37 }]);
+          assert.equal(process.killSignals[0], "SIGTERM");
+        }),
+      (harness) => harness.dispose,
+    ).pipe(Effect.provide(NodeServices.layer)),
+);
+
+it.live("cleans a project PTY after a committed project deletion and publishes its receipt", () =>
+  Effect.gen(function* () {
+    const activation = yield* Deferred.make<void>();
+    return yield* Effect.acquireUseRelease(
+      makeOrchestrationIntegrationHarness({
+        provider: CODEX_PROVIDER,
+        projectTerminals: true,
+        serverActivation: Deferred.await(activation),
+      }),
+      (harness) =>
+        Effect.gen(function* () {
+          const projectId = asProjectId("project-terminal-committed-delete");
+          const threadId = ThreadId.make("thread-terminal-committed-delete");
+          const providerInstanceId = defaultInstanceIdForDriver(CODEX_PROVIDER);
+          const model = DEFAULT_MODEL_BY_PROVIDER[CODEX_PROVIDER] ?? DEFAULT_MODEL;
+          const createdAt = nowIso();
+          const manager = harness.projectTerminalManager;
+          const exited = yield* Deferred.make<void>();
+
+          yield* harness.engine.dispatch({
+            type: "project.create",
+            commandId: CommandId.make("cmd-project-terminal-committed-delete"),
+            projectId,
+            title: "Project terminal committed delete",
+            workspaceRoot: harness.workspaceDir,
+            createdAt,
+          });
+          yield* harness.engine.dispatch({
+            type: "thread.create",
+            commandId: CommandId.make("cmd-thread-terminal-committed-delete"),
+            threadId,
+            projectId,
+            title: "Terminal owner thread",
+            modelSelection: { instanceId: providerInstanceId, model },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            branch: null,
+            worktreePath: harness.workspaceDir,
+            createdAt,
+          });
+
+          const terminal = yield* harness.projectTerminalService
+            .spawn({ title: "retained history shell" })
+            .pipe(
+              Effect.provideService(McpInvocationContext.McpInvocationContext, {
+                environmentId: EnvironmentId.make("environment-project-terminal-committed-delete"),
+                threadId,
+                providerSessionId: "provider-session-project-terminal-committed-delete",
+                providerInstanceId,
+                capabilities: new Set<McpInvocationContext.McpCapability>(["terminal"]),
+                issuedAt: 1,
+              }),
+            );
+          const [process] = harness.projectTerminalPtyProcesses;
+          assert.ok(process);
+          const removeExitListener = yield* manager.subscribeProjectEvents((event) =>
+            event.type === "exited" && event.target.terminalId === terminal.terminalId
+              ? Deferred.succeed(exited, undefined).pipe(Effect.asVoid)
+              : Effect.void,
+          );
+
+          process.emitOutput("retained history from the PTY\n");
+          process.finishExit({ exitCode: 0, signal: null });
+          yield* Deferred.await(exited);
+
+          const historyPath = NodePath.join(
+            harness.rootDir,
+            "userdata",
+            "logs",
+            "terminals",
+            "projects",
+            Buffer.from(String(projectId)).toString("base64url"),
+            `terminal_${Buffer.from(terminal.terminalId).toString("base64url")}.log`,
+          );
+          assert.equal(NodeFS.readFileSync(historyPath, "utf8"), "retained history from the PTY\n");
+          assert.equal((yield* manager.listProject(projectId)).length, 1);
+
+          const threadDeletion = yield* harness.engine.dispatch({
+            type: "thread.delete",
+            commandId: CommandId.make("cmd-thread-terminal-before-project-delete"),
+            threadId,
+          });
+          const projectDeletion = yield* harness.engine.dispatch({
+            type: "project.delete",
+            commandId: CommandId.make("cmd-project-terminal-delete-after-thread"),
+            projectId,
+          });
+          assert.ok(projectDeletion.sequence > threadDeletion.sequence);
+          assert.equal(
+            Option.isNone(yield* harness.snapshotQuery.getProjectShellById(projectId)),
+            true,
+          );
+          assert.equal((yield* manager.listProject(projectId)).length, 1);
+          assert.equal(NodeFS.existsSync(historyPath), true);
+
+          const closedReceipt = yield* Deferred.make<ProjectTerminalsClosedReceipt>();
+          const receiptFiber = yield* Effect.forkChild(
+            Stream.runForEach(harness.runtimeReceiptBus.streamEventsForTest, (receipt) =>
+              receipt.type === "project.terminals.closed" &&
+              receipt.projectId === projectId &&
+              receipt.sequence === projectDeletion.sequence
+                ? Deferred.succeed(closedReceipt, receipt).pipe(Effect.asVoid)
+                : Effect.void,
+            ),
+          );
+
+          yield* Deferred.succeed(activation, undefined);
+          yield* harness.drainProjectTerminalThrough(projectDeletion.sequence);
+          const receipt = yield* Deferred.await(closedReceipt);
+          yield* Fiber.interrupt(receiptFiber);
+          removeExitListener();
+
+          assert.deepEqual(receipt, {
+            type: "project.terminals.closed",
+            projectId,
+            sequence: projectDeletion.sequence,
+          });
+          assert.deepEqual(yield* manager.listProject(projectId), []);
+          assert.equal(NodeFS.existsSync(historyPath), false);
+        }),
+      (harness) => harness.dispose,
+    );
+  }).pipe(Effect.provide(NodeServices.layer)),
 );
 
 it.live.skipIf(!process.env.CODEX_BINARY_PATH)(

@@ -7,6 +7,8 @@ import {
   type TerminalMetadataStreamEvent,
   type TerminalOpenInput,
   type TerminalRestartInput,
+  ProjectId,
+  ThreadId,
   ProviderDriverKind,
   ProviderInstanceId,
   ServerSettingsError,
@@ -15,6 +17,7 @@ import {
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Data from "effect/Data";
 import * as Clock from "effect/Clock";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
@@ -40,7 +43,9 @@ import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as ProcessRunner from "../processRunner.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as TerminalManager from "./Manager.ts";
+import { BoundedTerminalHistory } from "./History.ts";
 import * as PtyAdapter from "./PtyAdapter.ts";
+import type { ProjectTerminalRuntimeEvent } from "./RuntimeTypes.ts";
 
 class WaitForConditionError extends Data.TaggedError("WaitForConditionError")<{
   readonly message: string;
@@ -50,7 +55,12 @@ class FakePtyProcess implements PtyAdapter.PtyProcess {
   readonly writes: string[] = [];
   readonly resizeCalls: Array<{ cols: number; rows: number }> = [];
   readonly killSignals: Array<string | undefined> = [];
+  private readonly killSignalReceipts = new Map<string, Map<number, Deferred.Deferred<void>>>();
+  readonly killFailuresBySignal = new Map<string, Error>();
+  readonly firstKillSignal = Deferred.makeUnsafe<string | undefined>();
   readonly pid: number;
+  killFailure: Error | undefined;
+  exitOnKillSignal = false;
   writeFailure: unknown | undefined;
   resizeFailure: unknown | undefined;
   private readonly dataListeners = new Set<(data: string) => void>();
@@ -76,8 +86,52 @@ class FakePtyProcess implements PtyAdapter.PtyProcess {
   }
 
   kill(signal?: string): void {
-    this.killed = true;
     this.killSignals.push(signal);
+    if (signal !== undefined) {
+      const count = this.killSignals.filter((sent) => sent === signal).length;
+      for (const [occurrence, receipt] of this.killSignalReceipts.get(signal) ?? []) {
+        if (count >= occurrence && !Deferred.isDoneUnsafe(receipt)) {
+          Deferred.doneUnsafe(receipt, Effect.succeed(undefined));
+        }
+      }
+    }
+    if (!Deferred.isDoneUnsafe(this.firstKillSignal)) {
+      Deferred.doneUnsafe(this.firstKillSignal, Effect.succeed(signal));
+    }
+    const failure =
+      (signal === undefined ? undefined : this.killFailuresBySignal.get(signal)) ??
+      this.killFailure;
+    if (failure !== undefined) {
+      throw failure;
+    }
+    this.killed = true;
+    if (signal === "SIGKILL" && this.exitOnKillSignal) {
+      this.emitExit({ exitCode: 0, signal: 9 });
+    }
+  }
+
+  get dataListenerCount(): number {
+    return this.dataListeners.size;
+  }
+
+  get exitListenerCount(): number {
+    return this.exitListeners.size;
+  }
+
+  killSignalReceipt(signal: string, occurrence = 1): Deferred.Deferred<void> {
+    let receipts = this.killSignalReceipts.get(signal);
+    if (!receipts) {
+      receipts = new Map();
+      this.killSignalReceipts.set(signal, receipts);
+    }
+    const existing = receipts.get(occurrence);
+    if (existing) return existing;
+    const receipt = Deferred.makeUnsafe<void>();
+    receipts.set(occurrence, receipt);
+    if (this.killSignals.filter((sent) => sent === signal).length >= occurrence) {
+      Deferred.doneUnsafe(receipt, Effect.succeed(undefined));
+    }
+    return receipt;
   }
 
   onData(callback: (data: string) => void): () => void {
@@ -213,6 +267,18 @@ const multiTerminalHistoryLogPath = (
     }),
   );
 
+const projectTerminalHistoryLogPath = (logsDir: string, projectId: string, terminalId: string) =>
+  Effect.service(Path.Path).pipe(
+    Effect.map(({ join }) =>
+      join(
+        logsDir,
+        "projects",
+        Encoding.encodeBase64Url(projectId),
+        `terminal_${Encoding.encodeBase64Url(terminalId)}.log`,
+      ),
+    ),
+  );
+
 interface CreateManagerOptions {
   shellResolver?: () => string;
   env?: NodeJS.ProcessEnv;
@@ -230,6 +296,10 @@ interface CreateManagerOptions {
   maxRetainedInactiveSessions?: number;
   historyByteLimit?: number;
   ptyAdapter?: FakePtyAdapter;
+  registerTerminalProcesses?: Parameters<
+    typeof TerminalManager.makeWithOptions
+  >[0]["registerTerminalProcesses"];
+  unregisterTerminal?: Parameters<typeof TerminalManager.makeWithOptions>[0]["unregisterTerminal"];
   resolveProviderInstanceEnvironment?: Parameters<
     typeof TerminalManager.makeWithOptions
   >[0]["resolveProviderInstanceEnvironment"];
@@ -277,6 +347,12 @@ const createManager = (
         processKillGraceMs: options.processKillGraceMs ?? 1,
         ...(options.maxRetainedInactiveSessions !== undefined
           ? { maxRetainedInactiveSessions: options.maxRetainedInactiveSessions }
+          : {}),
+        ...(options.registerTerminalProcesses !== undefined
+          ? { registerTerminalProcesses: options.registerTerminalProcesses }
+          : {}),
+        ...(options.unregisterTerminal !== undefined
+          ? { unregisterTerminal: options.unregisterTerminal }
           : {}),
         ...(options.resolveProviderInstanceEnvironment !== undefined
           ? { resolveProviderInstanceEnvironment: options.resolveProviderInstanceEnvironment }
@@ -348,11 +424,7 @@ it("preserves line and byte limits across arbitrary chunks, Unicode, ANSI sequen
   for (const maxBytes of [0, 3, 8, 64, Infinity]) {
     for (const maxLines of [0, 1, 3, 5, 5_000]) {
       let expected = retainedHistory("before\ninitial\n", maxLines, maxBytes);
-      const history = new TerminalManager.BoundedTerminalHistory(
-        maxLines,
-        "before\ninitial\n",
-        maxBytes,
-      );
+      const history = new BoundedTerminalHistory(maxLines, "before\ninitial\n", maxBytes);
       expect(history.value()).toBe(expected);
 
       for (let step = 0; step < 300; step += 1) {
@@ -373,7 +445,7 @@ it("preserves line and byte limits across arbitrary chunks, Unicode, ANSI sequen
 it("bounds long partial lines and joins surrogate pairs across chunk boundaries", () => {
   const maxBytes = 65_539;
   let expected = "";
-  const history = new TerminalManager.BoundedTerminalHistory(5_000, "", maxBytes);
+  const history = new BoundedTerminalHistory(5_000, "", maxBytes);
   const writes = [
     "a".repeat(16_383) + "😀" + "b".repeat(70_000),
     "\r" + "c".repeat(70_000) + "\ud83d",
@@ -391,7 +463,7 @@ it("bounds long partial lines and joins surrogate pairs across chunk boundaries"
 it("preserves retained lines as older storage is compacted", () => {
   for (const maxLines of [3, 5_000]) {
     let expected = "";
-    const history = new TerminalManager.BoundedTerminalHistory(maxLines, expected);
+    const history = new BoundedTerminalHistory(maxLines, expected);
     for (let batch = 0; batch < 40; batch += 1) {
       const chunk = Array.from({ length: 300 }, (_, line) => `${batch}:${line}\n`).join("");
       history.append(chunk);
@@ -419,6 +491,1024 @@ it.layer(
       assert.equal(second.threadId, "thread-1");
       assert.equal(third.threadId, "thread-1");
       expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    }),
+  );
+
+  it.effect("keeps project terminals independent from equal-valued thread identities", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const projectId = ProjectId.make("same-owner-id");
+      const projectInput = {
+        projectId,
+        terminalId: "same-terminal-id",
+        creatingThreadId: ThreadId.make("same-owner-id"),
+        cwd: process.cwd(),
+        title: "Project-owned process",
+      };
+      yield* manager.createProject(projectInput);
+      yield* manager.open(
+        openInput({
+          threadId: "same-owner-id",
+          terminalId: "same-terminal-id",
+        }),
+      );
+      yield* manager.createProject({
+        ...projectInput,
+        projectId: ProjectId.make("unrelated-project"),
+        creatingThreadId: ThreadId.make("thread-from-unrelated-project"),
+      });
+
+      expect(ptyAdapter.processes).toHaveLength(3);
+      expect(ptyAdapter.spawnInputs).toHaveLength(3);
+      const [projectProcess, threadProcess, unrelatedProcess] = ptyAdapter.processes;
+      expect(projectProcess).toBeDefined();
+      expect(threadProcess).toBeDefined();
+      expect(unrelatedProcess).toBeDefined();
+      if (!projectProcess || !threadProcess || !unrelatedProcess) return;
+
+      projectProcess.emitData("project output stays retained\n");
+      threadProcess.emitData("thread history is separate\n");
+      yield* manager.close({
+        threadId: "same-owner-id",
+        terminalId: "same-terminal-id",
+        deleteHistory: true,
+      });
+
+      const projectSessions = yield* manager.listProject(projectId);
+      expect(projectSessions).toHaveLength(1);
+      expect(projectProcess.killed).toBe(false);
+      yield* manager.writeProject({
+        projectId,
+        terminalId: "same-terminal-id",
+        data: "still writable",
+      });
+      expect(projectProcess.writes).toEqual(["still writable"]);
+
+      const closeProject = yield* manager.closeProject(projectId).pipe(Effect.forkScoped);
+      expect(yield* Deferred.await(projectProcess.firstKillSignal)).toBe("SIGTERM");
+      projectProcess.emitExit({ exitCode: 0, signal: null });
+      yield* Fiber.join(closeProject);
+      expect(yield* manager.listProject(projectId)).toHaveLength(0);
+      expect(projectProcess.killed).toBe(true);
+      expect(unrelatedProcess.killed).toBe(false);
+      expect(yield* manager.listProject(ProjectId.make("unrelated-project"))).toHaveLength(1);
+      expect(threadProcess.killed).toBe(true);
+    }),
+  );
+
+  it.effect(
+    "passes project commands and arguments directly and omits environment from summaries",
+    () =>
+      Effect.gen(function* () {
+        const { manager, ptyAdapter } = yield* createManager();
+        const projectId = ProjectId.make("project-direct-spawn");
+        const command = "tool with spaces; $(echo not-a-shell-command)";
+        const args = ["argument with spaces", "$(touch must-not-run)", "--literal=a;b"];
+        const summary = yield* manager.createProject({
+          projectId,
+          terminalId: "direct",
+          creatingThreadId: ThreadId.make("origin-thread"),
+          cwd: process.cwd(),
+          title: "Long-lived task",
+          command,
+          args,
+          env: { TOOLKIT_SECRET: "must-not-appear-in-summary" },
+        });
+
+        expect(ptyAdapter.spawnInputs).toHaveLength(1);
+        expect(ptyAdapter.spawnInputs[0]).toMatchObject({
+          shell: command,
+          args,
+          cwd: process.cwd(),
+          env: { TOOLKIT_SECRET: "must-not-appear-in-summary" },
+        });
+        expect(summary).toMatchObject({
+          projectId,
+          terminalId: "direct",
+          title: "Long-lived task",
+          command,
+          args,
+          creatingThreadId: "origin-thread",
+          status: "running",
+        });
+        expect(summary).not.toHaveProperty("env");
+        expect(summary).not.toHaveProperty("history");
+        expect(yield* manager.listProject(projectId)).toEqual([summary]);
+      }),
+  );
+
+  it.effect("does not fall back to a shell when a direct project command fails", () =>
+    Effect.gen(function* () {
+      let shellResolverCalls = 0;
+      const { manager, ptyAdapter } = yield* createManager(5, {
+        shellResolver: () => {
+          shellResolverCalls += 1;
+          return "/bin/unexpected-shell";
+        },
+      });
+      ptyAdapter.spawnFailures.push(new Error("program not found"));
+      const projectId = ProjectId.make("project-no-shell-fallback");
+      const result = yield* Effect.exit(
+        manager.createProject({
+          projectId,
+          terminalId: "missing-program",
+          creatingThreadId: ThreadId.make("origin-thread"),
+          cwd: process.cwd(),
+          command: "missing-program",
+          args: ["--flag"],
+        }),
+      );
+
+      expect(result._tag).toBe("Failure");
+      expect(shellResolverCalls).toBe(0);
+      expect(ptyAdapter.spawnInputs).toHaveLength(1);
+      expect(ptyAdapter.spawnInputs[0]).toMatchObject({
+        shell: "missing-program",
+        args: ["--flag"],
+      });
+      expect(yield* manager.listProject(projectId)).toHaveLength(0);
+    }),
+  );
+
+  it.effect("uses the existing shell selection when a project command is omitted", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager(5, {
+        shellResolver: () => "/custom/interactive-shell",
+      });
+      yield* manager.createProject({
+        projectId: ProjectId.make("project-default-shell"),
+        terminalId: "shell",
+        creatingThreadId: ThreadId.make("origin-thread"),
+        cwd: process.cwd(),
+      });
+
+      expect(ptyAdapter.spawnInputs).toHaveLength(1);
+      expect(ptyAdapter.spawnInputs[0]?.shell).toBe("/custom/interactive-shell");
+    }),
+  );
+
+  it.effect("reads project output with independent cursors and a scoped event subscription", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const projectId = ProjectId.make("project-read-independent-cursors");
+      const otherProjectId = ProjectId.make("project-read-unrelated-events");
+      const terminalId = "shared-shell";
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      yield* manager.createProject({
+        projectId: otherProjectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("other-creator"),
+        cwd: process.cwd(),
+      });
+      const ptyProcess = ptyAdapter.processes[0];
+      const otherProcess = ptyAdapter.processes[1];
+      expect(ptyProcess).toBeDefined();
+      expect(otherProcess).toBeDefined();
+      if (!ptyProcess || !otherProcess) return;
+
+      const scopedEvents = yield* Ref.make<ReadonlyArray<ProjectTerminalRuntimeEvent>>([]);
+      const ownOutput = yield* Deferred.make<void>();
+      const unrelatedOutput = yield* Deferred.make<void>();
+      const unsubscribeScoped = yield* manager.subscribeProjectTerminal(
+        { projectId, terminalId },
+        (event) =>
+          Effect.gen(function* () {
+            yield* Ref.update(scopedEvents, (events) => [...events, event]);
+            if (event.type === "output") yield* Deferred.succeed(ownOutput, undefined);
+          }),
+      );
+      const unsubscribeAll = yield* manager.subscribeProjectEvents((event) =>
+        event.type === "output" &&
+        event.target.owner.kind === "project" &&
+        event.target.owner.projectId === otherProjectId
+          ? Deferred.succeed(unrelatedOutput, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribeScoped));
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribeAll));
+
+      ptyProcess.emitData("first\nsecond\n");
+      yield* Deferred.await(ownOutput);
+      const firstReader = yield* manager.readProject({ projectId, terminalId, maxBytes: 6 });
+      const secondReader = yield* manager.readProject({ projectId, terminalId, maxBytes: 6 });
+      expect(firstReader).toMatchObject({ kind: "stream", output: "first\n", hasMore: true });
+      expect(secondReader).toEqual(firstReader);
+      if (firstReader.kind !== "stream") return;
+
+      const nextPage = yield* manager.readProject({
+        projectId,
+        terminalId,
+        cursor: firstReader.nextCursor,
+        maxBytes: 7,
+      });
+      const repeatedCursor = yield* manager.readProject({
+        projectId,
+        terminalId,
+        cursor: firstReader.nextCursor,
+        maxBytes: 7,
+      });
+      expect(nextPage).toMatchObject({ kind: "stream", output: "second\n", hasMore: false });
+      expect(repeatedCursor).toEqual(nextPage);
+
+      const tail = yield* manager.readProject({ projectId, terminalId, tailLines: 1 });
+      expect(tail).toMatchObject({ kind: "stream", output: "second\n", hasMore: false });
+      if (tail.kind !== "stream") return;
+      const nextOutput = yield* Deferred.make<void>();
+      const unsubscribeNext = yield* manager.subscribeProjectTerminal(
+        { projectId, terminalId },
+        (event) =>
+          event.type === "output" && event.data === "third\n"
+            ? Deferred.succeed(nextOutput, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribeNext));
+      ptyProcess.emitData("third\n");
+      yield* Deferred.await(nextOutput);
+      const followedTail = yield* manager.readProject({
+        projectId,
+        terminalId,
+        cursor: tail.nextCursor,
+      });
+      expect(followedTail).toMatchObject({ kind: "stream", output: "third\n", hasMore: false });
+
+      otherProcess.emitData("other project output\n");
+      yield* Deferred.await(unrelatedOutput);
+      const receivedEvents = yield* Ref.get(scopedEvents);
+      expect(receivedEvents.map((event) => event.type)).toEqual(["output", "output"]);
+      expect(
+        receivedEvents.every(
+          (event) =>
+            event.target.owner.kind === "project" && event.target.owner.projectId === projectId,
+        ),
+      ).toBe(true);
+    }),
+  );
+
+  it.effect("binds search cursors to query, terminal, and history generation", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const projectId = ProjectId.make("project-search-cursors");
+      const terminalId = "search-shell";
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
+      const outputReady = yield* Deferred.make<void>();
+      const exitReady = yield* Deferred.make<void>();
+      const unsubscribe = yield* manager.subscribeProjectTerminal(
+        { projectId, terminalId },
+        (event) =>
+          event.type === "output"
+            ? Deferred.succeed(outputReady, undefined).pipe(Effect.asVoid)
+            : event.type === "exited"
+              ? Deferred.succeed(exitReady, undefined).pipe(Effect.asVoid)
+              : Effect.void,
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+      ptyProcess.emitData("one needle two needle");
+      yield* Deferred.await(outputReady);
+      const search = yield* manager.readProject({
+        projectId,
+        terminalId,
+        search: { text: "needle", ignoreCase: false },
+        maxBytes: 64,
+      });
+      expect(search).toMatchObject({
+        kind: "search",
+        matches: [
+          { start: 4, end: 10 },
+          { start: 15, end: 21 },
+        ],
+        hasMore: false,
+      });
+      if (search.kind !== "search") return;
+
+      const changedQuery = yield* Effect.exit(
+        manager.readProject({
+          projectId,
+          terminalId,
+          cursor: search.nextCursor,
+          search: { text: "other" },
+        }),
+      );
+      expect(Exit.isFailure(changedQuery)).toBe(true);
+      if (Exit.isFailure(changedQuery)) {
+        expect(Option.getOrNull(Cause.findErrorOption(changedQuery.cause))).toMatchObject({
+          reason: "invalid-search-cursor",
+        });
+      }
+      const searchCursorAsStream = yield* Effect.exit(
+        manager.readProject({ projectId, terminalId, cursor: search.nextCursor }),
+      );
+      expect(Exit.isFailure(searchCursorAsStream)).toBe(true);
+      if (Exit.isFailure(searchCursorAsStream)) {
+        expect(Option.getOrNull(Cause.findErrorOption(searchCursorAsStream.cause))).toMatchObject({
+          reason: "invalid-search-cursor",
+        });
+      }
+      const malformed = yield* Effect.exit(
+        manager.readProject({ projectId, terminalId, cursor: "not-a-valid-base64url-cursor!" }),
+      );
+      expect(Exit.isFailure(malformed)).toBe(true);
+      if (Exit.isFailure(malformed)) {
+        expect(Option.getOrNull(Cause.findErrorOption(malformed.cause))).toMatchObject({
+          reason: "invalid-cursor",
+        });
+      }
+
+      const stream = yield* manager.readProject({ projectId, terminalId });
+      expect(stream.kind).toBe("stream");
+      if (stream.kind !== "stream") return;
+      const futureCursorPayload = Buffer.from(stream.nextCursor, "base64url")
+        .toString("utf8")
+        .replace(/"position":\d+/, '"position":9999');
+      const futureCursor = Buffer.from(futureCursorPayload, "utf8").toString("base64url");
+      const future = yield* Effect.exit(
+        manager.readProject({ projectId, terminalId, cursor: futureCursor }),
+      );
+      expect(Exit.isFailure(future)).toBe(true);
+      if (Exit.isFailure(future)) {
+        expect(Option.getOrNull(Cause.findErrorOption(future.cause))).toMatchObject({
+          reason: "invalid-cursor",
+        });
+      }
+
+      yield* manager.createProject({
+        projectId,
+        terminalId: "another-terminal",
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const foreignTerminal = yield* Effect.exit(
+        manager.readProject({
+          projectId,
+          terminalId: "another-terminal",
+          cursor: stream.nextCursor,
+        }),
+      );
+      expect(Exit.isFailure(foreignTerminal)).toBe(true);
+      if (Exit.isFailure(foreignTerminal)) {
+        expect(Option.getOrNull(Cause.findErrorOption(foreignTerminal.cause))).toMatchObject({
+          reason: "invalid-cursor",
+        });
+      }
+
+      ptyProcess.emitExit({ exitCode: 0, signal: null });
+      yield* Deferred.await(exitReady);
+      yield* manager.killProjectTerminal({ projectId, terminalId, cleanup: true });
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const staleGeneration = yield* Effect.exit(
+        manager.readProject({ projectId, terminalId, cursor: stream.nextCursor }),
+      );
+      expect(Exit.isFailure(staleGeneration)).toBe(true);
+      if (Exit.isFailure(staleGeneration)) {
+        expect(Option.getOrNull(Cause.findErrorOption(staleGeneration.cause))).toMatchObject({
+          reason: "invalid-cursor",
+        });
+      }
+    }),
+  );
+
+  it.effect(
+    "marks the initial retained-output gap and reads exited history without respawning",
+    () =>
+      Effect.gen(function* () {
+        const { manager, ptyAdapter } = yield* createManager(5, { historyByteLimit: 5 });
+        const projectId = ProjectId.make("project-read-after-exit");
+        const terminalId = "finished-shell";
+        yield* manager.createProject({
+          projectId,
+          terminalId,
+          creatingThreadId: ThreadId.make("creator"),
+          cwd: process.cwd(),
+        });
+        const ptyProcess = ptyAdapter.processes[0];
+        expect(ptyProcess).toBeDefined();
+        if (!ptyProcess) return;
+
+        const outputReady = yield* Deferred.make<void>();
+        const exitReady = yield* Deferred.make<void>();
+        const unsubscribe = yield* manager.subscribeProjectTerminal(
+          { projectId, terminalId },
+          (event) =>
+            event.type === "output"
+              ? Deferred.succeed(outputReady, undefined).pipe(Effect.asVoid)
+              : event.type === "exited"
+                ? Deferred.succeed(exitReady, undefined).pipe(Effect.asVoid)
+                : Effect.void,
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+        ptyProcess.emitData("0123456789");
+        yield* Deferred.await(outputReady);
+        const initial = yield* manager.readProject({ projectId, terminalId, maxBytes: 5 });
+        expect(initial).toMatchObject({ kind: "stream", output: "56789", truncated: true });
+
+        ptyProcess.emitExit({ exitCode: 17, signal: null });
+        yield* Deferred.await(exitReady);
+        const afterExit = yield* manager.readProject({ projectId, terminalId });
+        expect(afterExit).toMatchObject({
+          kind: "stream",
+          output: "56789",
+          truncated: true,
+          terminal: { status: "exited", exitCode: 17 },
+        });
+        expect(ptyAdapter.spawnInputs).toHaveLength(1);
+        expect(ptyAdapter.processes).toHaveLength(1);
+      }),
+  );
+
+  it.effect("waits for project process exit and retains final output until cleanup", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter, logsDir } = yield* createManager();
+      const projectId = ProjectId.make("project-close-waits");
+      yield* manager.createProject({
+        projectId,
+        terminalId: "interactive",
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
+
+      const eventsRef = yield* Ref.make<ReadonlyArray<ProjectTerminalRuntimeEvent>>([]);
+      const unsubscribe = yield* manager.subscribeProjectEvents((event) =>
+        Ref.update(eventsRef, (events) => [...events, event]),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+      const close = yield* manager.closeProject(projectId).pipe(Effect.forkScoped);
+      expect(yield* Deferred.await(ptyProcess.firstKillSignal)).toBe("SIGTERM");
+      expect(ptyProcess.killSignals).toEqual(["SIGTERM"]);
+      expect(ptyProcess.dataListenerCount).toBe(1);
+      expect(ptyProcess.exitListenerCount).toBe(1);
+      expect((yield* manager.listProject(projectId))[0]?.status).toBe("stopping");
+
+      ptyProcess.emitData("final output before exit\n");
+      ptyProcess.emitExit({ exitCode: 23, signal: null });
+      yield* Fiber.join(close);
+
+      const events = yield* Ref.get(eventsRef);
+      const types = events.map((event) => event.type);
+      expect(types).toContain("output");
+      expect(types).toContain("exited");
+      expect(types).toContain("closed");
+      expect(types.indexOf("output")).toBeLessThan(types.indexOf("exited"));
+      expect(ptyProcess.dataListenerCount).toBe(0);
+      expect(ptyProcess.exitListenerCount).toBe(0);
+      expect(yield* manager.listProject(projectId)).toHaveLength(0);
+      const projectDirectory = yield* Effect.service(Path.Path).pipe(
+        Effect.map(({ join }) => join(logsDir, "projects", Encoding.encodeBase64Url(projectId))),
+      );
+      expect(yield* pathExists(projectDirectory)).toBe(false);
+    }),
+  );
+
+  it.effect("does not deadlock project close when an exit subscriber cleans up the terminal", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const projectId = ProjectId.make("project-close-subscriber-cleanup");
+      const terminalId = "interactive";
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
+
+      const cleanupFinished = yield* Deferred.make<void>();
+      const unsubscribe = yield* manager.subscribeProjectEvents((event) => {
+        if (event.type !== "exited") return Effect.void;
+        return manager.killProjectTerminal({ projectId, terminalId, cleanup: true }).pipe(
+          Effect.flatMap(() => Deferred.succeed(cleanupFinished, undefined)),
+          Effect.catch(() => Deferred.succeed(cleanupFinished, undefined)),
+          Effect.asVoid,
+        );
+      });
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+      const close = yield* manager.closeProject(projectId).pipe(Effect.forkScoped);
+      expect(yield* Deferred.await(ptyProcess.firstKillSignal)).toBe("SIGTERM");
+      ptyProcess.emitExit({ exitCode: 0, signal: null });
+
+      yield* Deferred.await(cleanupFinished);
+      yield* Fiber.join(close);
+      expect(yield* manager.listProject(projectId)).toHaveLength(0);
+    }),
+  );
+
+  it.effect("releases project close admission when the waiting caller is interrupted", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const projectId = ProjectId.make("project-close-interrupted");
+      yield* manager.createProject({
+        projectId,
+        terminalId: "first",
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const firstProcess = ptyAdapter.processes[0];
+      expect(firstProcess).toBeDefined();
+      if (!firstProcess) return;
+
+      const firstClose = yield* manager.closeProject(projectId).pipe(Effect.forkScoped);
+      expect(yield* Deferred.await(firstProcess.firstKillSignal)).toBe("SIGTERM");
+      yield* Fiber.interrupt(firstClose);
+
+      const secondSummary = yield* manager.createProject({
+        projectId,
+        terminalId: "created-after-interrupt",
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      expect(secondSummary.terminalId).toBe("created-after-interrupt");
+      const secondProcess = ptyAdapter.processes[1];
+      expect(secondProcess).toBeDefined();
+      if (!secondProcess) return;
+
+      const retryClose = yield* manager.closeProject(projectId).pipe(Effect.forkScoped);
+      expect(yield* Deferred.await(secondProcess.firstKillSignal)).toBe("SIGTERM");
+      firstProcess.emitExit({ exitCode: 0, signal: null });
+      secondProcess.emitExit({ exitCode: 0, signal: null });
+      yield* Fiber.join(retryClose);
+      expect(yield* manager.listProject(projectId)).toHaveLength(0);
+    }),
+  );
+
+  it.effect("surfaces project history deletion failures and allows cleanup to be retried", () =>
+    Effect.gen(function* () {
+      const baseFileSystem = yield* FileSystem.FileSystem;
+      let failRemoval: "terminal-history" | "project-directory" | null = null;
+      const fileSystem = new Proxy(baseFileSystem, {
+        get(target, property) {
+          if (property === "remove") {
+            return (
+              path: string,
+              options?: { readonly recursive?: boolean; readonly force?: boolean },
+            ) => {
+              const shouldFail =
+                (failRemoval === "terminal-history" &&
+                  path.includes("/projects/") &&
+                  path.endsWith(".log")) ||
+                (failRemoval === "project-directory" &&
+                  path.includes("/projects/") &&
+                  options?.recursive === true);
+              return shouldFail
+                ? Effect.fail(
+                    PlatformError.systemError({
+                      _tag: "PermissionDenied",
+                      module: "FileSystem",
+                      method: "remove",
+                      pathOrDescriptor: path,
+                    }),
+                  )
+                : target.remove(path, options);
+            };
+          }
+          const value = Reflect.get(target, property, target) as unknown;
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+      const { manager, ptyAdapter, logsDir } = yield* createManager().pipe(
+        Effect.provideService(FileSystem.FileSystem, fileSystem),
+      );
+      const projectId = ProjectId.make("project-history-delete-failure");
+      const terminalId = "finished";
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
+
+      const terminalLog = yield* projectTerminalHistoryLogPath(logsDir, projectId, terminalId);
+      failRemoval = "terminal-history";
+      const terminalCleanup = yield* manager
+        .killProjectTerminal({ projectId, terminalId, cleanup: true })
+        .pipe(Effect.exit, Effect.forkScoped);
+      expect(yield* Deferred.await(ptyProcess.firstKillSignal)).toBe("SIGTERM");
+      ptyProcess.emitData("cleanup output before exit\n");
+      ptyProcess.emitExit({ exitCode: 0, signal: null });
+      const cleanupResult = yield* Fiber.join(terminalCleanup);
+      expect(cleanupResult._tag).toBe("Failure");
+      if (Exit.isFailure(cleanupResult)) {
+        const error = Cause.findErrorOption(cleanupResult.cause);
+        expect(Option.getOrNull(error)).toMatchObject({
+          _tag: "TerminalToolError",
+          operation: "kill",
+          reason: "cleanup-failed",
+        });
+      }
+      expect(yield* manager.listProject(projectId)).toHaveLength(1);
+      expect(yield* pathExists(terminalLog)).toBe(true);
+
+      failRemoval = null;
+      yield* manager.killProjectTerminal({ projectId, terminalId, cleanup: true });
+      expect(yield* manager.listProject(projectId)).toHaveLength(0);
+      expect(yield* pathExists(terminalLog)).toBe(false);
+
+      yield* manager.createProject({
+        projectId,
+        terminalId: "directory-cleanup",
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const directoryProcess = ptyAdapter.processes[1];
+      expect(directoryProcess).toBeDefined();
+      if (!directoryProcess) return;
+      const directoryExit = yield* Deferred.make<void>();
+      const unsubscribeDirectory = yield* manager.subscribeProjectEvents((event) =>
+        event.type === "exited"
+          ? Deferred.succeed(directoryExit, undefined).pipe(Effect.asVoid)
+          : Effect.void,
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribeDirectory));
+      directoryProcess.emitExit({ exitCode: 0, signal: null });
+      yield* Deferred.await(directoryExit);
+
+      failRemoval = "project-directory";
+      const closeResult = yield* Effect.exit(manager.closeProject(projectId));
+      expect(closeResult._tag).toBe("Failure");
+      if (Exit.isFailure(closeResult)) {
+        const error = Cause.findErrorOption(closeResult.cause);
+        expect(Option.getOrNull(error)).toMatchObject({
+          _tag: "TerminalToolError",
+          operation: "close",
+          reason: "cleanup-failed",
+        });
+      }
+      failRemoval = null;
+      yield* manager.closeProject(projectId);
+      const projectDirectory = yield* Effect.service(Path.Path).pipe(
+        Effect.map(({ join }) => join(logsDir, "projects", Encoding.encodeBase64Url(projectId))),
+      );
+      expect(yield* pathExists(projectDirectory)).toBe(false);
+    }),
+  );
+
+  it.effect("does not remove a project terminal when termination fails", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const projectId = ProjectId.make("project-close-kill-failure");
+      yield* manager.createProject({
+        projectId,
+        terminalId: "interactive",
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
+
+      ptyProcess.killFailure = new Error("signal rejected");
+      const closeResult = yield* Effect.exit(manager.closeProject(projectId));
+
+      expect(closeResult._tag).toBe("Failure");
+      expect((yield* manager.listProject(projectId))[0]?.status).toBe("running");
+      expect(ptyProcess.dataListenerCount).toBe(1);
+      expect(ptyProcess.exitListenerCount).toBe(1);
+    }),
+  );
+
+  it.effect(
+    "surfaces SIGKILL escalation failure from project close and retries on repeated kill",
+    () =>
+      Effect.gen(function* () {
+        const { manager, ptyAdapter } = yield* createManager(5, { processKillGraceMs: 1 });
+        const projectId = ProjectId.make("project-sigkill-retry");
+        const terminalId = "interactive";
+        yield* manager.createProject({
+          projectId,
+          terminalId,
+          creatingThreadId: ThreadId.make("creator"),
+          cwd: process.cwd(),
+        });
+        const ptyProcess = ptyAdapter.processes[0];
+        expect(ptyProcess).toBeDefined();
+        if (!ptyProcess) return;
+
+        const firstSigkill = ptyProcess.killSignalReceipt("SIGKILL");
+        ptyProcess.killFailuresBySignal.set("SIGKILL", new Error("force signal rejected"));
+        const closed = yield* Deferred.make<void>();
+        const unsubscribe = yield* manager.subscribeProjectEvents((event) =>
+          event.type === "closed"
+            ? Deferred.succeed(closed, undefined).pipe(Effect.asVoid)
+            : Effect.void,
+        );
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+        yield* manager.killProjectTerminal({ projectId, terminalId });
+        expect(yield* Deferred.await(ptyProcess.firstKillSignal)).toBe("SIGTERM");
+        yield* Deferred.await(firstSigkill);
+
+        const closeResult = yield* Effect.exit(manager.closeProject(projectId));
+        expect(closeResult._tag).toBe("Failure");
+        expect((yield* manager.listProject(projectId))[0]?.status).toBe("stopping");
+        expect(ptyProcess.dataListenerCount).toBe(1);
+        expect(ptyProcess.exitListenerCount).toBe(1);
+
+        ptyProcess.killFailuresBySignal.delete("SIGKILL");
+        const retrySigkill = ptyProcess.killSignalReceipt("SIGKILL", 2);
+        ptyProcess.exitOnKillSignal = true;
+        yield* manager.killProjectTerminal({ projectId, terminalId, cleanup: true });
+        yield* Deferred.await(retrySigkill);
+        expect(
+          ptyProcess.killSignals.filter((signal) => signal === "SIGKILL").length,
+        ).toBeGreaterThanOrEqual(2);
+        yield* Deferred.await(closed);
+        expect(yield* manager.listProject(projectId)).toHaveLength(0);
+      }),
+  );
+
+  it.effect("surfaces SIGKILL escalation failure from cleanup and permits retry", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager(5, { processKillGraceMs: 0 });
+      const projectId = ProjectId.make("project-cleanup-sigkill-retry");
+      const terminalId = "interactive";
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
+
+      const firstSigkill = ptyProcess.killSignalReceipt("SIGKILL");
+      ptyProcess.killFailuresBySignal.set("SIGKILL", new Error("force signal rejected"));
+      const cleanup = yield* manager
+        .killProjectTerminal({ projectId, terminalId, cleanup: true })
+        .pipe(Effect.exit, Effect.forkScoped);
+      expect(yield* Deferred.await(ptyProcess.firstKillSignal)).toBe("SIGTERM");
+      yield* Deferred.await(firstSigkill);
+
+      const cleanupResult = yield* Fiber.join(cleanup);
+      expect(cleanupResult._tag).toBe("Failure");
+      if (Exit.isFailure(cleanupResult)) {
+        const error = Cause.findErrorOption(cleanupResult.cause);
+        expect(Option.getOrNull(error)).toMatchObject({
+          _tag: "TerminalToolError",
+          operation: "kill",
+          reason: "kill-failed",
+        });
+      }
+      expect((yield* manager.listProject(projectId))[0]?.status).toBe("stopping");
+      expect(ptyProcess.dataListenerCount).toBe(1);
+      expect(ptyProcess.exitListenerCount).toBe(1);
+
+      ptyProcess.killFailuresBySignal.delete("SIGKILL");
+      ptyProcess.exitOnKillSignal = true;
+      const retrySigkill = ptyProcess.killSignalReceipt("SIGKILL", 2);
+      const retry = yield* manager
+        .killProjectTerminal({ projectId, terminalId, cleanup: true })
+        .pipe(Effect.exit, Effect.forkScoped);
+      yield* Deferred.await(retrySigkill);
+      const retryResult = yield* Fiber.join(retry);
+      expect(retryResult._tag).toBe("Success");
+      expect(yield* manager.listProject(projectId)).toHaveLength(0);
+    }),
+  );
+
+  it.effect(
+    "persists project history before exit cleanup and isolates legacy thread filenames",
+    () =>
+      Effect.gen(function* () {
+        const { manager, ptyAdapter, logsDir } = yield* createManager();
+        const projectId = ProjectId.make("project-exit-persist-order");
+        const terminalId = "interactive";
+        yield* manager.createProject({
+          projectId,
+          terminalId,
+          creatingThreadId: ThreadId.make("creator"),
+          cwd: process.cwd(),
+        });
+        const ptyProcess = ptyAdapter.processes[0];
+        expect(ptyProcess).toBeDefined();
+        if (!ptyProcess) return;
+
+        const outputObserved = yield* Deferred.make<void>();
+        const exitObserved = yield* Deferred.make<string | null>();
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const logPath = yield* projectTerminalHistoryLogPath(logsDir, projectId, terminalId);
+        const legacyCollisionThreadId = `project_${Encoding.encodeBase64Url(projectId)}_${Encoding.encodeBase64Url(terminalId)}`;
+        const unsubscribe = yield* manager.subscribeProjectEvents((event) => {
+          if (event.type === "output") {
+            return Deferred.succeed(outputObserved, undefined).pipe(Effect.asVoid);
+          }
+          if (event.type !== "exited") return Effect.void;
+          return Effect.gen(function* () {
+            yield* manager.close({ threadId: legacyCollisionThreadId, deleteHistory: true });
+            const exists = yield* pathExists(logPath);
+            const output = exists ? yield* readFileString(logPath) : null;
+            if (exists) {
+              yield* manager.killProjectTerminal({ projectId, terminalId, cleanup: true });
+            }
+            yield* Deferred.succeed(exitObserved, output).pipe(Effect.asVoid);
+          }).pipe(
+            Effect.provideService(FileSystem.FileSystem, fs),
+            Effect.provideService(Path.Path, path),
+            Effect.catch(() => Deferred.succeed(exitObserved, null).pipe(Effect.asVoid)),
+          );
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+        ptyProcess.emitData("persist before exit notification\n");
+        yield* Deferred.await(outputObserved);
+        ptyProcess.emitExit({ exitCode: 0, signal: null });
+
+        expect(yield* Deferred.await(exitObserved)).toBe("persist before exit notification\n");
+        expect(yield* manager.listProject(projectId)).toHaveLength(0);
+        expect(yield* pathExists(logPath)).toBe(false);
+      }),
+  );
+
+  it.effect("does not recreate thread history after an exit subscriber deletes it", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter, logsDir } = yield* createManager();
+      const threadId = "thread-exit-cleanup-order";
+      const terminalId = DEFAULT_TERMINAL_ID;
+      yield* manager.open(openInput({ threadId, terminalId }));
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
+
+      const exitObserved = yield* Deferred.make<void>();
+      const outputObserved = yield* Deferred.make<void>();
+      const historyObservedDuringExit = yield* Deferred.make<boolean>();
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const logPath = yield* historyLogPath(logsDir, threadId);
+      const unsubscribe = yield* manager.subscribe((event) => {
+        if (event.type === "output" && event.threadId === threadId) {
+          return Deferred.succeed(outputObserved, undefined).pipe(Effect.asVoid);
+        }
+        if (event.type !== "exited" || event.threadId !== threadId) return Effect.void;
+        // Check that the final history exists at notification time, then let the subscriber
+        // delete it. A persistence write after this callback would recreate the deleted file.
+        return Effect.gen(function* () {
+          const exists = yield* pathExists(logPath);
+          yield* Deferred.succeed(historyObservedDuringExit, exists);
+          yield* manager.close({ threadId, terminalId, deleteHistory: true });
+          yield* Deferred.succeed(exitObserved, undefined);
+        }).pipe(
+          Effect.provideService(FileSystem.FileSystem, fs),
+          Effect.provideService(Path.Path, path),
+          Effect.catch(() => Deferred.succeed(exitObserved, undefined)),
+          Effect.asVoid,
+        );
+      });
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+      ptyProcess.emitData("thread output before exit cleanup\n");
+      yield* Deferred.await(outputObserved);
+      ptyProcess.emitExit({ exitCode: 0, signal: null });
+      yield* Deferred.await(exitObserved);
+      expect(yield* Deferred.await(historyObservedDuringExit)).toBe(true);
+      expect(yield* pathExists(logPath)).toBe(false);
+    }),
+  );
+
+  it.effect("removes history from evicted project sessions when the project closes", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter, logsDir } = yield* createManager(5, {
+        maxRetainedInactiveSessions: 0,
+      });
+      const projectId = ProjectId.make("project-evicted-history");
+      const terminalId = "finished";
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
+
+      const outputObserved = yield* Deferred.make<void>();
+      const exitObserved = yield* Deferred.make<void>();
+      const unsubscribe = yield* manager.subscribeProjectEvents((event) => {
+        if (event.type === "output") {
+          return Deferred.succeed(outputObserved, undefined).pipe(Effect.asVoid);
+        }
+        return event.type === "exited"
+          ? Deferred.succeed(exitObserved, undefined).pipe(Effect.asVoid)
+          : Effect.void;
+      });
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+      ptyProcess.emitData("history from an evicted session\n");
+      yield* Deferred.await(outputObserved);
+      ptyProcess.emitExit({ exitCode: 0, signal: null });
+      yield* Deferred.await(exitObserved);
+
+      const logPath = yield* projectTerminalHistoryLogPath(logsDir, projectId, terminalId);
+      expect(yield* readFileString(logPath)).toBe("history from an evicted session\n");
+      yield* manager.createProject({
+        projectId,
+        terminalId: "still-running",
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const activeProcess = ptyAdapter.processes[1];
+      expect(activeProcess).toBeDefined();
+      if (!activeProcess) return;
+
+      expect(
+        (yield* manager.listProject(projectId)).map((terminal) => terminal.terminalId),
+      ).toEqual(["still-running"]);
+      const closeProject = yield* manager.closeProject(projectId).pipe(Effect.forkScoped);
+      expect(yield* Deferred.await(activeProcess.firstKillSignal)).toBe("SIGTERM");
+      activeProcess.emitExit({ exitCode: 0, signal: null });
+      yield* Fiber.join(closeProject);
+
+      const projectDirectory = yield* Effect.service(Path.Path).pipe(
+        Effect.map(({ join }) => join(logsDir, "projects", Encoding.encodeBase64Url(projectId))),
+      );
+      expect(yield* pathExists(projectDirectory)).toBe(false);
+      expect(yield* pathExists(logPath)).toBe(false);
+    }),
+  );
+
+  it.effect("retains final output on kill and reuses an in-flight termination", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter, logsDir } = yield* createManager(5, {
+        processKillGraceMs: 10_000,
+      });
+      const projectId = ProjectId.make("project-retained-kill");
+      const terminalId = "interactive";
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
+
+      const outputObserved = yield* Deferred.make<void>();
+      const exitObserved = yield* Deferred.make<void>();
+      const unsubscribe = yield* manager.subscribeProjectEvents((event) => {
+        if (event.type === "output") {
+          return Deferred.succeed(outputObserved, undefined).pipe(Effect.asVoid);
+        }
+        return event.type === "exited"
+          ? Deferred.succeed(exitObserved, undefined).pipe(Effect.asVoid)
+          : Effect.void;
+      });
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+      yield* manager.killProjectTerminal({ projectId, terminalId });
+      expect(yield* Deferred.await(ptyProcess.firstKillSignal)).toBe("SIGTERM");
+      expect((yield* manager.listProject(projectId))[0]?.status).toBe("stopping");
+      expect(ptyProcess.dataListenerCount).toBe(1);
+      expect(ptyProcess.exitListenerCount).toBe(1);
+
+      yield* manager.killProjectTerminal({ projectId, terminalId });
+      expect(ptyProcess.killSignals.filter((signal) => signal === "SIGTERM")).toHaveLength(1);
+      ptyProcess.emitData("output after kill request\n");
+      yield* Deferred.await(outputObserved);
+      ptyProcess.emitExit({ exitCode: 17, signal: null });
+      yield* Deferred.await(exitObserved);
+
+      const [summary] = yield* manager.listProject(projectId);
+      expect(summary).toMatchObject({
+        status: "killed",
+        exitCode: 17,
+        exitSignal: null,
+        pid: null,
+      });
+      const logPath = yield* projectTerminalHistoryLogPath(logsDir, projectId, terminalId);
+      expect(yield* readFileString(logPath)).toBe("output after kill request\n");
+
+      yield* manager.killProjectTerminal({ projectId, terminalId, cleanup: true });
+      expect(yield* manager.listProject(projectId)).toHaveLength(0);
+      expect(yield* pathExists(logPath)).toBe(false);
     }),
   );
 
@@ -1343,7 +2433,7 @@ it.layer(
       expect(events.filter((event) => event.type === "output").map((event) => event.data)).toEqual(
         writes,
       );
-      const snapshot = events.filter((event) => event.type === "snapshot").at(-1)?.snapshot;
+      const snapshot = events.findLast((event) => event.type === "snapshot")?.snapshot;
       expect(snapshot?.history).toBe("aa😀\rEND");
       expect(snapshot?.sequence).toBe(reopened.sequence);
     }),
@@ -2605,21 +3695,55 @@ it.layer(
   it.effect("scoped runtime shutdown stops active terminals cleanly", () =>
     Effect.gen(function* () {
       const scope = yield* Scope.make("sequential");
+      const registrations = yield* Deferred.make<{
+        readonly threadId: string;
+        readonly terminalId: string;
+        readonly processIds: ReadonlyArray<number>;
+      }>();
+      const unregistered = yield* Ref.make<ReadonlyArray<string>>([]);
       const { manager, ptyAdapter } = yield* createManager(5, {
         processKillGraceMs: 10,
+        subprocessInspector: () =>
+          Effect.succeed({
+            hasRunningSubprocess: false,
+            childCommand: null,
+            processIds: [10001, 10002],
+          }),
+        subprocessPollIntervalMs: 20,
+        registerTerminalProcesses: (input) =>
+          Deferred.succeed(registrations, input).pipe(Effect.asVoid),
+        unregisterTerminal: (input) =>
+          Ref.update(unregistered, (items) => [...items, `${input.threadId}:${input.terminalId}`]),
       }).pipe(Effect.provideService(Scope.Scope, scope));
       yield* manager.open(openInput());
-      const process = ptyAdapter.processes[0];
-      expect(process).toBeDefined();
-      if (!process) return;
+      expect(yield* Deferred.await(registrations)).toEqual({
+        threadId: "thread-1",
+        terminalId: DEFAULT_TERMINAL_ID,
+        processIds: [10001, 10002],
+      });
+      yield* manager.createProject({
+        projectId: ProjectId.make("shutdown-project"),
+        terminalId: "project-terminal",
+        creatingThreadId: ThreadId.make("origin-thread"),
+        cwd: process.cwd(),
+      });
+      const [threadProcess, projectProcess] = ptyAdapter.processes;
+      expect(threadProcess).toBeDefined();
+      expect(projectProcess).toBeDefined();
+      if (!threadProcess || !projectProcess) return;
 
       const closeScope = yield* Scope.close(scope, Exit.void).pipe(Effect.forkScoped);
-      yield* Effect.yieldNow;
-      yield* TestClock.adjust("10 millis");
+      expect(yield* Deferred.await(threadProcess.firstKillSignal)).toBe("SIGTERM");
+      expect(yield* Deferred.await(projectProcess.firstKillSignal)).toBe("SIGTERM");
+      expect(threadProcess.dataListenerCount).toBe(0);
+      expect(threadProcess.exitListenerCount).toBe(0);
+      expect(projectProcess.dataListenerCount).toBe(0);
+      expect(projectProcess.exitListenerCount).toBe(0);
+      expect(yield* Ref.get(unregistered)).toEqual([`thread-1:${DEFAULT_TERMINAL_ID}`]);
       yield* Fiber.join(closeScope);
 
-      assert.equal(process.killSignals[0], "SIGTERM");
-      expect(process.killSignals).toContain("SIGKILL");
-    }).pipe(Effect.provide(TestClock.layer())),
+      expect(threadProcess.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+      expect(projectProcess.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+    }),
   );
 });

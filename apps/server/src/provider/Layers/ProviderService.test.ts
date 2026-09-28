@@ -97,6 +97,7 @@ import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Lay
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import * as ThreadBackgroundLiveness from "../../orchestration/ThreadBackgroundLiveness.ts";
 import * as ThreadPlanProgress from "../../orchestration/ThreadPlanProgress.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   SkillCatalogService,
   type SkillCatalogServiceShape,
@@ -162,12 +163,14 @@ type LegacyProviderRuntimeEvent = {
 function makeFakeCodexAdapter(
   provider: ProviderDriverKind = CODEX_DRIVER,
   supportsConversationRollback?: boolean,
+  onStartSession?: () => void,
 ) {
   const sessions = new Map<ThreadId, ProviderSession>();
   const runtimeEventPubSub = Effect.runSync(PubSub.unbounded<ProviderRuntimeEvent>());
 
   const startSession = vi.fn((input: ProviderAdapterSessionStartInput) =>
     Effect.sync(() => {
+      onStartSession?.();
       const now = "2026-01-01T00:00:00.000Z";
       const session: ProviderSession = {
         provider,
@@ -5227,13 +5230,22 @@ describe("agent browser access", () => {
     access: boolean | { readonly browser: boolean; readonly device: boolean },
     threadId: ThreadId,
     projectOverride?: boolean | { readonly browser?: boolean; readonly device?: boolean },
-    options?: { readonly withoutOrchestration?: boolean; readonly projectWorkEnabled?: boolean },
+    options?: {
+      readonly withoutOrchestration?: boolean;
+      readonly projectWorkEnabled?: boolean;
+      readonly provideManagedCredential?: boolean;
+      readonly onManagedSession?: (
+        session: McpProviderSession.McpProviderSessionConfig | undefined,
+      ) => void;
+    },
   ) =>
     Effect.gen(function* () {
       const enableAgentBrowserAccess = typeof access === "boolean" ? access : access.browser;
       const enableAgentDeviceAccess = typeof access === "boolean" ? access : access.device;
       const issued: Array<{ threadId: ThreadId; capabilities: ReadonlyArray<string> }> = [];
-      const codex = makeFakeCodexAdapter();
+      const codex = makeFakeCodexAdapter(CODEX_DRIVER, undefined, () =>
+        options?.onManagedSession?.(McpProviderSession.readMcpProviderSession(threadId)),
+      );
       const providerAdapterLayer = Layer.succeed(
         ProviderAdapterRegistry.ProviderAdapterRegistry,
         makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter }),
@@ -5296,7 +5308,23 @@ describe("agent browser access", () => {
               threadId: request.threadId,
               capabilities: [...(request.capabilities ?? [])].toSorted(),
             });
-            return undefined;
+            if (!options?.provideManagedCredential) return undefined;
+            return {
+              config: {
+                environmentId: EnvironmentId.make("environment-provider-service-test"),
+                threadId: request.threadId,
+                providerSessionId: `provider-session-${request.threadId}`,
+                providerInstanceId: codexInstanceId,
+                endpoint: "http://127.0.0.1:43123/mcp",
+                authorizationHeader: "Bearer managed-session-token",
+                capabilities: new Set([
+                  "pull-requests",
+                  "terminal",
+                  ...(request.capabilities ?? []),
+                  ...((request.includePreview ?? true) ? ["preview"] : []),
+                ]),
+              },
+            };
           }),
       }).pipe(
         Layer.provide(providerAdapterLayer),
@@ -5359,6 +5387,25 @@ describe("agent browser access", () => {
       const issued = yield* startSessionWith(false, threadId);
 
       assert.deepEqual(issued, [{ threadId, capabilities: ["pull-requests"] }]);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("keeps the managed endpoint when terminal access is enabled without preview", () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-terminal-without-preview");
+      let managedSession: McpProviderSession.McpProviderSessionConfig | undefined;
+      const issued = yield* startSessionWith(false, threadId, undefined, {
+        provideManagedCredential: true,
+        onManagedSession: (session) => {
+          managedSession = session;
+        },
+      });
+
+      assert.deepEqual(issued, [{ threadId, capabilities: ["pull-requests"] }]);
+      assert.equal(managedSession?.endpoint, "http://127.0.0.1:43123/mcp");
+      assert.equal(managedSession?.capabilities.has("terminal"), true);
+      assert.equal(managedSession?.capabilities.has("preview"), false);
+      McpProviderSession.clearMcpProviderSession(threadId);
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 

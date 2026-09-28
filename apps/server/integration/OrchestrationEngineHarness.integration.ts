@@ -67,6 +67,8 @@ import {
   type OrchestrationEngineShape,
 } from "../src/orchestration/Services/OrchestrationEngine.ts";
 import { ThreadDeletionReactor } from "../src/orchestration/Services/ThreadDeletionReactor.ts";
+import { ProjectTerminalReactor } from "../src/orchestration/Services/ProjectTerminalReactor.ts";
+import { ProjectTerminalReactorLive } from "../src/orchestration/Layers/ProjectTerminalReactor.ts";
 import * as ThreadSettlementReactor from "../src/orchestration/ThreadSettlementReactor.ts";
 import * as PullRequestSyncReactor from "../src/orchestration/PullRequestSyncReactor.ts";
 import * as ThreadPullRequestReactor from "../src/orchestration/ThreadPullRequestReactor.ts";
@@ -85,12 +87,87 @@ import {
 import { deriveServerPaths, ServerConfig } from "../src/config.ts";
 import * as WorkspaceEntries from "../src/workspace/WorkspaceEntries.ts";
 import * as WorkspacePaths from "../src/workspace/WorkspacePaths.ts";
+import * as ProcessRunner from "../src/processRunner.ts";
+import * as PtyAdapter from "../src/terminal/PtyAdapter.ts";
+import * as TerminalManager from "../src/terminal/Manager.ts";
+import { ServerActivation } from "../src/serverActivation.ts";
+import {
+  ProjectTerminalService,
+  type ProjectTerminalServiceShape,
+} from "../src/terminal/ProjectTerminalService.ts";
+import { ProjectTerminalServiceLive } from "../src/terminal/ProjectTerminalService.ts";
+import { ThreadDeletionReactorLive } from "../src/orchestration/Layers/ThreadDeletionReactor.ts";
 import * as VcsDriverRegistry from "../src/vcs/VcsDriverRegistry.ts";
 import { VcsStatusBroadcaster } from "../src/vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../src/git/GitWorkflowService.ts";
 import * as VcsProcess from "../src/vcs/VcsProcess.ts";
 import * as AgentAwarenessRelay from "../src/relay/AgentAwarenessRelay.ts";
 import * as PullRequestService from "../src/pullRequest/PullRequestService.ts";
+
+export interface OrchestrationIntegrationTerminalProcess extends PtyAdapter.PtyProcess {
+  readonly writes: Array<string>;
+  readonly resizeCalls: Array<{ readonly cols: number; readonly rows: number }>;
+  readonly killSignals: Array<string | undefined>;
+  emitOutput(data: string): void;
+  finishExit(event: PtyAdapter.PtyExitEvent): void;
+}
+
+class HarnessTerminalProcess implements OrchestrationIntegrationTerminalProcess {
+  readonly writes: Array<string> = [];
+  readonly resizeCalls: Array<{ readonly cols: number; readonly rows: number }> = [];
+  readonly killSignals: Array<string | undefined> = [];
+  private readonly dataListeners = new Set<(data: string) => void>();
+  private readonly exitListeners = new Set<(event: PtyAdapter.PtyExitEvent) => void>();
+  readonly pid: number;
+
+  constructor(pid: number) {
+    this.pid = pid;
+  }
+
+  write(data: string): void {
+    this.writes.push(data);
+  }
+
+  resize(cols: number, rows: number): void {
+    this.resizeCalls.push({ cols, rows });
+  }
+
+  kill(signal?: string): void {
+    this.killSignals.push(signal);
+  }
+
+  onData(callback: (data: string) => void): () => void {
+    this.dataListeners.add(callback);
+    return () => this.dataListeners.delete(callback);
+  }
+
+  onExit(callback: (event: PtyAdapter.PtyExitEvent) => void): () => void {
+    this.exitListeners.add(callback);
+    return () => this.exitListeners.delete(callback);
+  }
+
+  emitOutput(data: string): void {
+    for (const listener of this.dataListeners) listener(data);
+  }
+
+  finishExit(event: PtyAdapter.PtyExitEvent): void {
+    for (const listener of this.exitListeners) listener(event);
+  }
+}
+
+type HarnessTerminalPtyAdapterService = PtyAdapter.PtyAdapter["Service"];
+
+class HarnessTerminalPtyAdapter implements HarnessTerminalPtyAdapterService {
+  readonly processes: Array<HarnessTerminalProcess> = [];
+
+  spawn(_input: PtyAdapter.PtySpawnInput) {
+    return Effect.sync(() => {
+      const process = new HarnessTerminalProcess(70_000 + this.processes.length);
+      this.processes.push(process);
+      return process;
+    });
+  }
+}
 
 const decodeCodexSettings = Schema.decodeEffect(CodexSettings);
 
@@ -192,6 +269,10 @@ export interface OrchestrationIntegrationHarness {
   readonly checkpointStore: CheckpointStore.CheckpointStore["Service"];
   readonly checkpointRepository: ProjectionCheckpointRepository["Service"];
   readonly pendingApprovalRepository: ProjectionPendingApprovalRepository["Service"];
+  readonly runtimeReceiptBus: RuntimeReceiptBus["Service"];
+  readonly projectTerminalService: ProjectTerminalServiceShape;
+  readonly projectTerminalManager: TerminalManager.TerminalManager["Service"];
+  readonly projectTerminalPtyProcesses: ReadonlyArray<OrchestrationIntegrationTerminalProcess>;
   readonly waitForThread: (
     threadId: string,
     predicate: (thread: OrchestrationThread) => boolean,
@@ -228,6 +309,8 @@ export interface OrchestrationIntegrationHarness {
     ): Effect.Effect<Receipt, never>;
   };
   readonly drainProviderRuntime: Effect.Effect<void>;
+  readonly drainThreadDeletionThrough: (sequence: number) => Effect.Effect<void>;
+  readonly drainProjectTerminalThrough: (sequence: number) => Effect.Effect<void>;
   readonly drainCheckpointReactor: Effect.Effect<void>;
   readonly dispose: Effect.Effect<void, never>;
 }
@@ -237,6 +320,10 @@ interface MakeOrchestrationIntegrationHarnessOptions {
   readonly realCodex?: boolean;
   /** Tracer for every fiber the harness runtime runs, including reactors. */
   readonly tracer?: Tracer.Tracer;
+  /** Use the real thread-deletion reactor; all harnesses use the project-terminal runtime. */
+  readonly projectTerminals?: boolean;
+  /** Hold reactor consumers parked after startup until the test releases activation. */
+  readonly serverActivation?: Effect.Effect<void, never, never>;
 }
 
 export const makeOrchestrationIntegrationHarness = (
@@ -323,6 +410,46 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(ThreadBackgroundLiveness.layer),
       Layer.provideMerge(ThreadPlanProgress.layer),
     );
+    const projectTerminalPtyAdapter = new HarnessTerminalPtyAdapter();
+    const projectTerminalManagerLayer = Layer.effect(
+      TerminalManager.TerminalManager,
+      TerminalManager.makeWithOptions({
+        logsDir: path.join(rootDir, "userdata", "logs", "terminals"),
+        ptyAdapter: projectTerminalPtyAdapter,
+        shellResolver: () => "/bin/sh",
+        env: process.env,
+        processTable: Effect.succeed([]),
+        subprocessPollIntervalMs: 60_000,
+        processKillGraceMs: 1,
+        resolveProviderInstanceEnvironment: (_providerInstanceId, env) => Effect.succeed(env ?? {}),
+      }),
+    ).pipe(
+      Layer.provide(
+        Layer.mergeAll(
+          NodeServices.layer,
+          ProcessRunner.layer.pipe(Layer.provide(NodeServices.layer)),
+        ),
+      ),
+    );
+    const projectTerminalRuntimeServicesLayer = Layer.mergeAll(
+      runtimeServicesLayer,
+      projectTerminalManagerLayer,
+    );
+    const projectTerminalServiceLayer = ProjectTerminalServiceLive.pipe(
+      Layer.provideMerge(projectTerminalRuntimeServicesLayer),
+    );
+    const projectTerminalReactorLayer = ProjectTerminalReactorLive.pipe(
+      Layer.provideMerge(projectTerminalServiceLayer),
+    );
+    const threadDeletionReactorLayer = options?.projectTerminals
+      ? ThreadDeletionReactorLive.pipe(
+          Layer.provide(ThreadHistoryArchive.layer),
+          Layer.provideMerge(projectTerminalRuntimeServicesLayer),
+        )
+      : Layer.succeed(ThreadDeletionReactor, {
+          start: () => Effect.void,
+          drainThrough: () => Effect.void,
+        });
     const serverSettingsLayer = ServerSettingsService.layerTest();
     const runtimeIngestionLayer = ProviderRuntimeIngestionLive.pipe(
       Layer.provideMerge(runtimeServicesLayer),
@@ -392,12 +519,8 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(runtimeIngestionLayer),
       Layer.provideMerge(providerCommandReactorLayer),
       Layer.provideMerge(checkpointReactorLayer),
-      Layer.provideMerge(
-        Layer.succeed(ThreadDeletionReactor, {
-          start: () => Effect.void,
-          drainThrough: () => Effect.void,
-        }),
-      ),
+      Layer.provideMerge(threadDeletionReactorLayer),
+      Layer.provideMerge(projectTerminalReactorLayer),
       Layer.provideMerge(
         Layer.succeed(ThreadPullRequestReactor.ThreadPullRequestReactor, {
           start: () => Effect.void,
@@ -431,13 +554,14 @@ export const makeOrchestrationIntegrationHarness = (
       ),
     );
     const layer = Layer.empty.pipe(
-      Layer.provideMerge(runtimeServicesLayer),
+      Layer.provideMerge(projectTerminalRuntimeServicesLayer),
       Layer.provideMerge(orchestrationReactorLayer),
       Layer.provideMerge(providerRegistryLayer),
       Layer.provide(persistenceLayer),
       Layer.provideMerge(RepositoryIdentityResolver.layer),
       Layer.provideMerge(ServerSettingsService.layerTest()),
       Layer.provideMerge(ServerConfig.layerTest(workspaceDir, rootDir)),
+      Layer.provideMerge(VcsProcess.layer),
       Layer.provideMerge(NodeServices.layer),
       Layer.provideMerge(
         options?.tracer ? Layer.succeed(Tracer.Tracer, options.tracer) : Layer.empty,
@@ -478,10 +602,30 @@ export const makeOrchestrationIntegrationHarness = (
     const runtimeReceiptBus = yield* tryRuntimePromise("load RuntimeReceiptBus service", () =>
       runtime.runPromise(Effect.service(RuntimeReceiptBus)),
     ).pipe(Effect.orDie);
+    const threadDeletionReactor = yield* tryRuntimePromise(
+      "load ThreadDeletionReactor service",
+      () => runtime.runPromise(Effect.service(ThreadDeletionReactor)),
+    ).pipe(Effect.orDie);
+    const projectTerminalReactor = yield* tryRuntimePromise(
+      "load ProjectTerminalReactor service",
+      () => runtime.runPromise(Effect.service(ProjectTerminalReactor)),
+    ).pipe(Effect.orDie);
+    const projectTerminalService = yield* tryRuntimePromise(
+      "load ProjectTerminalService service",
+      () => runtime.runPromise(Effect.service(ProjectTerminalService)),
+    ).pipe(Effect.orDie);
+    const projectTerminalManager = yield* tryRuntimePromise("load TerminalManager service", () =>
+      runtime.runPromise(Effect.service(TerminalManager.TerminalManager)),
+    ).pipe(Effect.orDie);
 
     const scope = yield* Scope.make("sequential");
+    const startReactor = reactor.start().pipe(Scope.provide(scope));
+    const startReactorWithActivation =
+      options?.serverActivation === undefined
+        ? startReactor
+        : startReactor.pipe(Effect.provideService(ServerActivation, options.serverActivation));
     yield* tryRuntimePromise("start OrchestrationReactor", () =>
-      runtime.runPromise(reactor.start().pipe(Scope.provide(scope))),
+      runtime.runPromise(startReactorWithActivation),
     ).pipe(Effect.orDie);
     const receiptHistory = yield* Ref.make<ReadonlyArray<OrchestrationRuntimeReceipt>>([]);
     yield* Stream.runForEach(runtimeReceiptBus.streamEventsForTest, (receipt) =>
@@ -618,11 +762,18 @@ export const makeOrchestrationIntegrationHarness = (
       checkpointStore,
       checkpointRepository,
       pendingApprovalRepository,
+      runtimeReceiptBus,
+      projectTerminalService,
+      projectTerminalManager,
+      projectTerminalPtyProcesses: projectTerminalPtyAdapter?.processes ?? [],
       waitForThread,
       waitForDomainEvent,
       waitForPendingApproval,
       waitForReceipt,
       drainProviderRuntime: providerRuntimeIngestion.drain,
+      drainThreadDeletionThrough: (sequence) => threadDeletionReactor.drainThrough(sequence),
+      drainProjectTerminalThrough: (sequence) =>
+        projectTerminalReactor.drainThrough(sequence).pipe(Effect.orDie),
       drainCheckpointReactor: checkpointReactor.drain,
       dispose,
     } satisfies OrchestrationIntegrationHarness;
