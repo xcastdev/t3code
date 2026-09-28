@@ -30,8 +30,10 @@ Status at the current checkout. This tracks the [workspace direction](https://gi
 
 7. **Per-subagent controls**
    - [x] Show native subagent status in the [Agents panel](../apps/web/src/components/AgentsPanel.tsx).
-   - [ ] Add separately routed transcripts, terminal and interaction controls, identities, lifecycle rules, and authorization for each subagent.
+   - [x] Open a selected subagent's captured transcript on web, desktop, and mobile, including earlier activity when available. Show when provider history is partial or unavailable; see [Subagent activity](user/chat-timeline.md#subagent-activity).
+   - [x] Route supported message, stop, approval, and question actions to the selected subagent, with server-side authorization. Availability depends on the provider and active session.
+   - [ ] Complete per-subagent coverage across providers, including agents that only expose grouped activity. Add individual lifecycle and interaction controls where the provider supports them.
 
 ## Other proposed capability
 
-- [ ] Expose a terminal toolkit through T3's MCP server with bounded output, read cursors, capability checks, and session cleanup. The current [MCP server](../apps/server/src/mcp/McpHttpServer.ts) registers preview, device, pull request, and Project Work toolkits, but no terminal toolkit.
+- [x] Expose a shared project terminal toolkit through T3's [MCP server](../apps/server/src/mcp/McpHttpServer.ts), with bounded output, read cursors, capability checks, and session cleanup. See [Agent terminals](user/terminal.md#agent-terminals).
