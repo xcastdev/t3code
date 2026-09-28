@@ -7,6 +7,7 @@ import {
   ProviderSendTurnInput,
   ProviderSession,
   ProviderSessionStartInput,
+  ProviderApprovalResponseResult,
   ProviderUploadFeedbackError,
   ProviderUploadFeedbackInput,
   ProviderUploadFeedbackResult,
@@ -18,6 +19,9 @@ const decodeProviderSession = Schema.decodeUnknownSync(ProviderSession);
 const decodeProviderEvent = Schema.decodeUnknownSync(ProviderEvent);
 const decodeProviderUploadFeedbackInput = Schema.decodeUnknownSync(ProviderUploadFeedbackInput);
 const decodeProviderUploadFeedbackResult = Schema.decodeUnknownSync(ProviderUploadFeedbackResult);
+const decodeProviderApprovalResponseResult = Schema.decodeUnknownSync(
+  ProviderApprovalResponseResult,
+);
 
 function getOptionValue(
   options: ReadonlyArray<{ id: string; value: unknown }> | undefined,
@@ -117,6 +121,28 @@ describe("ProviderSessionStartInput", () => {
     expect(parsed.provider).toBe("ollama");
     expect(parsed.providerInstanceId).toBe("ollama_local");
     expect(parsed.modelSelection?.instanceId).toBe("ollama_local");
+  });
+});
+
+describe("ProviderApprovalResponseResult", () => {
+  it("keeps native settlement and child handoff as independent states", () => {
+    expect(
+      decodeProviderApprovalResponseResult({
+        nativeStatus: "responded",
+        handoffStatus: "unavailable",
+        requestId: "request-public",
+        nativeRequestId: "request-native",
+        agentKey: "agent-child",
+        sessionGeneration: "generation-4",
+      }),
+    ).toEqual({
+      nativeStatus: "responded",
+      handoffStatus: "unavailable",
+      requestId: "request-public",
+      nativeRequestId: "request-native",
+      agentKey: "agent-child",
+      sessionGeneration: "generation-4",
+    });
   });
 });
 

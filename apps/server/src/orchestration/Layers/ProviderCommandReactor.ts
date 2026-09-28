@@ -2,6 +2,7 @@ import {
   type ChatAttachment,
   CommandId,
   EventId,
+  ApprovalRequestId,
   type ModelSelection,
   type OrchestrationEvent,
   ProviderDriverKind,
@@ -295,6 +296,87 @@ const make = Effect.gen(function* () {
               ...(input.requestId ? { requestId: input.requestId } : {}),
             },
             turnId: input.turnId,
+            createdAt: input.createdAt,
+          },
+          createdAt: input.createdAt,
+        }),
+      ),
+    );
+
+  const getRequestHandoffContext = (threadId: ThreadId, requestId: string) =>
+    Effect.gen(function* () {
+      const query = projectionSnapshotQuery.getUserInputActivity;
+      if (!query) return {};
+      const activity = Option.getOrUndefined(
+        yield* query({ threadId, requestId: ApprovalRequestId.make(requestId) }).pipe(
+          Effect.catchCause(() => Effect.succeed(Option.none())),
+        ),
+      );
+      const payload = activity?.payload;
+      if (typeof payload !== "object" || payload === null) return {};
+      const read = (key: string): string | undefined => {
+        const value = Reflect.get(payload, key);
+        return typeof value === "string" && value.length > 0 ? value : undefined;
+      };
+      return {
+        ...(read("nativeRequestId") ? { nativeRequestId: read("nativeRequestId")! } : {}),
+        ...(read("agentKey") ? { agentKey: read("agentKey")! } : {}),
+        ...(read("sessionGeneration") ? { sessionGeneration: read("sessionGeneration")! } : {}),
+      };
+    });
+
+  const appendHandoffActivity = (input: {
+    readonly threadId: ThreadId;
+    readonly requestId: string;
+    readonly createdAt: string;
+    readonly status: "pending" | "recorded" | "unavailable" | "failed" | "unknown";
+    readonly kind?: "approval.handoff" | "user-input.handoff";
+    readonly nativeRequestId?: string;
+    readonly agentKey?: string;
+    readonly sessionGeneration?: string;
+    readonly detail?: string;
+  }) =>
+    serverCommandId("child-request-handoff").pipe(
+      Effect.flatMap((commandId) =>
+        orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId,
+          threadId: input.threadId,
+          activity: {
+            id: EventId.make(
+              `child-request-handoff:${input.kind ?? "user-input.handoff"}:${input.requestId}`,
+            ),
+            tone: input.status === "failed" ? "error" : "info",
+            kind: input.kind ?? "user-input.handoff",
+            summary:
+              input.status === "pending"
+                ? input.kind === "approval.handoff"
+                  ? "Recording child approval choice with its parent"
+                  : "Recording child answer with its parent"
+                : input.status === "recorded"
+                  ? input.kind === "approval.handoff"
+                    ? "Child approval choice recorded for its parent"
+                    : "Child answer recorded for its parent"
+                  : input.status === "unavailable"
+                    ? input.kind === "approval.handoff"
+                      ? "Parent approval handoff unavailable"
+                      : "Parent answer handoff unavailable"
+                    : input.status === "unknown"
+                      ? input.kind === "approval.handoff"
+                        ? "Parent approval handoff outcome unknown"
+                        : "Parent answer handoff outcome unknown"
+                      : input.kind === "approval.handoff"
+                        ? "Parent approval handoff failed"
+                        : "Parent answer handoff failed",
+            payload: {
+              requestId: input.requestId,
+              handoffStatus: input.status,
+              ...(input.nativeRequestId ? { nativeRequestId: input.nativeRequestId } : {}),
+              ...(input.agentKey ? { agentKey: input.agentKey } : {}),
+              ...(input.sessionGeneration ? { sessionGeneration: input.sessionGeneration } : {}),
+              ...(input.detail ? { detail: input.detail } : {}),
+            },
+            turnId: null,
             createdAt: input.createdAt,
           },
           createdAt: input.createdAt,
@@ -1815,6 +1897,21 @@ const make = Effect.gen(function* () {
         });
       }
     }
+    const pendingHandoffs = projectionSnapshotQuery.listPendingAgentHandoffs;
+    if (!pendingHandoffs) return;
+    for (const handoff of yield* pendingHandoffs()) {
+      yield* appendHandoffActivity({
+        threadId: handoff.threadId,
+        requestId: handoff.requestId,
+        createdAt: handoff.createdAt,
+        kind: handoff.kind,
+        status: "unknown",
+        ...(handoff.nativeRequestId ? { nativeRequestId: handoff.nativeRequestId } : {}),
+        ...(handoff.agentKey ? { agentKey: handoff.agentKey } : {}),
+        ...(handoff.sessionGeneration ? { sessionGeneration: handoff.sessionGeneration } : {}),
+        detail: "The server restarted before the parent handoff outcome was recorded.",
+      });
+    }
   });
 
   const processApprovalResponseRequested = Effect.fn("processApprovalResponseRequested")(function* (
@@ -1837,27 +1934,81 @@ const make = Effect.gen(function* () {
       });
     }
 
-    yield* providerService
+    const requestContext = yield* getRequestHandoffContext(
+      event.payload.threadId,
+      event.payload.requestId,
+    );
+    const isChildRequest = requestContext.agentKey !== undefined;
+    if (isChildRequest) {
+      yield* appendHandoffActivity({
+        ...requestContext,
+        kind: "approval.handoff",
+        threadId: event.payload.threadId,
+        requestId: event.payload.requestId,
+        createdAt: event.payload.createdAt,
+        status: "pending",
+      });
+    }
+
+    const response = yield* providerService
       .respondToRequest({
         threadId: event.payload.threadId,
         requestId: event.payload.requestId,
         decision: event.payload.decision,
       })
-      .pipe(
-        Effect.catchCause((cause) =>
-          appendProviderFailureActivity({
-            threadId: event.payload.threadId,
-            kind: "provider.approval.respond.failed",
-            summary: "Provider approval response failed",
-            detail: isUnknownPendingApprovalRequestError(cause)
-              ? stalePendingRequestDetail("approval", event.payload.requestId)
-              : Cause.pretty(cause),
-            turnId: null,
-            createdAt: event.payload.createdAt,
-            requestId: event.payload.requestId,
-          }),
-        ),
-      );
+      .pipe(Effect.result);
+    if (response._tag === "Failure") {
+      const cause = Cause.fail(response.failure);
+      yield* appendProviderFailureActivity({
+        threadId: event.payload.threadId,
+        kind: "provider.approval.respond.failed",
+        summary: "Provider approval response failed",
+        detail: isUnknownPendingApprovalRequestError(cause)
+          ? stalePendingRequestDetail("approval", event.payload.requestId)
+          : Cause.pretty(cause),
+        turnId: null,
+        createdAt: event.payload.createdAt,
+        requestId: event.payload.requestId,
+      });
+      if (isChildRequest) {
+        yield* appendHandoffActivity({
+          ...requestContext,
+          kind: "approval.handoff",
+          threadId: event.payload.threadId,
+          requestId: event.payload.requestId,
+          createdAt: event.payload.createdAt,
+          status: "unknown",
+          detail: "The native approval response did not return a confirmed handoff result.",
+        });
+      }
+      return;
+    }
+    if (isChildRequest) {
+      const handoff =
+        typeof response.success === "object" && response.success !== null
+          ? response.success
+          : undefined;
+      yield* appendHandoffActivity({
+        ...requestContext,
+        kind: "approval.handoff",
+        threadId: event.payload.threadId,
+        requestId: event.payload.requestId,
+        createdAt: event.payload.createdAt,
+        status: handoff?.handoffStatus ?? "unknown",
+        ...((handoff?.nativeRequestId ?? requestContext.nativeRequestId)
+          ? { nativeRequestId: handoff?.nativeRequestId ?? requestContext.nativeRequestId }
+          : {}),
+        ...((handoff?.agentKey ?? requestContext.agentKey)
+          ? { agentKey: handoff?.agentKey ?? requestContext.agentKey }
+          : {}),
+        ...((handoff?.sessionGeneration ?? requestContext.sessionGeneration)
+          ? { sessionGeneration: handoff?.sessionGeneration ?? requestContext.sessionGeneration }
+          : {}),
+        ...(handoff?.nativeStatus === "unknown"
+          ? { detail: "The provider could not confirm the native approval outcome." }
+          : {}),
+      });
+    }
   });
 
   const processUserInputResponseRequested = Effect.fn("processUserInputResponseRequested")(
@@ -1881,30 +2032,73 @@ const make = Effect.gen(function* () {
         });
       }
 
-      yield* providerService
+      const requestContext = yield* getRequestHandoffContext(
+        event.payload.threadId,
+        event.payload.requestId,
+      );
+      yield* appendHandoffActivity({
+        ...requestContext,
+        threadId: event.payload.threadId,
+        requestId: event.payload.requestId,
+        createdAt: event.payload.createdAt,
+        status: "pending",
+      });
+
+      const result = yield* providerService
         .respondToUserInput({
           threadId: event.payload.threadId,
           requestId: event.payload.requestId,
-          answers: event.payload.answers,
+          ...(event.payload.answers ? { answers: event.payload.answers } : {}),
+          ...(event.payload.resolution ? { resolution: event.payload.resolution } : {}),
           ...(event.payload.attachmentsByQuestionId
             ? { attachmentsByQuestionId: event.payload.attachmentsByQuestionId }
             : {}),
         })
-        .pipe(
-          Effect.catchCause((cause) =>
-            appendProviderFailureActivity({
-              threadId: event.payload.threadId,
-              kind: "provider.user-input.respond.failed",
-              summary: "Provider user input response failed",
-              detail: isUnknownPendingUserInputRequestError(cause)
-                ? stalePendingRequestDetail("user-input", event.payload.requestId)
-                : Cause.pretty(cause),
-              turnId: null,
-              createdAt: event.payload.createdAt,
-              requestId: event.payload.requestId,
-            }),
-          ),
-        );
+        .pipe(Effect.result);
+      if (result._tag === "Failure") {
+        const cause = Cause.fail(result.failure);
+        yield* appendProviderFailureActivity({
+          threadId: event.payload.threadId,
+          kind: "provider.user-input.respond.failed",
+          summary: "Provider user input response failed",
+          detail: isUnknownPendingUserInputRequestError(cause)
+            ? stalePendingRequestDetail("user-input", event.payload.requestId)
+            : Cause.pretty(cause),
+          turnId: null,
+          createdAt: event.payload.createdAt,
+          requestId: event.payload.requestId,
+        });
+        return yield* appendHandoffActivity({
+          ...requestContext,
+          threadId: event.payload.threadId,
+          requestId: event.payload.requestId,
+          createdAt: event.payload.createdAt,
+          status: "unknown",
+          detail: "Native resolution did not return a confirmed handoff result.",
+        });
+      }
+      yield* appendHandoffActivity({
+        ...requestContext,
+        threadId: event.payload.threadId,
+        requestId: event.payload.requestId,
+        createdAt: event.payload.createdAt,
+        status: result.success?.handoffStatus ?? "unknown",
+        ...((result.success?.nativeRequestId ?? requestContext.nativeRequestId)
+          ? { nativeRequestId: result.success?.nativeRequestId ?? requestContext.nativeRequestId }
+          : {}),
+        ...((result.success?.agentKey ?? requestContext.agentKey)
+          ? { agentKey: result.success?.agentKey ?? requestContext.agentKey }
+          : {}),
+        ...((result.success?.sessionGeneration ?? requestContext.sessionGeneration)
+          ? {
+              sessionGeneration:
+                result.success?.sessionGeneration ?? requestContext.sessionGeneration,
+            }
+          : {}),
+        ...(result.success?.nativeStatus === "unsupported"
+          ? { detail: "This provider has no native cancellation operation." }
+          : {}),
+      });
     },
   );
 

@@ -13,6 +13,7 @@ import {
   type HookCallback,
   query,
   getSessionMessages,
+  getSubagentMessages,
   forkSession,
   type Options as ClaudeQueryOptions,
   type PermissionMode,
@@ -468,6 +469,13 @@ interface ClaudeSessionContext {
   readonly workflowMemberFingerprints: Map<string, string>;
   /** Task ids that have started and not yet reached a terminal state. */
   readonly liveTaskIds: Set<string>;
+  /** Native task_notification observers installed before a targeted stop dispatch. */
+  readonly taskStopObservers: Map<string, Deferred.Deferred<"stopped" | "other">>;
+  /** One stop result per child and session generation, shared by duplicate commands. */
+  readonly taskStopCalls: Map<
+    RuntimeAgentKey,
+    Deferred.Deferred<"completed" | "unknown" | "stale">
+  >;
   turnState: ClaudeTurnState | undefined;
   lastKnownContextWindow: number | undefined;
   lastKnownTokenUsage: ThreadTokenUsageSnapshot | undefined;
@@ -483,6 +491,7 @@ interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
   readonly setModel: (model?: string) => Promise<void>;
   readonly setPermissionMode: (mode: PermissionMode) => Promise<void>;
   readonly setMaxThinkingTokens: (maxThinkingTokens: number | null) => Promise<void>;
+  readonly stopTask: (taskId: string) => Promise<void>;
   readonly close: () => void;
 }
 
@@ -494,6 +503,7 @@ export interface ClaudeAdapterLiveOptions {
     readonly options: ClaudeQueryOptions;
   }) => ClaudeQueryRuntime;
   readonly getSessionMessages?: typeof getSessionMessages;
+  readonly getSubagentMessages?: typeof getSubagentMessages;
   readonly forkSession?: typeof forkSession;
   readonly nativeEventLogPath?: string;
   readonly nativeEventLogger?: EventNdjsonLogger;
@@ -4258,6 +4268,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       }
       case "task_notification": {
         context.liveTaskIds.delete(message.task_id);
+        const stopObserver = context.taskStopObservers.get(message.task_id);
+        if (stopObserver) {
+          context.taskStopObservers.delete(message.task_id);
+          yield* Deferred.succeed(stopObserver, message.status === "stopped" ? "stopped" : "other");
+        }
         const agent = context.taskAgents.get(message.task_id);
         if (agent) {
           if (message.status === "completed") {
@@ -4874,6 +4889,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const pendingTaskModels = new Map<string, string>();
       const workflowMemberFingerprints = new Map<string, string>();
       const liveTaskIds = new Set<string>();
+      const taskStopObservers = new Map<string, Deferred.Deferred<"stopped" | "other">>();
+      const taskStopCalls = new Map<
+        RuntimeAgentKey,
+        Deferred.Deferred<"completed" | "unknown" | "stale">
+      >();
 
       const contextRef = yield* Ref.make<ClaudeSessionContext | undefined>(undefined);
 
@@ -5244,6 +5264,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             payload: {
               toolName,
               input: toolInput,
+              providerRequestId: callbackOptions.requestId,
             },
           },
         });
@@ -5329,7 +5350,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       ) => runPromise(handleResumeDialog(request, callbackOptions));
       const childApprovalOutcomeHandoff: HookCallback = async (hookInput) => {
         const hookEventName = hookInput.hook_event_name;
-        if (hookEventName !== "PostToolBatch" && hookEventName !== "UserPromptSubmit") return {};
+        if (
+          hookEventName !== "PostToolBatch" &&
+          hookEventName !== "UserPromptSubmit" &&
+          hookEventName !== "Stop"
+        ) {
+          return {};
+        }
         const deliverable: Array<ClaudeChildApprovalOutcome> = [];
         const unresolvedOrOtherParent: Array<ClaudeChildApprovalOutcome> = [];
         for (const outcome of childApprovalOutcomes) {
@@ -5493,6 +5520,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         hooks: {
           PostToolBatch: [{ hooks: [childApprovalOutcomeHandoff] }],
           UserPromptSubmit: [{ hooks: [childApprovalOutcomeHandoff] }],
+          Stop: [{ hooks: [childApprovalOutcomeHandoff] }],
         },
         onUserDialog,
         supportedDialogKinds: ["resume_return"],
@@ -5615,6 +5643,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         pendingTaskModels,
         workflowMemberFingerprints,
         liveTaskIds,
+        taskStopObservers,
+        taskStopCalls,
         turnState: undefined,
         lastKnownContextWindow: initialContextWindow,
         lastKnownTokenUsage: undefined,
@@ -5868,6 +5898,306 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       yield* stopSessionInternal(context);
     },
   );
+
+  const stopAgent: NonNullable<ClaudeAdapterShape["stopAgent"]> = Effect.fn("stopAgent")(
+    function* (threadId, agentKey) {
+      const context = sessions.get(threadId);
+      const task = context
+        ? Array.from(context.taskAgents.values()).find(
+            (candidate) => candidate.agentKey === agentKey,
+          )
+        : undefined;
+      if (
+        !context ||
+        context.stopped ||
+        sessions.get(threadId) !== context ||
+        !task ||
+        !context.liveTaskIds.has(task.taskId)
+      ) {
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "task/stop",
+          detail: "The Claude child handle is stale or the child has already completed.",
+        });
+      }
+
+      const existing = context.taskStopCalls.get(agentKey);
+      if (existing) {
+        const result = yield* Deferred.await(existing);
+        if (result === "stale") {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "task/stop",
+            detail: "The Claude child handle became stale before stop dispatch.",
+          });
+        }
+        return result;
+      }
+
+      const resultDeferred = yield* Deferred.make<"completed" | "unknown" | "stale">();
+      const claim = yield* Effect.sync(() => {
+        const inFlight = context.taskStopCalls.get(agentKey);
+        if (inFlight) return { owner: false as const, result: inFlight };
+        context.taskStopCalls.set(agentKey, resultDeferred);
+        return { owner: true as const, result: resultDeferred };
+      });
+      if (!claim.owner) {
+        const result = yield* Deferred.await(claim.result);
+        if (result === "stale") {
+          return yield* new ProviderAdapterRequestError({
+            provider: PROVIDER,
+            method: "task/stop",
+            detail: "The Claude child handle became stale before stop dispatch.",
+          });
+        }
+        return result;
+      }
+
+      const observer = yield* Deferred.make<"stopped" | "other">();
+      context.taskStopObservers.set(task.taskId, observer);
+      const stillCurrent =
+        sessions.get(threadId) === context &&
+        !context.stopped &&
+        context.liveTaskIds.has(task.taskId);
+      let result: "completed" | "unknown" | "stale";
+      if (!stillCurrent) {
+        context.taskStopObservers.delete(task.taskId);
+        result = "stale";
+      } else {
+        // Once stopTask is invoked the native outcome is uncertain until its
+        // task_notification arrives. Never retry after this dispatch point.
+        const dispatch = yield* Effect.exit(
+          Effect.tryPromise({
+            try: () => context.query.stopTask(task.taskId),
+            catch: (cause): ProviderAdapterError => toRequestError(threadId, "task/stop", cause),
+          }).pipe(Effect.timeoutOption("2 seconds")),
+        );
+        if (dispatch._tag === "Failure" || dispatch.value._tag === "None") {
+          result = "unknown";
+        } else {
+          const completion = yield* Deferred.await(observer).pipe(
+            Effect.timeoutOption("3 seconds"),
+          );
+          result =
+            completion._tag === "Some" && completion.value === "stopped" ? "completed" : "unknown";
+        }
+      }
+      context.taskStopObservers.delete(task.taskId);
+      context.taskStopCalls.delete(agentKey);
+      yield* Deferred.succeed(resultDeferred, result);
+      if (result === "stale") {
+        return yield* new ProviderAdapterRequestError({
+          provider: PROVIDER,
+          method: "task/stop",
+          detail: "The Claude child handle became stale before stop dispatch.",
+        });
+      }
+      return result;
+    },
+  );
+
+  const getAgentActionCapabilities: NonNullable<
+    ClaudeAdapterShape["getAgentActionCapabilities"]
+  > = (threadId, agentKey) =>
+    Effect.sync(() => {
+      const context = sessions.get(threadId);
+      if (!context || context.stopped) {
+        return {
+          message: "unsupported" as const,
+          answerRequests: "unsupported" as const,
+          stop: "unsupported" as const,
+        };
+      }
+      const task = Array.from(context.taskAgents.values()).find(
+        (candidate) => candidate.agentKey === agentKey,
+      );
+      if (!task) {
+        return {
+          message: "unverified" as const,
+          answerRequests: "unverified" as const,
+          stop: "unverified" as const,
+        };
+      }
+      const hasPendingApproval = Array.from(context.pendingApprovals.values()).some(
+        (pending) => pending.agentKey === agentKey,
+      );
+      return {
+        message: "unsupported" as const,
+        answerRequests: hasPendingApproval ? ("unverified" as const) : ("unsupported" as const),
+        stop: context.liveTaskIds.has(task.taskId)
+          ? ("supported" as const)
+          : ("unsupported" as const),
+      };
+    });
+
+  const readAgentTranscriptPage: NonNullable<ClaudeAdapterShape["readAgentTranscriptPage"]> =
+    Effect.fn("readAgentTranscriptPage")(function* (threadId, agentKey, sourceCursor, limit) {
+      const context = sessions.get(threadId);
+      if (!context || context.stopped || !context.resumeSessionId) {
+        return {
+          entries: [],
+          hasMore: false,
+          completeness: "partial" as const,
+          reason: "The active Claude parent session is unavailable for native child history.",
+        };
+      }
+      const parentSessionId = context.resumeSessionId;
+      const task = Array.from(context.taskAgents.values()).find(
+        (candidate) => candidate.agentKey === agentKey,
+      );
+      if (!task || !task.providerAgentId) {
+        return {
+          entries: [],
+          hasMore: false,
+          completeness: "partial" as const,
+          reason: "Claude has not exposed a native transcript identity for this child.",
+        };
+      }
+      const providerAgentId = task.providerAgentId;
+      const offset = sourceCursor === undefined ? 0 : Number(sourceCursor);
+      if (!Number.isSafeInteger(offset) || offset < 0) {
+        return {
+          entries: [],
+          hasMore: false,
+          completeness: "partial" as const,
+          reason:
+            "The Claude native transcript cursor is invalid; recovery will retry from the start.",
+        };
+      }
+      const readLimit = Math.min(100, Math.max(1, limit));
+      const scopedWorkerArguments =
+        claudeEnvironment.CLAUDE_CONFIG_DIR === process.env.CLAUDE_CONFIG_DIR
+          ? undefined
+          : (yield* HostProcessIsExecutable)
+            ? ["__claude-history"]
+            : [
+                yield* path
+                  .fromFileUrl(
+                    new URL(
+                      import.meta.url.endsWith(".ts")
+                        ? "../../claude-history-worker.ts"
+                        : "./claude-history-worker.mjs",
+                      import.meta.url,
+                    ),
+                  )
+                  .pipe(
+                    Effect.mapError((cause) =>
+                      toRequestError(threadId, "getSubagentMessages", cause),
+                    ),
+                  ),
+              ];
+      const messages = yield* Effect.tryPromise({
+        try: async () => {
+          const readOptions = {
+            ...(context.session.cwd ? { dir: context.session.cwd } : {}),
+            limit: readLimit + 1,
+            offset,
+          };
+          if (options?.getSubagentMessages) {
+            return options.getSubagentMessages(parentSessionId, providerAgentId, readOptions);
+          }
+          if (claudeEnvironment.CLAUDE_CONFIG_DIR === process.env.CLAUDE_CONFIG_DIR) {
+            return getSubagentMessages(parentSessionId, providerAgentId, readOptions);
+          }
+          const workerOptions = {
+            ...readOptions,
+            agentId: providerAgentId,
+          };
+          const result = await Effect.runPromise(
+            spawnAndCollect(
+              process.execPath,
+              ChildProcess.make(
+                process.execPath,
+                [
+                  ...scopedWorkerArguments!,
+                  "getSubagentMessages",
+                  parentSessionId,
+                  encodeHistoryArgs(workerOptions),
+                ],
+                { env: { ...claudeEnvironment, ELECTRON_RUN_AS_NODE: "1" } },
+              ),
+            ).pipe(
+              Effect.timeout("8 seconds"),
+              Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            ),
+          );
+          if (result.code !== 0) throw new Error(result.stderr || "Claude child history failed.");
+          return decodeSessionMessages(result.stdout);
+        },
+        catch: (cause) => toRequestError(threadId, "getSubagentMessages", cause),
+      }).pipe(
+        Effect.timeoutOrElse({
+          duration: "8 seconds",
+          orElse: () =>
+            Effect.fail(
+              new ProviderAdapterRequestError({
+                provider: PROVIDER,
+                method: "getSubagentMessages",
+                detail: "Claude child transcript recovery exceeded the bounded read time.",
+              }),
+            ),
+        }),
+      );
+      if (context.stopped || sessions.get(threadId) !== context) {
+        return {
+          entries: [],
+          hasMore: false,
+          completeness: "partial" as const,
+          reason: "The Claude provider session changed during child transcript recovery.",
+        };
+      }
+      const hasMore = messages.length > readLimit;
+      const selected = hasMore ? messages.slice(0, readLimit) : messages;
+      const entries = selected.flatMap((message, index) => {
+        const rawMessage = message.message;
+        if (rawMessage === null || typeof rawMessage !== "object") return [];
+        const content = Reflect.get(rawMessage, "content");
+        const text =
+          typeof content === "string"
+            ? content
+            : Array.isArray(content)
+              ? content
+                  .flatMap((block) => {
+                    if (block === null || typeof block !== "object") return [];
+                    const value = Reflect.get(block, "text");
+                    return Reflect.get(block, "type") === "text" && typeof value === "string"
+                      ? [value]
+                      : [];
+                  })
+                  .join("")
+              : "";
+        if (text.length === 0 || (message.type !== "assistant" && message.type !== "user")) {
+          return [];
+        }
+        const nativeIndex = offset + index;
+        return [
+          {
+            nativeEntryId: `claude:${providerAgentId}:${message.uuid}`,
+            providerOrderKey: `claude:${String(nativeIndex).padStart(12, "0")}`,
+            createdAt: context.session.createdAt,
+            role: message.type,
+            content: text.slice(0, 65_536),
+            status: "completed" as const,
+          },
+        ];
+      });
+      if (messages.length === 0 && offset === 0) {
+        return {
+          entries,
+          hasMore: false,
+          completeness: "partial" as const,
+          reason:
+            "Claude returned no child transcript rows; the SDK does not distinguish an empty transcript from a missing one.",
+        };
+      }
+      return {
+        entries,
+        ...(hasMore ? { nextSourceCursor: String(offset + selected.length) } : {}),
+        hasMore,
+        completeness: hasMore ? ("partial" as const) : ("complete" as const),
+        ...(hasMore ? { reason: "More native Claude child transcript pages remain." } : {}),
+      };
+    });
 
   const readThread: ClaudeAdapterShape["readThread"] = Effect.fn("readThread")(
     function* (threadId) {
@@ -6236,6 +6566,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     startSession,
     sendTurn,
     interruptTurn,
+    stopAgent,
+    getAgentActionCapabilities,
+    readAgentTranscriptPage,
     readThread,
     rollbackThread,
     forkThread,

@@ -31,6 +31,7 @@ import {
   ProviderDriverKind,
   RuntimeAgentKey,
   OrchestrationAgentActionState,
+  OrchestrationAgentHandoffState,
   OrchestrationAgentCapabilities,
   OrchestrationAgentIdentity,
   OrchestrationAgentStatus,
@@ -178,6 +179,8 @@ const ProjectionAgentTranscriptReadRowSchema = Schema.Struct({
   activityId: EventId,
   eventSequence: NonNegativeInt,
   cursorSequence: NonNegativeInt,
+  nativeEntryId: Schema.String,
+  providerOrderKey: Schema.String,
   createdAt: IsoDateTime,
   kind: Schema.String,
   summary: Schema.String,
@@ -186,7 +189,18 @@ const ProjectionAgentTranscriptReadRowSchema = Schema.Struct({
   detail: Schema.NullOr(Schema.String),
   status: Schema.NullOr(Schema.String),
   deliveryStatus: Schema.NullOr(Schema.String),
+  handoffStatus: Schema.NullOr(Schema.String),
   requestId: Schema.NullOr(Schema.String),
+});
+const ProjectionAgentTranscriptBoundaryRowSchema = Schema.Struct({
+  nativeEntryId: Schema.String,
+  providerOrderKey: Schema.String,
+});
+const ProjectionAgentTranscriptNativeRevisionRowSchema = Schema.Struct({
+  nativeEntryId: Schema.String,
+  providerOrderKey: Schema.String,
+  eventSequence: NonNegativeInt,
+  content: Schema.NullOr(Schema.String),
 });
 const ProjectionAgentIdentityDbRowSchema = Schema.Struct({
   title: Schema.NullOr(Schema.String),
@@ -208,6 +222,16 @@ const ProjectionPendingAgentActionDbRowSchema = Schema.Struct({
   actionId: Schema.String,
   action: Schema.Literals(["message", "stop"]),
   content: Schema.NullOr(Schema.String),
+});
+const ProjectionPendingAgentHandoffDbRowSchema = Schema.Struct({
+  threadId: ThreadId,
+  activityId: EventId,
+  createdAt: IsoDateTime,
+  kind: Schema.Literals(["approval.handoff", "user-input.handoff"]),
+  requestId: Schema.String,
+  nativeRequestId: Schema.NullOr(Schema.String),
+  agentKey: Schema.NullOr(RuntimeAgentKey),
+  sessionGeneration: Schema.NullOr(Schema.String),
 });
 const ProjectionThreadActivityIdRowSchema = Schema.Struct({
   activityId: ProjectionThreadActivity.fields.activityId,
@@ -688,6 +712,7 @@ function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: st
 
 const agentTranscriptStatus = Schema.decodeUnknownOption(OrchestrationAgentStatus);
 const agentTranscriptActionState = Schema.decodeUnknownOption(OrchestrationAgentActionState);
+const agentTranscriptHandoffState = Schema.decodeUnknownOption(OrchestrationAgentHandoffState);
 const agentTranscriptProviderDriver = Schema.decodeUnknownOption(ProviderDriverKind);
 const isAgentTranscriptRequestId = Schema.is(ApprovalRequestId);
 const isAgentTranscriptRuntimeAgentKey = Schema.is(RuntimeAgentKey);
@@ -1838,7 +1863,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         created_at AS "createdAt"
       FROM projection_thread_activities
       WHERE thread_id = ${threadId}
-        AND kind IN ('user-input.requested', 'user-input.resolved')
+        AND kind IN (
+          'approval.requested', 'approval.resolved',
+          'user-input.requested', 'user-input.resolved'
+        )
         AND json_extract(payload_json, '$.requestId') = ${requestId}
       ORDER BY sequence DESC, created_at DESC, activity_id DESC
       LIMIT 1
@@ -2110,17 +2138,19 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     Request: Schema.Struct({
       threadId: ThreadId,
       agentKey: RuntimeAgentKey,
-      beforeEventSequence: Schema.optional(NonNegativeInt),
-      beforeActivityId: Schema.optional(EventId),
+      beforeProviderOrderKey: Schema.optional(Schema.String),
+      beforeNativeEntryId: Schema.optional(Schema.String),
       limit: Schema.Number,
     }),
     Result: ProjectionAgentTranscriptReadRowSchema,
-    execute: ({ threadId, agentKey, beforeEventSequence, beforeActivityId, limit }) =>
+    execute: ({ threadId, agentKey, beforeProviderOrderKey, beforeNativeEntryId, limit }) =>
       sql`
         SELECT
           activity_id AS "activityId",
           event_sequence AS "eventSequence",
           COALESCE(first_event_sequence, event_sequence) AS "cursorSequence",
+          native_entry_id AS "nativeEntryId",
+          provider_order_key AS "providerOrderKey",
           created_at AS "createdAt",
           kind,
           substr(summary, 1, 512) AS summary,
@@ -2139,33 +2169,108 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           CASE WHEN json_type(payload_json, '$.deliveryStatus') = 'text'
             THEN substr(json_extract(payload_json, '$.deliveryStatus'), 1, 64)
             ELSE NULL END AS "deliveryStatus",
+          CASE WHEN json_type(payload_json, '$.handoffStatus') = 'text'
+            THEN substr(json_extract(payload_json, '$.handoffStatus'), 1, 32)
+            ELSE NULL END AS "handoffStatus",
           CASE WHEN json_type(payload_json, '$.requestId') = 'text'
             THEN substr(json_extract(payload_json, '$.requestId'), 1, 200)
             ELSE NULL END AS "requestId"
         FROM (
+          WITH revisions AS (
+            SELECT
+              activities.*,
+              COALESCE(json_extract(payload_json, '$.nativeEntryId'), activity_id) AS native_entry_id,
+              COALESCE(json_extract(payload_json, '$.providerOrderKey'), created_at) AS provider_order_key,
+              ROW_NUMBER() OVER (
+                PARTITION BY COALESCE(json_extract(payload_json, '$.nativeEntryId'), activity_id)
+                ORDER BY event_sequence DESC, activity_id DESC
+              ) AS revision_rank
+            FROM projection_thread_activities AS activities
+            WHERE thread_id = ${threadId}
+              AND agent_key = ${agentKey}
+              AND event_sequence IS NOT NULL
+          )
           SELECT *
-          FROM projection_thread_activities
-          WHERE thread_id = ${threadId}
-            AND agent_key = ${agentKey}
-            AND event_sequence IS NOT NULL
+          FROM revisions
+          WHERE revision_rank = 1
             ${
-              beforeEventSequence === undefined
+              beforeProviderOrderKey === undefined
                 ? sql``
-                : beforeActivityId === undefined
-                  ? sql`AND COALESCE(first_event_sequence, event_sequence) < ${beforeEventSequence}`
+                : beforeNativeEntryId === undefined
+                  ? sql`AND provider_order_key < ${beforeProviderOrderKey}`
                   : sql`AND (
-                    COALESCE(first_event_sequence, event_sequence) < ${beforeEventSequence}
+                    provider_order_key < ${beforeProviderOrderKey}
                     OR (
-                      COALESCE(first_event_sequence, event_sequence) = ${beforeEventSequence}
-                      AND activity_id < ${beforeActivityId}
+                      provider_order_key = ${beforeProviderOrderKey}
+                      AND native_entry_id < ${beforeNativeEntryId}
                     )
                   )`
             }
-          ORDER BY COALESCE(first_event_sequence, event_sequence) DESC, activity_id DESC
+          ORDER BY provider_order_key DESC, native_entry_id DESC
           LIMIT ${limit}
         ) AS agent_activities
-        ORDER BY COALESCE(first_event_sequence, event_sequence) ASC, activity_id ASC
+        ORDER BY provider_order_key ASC, native_entry_id ASC
       `,
+  });
+
+  const listAgentTranscriptNativeRevisionRows = SqlSchema.findAll({
+    Request: Schema.Struct({
+      threadId: ThreadId,
+      agentKey: RuntimeAgentKey,
+      nativeEntryIds: Schema.Array(Schema.String),
+    }),
+    Result: ProjectionAgentTranscriptNativeRevisionRowSchema,
+    execute: ({ threadId, agentKey, nativeEntryIds }) => sql`
+      WITH revisions AS (
+        SELECT
+          COALESCE(json_extract(payload_json, '$.nativeEntryId'), activity_id) AS "nativeEntryId",
+          COALESCE(json_extract(payload_json, '$.providerOrderKey'), created_at) AS "providerOrderKey",
+          event_sequence AS "eventSequence",
+          CASE WHEN json_type(payload_json, '$.content') = 'text'
+            THEN substr(json_extract(payload_json, '$.content'), 1, 65536)
+            ELSE NULL END AS content,
+          ROW_NUMBER() OVER (
+            PARTITION BY COALESCE(json_extract(payload_json, '$.nativeEntryId'), activity_id)
+            ORDER BY event_sequence DESC, activity_id DESC
+          ) AS revision_rank
+        FROM projection_thread_activities
+        WHERE thread_id = ${threadId}
+          AND agent_key = ${agentKey}
+          AND event_sequence IS NOT NULL
+          AND json_extract(payload_json, '$.nativeEntryId') IN (
+            SELECT value FROM json_each(${JSON.stringify(nativeEntryIds)})
+          )
+      )
+      SELECT "nativeEntryId", "providerOrderKey", "eventSequence", content
+      FROM revisions
+      WHERE revision_rank = 1
+    `,
+  });
+
+  const getAgentTranscriptBoundaryRow = SqlSchema.findOneOption({
+    Request: Schema.Struct({
+      threadId: ThreadId,
+      agentKey: RuntimeAgentKey,
+      beforeEventSequence: NonNegativeInt,
+      beforeActivityId: Schema.optional(EventId),
+    }),
+    Result: ProjectionAgentTranscriptBoundaryRowSchema,
+    execute: ({ threadId, agentKey, beforeEventSequence, beforeActivityId }) => sql`
+      SELECT
+        COALESCE(json_extract(payload_json, '$.nativeEntryId'), activity_id) AS "nativeEntryId",
+        COALESCE(json_extract(payload_json, '$.providerOrderKey'), created_at) AS "providerOrderKey"
+      FROM projection_thread_activities
+      WHERE thread_id = ${threadId}
+        AND agent_key = ${agentKey}
+        AND event_sequence IS NOT NULL
+        ${
+          beforeActivityId === undefined
+            ? sql`AND COALESCE(first_event_sequence, event_sequence) = ${beforeEventSequence}`
+            : sql`AND activity_id = ${beforeActivityId}`
+        }
+      ORDER BY event_sequence DESC, activity_id DESC
+      LIMIT 1
+    `,
   });
 
   const listPendingAgentActionRows = SqlSchema.findAll({
@@ -2235,6 +2340,45 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       SELECT * FROM pending_activities
       UNION ALL
       SELECT * FROM unmatched_intents
+      ORDER BY "createdAt" ASC, "activityId" ASC
+      LIMIT 1000
+    `,
+  });
+
+  const listPendingAgentHandoffRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionPendingAgentHandoffDbRowSchema,
+    execute: () => sql`
+      WITH latest_handoffs AS (
+        SELECT
+          thread_id AS "threadId",
+          activity_id AS "activityId",
+          created_at AS "createdAt",
+          kind,
+          substr(json_extract(payload_json, '$.requestId'), 1, 200) AS "requestId",
+          CASE WHEN json_type(payload_json, '$.nativeRequestId') = 'text'
+            THEN substr(json_extract(payload_json, '$.nativeRequestId'), 1, 200)
+            ELSE NULL END AS "nativeRequestId",
+          CASE WHEN json_type(payload_json, '$.agentKey') = 'text'
+            THEN substr(json_extract(payload_json, '$.agentKey'), 1, 128)
+            ELSE NULL END AS "agentKey",
+          CASE WHEN json_type(payload_json, '$.sessionGeneration') = 'text'
+            THEN substr(json_extract(payload_json, '$.sessionGeneration'), 1, 200)
+            ELSE NULL END AS "sessionGeneration",
+          json_extract(payload_json, '$.handoffStatus') AS "handoffStatus",
+          ROW_NUMBER() OVER (
+            PARTITION BY thread_id, kind, json_extract(payload_json, '$.requestId')
+            ORDER BY event_sequence DESC, created_at DESC, activity_id DESC
+          ) AS state_order
+        FROM projection_thread_activities
+        WHERE kind IN ('approval.handoff', 'user-input.handoff')
+          AND json_type(payload_json, '$.requestId') = 'text'
+      )
+      SELECT
+        "threadId", "activityId", "createdAt", kind, "requestId",
+        "nativeRequestId", "agentKey", "sessionGeneration"
+      FROM latest_handoffs
+      WHERE state_order = 1 AND "handoffStatus" = 'pending'
       ORDER BY "createdAt" ASC, "activityId" ASC
       LIMIT 1000
     `,
@@ -4675,17 +4819,45 @@ pending_approval_requests AS (
             input.cursor === undefined
               ? null
               : decodeAgentTranscriptCursor(input.cursor, input.threadId, input.agentKey);
-          const cursor = decodedCursor;
+          let cursor = decodedCursor;
+          let cursorBoundaryLost = false;
+          if (cursor?.legacy && cursor.beforeEventSequence !== undefined) {
+            const legacyBoundary = yield* getAgentTranscriptBoundaryRow({
+              threadId: input.threadId,
+              agentKey: input.agentKey,
+              beforeEventSequence: cursor.beforeEventSequence,
+              ...(cursor.beforeActivityId === undefined
+                ? {}
+                : { beforeActivityId: cursor.beforeActivityId }),
+            }).pipe(
+              Effect.mapError(
+                toPersistenceSqlOrDecodeError(
+                  "ProjectionSnapshotQuery.getAgentTranscriptPage:legacyCursor:query",
+                  "ProjectionSnapshotQuery.getAgentTranscriptPage:legacyCursor:decodeRow",
+                ),
+              ),
+            );
+            cursorBoundaryLost = Option.isNone(legacyBoundary);
+            cursor = Option.match(legacyBoundary, {
+              onNone: () => null,
+              onSome: (boundary) => ({
+                beforeProviderOrderKey: boundary.providerOrderKey,
+                beforeNativeEntryId: boundary.nativeEntryId,
+              }),
+            });
+          }
           const rawRows = yield* listAgentTranscriptActivityRows({
             threadId: input.threadId,
             agentKey: input.agentKey,
             ...(cursor === null
               ? {}
               : {
-                  beforeEventSequence: cursor.beforeEventSequence,
-                  ...(cursor.beforeActivityId === undefined
+                  ...(cursor.beforeProviderOrderKey === undefined
                     ? {}
-                    : { beforeActivityId: cursor.beforeActivityId }),
+                    : { beforeProviderOrderKey: cursor.beforeProviderOrderKey }),
+                  ...(cursor.beforeNativeEntryId === undefined
+                    ? {}
+                    : { beforeNativeEntryId: cursor.beforeNativeEntryId }),
                 }),
             limit: pageSize + 1,
           }).pipe(
@@ -4769,6 +4941,8 @@ pending_approval_requests AS (
               {
                 id: row.activityId,
                 eventSequence: row.eventSequence,
+                nativeEntryId: row.nativeEntryId,
+                providerOrderKey: row.providerOrderKey,
                 createdAt: row.createdAt,
                 kind,
                 ...(role === undefined ? {} : { role }),
@@ -4777,6 +4951,13 @@ pending_approval_requests AS (
                 ...(detail === undefined ? {} : { detail }),
                 ...(status === undefined ? {} : { status }),
                 ...(deliveryStatus === undefined ? {} : { deliveryStatus }),
+                ...(row.handoffStatus === null
+                  ? {}
+                  : {
+                      handoffStatus: Option.getOrUndefined(
+                        agentTranscriptHandoffState(row.handoffStatus),
+                      ),
+                    }),
                 ...(requestId === undefined ? {} : { requestId }),
               },
             ];
@@ -4787,8 +4968,14 @@ pending_approval_requests AS (
               ? encodeAgentTranscriptCursor({
                   threadId: input.threadId,
                   agentKey: input.agentKey,
-                  beforeEventSequence: selectedRows[0].cursorSequence,
-                  beforeActivityId: selectedRows[0].activityId,
+                  beforeProviderOrderKey: selectedRows[0].providerOrderKey,
+                  beforeNativeEntryId: selectedRows[0].nativeEntryId,
+                  ...(cursor?.nativeSourceCursor === undefined
+                    ? {}
+                    : { nativeSourceCursor: cursor.nativeSourceCursor }),
+                  ...(cursor?.revisionWatermark === undefined
+                    ? {}
+                    : { revisionWatermark: cursor.revisionWatermark }),
                 })
               : null;
 
@@ -4866,15 +5053,21 @@ pending_approval_requests AS (
             hasMore,
             snapshotSequence: snapshotSequence.snapshotSequence,
             threadSequence,
-            completeness: hasTranscript
+            completeness: cursorBoundaryLost
               ? {
                   state: "partial" as const,
-                  reason: "Only child messages and activity captured by the provider are shown.",
+                  reason:
+                    "The legacy transcript cursor row is unavailable; recovery restarted from the first native boundary.",
                 }
-              : {
-                  state: "unavailable" as const,
-                  reason: "The provider has not supplied child message content for this agent.",
-                },
+              : hasTranscript
+                ? {
+                    state: "partial" as const,
+                    reason: "Only child messages and activity captured by the provider are shown.",
+                  }
+                : {
+                    state: "unavailable" as const,
+                    reason: "The provider has not supplied child message content for this agent.",
+                  },
           });
         }),
       )
@@ -4897,6 +5090,32 @@ pending_approval_requests AS (
         ),
       ),
     );
+
+  const listPendingAgentHandoffs: NonNullable<
+    ProjectionSnapshotQueryShape["listPendingAgentHandoffs"]
+  > = () =>
+    listPendingAgentHandoffRows(undefined).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.listPendingAgentHandoffs:query",
+          "ProjectionSnapshotQuery.listPendingAgentHandoffs:decodeRows",
+        ),
+      ),
+    );
+
+  const getAgentTranscriptNativeRevisions: NonNullable<
+    ProjectionSnapshotQueryShape["getAgentTranscriptNativeRevisions"]
+  > = (input) =>
+    input.nativeEntryIds.length === 0
+      ? Effect.succeed([])
+      : listAgentTranscriptNativeRevisionRows(input).pipe(
+          Effect.mapError(
+            toPersistenceSqlOrDecodeError(
+              "ProjectionSnapshotQuery.getAgentTranscriptNativeRevisions:query",
+              "ProjectionSnapshotQuery.getAgentTranscriptNativeRevisions:decodeRows",
+            ),
+          ),
+        );
 
   return {
     getCommandReadModel,
@@ -4922,6 +5141,8 @@ pending_approval_requests AS (
     getThreadDetailSnapshot,
     getAgentTranscriptPage,
     listPendingAgentActions,
+    listPendingAgentHandoffs,
+    getAgentTranscriptNativeRevisions,
   } satisfies ProjectionSnapshotQueryShape;
 });
 

@@ -148,6 +148,10 @@ import {
 import type { ProviderInstance } from "./provider/ProviderDriver.ts";
 import * as ProviderSessionDirectory from "./provider/Services/ProviderSessionDirectory.ts";
 import { ProviderAdapterRequestError } from "./provider/Errors.ts";
+import {
+  encodeAgentTranscriptCursor,
+  decodeAgentTranscriptCursor,
+} from "./orchestration/agentTranscriptCursor.ts";
 import { makeManualOnlyProviderMaintenanceCapabilities } from "./provider/providerMaintenance.ts";
 import * as ServerLifecycleEvents from "./serverLifecycleEvents.ts";
 import * as ServerRuntimeStartup from "./serverRuntimeStartup.ts";
@@ -12002,6 +12006,17 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     Effect.gen(function* () {
       const threadId = ThreadId.make("thread-agent-transcript-rpc");
       const agentKey = RuntimeAgentKey.make("agent-transcript-rpc");
+      const recoveredEntry = {
+        id: EventId.make("agent-transcript-recovered-event"),
+        nativeEntryId: "native-message-1:block-0",
+        providerOrderKey: "000001",
+        eventSequence: 5,
+        createdAt: "2026-09-28T00:00:00.000Z",
+        kind: "message" as const,
+        role: "assistant" as const,
+        summary: "Recovered answer",
+        content: "Recovered answer from native child history.",
+      };
       const page: OrchestrationAgentTranscriptPage = {
         threadId,
         agent: {
@@ -12025,6 +12040,15 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         threadSequence: 5,
         completeness: { state: "partial", reason: "Only captured child activity is shown." },
       };
+      const recoveredPage: OrchestrationAgentTranscriptPage = {
+        ...page,
+        entries: [recoveredEntry],
+        snapshotSequence: 5,
+        completeness: { state: "complete" },
+      };
+      const projectionReads: Array<unknown> = [];
+      const dispatched: Array<OrchestrationCommand> = [];
+      const nativeReads: Array<unknown> = [];
       yield* buildAppUnderTest({
         layers: {
           projectionSnapshotQuery: {
@@ -12033,7 +12057,42 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
                 assert.equal(input.threadId, threadId);
                 assert.equal(input.agentKey, agentKey);
                 assert.equal(input.limit, undefined);
-                return Option.some(page);
+                projectionReads.push(input);
+                return Option.some(projectionReads.length === 1 ? page : recoveredPage);
+              }),
+            getAgentTranscriptNativeRevisions: () => Effect.succeed([]),
+          },
+          providerService: {
+            readAgentTranscriptPage: (input) =>
+              Effect.sync(() => {
+                nativeReads.push(input);
+                return {
+                  entries: [
+                    {
+                      nativeEntryId: recoveredEntry.nativeEntryId!,
+                      providerOrderKey: recoveredEntry.providerOrderKey!,
+                      createdAt: recoveredEntry.createdAt,
+                      role: recoveredEntry.role,
+                      content: recoveredEntry.content,
+                      status: "completed" as const,
+                    },
+                  ],
+                  hasMore: false,
+                  completeness: "complete" as const,
+                };
+              }),
+            getAgentCapabilities: () =>
+              Effect.succeed({
+                message: { state: "unsupported" as const, reason: "Provider reason." },
+                answerRequests: { state: "unsupported" as const, reason: "No pending request." },
+                stop: { state: "supported" as const },
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command);
+                return { sequence: 5 };
               }),
           },
         },
@@ -12045,7 +12104,446 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           client[ORCHESTRATION_WS_METHODS.getAgentTranscriptPage]({ threadId, agentKey }),
         ),
       );
-      assert.deepEqual(result, page);
+      assert.equal(nativeReads.length, 1);
+      assert.deepEqual(nativeReads[0], { threadId, agentKey, limit: 8 });
+      assert.equal(dispatched.length, 1);
+      const persisted = dispatched[0];
+      assert.equal(persisted?.type, "thread.activity.append");
+      if (persisted?.type === "thread.activity.append") {
+        assert.equal(persisted.activity.kind, "agent.transcript.message");
+        assert.deepInclude(persisted.activity.payload, {
+          nativeEntryId: recoveredEntry.nativeEntryId,
+          providerOrderKey: recoveredEntry.providerOrderKey,
+        });
+      }
+      assert.equal(projectionReads.length, 2, "RPC waits for the persisted revision projection");
+      assert.equal(result.entries[0]?.nativeEntryId, recoveredEntry.nativeEntryId);
+      assert.equal(result.entries[0]?.eventSequence, 5);
+      assert.deepEqual(result.completeness, { state: "complete" });
+      assert.deepEqual(result.agent.capabilities.message, {
+        state: "unsupported",
+        reason: "Provider reason.",
+      });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("keeps the incoming native cursor retryable after native recovery fails", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-agent-transcript-retry");
+      const agentKey = RuntimeAgentKey.make("agent-transcript-retry");
+      const page: OrchestrationAgentTranscriptPage = {
+        threadId,
+        agent: {
+          key: agentKey,
+          parentKey: null,
+          title: "Researcher",
+          role: "Researcher",
+          provider: ProviderDriverKind.make("opencode"),
+          status: "running",
+          capabilities: {
+            transcript: { state: "supported" },
+            message: { state: "unsupported", reason: "not available" },
+            answerRequests: { state: "unverified", reason: "not verified" },
+            stop: { state: "unsupported", reason: "not available" },
+          },
+        },
+        entries: [],
+        nextCursor: null,
+        hasMore: false,
+        snapshotSequence: 12,
+        threadSequence: 12,
+        completeness: { state: "complete" },
+      };
+      const incomingCursor = encodeAgentTranscriptCursor({
+        threadId,
+        agentKey,
+        nativeSourceCursor: "native-page-9",
+        revisionWatermark: 11,
+      });
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getAgentTranscriptPage: () => Effect.succeed(Option.some(page)),
+          },
+          providerService: {
+            readAgentTranscriptPage: () =>
+              Effect.fail(
+                new ProviderAdapterRequestError({
+                  provider: ProviderDriverKind.make("opencode"),
+                  method: "v2.session.messages",
+                  detail: "native history is unavailable",
+                }),
+              ),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws?connectionMethod=direct");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.getAgentTranscriptPage]({
+            threadId,
+            agentKey,
+            cursor: incomingCursor,
+          }),
+        ),
+      );
+      assert.equal(result.completeness.state, "partial");
+      assert.equal(result.hasMore, true);
+      assert.ok(result.nextCursor);
+      assert.deepEqual(decodeAgentTranscriptCursor(result.nextCursor!, threadId, agentKey), {
+        nativeSourceCursor: "native-page-9",
+        revisionWatermark: 11,
+        nativeSourceComplete: false,
+      });
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("returns a retryable partial page when native revision dispatch fails", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-agent-transcript-dispatch-retry");
+      const agentKey = RuntimeAgentKey.make("agent-transcript-dispatch-retry");
+      const page: OrchestrationAgentTranscriptPage = {
+        threadId,
+        agent: {
+          key: agentKey,
+          parentKey: null,
+          title: "Researcher",
+          role: "Researcher",
+          provider: ProviderDriverKind.make("opencode"),
+          status: "running",
+          capabilities: {
+            transcript: { state: "supported" },
+            message: { state: "unsupported", reason: "not available" },
+            answerRequests: { state: "unverified", reason: "not verified" },
+            stop: { state: "unsupported", reason: "not available" },
+          },
+        },
+        entries: [],
+        nextCursor: null,
+        hasMore: false,
+        snapshotSequence: 12,
+        threadSequence: 12,
+        completeness: { state: "complete" },
+      };
+      const incomingCursor = encodeAgentTranscriptCursor({
+        threadId,
+        agentKey,
+        nativeSourceCursor: "native-page-4",
+      });
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getAgentTranscriptPage: () => Effect.succeed(Option.some(page)),
+            getAgentTranscriptNativeRevisions: () => Effect.succeed([]),
+          },
+          providerService: {
+            readAgentTranscriptPage: () =>
+              Effect.succeed({
+                entries: [
+                  {
+                    nativeEntryId: "native-entry-retry",
+                    providerOrderKey: "2026-09-28T00:00:00.000Z",
+                    createdAt: "2026-09-28T00:00:00.000Z",
+                    role: "assistant" as const,
+                    content: "retry me",
+                    status: "completed" as const,
+                  },
+                ],
+                hasMore: false,
+                completeness: "complete" as const,
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: () => Effect.fail(new OrchestrationThreadSettleBlockedError({ threadId })),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws?connectionMethod=direct");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.getAgentTranscriptPage]({
+            threadId,
+            agentKey,
+            cursor: incomingCursor,
+          }),
+        ),
+      );
+      assert.equal(result.completeness.state, "partial");
+      assert.equal(result.hasMore, true);
+      assert.ok(result.nextCursor);
+      assert.equal(
+        decodeAgentTranscriptCursor(result.nextCursor!, threadId, agentKey)?.nativeSourceCursor,
+        "native-page-4",
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("finishes forward native recovery before following backward transcript cursors", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-agent-transcript-forward-recovery");
+      const agentKey = RuntimeAgentKey.make("agent-transcript-forward-recovery");
+      const persistedEntries: Array<OrchestrationAgentTranscriptPage["entries"][number]> = [];
+      const nativeReads: Array<string | undefined> = [];
+      let eventSequence = 0;
+      const pageForCursor = (cursor: string | undefined, limit: number) => {
+        const decoded = cursor ? decodeAgentTranscriptCursor(cursor, threadId, agentKey) : null;
+        const available = [...persistedEntries]
+          .filter(
+            (entry) =>
+              decoded?.beforeProviderOrderKey === undefined ||
+              entry.providerOrderKey! < decoded.beforeProviderOrderKey ||
+              (entry.providerOrderKey === decoded.beforeProviderOrderKey &&
+                entry.nativeEntryId! < (decoded.beforeNativeEntryId ?? "")),
+          )
+          .sort((left, right) => right.providerOrderKey!.localeCompare(left.providerOrderKey!));
+        const entries = available.slice(0, limit);
+        const hasMore = available.length > entries.length;
+        const nextCursor =
+          hasMore && entries[0]
+            ? encodeAgentTranscriptCursor({
+                threadId,
+                agentKey,
+                beforeProviderOrderKey: entries[0].providerOrderKey!,
+                beforeNativeEntryId: entries[0].nativeEntryId!,
+                ...(decoded?.nativeSourceCursor === undefined
+                  ? {}
+                  : { nativeSourceCursor: decoded.nativeSourceCursor }),
+                ...(decoded?.revisionWatermark === undefined
+                  ? {}
+                  : { revisionWatermark: decoded.revisionWatermark }),
+              })
+            : null;
+        return {
+          threadId,
+          agent: {
+            key: agentKey,
+            parentKey: null,
+            title: "Researcher",
+            role: "Researcher",
+            provider: ProviderDriverKind.make("claudeAgent"),
+            status: "running" as const,
+            capabilities: {
+              transcript: { state: "supported" as const },
+              message: { state: "supported" as const },
+              answerRequests: { state: "unsupported" as const, reason: "No pending request." },
+              stop: { state: "supported" as const },
+            },
+          },
+          entries,
+          nextCursor,
+          hasMore,
+          snapshotSequence: 100,
+          threadSequence: 100,
+          completeness: { state: "complete" as const },
+        } satisfies OrchestrationAgentTranscriptPage;
+      };
+      const nativePage = (first: boolean) => {
+        const start = first ? 1 : 9;
+        return {
+          entries: Array.from({ length: 8 }, (_, index) => {
+            const ordinal = start + index;
+            const createdAt = DateTime.formatIso(
+              DateTime.add(DateTime.makeUnsafe("2026-01-01T00:00:00.000Z"), {
+                seconds: ordinal,
+              }),
+            );
+            return {
+              nativeEntryId: `native-entry-${ordinal.toString().padStart(2, "0")}`,
+              providerOrderKey: ordinal.toString().padStart(6, "0"),
+              createdAt,
+              role: "assistant" as const,
+              content: `native message ${ordinal}`,
+              status: "completed" as const,
+            };
+          }),
+          hasMore: first,
+          ...(first ? { nextSourceCursor: "native-page-8" } : {}),
+          completeness: first ? ("partial" as const) : ("complete" as const),
+        };
+      };
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getAgentTranscriptPage: (input) =>
+              Effect.sync(() => Option.some(pageForCursor(input.cursor, input.limit ?? 50))),
+            getAgentTranscriptNativeRevisions: () => Effect.succeed([]),
+          },
+          providerService: {
+            readAgentTranscriptPage: (input) =>
+              Effect.sync(() => {
+                nativeReads.push(input.sourceCursor);
+                return nativePage(input.sourceCursor === undefined);
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                if (command.type !== "thread.activity.append") {
+                  throw new Error("Expected recovered transcript append command");
+                }
+                const payloadSchema = Schema.Struct({
+                  nativeEntryId: Schema.String,
+                  providerOrderKey: Schema.String,
+                  role: Schema.Literals(["assistant", "user", "tool"]),
+                  content: Schema.String,
+                });
+                if (!Schema.is(payloadSchema)(command.activity.payload)) {
+                  throw new Error("Expected valid recovered transcript payload");
+                }
+                const payload = command.activity.payload;
+                eventSequence += 1;
+                persistedEntries.push({
+                  id: command.activity.id,
+                  eventSequence,
+                  nativeEntryId: payload.nativeEntryId,
+                  providerOrderKey: payload.providerOrderKey,
+                  createdAt: command.activity.createdAt,
+                  kind: "message",
+                  role: payload.role,
+                  content: payload.content,
+                  summary: command.activity.summary,
+                });
+                return { sequence: eventSequence };
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws?connectionMethod=direct");
+      const pages: Array<OrchestrationAgentTranscriptPage> = [];
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            let cursor: string | undefined;
+            for (let index = 0; index < 24; index += 1) {
+              const page = yield* client[ORCHESTRATION_WS_METHODS.getAgentTranscriptPage]({
+                threadId,
+                agentKey,
+                limit: 1,
+                ...(cursor === undefined ? {} : { cursor }),
+              });
+              pages.push(page);
+              if (page.nextCursor === null || !page.hasMore) break;
+              cursor = page.nextCursor;
+            }
+          }),
+        ),
+      );
+
+      assert.deepEqual(nativeReads, [undefined, "native-page-8"]);
+      assert.ok(pages.length >= 16);
+      const firstCursor = pages[0]?.nextCursor;
+      assert.ok(firstCursor);
+      const firstDecoded = decodeAgentTranscriptCursor(firstCursor!, threadId, agentKey);
+      assert.deepEqual(firstDecoded, {
+        nativeSourceCursor: "native-page-8",
+        revisionWatermark: 8,
+        nativeSourceComplete: false,
+      });
+      const secondCursor = pages[1]?.nextCursor;
+      assert.ok(secondCursor);
+      const secondDecoded = decodeAgentTranscriptCursor(secondCursor!, threadId, agentKey);
+      assert.equal(secondDecoded?.beforeProviderOrderKey, "000016");
+      assert.equal(secondDecoded?.nativeSourceComplete, true);
+      const recoveredIds = new Set(
+        pages.flatMap((page) =>
+          page.entries.flatMap((entry) => (entry.nativeEntryId ? [entry.nativeEntryId] : [])),
+        ),
+      );
+      assert.deepEqual(
+        [...recoveredIds].sort(),
+        Array.from(
+          { length: 16 },
+          (_, index) => `native-entry-${(index + 1).toString().padStart(2, "0")}`,
+        ),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("does not append a duplicate native revision outside the current page", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-agent-transcript-dedupe");
+      const agentKey = RuntimeAgentKey.make("agent-transcript-dedupe");
+      const entry = {
+        nativeEntryId: "native-entry-old",
+        providerOrderKey: "2026-09-27T00:00:00.000Z",
+        createdAt: "2026-09-27T00:00:00.000Z",
+        role: "assistant" as const,
+        content: "already persisted",
+        status: "completed" as const,
+      };
+      const page: OrchestrationAgentTranscriptPage = {
+        threadId,
+        agent: {
+          key: agentKey,
+          parentKey: null,
+          title: "Researcher",
+          role: "Researcher",
+          provider: ProviderDriverKind.make("claudeAgent"),
+          status: "running",
+          capabilities: {
+            transcript: { state: "supported" },
+            message: { state: "unsupported", reason: "not available" },
+            answerRequests: { state: "unsupported", reason: "not available" },
+            stop: { state: "unsupported", reason: "not available" },
+          },
+        },
+        entries: [],
+        nextCursor: null,
+        hasMore: false,
+        snapshotSequence: 12,
+        threadSequence: 12,
+        completeness: { state: "complete" },
+      };
+      const dispatches: Array<unknown> = [];
+      let projectionReads = 0;
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getAgentTranscriptPage: () =>
+              Effect.sync(() => {
+                projectionReads += 1;
+                return Option.some(page);
+              }),
+            getAgentTranscriptNativeRevisions: () =>
+              Effect.succeed([
+                {
+                  nativeEntryId: entry.nativeEntryId,
+                  providerOrderKey: entry.providerOrderKey,
+                  eventSequence: 3,
+                  content: entry.content,
+                },
+              ]),
+          },
+          providerService: {
+            readAgentTranscriptPage: () =>
+              Effect.succeed({
+                entries: [entry],
+                hasMore: false,
+                completeness: "complete" as const,
+              }),
+          },
+          orchestrationEngine: {
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatches.push(command);
+                return { sequence: 13 };
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws?connectionMethod=direct");
+      yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.getAgentTranscriptPage]({ threadId, agentKey }),
+        ),
+      );
+      assert.deepEqual(dispatches, []);
+      assert.equal(projectionReads, 1);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

@@ -85,6 +85,25 @@ it.layer(NodeServices.layer)("OpenCode approval bridge", (it) => {
         /does not establish that the operation ran or succeeded/i,
       );
 
+      yield* bridge.recordQuestionResolution({
+        parentSessionId: "ses_parent",
+        childSessionId: "ses_question_child",
+        requestId: "question-public-request",
+        nativeRequestId: "question-native-request",
+        resolution: {
+          type: "answered",
+          answers: { "Which environment?": "staging" },
+        },
+      });
+      const questionOutput = { system: ["base parent instructions"] };
+      yield* Effect.promise(() =>
+        hooks["experimental.chat.system.transform"]({ sessionID: "ses_parent" }, questionOutput),
+      );
+      const questionParentFacts = questionOutput.system.join("\n");
+      NodeAssert.match(questionParentFacts, /user answered the child question/i);
+      NodeAssert.match(questionParentFacts, /question-native-request/);
+      NodeAssert.match(questionParentFacts, /"Which environment\?":"staging"/);
+
       const unrelated = { system: ["sibling parent instructions"] };
       yield* Effect.promise(() =>
         hooks["experimental.chat.system.transform"]({ sessionID: "ses_sibling_parent" }, unrelated),

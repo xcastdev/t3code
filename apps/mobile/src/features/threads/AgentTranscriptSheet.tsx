@@ -576,6 +576,19 @@ export function AgentTranscriptSheet(props: {
                   {entry.detail ? ` · ${entry.detail}` : ""}
                 </Text>
               ) : null}
+              {entry.handoffStatus ? (
+                <Text accessibilityRole="text" className="text-xs text-foreground-muted">
+                  {entry.handoffStatus === "pending"
+                    ? "Parent handoff pending"
+                    : entry.handoffStatus === "recorded"
+                      ? "Added to parent context"
+                      : entry.handoffStatus === "unavailable"
+                        ? "Parent handoff unavailable"
+                        : entry.handoffStatus === "failed"
+                          ? "Parent handoff failed"
+                          : "Parent handoff outcome unknown"}
+                </Text>
+              ) : null}
             </View>
           ))}
           {canMessage ? (

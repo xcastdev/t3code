@@ -19,6 +19,10 @@ import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import {
+  decodeAgentTranscriptCursor,
+  encodeAgentTranscriptCursor,
+} from "./orchestration/agentTranscriptCursor.ts";
+import {
   DEFAULT_AUTOMATIC_GIT_FETCH_INTERVAL,
   AuthAccessStreamError,
   type AuthAccessStreamEvent,
@@ -2195,6 +2199,7 @@ const makeWsRpcLayer = (
             threadResumeCompletionMarker: true,
             threadSnapshotPagination: true,
             threadAgentActionEvents: true,
+            threadUserInputResolution: true,
           };
         });
 
@@ -3034,54 +3039,294 @@ const makeWsRpcLayer = (
         [ORCHESTRATION_WS_METHODS.getAgentTranscriptPage]: (input) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.getAgentTranscriptPage,
-            (
-              projectionSnapshotQuery.getAgentTranscriptPage?.(input) ??
-              Effect.succeed(Option.none())
-            ).pipe(
-              Effect.mapError(
-                (cause) =>
-                  new OrchestrationGetSnapshotError({
-                    message: `Failed to load agent transcript for thread ${input.threadId}`,
-                    cause,
-                  }),
-              ),
-              Effect.flatMap(
-                Option.match({
-                  onNone: () =>
-                    Effect.fail(
+            Effect.gen(function* () {
+              const queryPage = (cursor?: string) =>
+                (
+                  projectionSnapshotQuery.getAgentTranscriptPage?.({ ...input, cursor }) ??
+                  Effect.succeed(Option.none())
+                ).pipe(
+                  Effect.mapError(
+                    (cause) =>
                       new OrchestrationGetSnapshotError({
-                        message: `Agent ${input.agentKey} was not found on thread ${input.threadId}`,
+                        message: `Failed to load agent transcript for thread ${input.threadId}`,
+                        cause,
                       }),
+                  ),
+                );
+              const initialOption = yield* queryPage(input.cursor);
+              if (Option.isNone(initialOption)) {
+                return yield* new OrchestrationGetSnapshotError({
+                  message: `Agent ${input.agentKey} was not found on thread ${input.threadId}`,
+                });
+              }
+              const sourceCursor = input.cursor
+                ? decodeAgentTranscriptCursor(input.cursor, input.threadId, input.agentKey)
+                : null;
+              let page = initialOption.value;
+              let nativePage:
+                | import("./provider/Services/ProviderAdapter.ts").ProviderAgentTranscriptPage
+                | undefined;
+              let nativeReadFailure: string | undefined;
+              let nativeIngestionFailure: string | undefined;
+              let receiptSequence = 0;
+              if (!sourceCursor?.nativeSourceComplete) {
+                const nativeResult = yield* (
+                  providerService.readAgentTranscriptPage
+                    ? providerService.readAgentTranscriptPage({
+                        threadId: input.threadId,
+                        agentKey: input.agentKey,
+                        ...(sourceCursor?.nativeSourceCursor === undefined
+                          ? {}
+                          : { sourceCursor: sourceCursor.nativeSourceCursor }),
+                        // Eight bounded rows cap a page at 512 KiB after the
+                        // adapter's 64 KiB per-entry limit.
+                        limit: 8,
+                      })
+                    : Effect.succeed(undefined)
+                )
+                  .pipe(
+                    Effect.mapError(
+                      (cause) =>
+                        new OrchestrationGetSnapshotError({
+                          message: `Failed to recover native child transcript for ${input.agentKey}`,
+                          cause,
+                        }),
                     ),
-                  onSome: (page) =>
-                    Effect.gen(function* () {
-                      const actionCapabilities = providerService.getAgentCapabilities
-                        ? yield* providerService.getAgentCapabilities({
-                            threadId: input.threadId,
-                            agentKey: input.agentKey,
-                          })
-                        : {
-                            message: { state: "unverified" as const },
-                            answerRequests: { state: "unverified" as const },
-                            stop: { state: "unverified" as const },
-                          };
-                      return {
-                        ...page,
-                        agent: {
-                          ...page.agent,
-                          capabilities: {
-                            ...page.agent.capabilities,
-                            ...actionCapabilities,
-                          },
+                  )
+                  .pipe(Effect.result);
+                if (nativeResult._tag === "Failure") {
+                  nativeReadFailure = nativeResult.failure.message;
+                } else {
+                  nativePage = nativeResult.success;
+                }
+              }
+              // Native readers walk old-to-new, while the transcript projection
+              // pages newest-to-oldest. Keep their positions separate until the
+              // native walk completes; otherwise a backward cursor can skip the
+              // newer rows ingested by the next native page forever.
+              const nativeRecoveryPhase =
+                sourceCursor?.nativeSourceComplete !== true &&
+                (nativePage !== undefined || nativeReadFailure !== undefined);
+              const projectionCursor = nativeRecoveryPhase
+                ? encodeAgentTranscriptCursor({
+                    threadId: input.threadId,
+                    agentKey: input.agentKey,
+                    ...(sourceCursor?.nativeSourceCursor === undefined
+                      ? {}
+                      : { nativeSourceCursor: sourceCursor.nativeSourceCursor }),
+                    ...(sourceCursor?.revisionWatermark === undefined
+                      ? {}
+                      : { revisionWatermark: sourceCursor.revisionWatermark }),
+                  })
+                : input.cursor;
+
+              if (nativePage) {
+                const priorEntries = new Map(
+                  page.entries
+                    .filter((entry) => entry.nativeEntryId !== undefined)
+                    .map((entry) => [entry.nativeEntryId!, entry]),
+                );
+                const readKnownRevisions =
+                  projectionSnapshotQuery.getAgentTranscriptNativeRevisions;
+                if (readKnownRevisions) {
+                  const knownResult = yield* readKnownRevisions({
+                    threadId: input.threadId,
+                    agentKey: input.agentKey,
+                    nativeEntryIds: nativePage.entries.map((entry) => entry.nativeEntryId),
+                  })
+                    .pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new OrchestrationGetSnapshotError({
+                            message: `Failed to check persisted child transcript revisions for ${input.agentKey}`,
+                            cause,
+                          }),
+                      ),
+                    )
+                    .pipe(Effect.result);
+                  if (knownResult._tag === "Failure") {
+                    nativeReadFailure = knownResult.failure.message;
+                  } else {
+                    for (const entry of knownResult.success) {
+                      priorEntries.set(entry.nativeEntryId, {
+                        id: EventId.make(`agent-transcript-native:${entry.nativeEntryId}`),
+                        nativeEntryId: entry.nativeEntryId,
+                        providerOrderKey: entry.providerOrderKey,
+                        eventSequence: entry.eventSequence,
+                        createdAt: "1970-01-01T00:00:00.000Z",
+                        kind: "message",
+                        content: entry.content ?? undefined,
+                        summary: "Child response",
+                      });
+                    }
+                  }
+                }
+                for (const entry of nativePage.entries) {
+                  if (nativeReadFailure !== undefined) break;
+                  const previous = priorEntries.get(entry.nativeEntryId);
+                  if (
+                    previous?.content === entry.content &&
+                    previous.providerOrderKey === entry.providerOrderKey
+                  ) {
+                    continue;
+                  }
+                  const firstLine = entry.content.trimStart().split(/\r?\n/, 1)[0] ?? "";
+                  const createdAt = entry.createdAt;
+                  const receiptResult = yield* orchestrationEngine
+                    .dispatch({
+                      type: "thread.activity.append",
+                      commandId: yield* serverCommandId("agent-transcript-revision"),
+                      threadId: input.threadId,
+                      activity: {
+                        id: EventId.make(
+                          `agent-transcript-native:${input.threadId}:${input.agentKey}:${entry.nativeEntryId}`,
+                        ),
+                        createdAt,
+                        tone: "info",
+                        kind: "agent.transcript.message",
+                        summary: firstLine.length > 0 ? firstLine.slice(0, 120) : "Child response",
+                        payload: {
+                          agentKey: input.agentKey,
+                          ...(page.agent.title ? { title: page.agent.title } : {}),
+                          ...(page.agent.provider ? { provider: page.agent.provider } : {}),
+                          nativeEntryId: entry.nativeEntryId,
+                          providerOrderKey: entry.providerOrderKey,
+                          role: entry.role,
+                          content: entry.content.slice(0, 65_536),
+                          status: entry.status,
+                          timelineBypass: true,
                         },
-                      };
-                    }).pipe(
-                      // Capability lookup is fail-closed. The projection's
-                      // unverified defaults remain in place if the live
-                      // provider binding cannot be resolved.
-                      Effect.catchCause(() => Effect.succeed(page)),
-                    ),
-                }),
+                        turnId: null,
+                      },
+                      createdAt,
+                    })
+                    .pipe(
+                      Effect.mapError(
+                        (cause) =>
+                          new OrchestrationGetSnapshotError({
+                            message: `Failed to persist recovered child transcript for ${input.agentKey}`,
+                            cause,
+                          }),
+                      ),
+                    )
+                    .pipe(Effect.result);
+                  if (receiptResult._tag === "Failure") {
+                    nativeIngestionFailure = receiptResult.failure.message;
+                    break;
+                  }
+                  const receipt = receiptResult.success;
+                  receiptSequence = Math.max(receiptSequence, receipt.sequence);
+                  priorEntries.set(entry.nativeEntryId, {
+                    id: EventId.make(`agent-transcript-native:${entry.nativeEntryId}`),
+                    nativeEntryId: entry.nativeEntryId,
+                    providerOrderKey: entry.providerOrderKey,
+                    eventSequence: receipt.sequence,
+                    createdAt,
+                    kind: "message",
+                    role: entry.role,
+                    content: entry.content,
+                    summary: firstLine.length > 0 ? firstLine.slice(0, 120) : "Child response",
+                  });
+                }
+                nativeReadFailure ??= nativeIngestionFailure;
+              }
+              if (receiptSequence > 0 || nativeRecoveryPhase) {
+                const updatedOption = yield* queryPage(projectionCursor);
+                if (Option.isSome(updatedOption)) page = updatedOption.value;
+              }
+
+              const projectionCaughtUp = receiptSequence <= page.snapshotSequence;
+              const nativeNeedsRetry =
+                nativeReadFailure !== undefined ||
+                (nativePage !== undefined &&
+                  (nativePage.hasMore || nativePage.completeness === "partial")) ||
+                !projectionCaughtUp;
+              const retrySourceCursor =
+                nativeReadFailure !== undefined || !projectionCaughtUp
+                  ? sourceCursor?.nativeSourceCursor
+                  : nativePage?.nextSourceCursor;
+              const nextCursorBase = page.nextCursor
+                ? decodeAgentTranscriptCursor(page.nextCursor, input.threadId, input.agentKey)
+                : null;
+              let nextCursor = page.nextCursor;
+              let hasMore = page.hasMore;
+              let completeness = page.completeness;
+              if (nativeNeedsRetry) {
+                nextCursor = encodeAgentTranscriptCursor({
+                  threadId: input.threadId,
+                  agentKey: input.agentKey,
+                  ...(nativeRecoveryPhase || !nextCursorBase ? {} : nextCursorBase),
+                  ...(retrySourceCursor === undefined
+                    ? {}
+                    : { nativeSourceCursor: retrySourceCursor }),
+                  ...(receiptSequence > 0
+                    ? { revisionWatermark: receiptSequence }
+                    : sourceCursor?.revisionWatermark === undefined
+                      ? {}
+                      : { revisionWatermark: sourceCursor.revisionWatermark }),
+                  nativeSourceComplete: false,
+                });
+                hasMore = true;
+                completeness = {
+                  state: "partial",
+                  reason:
+                    nativeReadFailure ??
+                    (!projectionCaughtUp
+                      ? "Recovered child entries are durably recorded and waiting for projection; retry this page."
+                      : (nativePage?.reason ??
+                        "Native child transcript recovery is incomplete; retry this page.")),
+                };
+              } else if (
+                nativePage?.completeness === "complete" ||
+                sourceCursor?.nativeSourceComplete
+              ) {
+                if (nextCursorBase) {
+                  nextCursor = encodeAgentTranscriptCursor({
+                    threadId: input.threadId,
+                    agentKey: input.agentKey,
+                    ...nextCursorBase,
+                    nativeSourceComplete: true,
+                    ...(receiptSequence > 0
+                      ? { revisionWatermark: receiptSequence }
+                      : sourceCursor?.revisionWatermark === undefined
+                        ? {}
+                        : { revisionWatermark: sourceCursor.revisionWatermark }),
+                  });
+                }
+                completeness = { state: "complete" };
+              }
+
+              const actionCapabilities = providerService.getAgentCapabilities
+                ? yield* providerService
+                    .getAgentCapabilities({ threadId: input.threadId, agentKey: input.agentKey })
+                    .pipe(Effect.catchCause(() => Effect.succeed(undefined)))
+                : undefined;
+              return {
+                ...page,
+                entries: page.entries,
+                nextCursor,
+                hasMore,
+                completeness,
+                agent: {
+                  ...page.agent,
+                  ...(actionCapabilities === undefined
+                    ? {}
+                    : {
+                        capabilities: {
+                          ...page.agent.capabilities,
+                          ...actionCapabilities,
+                        },
+                      }),
+                },
+              };
+            }).pipe(
+              Effect.mapError((cause) =>
+                cause._tag === "OrchestrationGetSnapshotError"
+                  ? cause
+                  : new OrchestrationGetSnapshotError({
+                      message: `Failed to recover the transcript for child ${input.agentKey}`,
+                      cause,
+                    }),
               ),
             ),
             { "rpc.aggregate": "orchestration" },

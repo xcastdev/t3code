@@ -2785,8 +2785,23 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
+      const resolution =
+        command.resolution ??
+        (command.answers === undefined
+          ? undefined
+          : { type: "answered" as const, answers: command.answers });
+      if (!resolution) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "A user-input resolution is required.",
+        });
+      }
+      const answers = resolution.type === "answered" ? resolution.answers : {};
       const request = userInputActivity;
-      const attachments = Object.values(command.attachmentsByQuestionId ?? {}).flat();
+      const attachments =
+        resolution.type === "answered"
+          ? Object.values(command.attachmentsByQuestionId ?? {}).flat()
+          : [];
       let questionTextById: Record<string, string> = {};
       if (attachments.length > 0) {
         const payload =
@@ -2827,25 +2842,89 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
             detail: "This question has already been answered.",
           });
         }
+        if (resolution.type === "cancelled") {
+          return {
+            ...(yield* withEventBase({
+              aggregateKind: "thread",
+              aggregateId: command.threadId,
+              occurredAt: command.createdAt,
+              commandId: command.commandId,
+            })),
+            type: "thread.activity-appended",
+            payload: {
+              threadId: command.threadId,
+              activity: {
+                id: EventId.make(`async-dismiss:${command.requestId}`),
+                kind: "user-input.resolved",
+                summary: "User input cancelled",
+                tone: "info",
+                turnId: request.turnId,
+                createdAt: command.createdAt,
+                payload: {
+                  requestId: command.requestId,
+                  responseMode: "message",
+                  resolution,
+                },
+              },
+            },
+          };
+        }
         const replies: string[] = [];
-        for (const question of payload.value.questions) {
-          const answer = command.answers[question.id];
+        const skippedQuestionIds = new Set(resolution.skippedQuestionIds ?? []);
+        for (const skippedId of skippedQuestionIds) {
           if (
-            typeof answer !== "string" ||
-            (answer.trim().length === 0 && !command.attachmentsByQuestionId?.[question.id]?.length)
+            !payload.value.questions.some((question) => question.id === skippedId) ||
+            Object.hasOwn(answers, skippedId)
           ) {
+            return yield* new OrchestrationCommandInvariantError({
+              commandType: command.type,
+              detail: "Skipped question IDs must name unanswered questions.",
+            });
+          }
+        }
+        for (const question of payload.value.questions) {
+          if (skippedQuestionIds.has(question.id)) continue;
+          if (!Object.hasOwn(answers, question.id) || typeof answers[question.id] !== "string") {
             return yield* new OrchestrationCommandInvariantError({
               commandType: command.type,
               detail: "Answer each question before sending.",
             });
           }
+          const answer = answers[question.id] as string;
           const questionAttachments = command.attachmentsByQuestionId?.[question.id] ?? [];
           const attachmentLabels = questionAttachments
             .map((attachment) => `Attached file: ${attachment.name} (${attachment.id})`)
             .join("\n");
           replies.push(
-            [`${question.question}\n${answer.trim()}`, attachmentLabels].filter(Boolean).join("\n"),
+            [`${question.question}\n${answer}`, attachmentLabels].filter(Boolean).join("\n"),
           );
+        }
+        if (replies.length === 0) {
+          return {
+            ...(yield* withEventBase({
+              aggregateKind: "thread",
+              aggregateId: command.threadId,
+              occurredAt: command.createdAt,
+              commandId: command.commandId,
+            })),
+            type: "thread.activity-appended",
+            payload: {
+              threadId: command.threadId,
+              activity: {
+                id: EventId.make(`async-dismiss:${command.requestId}`),
+                kind: "user-input.resolved",
+                summary: "User input skipped",
+                tone: "info",
+                turnId: request.turnId,
+                createdAt: command.createdAt,
+                payload: {
+                  requestId: command.requestId,
+                  responseMode: "message",
+                  resolution,
+                },
+              },
+            },
+          };
         }
         // Commit the answer and its message together. The normal turn path
         // steers a running agent or resumes an idle session.
@@ -2867,7 +2946,8 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
                 payload: {
                   requestId: command.requestId,
                   responseMode: "message",
-                  answers: command.answers,
+                  answers,
+                  resolution,
                   ...(command.attachmentsByQuestionId
                     ? { attachmentsByQuestionId: command.attachmentsByQuestionId }
                     : {}),
@@ -2903,7 +2983,8 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           threadId: command.threadId,
           requestId: command.requestId,
-          answers: command.answers,
+          ...(answers === undefined ? {} : { answers }),
+          resolution,
           ...(command.attachmentsByQuestionId
             ? { attachmentsByQuestionId: command.attachmentsByQuestionId }
             : {}),

@@ -16,6 +16,8 @@ import type {
   ProviderInstanceId,
   ProviderRespondToRequestInput,
   ProviderRespondToUserInputInput,
+  ProviderUserInputResponseResult,
+  ProviderApprovalResponseResult,
   ProviderRuntimeEvent,
   ProviderSendTurnInput,
   ProviderSession,
@@ -34,7 +36,10 @@ import type * as Effect from "effect/Effect";
 import type * as Stream from "effect/Stream";
 
 import type { ProviderServiceError } from "../Errors.ts";
-import type { ProviderAdapterCapabilities } from "./ProviderAdapter.ts";
+import type {
+  ProviderAdapterCapabilities,
+  ProviderAgentTranscriptPage,
+} from "./ProviderAdapter.ts";
 import type { ProviderInstanceRoutingInfo } from "./ProviderAdapterRegistry.ts";
 
 /**
@@ -79,6 +84,14 @@ export interface ProviderServiceShape {
     ProviderServiceError
   >;
 
+  /** Read one bounded native transcript page for a current child handle. */
+  readonly readAgentTranscriptPage?: (input: {
+    readonly threadId: ThreadId;
+    readonly agentKey: RuntimeAgentKey;
+    readonly sourceCursor?: string;
+    readonly limit: number;
+  }) => Effect.Effect<ProviderAgentTranscriptPage | undefined, ProviderServiceError>;
+
   readonly compactThread: (
     threadId: ThreadId,
     modelSelection?: ProviderSendTurnInput["modelSelection"],
@@ -97,14 +110,14 @@ export interface ProviderServiceShape {
    */
   readonly respondToRequest: (
     input: ProviderRespondToRequestInput,
-  ) => Effect.Effect<void, ProviderServiceError>;
+  ) => Effect.Effect<void | ProviderApprovalResponseResult, ProviderServiceError>;
 
   /**
    * Respond to a provider structured user-input request.
    */
   readonly respondToUserInput: (
     input: ProviderRespondToUserInputInput,
-  ) => Effect.Effect<void, ProviderServiceError>;
+  ) => Effect.Effect<ProviderUserInputResponseResult, ProviderServiceError>;
 
   /**
    * Stop a provider session.

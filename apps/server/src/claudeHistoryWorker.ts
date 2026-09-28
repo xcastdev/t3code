@@ -1,4 +1,8 @@
-import { forkSession, getSessionMessages } from "@anthropic-ai/claude-agent-sdk";
+import {
+  forkSession,
+  getSessionMessages,
+  getSubagentMessages,
+} from "@anthropic-ai/claude-agent-sdk";
 import * as Schema from "effect/Schema";
 
 // A separate process gives SDK history helpers the provider's environment without
@@ -14,6 +18,9 @@ const decodeHistoryOptions = Schema.decodeSync(
       dir: Schema.optionalKey(Schema.String),
       includeSystemMessages: Schema.optionalKey(Schema.Boolean),
       upToMessageId: Schema.optionalKey(Schema.String),
+      agentId: Schema.optionalKey(Schema.String),
+      limit: Schema.optionalKey(Schema.Number),
+      offset: Schema.optionalKey(Schema.Number),
     }),
   ),
 );
@@ -28,10 +35,16 @@ export async function runClaudeHistoryWorker(
   const result =
     method === "getSessionMessages"
       ? await getSessionMessages(sessionId, options)
-      : method === "forkSession"
-        ? await forkSession(sessionId, options)
-        : (() => {
-            throw new Error("Unknown Claude history operation.");
-          })();
+      : method === "getSubagentMessages"
+        ? options.agentId
+          ? await getSubagentMessages(sessionId, options.agentId, options)
+          : (() => {
+              throw new Error("Claude subagent history requires an agent id.");
+            })()
+        : method === "forkSession"
+          ? await forkSession(sessionId, options)
+          : (() => {
+              throw new Error("Unknown Claude history operation.");
+            })();
   process.stdout.write(JSON.stringify(result));
 }

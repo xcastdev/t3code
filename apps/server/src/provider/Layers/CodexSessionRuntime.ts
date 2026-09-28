@@ -14,6 +14,9 @@ import {
   type ProviderSession,
   type ProviderTurnStartResult,
   type ProviderUserInputAnswers,
+  type ProviderUserInputResolution,
+  type ProviderUserInputResponseResult,
+  type ProviderApprovalResponseResult,
   RuntimeMode,
   ThreadId,
   TurnId,
@@ -27,6 +30,7 @@ import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -53,6 +57,7 @@ import {
 } from "../CodexDeveloperInstructions.ts";
 import type { ProjectWorkRuntimeContext } from "../RuntimeInstructions.ts";
 const decodeV2TurnStartResponse = Schema.decodeUnknownEffect(EffectCodexSchema.V2TurnStartResponse);
+const encodeUnknownJsonString = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 const PROVIDER = ProviderDriverKind.make("codex");
 
@@ -229,6 +234,14 @@ export interface CodexSessionRuntimeShape {
   ) => Effect.Effect<ProviderTurnStartResult, CodexSessionRuntimeError>;
   readonly compactThread: Effect.Effect<void, CodexSessionRuntimeError>;
   readonly interruptTurn: (turnId?: TurnId) => Effect.Effect<void, CodexSessionRuntimeError>;
+  readonly stopAgent: (
+    agentKey: RuntimeAgentKey,
+  ) => Effect.Effect<"completed" | "unknown", CodexSessionRuntimeError>;
+  readonly getAgentActionCapabilities: (agentKey: RuntimeAgentKey) => Effect.Effect<{
+    readonly message: "supported" | "unsupported" | "unverified";
+    readonly answerRequests: "supported" | "unsupported" | "unverified";
+    readonly stop: "supported" | "unsupported" | "unverified";
+  }>;
   readonly readThread: Effect.Effect<CodexThreadSnapshot, CodexSessionRuntimeError>;
   readonly forkThread: (
     lastTurnId?: TurnId,
@@ -242,11 +255,15 @@ export interface CodexSessionRuntimeShape {
   readonly respondToRequest: (
     requestId: ApprovalRequestId,
     decision: ProviderApprovalDecision,
-  ) => Effect.Effect<void, CodexSessionRuntimeError>;
+  ) => Effect.Effect<ProviderApprovalResponseResult, CodexSessionRuntimeError>;
   readonly respondToUserInput: (
     requestId: ApprovalRequestId,
     answers: ProviderUserInputAnswers,
   ) => Effect.Effect<void, CodexSessionRuntimeError>;
+  readonly resolveUserInput: (
+    requestId: ApprovalRequestId,
+    resolution: ProviderUserInputResolution,
+  ) => Effect.Effect<ProviderUserInputResponseResult, CodexSessionRuntimeError>;
   readonly events: Stream.Stream<ProviderEvent, never>;
   readonly close: Effect.Effect<void>;
 }
@@ -256,6 +273,7 @@ export type CodexSessionRuntimeError =
   | CodexSessionRuntimePendingApprovalNotFoundError
   | CodexSessionRuntimePendingUserInputNotFoundError
   | CodexSessionRuntimeInvalidUserInputAnswersError
+  | CodexSessionRuntimeChildNotFoundError
   | CodexSessionRuntimeThreadIdMissingError;
 
 export class CodexSessionRuntimePendingApprovalNotFoundError extends Schema.TaggedError<CodexSessionRuntimePendingApprovalNotFoundError>()(
@@ -291,6 +309,22 @@ export class CodexSessionRuntimeInvalidUserInputAnswersError extends Schema.Tagg
   }
 }
 
+export class CodexSessionRuntimeChildNotFoundError extends Schema.TaggedError<CodexSessionRuntimeChildNotFoundError>()(
+  "CodexSessionRuntimeChildNotFoundError",
+  {
+    agentKey: RuntimeAgentKey,
+  },
+) {
+  override get message(): string {
+    return `The Codex child handle is stale or no longer running: ${this.agentKey}`;
+  }
+}
+
+interface PendingCollabChildStop {
+  readonly turnId: string;
+  readonly completion: Deferred.Deferred<"interrupted" | "other">;
+}
+
 export class CodexSessionRuntimeThreadIdMissingError extends Schema.TaggedError<CodexSessionRuntimeThreadIdMissingError>()(
   "CodexSessionRuntimeThreadIdMissingError",
   {
@@ -324,10 +358,12 @@ interface ApprovalCorrelation {
 
 interface PendingUserInput {
   readonly requestId: ApprovalRequestId;
+  readonly nativeRequestId?: string;
   readonly turnId: TurnId | undefined;
   readonly itemId: ProviderItemId | undefined;
   readonly agentKey?: RuntimeAgentKey;
   readonly agentTitle?: string;
+  readonly questionIds: ReadonlyArray<string>;
   readonly answers: Deferred.Deferred<ProviderUserInputAnswers>;
 }
 
@@ -357,6 +393,82 @@ function mcpElicitationFormFields(payload: EffectCodexSchema.McpServerElicitatio
     return undefined;
   }
   return payload.requestedSchema;
+}
+
+export function toCodexMcpElicitationUserInput(
+  payload: EffectCodexSchema.McpServerElicitationRequestParams,
+):
+  | {
+      readonly questions: ReadonlyArray<{
+        readonly id: string;
+        readonly header: string;
+        readonly question: string;
+        readonly options: ReadonlyArray<never>;
+        readonly allowCustomAnswer: true;
+        readonly multiSelect: false;
+      }>;
+      readonly requiredQuestionIds: ReadonlyArray<string>;
+    }
+  | undefined {
+  const form = mcpElicitationFormFields(payload);
+  if (!form?.properties) return undefined;
+  const entries = Object.entries(form.properties);
+  if (
+    entries.length === 0 ||
+    entries.some(
+      ([, field]) =>
+        field.type !== "string" || (field.enum?.length ?? 0) > 0 || (field.oneOf?.length ?? 0) > 0,
+    )
+  ) {
+    return undefined;
+  }
+  const fallbackQuestion = payload.message.trim() || "Provide a response.";
+  return {
+    questions: entries.map(([id, field]) => ({
+      id,
+      header: field.title?.trim() || id,
+      question: field.description?.trim() || fallbackQuestion,
+      options: [],
+      allowCustomAnswer: true,
+      multiSelect: false,
+    })),
+    requiredQuestionIds: form.required ?? [],
+  };
+}
+
+export function toCodexMcpElicitationAnswer(
+  payload: EffectCodexSchema.McpServerElicitationRequestParams,
+  answers: ProviderUserInputAnswers,
+): EffectCodexSchema.McpServerElicitationRequestResponse {
+  const userInput = toCodexMcpElicitationUserInput(payload);
+  if (!userInput) return { action: "decline" };
+  const content: Record<string, string> = {};
+  for (const question of userInput.questions) {
+    if (!Object.hasOwn(answers, question.id)) continue;
+    const answer = answers[question.id];
+    if (typeof answer === "string") {
+      content[question.id] = answer;
+      continue;
+    }
+    if (Array.isArray(answer) && answer.length === 1 && typeof answer[0] === "string") {
+      content[question.id] = answer[0];
+      continue;
+    }
+    if (
+      typeof answer === "object" &&
+      answer !== null &&
+      "answers" in answer &&
+      Array.isArray(answer.answers) &&
+      answer.answers.length === 1 &&
+      typeof answer.answers[0] === "string"
+    ) {
+      content[question.id] = answer.answers[0];
+    }
+  }
+  if (userInput.requiredQuestionIds.some((questionId) => !Object.hasOwn(content, questionId))) {
+    return { action: "decline" };
+  }
+  return { action: "accept", content };
 }
 
 function mcpElicitationFieldOptions(field: typeof McpElicitationFormField.Type) {
@@ -1428,11 +1540,22 @@ export const makeCodexSessionRuntime = (
     const pendingApprovalsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingApproval>());
     const approvalCorrelationsRef = yield* Ref.make(new Map<string, ApprovalCorrelation>());
     const pendingUserInputsRef = yield* Ref.make(new Map<ApprovalRequestId, PendingUserInput>());
+    const resolvedUserInputResultsRef = yield* Ref.make(
+      new Map<ApprovalRequestId, ProviderUserInputResponseResult>(),
+    );
     const collabReceiverTurnsRef = yield* Ref.make(new Map<string, TurnId>());
     const collabChildAgentsRef = yield* Ref.make(new Map<string, CollabChildAgentState>());
     const collabChildMetadataRef = yield* Ref.make(new Map<string, CollabChildMetadataState>());
     /** Child provider-thread id → its currently running provider turn id. */
     const collabChildLiveTurnsRef = yield* Ref.make(new Map<string, string>());
+    /** Completion observers are installed before child turn/interrupt dispatch. */
+    const collabChildStopObserversRef = yield* Ref.make(
+      new Map<RuntimeAgentKey, PendingCollabChildStop>(),
+    );
+    /** Coalesce duplicate Stop commands within this runtime generation. */
+    const collabChildStopCallsRef = yield* Ref.make(
+      new Map<RuntimeAgentKey, Deferred.Deferred<"completed" | "unknown" | "stale">>(),
+    );
     const suppressMemoryConsolidationNotification = makeMemoryConsolidationNotificationFilter();
     const closedRef = yield* Ref.make(false);
 
@@ -1490,6 +1613,7 @@ export const makeCodexSessionRuntime = (
             }),
         ),
       );
+    const sessionGenerationId = yield* randomUUIDv4("provider-event");
 
     const requestAgentLinkage = Effect.fn("requestAgentLinkage")(function* (payload: unknown) {
       const providerThreadId =
@@ -1557,6 +1681,7 @@ export const makeCodexSessionRuntime = (
           id: EventId.make(id),
           provider: PROVIDER,
           ...(options.providerInstanceId ? { providerInstanceId: options.providerInstanceId } : {}),
+          sessionGeneration: sessionGenerationId,
           createdAt: yield* nowIso,
           ...event,
         });
@@ -1928,7 +2053,19 @@ export const makeCodexSessionRuntime = (
             });
             return true;
           }
-          case "turn/completed":
+          case "turn/completed": {
+            const completedTurnId =
+              typeof (notification.params as { turn?: { id?: unknown } }).turn?.id === "string"
+                ? ((notification.params as { turn: { id: string } }).turn.id as string)
+                : undefined;
+            const stopObserver = (yield* Ref.get(collabChildStopObserversRef)).get(child.agentKey);
+            if (stopObserver && stopObserver.turnId === completedTurnId) {
+              const status = (notification.params as { turn?: { status?: unknown } }).turn?.status;
+              yield* Deferred.succeed(
+                stopObserver.completion,
+                status === "interrupted" ? "interrupted" : "other",
+              );
+            }
             yield* Ref.update(collabChildLiveTurnsRef, (current) => {
               const next = new Map(current);
               next.delete(child.agentThreadId);
@@ -1945,6 +2082,7 @@ export const makeCodexSessionRuntime = (
               },
             });
             return true;
+          }
           case "thread/status/changed":
             yield* emitEvent({
               kind: "notification",
@@ -2397,9 +2535,49 @@ export const makeCodexSessionRuntime = (
       }),
     );
 
-    yield* client.handleServerRequest("mcpServer/elicitation/request", (payload) =>
+    yield* client.handleServerRequest("mcpServer/elicitation/request", (payload, nativeRequestId) =>
       Effect.gen(function* () {
         const agentLinkage = yield* requestAgentLinkage(payload);
+        const userInput = toCodexMcpElicitationUserInput(payload);
+        if (userInput) {
+          const requestId = ApprovalRequestId.make(yield* randomUUIDv4("mcp-elicitation-request"));
+          const turnId = payload.turnId
+            ? TurnId.make(payload.turnId)
+            : (yield* Ref.get(sessionRef)).activeTurnId;
+          const answers = yield* Deferred.make<ProviderUserInputAnswers>();
+          yield* Ref.update(pendingUserInputsRef, (current) => {
+            const next = new Map(current);
+            next.set(requestId, {
+              requestId,
+              nativeRequestId: String(nativeRequestId),
+              turnId,
+              itemId: undefined,
+              ...agentLinkage,
+              questionIds: userInput.questions.map((question) => question.id),
+              answers,
+            });
+            return next;
+          });
+          yield* emitEvent({
+            kind: "request",
+            threadId: options.threadId,
+            method: "mcpServer/elicitation/request",
+            requestId,
+            ...agentLinkage,
+            ...(turnId ? { turnId } : {}),
+            payload,
+          });
+          const resolvedAnswers = yield* Deferred.await(answers).pipe(
+            Effect.ensuring(
+              Ref.update(pendingUserInputsRef, (current) => {
+                const next = new Map(current);
+                next.delete(requestId);
+                return next;
+              }),
+            ),
+          );
+          return toCodexMcpElicitationAnswer(payload, resolvedAnswers);
+        }
         if (toMcpElicitationResponse(payload, "accept").action !== "accept") {
           yield* Effect.logWarning("Declined an unsupported MCP elicitation.", {
             serverName: payload.serverName,
@@ -2481,6 +2659,7 @@ export const makeCodexSessionRuntime = (
             turnId,
             itemId,
             ...agentLinkage,
+            questionIds: payload.questions.map((question) => question.id),
             answers,
           });
           return next;
@@ -2667,6 +2846,139 @@ export const makeCodexSessionRuntime = (
       yield* Queue.shutdown(events);
     });
 
+    const resolveUserInput = Effect.fn("resolveUserInput")(function* (
+      requestId: ApprovalRequestId,
+      resolution: ProviderUserInputResolution,
+    ) {
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const alreadyResolved = (yield* Ref.get(resolvedUserInputResultsRef)).get(requestId);
+          if (alreadyResolved) return alreadyResolved;
+          if (resolution.type === "cancelled") {
+            return { nativeStatus: "unsupported", requestId } as const;
+          }
+
+          const pending = (yield* Ref.get(pendingUserInputsRef)).get(requestId);
+          if (!pending) {
+            return yield* new CodexSessionRuntimePendingUserInputNotFoundError({ requestId });
+          }
+          const answers: Record<string, unknown> = Object.fromEntries(
+            Object.entries(resolution.answers),
+          );
+          const skippedIds = new Set(resolution.skippedQuestionIds ?? []);
+          for (const questionId of skippedIds) {
+            if (!pending.questionIds.includes(questionId) || Object.hasOwn(answers, questionId)) {
+              return yield* new CodexSessionRuntimeInvalidUserInputAnswersError({ questionId });
+            }
+            // An explicit skip is encoded as an empty native choice list; a typed
+            // empty string remains a distinct one-element answer list.
+            answers[questionId] = { answers: [] };
+          }
+          const codexAnswers = yield* toCodexUserInputAnswers(answers);
+          const claimed = yield* Ref.modify(pendingUserInputsRef, (current) => {
+            if (current.get(requestId) !== pending) return [false, current] as const;
+            const next = new Map(current);
+            next.delete(requestId);
+            return [true, next] as const;
+          });
+          if (!claimed) {
+            const settled = (yield* Ref.get(resolvedUserInputResultsRef)).get(requestId);
+            if (settled) return settled;
+            return yield* new CodexSessionRuntimePendingUserInputNotFoundError({ requestId });
+          }
+
+          const handoffStatus = pending.agentKey
+            ? yield* Effect.gen(function* () {
+                const children = yield* Ref.get(collabChildAgentsRef);
+                const child = Array.from(children.values()).find(
+                  (candidate) => candidate.agentKey === pending.agentKey,
+                );
+                const parentThreadId = child?.parentThreadId;
+                if (!child || !parentThreadId) return "unavailable" as const;
+                const rootThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
+                const parentExists =
+                  parentThreadId === rootThreadId ||
+                  Array.from(children.values()).some(
+                    (candidate) => candidate.agentThreadId === parentThreadId,
+                  );
+                if (!parentExists) return "unavailable" as const;
+                const message =
+                  `T3 recorded the user's answer to child request ${requestId}: ` +
+                  `${encodeUnknownJsonString({ answers: resolution.answers, skippedQuestionIds: resolution.skippedQuestionIds ?? [] })}. ` +
+                  "This records the submitted answer only; it does not claim any requested operation succeeded.";
+                const exit = yield* Effect.exit(
+                  restore(
+                    client
+                      .request("thread/inject_items", {
+                        threadId: parentThreadId,
+                        items: [
+                          {
+                            type: "message",
+                            role: "developer",
+                            content: [{ type: "input_text", text: message }],
+                          },
+                        ],
+                      })
+                      .pipe(Effect.timeoutOption("2 seconds")),
+                  ),
+                );
+                if (Exit.isFailure(exit)) {
+                  return parentThreadId === rootThreadId
+                    ? ("failed" as const)
+                    : ("unavailable" as const);
+                }
+                if (Option.isNone(exit.value)) return "unknown" as const;
+                return "recorded" as const;
+              })
+            : undefined;
+
+          // Parent-context injection is independent of native settlement. The
+          // child always receives its answer after this bounded handoff attempt.
+          yield* Deferred.succeed(pending.answers, answers);
+          yield* emitEvent({
+            kind: "notification",
+            threadId: options.threadId,
+            method: "item/tool/requestUserInput/answered",
+            requestId: pending.requestId,
+            ...(pending.turnId ? { turnId: pending.turnId } : {}),
+            ...(pending.itemId ? { itemId: pending.itemId } : {}),
+            ...(pending.agentKey ? { agentKey: pending.agentKey } : {}),
+            payload: {
+              answers: codexAnswers,
+              resolution: {
+                type: "answered",
+                answers: resolution.answers,
+                ...(resolution.skippedQuestionIds
+                  ? { skippedQuestionIds: resolution.skippedQuestionIds }
+                  : {}),
+              },
+            },
+          });
+          const result: ProviderUserInputResponseResult = {
+            nativeStatus: "answered",
+            ...(handoffStatus ? { handoffStatus } : {}),
+            requestId,
+            nativeRequestId:
+              pending.nativeRequestId ??
+              (pending.itemId ? String(pending.itemId) : String(requestId)),
+            ...(pending.agentKey ? { agentKey: pending.agentKey } : {}),
+            sessionGeneration: sessionGenerationId,
+          };
+          yield* Ref.update(resolvedUserInputResultsRef, (current) => {
+            const next = new Map(current);
+            next.set(requestId, result);
+            while (next.size > 128) {
+              const oldest = next.keys().next().value;
+              if (oldest === undefined) break;
+              next.delete(oldest);
+            }
+            return next;
+          });
+          return result;
+        }),
+      );
+    });
+
     return {
       start,
       getSession: Ref.get(sessionRef),
@@ -2769,6 +3081,124 @@ export const makeCodexSessionRuntime = (
             turnId: effectiveTurnId,
           });
         }),
+      stopAgent: (agentKey): Effect.Effect<"completed" | "unknown", CodexSessionRuntimeError> =>
+        Effect.gen(function* () {
+          const children = yield* Ref.get(collabChildAgentsRef);
+          const child = Array.from(children.values()).find(
+            (candidate) => candidate.agentKey === agentKey,
+          );
+          const liveTurnId = child
+            ? (yield* Ref.get(collabChildLiveTurnsRef)).get(child.agentThreadId)
+            : undefined;
+          if (!child || !liveTurnId || (yield* Ref.get(closedRef))) {
+            return yield* new CodexSessionRuntimeChildNotFoundError({ agentKey });
+          }
+
+          const resultDeferred = yield* Deferred.make<"completed" | "unknown" | "stale">();
+          const claim = yield* Ref.modify(collabChildStopCallsRef, (current) => {
+            const existing = current.get(agentKey);
+            if (existing) return [existing, current] as const;
+            const next = new Map(current);
+            next.set(agentKey, resultDeferred);
+            return [resultDeferred, next] as const;
+          });
+          if (claim !== resultDeferred) {
+            const result = yield* Deferred.await(claim);
+            if (result === "stale") {
+              return yield* new CodexSessionRuntimeChildNotFoundError({ agentKey });
+            }
+            return result;
+          }
+
+          const completion = yield* Deferred.make<"interrupted" | "other">();
+          yield* Ref.update(collabChildStopObserversRef, (current) => {
+            const next = new Map(current);
+            next.set(agentKey, { turnId: liveTurnId, completion });
+            return next;
+          });
+          const stopExit = yield* Effect.exit(
+            Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                const currentChild = (yield* Ref.get(collabChildAgentsRef)).get(
+                  child.agentThreadId,
+                );
+                const currentTurn = (yield* Ref.get(collabChildLiveTurnsRef)).get(
+                  child.agentThreadId,
+                );
+                if (
+                  (yield* Ref.get(closedRef)) ||
+                  currentChild?.agentKey !== agentKey ||
+                  currentTurn !== liveTurnId
+                ) {
+                  return "stale" as const;
+                }
+
+                // The observer above is live before the native request is sent.
+                // Once dispatch begins, a timeout or request error is unknown
+                // and must not be retried as a second interrupt.
+                const dispatched = yield* restore(
+                  client
+                    .request("turn/interrupt", {
+                      threadId: child.agentThreadId,
+                      turnId: liveTurnId,
+                    })
+                    .pipe(Effect.timeoutOption("2 seconds")),
+                );
+                if (dispatched._tag === "None") return "unknown" as const;
+                const observed = yield* restore(
+                  Deferred.await(completion).pipe(Effect.timeoutOption("3 seconds")),
+                );
+                return observed._tag === "Some" && observed.value === "interrupted"
+                  ? ("completed" as const)
+                  : ("unknown" as const);
+              }),
+            ),
+          );
+          const result = stopExit._tag === "Success" ? stopExit.value : ("unknown" as const);
+          yield* Ref.update(collabChildStopObserversRef, (current) => {
+            const next = new Map(current);
+            next.delete(agentKey);
+            return next;
+          });
+          yield* Ref.update(collabChildStopCallsRef, (current) => {
+            const next = new Map(current);
+            next.delete(agentKey);
+            return next;
+          });
+          yield* Deferred.succeed(resultDeferred, result);
+          if (result === "stale") {
+            return yield* new CodexSessionRuntimeChildNotFoundError({ agentKey });
+          }
+          return result;
+        }),
+      getAgentActionCapabilities: (agentKey) =>
+        Effect.gen(function* () {
+          const children = yield* Ref.get(collabChildAgentsRef);
+          const child = Array.from(children.values()).find(
+            (candidate) => candidate.agentKey === agentKey,
+          );
+          if (!child) {
+            return {
+              message: "unverified" as const,
+              answerRequests: "unverified" as const,
+              stop: "unverified" as const,
+            };
+          }
+          const hasPendingRequest =
+            Array.from((yield* Ref.get(pendingApprovalsRef)).values()).some(
+              (pending) => pending.agentKey === agentKey,
+            ) ||
+            Array.from((yield* Ref.get(pendingUserInputsRef)).values()).some(
+              (pending) => pending.agentKey === agentKey,
+            );
+          return {
+            message: "unsupported" as const,
+            answerRequests: hasPendingRequest ? ("unverified" as const) : ("unsupported" as const),
+            stop: (yield* Ref.get(collabChildLiveTurnsRef)).has(child.agentThreadId)
+              ? ("supported" as const)
+              : ("unsupported" as const),
+          };
+        }),
       readThread: Effect.gen(function* () {
         const providerThreadId = yield* readProviderThreadId;
         return yield* readCodexThread(client, providerThreadId);
@@ -2826,8 +3256,10 @@ export const makeCodexSessionRuntime = (
               next.delete(requestId);
               return next;
             });
+            let handoffParentThreadId: string | undefined;
+            let handoffRootThreadId: string | undefined;
             const recordChildChoice = Effect.gen(function* () {
-              if (!pending.agentKey) return;
+              if (!pending.agentKey) return undefined;
               const children = yield* Ref.get(collabChildAgentsRef);
               const child = Array.from(children.values()).find(
                 (candidate) => candidate.agentKey === pending.agentKey,
@@ -2836,7 +3268,15 @@ export const makeCodexSessionRuntime = (
               // before releasing the native request. This is best-effort: Codex
               // rejects direct injection into some nested agent threads, and a
               // timeout/provider error must never strand the approval itself.
-              if (!child?.parentThreadId) return;
+              if (!child?.parentThreadId) return "unavailable" as const;
+              handoffParentThreadId = child.parentThreadId;
+              handoffRootThreadId = currentProviderThreadId(yield* Ref.get(sessionRef));
+              const parentExists =
+                handoffParentThreadId === handoffRootThreadId ||
+                Array.from(children.values()).some(
+                  (candidate) => candidate.agentThreadId === handoffParentThreadId,
+                );
+              if (!parentExists) return "unavailable" as const;
               const message =
                 `The T3 user chose "${decision}" for child ${pending.requestKind} approval request ${pending.requestId}. ` +
                 "This records the user's choice only; it does not establish that the operation ran or succeeded.";
@@ -2859,7 +3299,9 @@ export const makeCodexSessionRuntime = (
                   agentKey: pending.agentKey,
                   parentThreadId: child.parentThreadId,
                 });
+                return "unknown" as const;
               }
+              return "recorded" as const;
             });
             const handoffExit = yield* Effect.exit(restore(recordChildChoice));
             yield* Deferred.succeed(pending.decision, decision);
@@ -2891,35 +3333,30 @@ export const makeCodexSessionRuntime = (
                 },
               );
             }
+            const handoffStatus = Exit.isSuccess(handoffExit)
+              ? handoffExit.value
+              : Cause.hasInterrupts(handoffExit.cause)
+                ? ("unknown" as const)
+                : handoffParentThreadId !== undefined &&
+                    handoffRootThreadId !== undefined &&
+                    handoffParentThreadId !== handoffRootThreadId
+                  ? ("unavailable" as const)
+                  : ("failed" as const);
+            return {
+              nativeStatus: "responded",
+              requestId: pending.requestId,
+              nativeRequestId: pending.jsonRpcId,
+              ...(pending.agentKey ? { agentKey: pending.agentKey } : {}),
+              sessionGeneration: sessionGenerationId,
+              ...(pending.agentKey ? { handoffStatus: handoffStatus ?? "unavailable" } : {}),
+            } satisfies ProviderApprovalResponseResult;
           }),
         ),
       respondToUserInput: (requestId, answers) =>
         Effect.gen(function* () {
-          const pending = (yield* Ref.get(pendingUserInputsRef)).get(requestId);
-          if (!pending) {
-            return yield* new CodexSessionRuntimePendingUserInputNotFoundError({
-              requestId,
-            });
-          }
-          const codexAnswers = yield* toCodexUserInputAnswers(answers);
-          yield* Ref.update(pendingUserInputsRef, (current) => {
-            const next = new Map(current);
-            next.delete(requestId);
-            return next;
-          });
-          yield* Deferred.succeed(pending.answers, answers);
-          yield* emitEvent({
-            kind: "notification",
-            threadId: options.threadId,
-            method: "item/tool/requestUserInput/answered",
-            requestId: pending.requestId,
-            ...(pending.turnId ? { turnId: pending.turnId } : {}),
-            ...(pending.itemId ? { itemId: pending.itemId } : {}),
-            payload: {
-              answers: codexAnswers,
-            },
-          });
+          yield* resolveUserInput(requestId, { type: "answered", answers });
         }),
+      resolveUserInput,
       events: Stream.fromQueue(events),
       close,
     } satisfies CodexSessionRuntimeShape;

@@ -600,6 +600,8 @@ export const ServerConfig = Schema.Struct({
   threadSnapshotPagination: Schema.optionalKey(Schema.Boolean),
   /** Whether thread subscriptions accept and emit agent action intent events. */
   threadAgentActionEvents: Schema.optionalKey(Schema.Boolean),
+  /** Tagged user-input answered/cancelled resolutions are accepted. */
+  threadUserInputResolution: Schema.optionalKey(Schema.Boolean),
   /**
    * Palettes published by this environment's machine. Never sent in a config
    * snapshot: the theme stream emits the current set before any change, so a

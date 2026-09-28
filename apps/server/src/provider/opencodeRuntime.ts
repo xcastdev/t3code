@@ -545,19 +545,69 @@ export function toOpenCodePermissionReply(
 export function toOpenCodeQuestionAnswers(
   request: QuestionRequest,
   answers: Record<string, unknown>,
+  skippedQuestionIds: ReadonlyArray<string> = [],
 ): Array<QuestionAnswer> {
-  return request.questions.map((question, index) => {
-    const raw =
-      answers[openCodeQuestionId(index, question)] ??
-      answers[question.header] ??
-      answers[question.question];
-    if (Array.isArray(raw)) {
-      return raw.filter((value): value is string => typeof value === "string");
+  const canonicalIds = request.questions.map((question, index) =>
+    openCodeQuestionId(index, question),
+  );
+  const skipped = new Set(skippedQuestionIds);
+  if (skipped.size !== skippedQuestionIds.length) {
+    throw new Error("OpenCode question skips contain duplicate question IDs.");
+  }
+  for (const skippedId of skipped) {
+    if (!canonicalIds.includes(skippedId)) {
+      throw new Error(`OpenCode question skip references unknown question '${skippedId}'.`);
     }
-    if (typeof raw === "string") {
-      return raw.trim().length > 0 ? [raw] : [];
+  }
+
+  const indexesByAlias = new Map<string, Set<number>>();
+  request.questions.forEach((question, index) => {
+    for (const alias of [canonicalIds[index]!, question.header, question.question]) {
+      if (alias.length === 0) continue;
+      const indexes = indexesByAlias.get(alias) ?? new Set<number>();
+      indexes.add(index);
+      indexesByAlias.set(alias, indexes);
     }
-    return [];
+  });
+  const answersByQuestion = request.questions.map(() => [] as Array<Array<string>>);
+  for (const [alias, raw] of Object.entries(answers)) {
+    const indexes = indexesByAlias.get(alias);
+    if (!indexes) throw new Error(`OpenCode answer references unknown question '${alias}'.`);
+    if (indexes.size !== 1) throw new Error(`OpenCode answer key '${alias}' is ambiguous.`);
+    const normalized =
+      typeof raw === "string"
+        ? [raw]
+        : Array.isArray(raw) && raw.every((value): value is string => typeof value === "string")
+          ? raw
+          : undefined;
+    if (!normalized)
+      throw new Error(`OpenCode answer for '${alias}' must be a string or string array.`);
+    answersByQuestion[indexes.values().next().value!]?.push(normalized);
+  }
+
+  return request.questions.map((_question, index) => {
+    const questionId = canonicalIds[index]!;
+    const values = answersByQuestion[index] ?? [];
+    if (skipped.has(questionId)) {
+      if (values.length > 0) {
+        throw new Error(`OpenCode question '${questionId}' cannot be both answered and skipped.`);
+      }
+      return [];
+    }
+    if (values.length === 0) {
+      throw new Error(
+        `OpenCode question '${questionId}' is absent; only explicit skips may be empty.`,
+      );
+    }
+    const [first, ...rest] = values;
+    if (
+      rest.some(
+        (value) => value.length !== first!.length || value.some((entry, i) => entry !== first![i]),
+      )
+    ) {
+      throw new Error(`OpenCode question '${questionId}' has conflicting answer aliases.`);
+    }
+    return first!;
   });
 }
 

@@ -25,6 +25,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderSessionStartInput,
+  RuntimeAgentKey,
   ThreadId,
   TurnId,
   CommandId,
@@ -67,6 +68,7 @@ import {
 import type {
   ProviderAdapterShape,
   ProviderAdapterSessionStartInput,
+  ProviderAgentTranscriptPage,
 } from "../Services/ProviderAdapter.ts";
 import * as ProviderAdapterRegistry from "../Services/ProviderAdapterRegistry.ts";
 import * as ProviderService from "../Services/ProviderService.ts";
@@ -1251,6 +1253,97 @@ it.effect("ProviderServiceLive rejects new sessions for disabled custom instance
 );
 
 const routing = makeProviderServiceLayer();
+
+const agentActionsInstanceId = ProviderInstanceId.make("agent-actions-test");
+const agentActionsFixture = makeFakeCodexAdapter(CODEX_DRIVER);
+const agentActionsCapabilities = vi.fn(() =>
+  Effect.succeed({
+    message: "supported" as const,
+    answerRequests: "unverified" as const,
+    stop: "supported" as const,
+  }),
+);
+const nativeTranscriptPage: ProviderAgentTranscriptPage = {
+  entries: [
+    {
+      nativeEntryId: "message-1:block-0",
+      providerOrderKey: "001",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      role: "assistant",
+      content: "Recovered child output",
+      status: "completed",
+    },
+  ],
+  nextSourceCursor: "provider-cursor-1",
+  hasMore: true,
+  completeness: "complete",
+};
+const readNativeTranscriptPage = vi.fn(
+  (
+    _threadId: ThreadId,
+    _agentKey: RuntimeAgentKey,
+    _sourceCursor: string | undefined,
+    _limit: number,
+  ) => Effect.succeed(nativeTranscriptPage),
+);
+const agentActionsAdapter = {
+  ...agentActionsFixture.adapter,
+  getAgentActionCapabilities: agentActionsCapabilities,
+  readAgentTranscriptPage: readNativeTranscriptPage,
+};
+const agentActionsService = makeProviderServiceLayer({
+  registry: makeStaticInstanceRegistry([[agentActionsInstanceId, agentActionsAdapter]]),
+});
+
+agentActionsService.layer("ProviderService child actions and transcript routing", (it) => {
+  it.effect("uses the active session child handle and clamps transcript pages", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const getAgentCapabilities = provider.getAgentCapabilities;
+      const readAgentTranscriptPage = provider.readAgentTranscriptPage;
+      if (!getAgentCapabilities || !readAgentTranscriptPage) {
+        throw new Error("ProviderService child actions are unavailable.");
+      }
+      const threadId = asThreadId("agent-actions-active-session");
+      const agentKey = RuntimeAgentKey.make("child-native-key");
+      yield* provider.startSession(threadId, {
+        providerInstanceId: agentActionsInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const capabilities = yield* getAgentCapabilities({ threadId, agentKey });
+      assert.deepEqual(capabilities, {
+        message: { state: "supported" },
+        answerRequests: {
+          state: "unverified",
+          reason:
+            "The current codex child identity or answering requests path could not be verified.",
+        },
+        stop: { state: "supported" },
+      });
+      assert.deepEqual(agentActionsCapabilities.mock.calls, [[threadId, agentKey]]);
+
+      const page = yield* readAgentTranscriptPage({
+        threadId,
+        agentKey,
+        sourceCursor: "provider-cursor-0",
+        limit: 500,
+      });
+      assert.deepEqual(page, nativeTranscriptPage);
+      assert.deepEqual(readNativeTranscriptPage.mock.calls, [
+        [threadId, agentKey, "provider-cursor-0", 100],
+      ]);
+      yield* provider.stopSession({ threadId });
+
+      const inactiveCapabilities = yield* getAgentCapabilities({ threadId, agentKey });
+      assert.equal(inactiveCapabilities.message.state, "unsupported");
+      assert.include(inactiveCapabilities.message.reason ?? "", "no active session");
+      assert.isUndefined(yield* readAgentTranscriptPage({ threadId, agentKey, limit: 20 }));
+      assert.equal(readNativeTranscriptPage.mock.calls.length, 1);
+    }),
+  );
+});
 
 const customCompactionDriver = ProviderDriverKind.make("custom-compaction-provider");
 const nativeCompactionInstanceId = ProviderInstanceId.make("native-compaction");

@@ -67,6 +67,7 @@ type MessageEntry = {
   info: {
     id: string;
     role: "user" | "assistant";
+    time?: { created?: number; completed?: number };
   };
   parts: Array<unknown>;
 };
@@ -105,6 +106,14 @@ const runtimeMock = {
     promptEchoEvents: [] as Array<unknown>,
     closeError: null as Error | null,
     messages: [] as MessageEntry[],
+    v2MessagesBySession: new Map<string, Array<unknown>>(),
+    v2MessageCalls: [] as Array<{
+      sessionID: string;
+      directory?: string;
+      limit: number;
+      cursor?: string;
+      order?: "asc" | "desc";
+    }>,
     forkMessagesBySession: new Map<string, MessageEntry[]>(),
     forkPreservesBoundary: true,
     forkDirectoryOverride: null as string | null,
@@ -187,6 +196,8 @@ const runtimeMock = {
     this.state.promptEchoEvents.length = 0;
     this.state.closeError = null;
     this.state.messages = [];
+    this.state.v2MessagesBySession.clear();
+    this.state.v2MessageCalls.length = 0;
     this.state.forkMessagesBySession.clear();
     this.state.forkPreservesBoundary = true;
     this.state.forkDirectoryOverride = null;
@@ -491,6 +502,37 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
               break;
             }
           }
+        },
+      },
+      v2: {
+        session: {
+          messages: async (input: {
+            sessionID: string;
+            directory?: string;
+            limit?: number;
+            cursor?: string;
+            order?: "asc" | "desc";
+          }) => {
+            if (input.cursor !== undefined && input.order !== undefined) {
+              throw new Error("OpenCode does not allow order with a cursor");
+            }
+            const limit = input.limit ?? 50;
+            runtimeMock.state.v2MessageCalls.push({
+              sessionID: input.sessionID,
+              ...(input.directory ? { directory: input.directory } : {}),
+              limit,
+              ...(input.cursor ? { cursor: input.cursor } : {}),
+              ...(input.order ? { order: input.order } : {}),
+            });
+            const rows = runtimeMock.state.v2MessagesBySession.get(input.sessionID) ?? [];
+            const offset = input.cursor === undefined ? 0 : Number(input.cursor);
+            const items = rows.slice(offset, offset + limit);
+            const nextOffset = offset + items.length;
+            const next = nextOffset < rows.length ? String(nextOffset) : undefined;
+            return {
+              data: { items, cursor: { ...(next === undefined ? {} : { next }) } },
+            };
+          },
         },
       },
       config: {
@@ -4602,11 +4644,16 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         );
         systemDuringNativeReply = output.system;
       };
-      yield* adapter.respondToRequest(
+      const approvalResult = yield* adapter.respondToRequest(
         threadId,
         ApprovalRequestId.make(opened.requestId),
         "decline",
       );
+      NodeAssert.equal(approvalResult?.nativeStatus, "responded");
+      NodeAssert.equal(approvalResult?.handoffStatus, "recorded");
+      NodeAssert.equal(approvalResult?.nativeRequestId, "per_bridge_denied");
+      NodeAssert.equal(approvalResult?.agentKey, childStarted.agentKey);
+      NodeAssert.equal(typeof approvalResult?.sessionGeneration, "string");
       NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
         { requestID: "per_bridge_denied", reply: "reject" },
       ]);
@@ -4680,7 +4727,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         threadId,
         childStarted.agentKey,
       );
-      NodeAssert.equal(noRequestCapabilities.answerRequests, "unverified");
+      NodeAssert.equal(noRequestCapabilities.answerRequests, "unsupported");
 
       childPermission.resolve({
         id: "evt-child-permission",
@@ -4705,7 +4752,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         threadId,
         childStarted.agentKey,
       );
-      NodeAssert.equal(pendingCapabilities.answerRequests, "supported");
+      NodeAssert.equal(pendingCapabilities.answerRequests, "unverified");
       NodeAssert.equal(
         opened.raw?.source === "opencode.sdk.event" &&
           typeof opened.raw.payload === "object" &&
@@ -4750,7 +4797,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         threadId,
         childStarted.agentKey,
       );
-      NodeAssert.equal(settledCapabilities.answerRequests, "unverified");
+      NodeAssert.equal(settledCapabilities.answerRequests, "unsupported");
 
       yield* adapter.stopSession(threadId);
     }),
@@ -4892,7 +4939,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const capabilities = yield* adapter.getAgentActionCapabilities!(threadId, keyA);
       NodeAssert.deepEqual(capabilities, {
         message: "supported",
-        answerRequests: "supported",
+        answerRequests: "unverified",
         stop: "supported",
       });
 
@@ -4927,6 +4974,275 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       NodeAssert.ok(parentTurn.turnId);
       const parentPrompt = runtimeMock.state.promptCalls.at(-1) as { sessionID: string };
       NodeAssert.equal(parentPrompt.sessionID, parentId);
+
+      yield* adapter.stopSession(threadId);
+      keepStreamOpen.resolve(undefined);
+    }),
+  );
+
+  it.effect("reads bounded OpenCode child message pages from the validated native session", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-child-transcript-recovery");
+      const parentId = "ses_parent_recovery";
+      const childId = "ses_child_recovery";
+      const childCreated = promiseWithResolvers<unknown>();
+      const childAssistantHeader = promiseWithResolvers<unknown>();
+      const childAssistantText = promiseWithResolvers<unknown>();
+      const childAssistantTextOutOfOrder = promiseWithResolvers<unknown>();
+      const keepStreamOpen = promiseWithResolvers<unknown>();
+      const assistantCreatedAt = 1_778_000_001_000;
+      runtimeMock.state.createdSessionIds.push(parentId);
+      runtimeMock.state.sessionParentById.set(childId, parentId);
+      runtimeMock.state.v2MessagesBySession.set(childId, [
+        {
+          type: "user",
+          id: "message-user-1",
+          time: { created: 1_778_000_000_000 },
+          text: "child question",
+        },
+        {
+          type: "assistant",
+          id: "message-assistant-1",
+          time: { created: 1_778_000_001_000, completed: 1_778_000_002_000 },
+          content: Array.from({ length: 130 }, (_, index) => ({
+            type: "text",
+            text: `block-${index}`,
+          })),
+        },
+      ]);
+      runtimeMock.state.messages = [
+        { info: { id: "message-user-1", role: "user" }, parts: [] },
+        {
+          info: {
+            id: "message-assistant-1",
+            role: "assistant",
+            time: { created: assistantCreatedAt, completed: assistantCreatedAt + 1_000 },
+          },
+          parts: Array.from({ length: 130 }, (_, index) => ({
+            id: `part-text-${index}`,
+            sessionID: childId,
+            messageID: "message-assistant-1",
+            type: "text",
+            text: `block-${index}`,
+            time: {
+              start: assistantCreatedAt + index * 100,
+              end: assistantCreatedAt + index * 100 + 50,
+            },
+          })),
+        },
+      ];
+      runtimeMock.state.subscribedEvents = [
+        childCreated.promise,
+        childAssistantHeader.promise,
+        childAssistantText.promise,
+        childAssistantTextOutOfOrder.promise,
+        keepStreamOpen.promise,
+      ];
+      const childStartedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.threadId === threadId &&
+            event.type === "session.started" &&
+            event.agentKey !== undefined,
+        ),
+        Stream.runHead,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "approval-required",
+      });
+      childCreated.resolve({
+        id: "evt-child-transcript-created",
+        type: "session.created",
+        properties: {
+          sessionID: childId,
+          info: { id: childId, parentID: parentId, title: "History child" },
+        },
+      });
+      const childStarted = Option.getOrThrow(
+        yield* Fiber.join(childStartedFiber).pipe(Effect.timeout("1 second")),
+      );
+      const agentKey = childStarted.agentKey;
+      NodeAssert.ok(agentKey);
+      const liveAssistantDeltaFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.threadId === threadId &&
+            event.type === "content.delta" &&
+            event.agentKey === agentKey,
+        ),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      childAssistantHeader.resolve({
+        id: "evt-child-assistant-header",
+        type: "message.updated",
+        properties: {
+          sessionID: childId,
+          info: {
+            id: "message-assistant-1",
+            role: "assistant",
+            time: { created: assistantCreatedAt },
+          },
+        },
+      });
+      childAssistantText.resolve({
+        id: "evt-child-assistant-text",
+        type: "message.part.updated",
+        properties: {
+          sessionID: childId,
+          part: {
+            id: "part-text-10",
+            sessionID: childId,
+            messageID: "message-assistant-1",
+            type: "text",
+            text: "block-10",
+            time: { start: assistantCreatedAt + 1_000 },
+          },
+        },
+      });
+      childAssistantTextOutOfOrder.resolve({
+        id: "evt-child-assistant-text-2",
+        type: "message.part.updated",
+        properties: {
+          sessionID: childId,
+          part: {
+            id: "part-text-2",
+            sessionID: childId,
+            messageID: "message-assistant-1",
+            type: "text",
+            text: "block-2",
+            time: { start: assistantCreatedAt + 200 },
+          },
+        },
+      });
+      const liveAssistantDeltas = Array.from(
+        yield* Fiber.join(liveAssistantDeltaFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.deepEqual(
+        liveAssistantDeltas.map((event) => [event.nativeEntryId, event.providerOrderKey]),
+        [
+          [`opencode:${agentKey}:part-text-10`, "2026-05-05T16:53:22.000Z"],
+          [`opencode:${agentKey}:part-text-2`, "2026-05-05T16:53:21.200Z"],
+        ],
+      );
+      const readPage = adapter.readAgentTranscriptPage;
+      NodeAssert.ok(readPage);
+
+      const firstPage = yield* readPage!(threadId, agentKey, undefined, 1);
+      NodeAssert.deepEqual(
+        firstPage.entries.map((entry) => [entry.role, entry.content]),
+        [["user", "child question"]],
+      );
+      NodeAssert.equal(
+        firstPage.entries[0]?.nativeEntryId,
+        "opencode:ses_child_recovery:message-user-1:user",
+      );
+      NodeAssert.equal(firstPage.hasMore, true);
+      NodeAssert.equal(firstPage.completeness, "partial");
+      NodeAssert.ok(firstPage.nextSourceCursor);
+      NodeAssert.deepEqual(runtimeMock.state.v2MessageCalls[0], {
+        sessionID: childId,
+        directory: process.cwd(),
+        limit: 1,
+        order: "asc",
+      });
+
+      const secondPage = yield* readPage!(threadId, agentKey, firstPage.nextSourceCursor, 1);
+      NodeAssert.equal(secondPage.entries.length, 128);
+      NodeAssert.deepEqual(
+        secondPage.entries.slice(0, 2).map((entry) => entry.content),
+        ["block-0", "block-1"],
+      );
+      NodeAssert.deepEqual(
+        secondPage.entries.slice(0, 12).map((entry) => entry.nativeEntryId),
+        Array.from({ length: 12 }, (_, index) => `opencode:${agentKey}:part-text-${index}`),
+      );
+      NodeAssert.equal(
+        secondPage.entries[10]?.nativeEntryId,
+        liveAssistantDeltas[0]?.nativeEntryId,
+      );
+      NodeAssert.equal(
+        secondPage.entries[10]?.providerOrderKey,
+        liveAssistantDeltas[0]?.providerOrderKey,
+      );
+      NodeAssert.equal(secondPage.entries[2]?.nativeEntryId, liveAssistantDeltas[1]?.nativeEntryId);
+      NodeAssert.equal(
+        secondPage.entries[2]?.providerOrderKey,
+        liveAssistantDeltas[1]?.providerOrderKey,
+      );
+      NodeAssert.equal(secondPage.entries[0]?.providerOrderKey, "2026-05-05T16:53:21.000Z");
+      NodeAssert.equal(secondPage.entries[10]?.providerOrderKey, secondPage.entries[10]?.createdAt);
+      NodeAssert.equal(secondPage.completeness, "partial");
+      NodeAssert.equal(secondPage.hasMore, true);
+      NodeAssert.ok(secondPage.nextSourceCursor);
+      NodeAssert.deepEqual(runtimeMock.state.v2MessageCalls[1], {
+        sessionID: childId,
+        directory: process.cwd(),
+        limit: 1,
+        cursor: "1",
+      });
+
+      const thirdPage = yield* readPage!(threadId, agentKey, secondPage.nextSourceCursor, 1);
+      NodeAssert.deepEqual(
+        thirdPage.entries.map((entry) => entry.content),
+        ["block-128", "block-129"],
+      );
+      NodeAssert.equal(thirdPage.completeness, "complete");
+      NodeAssert.equal(thirdPage.hasMore, false);
+
+      runtimeMock.state.v2MessagesBySession.set(childId, [
+        {
+          type: "assistant",
+          id: "message-large-transcript",
+          time: { created: 1_778_000_003_000, completed: 1_778_000_004_000 },
+          content: Array.from({ length: 10 }, (_, index) => ({
+            type: "text",
+            id: `large-part-${index}`,
+            text: "x".repeat(65_536),
+          })),
+        },
+      ]);
+      runtimeMock.state.messages = [
+        {
+          info: {
+            id: "message-large-transcript",
+            role: "assistant",
+            time: { created: 1_778_000_003_000, completed: 1_778_000_004_000 },
+          },
+          parts: Array.from({ length: 10 }, (_, index) => ({
+            id: `large-part-${index}`,
+            sessionID: childId,
+            messageID: "message-large-transcript",
+            type: "text",
+            text: "x".repeat(65_536),
+            time: { start: 1_778_000_003_000 + index },
+          })),
+        },
+      ];
+      const byteBoundedPage = yield* readPage!(threadId, agentKey, undefined, 1);
+      NodeAssert.equal(byteBoundedPage.entries.length, 8);
+      NodeAssert.ok(
+        byteBoundedPage.entries.reduce(
+          (total, entry) => total + Buffer.byteLength(entry.content),
+          0,
+        ) <=
+          512 * 1024,
+      );
+      NodeAssert.equal(byteBoundedPage.hasMore, true);
+      NodeAssert.ok(byteBoundedPage.nextSourceCursor);
+      const byteBoundedRemainder = yield* readPage!(
+        threadId,
+        agentKey,
+        byteBoundedPage.nextSourceCursor,
+        1,
+      );
+      NodeAssert.equal(byteBoundedRemainder.entries.length, 2);
+      NodeAssert.equal(byteBoundedRemainder.hasMore, false);
 
       yield* adapter.stopSession(threadId);
       keepStreamOpen.resolve(undefined);

@@ -86,6 +86,24 @@ export interface PendingAgentActionActivity {
   readonly content: string | null;
 }
 
+export interface PendingAgentHandoffActivity {
+  readonly threadId: ThreadId;
+  readonly activityId: string;
+  readonly createdAt: string;
+  readonly kind: "approval.handoff" | "user-input.handoff";
+  readonly requestId: string;
+  readonly nativeRequestId: string | null;
+  readonly agentKey: string | null;
+  readonly sessionGeneration: string | null;
+}
+
+export interface AgentTranscriptNativeRevision {
+  readonly nativeEntryId: string;
+  readonly providerOrderKey: string;
+  readonly eventSequence: number;
+  readonly content: string | null;
+}
+
 /**
  * ProjectionSnapshotQueryShape - Service API for read-model snapshots.
  */
@@ -280,10 +298,21 @@ export interface ProjectionSnapshotQueryShape {
   readonly getAgentTranscriptPage?: (
     input: OrchestrationGetAgentTranscriptPageInput,
   ) => Effect.Effect<Option.Option<OrchestrationAgentTranscriptPage>, ProjectionRepositoryError>;
+  /** Read current revisions for native identities independently of page bounds. */
+  readonly getAgentTranscriptNativeRevisions?: (input: {
+    readonly threadId: ThreadId;
+    readonly agentKey: import("@t3tools/contracts").RuntimeAgentKey;
+    readonly nativeEntryIds: ReadonlyArray<string>;
+  }) => Effect.Effect<ReadonlyArray<AgentTranscriptNativeRevision>, ProjectionRepositoryError>;
 
   /** Read a bounded set of durable child action intents left pending at restart. */
   readonly listPendingAgentActions?: () => Effect.Effect<
     ReadonlyArray<PendingAgentActionActivity>,
+    ProjectionRepositoryError
+  >;
+  /** Read child request handoffs whose last durable state was pending at restart. */
+  readonly listPendingAgentHandoffs?: () => Effect.Effect<
+    ReadonlyArray<PendingAgentHandoffActivity>,
     ProjectionRepositoryError
   >;
 }

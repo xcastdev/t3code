@@ -1,4 +1,8 @@
 import { fromLenientJson } from "@t3tools/shared/schemaJson";
+import {
+  ProviderUserInputResolution,
+  type ProviderUserInputResolution as ProviderUserInputResolutionType,
+} from "@t3tools/contracts";
 import * as Data from "effect/Data";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -13,6 +17,22 @@ export interface OpenCodeApprovalDecision {
   readonly requestType: string;
   readonly decision: "approvedOnce" | "approvedForSession" | "denied";
 }
+
+export interface OpenCodeQuestionResolution {
+  readonly parentSessionId: string;
+  readonly childSessionId: string;
+  readonly requestId: string;
+  readonly nativeRequestId: string;
+  readonly resolution: Extract<ProviderUserInputResolutionType, { readonly type: "answered" }>;
+}
+
+type OpenCodeBridgeEntry =
+  | Omit<OpenCodeApprovalDecision, "parentSessionId">
+  | Omit<OpenCodeQuestionResolution, "parentSessionId">;
+
+const encodeUserInputResolution = Schema.encodeSync(
+  Schema.fromJsonString(ProviderUserInputResolution),
+);
 
 const MAX_PARENT_SESSIONS = 64;
 const MAX_DECISIONS_PER_PARENT = 32;
@@ -66,9 +86,12 @@ export const T3CodeApprovalBridge = async () => ({
       if (!entry || typeof entry !== "object") return [];
       if (
         typeof entry.childSessionId !== "string" ||
-        typeof entry.requestId !== "string" ||
-        typeof entry.requestType !== "string"
+        typeof entry.requestId !== "string"
       ) return [];
+      if (entry.resolution && typeof entry.resolution === "object") {
+        return ["The user answered the child question (request ID " + entry.requestId + "; native request ID " + String(entry.nativeRequestId ?? "unknown") + "; child session " + entry.childSessionId + "): " + JSON.stringify(entry.resolution) + ". This records the submitted answer only; it does not claim a requested operation succeeded."];
+      }
+      if (typeof entry.requestType !== "string") return [];
       const action = entry.decision === "denied"
         ? "deny"
         : entry.decision === "approvedOnce"
@@ -113,10 +136,7 @@ export const makeOpenCodeApprovalBridge = Effect.fn("makeOpenCodeApprovalBridge"
   yield* fs.writeFileString(pluginPath, pluginSource(statusPath));
   yield* fs.writeFileString(statusPath, "{}");
 
-  const decisions = new Map<
-    string,
-    Map<string, Omit<OpenCodeApprovalDecision, "parentSessionId">>
-  >();
+  const decisions = new Map<string, Map<string, OpenCodeBridgeEntry>>();
   const writePermit = Semaphore.makeUnsafe(1);
   const record = Effect.fn("recordOpenCodeApprovalDecision")(function* (
     input: OpenCodeApprovalDecision,
@@ -141,13 +161,71 @@ export const makeOpenCodeApprovalBridge = Effect.fn("makeOpenCodeApprovalBridge"
           parent = new Map();
           decisions.set(parentSessionId, parent);
         }
-        const key = `${childSessionId}\u0000${requestId}`;
+        const key = `approval\u0000${childSessionId}\u0000${requestId}`;
         parent.delete(key);
         parent.set(key, {
           childSessionId,
           requestId,
           requestType,
           decision: input.decision,
+        });
+        while (parent.size > MAX_DECISIONS_PER_PARENT) {
+          const oldestKey = parent.keys().next().value;
+          if (oldestKey === undefined) break;
+          parent.delete(oldestKey);
+        }
+        const content = encodeUnknownJsonString(
+          Object.fromEntries(
+            [...decisions].map(([sessionId, requests]) => [
+              sessionId,
+              Object.fromEntries(requests),
+            ]),
+          ),
+        );
+        const nextPath = path.join(directory, "decisions.next.json");
+        yield* fs.writeFileString(nextPath, content);
+        yield* fs.rename(nextPath, statusPath);
+      }),
+    );
+  });
+
+  const recordQuestionResolution = Effect.fn("recordOpenCodeQuestionResolution")(function* (
+    input: OpenCodeQuestionResolution,
+  ) {
+    const parentSessionId = safeIdentifier(input.parentSessionId);
+    const childSessionId = safeIdentifier(input.childSessionId);
+    const requestId = safeIdentifier(input.requestId);
+    const nativeRequestId = safeIdentifier(input.nativeRequestId);
+    const resolutionJson = encodeUserInputResolution(input.resolution);
+    if (
+      !parentSessionId ||
+      !childSessionId ||
+      !requestId ||
+      !nativeRequestId ||
+      resolutionJson.length > 65_536
+    ) {
+      return yield* new OpenCodeApprovalBridgeError({
+        detail: "OpenCode question history contains an invalid identity or oversized answer.",
+      });
+    }
+    yield* writePermit.withPermit(
+      Effect.gen(function* () {
+        let parent = decisions.get(parentSessionId);
+        if (!parent) {
+          if (decisions.size >= MAX_PARENT_SESSIONS) {
+            const oldestParentSessionId = decisions.keys().next().value;
+            if (oldestParentSessionId !== undefined) decisions.delete(oldestParentSessionId);
+          }
+          parent = new Map();
+          decisions.set(parentSessionId, parent);
+        }
+        const key = `question\u0000${childSessionId}\u0000${requestId}`;
+        parent.delete(key);
+        parent.set(key, {
+          childSessionId,
+          requestId,
+          nativeRequestId,
+          resolution: input.resolution,
         });
         while (parent.size > MAX_DECISIONS_PER_PARENT) {
           const oldestKey = parent.keys().next().value;
@@ -176,6 +254,7 @@ export const makeOpenCodeApprovalBridge = Effect.fn("makeOpenCodeApprovalBridge"
       plugin: [...(Array.isArray(config.plugin) ? config.plugin : []), pluginPath],
     }),
     record,
+    recordQuestionResolution,
   };
 });
 

@@ -32,6 +32,7 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
   it.effect("initializes, handles typed server requests, and reads account and skills data", () =>
     Effect.gen(function* () {
       const userInputRequests = yield* Ref.make<Array<unknown>>([]);
+      const userInputRequestIds = yield* Ref.make<Array<string | number>>([]);
       const messageDeltas = yield* Ref.make<Array<unknown>>([]);
       const handle = yield* makeHandle();
       const scope = yield* Scope.make();
@@ -41,8 +42,11 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
       const result = yield* Effect.gen(function* () {
         const client = yield* CodexClient.CodexAppServerClient;
 
-        yield* client.handleServerRequest("item/tool/requestUserInput", (payload) =>
-          Ref.update(userInputRequests, (current) => [...current, payload]).pipe(
+        yield* client.handleServerRequest("item/tool/requestUserInput", (payload, requestId) =>
+          Effect.all([
+            Ref.update(userInputRequests, (current) => [...current, payload]),
+            Ref.update(userInputRequestIds, (current) => [...current, requestId]),
+          ]).pipe(
             Effect.as({
               answers: {
                 approved: {
@@ -113,6 +117,7 @@ it.layer(NodeServices.layer)("effect-codex-app-server client", (it) => {
           ],
         },
       ]);
+      assert.deepEqual(yield* Ref.get(userInputRequestIds), [10_000]);
       assert.deepEqual(yield* Ref.get(messageDeltas), [
         {
           delta: "Mock server is ready.",

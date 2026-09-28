@@ -1,9 +1,15 @@
 import * as NodeAssert from "node:assert/strict";
 
 import * as RegExpUtils from "effect/RegExp";
+import type { QuestionRequest } from "@opencode-ai/sdk/v2";
 import { describe, it } from "vite-plus/test";
 
-import { buildOpenCodePermissionRules, toOpenCodePermissionReply } from "./opencodeRuntime.ts";
+import {
+  buildOpenCodePermissionRules,
+  openCodeQuestionId,
+  toOpenCodePermissionReply,
+  toOpenCodeQuestionAnswers,
+} from "./opencodeRuntime.ts";
 
 function actionFor(
   runtimeMode: Parameters<typeof buildOpenCodePermissionRules>[0],
@@ -85,5 +91,75 @@ describe("toOpenCodePermissionReply", () => {
     ["cancel", "reject"],
   ] as const)("maps %s to %s", (decision, reply) => {
     NodeAssert.equal(toOpenCodePermissionReply(decision), reply);
+  });
+});
+
+describe("toOpenCodeQuestionAnswers", () => {
+  const request: QuestionRequest = {
+    id: "question-request",
+    sessionID: "session",
+    questions: [
+      {
+        header: "Scope",
+        question: "Where should it apply?",
+        options: [{ label: "Workspace", description: "Only this workspace." }],
+      },
+      {
+        header: "Reason",
+        question: "Why?",
+        options: [{ label: "Build", description: "Build task." }],
+      },
+    ],
+  };
+
+  it("preserves empty answers and only turns explicit skip IDs into empty native answers", () => {
+    const first = request.questions[0]!;
+    const second = request.questions[1]!;
+    NodeAssert.deepEqual(
+      toOpenCodeQuestionAnswers(request, {
+        [openCodeQuestionId(0, first)]: "",
+        [openCodeQuestionId(1, second)]: ["Build"],
+      }),
+      [[""], ["Build"]],
+    );
+    NodeAssert.deepEqual(
+      toOpenCodeQuestionAnswers(request, { Scope: "Workspace" }, [openCodeQuestionId(1, second)]),
+      [["Workspace"], []],
+    );
+  });
+
+  it("rejects absent, unknown, conflicting, and answer-plus-skip values", () => {
+    const first = request.questions[0]!;
+    const second = request.questions[1]!;
+    NodeAssert.throws(() => toOpenCodeQuestionAnswers(request, { Scope: "Workspace" }), /absent/);
+    NodeAssert.throws(
+      () =>
+        toOpenCodeQuestionAnswers(request, { Scope: "Workspace", Other: "x" }, [
+          openCodeQuestionId(1, second),
+        ]),
+      /unknown question/,
+    );
+    NodeAssert.throws(
+      () =>
+        toOpenCodeQuestionAnswers(
+          request,
+          { Scope: "Workspace", [openCodeQuestionId(0, first)]: "Project" },
+          [openCodeQuestionId(1, second)],
+        ),
+      /conflicting answer aliases/,
+    );
+    NodeAssert.throws(
+      () =>
+        toOpenCodeQuestionAnswers(
+          request,
+          { Scope: "Workspace", [openCodeQuestionId(1, second)]: "Build" },
+          [openCodeQuestionId(0, first)],
+        ),
+      /both answered and skipped/,
+    );
+    NodeAssert.throws(
+      () => toOpenCodeQuestionAnswers(request, { Scope: "Workspace" }, ["question-unknown"]),
+      /unknown question/,
+    );
   });
 });

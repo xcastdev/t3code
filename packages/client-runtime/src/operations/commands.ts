@@ -6,8 +6,11 @@ import {
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 
-import type { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import {
   type EnvironmentRpcFailure,
   type EnvironmentRpcSuccess,
@@ -65,9 +68,20 @@ export type StopThreadSessionInput = CommandInput<"thread.session.stop">;
 type DispatchTag = typeof ORCHESTRATION_WS_METHODS.dispatchCommand;
 type CommandEffect = Effect.Effect<
   EnvironmentRpcSuccess<DispatchTag>,
-  EnvironmentRpcFailure<DispatchTag> | EnvironmentRpcUnavailableError,
+  | EnvironmentRpcFailure<DispatchTag>
+  | EnvironmentRpcUnavailableError
+  | UnsupportedUserInputResolutionError,
   Crypto.Crypto | EnvironmentSupervisor
 >;
+
+export class UnsupportedUserInputResolutionError extends Schema.TaggedError<UnsupportedUserInputResolutionError>()(
+  "UnsupportedUserInputResolutionError",
+  { resolution: Schema.Literal("cancelled") },
+) {
+  override get message(): string {
+    return "This server does not support tagged user-input resolutions.";
+  }
+}
 
 function commandId(input: { readonly commandId?: CommandId }) {
   return Effect.gen(function* () {
@@ -363,8 +377,28 @@ export const respondToThreadApproval: (input: RespondToThreadApprovalInput) => C
 export const respondToThreadUserInput: (input: RespondToThreadUserInputInput) => CommandEffect =
   Effect.fn("EnvironmentCommands.respondToThreadUserInput")(function* (input) {
     const metadata = yield* timestampedCommandMetadata(input);
+    const service = yield* EnvironmentSupervisor;
+    const session = yield* SubscriptionRef.get(service.session);
+    const supportsTaggedResolution = yield* Option.match(session, {
+      onNone: () => Effect.succeed(false),
+      onSome: (current) =>
+        current.initialConfig.pipe(
+          Effect.map((config) => config.threadUserInputResolution === true),
+          Effect.orElseSucceed(() => false),
+        ),
+    });
+    if (input.resolution?.type === "cancelled" && !supportsTaggedResolution) {
+      return yield* new UnsupportedUserInputResolutionError({ resolution: "cancelled" });
+    }
+    const resolution = input.resolution;
+    const answers =
+      input.answers ?? (resolution?.type === "answered" ? resolution.answers : undefined);
+    const useTaggedResolution = supportsTaggedResolution && resolution !== undefined;
+    const { resolution: _resolution, ...legacyInput } = input;
     return yield* dispatch({
-      ...input,
+      ...legacyInput,
+      ...(useTaggedResolution ? { resolution } : {}),
+      ...(answers === undefined ? {} : { answers }),
       type: "thread.user-input.respond",
       commandId: metadata.commandId,
       createdAt: metadata.createdAt,

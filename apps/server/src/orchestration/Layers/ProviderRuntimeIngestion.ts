@@ -482,6 +482,10 @@ export function runtimeEventToActivities(
             ...(event.payload.options ? { options: event.payload.options } : {}),
             ...(event.agentKey ? { agentKey: event.agentKey } : {}),
             ...(event.agentTitle ? { agentTitle: event.agentTitle } : {}),
+            ...((event.nativeRequestId ?? event.requestId)
+              ? { nativeRequestId: event.nativeRequestId ?? event.requestId }
+              : {}),
+            ...(event.sessionGeneration ? { sessionGeneration: event.sessionGeneration } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -508,6 +512,10 @@ export function runtimeEventToActivities(
             ...(event.payload.decision ? { decision: event.payload.decision } : {}),
             ...(event.agentKey ? { agentKey: event.agentKey } : {}),
             ...(event.agentTitle ? { agentTitle: event.agentTitle } : {}),
+            ...((event.nativeRequestId ?? event.requestId)
+              ? { nativeRequestId: event.nativeRequestId ?? event.requestId }
+              : {}),
+            ...(event.sessionGeneration ? { sessionGeneration: event.sessionGeneration } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -606,6 +614,10 @@ export function runtimeEventToActivities(
             ...(event.payload.responseMode ? { responseMode: event.payload.responseMode } : {}),
             ...(event.agentKey ? { agentKey: event.agentKey } : {}),
             ...(event.agentTitle ? { agentTitle: event.agentTitle } : {}),
+            ...((event.nativeRequestId ?? event.requestId)
+              ? { nativeRequestId: event.nativeRequestId ?? event.requestId }
+              : {}),
+            ...(event.sessionGeneration ? { sessionGeneration: event.sessionGeneration } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -1124,6 +1136,8 @@ const make = Effect.gen(function* () {
             summary: firstLine.length > 0 ? truncateDetail(firstLine, 120) : "Assistant response",
             payload: {
               agentKey: event.agentKey,
+              nativeEntryId: event.nativeEntryId ?? `${event.provider}:${event.agentKey}:${itemId}`,
+              providerOrderKey: event.providerOrderKey ?? input.createdAt,
               ...(event.agentTitle
                 ? { title: event.agentTitle, agentTitle: event.agentTitle }
                 : {}),

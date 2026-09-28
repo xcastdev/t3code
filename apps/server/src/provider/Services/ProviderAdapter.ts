@@ -12,6 +12,9 @@ import type {
   ProviderApprovalDecision,
   ProviderDriverKind,
   ProviderUserInputAnswers,
+  ProviderUserInputResolution,
+  ProviderUserInputResponseResult,
+  ProviderApprovalResponseResult,
   ProviderRuntimeEvent,
   ProviderSendTurnInput,
   ProviderSession,
@@ -97,6 +100,25 @@ export interface ProviderThreadSnapshot {
   readonly turns: ReadonlyArray<ProviderThreadTurnSnapshot>;
 }
 
+/** One native child message/block ready for durable transcript projection. */
+export interface ProviderAgentTranscriptItem {
+  readonly nativeEntryId: string;
+  readonly providerOrderKey: string;
+  readonly createdAt: string;
+  readonly role: "assistant" | "user" | "tool";
+  readonly content: string;
+  readonly status: "running" | "completed";
+}
+
+/** Bounded native-source page. Cursor ownership stays inside its provider adapter. */
+export interface ProviderAgentTranscriptPage {
+  readonly entries: ReadonlyArray<ProviderAgentTranscriptItem>;
+  readonly nextSourceCursor?: string;
+  readonly hasMore: boolean;
+  readonly completeness: "complete" | "partial";
+  readonly reason?: string;
+}
+
 export interface ProviderAdapterShape<TError> {
   /**
    * Provider kind implemented by this adapter.
@@ -144,6 +166,14 @@ export interface ProviderAdapterShape<TError> {
     TError
   >;
 
+  /** Read one bounded page from this provider's native child transcript. */
+  readonly readAgentTranscriptPage?: (
+    threadId: ThreadId,
+    agentKey: RuntimeAgentKey,
+    sourceCursor: string | undefined,
+    limit: number,
+  ) => Effect.Effect<ProviderAgentTranscriptPage, TError>;
+
   /** Omitted when this adapter does not support manual context compaction. */
   readonly compaction?: ProviderCompaction<TError>;
 
@@ -159,7 +189,7 @@ export interface ProviderAdapterShape<TError> {
     threadId: ThreadId,
     requestId: ApprovalRequestId,
     decision: ProviderApprovalDecision,
-  ) => Effect.Effect<void, TError>;
+  ) => Effect.Effect<void | ProviderApprovalResponseResult, TError>;
 
   /**
    * Respond to a structured user-input request.
@@ -169,6 +199,20 @@ export interface ProviderAdapterShape<TError> {
     requestId: ApprovalRequestId,
     answers: ProviderUserInputAnswers,
   ) => Effect.Effect<void, TError>;
+
+  /** Resolve a tagged user-input request when the adapter can preserve its semantics. */
+  readonly resolveUserInput?: (
+    threadId: ThreadId,
+    requestId: ApprovalRequestId,
+    resolution: ProviderUserInputResolution,
+    attachmentsByQuestionId?: import("@t3tools/contracts").UserInputAttachments,
+  ) => Effect.Effect<ProviderUserInputResponseResult, TError>;
+
+  /** Implemented only when the provider has a native question-cancellation operation. */
+  readonly cancelUserInput?: (
+    threadId: ThreadId,
+    requestId: ApprovalRequestId,
+  ) => Effect.Effect<ProviderUserInputResponseResult, TError>;
 
   /**
    * Stop one provider session.

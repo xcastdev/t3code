@@ -20,6 +20,8 @@ import {
   ProviderRequestKind,
   ProviderSandboxMode,
   ProviderUserInputAnswers,
+  ProviderUserInputResolution,
+  OrchestrationAgentHandoffState,
   UserInputAttachments,
   RuntimeMode,
 } from "./orchestration.ts";
@@ -108,13 +110,35 @@ export const ProviderRespondToRequestInput = Schema.Struct({
 });
 export type ProviderRespondToRequestInput = typeof ProviderRespondToRequestInput.Type;
 
+/** Native approval settlement and parent-context handoff are reported separately. */
+export const ProviderApprovalResponseResult = Schema.Struct({
+  nativeStatus: Schema.Literals(["responded", "unknown"]),
+  handoffStatus: Schema.optional(OrchestrationAgentHandoffState),
+  requestId: ApprovalRequestId,
+  nativeRequestId: Schema.optional(TrimmedNonEmptyString),
+  agentKey: Schema.optional(RuntimeAgentKey),
+  sessionGeneration: Schema.optional(TrimmedNonEmptyString),
+});
+export type ProviderApprovalResponseResult = typeof ProviderApprovalResponseResult.Type;
+
 export const ProviderRespondToUserInputInput = Schema.Struct({
   threadId: ThreadId,
   requestId: ApprovalRequestId,
-  answers: ProviderUserInputAnswers,
+  answers: Schema.optional(ProviderUserInputAnswers),
+  resolution: Schema.optional(ProviderUserInputResolution),
   attachmentsByQuestionId: Schema.optional(UserInputAttachments),
 });
 export type ProviderRespondToUserInputInput = typeof ProviderRespondToUserInputInput.Type;
+
+export const ProviderUserInputResponseResult = Schema.Struct({
+  nativeStatus: Schema.Literals(["answered", "cancelled", "unsupported", "unknown"]),
+  handoffStatus: Schema.optional(OrchestrationAgentHandoffState),
+  requestId: ApprovalRequestId,
+  nativeRequestId: Schema.optional(TrimmedNonEmptyString),
+  agentKey: Schema.optional(RuntimeAgentKey),
+  sessionGeneration: Schema.optional(TrimmedNonEmptyString),
+});
+export type ProviderUserInputResponseResult = typeof ProviderUserInputResponseResult.Type;
 
 export const ProviderUploadFeedbackInput = Schema.Struct({
   threadId: ThreadId,
@@ -155,6 +179,7 @@ export const ProviderEvent = Schema.Struct({
   itemId: Schema.optional(ProviderItemId),
   requestId: Schema.optional(ApprovalRequestId),
   requestKind: Schema.optional(ProviderRequestKind),
+  sessionGeneration: Schema.optional(TrimmedNonEmptyString),
   agentKey: Schema.optional(RuntimeAgentKey),
   agentTitle: Schema.optional(TrimmedNonEmptyString),
   textDelta: Schema.optional(Schema.String),

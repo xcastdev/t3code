@@ -11,6 +11,7 @@ import type {
   PermissionResult,
   SDKMessage,
   SDKUserMessage,
+  SessionMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import {
   ApprovalRequestId,
@@ -70,6 +71,8 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   public readonly setModelCalls: Array<string | undefined> = [];
   public readonly setPermissionModeCalls: Array<string> = [];
   public readonly setMaxThinkingTokensCalls: Array<number | null> = [];
+  public readonly stopTaskCalls: Array<string> = [];
+  public stopTaskHandler: ((taskId: string) => Promise<void>) | undefined;
   public closeCalls = 0;
   public closeError: unknown | undefined;
 
@@ -117,6 +120,11 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
 
   readonly setMaxThinkingTokens = async (maxThinkingTokens: number | null): Promise<void> => {
     this.setMaxThinkingTokensCalls.push(maxThinkingTokens);
+  };
+
+  readonly stopTask = async (taskId: string): Promise<void> => {
+    this.stopTaskCalls.push(taskId);
+    await this.stopTaskHandler?.(taskId);
   };
 
   readonly close = (): void => {
@@ -171,6 +179,7 @@ function makeHarness(config?: {
   readonly scopedLimitNames?: ClaudeAdapterLiveOptions["scopedLimitNames"];
   readonly environment?: ClaudeAdapterLiveOptions["environment"];
   readonly getSessionMessages?: ClaudeAdapterLiveOptions["getSessionMessages"];
+  readonly getSubagentMessages?: ClaudeAdapterLiveOptions["getSubagentMessages"];
   readonly forkSession?: ClaudeAdapterLiveOptions["forkSession"];
 }) {
   const query = new FakeClaudeQuery();
@@ -188,6 +197,7 @@ function makeHarness(config?: {
     ...(config?.scopedLimitNames ? { scopedLimitNames: config.scopedLimitNames } : {}),
     modelCatalog: Effect.succeed(SYNTHETIC_CLAUDE_MODEL_CATALOG),
     ...(config?.getSessionMessages ? { getSessionMessages: config.getSessionMessages } : {}),
+    ...(config?.getSubagentMessages ? { getSubagentMessages: config.getSubagentMessages } : {}),
     ...(config?.forkSession ? { forkSession: config.forkSession } : {}),
     createQuery: (input) => {
       if (createInput && config?.getSessionMessages) queries.push(new FakeClaudeQuery());
@@ -3189,6 +3199,264 @@ describe("ClaudeAdapterLive", () => {
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),
     );
+  });
+
+  it.effect("stopAgent coalesces duplicate stops and waits for the native stopped event", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const startedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "task.started"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId: session.threadId, input: "start a child" });
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-stop-target",
+        description: "Target child",
+        task_type: "local_agent",
+        uuid: "task-stop-started",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      const started = Array.from(yield* Fiber.join(startedFiber))[0];
+      assert.isDefined(started);
+      assert.equal(started.type, "task.started");
+      if (started.type !== "task.started") return;
+
+      let signalStopCalled!: () => void;
+      const stopCalled = new Promise<void>((resolve) => {
+        signalStopCalled = resolve;
+      });
+      let releaseStop!: () => void;
+      const stopGate = new Promise<void>((resolve) => {
+        releaseStop = resolve;
+      });
+      harness.query.stopTaskHandler = async () => {
+        signalStopCalled();
+        await stopGate;
+      };
+      const agentKey = started.payload.agentKey;
+      if (agentKey === undefined) throw new Error("Claude did not expose the started child key.");
+      const first = yield* adapter.stopAgent!(session.threadId, agentKey).pipe(Effect.forkChild);
+      const duplicate = yield* adapter.stopAgent!(session.threadId, agentKey).pipe(
+        Effect.forkChild,
+      );
+      yield* Effect.promise(() => stopCalled);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        task_id: "task-stop-target",
+        status: "stopped",
+        output_file: "/tmp/task-stop-target.jsonl",
+        summary: "Stopped",
+        uuid: "task-stop-completed",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      releaseStop();
+
+      const results = yield* Effect.all([Fiber.join(first), Fiber.join(duplicate)]);
+      assert.deepEqual(results, ["completed", "completed"]);
+      assert.deepEqual(harness.query.stopTaskCalls, ["task-stop-target"]);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect("stopAgent reports unknown after dispatch when native completion is missing", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const startedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "task.started"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId: session.threadId, input: "start a child" });
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-stop-timeout",
+        description: "Target child",
+        task_type: "local_agent",
+        uuid: "task-stop-timeout-started",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      const started = Array.from(yield* Fiber.join(startedFiber))[0];
+      assert.isDefined(started);
+      if (started?.type !== "task.started") return;
+
+      const agentKey = started.payload.agentKey;
+      if (agentKey === undefined) throw new Error("Claude did not expose the started child key.");
+      const stopping = yield* adapter.stopAgent!(session.threadId, agentKey).pipe(Effect.forkChild);
+      yield* TestClock.adjust("3 seconds");
+      assert.equal(yield* Fiber.join(stopping), "unknown");
+      assert.deepEqual(harness.query.stopTaskCalls, ["task-stop-timeout"]);
+    }).pipe(Effect.provide(harness.layer));
+  });
+
+  it.effect(
+    "a replaced Claude session rejects its prior child handle before native dispatch",
+    () => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const startedFiber = yield* adapter.streamEvents.pipe(
+          Stream.filter((event) => event.type === "task.started"),
+          Stream.take(1),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        const firstSession = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+        yield* adapter.sendTurn({ threadId: firstSession.threadId, input: "start a child" });
+        harness.query.emit({
+          type: "system",
+          subtype: "task_started",
+          task_id: "task-old-generation",
+          description: "Old child",
+          task_type: "local_agent",
+          uuid: "task-old-generation-started",
+          session_id: "sdk-session",
+        } as unknown as SDKMessage);
+        const started = Array.from(yield* Fiber.join(startedFiber))[0];
+        assert.isDefined(started);
+        if (started?.type !== "task.started") return;
+
+        const agentKey = started.payload.agentKey;
+        if (agentKey === undefined) throw new Error("Claude did not expose the started child key.");
+        yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+        const result = yield* Effect.exit(adapter.stopAgent!(firstSession.threadId, agentKey));
+        assert.equal(result._tag, "Failure");
+        assert.deepEqual(harness.query.stopTaskCalls, []);
+      }).pipe(Effect.provide(harness.layer));
+    },
+  );
+
+  it.effect("reads bounded Claude child history with stable identities and offset cursors", () => {
+    let rows: Array<SessionMessage> = [
+      {
+        type: "user",
+        uuid: "history-user-1",
+        session_id: "sdk-session-history",
+        message: { content: "question" },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
+      {
+        type: "assistant",
+        uuid: "history-assistant-1",
+        session_id: "sdk-session-history",
+        message: {
+          content: [
+            { type: "text", text: "answer" },
+            { type: "thinking", thinking: "private reasoning" },
+          ],
+        },
+        parent_tool_use_id: null,
+        parent_agent_id: null,
+      },
+    ];
+    const reads: Array<{ sessionId: string; agentId: string; offset: number; limit: number }> = [];
+    const harness = makeHarness({
+      getSubagentMessages: async (sessionId, agentId, options) => {
+        const offset = options?.offset ?? 0;
+        const limit = options?.limit ?? rows.length;
+        reads.push({ sessionId, agentId, offset, limit });
+        return rows.slice(offset, offset + limit);
+      },
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const startedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.type === "task.started"),
+        Stream.take(1),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({ threadId: session.threadId, input: "start a child" });
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-history",
+        agent_id: "agent-history",
+        description: "History child",
+        task_type: "local_agent",
+        uuid: "task-history-started",
+        session_id: "sdk-session-history",
+      } as unknown as SDKMessage);
+      const started = Array.from(yield* Fiber.join(startedFiber))[0];
+      if (started?.type !== "task.started" || started.payload.agentKey === undefined) {
+        throw new Error("Claude did not expose the child identity needed for history recovery.");
+      }
+      const readPage = adapter.readAgentTranscriptPage;
+      if (!readPage) throw new Error("Claude child transcript recovery is unavailable.");
+
+      const firstPage = yield* readPage(session.threadId, started.payload.agentKey, undefined, 1);
+      assert.deepEqual(reads, [
+        { sessionId: "sdk-session-history", agentId: "agent-history", offset: 0, limit: 2 },
+      ]);
+      assert.equal(firstPage.hasMore, true);
+      assert.equal(firstPage.completeness, "partial");
+      assert.equal(firstPage.nextSourceCursor, "1");
+      assert.deepEqual(
+        firstPage.entries.map((entry) => [entry.role, entry.content]),
+        [["user", "question"]],
+      );
+      assert.equal(firstPage.entries[0]?.nativeEntryId, "claude:agent-history:history-user-1");
+
+      const secondPage = yield* readPage(
+        session.threadId,
+        started.payload.agentKey,
+        firstPage.nextSourceCursor,
+        1,
+      );
+      assert.deepEqual(
+        secondPage.entries.map((entry) => [entry.role, entry.content]),
+        [["assistant", "answer"]],
+      );
+      assert.equal(
+        secondPage.entries[0]?.nativeEntryId,
+        "claude:agent-history:history-assistant-1",
+      );
+      assert.equal(secondPage.entries[0]?.providerOrderKey, "claude:000000000001");
+      assert.equal(secondPage.hasMore, false);
+      assert.equal(secondPage.completeness, "complete");
+      assert.deepEqual(reads[1], {
+        sessionId: "sdk-session-history",
+        agentId: "agent-history",
+        offset: 1,
+        limit: 2,
+      });
+
+      rows = [];
+      const emptyRead = yield* readPage(session.threadId, started.payload.agentKey, undefined, 1);
+      assert.equal(emptyRead.completeness, "partial");
+      assert.match(emptyRead.reason ?? "", /does not distinguish an empty transcript/);
+    }).pipe(Effect.provide(harness.layer));
   });
 
   it.effect("interruptTurn settles live tasks and closes the provider session", () => {
@@ -7161,9 +7429,11 @@ describe("ClaudeAdapterLive", () => {
       assert.equal(typeof canUseTool, "function");
       const postToolBatch = options?.hooks?.PostToolBatch?.[0]?.hooks[0];
       const userPromptSubmit = options?.hooks?.UserPromptSubmit?.[0]?.hooks[0];
+      const stop = options?.hooks?.Stop?.[0]?.hooks[0];
       assert.equal(typeof postToolBatch, "function");
       assert.equal(typeof userPromptSubmit, "function");
-      if (!canUseTool || !postToolBatch || !userPromptSubmit) {
+      assert.equal(typeof stop, "function");
+      if (!canUseTool || !postToolBatch || !userPromptSubmit || !stop) {
         throw new Error("Claude child-approval handoff hooks are unavailable.");
       }
 
@@ -7265,6 +7535,19 @@ describe("ClaudeAdapterLive", () => {
           undefined,
           { signal },
         );
+      const invokeStop = (agentId?: string) =>
+        stop(
+          {
+            hook_event_name: "Stop",
+            session_id: "sdk-session-child-approval",
+            transcript_path: "/tmp/claude-child-approval.jsonl",
+            cwd: "/tmp",
+            stop_hook_active: false,
+            ...(agentId ? { agent_id: agentId } : {}),
+          },
+          undefined,
+          { signal },
+        );
       const additionalContext = (
         output: Awaited<ReturnType<typeof postToolBatch>>,
       ): string | undefined =>
@@ -7281,17 +7564,25 @@ describe("ClaudeAdapterLive", () => {
             ? output.hookSpecificOutput.additionalContext
             : undefined
           : undefined;
+      const stopAdditionalContext = (
+        output: Awaited<ReturnType<typeof stop>>,
+      ): string | undefined =>
+        "hookSpecificOutput" in output
+          ? output.hookSpecificOutput?.hookEventName === "Stop"
+            ? output.hookSpecificOutput.additionalContext
+            : undefined
+          : undefined;
       const childContext = yield* Effect.promise(() => invokePostToolBatch("task-child"));
       assert.equal(additionalContext(childContext), undefined);
       const siblingContext = yield* Effect.promise(() => invokePostToolBatch("task-sibling"));
       assert.equal(additionalContext(siblingContext), undefined);
-      const parentContext = yield* Effect.promise(() => invokePostToolBatch("task-parent"));
-      const allowedHandoff = additionalContext(parentContext) ?? "";
+      const nestedParentContext = yield* Effect.promise(() => invokeStop("task-parent"));
+      const allowedHandoff = stopAdditionalContext(nestedParentContext) ?? "";
       assert.match(allowedHandoff, /user chose to allow once/i);
       assert.match(allowedHandoff, /native-request-allow/);
       assert.match(allowedHandoff, /does not establish that the operation ran or succeeded/i);
-      const parentAfterDrain = yield* Effect.promise(() => invokePostToolBatch("task-parent"));
-      assert.equal(additionalContext(parentAfterDrain), undefined);
+      const rootStopAfterNestedDrain = yield* Effect.promise(() => invokeStop());
+      assert.equal(stopAdditionalContext(rootStopAfterNestedDrain), undefined);
 
       const denied = yield* decide("native-request-deny", "decline");
       if (denied === null || denied.permission === null) {

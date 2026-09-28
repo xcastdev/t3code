@@ -72,6 +72,7 @@ import {
   CodexSessionRuntimeThreadIdMissingError,
   describeMcpElicitation,
   makeCodexSessionRuntime,
+  toCodexMcpElicitationUserInput,
   type CodexSessionRuntimeError,
   type CodexSessionRuntimeOptions,
   type CodexSessionRuntimeShape,
@@ -1001,6 +1002,7 @@ function runtimeEventBase(
     ...(event.turnId ? { turnId: event.turnId } : {}),
     ...(event.itemId ? { itemId: asRuntimeItemId(event.itemId) } : {}),
     ...(event.requestId ? { requestId: asRuntimeRequestId(event.requestId) } : {}),
+    ...(event.sessionGeneration ? { sessionGeneration: event.sessionGeneration } : {}),
     ...(event.agentKey ? { agentKey: event.agentKey } : {}),
     ...(event.agentTitle ? { agentTitle: event.agentTitle } : {}),
     ...(refs ? { providerRefs: refs } : {}),
@@ -1469,6 +1471,23 @@ function mapToRuntimeEvents(
           },
         },
       ];
+    }
+
+    if (event.method === "mcpServer/elicitation/request") {
+      const payload = readPayload(
+        EffectCodexSchema.McpServerElicitationRequestParams,
+        event.payload,
+      );
+      const userInput = payload ? toCodexMcpElicitationUserInput(payload) : undefined;
+      if (userInput) {
+        return [
+          {
+            ...runtimeEventBase(event, canonicalThreadId),
+            type: "user-input.requested",
+            payload: { questions: userInput.questions },
+          },
+        ];
+      }
     }
 
     const elicitation =
@@ -2781,6 +2800,31 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       ),
     );
 
+  const stopAgent: NonNullable<CodexAdapterShape["stopAgent"]> = (threadId, agentKey) =>
+    requireSession(threadId).pipe(
+      Effect.flatMap((session) => session.runtime.stopAgent(agentKey)),
+      Effect.mapError((cause) =>
+        cause._tag === "ProviderAdapterSessionNotFoundError"
+          ? cause
+          : mapCodexRuntimeError(threadId, "turn/interrupt", cause),
+      ),
+    );
+
+  const getAgentActionCapabilities: NonNullable<CodexAdapterShape["getAgentActionCapabilities"]> = (
+    threadId,
+    agentKey,
+  ) =>
+    requireSession(threadId).pipe(
+      Effect.flatMap((session) => session.runtime.getAgentActionCapabilities(agentKey)),
+      Effect.catch(() =>
+        Effect.succeed({
+          message: "unverified" as const,
+          answerRequests: "unverified" as const,
+          stop: "unverified" as const,
+        }),
+      ),
+    );
+
   const compactThread = Effect.fn("compactThread")(function* (threadId: ThreadId) {
     const session = yield* requireSession(threadId);
     yield* session.runtime.compactThread.pipe(
@@ -2882,6 +2926,21 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
       ),
     );
 
+  const resolveUserInput: NonNullable<CodexAdapterShape["resolveUserInput"]> = (
+    threadId,
+    requestId,
+    resolution,
+    _attachmentsByQuestionId,
+  ) =>
+    requireSession(threadId).pipe(
+      Effect.flatMap((session) => session.runtime.resolveUserInput(requestId, resolution)),
+      Effect.mapError((cause) =>
+        cause._tag === "ProviderAdapterSessionNotFoundError"
+          ? cause
+          : mapCodexRuntimeError(threadId, "item/tool/requestUserInput", cause),
+      ),
+    );
+
   const writeNativeEvent = Effect.fnUntraced(function* (event: ProviderEvent) {
     if (!nativeEventLogger) {
       return;
@@ -2952,12 +3011,15 @@ export const makeCodexAdapter = Effect.fn("makeCodexAdapter")(function* (
     sendTurn,
     compaction: { type: "native", start: compactThread },
     interruptTurn,
+    stopAgent,
+    getAgentActionCapabilities,
     readThread,
     rollbackThread,
     forkThread,
     uploadFeedback,
     respondToRequest,
     respondToUserInput,
+    resolveUserInput,
     stopSession,
     listSessions,
     hasSession,

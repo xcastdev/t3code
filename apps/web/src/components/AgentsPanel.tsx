@@ -816,6 +816,25 @@ function deliveryStatusLabel(
   }
 }
 
+function handoffStatusLabel(
+  status: OrchestrationAgentTranscriptEntry["handoffStatus"],
+): string | null {
+  switch (status) {
+    case "pending":
+      return "Parent handoff pending";
+    case "recorded":
+      return "Added to parent context";
+    case "unavailable":
+      return "Parent handoff unavailable";
+    case "failed":
+      return "Parent handoff failed";
+    case "unknown":
+      return "Parent handoff outcome unknown";
+    default:
+      return null;
+  }
+}
+
 function AgentTranscriptEntryMeta({
   entry,
   align = "start",
@@ -824,6 +843,7 @@ function AgentTranscriptEntryMeta({
   align?: "start" | "end";
 }) {
   const deliveryStatus = deliveryStatusLabel(entry.deliveryStatus);
+  const handoffStatus = handoffStatusLabel(entry.handoffStatus);
   return (
     <div
       className={cn(
@@ -841,6 +861,7 @@ function AgentTranscriptEntryMeta({
           {entry.detail ? ` · ${entry.detail}` : ""}
         </span>
       ) : null}
+      {handoffStatus ? <span role="status">{handoffStatus}</span> : null}
     </div>
   );
 }
@@ -917,7 +938,9 @@ function AgentTranscriptActivity({ entry }: { entry: OrchestrationAgentTranscrip
             {entry.content}
           </pre>
         ) : null}
-        {entry.status || entry.deliveryStatus ? <AgentTranscriptEntryMeta entry={entry} /> : null}
+        {entry.status || entry.deliveryStatus || entry.handoffStatus ? (
+          <AgentTranscriptEntryMeta entry={entry} />
+        ) : null}
       </div>
     </article>
   );

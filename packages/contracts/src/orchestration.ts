@@ -175,6 +175,26 @@ export type ProviderApprovalOption = typeof ProviderApprovalOption.Type;
 export const ProviderUserInputAnswers = Schema.Record(Schema.String, Schema.Unknown);
 export type ProviderUserInputAnswers = typeof ProviderUserInputAnswers.Type;
 
+/** New clients use this negotiated form when a question can be skipped or cancelled. */
+export const ProviderUserInputResolution = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("answered"),
+    answers: ProviderUserInputAnswers,
+    skippedQuestionIds: Schema.optional(Schema.Array(TrimmedNonEmptyString)),
+  }),
+  Schema.Struct({ type: Schema.Literal("cancelled") }),
+]);
+export type ProviderUserInputResolution = typeof ProviderUserInputResolution.Type;
+
+export const OrchestrationAgentHandoffState = Schema.Literals([
+  "pending",
+  "recorded",
+  "unavailable",
+  "failed",
+  "unknown",
+]);
+export type OrchestrationAgentHandoffState = typeof OrchestrationAgentHandoffState.Type;
+
 export const PROVIDER_SEND_TURN_MAX_INPUT_CHARS = 120_000;
 export const PROVIDER_SEND_TURN_MAX_ATTACHMENTS = 8;
 export const PROVIDER_SEND_TURN_MAX_IMAGE_BYTES = 10 * 1024 * 1024;
@@ -1135,6 +1155,10 @@ export type OrchestrationAgentIdentity = typeof OrchestrationAgentIdentity.Type;
 export const OrchestrationAgentTranscriptEntry = Schema.Struct({
   id: EventId,
   eventSequence: NonNegativeInt,
+  /** Stable provider message/block identity across persisted content revisions. */
+  nativeEntryId: Schema.optional(TrimmedNonEmptyString),
+  /** Provider-native chronology key, independent of persisted event sequence. */
+  providerOrderKey: Schema.optional(TrimmedNonEmptyString),
   createdAt: IsoDateTime,
   kind: Schema.Literals(["message", "tool", "request", "status"]),
   role: Schema.optional(Schema.Literals(["assistant", "user", "tool"])),
@@ -1143,6 +1167,7 @@ export const OrchestrationAgentTranscriptEntry = Schema.Struct({
   detail: Schema.optional(Schema.String.check(Schema.isMaxLength(16_384))),
   status: Schema.optional(OrchestrationAgentStatus),
   deliveryStatus: Schema.optional(OrchestrationAgentActionState),
+  handoffStatus: Schema.optional(OrchestrationAgentHandoffState),
   requestId: Schema.optional(ApprovalRequestId),
 });
 export type OrchestrationAgentTranscriptEntry = typeof OrchestrationAgentTranscriptEntry.Type;
@@ -1156,7 +1181,7 @@ const OrchestrationAgentTranscriptPageSize = PositiveInt.check(
 export const OrchestrationGetAgentTranscriptPageInput = Schema.Struct({
   threadId: ThreadId,
   agentKey: RuntimeAgentKey,
-  cursor: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
+  cursor: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(2048))),
   limit: Schema.optional(OrchestrationAgentTranscriptPageSize),
 });
 export type OrchestrationGetAgentTranscriptPageInput =
@@ -1168,7 +1193,7 @@ export const OrchestrationAgentTranscriptPage = Schema.Struct({
   entries: Schema.Array(OrchestrationAgentTranscriptEntry).check(
     Schema.isMaxLength(ORCHESTRATION_AGENT_TRANSCRIPT_PAGE_SIZE_MAX),
   ),
-  nextCursor: Schema.NullOr(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
+  nextCursor: Schema.NullOr(TrimmedNonEmptyString.check(Schema.isMaxLength(2048))),
   hasMore: Schema.Boolean,
   snapshotSequence: NonNegativeInt,
   threadSequence: NonNegativeInt,
@@ -1696,7 +1721,9 @@ const ThreadUserInputRespondCommand = Schema.Struct({
   commandId: CommandId,
   threadId: ThreadId,
   requestId: ApprovalRequestId,
-  answers: ProviderUserInputAnswers,
+  /** Legacy clients send answers. New clients send a negotiated resolution. */
+  answers: Schema.optional(ProviderUserInputAnswers),
+  resolution: Schema.optional(ProviderUserInputResolution),
   attachmentsByQuestionId: Schema.optional(UserInputAttachments),
   createdAt: IsoDateTime,
 });
@@ -2444,7 +2471,8 @@ export const ThreadApprovalResponseRequestedPayload = Schema.Struct({
 const ThreadUserInputResponseRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   requestId: ApprovalRequestId,
-  answers: ProviderUserInputAnswers,
+  answers: Schema.optional(ProviderUserInputAnswers),
+  resolution: Schema.optional(ProviderUserInputResolution),
   attachmentsByQuestionId: Schema.optional(UserInputAttachments),
   createdAt: IsoDateTime,
 });

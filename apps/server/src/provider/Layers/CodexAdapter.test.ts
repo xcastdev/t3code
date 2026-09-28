@@ -17,6 +17,8 @@ import {
   type ProviderSession,
   type ProviderTurnStartResult,
   type ProviderUserInputAnswers,
+  type ProviderUserInputResolution,
+  type ProviderUserInputResponseResult,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -93,6 +95,15 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
     Promise.resolve(undefined),
   );
 
+  public readonly stopAgent = (_agentKey: RuntimeAgentKey) => Effect.succeed("completed" as const);
+
+  public readonly getAgentActionCapabilities = (_agentKey: RuntimeAgentKey) =>
+    Effect.succeed({
+      message: "unsupported" as const,
+      answerRequests: "unsupported" as const,
+      stop: "unsupported" as const,
+    });
+
   public readonly readThreadImpl = vi.fn((): Promise<CodexThreadSnapshot> =>
     Promise.resolve({
       threadId: "provider-thread-1",
@@ -120,6 +131,12 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
     (_requestId: ApprovalRequestId, _answers: ProviderUserInputAnswers): Promise<void> =>
       Promise.resolve(undefined),
   );
+
+  public readonly resolveUserInput = (
+    requestId: ApprovalRequestId,
+    _resolution: ProviderUserInputResolution,
+  ): Effect.Effect<ProviderUserInputResponseResult> =>
+    Effect.succeed({ nativeStatus: "answered", requestId });
 
   public readonly closeImpl = vi.fn(() => Promise.resolve(undefined));
 
@@ -158,7 +175,9 @@ class FakeCodexRuntime implements CodexSessionRuntimeShape {
   }
 
   respondToRequest(requestId: ApprovalRequestId, decision: ProviderApprovalDecision) {
-    return Effect.promise(() => this.respondToRequestImpl(requestId, decision));
+    return Effect.promise(() => this.respondToRequestImpl(requestId, decision)).pipe(
+      Effect.map(() => ({ nativeStatus: "responded" as const, requestId })),
+    );
   }
 
   respondToUserInput(requestId: ApprovalRequestId, answers: ProviderUserInputAnswers) {
@@ -2640,6 +2659,59 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
           });
         }
       }),
+  );
+
+  it.effect("maps free-text MCP elicitation forms to custom-answer questions", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const eventsFiber = yield* Stream.runCollect(Stream.take(adapter.streamEvents, 1)).pipe(
+        Effect.forkChild,
+      );
+      yield* runtime.emit({
+        id: asEventId("evt-mcp-user-input-requested"),
+        kind: "request",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "mcpServer/elicitation/request",
+        requestId: ApprovalRequestId.make("req-mcp-user-input-1"),
+        agentKey: RuntimeAgentKey.make("child-mcp-user-input"),
+        payload: {
+          mode: "form",
+          message: "Which token should the child use?",
+          serverName: "native-question",
+          threadId: "child-thread-1",
+          turnId: "child-turn-1",
+          requestedSchema: {
+            type: "object",
+            properties: {
+              token: {
+                type: "string",
+                title: "Deployment token",
+                description: "Provide the exact token value.",
+              },
+            },
+            required: ["token"],
+          },
+        },
+      } satisfies ProviderEvent);
+
+      const [event] = Array.from(yield* Fiber.join(eventsFiber));
+      NodeAssert.equal(event?.type, "user-input.requested");
+      if (event?.type !== "user-input.requested") return;
+      NodeAssert.equal(event.requestId, "req-mcp-user-input-1");
+      NodeAssert.equal(event.agentKey, "child-mcp-user-input");
+      NodeAssert.deepEqual(event.payload.questions, [
+        {
+          id: "token",
+          header: "Deployment token",
+          question: "Provide the exact token value.",
+          options: [],
+          allowCustomAnswer: true,
+          multiSelect: false,
+        },
+      ]);
+    }),
   );
 
   it.effect("maps async agent questions without ending the turn", () =>

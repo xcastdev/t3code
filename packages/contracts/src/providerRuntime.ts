@@ -266,6 +266,13 @@ const ProviderRuntimeEventBase = Schema.Struct({
   turnId: Schema.optional(TurnId),
   itemId: Schema.optional(RuntimeItemId),
   requestId: Schema.optional(RuntimeRequestId),
+  /** Native request identity when the public request ID is adapter-owned. */
+  nativeRequestId: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** Generation of the provider session that emitted this child request. */
+  sessionGeneration: Schema.optional(TrimmedNonEmptyStringSchema),
+  /** Stable native transcript identity/order when supplied by the adapter. */
+  nativeEntryId: Schema.optional(TrimmedNonEmptyStringSchema),
+  providerOrderKey: Schema.optional(TrimmedNonEmptyStringSchema),
   /** Opaque T3 identity of the child that owns this event, never a provider id. */
   agentKey: Schema.optional(RuntimeAgentKey),
   parentAgentKey: Schema.optional(RuntimeAgentKey),

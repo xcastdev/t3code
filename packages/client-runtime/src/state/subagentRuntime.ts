@@ -20,6 +20,7 @@
 import {
   ApprovalRequestId,
   OrchestrationAgentActionState,
+  OrchestrationAgentHandoffState,
   OrchestrationAgentStatus,
   RuntimeAgentKey,
   type OrchestrationAgentTranscriptPage,
@@ -988,6 +989,19 @@ export function formatSubagentTokenCount(totalTokens: number): string {
 export const AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT = 500;
 export const AGENT_TRANSCRIPT_RECENT_PAGE_ENTRY_LIMIT = 50;
 
+const agentTranscriptIdentity = (entry: OrchestrationAgentTranscriptEntry) =>
+  entry.nativeEntryId ?? entry.id;
+
+const compareAgentTranscriptOrder = (
+  left: OrchestrationAgentTranscriptEntry,
+  right: OrchestrationAgentTranscriptEntry,
+) =>
+  (left.providerOrderKey ?? left.createdAt).localeCompare(
+    right.providerOrderKey ?? right.createdAt,
+  ) ||
+  agentTranscriptIdentity(left).localeCompare(agentTranscriptIdentity(right)) ||
+  left.id.localeCompare(right.id);
+
 /**
  * Keep an older page window usable while separately catching up the newest
  * page after reconnects or live child activity. The extra page is a fixed
@@ -1006,17 +1020,13 @@ export function mergeAgentTranscriptPageWindows(
     ...newestPageEntries,
     ...liveEntries,
   ]) {
-    const previous = byId.get(entry.id);
+    const identity = agentTranscriptIdentity(entry);
+    const previous = byId.get(identity);
     if (previous === undefined || entry.eventSequence > previous.eventSequence) {
-      byId.set(entry.id, entry);
+      byId.set(identity, entry);
     }
   }
-  const merged = [...byId.values()].sort(
-    (left, right) =>
-      left.eventSequence - right.eventSequence ||
-      left.createdAt.localeCompare(right.createdAt) ||
-      left.id.localeCompare(right.id),
-  );
+  const merged = [...byId.values()].sort(compareAgentTranscriptOrder);
   const limit =
     AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT +
     (recoveredEntries.length > 0 ? AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT : 0) +
@@ -1027,13 +1037,10 @@ export function mergeAgentTranscriptPageWindows(
   const recentWindow =
     AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT + AGENT_TRANSCRIPT_RECENT_PAGE_ENTRY_LIMIT;
   const recent = merged.slice(-recentWindow);
-  const boundedById = new Map([...older, ...recent].map((entry) => [entry.id, entry] as const));
-  return [...boundedById.values()].sort(
-    (left, right) =>
-      left.eventSequence - right.eventSequence ||
-      left.createdAt.localeCompare(right.createdAt) ||
-      left.id.localeCompare(right.id),
+  const boundedById = new Map(
+    [...older, ...recent].map((entry) => [agentTranscriptIdentity(entry), entry] as const),
   );
+  return [...boundedById.values()].sort(compareAgentTranscriptOrder);
 }
 
 export const AGENT_TRANSCRIPT_RECONNECT_MAX_PAGES = 10;
@@ -1097,20 +1104,16 @@ export function mergeAgentTranscriptEntries(
   retention: "newest" | "oldest" = "newest",
 ): ReadonlyArray<OrchestrationAgentTranscriptEntry> {
   const byId = new Map<string, OrchestrationAgentTranscriptEntry>();
-  for (const entry of current) byId.set(entry.id, entry);
+  for (const entry of current) byId.set(agentTranscriptIdentity(entry), entry);
   for (const entry of incoming) {
-    const previous = byId.get(entry.id);
+    const identity = agentTranscriptIdentity(entry);
+    const previous = byId.get(identity);
     if (previous === undefined || entry.eventSequence > previous.eventSequence) {
-      byId.set(entry.id, entry);
+      byId.set(identity, entry);
     }
   }
   const boundedLimit = Math.max(1, Math.min(limit, AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT));
-  const merged = [...byId.values()].sort(
-    (left, right) =>
-      left.eventSequence - right.eventSequence ||
-      left.createdAt.localeCompare(right.createdAt) ||
-      left.id.localeCompare(right.id),
-  );
+  const merged = [...byId.values()].sort(compareAgentTranscriptOrder);
   return merged.length <= boundedLimit
     ? merged
     : retention === "oldest"
@@ -1132,17 +1135,24 @@ export function firstDiscardedAgentTranscriptCursor(
   limit = AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT,
 ): string | null {
   const retainedIds = new Set(
-    mergeAgentTranscriptEntries(current, incoming, limit).map((entry) => entry.id),
+    mergeAgentTranscriptEntries(current, incoming, limit).map(agentTranscriptIdentity),
   );
   const byId = new Map<string, OrchestrationAgentTranscriptEntry>();
-  for (const entry of [...current, ...incoming]) byId.set(entry.id, entry);
+  for (const entry of [...current, ...incoming]) {
+    const identity = agentTranscriptIdentity(entry);
+    const previous = byId.get(identity);
+    if (previous === undefined || entry.eventSequence > previous.eventSequence) {
+      byId.set(identity, entry);
+    }
+  }
   const discarded = [...byId.values()]
-    .filter((entry) => !retainedIds.has(entry.id))
-    .sort((left, right) => right.eventSequence - left.eventSequence);
+    .filter((entry) => !retainedIds.has(agentTranscriptIdentity(entry)))
+    .sort((left, right) => compareAgentTranscriptOrder(right, left));
   if (discarded.length === 0) return null;
 
   for (const entry of discarded) {
-    const cursor = pageCursorByEntryId.get(entry.id);
+    const cursor =
+      pageCursorByEntryId.get(agentTranscriptIdentity(entry)) ?? pageCursorByEntryId.get(entry.id);
     if (cursor !== undefined) return cursor;
   }
   return fallbackCursor;
@@ -1151,6 +1161,7 @@ export function firstDiscardedAgentTranscriptCursor(
 const isApprovalRequestId = Schema.is(ApprovalRequestId);
 const isTranscriptStatus = Schema.is(OrchestrationAgentStatus);
 const isTranscriptActionState = Schema.is(OrchestrationAgentActionState);
+const isTranscriptHandoffState = Schema.is(OrchestrationAgentHandoffState);
 
 /** Convert the current thread window's child-owned activities into live rows. */
 export function agentTranscriptEntriesFromActivities(
@@ -1172,6 +1183,11 @@ export function agentTranscriptEntriesFromActivities(
       rawDeliveryStatus && isTranscriptActionState(rawDeliveryStatus)
         ? rawDeliveryStatus
         : undefined;
+    const rawHandoffStatus = asString(payload.handoffStatus);
+    const handoffStatus =
+      rawHandoffStatus && isTranscriptHandoffState(rawHandoffStatus) ? rawHandoffStatus : undefined;
+    const nativeEntryId = asString(payload.nativeEntryId);
+    const providerOrderKey = asString(payload.providerOrderKey);
     const requestId =
       typeof payload.requestId === "string" && isApprovalRequestId(payload.requestId)
         ? payload.requestId
@@ -1182,6 +1198,8 @@ export function agentTranscriptEntriesFromActivities(
     entries.push({
       id: activity.id,
       eventSequence: activity.eventSequence ?? activity.sequence ?? 0,
+      ...(nativeEntryId === undefined ? {} : { nativeEntryId }),
+      ...(providerOrderKey === undefined ? {} : { providerOrderKey }),
       createdAt: activity.createdAt,
       kind: isMessage
         ? "message"
@@ -1198,6 +1216,7 @@ export function agentTranscriptEntriesFromActivities(
       ...(detail === undefined ? {} : { detail }),
       ...(status === undefined ? {} : { status }),
       ...(deliveryStatus === undefined ? {} : { deliveryStatus }),
+      ...(handoffStatus === undefined ? {} : { handoffStatus }),
       ...(requestId === undefined ? {} : { requestId }),
     });
   }

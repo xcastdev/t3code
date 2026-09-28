@@ -202,6 +202,25 @@ rl.on("line", (line) => {
       return;
     }
     write({ id, result: {} });
+    if (script.interruptCompletionFor === target) {
+      write({
+        jsonrpc: "2.0",
+        method: "turn/completed",
+        params: {
+          threadId: target,
+          turn: {
+            id: message.params?.turnId,
+            items: [],
+            itemsView: "notLoaded",
+            status: script.interruptCompletionStatus ?? "interrupted",
+            error: null,
+            startedAt: 1_778_000_000,
+            completedAt: 1_778_000_001,
+            durationMs: 1_000,
+          },
+        },
+      });
+    }
     return;
   }
   if (id !== undefined) {

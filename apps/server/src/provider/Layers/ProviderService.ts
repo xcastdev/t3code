@@ -3103,26 +3103,50 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       operation: "ProviderService.getAgentCapabilities",
       allowRecovery: false,
     }).pipe(Effect.result);
-    if (routed._tag === "Failure" || !routed.success.isActive) return unverified;
+    if (routed._tag === "Failure") {
+      const unsupported = (action: string): OrchestrationAgentCapability => ({
+        state: "unsupported",
+        reason: `There is no active provider session for ${action} on this child.`,
+      });
+      return {
+        message: unsupported("messaging"),
+        answerRequests: unsupported("answering child requests"),
+        stop: unsupported("stopping"),
+      };
+    }
+    if (!routed.success.isActive) {
+      const provider = String(routed.success.adapter.provider);
+      const unsupported = (action: string): OrchestrationAgentCapability => ({
+        state: "unsupported",
+        reason: `Provider '${provider}' has no active session for ${action} on this child.`,
+      });
+      return {
+        message: unsupported("messaging"),
+        answerRequests: unsupported("answering child requests"),
+        stop: unsupported("stopping"),
+      };
+    }
     const resolve = routed.success.adapter.getAgentActionCapabilities;
     if (!resolve) {
+      const provider = String(routed.success.adapter.provider);
       return {
         message: {
           state: "unsupported",
-          reason: `Provider '${routed.success.adapter.provider}' does not support child messaging.`,
+          reason: `Provider '${provider}' does not support messaging this child.`,
         },
         answerRequests: {
-          state: "unverified",
-          reason: "Child request ownership has not been validated for this provider.",
+          state: "unsupported",
+          reason: `Provider '${provider}' does not support answering requests for this child.`,
         },
         stop: {
           state: "unsupported",
-          reason: `Provider '${routed.success.adapter.provider}' does not support child-only stop.`,
+          reason: `Provider '${provider}' does not support stopping this child.`,
         },
       };
     }
     const capabilities = yield* resolve(input.threadId, input.agentKey).pipe(Effect.result);
     if (capabilities._tag === "Failure") return unverified;
+    const provider = String(routed.success.adapter.provider);
     const adapt = (
       state: "supported" | "unsupported" | "unverified",
       action: "messaging" | "answering requests" | "stopping",
@@ -3133,14 +3157,33 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
             state,
             reason:
               state === "unsupported"
-                ? `The current OpenCode child session does not support ${action}.`
-                : `The current OpenCode child session could not verify ${action}.`,
+                ? `Provider '${provider}' does not support ${action} for this child in its current state.`
+                : `The current ${provider} child identity or ${action} path could not be verified.`,
           };
     return {
       message: adapt(capabilities.success.message, "messaging"),
       answerRequests: adapt(capabilities.success.answerRequests, "answering requests"),
       stop: adapt(capabilities.success.stop, "stopping"),
     };
+  });
+
+  const readAgentTranscriptPage: ProviderServiceMethod<"readAgentTranscriptPage"> = Effect.fn(
+    "ProviderService.readAgentTranscriptPage",
+  )(function* (input) {
+    const routed = yield* resolveRoutableSession({
+      threadId: input.threadId,
+      operation: "ProviderService.readAgentTranscriptPage",
+      allowRecovery: false,
+    }).pipe(Effect.result);
+    if (routed._tag === "Failure" || !routed.success.isActive) return undefined;
+    const read = routed.success.adapter.readAgentTranscriptPage;
+    if (!read) return undefined;
+    return yield* read(
+      input.threadId,
+      input.agentKey,
+      input.sourceCursor,
+      Math.min(100, Math.max(1, input.limit)),
+    );
   });
 
   const compactThread: ProviderServiceMethod<"compactThread"> = Effect.fn("compactThread")(
@@ -3325,11 +3368,16 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "provider.thread_id": input.threadId,
           "provider.request_id": input.requestId,
         });
-        yield* routed.adapter.respondToRequest(routed.threadId, input.requestId, input.decision);
+        const response = yield* routed.adapter.respondToRequest(
+          routed.threadId,
+          input.requestId,
+          input.decision,
+        );
         yield* analytics.record("provider.request.responded", {
           provider: routed.adapter.provider,
           decision: input.decision,
         });
+        return response;
       }).pipe(
         withMetrics({
           counter: providerTurnsTotal,
@@ -3364,11 +3412,46 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         "provider.thread_id": input.threadId,
         "provider.request_id": input.requestId,
       });
+      const resolution =
+        input.resolution ??
+        (input.answers === undefined
+          ? undefined
+          : { type: "answered" as const, answers: input.answers });
+      if (!resolution) {
+        return yield* new ProviderValidationError({
+          operation: "ProviderService.respondToUserInput",
+          issue: "A user-input resolution is required.",
+        });
+      }
+      if (resolution.type === "cancelled") {
+        if (!routed.adapter.cancelUserInput) {
+          return {
+            nativeStatus: "unsupported" as const,
+            requestId: input.requestId,
+          };
+        }
+        return yield* routed.adapter.cancelUserInput(routed.threadId, input.requestId);
+      }
+
       const answers = yield* appendUserInputAttachmentPaths({
         ...input,
+        answers: input.answers ?? resolution.answers,
         attachmentsDir: serverConfig.attachmentsDir,
       }).pipe(Effect.provideService(FileSystem.FileSystem, fileSystem));
+      const enrichedResolution = { ...resolution, answers };
+      if (routed.adapter.resolveUserInput) {
+        return yield* routed.adapter.resolveUserInput(
+          routed.threadId,
+          input.requestId,
+          enrichedResolution,
+          input.attachmentsByQuestionId,
+        );
+      }
       yield* routed.adapter.respondToUserInput(routed.threadId, input.requestId, answers);
+      return {
+        nativeStatus: "answered" as const,
+        requestId: input.requestId,
+      };
     }).pipe(
       withMetrics({
         counter: providerTurnsTotal,
@@ -3841,6 +3924,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     messageAgent,
     stopAgent,
     getAgentCapabilities,
+    readAgentTranscriptPage,
     compactThread,
     interruptTurn,
     respondToRequest,

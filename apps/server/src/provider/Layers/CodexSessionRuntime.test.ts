@@ -23,6 +23,8 @@ import {
   readCodexThread,
   rollbackCodexThread,
   routeCodexChildNotification,
+  toCodexMcpElicitationAnswer,
+  toCodexMcpElicitationUserInput,
   toMcpElicitationResponse,
 } from "./CodexSessionRuntime.ts";
 const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequestError);
@@ -410,30 +412,30 @@ describe("buildTurnStartParams", () => {
     }),
   );
 
-  it("omits collaboration mode when interaction mode is absent", () => {
-    const params = Effect.runSync(
-      buildTurnStartParams({
+  it.effect("omits collaboration mode when interaction mode is absent", () =>
+    Effect.gen(function* () {
+      const params = yield* buildTurnStartParams({
         threadId: "provider-thread-1",
         runtimeMode: "approval-required",
         prompt: "Review",
-      }),
-    );
+      });
 
-    NodeAssert.deepStrictEqual(params, {
-      threadId: "provider-thread-1",
-      approvalPolicy: "untrusted",
-      approvalsReviewer: "user",
-      sandboxPolicy: {
-        type: "readOnly",
-      },
-      input: [
-        {
-          type: "text",
-          text: "Review",
+      NodeAssert.deepStrictEqual(params, {
+        threadId: "provider-thread-1",
+        approvalPolicy: "untrusted",
+        approvalsReviewer: "user",
+        sandboxPolicy: {
+          type: "readOnly",
         },
-      ],
-    });
-  });
+        input: [
+          {
+            type: "text",
+            text: "Review",
+          },
+        ],
+      });
+    }),
+  );
 });
 
 describe("Codex MCP elicitation approvals", () => {
@@ -596,6 +598,47 @@ describe("Codex MCP elicitation approvals", () => {
     NodeAssert.deepStrictEqual(toMcpElicitationResponse(inputRequest, "accept"), {
       action: "decline",
     });
+    NodeAssert.deepStrictEqual(toCodexMcpElicitationUserInput(inputRequest), {
+      questions: [
+        {
+          id: "email",
+          header: "email",
+          question: "Allow ChatGPT to use Safari?",
+          options: [],
+          allowCustomAnswer: true,
+          multiSelect: false,
+        },
+      ],
+      requiredQuestionIds: ["email"],
+    });
+    NodeAssert.deepStrictEqual(toCodexMcpElicitationAnswer(inputRequest, { email: "" }), {
+      action: "accept",
+      content: { email: "" },
+    });
+    NodeAssert.deepStrictEqual(toCodexMcpElicitationAnswer(inputRequest, {}), {
+      action: "decline",
+    });
+  });
+
+  it("keeps approval choice forms on the approval path", () => {
+    NodeAssert.equal(toCodexMcpElicitationUserInput(request), undefined);
+  });
+
+  it("omits explicitly skipped optional form fields without inventing an empty answer", () => {
+    const optionalRequest = {
+      ...request,
+      requestedSchema: {
+        type: "object",
+        properties: {
+          note: { type: "string", title: "Optional note" },
+        },
+      },
+    } satisfies EffectCodexSchema.McpServerElicitationRequestParams;
+
+    NodeAssert.deepStrictEqual(
+      toCodexMcpElicitationAnswer(optionalRequest, { note: { answers: [] } }),
+      { action: "accept", content: {} },
+    );
   });
 
   it("does not approve URL elicitations without opening their requested URL", () => {

@@ -30,6 +30,7 @@ import * as ThreadBackgroundLiveness from "../ThreadBackgroundLiveness.ts";
 import * as ThreadPlanProgress from "../ThreadPlanProgress.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
 import { encodeThreadDetailPageCursor } from "../threadDetailCursor.ts";
+import { decodeAgentTranscriptCursor } from "../agentTranscriptCursor.ts";
 import { projectThreadDetailSnapshot } from "../ActivityPayloadProjection.ts";
 import { makeSqlStatementCounter } from "../../../integration/SqlStatementCounter.integration.ts";
 
@@ -2690,6 +2691,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
         },
       ] as const;
       for (const activity of activities) {
+        const createdAt = `2026-09-01T00:00:00.${String(activity.sequence).padStart(3, "0")}Z`;
         yield* sql`
           INSERT INTO projection_thread_activities (
             activity_id, thread_id, turn_id, tone, kind, summary, payload_json,
@@ -2697,7 +2699,7 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
           ) VALUES (
             ${activity.id}, 'thread-w', NULL, 'info', ${activity.kind}, ${activity.summary},
             ${encodeUnknownJson(activity.payload)}, NULL, ${agentKey}, ${activity.sequence}, ${activity.sequence},
-            '2026-09-01T00:00:00.000Z'
+            ${createdAt}
           )
         `;
         yield* sql`
@@ -2832,6 +2834,226 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
         assert.equal(page.value.agent.capabilities.transcript.state, "unverified");
         assert.equal(page.value.completeness.state, "unavailable");
       }
+    }),
+  );
+
+  it.effect("folds transcript revisions before native-order keyset paging", () =>
+    Effect.gen(function* () {
+      yield* seedFanOutThread();
+      const sql = yield* SqlClient.SqlClient;
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const getAgentTranscriptPage = snapshotQuery.getAgentTranscriptPage;
+      assert.ok(getAgentTranscriptPage);
+      const agentKey = RuntimeAgentKey.make("agent-native-revisions");
+      const revisions = [
+        {
+          id: "native-a-revision-old",
+          sequence: 10,
+          nativeEntryId: "native-a",
+          providerOrderKey: "001",
+          content: "old revision",
+        },
+        {
+          id: "native-b",
+          sequence: 11,
+          nativeEntryId: "native-b",
+          providerOrderKey: "002",
+          content: "middle message",
+        },
+        {
+          id: "native-c",
+          sequence: 12,
+          nativeEntryId: "native-c",
+          providerOrderKey: "003",
+          content: "latest message",
+        },
+        {
+          id: "native-a-revision-new",
+          sequence: 100,
+          nativeEntryId: "native-a",
+          providerOrderKey: "001",
+          content: "revised oldest message",
+        },
+      ] as const;
+      for (const revision of revisions) {
+        yield* sql`
+          INSERT INTO projection_thread_activities (
+            activity_id, thread_id, turn_id, tone, kind, summary, payload_json,
+            sequence, agent_key, event_sequence, first_event_sequence, created_at
+          ) VALUES (
+            ${revision.id}, 'thread-w', NULL, 'info', 'agent.transcript.message',
+            ${revision.content},
+            ${encodeUnknownJson({
+              agentKey,
+              role: "assistant",
+              content: revision.content,
+              nativeEntryId: revision.nativeEntryId,
+              providerOrderKey: revision.providerOrderKey,
+            })},
+            NULL, ${agentKey}, ${revision.sequence}, ${revision.sequence},
+            '2026-09-01T00:00:00.000Z'
+          )
+        `;
+      }
+
+      const knownRevisions = snapshotQuery.getAgentTranscriptNativeRevisions;
+      assert.ok(knownRevisions);
+      assert.deepEqual(
+        yield* knownRevisions({
+          threadId: threadW,
+          agentKey,
+          nativeEntryIds: ["native-a"],
+        }),
+        [
+          {
+            nativeEntryId: "native-a",
+            providerOrderKey: "001",
+            eventSequence: 100,
+            content: "revised oldest message",
+          },
+        ],
+      );
+
+      const firstPage = yield* getAgentTranscriptPage({ threadId: threadW, agentKey, limit: 2 });
+      assert.equal(firstPage._tag, "Some");
+      if (firstPage._tag === "None") return;
+      assert.deepEqual(
+        firstPage.value.entries.map((entry) => [entry.nativeEntryId, entry.providerOrderKey]),
+        [
+          ["native-b", "002"],
+          ["native-c", "003"],
+        ],
+      );
+      assert.equal(firstPage.value.hasMore, true);
+      assert.ok(firstPage.value.nextCursor);
+      assert.deepEqual(
+        decodeAgentTranscriptCursor(firstPage.value.nextCursor!, threadW, agentKey),
+        { beforeProviderOrderKey: "002", beforeNativeEntryId: "native-b" },
+      );
+
+      const olderPage = yield* getAgentTranscriptPage({
+        threadId: threadW,
+        agentKey,
+        cursor: firstPage.value.nextCursor ?? undefined,
+        limit: 2,
+      });
+      assert.equal(olderPage._tag, "Some");
+      if (olderPage._tag === "Some") {
+        assert.equal(olderPage.value.entries.length, 1);
+        assert.equal(olderPage.value.entries[0]?.nativeEntryId, "native-a");
+        assert.equal(olderPage.value.entries[0]?.providerOrderKey, "001");
+        assert.equal(olderPage.value.entries[0]?.content, "revised oldest message");
+        assert.equal(olderPage.value.entries[0]?.eventSequence, 100);
+        assert.equal(olderPage.value.hasMore, false);
+      }
+    }),
+  );
+
+  it.effect("keeps OpenCode text parts in provider timestamp order across two-digit IDs", () =>
+    Effect.gen(function* () {
+      yield* seedFanOutThread();
+      const sql = yield* SqlClient.SqlClient;
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const getAgentTranscriptPage = snapshotQuery.getAgentTranscriptPage;
+      assert.ok(getAgentTranscriptPage);
+      const agentKey = RuntimeAgentKey.make("agent-opencode-part-order");
+
+      for (const index of [0, 1, 10, 2, 3, 4, 5, 6, 7, 8, 9, 11]) {
+        const providerOrderKey = `2026-09-01T00:00:${String(index).padStart(2, "0")}.000Z`;
+        yield* sql`
+          INSERT INTO projection_thread_activities (
+            activity_id, thread_id, turn_id, tone, kind, summary, payload_json,
+            sequence, agent_key, event_sequence, first_event_sequence, created_at
+          ) VALUES (
+            ${`opencode-part-event-${index}`}, 'thread-w', NULL, 'info',
+            'agent.transcript.message', ${`block ${index}`},
+            ${encodeUnknownJson({
+              agentKey,
+              role: "assistant",
+              content: `block-${index}`,
+              nativeEntryId: `opencode:${agentKey}:part-text-${index}`,
+              providerOrderKey,
+            })},
+            NULL, ${agentKey}, ${index + 1}, ${index + 1}, ${providerOrderKey}
+          )
+        `;
+      }
+
+      const page = yield* getAgentTranscriptPage({ threadId: threadW, agentKey, limit: 20 });
+      assert.equal(page._tag, "Some");
+      if (page._tag === "Some") {
+        assert.deepEqual(
+          page.value.entries.map((entry) => entry.nativeEntryId),
+          Array.from({ length: 12 }, (_, index) => `opencode:${agentKey}:part-text-${index}`),
+        );
+        assert.deepEqual(
+          page.value.entries.map((entry) => entry.content),
+          Array.from({ length: 12 }, (_, index) => `block-${index}`),
+        );
+      }
+    }),
+  );
+
+  it.effect("returns only the latest pending handoff with its child and generation", () =>
+    Effect.gen(function* () {
+      yield* seedFanOutThread();
+      const sql = yield* SqlClient.SqlClient;
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const listPendingHandoffs = snapshotQuery.listPendingAgentHandoffs;
+      assert.ok(listPendingHandoffs);
+      const agentKey = RuntimeAgentKey.make("agent-handoff-pending");
+      const rows = [
+        {
+          id: "handoff-replaced-pending",
+          requestId: "request-replaced",
+          sequence: 110,
+          handoffStatus: "pending",
+        },
+        {
+          id: "handoff-replaced-recorded",
+          requestId: "request-replaced",
+          sequence: 111,
+          handoffStatus: "recorded",
+        },
+        {
+          id: "handoff-still-pending",
+          requestId: "request-pending",
+          sequence: 112,
+          handoffStatus: "pending",
+        },
+      ] as const;
+      for (const row of rows) {
+        yield* sql`
+          INSERT INTO projection_thread_activities (
+            activity_id, thread_id, turn_id, tone, kind, summary, payload_json,
+            sequence, agent_key, event_sequence, first_event_sequence, created_at
+          ) VALUES (
+            ${row.id}, 'thread-w', NULL, 'info', 'approval.handoff', 'Approval handoff',
+            ${encodeUnknownJson({
+              requestId: row.requestId,
+              handoffStatus: row.handoffStatus,
+              nativeRequestId: `native-${row.requestId}`,
+              agentKey,
+              sessionGeneration: "generation-7",
+            })},
+            NULL, ${agentKey}, ${row.sequence}, ${row.sequence},
+            '2026-09-01T00:00:00.000Z'
+          )
+        `;
+      }
+
+      assert.deepEqual(yield* listPendingHandoffs(), [
+        {
+          threadId: threadW,
+          activityId: asEventId("handoff-still-pending"),
+          createdAt: "2026-09-01T00:00:00.000Z",
+          kind: "approval.handoff",
+          requestId: "request-pending",
+          nativeRequestId: "native-request-pending",
+          agentKey,
+          sessionGeneration: "generation-7",
+        },
+      ]);
     }),
   );
 

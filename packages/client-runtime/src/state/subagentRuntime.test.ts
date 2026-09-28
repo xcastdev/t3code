@@ -476,6 +476,7 @@ describe("agent transcript merge", () => {
       return {
         id: EventId.make(`transcript-${eventSequence}`),
         eventSequence,
+        providerOrderKey: `transcript:${String(eventSequence).padStart(12, "0")}`,
         createdAt: `2026-08-01T10:00:${String(eventSequence % 60).padStart(2, "0")}.000Z`,
         kind: "message" as const,
         role: "assistant" as const,
@@ -608,6 +609,93 @@ describe("agent transcript merge", () => {
     ]);
   });
 
+  it("merges revisions by native identity and keeps provider chronology during live extension", () => {
+    const selected = RuntimeAgentKey.make("child-native-revision");
+    const oldRevision: OrchestrationAgentTranscriptEntry = {
+      id: EventId.make("revision-old-event"),
+      eventSequence: 10,
+      nativeEntryId: "provider-message-a:block-0",
+      providerOrderKey: "001",
+      createdAt: "2026-08-01T10:00:00.000Z",
+      kind: "message",
+      role: "assistant",
+      summary: "partial answer",
+      content: "The answer is",
+    };
+    const nextChronologically: OrchestrationAgentTranscriptEntry = {
+      id: EventId.make("later-message-event"),
+      eventSequence: 11,
+      nativeEntryId: "provider-message-b:block-0",
+      providerOrderKey: "002",
+      createdAt: "2026-08-01T10:00:01.000Z",
+      kind: "message",
+      role: "assistant",
+      summary: "second answer",
+      content: "Second message",
+    };
+    const revision = {
+      ...oldRevision,
+      id: EventId.make("revision-new-event"),
+      eventSequence: 100,
+      summary: "complete answer",
+      content: "The answer is complete.",
+    };
+
+    const live = agentTranscriptEntriesFromActivities(
+      [
+        {
+          ...activity("agent.transcript.message", {
+            agentKey: selected,
+            nativeEntryId: revision.nativeEntryId,
+            providerOrderKey: revision.providerOrderKey,
+            role: "assistant",
+            content: revision.content,
+          }),
+          eventSequence: 101,
+        },
+      ],
+      selected,
+    );
+    const merged = mergeAgentTranscriptEntries(
+      [oldRevision, nextChronologically],
+      [revision, ...live],
+    );
+
+    expect(merged).toHaveLength(2);
+    expect(merged[0]).toMatchObject({
+      nativeEntryId: "provider-message-a:block-0",
+      providerOrderKey: "001",
+      eventSequence: 101,
+      content: "The answer is complete.",
+    });
+    expect(merged[1]).toMatchObject({
+      nativeEntryId: "provider-message-b:block-0",
+      providerOrderKey: "002",
+      content: "Second message",
+    });
+  });
+
+  it("sorts OpenCode text parts by native timestamps instead of numeric-looking IDs", () => {
+    const observed = [0, 1, 10, 2, 3, 4, 5, 6, 7, 8, 9, 11].map((index) => {
+      const providerOrderKey = `2026-09-01T00:00:${String(index).padStart(2, "0")}.000Z`;
+      return {
+        id: EventId.make(`opencode-part-event-${index}`),
+        eventSequence: index + 1,
+        nativeEntryId: `opencode:child:part-text-${index}`,
+        providerOrderKey,
+        createdAt: providerOrderKey,
+        kind: "message" as const,
+        role: "assistant" as const,
+        summary: `block ${index}`,
+        content: `block-${index}`,
+      };
+    });
+
+    expect(mergeAgentTranscriptEntries([], observed).map((entry) => entry.content)).toEqual(
+      Array.from({ length: 12 }, (_, index) => `block-${index}`),
+    );
+  });
+
   it("projects only activities owned by the selected key and caps retained history", () => {
     const selected = RuntimeAgentKey.make("child-key-1");
     const other = RuntimeAgentKey.make("child-key-2");
@@ -734,6 +822,7 @@ describe("agent transcript merge", () => {
     const loaded = Array.from({ length: 500 }, (_, index) => ({
       id: EventId.make(`bridge-old-${index}`),
       eventSequence: index,
+      providerOrderKey: `bridge:${String(index).padStart(6, "0")}`,
       createdAt: "2026-08-01T10:00:00.000Z",
       kind: "status" as const,
       summary: `old ${index}`,
@@ -741,6 +830,7 @@ describe("agent transcript merge", () => {
     const recovered = Array.from({ length: 500 }, (_, index) => ({
       id: EventId.make(`bridge-gap-${index}`),
       eventSequence: 500 + index,
+      providerOrderKey: `bridge:${String(500 + index).padStart(6, "0")}`,
       createdAt: "2026-08-01T10:00:01.000Z",
       kind: "status" as const,
       summary: `gap ${index}`,
@@ -748,6 +838,7 @@ describe("agent transcript merge", () => {
     const newest = Array.from({ length: 50 }, (_, index) => ({
       id: EventId.make(`bridge-new-${index}`),
       eventSequence: 1_000 + index,
+      providerOrderKey: `bridge:${String(1_000 + index).padStart(6, "0")}`,
       createdAt: "2026-08-01T10:00:02.000Z",
       kind: "status" as const,
       summary: `new ${index}`,

@@ -5,6 +5,7 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderRuntimeEvent,
+  type ProviderUserInputResponseResult,
   type ProviderSendTurnInput,
   type ProviderSession,
   RuntimeItemId,
@@ -61,6 +62,7 @@ import {
 } from "../Errors.ts";
 import { buildRuntimeInstructions } from "../RuntimeInstructions.ts";
 import { type OpenCodeAdapterShape } from "../Services/OpenCodeAdapter.ts";
+import type { ProviderAgentTranscriptItem } from "../Services/ProviderAdapter.ts";
 import {
   projectMcpNativeKey,
   type ProviderAdapterSessionStartInput,
@@ -367,6 +369,57 @@ type OpenCodeTextPartState = Pick<OpenCodeTextPart, "id" | "messageID" | "type" 
   agentTitle?: string;
 };
 
+const OPENCODE_TRANSCRIPT_MAX_BLOCKS = 128;
+const OPENCODE_TRANSCRIPT_MAX_ENTRY_BYTES = 65_536;
+const OPENCODE_TRANSCRIPT_MAX_PAGE_BYTES = 512 * 1024;
+
+type OpenCodeTranscriptCursor = {
+  readonly providerCursor?: string;
+  readonly itemIndex: number;
+  readonly partIndex: number;
+};
+
+function decodeOpenCodeTranscriptCursor(cursor: string | undefined): OpenCodeTranscriptCursor {
+  const empty = { itemIndex: 0, partIndex: 0 };
+  if (!cursor?.startsWith("opencode-transcript-v1:")) {
+    return cursor === undefined ? empty : { ...empty, providerCursor: cursor };
+  }
+  try {
+    const value: unknown = JSON.parse(
+      Buffer.from(cursor.slice("opencode-transcript-v1:".length), "base64url").toString("utf8"),
+    );
+    if (
+      typeof value === "object" &&
+      value !== null &&
+      "itemIndex" in value &&
+      typeof value.itemIndex === "number" &&
+      Number.isSafeInteger(value.itemIndex) &&
+      value.itemIndex >= 0 &&
+      "partIndex" in value &&
+      typeof value.partIndex === "number" &&
+      Number.isSafeInteger(value.partIndex) &&
+      value.partIndex >= 0 &&
+      (!("providerCursor" in value) || typeof value.providerCursor === "string")
+    ) {
+      return value as OpenCodeTranscriptCursor;
+    }
+  } catch {
+    // An old opaque provider cursor remains a valid provider cursor.
+  }
+  return { ...empty, providerCursor: cursor };
+}
+
+function encodeOpenCodeTranscriptCursor(cursor: OpenCodeTranscriptCursor): string {
+  return `opencode-transcript-v1:${Buffer.from(JSON.stringify(cursor)).toString("base64url")}`;
+}
+
+function boundOpenCodeTranscriptText(text: string): string {
+  const bytes = Buffer.from(text, "utf8");
+  return bytes.byteLength <= OPENCODE_TRANSCRIPT_MAX_ENTRY_BYTES
+    ? text
+    : new TextDecoder().decode(bytes.subarray(0, OPENCODE_TRANSCRIPT_MAX_ENTRY_BYTES));
+}
+
 type OpenCodeStepUsage = Pick<Extract<Part, { readonly type: "step-finish" }>, "id" | "tokens">;
 
 interface OpenCodeSessionContext {
@@ -376,6 +429,7 @@ interface OpenCodeSessionContext {
   readonly client: OpencodeClient;
   readonly server: OpenCodeServerConnection;
   readonly approvalBridge?: OpenCodeApprovalBridge;
+  readonly generationId: string;
   readonly directory: string;
   readonly managedSkillRoot?: string;
   openCodeSessionId: string;
@@ -400,6 +454,8 @@ interface OpenCodeSessionContext {
   readonly requestRelationRetries: Map<string, OpenCodeRequestRelationRetry>;
   readonly pendingPermissions: Map<string, PermissionRequest>;
   readonly pendingQuestions: Map<string, QuestionRequest>;
+  readonly resolvingQuestionIds: Set<string>;
+  readonly userInputResolutionByPublicId: Map<string, ProviderUserInputResponseResult>;
   readonly messageRoleById: Map<string, "user" | "assistant">;
   // OpenCode permits edits to completed parts. Keep text for snapshot comparison
   // until native removal or session teardown, but do not retain other part payloads.
@@ -585,6 +641,10 @@ type EventBaseInput = {
   readonly turnId?: TurnId | undefined;
   readonly itemId?: string | undefined;
   readonly requestId?: string | undefined;
+  readonly nativeRequestId?: string | undefined;
+  readonly sessionGeneration?: string | undefined;
+  readonly nativeEntryId?: string | undefined;
+  readonly providerOrderKey?: string | undefined;
   readonly agentKey?: RuntimeAgentKey | undefined;
   readonly parentAgentKey?: RuntimeAgentKey | undefined;
   readonly agentTitle?: string | undefined;
@@ -1497,6 +1557,10 @@ export function makeOpenCodeAdapter(
           ...(input.turnId ? { turnId: input.turnId } : {}),
           ...(input.itemId ? { itemId: RuntimeItemId.make(input.itemId) } : {}),
           ...(input.requestId ? { requestId: RuntimeRequestId.make(input.requestId) } : {}),
+          ...(input.nativeRequestId ? { nativeRequestId: input.nativeRequestId } : {}),
+          ...(input.sessionGeneration ? { sessionGeneration: input.sessionGeneration } : {}),
+          ...(input.nativeEntryId ? { nativeEntryId: input.nativeEntryId } : {}),
+          ...(input.providerOrderKey ? { providerOrderKey: input.providerOrderKey } : {}),
           ...(input.agentKey ? { agentKey: input.agentKey } : {}),
           ...(input.parentAgentKey ? { parentAgentKey: input.parentAgentKey } : {}),
           ...(input.agentTitle ? { agentTitle: input.agentTitle } : {}),
@@ -2087,12 +2151,17 @@ export function makeOpenCodeAdapter(
       const { latestText, deltaToEmit } = mergeOpenCodeAssistantText(part.emittedText, part.text);
       part.emittedText = latestText;
       part.text = latestText;
+      const providerOrderKey = part.time ? isoFromEpochMs(part.time.start) : undefined;
+      const nativeEntryId =
+        part.agentKey !== undefined ? `opencode:${part.agentKey}:${part.id}` : undefined;
       if (deltaToEmit.length > 0) {
         yield* emit({
           ...(yield* buildEventBase({
             threadId: context.session.threadId,
             turnId,
             itemId: part.id,
+            ...(nativeEntryId ? { nativeEntryId } : {}),
+            ...(providerOrderKey ? { providerOrderKey } : {}),
             agentKey: part.agentKey,
             agentTitle: part.agentTitle,
             createdAt: part.time !== undefined ? isoFromEpochMs(part.time.start) : undefined,
@@ -2113,6 +2182,7 @@ export function makeOpenCodeAdapter(
             threadId: context.session.threadId,
             turnId,
             itemId: part.id,
+            ...(nativeEntryId && providerOrderKey ? { nativeEntryId, providerOrderKey } : {}),
             agentKey: part.agentKey,
             agentTitle: part.agentTitle,
             createdAt: isoFromEpochMs(part.time.end),
@@ -2309,7 +2379,7 @@ export function makeOpenCodeAdapter(
         );
       return {
         message: "supported" as const,
-        answerRequests: hasPendingChildRequest ? ("supported" as const) : ("unverified" as const),
+        answerRequests: hasPendingChildRequest ? ("unverified" as const) : ("unsupported" as const),
         stop:
           status?.type === "busy" || status?.type === "retry"
             ? ("supported" as const)
@@ -2318,6 +2388,177 @@ export function makeOpenCodeAdapter(
               : ("unverified" as const),
       };
     });
+
+    const readAgentTranscriptPage: NonNullable<OpenCodeAdapterShape["readAgentTranscriptPage"]> =
+      Effect.fn("readAgentTranscriptPage")(function* (threadId, agentKey, sourceCursor, limit) {
+        const { context, sessionId } = yield* nativeChildForAgent(threadId, agentKey);
+        const cursor = decodeOpenCodeTranscriptCursor(sourceCursor);
+        const response = yield* runOpenCodeSdk("v2.session.messages", (signal) =>
+          context.client.v2.session.messages(
+            {
+              sessionID: sessionId,
+              directory: context.directory,
+              limit: Math.max(1, Math.min(limit, 50)),
+              ...(cursor.providerCursor === undefined
+                ? { order: "asc" as const }
+                : { cursor: cursor.providerCursor }),
+            },
+            { signal },
+          ),
+        ).pipe(
+          Effect.mapError(toRequestError),
+          Effect.timeoutOrElse({
+            duration: "8 seconds",
+            orElse: () =>
+              Effect.fail(
+                toRequestError(
+                  new OpenCodeRuntimeError({
+                    operation: "v2.session.messages",
+                    detail: "OpenCode child transcript read exceeded the bounded read time.",
+                  }),
+                ),
+              ),
+          }),
+        );
+        yield* assertCurrentChildHandle(threadId, context, agentKey, sessionId);
+        const items = response.data?.items ?? [];
+        const assistantDetails = yield* Effect.all(
+          items.map((message, index) =>
+            index < cursor.itemIndex || message.type !== "assistant"
+              ? Effect.succeed(undefined)
+              : runOpenCodeSdk("session.message", (signal) =>
+                  context.client.session.message(
+                    {
+                      sessionID: sessionId,
+                      messageID: message.id,
+                    },
+                    { signal },
+                  ),
+                ).pipe(Effect.mapError(toRequestError)),
+          ),
+          { concurrency: 4 },
+        ).pipe(
+          Effect.timeoutOrElse({
+            duration: "8 seconds",
+            orElse: () =>
+              Effect.fail(
+                toRequestError(
+                  new OpenCodeRuntimeError({
+                    operation: "session.message",
+                    detail: "OpenCode child transcript details exceeded the bounded read time.",
+                  }),
+                ),
+              ),
+          }),
+        );
+        yield* assertCurrentChildHandle(threadId, context, agentKey, sessionId);
+        const entries: ProviderAgentTranscriptItem[] = [];
+        let pageBytes = 0;
+        let resumeItemIndex: number | undefined;
+        let resumePartIndex: number | undefined;
+        outer: for (const [messageIndex, message] of items.entries()) {
+          if (messageIndex < cursor.itemIndex) continue;
+          if (message.time.created === undefined) continue;
+          const createdAt = isoFromEpochMs(message.time.created);
+          if (createdAt === undefined) continue;
+          const firstPartIndex = messageIndex === cursor.itemIndex ? cursor.partIndex : 0;
+          if (message.type === "user") {
+            if (firstPartIndex > 0) continue;
+            if (message.text.length === 0) continue;
+            if (entries.length >= OPENCODE_TRANSCRIPT_MAX_BLOCKS) {
+              resumeItemIndex = messageIndex;
+              resumePartIndex = 0;
+              break;
+            }
+            const content = boundOpenCodeTranscriptText(message.text);
+            const contentBytes = Buffer.byteLength(content, "utf8");
+            if (
+              pageBytes + contentBytes > OPENCODE_TRANSCRIPT_MAX_PAGE_BYTES &&
+              entries.length > 0
+            ) {
+              resumeItemIndex = messageIndex;
+              resumePartIndex = 0;
+              break;
+            }
+            entries.push({
+              nativeEntryId: `opencode:${sessionId}:${message.id}:user`,
+              providerOrderKey: createdAt,
+              createdAt,
+              role: "user",
+              content,
+              status: "completed",
+            });
+            pageBytes += contentBytes;
+            continue;
+          }
+          if (message.type !== "assistant") continue;
+          const detail = assistantDetails[messageIndex];
+          const nativeMessage = detail?.data;
+          if (nativeMessage === undefined || nativeMessage.info.id !== message.id) {
+            return yield* toRequestError(
+              new OpenCodeRuntimeError({
+                operation: "session.message",
+                detail: `OpenCode did not return child transcript details for message ${message.id}.`,
+              }),
+            );
+          }
+          for (const [index, part] of nativeMessage.parts.entries()) {
+            if (part.type !== "text") continue;
+            if (index < firstPartIndex) continue;
+            if (part.text.length === 0) continue;
+            if (entries.length >= OPENCODE_TRANSCRIPT_MAX_BLOCKS) {
+              resumeItemIndex = messageIndex;
+              resumePartIndex = index;
+              break outer;
+            }
+            const content = boundOpenCodeTranscriptText(part.text);
+            const contentBytes = Buffer.byteLength(content, "utf8");
+            if (
+              pageBytes + contentBytes > OPENCODE_TRANSCRIPT_MAX_PAGE_BYTES &&
+              entries.length > 0
+            ) {
+              resumeItemIndex = messageIndex;
+              resumePartIndex = index;
+              break outer;
+            }
+            const partTime = isoFromEpochMs(part.time?.start ?? message.time.created) ?? createdAt;
+            entries.push({
+              nativeEntryId: `opencode:${agentKey}:${part.id}`,
+              providerOrderKey: partTime,
+              createdAt: partTime,
+              role: "assistant",
+              content,
+              status: message.time.completed === undefined ? "running" : "completed",
+            });
+            pageBytes += contentBytes;
+          }
+        }
+        const nextSourceCursor = response.data?.cursor?.next;
+        const hasMore = resumeItemIndex !== undefined || nextSourceCursor !== undefined;
+        const nextCursor =
+          resumeItemIndex !== undefined
+            ? encodeOpenCodeTranscriptCursor({
+                ...(cursor.providerCursor === undefined
+                  ? {}
+                  : { providerCursor: cursor.providerCursor }),
+                itemIndex: resumeItemIndex,
+                partIndex: resumePartIndex ?? 0,
+              })
+            : nextSourceCursor === undefined
+              ? undefined
+              : encodeOpenCodeTranscriptCursor({
+                  providerCursor: nextSourceCursor,
+                  itemIndex: 0,
+                  partIndex: 0,
+                });
+        return {
+          entries,
+          ...(nextCursor ? { nextSourceCursor: nextCursor } : {}),
+          hasMore,
+          completeness: hasMore ? ("partial" as const) : ("complete" as const),
+          ...(hasMore ? { reason: "More native OpenCode child transcript pages remain." } : {}),
+        };
+      });
 
     const isRelatedOpenCodeSession = Effect.fn("isRelatedOpenCodeSession")(function* (
       context: OpenCodeSessionContext,
@@ -2412,6 +2653,8 @@ export function makeOpenCodeAdapter(
         threadId: context.session.threadId,
         turnId: context.activeTurnId,
         requestId: publicRequestId,
+        nativeRequestId: request.id,
+        sessionGeneration: context.generationId,
         ...(agentKey && context.agentTitleBySessionId.get(request.sessionID)
           ? { agentTitle: context.agentTitleBySessionId.get(request.sessionID) }
           : {}),
@@ -2524,6 +2767,8 @@ export function makeOpenCodeAdapter(
         threadId: context.session.threadId,
         turnId: context.activeTurnId,
         requestId: publicRequestId,
+        nativeRequestId: request.id,
+        sessionGeneration: context.generationId,
         ...(agentKey && context.agentTitleBySessionId.get(request.sessionID)
           ? { agentTitle: context.agentTitleBySessionId.get(request.sessionID) }
           : {}),
@@ -4099,6 +4344,7 @@ export function makeOpenCodeAdapter(
         });
 
         const createdAt = yield* nowIso;
+        const generationId = yield* randomUUIDv4;
         const session: ProviderSession = {
           provider: PROVIDER,
           providerInstanceId: boundInstanceId,
@@ -4125,6 +4371,7 @@ export function makeOpenCodeAdapter(
           client: started.client,
           server: started.server,
           ...(started.approvalBridge ? { approvalBridge: started.approvalBridge } : {}),
+          generationId,
           directory,
           ...(managedSkillPlan === undefined ? {} : { managedSkillRoot: managedSkillPlan.root }),
           openCodeSessionId: started.openCodeSession.id,
@@ -4147,6 +4394,8 @@ export function makeOpenCodeAdapter(
           requestRelationRetries: new Map(),
           pendingPermissions: new Map(),
           pendingQuestions: new Map(),
+          resolvingQuestionIds: new Set(),
+          userInputResolutionByPublicId: new Map(),
           textPartsByMessageId: new Map(),
           messageRoleById: new Map(),
           turnTokenUsage: undefined,
@@ -4919,37 +5168,37 @@ export function makeOpenCodeAdapter(
       const reply = toOpenCodePermissionReply(decision);
       const agentKey = context.agentKeyByRequestId.get(nativeRequestId);
       const parentSessionId = context.parentSessionIdBySessionId.get(request.sessionID);
-      if (
-        context.approvalBridge &&
-        agentKey &&
-        request.sessionID !== context.openCodeSessionId &&
-        context.relatedSessionIds.has(request.sessionID) &&
-        parentSessionId
-      ) {
-        yield* context.approvalBridge
-          .record({
-            parentSessionId,
-            childSessionId: request.sessionID,
-            requestId: nativeRequestId,
-            requestType: request.permission,
-            decision:
-              reply === "once"
-                ? "approvedOnce"
-                : reply === "always"
-                  ? "approvedForSession"
-                  : "denied",
-          })
-          .pipe(
-            Effect.mapError(
-              (cause) =>
-                new ProviderAdapterRequestError({
-                  provider: PROVIDER,
-                  method: "approval.history.record",
-                  detail: "OpenCode could not record the child permission choice.",
-                  cause,
-                }),
-            ),
-          );
+      let handoffStatus: "recorded" | "unavailable" | "failed" | "unknown" | undefined;
+      if (agentKey && request.sessionID !== context.openCodeSessionId) {
+        handoffStatus =
+          !context.approvalBridge ||
+          !parentSessionId ||
+          !context.relatedSessionIds.has(parentSessionId)
+            ? "unavailable"
+            : yield* Effect.exit(
+                context.approvalBridge
+                  .record({
+                    parentSessionId,
+                    childSessionId: request.sessionID,
+                    requestId: nativeRequestId,
+                    requestType: request.permission,
+                    decision:
+                      reply === "once"
+                        ? "approvedOnce"
+                        : reply === "always"
+                          ? "approvedForSession"
+                          : "denied",
+                  })
+                  .pipe(Effect.timeoutOption("2 seconds")),
+              ).pipe(
+                Effect.map((exit) =>
+                  Exit.isFailure(exit)
+                    ? ("failed" as const)
+                    : Option.isNone(exit.value)
+                      ? ("unknown" as const)
+                      : ("recorded" as const),
+                ),
+              );
       }
       yield* runOpenCodeSdk("permission.reply", (signal) =>
         context.client.permission.reply(
@@ -4987,65 +5236,182 @@ export function makeOpenCodeAdapter(
         },
         { type: "permission.reply", requestID: nativeRequestId, reply },
       );
+      return {
+        nativeStatus: "responded",
+        requestId,
+        nativeRequestId,
+        ...(agentKey ? { agentKey } : {}),
+        sessionGeneration: context.generationId,
+        ...(handoffStatus ? { handoffStatus } : {}),
+      } as const;
     });
 
-    const respondToUserInput: OpenCodeAdapterShape["respondToUserInput"] = Effect.fn(
-      "respondToUserInput",
-    )(function* (threadId, requestId, answers) {
-      const context = yield* ensureSessionContext(sessions, threadId);
-      if (context.resolvedPublicRequestIds.has(requestId)) return;
-      const nativeRequestId = nativeRequestIdForOpenCodeRequest(context, requestId);
-      const request = context.pendingQuestions.get(nativeRequestId);
-      if (!request) {
-        if (context.emittedTerminalRequestIds.has(nativeRequestId)) return;
-        return yield* new ProviderAdapterRequestError({
-          provider: PROVIDER,
-          method: "question.reply",
-          detail:
-            context.pendingRequestRecovery || context.requestRelationRetries.has(requestId)
-              ? "OpenCode is still loading this question. Try again."
-              : `Unknown pending user-input request: ${requestId}`,
-        });
-      }
+    const resolveUserInput: NonNullable<OpenCodeAdapterShape["resolveUserInput"]> = (
+      threadId,
+      requestId,
+      resolution,
+    ) =>
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          const context = yield* ensureSessionContext(sessions, threadId);
+          const previous = context.userInputResolutionByPublicId.get(requestId);
+          if (previous) return previous;
+          if (resolution.type === "cancelled") {
+            return { nativeStatus: "unsupported", requestId } as const;
+          }
+          const nativeRequestId = nativeRequestIdForOpenCodeRequest(context, requestId);
+          const request = context.pendingQuestions.get(nativeRequestId);
+          if (!request) {
+            if (context.resolvingQuestionIds.has(nativeRequestId)) {
+              return {
+                nativeStatus: "unknown",
+                handoffStatus: "unknown",
+                requestId,
+                nativeRequestId,
+                ...(context.agentKeyByRequestId.get(nativeRequestId)
+                  ? { agentKey: context.agentKeyByRequestId.get(nativeRequestId)! }
+                  : {}),
+                sessionGeneration: context.generationId,
+              } as const;
+            }
+            if (context.emittedTerminalRequestIds.has(nativeRequestId)) {
+              return { nativeStatus: "unknown", requestId, nativeRequestId } as const;
+            }
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "question.reply",
+              detail:
+                context.pendingRequestRecovery || context.requestRelationRetries.has(requestId)
+                  ? "OpenCode is still loading this question. Try again."
+                  : `Unknown pending user-input request: ${requestId}`,
+            });
+          }
+          if (context.resolvingQuestionIds.has(nativeRequestId)) {
+            return {
+              nativeStatus: "unknown",
+              handoffStatus: "unknown",
+              requestId,
+              nativeRequestId,
+              ...(context.agentKeyByRequestId.get(nativeRequestId)
+                ? { agentKey: context.agentKeyByRequestId.get(nativeRequestId)! }
+                : {}),
+              sessionGeneration: context.generationId,
+            } as const;
+          }
+          context.resolvingQuestionIds.add(nativeRequestId);
+          let questionAnswers: ReturnType<typeof toOpenCodeQuestionAnswers>;
+          try {
+            questionAnswers = toOpenCodeQuestionAnswers(
+              request,
+              resolution.answers,
+              resolution.skippedQuestionIds ?? [],
+            );
+          } catch (cause) {
+            return yield* new ProviderAdapterRequestError({
+              provider: PROVIDER,
+              method: "question.reply",
+              detail: cause instanceof Error ? cause.message : "Invalid OpenCode question answers.",
+              cause,
+            });
+          }
+          const agentKey = context.agentKeyByRequestId.get(nativeRequestId);
+          const parentSessionId = context.parentSessionIdBySessionId.get(request.sessionID);
+          const handoffStatus = agentKey
+            ? !parentSessionId ||
+              !context.relatedSessionIds.has(parentSessionId) ||
+              !context.approvalBridge
+              ? ("unavailable" as const)
+              : yield* Effect.exit(
+                  context.approvalBridge
+                    .recordQuestionResolution({
+                      parentSessionId,
+                      childSessionId: request.sessionID,
+                      requestId,
+                      nativeRequestId,
+                      resolution,
+                    })
+                    .pipe(Effect.timeoutOption("2 seconds")),
+                ).pipe(
+                  Effect.map((exit) =>
+                    Exit.isFailure(exit)
+                      ? ("failed" as const)
+                      : Option.isNone(exit.value)
+                        ? ("unknown" as const)
+                        : ("recorded" as const),
+                  ),
+                )
+            : undefined;
 
-      const questionAnswers = toOpenCodeQuestionAnswers(request, answers);
-      yield* runOpenCodeSdk("question.reply", (signal) =>
-        context.client.question.reply(
-          {
-            requestID: nativeRequestId,
-            answers: questionAnswers,
-          },
-          { signal },
-        ),
-      ).pipe(
-        Effect.mapError(toRequestError),
-        Effect.timeoutOrElse({
-          duration: "10 seconds",
-          orElse: () =>
-            Effect.fail(
-              new ProviderAdapterRequestError({
-                provider: PROVIDER,
-                method: "question.reply",
-                detail: "OpenCode question reply did not complete within 10 seconds.",
-              }),
+          yield* runOpenCodeSdk("question.reply", (signal) =>
+            context.client.question.reply(
+              {
+                requestID: nativeRequestId,
+                answers: questionAnswers,
+              },
+              { signal },
             ),
-        }),
+          ).pipe(
+            Effect.mapError(toRequestError),
+            Effect.timeoutOrElse({
+              duration: "10 seconds",
+              orElse: () =>
+                Effect.fail(
+                  new ProviderAdapterRequestError({
+                    provider: PROVIDER,
+                    method: "question.reply",
+                    detail: "OpenCode question reply did not complete within 10 seconds.",
+                  }),
+                ),
+            }),
+          );
+          yield* resolvePendingOpenCodeRequest(context, nativeRequestId);
+          yield* emitTerminalOpenCodeRequest(
+            context,
+            {
+              id: `reply:${nativeRequestId}`,
+              type: "question.replied",
+              properties: {
+                sessionID: request.sessionID,
+                requestID: nativeRequestId,
+                answers: questionAnswers,
+              },
+            },
+            { type: "question.reply", requestID: nativeRequestId },
+          );
+          context.resolvingQuestionIds.delete(nativeRequestId);
+          const result: ProviderUserInputResponseResult = {
+            nativeStatus: "answered",
+            ...(handoffStatus ? { handoffStatus } : {}),
+            requestId,
+            nativeRequestId,
+            ...(agentKey ? { agentKey } : {}),
+            sessionGeneration: context.generationId,
+          };
+          context.userInputResolutionByPublicId.set(requestId, result);
+          while (context.userInputResolutionByPublicId.size > 128) {
+            const oldest = context.userInputResolutionByPublicId.keys().next().value;
+            if (oldest === undefined) break;
+            context.userInputResolutionByPublicId.delete(oldest);
+          }
+          return result;
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              const context = sessions.get(threadId);
+              if (context) {
+                const nativeRequestId = nativeRequestIdForOpenCodeRequest(context, requestId);
+                context.resolvingQuestionIds.delete(nativeRequestId);
+              }
+            }),
+          ),
+        ),
       );
-      yield* resolvePendingOpenCodeRequest(context, nativeRequestId);
-      yield* emitTerminalOpenCodeRequest(
-        context,
-        {
-          id: `reply:${nativeRequestId}`,
-          type: "question.replied",
-          properties: {
-            sessionID: request.sessionID,
-            requestID: nativeRequestId,
-            answers: questionAnswers,
-          },
-        },
-        { type: "question.reply", requestID: nativeRequestId },
-      );
-    });
+
+    const respondToUserInput: OpenCodeAdapterShape["respondToUserInput"] = (
+      threadId,
+      requestId,
+      answers,
+    ) => Effect.asVoid(resolveUserInput(threadId, requestId, { type: "answered", answers }));
 
     const stopSession: OpenCodeAdapterShape["stopSession"] = Effect.fn("stopSession")(
       function* (threadId) {
@@ -5274,10 +5640,12 @@ export function makeOpenCodeAdapter(
       messageAgent,
       stopAgent,
       getAgentActionCapabilities,
+      readAgentTranscriptPage,
       compaction: { type: "native", start: compactThread },
       interruptTurn,
       respondToRequest,
       respondToUserInput,
+      resolveUserInput,
       stopSession,
       listSessions,
       hasSession,
