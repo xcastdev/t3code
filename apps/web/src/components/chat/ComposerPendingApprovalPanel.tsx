@@ -29,13 +29,22 @@ export const ComposerPendingApprovalPanel = memo(function ComposerPendingApprova
         : approval.requestKind === "file-read"
           ? "File to read"
           : "File change";
+  const ownerLabel = approval.agentKey ? `Subagent · ${approval.agentTitle || "Agent"}` : null;
 
   return (
     <span
-      aria-label={fallbackLabel}
+      aria-label={ownerLabel ? `${ownerLabel}: ${fallbackLabel}` : fallbackLabel}
       className={cn("flex min-w-0 flex-1 items-center gap-2", className)}
       role="group"
     >
+      {ownerLabel ? (
+        <span
+          className="shrink-0 rounded-sm border border-border/60 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+          data-subagent-request-owner
+        >
+          {ownerLabel}
+        </span>
+      ) : null}
       {approval.appName ? (
         <span className="max-w-32 shrink truncate text-[11px] font-medium text-foreground">
           {approval.appName}

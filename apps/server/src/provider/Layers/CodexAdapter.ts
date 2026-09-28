@@ -23,6 +23,7 @@ import {
   type ToolActivitySource,
   type ProviderUserInputAnswers,
   RuntimeItemId,
+  RuntimeAgentKey,
   RuntimeRequestId,
   RuntimeTaskId,
   type RuntimeTaskUsage,
@@ -1000,6 +1001,8 @@ function runtimeEventBase(
     ...(event.turnId ? { turnId: event.turnId } : {}),
     ...(event.itemId ? { itemId: asRuntimeItemId(event.itemId) } : {}),
     ...(event.requestId ? { requestId: asRuntimeRequestId(event.requestId) } : {}),
+    ...(event.agentKey ? { agentKey: event.agentKey } : {}),
+    ...(event.agentTitle ? { agentTitle: event.agentTitle } : {}),
     ...(refs ? { providerRefs: refs } : {}),
     raw: {
       source: eventRawSource(event),
@@ -1077,6 +1080,12 @@ function mapCollabAgentEvent(
   const agentPath = typeof payload.agentPath === "string" ? payload.agentPath : undefined;
   const pathLeaf = agentPath?.split("/").findLast((segment) => segment.length > 0);
   const nickname = typeof payload.nickname === "string" ? payload.nickname : undefined;
+  const agentKey =
+    typeof payload.agentKey === "string" ? RuntimeAgentKey.make(payload.agentKey) : undefined;
+  const parentAgentKey =
+    typeof payload.parentAgentKey === "string"
+      ? RuntimeAgentKey.make(payload.parentAgentKey)
+      : undefined;
   const role =
     (typeof payload.role === "string" ? payload.role : undefined) ?? pathLeaf ?? "general-purpose";
   // A bare thread id is not a name. Omitting the title lets the client fold
@@ -1086,10 +1095,21 @@ function mapCollabAgentEvent(
   const title = knownName ?? agentThreadId;
   const model = typeof payload.model === "string" ? payload.model.trim() : "";
   const effort = typeof payload.effort === "string" ? payload.effort.trim() : "";
+  const transcriptBase = {
+    ...base,
+    ...(agentKey ? { agentKey } : {}),
+    ...(event.agentTitle
+      ? { agentTitle: event.agentTitle }
+      : knownName
+        ? { agentTitle: knownName }
+        : {}),
+  };
   // Identity repeated on every status patch so rows are self-describing when
   // the start row ages out of activity retention (review finding: a
   // reconstructed agent had a UUID name and no role/path).
   const linkage = {
+    ...(agentKey ? { agentKey } : {}),
+    ...(parentAgentKey ? { parentAgentKey } : {}),
     role,
     ...(knownName ? { title: knownName } : {}),
     ...(model ? { model } : {}),
@@ -1109,9 +1129,6 @@ function mapCollabAgentEvent(
             description: title,
             title,
             ...linkage,
-            ...(typeof payload.parentThreadId === "string"
-              ? { parentAgentId: payload.parentThreadId }
-              : {}),
           },
         },
       ];
@@ -1276,6 +1293,44 @@ function mapCollabAgentEvent(
         },
       ];
     }
+    case "collabAgent/messageDelta": {
+      const delta =
+        event.textDelta ?? (typeof payload.delta === "string" ? payload.delta : undefined);
+      if (!agentKey || !event.itemId || !delta) {
+        return [];
+      }
+      return [
+        {
+          ...transcriptBase,
+          type: "content.delta",
+          payload: {
+            streamKind: "assistant_text",
+            delta,
+          },
+        },
+      ];
+    }
+    case "collabAgent/reasoningDelta": {
+      const delta =
+        event.textDelta ?? (typeof payload.delta === "string" ? payload.delta : undefined);
+      const streamKind =
+        payload.streamKind === "reasoning_summary_text"
+          ? "reasoning_summary_text"
+          : "reasoning_text";
+      if (!agentKey || !event.itemId || !delta) {
+        return [];
+      }
+      return [
+        {
+          ...transcriptBase,
+          type: "content.delta",
+          payload: {
+            streamKind,
+            delta,
+          },
+        },
+      ];
+    }
     case "collabAgent/item": {
       const item =
         typeof payload.item === "object" && payload.item !== null
@@ -1285,6 +1340,55 @@ function mapCollabAgentEvent(
       if (!itemTypeRaw) {
         return [];
       }
+      const canonical = toCanonicalItemType(itemTypeRaw);
+      const lifecycle = typeof payload.lifecycle === "string" ? payload.lifecycle : undefined;
+      const assistantText = typeof item?.text === "string" ? item.text : undefined;
+      const reasoningContent = Array.isArray(item?.content)
+        ? item.content.filter((part): part is string => typeof part === "string").join("\n")
+        : "";
+      const reasoningSummary = Array.isArray(item?.summary)
+        ? item.summary.filter((part): part is string => typeof part === "string").join("\n")
+        : "";
+      if (
+        canonical === "assistant_message" &&
+        lifecycle === "item/completed" &&
+        agentKey &&
+        event.itemId &&
+        assistantText
+      ) {
+        return [
+          {
+            ...transcriptBase,
+            type: "item.completed",
+            payload: {
+              itemType: "assistant_message",
+              status: "completed",
+              title: "Assistant response",
+              detail: assistantText,
+            },
+          },
+        ];
+      }
+      if (
+        canonical === "reasoning" &&
+        lifecycle === "item/completed" &&
+        agentKey &&
+        event.itemId &&
+        (reasoningContent || reasoningSummary)
+      ) {
+        return [
+          {
+            ...transcriptBase,
+            type: "item.completed",
+            payload: {
+              itemType: "reasoning",
+              status: "completed",
+              title: "Reasoning",
+              detail: reasoningContent || reasoningSummary,
+            },
+          },
+        ];
+      }
       // A loose summary from the raw item: the child stream is untyped at
       // this boundary (synthetic event payload), so read best-effort fields
       // rather than force a schema decode.
@@ -1292,7 +1396,6 @@ function mapCollabAgentEvent(
         (typeof item?.command === "string" ? item.command : undefined) ??
         (typeof item?.title === "string" ? item.title : undefined) ??
         (typeof item?.query === "string" ? item.query : undefined);
-      const canonical = toCanonicalItemType(itemTypeRaw);
       const summary = looseSummary ?? canonical.replaceAll("_", " ");
       return [
         {

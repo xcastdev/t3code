@@ -1,7 +1,7 @@
 import { ORCHESTRATION_WS_METHODS } from "@t3tools/contracts";
 import { Atom } from "effect/unstable/reactivity";
 
-import { createEnvironmentRpcQueryAtomFamily } from "./runtime.ts";
+import { createEnvironmentRpcCommand, createEnvironmentRpcQueryAtomFamily } from "./runtime.ts";
 import type { EnvironmentRegistry } from "../connection/registry.ts";
 
 export function createOrchestrationEnvironmentAtoms<R, E>(
@@ -41,6 +41,17 @@ export function createOrchestrationEnvironmentAtoms<R, E>(
     historyArchive: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:orchestration:history-archive",
       tag: ORCHESTRATION_WS_METHODS.getHistoryArchive,
+    }),
+    agentTranscriptPage: createEnvironmentRpcQueryAtomFamily(runtime, {
+      label: "environment-data:orchestration:agent-transcript-page",
+      tag: ORCHESTRATION_WS_METHODS.getAgentTranscriptPage,
+      // Child rows can be upserted while the provider streams content.
+      staleTimeMs: 0,
+      idleTtlMs: 30_000,
+    }),
+    readAgentTranscriptPage: createEnvironmentRpcCommand(runtime, {
+      label: "read agent transcript page",
+      tag: ORCHESTRATION_WS_METHODS.getAgentTranscriptPage,
     }),
   };
 }

@@ -1,6 +1,11 @@
-import { EventId, TurnId, type OrchestrationThreadActivity } from "@t3tools/contracts";
+import {
+  EventId,
+  RuntimeAgentKey,
+  TurnId,
+  type OrchestrationThreadActivity,
+} from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
-import { derivePendingRequests } from "./pendingRequests.ts";
+import { derivePendingRequests, derivePendingRequestsForAgent } from "./pendingRequests.ts";
 
 let nextActivityId = 0;
 
@@ -156,6 +161,78 @@ describe("pending approvals", () => {
         appName: "Safari",
         options,
       },
+    ]);
+  });
+
+  it("keeps child ownership on the shared approval identity", () => {
+    const activities = [
+      makeActivity({
+        kind: "approval.requested",
+        payload: {
+          requestId: "req-child",
+          requestKind: "command",
+          agentKey: "agent-key-1",
+          agentTitle: "Search agent",
+        },
+      }),
+    ];
+
+    expect(derivePendingRequests(activities).approvals).toMatchObject([
+      {
+        requestId: "req-child",
+        agentKey: "agent-key-1",
+        agentTitle: "Search agent",
+      },
+    ]);
+  });
+
+  it("settles one child approval identity in both parent and agent selectors", () => {
+    const agentKey = RuntimeAgentKey.make("agent-shared-request");
+    const requested = makeActivity({
+      kind: "approval.requested",
+      payload: { requestId: "req-shared-child", requestKind: "command", agentKey },
+    });
+    const resolved = makeActivity({
+      kind: "approval.resolved",
+      payload: { requestId: "req-shared-child" },
+    });
+
+    expect(
+      derivePendingRequests([requested]).approvals.map((request) => request.requestId),
+    ).toEqual(["req-shared-child"]);
+    expect(
+      derivePendingRequestsForAgent([requested], agentKey).approvals.map(
+        (request) => request.requestId,
+      ),
+    ).toEqual(["req-shared-child"]);
+    expect(derivePendingRequests([requested, resolved]).approvals).toEqual([]);
+    expect(derivePendingRequestsForAgent([requested, resolved], agentKey).approvals).toEqual([]);
+  });
+
+  it("closes a child request from an ownerless stale-response event without closing its sibling", () => {
+    const childKey = RuntimeAgentKey.make("child-key");
+    const siblingKey = RuntimeAgentKey.make("sibling-key");
+    const activities = [
+      makeActivity({
+        kind: "approval.requested",
+        payload: { requestId: "req-child", requestKind: "command", agentKey: childKey },
+      }),
+      makeActivity({
+        kind: "approval.requested",
+        payload: { requestId: "req-sibling", requestKind: "command", agentKey: siblingKey },
+      }),
+      makeActivity({
+        kind: "provider.approval.respond.failed",
+        payload: {
+          requestId: "req-child",
+          detail: "Unknown pending permission request: req-child",
+        },
+      }),
+    ];
+
+    expect(derivePendingRequestsForAgent(activities, childKey).approvals).toEqual([]);
+    expect(derivePendingRequestsForAgent(activities, siblingKey).approvals).toMatchObject([
+      { requestId: "req-sibling", agentKey: siblingKey },
     ]);
   });
 

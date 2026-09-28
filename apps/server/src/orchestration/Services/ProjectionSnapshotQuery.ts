@@ -21,6 +21,8 @@ import type {
   OrchestrationShellSnapshot,
   OrchestrationThread,
   OrchestrationThreadActivity,
+  OrchestrationAgentTranscriptPage,
+  OrchestrationGetAgentTranscriptPageInput,
   OrchestrationThreadDetailSnapshot,
   OrchestrationThreadDetailWindow,
   OrchestrationThreadShell,
@@ -71,6 +73,17 @@ export interface ProjectionThreadDetailQuery {
    * the activity query. Omit this option to preserve the full detail response.
    */
   readonly activityKinds?: ReadonlyArray<string>;
+}
+
+export interface PendingAgentActionActivity {
+  readonly threadId: ThreadId;
+  readonly activityId: string;
+  readonly createdAt: string;
+  readonly kind: "agent.action.result" | "agent.transcript.message";
+  readonly agentKey: string;
+  readonly actionId: string;
+  readonly action: "message" | "stop";
+  readonly content: string | null;
 }
 
 /**
@@ -262,6 +275,17 @@ export interface ProjectionSnapshotQueryShape {
     threadId: ThreadId,
     window?: OrchestrationThreadDetailWindow,
   ) => Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>, ProjectionRepositoryError>;
+
+  /** Read one bounded page of a child transcript and its identity metadata. */
+  readonly getAgentTranscriptPage?: (
+    input: OrchestrationGetAgentTranscriptPageInput,
+  ) => Effect.Effect<Option.Option<OrchestrationAgentTranscriptPage>, ProjectionRepositoryError>;
+
+  /** Read a bounded set of durable child action intents left pending at restart. */
+  readonly listPendingAgentActions?: () => Effect.Effect<
+    ReadonlyArray<PendingAgentActionActivity>,
+    ProjectionRepositoryError
+  >;
 }
 
 /**

@@ -1,4 +1,5 @@
 import * as NodeAssert from "node:assert/strict";
+import * as NodeURL from "node:url";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
@@ -126,6 +127,7 @@ const runtimeMock = {
     }>,
     questionReplyImplementation: null as ((signal?: AbortSignal) => Promise<void>) | null,
     sessionStatus: "idle" as "idle" | "busy",
+    sessionStatusById: new Map<string, "idle" | "busy" | "retry">(),
     sessionStatusFailures: 0,
     sessionStatusCalls: 0,
     sessionStatusImplementation: null as (() => Promise<unknown>) | null,
@@ -138,6 +140,7 @@ const runtimeMock = {
     transientErrorSessionIds: new Set<string>(),
     sessionDirectoryById: new Map<string, string>(),
     sessionParentById: new Map<string, string>(),
+    sessionTitleById: new Map<string, string>(),
     pendingPermissions: [] as Array<PermissionRequest>,
     pendingQuestions: [] as Array<QuestionRequest>,
     permissionListCalls: 0,
@@ -199,6 +202,7 @@ const runtimeMock = {
     this.state.questionReplyCalls.length = 0;
     this.state.questionReplyImplementation = null;
     this.state.sessionStatus = "idle";
+    this.state.sessionStatusById.clear();
     this.state.sessionStatusFailures = 0;
     this.state.sessionStatusCalls = 0;
     this.state.sessionStatusImplementation = null;
@@ -209,6 +213,7 @@ const runtimeMock = {
     this.state.transientErrorSessionIds.clear();
     this.state.sessionDirectoryById.clear();
     this.state.sessionParentById.clear();
+    this.state.sessionTitleById.clear();
     this.state.pendingPermissions = [];
     this.state.pendingQuestions = [];
     this.state.permissionListCalls = 0;
@@ -306,6 +311,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
           }
           const directory = runtimeMock.state.sessionDirectoryById.get(sessionID);
           const parentID = runtimeMock.state.sessionParentById.get(sessionID);
+          const title = runtimeMock.state.sessionTitleById.get(sessionID);
           return {
             data: {
               id: sessionID,
@@ -315,6 +321,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
                 : {}),
               ...(directory ? { directory } : {}),
               ...(parentID ? { parentID } : {}),
+              ...(title ? { title } : {}),
             },
           };
         },
@@ -373,6 +380,7 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
           runtimeMock.state.pendingQuestions = runtimeMock.state.pendingQuestions.filter(
             (request) => request.sessionID !== sessionID,
           );
+          return { data: true };
         },
         children: async ({ sessionID }: { sessionID: string }) => {
           runtimeMock.state.sessionChildrenCalls.push(sessionID);
@@ -392,12 +400,21 @@ const OpenCodeRuntimeTestDouble: OpenCodeRuntimeShape = {
             throw new Error("status failed");
           }
           return {
-            data:
-              runtimeMock.state.sessionStatus === "idle"
-                ? {}
-                : {
-                    "http://127.0.0.1:9999/session": { type: "busy" as const },
-                  },
+            data: {
+              ...(runtimeMock.state.sessionStatus === "busy"
+                ? { "http://127.0.0.1:9999/session": { type: "busy" as const } }
+                : {}),
+              ...Object.fromEntries(
+                runtimeMock.state.sessionStatusById
+                  .entries()
+                  .map(([id, type]) => [
+                    id,
+                    type === "retry"
+                      ? { type, attempt: 1, message: "retrying", next: 1 }
+                      : { type },
+                  ]),
+              ),
+            },
           };
         },
         promptAsync: async (input: unknown) => {
@@ -663,6 +680,14 @@ const providerSessionDirectoryTestLayer = Layer.succeed(ProviderSessionDirectory
 // probe (serverUrl, serverPassword) must be threaded directly through the
 // decoded `OpenCodeSettings`.
 const decodeOpenCodeSettingsEffect = Schema.decodeUnknownEffect(OpenCodeSettings);
+const decodeBridgeOpenCodeConfig = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      model: Schema.optional(Schema.String),
+      plugin: Schema.optional(Schema.Array(Schema.Unknown)),
+    }),
+  ),
+);
 const openCodeAdapterTestSettings = Schema.decodeSync(OpenCodeSettings)({
   binaryPath: "fake-opencode",
   serverUrl: "http://127.0.0.1:9999",
@@ -773,9 +798,14 @@ it.effect(
         skillPlan: plan,
       });
       NodeAssert.equal(runtimeMock.state.connectionEnvironments[0]?.OPENCODE_CONFIG_DIR, configDir);
-      NodeAssert.equal(
-        runtimeMock.state.connectionEnvironments[0]?.OPENCODE_CONFIG_CONTENT,
-        '{"model":"example/model"}',
+      const configContent = runtimeMock.state.connectionEnvironments[0]?.OPENCODE_CONFIG_CONTENT;
+      NodeAssert.equal(typeof configContent, "string");
+      const runtimeConfig = decodeBridgeOpenCodeConfig(configContent as string);
+      NodeAssert.equal(runtimeConfig.model, "example/model");
+      NodeAssert.ok(
+        runtimeConfig.plugin?.some(
+          (entry) => typeof entry === "string" && entry.includes("t3-opencode-approval-"),
+        ),
       );
       NodeAssert.equal(runtimeMock.state.sessionCreateUrls.length, 1);
     }).pipe(Effect.provide(externalAdapterDependencies)),
@@ -2711,20 +2741,42 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       // The child's `session.created` event was missed. Only the ancestry
       // lookup can prove that `ses_child` belongs to this thread.
       runtimeMock.state.sessionParentById.set("ses_child", "http://127.0.0.1:9999/session");
+      runtimeMock.state.sessionTitleById.set("ses_child", "Approval helper");
       runtimeMock.state.sessionStatus = "busy";
       const busy = promiseWithResolvers<unknown>();
       const childPermission = promiseWithResolvers<unknown>();
       const idle = promiseWithResolvers<unknown>();
       runtimeMock.state.subscribedEvents = [busy.promise, childPermission.promise, idle.promise];
 
+      const relatedEvents: Array<{
+        type: string;
+        agentKey?: string | undefined;
+        agentTitle?: string | undefined;
+      }> = [];
+      const requestEmitted = promiseWithResolvers<void>();
+      const turnCompleted = promiseWithResolvers<void>();
+      let completedTokenUsage: unknown;
       const eventsFiber = yield* adapter.streamEvents.pipe(
         Stream.filter(
           (event) =>
             event.threadId === threadId &&
-            (event.type === "request.opened" || event.type === "turn.completed"),
+            ((event.type === "session.started" && event.agentKey !== undefined) ||
+              event.type === "request.opened" ||
+              event.type === "turn.completed"),
         ),
-        Stream.take(2),
-        Stream.runCollect,
+        Stream.tap((event) =>
+          Effect.sync(() => {
+            if (event.type === "session.started" || event.type === "request.opened") {
+              relatedEvents.push(event);
+            }
+            if (event.type === "request.opened") requestEmitted.resolve(undefined);
+            if (event.type === "turn.completed") {
+              completedTokenUsage = event.payload.tokenUsage;
+              turnCompleted.resolve(undefined);
+            }
+          }),
+        ),
+        Stream.runDrain,
         Effect.forkChild,
       );
       yield* adapter.startSession({
@@ -2773,19 +2825,28 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         },
       });
 
-      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      yield* Effect.promise(() => requestEmitted.promise);
+      yield* Effect.yieldNow;
       NodeAssert.deepEqual(
-        events.map((event) => event.type),
-        ["request.opened", "turn.completed"],
+        relatedEvents.map((event) => event.type),
+        ["session.started", "request.opened"],
       );
-      const completed = events[1];
-      if (completed?.type === "turn.completed") {
-        NodeAssert.deepEqual(completed.payload.tokenUsage, {
-          usageStatus: "unavailable",
-          usageScope: "main_agent",
-          hasSubagents: true,
-        });
-      }
+      const startedEvent = relatedEvents[0];
+      const requestEvent = relatedEvents[1];
+      NodeAssert.equal(startedEvent?.type, "session.started");
+      NodeAssert.equal(startedEvent?.agentTitle, "Approval helper");
+      NodeAssert.equal(typeof startedEvent?.agentKey, "string");
+      NodeAssert.equal(typeof requestEvent?.agentKey, "string");
+      NodeAssert.notEqual(requestEvent?.agentKey, "ses_child");
+      NodeAssert.equal(requestEvent?.agentKey, startedEvent?.agentKey);
+      NodeAssert.equal(requestEvent?.agentTitle, "Approval helper");
+      yield* Effect.promise(() => turnCompleted.promise);
+      NodeAssert.deepEqual(completedTokenUsage, {
+        usageStatus: "unavailable",
+        usageScope: "main_agent",
+        hasSubagents: true,
+      });
+      yield* Fiber.interrupt(eventsFiber);
       yield* adapter.stopSession(threadId);
     }),
   );
@@ -4436,11 +4497,141 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
+  it.effect("records child approval choices for the owning local parent prompt", () =>
+    Effect.gen(function* () {
+      const settings = yield* decodeOpenCodeSettingsEffect({
+        binaryPath: "fake-opencode",
+        serverUrl: "",
+      });
+      const adapter = yield* makeOpenCodeAdapter(settings, {
+        environment: { OPENCODE_CONFIG_CONTENT: '{"model":"example/model"}' },
+      });
+      const threadId = asThreadId("thread-child-approval-history");
+      const childCreated = promiseWithResolvers<unknown>();
+      const childPermission = promiseWithResolvers<unknown>();
+      runtimeMock.state.createdSessionIds.push("ses_parent");
+      runtimeMock.state.subscribedEvents = [childCreated.promise, childPermission.promise];
+
+      const childStartedObserved = promiseWithResolvers<void>();
+      const childRequestOpened = promiseWithResolvers<void>();
+      const childEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.threadId === threadId &&
+            ((event.type === "session.started" && event.agentKey !== undefined) ||
+              event.type === "request.opened"),
+        ),
+        Stream.tap((event) =>
+          Effect.sync(() => {
+            if (event.type === "session.started") childStartedObserved.resolve(undefined);
+            if (event.type === "request.opened") childRequestOpened.resolve(undefined);
+          }),
+        ),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "approval-required",
+      });
+
+      const configContent = runtimeMock.state.connectionEnvironments[0]?.OPENCODE_CONFIG_CONTENT;
+      NodeAssert.equal(typeof configContent, "string");
+      const config = decodeBridgeOpenCodeConfig(configContent as string);
+      const bridgePluginPath = config.plugin?.find(
+        (entry): entry is string =>
+          typeof entry === "string" && entry.includes("t3-opencode-approval-"),
+      );
+      NodeAssert.ok(bridgePluginPath);
+      const pluginModule = (yield* Effect.promise(
+        () => import(NodeURL.pathToFileURL(bridgePluginPath).href),
+      )) as {
+        T3CodeApprovalBridge: () => Promise<{
+          "experimental.chat.system.transform": (
+            input: { readonly sessionID: string },
+            output: { system: Array<string> },
+          ) => Promise<void>;
+        }>;
+      };
+      const bridgeHooks = yield* Effect.promise(() => pluginModule.T3CodeApprovalBridge());
+      const beforeDecision = { system: ["base parent instructions"] };
+      yield* Effect.promise(() =>
+        bridgeHooks["experimental.chat.system.transform"](
+          { sessionID: "ses_parent" },
+          beforeDecision,
+        ),
+      );
+      NodeAssert.deepEqual(beforeDecision.system, ["base parent instructions"]);
+
+      childCreated.resolve({
+        id: "evt-history-child-created",
+        type: "session.created",
+        properties: {
+          sessionID: "ses_child",
+          info: { id: "ses_child", parentID: "ses_parent", title: "Child task" },
+        },
+      });
+      yield* Effect.promise(() => childStartedObserved.promise);
+      childPermission.resolve({
+        id: "evt-history-child-permission",
+        type: "permission.asked",
+        properties: permissionRequest("per_bridge_denied", "ses_child"),
+      });
+      yield* Effect.promise(() => childRequestOpened.promise);
+      const childEvents = Array.from(
+        yield* Fiber.join(childEventsFiber).pipe(Effect.timeout("1 second")),
+      );
+      const childStarted = childEvents.find(
+        (event) => event.type === "session.started" && event.agentKey !== undefined,
+      );
+      NodeAssert.ok(childStarted);
+      NodeAssert.ok(childStarted.agentKey);
+      const opened = childEvents.find((event) => event.type === "request.opened");
+      NodeAssert.ok(opened);
+      NodeAssert.ok(opened.requestId);
+      NodeAssert.equal(opened.agentKey, childStarted.agentKey);
+
+      let systemDuringNativeReply: Array<string> = [];
+      runtimeMock.state.permissionReplyImplementation = async () => {
+        const output = { system: ["base parent instructions"] };
+        await bridgeHooks["experimental.chat.system.transform"](
+          { sessionID: "ses_parent" },
+          output,
+        );
+        systemDuringNativeReply = output.system;
+      };
+      yield* adapter.respondToRequest(
+        threadId,
+        ApprovalRequestId.make(opened.requestId),
+        "decline",
+      );
+      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
+        { requestID: "per_bridge_denied", reply: "reject" },
+      ]);
+      NodeAssert.match(systemDuringNativeReply.join("\n"), /user chose to deny/i);
+      NodeAssert.match(systemDuringNativeReply.join("\n"), /per_bridge_denied/);
+
+      const siblingPrompt = { system: ["sibling parent instructions"] };
+      yield* Effect.promise(() =>
+        bridgeHooks["experimental.chat.system.transform"](
+          { sessionID: "ses_sibling_parent" },
+          siblingPrompt,
+        ),
+      );
+      NodeAssert.deepEqual(siblingPrompt.system, ["sibling parent instructions"]);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
   it.effect("routes child-session approval requests and replies through the parent thread", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("thread-child-approval");
+      const childPermission = promiseWithResolvers<unknown>();
       const permissionReply = promiseWithResolvers<unknown>();
+      runtimeMock.state.sessionParentById.set("ses_child", "http://127.0.0.1:9999/session");
       runtimeMock.state.subscribedEvents = [
         {
           id: "evt-child-created",
@@ -4454,24 +4645,23 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
             },
           },
         },
-        {
-          id: "evt-child-permission",
-          type: "permission.asked",
-          properties: {
-            id: "per_child",
-            sessionID: "ses_child",
-            permission: "external_directory",
-            patterns: ["/tmp/external/*"],
-            metadata: { source: "child" },
-            always: ["/tmp/external/*"],
-          },
-        },
+        childPermission.promise,
         permissionReply.promise,
       ];
 
+      const childStartedFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.threadId === threadId &&
+            event.type === "session.started" &&
+            event.agentKey !== undefined,
+        ),
+        Stream.runHead,
+        Effect.forkChild,
+      );
       const openedEventsFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter((event) => event.threadId === threadId),
-        Stream.take(3),
+        Stream.filter((event) => event.threadId === threadId && event.type === "request.opened"),
+        Stream.take(1),
         Stream.runCollect,
         Effect.forkChild,
       );
@@ -4481,12 +4671,41 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         runtimeMode: "approval-required",
       });
 
+      const childStarted = Option.getOrThrow(
+        yield* Fiber.join(childStartedFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.ok(childStarted.agentKey);
+      NodeAssert.notEqual(childStarted.agentKey, "ses_child");
+      const noRequestCapabilities = yield* adapter.getAgentActionCapabilities!(
+        threadId,
+        childStarted.agentKey,
+      );
+      NodeAssert.equal(noRequestCapabilities.answerRequests, "unverified");
+
+      childPermission.resolve({
+        id: "evt-child-permission",
+        type: "permission.asked",
+        properties: {
+          id: "per_child",
+          sessionID: "ses_child",
+          permission: "external_directory",
+          patterns: ["/tmp/external/*"],
+          metadata: { source: "child" },
+          always: ["/tmp/external/*"],
+        },
+      });
       const openedEvents = Array.from(
         yield* Fiber.join(openedEventsFiber).pipe(Effect.timeout("1 second")),
       );
       const opened = openedEvents.find((event) => event.type === "request.opened");
       NodeAssert.ok(opened);
-      NodeAssert.equal(opened.requestId, "per_child");
+      NodeAssert.notEqual(opened.requestId, "per_child");
+      NodeAssert.equal(opened.agentKey, childStarted.agentKey);
+      const pendingCapabilities = yield* adapter.getAgentActionCapabilities!(
+        threadId,
+        childStarted.agentKey,
+      );
+      NodeAssert.equal(pendingCapabilities.answerRequests, "supported");
       NodeAssert.equal(
         opened.raw?.source === "opencode.sdk.event" &&
           typeof opened.raw.payload === "object" &&
@@ -4496,10 +4715,11 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           : undefined,
         "ses_child",
       );
+      NodeAssert.ok(opened.requestId);
 
       yield* adapter.respondToRequest(
         threadId,
-        ApprovalRequestId.make("per_child"),
+        ApprovalRequestId.make(opened.requestId),
         "acceptForSession",
       );
       NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
@@ -4507,7 +4727,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       ]);
 
       const resolvedEventFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter((event) => event.threadId === threadId),
+        Stream.filter((event) => event.threadId === threadId && event.type === "request.resolved"),
         Stream.take(1),
         Stream.runHead,
         Effect.forkChild,
@@ -4521,10 +4741,195 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           reply: "always",
         },
       });
-      const resolved = yield* Fiber.join(resolvedEventFiber).pipe(Effect.timeout("1 second"));
-      NodeAssert.equal(Option.getOrUndefined(resolved)?.type, "request.resolved");
+      const resolved = Option.getOrThrow(
+        yield* Fiber.join(resolvedEventFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.equal(resolved.requestId, opened.requestId);
+      NodeAssert.equal(resolved.agentKey, childStarted.agentKey);
+      const settledCapabilities = yield* adapter.getAgentActionCapabilities!(
+        threadId,
+        childStarted.agentKey,
+      );
+      NodeAssert.equal(settledCapabilities.answerRequests, "unverified");
 
       yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("rejects a child approval id from a replaced OpenCode session generation", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-child-request-generation");
+      const parentId = "http://127.0.0.1:9999/session";
+      const childId = "ses_reused_child";
+      runtimeMock.state.sessionParentById.set(childId, parentId);
+      const eventsForGeneration = (suffix: string) => [
+        {
+          id: `evt-child-created-${suffix}`,
+          type: "session.created",
+          properties: {
+            sessionID: childId,
+            info: { id: childId, parentID: parentId, title: "Child" },
+          },
+        },
+        {
+          id: `evt-child-permission-${suffix}`,
+          type: "permission.asked",
+          properties: permissionRequest("per_reused", childId),
+        },
+      ];
+      const openedForGeneration = () =>
+        adapter.streamEvents.pipe(
+          Stream.filter((event) => event.threadId === threadId && event.type === "request.opened"),
+          Stream.runHead,
+          Effect.forkChild,
+        );
+
+      runtimeMock.state.subscribedEvents = eventsForGeneration("first");
+      const firstOpenedFiber = yield* openedForGeneration();
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "approval-required",
+      });
+      const firstOpened = Option.getOrThrow(
+        yield* Fiber.join(firstOpenedFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.notEqual(firstOpened.requestId, "per_reused");
+      yield* adapter.stopSession(threadId);
+
+      runtimeMock.state.subscribedEvents = eventsForGeneration("second");
+      const secondOpenedFiber = yield* openedForGeneration();
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "approval-required",
+      });
+      const secondOpened = Option.getOrThrow(
+        yield* Fiber.join(secondOpenedFiber).pipe(Effect.timeout("1 second")),
+      );
+      NodeAssert.ok(firstOpened.requestId);
+      NodeAssert.ok(secondOpened.requestId);
+      NodeAssert.notEqual(secondOpened.requestId, firstOpened.requestId);
+
+      const staleAnswer = yield* Effect.exit(
+        adapter.respondToRequest(threadId, ApprovalRequestId.make(firstOpened.requestId), "accept"),
+      );
+      NodeAssert.equal(Exit.isFailure(staleAnswer), true);
+      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, []);
+
+      yield* adapter.respondToRequest(
+        threadId,
+        ApprovalRequestId.make(secondOpened.requestId),
+        "accept",
+      );
+      NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
+        { requestID: "per_reused", reply: "once" },
+      ]);
+      yield* adapter.stopSession(threadId);
+    }),
+  );
+
+  it.effect("messages and stops one live child without stopping its parent or sibling", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-child-actions-isolated");
+      const parentId = "http://127.0.0.1:9999/session";
+      const keepStreamOpen = promiseWithResolvers<unknown>();
+      runtimeMock.state.sessionParentById.set("ses_child_a", parentId);
+      runtimeMock.state.sessionParentById.set("ses_child_b", parentId);
+      runtimeMock.state.sessionStatusById.set("ses_child_a", "busy");
+      runtimeMock.state.sessionStatusById.set("ses_child_b", "busy");
+      runtimeMock.state.subscribedEvents = [
+        {
+          id: "evt-child-a-created",
+          type: "session.created",
+          properties: {
+            sessionID: "ses_child_a",
+            info: { id: "ses_child_a", parentID: parentId, title: "Child A" },
+          },
+        },
+        {
+          id: "evt-child-b-created",
+          type: "session.created",
+          properties: {
+            sessionID: "ses_child_b",
+            info: { id: "ses_child_b", parentID: parentId, title: "Child B" },
+          },
+        },
+        {
+          id: "evt-child-a-ask",
+          type: "permission.asked",
+          properties: permissionRequest("per_child_a", "ses_child_a"),
+        },
+        {
+          id: "evt-child-b-ask",
+          type: "permission.asked",
+          properties: permissionRequest("per_child_b", "ses_child_b"),
+        },
+        keepStreamOpen.promise,
+      ];
+      const requestsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId && event.type === "request.opened"),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "approval-required",
+      });
+      const requests = Array.from(
+        yield* Fiber.join(requestsFiber).pipe(Effect.timeout("1 second")),
+      );
+      const keyA = requests[0]?.agentKey;
+      const keyB = requests[1]?.agentKey;
+      NodeAssert.ok(keyA);
+      NodeAssert.ok(keyB);
+      NodeAssert.notEqual(keyA, keyB);
+
+      const capabilities = yield* adapter.getAgentActionCapabilities!(threadId, keyA);
+      NodeAssert.deepEqual(capabilities, {
+        message: "supported",
+        answerRequests: "supported",
+        stop: "supported",
+      });
+
+      NodeAssert.equal(
+        yield* adapter.messageAgent!(threadId, keyA, "Review this patch"),
+        "accepted",
+      );
+      const childPrompt = runtimeMock.state.promptCalls.at(-1) as {
+        sessionID: string;
+        parts: Array<{ text: string }>;
+      };
+      NodeAssert.equal(childPrompt.sessionID, "ses_child_a");
+      NodeAssert.deepEqual(childPrompt.parts, [{ type: "text", text: "Review this patch" }]);
+
+      NodeAssert.equal(yield* adapter.stopAgent!(threadId, keyA), "completed");
+      NodeAssert.deepEqual(runtimeMock.state.abortCalls, ["ses_child_a"]);
+      NodeAssert.equal(
+        yield* adapter.messageAgent!(threadId, keyB, "Sibling still active"),
+        "accepted",
+      );
+      const siblingPrompt = runtimeMock.state.promptCalls.at(-1) as { sessionID: string };
+      NodeAssert.equal(siblingPrompt.sessionID, "ses_child_b");
+
+      const parentTurn = yield* adapter.sendTurn({
+        threadId,
+        input: "Parent remains active",
+        modelSelection: createModelSelection(
+          ProviderInstanceId.make("opencode"),
+          "opencode/kimi-k3",
+        ),
+      });
+      NodeAssert.ok(parentTurn.turnId);
+      const parentPrompt = runtimeMock.state.promptCalls.at(-1) as { sessionID: string };
+      NodeAssert.equal(parentPrompt.sessionID, parentId);
+
+      yield* adapter.stopSession(threadId);
+      keepStreamOpen.resolve(undefined);
     }),
   );
 
@@ -4744,46 +5149,62 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
     }),
   );
 
-  it.effect("routes child-session questions and replies through the parent thread", () =>
+  it.effect("registers a nested child first seen via session.updated", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
       const threadId = asThreadId("thread-child-question");
+      const childSessionId = "ses_child_question";
+      const parentChildSessionId = "ses_question_coordinator";
       const questionReply = promiseWithResolvers<unknown>();
+      runtimeMock.state.sessionParentById.set(childSessionId, parentChildSessionId);
+      runtimeMock.state.sessionParentById.set(
+        parentChildSessionId,
+        "http://127.0.0.1:9999/session",
+      );
+      runtimeMock.state.sessionTitleById.set(childSessionId, "Question helper");
+      runtimeMock.state.sessionTitleById.set(parentChildSessionId, "Question coordinator");
+      const childQuestion = promiseWithResolvers<unknown>();
+      const parentChildCreated = promiseWithResolvers<unknown>();
+      const childUpdated = promiseWithResolvers<unknown>();
+      const coordinatorStarted = promiseWithResolvers<void>();
       runtimeMock.state.subscribedEvents = [
-        {
-          id: "evt-child-created",
-          type: "session.created",
-          properties: {
-            sessionID: "ses_child_question",
-            info: {
-              id: "ses_child_question",
-              parentID: "http://127.0.0.1:9999/session",
-              title: "Child session",
-            },
-          },
-        },
-        {
-          id: "evt-child-question",
-          type: "question.asked",
-          properties: {
-            id: "que_child",
-            sessionID: "ses_child_question",
-            questions: [
-              {
-                header: "Scope",
-                question: "Which scope should OpenCode use?",
-                options: [{ label: "Workspace", description: "Use this workspace." }],
-              },
-            ],
-          },
-        },
+        parentChildCreated.promise,
+        childUpdated.promise,
+        childQuestion.promise,
         questionReply.promise,
       ];
 
-      const requestedEventsFiber = yield* adapter.streamEvents.pipe(
-        Stream.filter((event) => event.threadId === threadId),
-        Stream.take(3),
-        Stream.runCollect,
+      const childEvents: Array<{
+        type: string;
+        agentKey?: string | undefined;
+        agentTitle?: string | undefined;
+        parentAgentKey?: string | undefined;
+        requestId?: string | undefined;
+      }> = [];
+      const questionRequested = promiseWithResolvers<void>();
+      const childEventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter(
+          (event) =>
+            event.threadId === threadId &&
+            ((event.type === "session.started" && event.agentKey !== undefined) ||
+              event.type === "user-input.requested"),
+        ),
+        Stream.tap((event) =>
+          Effect.sync(() => {
+            childEvents.push({
+              type: event.type,
+              ...(event.agentKey ? { agentKey: event.agentKey } : {}),
+              ...(event.agentTitle ? { agentTitle: event.agentTitle } : {}),
+              ...(event.parentAgentKey ? { parentAgentKey: event.parentAgentKey } : {}),
+              ...(event.type === "user-input.requested" ? { requestId: event.requestId } : {}),
+            });
+            if (event.type === "session.started" && event.agentTitle === "Question coordinator") {
+              coordinatorStarted.resolve(undefined);
+            }
+            if (event.type === "user-input.requested") questionRequested.resolve(undefined);
+          }),
+        ),
+        Stream.runDrain,
         Effect.forkChild,
       );
       yield* adapter.startSession({
@@ -4792,14 +5213,64 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         runtimeMode: "approval-required",
       });
 
-      const requestedEvents = Array.from(
-        yield* Fiber.join(requestedEventsFiber).pipe(Effect.timeout("1 second")),
-      );
-      const requested = requestedEvents.find((event) => event.type === "user-input.requested");
-      NodeAssert.ok(requested);
-      NodeAssert.equal(requested.requestId, "que_child");
+      parentChildCreated.resolve({
+        id: "evt-question-coordinator-created",
+        type: "session.created",
+        properties: {
+          sessionID: parentChildSessionId,
+          info: {
+            id: parentChildSessionId,
+            parentID: "http://127.0.0.1:9999/session",
+            title: "Question coordinator",
+          },
+        },
+      });
+      yield* Effect.promise(() => coordinatorStarted.promise);
+      childUpdated.resolve({
+        id: "evt-question-helper-updated",
+        type: "session.updated",
+        properties: {
+          sessionID: childSessionId,
+          info: {
+            id: childSessionId,
+            parentID: parentChildSessionId,
+            title: "Question helper",
+          },
+        },
+      });
+      childQuestion.resolve({
+        id: "evt-child-question",
+        type: "question.asked",
+        properties: {
+          id: "que_child",
+          sessionID: childSessionId,
+          questions: [
+            {
+              header: "Scope",
+              question: "Which scope should OpenCode use?",
+              options: [{ label: "Workspace", description: "Use this workspace." }],
+            },
+          ],
+        },
+      });
 
-      yield* adapter.respondToUserInput(threadId, ApprovalRequestId.make("que_child"), {
+      yield* Effect.promise(() => questionRequested.promise);
+      yield* Effect.yieldNow;
+      NodeAssert.deepEqual(
+        childEvents.map((event) => event.type),
+        ["session.started", "session.started", "user-input.requested"],
+      );
+      NodeAssert.equal(childEvents[0]?.agentTitle, "Question coordinator");
+      NodeAssert.equal(childEvents[1]?.agentTitle, "Question helper");
+      NodeAssert.equal(childEvents[1]?.parentAgentKey, childEvents[0]?.agentKey);
+      const requestId = childEvents[2]?.requestId;
+      NodeAssert.ok(typeof requestId === "string");
+      NodeAssert.notEqual(requestId, "que_child");
+      NodeAssert.equal(childEvents[2]?.agentKey, childEvents[1]?.agentKey);
+      NodeAssert.equal(childEvents[2]?.agentTitle, "Question helper");
+      yield* Fiber.interrupt(childEventsFiber);
+
+      yield* adapter.respondToUserInput(threadId, ApprovalRequestId.make(requestId), {
         Scope: "Workspace",
       });
       NodeAssert.deepEqual(runtimeMock.state.questionReplyCalls, [
@@ -4816,7 +5287,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         id: "evt-child-question-replied",
         type: "question.replied",
         properties: {
-          sessionID: "ses_child_question",
+          sessionID: childSessionId,
           requestID: "que_child",
           answers: [["Workspace"]],
         },
@@ -4857,12 +5328,24 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const requests = Array.from(
         yield* Fiber.join(requestsFiber).pipe(Effect.timeout("1 second")),
       );
-      NodeAssert.deepEqual(requests.map((event) => [event.type, event.requestId]).sort(), [
-        ["request.opened", "per_existing"],
-        ["user-input.requested", "que_existing"],
+      NodeAssert.deepEqual(requests.map((event) => event.type).sort(), [
+        "request.opened",
+        "user-input.requested",
       ]);
-      yield* adapter.respondToRequest(threadId, ApprovalRequestId.make("per_existing"), "accept");
-      yield* adapter.respondToUserInput(threadId, ApprovalRequestId.make("que_existing"), {
+      const permission = requests.find((event) => event.type === "request.opened");
+      const question = requests.find((event) => event.type === "user-input.requested");
+      NodeAssert.ok(permission);
+      NodeAssert.ok(question);
+      NodeAssert.ok(permission.requestId);
+      NodeAssert.ok(question.requestId);
+      NodeAssert.notEqual(permission.requestId, "per_existing");
+      NodeAssert.notEqual(question.requestId, "que_existing");
+      yield* adapter.respondToRequest(
+        threadId,
+        ApprovalRequestId.make(permission.requestId),
+        "accept",
+      );
+      yield* adapter.respondToUserInput(threadId, ApprovalRequestId.make(question.requestId), {
         Scope: "Workspace",
       });
       NodeAssert.deepEqual(runtimeMock.state.permissionReplyCalls, [
@@ -4934,7 +5417,14 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
           events.map((event) => event.type),
           ["runtime.warning", "request.opened"],
         );
-        yield* adapter.respondToRequest(threadId, ApprovalRequestId.make("per_retry"), "accept");
+        const request = events.find((event) => event.type === "request.opened");
+        NodeAssert.ok(request);
+        NodeAssert.ok(request.requestId);
+        yield* adapter.respondToRequest(
+          threadId,
+          ApprovalRequestId.make(request.requestId),
+          "accept",
+        );
       }),
   );
 
@@ -5170,7 +5660,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
       const opened = Option.getOrUndefined(
         yield* Fiber.join(openedFiber).pipe(Effect.timeout("1 second")),
       );
-      NodeAssert.equal(opened?.requestId, pending.id);
+      NodeAssert.notEqual(opened?.requestId, pending.id);
       NodeAssert.equal(runtimeMock.state.permissionListCalls, 2);
     }),
   );
@@ -7296,6 +7786,112 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
         latestText: "Hello world",
         deltaToEmit: "",
       });
+    }),
+  );
+
+  it.effect("keeps related child text and tools on the child owner key", () =>
+    Effect.gen(function* () {
+      const adapter = yield* OpenCodeAdapter;
+      const threadId = asThreadId("thread-opencode-child-transcript");
+      const parentSessionId = "http://127.0.0.1:9999/session";
+      const childSessionId = "ses_child_transcript";
+      const childMessageId = "msg-child-transcript";
+      const textPart = {
+        id: "part-child-text",
+        sessionID: childSessionId,
+        messageID: childMessageId,
+        type: "text",
+        text: "Child answer",
+        time: { start: 1 },
+      };
+      runtimeMock.state.endEventStream = true;
+      runtimeMock.state.subscribedEvents = [
+        {
+          type: "session.created",
+          properties: {
+            sessionID: childSessionId,
+            info: {
+              id: childSessionId,
+              parentID: parentSessionId,
+              title: "Research child",
+            },
+          },
+        },
+        {
+          type: "message.updated",
+          properties: {
+            sessionID: childSessionId,
+            info: { id: childMessageId, role: "assistant" },
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: { sessionID: childSessionId, part: textPart, time: 1 },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: childSessionId,
+            part: { ...textPart, time: { start: 1, end: 2 } },
+            time: 2,
+          },
+        },
+        {
+          type: "message.part.updated",
+          properties: {
+            sessionID: childSessionId,
+            part: {
+              id: "part-child-tool",
+              sessionID: childSessionId,
+              messageID: childMessageId,
+              type: "tool",
+              callID: "call-child-tool",
+              tool: "bash",
+              state: {
+                status: "completed",
+                input: { command: "echo child" },
+                output: "child",
+                title: "Run command",
+                metadata: {},
+                time: { start: 3, end: 4 },
+              },
+            },
+            time: 4,
+          },
+        },
+      ];
+      const eventsFiber = yield* adapter.streamEvents.pipe(
+        Stream.filter((event) => event.threadId === threadId),
+        Stream.takeUntil((event) => event.type === "session.exited"),
+        Stream.runCollect,
+        Effect.forkChild,
+      );
+
+      yield* adapter.startSession({
+        provider: ProviderDriverKind.make("opencode"),
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const events = Array.from(yield* Fiber.join(eventsFiber).pipe(Effect.timeout("1 second")));
+      const content = events.find((event) => event.type === "content.delta");
+      const completed = events.find((event) => event.type === "item.completed");
+      const tool = events.find(
+        (event) => event.type === "item.completed" && event.itemId === "call-child-tool",
+      );
+      NodeAssert.ok(content?.type === "content.delta");
+      NodeAssert.ok(completed?.type === "item.completed");
+      NodeAssert.ok(tool?.type === "item.completed");
+      if (content?.type === "content.delta" && completed?.type === "item.completed") {
+        NodeAssert.equal(content.payload.delta, "Child answer");
+        NodeAssert.ok(content.agentKey);
+        NodeAssert.equal(completed.agentKey, content.agentKey);
+        NodeAssert.equal(completed.agentTitle, "Research child");
+      }
+      if (tool?.type === "item.completed") {
+        NodeAssert.ok(tool.agentKey);
+        NodeAssert.equal(tool.agentTitle, "Research child");
+      }
     }),
   );
 

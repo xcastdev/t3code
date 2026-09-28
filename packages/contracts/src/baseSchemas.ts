@@ -164,6 +164,9 @@ export const RuntimeRequestId = makeEntityId("RuntimeRequestId");
 export type RuntimeRequestId = typeof RuntimeRequestId.Type;
 export const RuntimeTaskId = makeEntityId("RuntimeTaskId");
 export type RuntimeTaskId = typeof RuntimeTaskId.Type;
+/** Opaque, session-scoped identity for a provider-owned child agent. */
+export const RuntimeAgentKey = makeEntityId("RuntimeAgentKey");
+export type RuntimeAgentKey = typeof RuntimeAgentKey.Type;
 export const ApprovalRequestId = makeEntityId("ApprovalRequestId");
 export type ApprovalRequestId = typeof ApprovalRequestId.Type;
 export const CheckpointRef = makeEntityId("CheckpointRef");

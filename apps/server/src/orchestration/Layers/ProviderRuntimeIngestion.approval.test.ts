@@ -1,6 +1,7 @@
 import {
   EventId,
   ProviderDriverKind,
+  RuntimeAgentKey,
   RuntimeRequestId,
   ThreadId,
   type ProviderRuntimeEvent,
@@ -44,6 +45,8 @@ describe("runtimeEventToActivities approval details", () => {
       createdAt: "2026-08-24T00:00:00.000Z",
       threadId: ThreadId.make("thread-1"),
       requestId: RuntimeRequestId.make("approval-safari"),
+      agentKey: RuntimeAgentKey.make("agent-opaque-1"),
+      agentTitle: "Research agent",
       payload: {
         requestType: "mcp_elicitation_approval",
         detail: "Allow ChatGPT to use Safari?",
@@ -64,6 +67,8 @@ describe("runtimeEventToActivities approval details", () => {
         detail: "Allow ChatGPT to use Safari?",
         appName: "Safari",
         options,
+        agentKey: "agent-opaque-1",
+        agentTitle: "Research agent",
       },
     });
   });

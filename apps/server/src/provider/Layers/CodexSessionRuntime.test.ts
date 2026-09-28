@@ -22,9 +22,19 @@ import {
   openCodexThread,
   readCodexThread,
   rollbackCodexThread,
+  routeCodexChildNotification,
   toMcpElicitationResponse,
 } from "./CodexSessionRuntime.ts";
 const isCodexAppServerRequestError = Schema.is(CodexErrors.CodexAppServerRequestError);
+
+describe("routeCodexChildNotification", () => {
+  it("routes child assistant and reasoning deltas to the child transcript path", () => {
+    NodeAssert.equal(routeCodexChildNotification("item/agentMessage/delta"), "agent-event");
+    NodeAssert.equal(routeCodexChildNotification("item/reasoning/textDelta"), "agent-event");
+    NodeAssert.equal(routeCodexChildNotification("item/reasoning/summaryTextDelta"), "agent-event");
+    NodeAssert.equal(routeCodexChildNotification("serverRequest/resolved"), "parent");
+  });
+});
 
 describe("Codex thread history", () => {
   for (const numTurns of [1, 3]) {

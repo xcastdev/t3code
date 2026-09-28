@@ -21,6 +21,7 @@ import {
   EnvironmentId,
   EventId,
   MessageId,
+  RuntimeAgentKey,
   ProjectId,
   ThreadId,
   TurnId,
@@ -200,6 +201,8 @@ describe("ProviderCommandReactor", () => {
     readonly compactThreadEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly interruptTurnEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly stopSessionEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
+    readonly messageAgentEffect?: ProviderServiceShape["messageAgent"];
+    readonly stopAgentEffect?: ProviderServiceShape["stopAgent"];
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderServiceError>;
@@ -312,6 +315,12 @@ describe("ProviderCommandReactor", () => {
         ),
       ),
     );
+    const messageAgent = vi.fn<NonNullable<ProviderServiceShape["messageAgent"]>>(
+      (actionInput) => input?.messageAgentEffect?.(actionInput) ?? Effect.succeed("accepted"),
+    );
+    const stopAgent = vi.fn<NonNullable<ProviderServiceShape["stopAgent"]>>(
+      (actionInput) => input?.stopAgentEffect?.(actionInput) ?? Effect.succeed("completed"),
+    );
     const renameBranch = vi.fn((input: unknown) =>
       Effect.succeed({
         branch:
@@ -380,6 +389,14 @@ describe("ProviderCommandReactor", () => {
       respondToRequest: respondToRequest as ProviderServiceShape["respondToRequest"],
       respondToUserInput: respondToUserInput as ProviderServiceShape["respondToUserInput"],
       stopSession: stopSession as ProviderServiceShape["stopSession"],
+      messageAgent,
+      stopAgent,
+      getAgentCapabilities: () =>
+        Effect.succeed({
+          message: { state: "supported" },
+          answerRequests: { state: "supported" },
+          stop: { state: "supported" },
+        }),
       listSessions: () => Effect.succeed(runtimeSessions),
       getCapabilities: (_provider) =>
         Effect.succeed({
@@ -635,6 +652,8 @@ describe("ProviderCommandReactor", () => {
       respondToRequest,
       respondToUserInput,
       stopSession,
+      messageAgent,
+      stopAgent,
       renameBranch,
       pruneWorktrees,
       createWorktree,
@@ -651,6 +670,245 @@ describe("ProviderCommandReactor", () => {
       },
     };
   }
+
+  effectIt.effect("dispatches child message and stop intents through the provider worker", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() => createHarness());
+      const threadId = ThreadId.make("thread-1");
+      const agentKey = RuntimeAgentKey.make("agent:reactor-integration");
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      const acceptedMessageActivity = yield* Effect.promise(() =>
+        harness.runEffect(
+          harness.engine.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "thread.activity-appended" &&
+                event.payload.activity.kind === "agent.transcript.message" &&
+                typeof event.payload.activity.payload === "object" &&
+                event.payload.activity.payload !== null &&
+                "deliveryStatus" in event.payload.activity.payload &&
+                event.payload.activity.payload.deliveryStatus === "accepted",
+            ),
+            Stream.take(1),
+            Stream.toPull,
+            Scope.provide(scope!),
+          ),
+        ),
+      );
+      yield* harness.engine.dispatch({
+        type: "thread.agent.message",
+        commandId: CommandId.make("cmd-agent-message-integration"),
+        threadId,
+        agentKey,
+        text: "Check the failed test and report the minimal fix.",
+        createdAt,
+      });
+      yield* Effect.promise(() => harness.runEffect(acceptedMessageActivity));
+      yield* Effect.promise(() => harness.drain());
+
+      expect(harness.messageAgent).toHaveBeenCalledWith({
+        threadId,
+        agentKey,
+        text: "Check the failed test and report the minimal fix.",
+      });
+      let thread = (yield* Effect.promise(() => harness.readModel())).threads.find(
+        (entry) => entry.id === threadId,
+      );
+      let messageActivity = thread?.activities.find(
+        (activity) => activity.kind === "agent.transcript.message",
+      );
+      expect(messageActivity).toMatchObject({
+        payload: {
+          agentKey,
+          action: "message",
+          role: "user",
+          content: "Check the failed test and report the minimal fix.",
+          deliveryStatus: "accepted",
+          timelineBypass: true,
+        },
+      });
+      expect(thread?.messages).toHaveLength(0);
+
+      const completedStopActivity = yield* Effect.promise(() =>
+        harness.runEffect(
+          harness.engine.streamDomainEvents.pipe(
+            Stream.filter(
+              (event) =>
+                event.type === "thread.activity-appended" &&
+                event.payload.activity.kind === "agent.action.result" &&
+                typeof event.payload.activity.payload === "object" &&
+                event.payload.activity.payload !== null &&
+                "action" in event.payload.activity.payload &&
+                event.payload.activity.payload.action === "stop" &&
+                "status" in event.payload.activity.payload &&
+                event.payload.activity.payload.status === "completed",
+            ),
+            Stream.take(1),
+            Stream.toPull,
+            Scope.provide(scope!),
+          ),
+        ),
+      );
+      yield* harness.engine.dispatch({
+        type: "thread.agent.stop",
+        commandId: CommandId.make("cmd-agent-stop-integration"),
+        threadId,
+        agentKey,
+        createdAt,
+      });
+      yield* Effect.promise(() => harness.runEffect(completedStopActivity));
+      yield* Effect.promise(() => harness.drain());
+      expect(harness.stopAgent).toHaveBeenCalledWith({ threadId, agentKey });
+      thread = (yield* Effect.promise(() => harness.readModel())).threads.find(
+        (entry) => entry.id === threadId,
+      );
+      expect(
+        thread?.activities.find((activity) => activity.kind === "agent.action.result"),
+      ).toMatchObject({
+        payload: {
+          agentKey,
+          action: "stop",
+          status: "completed",
+          timelineBypass: true,
+        },
+      });
+    }),
+  );
+
+  effectIt.effect("settles pending child actions as unknown after restart without resending", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() => createHarness({ deferReactorStart: true }));
+      const threadId = ThreadId.make("thread-1");
+      const agentKey = RuntimeAgentKey.make("agent:recovered");
+      const createdAt = "2026-01-01T00:00:00.000Z";
+      yield* harness.engine.dispatch({
+        type: "thread.activity.append",
+        commandId: CommandId.make("cmd-pending-agent-message"),
+        threadId,
+        activity: {
+          id: EventId.make("agent-message:recovered-message-action"),
+          tone: "info",
+          kind: "agent.transcript.message",
+          summary: "Sending user message to subagent",
+          payload: {
+            agentKey,
+            actionId: "recovered-message-action",
+            action: "message",
+            role: "user",
+            content: "Continue from the saved checkpoint.",
+            status: "running",
+            deliveryStatus: "pending",
+            timelineBypass: true,
+          },
+          turnId: null,
+          createdAt,
+        },
+        createdAt,
+      });
+      yield* harness.engine.dispatch({
+        type: "thread.activity.append",
+        commandId: CommandId.make("cmd-pending-agent-stop"),
+        threadId,
+        activity: {
+          id: EventId.make("agent-action:recovered-stop-action"),
+          tone: "info",
+          kind: "agent.action.result",
+          summary: "Stopping subagent",
+          payload: {
+            agentKey,
+            actionId: "recovered-stop-action",
+            action: "stop",
+            status: "pending",
+            timelineBypass: true,
+          },
+          turnId: null,
+          createdAt,
+        },
+        createdAt,
+      });
+
+      yield* Effect.promise(() => harness.startReactor());
+      const thread = (yield* Effect.promise(() => harness.readModel())).threads.find(
+        (entry) => entry.id === threadId,
+      );
+      expect(
+        thread?.activities.find((activity) => activity.kind === "agent.transcript.message"),
+      ).toMatchObject({
+        payload: { content: "Continue from the saved checkpoint.", deliveryStatus: "unknown" },
+      });
+      expect(
+        thread?.activities.find(
+          (activity) =>
+            activity.kind === "agent.action.result" &&
+            typeof activity.payload === "object" &&
+            activity.payload !== null &&
+            "actionId" in activity.payload &&
+            activity.payload.actionId === "recovered-stop-action",
+        ),
+      ).toMatchObject({ payload: { status: "unknown", timelineBypass: true } });
+      expect(harness.messageAgent).not.toHaveBeenCalled();
+      expect(harness.stopAgent).not.toHaveBeenCalled();
+    }),
+  );
+
+  effectIt.effect(
+    "recovers persisted child intents with no activity as unknown without resending",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() => createHarness({ deferReactorStart: true }));
+        const threadId = ThreadId.make("thread-1");
+        const agentKey = RuntimeAgentKey.make("agent:unmatched-intent");
+        const createdAt = "2026-01-01T00:00:00.000Z";
+
+        yield* harness.engine.dispatch({
+          type: "thread.agent.message",
+          commandId: CommandId.make("cmd-unmatched-agent-message"),
+          threadId,
+          agentKey,
+          text: "Check the authorization failure.",
+          createdAt,
+        });
+        yield* harness.engine.dispatch({
+          type: "thread.agent.stop",
+          commandId: CommandId.make("cmd-unmatched-agent-stop"),
+          threadId,
+          agentKey,
+          createdAt,
+        });
+
+        yield* Effect.promise(() => harness.startReactor());
+        const thread = (yield* Effect.promise(() => harness.readModel())).threads.find(
+          (entry) => entry.id === threadId,
+        );
+        const messageActivity = thread?.activities.find(
+          (activity) => activity.kind === "agent.transcript.message",
+        );
+        const stopActivity = thread?.activities.find(
+          (activity) => activity.kind === "agent.action.result",
+        );
+        expect(messageActivity).toMatchObject({
+          payload: {
+            agentKey,
+            actionId: expect.any(String),
+            action: "message",
+            content: "Check the authorization failure.",
+            deliveryStatus: "unknown",
+            timelineBypass: true,
+          },
+        });
+        expect(stopActivity).toMatchObject({
+          payload: {
+            agentKey,
+            actionId: expect.any(String),
+            action: "stop",
+            status: "unknown",
+            timelineBypass: true,
+          },
+        });
+        expect(harness.messageAgent).not.toHaveBeenCalled();
+        expect(harness.stopAgent).not.toHaveBeenCalled();
+      }),
+  );
 
   effectIt.effect.each(["new", "ready", "stopped"] as const)(
     "handles sign-out for a %s thread before worktree repair, text helpers, or startup",

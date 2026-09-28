@@ -3943,6 +3943,862 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("emits Claude subagent text with the owning opaque agent key", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const events: Array<ProviderRuntimeEvent> = [];
+      const drained = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (
+            event.type === "task.progress" &&
+            event.payload.taskId === "transcript-drain-sentinel"
+          ) {
+            yield* Deferred.succeed(drained, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "spawn an agent",
+        attachments: [],
+      });
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-transcript",
+        description: "Research child",
+        task_type: "local_agent",
+        tool_use_id: "toolu_agent_transcript",
+        uuid: "task-transcript-started",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session",
+        uuid: "child-stream-message-start",
+        parent_tool_use_id: "toolu_agent_transcript",
+        event: {
+          type: "message_start",
+          message: {
+            id: "msg-child-transcript",
+            type: "message",
+            role: "assistant",
+            model: "claude-opus-4-1",
+            content: [],
+            stop_reason: null,
+            stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session",
+        uuid: "child-stream-block-start",
+        parent_tool_use_id: "toolu_agent_transcript",
+        event: {
+          type: "content_block_start",
+          index: 1,
+          content_block: { type: "text", text: "" },
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session",
+        uuid: "child-stream-text",
+        parent_tool_use_id: "toolu_agent_transcript",
+        event: {
+          type: "content_block_delta",
+          index: 1,
+          delta: { type: "text_delta", text: "Child answer" },
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session",
+        uuid: "child-stream-block-stop",
+        parent_tool_use_id: "toolu_agent_transcript",
+        event: { type: "content_block_stop", index: 1 },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session",
+        uuid: "child-assistant-snapshot",
+        parent_tool_use_id: "toolu_agent_transcript",
+        message: {
+          id: "msg-child-transcript",
+          model: "claude-opus-4-1",
+          content: [
+            { type: "tool_use", id: "toolu-child-read", name: "Read", input: {} },
+            { type: "text", text: "Child answer" },
+          ],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_progress",
+        task_id: "transcript-drain-sentinel",
+        description: "Drain subagent text events",
+        usage: { total_tokens: 0, tool_uses: 0, duration_ms: 0 },
+        uuid: "transcript-drain-sentinel-event",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+
+      yield* Deferred.await(drained);
+      eventsFiber.interruptUnsafe();
+      const childTranscriptEvents = events.filter(
+        (event) =>
+          event.agentKey !== undefined &&
+          (event.type === "content.delta" || event.type === "item.completed"),
+      );
+      assert.equal(childTranscriptEvents.length, 2);
+      const delta = childTranscriptEvents[0];
+      const completed = childTranscriptEvents[1];
+      assert.equal(delta?.type, "content.delta");
+      assert.equal(completed?.type, "item.completed");
+      if (delta?.type === "content.delta" && completed?.type === "item.completed") {
+        assert.equal(delta.payload.delta, "Child answer");
+        assert.ok(delta.agentKey);
+        assert.equal(completed.itemId, delta.itemId);
+        assert.equal(completed.agentKey, delta.agentKey);
+        assert.equal(delta.agentTitle, "Research child");
+        assert.equal(completed.agentTitle, "Research child");
+        assert.equal(completed.payload.detail, "Child answer");
+      }
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("emits child assistant snapshots as child transcript items only", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const events: Array<ProviderRuntimeEvent> = [];
+      const drained = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (
+            event.type === "task.progress" &&
+            event.payload.taskId === "snapshot-drain-sentinel"
+          ) {
+            yield* Deferred.succeed(drained, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "spawn an agent",
+        attachments: [],
+      });
+      harness.query.emit({
+        type: "assistant",
+        parent_tool_use_id: "toolu_snapshot_transcript",
+        uuid: "snapshot-assistant-uuid",
+        session_id: "sdk-session",
+        message: {
+          id: "snapshot-child-message",
+          model: "claude-opus-4-1",
+          content: [
+            { type: "text", text: "The child found the answer." },
+            { type: "thinking", thinking: "The child considered the evidence." },
+          ],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-snapshot-transcript",
+        description: "Research child",
+        task_type: "local_agent",
+        tool_use_id: "toolu_snapshot_transcript",
+        uuid: "snapshot-task-started",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "assistant",
+        parent_tool_use_id: "toolu_snapshot_transcript",
+        uuid: "snapshot-assistant-uuid-2",
+        session_id: "sdk-session",
+        message: {
+          id: "snapshot-child-message-2",
+          model: "claude-opus-4-1",
+          content: [{ type: "text", text: "The child sent a second response." }],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "assistant",
+        parent_tool_use_id: "toolu_other_snapshot_transcript",
+        uuid: "other-snapshot-assistant-uuid",
+        session_id: "sdk-session",
+        message: {
+          id: "snapshot-child-message",
+          model: "claude-opus-4-1",
+          content: [{ type: "text", text: "A different child response." }],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-other-snapshot-transcript",
+        description: "Other child",
+        task_type: "local_agent",
+        tool_use_id: "toolu_other_snapshot_transcript",
+        uuid: "other-snapshot-task-started",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_progress",
+        task_id: "snapshot-drain-sentinel",
+        description: "Drain child snapshot",
+        usage: { total_tokens: 0, tool_uses: 0, duration_ms: 0 },
+        uuid: "snapshot-drain-sentinel-event",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+
+      yield* Deferred.await(drained);
+      eventsFiber.interruptUnsafe();
+      const transcriptItems = events.filter(
+        (event) => event.type === "item.completed" && event.payload.detail !== undefined,
+      );
+      assert.equal(transcriptItems.length, 4);
+      assert.deepEqual(
+        transcriptItems.map((event) =>
+          event.type === "item.completed" ? event.payload.detail : undefined,
+        ),
+        [
+          "The child found the answer.",
+          "The child considered the evidence.",
+          "The child sent a second response.",
+          "A different child response.",
+        ],
+      );
+      const firstItem = transcriptItems[0];
+      const secondItem = transcriptItems[1];
+      const thirdItem = transcriptItems[2];
+      const otherItem = transcriptItems[3];
+      assert.equal(firstItem?.agentTitle, "Research child");
+      assert.equal(secondItem?.agentKey, firstItem?.agentKey);
+      assert.equal(thirdItem?.agentKey, firstItem?.agentKey);
+      assert.notEqual(otherItem?.agentKey, firstItem?.agentKey);
+      assert.notEqual(otherItem?.itemId, firstItem?.itemId);
+      if (secondItem?.type === "item.completed") {
+        assert.equal(secondItem.payload.itemType, "reasoning");
+      }
+      assert.equal(
+        events.some(
+          (event) =>
+            event.agentKey === undefined &&
+            event.type === "item.completed" &&
+            [
+              "The child found the answer.",
+              "The child considered the evidence.",
+              "The child sent a second response.",
+              "A different child response.",
+            ].includes(event.payload.detail ?? ""),
+        ),
+        false,
+      );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("uses the provider task output file for missing child assistant messages", () => {
+    const harness = makeHarness();
+    const outputDirectory = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-claude-subagent-output-"),
+    );
+    const tasksDirectory = NodePath.join(outputDirectory, "tasks");
+    const subagentsDirectory = NodePath.join(outputDirectory, "subagents");
+    NodeFS.mkdirSync(tasksDirectory);
+    NodeFS.mkdirSync(subagentsDirectory);
+    const outputFile = NodePath.join(tasksDirectory, "task-output-file.output");
+    const transcriptFile = NodePath.join(subagentsDirectory, "agent-task-output-file.jsonl");
+    NodeFS.writeFileSync(
+      transcriptFile,
+      [
+        JSON.stringify({
+          type: "assistant",
+          isSidechain: true,
+          agentId: "task-output-file",
+          uuid: "output-file-assistant-uuid",
+          message: {
+            id: "output-file-message-id",
+            content: [{ type: "text", text: "The provider supplied this child answer." }],
+          },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          isSidechain: true,
+          agentId: "other-task",
+          uuid: "other-output-file-assistant-uuid",
+          message: {
+            id: "other-output-file-message-id",
+            content: [{ type: "text", text: "Do not attribute this answer." }],
+          },
+        }),
+        JSON.stringify({
+          type: "assistant",
+          isSidechain: false,
+          agentId: "task-output-file",
+          uuid: "parent-output-file-assistant-uuid",
+          message: {
+            id: "parent-output-file-message-id",
+            content: [{ type: "text", text: "Do not show parent text in the child." }],
+          },
+        }),
+        "",
+      ].join("\n"),
+    );
+    NodeFS.symlinkSync(transcriptFile, outputFile);
+
+    return Effect.gen(function* () {
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(outputDirectory, { recursive: true, force: true })),
+      );
+      const adapter = yield* ClaudeAdapter;
+      const events: Array<ProviderRuntimeEvent> = [];
+      const drained = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (
+            event.type === "task.progress" &&
+            event.payload.taskId === "output-file-drain-sentinel"
+          ) {
+            yield* Deferred.succeed(drained, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "spawn an agent",
+        attachments: [],
+      });
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-output-file",
+        description: "Calculate an answer",
+        task_type: "local_agent",
+        tool_use_id: "toolu_output_file",
+        uuid: "output-file-task-started",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        task_id: "task-output-file",
+        status: "completed",
+        output_file: outputFile,
+        summary: "Answer calculated",
+        uuid: "output-file-task-completed",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_progress",
+        task_id: "output-file-drain-sentinel",
+        description: "Drain provider task output",
+        usage: { total_tokens: 0, tool_uses: 0, duration_ms: 0 },
+        uuid: "output-file-drain-sentinel-event",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+
+      yield* Deferred.await(drained);
+      eventsFiber.interruptUnsafe();
+      const childMessages = events.filter(
+        (event) =>
+          event.agentKey !== undefined &&
+          event.type === "item.completed" &&
+          event.payload.itemType === "assistant_message",
+      );
+      assert.equal(childMessages.length, 1);
+      const childMessage = childMessages[0];
+      assert.equal(childMessage?.type, "item.completed");
+      if (childMessage?.type === "item.completed") {
+        assert.equal(childMessage.payload.detail, "The provider supplied this child answer.");
+        assert.equal(childMessage.agentTitle, "Calculate an answer");
+        assert.equal(
+          childMessage.itemId,
+          "claude-subagent:task-output-file:output-file-message-id:0",
+        );
+      }
+    }).pipe(
+      Effect.scoped,
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("does not read a task output symlink for a different child", () => {
+    const harness = makeHarness();
+    const outputDirectory = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-claude-subagent-unrelated-output-"),
+    );
+    const tasksDirectory = NodePath.join(outputDirectory, "tasks");
+    const subagentsDirectory = NodePath.join(outputDirectory, "subagents");
+    NodeFS.mkdirSync(tasksDirectory);
+    NodeFS.mkdirSync(subagentsDirectory);
+    const taskId = "task-expected-child";
+    const outputFile = NodePath.join(tasksDirectory, `${taskId}.output`);
+    const unrelatedTranscript = NodePath.join(subagentsDirectory, "agent-other-child.jsonl");
+    NodeFS.writeFileSync(
+      unrelatedTranscript,
+      `${JSON.stringify({
+        type: "assistant",
+        isSidechain: true,
+        agentId: taskId,
+        message: {
+          id: "unrelated-output-message",
+          content: [{ type: "text", text: "Do not follow an unrelated task link." }],
+        },
+      })}\n`,
+    );
+    NodeFS.symlinkSync(unrelatedTranscript, outputFile);
+
+    return Effect.gen(function* () {
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(outputDirectory, { recursive: true, force: true })),
+      );
+      const adapter = yield* ClaudeAdapter;
+      const events: Array<ProviderRuntimeEvent> = [];
+      const drained = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (
+            event.type === "task.progress" &&
+            event.payload.taskId === "unrelated-output-drain-sentinel"
+          ) {
+            yield* Deferred.succeed(drained, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "spawn an agent",
+        attachments: [],
+      });
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: taskId,
+        description: "Expected child",
+        task_type: "local_agent",
+        uuid: "unrelated-output-task-started",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        task_id: taskId,
+        status: "completed",
+        output_file: outputFile,
+        uuid: "unrelated-output-task-completed",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_progress",
+        task_id: "unrelated-output-drain-sentinel",
+        description: "Drain unrelated output check",
+        usage: { total_tokens: 0, tool_uses: 0, duration_ms: 0 },
+        uuid: "unrelated-output-drain-sentinel-event",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+
+      yield* Deferred.await(drained);
+      eventsFiber.interruptUnsafe();
+      assert.equal(
+        events.some(
+          (event) =>
+            event.agentKey !== undefined &&
+            event.type === "item.completed" &&
+            event.payload.itemType === "assistant_message",
+        ),
+        false,
+      );
+    }).pipe(
+      Effect.scoped,
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("uses the child tool result when its transcript file is not ready yet", () => {
+    const harness = makeHarness();
+    const outputDirectory = NodeFS.mkdtempSync(
+      NodePath.join(NodeOS.tmpdir(), "t3-claude-subagent-result-"),
+    );
+    const tasksDirectory = NodePath.join(outputDirectory, "tasks");
+    NodeFS.mkdirSync(tasksDirectory);
+    const outputFile = NodePath.join(tasksDirectory, "task-handback-result.output");
+
+    return Effect.gen(function* () {
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => NodeFS.rmSync(outputDirectory, { recursive: true, force: true })),
+      );
+      const adapter = yield* ClaudeAdapter;
+      const events: Array<ProviderRuntimeEvent> = [];
+      const drained = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (
+            event.type === "task.progress" &&
+            event.payload.taskId === "handback-drain-sentinel"
+          ) {
+            yield* Deferred.succeed(drained, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "spawn an agent",
+        attachments: [],
+      });
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session",
+        uuid: "handback-agent-tool-start",
+        event: {
+          type: "content_block_start",
+          index: 0,
+          content_block: {
+            type: "tool_use",
+            id: "toolu_handback_agent",
+            name: "Agent",
+            input: { description: "Calculate 11 + 12" },
+          },
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-handback-result",
+        description: "Calculate 11 + 12",
+        task_type: "local_agent",
+        tool_use_id: "toolu_handback_agent",
+        uuid: "handback-task-started",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "assistant",
+        session_id: "sdk-session",
+        uuid: "handback-reasoning-snapshot",
+        parent_tool_use_id: "toolu_handback_agent",
+        message: {
+          id: "handback-reasoning-message",
+          content: [{ type: "thinking", thinking: "The child checked the arithmetic." }],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_notification",
+        task_id: "task-handback-result",
+        status: "completed",
+        output_file: outputFile,
+        summary: "11 + 12 = 23.",
+        uuid: "handback-task-completed",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "user",
+        session_id: "sdk-session",
+        uuid: "handback-agent-tool-result",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_handback_agent",
+              content:
+                "[Subagent hand-back] The text below is the final report of a subagent. The report follows:\n  11 + 12 = 23.\nagentId: task-handback-result (use SendMessage to continue)\n<usage>subagent_tokens: 10</usage>",
+            },
+          ],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_progress",
+        task_id: "handback-drain-sentinel",
+        description: "Drain provider result fallback",
+        usage: { total_tokens: 0, tool_uses: 0, duration_ms: 0 },
+        uuid: "handback-drain-sentinel-event",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+
+      yield* Deferred.await(drained);
+      eventsFiber.interruptUnsafe();
+      const childMessages = events.filter(
+        (event) =>
+          event.agentKey !== undefined &&
+          event.type === "item.completed" &&
+          event.payload.itemType === "assistant_message",
+      );
+      assert.equal(childMessages.length, 1);
+      const childReasoning = events.filter(
+        (event) =>
+          event.agentKey !== undefined &&
+          event.type === "item.completed" &&
+          event.payload.itemType === "reasoning",
+      );
+      assert.equal(childReasoning.length, 1);
+      assert.equal(childMessages[0]?.agentKey, childReasoning[0]?.agentKey);
+      const childMessage = childMessages[0];
+      assert.equal(childMessage?.type, "item.completed");
+      if (childMessage?.type === "item.completed") {
+        assert.equal(childMessage.payload.detail, "11 + 12 = 23.");
+        assert.equal(childMessage.agentTitle, "Calculate 11 + 12");
+      }
+    }).pipe(
+      Effect.scoped,
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect(
+    "flushes streamed child assistant text when task completion ends without a snapshot",
+    () => {
+      const harness = makeHarness();
+      return Effect.gen(function* () {
+        const adapter = yield* ClaudeAdapter;
+        const events: Array<ProviderRuntimeEvent> = [];
+        const drained = yield* Deferred.make<void>();
+        const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+          Effect.gen(function* () {
+            events.push(event);
+            if (
+              event.type === "task.progress" &&
+              event.payload.taskId === "termination-drain-sentinel"
+            ) {
+              yield* Deferred.succeed(drained, undefined);
+            }
+          }),
+        ).pipe(Effect.forkChild);
+
+        const session = yield* adapter.startSession({
+          threadId: THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          runtimeMode: "full-access",
+        });
+        yield* adapter.sendTurn({
+          threadId: session.threadId,
+          input: "spawn an agent",
+          attachments: [],
+        });
+        harness.query.emit({
+          type: "system",
+          subtype: "task_started",
+          task_id: "task-termination-transcript",
+          description: "Research child",
+          task_type: "local_agent",
+          tool_use_id: "toolu_termination_transcript",
+          uuid: "termination-task-started",
+          session_id: "sdk-session",
+        } as unknown as SDKMessage);
+        harness.query.emit({
+          type: "stream_event",
+          session_id: "sdk-session",
+          uuid: "termination-message-start",
+          parent_tool_use_id: "toolu_termination_transcript",
+          event: {
+            type: "message_start",
+            message: { id: "termination-message", type: "message", role: "assistant" },
+          },
+        } as unknown as SDKMessage);
+        harness.query.emit({
+          type: "stream_event",
+          session_id: "sdk-session",
+          uuid: "termination-text-delta",
+          parent_tool_use_id: "toolu_termination_transcript",
+          event: {
+            type: "content_block_delta",
+            index: 0,
+            delta: { type: "text_delta", text: "Partial child answer" },
+          },
+        } as unknown as SDKMessage);
+        harness.query.emit({
+          type: "system",
+          subtype: "task_notification",
+          task_id: "task-termination-transcript",
+          status: "completed",
+          summary: "Task completed",
+          uuid: "termination-task-notification",
+          session_id: "sdk-session",
+        } as unknown as SDKMessage);
+        harness.query.emit({
+          type: "system",
+          subtype: "task_progress",
+          task_id: "termination-drain-sentinel",
+          description: "Drain child termination",
+          usage: { total_tokens: 0, tool_uses: 0, duration_ms: 0 },
+          uuid: "termination-drain-sentinel-event",
+          session_id: "sdk-session",
+        } as unknown as SDKMessage);
+
+        yield* Deferred.await(drained);
+        eventsFiber.interruptUnsafe();
+        const completed = events.find(
+          (event) =>
+            event.agentKey !== undefined &&
+            event.type === "item.completed" &&
+            event.payload.itemType === "assistant_message",
+        );
+        assert.ok(completed);
+        if (completed?.type === "item.completed") {
+          assert.equal(completed.payload.detail, "Partial child answer");
+        }
+      }).pipe(
+        Effect.provideService(Random.Random, makeDeterministicRandomService()),
+        Effect.provide(harness.layer),
+      );
+    },
+  );
+
+  it.effect("tags child tool lifecycle events with the owning opaque agent key", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const events: Array<ProviderRuntimeEvent> = [];
+      const drained = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          events.push(event);
+          if (event.type === "task.progress" && event.payload.taskId === "tool-drain-sentinel") {
+            yield* Deferred.succeed(drained, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "spawn an agent and use a tool",
+        attachments: [],
+      });
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-tool-child",
+        description: "Child doing tool work",
+        task_type: "local_agent",
+        tool_use_id: "toolu_agent_tool_child",
+        uuid: "task-tool-child-started",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session",
+        uuid: "child-tool-start",
+        parent_tool_use_id: "toolu_agent_tool_child",
+        event: {
+          type: "content_block_start",
+          index: 1,
+          content_block: {
+            type: "tool_use",
+            id: "toolu_child_read",
+            name: "Read",
+            input: { file_path: "/workspace/src/index.ts" },
+          },
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "user",
+        session_id: "sdk-session",
+        uuid: "child-tool-result",
+        parent_tool_use_id: "toolu_agent_tool_child",
+        message: {
+          role: "user",
+          content: [
+            {
+              type: "tool_result",
+              tool_use_id: "toolu_child_read",
+              content: "export {};",
+            },
+          ],
+        },
+      } as unknown as SDKMessage);
+      harness.query.emit({
+        type: "system",
+        subtype: "task_progress",
+        task_id: "tool-drain-sentinel",
+        description: "Drain child tool lifecycle events",
+        usage: { total_tokens: 0, tool_uses: 0, duration_ms: 0 },
+        uuid: "tool-drain-sentinel-event",
+        session_id: "sdk-session",
+      } as unknown as SDKMessage);
+
+      yield* Deferred.await(drained);
+      eventsFiber.interruptUnsafe();
+      const childTaskEvent = events.find(
+        (event) => event.type === "task.started" && event.payload.taskId === "task-tool-child",
+      );
+      const childAgentKey =
+        childTaskEvent?.type === "task.started" ? childTaskEvent.payload.agentKey : undefined;
+      const childToolEvents = events.filter(
+        (event) =>
+          (event.type === "item.started" ||
+            event.type === "item.updated" ||
+            event.type === "item.completed") &&
+          event.itemId === "toolu_child_read",
+      );
+      assert.equal(childToolEvents.length, 3);
+      assert.ok(childAgentKey);
+      assert.deepEqual(
+        childToolEvents.map((event) => event.agentKey),
+        [childAgentKey, childAgentKey, childAgentKey],
+      );
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("a subagent snapshot that beats task_started still wins over the seed", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
@@ -6180,6 +7036,7 @@ describe("ClaudeAdapterLive", () => {
         {
           signal: new AbortController().signal,
           requestId: "request-1",
+          agentID: "claude-native-child-1",
           suggestions: [
             {
               type: "setMode",
@@ -6203,6 +7060,8 @@ describe("ClaudeAdapterLive", () => {
       assert.deepEqual(requested.value.providerRefs, {
         providerItemId: ProviderItemId.make("tool-use-1"),
       });
+      assert.equal(typeof requested.value.agentKey, "string");
+      assert.notEqual(requested.value.agentKey, "claude-native-child-1");
       const runtimeRequestId = requested.value.requestId;
       assert.equal(typeof runtimeRequestId, "string");
       if (runtimeRequestId === undefined) {
@@ -6225,6 +7084,7 @@ describe("ClaudeAdapterLive", () => {
         return;
       }
       assert.equal(resolved.value.requestId, requested.value.requestId);
+      assert.equal(resolved.value.agentKey, requested.value.agentKey);
       assert.equal(resolved.value.payload.decision, "accept");
       assert.deepEqual(resolved.value.providerRefs, {
         providerItemId: ProviderItemId.make("tool-use-1"),
@@ -6232,6 +7092,255 @@ describe("ClaudeAdapterLive", () => {
 
       const permissionResult = yield* Effect.promise(() => permissionPromise);
       assert.equal((permissionResult as PermissionResult).behavior, "allow");
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("hands child approval choices to only the immediate owning model", () => {
+    const harness = makeHarness();
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const signal = yield* Effect.abortSignal;
+      const session = yield* adapter.startSession({
+        threadId: THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        runtimeMode: "approval-required",
+      });
+      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
+      yield* adapter.sendTurn({
+        threadId: session.threadId,
+        input: "delegate this work",
+        attachments: [],
+      });
+      yield* Stream.take(adapter.streamEvents, 1).pipe(Stream.runDrain);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-parent",
+        description: "Parent worker",
+        task_type: "local_agent",
+        tool_use_id: "root-spawn-tool",
+        uuid: "parent-task-started",
+        session_id: "sdk-session-child-approval",
+      } as unknown as SDKMessage);
+      const parentStarted = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "task.started" && event.payload.taskId === "task-parent",
+      ).pipe(Stream.runHead);
+      assert.equal(parentStarted._tag, "Some");
+      if (parentStarted._tag !== "Some") throw new Error("Parent task did not start.");
+
+      harness.query.emit({
+        type: "stream_event",
+        session_id: "sdk-session-child-approval",
+        uuid: "nested-task-tool-started",
+        parent_tool_use_id: "root-spawn-tool",
+        event: {
+          type: "content_block_start",
+          index: 1,
+          content_block: {
+            type: "tool_use",
+            id: "nested-spawn-tool",
+            name: "Task",
+            input: { description: "Nested worker", prompt: "run a task" },
+          },
+        },
+      } as unknown as SDKMessage);
+      const nestedToolStarted = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "item.started" && String(event.itemId) === "nested-spawn-tool",
+      ).pipe(Stream.runHead);
+      assert.equal(nestedToolStarted._tag, "Some");
+      if (nestedToolStarted._tag !== "Some") throw new Error("Nested Task tool did not start.");
+
+      const options = harness.getLastCreateQueryInput()?.options;
+      const canUseTool = options?.canUseTool;
+      assert.equal(typeof canUseTool, "function");
+      const postToolBatch = options?.hooks?.PostToolBatch?.[0]?.hooks[0];
+      const userPromptSubmit = options?.hooks?.UserPromptSubmit?.[0]?.hooks[0];
+      assert.equal(typeof postToolBatch, "function");
+      assert.equal(typeof userPromptSubmit, "function");
+      if (!canUseTool || !postToolBatch || !userPromptSubmit) {
+        throw new Error("Claude child-approval handoff hooks are unavailable.");
+      }
+
+      const decide = Effect.fn("decideChildApproval")(function* (
+        requestId: string,
+        decision: "accept" | "decline",
+        agentId = "task-child",
+      ) {
+        const permission = canUseTool(
+          "Bash",
+          { command: "git status" },
+          {
+            signal,
+            requestId,
+            agentID: agentId,
+            toolUseID: `tool-${requestId}`,
+          },
+        );
+        const opened = yield* Stream.filter(
+          adapter.streamEvents,
+          (event) => event.type === "request.opened",
+        ).pipe(Stream.runHead);
+        assert.equal(opened._tag, "Some");
+        if (opened._tag !== "Some") throw new Error("Child approval request did not open.");
+        if (opened.value.type !== "request.opened" || typeof opened.value.agentKey !== "string") {
+          throw new Error("Child approval request did not include its agent identity.");
+        }
+        const resolvedRequestId = opened.value.requestId;
+        assert.equal(typeof resolvedRequestId, "string");
+        if (typeof resolvedRequestId !== "string") {
+          throw new Error("Child approval request ID is missing.");
+        }
+        yield* adapter.respondToRequest(
+          session.threadId,
+          ApprovalRequestId.make(resolvedRequestId),
+          decision,
+        );
+        const resolved = yield* Stream.runHead(adapter.streamEvents);
+        assert.equal(resolved._tag, "Some");
+        if (resolved._tag !== "Some" || resolved.value.type !== "request.resolved") {
+          throw new Error("Child approval request did not resolve.");
+        }
+        return {
+          permission: yield* Effect.promise(() => permission),
+          agentKey: opened.value.agentKey,
+        };
+      });
+
+      const allowed = yield* decide("native-request-allow", "accept");
+      if (allowed === null || allowed.permission === null) {
+        throw new Error("Child allow decision returned no result.");
+      }
+      assert.equal(allowed.permission.behavior, "allow");
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-child",
+        description: "Nested worker",
+        task_type: "local_agent",
+        tool_use_id: "nested-spawn-tool",
+        uuid: "child-task-started",
+        session_id: "sdk-session-child-approval",
+      } as unknown as SDKMessage);
+      const childStarted = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "task.started" && event.payload.taskId === "task-child",
+      ).pipe(Stream.runHead);
+      assert.equal(childStarted._tag, "Some");
+      if (childStarted._tag !== "Some" || childStarted.value.type !== "task.started") {
+        throw new Error("Child task did not start.");
+      }
+      assert.equal(childStarted.value.payload.agentKey, allowed.agentKey);
+
+      const invokePostToolBatch = (agentId?: string) =>
+        postToolBatch(
+          {
+            hook_event_name: "PostToolBatch",
+            session_id: "sdk-session-child-approval",
+            transcript_path: "/tmp/claude-child-approval.jsonl",
+            cwd: "/tmp",
+            ...(agentId ? { agent_id: agentId } : {}),
+            tool_calls: [],
+          },
+          undefined,
+          { signal },
+        );
+      const invokeUserPromptSubmit = (agentId?: string) =>
+        userPromptSubmit(
+          {
+            hook_event_name: "UserPromptSubmit",
+            session_id: "sdk-session-child-approval",
+            transcript_path: "/tmp/claude-child-approval.jsonl",
+            cwd: "/tmp",
+            prompt: "A child task has updated.",
+            source: "system",
+            ...(agentId ? { agent_id: agentId } : {}),
+          },
+          undefined,
+          { signal },
+        );
+      const additionalContext = (
+        output: Awaited<ReturnType<typeof postToolBatch>>,
+      ): string | undefined =>
+        "hookSpecificOutput" in output
+          ? output.hookSpecificOutput?.hookEventName === "PostToolBatch"
+            ? output.hookSpecificOutput.additionalContext
+            : undefined
+          : undefined;
+      const userPromptAdditionalContext = (
+        output: Awaited<ReturnType<typeof userPromptSubmit>>,
+      ): string | undefined =>
+        "hookSpecificOutput" in output
+          ? output.hookSpecificOutput?.hookEventName === "UserPromptSubmit"
+            ? output.hookSpecificOutput.additionalContext
+            : undefined
+          : undefined;
+      const childContext = yield* Effect.promise(() => invokePostToolBatch("task-child"));
+      assert.equal(additionalContext(childContext), undefined);
+      const siblingContext = yield* Effect.promise(() => invokePostToolBatch("task-sibling"));
+      assert.equal(additionalContext(siblingContext), undefined);
+      const parentContext = yield* Effect.promise(() => invokePostToolBatch("task-parent"));
+      const allowedHandoff = additionalContext(parentContext) ?? "";
+      assert.match(allowedHandoff, /user chose to allow once/i);
+      assert.match(allowedHandoff, /native-request-allow/);
+      assert.match(allowedHandoff, /does not establish that the operation ran or succeeded/i);
+      const parentAfterDrain = yield* Effect.promise(() => invokePostToolBatch("task-parent"));
+      assert.equal(additionalContext(parentAfterDrain), undefined);
+
+      const denied = yield* decide("native-request-deny", "decline");
+      if (denied === null || denied.permission === null) {
+        throw new Error("Child deny decision returned no result.");
+      }
+      assert.equal(denied.permission.behavior, "deny");
+      // A background child can request/receive approval after the parent's
+      // last tool batch. Its system task-notification prompt must still carry
+      // the user's choice into the immediate parent before inference.
+      const deniedContext = yield* Effect.promise(() => invokeUserPromptSubmit("task-parent"));
+      const deniedHandoff = userPromptAdditionalContext(deniedContext) ?? "";
+      assert.match(deniedHandoff, /user chose to deny/i);
+      assert.match(deniedHandoff, /native-request-deny/);
+      const siblingPromptContext = yield* Effect.promise(() =>
+        invokeUserPromptSubmit("task-sibling"),
+      );
+      assert.equal(userPromptAdditionalContext(siblingPromptContext), undefined);
+      const parentPromptAfterDrain = yield* Effect.promise(() =>
+        invokeUserPromptSubmit("task-parent"),
+      );
+      assert.equal(userPromptAdditionalContext(parentPromptAfterDrain), undefined);
+      const rootContext = yield* Effect.promise(() => invokePostToolBatch());
+      assert.equal(additionalContext(rootContext), undefined);
+
+      harness.query.emit({
+        type: "system",
+        subtype: "task_started",
+        task_id: "task-root-child",
+        description: "Top-level worker",
+        task_type: "local_agent",
+        tool_use_id: "root-child-tool",
+        uuid: "root-child-task-started",
+        session_id: "sdk-session-child-approval",
+      } as unknown as SDKMessage);
+      const rootChildStarted = yield* Stream.filter(
+        adapter.streamEvents,
+        (event) => event.type === "task.started" && event.payload.taskId === "task-root-child",
+      ).pipe(Stream.runHead);
+      assert.equal(rootChildStarted._tag, "Some");
+      if (rootChildStarted._tag !== "Some") throw new Error("Top-level child task did not start.");
+      const rootAllowed = yield* decide("native-request-root", "accept", "task-root-child");
+      if (rootAllowed === null || rootAllowed.permission === null) {
+        throw new Error("Top-level child allow decision returned no result.");
+      }
+      assert.equal(rootAllowed.permission.behavior, "allow");
+      const rootApprovalContext = yield* Effect.promise(() => invokePostToolBatch());
+      const rootHandoff = additionalContext(rootApprovalContext) ?? "";
+      assert.match(rootHandoff, /user chose to allow once/i);
+      assert.match(rootHandoff, /native-request-root/);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

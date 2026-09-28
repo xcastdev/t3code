@@ -180,6 +180,11 @@ export function PendingUserInputCard(props: PendingUserInputCardProps) {
         <Text className="font-sans text-xs text-foreground-muted">
           {questionCount} question{questionCount === 1 ? "" : "s"}
         </Text>
+        {props.pendingUserInput.agentKey ? (
+          <Text className="font-sans text-xs text-foreground-muted">
+            · Subagent {props.pendingUserInput.agentTitle || "Agent"}
+          </Text>
+        ) : null}
         <View className="flex-1" />
         <SymbolView
           name="chevron.up"
@@ -236,6 +241,14 @@ export function PendingUserInputCard(props: PendingUserInputCardProps) {
           <Text className="font-t3-bold text-2xs uppercase tracking-[1.1px] text-foreground-secondary">
             User input needed
           </Text>
+          {props.pendingUserInput.agentKey ? (
+            <Text
+              accessibilityLabel={`Request from subagent ${props.pendingUserInput.agentTitle || "Agent"}`}
+              className="font-t3-bold text-xs text-foreground-muted"
+            >
+              Subagent · {props.pendingUserInput.agentTitle || "Agent"}
+            </Text>
+          ) : null}
           <Text className="font-t3-bold text-lg text-foreground">Fill in the pending answers</Text>
         </View>
         <View className="h-8 w-8 items-center justify-center rounded-full bg-subtle-strong">

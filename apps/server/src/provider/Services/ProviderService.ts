@@ -26,6 +26,8 @@ import type {
   MessageId,
   ThreadId,
   ProviderTurnStartResult,
+  RuntimeAgentKey,
+  OrchestrationAgentCapability,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
@@ -53,6 +55,29 @@ export interface ProviderServiceShape {
   readonly sendTurn: (
     input: ProviderSendTurnInput,
   ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
+
+  readonly messageAgent?: (input: {
+    readonly threadId: ThreadId;
+    readonly agentKey: RuntimeAgentKey;
+    readonly text: string;
+  }) => Effect.Effect<"accepted" | "unknown", ProviderServiceError>;
+
+  readonly stopAgent?: (input: {
+    readonly threadId: ThreadId;
+    readonly agentKey: RuntimeAgentKey;
+  }) => Effect.Effect<"completed" | "unknown", ProviderServiceError>;
+
+  readonly getAgentCapabilities?: (input: {
+    readonly threadId: ThreadId;
+    readonly agentKey: RuntimeAgentKey;
+  }) => Effect.Effect<
+    {
+      readonly message: OrchestrationAgentCapability;
+      readonly answerRequests: OrchestrationAgentCapability;
+      readonly stop: OrchestrationAgentCapability;
+    },
+    ProviderServiceError
+  >;
 
   readonly compactThread: (
     threadId: ThreadId,

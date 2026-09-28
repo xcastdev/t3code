@@ -3,6 +3,7 @@ import {
   AuthOrchestrationReadScope,
   AuthRelayReadScope,
   AuthRelayWriteScope,
+  ORCHESTRATION_WS_METHODS,
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
@@ -47,6 +48,15 @@ describe("RPC authorization scopes", () => {
 
   it("requires permission to operate on a thread before uploading feedback", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.providerUploadFeedback)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+  });
+
+  it("keeps subagent history read-only and child actions under orchestration operate scope", () => {
+    expect(requiredScopeForRpcMethod(ORCHESTRATION_WS_METHODS.getAgentTranscriptPage)).toBe(
+      AuthOrchestrationReadScope,
+    );
+    expect(requiredScopeForRpcMethod(ORCHESTRATION_WS_METHODS.dispatchCommand)).toBe(
       AuthOrchestrationOperateScope,
     );
   });

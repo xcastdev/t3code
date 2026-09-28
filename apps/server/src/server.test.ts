@@ -25,12 +25,14 @@ import {
   type OrchestrationThreadStreamItem,
   type OrchestrationThreadActivity,
   type OrchestrationThreadShell,
+  type OrchestrationAgentTranscriptPage,
   TerminalNotRunningError,
   type OrchestrationCommand,
   type OrchestrationEvent,
   ORCHESTRATION_WS_METHODS,
   type PreviewEvent,
   ProjectId,
+  RuntimeAgentKey,
   type ProviderAuthState,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -4939,6 +4941,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       assert.isUndefined(response.shellRevealInFileManager);
       assert.isUndefined(response.shellRevealInFileManagerKind);
       assert.equal(response.threadResumeCompletionMarker, true);
+      assert.equal(response.threadAgentActionEvents, true);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -9390,6 +9393,62 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
+  it.effect("gates child action intent events on the negotiated client capability", () =>
+    Effect.gen(function* () {
+      const event = {
+        sequence: 99_999,
+        eventId: EventId.make("event-agent-action-1"),
+        aggregateKind: "thread",
+        aggregateId: defaultThreadId,
+        occurredAt: "2026-01-01T00:00:01.000Z",
+        commandId: null,
+        causationEventId: null,
+        correlationId: null,
+        metadata: {},
+        type: "thread.agent-message-requested",
+        payload: {
+          threadId: defaultThreadId,
+          agentKey: RuntimeAgentKey.make("agent-key-1"),
+          text: "check the build",
+          createdAt: "2026-01-01T00:00:01.000Z",
+        },
+      } satisfies OrchestrationEvent;
+      yield* buildAppUnderTest({
+        layers: {
+          orchestrationEngine: {
+            latestSequence: Effect.succeed(100_000),
+            getThreadReplayStats: () =>
+              Effect.succeed({ eventCount: 1, payloadBytes: 128, hasCreateEvent: false }),
+            readThreadEvents: () => Stream.make(event),
+          },
+        },
+      });
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const collect = (includeAgentActionEvents: boolean) =>
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.subscribeThread]({
+            threadId: defaultThreadId,
+            afterSequence: 5,
+            requestCompletionMarker: true,
+            ...(includeAgentActionEvents ? { includeAgentActionEvents: true } : {}),
+          }).pipe(
+            Stream.takeUntil((item) => item.kind === "synchronized"),
+            Stream.runCollect,
+          ),
+        );
+      const oldClientItems = yield* Effect.scoped(collect(false));
+      const newClientItems = yield* Effect.scoped(collect(true));
+      assert.deepEqual(
+        oldClientItems.map((item) => item.kind),
+        ["synchronized"],
+      );
+      assert.deepEqual(
+        newClientItems.map((item) => (item.kind === "event" ? item.event.type : item.kind)),
+        ["thread.agent-message-requested", "synchronized"],
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
   it.effect("subscribeThread resets cached history when its ID is created again", () =>
     Effect.gen(function* () {
       const thread = {
@@ -11936,6 +11995,57 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
         assert.equal(failedSession.session.status, "error");
         assert.include(failedSession.session.lastError ?? "", "worktree exploded");
       }
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("routes bounded subagent transcript reads through the shared WebSocket RPC", () =>
+    Effect.gen(function* () {
+      const threadId = ThreadId.make("thread-agent-transcript-rpc");
+      const agentKey = RuntimeAgentKey.make("agent-transcript-rpc");
+      const page: OrchestrationAgentTranscriptPage = {
+        threadId,
+        agent: {
+          key: agentKey,
+          parentKey: null,
+          title: "Researcher",
+          role: "Researcher",
+          provider: ProviderDriverKind.make("opencode"),
+          status: "running",
+          capabilities: {
+            transcript: { state: "supported" },
+            message: { state: "supported" },
+            answerRequests: { state: "unverified", reason: "No current request." },
+            stop: { state: "supported" },
+          },
+        },
+        entries: [],
+        nextCursor: null,
+        hasMore: false,
+        snapshotSequence: 4,
+        threadSequence: 5,
+        completeness: { state: "partial", reason: "Only captured child activity is shown." },
+      };
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getAgentTranscriptPage: (input) =>
+              Effect.sync(() => {
+                assert.equal(input.threadId, threadId);
+                assert.equal(input.agentKey, agentKey);
+                assert.equal(input.limit, undefined);
+                return Option.some(page);
+              }),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws?connectionMethod=direct");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[ORCHESTRATION_WS_METHODS.getAgentTranscriptPage]({ threadId, agentKey }),
+        ),
+      );
+      assert.deepEqual(result, page);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

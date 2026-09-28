@@ -108,6 +108,12 @@ const BUFFERED_PROPOSED_PLAN_BY_ID_CACHE_CAPACITY = 10_000;
 const BUFFERED_PROPOSED_PLAN_BY_ID_TTL = Duration.minutes(120);
 const TASK_DESCRIPTION_BY_TASK_CACHE_CAPACITY = 10_000;
 const TASK_DESCRIPTION_BY_TASK_TTL = Duration.minutes(120);
+const AGENT_TRANSCRIPT_BUFFER_CAPACITY = 10_000;
+const AGENT_TRANSCRIPT_BUFFER_TTL = Duration.minutes(120);
+const AGENT_TRANSCRIPT_MAX_CHARS = 65_536;
+const AGENT_TRANSCRIPT_MAX_EVENT_IDS = 50_000;
+const AGENT_TRANSCRIPT_DELIVERY_INTERVAL_MS = 400;
+const AGENT_TRANSCRIPT_DELIVERY_CHAR_THRESHOLD = 4_096;
 const MAX_BUFFERED_ASSISTANT_CHARS = 24_000;
 // Paragraphs that finish within this window after a delivery stay buffered
 // and land together on the next one. Keeps fast models from repainting the
@@ -130,6 +136,14 @@ type RuntimeIngestionInput =
       source: "domain";
       event: TurnStartRequestedDomainEvent;
     };
+
+interface AgentTranscriptBuffer {
+  readonly itemId: string;
+  readonly content: string;
+  readonly publishedLength: number;
+  readonly lastPublishedAt: number;
+  readonly createdAt: string;
+}
 
 function toTurnId(value: TurnId | string | undefined): TurnId | undefined {
   return value === undefined ? undefined : TurnId.make(String(value));
@@ -380,7 +394,10 @@ function requestKindFromCanonicalRequestType(
  * into the persisted activity payload. Identity fields ride on every row so
  * client folds survive activity retention; absent fields stay absent.
  */
-function taskLinkageActivityFields(payload: Record<string, unknown>): Record<string, unknown> {
+function taskLinkageActivityFields(
+  payload: Record<string, unknown>,
+  provider?: ProviderRuntimeEvent["provider"],
+): Record<string, unknown> {
   const fields: Record<string, unknown> = {
     // Server-stamped classification: persisted rows are self-describing, so
     // clients trust the stamp instead of re-deriving agent-vs-background
@@ -390,8 +407,11 @@ function taskLinkageActivityFields(payload: Record<string, unknown>): Record<str
       taskType: typeof payload.taskType === "string" ? payload.taskType : undefined,
       agentId: typeof payload.agentId === "string" ? payload.agentId : undefined,
     }),
+    ...(provider === undefined ? {} : { provider }),
   };
   for (const key of [
+    "agentKey",
+    "parentAgentKey",
     "taskType",
     "agentId",
     "title",
@@ -460,6 +480,8 @@ export function runtimeEventToActivities(
             ...(event.payload.detail ? { detail: event.payload.detail } : {}),
             ...(event.payload.appName ? { appName: event.payload.appName } : {}),
             ...(event.payload.options ? { options: event.payload.options } : {}),
+            ...(event.agentKey ? { agentKey: event.agentKey } : {}),
+            ...(event.agentTitle ? { agentTitle: event.agentTitle } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -484,6 +506,8 @@ export function runtimeEventToActivities(
             ...(requestKind ? { requestKind } : {}),
             requestType: event.payload.requestType,
             ...(event.payload.decision ? { decision: event.payload.decision } : {}),
+            ...(event.agentKey ? { agentKey: event.agentKey } : {}),
+            ...(event.agentTitle ? { agentTitle: event.agentTitle } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -580,6 +604,8 @@ export function runtimeEventToActivities(
             ...(event.requestId ? { requestId: event.requestId } : {}),
             questions: event.payload.questions,
             ...(event.payload.responseMode ? { responseMode: event.payload.responseMode } : {}),
+            ...(event.agentKey ? { agentKey: event.agentKey } : {}),
+            ...(event.agentTitle ? { agentTitle: event.agentTitle } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -598,6 +624,8 @@ export function runtimeEventToActivities(
           payload: {
             ...(event.requestId ? { requestId: event.requestId } : {}),
             answers: event.payload.answers,
+            ...(event.agentKey ? { agentKey: event.agentKey } : {}),
+            ...(event.agentTitle ? { agentTitle: event.agentTitle } : {}),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -624,7 +652,7 @@ export function runtimeEventToActivities(
             ...(event.payload.description
               ? { detail: truncateDetail(event.payload.description) }
               : {}),
-            ...taskLinkageActivityFields(event.payload as Record<string, unknown>),
+            ...taskLinkageActivityFields(event.payload as Record<string, unknown>, event.provider),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -633,7 +661,10 @@ export function runtimeEventToActivities(
     }
 
     case "task.progress": {
-      const linkage = taskLinkageActivityFields(event.payload as Record<string, unknown>);
+      const linkage = taskLinkageActivityFields(
+        event.payload as Record<string, unknown>,
+        event.provider,
+      );
       // Usage and activity are independent latest-state streams. Keeping them
       // under separate stable ids prevents a command/reasoning update from
       // replacing the last known token count (and prevents a usage-only tick
@@ -732,7 +763,7 @@ export function runtimeEventToActivities(
             ...(event.payload.isBackgrounded !== undefined
               ? { isBackgrounded: event.payload.isBackgrounded }
               : {}),
-            ...taskLinkageActivityFields(event.payload as Record<string, unknown>),
+            ...taskLinkageActivityFields(event.payload as Record<string, unknown>, event.provider),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -800,7 +831,7 @@ export function runtimeEventToActivities(
                 }
               : {}),
             ...(event.payload.usage !== undefined ? { usage: event.payload.usage } : {}),
-            ...taskLinkageActivityFields(event.payload as Record<string, unknown>),
+            ...taskLinkageActivityFields(event.payload as Record<string, unknown>, event.provider),
           },
           turnId: toTurnId(event.turnId) ?? null,
           ...maybeSequence,
@@ -1028,6 +1059,18 @@ const make = Effect.gen(function* () {
     lookup: () => Effect.succeed(""),
   });
 
+  const agentTranscriptBuffers = yield* Cache.make<string, AgentTranscriptBuffer>({
+    capacity: AGENT_TRANSCRIPT_BUFFER_CAPACITY,
+    timeToLive: AGENT_TRANSCRIPT_BUFFER_TTL,
+    lookup: () =>
+      Effect.die(new Error("agent transcript buffer should be read before initialization")),
+  });
+  const seenAgentTranscriptEventIds = yield* Cache.make<EventId, true>({
+    capacity: AGENT_TRANSCRIPT_MAX_EVENT_IDS,
+    timeToLive: AGENT_TRANSCRIPT_BUFFER_TTL,
+    lookup: () => Effect.succeed(true),
+  });
+
   const rememberTaskDescription = (threadId: ThreadId, taskId: string, description: string) =>
     Cache.set(taskDescriptionByTaskKey, providerTaskKey(threadId, taskId), description);
 
@@ -1048,6 +1091,177 @@ const make = Effect.gen(function* () {
       .getThreadRuntimeContext(threadId)
       .pipe(Effect.map(Option.getOrUndefined));
   });
+
+  const agentTranscriptBufferKey = (event: ProviderRuntimeEvent) =>
+    event.agentKey !== undefined && event.itemId !== undefined
+      ? `${event.threadId}:${event.agentKey}:${event.itemId}`
+      : undefined;
+
+  const appendAgentTranscriptMessage = (input: {
+    readonly event: ProviderRuntimeEvent;
+    readonly itemId?: string;
+    readonly createdAt: string;
+    readonly content: string;
+    readonly status: "running" | "completed";
+  }) => {
+    const { event } = input;
+    const itemId = input.itemId ?? event.itemId;
+    if (!event.agentKey || !itemId || input.content.length === 0) return Effect.void;
+    const firstLine = input.content.trimStart().split(/\r?\n/, 1)[0] ?? "";
+    const sessionSequence = (event as ProviderRuntimeEvent & { sessionSequence?: number })
+      .sessionSequence;
+    return providerCommandId(event, "agent-transcript-upsert").pipe(
+      Effect.flatMap((commandId) =>
+        orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId,
+          threadId: event.threadId,
+          activity: {
+            id: EventId.make(`agent-transcript:${event.threadId}:${event.agentKey}:${itemId}`),
+            createdAt: input.createdAt,
+            tone: "info",
+            kind: "agent.transcript.message",
+            summary: firstLine.length > 0 ? truncateDetail(firstLine, 120) : "Assistant response",
+            payload: {
+              agentKey: event.agentKey,
+              ...(event.agentTitle
+                ? { title: event.agentTitle, agentTitle: event.agentTitle }
+                : {}),
+              provider: event.provider,
+              role: "assistant",
+              content: input.content.slice(0, AGENT_TRANSCRIPT_MAX_CHARS),
+              status: input.status,
+              timelineBypass: true,
+            },
+            turnId: toTurnId(event.turnId) ?? null,
+            ...(sessionSequence === undefined ? {} : { sequence: sessionSequence }),
+          },
+          createdAt: input.createdAt,
+        }),
+      ),
+    );
+  };
+
+  const ingestAgentTranscriptDelta = (event: ProviderRuntimeEvent, delta: string) =>
+    Effect.gen(function* () {
+      const key = agentTranscriptBufferKey(event);
+      if (key === undefined || event.agentKey === undefined || event.itemId === undefined) return;
+      if (Option.isSome(yield* Cache.getOption(seenAgentTranscriptEventIds, event.eventId))) return;
+
+      const previous = Option.getOrUndefined(yield* Cache.getOption(agentTranscriptBuffers, key));
+      const prior = previous ?? {
+        itemId: String(event.itemId),
+        content: "",
+        publishedLength: 0,
+        lastPublishedAt: 0,
+        createdAt: event.createdAt,
+      };
+      const content = `${prior.content}${delta}`.slice(0, AGENT_TRANSCRIPT_MAX_CHARS);
+      const nowMillis = yield* Clock.currentTimeMillis;
+      const shouldPublish =
+        prior.publishedLength === 0 ||
+        nowMillis - prior.lastPublishedAt >= AGENT_TRANSCRIPT_DELIVERY_INTERVAL_MS ||
+        content.length - prior.publishedLength >= AGENT_TRANSCRIPT_DELIVERY_CHAR_THRESHOLD;
+      const next: AgentTranscriptBuffer = { ...prior, content };
+      yield* Cache.set(agentTranscriptBuffers, key, next);
+      yield* Cache.set(seenAgentTranscriptEventIds, event.eventId, true);
+      if (shouldPublish && content.length > prior.publishedLength) {
+        yield* appendAgentTranscriptMessage({
+          event,
+          createdAt: prior.createdAt,
+          content,
+          status: "running",
+        });
+        yield* Cache.set(agentTranscriptBuffers, key, {
+          ...next,
+          publishedLength: content.length,
+          lastPublishedAt: nowMillis,
+        });
+      }
+    });
+
+  const completeAgentTranscriptMessage = (event: ProviderRuntimeEvent, fallbackText?: string) =>
+    Effect.gen(function* () {
+      const key = agentTranscriptBufferKey(event);
+      if (key === undefined || event.agentKey === undefined || event.itemId === undefined) return;
+      if (Option.isSome(yield* Cache.getOption(seenAgentTranscriptEventIds, event.eventId))) return;
+      const previous = Option.getOrUndefined(yield* Cache.getOption(agentTranscriptBuffers, key));
+      const content = fallbackText || previous?.content || "";
+      yield* Cache.set(seenAgentTranscriptEventIds, event.eventId, true);
+      if (content.length > 0) {
+        yield* appendAgentTranscriptMessage({
+          event,
+          createdAt: previous?.createdAt ?? event.createdAt,
+          content,
+          status: "completed",
+        });
+      }
+      yield* Cache.invalidate(agentTranscriptBuffers, key);
+    });
+
+  const flushAgentTranscriptBuffers = (
+    event: ProviderRuntimeEvent,
+    status: "running" | "completed",
+  ) =>
+    Effect.gen(function* () {
+      if (event.agentKey === undefined) return;
+      const prefix = `${event.threadId}:${event.agentKey}:`;
+      const keys = Array.from(yield* Cache.keys(agentTranscriptBuffers));
+      for (const key of keys) {
+        if (!key.startsWith(prefix)) continue;
+        const buffer = Option.getOrUndefined(yield* Cache.getOption(agentTranscriptBuffers, key));
+        if (buffer?.content) {
+          yield* appendAgentTranscriptMessage({
+            event,
+            itemId: buffer.itemId,
+            createdAt: buffer.createdAt,
+            content: buffer.content,
+            status,
+          });
+        }
+        yield* Cache.invalidate(agentTranscriptBuffers, key);
+      }
+    });
+
+  const appendAgentStatusActivity = (
+    event: ProviderRuntimeEvent,
+    status: "running" | "waiting" | "idle" | "completed" | "failed" | "cancelled" | "interrupted",
+    summary: string,
+    title?: string,
+  ) => {
+    if (event.agentKey === undefined) return Effect.void;
+    const sessionSequence = (event as ProviderRuntimeEvent & { sessionSequence?: number })
+      .sessionSequence;
+    return providerCommandId(event, "agent-status").pipe(
+      Effect.flatMap((commandId) =>
+        orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId,
+          threadId: event.threadId,
+          activity: {
+            id: event.eventId,
+            createdAt: event.createdAt,
+            tone: status === "failed" ? "error" : "info",
+            kind: "agent.status",
+            summary,
+            payload: {
+              agentKey: event.agentKey,
+              ...(event.parentAgentKey === undefined
+                ? {}
+                : { parentAgentKey: event.parentAgentKey }),
+              ...((title ?? event.agentTitle) ? { title: title ?? event.agentTitle } : {}),
+              provider: event.provider,
+              status,
+              timelineBypass: true,
+            },
+            turnId: null,
+            ...(sessionSequence === undefined ? {} : { sequence: sessionSequence }),
+          },
+          createdAt: event.createdAt,
+        }),
+      ),
+    );
+  };
 
   const getThreadMessageById = Effect.fn("getThreadMessageById")(function* (
     threadId: ThreadId,
@@ -1603,6 +1817,97 @@ const make = Effect.gen(function* () {
       const thread = yield* resolveThreadRuntimeContext(event.threadId);
       if (!thread) return;
 
+      if (
+        event.agentKey !== undefined &&
+        event.type === "content.delta" &&
+        event.payload.streamKind === "assistant_text"
+      ) {
+        yield* ingestAgentTranscriptDelta(event, event.payload.delta);
+        return;
+      }
+      if (
+        event.agentKey !== undefined &&
+        event.type === "item.completed" &&
+        event.payload.itemType === "assistant_message"
+      ) {
+        yield* completeAgentTranscriptMessage(event, event.payload.detail);
+        return;
+      }
+
+      // Provider child turn/session events share a parent thread id. They must
+      // not settle the parent turn, flush its assistant text, or create a
+      // parent checkpoint. Keep a small owned status activity for the child.
+      if (event.agentKey !== undefined) {
+        switch (event.type) {
+          case "session.started":
+          case "thread.started":
+          case "turn.started":
+            yield* appendAgentStatusActivity(event, "running", "Subagent started");
+            return;
+          case "session.exited":
+            yield* flushAgentTranscriptBuffers(event, "completed");
+            yield* appendAgentStatusActivity(event, "cancelled", "Subagent session stopped");
+            return;
+          case "session.state.changed": {
+            const status =
+              event.payload.state === "error"
+                ? "failed"
+                : event.payload.state === "stopped"
+                  ? "cancelled"
+                  : event.payload.state === "waiting"
+                    ? "waiting"
+                    : event.payload.state === "ready"
+                      ? "idle"
+                      : "running";
+            if (status === "failed" || status === "cancelled") {
+              yield* flushAgentTranscriptBuffers(event, "completed");
+            }
+            yield* appendAgentStatusActivity(event, status, `Subagent ${event.payload.state}`);
+            return;
+          }
+          case "turn.completed": {
+            const status =
+              normalizeRuntimeTurnState(event.payload.state) === "failed" ? "failed" : "completed";
+            yield* flushAgentTranscriptBuffers(event, "completed");
+            yield* appendAgentStatusActivity(event, status, "Subagent turn completed");
+            return;
+          }
+          case "turn.aborted":
+            yield* flushAgentTranscriptBuffers(event, "completed");
+            yield* appendAgentStatusActivity(event, "interrupted", "Subagent turn interrupted");
+            return;
+          case "task.completed":
+            yield* flushAgentTranscriptBuffers(event, "completed");
+            break;
+          case "task.updated":
+            if (
+              event.payload.status === "completed" ||
+              event.payload.status === "failed" ||
+              event.payload.status === "interrupted" ||
+              event.payload.status === "cancelled"
+            ) {
+              yield* flushAgentTranscriptBuffers(event, "completed");
+            }
+            break;
+          case "thread.metadata.updated":
+            yield* appendAgentStatusActivity(
+              event,
+              "running",
+              "Subagent details updated",
+              event.agentTitle ?? event.payload.name,
+            );
+            return;
+          case "turn.plan.updated":
+          case "turn.proposed.delta":
+          case "turn.proposed.completed":
+          case "turn.diff.updated":
+          case "thread.state.changed":
+            return;
+          default:
+            break;
+        }
+      }
+
       const now = event.createdAt;
       const eventTurnId = toTurnId(event.turnId);
       const activeTurnId = thread.session?.activeTurnId ?? null;
@@ -1831,8 +2136,9 @@ const make = Effect.gen(function* () {
       }
 
       const pauseForUserTurnId =
-        event.type === "request.opened" ||
-        (event.type === "user-input.requested" && event.payload.responseMode !== "message")
+        !event.agentKey &&
+        (event.type === "request.opened" ||
+          (event.type === "user-input.requested" && event.payload.responseMode !== "message"))
           ? toTurnId(event.turnId)
           : undefined;
       if (pauseForUserTurnId) {
@@ -1982,6 +2288,7 @@ const make = Effect.gen(function* () {
             if (
               activity.kind === "user-input.requested" &&
               activity.turnId === turnId &&
+              typeof payload?.agentKey !== "string" &&
               payload?.responseMode !== "message"
             ) {
               pendingRequestIds.add(requestId);
@@ -2260,7 +2567,31 @@ const make = Effect.gen(function* () {
         }
       }
 
-      const activities = runtimeEventToActivities(activityEvent, taskTitle);
+      const unownedActivities = runtimeEventToActivities(activityEvent, taskTitle);
+      const activities =
+        activityEvent.agentKey === undefined
+          ? unownedActivities
+          : unownedActivities.map((activity) => {
+              const payload =
+                typeof activity.payload === "object" && activity.payload !== null
+                  ? (activity.payload as Record<string, unknown>)
+                  : {};
+              return {
+                ...activity,
+                payload: {
+                  ...payload,
+                  agentKey: activityEvent.agentKey,
+                  ...(activityEvent.agentTitle
+                    ? {
+                        title: activityEvent.agentTitle,
+                        agentTitle: activityEvent.agentTitle,
+                      }
+                    : {}),
+                  provider: activityEvent.provider,
+                  timelineBypass: true,
+                },
+              };
+            });
       yield* Effect.forEach(activities, (activity) =>
         providerCommandId(event, "thread-activity-append").pipe(
           Effect.flatMap((commandId) =>

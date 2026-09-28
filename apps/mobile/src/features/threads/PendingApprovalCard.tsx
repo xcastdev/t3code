@@ -34,6 +34,14 @@ export function PendingApprovalCard(props: PendingApprovalCardProps) {
       <Text className="font-t3-bold text-2xs uppercase tracking-[1.1px] text-foreground-secondary">
         Approval needed
       </Text>
+      {props.approval.agentKey ? (
+        <Text
+          accessibilityLabel={`Request from subagent ${props.approval.agentTitle || "Agent"}`}
+          className="font-t3-bold text-xs text-foreground-muted"
+        >
+          Subagent · {props.approval.agentTitle || "Agent"}
+        </Text>
+      ) : null}
       <Text className="font-t3-bold text-lg text-foreground">
         {props.approval.appName ?? props.approval.requestKind}
       </Text>

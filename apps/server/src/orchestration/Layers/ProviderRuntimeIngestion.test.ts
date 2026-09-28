@@ -20,6 +20,7 @@ import {
   type OrchestrationCommand,
   ProjectId,
   ProviderItemId,
+  RuntimeAgentKey,
   RuntimeRequestId,
   type ServerSettings,
   ThreadId,
@@ -122,6 +123,9 @@ function createProviderServiceHarness() {
   const service: ProviderServiceShape = {
     startSession: () => unsupported(),
     sendTurn: () => unsupported(),
+    messageAgent: () => unsupported(),
+    stopAgent: () => unsupported(),
+    getAgentCapabilities: () => unsupported(),
     compactThread: () => unsupported(),
     interruptTurn: () => unsupported(),
     respondToRequest: () => unsupported(),
@@ -2696,6 +2700,219 @@ describe("ProviderRuntimeIngestion", () => {
     ).toMatchObject([{ payload: { requestId: request.requestId } }]);
   });
 
+  it("keeps a child question open and the parent message streaming when the parent turn completes", async () => {
+    const harness = await createHarness({ serverSettings: { responseStreamingMode: "token" } });
+    const base = {
+      provider: ProviderDriverKind.make("claudeAgent"),
+      createdAt: "2026-01-01T00:00:00.000Z",
+      threadId: asThreadId("thread-1"),
+      turnId: asTurnId("parent-turn-with-child-question"),
+    };
+    const childRequest: ProviderRuntimeEvent = {
+      ...base,
+      type: "user-input.requested",
+      eventId: asEventId("child-question-opened"),
+      requestId: RuntimeRequestId.make("child-question"),
+      agentKey: RuntimeAgentKey.make("agent-key-1"),
+      agentTitle: "Research agent",
+      payload: {
+        questions: [
+          {
+            id: "choice",
+            header: "Choice",
+            question: "Continue?",
+            options: [{ label: "Yes", description: "Continue the child agent." }],
+          },
+        ],
+      },
+    };
+    await harness.emitAndDrain([
+      { ...base, type: "turn.started", eventId: asEventId("parent-turn-started") },
+      {
+        ...base,
+        type: "content.delta",
+        eventId: asEventId("parent-text-before-child-question"),
+        itemId: asItemId("parent-assistant-message"),
+        payload: { streamKind: "assistant_text", delta: "Parent progress." },
+      },
+      childRequest,
+    ]);
+    const beforeCompletion = (await harness.readModel()).threads[0]!;
+    expect(beforeCompletion.messages).toMatchObject([
+      { text: "Parent progress.", streaming: true },
+    ]);
+    expect((await harness.readThreadShell()).hasPendingUserInput).toBe(true);
+
+    await harness.emitAndDrain([
+      {
+        ...base,
+        type: "turn.completed",
+        eventId: asEventId("parent-turn-completed"),
+        payload: { state: "completed" },
+      },
+    ]);
+
+    const afterCompletion = (await harness.readModel()).threads[0]!;
+    expect((await harness.readThreadShell()).hasPendingUserInput).toBe(true);
+    expect(
+      afterCompletion.activities.filter((activity) => activity.kind === "user-input.resolved"),
+    ).toHaveLength(0);
+    expect(
+      afterCompletion.activities.find((activity) => activity.kind === "user-input.requested")
+        ?.payload,
+    ).toMatchObject({
+      requestId: "child-question",
+      agentKey: "agent-key-1",
+      agentTitle: "Research agent",
+    });
+  });
+
+  it("persists child narration by opaque agent key without creating or completing parent messages", async () => {
+    const harness = await createHarness({ serverSettings: { responseStreamingMode: "token" } });
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("parent-turn-with-child");
+    const agentKey = RuntimeAgentKey.make("agent-key-transcript");
+    const base = {
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      turnId,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+
+    await harness.emitAndDrain([
+      { ...base, type: "turn.started", eventId: asEventId("parent-started") },
+      {
+        ...base,
+        type: "content.delta",
+        eventId: asEventId("parent-delta-before-child"),
+        itemId: asItemId("parent-message-before-child"),
+        payload: { streamKind: "assistant_text", delta: "Parent answer." },
+      },
+      {
+        ...base,
+        type: "content.delta",
+        eventId: asEventId("child-delta-one"),
+        agentKey,
+        agentTitle: "Research agent",
+        itemId: asItemId("child-message"),
+        payload: { streamKind: "assistant_text", delta: "Child " },
+      },
+      {
+        ...base,
+        type: "content.delta",
+        eventId: asEventId("child-delta-two"),
+        agentKey,
+        agentTitle: "Research agent",
+        itemId: asItemId("child-message"),
+        payload: { streamKind: "assistant_text", delta: "answer." },
+      },
+      {
+        ...base,
+        type: "thread.state.changed",
+        eventId: asEventId("child-compacted"),
+        agentKey,
+        agentTitle: "Research agent",
+        payload: { state: "compacted", detail: "child compacted" },
+      },
+      {
+        ...base,
+        type: "item.completed",
+        eventId: asEventId("child-message-completed"),
+        agentKey,
+        agentTitle: "Research agent",
+        itemId: asItemId("child-message"),
+        payload: {
+          itemType: "assistant_message",
+          status: "completed",
+          detail: "Child answer from the complete provider snapshot.",
+        },
+      },
+      {
+        ...base,
+        type: "turn.completed",
+        eventId: asEventId("child-turn-completed"),
+        agentKey,
+        agentTitle: "Research agent",
+        payload: { state: "completed" },
+      },
+      {
+        ...base,
+        type: "turn.completed",
+        eventId: asEventId("parent-turn-completed-after-child"),
+        payload: { state: "completed" },
+      },
+    ]);
+
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    expect(thread?.messages).toHaveLength(1);
+    expect(thread?.messages[0]).toMatchObject({ text: "Parent answer.", streaming: false });
+    expect(thread?.latestTurn).toMatchObject({ turnId, state: "completed" });
+    expect(thread?.activities.some((activity) => activity.summary === "Context compacted")).toBe(
+      false,
+    );
+    expect(
+      thread?.activities.filter((activity) => activity.kind === "agent.transcript.message"),
+    ).toMatchObject([
+      {
+        payload: {
+          agentKey,
+          title: "Research agent",
+          content: "Child answer from the complete provider snapshot.",
+          status: "completed",
+          timelineBypass: true,
+        },
+      },
+    ]);
+  });
+
+  it("flushes the final child narration tail when its turn completes", async () => {
+    const harness = await createHarness({ serverSettings: { responseStreamingMode: "token" } });
+    const threadId = asThreadId("thread-1");
+    const agentKey = RuntimeAgentKey.make("agent-key-tail-flush");
+    const base = {
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      turnId: asTurnId("parent-turn-tail-flush"),
+      agentKey,
+      agentTitle: "Research agent",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    };
+
+    await harness.emitAndDrain([
+      {
+        ...base,
+        type: "content.delta",
+        eventId: asEventId("child-tail-delta-one"),
+        itemId: asItemId("child-tail-message"),
+        payload: { streamKind: "assistant_text", delta: "Visible prefix " },
+      },
+      {
+        ...base,
+        type: "content.delta",
+        eventId: asEventId("child-tail-delta-two"),
+        itemId: asItemId("child-tail-message"),
+        payload: { streamKind: "assistant_text", delta: "final tail" },
+      },
+      {
+        ...base,
+        type: "turn.completed",
+        eventId: asEventId("child-tail-turn-completed"),
+        payload: { state: "completed" },
+      },
+    ]);
+
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    const transcript = thread?.activities.find(
+      (activity) => activity.kind === "agent.transcript.message",
+    );
+    expect(transcript?.payload).toMatchObject({
+      agentKey,
+      content: "Visible prefix final tail",
+      status: "completed",
+    });
+    expect(thread?.messages).toHaveLength(0);
+  });
+
   it("preserves answered questions and leaves newer, child and async questions pending", async () => {
     const harness = await createHarness();
     const answered = userInputEvent("old-turn", "answered-question");
@@ -3709,6 +3926,8 @@ describe("ProviderRuntimeIngestion", () => {
   it("maps session/thread lifecycle and item.started into session/activity projections", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
+    const childAgentKey = RuntimeAgentKey.make("agent-status-child");
+    const parentAgentKey = RuntimeAgentKey.make("agent-status-parent");
 
     harness.emit({
       type: "session.started",
@@ -3717,6 +3936,16 @@ describe("ProviderRuntimeIngestion", () => {
       createdAt: now,
       threadId: asThreadId("thread-1"),
       message: "session started",
+    });
+    harness.emit({
+      type: "session.started",
+      eventId: asEventId("evt-child-session-started"),
+      provider: ProviderDriverKind.make("codex"),
+      createdAt: now,
+      threadId: asThreadId("thread-1"),
+      agentKey: childAgentKey,
+      parentAgentKey,
+      agentTitle: "Nested helper",
     });
     harness.emit({
       type: "thread.started",
@@ -3762,10 +3991,23 @@ describe("ProviderRuntimeIngestion", () => {
         entry.session?.activeTurnId === null &&
         entry.activities.some(
           (activity: ProviderRuntimeTestActivity) => activity.kind === "tool.started",
+        ) &&
+        entry.activities.some(
+          (activity: ProviderRuntimeTestActivity) =>
+            activity.id === "evt-child-session-started" && activity.kind === "agent.status",
         ),
     );
 
     expect(thread.session?.status).toBe("ready");
+    const childLifecycle = thread.activities.find(
+      (entry: ProviderRuntimeTestActivity) => entry.id === "evt-child-session-started",
+    );
+    expect(childLifecycle?.payload).toMatchObject({
+      agentKey: childAgentKey,
+      parentAgentKey,
+      title: "Nested helper",
+      status: "running",
+    });
     const activity = thread.activities.find(
       (entry: ProviderRuntimeTestActivity) => entry.kind === "tool.started",
     );

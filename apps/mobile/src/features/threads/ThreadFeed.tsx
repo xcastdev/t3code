@@ -11,6 +11,7 @@ import type {
   OrchestrationMessageContext,
   ThreadId,
   TurnId,
+  RuntimeAgentKey,
 } from "@t3tools/contracts";
 import { renderAssistantCitationsAsText } from "@t3tools/shared/assistantCitations";
 import { encodeComposerContextFragment } from "@t3tools/shared/composerContextClipboard";
@@ -241,6 +242,7 @@ export interface ThreadFeedProps {
   readonly queuedMessages: ReadonlyArray<QueuedThreadMessage>;
   readonly dispatchingMessageId: MessageId | null;
   readonly onEditPendingMessage: (message: QueuedThreadMessage) => void;
+  readonly onOpenAgent: (agentKey: RuntimeAgentKey, title: string) => void;
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
   readonly workspaceRoot?: string | null;
@@ -1345,6 +1347,7 @@ function renderFeedEntry(
   props: Pick<
     ThreadFeedProps,
     | "environmentId"
+    | "onOpenAgent"
     | "onUseArtifactTemplate"
     | "skills"
     | "dispatchingMessageId"
@@ -1421,6 +1424,7 @@ function renderFeedEntry(
         rowSizing={props.workRowSizing}
         onToggle={() => props.onToggleWorkGroup(entry.id, entry.id)}
         onCopy={() => props.onCopyWorkRow(entry.activity.id, entry.activity.getCopyText())}
+        onSelectAgent={props.onOpenAgent}
       />
     );
   }
@@ -2666,6 +2670,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
             environmentId: props.environmentId,
             dispatchingMessageId: props.dispatchingMessageId,
             onEditPendingMessage: props.onEditPendingMessage,
+            onOpenAgent: props.onOpenAgent,
             copiedRowId,
             expandedWorkRows,
             workRowSizing,
@@ -2699,6 +2704,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
     [
       props.dispatchingMessageId,
       props.onEditPendingMessage,
+      props.onOpenAgent,
       copiedRowId,
       disclosureToggleSettling,
       expandedWorkRows,

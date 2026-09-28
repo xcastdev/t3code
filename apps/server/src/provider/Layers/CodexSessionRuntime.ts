@@ -4,6 +4,7 @@ import {
   EventId,
   ProviderDriverKind,
   ProviderItemId,
+  RuntimeAgentKey,
   type ProviderInstanceId,
   type ProviderApprovalDecision,
   type ProviderApprovalOption,
@@ -20,6 +21,7 @@ import {
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import { normalizeModelSlug } from "@t3tools/shared/model";
 import * as Crypto from "effect/Crypto";
+import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -306,6 +308,8 @@ interface PendingApproval {
   readonly requestKind: ProviderRequestKind;
   readonly turnId: TurnId | undefined;
   readonly itemId: ProviderItemId | undefined;
+  readonly agentKey?: RuntimeAgentKey;
+  readonly agentTitle?: string;
   readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
 }
 
@@ -314,12 +318,16 @@ interface ApprovalCorrelation {
   readonly requestKind: ProviderRequestKind;
   readonly turnId: TurnId | undefined;
   readonly itemId: ProviderItemId | undefined;
+  readonly agentKey?: RuntimeAgentKey;
+  readonly agentTitle?: string;
 }
 
 interface PendingUserInput {
   readonly requestId: ApprovalRequestId;
   readonly turnId: TurnId | undefined;
   readonly itemId: ProviderItemId | undefined;
+  readonly agentKey?: RuntimeAgentKey;
+  readonly agentTitle?: string;
   readonly answers: Deferred.Deferred<ProviderUserInputAnswers>;
 }
 
@@ -1014,6 +1022,7 @@ function readRouteFields(notification: CodexServerNotification): {
  */
 interface CollabChildAgentState {
   readonly agentThreadId: string;
+  readonly agentKey: RuntimeAgentKey;
   readonly nickname: string | undefined;
   readonly role: string | undefined;
   readonly agentPath: string | undefined;
@@ -1038,9 +1047,14 @@ interface CollabChildMetadataState {
 function collabChildIdentity(
   child: CollabChildAgentState,
   metadata: CollabChildMetadataState | undefined,
+  children: ReadonlyMap<string, CollabChildAgentState>,
 ) {
+  const parent = child.parentThreadId ? children.get(child.parentThreadId) : undefined;
   return {
     agentThreadId: child.agentThreadId,
+    agentKey: child.agentKey,
+    ...(parent ? { parentAgentKey: parent.agentKey } : {}),
+    ...(child.nickname ? { agentTitle: child.nickname } : {}),
     ...(child.nickname ? { nickname: child.nickname } : {}),
     ...(child.role ? { role: child.role } : {}),
     ...(child.agentPath ? { agentPath: child.agentPath } : {}),
@@ -1112,23 +1126,34 @@ function rememberCollabReceiverTurns(
 }
 
 function shouldSuppressChildConversationNotification(
-  method: CodexRpc.ServerNotificationMethod,
+  notification: CodexServerNotification,
 ): boolean {
+  if (
+    (notification.method === "item/started" || notification.method === "item/completed") &&
+    (notification.params.item.type === "agentMessage" ||
+      notification.params.item.type === "reasoning")
+  ) {
+    return true;
+  }
+
   return (
-    method === "thread/started" ||
-    method === "thread/status/changed" ||
-    method === "thread/archived" ||
-    method === "thread/unarchived" ||
-    method === "thread/closed" ||
-    method === "thread/compacted" ||
-    method === "thread/name/updated" ||
-    method === "thread/settings/updated" ||
-    method === "thread/tokenUsage/updated" ||
-    method === "model/rerouted" ||
-    method === "turn/started" ||
-    method === "turn/completed" ||
-    method === "turn/plan/updated" ||
-    method === "item/plan/delta"
+    notification.method === "thread/started" ||
+    notification.method === "thread/status/changed" ||
+    notification.method === "thread/archived" ||
+    notification.method === "thread/unarchived" ||
+    notification.method === "thread/closed" ||
+    notification.method === "thread/compacted" ||
+    notification.method === "thread/name/updated" ||
+    notification.method === "thread/settings/updated" ||
+    notification.method === "thread/tokenUsage/updated" ||
+    notification.method === "model/rerouted" ||
+    notification.method === "turn/started" ||
+    notification.method === "turn/completed" ||
+    notification.method === "item/agentMessage/delta" ||
+    notification.method === "item/reasoning/textDelta" ||
+    notification.method === "item/reasoning/summaryTextDelta" ||
+    notification.method === "turn/plan/updated" ||
+    notification.method === "item/plan/delta"
   );
 }
 
@@ -1141,8 +1166,8 @@ function shouldSuppressChildConversationNotification(
  * - "agent-event": map to a synthetic collabAgent/* event (Agents surface).
  * - "parent": pass through to the parent path — it carries state the parent
  *   still owns (approval correlation cleanup).
- * - "drop": genuine child chatter with no parent meaning (deltas, name and
- *   plan updates).
+ * - "drop": genuine child chatter with no parent meaning (name and plan
+ *   updates).
  *
  * Default is "drop" ONLY for the enumerated chatter; anything unrecognized
  * routes to "parent" so new wire methods surface instead of vanishing
@@ -1157,6 +1182,9 @@ const CHILD_AGENT_EVENT_METHODS: ReadonlySet<string> = new Set([
   "thread/tokenUsage/updated",
   "thread/settings/updated",
   "model/rerouted",
+  "item/agentMessage/delta",
+  "item/reasoning/textDelta",
+  "item/reasoning/summaryTextDelta",
   "item/started",
   "item/completed",
   "thread/closed",
@@ -1164,9 +1192,6 @@ const CHILD_AGENT_EVENT_METHODS: ReadonlySet<string> = new Set([
 ]);
 
 const CHILD_CHATTER_METHODS: ReadonlySet<string> = new Set([
-  "item/agentMessage/delta",
-  "item/reasoning/textDelta",
-  "item/reasoning/summaryTextDelta",
   "item/reasoning/summaryPartAdded",
   "item/commandExecution/outputDelta",
   "item/fileChange/outputDelta",
@@ -1466,6 +1491,49 @@ export const makeCodexSessionRuntime = (
         ),
       );
 
+    const requestAgentLinkage = Effect.fn("requestAgentLinkage")(function* (payload: unknown) {
+      const providerThreadId =
+        typeof payload === "object" && payload !== null
+          ? Reflect.get(payload, "threadId")
+          : undefined;
+      if (typeof providerThreadId !== "string") return {};
+      const session = yield* Ref.get(sessionRef);
+      const parentThreadId = currentProviderThreadId(session);
+      if (parentThreadId === providerThreadId) return {};
+
+      // App-server requests can reach the server-request handler before the
+      // notification pump registers the child. The request's native threadId
+      // is authoritative here, so seed only that child and let the later
+      // spawn notification enrich its display metadata.
+      let child = (yield* Ref.get(collabChildAgentsRef)).get(providerThreadId);
+      if (!child) {
+        const candidateChild = {
+          agentThreadId: providerThreadId,
+          agentKey: RuntimeAgentKey.make(yield* randomUUIDv4("agent-key")),
+          nickname: undefined,
+          role: undefined,
+          agentPath: undefined,
+          depth: undefined,
+          // The request identifies its child thread, not the child's owner.
+          // Wait for thread/started or parent-side subAgentActivity to supply
+          // exact ancestry before routing a decision into model history.
+          parentThreadId: undefined,
+          spawnTurnId: session.activeTurnId,
+        };
+        yield* Ref.update(collabChildAgentsRef, (current) => {
+          if (current.has(providerThreadId)) return current;
+          const next = new Map(current);
+          next.set(providerThreadId, candidateChild);
+          return next;
+        });
+        child = (yield* Ref.get(collabChildAgentsRef)).get(providerThreadId) ?? candidateChild;
+      }
+      return {
+        agentKey: child.agentKey,
+        agentTitle: child.nickname ?? child.role ?? "Subagent",
+      };
+    });
+
     const sessionCreatedAt = yield* nowIso;
     const initialSession = {
       provider: PROVIDER,
@@ -1556,7 +1624,8 @@ export const makeCodexSessionRuntime = (
     const emitCollabChildMetadataUpdated = Effect.fn(
       "CodexSessionRuntime.emitCollabChildMetadataUpdated",
     )(function* (agentThreadId: string) {
-      const child = (yield* Ref.get(collabChildAgentsRef)).get(agentThreadId);
+      const children = yield* Ref.get(collabChildAgentsRef);
+      const child = children.get(agentThreadId);
       const metadata = (yield* Ref.get(collabChildMetadataRef)).get(agentThreadId);
       if (!child || metadata?.closed) {
         return;
@@ -1566,7 +1635,7 @@ export const makeCodexSessionRuntime = (
         threadId: options.threadId,
         ...(child.spawnTurnId ? { turnId: child.spawnTurnId } : {}),
         method: "collabAgent/metadataUpdated",
-        payload: collabChildIdentity(child, metadata),
+        payload: collabChildIdentity(child, metadata, children),
       });
     });
 
@@ -1680,11 +1749,14 @@ export const makeCodexSessionRuntime = (
           // child onto a new fleet's CTA (review finding). Only a genuinely
           // new registration captures the current turn.
           const existingChild = (yield* Ref.get(collabChildAgentsRef)).get(thread.id);
+          const agentKey =
+            existingChild?.agentKey ?? RuntimeAgentKey.make(yield* randomUUIDv4("agent-key"));
           const spawnTurnId = existingChild
             ? existingChild.spawnTurnId
             : ((yield* Ref.get(sessionRef)).activeTurnId ?? undefined);
           const state: CollabChildAgentState = {
             agentThreadId: thread.id,
+            agentKey,
             nickname: spawn.nickname ?? thread.agentNickname ?? existingChild?.nickname,
             role: spawn.role ?? thread.agentRole ?? existingChild?.role,
             agentPath: spawn.agentPath ?? existingChild?.agentPath,
@@ -1698,6 +1770,7 @@ export const makeCodexSessionRuntime = (
             next.set(thread.id, state);
             return next;
           });
+          const children = yield* Ref.get(collabChildAgentsRef);
           const metadata = (yield* Ref.get(collabChildMetadataRef)).get(thread.id);
           yield* emitEvent({
             kind: "notification",
@@ -1705,9 +1778,8 @@ export const makeCodexSessionRuntime = (
             method: "collabAgent/started",
             ...(state.spawnTurnId ? { turnId: state.spawnTurnId } : {}),
             payload: {
-              ...collabChildIdentity(state, metadata),
+              ...collabChildIdentity(state, metadata, children),
               ...(state.depth !== undefined ? { depth: state.depth } : {}),
-              ...(state.parentThreadId ? { parentThreadId: state.parentThreadId } : {}),
             },
           });
           yield* startCollabChildMetadataLookup(thread.id);
@@ -1736,6 +1808,10 @@ export const makeCodexSessionRuntime = (
             return false;
           }
           const activitySpawnTurnId = (yield* Ref.get(sessionRef)).activeTurnId ?? undefined;
+          const activityParentThreadId = readNotificationThreadId(notification);
+          const existingChild = (yield* Ref.get(collabChildAgentsRef)).get(item.agentThreadId);
+          const candidateAgentKey =
+            existingChild?.agentKey ?? RuntimeAgentKey.make(yield* randomUUIDv4("agent-key"));
           yield* Ref.update(collabChildAgentsRef, (current) => {
             const existing = current.get(item.agentThreadId);
             const next = new Map(current);
@@ -1748,18 +1824,20 @@ export const makeCodexSessionRuntime = (
             // finding); an unset spawn turn stays unset.
             next.set(item.agentThreadId, {
               agentThreadId: item.agentThreadId,
+              agentKey: existing?.agentKey ?? candidateAgentKey,
               nickname:
                 existing?.nickname ??
                 item.agentPath.split("/").findLast((segment) => segment.length > 0),
               role: existing?.role,
               agentPath: existing?.agentPath ?? item.agentPath,
               depth: existing?.depth,
-              parentThreadId: existing?.parentThreadId,
+              parentThreadId: existing?.parentThreadId ?? activityParentThreadId,
               spawnTurnId: existing ? existing.spawnTurnId : activitySpawnTurnId,
             });
             return next;
           });
-          const registeredChild = (yield* Ref.get(collabChildAgentsRef)).get(item.agentThreadId);
+          const children = yield* Ref.get(collabChildAgentsRef);
+          const registeredChild = children.get(item.agentThreadId);
           const metadata = (yield* Ref.get(collabChildMetadataRef)).get(item.agentThreadId);
           yield* emitEvent({
             kind: "notification",
@@ -1768,7 +1846,7 @@ export const makeCodexSessionRuntime = (
             ...(registeredChild?.spawnTurnId ? { turnId: registeredChild.spawnTurnId } : {}),
             payload: {
               ...(registeredChild
-                ? collabChildIdentity(registeredChild, metadata)
+                ? collabChildIdentity(registeredChild, metadata, children)
                 : { agentThreadId: item.agentThreadId, agentPath: item.agentPath }),
               activityKind: item.kind,
             },
@@ -1826,7 +1904,7 @@ export const makeCodexSessionRuntime = (
           return false;
         }
         const metadata = (yield* Ref.get(collabChildMetadataRef)).get(child.agentThreadId);
-        const childIdentity = collabChildIdentity(child, metadata);
+        const childIdentity = collabChildIdentity(child, metadata, children);
         switch (notification.method) {
           case "turn/started": {
             yield* markCollabChildOpen(child.agentThreadId);
@@ -1897,10 +1975,47 @@ export const makeCodexSessionRuntime = (
               kind: "notification",
               threadId: options.threadId,
               ...(child.spawnTurnId ? { turnId: child.spawnTurnId } : {}),
+              itemId: ProviderItemId.make(notification.params.item.id),
+              agentKey: child.agentKey,
+              ...(child.nickname ? { agentTitle: child.nickname } : {}),
               method: "collabAgent/item",
               payload: {
                 ...childIdentity,
+                lifecycle: notification.method,
                 item: notification.params.item,
+              },
+            });
+            return true;
+          case "item/agentMessage/delta":
+            yield* emitEvent({
+              kind: "notification",
+              threadId: options.threadId,
+              ...(child.spawnTurnId ? { turnId: child.spawnTurnId } : {}),
+              itemId: ProviderItemId.make(notification.params.itemId),
+              agentKey: child.agentKey,
+              ...(child.nickname ? { agentTitle: child.nickname } : {}),
+              method: "collabAgent/messageDelta",
+              textDelta: notification.params.delta,
+              payload: childIdentity,
+            });
+            return true;
+          case "item/reasoning/textDelta":
+          case "item/reasoning/summaryTextDelta":
+            yield* emitEvent({
+              kind: "notification",
+              threadId: options.threadId,
+              ...(child.spawnTurnId ? { turnId: child.spawnTurnId } : {}),
+              itemId: ProviderItemId.make(notification.params.itemId),
+              agentKey: child.agentKey,
+              ...(child.nickname ? { agentTitle: child.nickname } : {}),
+              method: "collabAgent/reasoningDelta",
+              textDelta: notification.params.delta,
+              payload: {
+                ...childIdentity,
+                streamKind:
+                  notification.method === "item/reasoning/summaryTextDelta"
+                    ? "reasoning_summary_text"
+                    : "reasoning_text",
               },
             });
             return true;
@@ -2005,7 +2120,7 @@ export const makeCodexSessionRuntime = (
         })();
         if (
           (childParentTurnId !== undefined || foreignConversation) &&
-          shouldSuppressChildConversationNotification(notification.method)
+          shouldSuppressChildConversationNotification(notification)
         ) {
           // Stop-everything must not depend on registration timing: a
           // child's turn/started can arrive before the subAgentActivity that
@@ -2049,6 +2164,8 @@ export const makeCodexSessionRuntime = (
 
         let requestId: ApprovalRequestId | undefined;
         let requestKind: ProviderRequestKind | undefined;
+        let agentKey: RuntimeAgentKey | undefined;
+        let agentTitle: string | undefined;
         let turnId = childParentTurnId ?? route.turnId;
         let itemId = route.itemId;
 
@@ -2063,6 +2180,8 @@ export const makeCodexSessionRuntime = (
           if (correlation) {
             requestId = correlation.requestId;
             requestKind = correlation.requestKind;
+            agentKey = correlation.agentKey;
+            agentTitle = correlation.agentTitle;
             turnId = correlation.turnId ?? turnId;
             itemId = correlation.itemId ?? itemId;
             yield* Ref.update(approvalCorrelationsRef, (current) => {
@@ -2082,6 +2201,8 @@ export const makeCodexSessionRuntime = (
           ...(itemId ? { itemId } : {}),
           ...(requestId ? { requestId } : {}),
           ...(requestKind ? { requestKind } : {}),
+          ...(agentKey ? { agentKey } : {}),
+          ...(agentTitle ? { agentTitle } : {}),
           ...(notification.method === "item/agentMessage/delta"
             ? { textDelta: notification.params.delta }
             : {}),
@@ -2156,6 +2277,7 @@ export const makeCodexSessionRuntime = (
 
     yield* client.handleServerRequest("item/commandExecution/requestApproval", (payload) =>
       Effect.gen(function* () {
+        const agentLinkage = yield* requestAgentLinkage(payload);
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4("command-approval-request"));
         const turnId = TurnId.make(payload.turnId);
         const itemId = ProviderItemId.make(payload.itemId);
@@ -2169,6 +2291,7 @@ export const makeCodexSessionRuntime = (
             requestKind: "command",
             turnId,
             itemId,
+            ...agentLinkage,
             decision,
           });
           return next;
@@ -2180,6 +2303,7 @@ export const makeCodexSessionRuntime = (
             requestKind: "command",
             turnId,
             itemId,
+            ...agentLinkage,
           });
           return next;
         });
@@ -2190,6 +2314,7 @@ export const makeCodexSessionRuntime = (
           method: "item/commandExecution/requestApproval",
           requestId,
           requestKind: "command",
+          ...agentLinkage,
           ...(turnId ? { turnId } : {}),
           ...(itemId ? { itemId } : {}),
           payload,
@@ -2212,6 +2337,7 @@ export const makeCodexSessionRuntime = (
 
     yield* client.handleServerRequest("item/fileChange/requestApproval", (payload) =>
       Effect.gen(function* () {
+        const agentLinkage = yield* requestAgentLinkage(payload);
         const requestId = ApprovalRequestId.make(
           yield* randomUUIDv4("file-change-approval-request"),
         );
@@ -2227,6 +2353,7 @@ export const makeCodexSessionRuntime = (
             requestKind: "file-change",
             turnId,
             itemId,
+            ...agentLinkage,
             decision,
           });
           return next;
@@ -2238,6 +2365,7 @@ export const makeCodexSessionRuntime = (
             requestKind: "file-change",
             turnId,
             itemId,
+            ...agentLinkage,
           });
           return next;
         });
@@ -2248,6 +2376,7 @@ export const makeCodexSessionRuntime = (
           method: "item/fileChange/requestApproval",
           requestId,
           requestKind: "file-change",
+          ...agentLinkage,
           ...(turnId ? { turnId } : {}),
           ...(itemId ? { itemId } : {}),
           payload,
@@ -2270,6 +2399,7 @@ export const makeCodexSessionRuntime = (
 
     yield* client.handleServerRequest("mcpServer/elicitation/request", (payload) =>
       Effect.gen(function* () {
+        const agentLinkage = yield* requestAgentLinkage(payload);
         if (toMcpElicitationResponse(payload, "accept").action !== "accept") {
           yield* Effect.logWarning("Declined an unsupported MCP elicitation.", {
             serverName: payload.serverName,
@@ -2295,6 +2425,7 @@ export const makeCodexSessionRuntime = (
             requestKind: "mcp-elicitation",
             turnId,
             itemId: undefined,
+            ...agentLinkage,
             decision,
           });
           return next;
@@ -2306,6 +2437,7 @@ export const makeCodexSessionRuntime = (
             requestKind: "mcp-elicitation",
             turnId,
             itemId: undefined,
+            ...agentLinkage,
           });
           return next;
         });
@@ -2316,6 +2448,7 @@ export const makeCodexSessionRuntime = (
           method: "mcpServer/elicitation/request",
           requestId,
           requestKind: "mcp-elicitation",
+          ...agentLinkage,
           ...(turnId ? { turnId } : {}),
           payload,
         });
@@ -2335,6 +2468,7 @@ export const makeCodexSessionRuntime = (
 
     yield* client.handleServerRequest("item/tool/requestUserInput", (payload) =>
       Effect.gen(function* () {
+        const agentLinkage = yield* requestAgentLinkage(payload);
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4("user-input-request"));
         const turnId = TurnId.make(payload.turnId);
         const itemId = ProviderItemId.make(payload.itemId);
@@ -2346,6 +2480,7 @@ export const makeCodexSessionRuntime = (
             requestId,
             turnId,
             itemId,
+            ...agentLinkage,
             answers,
           });
           return next;
@@ -2358,6 +2493,7 @@ export const makeCodexSessionRuntime = (
           requestId,
           ...(turnId ? { turnId } : {}),
           ...(itemId ? { itemId } : {}),
+          ...agentLinkage,
           payload,
         });
 
@@ -2677,34 +2813,86 @@ export const makeCodexSessionRuntime = (
           });
         }),
       respondToRequest: (requestId, decision) =>
-        Effect.gen(function* () {
-          const pending = (yield* Ref.get(pendingApprovalsRef)).get(requestId);
-          if (!pending) {
-            return yield* new CodexSessionRuntimePendingApprovalNotFoundError({
-              requestId,
+        Effect.uninterruptibleMask((restore) =>
+          Effect.gen(function* () {
+            const pending = (yield* Ref.get(pendingApprovalsRef)).get(requestId);
+            if (!pending) {
+              return yield* new CodexSessionRuntimePendingApprovalNotFoundError({
+                requestId,
+              });
+            }
+            yield* Ref.update(pendingApprovalsRef, (current) => {
+              const next = new Map(current);
+              next.delete(requestId);
+              return next;
             });
-          }
-          yield* Ref.update(pendingApprovalsRef, (current) => {
-            const next = new Map(current);
-            next.delete(requestId);
-            return next;
-          });
-          yield* Deferred.succeed(pending.decision, decision);
-          yield* emitEvent({
-            kind: "notification",
-            threadId: options.threadId,
-            method: "item/requestApproval/decision",
-            requestId: pending.requestId,
-            requestKind: pending.requestKind,
-            ...(pending.turnId ? { turnId: pending.turnId } : {}),
-            ...(pending.itemId ? { itemId: pending.itemId } : {}),
-            payload: {
+            const recordChildChoice = Effect.gen(function* () {
+              if (!pending.agentKey) return;
+              const children = yield* Ref.get(collabChildAgentsRef);
+              const child = Array.from(children.values()).find(
+                (candidate) => candidate.agentKey === pending.agentKey,
+              );
+              // Record the user's choice in the immediate parent model's history
+              // before releasing the native request. This is best-effort: Codex
+              // rejects direct injection into some nested agent threads, and a
+              // timeout/provider error must never strand the approval itself.
+              if (!child?.parentThreadId) return;
+              const message =
+                `The T3 user chose "${decision}" for child ${pending.requestKind} approval request ${pending.requestId}. ` +
+                "This records the user's choice only; it does not establish that the operation ran or succeeded.";
+              const injected = yield* client
+                .request("thread/inject_items", {
+                  threadId: child.parentThreadId,
+                  items: [
+                    {
+                      type: "message",
+                      role: "developer",
+                      content: [{ type: "input_text", text: message }],
+                    },
+                  ],
+                })
+                .pipe(Effect.timeoutOption("2 seconds"));
+              if (injected._tag === "None") {
+                yield* Effect.logWarning("Codex timed out recording a child approval choice", {
+                  requestId: pending.requestId,
+                  requestKind: pending.requestKind,
+                  agentKey: pending.agentKey,
+                  parentThreadId: child.parentThreadId,
+                });
+              }
+            });
+            const handoffExit = yield* Effect.exit(restore(recordChildChoice));
+            yield* Deferred.succeed(pending.decision, decision);
+            yield* emitEvent({
+              kind: "notification",
+              threadId: options.threadId,
+              method: "item/requestApproval/decision",
               requestId: pending.requestId,
               requestKind: pending.requestKind,
-              decision,
-            },
-          });
-        }),
+              ...(pending.turnId ? { turnId: pending.turnId } : {}),
+              ...(pending.itemId ? { itemId: pending.itemId } : {}),
+              payload: {
+                requestId: pending.requestId,
+                requestKind: pending.requestKind,
+                decision,
+              },
+            });
+            if (Exit.isFailure(handoffExit)) {
+              if (Cause.hasInterrupts(handoffExit.cause)) {
+                return yield* Effect.failCause(handoffExit.cause);
+              }
+              yield* Effect.logWarning(
+                "Codex could not record a child approval choice in its immediate parent history",
+                {
+                  requestId: pending.requestId,
+                  requestKind: pending.requestKind,
+                  ...(pending.agentKey ? { agentKey: pending.agentKey } : {}),
+                  cause: handoffExit.cause,
+                },
+              );
+            }
+          }),
+        ),
       respondToUserInput: (requestId, answers) =>
         Effect.gen(function* () {
           const pending = (yield* Ref.get(pendingUserInputsRef)).get(requestId);

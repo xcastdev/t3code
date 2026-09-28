@@ -22,8 +22,10 @@ import type {
   ProviderApprovalDecision,
   ProviderInteractionMode,
   RuntimeMode,
+  RuntimeAgentKey,
   ServerConfig as T3ServerConfig,
   ThreadId,
+  OrchestrationThreadActivity,
   UsageLimitsReport,
   UserInputQuestion,
 } from "@t3tools/contracts";
@@ -106,6 +108,7 @@ import {
   ThreadComposer,
 } from "./ThreadComposer";
 import { ThreadFeed } from "./ThreadFeed";
+import { AgentTranscriptSheet } from "./AgentTranscriptSheet";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 import { resolveThreadFeedSubmissionAnchor } from "./thread-feed-live-follow";
 
@@ -119,6 +122,7 @@ export interface ThreadDetailScreenProps {
   readonly feedbackSubmissions: ReadonlyArray<CodexFeedbackSubmission>;
   readonly onDismissFeedback: (id: MessageId) => void;
   readonly selectedThreadFeed: ReadonlyArray<ThreadFeedEntry>;
+  readonly activities: ReadonlyArray<OrchestrationThreadActivity>;
   readonly activeWorkStartedAt: string | null;
   readonly isCompacting: boolean;
   /**
@@ -274,6 +278,13 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
   // lifts it. A healthy resume sees no visual difference (the translation is
   // already zero while the keyboard is closed).
   const [keyboardStateSuspect, setKeyboardStateSuspect] = useState(false);
+  const [selectedAgent, setSelectedAgent] = useState<{
+    readonly agentKey: RuntimeAgentKey;
+    readonly title: string;
+  } | null>(null);
+  useEffect(() => {
+    setSelectedAgent(null);
+  }, [props.environmentId, props.selectedThread.id]);
   useEffect(() => {
     if (Platform.OS !== "android") {
       return;
@@ -880,6 +891,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
             threadId={props.selectedThread.id}
             workspaceRoot={props.threadCwd}
             feed={props.selectedThreadFeed}
+            onOpenAgent={(agentKey, title) => setSelectedAgent({ agentKey, title })}
             queuedMessages={props.queuedMessages}
             dispatchingMessageId={props.dispatchingMessageId}
             onEditPendingMessage={handleEditPendingMessage}
@@ -1070,6 +1082,20 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
             </View>
           </Animated.View>
         </KeyboardStickyView>
+      ) : null}
+      {selectedAgent ? (
+        <AgentTranscriptSheet
+          visible
+          isConnected={props.connectionStateLabel === "connected"}
+          environmentId={props.environmentId}
+          threadId={props.selectedThread.id}
+          agentKey={selectedAgent.agentKey}
+          title={selectedAgent.title}
+          activities={props.activities}
+          respondingApprovalId={props.respondingApprovalId}
+          onRespondToApproval={props.onRespondToApproval}
+          onClose={() => setSelectedAgent(null)}
+        />
       ) : null}
     </View>
   );

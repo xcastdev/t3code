@@ -50,6 +50,8 @@ export type SetThreadRuntimeModeInput = CommandInput<"thread.runtime-mode.set">;
 export type SetThreadInteractionModeInput = CommandInput<"thread.interaction-mode.set">;
 export type StartThreadTurnInput = CommandInput<"thread.turn.start">;
 export type InterruptThreadTurnInput = CommandInput<"thread.turn.interrupt">;
+export type MessageAgentInput = CommandInput<"thread.agent.message">;
+export type StopAgentInput = CommandInput<"thread.agent.stop">;
 export type RespondToThreadApprovalInput = CommandInput<"thread.approval.respond">;
 export type RespondToThreadUserInputInput = CommandInput<"thread.user-input.respond">;
 export type DismissThreadUserInputInput = CommandInput<"thread.user-input.dismiss">;
@@ -318,6 +320,30 @@ export const interruptThreadTurn: (input: InterruptThreadTurnInput) => CommandEf
   return yield* dispatch({
     ...input,
     type: "thread.turn.interrupt",
+    commandId: metadata.commandId,
+    createdAt: metadata.createdAt,
+  });
+});
+
+export const messageAgent: (input: MessageAgentInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.messageAgent",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({
+    ...input,
+    type: "thread.agent.message",
+    commandId: metadata.commandId,
+    createdAt: metadata.createdAt,
+  });
+});
+
+export const stopAgent: (input: StopAgentInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.stopAgent",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({
+    ...input,
+    type: "thread.agent.stop",
     commandId: metadata.commandId,
     createdAt: metadata.createdAt,
   });

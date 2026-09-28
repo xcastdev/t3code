@@ -18,6 +18,7 @@ import type {
   ProviderSessionStartInput,
   ProviderUploadFeedbackInput,
   ProviderUploadFeedbackResult,
+  RuntimeAgentKey,
   ThreadId,
   ProviderTurnStartResult,
   TurnId,
@@ -116,6 +117,32 @@ export interface ProviderAdapterShape<TError> {
   readonly sendTurn: (
     input: ProviderSendTurnInput,
   ) => Effect.Effect<ProviderTurnStartResult, TError>;
+
+  /** Send directly to one live, adapter-owned child session when supported. */
+  readonly messageAgent?: (
+    threadId: ThreadId,
+    agentKey: RuntimeAgentKey,
+    text: string,
+  ) => Effect.Effect<"accepted" | "unknown", TError>;
+
+  /** Stop only one live, adapter-owned child session when supported. */
+  readonly stopAgent?: (
+    threadId: ThreadId,
+    agentKey: RuntimeAgentKey,
+  ) => Effect.Effect<"completed" | "unknown", TError>;
+
+  /** Validate the current session-generation-bound child control path. */
+  readonly getAgentActionCapabilities?: (
+    threadId: ThreadId,
+    agentKey: RuntimeAgentKey,
+  ) => Effect.Effect<
+    {
+      readonly message: "supported" | "unsupported" | "unverified";
+      readonly answerRequests: "supported" | "unsupported" | "unverified";
+      readonly stop: "supported" | "unsupported" | "unverified";
+    },
+    TError
+  >;
 
   /** Omitted when this adapter does not support manual context compaction. */
   readonly compaction?: ProviderCompaction<TError>;

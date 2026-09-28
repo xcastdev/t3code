@@ -5,6 +5,7 @@ import {
   EventId,
   IsoDateTime,
   ProviderItemId,
+  RuntimeAgentKey,
   ThreadId,
   TurnId,
 } from "./baseSchemas.ts";
@@ -154,6 +155,8 @@ export const ProviderEvent = Schema.Struct({
   itemId: Schema.optional(ProviderItemId),
   requestId: Schema.optional(ApprovalRequestId),
   requestKind: Schema.optional(ProviderRequestKind),
+  agentKey: Schema.optional(RuntimeAgentKey),
+  agentTitle: Schema.optional(TrimmedNonEmptyString),
   textDelta: Schema.optional(Schema.String),
   payload: Schema.optional(Schema.Unknown),
 });

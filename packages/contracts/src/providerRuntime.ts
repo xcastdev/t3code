@@ -6,6 +6,7 @@ import {
   NonNegativeInt,
   ProviderItemId,
   PositiveInt,
+  RuntimeAgentKey,
   RuntimeItemId,
   RuntimeRequestId,
   RuntimeTaskId,
@@ -265,6 +266,10 @@ const ProviderRuntimeEventBase = Schema.Struct({
   turnId: Schema.optional(TurnId),
   itemId: Schema.optional(RuntimeItemId),
   requestId: Schema.optional(RuntimeRequestId),
+  /** Opaque T3 identity of the child that owns this event, never a provider id. */
+  agentKey: Schema.optional(RuntimeAgentKey),
+  parentAgentKey: Schema.optional(RuntimeAgentKey),
+  agentTitle: Schema.optional(TrimmedNonEmptyStringSchema),
   providerRefs: Schema.optional(ProviderRefs),
   raw: Schema.optional(RuntimeEventRaw),
 });
@@ -632,6 +637,9 @@ export function classifyTaskAgentKind(input: {
  * All fields optional: old emitters and old rows decode unchanged.
  */
 const taskAgentLinkageFields = {
+  /** Opaque, provider-session-scoped identity used for agent history/actions. */
+  agentKey: Schema.optional(RuntimeAgentKey),
+  parentAgentKey: Schema.optional(RuntimeAgentKey),
   /** SDK task_type (subagent/shell/monitor/local_workflow/…), repeated on
    * every row so folds can classify without the start row. */
   taskType: Schema.optional(TrimmedNonEmptyStringSchema),

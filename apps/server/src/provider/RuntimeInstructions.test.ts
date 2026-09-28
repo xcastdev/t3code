@@ -2,6 +2,17 @@ import { describe, expect, it } from "vite-plus/test";
 import { buildRuntimeInstructions } from "./RuntimeInstructions.ts";
 
 describe("buildRuntimeInstructions", () => {
+  it("tells OpenCode parents that child permission prompts are handled outside task output", () => {
+    const instructions = buildRuntimeInstructions({ harness: "OpenCode" });
+
+    expect(instructions).toContain("Subagent permission requests can appear in T3 Code");
+    expect(instructions).toContain("Do not infer that a child action was auto-approved");
+    expect(instructions).toContain("If T3 Code supplies a subagent permission status note");
+    expect(buildRuntimeInstructions({ harness: "Codex" })).not.toContain(
+      "Subagent permission requests can appear in T3 Code",
+    );
+  });
+
   it("requires explicit registration of every PR and stack layer", () => {
     const instructions = buildRuntimeInstructions({ harness: "Codex" });
     expect(instructions).toContain("When the t3-code MCP server exposes link_pull_request");

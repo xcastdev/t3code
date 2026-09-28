@@ -102,7 +102,7 @@ function capturedStartedActivity(childId = CHILD_A) {
   };
 }
 
-function capturedSpawnedThread(childId = CHILD_A) {
+function capturedSpawnedThread(childId = CHILD_A, parentThreadId = ROOT) {
   const captured = wireFixture.notifications.find((entry) => entry.method === "thread/started");
   assert.isDefined(captured);
   return {
@@ -112,7 +112,7 @@ function capturedSpawnedThread(childId = CHILD_A) {
         ...captured.params.thread,
         id: childId,
         sessionId: childId,
-        parentThreadId: ROOT,
+        parentThreadId,
         agentNickname: "model-check",
         agentRole: "verifier",
         source: {
@@ -122,7 +122,7 @@ function capturedSpawnedThread(childId = CHILD_A) {
               agent_path: "/root/model-check",
               agent_role: "verifier",
               depth: 1,
-              parent_thread_id: ROOT,
+              parent_thread_id: parentThreadId,
             },
           },
         },
@@ -158,6 +158,14 @@ function readRecordedRequests() {
     .map((line) => JSON.parse(line) as { method: string; params: Record<string, unknown> });
 }
 
+function readRecordedApprovalInjections() {
+  return NodeFS.readFileSync(`${scriptPath}.injections`, "utf8")
+    .trim()
+    .split("\n")
+    .filter((line) => line.length > 0)
+    .map((line) => JSON.parse(line) as { method: string; params: Record<string, unknown> });
+}
+
 const scriptPath = NodePath.join(import.meta.dirname, "../testFixtures/.collab-script.json");
 // Windows cannot run the shebang wrapper; the .cmd sibling does the same job.
 const peerPath = NodePath.join(
@@ -166,6 +174,156 @@ const peerPath = NodePath.join(
 );
 
 describe("CodexSessionRuntime collab integration", () => {
+  it.effect("keeps child assistant deltas and final text on the registered child identity", () =>
+    Effect.gen(function* () {
+      const childTurnId = `${CHILD_A}-turn-1`;
+      const script = {
+        rootThreadId: ROOT,
+        notifications: [
+          capturedSpawnedThread(CHILD_A),
+          {
+            method: "item/agentMessage/delta",
+            params: {
+              threadId: CHILD_A,
+              turnId: childTurnId,
+              itemId: "child-message-1",
+              delta: "Child answer",
+            },
+          },
+          {
+            method: "item/reasoning/textDelta",
+            params: {
+              threadId: CHILD_A,
+              turnId: childTurnId,
+              itemId: "child-reasoning-1",
+              contentIndex: 0,
+              delta: "The child considered the evidence.",
+            },
+          },
+          {
+            method: "item/completed",
+            params: {
+              threadId: CHILD_A,
+              turnId: childTurnId,
+              completedAtMs: 1_778_000_000_000,
+              item: {
+                type: "reasoning",
+                id: "child-reasoning-1",
+                content: ["The child considered the evidence."],
+              },
+            },
+          },
+          {
+            method: "item/completed",
+            params: {
+              threadId: CHILD_A,
+              turnId: childTurnId,
+              completedAtMs: 1_778_000_000_000,
+              item: {
+                type: "agentMessage",
+                id: "child-message-1",
+                text: "Child answer",
+                phase: "final_answer",
+              },
+            },
+          },
+          {
+            method: "turn/completed",
+            params: {
+              threadId: ROOT,
+              turn: { id: `${ROOT}-turn-1`, status: "completed", items: [] },
+            },
+          },
+        ],
+        childResumeSnapshots: {
+          [CHILD_A]: { model: "child-model", notifications: [] },
+        },
+      };
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          NodeFS.rmSync(scriptPath, { force: true });
+          NodeFS.rmSync(`${scriptPath}.requests`, { force: true });
+        }),
+      );
+
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("thread-collab-child-transcript"),
+        binaryPath: peerPath,
+        cwd: NodeOS.tmpdir(),
+        runtimeMode: "full-access",
+        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+      });
+      const eventsFiber = yield* runtime.events.pipe(
+        Stream.takeUntil((event) => event.method === "turn/completed"),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "start child transcript" });
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      const childDelta = events.find((event) => event.method === "collabAgent/messageDelta");
+      const childReasoningDelta = events.find(
+        (event) => event.method === "collabAgent/reasoningDelta",
+      );
+      const childCompletion = events.find(
+        (event) =>
+          event.method === "collabAgent/item" &&
+          (event.payload as { lifecycle?: string; item?: { type?: string } }).lifecycle ===
+            "item/completed" &&
+          (event.payload as { item?: { type?: string } }).item?.type === "agentMessage",
+      );
+      const childReasoningCompletion = events.find(
+        (event) =>
+          event.method === "collabAgent/item" &&
+          (event.payload as { lifecycle?: string; item?: { type?: string } }).lifecycle ===
+            "item/completed" &&
+          (event.payload as { item?: { type?: string } }).item?.type === "reasoning",
+      );
+      assert.isDefined(childDelta);
+      assert.isDefined(childReasoningDelta);
+      assert.isDefined(childCompletion);
+      assert.isDefined(childReasoningCompletion);
+      assert.equal(childDelta?.itemId, "child-message-1");
+      assert.equal(childDelta?.textDelta, "Child answer");
+      assert.equal(
+        childDelta?.agentKey,
+        (childDelta?.payload as { agentKey?: string } | undefined)?.agentKey,
+      );
+      assert.equal(childReasoningDelta?.itemId, "child-reasoning-1");
+      assert.equal(childReasoningDelta?.textDelta, "The child considered the evidence.");
+      assert.equal(childReasoningDelta?.agentKey, childDelta?.agentKey);
+      assert.equal(childCompletion?.itemId, "child-message-1");
+      assert.equal(childCompletion?.agentKey, childDelta?.agentKey);
+      assert.equal(childReasoningCompletion?.itemId, "child-reasoning-1");
+      assert.equal(childReasoningCompletion?.agentKey, childDelta?.agentKey);
+      const completionPayload = childCompletion?.payload as
+        | {
+            agentThreadId?: string;
+            lifecycle?: string;
+            item?: { type?: string; id?: string; text?: string };
+          }
+        | undefined;
+      assert.equal(completionPayload?.agentThreadId, CHILD_A);
+      assert.equal(completionPayload?.lifecycle, "item/completed");
+      assert.equal(completionPayload?.item?.type, "agentMessage");
+      assert.equal(completionPayload?.item?.id, "child-message-1");
+      assert.equal(completionPayload?.item?.text, "Child answer");
+      assert.isFalse(
+        events.some(
+          (event) =>
+            event.method === "item/agentMessage/delta" ||
+            event.method === "item/reasoning/textDelta",
+        ),
+      );
+      assert.isTrue(events.some((event) => event.method === "turn/completed"));
+
+      yield* runtime.close;
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
   it.effect("looks up child model metadata once after activity registration", () =>
     Effect.gen(function* () {
       const script = {
@@ -231,6 +389,63 @@ describe("CodexSessionRuntime collab integration", () => {
           params: { threadId: CHILD_A, excludeTurns: true },
         },
       ]);
+
+      yield* runtime.close;
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect("maps nested child parent thread ids to opaque parent agent keys", () =>
+    Effect.gen(function* () {
+      const script = {
+        rootThreadId: ROOT,
+        notifications: [capturedSpawnedThread(CHILD_A), capturedSpawnedThread(CHILD_B, CHILD_A)],
+        childResumeSnapshots: {
+          [CHILD_A]: { model: "child-model", notifications: [] },
+          [CHILD_B]: { model: "nested-model", notifications: [] },
+        },
+      };
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          NodeFS.rmSync(scriptPath, { force: true });
+          NodeFS.rmSync(`${scriptPath}.requests`, { force: true });
+        }),
+      );
+
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("thread-collab-nested-linkage"),
+        binaryPath: peerPath,
+        cwd: NodeOS.tmpdir(),
+        runtimeMode: "full-access",
+        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+      });
+      const eventsFiber = yield* runtime.events.pipe(
+        Stream.filter((event) => event.method === "collabAgent/started"),
+        Stream.take(2),
+        Stream.runCollect,
+        Effect.forkScoped,
+      );
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "start nested children" });
+      const events = Array.from(yield* Fiber.join(eventsFiber));
+      const parent = events.find(
+        (event) => (event.payload as { agentThreadId?: string }).agentThreadId === CHILD_A,
+      );
+      const nested = events.find(
+        (event) => (event.payload as { agentThreadId?: string }).agentThreadId === CHILD_B,
+      );
+      const parentPayload = parent?.payload as
+        | { agentKey?: string; parentThreadId?: string }
+        | undefined;
+      const nestedPayload = nested?.payload as
+        | { agentKey?: string; parentAgentKey?: string; parentThreadId?: string }
+        | undefined;
+      assert.isString(parentPayload?.agentKey);
+      assert.equal(nestedPayload?.parentAgentKey, parentPayload?.agentKey);
+      assert.notEqual(parentPayload?.agentKey, CHILD_A);
+      assert.equal(parentPayload?.parentThreadId, undefined);
+      assert.equal(nestedPayload?.parentThreadId, undefined);
 
       yield* runtime.close;
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
@@ -316,6 +531,9 @@ describe("CodexSessionRuntime collab integration", () => {
         model: "child-before",
         effort: "medium",
       });
+      const startedPayload = started?.payload as { agentKey?: unknown } | undefined;
+      assert.equal(typeof startedPayload?.agentKey, "string");
+      assert.notEqual(startedPayload?.agentKey, CHILD_A);
       const childStatus = events.find((event) => event.method === "collabAgent/statusChanged");
       assert.deepInclude(childStatus?.payload, {
         agentThreadId: CHILD_A,
@@ -765,4 +983,296 @@ describe("CodexSessionRuntime collab integration", () => {
       }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
     );
   }
+
+  it.live("answers a child Codex elicitation with the child-scoped request identity", () =>
+    Effect.gen(function* () {
+      const scriptedRequest = {
+        id: 7002,
+        method: "mcpServer/elicitation/request",
+        params: {
+          mode: "form",
+          message: "Allow the child to use Safari?",
+          serverName: "computer-use",
+          threadId: CHILD_A,
+          turnId: wireFixture.responses.turnStart.turn.id,
+          _meta: { app_name: "Safari" },
+          requestedSchema: {
+            type: "object",
+            properties: { approval: { type: "string", enum: ["once"] } },
+            required: ["approval"],
+          },
+        },
+      };
+      const script = {
+        rootThreadId: ROOT,
+        holdTurnOpen: true,
+        completeTurnOnServerResponse: true,
+        notifications: [capturedSpawnedThread(), capturedStartedActivity()],
+        serverRequests: [scriptedRequest],
+      };
+      const responsesPath = `${scriptPath}.responses`;
+      const injectionsPath = `${scriptPath}.injections`;
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
+      NodeFS.rmSync(responsesPath, { force: true });
+      NodeFS.writeFileSync(injectionsPath, "", "utf8");
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          NodeFS.rmSync(scriptPath, { force: true });
+          NodeFS.rmSync(responsesPath, { force: true });
+          NodeFS.rmSync(injectionsPath, { force: true });
+        }),
+      );
+
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("thread-codex-child-approval"),
+        binaryPath: peerPath,
+        cwd: NodeOS.tmpdir(),
+        runtimeMode: "auto",
+        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+      });
+      const approvalRequested = yield* Deferred.make<ProviderEvent>();
+      const childStarted = yield* Deferred.make<ProviderEvent>();
+      const turnCompleted = yield* Deferred.make<void>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) =>
+          event.method === "mcpServer/elicitation/request"
+            ? Deferred.succeed(approvalRequested, event).pipe(Effect.asVoid)
+            : event.method === "collabAgent/started" &&
+                (event.payload as { agentThreadId?: string }).agentThreadId === CHILD_A
+              ? Deferred.succeed(childStarted, event).pipe(Effect.asVoid)
+              : event.method === "turn/completed"
+                ? Deferred.succeed(turnCompleted, undefined).pipe(Effect.asVoid)
+                : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "Have the child request approval" });
+      const approval = yield* Deferred.await(approvalRequested);
+      assert.equal(approval.requestKind, "mcp-elicitation");
+      assert.equal(typeof approval.agentKey, "string");
+      assert.notEqual(approval.agentKey, CHILD_A);
+      assert.equal(approval.agentTitle, "Subagent");
+      const child = yield* Deferred.await(childStarted);
+      assert.equal((child.payload as { agentKey?: string }).agentKey, approval.agentKey);
+      assert.equal((child.payload as { nickname?: string }).nickname, "model-check");
+      assert.isDefined(approval.requestId);
+      if (approval.requestId === undefined) return;
+
+      yield* runtime.respondToRequest(approval.requestId, "accept");
+      yield* Deferred.await(turnCompleted);
+      const [injection] = readRecordedApprovalInjections();
+      assert.isDefined(injection, "the child approval choice was not injected into its parent");
+      assert.equal(injection.method, "thread/inject_items");
+      assert.equal(injection.params.threadId, ROOT);
+      const items = injection.params.items as Array<{
+        type?: string;
+        role?: string;
+        content?: Array<{ type?: string; text?: string }>;
+      }>;
+      assert.equal(items[0]?.type, "message");
+      assert.equal(items[0]?.role, "developer");
+      assert.match(items[0]?.content?.[0]?.text ?? "", /user chose.*accept/i);
+      assert.match(items[0]?.content?.[0]?.text ?? "", /does not establish.*ran or succeeded/i);
+      const recordedResponse = yield* decodeMcpElicitationResponse(
+        NodeFS.readFileSync(responsesPath, "utf8"),
+      );
+      assert.equal(recordedResponse.id, scriptedRequest.id);
+      assert.deepEqual(recordedResponse.result, {
+        action: "accept",
+        content: { approval: "once" },
+      });
+
+      yield* runtime.close;
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("answers nested Codex approval when immediate-parent injection is unsupported", () =>
+    Effect.gen(function* () {
+      const scriptedRequest = {
+        id: 7003,
+        method: "mcpServer/elicitation/request",
+        params: {
+          mode: "form",
+          message: "Allow the nested child to use Safari?",
+          serverName: "computer-use",
+          threadId: CHILD_B,
+          turnId: wireFixture.responses.turnStart.turn.id,
+          _meta: { app_name: "Safari" },
+          requestedSchema: {
+            type: "object",
+            properties: { approval: { type: "string", enum: ["once"] } },
+            required: ["approval"],
+          },
+        },
+      };
+      const script = {
+        rootThreadId: ROOT,
+        holdTurnOpen: true,
+        completeTurnOnServerResponse: true,
+        rejectInjectFor: CHILD_A,
+        notifications: [
+          capturedSpawnedThread(CHILD_A, ROOT),
+          capturedSpawnedThread(CHILD_B, CHILD_A),
+        ],
+        serverRequests: [scriptedRequest],
+      };
+      const responsesPath = `${scriptPath}.responses`;
+      const injectionsPath = `${scriptPath}.injections`;
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
+      NodeFS.rmSync(responsesPath, { force: true });
+      NodeFS.writeFileSync(injectionsPath, "", "utf8");
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          NodeFS.rmSync(scriptPath, { force: true });
+          NodeFS.rmSync(responsesPath, { force: true });
+          NodeFS.rmSync(injectionsPath, { force: true });
+        }),
+      );
+
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("thread-codex-nested-child-approval"),
+        binaryPath: peerPath,
+        cwd: NodeOS.tmpdir(),
+        runtimeMode: "auto",
+        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+      });
+      const approvalRequested = yield* Deferred.make<ProviderEvent>();
+      const turnCompleted = yield* Deferred.make<void>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) =>
+          event.method === "mcpServer/elicitation/request" &&
+          (event.payload as { threadId?: string }).threadId === CHILD_B
+            ? Deferred.succeed(approvalRequested, event).pipe(Effect.asVoid)
+            : event.method === "turn/completed"
+              ? Deferred.succeed(turnCompleted, undefined).pipe(Effect.asVoid)
+              : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "Have a nested child request approval" });
+      const approval = yield* Deferred.await(approvalRequested);
+      assert.equal(typeof approval.agentKey, "string");
+      assert.isDefined(approval.requestId);
+      if (approval.requestId === undefined) return;
+
+      yield* runtime.respondToRequest(approval.requestId, "decline");
+      yield* Deferred.await(turnCompleted);
+      const [injection] = readRecordedApprovalInjections();
+      assert.isDefined(injection, "the nested decision should attempt the immediate parent");
+      assert.equal(injection.params.threadId, CHILD_A);
+      const recordedResponse = yield* decodeMcpElicitationResponse(
+        NodeFS.readFileSync(responsesPath, "utf8"),
+      );
+      assert.equal(recordedResponse.id, scriptedRequest.id);
+      assert.deepEqual(recordedResponse.result, { action: "decline" });
+
+      yield* runtime.close;
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
+
+  it.live("settles native child approval if parent-history injection is interrupted", () =>
+    Effect.gen(function* () {
+      const scriptedRequest = {
+        id: 7004,
+        method: "mcpServer/elicitation/request",
+        params: {
+          mode: "form",
+          message: "Allow the child to use Safari?",
+          serverName: "computer-use",
+          threadId: CHILD_A,
+          turnId: wireFixture.responses.turnStart.turn.id,
+          _meta: { app_name: "Safari" },
+          requestedSchema: {
+            type: "object",
+            properties: { approval: { type: "string", enum: ["once"] } },
+            required: ["approval"],
+          },
+        },
+      };
+      const script = {
+        rootThreadId: ROOT,
+        holdTurnOpen: true,
+        completeTurnOnServerResponse: true,
+        hangInjectFor: ROOT,
+        notifications: [capturedSpawnedThread(), capturedStartedActivity()],
+        serverRequests: [scriptedRequest],
+      };
+      const responsesPath = `${scriptPath}.responses`;
+      const injectionsPath = `${scriptPath}.injections`;
+      // @effect-diagnostics-next-line preferSchemaOverJson:off
+      NodeFS.writeFileSync(scriptPath, JSON.stringify(script), "utf8");
+      NodeFS.rmSync(responsesPath, { force: true });
+      NodeFS.writeFileSync(injectionsPath, "", "utf8");
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          NodeFS.rmSync(scriptPath, { force: true });
+          NodeFS.rmSync(responsesPath, { force: true });
+          NodeFS.rmSync(injectionsPath, { force: true });
+        }),
+      );
+
+      const runtime = yield* makeCodexSessionRuntime({
+        threadId: ThreadId.make("thread-codex-interrupted-child-approval"),
+        binaryPath: peerPath,
+        cwd: NodeOS.tmpdir(),
+        runtimeMode: "auto",
+        environment: { ...process.env, T3_CODEX_COLLAB_SCRIPT: scriptPath },
+      });
+      const approvalRequested = yield* Deferred.make<ProviderEvent>();
+      const turnCompleted = yield* Deferred.make<void>();
+      yield* runtime.events.pipe(
+        Stream.runForEach((event) =>
+          event.method === "mcpServer/elicitation/request" &&
+          (event.payload as { threadId?: string }).threadId === CHILD_A
+            ? Deferred.succeed(approvalRequested, event).pipe(Effect.asVoid)
+            : event.method === "turn/completed"
+              ? Deferred.succeed(turnCompleted, undefined).pipe(Effect.asVoid)
+              : Effect.void,
+        ),
+        Effect.forkScoped,
+      );
+
+      yield* runtime.start();
+      yield* runtime.sendTurn({ input: "Have a child request approval" });
+      const approval = yield* Deferred.await(approvalRequested);
+      assert.isDefined(approval.requestId);
+      if (approval.requestId === undefined) return;
+
+      let stopWaitingForInjection = () => {};
+      const injectionStarted = new Promise<void>((resolve) => {
+        const watcher = NodeFS.watch(injectionsPath, () => {
+          if (NodeFS.readFileSync(injectionsPath, "utf8").trim().length === 0) return;
+          watcher.close();
+          resolve();
+        });
+        stopWaitingForInjection = () => watcher.close();
+      });
+      yield* Effect.addFinalizer(() => Effect.sync(stopWaitingForInjection));
+      const responseFiber = yield* runtime
+        .respondToRequest(approval.requestId, "accept")
+        .pipe(Effect.forkScoped);
+      yield* Effect.promise(() => injectionStarted);
+      yield* Fiber.interrupt(responseFiber);
+
+      const completed = yield* Deferred.await(turnCompleted).pipe(Effect.timeoutOption("1 second"));
+      if (completed._tag !== "Some") {
+        throw new Error("native approval was not answered after injection cancellation");
+      }
+      const recordedResponse = yield* decodeMcpElicitationResponse(
+        NodeFS.readFileSync(responsesPath, "utf8"),
+      );
+      assert.deepEqual(recordedResponse.result, {
+        action: "accept",
+        content: { approval: "once" },
+      });
+
+      yield* runtime.close;
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+  );
 });

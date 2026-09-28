@@ -1,5 +1,6 @@
 import {
   ApprovalRequestId,
+  RuntimeAgentKey,
   type OrchestrationThreadActivity,
   ProviderApprovalOption,
   ProviderRequestKind,
@@ -16,6 +17,8 @@ export interface PendingApproval {
   readonly detail?: string;
   readonly appName?: string;
   readonly options?: ReadonlyArray<ProviderApprovalOption>;
+  readonly agentKey?: RuntimeAgentKey;
+  readonly agentTitle?: string;
 }
 
 export interface PendingUserInput {
@@ -24,9 +27,12 @@ export interface PendingUserInput {
   readonly questions: ReadonlyArray<UserInputQuestion>;
   /** Async questions can be dismissed without a reply; native callbacks cannot. */
   readonly dismissible: boolean;
+  readonly agentKey?: RuntimeAgentKey;
+  readonly agentTitle?: string;
 }
 
 const isRequestId = Schema.is(ApprovalRequestId);
+const isAgentKey = Schema.is(RuntimeAgentKey);
 const isProviderRequestKind = Schema.is(ProviderRequestKind);
 const isProviderApprovalOption = Schema.is(ProviderApprovalOption);
 const QuestionOption = Schema.Struct({
@@ -157,6 +163,10 @@ export function derivePendingRequests(activities: ReadonlyArray<OrchestrationThr
           ? { appName: payload.appName }
           : {}),
         ...(options.length > 0 ? { options } : {}),
+        ...(isAgentKey(payload.agentKey) ? { agentKey: payload.agentKey } : {}),
+        ...(typeof payload.agentTitle === "string" && payload.agentTitle.trim()
+          ? { agentTitle: payload.agentTitle.trim() }
+          : {}),
       });
     } else if (activity.kind === "user-input.requested") {
       if (closedUserInputs.has(requestId)) continue;
@@ -167,6 +177,10 @@ export function derivePendingRequests(activities: ReadonlyArray<OrchestrationThr
         createdAt: activity.createdAt,
         questions,
         dismissible: payload.responseMode === "message",
+        ...(isAgentKey(payload.agentKey) ? { agentKey: payload.agentKey } : {}),
+        ...(typeof payload.agentTitle === "string" && payload.agentTitle.trim()
+          ? { agentTitle: payload.agentTitle.trim() }
+          : {}),
       });
     } else if (
       activity.kind === "approval.resolved" ||
@@ -192,5 +206,17 @@ export function derivePendingRequests(activities: ReadonlyArray<OrchestrationThr
   return {
     approvals: [...approvals.values()].sort(byCreatedAt),
     userInputs: [...userInputs.values()].sort(byCreatedAt),
+  };
+}
+
+/** Derive against the full parent stream so ownerless failure events can close a child request. */
+export function derivePendingRequestsForAgent(
+  activities: ReadonlyArray<OrchestrationThreadActivity>,
+  agentKey: RuntimeAgentKey,
+) {
+  const requests = derivePendingRequests(activities);
+  return {
+    approvals: requests.approvals.filter((request) => request.agentKey === agentKey),
+    userInputs: requests.userInputs.filter((request) => request.agentKey === agentKey),
   };
 }

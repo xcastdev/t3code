@@ -2194,6 +2194,7 @@ const makeWsRpcLayer = (
                 }),
             threadResumeCompletionMarker: true,
             threadSnapshotPagination: true,
+            threadAgentActionEvents: true,
           };
         });
 
@@ -3030,6 +3031,61 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "orchestration" },
           ),
+        [ORCHESTRATION_WS_METHODS.getAgentTranscriptPage]: (input) =>
+          observeRpcEffect(
+            ORCHESTRATION_WS_METHODS.getAgentTranscriptPage,
+            (
+              projectionSnapshotQuery.getAgentTranscriptPage?.(input) ??
+              Effect.succeed(Option.none())
+            ).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new OrchestrationGetSnapshotError({
+                    message: `Failed to load agent transcript for thread ${input.threadId}`,
+                    cause,
+                  }),
+              ),
+              Effect.flatMap(
+                Option.match({
+                  onNone: () =>
+                    Effect.fail(
+                      new OrchestrationGetSnapshotError({
+                        message: `Agent ${input.agentKey} was not found on thread ${input.threadId}`,
+                      }),
+                    ),
+                  onSome: (page) =>
+                    Effect.gen(function* () {
+                      const actionCapabilities = providerService.getAgentCapabilities
+                        ? yield* providerService.getAgentCapabilities({
+                            threadId: input.threadId,
+                            agentKey: input.agentKey,
+                          })
+                        : {
+                            message: { state: "unverified" as const },
+                            answerRequests: { state: "unverified" as const },
+                            stop: { state: "unverified" as const },
+                          };
+                      return {
+                        ...page,
+                        agent: {
+                          ...page.agent,
+                          capabilities: {
+                            ...page.agent.capabilities,
+                            ...actionCapabilities,
+                          },
+                        },
+                      };
+                    }).pipe(
+                      // Capability lookup is fail-closed. The projection's
+                      // unverified defaults remain in place if the live
+                      // provider binding cannot be resolved.
+                      Effect.catchCause(() => Effect.succeed(page)),
+                    ),
+                }),
+              ),
+            ),
+            { "rpc.aggregate": "orchestration" },
+          ),
         [ORCHESTRATION_WS_METHODS.subscribeThread]: (input) =>
           observeRpcStreamEffect(
             ORCHESTRATION_WS_METHODS.subscribeThread,
@@ -3037,7 +3093,10 @@ const makeWsRpcLayer = (
               const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
                 event.aggregateKind === "thread" &&
                 event.aggregateId === input.threadId &&
-                isThreadDetailEvent(event);
+                (isThreadDetailEvent(event) ||
+                  (input.includeAgentActionEvents === true &&
+                    (event.type === "thread.agent-message-requested" ||
+                      event.type === "thread.agent-stop-requested")));
 
               const liveStream = orchestrationEngine.streamDomainEvents.pipe(
                 Stream.filter(isThisThreadDetailEvent),

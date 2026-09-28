@@ -5,6 +5,7 @@ import {
   OrchestrationMessageContext,
   EnvironmentId,
   CheckpointRef,
+  EventId,
   IsoDateTime,
   MessageId,
   NonNegativeInt,
@@ -27,6 +28,13 @@ import {
   McpDefinitionId,
   ProjectMcpUrl,
   ProviderInstanceId,
+  ProviderDriverKind,
+  RuntimeAgentKey,
+  OrchestrationAgentActionState,
+  OrchestrationAgentCapabilities,
+  OrchestrationAgentIdentity,
+  OrchestrationAgentStatus,
+  OrchestrationAgentTranscriptPage,
   SkillApplicationDetail,
   TurnId,
   type OrchestrationCheckpointSummary,
@@ -81,6 +89,10 @@ import {
   decodeThreadDetailPageCursor,
   encodeThreadDetailPageCursor,
 } from "../threadDetailCursor.ts";
+import {
+  decodeAgentTranscriptCursor,
+  encodeAgentTranscriptCursor,
+} from "../agentTranscriptCursor.ts";
 import { projectActivityPayload } from "../ActivityPayloadProjection.ts";
 import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityResolver.ts";
 import { ORCHESTRATION_PROJECTOR_NAMES } from "./ProjectionPipeline.ts";
@@ -159,8 +171,44 @@ const ProjectionThreadActivityDbRowSchema = ProjectionThreadActivity.mapFields(
   Struct.assign({
     payload: Schema.fromJsonString(Schema.Unknown),
     sequence: Schema.NullOr(NonNegativeInt),
+    eventSequence: Schema.NullOr(NonNegativeInt),
   }),
 );
+const ProjectionAgentTranscriptReadRowSchema = Schema.Struct({
+  activityId: EventId,
+  eventSequence: NonNegativeInt,
+  cursorSequence: NonNegativeInt,
+  createdAt: IsoDateTime,
+  kind: Schema.String,
+  summary: Schema.String,
+  role: Schema.NullOr(Schema.String),
+  content: Schema.NullOr(Schema.String),
+  detail: Schema.NullOr(Schema.String),
+  status: Schema.NullOr(Schema.String),
+  deliveryStatus: Schema.NullOr(Schema.String),
+  requestId: Schema.NullOr(Schema.String),
+});
+const ProjectionAgentIdentityDbRowSchema = Schema.Struct({
+  title: Schema.NullOr(Schema.String),
+  role: Schema.NullOr(Schema.String),
+  parentAgentKey: Schema.NullOr(Schema.String),
+  provider: Schema.NullOr(Schema.String),
+});
+const ProjectionAgentLifecycleDbRowSchema = Schema.Struct({
+  kind: Schema.String,
+  eventSequence: NonNegativeInt,
+  status: Schema.NullOr(Schema.String),
+});
+const ProjectionPendingAgentActionDbRowSchema = Schema.Struct({
+  threadId: ThreadId,
+  activityId: EventId,
+  createdAt: IsoDateTime,
+  kind: Schema.Literals(["agent.action.result", "agent.transcript.message"]),
+  agentKey: RuntimeAgentKey,
+  actionId: Schema.String,
+  action: Schema.Literals(["message", "stop"]),
+  content: Schema.NullOr(Schema.String),
+});
 const ProjectionThreadActivityIdRowSchema = Schema.Struct({
   activityId: ProjectionThreadActivity.fields.activityId,
 });
@@ -627,6 +675,7 @@ function mapThreadActivityRow(
     turnId: row.turnId,
     createdAt: row.createdAt,
     ...(row.sequence !== null ? { sequence: row.sequence } : {}),
+    ...(row.eventSequence !== null ? { eventSequence: row.eventSequence } : {}),
   };
 }
 
@@ -635,6 +684,53 @@ function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: st
     Schema.isSchemaError(cause)
       ? toPersistenceDecodeError(decodeOperation)(cause)
       : toPersistenceSqlError(sqlOperation)(cause);
+}
+
+const agentTranscriptStatus = Schema.decodeUnknownOption(OrchestrationAgentStatus);
+const agentTranscriptActionState = Schema.decodeUnknownOption(OrchestrationAgentActionState);
+const agentTranscriptProviderDriver = Schema.decodeUnknownOption(ProviderDriverKind);
+const isAgentTranscriptRequestId = Schema.is(ApprovalRequestId);
+const isAgentTranscriptRuntimeAgentKey = Schema.is(RuntimeAgentKey);
+const agentTranscriptPageLimit = 50;
+const agentTranscriptPageLimitMax = 100;
+
+function boundedText(value: unknown, maxLength: number): string | undefined {
+  if (typeof value !== "string") return undefined;
+  const text = value.slice(0, maxLength);
+  return text.length > 0 ? text : undefined;
+}
+
+function agentTranscriptProvider(value: string | null | undefined): ProviderDriverKind {
+  if (value !== null && value !== undefined) {
+    const decoded = agentTranscriptProviderDriver(value);
+    if (Option.isSome(decoded)) return decoded.value;
+  }
+  return ProviderDriverKind.make("unknown");
+}
+
+function agentTranscriptCapabilities(
+  hasTranscript: boolean,
+): typeof OrchestrationAgentCapabilities.Type {
+  return {
+    transcript: hasTranscript
+      ? { state: "supported" }
+      : {
+          state: "unverified",
+          reason: "The provider has not supplied child message content for this agent.",
+        },
+    message: {
+      state: "unverified",
+      reason: "A current child handle has not been validated for this session.",
+    },
+    answerRequests: {
+      state: "unverified",
+      reason: "A live child request response path has not been validated for this session.",
+    },
+    stop: {
+      state: "unverified",
+      reason: "A current child-only stop handle has not been validated for this session.",
+    },
+  };
 }
 
 const makeProjectionSnapshotQuery = Effect.gen(function* () {
@@ -954,6 +1050,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           summary,
           payload_json AS "payload",
           sequence,
+          event_sequence AS "eventSequence",
           created_at AS "createdAt"
         FROM projection_thread_activities
         ORDER BY
@@ -1695,6 +1792,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           summary,
           payload_json AS "payload",
           sequence,
+          event_sequence AS "eventSequence",
           created_at AS "createdAt"
         FROM (
           SELECT
@@ -1706,6 +1804,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             summary,
             payload_json,
             sequence,
+            event_sequence,
             created_at
           FROM projection_thread_activities
           WHERE thread_id = ${threadId}
@@ -1735,6 +1834,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         summary,
         payload_json AS "payload",
         sequence,
+        event_sequence AS "eventSequence",
         created_at AS "createdAt"
       FROM projection_thread_activities
       WHERE thread_id = ${threadId}
@@ -1786,6 +1886,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           summary,
           payload_json AS "payload",
           sequence,
+          event_sequence AS "eventSequence",
           created_at AS "createdAt"
         FROM projection_thread_activities
         -- The selectors already scoped these globally unique ids to the
@@ -1808,6 +1909,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           summary,
           payload_json AS "payload",
           sequence,
+          event_sequence AS "eventSequence",
           created_at AS "createdAt"
         FROM (
           SELECT
@@ -1819,6 +1921,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             summary,
             payload_json,
             sequence,
+            event_sequence,
             created_at
           FROM projection_thread_activities
           WHERE thread_id = ${threadId}
@@ -2000,6 +2103,234 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             'thread.reverted',
             'thread.session-set'
           )
+      `,
+  });
+
+  const listAgentTranscriptActivityRows = SqlSchema.findAll({
+    Request: Schema.Struct({
+      threadId: ThreadId,
+      agentKey: RuntimeAgentKey,
+      beforeEventSequence: Schema.optional(NonNegativeInt),
+      beforeActivityId: Schema.optional(EventId),
+      limit: Schema.Number,
+    }),
+    Result: ProjectionAgentTranscriptReadRowSchema,
+    execute: ({ threadId, agentKey, beforeEventSequence, beforeActivityId, limit }) =>
+      sql`
+        SELECT
+          activity_id AS "activityId",
+          event_sequence AS "eventSequence",
+          COALESCE(first_event_sequence, event_sequence) AS "cursorSequence",
+          created_at AS "createdAt",
+          kind,
+          substr(summary, 1, 512) AS summary,
+          CASE WHEN json_type(payload_json, '$.role') = 'text'
+            THEN substr(json_extract(payload_json, '$.role'), 1, 16)
+            ELSE NULL END AS role,
+          CASE WHEN json_type(payload_json, '$.content') = 'text'
+            THEN substr(json_extract(payload_json, '$.content'), 1, 65536)
+            ELSE NULL END AS content,
+          CASE WHEN json_type(payload_json, '$.detail') = 'text'
+            THEN substr(json_extract(payload_json, '$.detail'), 1, 16384)
+            ELSE NULL END AS detail,
+          CASE WHEN json_type(payload_json, '$.status') = 'text'
+            THEN substr(json_extract(payload_json, '$.status'), 1, 64)
+            ELSE NULL END AS status,
+          CASE WHEN json_type(payload_json, '$.deliveryStatus') = 'text'
+            THEN substr(json_extract(payload_json, '$.deliveryStatus'), 1, 64)
+            ELSE NULL END AS "deliveryStatus",
+          CASE WHEN json_type(payload_json, '$.requestId') = 'text'
+            THEN substr(json_extract(payload_json, '$.requestId'), 1, 200)
+            ELSE NULL END AS "requestId"
+        FROM (
+          SELECT *
+          FROM projection_thread_activities
+          WHERE thread_id = ${threadId}
+            AND agent_key = ${agentKey}
+            AND event_sequence IS NOT NULL
+            ${
+              beforeEventSequence === undefined
+                ? sql``
+                : beforeActivityId === undefined
+                  ? sql`AND COALESCE(first_event_sequence, event_sequence) < ${beforeEventSequence}`
+                  : sql`AND (
+                    COALESCE(first_event_sequence, event_sequence) < ${beforeEventSequence}
+                    OR (
+                      COALESCE(first_event_sequence, event_sequence) = ${beforeEventSequence}
+                      AND activity_id < ${beforeActivityId}
+                    )
+                  )`
+            }
+          ORDER BY COALESCE(first_event_sequence, event_sequence) DESC, activity_id DESC
+          LIMIT ${limit}
+        ) AS agent_activities
+        ORDER BY COALESCE(first_event_sequence, event_sequence) ASC, activity_id ASC
+      `,
+  });
+
+  const listPendingAgentActionRows = SqlSchema.findAll({
+    Request: Schema.Void,
+    Result: ProjectionPendingAgentActionDbRowSchema,
+    execute: () => sql`
+      WITH pending_activities AS (
+      SELECT
+        thread_id AS "threadId",
+        activity_id AS "activityId",
+        created_at AS "createdAt",
+        kind,
+        substr(json_extract(payload_json, '$.agentKey'), 1, 128) AS "agentKey",
+        substr(json_extract(payload_json, '$.actionId'), 1, 256) AS "actionId",
+        json_extract(payload_json, '$.action') AS action,
+        CASE WHEN json_type(payload_json, '$.content') = 'text'
+          THEN substr(json_extract(payload_json, '$.content'), 1, 16000)
+          ELSE NULL END AS content
+      FROM projection_thread_activities
+      WHERE kind IN ('agent.action.result', 'agent.transcript.message')
+        AND json_type(payload_json, '$.agentKey') = 'text'
+        AND json_type(payload_json, '$.actionId') = 'text'
+        AND json_type(payload_json, '$.action') = 'text'
+        AND json_extract(payload_json, '$.action') IN ('message', 'stop')
+        AND (
+          (kind = 'agent.action.result'
+            AND json_extract(payload_json, '$.status') = 'pending')
+          OR
+          (kind = 'agent.transcript.message'
+            AND json_extract(payload_json, '$.deliveryStatus') = 'pending')
+        )
+      ), unmatched_intents AS (
+        SELECT
+          events.stream_id AS "threadId",
+          events.event_id AS "activityId",
+          events.occurred_at AS "createdAt",
+          CASE events.event_type
+            WHEN 'thread.agent-message-requested' THEN 'agent.transcript.message'
+            ELSE 'agent.action.result'
+          END AS kind,
+          substr(json_extract(events.payload_json, '$.agentKey'), 1, 128) AS "agentKey",
+          events.event_id AS "actionId",
+          CASE events.event_type
+            WHEN 'thread.agent-message-requested' THEN 'message'
+            ELSE 'stop'
+          END AS action,
+          CASE WHEN events.event_type = 'thread.agent-message-requested'
+            AND json_type(events.payload_json, '$.text') = 'text'
+            THEN substr(json_extract(events.payload_json, '$.text'), 1, 16000)
+            ELSE NULL END AS content
+        FROM orchestration_events AS events
+        WHERE events.aggregate_kind = 'thread'
+          AND events.event_type IN (
+            'thread.agent-message-requested',
+            'thread.agent-stop-requested'
+          )
+          AND json_type(events.payload_json, '$.agentKey') = 'text'
+          AND NOT EXISTS (
+            SELECT 1
+            FROM projection_thread_activities AS activities
+            WHERE activities.thread_id = events.stream_id
+              AND activities.kind IN ('agent.action.result', 'agent.transcript.message')
+              AND json_type(activities.payload_json, '$.actionId') = 'text'
+              AND json_extract(activities.payload_json, '$.actionId') = events.event_id
+          )
+      )
+      SELECT * FROM pending_activities
+      UNION ALL
+      SELECT * FROM unmatched_intents
+      ORDER BY "createdAt" ASC, "activityId" ASC
+      LIMIT 1000
+    `,
+  });
+
+  // Identity metadata is selected from JSON fields in SQLite so transcript
+  // bodies never enter memory just to render the agent heading.
+  const getAgentIdentityRow = SqlSchema.findOneOption({
+    Request: Schema.Struct({ threadId: ThreadId, agentKey: RuntimeAgentKey }),
+    Result: ProjectionAgentIdentityDbRowSchema,
+    execute: ({ threadId, agentKey }) =>
+      sql`
+        SELECT
+          (
+            SELECT substr(json_extract(payload_json, '$.title'), 1, 256)
+            FROM projection_thread_activities
+            WHERE thread_id = ${threadId} AND agent_key = ${agentKey}
+              AND event_sequence IS NOT NULL
+              AND json_type(payload_json, '$.title') = 'text'
+            ORDER BY event_sequence DESC, activity_id DESC LIMIT 1
+          ) AS title,
+          (
+            SELECT substr(json_extract(payload_json, '$.role'), 1, 256)
+            FROM projection_thread_activities
+            WHERE thread_id = ${threadId} AND agent_key = ${agentKey}
+              AND event_sequence IS NOT NULL
+              AND json_type(payload_json, '$.role') = 'text'
+            ORDER BY event_sequence DESC, activity_id DESC LIMIT 1
+          ) AS role,
+          (
+            SELECT substr(json_extract(payload_json, '$.parentAgentKey'), 1, 128)
+            FROM projection_thread_activities
+            WHERE thread_id = ${threadId} AND agent_key = ${agentKey}
+              AND event_sequence IS NOT NULL
+              AND json_type(payload_json, '$.parentAgentKey') = 'text'
+            ORDER BY event_sequence DESC, activity_id DESC LIMIT 1
+          ) AS "parentAgentKey",
+          (
+            SELECT substr(json_extract(payload_json, '$.provider'), 1, 64)
+            FROM projection_thread_activities
+            WHERE thread_id = ${threadId} AND agent_key = ${agentKey}
+              AND event_sequence IS NOT NULL
+              AND json_type(payload_json, '$.provider') = 'text'
+            ORDER BY event_sequence DESC, activity_id DESC LIMIT 1
+          ) AS provider
+        FROM (SELECT 1) AS singleton
+        WHERE EXISTS (
+          SELECT 1 FROM projection_thread_activities
+          WHERE thread_id = ${threadId} AND agent_key = ${agentKey}
+            AND event_sequence IS NOT NULL
+        )
+      `,
+  });
+
+  const getLatestAgentLifecycleRow = SqlSchema.findOneOption({
+    Request: Schema.Struct({ threadId: ThreadId, agentKey: RuntimeAgentKey }),
+    Result: ProjectionAgentLifecycleDbRowSchema,
+    execute: ({ threadId, agentKey }) =>
+      sql`
+        SELECT kind, event_sequence AS "eventSequence", status
+        FROM (
+          SELECT kind, event_sequence, activity_id,
+            CASE WHEN json_type(payload_json, '$.status') = 'text'
+              THEN substr(json_extract(payload_json, '$.status'), 1, 64)
+              ELSE NULL END AS status
+          FROM projection_thread_activities
+          WHERE thread_id = ${threadId} AND agent_key = ${agentKey}
+            AND kind IN (
+              'agent.status',
+              'task.started',
+              'task.progress',
+              'task.updated',
+              'task.completed'
+            )
+            AND event_sequence IS NOT NULL
+        ) AS latest_lifecycle
+        ORDER BY event_sequence DESC, activity_id DESC
+        LIMIT 1
+      `,
+  });
+
+  const hasAgentTranscriptRow = SqlSchema.findOneOption({
+    Request: Schema.Struct({ threadId: ThreadId, agentKey: RuntimeAgentKey }),
+    Result: Schema.Struct({ found: Schema.Literal(1) }),
+    execute: ({ threadId, agentKey }) =>
+      sql`
+        SELECT 1 AS found
+        FROM projection_thread_activities
+        WHERE thread_id = ${threadId}
+          AND agent_key = ${agentKey}
+          AND kind = 'agent.transcript.message'
+          AND event_sequence IS NOT NULL
+          AND json_type(payload_json, '$.provider') = 'text'
+          AND json_extract(payload_json, '$.role') = 'assistant'
+          AND json_type(payload_json, '$.content') = 'text'
+        LIMIT 1
       `,
   });
 
@@ -2187,6 +2518,7 @@ pending_approval_requests AS (
           activity.summary,
           activity.payload_json AS "payload",
           activity.sequence,
+          activity.event_sequence AS "eventSequence",
           activity.created_at AS "createdAt"
         FROM pinned_activity_ids AS pinned
         INNER JOIN projection_thread_activities AS activity
@@ -2220,6 +2552,7 @@ pending_approval_requests AS (
           summary,
           payload_json AS "payload",
           sequence,
+          event_sequence AS "eventSequence",
           created_at AS "createdAt"
         FROM (
           SELECT
@@ -2231,6 +2564,7 @@ pending_approval_requests AS (
             summary,
             payload_json,
             sequence,
+            event_sequence,
             created_at
           FROM projection_thread_activities
           WHERE thread_id = ${threadId}
@@ -4322,6 +4656,248 @@ pending_approval_requests AS (
         ),
       );
 
+  const getAgentTranscriptPage: NonNullable<
+    ProjectionSnapshotQueryShape["getAgentTranscriptPage"]
+  > = (input) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const threadContext = yield* getThreadRuntimeContext(input.threadId);
+          if (Option.isNone(threadContext)) {
+            return Option.none<OrchestrationAgentTranscriptPage>();
+          }
+
+          const pageSize = Math.min(
+            input.limit ?? agentTranscriptPageLimit,
+            agentTranscriptPageLimitMax,
+          );
+          const decodedCursor =
+            input.cursor === undefined
+              ? null
+              : decodeAgentTranscriptCursor(input.cursor, input.threadId, input.agentKey);
+          const cursor = decodedCursor;
+          const rawRows = yield* listAgentTranscriptActivityRows({
+            threadId: input.threadId,
+            agentKey: input.agentKey,
+            ...(cursor === null
+              ? {}
+              : {
+                  beforeEventSequence: cursor.beforeEventSequence,
+                  ...(cursor.beforeActivityId === undefined
+                    ? {}
+                    : { beforeActivityId: cursor.beforeActivityId }),
+                }),
+            limit: pageSize + 1,
+          }).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getAgentTranscriptPage:activities:query",
+                "ProjectionSnapshotQuery.getAgentTranscriptPage:activities:decodeRows",
+              ),
+            ),
+          );
+          const identityOption = yield* getAgentIdentityRow({
+            threadId: input.threadId,
+            agentKey: input.agentKey,
+          }).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getAgentTranscriptPage:identity:query",
+                "ProjectionSnapshotQuery.getAgentTranscriptPage:identity:decodeRow",
+              ),
+            ),
+          );
+          if (rawRows.length === 0 && Option.isNone(identityOption)) {
+            return Option.none<OrchestrationAgentTranscriptPage>();
+          }
+
+          const latestLifecycle = yield* getLatestAgentLifecycleRow({
+            threadId: input.threadId,
+            agentKey: input.agentKey,
+          }).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getAgentTranscriptPage:lifecycle:query",
+                "ProjectionSnapshotQuery.getAgentTranscriptPage:lifecycle:decodeRow",
+              ),
+            ),
+          );
+          const hasTranscriptOption = yield* hasAgentTranscriptRow({
+            threadId: input.threadId,
+            agentKey: input.agentKey,
+          }).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getAgentTranscriptPage:transcript:query",
+                "ProjectionSnapshotQuery.getAgentTranscriptPage:transcript:decodeRow",
+              ),
+            ),
+          );
+          const selectedRows = rawRows.length > pageSize ? rawRows.slice(1) : rawRows;
+          const entries = selectedRows.flatMap((row) => {
+            const kind: "message" | "tool" | "request" | "status" =
+              row.kind === "agent.transcript.message"
+                ? "message"
+                : row.kind.startsWith("tool.")
+                  ? "tool"
+                  : row.kind.startsWith("approval.") || row.kind.startsWith("user-input.")
+                    ? "request"
+                    : "status";
+            const status =
+              row.status !== null
+                ? Option.getOrUndefined(agentTranscriptStatus(row.status))
+                : undefined;
+            const deliveryStatus =
+              row.deliveryStatus !== null
+                ? Option.getOrUndefined(agentTranscriptActionState(row.deliveryStatus))
+                : undefined;
+            const requestId =
+              row.requestId !== null && isAgentTranscriptRequestId(row.requestId)
+                ? row.requestId
+                : undefined;
+            const role: "assistant" | "user" | "tool" | undefined =
+              row.role === "assistant"
+                ? "assistant"
+                : row.role === "user"
+                  ? "user"
+                  : row.role === "tool"
+                    ? "tool"
+                    : undefined;
+            const content = boundedText(row.content, 65_536);
+            const detail = boundedText(row.detail, 16_384);
+            return [
+              {
+                id: row.activityId,
+                eventSequence: row.eventSequence,
+                createdAt: row.createdAt,
+                kind,
+                ...(role === undefined ? {} : { role }),
+                ...(content === undefined ? {} : { content }),
+                summary: boundedText(row.summary, 512) ?? "Agent activity",
+                ...(detail === undefined ? {} : { detail }),
+                ...(status === undefined ? {} : { status }),
+                ...(deliveryStatus === undefined ? {} : { deliveryStatus }),
+                ...(requestId === undefined ? {} : { requestId }),
+              },
+            ];
+          });
+          const hasMore = rawRows.length > pageSize;
+          const nextCursor =
+            hasMore && selectedRows[0] !== undefined
+              ? encodeAgentTranscriptCursor({
+                  threadId: input.threadId,
+                  agentKey: input.agentKey,
+                  beforeEventSequence: selectedRows[0].cursorSequence,
+                  beforeActivityId: selectedRows[0].activityId,
+                })
+              : null;
+
+          let status: typeof OrchestrationAgentStatus.Type = "idle";
+          if (Option.isSome(latestLifecycle)) {
+            const lifecycle = latestLifecycle.value;
+            if (lifecycle.kind === "task.completed") {
+              status =
+                lifecycle.status === "failed"
+                  ? "failed"
+                  : lifecycle.status === "stopped" || lifecycle.status === "cancelled"
+                    ? "cancelled"
+                    : "completed";
+            } else {
+              const decoded =
+                lifecycle.status === null
+                  ? Option.none<typeof OrchestrationAgentStatus.Type>()
+                  : agentTranscriptStatus(lifecycle.status);
+              status = Option.getOrElse(decoded, () => "running");
+            }
+          } else if (Option.isSome(hasTranscriptOption)) {
+            status = "running";
+          }
+
+          const metadata = Option.getOrUndefined(identityOption);
+          const role = boundedText(metadata?.role, 256);
+          const title = boundedText(metadata?.title, 256) ?? role ?? "Subagent";
+          const parentKeyValue = boundedText(metadata?.parentAgentKey, 128);
+          const parentKey =
+            parentKeyValue !== undefined && isAgentTranscriptRuntimeAgentKey(parentKeyValue)
+              ? parentKeyValue
+              : null;
+          // Provider/session facts must come from the child's persisted
+          // metadata. The parent's current provider may have changed since
+          // this agent was created and is never a safe fallback.
+          const provider = agentTranscriptProvider(metadata?.provider);
+          const hasTranscript = Option.isSome(hasTranscriptOption);
+          const snapshotSequence = yield* getSnapshotSequence().pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getAgentTranscriptPage:snapshotSequence:query",
+                "ProjectionSnapshotQuery.getAgentTranscriptPage:snapshotSequence:decodeRows",
+              ),
+            ),
+          );
+          const watermarkRow = yield* getThreadEventWatermarkRow({
+            threadId: input.threadId,
+            maxSequence: snapshotSequence.snapshotSequence,
+          }).pipe(
+            Effect.mapError(
+              toPersistenceSqlOrDecodeError(
+                "ProjectionSnapshotQuery.getAgentTranscriptPage:threadWatermark:query",
+                "ProjectionSnapshotQuery.getAgentTranscriptPage:threadWatermark:decodeRow",
+              ),
+            ),
+          );
+          const threadSequence = Option.match(watermarkRow, {
+            onNone: () => 0,
+            onSome: (row) => row.threadSequence ?? 0,
+          });
+          const identity: OrchestrationAgentIdentity = {
+            key: input.agentKey,
+            parentKey,
+            title,
+            role: role ?? null,
+            provider,
+            status,
+            capabilities: agentTranscriptCapabilities(hasTranscript),
+          };
+          return Option.some({
+            threadId: input.threadId,
+            agent: identity,
+            entries,
+            nextCursor,
+            hasMore,
+            snapshotSequence: snapshotSequence.snapshotSequence,
+            threadSequence,
+            completeness: hasTranscript
+              ? {
+                  state: "partial" as const,
+                  reason: "Only child messages and activity captured by the provider are shown.",
+                }
+              : {
+                  state: "unavailable" as const,
+                  reason: "The provider has not supplied child message content for this agent.",
+                },
+          });
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          isPersistenceError(error)
+            ? error
+            : toPersistenceSqlError("ProjectionSnapshotQuery.getAgentTranscriptPage:transaction")(
+                error,
+              ),
+        ),
+      );
+
+  const listPendingAgentActions: ProjectionSnapshotQueryShape["listPendingAgentActions"] = () =>
+    listPendingAgentActionRows(undefined).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionSnapshotQuery.listPendingAgentActions:query",
+          "ProjectionSnapshotQuery.listPendingAgentActions:decodeRows",
+        ),
+      ),
+    );
+
   return {
     getCommandReadModel,
     getUserInputActivity,
@@ -4344,6 +4920,8 @@ pending_approval_requests AS (
     getTurnStartMessage,
     getThreadDetailById,
     getThreadDetailSnapshot,
+    getAgentTranscriptPage,
+    listPendingAgentActions,
   } satisfies ProjectionSnapshotQueryShape;
 });
 

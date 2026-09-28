@@ -10,6 +10,7 @@
 
 import {
   type CanUseTool,
+  type HookCallback,
   query,
   getSessionMessages,
   forkSession,
@@ -48,6 +49,7 @@ import {
   type ProviderUserInputAnswers,
   type RuntimeContentStreamKind,
   RuntimeItemId,
+  RuntimeAgentKey,
   RuntimeRequestId,
   RuntimeTaskId,
   type RuntimeTaskStatus,
@@ -203,11 +205,104 @@ interface AssistantTextBlockState {
   completionEmitted: boolean;
 }
 
+interface ClaudeSubagentTextBlockState {
+  readonly taskId: string;
+  readonly messageId: string;
+  readonly index: number;
+  readonly itemType: "assistant_message" | "reasoning";
+  readonly streamKind: "assistant_text" | "reasoning_text";
+  readonly itemId: string;
+  content: string;
+  completed: boolean;
+}
+
+interface ClaudeSubagentSnapshotBlock {
+  readonly index: number;
+  readonly itemType: "assistant_message" | "reasoning";
+  readonly streamKind: "assistant_text" | "reasoning_text";
+  readonly text: string;
+}
+
+interface PendingClaudeSubagentTextSnapshot {
+  readonly messageId: string;
+  readonly blocks: ReadonlyArray<ClaudeSubagentSnapshotBlock>;
+}
+
 interface PendingApproval {
   readonly requestType: CanonicalRequestType;
   readonly detail?: string;
   readonly suggestions?: ReadonlyArray<PermissionUpdate>;
+  readonly agentKey?: RuntimeAgentKey;
+  readonly agentTitle?: string;
+  readonly childHandoff?: ClaudeChildApprovalOutcomeDraft;
   readonly decision: Deferred.Deferred<ProviderApprovalDecision>;
+}
+
+interface ClaudeChildApprovalOutcomeDraft {
+  readonly requesterAgentId: string;
+  readonly childAgentId: string;
+  readonly providerRequestId: string;
+  readonly requestType: CanonicalRequestType;
+  readonly toolName: string;
+  readonly toolUseId?: string;
+}
+
+interface ClaudeChildApprovalOutcome extends ClaudeChildApprovalOutcomeDraft {
+  readonly decision: ProviderApprovalDecision;
+}
+
+const MAX_CHILD_APPROVAL_OUTCOMES_PER_SESSION = 128;
+
+function safeClaudeApprovalContextField(value: string): string {
+  return Array.from(value, (character) => {
+    const code = character.charCodeAt(0);
+    return code <= 0x1f || code === 0x7f || character === "<" || character === ">"
+      ? " "
+      : character;
+  })
+    .join("")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+}
+
+function approvalChoiceLabel(decision: ProviderApprovalDecision): string {
+  switch (decision) {
+    case "accept":
+      return "allow once";
+    case "acceptForSession":
+      return "allow for this session";
+    case "acceptAlways":
+      return "allow always";
+    case "decline":
+      return "deny";
+    case "cancel":
+      return "cancel";
+  }
+}
+
+function rememberChildApprovalOutcome(
+  outcomes: Array<ClaudeChildApprovalOutcome>,
+  draft: ClaudeChildApprovalOutcomeDraft,
+  decision: ProviderApprovalDecision,
+): void {
+  outcomes.push({ ...draft, decision });
+  if (outcomes.length > MAX_CHILD_APPROVAL_OUTCOMES_PER_SESSION) {
+    outcomes.splice(0, outcomes.length - MAX_CHILD_APPROVAL_OUTCOMES_PER_SESSION);
+  }
+}
+
+function formatChildApprovalOutcomes(outcomes: ReadonlyArray<ClaudeChildApprovalOutcome>): string {
+  const lines = outcomes.map((outcome) => {
+    const toolName = safeClaudeApprovalContextField(outcome.toolName) || "tool";
+    const childAgentId = safeClaudeApprovalContextField(outcome.childAgentId) || "unknown";
+    const requestId = safeClaudeApprovalContextField(outcome.providerRequestId) || "unknown";
+    const toolUseId = outcome.toolUseId
+      ? `; tool call ${safeClaudeApprovalContextField(outcome.toolUseId) || "unknown"}`
+      : "";
+    return `The user chose to ${approvalChoiceLabel(outcome.decision)} the child permission request for ${toolName} (request type ${outcome.requestType}; request ID ${requestId}${toolUseId}; child agent ${childAgentId}). This records the user's choice only; it does not establish that the operation ran or succeeded.`;
+  });
+  return `<t3_code_child_permission_history>\n${lines.join("\n")}\n</t3_code_child_permission_history>`;
 }
 
 /**
@@ -245,6 +340,8 @@ function toSessionPermissionUpdates(
 interface PendingUserInput {
   readonly questions: ReadonlyArray<UserInputQuestion>;
   readonly answers: Deferred.Deferred<ProviderUserInputAnswers>;
+  readonly agentKey?: RuntimeAgentKey;
+  readonly agentTitle?: string;
   /** Unparks the waiting handler as cancelled. Session teardown must run it. */
   readonly cancel: Effect.Effect<void>;
 }
@@ -260,6 +357,8 @@ interface ToolInFlight {
   readonly lastEmittedInputFingerprint?: string;
   /** Owning agent when this tool ran inside a subagent (see attribution note). */
   readonly agentId?: string;
+  /** Opaque T3 identity captured while the native task mapping is available. */
+  readonly agentKey?: RuntimeAgentKey;
   readonly parentToolUseId?: string;
 }
 
@@ -277,6 +376,9 @@ interface ClaudeTaskState {
  */
 interface ClaudeTaskAgentState {
   readonly taskId: string;
+  readonly agentKey: RuntimeAgentKey;
+  /** Native SDK identity used by canUseTool and SDK hooks when available. */
+  providerAgentId?: string;
   toolUseId: string | undefined;
   description: string | undefined;
   subagentType: string | undefined;
@@ -343,6 +445,13 @@ interface ClaudeSessionContext {
   readonly inFlightTools: Map<number, ToolInFlight>;
   readonly claudeTasks: Map<string, ClaudeTaskState>;
   readonly taskAgents: Map<string, ClaudeTaskAgentState>;
+  readonly taskIdsByProviderAgentId: Map<string, string>;
+  readonly agentKeysByProviderId: Map<string, RuntimeAgentKey>;
+  readonly childApprovalOutcomes: Array<ClaudeChildApprovalOutcome>;
+  readonly subagentTextBlocks: Map<string, ClaudeSubagentTextBlockState>;
+  readonly subagentMessageIdsByTaskId: Map<string, string>;
+  readonly pendingSubagentTextSnapshots: Map<string, Array<PendingClaudeSubagentTextSnapshot>>;
+  subagentTextBlockSequence: number;
   /**
    * Authoritative subagent models from assistant snapshots that arrived before
    * their task_started registered the task, keyed by parent_tool_use_id.
@@ -1290,6 +1399,10 @@ function taskLinkageFor(
   }
   return {
     ...(agent.taskType ? { taskType: agent.taskType } : {}),
+    agentKey: agent.agentKey,
+    ...(agent.owningAgentId && agents.get(agent.owningAgentId)
+      ? { parentAgentKey: agents.get(agent.owningAgentId)?.agentKey }
+      : {}),
     ...(agent.owningAgentId ? { agentId: agent.owningAgentId } : {}),
     ...(agent.description ? { title: agent.description } : {}),
     ...(agent.subagentType ? { role: agent.subagentType } : {}),
@@ -1697,6 +1810,94 @@ function extractAssistantTextBlocks(message: SDKMessage): Array<string> {
   }
 
   return fragments;
+}
+
+function extractClaudeSubagentSnapshotBlocks(
+  message: SDKMessage,
+): Array<ClaudeSubagentSnapshotBlock> {
+  if (message.type !== "assistant") {
+    return [];
+  }
+
+  const content = (message.message as { content?: unknown } | undefined)?.content;
+  if (!Array.isArray(content)) {
+    return [];
+  }
+
+  const blocks: Array<ClaudeSubagentSnapshotBlock> = [];
+  for (const [index, value] of content.entries()) {
+    if (!value || typeof value !== "object") continue;
+    const block = value as { type?: unknown; text?: unknown; thinking?: unknown };
+    if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) {
+      blocks.push({
+        index,
+        itemType: "assistant_message",
+        streamKind: "assistant_text",
+        text: block.text,
+      });
+    } else if (
+      block.type === "thinking" &&
+      typeof block.thinking === "string" &&
+      block.thinking.length > 0
+    ) {
+      blocks.push({
+        index,
+        itemType: "reasoning",
+        streamKind: "reasoning_text",
+        text: block.thinking,
+      });
+    }
+  }
+  return blocks;
+}
+
+function extractClaudeSubagentOutputMessages(
+  transcript: string,
+  taskId: string,
+): Array<PendingClaudeSubagentTextSnapshot> {
+  const messages: Array<PendingClaudeSubagentTextSnapshot> = [];
+  for (const line of transcript.split(/\r?\n/)) {
+    if (line.length === 0) continue;
+    let value: unknown;
+    try {
+      value = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+    const record = value as Record<string, unknown>;
+    if (record.type !== "assistant" || record.isSidechain !== true || record.agentId !== taskId) {
+      continue;
+    }
+    const message =
+      record.message && typeof record.message === "object" && !Array.isArray(record.message)
+        ? (record.message as Record<string, unknown>)
+        : undefined;
+    const messageId = readString(message?.id) ?? readString(record.uuid);
+    if (!messageId) continue;
+    const blocks = extractClaudeSubagentSnapshotBlocks(record as SDKMessage).slice(0, 16);
+    if (blocks.length > 0) messages.push({ messageId, blocks });
+    if (messages.length >= 256) break;
+  }
+  return messages;
+}
+
+function extractClaudeSubagentHandbackText(resultText: string, taskId: string): string | undefined {
+  const handbackMarker = "[Subagent hand-back]";
+  const reportMarker = "The report follows:\n";
+  if (!resultText.startsWith(handbackMarker)) return undefined;
+  const reportMarkerIndex = resultText.indexOf(reportMarker);
+  const taskIdentity = `\nagentId: ${taskId} `;
+  const taskIdentityIndex = resultText.lastIndexOf(taskIdentity);
+  if (reportMarkerIndex < 0 || taskIdentityIndex <= reportMarkerIndex) return undefined;
+
+  const report = resultText
+    .slice(reportMarkerIndex + reportMarker.length, taskIdentityIndex)
+    .split(/\r?\n/)
+    .map((line) => (line.startsWith("  ") ? line.slice(2) : line))
+    .join("\n")
+    .trim();
+  return report.length > 0 ? report : undefined;
 }
 
 function extractContentBlockText(block: unknown): string {
@@ -2699,6 +2900,236 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     yield* updateResumeCursor(context);
   });
 
+  const subagentTextBlockKey = (taskId: string, messageId: string, index: number) =>
+    JSON.stringify([taskId, messageId, index]);
+
+  const subagentTextItemId = (taskId: string, messageId: string, index: number) =>
+    `claude-subagent:${encodeURIComponent(taskId)}:${encodeURIComponent(messageId)}:${index}`;
+
+  const getOrCreateSubagentTextBlock = (
+    context: ClaudeSessionContext,
+    agent: ClaudeTaskAgentState,
+    messageId: string,
+    index: number,
+    itemType: ClaudeSubagentSnapshotBlock["itemType"],
+    streamKind: ClaudeSubagentSnapshotBlock["streamKind"],
+  ) => {
+    const key = subagentTextBlockKey(agent.taskId, messageId, index);
+    let state = context.subagentTextBlocks.get(key);
+    if (!state) {
+      state = {
+        taskId: agent.taskId,
+        messageId,
+        index,
+        itemType,
+        streamKind,
+        itemId: subagentTextItemId(agent.taskId, messageId, index),
+        content: "",
+        completed: false,
+      };
+      context.subagentTextBlocks.set(key, state);
+    }
+    return state;
+  };
+
+  const emitSubagentTextItemCompleted = Effect.fn("emitSubagentTextItemCompleted")(function* (
+    context: ClaudeSessionContext,
+    agent: ClaudeTaskAgentState,
+    state: ClaudeSubagentTextBlockState,
+  ) {
+    if (state.completed) return false;
+    state.completed = true;
+    const stamp = yield* makeEventStamp();
+    yield* offerRuntimeEvent({
+      type: "item.completed",
+      eventId: stamp.eventId,
+      provider: PROVIDER,
+      createdAt: stamp.createdAt,
+      threadId: context.session.threadId,
+      itemId: asRuntimeItemId(state.itemId),
+      agentKey: agent.agentKey,
+      ...(agent.description ? { agentTitle: agent.description } : {}),
+      payload: {
+        itemType: state.itemType,
+        status: "completed",
+        title: state.itemType === "reasoning" ? "Reasoning" : "Assistant response",
+        ...(state.content ? { detail: state.content } : {}),
+      },
+      providerRefs: nativeProviderRefs(context, { providerItemId: state.itemId }),
+    });
+    return true;
+  });
+
+  const emitSubagentAssistantSnapshot = Effect.fn("emitSubagentAssistantSnapshot")(function* (
+    context: ClaudeSessionContext,
+    agent: ClaudeTaskAgentState,
+    messageId: string,
+    blocks: ReadonlyArray<ClaudeSubagentSnapshotBlock>,
+  ) {
+    if (agent.skipTranscript) return;
+    for (const [index, block] of blocks.entries()) {
+      if (index >= 16 || block.text.length === 0) continue;
+      const state = getOrCreateSubagentTextBlock(
+        context,
+        agent,
+        messageId,
+        block.index,
+        block.itemType,
+        block.streamKind,
+      );
+      state.content = block.text.slice(0, 65_536);
+      yield* emitSubagentTextItemCompleted(context, agent, state);
+    }
+  });
+
+  const emitSubagentOutputFileTranscript = Effect.fn("emitSubagentOutputFileTranscript")(function* (
+    context: ClaudeSessionContext,
+    agent: ClaudeTaskAgentState,
+    outputFile: string | undefined,
+  ) {
+    if (agent.skipTranscript || !outputFile || !path.isAbsolute(outputFile)) return;
+    if (!/^[a-zA-Z0-9_-]+$/.test(agent.taskId)) return;
+    if (
+      path.basename(outputFile) !== `${agent.taskId}.output` ||
+      path.basename(path.dirname(outputFile)) !== "tasks"
+    ) {
+      return;
+    }
+    // Claude exposes task output through a task-specific symlink to the
+    // matching subagent JSONL. Resolve it before stat/read, and only follow
+    // the expected task-specific artifact names.
+    const transcriptPath = yield* fileSystem
+      .realPath(outputFile)
+      .pipe(Effect.orElseSucceed(() => undefined));
+    if (!transcriptPath) return;
+    const transcriptName = path.basename(transcriptPath);
+    const transcriptDirectory = path.basename(path.dirname(transcriptPath));
+    if (
+      !(
+        (transcriptName === `${agent.taskId}.output` && transcriptDirectory === "tasks") ||
+        (transcriptName === `agent-${agent.taskId}.jsonl` && transcriptDirectory === "subagents")
+      )
+    ) {
+      return;
+    }
+    const fileInfo = yield* fileSystem
+      .stat(transcriptPath)
+      .pipe(Effect.orElseSucceed(() => undefined));
+    // A task output is a provider-owned JSONL transcript. Keep the fallback
+    // bounded because task_notification may reference a long-running agent.
+    if (!fileInfo || fileInfo.type !== "File" || fileInfo.size > 4_194_304n) return;
+    const rawTranscript = yield* fileSystem
+      .readFileString(transcriptPath)
+      .pipe(Effect.orElseSucceed(() => undefined));
+    if (!rawTranscript) return;
+    for (const snapshot of extractClaudeSubagentOutputMessages(rawTranscript, agent.taskId)) {
+      yield* emitSubagentAssistantSnapshot(context, agent, snapshot.messageId, snapshot.blocks);
+    }
+  });
+
+  const emitSubagentToolResultFallback = Effect.fn("emitSubagentToolResultFallback")(function* (
+    context: ClaudeSessionContext,
+    agent: ClaudeTaskAgentState,
+    toolUseId: string,
+    resultText: string,
+  ) {
+    if (agent.skipTranscript) return;
+    // A streamed or output-file transcript is more complete and has native
+    // message boundaries. Use the hand-back only when the provider supplied
+    // no child assistant text at all.
+    if (
+      Array.from(context.subagentTextBlocks.values()).some(
+        (state) =>
+          state.taskId === agent.taskId &&
+          state.itemType === "assistant_message" &&
+          state.content.length > 0,
+      )
+    ) {
+      return;
+    }
+    const answer = extractClaudeSubagentHandbackText(resultText, agent.taskId);
+    if (!answer) return;
+    const messageId = `tool-result:${toolUseId}`;
+    const state = getOrCreateSubagentTextBlock(
+      context,
+      agent,
+      messageId,
+      0,
+      "assistant_message",
+      "assistant_text",
+    );
+    state.content = answer.slice(0, 65_536);
+    yield* emitSubagentTextItemCompleted(context, agent, state);
+  });
+
+  const flushSubagentTextBlocksForTask = Effect.fn("flushSubagentTextBlocksForTask")(function* (
+    context: ClaudeSessionContext,
+    agent: ClaudeTaskAgentState,
+  ) {
+    for (const state of context.subagentTextBlocks.values()) {
+      if (state.taskId === agent.taskId) {
+        yield* emitSubagentTextItemCompleted(context, agent, state);
+      }
+    }
+  });
+
+  const emitSubagentTextDelta = Effect.fn("emitSubagentTextDelta")(function* (
+    context: ClaudeSessionContext,
+    agent: ClaudeTaskAgentState,
+    index: number,
+    delta: string,
+    streamKind: ClaudeSubagentSnapshotBlock["streamKind"] = "assistant_text",
+  ) {
+    if (delta.length === 0 || agent.skipTranscript) return;
+    const messageId = context.subagentMessageIdsByTaskId.get(agent.taskId) ?? "stream-default";
+    const itemType = streamKind === "reasoning_text" ? "reasoning" : "assistant_message";
+    const state = getOrCreateSubagentTextBlock(
+      context,
+      agent,
+      messageId,
+      index,
+      itemType,
+      streamKind,
+    );
+    if (state.completed) return;
+    const nextDelta = delta.slice(0, Math.max(0, 65_536 - state.content.length));
+    if (nextDelta.length === 0) return;
+    state.content += nextDelta;
+    const stamp = yield* makeEventStamp();
+    yield* offerRuntimeEvent({
+      type: "content.delta",
+      eventId: stamp.eventId,
+      provider: PROVIDER,
+      createdAt: stamp.createdAt,
+      threadId: context.session.threadId,
+      itemId: asRuntimeItemId(state.itemId),
+      agentKey: agent.agentKey,
+      ...(agent.description ? { agentTitle: agent.description } : {}),
+      payload: {
+        streamKind,
+        delta: nextDelta,
+      },
+      providerRefs: nativeProviderRefs(context, { providerItemId: state.itemId }),
+    });
+  });
+
+  const completeSubagentTextBlock = (
+    context: ClaudeSessionContext,
+    agent: ClaudeTaskAgentState,
+    index: number,
+  ) => {
+    const messageId = context.subagentMessageIdsByTaskId.get(agent.taskId);
+    if (!messageId) return false;
+    const state = context.subagentTextBlocks.get(
+      subagentTextBlockKey(agent.taskId, messageId, index),
+    );
+    if (!state) return false;
+    // The completed assistant snapshot follows the stream on common Claude
+    // paths. Keep this state so the snapshot can fill a lost suffix on the
+    // same item, or let task termination flush it when snapshots are absent.
+    return true;
+  };
+
   const handleStreamEvent = Effect.fn("handleStreamEvent")(function* (
     context: ClaudeSessionContext,
     message: SDKMessage,
@@ -2709,6 +3140,56 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
     const { event } = message;
 
+    const streamParentToolUseId = (message as { parent_tool_use_id?: string | null })
+      .parent_tool_use_id;
+    const owningTaskId = agentIdForParentToolUse(context.taskAgents, streamParentToolUseId);
+    const owningAgent = owningTaskId ? context.taskAgents.get(owningTaskId) : undefined;
+    if (streamParentToolUseId && owningAgent) {
+      if (event.type === "message_start") {
+        const streamMessageId =
+          trimmedString((event.message as { id?: unknown } | undefined)?.id) ??
+          trimmedString(message.uuid);
+        if (streamMessageId) {
+          context.subagentMessageIdsByTaskId.set(owningAgent.taskId, streamMessageId);
+        }
+        return;
+      }
+      if (
+        event.type === "content_block_start" &&
+        (event.content_block.type === "text" || event.content_block.type === "thinking")
+      ) {
+        const streamKind =
+          event.content_block.type === "thinking" ? "reasoning_text" : "assistant_text";
+        const initialText =
+          event.content_block.type === "thinking"
+            ? event.content_block.thinking
+            : extractContentBlockText(event.content_block);
+        yield* emitSubagentTextDelta(context, owningAgent, event.index, initialText, streamKind);
+        return;
+      }
+      if (event.type === "content_block_delta") {
+        if (event.delta.type === "text_delta") {
+          yield* emitSubagentTextDelta(context, owningAgent, event.index, event.delta.text);
+          return;
+        }
+        if (event.delta.type === "thinking_delta") {
+          yield* emitSubagentTextDelta(
+            context,
+            owningAgent,
+            event.index,
+            event.delta.thinking,
+            "reasoning_text",
+          );
+          return;
+        }
+      }
+      if (event.type === "content_block_stop") {
+        if (completeSubagentTextBlock(context, owningAgent, event.index)) return;
+        const tool = context.inFlightTools.get(event.index);
+        if (tool?.parentToolUseId !== streamParentToolUseId) return;
+      }
+    }
+
     // Subagent-owned stream traffic (parent_tool_use_id set) must not write
     // into the parent transcript: with forwardSubagentText off the SDK still
     // forwards subagent tool_use/tool_result blocks and their wrapping
@@ -2716,8 +3197,6 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     // narration into the chat (live-test finding). Their results reach the
     // UI via the task.* lifecycle; their tool blocks are attributed and
     // re-homed by the quiet-timeline filter.
-    const streamParentToolUseId = (message as { parent_tool_use_id?: string | null })
-      .parent_tool_use_id;
     if (streamParentToolUseId !== null && streamParentToolUseId !== undefined) {
       // Drop only the subagent's narration (text/thinking); tool_use blocks
       // and their input_json_delta frames must flow so attributed tool items
@@ -2945,6 +3424,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const parentToolUseId =
         (message as { parent_tool_use_id?: string | null }).parent_tool_use_id ?? undefined;
       const owningAgentId = agentIdForParentToolUse(context.taskAgents, parentToolUseId);
+      const owningAgent = owningAgentId ? context.taskAgents.get(owningAgentId) : undefined;
 
       const tool: ToolInFlight = {
         itemId,
@@ -2956,6 +3436,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         partialInputJson: "",
         ...(inputFingerprint ? { lastEmittedInputFingerprint: inputFingerprint } : {}),
         ...(owningAgentId ? { agentId: owningAgentId } : {}),
+        ...(owningAgent ? { agentKey: owningAgent.agentKey } : {}),
         ...(parentToolUseId ? { parentToolUseId } : {}),
       };
       context.inFlightTools.set(index, tool);
@@ -2967,6 +3448,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         provider: PROVIDER,
         createdAt: stamp.createdAt,
         threadId: context.session.threadId,
+        ...(tool.agentKey ? { agentKey: tool.agentKey } : {}),
         ...(context.turnState ? { turnId: asCanonicalTurnId(context.turnState.turnId) } : {}),
         itemId: asRuntimeItemId(tool.itemId),
         payload: {
@@ -3033,6 +3515,19 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
 
       const [index, tool] = toolEntry;
       const itemStatus = toolResult.isError ? "failed" : "completed";
+      if (!toolResult.isError) {
+        const childAgent = Array.from(context.taskAgents.values()).find(
+          (agent) => agent.toolUseId === toolResult.toolUseId,
+        );
+        if (childAgent) {
+          yield* emitSubagentToolResultFallback(
+            context,
+            childAgent,
+            toolResult.toolUseId,
+            toolResult.text,
+          );
+        }
+      }
       const toolUseResult = readClaudeToolUseResult(message);
       const toolData = {
         toolName: tool.toolName,
@@ -3047,6 +3542,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         provider: PROVIDER,
         createdAt: updatedStamp.createdAt,
         threadId: context.session.threadId,
+        ...(tool.agentKey ? { agentKey: tool.agentKey } : {}),
         ...(context.turnState ? { turnId: asCanonicalTurnId(context.turnState.turnId) } : {}),
         itemId: asRuntimeItemId(tool.itemId),
         payload: {
@@ -3101,6 +3597,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         provider: PROVIDER,
         createdAt: completedStamp.createdAt,
         threadId: context.session.threadId,
+        ...(tool.agentKey ? { agentKey: tool.agentKey } : {}),
         ...(context.turnState ? { turnId: asCanonicalTurnId(context.turnState.turnId) } : {}),
         itemId: asRuntimeItemId(tool.itemId),
         payload: {
@@ -3143,8 +3640,15 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
               : {}),
           };
           const existing = context.taskAgents.get(workflowTaskId);
+          const agentKey =
+            existing?.agentKey ??
+            context.agentKeysByProviderId.get(workflowTaskId) ??
+            RuntimeAgentKey.make(yield* randomUUIDv4);
+          context.agentKeysByProviderId.set(workflowTaskId, agentKey);
           context.taskAgents.set(workflowTaskId, {
             taskId: workflowTaskId,
+            agentKey,
+            ...(existing?.providerAgentId ? { providerAgentId: existing.providerAgentId } : {}),
             toolUseId: existing?.toolUseId ?? tool.itemId,
             description: existing?.description,
             subagentType: existing?.subagentType,
@@ -3205,6 +3709,30 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             assistantParentToolUseId,
             snapshotModel,
           );
+        }
+      }
+      const snapshotTextBlocks = extractClaudeSubagentSnapshotBlocks(message)
+        .slice(0, 16)
+        .map((block) => ({ ...block, text: block.text.slice(0, 65_536) }));
+      if (snapshotTextBlocks.length > 0) {
+        context.subagentTextBlockSequence += 1;
+        const snapshotMessageId =
+          trimmedString((message.message as { id?: unknown } | undefined)?.id) ??
+          trimmedString(message.uuid) ??
+          `snapshot-${context.subagentTextBlockSequence}`;
+        if (owningAgent) {
+          context.subagentMessageIdsByTaskId.set(owningAgent.taskId, snapshotMessageId);
+          yield* emitSubagentAssistantSnapshot(
+            context,
+            owningAgent,
+            snapshotMessageId,
+            snapshotTextBlocks,
+          );
+        } else {
+          const pending = context.pendingSubagentTextSnapshots.get(assistantParentToolUseId) ?? [];
+          pending.push({ messageId: snapshotMessageId, blocks: snapshotTextBlocks });
+          if (pending.length > 8) pending.shift();
+          context.pendingSubagentTextSnapshots.set(assistantParentToolUseId, pending);
         }
       }
       context.lastAssistantUuid = message.uuid;
@@ -3586,10 +4114,19 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           (typeof rawLaunchEffort === "number" && Number.isFinite(rawLaunchEffort)
             ? String(rawLaunchEffort)
             : context.currentEffort);
+        const providerAgentId = trimmedString(Reflect.get(message, "agent_id"));
+        const knownAgentKey =
+          (providerAgentId ? context.agentKeysByProviderId.get(providerAgentId) : undefined) ??
+          context.agentKeysByProviderId.get(message.task_id);
+        const agentKey = knownAgentKey ?? RuntimeAgentKey.make(yield* randomUUIDv4);
+        context.agentKeysByProviderId.set(message.task_id, agentKey);
+        if (providerAgentId) context.agentKeysByProviderId.set(providerAgentId, agentKey);
         // Remember the agent identity so every later task.* payload for this
         // taskId is self-describing (identity must survive activity retention).
-        context.taskAgents.set(message.task_id, {
+        const taskAgent: ClaudeTaskAgentState = {
           taskId: message.task_id,
+          agentKey,
+          ...(providerAgentId ? { providerAgentId } : {}),
           toolUseId: message.tool_use_id,
           description: message.description,
           subagentType: message.subagent_type,
@@ -3600,13 +4137,21 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           owningAgentId,
           model,
           effort,
-        });
+        };
+        context.taskAgents.set(message.task_id, taskAgent);
+        if (providerAgentId) {
+          context.taskIdsByProviderAgentId.set(providerAgentId, message.task_id);
+        }
         context.liveTaskIds.add(message.task_id);
         yield* offerRuntimeEvent({
           ...base,
           type: "task.started",
           payload: {
             taskId: RuntimeTaskId.make(message.task_id),
+            agentKey,
+            ...(owningAgentId && context.taskAgents.get(owningAgentId)
+              ? { parentAgentKey: context.taskAgents.get(owningAgentId)?.agentKey }
+              : {}),
             description: message.description,
             ...(message.task_type ? { taskType: message.task_type } : {}),
             ...(owningAgentId ? { agentId: owningAgentId } : {}),
@@ -3618,6 +4163,24 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
             ...(message.workflow_name ? { workflowName: message.workflow_name } : {}),
           },
         });
+        if (toolUseId) {
+          const pendingSnapshots = context.pendingSubagentTextSnapshots.get(toolUseId);
+          if (pendingSnapshots) {
+            context.pendingSubagentTextSnapshots.delete(toolUseId);
+            const registeredAgent = context.taskAgents.get(message.task_id);
+            if (registeredAgent) {
+              for (const snapshot of pendingSnapshots) {
+                context.subagentMessageIdsByTaskId.set(registeredAgent.taskId, snapshot.messageId);
+                yield* emitSubagentAssistantSnapshot(
+                  context,
+                  registeredAgent,
+                  snapshot.messageId,
+                  snapshot.blocks,
+                );
+              }
+            }
+          }
+        }
         return;
       }
       case "task_progress": {
@@ -3664,6 +4227,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           patch.status !== undefined ? CLAUDE_TASK_PATCH_STATUS[patch.status] : undefined;
         if (status === "completed" || status === "failed" || status === "cancelled") {
           context.liveTaskIds.delete(message.task_id);
+          const agent = context.taskAgents.get(message.task_id);
+          // Successful task updates precede task_notification, which carries
+          // the provider's final output_file. Keep streamed child items open
+          // until that result can fill any missing suffix.
+          if (agent && status !== "completed") {
+            yield* flushSubagentTextBlocksForTask(context, agent);
+          }
         }
         const endedAt =
           typeof patch.end_time === "number" && Number.isFinite(patch.end_time)
@@ -3688,6 +4258,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       }
       case "task_notification": {
         context.liveTaskIds.delete(message.task_id);
+        const agent = context.taskAgents.get(message.task_id);
+        if (agent) {
+          if (message.status === "completed") {
+            yield* emitSubagentOutputFileTranscript(context, agent, message.output_file);
+          }
+          yield* flushSubagentTextBlocksForTask(context, agent);
+        }
         yield* emitThreadTokenUsage(
           context,
           normalizeClaudeTaskProgressTokenUsage(message.usage, context),
@@ -4125,6 +4702,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       if (!context.liveTaskIds.delete(taskId)) {
         continue;
       }
+      const agent = context.taskAgents.get(taskId);
+      if (agent) yield* flushSubagentTextBlocksForTask(context, agent);
       const stamp = yield* makeEventStamp();
       yield* offerRuntimeEvent({
         type: "task.completed",
@@ -4157,6 +4736,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           requestType: pending.requestType,
           decision: "cancel",
         },
+        ...(pending.agentKey ? { agentKey: pending.agentKey } : {}),
+        ...(pending.agentTitle ? { agentTitle: pending.agentTitle } : {}),
         providerRefs: nativeProviderRefs(context),
       });
     }
@@ -4281,11 +4862,65 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       const inFlightTools = new Map<number, ToolInFlight>();
       const claudeTasks = new Map<string, ClaudeTaskState>();
       const taskAgents = new Map<string, ClaudeTaskAgentState>();
+      const taskIdsByProviderAgentId = new Map<string, string>();
+      const agentKeysByProviderId = new Map<string, RuntimeAgentKey>();
+      const childApprovalOutcomes: Array<ClaudeChildApprovalOutcome> = [];
+      const subagentTextBlocks = new Map<string, ClaudeSubagentTextBlockState>();
+      const subagentMessageIdsByTaskId = new Map<string, string>();
+      const pendingSubagentTextSnapshots = new Map<
+        string,
+        Array<PendingClaudeSubagentTextSnapshot>
+      >();
       const pendingTaskModels = new Map<string, string>();
       const workflowMemberFingerprints = new Map<string, string>();
       const liveTaskIds = new Set<string>();
 
       const contextRef = yield* Ref.make<ClaudeSessionContext | undefined>(undefined);
+
+      const runtimeAgentKeyForProviderId = Effect.fn("runtimeAgentKeyForProviderId")(function* (
+        context: ClaudeSessionContext,
+        providerAgentId: string,
+      ) {
+        const known = context.agentKeysByProviderId.get(providerAgentId);
+        if (known) return known;
+        const key = RuntimeAgentKey.make(yield* randomUUIDv4);
+        context.agentKeysByProviderId.set(providerAgentId, key);
+        return key;
+      });
+
+      const taskAgentForProviderAgentId = (
+        context: ClaudeSessionContext,
+        providerAgentId: string,
+      ): ClaudeTaskAgentState | undefined => {
+        const taskId = context.taskIdsByProviderAgentId.get(providerAgentId) ?? providerAgentId;
+        return context.taskAgents.get(taskId);
+      };
+
+      const providerAgentIdForCallback = (
+        context: ClaudeSessionContext,
+        callbackOptions: { readonly toolUseID?: string; readonly agentID?: string },
+      ): string | undefined => {
+        const launchingTool = callbackOptions.toolUseID
+          ? Array.from(context.inFlightTools.values()).find(
+              (tool) => tool.itemId === callbackOptions.toolUseID,
+            )
+          : undefined;
+        return callbackOptions.agentID ?? launchingTool?.agentId;
+      };
+
+      const requestAgentLinkage = Effect.fn("requestAgentLinkage")(function* (
+        context: ClaudeSessionContext,
+        callbackOptions: { readonly toolUseID?: string; readonly agentID?: string },
+      ) {
+        const providerAgentId = providerAgentIdForCallback(context, callbackOptions);
+        if (!providerAgentId) return {};
+        const agentKey = yield* runtimeAgentKeyForProviderId(context, providerAgentId);
+        const agent = taskAgentForProviderAgentId(context, providerAgentId);
+        return {
+          agentKey,
+          ...(agent?.description ? { agentTitle: agent.description } : {}),
+        };
+      });
 
       /**
        * Handle AskUserQuestion tool calls by emitting a `user-input.requested`
@@ -4297,9 +4932,11 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         callbackOptions: {
           readonly signal: AbortSignal;
           readonly toolUseID?: string;
+          readonly agentID?: string;
         },
       ) {
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
+        const agentLinkage = yield* requestAgentLinkage(context, callbackOptions);
 
         // Parse questions from the SDK's AskUserQuestion input.
         // `id` MUST equal the full question text — Claude SDK >= 2.1.121 looks
@@ -4337,6 +4974,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         const pendingInput: PendingUserInput = {
           questions,
           answers: answersDeferred,
+          ...agentLinkage,
           cancel: settleAsAborted,
         };
 
@@ -4354,6 +4992,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
               }
             : {}),
           requestId: asRuntimeRequestId(requestId),
+          ...agentLinkage,
           payload: { questions },
           providerRefs: nativeProviderRefs(context, {
             providerItemId: callbackOptions.toolUseID,
@@ -4402,6 +5041,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
               }
             : {}),
           requestId: asRuntimeRequestId(requestId),
+          ...agentLinkage,
           payload: { answers },
           providerRefs: nativeProviderRefs(context, {
             providerItemId: callbackOptions.toolUseID,
@@ -4552,12 +5192,26 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         }
 
         const requestId = ApprovalRequestId.make(yield* randomUUIDv4);
+        const agentLinkage = yield* requestAgentLinkage(context, callbackOptions);
         const requestType = classifyRequestType(toolName);
         const detail = summarizeToolRequest(toolName, toolInput);
+        const requesterProviderAgentId = providerAgentIdForCallback(context, callbackOptions);
+        const childHandoff: ClaudeChildApprovalOutcomeDraft | undefined = requesterProviderAgentId
+          ? {
+              requesterAgentId: requesterProviderAgentId,
+              childAgentId: requesterProviderAgentId,
+              providerRequestId: callbackOptions.requestId,
+              requestType,
+              toolName,
+              ...(callbackOptions.toolUseID ? { toolUseId: callbackOptions.toolUseID } : {}),
+            }
+          : undefined;
         const decisionDeferred = yield* Deferred.make<ProviderApprovalDecision>();
         const pendingApproval: PendingApproval = {
           requestType,
           detail,
+          ...agentLinkage,
+          ...(childHandoff ? { childHandoff } : {}),
           decision: decisionDeferred,
           ...(callbackOptions.suggestions ? { suggestions: callbackOptions.suggestions } : {}),
         };
@@ -4571,6 +5225,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           threadId: context.session.threadId,
           ...(context.turnState ? { turnId: asCanonicalTurnId(context.turnState.turnId) } : {}),
           requestId: asRuntimeRequestId(requestId),
+          ...agentLinkage,
           payload: {
             requestType,
             detail,
@@ -4624,6 +5279,8 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
           threadId: context.session.threadId,
           ...(context.turnState ? { turnId: asCanonicalTurnId(context.turnState.turnId) } : {}),
           requestId: asRuntimeRequestId(requestId),
+          ...(pendingApproval.agentKey ? { agentKey: pendingApproval.agentKey } : {}),
+          ...(pendingApproval.agentTitle ? { agentTitle: pendingApproval.agentTitle } : {}),
           payload: {
             requestType,
             decision,
@@ -4670,6 +5327,37 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         request,
         callbackOptions,
       ) => runPromise(handleResumeDialog(request, callbackOptions));
+      const childApprovalOutcomeHandoff: HookCallback = async (hookInput) => {
+        const hookEventName = hookInput.hook_event_name;
+        if (hookEventName !== "PostToolBatch" && hookEventName !== "UserPromptSubmit") return {};
+        const deliverable: Array<ClaudeChildApprovalOutcome> = [];
+        const unresolvedOrOtherParent: Array<ClaudeChildApprovalOutcome> = [];
+        for (const outcome of childApprovalOutcomes) {
+          const requesterTaskId =
+            taskIdsByProviderAgentId.get(outcome.requesterAgentId) ?? outcome.requesterAgentId;
+          const requester = taskAgents.get(requesterTaskId);
+          if (!requester) {
+            unresolvedOrOtherParent.push(outcome);
+            continue;
+          }
+          const parentAgentId = requester.owningAgentId
+            ? (taskAgents.get(requester.owningAgentId)?.providerAgentId ?? requester.owningAgentId)
+            : undefined;
+          if (parentAgentId === hookInput.agent_id) {
+            deliverable.push(outcome);
+          } else {
+            unresolvedOrOtherParent.push(outcome);
+          }
+        }
+        childApprovalOutcomes.splice(0, childApprovalOutcomes.length, ...unresolvedOrOtherParent);
+        if (deliverable.length === 0) return {};
+        return {
+          hookSpecificOutput: {
+            hookEventName,
+            additionalContext: formatChildApprovalOutcomes(deliverable),
+          },
+        };
+      };
 
       const claudeBinaryPath = claudeSdkExecutablePath;
       const {
@@ -4802,6 +5490,10 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         ...(newSessionId ? { sessionId: newSessionId } : {}),
         includePartialMessages: true,
         canUseTool,
+        hooks: {
+          PostToolBatch: [{ hooks: [childApprovalOutcomeHandoff] }],
+          UserPromptSubmit: [{ hooks: [childApprovalOutcomeHandoff] }],
+        },
         onUserDialog,
         supportedDialogKinds: ["resume_return"],
         env: McpProviderSession.withAgentDeviceEnvironment(claudeEnvironment, mcpSession),
@@ -4913,6 +5605,13 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         inFlightTools,
         claudeTasks,
         taskAgents,
+        taskIdsByProviderAgentId,
+        agentKeysByProviderId,
+        childApprovalOutcomes,
+        subagentTextBlocks,
+        subagentMessageIdsByTaskId,
+        pendingSubagentTextSnapshots,
+        subagentTextBlockSequence: 0,
         pendingTaskModels,
         workflowMemberFingerprints,
         liveTaskIds,
@@ -5449,6 +6148,9 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       }
 
       context.pendingApprovals.delete(requestId);
+      if (pending.childHandoff) {
+        rememberChildApprovalOutcome(context.childApprovalOutcomes, pending.childHandoff, decision);
+      }
       yield* Deferred.succeed(pending.decision, decision);
     },
   );

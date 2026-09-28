@@ -11,6 +11,8 @@ import {
   IsoDateTime,
   NonNegativeInt,
   OrchestrationThreadActivityTone,
+  PositiveInt,
+  RuntimeAgentKey,
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -30,9 +32,21 @@ export const ProjectionThreadActivity = Schema.Struct({
   summary: Schema.String,
   payload: Schema.Unknown,
   sequence: Schema.optional(NonNegativeInt),
+  agentKey: Schema.optional(RuntimeAgentKey),
+  eventSequence: Schema.optional(NonNegativeInt),
   createdAt: IsoDateTime,
 });
 export type ProjectionThreadActivity = typeof ProjectionThreadActivity.Type;
+
+export const ListProjectionAgentActivitiesInput = Schema.Struct({
+  threadId: ThreadId,
+  agentKey: RuntimeAgentKey,
+  activityKinds: Schema.optional(Schema.Array(Schema.String)),
+  beforeEventSequence: Schema.optional(NonNegativeInt),
+  beforeActivityId: Schema.optional(EventId),
+  limit: PositiveInt,
+});
+export type ListProjectionAgentActivitiesInput = typeof ListProjectionAgentActivitiesInput.Type;
 
 export const ListProjectionThreadActivitiesInput = Schema.Struct({
   threadId: ThreadId,
@@ -92,6 +106,11 @@ export interface ProjectionThreadActivityRepositoryShape {
   readonly getLatestTaskActivity: (
     input: GetLatestProjectionThreadTaskActivityInput,
   ) => Effect.Effect<Option.Option<ProjectionThreadActivity>, ProjectionRepositoryError>;
+
+  /** Read an indexed, ordered slice of rows attributed to one opaque agent key. */
+  readonly listByAgentKey: (
+    input: ListProjectionAgentActivitiesInput,
+  ) => Effect.Effect<ReadonlyArray<ProjectionThreadActivity>, ProjectionRepositoryError>;
 
   /**
    * Delete projected thread activity rows by thread.

@@ -5,7 +5,11 @@ import {
   requestKindFromRequestType,
   type PendingApproval,
 } from "@t3tools/client-runtime/pending-requests";
-import { UserInputAttachmentAnswerPayload, isToolLifecycleItemType } from "@t3tools/contracts";
+import {
+  RuntimeAgentKey,
+  UserInputAttachmentAnswerPayload,
+  isToolLifecycleItemType,
+} from "@t3tools/contracts";
 import type {
   OrchestrationLatestTurn,
   OrchestrationThread,
@@ -111,6 +115,8 @@ export interface WorkLogEntry {
     readonly workflowId: string | null;
     readonly agentTaskIds: ReadonlyArray<string>;
     readonly agents: ReadonlyArray<{
+      readonly agentKey?: RuntimeAgentKey;
+      readonly parentAgentKey?: RuntimeAgentKey;
       readonly title: string;
       readonly status: WorkLogToolLifecycleStatus | undefined;
       readonly detail: string | undefined;
@@ -123,6 +129,8 @@ export interface WorkLogEntry {
 
 interface DerivedWorkLogEntry extends WorkLogEntry {
   sourceActivityKind: OrchestrationThreadActivity["kind"];
+  agentKey?: RuntimeAgentKey;
+  parentAgentKey?: RuntimeAgentKey;
   collapseKey?: string;
   /** Grouping key for subagent lifecycle rows (one row per agent). */
   taskId?: string;
@@ -216,6 +224,8 @@ export interface AgentSpawnSummary {
   readonly status: string;
   readonly tone: "working" | "completed" | "failed" | "stopped";
   readonly members: ReadonlyArray<{
+    readonly agentKey?: RuntimeAgentKey;
+    readonly parentAgentKey?: RuntimeAgentKey;
     readonly title: string;
     readonly status: string;
     readonly tone: "working" | "completed" | "failed" | "stopped";
@@ -513,6 +523,15 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
     entry.toolCallId = toolCallId;
   }
   if (isTaskActivity && payload) {
+    if (typeof payload.agentKey === "string" && Schema.is(RuntimeAgentKey)(payload.agentKey)) {
+      entry.agentKey = payload.agentKey;
+    }
+    if (
+      typeof payload.parentAgentKey === "string" &&
+      Schema.is(RuntimeAgentKey)(payload.parentAgentKey)
+    ) {
+      entry.parentAgentKey = payload.parentAgentKey;
+    }
     if (payload.agentKind !== "agent") {
       entry.isBackgroundTask = true;
     }
@@ -666,6 +685,12 @@ function agentSpawnMember(
   previous?: NonNullable<WorkLogEntry["agentSpawn"]>["agents"][number],
 ) {
   return {
+    ...((entry.agentKey ?? previous?.agentKey)
+      ? { agentKey: entry.agentKey ?? previous?.agentKey }
+      : {}),
+    ...((entry.parentAgentKey ?? previous?.parentAgentKey)
+      ? { parentAgentKey: entry.parentAgentKey ?? previous?.parentAgentKey }
+      : {}),
     title: entry.toolTitle ?? previous?.title ?? entry.label,
     status: entry.toolLifecycleStatus ?? previous?.status,
     detail: entry.detail ?? previous?.detail,
@@ -1113,6 +1138,8 @@ export function agentSpawnSummary(
   const members = agentSpawnMembers(spawn).map((agent) => {
     const tone = agentSpawnTone(agent.status);
     return {
+      ...(agent.agentKey ? { agentKey: agent.agentKey } : {}),
+      ...(agent.parentAgentKey ? { parentAgentKey: agent.parentAgentKey } : {}),
       title: agent.title,
       status: tone === "working" ? "working" : (agent.status ?? tone),
       tone,

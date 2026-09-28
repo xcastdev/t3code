@@ -77,6 +77,26 @@ describe("ProviderRuntimeEvent", () => {
     expect(parsed.providerInstanceId).toBe("ollama_local");
   });
 
+  it("decodes parent ownership on nested child lifecycle events", () => {
+    const parsed = decodeRuntimeEvent({
+      type: "session.started",
+      eventId: "event-nested-child-started",
+      provider: "opencode",
+      createdAt: "2026-02-28T00:00:00.000Z",
+      threadId: "thread-1",
+      agentKey: "child-key",
+      parentAgentKey: "parent-key",
+      agentTitle: "Nested helper",
+      payload: {},
+    });
+
+    expect(parsed).toMatchObject({
+      agentKey: "child-key",
+      parentAgentKey: "parent-key",
+      agentTitle: "Nested helper",
+    });
+  });
+
   it("decodes turn.plan.updated for plan rendering", () => {
     const parsed = decodeRuntimeEvent({
       type: "turn.plan.updated",

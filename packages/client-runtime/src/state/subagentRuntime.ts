@@ -17,7 +17,16 @@
  * folding (completion can create an agent; a late start only fills
  * metadata).
  */
-import type { OrchestrationThreadActivity } from "@t3tools/contracts";
+import {
+  ApprovalRequestId,
+  OrchestrationAgentActionState,
+  OrchestrationAgentStatus,
+  RuntimeAgentKey,
+  type OrchestrationAgentTranscriptPage,
+  type OrchestrationAgentTranscriptEntry,
+  type OrchestrationThreadActivity,
+} from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 
 export type RuntimeSubagentStatus =
   | "pending"
@@ -58,6 +67,9 @@ export interface SubagentRunHandles {
 
 export interface RuntimeSubagent {
   readonly id: string;
+  /** Stable opaque key used for transcript reads and actions when available. */
+  readonly agentKey?: RuntimeAgentKey;
+  readonly parentAgentKey?: RuntimeAgentKey;
   readonly kind: "subagent" | "subagent_batch" | "workflow" | "workflow_agent";
   readonly title: string;
   readonly role: string | null;
@@ -140,6 +152,12 @@ function appendActivity(
 
 function asString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+const isAgentKey = Schema.is(RuntimeAgentKey);
+
+function asAgentKey(value: unknown): RuntimeAgentKey | undefined {
+  return typeof value === "string" && isAgentKey(value) ? value : undefined;
 }
 
 function asCount(value: unknown): number | undefined {
@@ -227,6 +245,8 @@ function mergeUsageMax(
 
 interface MutableAgent {
   id: string;
+  agentKey?: RuntimeAgentKey;
+  parentAgentKey?: RuntimeAgentKey;
   kind: RuntimeSubagent["kind"];
   title: string;
   role: string | null;
@@ -282,8 +302,12 @@ function getOrCreate(
   if (existing) {
     return existing;
   }
+  const agentKey = asAgentKey(payload.agentKey);
+  const parentAgentKey = asAgentKey(payload.parentAgentKey);
   const created: MutableAgent = {
     id,
+    ...(agentKey === undefined ? {} : { agentKey }),
+    ...(parentAgentKey === undefined ? {} : { parentAgentKey }),
     kind: kindFromPayload(payload, id),
     title: asString(payload.title) ?? asString(payload.detail) ?? id,
     role: asString(payload.role) ?? null,
@@ -315,8 +339,52 @@ function getOrCreate(
   return created;
 }
 
+function findByAgentKey(
+  agents: Map<string, MutableAgent>,
+  agentKey: RuntimeAgentKey,
+): MutableAgent | undefined {
+  for (const agent of agents.values()) {
+    if (agent.agentKey === agentKey) return agent;
+  }
+  return undefined;
+}
+
+function hasAgentIdentity(
+  agents: Map<string, MutableAgent>,
+  taskId: string,
+  payload: Record<string, unknown>,
+): boolean {
+  const agentKey = asAgentKey(payload.agentKey);
+  return agents.has(taskId) || Boolean(agentKey && findByAgentKey(agents, agentKey));
+}
+
+function getOrCreateTaskAgent(
+  agents: Map<string, MutableAgent>,
+  taskId: string,
+  payload: Record<string, unknown>,
+  at: string,
+): MutableAgent {
+  const agentKey = asAgentKey(payload.agentKey);
+  const keyedAgent = agentKey ? findByAgentKey(agents, agentKey) : undefined;
+  if (keyedAgent && keyedAgent.id !== taskId) {
+    for (const [id, candidate] of agents) {
+      if (candidate === keyedAgent) agents.delete(id);
+    }
+    // Lifecycle-only rows use the opaque key until provider task metadata
+    // arrives. Re-key once so later task and workflow rows retain their
+    // provider task identity without rendering a duplicate child.
+    keyedAgent.id = taskId;
+    agents.set(taskId, keyedAgent);
+  }
+  return getOrCreate(agents, taskId, payload, at);
+}
+
 /** Metadata fill from any payload: never downgrades known values to null. */
 function fillMetadata(agent: MutableAgent, payload: Record<string, unknown>): void {
+  const agentKey = asAgentKey(payload.agentKey);
+  if (agentKey) agent.agentKey = agentKey;
+  const parentAgentKey = asAgentKey(payload.parentAgentKey);
+  if (parentAgentKey) agent.parentAgentKey = parentAgentKey;
   if (payload.taskType === "subagent_batch") agent.kind = "subagent_batch";
   const title = asString(payload.title);
   if (title) agent.title = title;
@@ -480,8 +548,8 @@ export function foldSubagentActivities(
         // Only real agents join the roster. Shells, monitors, and plan-mode
         // tasks are background work — they render in the ordinary work log,
         // not the Agents surface (a "Run 12s stall" shell is not a subagent).
-        if (isBackgroundTaskActivity(payload)) break;
-        const agent = getOrCreate(agents, taskId, payload, at);
+        if (isBackgroundTaskActivity(payload) && !hasAgentIdentity(agents, taskId, payload)) break;
+        const agent = getOrCreateTaskAgent(agents, taskId, payload, at);
         fillMetadata(agent, payload);
         // Order-robustness: a start row arriving after a terminal state is a
         // late/out-of-order delivery and only fills metadata — it must not
@@ -508,9 +576,9 @@ export function foldSubagentActivities(
         // Membership is sticky per taskId: rows after the first (terminal
         // rows often carry only taskId+status, no marker fields) inherit the
         // first row's classification instead of being re-judged.
-        const existed = agents.has(taskId);
+        const existed = hasAgentIdentity(agents, taskId, payload);
         if (!existed && isBackgroundTaskActivity(payload)) break;
-        const agent = getOrCreate(agents, taskId, payload, at);
+        const agent = getOrCreateTaskAgent(agents, taskId, payload, at);
         fillMetadata(agent, payload);
         if (agent.activationCount === 0) agent.activationCount = 1;
         const explicitStatus = asRuntimeStatus(payload.status);
@@ -547,8 +615,8 @@ export function foldSubagentActivities(
         // Membership is sticky per taskId: rows after the first (terminal
         // rows often carry only taskId+status, no marker fields) inherit the
         // first row's classification instead of being re-judged.
-        if (!agents.has(taskId) && isBackgroundTaskActivity(payload)) break;
-        const agent = getOrCreate(agents, taskId, payload, at);
+        if (!hasAgentIdentity(agents, taskId, payload) && isBackgroundTaskActivity(payload)) break;
+        const agent = getOrCreateTaskAgent(agents, taskId, payload, at);
         fillMetadata(agent, payload);
         const detail = asString(payload.detail);
         if (detail) agent.progress = bounded(detail);
@@ -577,8 +645,8 @@ export function foldSubagentActivities(
         // Membership is sticky per taskId: rows after the first (terminal
         // rows often carry only taskId+status, no marker fields) inherit the
         // first row's classification instead of being re-judged.
-        if (!agents.has(taskId) && isBackgroundTaskActivity(payload)) break;
-        const agent = getOrCreate(agents, taskId, payload, at);
+        if (!hasAgentIdentity(agents, taskId, payload) && isBackgroundTaskActivity(payload)) break;
+        const agent = getOrCreateTaskAgent(agents, taskId, payload, at);
         fillMetadata(agent, payload);
         if (agent.activationCount === 0) agent.activationCount = 1;
         // Already-terminal: status and timestamps are frozen (first write
@@ -613,11 +681,31 @@ export function foldSubagentActivities(
         agent.updatedAt = at;
         break;
       }
+      case "agent.status": {
+        const agentKey = asAgentKey(payload.agentKey);
+        const status = asRuntimeStatus(payload.status);
+        if (!agentKey || !status) break;
+        const agent =
+          findByAgentKey(agents, agentKey) ??
+          getOrCreate(agents, String(agentKey), { ...payload, agentKey }, at);
+        fillMetadata(agent, payload);
+        if (agent.activationCount === 0) agent.activationCount = 1;
+        applyStatus(agent, status, at);
+        if (agent.startedAt === null && !isTerminalSubagentStatus(status)) {
+          agent.startedAt = at;
+        }
+        const summary = asString(activity.summary);
+        if (summary) agent.progress = bounded(summary);
+        agent.updatedAt = at;
+        break;
+      }
       case "tool.progress": {
         // Agent-owned heartbeat: "what it's doing right now".
         const taskId = asString(payload.taskId);
         if (!taskId) break;
-        const agent = agents.get(taskId);
+        const agentKey = asAgentKey(payload.agentKey);
+        const agent =
+          agents.get(taskId) ?? (agentKey ? findByAgentKey(agents, agentKey) : undefined);
         if (!agent) break;
         const toolName = asString(payload.toolName);
         if (toolName) {
@@ -889,4 +977,229 @@ export function formatSubagentTokenCount(totalTokens: number): string {
     return `${value >= 100 ? Math.round(value) : value.toFixed(1)}k`;
   }
   return `${(totalTokens / 1_000_000).toFixed(1)}M`;
+}
+
+/**
+ * A subagent view combines pageable persisted rows with the parent thread's
+ * live activity stream. Upserted activities reuse their id, so event sequence
+ * decides which version wins. Keep the rendered window bounded even when the
+ * user walks back through a long transcript.
+ */
+export const AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT = 500;
+export const AGENT_TRANSCRIPT_RECENT_PAGE_ENTRY_LIMIT = 50;
+
+/**
+ * Keep an older page window usable while separately catching up the newest
+ * page after reconnects or live child activity. The extra page is a fixed
+ * bound; it cannot make a long transcript grow with the parent thread.
+ */
+export function mergeAgentTranscriptPageWindows(
+  loadedEntries: ReadonlyArray<OrchestrationAgentTranscriptEntry>,
+  newestPageEntries: ReadonlyArray<OrchestrationAgentTranscriptEntry>,
+  liveEntries: ReadonlyArray<OrchestrationAgentTranscriptEntry>,
+  recoveredEntries: ReadonlyArray<OrchestrationAgentTranscriptEntry> = [],
+): ReadonlyArray<OrchestrationAgentTranscriptEntry> {
+  const byId = new Map<string, OrchestrationAgentTranscriptEntry>();
+  for (const entry of [
+    ...loadedEntries,
+    ...recoveredEntries,
+    ...newestPageEntries,
+    ...liveEntries,
+  ]) {
+    const previous = byId.get(entry.id);
+    if (previous === undefined || entry.eventSequence > previous.eventSequence) {
+      byId.set(entry.id, entry);
+    }
+  }
+  const merged = [...byId.values()].sort(
+    (left, right) =>
+      left.eventSequence - right.eventSequence ||
+      left.createdAt.localeCompare(right.createdAt) ||
+      left.id.localeCompare(right.id),
+  );
+  const limit =
+    AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT +
+    (recoveredEntries.length > 0 ? AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT : 0) +
+    AGENT_TRANSCRIPT_RECENT_PAGE_ENTRY_LIMIT;
+  if (merged.length <= limit) return merged;
+
+  const older = merged.slice(0, AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT);
+  const recentWindow =
+    AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT + AGENT_TRANSCRIPT_RECENT_PAGE_ENTRY_LIMIT;
+  const recent = merged.slice(-recentWindow);
+  const boundedById = new Map([...older, ...recent].map((entry) => [entry.id, entry] as const));
+  return [...boundedById.values()].sort(
+    (left, right) =>
+      left.eventSequence - right.eventSequence ||
+      left.createdAt.localeCompare(right.createdAt) ||
+      left.id.localeCompare(right.id),
+  );
+}
+
+export const AGENT_TRANSCRIPT_RECONNECT_MAX_PAGES = 10;
+
+/**
+ * Recover child rows missed while disconnected by walking backward from the
+ * refreshed newest page until it overlaps the last observed thread watermark.
+ * A finite page bound keeps remote reconnect traffic predictable; when the
+ * bound is reached, `nextCursor` lets the client expose a clear continuation.
+ */
+export async function recoverAgentTranscriptGap(options: {
+  readonly startCursor: string | null;
+  readonly watermark: number;
+  readonly fetchPage: (cursor: string) => Promise<OrchestrationAgentTranscriptPage>;
+  readonly maxPages?: number;
+}): Promise<{
+  readonly entries: ReadonlyArray<OrchestrationAgentTranscriptEntry>;
+  readonly nextCursor: string | null;
+  readonly reachedWatermark: boolean;
+  readonly pagesRead: number;
+}> {
+  const maxPages = Math.max(1, options.maxPages ?? AGENT_TRANSCRIPT_RECONNECT_MAX_PAGES);
+  let cursor = options.startCursor;
+  let pagesRead = 0;
+  let reachedWatermark = options.watermark <= 0 || cursor === null;
+  const entries: Array<OrchestrationAgentTranscriptEntry> = [];
+
+  while (!reachedWatermark && cursor !== null && pagesRead < maxPages) {
+    const page = await options.fetchPage(cursor);
+    pagesRead += 1;
+    entries.push(...page.entries);
+    if (page.entries.some((entry) => entry.eventSequence <= options.watermark)) {
+      reachedWatermark = true;
+      break;
+    }
+    if (!page.hasMore || page.nextCursor === null) {
+      reachedWatermark = true;
+      cursor = null;
+      break;
+    }
+    cursor = page.nextCursor;
+  }
+
+  return {
+    entries,
+    nextCursor: reachedWatermark ? null : cursor,
+    reachedWatermark,
+    pagesRead,
+  };
+}
+
+/**
+ * Merge one displayed page window without treating the retention cap as a
+ * completeness signal. Reconnect progress is governed by its durable cursor
+ * and watermark; older rows outside this bounded window remain pageable.
+ */
+export function mergeAgentTranscriptEntries(
+  current: ReadonlyArray<OrchestrationAgentTranscriptEntry>,
+  incoming: ReadonlyArray<OrchestrationAgentTranscriptEntry>,
+  limit = AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT,
+  retention: "newest" | "oldest" = "newest",
+): ReadonlyArray<OrchestrationAgentTranscriptEntry> {
+  const byId = new Map<string, OrchestrationAgentTranscriptEntry>();
+  for (const entry of current) byId.set(entry.id, entry);
+  for (const entry of incoming) {
+    const previous = byId.get(entry.id);
+    if (previous === undefined || entry.eventSequence > previous.eventSequence) {
+      byId.set(entry.id, entry);
+    }
+  }
+  const boundedLimit = Math.max(1, Math.min(limit, AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT));
+  const merged = [...byId.values()].sort(
+    (left, right) =>
+      left.eventSequence - right.eventSequence ||
+      left.createdAt.localeCompare(right.createdAt) ||
+      left.id.localeCompare(right.id),
+  );
+  return merged.length <= boundedLimit
+    ? merged
+    : retention === "oldest"
+      ? merged.slice(0, boundedLimit)
+      : merged.slice(-boundedLimit);
+}
+
+/**
+ * Find a cursor from which rows excluded by a bounded recovery window can be
+ * browsed. Prefer the exact page containing the newest omitted row; the
+ * fallback starts at the older edge of a refreshed newest page when the
+ * omitted row was already in the retained window.
+ */
+export function firstDiscardedAgentTranscriptCursor(
+  current: ReadonlyArray<OrchestrationAgentTranscriptEntry>,
+  incoming: ReadonlyArray<OrchestrationAgentTranscriptEntry>,
+  pageCursorByEntryId: ReadonlyMap<string, string>,
+  fallbackCursor: string | null = null,
+  limit = AGENT_TRANSCRIPT_CLIENT_ENTRY_LIMIT,
+): string | null {
+  const retainedIds = new Set(
+    mergeAgentTranscriptEntries(current, incoming, limit).map((entry) => entry.id),
+  );
+  const byId = new Map<string, OrchestrationAgentTranscriptEntry>();
+  for (const entry of [...current, ...incoming]) byId.set(entry.id, entry);
+  const discarded = [...byId.values()]
+    .filter((entry) => !retainedIds.has(entry.id))
+    .sort((left, right) => right.eventSequence - left.eventSequence);
+  if (discarded.length === 0) return null;
+
+  for (const entry of discarded) {
+    const cursor = pageCursorByEntryId.get(entry.id);
+    if (cursor !== undefined) return cursor;
+  }
+  return fallbackCursor;
+}
+
+const isApprovalRequestId = Schema.is(ApprovalRequestId);
+const isTranscriptStatus = Schema.is(OrchestrationAgentStatus);
+const isTranscriptActionState = Schema.is(OrchestrationAgentActionState);
+
+/** Convert the current thread window's child-owned activities into live rows. */
+export function agentTranscriptEntriesFromActivities(
+  activities: ReadonlyArray<OrchestrationThreadActivity>,
+  agentKey: RuntimeAgentKey,
+): ReadonlyArray<OrchestrationAgentTranscriptEntry> {
+  const entries: OrchestrationAgentTranscriptEntry[] = [];
+  for (const activity of activities) {
+    if (typeof activity.payload !== "object" || activity.payload === null) continue;
+    const payload = activity.payload as Record<string, unknown>;
+    if (asAgentKey(payload.agentKey) !== agentKey) continue;
+    const isMessage = activity.kind === "agent.transcript.message";
+    const isRequest =
+      activity.kind.startsWith("approval.") || activity.kind.startsWith("user-input.");
+    const rawStatus = asString(payload.status);
+    const status = rawStatus && isTranscriptStatus(rawStatus) ? rawStatus : undefined;
+    const rawDeliveryStatus = asString(payload.deliveryStatus);
+    const deliveryStatus =
+      rawDeliveryStatus && isTranscriptActionState(rawDeliveryStatus)
+        ? rawDeliveryStatus
+        : undefined;
+    const requestId =
+      typeof payload.requestId === "string" && isApprovalRequestId(payload.requestId)
+        ? payload.requestId
+        : undefined;
+    const content =
+      typeof payload.content === "string" ? payload.content.slice(0, 65_536) : undefined;
+    const detail = typeof payload.detail === "string" ? payload.detail.slice(0, 16_384) : undefined;
+    entries.push({
+      id: activity.id,
+      eventSequence: activity.eventSequence ?? activity.sequence ?? 0,
+      createdAt: activity.createdAt,
+      kind: isMessage
+        ? "message"
+        : isRequest
+          ? "request"
+          : activity.kind.startsWith("tool.")
+            ? "tool"
+            : "status",
+      ...(payload.role === "assistant" || payload.role === "user" || payload.role === "tool"
+        ? { role: payload.role }
+        : {}),
+      ...(content === undefined ? {} : { content }),
+      summary: activity.summary,
+      ...(detail === undefined ? {} : { detail }),
+      ...(status === undefined ? {} : { status }),
+      ...(deliveryStatus === undefined ? {} : { deliveryStatus }),
+      ...(requestId === undefined ? {} : { requestId }),
+    });
+  }
+  return entries;
 }

@@ -1,6 +1,6 @@
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as SqlSchema from "effect/unstable/sql/SqlSchema";
-import { NonNegativeInt } from "@t3tools/contracts";
+import { NonNegativeInt, RuntimeAgentKey } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -12,6 +12,7 @@ import { toPersistenceDecodeError, toPersistenceSqlError } from "../Errors.ts";
 import {
   DeleteProjectionThreadActivitiesInput,
   ListProjectionThreadActivitiesInput,
+  ListProjectionAgentActivitiesInput,
   GetLatestProjectionThreadTaskActivityInput,
   ProjectionThreadActivity,
   ProjectionThreadActivityRepository,
@@ -22,6 +23,8 @@ const ProjectionThreadActivityDbRowSchema = ProjectionThreadActivity.mapFields(
   Struct.assign({
     payload: Schema.fromJsonString(Schema.Unknown),
     sequence: Schema.NullOr(NonNegativeInt),
+    agentKey: Schema.NullOr(RuntimeAgentKey),
+    eventSequence: Schema.NullOr(NonNegativeInt),
   }),
 );
 
@@ -37,6 +40,8 @@ function toProjectionThreadActivity(
     summary: row.summary,
     payload: row.payload,
     ...(row.sequence !== null ? { sequence: row.sequence } : {}),
+    ...(row.agentKey !== null ? { agentKey: row.agentKey } : {}),
+    ...(row.eventSequence !== null ? { eventSequence: row.eventSequence } : {}),
     createdAt: row.createdAt,
   };
 }
@@ -52,13 +57,22 @@ function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: st
 const taskTitleWhitespace =
   "\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff";
 
+function activityAgentKey(payload: unknown) {
+  if (typeof payload !== "object" || payload === null) return undefined;
+  const candidate = (payload as Record<string, unknown>).agentKey;
+  return typeof candidate === "string" && Schema.is(RuntimeAgentKey)(candidate)
+    ? candidate
+    : undefined;
+}
+
 const makeProjectionThreadActivityRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
 
   const upsertProjectionThreadActivityRow = SqlSchema.void({
     Request: ProjectionThreadActivity,
-    execute: (row) =>
-      sql`
+    execute: (row) => {
+      const agentKey = row.agentKey ?? activityAgentKey(row.payload) ?? null;
+      return sql`
             INSERT INTO projection_thread_activities (
               activity_id,
               thread_id,
@@ -68,6 +82,9 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
               summary,
               payload_json,
               sequence,
+              agent_key,
+              event_sequence,
+              first_event_sequence,
               created_at
             )
             VALUES (
@@ -79,6 +96,9 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
               ${row.summary},
               ${JSON.stringify(row.payload)},
               ${row.sequence ?? null},
+              ${agentKey},
+              ${row.eventSequence ?? null},
+              ${row.eventSequence ?? null},
               ${row.createdAt}
             )
             ON CONFLICT (activity_id)
@@ -90,8 +110,15 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
               summary = excluded.summary,
               payload_json = excluded.payload_json,
               sequence = excluded.sequence,
+              agent_key = excluded.agent_key,
+              event_sequence = excluded.event_sequence,
+              first_event_sequence = COALESCE(
+                projection_thread_activities.first_event_sequence,
+                excluded.first_event_sequence
+              ),
               created_at = excluded.created_at
-          `,
+          `;
+    },
   });
 
   const listProjectionThreadActivityRows = SqlSchema.findAll({
@@ -108,6 +135,8 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
           summary,
           payload_json AS "payload",
           sequence,
+          agent_key AS "agentKey",
+          event_sequence AS "eventSequence",
           created_at AS "createdAt"
         FROM (
           SELECT *
@@ -139,6 +168,8 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
           summary,
           payload_json AS "payload",
           sequence,
+          agent_key AS "agentKey",
+          event_sequence AS "eventSequence",
           created_at AS "createdAt"
         FROM projection_thread_activities
         WHERE thread_id = ${threadId}
@@ -169,6 +200,8 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
           summary,
           payload_json AS "payload",
           sequence,
+          agent_key AS "agentKey",
+          event_sequence AS "eventSequence",
           created_at AS "createdAt"
         FROM projection_thread_activities
         WHERE thread_id = ${threadId}
@@ -195,6 +228,52 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
       sql`
         DELETE FROM projection_thread_activities
         WHERE thread_id = ${threadId}
+      `,
+  });
+
+  const listProjectionAgentActivityRows = SqlSchema.findAll({
+    Request: ListProjectionAgentActivitiesInput,
+    Result: ProjectionThreadActivityDbRowSchema,
+    execute: ({
+      threadId,
+      agentKey,
+      activityKinds,
+      beforeEventSequence,
+      beforeActivityId,
+      limit,
+    }) =>
+      sql`
+        SELECT
+          activity_id AS "activityId",
+          thread_id AS "threadId",
+          turn_id AS "turnId",
+          tone,
+          kind,
+          summary,
+          payload_json AS "payload",
+          sequence,
+          agent_key AS "agentKey",
+          event_sequence AS "eventSequence",
+          created_at AS "createdAt"
+        FROM (
+          SELECT *
+          FROM projection_thread_activities
+          WHERE thread_id = ${threadId}
+            AND agent_key = ${agentKey}
+            AND event_sequence IS NOT NULL
+            ${activityKinds === undefined ? sql`` : sql`AND ${sql.in("kind", activityKinds)}`}
+            ${
+              beforeEventSequence === undefined
+                ? sql``
+                : sql`AND (
+              COALESCE(first_event_sequence, event_sequence) < ${beforeEventSequence}
+              OR (COALESCE(first_event_sequence, event_sequence) = ${beforeEventSequence} AND activity_id < ${beforeActivityId ?? ""})
+            )`
+            }
+          ORDER BY COALESCE(first_event_sequence, event_sequence) DESC, activity_id DESC
+          LIMIT ${limit}
+        ) AS agent_activities
+        ORDER BY COALESCE(first_event_sequence, event_sequence) ASC, activity_id ASC
       `,
   });
 
@@ -244,6 +323,17 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
       Effect.map(Option.map(toProjectionThreadActivity)),
     );
 
+  const listByAgentKey: ProjectionThreadActivityRepositoryShape["listByAgentKey"] = (input) =>
+    listProjectionAgentActivityRows(input).pipe(
+      Effect.mapError(
+        toPersistenceSqlOrDecodeError(
+          "ProjectionThreadActivityRepository.listByAgentKey:query",
+          "ProjectionThreadActivityRepository.listByAgentKey:decodeRows",
+        ),
+      ),
+      Effect.map((rows) => rows.map(toProjectionThreadActivity)),
+    );
+
   const deleteByThreadId: ProjectionThreadActivityRepositoryShape["deleteByThreadId"] = (input) =>
     deleteProjectionThreadActivityRows(input).pipe(
       Effect.mapError(
@@ -256,6 +346,7 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
     listByThreadId,
     listUserInputLifecycleByThreadId,
     getLatestTaskActivity,
+    listByAgentKey,
     deleteByThreadId,
   } satisfies ProjectionThreadActivityRepositoryShape;
 });

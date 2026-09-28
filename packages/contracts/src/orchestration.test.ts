@@ -2,7 +2,7 @@ import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
-import { CommandId, ProjectId, ThreadId } from "./baseSchemas.ts";
+import { CommandId, EventId, ProjectId, ThreadId } from "./baseSchemas.ts";
 
 import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -14,6 +14,7 @@ import {
   OrchestrationDispatchCommandError,
   OrchestrationEvent,
   OrchestrationGetFullThreadDiffInput,
+  OrchestrationSubscribeThreadInput,
   OrchestrationGetTurnDiffInput,
   OrchestrationLatestTurn,
   ProjectCreatedPayload,
@@ -21,6 +22,7 @@ import {
   OrchestrationProposedPlan,
   OrchestrationSession,
   OrchestrationThread,
+  OrchestrationThreadActivity,
   OrchestrationThreadShell,
   ProjectCreateCommand,
   OrchestrationMessage,
@@ -42,6 +44,21 @@ const decodeFullThreadDiffInput = Schema.decodeUnknownEffect(OrchestrationGetFul
 const decodeThreadTurnDiff = Schema.decodeUnknownEffect(ThreadTurnDiff);
 const decodeProjectCreateCommand = Schema.decodeUnknownEffect(ProjectCreateCommand);
 const decodeProjectCreatedPayload = Schema.decodeUnknownEffect(ProjectCreatedPayload);
+const decodeSubscribeThreadInput = Schema.decodeUnknownSync(OrchestrationSubscribeThreadInput);
+
+it.effect("keeps agent action subscription opt-in backward compatible", () =>
+  Effect.gen(function* () {
+    assert.strictEqual(
+      decodeSubscribeThreadInput({ threadId: "thread-1" }).includeAgentActionEvents,
+      undefined,
+    );
+    assert.strictEqual(
+      decodeSubscribeThreadInput({ threadId: "thread-1", includeAgentActionEvents: true })
+        .includeAgentActionEvents,
+      true,
+    );
+  }),
+);
 const decodeProjectMetaUpdatedPayload = Schema.decodeUnknownEffect(ProjectMetaUpdatedPayload);
 const decodeThreadTurnStartCommand = Schema.decodeUnknownEffect(ThreadTurnStartCommand);
 const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
@@ -54,6 +71,7 @@ const decodeOrchestrationLatestTurn = Schema.decodeUnknownEffect(OrchestrationLa
 const decodeOrchestrationProposedPlan = Schema.decodeUnknownEffect(OrchestrationProposedPlan);
 const decodeOrchestrationSession = Schema.decodeUnknownEffect(OrchestrationSession);
 const decodeOrchestrationThread = Schema.decodeUnknownEffect(OrchestrationThread);
+const decodeOrchestrationThreadActivity = Schema.decodeUnknownEffect(OrchestrationThreadActivity);
 const decodeOrchestrationThreadShell = Schema.decodeUnknownEffect(OrchestrationThreadShell);
 const encodeThreadCreatedPayload = Schema.encodeEffect(ThreadCreatedPayload);
 
@@ -69,6 +87,28 @@ const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
 const decodeDispatchCommandError = Schema.decodeUnknownEffect(OrchestrationDispatchCommandError);
 const decodeSnapShotAccessibility = Schema.decodeUnknownEffect(SnapShotAccessibility);
+
+it.effect("keeps older persisted thread activities readable after agent history additions", () =>
+  Effect.gen(function* () {
+    const activity = yield* decodeOrchestrationThreadActivity({
+      id: EventId.make("legacy-activity-1"),
+      tone: "info",
+      kind: "task.started",
+      summary: "Started research",
+      payload: { taskId: "legacy-agent", taskType: "subagent", title: "Researcher" },
+      turnId: null,
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    assert.strictEqual(activity.kind, "task.started");
+    assert.strictEqual(activity.eventSequence, undefined);
+    assert.deepStrictEqual(activity.payload, {
+      taskId: "legacy-agent",
+      taskType: "subagent",
+      title: "Researcher",
+    });
+  }),
+);
 
 it.effect("keeps durable project-work commands out of legacy orchestration unions", () =>
   Effect.gen(function* () {

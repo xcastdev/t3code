@@ -10,8 +10,10 @@ import {
   ProviderDriverKind,
   ProviderInstanceId,
   ProviderItemId,
+  RuntimeAgentKey,
   type ProviderApprovalDecision,
   type ProviderEvent,
+  type ProviderRuntimeEvent,
   type ProviderSession,
   type ProviderTurnStartResult,
   type ProviderUserInputAnswers,
@@ -23,6 +25,7 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it, vi } from "@effect/vitest";
 
 import * as Context from "effect/Context";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -773,6 +776,37 @@ function codexTurnEvent(method: "turn/started" | "turn/completed", turnId: strin
 }
 
 lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
+  it.effect("maps nested Codex child linkage through opaque parent keys only", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const eventFiber = yield* Stream.runHead(adapter.streamEvents).pipe(Effect.forkChild);
+      const childKey = RuntimeAgentKey.make("opaque-child-key");
+      const parentKey = RuntimeAgentKey.make("opaque-parent-key");
+      yield* runtime.emit({
+        id: asEventId("evt-collab-nested-child"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "collabAgent/started",
+        payload: {
+          agentThreadId: "native-child-thread",
+          agentKey: childKey,
+          parentAgentKey: parentKey,
+          parentThreadId: "native-parent-thread",
+          title: "Nested researcher",
+        },
+      });
+      const event = yield* Fiber.join(eventFiber);
+      NodeAssert.equal(event._tag, "Some");
+      if (event._tag !== "Some" || event.value.type !== "task.started") return;
+      NodeAssert.equal(event.value.payload.agentKey, childKey);
+      NodeAssert.equal(event.value.payload.parentAgentKey, parentKey);
+      NodeAssert.equal("parentAgentId" in event.value.payload, false);
+      NodeAssert.equal("parentThreadId" in event.value.payload, false);
+    }),
+  );
+
   it.effect("calculates one Codex turn total from cumulative counters", () =>
     Effect.gen(function* () {
       const { adapter, runtime } = yield* startLifecycleRuntime();
@@ -1333,6 +1367,150 @@ lifecycleLayer("CodexAdapterLive lifecycle", (it) => {
       NodeAssert.equal(firstEvent.value.itemId, "msg_1");
       NodeAssert.equal(firstEvent.value.turnId, "turn-1");
       NodeAssert.equal(firstEvent.value.payload.itemType, "assistant_message");
+    }),
+  );
+
+  it.effect("maps child Codex response and supplied reasoning to identified transcript items", () =>
+    Effect.gen(function* () {
+      const { adapter, runtime } = yield* startLifecycleRuntime();
+      const receivedEvents: Array<ProviderRuntimeEvent> = [];
+      const drained = yield* Deferred.make<void>();
+      const eventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.gen(function* () {
+          receivedEvents.push(event);
+          if (
+            event.type === "task.started" &&
+            event.payload.taskId === "transcript-drain-sentinel"
+          ) {
+            yield* Deferred.succeed(drained, undefined);
+          }
+        }),
+      ).pipe(Effect.forkChild);
+      const childKey = RuntimeAgentKey.make("agent-child-a");
+
+      yield* runtime.emit({
+        id: asEventId("evt-child-message-delta"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("parent-turn"),
+        itemId: asItemId("native-message-1"),
+        createdAt: "2026-01-01T00:00:00.000Z",
+        method: "collabAgent/messageDelta",
+        textDelta: "Child answer",
+        payload: {
+          agentThreadId: "child-thread-a",
+          agentKey: childKey,
+          nickname: "Research child",
+        },
+      });
+      yield* runtime.emit({
+        id: asEventId("evt-child-message-completed"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("parent-turn"),
+        itemId: asItemId("native-message-1"),
+        createdAt: "2026-01-01T00:00:01.000Z",
+        method: "collabAgent/item",
+        payload: {
+          agentThreadId: "child-thread-a",
+          agentKey: childKey,
+          nickname: "Research child",
+          lifecycle: "item/completed",
+          item: {
+            type: "agentMessage",
+            id: "native-message-1",
+            text: "Child answer",
+          },
+        },
+      });
+      yield* runtime.emit({
+        id: asEventId("evt-child-reasoning-delta"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("parent-turn"),
+        itemId: asItemId("native-reasoning-1"),
+        createdAt: "2026-01-01T00:00:02.000Z",
+        method: "collabAgent/reasoningDelta",
+        textDelta: "The child considered the evidence.",
+        payload: {
+          agentThreadId: "child-thread-a",
+          agentKey: childKey,
+          nickname: "Research child",
+          streamKind: "reasoning_text",
+        },
+      });
+      yield* runtime.emit({
+        id: asEventId("evt-child-reasoning-completed"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        turnId: asTurnId("parent-turn"),
+        itemId: asItemId("native-reasoning-1"),
+        createdAt: "2026-01-01T00:00:03.000Z",
+        method: "collabAgent/item",
+        payload: {
+          agentThreadId: "child-thread-a",
+          agentKey: childKey,
+          nickname: "Research child",
+          lifecycle: "item/completed",
+          item: {
+            type: "reasoning",
+            id: "native-reasoning-1",
+            content: ["The child considered the evidence."],
+            summary: [],
+          },
+        },
+      });
+      yield* runtime.emit({
+        id: asEventId("evt-child-transcript-sentinel"),
+        kind: "notification",
+        provider: ProviderDriverKind.make("codex"),
+        threadId: asThreadId("thread-1"),
+        createdAt: "2026-01-01T00:00:03.000Z",
+        method: "collabAgent/started",
+        payload: {
+          agentThreadId: "transcript-drain-sentinel",
+          agentKey: RuntimeAgentKey.make("agent-sentinel"),
+          nickname: "Sentinel",
+          agentPath: "/root/sentinel",
+        },
+      });
+
+      yield* Deferred.await(drained);
+      eventsFiber.interruptUnsafe();
+      const transcriptEvents = receivedEvents.filter((event) => event.agentKey === childKey);
+      NodeAssert.deepStrictEqual(
+        transcriptEvents.map((event) => event.type),
+        ["content.delta", "item.completed", "content.delta", "item.completed"],
+      );
+      const [delta, completed, reasoningDelta, reasoningCompleted] = transcriptEvents;
+      NodeAssert.equal(delta?.agentKey, childKey);
+      NodeAssert.equal(delta?.agentTitle, "Research child");
+      NodeAssert.equal(delta?.itemId, "native-message-1");
+      if (delta?.type === "content.delta") {
+        NodeAssert.equal(delta.payload.delta, "Child answer");
+        NodeAssert.equal(delta.payload.streamKind, "assistant_text");
+      }
+      NodeAssert.equal(completed?.agentKey, childKey);
+      NodeAssert.equal(completed?.agentTitle, "Research child");
+      NodeAssert.equal(completed?.itemId, "native-message-1");
+      if (completed?.type === "item.completed") {
+        NodeAssert.equal(completed.payload.itemType, "assistant_message");
+        NodeAssert.equal(completed.payload.detail, "Child answer");
+      }
+      NodeAssert.equal(reasoningDelta?.itemId, "native-reasoning-1");
+      if (reasoningDelta?.type === "content.delta") {
+        NodeAssert.equal(reasoningDelta.payload.streamKind, "reasoning_text");
+        NodeAssert.equal(reasoningDelta.payload.delta, "The child considered the evidence.");
+      }
+      NodeAssert.equal(reasoningCompleted?.itemId, "native-reasoning-1");
+      if (reasoningCompleted?.type === "item.completed") {
+        NodeAssert.equal(reasoningCompleted.payload.itemType, "reasoning");
+        NodeAssert.equal(reasoningCompleted.payload.detail, "The child considered the evidence.");
+      }
     }),
   );
 

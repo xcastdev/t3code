@@ -28,6 +28,24 @@ rl.on("line", (line) => {
     return;
   }
   const { id, method } = message;
+  if (method === "thread/inject_items") {
+    NodeFS.appendFileSync(
+      `${process.env.T3_CODEX_COLLAB_SCRIPT}.injections`,
+      `${JSON.stringify({ method, params: message.params })}\n`,
+    );
+    if (script.hangInjectFor === message.params?.threadId) {
+      return;
+    }
+    if (script.rejectInjectFor === message.params?.threadId) {
+      write({
+        id,
+        error: { code: -32000, message: "direct injection is unavailable for this thread" },
+      });
+      return;
+    }
+    write({ id, result: {} });
+    return;
+  }
   if (method === undefined && script.serverRequests?.some((request) => request.id === id)) {
     NodeFS.appendFileSync(
       `${process.env.T3_CODEX_COLLAB_SCRIPT}.responses`,

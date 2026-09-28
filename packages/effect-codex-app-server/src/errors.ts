@@ -119,6 +119,7 @@ export const CodexAppServerIdentifierPurpose = Schema.Literals([
   "file-change-approval-request",
   "mcp-elicitation-request",
   "user-input-request",
+  "agent-key",
 ]);
 export type CodexAppServerIdentifierPurpose = typeof CodexAppServerIdentifierPurpose.Type;
 

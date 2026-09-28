@@ -75,6 +75,8 @@ type ProviderIntentEvent = Extract<
       | "thread.runtime-mode-set"
       | "thread.turn-start-requested"
       | "thread.turn-interrupt-requested"
+      | "thread.agent-message-requested"
+      | "thread.agent-stop-requested"
       | "thread.approval-response-requested"
       | "thread.user-input-response-requested"
       | "thread.session-stop-requested"
@@ -293,6 +295,99 @@ const make = Effect.gen(function* () {
               ...(input.requestId ? { requestId: input.requestId } : {}),
             },
             turnId: input.turnId,
+            createdAt: input.createdAt,
+          },
+          createdAt: input.createdAt,
+        }),
+      ),
+    );
+
+  const appendAgentActionResult = (input: {
+    readonly threadId: ThreadId;
+    readonly agentKey: string;
+    readonly actionId: string;
+    readonly createdAt: string;
+    readonly action: "message" | "stop";
+    readonly status: "pending" | "accepted" | "completed" | "failed" | "unknown";
+    readonly detail?: string;
+  }) =>
+    serverCommandId("agent-action-result").pipe(
+      Effect.flatMap((commandId) =>
+        orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId,
+          threadId: input.threadId,
+          activity: {
+            id: EventId.make(`agent-action:${input.actionId}`),
+            tone: input.status === "failed" ? "error" : "info",
+            kind: "agent.action.result",
+            summary:
+              input.status === "pending"
+                ? input.action === "message"
+                  ? "Sending message to subagent"
+                  : "Stopping subagent"
+                : input.status === "accepted"
+                  ? "Message accepted by subagent"
+                  : input.status === "completed"
+                    ? "Subagent stopped"
+                    : input.status === "unknown"
+                      ? "Subagent action outcome unknown"
+                      : "Subagent action failed",
+            payload: {
+              agentKey: input.agentKey,
+              actionId: input.actionId,
+              action: input.action,
+              status: input.status,
+              timelineBypass: true,
+              ...(input.detail ? { detail: input.detail } : {}),
+            },
+            turnId: null,
+            createdAt: input.createdAt,
+          },
+          createdAt: input.createdAt,
+        }),
+      ),
+    );
+
+  const appendAgentMessageActivity = (input: {
+    readonly threadId: ThreadId;
+    readonly agentKey: string;
+    readonly actionId: string;
+    readonly text: string;
+    readonly deliveryStatus: "pending" | "accepted" | "failed" | "unknown";
+    readonly createdAt: string;
+    readonly detail?: string;
+  }) =>
+    serverCommandId("agent-message-transcript").pipe(
+      Effect.flatMap((commandId) =>
+        orchestrationEngine.dispatch({
+          type: "thread.activity.append",
+          commandId,
+          threadId: input.threadId,
+          activity: {
+            id: EventId.make(`agent-message:${input.actionId}`),
+            tone: input.deliveryStatus === "failed" ? "error" : "info",
+            kind: "agent.transcript.message",
+            summary:
+              input.deliveryStatus === "pending"
+                ? "Sending user message to subagent"
+                : input.deliveryStatus === "accepted"
+                  ? "User message sent to subagent"
+                  : input.deliveryStatus === "unknown"
+                    ? "Subagent message delivery unknown"
+                    : "Subagent message delivery failed",
+            payload: {
+              agentKey: input.agentKey,
+              actionId: input.actionId,
+              action: "message",
+              role: "user",
+              content: input.text,
+              status: "running",
+              deliveryStatus: input.deliveryStatus,
+              timelineBypass: true,
+              ...(input.detail ? { detail: input.detail } : {}),
+            },
+            turnId: null,
             createdAt: input.createdAt,
           },
           createdAt: input.createdAt,
@@ -1608,6 +1703,120 @@ const make = Effect.gen(function* () {
       .pipe(Effect.catchCause(recoverInterruptFailure));
   });
 
+  const actionFailureStatus = (failure: unknown): "failed" | "unknown" =>
+    isProviderAdapterRequestError(failure) ? "unknown" : "failed";
+  const actionFailureDetail = (failure: unknown): string =>
+    failure instanceof Error ? failure.message : String(failure);
+
+  const processAgentMessageRequested = Effect.fn("processAgentMessageRequested")(function* (
+    event: Extract<ProviderIntentEvent, { type: "thread.agent-message-requested" }>,
+  ) {
+    const action = {
+      threadId: event.payload.threadId,
+      agentKey: event.payload.agentKey,
+      actionId: event.eventId,
+      text: event.payload.text,
+      createdAt: event.payload.createdAt,
+    };
+    // Persist the attempted text before touching the provider. A restart can
+    // then mark an interrupted dispatch unknown without ever resending it.
+    yield* appendAgentMessageActivity({ ...action, deliveryStatus: "pending" });
+    const outcome = yield* (
+      providerService.messageAgent
+        ? providerService.messageAgent({
+            threadId: event.payload.threadId,
+            agentKey: event.payload.agentKey,
+            text: event.payload.text,
+          })
+        : Effect.fail(
+            new ProviderAdapterValidationError({
+              provider: "provider-service",
+              operation: "messageAgent",
+              issue: "Subagent messaging is unavailable in this provider service.",
+            }),
+          )
+    ).pipe(Effect.result);
+    if (outcome._tag === "Failure") {
+      const status = actionFailureStatus(outcome.failure);
+      yield* appendAgentMessageActivity({
+        ...action,
+        deliveryStatus: status,
+        ...(status === "failed" ? { detail: actionFailureDetail(outcome.failure) } : {}),
+      });
+      return;
+    }
+    yield* appendAgentMessageActivity({ ...action, deliveryStatus: outcome.success });
+  });
+
+  const processAgentStopRequested = Effect.fn("processAgentStopRequested")(function* (
+    event: Extract<ProviderIntentEvent, { type: "thread.agent-stop-requested" }>,
+  ) {
+    const action = {
+      threadId: event.payload.threadId,
+      agentKey: event.payload.agentKey,
+      actionId: event.eventId,
+      action: "stop" as const,
+      createdAt: event.payload.createdAt,
+    };
+    yield* appendAgentActionResult({ ...action, status: "pending" });
+    const outcome = yield* (
+      providerService.stopAgent
+        ? providerService.stopAgent({
+            threadId: event.payload.threadId,
+            agentKey: event.payload.agentKey,
+          })
+        : Effect.fail(
+            new ProviderAdapterValidationError({
+              provider: "provider-service",
+              operation: "stopAgent",
+              issue: "Child-only stop is unavailable in this provider service.",
+            }),
+          )
+    ).pipe(Effect.result);
+    if (outcome._tag === "Failure") {
+      const status = actionFailureStatus(outcome.failure);
+      yield* appendAgentActionResult({
+        ...action,
+        status,
+        detail: actionFailureDetail(outcome.failure),
+      });
+      return;
+    }
+    yield* appendAgentActionResult({
+      ...action,
+      status: outcome.success,
+    });
+  });
+
+  const recoverPendingAgentActions = Effect.fn("recoverPendingAgentActions")(function* () {
+    const listPendingAgentActions = projectionSnapshotQuery.listPendingAgentActions;
+    if (!listPendingAgentActions) return;
+    const pending = yield* listPendingAgentActions();
+    for (const activity of pending) {
+      if (activity.kind === "agent.transcript.message" && activity.action === "message") {
+        yield* appendAgentMessageActivity({
+          threadId: activity.threadId,
+          agentKey: activity.agentKey,
+          actionId: activity.actionId,
+          text: activity.content ?? "",
+          deliveryStatus: "unknown",
+          createdAt: activity.createdAt,
+        });
+      } else if (activity.kind === "agent.action.result" && activity.action === "stop") {
+        yield* appendAgentActionResult({
+          threadId: activity.threadId,
+          agentKey: activity.agentKey,
+          actionId: activity.actionId,
+          action: "stop",
+          status: "unknown",
+          detail:
+            "The server restarted before the provider outcome was recorded; the action was not resent.",
+          createdAt: activity.createdAt,
+        });
+      }
+    }
+  });
+
   const processApprovalResponseRequested = Effect.fn("processApprovalResponseRequested")(function* (
     event: Extract<ProviderIntentEvent, { type: "thread.approval-response-requested" }>,
   ) {
@@ -1807,6 +2016,12 @@ const make = Effect.gen(function* () {
       case "thread.turn-interrupt-requested":
         yield* processTurnInterruptRequested(event);
         return;
+      case "thread.agent-message-requested":
+        yield* processAgentMessageRequested(event);
+        return;
+      case "thread.agent-stop-requested":
+        yield* processAgentStopRequested(event);
+        return;
       case "thread.approval-response-requested":
         yield* processApprovalResponseRequested(event);
         return;
@@ -1881,6 +2096,8 @@ const make = Effect.gen(function* () {
         event.type === "thread.runtime-mode-set" ||
         event.type === "thread.turn-start-requested" ||
         event.type === "thread.turn-interrupt-requested" ||
+        event.type === "thread.agent-message-requested" ||
+        event.type === "thread.agent-stop-requested" ||
         event.type === "thread.approval-response-requested" ||
         event.type === "thread.user-input-response-requested" ||
         event.type === "thread.session-stop-requested" ||
@@ -1889,6 +2106,22 @@ const make = Effect.gen(function* () {
         return yield* worker.enqueue(event);
       }
     });
+
+    // Provider intent events are deliberately not replayed. Durable pending
+    // activity rows are the recovery record: settle them as unknown before
+    // accepting new intents, and never issue a blind retry after restart.
+    yield* recoverPendingAgentActions().pipe(
+      Effect.catchCause((cause) => {
+        if (Cause.hasInterruptsOnly(cause)) return Effect.interrupt;
+        return Effect.logWarning(
+          "provider command reactor failed to recover pending agent actions",
+          {
+            failureKind: Cause.hasDies(cause) ? "defect" : "failure",
+            reasonCount: cause.reasons.length,
+          },
+        );
+      }),
+    );
 
     // Subscribe before returning, even while event handling waits for server activation.
     const domainEvents = yield* orchestrationEngine.subscribeDomainEvents;

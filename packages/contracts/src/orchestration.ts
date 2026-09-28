@@ -19,12 +19,13 @@ import {
   PositiveInt,
   ProjectId,
   ProviderItemId,
+  RuntimeAgentKey,
   ThreadId,
   TrimmedNonEmptyString,
   TrimmedString,
   TurnId,
 } from "./baseSchemas.ts";
-import { ProviderInstanceId } from "./providerInstance.ts";
+import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
 import {
   PullRequestActor,
   PullRequestChecksState,
@@ -53,6 +54,7 @@ export const ORCHESTRATION_WS_METHODS = {
   getHistoryArchive: "orchestration.getHistoryArchive",
   subscribeShell: "orchestration.subscribeShell",
   subscribeThread: "orchestration.subscribeThread",
+  getAgentTranscriptPage: "orchestration.getAgentTranscriptPage",
 } as const;
 
 export const ProviderApprovalPolicy = Schema.Literals([
@@ -606,6 +608,8 @@ export const OrchestrationThreadActivity = Schema.Struct({
   payload: Schema.Unknown,
   turnId: Schema.NullOr(TurnId),
   sequence: Schema.optional(NonNegativeInt),
+  /** Thread event sequence for id-deduplicated live/paged activity merges. */
+  eventSequence: Schema.optional(NonNegativeInt),
   createdAt: IsoDateTime,
 });
 export type OrchestrationThreadActivity = typeof OrchestrationThreadActivity.Type;
@@ -1037,6 +1041,8 @@ export const OrchestrationSubscribeThreadInput = Schema.Struct({
    * behavior. Live events are unaffected either way.
    */
   turnLimit: Schema.optionalKey(PositiveInt),
+  /** Opts into child action intent event variants added after older clients. */
+  includeAgentActionEvents: Schema.optionalKey(Schema.Boolean),
 });
 export type OrchestrationSubscribeThreadInput = typeof OrchestrationSubscribeThreadInput.Type;
 
@@ -1078,6 +1084,100 @@ export const OrchestrationThreadDetailPage = Schema.Struct({
   threadSequence: Schema.optionalKey(NonNegativeInt),
 });
 export type OrchestrationThreadDetailPage = typeof OrchestrationThreadDetailPage.Type;
+
+/** Provider actions are explicitly gated: absent evidence is never advertised. */
+export const OrchestrationAgentCapability = Schema.Struct({
+  state: Schema.Literals(["supported", "unsupported", "unverified"]),
+  reason: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
+});
+export type OrchestrationAgentCapability = typeof OrchestrationAgentCapability.Type;
+
+export const OrchestrationAgentCapabilities = Schema.Struct({
+  transcript: OrchestrationAgentCapability,
+  message: OrchestrationAgentCapability,
+  answerRequests: OrchestrationAgentCapability,
+  stop: OrchestrationAgentCapability,
+});
+export type OrchestrationAgentCapabilities = typeof OrchestrationAgentCapabilities.Type;
+
+export const OrchestrationAgentStatus = Schema.Literals([
+  "pending",
+  "running",
+  "waiting",
+  "idle",
+  "completed",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
+export type OrchestrationAgentStatus = typeof OrchestrationAgentStatus.Type;
+
+export const OrchestrationAgentActionState = Schema.Literals([
+  "pending",
+  "accepted",
+  "completed",
+  "failed",
+  "unknown",
+]);
+export type OrchestrationAgentActionState = typeof OrchestrationAgentActionState.Type;
+
+export const OrchestrationAgentIdentity = Schema.Struct({
+  key: RuntimeAgentKey,
+  parentKey: Schema.NullOr(RuntimeAgentKey),
+  title: TrimmedNonEmptyString,
+  role: Schema.NullOr(TrimmedNonEmptyString),
+  provider: ProviderDriverKind,
+  status: OrchestrationAgentStatus,
+  capabilities: OrchestrationAgentCapabilities,
+});
+export type OrchestrationAgentIdentity = typeof OrchestrationAgentIdentity.Type;
+
+export const OrchestrationAgentTranscriptEntry = Schema.Struct({
+  id: EventId,
+  eventSequence: NonNegativeInt,
+  createdAt: IsoDateTime,
+  kind: Schema.Literals(["message", "tool", "request", "status"]),
+  role: Schema.optional(Schema.Literals(["assistant", "user", "tool"])),
+  content: Schema.optional(Schema.String.check(Schema.isMaxLength(65_536))),
+  summary: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+  detail: Schema.optional(Schema.String.check(Schema.isMaxLength(16_384))),
+  status: Schema.optional(OrchestrationAgentStatus),
+  deliveryStatus: Schema.optional(OrchestrationAgentActionState),
+  requestId: Schema.optional(ApprovalRequestId),
+});
+export type OrchestrationAgentTranscriptEntry = typeof OrchestrationAgentTranscriptEntry.Type;
+
+export const ORCHESTRATION_AGENT_TRANSCRIPT_PAGE_SIZE_DEFAULT = 50;
+export const ORCHESTRATION_AGENT_TRANSCRIPT_PAGE_SIZE_MAX = 100;
+const OrchestrationAgentTranscriptPageSize = PositiveInt.check(
+  Schema.isLessThanOrEqualTo(ORCHESTRATION_AGENT_TRANSCRIPT_PAGE_SIZE_MAX),
+);
+
+export const OrchestrationGetAgentTranscriptPageInput = Schema.Struct({
+  threadId: ThreadId,
+  agentKey: RuntimeAgentKey,
+  cursor: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
+  limit: Schema.optional(OrchestrationAgentTranscriptPageSize),
+});
+export type OrchestrationGetAgentTranscriptPageInput =
+  typeof OrchestrationGetAgentTranscriptPageInput.Type;
+
+export const OrchestrationAgentTranscriptPage = Schema.Struct({
+  threadId: ThreadId,
+  agent: OrchestrationAgentIdentity,
+  entries: Schema.Array(OrchestrationAgentTranscriptEntry).check(
+    Schema.isMaxLength(ORCHESTRATION_AGENT_TRANSCRIPT_PAGE_SIZE_MAX),
+  ),
+  nextCursor: Schema.NullOr(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
+  hasMore: Schema.Boolean,
+  snapshotSequence: NonNegativeInt,
+  threadSequence: NonNegativeInt,
+  completeness: Schema.Struct({
+    state: Schema.Literals(["complete", "partial", "unavailable"]),
+    reason: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(512))),
+  }),
+});
+export type OrchestrationAgentTranscriptPage = typeof OrchestrationAgentTranscriptPage.Type;
 
 /**
  * Rows a single thread-detail read returns per thread. A client seeing this
@@ -1565,6 +1665,23 @@ const ThreadTurnInterruptCommand = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+const ThreadAgentMessageCommand = Schema.Struct({
+  type: Schema.Literal("thread.agent.message"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  agentKey: RuntimeAgentKey,
+  text: TrimmedNonEmptyString.check(Schema.isMaxLength(16_000)),
+  createdAt: IsoDateTime,
+});
+
+const ThreadAgentStopCommand = Schema.Struct({
+  type: Schema.Literal("thread.agent.stop"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  agentKey: RuntimeAgentKey,
+  createdAt: IsoDateTime,
+});
+
 const ThreadApprovalRespondCommand = Schema.Struct({
   type: Schema.Literal("thread.approval.respond"),
   commandId: CommandId,
@@ -1666,6 +1783,8 @@ const DispatchableClientOrchestrationCommand = Schema.Union([
   ThreadInteractionModeSetCommand,
   ThreadTurnStartCommand,
   ThreadTurnInterruptCommand,
+  ThreadAgentMessageCommand,
+  ThreadAgentStopCommand,
   ThreadApprovalRespondCommand,
   ThreadUserInputRespondCommand,
   ThreadUserInputDismissCommand,
@@ -1701,6 +1820,8 @@ export const ClientOrchestrationCommand = Schema.Union([
   ThreadInteractionModeSetCommand,
   ClientThreadTurnStartCommand,
   ThreadTurnInterruptCommand,
+  ThreadAgentMessageCommand,
+  ThreadAgentStopCommand,
   ThreadApprovalRespondCommand,
   ThreadUserInputRespondCommand,
   ThreadUserInputDismissCommand,
@@ -1937,6 +2058,8 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.message-sent",
   "thread.turn-start-requested",
   "thread.turn-interrupt-requested",
+  "thread.agent-message-requested",
+  "thread.agent-stop-requested",
   "thread.approval-response-requested",
   "thread.user-input-response-requested",
   "thread.checkpoint-revert-requested",
@@ -2298,6 +2421,19 @@ export const ThreadTurnInterruptRequestedPayload = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+export const ThreadAgentMessageRequestedPayload = Schema.Struct({
+  threadId: ThreadId,
+  agentKey: RuntimeAgentKey,
+  text: TrimmedNonEmptyString.check(Schema.isMaxLength(16_000)),
+  createdAt: IsoDateTime,
+});
+
+export const ThreadAgentStopRequestedPayload = Schema.Struct({
+  threadId: ThreadId,
+  agentKey: RuntimeAgentKey,
+  createdAt: IsoDateTime,
+});
+
 export const ThreadApprovalResponseRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   requestId: ApprovalRequestId,
@@ -2589,6 +2725,16 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.turn-interrupt-requested"),
     payload: ThreadTurnInterruptRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.agent-message-requested"),
+    payload: ThreadAgentMessageRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.agent-stop-requested"),
+    payload: ThreadAgentStopRequestedPayload,
   }),
   Schema.Struct({
     ...EventBaseFields,
@@ -2905,6 +3051,10 @@ export const OrchestrationRpcSchemas = {
   subscribeThread: {
     input: OrchestrationSubscribeThreadInput,
     output: OrchestrationThreadStreamItem,
+  },
+  getAgentTranscriptPage: {
+    input: OrchestrationGetAgentTranscriptPageInput,
+    output: OrchestrationAgentTranscriptPage,
   },
   subscribeShell: {
     input: OrchestrationSubscribeShellInput,

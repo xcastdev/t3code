@@ -145,6 +145,9 @@ function createProviderServiceHarness(
   const service: ProviderServiceShape = {
     startSession,
     sendTurn: () => unsupported(),
+    messageAgent: () => unsupported(),
+    stopAgent: () => unsupported(),
+    getAgentCapabilities: () => unsupported(),
     compactThread: () => unsupported(),
     interruptTurn: () => unsupported(),
     respondToRequest: () => unsupported(),

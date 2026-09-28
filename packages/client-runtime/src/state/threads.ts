@@ -736,6 +736,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
               ({}) as {
                 threadResumeCompletionMarker?: boolean;
                 threadSnapshotPagination?: boolean;
+                threadAgentActionEvents?: boolean;
               },
           ),
         );
@@ -744,6 +745,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
         // servers reject unknown query params, and a windowed WS fallback to
         // such a server would silently hide history.
         const supportsPagination = config.threadSnapshotPagination === true;
+        const supportsAgentActionEvents = config.threadAgentActionEvents === true;
         yield* Ref.set(paginationSupported, supportsPagination);
         yield* Ref.set(awaitingCompletion, supportsCompletionMarker);
         yield* markSynchronizing;
@@ -811,6 +813,7 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
           threadId,
           ...(canResume ? { afterSequence: sequence } : {}),
           ...(supportsCompletionMarker ? { requestCompletionMarker: true as const } : {}),
+          ...(supportsAgentActionEvents ? { includeAgentActionEvents: true as const } : {}),
           // The WS fallback snapshot (sent when afterSequence is missing or
           // the gap is too large) should be windowed the same as the HTTP
           // path; without this a resume failure re-downloads the full thread.

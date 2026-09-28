@@ -133,6 +133,7 @@ type LoaderResponse = Option.Option<OrchestrationThreadDetailSnapshot>;
 
 const makeHarness = Effect.fn("TestThreadPagination.makeHarness")(function* (options?: {
   readonly paginationCapability?: boolean;
+  readonly agentActionEventsCapability?: boolean;
   readonly initialResponse?: LoaderResponse;
   /** Cached snapshot returned by the cache store (simulates a warm cache). */
   readonly cached?: OrchestrationThreadDetailSnapshot;
@@ -156,6 +157,7 @@ const makeHarness = Effect.fn("TestThreadPagination.makeHarness")(function* (opt
     client,
     initialConfig: Effect.succeed({
       threadSnapshotPagination: options?.paginationCapability !== false,
+      ...(options?.agentActionEventsCapability === true ? { threadAgentActionEvents: true } : {}),
     } as never),
     subscribeServerConfig: (input) => client.subscribeServerConfig(input),
     ready: Effect.void,
@@ -289,7 +291,10 @@ const revertEvent = (sequence: number): OrchestrationThreadStreamItem => ({
 describe("thread pagination state", () => {
   it.effect("windows the initial load when the server advertises pagination", () =>
     Effect.gen(function* () {
-      const harness = yield* makeHarness({ initialResponse: Option.some(WINDOWED_SNAPSHOT) });
+      const harness = yield* makeHarness({
+        initialResponse: Option.some(WINDOWED_SNAPSHOT),
+        agentActionEventsCapability: true,
+      });
       const state = yield* harness.awaitState((value) => Option.isSome(value.page));
       expect(Option.getOrThrow(state.page)).toEqual({
         beforeCursor: "cursor-1",
@@ -300,6 +305,7 @@ describe("thread pagination state", () => {
       expect(windows[0]?.turnLimit).toBe(INITIAL_THREAD_USER_TURN_LIMIT);
       const subscribeInput = yield* Ref.get(harness.lastSubscribeInput);
       expect(subscribeInput?.turnLimit).toBe(INITIAL_THREAD_USER_TURN_LIMIT);
+      expect(subscribeInput?.includeAgentActionEvents).toBe(true);
     }),
   );
 
@@ -315,6 +321,7 @@ describe("thread pagination state", () => {
       expect(windows[0]).toBeUndefined();
       const subscribeInput = yield* Ref.get(harness.lastSubscribeInput);
       expect(subscribeInput?.turnLimit).toBeUndefined();
+      expect(subscribeInput?.includeAgentActionEvents).toBeUndefined();
     }),
   );
 

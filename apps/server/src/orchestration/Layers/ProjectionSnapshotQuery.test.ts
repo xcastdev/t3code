@@ -12,6 +12,7 @@ import {
   TurnId,
   ProviderInstanceId,
   OrchestrationMessageContext,
+  RuntimeAgentKey,
 } from "@t3tools/contracts";
 import { assert, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -46,6 +47,7 @@ const encodeThreadLinkedPullRequest = Schema.encodeSync(
 const encodeMessageContext = Schema.encodeEffect(
   Schema.fromJsonString(OrchestrationMessageContext),
 );
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 
 it.effect("reads project shells without loading threads or resolving excluded projects", () => {
   const resolved: string[] = [];
@@ -2614,6 +2616,221 @@ projectionSnapshotLayer("ProjectionSnapshotQuery windowed thread detail", (it) =
         assert.equal(snapshot.value.thread.messages.length, 9);
         assert.equal(snapshot.value.thread.activities.length, 6);
         assert.equal(snapshot.value.snapshotSequence, 42);
+      }
+    }),
+  );
+
+  it.effect("reads bounded child transcript pages by opaque identity and stable sequence", () =>
+    Effect.gen(function* () {
+      yield* seedFanOutThread();
+      const sql = yield* SqlClient.SqlClient;
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const getAgentTranscriptPage = snapshotQuery.getAgentTranscriptPage;
+      assert.ok(getAgentTranscriptPage);
+      const agentKey = RuntimeAgentKey.make("agent-key-1");
+      const activities = [
+        {
+          id: "agent-started",
+          sequence: 10,
+          kind: "task.started",
+          summary: "Task started",
+          payload: {
+            agentKey,
+            title: "Research subagent",
+            role: "researcher",
+            provider: "codex",
+            status: "running",
+          },
+        },
+        {
+          id: "agent-message-old",
+          sequence: 11,
+          kind: "agent.transcript.message",
+          summary: "Earlier response",
+          payload: {
+            agentKey,
+            provider: "codex",
+            role: "assistant",
+            content: "older child response",
+          },
+        },
+        {
+          id: "agent-tool",
+          sequence: 12,
+          kind: "tool.completed",
+          summary: "Ran search",
+          payload: { agentKey, toolName: "search", detail: "Found three files" },
+        },
+        {
+          id: "agent-message-new",
+          sequence: 13,
+          kind: "agent.transcript.message",
+          summary: "Latest response",
+          payload: {
+            agentKey,
+            provider: "codex",
+            role: "assistant",
+            content: "x".repeat(70_000),
+            deliveryStatus: "accepted",
+          },
+        },
+        {
+          id: "agent-completed",
+          sequence: 14,
+          kind: "task.completed",
+          summary: "Task completed",
+          payload: { agentKey, status: "completed" },
+        },
+        {
+          id: "agent-status-interrupted",
+          sequence: 15,
+          kind: "agent.status",
+          summary: "Subagent interrupted",
+          payload: { agentKey, status: "interrupted" },
+        },
+      ] as const;
+      for (const activity of activities) {
+        yield* sql`
+          INSERT INTO projection_thread_activities (
+            activity_id, thread_id, turn_id, tone, kind, summary, payload_json,
+            sequence, agent_key, event_sequence, first_event_sequence, created_at
+          ) VALUES (
+            ${activity.id}, 'thread-w', NULL, 'info', ${activity.kind}, ${activity.summary},
+            ${encodeUnknownJson(activity.payload)}, NULL, ${agentKey}, ${activity.sequence}, ${activity.sequence},
+            '2026-09-01T00:00:00.000Z'
+          )
+        `;
+        yield* sql`
+          INSERT INTO orchestration_events (
+            event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at,
+            command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json
+          ) VALUES (
+            ${`agent-event-${activity.sequence}`}, 'thread', 'thread-w', ${activity.sequence},
+            'thread.activity-appended', '2026-09-01T00:00:00.000Z', NULL, NULL, NULL,
+            'system', '{}', '{}'
+          )
+        `;
+      }
+
+      const firstPage = yield* getAgentTranscriptPage({
+        threadId: threadW,
+        agentKey,
+        limit: 2,
+      });
+      assert.equal(firstPage._tag, "Some");
+      if (firstPage._tag === "Some") {
+        assert.equal(firstPage.value.agent.key, agentKey);
+        assert.equal(firstPage.value.agent.title, "Research subagent");
+        assert.equal(firstPage.value.agent.provider, "codex");
+        assert.equal(firstPage.value.agent.status, "interrupted");
+        assert.equal(firstPage.value.agent.capabilities.message.state, "unverified");
+        assert.deepEqual(
+          firstPage.value.entries.map((entry) => entry.id),
+          ["agent-completed", "agent-status-interrupted"],
+        );
+        assert.equal(
+          firstPage.value.entries.some((entry) => entry.content?.length === 65_536),
+          false,
+        );
+        assert.equal(firstPage.value.hasMore, true);
+        assert.equal(firstPage.value.completeness.state, "partial");
+        assert.ok(firstPage.value.nextCursor);
+
+        // A mutable progress row can receive a later event sequence after the
+        // first page is read. Its first sequence remains the paging position.
+        yield* sql`
+          UPDATE projection_thread_activities
+          SET event_sequence = 100
+          WHERE activity_id = 'agent-message-old'
+        `;
+
+        const olderPage = yield* getAgentTranscriptPage({
+          threadId: threadW,
+          agentKey,
+          cursor: firstPage.value.nextCursor ?? undefined,
+          limit: 2,
+        });
+        assert.equal(olderPage._tag, "Some");
+        if (olderPage._tag === "Some") {
+          assert.deepEqual(
+            olderPage.value.entries.map((entry) => entry.id),
+            ["agent-tool", "agent-message-new"],
+          );
+          assert.equal(olderPage.value.hasMore, true);
+          assert.equal(olderPage.value.entries[1]?.content?.length, 65_536);
+          assert.equal(olderPage.value.entries[1]?.deliveryStatus, "accepted");
+          const oldestPage = yield* getAgentTranscriptPage({
+            threadId: threadW,
+            agentKey,
+            cursor: olderPage.value.nextCursor ?? undefined,
+            limit: 2,
+          });
+          assert.equal(oldestPage._tag, "Some");
+          if (oldestPage._tag === "Some") {
+            assert.deepEqual(
+              oldestPage.value.entries.map((entry) => entry.id),
+              ["agent-started", "agent-message-old"],
+            );
+            assert.equal(oldestPage.value.entries[1]?.eventSequence, 100);
+            assert.equal(oldestPage.value.hasMore, false);
+          }
+        }
+      }
+    }),
+  );
+
+  it.effect("does not treat a user message attempt as captured provider transcript evidence", () =>
+    Effect.gen(function* () {
+      yield* seedFanOutThread();
+      const sql = yield* SqlClient.SqlClient;
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const getAgentTranscriptPage = snapshotQuery.getAgentTranscriptPage;
+      assert.ok(getAgentTranscriptPage);
+      const agentKey = RuntimeAgentKey.make("agent-key-action-only");
+
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json,
+          sequence, agent_key, event_sequence, first_event_sequence, created_at
+        ) VALUES (
+          'agent-action-only-started', 'thread-w', NULL, 'info', 'task.started', 'Task started',
+          ${encodeUnknownJson({
+            agentKey,
+            title: "Action-only child",
+            role: "researcher",
+            provider: "opencode",
+            status: "running",
+          })}, NULL, ${agentKey}, 60, 60, '2026-09-01T00:00:00.000Z'
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary, payload_json,
+          sequence, agent_key, event_sequence, first_event_sequence, created_at
+        ) VALUES (
+          'agent-action-only-message', 'thread-w', NULL, 'info', 'agent.transcript.message',
+          'Subagent message delivery failed',
+          ${encodeUnknownJson({
+            agentKey,
+            actionId: "action-only-intent",
+            action: "message",
+            role: "user",
+            content: "Please inspect the failing test.",
+            deliveryStatus: "failed",
+            timelineBypass: true,
+          })}, NULL, ${agentKey}, 61, 61, '2026-09-01T00:00:01.000Z'
+        )
+      `;
+
+      const page = yield* getAgentTranscriptPage({ threadId: threadW, agentKey });
+      assert.equal(page._tag, "Some");
+      if (page._tag === "Some") {
+        assert.equal(
+          page.value.entries.some((entry) => entry.content === "Please inspect the failing test."),
+          true,
+        );
+        assert.equal(page.value.agent.capabilities.transcript.state, "unverified");
+        assert.equal(page.value.completeness.state, "unavailable");
       }
     }),
   );

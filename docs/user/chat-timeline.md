@@ -47,6 +47,17 @@ Each piece of work has a name, a short description, and its duration when timing
 Commands are styled distinctly from other tool calls. When space is tight, the description
 shortens first.
 
+## Subagent activity
+
+Open an agent from **Agents** on web or desktop, or from the thread work log on mobile, to view
+its captured messages and tool activity. Provider support varies, so T3 Code labels partial or
+unavailable history when it cannot show a complete transcript. Older captured activity is
+available through **Load earlier activity**.
+
+When the selected agent's current session supports it, its view offers **Message this subagent**
+and **Stop subagent**. These actions target only that agent. Pending approvals and questions also
+appear in the parent thread; answering in either view resolves the same request in both places.
+
 ## While the agent is working
 
 The working row names what is happening — running a command, reading a file — rather than a

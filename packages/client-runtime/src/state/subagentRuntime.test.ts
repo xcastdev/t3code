@@ -1,6 +1,20 @@
 import { describe, expect, it } from "vite-plus/test";
-import { classifyTaskAgentKind, type OrchestrationThreadActivity } from "@t3tools/contracts";
 import {
+  classifyTaskAgentKind,
+  EventId,
+  ProviderDriverKind,
+  RuntimeAgentKey,
+  ThreadId,
+  type OrchestrationAgentTranscriptEntry,
+  type OrchestrationAgentTranscriptPage,
+  type OrchestrationThreadActivity,
+} from "@t3tools/contracts";
+import {
+  firstDiscardedAgentTranscriptCursor,
+  mergeAgentTranscriptEntries,
+  mergeAgentTranscriptPageWindows,
+  recoverAgentTranscriptGap,
+  agentTranscriptEntriesFromActivities,
   deriveAgentPanelModel,
   foldSubagentActivities,
   formatSubagentModelLabel,
@@ -62,6 +76,60 @@ function fold(rows: ReadonlyArray<OrchestrationThreadActivity>) {
 }
 
 describe("foldSubagentActivities", () => {
+  it("seeds a child from provider lifecycle while its first request is pending", () => {
+    const agentKey = RuntimeAgentKey.make("opencode-child-key");
+    const parentAgentKey = RuntimeAgentKey.make("opencode-parent-key");
+    const agents = fold([
+      activity("agent.status", {
+        agentKey,
+        parentAgentKey,
+        provider: "opencode",
+        title: "Approval helper",
+        status: "running",
+        timelineBypass: true,
+      }),
+      activity("task.started", {
+        taskId: "open-code-task-id",
+        taskType: "subagent",
+        agentKey,
+        parentAgentKey,
+        title: "Approval helper",
+      }),
+    ]);
+
+    expect(agents).toHaveLength(1);
+    expect(agents[0]).toMatchObject({
+      id: "open-code-task-id",
+      agentKey,
+      parentAgentKey,
+      title: "Approval helper",
+      kind: "subagent",
+      status: "running",
+    });
+  });
+
+  it("keeps opaque child identity from persisted lifecycle rows", () => {
+    const agentKey = RuntimeAgentKey.make("child-key-1");
+    const parentAgentKey = RuntimeAgentKey.make("parent-key-1");
+    const agents = fold([
+      activity("task.started", {
+        taskId: "provider-child-1",
+        taskType: "subagent",
+        title: "Researcher",
+        agentKey,
+        parentAgentKey,
+      }),
+      activity("task.updated", {
+        taskId: "provider-child-1",
+        status: "running",
+        agentKey,
+        parentAgentKey,
+      }),
+    ]);
+
+    expect(agents[0]).toMatchObject({ agentKey, parentAgentKey, title: "Researcher" });
+  });
+
   it("shows the batch status limit after its parent turn ends without claiming a result", () => {
     const running = activity("task.progress", {
       taskId: "batch-1",
@@ -370,6 +438,328 @@ describe("foldSubagentActivities", () => {
     ]);
     expect(agents[0]!.runHandles?.sessionUrl).toBeUndefined();
     expect(agents[0]!.runHandles?.runId).toBe("run-1");
+  });
+});
+
+describe("agent transcript merge", () => {
+  const transcriptPage = (
+    entries: ReadonlyArray<OrchestrationAgentTranscriptEntry>,
+    nextCursor: string | null,
+    hasMore: boolean,
+  ): OrchestrationAgentTranscriptPage => ({
+    threadId: ThreadId.make("thread-transcript"),
+    agent: {
+      key: RuntimeAgentKey.make("agent-transcript"),
+      parentKey: null,
+      title: "Researcher",
+      role: null,
+      provider: ProviderDriverKind.make("opencode"),
+      status: "running",
+      capabilities: {
+        transcript: { state: "supported" },
+        message: { state: "supported" },
+        answerRequests: { state: "unverified" },
+        stop: { state: "supported" },
+      },
+    },
+    entries,
+    nextCursor,
+    hasMore,
+    snapshotSequence: 250,
+    threadSequence: 250,
+    completeness: { state: "complete" },
+  });
+
+  const entries = (from: number, to: number) =>
+    Array.from({ length: to - from + 1 }, (_, index) => {
+      const eventSequence = from + index;
+      return {
+        id: EventId.make(`transcript-${eventSequence}`),
+        eventSequence,
+        createdAt: `2026-08-01T10:00:${String(eventSequence % 60).padStart(2, "0")}.000Z`,
+        kind: "message" as const,
+        role: "assistant" as const,
+        summary: `entry ${eventSequence}`,
+      };
+    });
+
+  it("walks backward across more than one page to recover a reconnect watermark", async () => {
+    const pages = new Map<string, OrchestrationAgentTranscriptPage>([
+      ["cursor-1", transcriptPage(entries(151, 200), "cursor-2", true)],
+      ["cursor-2", transcriptPage(entries(101, 150), "cursor-3", true)],
+      ["cursor-3", transcriptPage(entries(51, 100), "cursor-4", true)],
+    ]);
+    const fetched: Array<string> = [];
+    const recovered = await recoverAgentTranscriptGap({
+      startCursor: "cursor-1",
+      watermark: 100,
+      fetchPage: async (cursor) => {
+        fetched.push(cursor);
+        const page = pages.get(cursor);
+        if (!page) throw new Error(`Unexpected transcript cursor ${cursor}`);
+        return page;
+      },
+    });
+
+    expect(fetched).toEqual(["cursor-1", "cursor-2", "cursor-3"]);
+    expect(recovered).toMatchObject({
+      reachedWatermark: true,
+      nextCursor: null,
+      pagesRead: 3,
+    });
+    expect(recovered.entries).toHaveLength(150);
+    expect(recovered.entries[0]?.eventSequence).toBe(151);
+    expect(recovered.entries.at(-1)?.eventSequence).toBe(100);
+  });
+
+  it("returns a continuation cursor when bounded reconnect catch-up cannot reach the watermark", async () => {
+    const recovered = await recoverAgentTranscriptGap({
+      startCursor: "cursor-1",
+      watermark: 100,
+      maxPages: 1,
+      fetchPage: async () => transcriptPage(entries(151, 200), "cursor-2", true),
+    });
+    expect(recovered).toMatchObject({
+      reachedWatermark: false,
+      nextCursor: "cursor-2",
+      pagesRead: 1,
+    });
+    expect(recovered.entries).toHaveLength(50);
+  });
+
+  it("keeps reconnect incompleteness cursor-driven across more than 500 recovered rows", async () => {
+    const readCursorPage = async (cursor: string) => {
+      const pageIndex = Number(cursor.slice("cursor-".length));
+      const from = 951 - pageIndex * 50;
+      return transcriptPage(entries(from, from + 49), `cursor-${pageIndex + 1}`, true);
+    };
+    const firstBatch = await recoverAgentTranscriptGap({
+      startCursor: "cursor-0",
+      watermark: 1,
+      maxPages: 10,
+      fetchPage: readCursorPage,
+    });
+    expect(firstBatch).toMatchObject({
+      reachedWatermark: false,
+      nextCursor: "cursor-10",
+      pagesRead: 10,
+    });
+
+    const firstWindow = mergeAgentTranscriptEntries([], firstBatch.entries);
+    expect(firstWindow).toHaveLength(500);
+    const secondBatch = await recoverAgentTranscriptGap({
+      startCursor: firstBatch.nextCursor,
+      watermark: 1,
+      maxPages: 10,
+      fetchPage: readCursorPage,
+    });
+    expect(secondBatch).toMatchObject({ reachedWatermark: true, nextCursor: null, pagesRead: 10 });
+
+    const retainedWindow = mergeAgentTranscriptEntries(firstWindow, secondBatch.entries);
+    expect(retainedWindow).toHaveLength(500);
+    expect(retainedWindow.at(-1)?.eventSequence).toBe(1000);
+  });
+
+  it("keeps the first discarded reconnect page reachable from its cursor", () => {
+    const current = entries(951, 1000);
+    const recovered = entries(51, 950);
+    const cursorByEntryId = new Map<string, string>();
+    const pageByCursor = new Map<string, ReadonlyArray<OrchestrationAgentTranscriptEntry>>();
+    for (let start = 51; start <= 901; start += 50) {
+      const cursor = `before-${start + 50}`;
+      const page = entries(start, start + 49);
+      pageByCursor.set(cursor, page);
+      for (const entry of page) {
+        cursorByEntryId.set(entry.id, cursor);
+      }
+    }
+
+    const retained = mergeAgentTranscriptEntries(current, recovered);
+    expect(retained).toHaveLength(500);
+    expect(retained[0]?.eventSequence).toBe(501);
+    expect(retained.at(-1)?.eventSequence).toBe(1000);
+
+    const discardedPageCursor = firstDiscardedAgentTranscriptCursor(
+      current,
+      recovered,
+      cursorByEntryId,
+    );
+    expect(discardedPageCursor).toBe("before-501");
+    if (discardedPageCursor === null) throw new Error("Expected a cursor for discarded history");
+    const browsedPage = pageByCursor.get(discardedPageCursor);
+    expect(browsedPage?.[0]?.eventSequence).toBe(451);
+    expect(browsedPage?.at(-1)?.eventSequence).toBe(500);
+  });
+
+  it("deduplicates page and live rows by activity id and keeps the newer event sequence", () => {
+    const oldPageEntry = {
+      id: EventId.make("activity-transcript-1"),
+      eventSequence: 11,
+      createdAt: "2026-08-01T10:00:00.000Z",
+      kind: "message" as const,
+      role: "assistant" as const,
+      summary: "Searching",
+      content: "Searching",
+    };
+    const liveEntry = { ...oldPageEntry, eventSequence: 18, content: "Searching the repository" };
+
+    expect(mergeAgentTranscriptEntries([oldPageEntry], [liveEntry, liveEntry])).toEqual([
+      liveEntry,
+    ]);
+  });
+
+  it("projects only activities owned by the selected key and caps retained history", () => {
+    const selected = RuntimeAgentKey.make("child-key-1");
+    const other = RuntimeAgentKey.make("child-key-2");
+    const activities = [
+      activity("agent.transcript.message", {
+        agentKey: selected,
+        role: "assistant",
+        content: "hello",
+        status: "running",
+      }),
+      activity("agent.transcript.message", {
+        agentKey: other,
+        role: "assistant",
+        content: "sibling text",
+      }),
+    ];
+    const live = agentTranscriptEntriesFromActivities(activities, selected);
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ kind: "message", role: "assistant", content: "hello" });
+
+    const history = Array.from({ length: 4 }, (_, index) => ({
+      id: EventId.make(`entry-${index}`),
+      eventSequence: index,
+      createdAt: `2026-08-01T10:00:0${index}.000Z`,
+      kind: "status" as const,
+      summary: `status ${index}`,
+    }));
+    expect(mergeAgentTranscriptEntries([], history, 2).map((entry) => entry.id)).toEqual([
+      "entry-2",
+      "entry-3",
+    ]);
+    expect(mergeAgentTranscriptEntries([], history, 2, "oldest").map((entry) => entry.id)).toEqual([
+      "entry-0",
+      "entry-1",
+    ]);
+    expect(
+      mergeAgentTranscriptEntries(history.slice(-2), history.slice(0, 2), 3, "oldest").map(
+        (entry) => entry.id,
+      ),
+    ).toEqual(["entry-0", "entry-1", "entry-2"]);
+  });
+
+  it("keeps Load earlier pages visible after the 500-entry window fills", () => {
+    const history = Array.from({ length: 600 }, (_, index) => ({
+      id: EventId.make(`entry-${index}`),
+      eventSequence: index,
+      createdAt: `2026-08-01T10:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`,
+      kind: "status" as const,
+      summary: `status ${index}`,
+    }));
+
+    // The initial page fills the client window with the newest 500 rows.
+    const initialPage = {
+      entries: history.slice(-500),
+      nextCursor: "cursor-before-entry-100",
+      hasMore: true,
+    };
+    const firstPage = mergeAgentTranscriptEntries([], initialPage.entries);
+    expect(firstPage).toHaveLength(500);
+    expect(firstPage[0]?.id).toBe("entry-100");
+
+    // The next API page comes from the cursor before that initial page.
+    const earlierRequestCursor = initialPage.nextCursor;
+    expect(earlierRequestCursor).toBe("cursor-before-entry-100");
+    const earlierPage = {
+      entries: history.slice(0, 100),
+      nextCursor: null,
+      hasMore: false,
+    };
+    const secondPage = mergeAgentTranscriptEntries(
+      firstPage,
+      earlierPage.entries,
+      undefined,
+      "oldest",
+    );
+
+    expect(secondPage).toHaveLength(500);
+    expect(secondPage[0]?.id).toBe("entry-0");
+    expect(secondPage.at(-1)?.id).toBe("entry-499");
+    expect(secondPage.some((entry) => entry.id === "entry-0")).toBe(true);
+    expect(secondPage.some((entry) => entry.id === "entry-599")).toBe(false);
+    // Paging state advances to the returned cursor even while the retained
+    // display window stays capped.
+    expect(earlierPage.nextCursor).toBeNull();
+    expect(earlierPage.hasMore).toBe(false);
+  });
+
+  it("keeps the older 500-row page window while merging a fresh newest boundary", () => {
+    const loadedOlderWindow = Array.from({ length: 500 }, (_, index) => ({
+      id: EventId.make(`older-entry-${index}`),
+      eventSequence: index,
+      createdAt: `2026-08-01T10:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`,
+      kind: "status" as const,
+      summary: `older ${index}`,
+    }));
+    const newestPage = Array.from({ length: 50 }, (_, index) => ({
+      id: EventId.make(`newest-entry-${index}`),
+      eventSequence: 1_000 + index,
+      createdAt: `2026-08-02T10:${String(Math.floor(index / 60)).padStart(2, "0")}:${String(index % 60).padStart(2, "0")}.000Z`,
+      kind: "message" as const,
+      role: "assistant" as const,
+      summary: `newest ${index}`,
+      content: `newest content ${index}`,
+    }));
+    const liveUpdate = {
+      ...newestPage[49]!,
+      eventSequence: 1_050,
+      content: "child replied after the older page was loaded",
+    };
+
+    const merged = mergeAgentTranscriptPageWindows(loadedOlderWindow, newestPage, [liveUpdate]);
+
+    expect(merged).toHaveLength(550);
+    expect(merged[0]?.id).toBe("older-entry-0");
+    expect(merged[499]?.id).toBe("older-entry-499");
+    expect(merged.at(-1)).toMatchObject({
+      id: "newest-entry-49",
+      eventSequence: 1_050,
+      content: "child replied after the older page was loaded",
+    });
+  });
+
+  it("retains a bounded reconnect bridge between a loaded history page and newest rows", () => {
+    const loaded = Array.from({ length: 500 }, (_, index) => ({
+      id: EventId.make(`bridge-old-${index}`),
+      eventSequence: index,
+      createdAt: "2026-08-01T10:00:00.000Z",
+      kind: "status" as const,
+      summary: `old ${index}`,
+    }));
+    const recovered = Array.from({ length: 500 }, (_, index) => ({
+      id: EventId.make(`bridge-gap-${index}`),
+      eventSequence: 500 + index,
+      createdAt: "2026-08-01T10:00:01.000Z",
+      kind: "status" as const,
+      summary: `gap ${index}`,
+    }));
+    const newest = Array.from({ length: 50 }, (_, index) => ({
+      id: EventId.make(`bridge-new-${index}`),
+      eventSequence: 1_000 + index,
+      createdAt: "2026-08-01T10:00:02.000Z",
+      kind: "status" as const,
+      summary: `new ${index}`,
+    }));
+
+    const merged = mergeAgentTranscriptPageWindows(loaded, newest, [], recovered);
+    expect(merged).toHaveLength(1_050);
+    expect(merged[0]?.id).toBe("bridge-old-0");
+    expect(merged[499]?.id).toBe("bridge-old-499");
+    expect(merged[500]?.id).toBe("bridge-gap-0");
+    expect(merged[999]?.id).toBe("bridge-gap-499");
+    expect(merged.at(-1)?.id).toBe("bridge-new-49");
   });
 });
 

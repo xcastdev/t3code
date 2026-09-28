@@ -7,6 +7,7 @@ import {
   MessageId,
   ProjectId,
   ProviderInstanceId,
+  RuntimeAgentKey,
   ThreadId,
   TurnId,
   type OrchestrationThread,
@@ -2996,11 +2997,19 @@ describe("quiet timeline: nested agents", () => {
       );
 
     // A working card is the live activity; no Thinking row sits under it.
-    const single = presentFor([agent("a-start", "task.started", "a", 1)]);
+    const opaqueAgentKey = RuntimeAgentKey.make("mobile-agent-key-a");
+    const single = presentFor([
+      agent("a-start", "task.started", "a", 1, { agentKey: opaqueAgentKey }),
+    ]);
     expect(single.map((row) => row.type)).toEqual(["agent-spawn"]);
     expect(single[0]).toMatchObject({
       id: `agent-spawn:${turnId}`,
-      summary: { title: "Agent a", status: "Working", tone: "working" },
+      summary: {
+        title: "Agent a",
+        status: "Working",
+        tone: "working",
+        members: [{ agentKey: opaqueAgentKey }],
+      },
     });
 
     // The server upserts the progress row with a new createdAt each tick;

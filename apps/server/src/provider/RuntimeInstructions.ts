@@ -2,6 +2,10 @@ const PULL_REQUEST_LINKING_INSTRUCTIONS = `<pull_request_linking>
 When the t3-code MCP server exposes link_pull_request, you must use it to register every pull request you create or work on for this thread. Call link_pull_request with the full PR URL immediately after creating a PR or starting work on an existing PR. For a stack, call it for every layer, not just the current branch or the top PR. This applies when creating or updating PRs through gh, gh stack, another CLI, or the host API: those operations do not register the PRs with this thread. Linking an already-linked PR is safe. Before finishing PR work, call list_thread_pull_requests and link any PR from your work that is missing. Do not link unrelated PRs mentioned only as background. If a linking call fails, report that failure instead of claiming the PR is linked.
 </pull_request_linking>`;
 
+const OPENCODE_SUBAGENT_PERMISSION_INSTRUCTIONS = `<subagent_permission_visibility>
+Subagent permission requests can appear in T3 Code's parent chat and agent panel without appearing in the parent OpenCode task result. The task result reports the child's work, not the history of permission prompts or answers. Do not infer that a child action was auto-approved because the task continued or because you did not see a prompt in your own tool output. If T3 Code supplies a subagent permission status note in your context, use that recorded outcome when reporting what happened. Otherwise, say that the task result alone cannot confirm how T3 handled the request.
+</subagent_permission_visibility>`;
+
 export interface ProjectWorkRuntimeContext {
   readonly projectId: string;
   readonly sourceRevision: number;
@@ -56,7 +60,7 @@ export function buildRuntimeInstructions(runtime: {
   const effort = toSingleLine(runtime.reasoningEffort ?? "");
   const modelInfo = model && model !== "auto" && model !== "default" ? `, as ${model}` : "";
   const effortInfo = effort ? ` with ${effort} reasoning effort` : "";
-  return `<runtime_info>In case you're asked: you are running in T3 Code through the ${harness} harness${modelInfo}${effortInfo}. No need to mention this otherwise. You can embed images and videos in your response using Markdown with absolute file paths.</runtime_info>\n\n${PULL_REQUEST_LINKING_INSTRUCTIONS}${runtime.projectWork ? `\n\n${projectWorkEnvelope(runtime.projectWork)}` : ""}`;
+  return `<runtime_info>In case you're asked: you are running in T3 Code through the ${harness} harness${modelInfo}${effortInfo}. No need to mention this otherwise. You can embed images and videos in your response using Markdown with absolute file paths.</runtime_info>\n\n${PULL_REQUEST_LINKING_INSTRUCTIONS}${harness === "OpenCode" ? `\n\n${OPENCODE_SUBAGENT_PERMISSION_INSTRUCTIONS}` : ""}${runtime.projectWork ? `\n\n${projectWorkEnvelope(runtime.projectWork)}` : ""}`;
 }
 
 function toSingleLine(value: string): string {

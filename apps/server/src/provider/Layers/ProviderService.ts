@@ -38,6 +38,7 @@ import {
   type ProviderSession,
   type McpCatalogSnapshot,
   type OrchestrationCommand,
+  type OrchestrationAgentCapability,
   type ResolvedProjectMcpServer,
   type ServerSettings as ServerSettingsValue,
 } from "@t3tools/contracts";
@@ -3040,6 +3041,108 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
+  const messageAgent: ProviderServiceMethod<"messageAgent"> = Effect.fn("messageAgent")(
+    function* (input) {
+      const routed = yield* resolveRoutableSession({
+        threadId: input.threadId,
+        operation: "ProviderService.messageAgent",
+        allowRecovery: false,
+      });
+      if (!routed.isActive || !routed.adapter.messageAgent) {
+        return yield* toValidationError(
+          "ProviderService.messageAgent",
+          routed.isActive
+            ? `Provider '${routed.adapter.provider}' does not support messaging this child agent.`
+            : "The provider session is no longer active; this child handle cannot be used.",
+        );
+      }
+      return yield* routed.adapter.messageAgent(input.threadId, input.agentKey, input.text);
+    },
+  );
+
+  const stopAgent: ProviderServiceMethod<"stopAgent"> = Effect.fn("stopAgent")(function* (input) {
+    const routed = yield* resolveRoutableSession({
+      threadId: input.threadId,
+      operation: "ProviderService.stopAgent",
+      allowRecovery: false,
+    });
+    if (!routed.isActive || !routed.adapter.stopAgent) {
+      return yield* toValidationError(
+        "ProviderService.stopAgent",
+        routed.isActive
+          ? `Provider '${routed.adapter.provider}' does not support stopping one child agent.`
+          : "The provider session is no longer active; this child handle cannot be used.",
+      );
+    }
+    return yield* routed.adapter.stopAgent(input.threadId, input.agentKey);
+  });
+
+  const getAgentCapabilities: ProviderServiceMethod<"getAgentCapabilities"> = Effect.fn(
+    "getAgentCapabilities",
+  )(function* (input) {
+    const unverified: {
+      readonly message: OrchestrationAgentCapability;
+      readonly answerRequests: OrchestrationAgentCapability;
+      readonly stop: OrchestrationAgentCapability;
+    } = {
+      message: {
+        state: "unverified",
+        reason: "A live child handle has not been validated for this provider session.",
+      },
+      answerRequests: {
+        state: "unverified",
+        reason: "A live child request path has not been validated for this provider session.",
+      },
+      stop: {
+        state: "unverified",
+        reason: "A live child-only stop handle has not been validated for this provider session.",
+      },
+    };
+    const routed = yield* resolveRoutableSession({
+      threadId: input.threadId,
+      operation: "ProviderService.getAgentCapabilities",
+      allowRecovery: false,
+    }).pipe(Effect.result);
+    if (routed._tag === "Failure" || !routed.success.isActive) return unverified;
+    const resolve = routed.success.adapter.getAgentActionCapabilities;
+    if (!resolve) {
+      return {
+        message: {
+          state: "unsupported",
+          reason: `Provider '${routed.success.adapter.provider}' does not support child messaging.`,
+        },
+        answerRequests: {
+          state: "unverified",
+          reason: "Child request ownership has not been validated for this provider.",
+        },
+        stop: {
+          state: "unsupported",
+          reason: `Provider '${routed.success.adapter.provider}' does not support child-only stop.`,
+        },
+      };
+    }
+    const capabilities = yield* resolve(input.threadId, input.agentKey).pipe(Effect.result);
+    if (capabilities._tag === "Failure") return unverified;
+    const adapt = (
+      state: "supported" | "unsupported" | "unverified",
+      action: "messaging" | "answering requests" | "stopping",
+    ): OrchestrationAgentCapability =>
+      state === "supported"
+        ? { state }
+        : {
+            state,
+            reason:
+              state === "unsupported"
+                ? `The current OpenCode child session does not support ${action}.`
+                : `The current OpenCode child session could not verify ${action}.`,
+          };
+    return {
+      message: adapt(capabilities.success.message, "messaging"),
+      answerRequests: adapt(capabilities.success.answerRequests, "answering requests"),
+      stop: adapt(capabilities.success.stop, "stopping"),
+    };
+  });
+
   const compactThread: ProviderServiceMethod<"compactThread"> = Effect.fn("compactThread")(
     function* (threadId, modelSelection, requestId) {
       const routed = yield* resolveRoutableSession({
@@ -3735,6 +3838,9 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   return {
     startSession,
     sendTurn,
+    messageAgent,
+    stopAgent,
+    getAgentCapabilities,
     compactThread,
     interruptTurn,
     respondToRequest,

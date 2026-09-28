@@ -187,6 +187,14 @@ const ComposerPendingUserInputCard = memo(function ComposerPendingUserInputCard(
       >
         <ComposerBanner.Icon />
         <ComposerBanner.Content>
+          {prompt.agentKey ? (
+            <span
+              className="shrink-0 rounded-sm border border-border/60 px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground"
+              data-subagent-request-owner
+            >
+              Subagent · {prompt.agentTitle || "Agent"}
+            </span>
+          ) : null}
           <span className="shrink-0 font-medium text-muted-foreground">
             {activeQuestion.header}
           </span>
