@@ -28,6 +28,8 @@ const commands = vi.hoisted(() => ({
 }));
 
 const state = vi.hoisted(() => ({
+  scopeSearch: {} as Record<string, string>,
+  configs: {} as Record<string, unknown>,
   session: {
     data: {
       authenticated: true,
@@ -64,6 +66,13 @@ vi.mock("@tanstack/react-router", () => ({
   useNavigate: () => vi.fn(),
 }));
 
+vi.mock("@effect/atom-react", () => ({
+  useAtomValue: (atom: { readonly kind?: string; readonly environmentId?: string }) =>
+    atom?.kind === "environment-config" && atom.environmentId
+      ? state.configs[atom.environmentId]
+      : null,
+}));
+
 vi.mock("../../env", () => ({ isElectron: false }));
 
 vi.mock("../../environments/primary", () => ({
@@ -95,8 +104,16 @@ vi.mock("~/state/environments", () => ({
   usePrimaryEnvironmentId: () => primaryEnvironmentId,
 }));
 
+vi.mock("./SettingsScopeContext", () => ({
+  useSettingsScope: () => ({ search: state.scopeSearch }),
+}));
+
 vi.mock("~/state/server", () => ({
   serverEnvironment: {
+    configValueAtom: (environmentId: EnvironmentId) => ({
+      kind: "environment-config",
+      environmentId,
+    }),
     testExternalNotification: atoms.testExternalNotification,
     updateSettings: atoms.updateSettings,
   },
@@ -114,6 +131,7 @@ import {
   ExternalNotificationDestinationCard,
   EnvironmentExternalNotificationsSettings,
   ExternalNotificationsSettings,
+  IntegrationsSettingsPanel,
 } from "./IntegrationsSettings";
 
 const primaryEnvironmentId = EnvironmentId.make("primary");
@@ -220,6 +238,17 @@ describe("external notification settings boundary", () => {
     commands.updatePrimarySettings.mockReset();
     commands.readScopedSettings.mockReset().mockReturnValue(settingsValue);
     environments = [makeEnvironment(remoteTarget), makeEnvironment(primaryTarget)];
+    state.scopeSearch = {};
+    state.configs = {
+      [remoteEnvironmentId]: {
+        providers: [],
+        environment: { capabilities: { globalMcpCatalog: true } },
+      },
+      [primaryEnvironmentId]: {
+        providers: [],
+        environment: { capabilities: { globalMcpCatalog: true } },
+      },
+    };
   });
 
   it("keeps its settings hooks stable when an environment connects", () => {
@@ -230,6 +259,58 @@ describe("external notification settings boundary", () => {
     renderEnvironmentSettings(false);
 
     expect(commands.readScopedSettings).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses an explicit nonprimary MCP environment and never falls back from a disconnected target", () => {
+    const target = {
+      namespace: "t3-resource",
+      version: 1,
+      kind: "mcp",
+      scope: "environment",
+      scopeId: remoteEnvironmentId,
+      intent: "create",
+    } as const;
+    state.scopeSearch = { machine: remoteEnvironmentId };
+    hooks.beginRender();
+    const remotePage = IntegrationsSettingsPanel({ resourceTarget: target });
+    expect(visitElements(remotePage, (element) => element.props.role === "tablist")).toBeNull();
+    const editor = visitElements(
+      remotePage,
+      (element) =>
+        element.props.environmentId === remoteEnvironmentId &&
+        Boolean(element.props.resourceTarget),
+    );
+    expect(editor?.props).toMatchObject({
+      environmentId: remoteEnvironmentId,
+      resourceTarget: target,
+    });
+
+    environments = [
+      {
+        ...makeEnvironment(remoteTarget),
+        connection: { phase: "connected", error: null, traceId: null },
+        serverConfig: null,
+      },
+      makeEnvironment(primaryTarget),
+    ];
+    hooks.beginRender();
+    const unavailablePage = IntegrationsSettingsPanel({ resourceTarget: target });
+    expect(
+      visitElements(
+        unavailablePage,
+        (element) =>
+          element.props.role === "status" &&
+          elementText(element.props.children).includes("selected MCP environment is unavailable"),
+      ),
+    ).not.toBeNull();
+    expect(
+      visitElements(
+        unavailablePage,
+        (element) =>
+          element.props.environmentId === primaryEnvironmentId &&
+          Boolean(element.props.resourceTarget),
+      ),
+    ).toBeNull();
   });
 
   it("renders device tabs and keeps the saved webhook secret out of client elements", () => {

@@ -34,6 +34,7 @@ import {
   resolveManagedTextResourceMutationEffects,
   resolveManagedTextResourceState,
 } from "./managedTextResources.logic";
+import type { ResourceTarget } from "../resources/resourceTarget";
 
 const isManagedTextResourceKey = Schema.is(ManagedTextResourceKey);
 
@@ -53,7 +54,11 @@ function projectStateLabel(entry: ManagedTextResourceSummary): string {
   return resolveManagedTextResourceState(entry).projectStateLabel;
 }
 
-export function ManagedTextResourcesSettings() {
+export function ManagedTextResourcesSettings({
+  resourceTarget = null,
+}: {
+  readonly resourceTarget?: ResourceTarget | null;
+}) {
   const { target } = useSettingsScope();
   const environmentId = target?.environmentId ?? null;
   const projectId = target?.projectId ?? null;
@@ -71,6 +76,7 @@ export function ManagedTextResourcesSettings() {
       environmentId={environmentId}
       projectId={projectId}
       targetLabel={target?.label ?? null}
+      resourceTarget={resourceTarget}
     />
   );
 }
@@ -79,22 +85,64 @@ function ManagedTextResourcesCatalogSettings(props: {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId | null;
   readonly targetLabel: string | null;
+  readonly resourceTarget: ResourceTarget | null;
 }) {
   const { environmentId, projectId } = props;
   const [kind, setKind] = useState<ManagedTextResourceKind>("command");
   const [selectedToken, setSelectedToken] = useState<string | null>(null);
   const [selectionVersion, setSelectionVersion] = useState(0);
   const [newEditorVersion, setNewEditorVersion] = useState(0);
+  const [dismissedTargetKey, setDismissedTargetKey] = useState<string | null>(null);
+  const resourceTargetKey = props.resourceTarget ? JSON.stringify(props.resourceTarget) : null;
+  const previousResourceTargetKey = useRef(resourceTargetKey);
+  const targetRequested = props.resourceTarget !== null && dismissedTargetKey !== resourceTargetKey;
   const catalogInput = useMemo(() => (projectId ? { projectId } : {}), [projectId]);
   useAtomValue(managedTextResourcesEnvironment.changes({ environmentId, input: catalogInput }));
   const catalog = useEnvironmentQuery(
     managedTextResourcesEnvironment.catalog({ environmentId, input: catalogInput }),
   );
   const entries = catalog.data?.entries ?? [];
-  const visibleEntries = entries.filter((entry) => entry.kind === kind);
-  const selected = entries.find((entry) => resourceToken(entry) === selectedToken) ?? null;
+  const targetKind =
+    props.resourceTarget?.kind === "command" || props.resourceTarget?.kind === "snippet"
+      ? props.resourceTarget.kind
+      : null;
+  const targetScopeId = props.resourceTarget?.scope === "project" ? projectId : environmentId;
+  const targetScopeMatches = targetKind !== null && props.resourceTarget?.scopeId === targetScopeId;
+  const editorScopeKey = `${environmentId}:${projectId ?? "environment"}`;
+  const requestedToken =
+    targetRequested &&
+    targetScopeMatches &&
+    props.resourceTarget?.kind === targetKind &&
+    props.resourceTarget.intent === "item" &&
+    props.resourceTarget.identity === "summary"
+      ? props.resourceTarget.id
+      : null;
+  const targetEntry =
+    entries.find((entry) => resourceToken(entry) === requestedToken && entry.kind === targetKind) ??
+    null;
+  const targetMissing =
+    targetRequested &&
+    (!targetScopeMatches ||
+      targetKind === null ||
+      props.resourceTarget?.kind !== targetKind ||
+      (props.resourceTarget.intent === "item" &&
+        !catalog.isPending &&
+        !catalog.error &&
+        targetEntry === null));
+  const activeKind = targetRequested && targetScopeMatches && targetKind ? targetKind : kind;
+  const visibleEntries = entries.filter((entry) => entry.kind === activeKind);
+  const selected = targetRequested
+    ? targetEntry
+    : (entries.find((entry) => resourceToken(entry) === selectedToken) ?? null);
+
+  useEffect(() => {
+    if (previousResourceTargetKey.current === resourceTargetKey) return;
+    previousResourceTargetKey.current = resourceTargetKey;
+    setDismissedTargetKey(null);
+  }, [resourceTargetKey]);
 
   const startNew = (nextKind: ManagedTextResourceKind) => {
+    if (resourceTargetKey) setDismissedTargetKey(resourceTargetKey);
     setKind(nextKind);
     setSelectedToken(null);
     setNewEditorVersion((version) => version + 1);
@@ -124,10 +172,11 @@ function ManagedTextResourcesCatalogSettings(props: {
                 <Button
                   key={candidate}
                   type="button"
-                  variant={kind === candidate ? "secondary" : "ghost"}
+                  variant={activeKind === candidate ? "secondary" : "ghost"}
                   size="xs"
-                  aria-pressed={kind === candidate}
+                  aria-pressed={activeKind === candidate}
                   onClick={() => {
+                    if (resourceTargetKey) setDismissedTargetKey(resourceTargetKey);
                     setKind(candidate);
                     setSelectedToken(null);
                   }}
@@ -149,7 +198,7 @@ function ManagedTextResourcesCatalogSettings(props: {
             ) : null}
             {!catalog.isPending && !catalog.error && visibleEntries.length === 0 ? (
               <p className="p-4 text-sm text-muted-foreground">
-                No {kind === "command" ? "commands" : "snippets"} are defined in this scope.
+                No {activeKind === "command" ? "commands" : "snippets"} are defined in this scope.
               </p>
             ) : null}
             {visibleEntries.map((entry) => {
@@ -158,11 +207,18 @@ function ManagedTextResourcesCatalogSettings(props: {
                 <button
                   key={resourceToken(entry)}
                   type="button"
-                  aria-current={resourceToken(entry) === selectedToken ? "true" : undefined}
-                  className={`grid w-full gap-1 border-b border-border/40 px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${resourceToken(entry) === selectedToken ? "bg-accent/70" : "hover:bg-accent/40"}`}
+                  aria-current={
+                    resourceToken(entry) === (targetRequested ? requestedToken : selectedToken)
+                      ? "true"
+                      : undefined
+                  }
+                  className={`grid w-full gap-1 border-b border-border/40 px-3 py-2.5 text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${resourceToken(entry) === (targetRequested ? requestedToken : selectedToken) ? "bg-accent/70" : "hover:bg-accent/40"}`}
                   onClick={() => {
+                    if (resourceTargetKey) setDismissedTargetKey(resourceTargetKey);
                     setSelectedToken(resourceToken(entry));
-                    setSelectionVersion((version) => version + 1);
+                    if (resourceToken(entry) !== selectedToken) {
+                      setSelectionVersion((version) => version + 1);
+                    }
                   }}
                 >
                   <span className="flex min-w-0 items-center gap-2">
@@ -182,22 +238,50 @@ function ManagedTextResourcesCatalogSettings(props: {
               );
             })}
           </div>
-          <ManagedTextResourceEditor
-            key={
-              selectedToken
-                ? `selected:${environmentId}:${projectId ?? "environment"}:${selectionVersion}`
-                : `new:${environmentId}:${projectId ?? "environment"}:${kind}:${newEditorVersion}`
-            }
-            environmentId={environmentId}
-            {...(projectId ? { projectId } : {})}
-            kind={kind}
-            selected={selected?.kind === kind ? selected : null}
-            catalogRevision={catalog.data?.catalogRevision ?? null}
-            catalogPending={catalog.isPending || Boolean(catalog.error)}
-            refreshCatalog={catalog.refresh}
-            onSelectionChange={(entry) => setSelectedToken(resourceToken(entry))}
-            onResetSelection={() => setSelectedToken(null)}
-          />
+          {targetMissing ? (
+            <div
+              className="grid place-items-center p-8 text-sm text-muted-foreground"
+              role="status"
+            >
+              This command or snippet target is no longer available in the selected catalog.
+            </div>
+          ) : targetRequested && props.resourceTarget?.intent === "item" && catalog.error ? (
+            <div
+              className="grid place-items-center gap-2 p-8 text-sm text-muted-foreground"
+              role="status"
+            >
+              <p>The catalog could not be read to find this resource.</p>
+              <Button type="button" variant="outline" size="xs" onClick={catalog.refresh}>
+                Retry catalog
+              </Button>
+            </div>
+          ) : targetRequested && props.resourceTarget?.intent === "item" && catalog.isPending ? (
+            <div
+              className="grid place-items-center p-8 text-sm text-muted-foreground"
+              role="status"
+            >
+              Reading catalog to find the requested resource…
+            </div>
+          ) : (
+            <ManagedTextResourceEditor
+              key={`${editorScopeKey}:${activeKind}:${targetRequested ? resourceTargetKey : "manual"}:${selectedToken ?? requestedToken ?? "new"}:${selectionVersion}:${newEditorVersion}`}
+              environmentId={environmentId}
+              {...(projectId ? { projectId } : {})}
+              kind={activeKind}
+              selected={selected?.kind === activeKind ? selected : null}
+              catalogRevision={catalog.data?.catalogRevision ?? null}
+              catalogPending={catalog.isPending || Boolean(catalog.error)}
+              refreshCatalog={catalog.refresh}
+              onSelectionChange={(entry) => {
+                if (resourceTargetKey) setDismissedTargetKey(resourceTargetKey);
+                setSelectedToken(resourceToken(entry));
+              }}
+              onResetSelection={() => {
+                if (resourceTargetKey) setDismissedTargetKey(resourceTargetKey);
+                setSelectedToken(null);
+              }}
+            />
+          )}
         </div>
       </SettingsSection>
       <p className="px-3 text-xs text-muted-foreground">

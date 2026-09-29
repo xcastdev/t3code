@@ -8,46 +8,8 @@ import {
   createEnvironmentRpcQueryAtomFamily,
   createEnvironmentSubscriptionAtomFamily,
 } from "./runtime.ts";
-import { Atom } from "effect/unstable/reactivity";
+import { Atom, type AtomRegistry } from "effect/unstable/reactivity";
 import { subscribe, type EnvironmentRpcInput } from "../rpc/client.ts";
-
-const catalogInvalidationAtom = Atom.family((key: string) =>
-  Atom.make(0).pipe(Atom.keepAlive, Atom.withLabel(`mcp-catalog-invalidation:${key}`)),
-);
-
-const globalRefresh = (target: {
-  readonly environmentId: EnvironmentId;
-  readonly input: { readonly scopeId: string };
-}) =>
-  catalogInvalidationAtom(
-    mcpCatalogScopeKey({
-      environmentId: target.environmentId,
-      scope: "global",
-      scopeId: target.input.scopeId,
-    }),
-  );
-const projectRefresh = (target: {
-  readonly environmentId: EnvironmentId;
-  readonly input: { readonly scopeId: string };
-}) =>
-  catalogInvalidationAtom(
-    mcpCatalogScopeKey({
-      environmentId: target.environmentId,
-      scope: "project",
-      scopeId: target.input.scopeId,
-    }),
-  );
-const sessionRefresh = (target: {
-  readonly environmentId: EnvironmentId;
-  readonly input: { readonly mcpCatalogSessionId: string };
-}) =>
-  catalogInvalidationAtom(
-    mcpCatalogScopeKey({
-      environmentId: target.environmentId,
-      scope: "session",
-      scopeId: target.input.mcpCatalogSessionId,
-    }),
-  );
 
 /** Stable scope key used to serialize catalog mutations without blocking other scopes. */
 export const mcpCatalogScopeKey = (input: {
@@ -55,6 +17,40 @@ export const mcpCatalogScopeKey = (input: {
   readonly scope: string;
   readonly scopeId: string;
 }): string => `${input.environmentId}:${input.scope}:${input.scopeId}`;
+
+export function makeMcpCatalogInvalidationSignals() {
+  const revisions = Atom.family((key: string) =>
+    Atom.make(0).pipe(Atom.keepAlive, Atom.withLabel(`mcp-catalog-invalidation:${key}`)),
+  );
+  const signal = (environmentId: EnvironmentId, scope: string, scopeId: string) =>
+    revisions(mcpCatalogScopeKey({ environmentId, scope, scopeId }));
+  const global = (target: {
+    readonly environmentId: EnvironmentId;
+    readonly input: { readonly scopeId: string };
+  }) => signal(target.environmentId, "global", target.input.scopeId);
+  const project = (target: {
+    readonly environmentId: EnvironmentId;
+    readonly input: { readonly scopeId: string };
+  }) =>
+    Atom.make(
+      (get) =>
+        `${get(signal(target.environmentId, "global", target.environmentId))}:${get(signal(target.environmentId, "project", target.input.scopeId))}`,
+    );
+  const session = (target: {
+    readonly environmentId: EnvironmentId;
+    readonly input: { readonly mcpCatalogSessionId: string };
+  }) => signal(target.environmentId, "session", target.input.mcpCatalogSessionId);
+  const publish = (
+    environmentId: EnvironmentId,
+    change: { readonly scope: string; readonly scopeId: string },
+    registry: AtomRegistry.AtomRegistry,
+  ) =>
+    registry.update(
+      signal(environmentId, change.scope, change.scopeId),
+      (revision) => revision + 1,
+    );
+  return { global, project, session, publish };
+}
 
 const scheduler = createAtomCommandScheduler();
 const serialScope: AtomCommandConcurrency<{
@@ -87,31 +83,32 @@ const serialScope: AtomCommandConcurrency<{
 export function createMcpCatalogEnvironmentAtoms<R, E>(
   runtime: import("effect/unstable/reactivity").Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
+  const invalidation = makeMcpCatalogInvalidationSignals();
   return {
     globalList: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:mcp-catalog:global-list",
       tag: WS_METHODS.mcpCatalogGlobalList,
-      refreshTrigger: globalRefresh,
+      refreshTrigger: invalidation.global,
     }),
     globalState: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:mcp-catalog:global-state",
       tag: WS_METHODS.mcpCatalogGlobalStateList,
-      refreshTrigger: globalRefresh,
+      refreshTrigger: invalidation.global,
     }),
     projectList: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:mcp-catalog:project-list",
       tag: WS_METHODS.mcpCatalogProjectList,
-      refreshTrigger: projectRefresh,
+      refreshTrigger: invalidation.project,
     }),
     projectState: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:mcp-catalog:project-state",
       tag: WS_METHODS.mcpCatalogProjectStateList,
-      refreshTrigger: projectRefresh,
+      refreshTrigger: invalidation.project,
     }),
     sessionGet: createEnvironmentRpcQueryAtomFamily(runtime, {
       label: "environment-data:mcp-catalog:session-get",
       tag: WS_METHODS.mcpCatalogSessionGet,
-      refreshTrigger: sessionRefresh,
+      refreshTrigger: invalidation.session,
     }),
     globalCreate: createEnvironmentRpcCommand(runtime, {
       label: "environment-command:mcp-catalog:global-create",
@@ -210,16 +207,7 @@ export function createMcpCatalogEnvironmentAtoms<R, E>(
         subscribe(WS_METHODS.mcpCatalogSubscribe, input),
       onValue: (target, value, registry) =>
         Effect.sync(() => {
-          registry.update(
-            catalogInvalidationAtom(
-              mcpCatalogScopeKey({
-                environmentId: target.environmentId,
-                scope: value.scope,
-                scopeId: value.scopeId,
-              }),
-            ),
-            (revision) => revision + 1,
-          );
+          invalidation.publish(target.environmentId, value, registry);
         }),
     }),
   };

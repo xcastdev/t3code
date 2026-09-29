@@ -9,7 +9,7 @@ import {
   type SkillManagedCatalogSummary,
 } from "@t3tools/contracts";
 import { BookOpenIcon, CloudCogIcon, ImportIcon, PlusIcon, RotateCcwIcon } from "lucide-react";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { useSettingsScope } from "../../components/settings/SettingsScopeContext";
 import { SettingsPageContainer, SettingsSection } from "../../components/settings/settingsLayout";
@@ -21,6 +21,7 @@ import { skillsEnvironment } from "../../state/skills";
 import { useAtomCommand } from "../../state/use-atom-command";
 import { useEnvironmentQuery } from "../../state/query";
 import { compatibilityLabel, skillStatusLabel, skillSurfaceSections } from "./skillCatalogModel";
+import type { ResourceTarget } from "../resources/resourceTarget";
 
 function SkillRow({
   entry,
@@ -583,7 +584,11 @@ function NativeSkillDetail({
   );
 }
 
-export function SkillsSettings() {
+export function SkillsSettings({
+  resourceTarget = null,
+}: {
+  readonly resourceTarget?: ResourceTarget | null;
+}) {
   const { target } = useSettingsScope();
   const environmentId = target?.environmentId;
   const projectId = target?.projectId;
@@ -599,12 +604,66 @@ export function SkillsSettings() {
   const [keyDraft, setKeyDraft] = useState("");
   const [nameDraft, setNameDraft] = useState("");
   const [bodyDraft, setBodyDraft] = useState("");
+  const targetKey = resourceTarget ? JSON.stringify(resourceTarget) : null;
+  const [dismissedTargetKey, setDismissedTargetKey] = useState<string | null>(null);
+  const previousTargetKey = useRef(targetKey);
+  const targetScopeId = resourceTarget?.scope === "project" ? projectId : environmentId;
+  const targetRequested = resourceTarget !== null && dismissedTargetKey !== targetKey;
+  const matchingSkillTarget =
+    resourceTarget?.kind === "skill" && resourceTarget.scopeId === targetScopeId;
+  const targetCatalogScope = resourceTarget?.scope === "project" ? "project" : "global";
+  const targetCatalogScopeId = resourceTarget?.scope === "project" ? projectId : "global";
+  const targetEntry =
+    targetRequested &&
+    matchingSkillTarget &&
+    resourceTarget?.kind === "skill" &&
+    resourceTarget.intent === "item" &&
+    resourceTarget.identity === "skill"
+      ? ((catalog.data?.entries ?? []).find(
+          (entry) =>
+            entry.origin === "managed" &&
+            entry.id === resourceTarget.id &&
+            entry.scopeId === targetCatalogScopeId &&
+            entry.scope === targetCatalogScope,
+        ) ?? null)
+      : null;
+  const diagnosticLocator =
+    targetRequested &&
+    matchingSkillTarget &&
+    resourceTarget?.kind === "skill" &&
+    resourceTarget.intent === "item" &&
+    resourceTarget.identity === "diagnostic"
+      ? ((catalog.data?.diagnostics ?? []).find(
+          (diagnostic) =>
+            `${diagnostic.scope}:${diagnostic.scopeId}:${diagnostic.name}` === resourceTarget.id &&
+            diagnostic.scopeId === targetCatalogScopeId &&
+            diagnostic.scope === targetCatalogScope,
+        ) ?? null)
+      : null;
+  const targetMissing =
+    targetRequested &&
+    (!matchingSkillTarget ||
+      resourceTarget?.kind !== "skill" ||
+      resourceTarget.intent === "item") &&
+    !catalog.isPending &&
+    !catalog.error &&
+    (!matchingSkillTarget || (targetEntry === null && diagnosticLocator === null));
   const sections = skillSurfaceSections(catalog.data?.entries ?? []);
-  const selected = (catalog.data?.entries ?? []).find((entry) => entry.id === selectedId) ?? null;
+  const selected = targetRequested
+    ? targetEntry
+    : ((catalog.data?.entries ?? []).find((entry) => entry.id === selectedId) ?? null);
 
   useEffect(() => {
-    if (selectedId === null && catalog.data?.entries[0]) setSelectedId(catalog.data.entries[0].id);
-  }, [catalog.data?.entries, selectedId]);
+    if (previousTargetKey.current === targetKey) return;
+    previousTargetKey.current = targetKey;
+    setDismissedTargetKey(null);
+  }, [targetKey]);
+
+  useEffect(() => {
+    if (!targetRequested && selectedId === null && catalog.data?.entries[0]) {
+      setSelectedId(catalog.data.entries[0].id);
+    }
+  }, [catalog.data?.entries, selectedId, targetRequested]);
 
   if (!environmentId) {
     return (
@@ -639,26 +698,39 @@ export function SkillsSettings() {
                   {discovery.discoveryError ? `: ${discovery.discoveryError.message}` : ""}
                 </p>
               ))}
-            {catalog.data?.diagnostics?.map((diagnostic) => (
-              <div
-                key={`${diagnostic.scope}:${diagnostic.scopeId}:${diagnostic.name}`}
-                className="border-b border-border/50 p-3 text-sm"
-                role="status"
-              >
-                <p className="font-medium text-destructive">{diagnostic.name} · Unavailable</p>
-                <p className="text-xs text-muted-foreground">
-                  {diagnostic.scope === "global" ? "Environment skill" : "Project skill"}
-                </p>
-                {diagnostic.reasons.map((reason) => (
-                  <p
-                    key={`${reason.code}:${reason.message}`}
-                    className="mt-1 text-xs text-muted-foreground"
-                  >
-                    {reason.message}
+            {catalog.data?.diagnostics?.map((diagnostic) => {
+              const locator = `${diagnostic.scope}:${diagnostic.scopeId}:${diagnostic.name}`;
+              const highlighted =
+                targetRequested &&
+                resourceTarget?.kind === "skill" &&
+                resourceTarget.intent === "item" &&
+                resourceTarget.identity === "diagnostic" &&
+                resourceTarget.id === locator;
+              return (
+                <div
+                  key={locator}
+                  id={highlighted ? "resource-target-diagnostic" : undefined}
+                  className={`border-b border-border/50 p-3 text-sm ${highlighted ? "bg-accent/70 ring-1 ring-inset ring-ring" : ""}`}
+                  role="status"
+                  onClick={() => {
+                    if (highlighted && targetKey) setDismissedTargetKey(targetKey);
+                  }}
+                >
+                  <p className="font-medium text-destructive">{diagnostic.name} · Unavailable</p>
+                  <p className="text-xs text-muted-foreground">
+                    {diagnostic.scope === "global" ? "Environment skill" : "Project skill"}
                   </p>
-                ))}
-              </div>
-            ))}
+                  {diagnostic.reasons.map((reason) => (
+                    <p
+                      key={`${reason.code}:${reason.message}`}
+                      className="mt-1 text-xs text-muted-foreground"
+                    >
+                      {reason.message}
+                    </p>
+                  ))}
+                </div>
+              );
+            })}
             {sections.managed.length === 0 && sections.native.length === 0 && !catalog.isPending ? (
               <p className="p-4 text-sm text-muted-foreground">
                 {catalog.data?.diagnostics?.length
@@ -670,8 +742,11 @@ export function SkillsSettings() {
               <SkillRow
                 key={entry.id}
                 entry={entry}
-                selected={entry.id === selected?.id}
-                onSelect={() => setSelectedId(entry.id)}
+                selected={entry.id === selected?.id || entry.id === targetEntry?.id}
+                onSelect={() => {
+                  if (targetKey) setDismissedTargetKey(targetKey);
+                  setSelectedId(entry.id);
+                }}
               />
             ))}
             {sections.native.length ? (
@@ -684,11 +759,29 @@ export function SkillsSettings() {
                 key={entry.id}
                 entry={entry}
                 selected={entry.id === selected?.id}
-                onSelect={() => setSelectedId(entry.id)}
+                onSelect={() => {
+                  if (targetKey) setDismissedTargetKey(targetKey);
+                  setSelectedId(entry.id);
+                }}
               />
             ))}
           </div>
-          {selected?.origin === "managed" ? (
+          {targetMissing ? (
+            <div
+              className="grid place-items-center p-8 text-sm text-muted-foreground"
+              role="status"
+            >
+              This skill target is no longer available in the selected catalog.
+            </div>
+          ) : diagnosticLocator ? (
+            <div
+              className="grid place-items-center p-8 text-sm text-muted-foreground"
+              role="status"
+            >
+              This skill has a catalog diagnostic and cannot be opened in the editor. Review its
+              recovery details in the list.
+            </div>
+          ) : selected?.origin === "managed" ? (
             <ManagedSkillEditor
               key={selected.id}
               entry={selected}
@@ -719,7 +812,11 @@ export function SkillsSettings() {
         providerIds={catalog.data?.installProviderInstances ?? []}
       />
 
-      <SettingsSection title="Create a managed skill" icon={<PlusIcon className="size-4" />}>
+      <SettingsSection
+        id="create-managed-skill"
+        title="Create a managed skill"
+        icon={<PlusIcon className="size-4" />}
+      >
         <div className="grid gap-3 p-4">
           <div className="grid gap-3 sm:grid-cols-2">
             <Input

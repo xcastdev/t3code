@@ -515,6 +515,15 @@ export function SettingResetButton({
   );
 }
 
+export const settingsTargetHashClearOptions = {
+  search: true as const,
+  hash: "",
+  replace: true,
+  resetScroll: false,
+  hashScrollIntoView: false,
+  state: { settingsTargetHighlight: true },
+};
+
 export function SettingsPageContainer({
   children,
   className,
@@ -531,13 +540,7 @@ export function SettingsPageContainer({
   });
   const targetId = hash.replace(/^#/, "") || null;
   const clearTargetHash = useCallback(() => {
-    void navigate({
-      hash: "",
-      replace: true,
-      resetScroll: false,
-      hashScrollIntoView: false,
-      state: { settingsTargetHighlight: true },
-    });
+    void navigate(settingsTargetHashClearOptions);
   }, [navigate]);
 
   return (

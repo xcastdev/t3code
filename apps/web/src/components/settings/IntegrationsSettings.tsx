@@ -122,6 +122,7 @@ import {
 import { searchableSetting } from "./settingsSearch";
 import { ProjectDefaultsSettings } from "./ProjectDefaultsSettings";
 import { useSettingsScope } from "./SettingsScopeContext";
+import type { ResourceTarget } from "../../features/resources/resourceTarget";
 import { BrowserImportWizard, type WizardTarget } from "./BrowserImportWizard";
 import type { ImportOutcome } from "./browserImportWizard.logic";
 
@@ -1631,7 +1632,11 @@ function BrowserProfilesSetting({ disabled }: { readonly disabled: boolean }) {
   );
 }
 
-export function IntegrationsSettingsPanel() {
+export function IntegrationsSettingsPanel({
+  resourceTarget = null,
+}: {
+  readonly resourceTarget?: ResourceTarget | null;
+}) {
   // Client-local preview defaults are editable only where the preview exists.
   const previewDefaultsDisabled = !isElectron;
   const previewDefaults = (
@@ -1647,14 +1652,29 @@ export function IntegrationsSettingsPanel() {
   );
   const { environments } = useEnvironments();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const settingsScope = useSettingsScope();
   const [selectedCatalogEnvironment, setSelectedCatalogEnvironment] =
     useState<EnvironmentId | null>(primaryEnvironmentId);
+  const hasExplicitEnvironment = settingsScope.search.machine !== undefined;
+  const selectedEnvironment = hasExplicitEnvironment
+    ? (environments.find((entry) => entry.environmentId === settingsScope.search.machine) ?? null)
+    : (environments.find((entry) => entry.environmentId === selectedCatalogEnvironment) ??
+      environments.find((entry) => entry.connection.phase === "connected") ??
+      null);
+  const explicitEnvironmentUnavailable =
+    hasExplicitEnvironment &&
+    (selectedEnvironment === null ||
+      selectedEnvironment.connection.phase !== "connected" ||
+      selectedEnvironment.serverConfig === null);
   const catalogEnvironmentId =
-    (selectedCatalogEnvironment &&
-      environments.some((entry) => entry.environmentId === selectedCatalogEnvironment) &&
-      selectedCatalogEnvironment) ||
-    environments[0]?.environmentId ||
-    null;
+    selectedEnvironment?.connection.phase === "connected" && selectedEnvironment.serverConfig
+      ? selectedEnvironment.environmentId
+      : null;
+  const resourceTargetMatches =
+    resourceTarget === null ||
+    (resourceTarget.kind === "mcp" &&
+      resourceTarget.scope === "environment" &&
+      resourceTarget.scopeId === catalogEnvironmentId);
   const catalogConfig = useAtomValue(
     serverEnvironment.configValueAtom(catalogEnvironmentId ?? ("" as EnvironmentId)),
   );
@@ -1664,9 +1684,17 @@ export function IntegrationsSettingsPanel() {
       {/* Server-authoritative agent access is scoped by the header selection;
           the preview defaults below are device-local and ignore it. */}
       <ProjectDefaultsSettings category="integrations" />
-      {catalogEnvironmentId ? (
+      {explicitEnvironmentUnavailable ? (
+        <p className="text-sm text-muted-foreground" role="status">
+          The selected MCP environment is unavailable. Reconnect it to open its catalog.
+        </p>
+      ) : !resourceTargetMatches ? (
+        <p className="text-sm text-muted-foreground" role="status">
+          This MCP target does not belong to the selected environment.
+        </p>
+      ) : catalogEnvironmentId ? (
         <>
-          {environments.length > 1 ? (
+          {environments.length > 1 && !hasExplicitEnvironment ? (
             <div className="flex flex-wrap gap-1" role="tablist" aria-label="MCP environment">
               {environments.map((entry) => (
                 <button
@@ -1688,6 +1716,7 @@ export function IntegrationsSettingsPanel() {
               key={catalogEnvironmentId}
               environmentId={catalogEnvironmentId}
               providers={catalogConfig.providers}
+              resourceTarget={resourceTarget}
             />
           ) : null}
         </>

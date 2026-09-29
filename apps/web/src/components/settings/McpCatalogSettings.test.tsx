@@ -41,10 +41,14 @@ const settings = (config: Record<string, unknown>) => ({
 
 const atoms = vi.hoisted(() => ({
   projectState: Symbol("projectState"),
+  globalState: Symbol("globalState"),
   changes: Symbol("changes"),
   create: Symbol("create"),
   update: Symbol("update"),
   remove: Symbol("remove"),
+  globalCreate: Symbol("globalCreate"),
+  globalUpdate: Symbol("globalUpdate"),
+  globalRemove: Symbol("globalRemove"),
   override: Symbol("override"),
   deleteOverride: Symbol("deleteOverride"),
   oauthBegin: Symbol("oauthBegin"),
@@ -53,12 +57,7 @@ const atoms = vi.hoisted(() => ({
 }));
 
 const query = vi.hoisted(() => ({
-  data: {
-    globalDefinitions: [],
-    projectDefinitions: [],
-    projectOverrides: [],
-    projectRevision: 0,
-  },
+  data: null as unknown,
   isPending: false,
 }));
 
@@ -69,12 +68,16 @@ const commands = vi.hoisted(() => ({
 vi.mock("../../state/projects", () => ({
   mcpCatalogEnvironment: {
     projectState: () => atoms.projectState,
+    globalState: () => atoms.globalState,
     changes: () => atoms.changes,
     projectCreate: atoms.create,
     projectUpdate: atoms.update,
     projectRemove: atoms.remove,
     projectOverride: atoms.override,
     projectDeleteOverride: atoms.deleteOverride,
+    globalCreate: atoms.globalCreate,
+    globalUpdate: atoms.globalUpdate,
+    globalRemove: atoms.globalRemove,
     oauthBegin: atoms.oauthBegin,
     oauthContinue: atoms.oauthContinue,
     oauthDisconnect: atoms.oauthDisconnect,
@@ -134,7 +137,7 @@ vi.mock("./settingsLayout", () => ({
   ),
 }));
 
-import { McpCatalogProjectSettings } from "./McpCatalogSettings";
+import { McpCatalogProjectSettings, McpCatalogSettings } from "./McpCatalogSettings";
 
 describe("scoped MCP editor draft handling", () => {
   it("keeps local edits when a subscription refresh arrives", () => {
@@ -212,5 +215,267 @@ describe("scoped OpenCode MCP warning", () => {
       instanceId: opencodeId,
     });
     expect(link.props.hash).toBe("provider-instance-opencode-manageExternalMcp");
+  });
+
+  it("opens a global MCP definition target in the selected environment editor", async () => {
+    const environmentId = EnvironmentId.make("environment");
+    const definition = {
+      definitionId: "global-definition",
+      logicalServerId: "weather-server",
+      scope: "global",
+      scopeId: environmentId,
+      name: "Weather service",
+      transport: {
+        type: "streamable-http",
+        url: "https://weather.example/mcp",
+        headers: [],
+        authorization: { type: "none" },
+      },
+      enabled: true,
+      providerInstanceIds: [],
+      revision: 1,
+    };
+    query.data = { definitions: [definition], globalRevision: 1 };
+    await act(() => {
+      renderer = create(
+        <McpCatalogSettings
+          environmentId={environmentId}
+          providers={[]}
+          resourceTarget={{
+            namespace: "t3-resource",
+            version: 1,
+            kind: "mcp",
+            scope: "environment",
+            scopeId: environmentId,
+            intent: "item",
+            identity: "definition",
+            id: definition.definitionId,
+          }}
+        />,
+      );
+    });
+
+    expect(renderer!.root.findByProps({ "aria-label": "MCP server name" }).props.value).toBe(
+      "Weather service",
+    );
+    expect(
+      renderer!.root.findAllByType("button").some((button) => button.children.join("") === "Save"),
+    ).toBe(true);
+  });
+
+  it("opens inherited and project override MCP targets in the matching project form", async () => {
+    const environmentId = EnvironmentId.make("environment");
+    const projectId = ProjectId.make("project");
+    const inherited = {
+      definitionId: "inherited-definition",
+      logicalServerId: "weather-server",
+      scope: "global",
+      scopeId: environmentId,
+      name: "Weather service",
+      transport: {
+        type: "streamable-http",
+        url: "https://weather.example/mcp",
+        headers: [],
+        authorization: { type: "none" },
+      },
+      enabled: true,
+      providerInstanceIds: [],
+      revision: 1,
+    };
+    const local = {
+      ...inherited,
+      definitionId: "local-definition",
+      logicalServerId: "local-server",
+      scope: "project",
+      scopeId: projectId,
+      name: "Local server",
+    };
+    const override = {
+      id: "weather-override",
+      scope: "project",
+      scopeId: projectId,
+      targetId: "weather-server",
+      enabled: false,
+      name: "Project weather",
+    };
+    const renderProjectTarget = async (
+      resourceTarget: React.ComponentProps<typeof McpCatalogProjectSettings>["resourceTarget"],
+    ) => {
+      await act(() => {
+        renderer = create(
+          <McpCatalogProjectSettings
+            environmentId={environmentId}
+            projectId={projectId}
+            providers={[]}
+            {...(resourceTarget === undefined ? {} : { resourceTarget })}
+          />,
+        );
+      });
+      return renderer!;
+    };
+
+    query.data = {
+      globalDefinitions: [inherited],
+      projectDefinitions: [local],
+      projectOverrides: [],
+      projectRevision: 1,
+    };
+    const localPage = await renderProjectTarget({
+      namespace: "t3-resource",
+      version: 1,
+      kind: "mcp",
+      scope: "project",
+      scopeId: projectId,
+      intent: "item",
+      identity: "definition",
+      id: local.definitionId,
+    });
+    expect(
+      localPage.root.findByProps({ "aria-label": "Project MCP server name" }).props.value,
+    ).toBe("Local server");
+    expect(
+      localPage.root
+        .findAllByType("button")
+        .some((button) => button.children.join("") === "Save local"),
+    ).toBe(true);
+    await act(() => localPage.unmount());
+    renderer = undefined;
+
+    query.data = {
+      globalDefinitions: [inherited],
+      projectDefinitions: [],
+      projectOverrides: [],
+      projectRevision: 1,
+    };
+    const inheritedPage = await renderProjectTarget({
+      namespace: "t3-resource",
+      version: 1,
+      kind: "mcp",
+      scope: "project",
+      scopeId: projectId,
+      intent: "item",
+      identity: "definition",
+      id: inherited.definitionId,
+    });
+    expect(
+      inheritedPage.root.findByProps({ "aria-label": "Project MCP server name" }).props.value,
+    ).toBe("Weather service");
+    expect(
+      inheritedPage.root
+        .findAllByType("button")
+        .some((button) => button.children.join("") === "Save override"),
+    ).toBe(true);
+    await act(() => inheritedPage.unmount());
+    renderer = undefined;
+
+    query.data = {
+      globalDefinitions: [inherited],
+      projectDefinitions: [],
+      projectOverrides: [override],
+      projectRevision: 2,
+    };
+    const overridePage = await renderProjectTarget({
+      namespace: "t3-resource",
+      version: 1,
+      kind: "mcp",
+      scope: "project",
+      scopeId: projectId,
+      intent: "item",
+      identity: "override",
+      id: override.id,
+    });
+    expect(
+      overridePage.root.findByProps({ "aria-label": "Project MCP server name" }).props.value,
+    ).toBe("Project weather");
+    expect(
+      overridePage.root
+        .findAllByType("button")
+        .some((button) => button.children.join("") === "Save override"),
+    ).toBe(true);
+  });
+
+  it("shows orphan and stale MCP targets only as recovery or missing states", async () => {
+    const environmentId = EnvironmentId.make("environment");
+    const projectId = ProjectId.make("project");
+    const orphan = {
+      id: "orphan-override",
+      scope: "project",
+      scopeId: projectId,
+      targetId: "removed-server",
+      name: "Removed server",
+    };
+    query.data = {
+      globalDefinitions: [],
+      projectDefinitions: [],
+      projectOverrides: [orphan],
+      projectRevision: 2,
+    };
+    await act(() => {
+      renderer = create(
+        <McpCatalogProjectSettings
+          environmentId={environmentId}
+          projectId={projectId}
+          providers={[]}
+          resourceTarget={{
+            namespace: "t3-resource",
+            version: 1,
+            kind: "mcp",
+            scope: "project",
+            scopeId: projectId,
+            intent: "item",
+            identity: "orphan-override",
+            id: orphan.id,
+          }}
+        />,
+      );
+    });
+
+    expect(renderer!.root.findAllByProps({ "aria-label": "Project MCP server name" })).toHaveLength(
+      0,
+    );
+    expect(
+      renderer!.root
+        .findAllByType("button")
+        .some((button) => button.children.join("") === "Edit override"),
+    ).toBe(false);
+    expect(
+      renderer!.root.findAll(
+        (node) => node.type === "p" && node.children.join("").includes("removed"),
+      ),
+    ).not.toHaveLength(0);
+    await act(() => renderer!.unmount());
+    renderer = undefined;
+
+    query.data = {
+      globalDefinitions: [],
+      projectDefinitions: [],
+      projectOverrides: [],
+      projectRevision: 2,
+    };
+    await act(() => {
+      renderer = create(
+        <McpCatalogProjectSettings
+          environmentId={environmentId}
+          projectId={projectId}
+          providers={[]}
+          resourceTarget={{
+            namespace: "t3-resource",
+            version: 1,
+            kind: "mcp",
+            scope: "project",
+            scopeId: projectId,
+            intent: "item",
+            identity: "definition",
+            id: "deleted-definition",
+          }}
+        />,
+      );
+    });
+    expect(renderer!.root.findByProps({ role: "status" }).children.join("")).toContain(
+      "no longer available",
+    );
+    expect(renderer!.root.findAllByProps({ "aria-label": "Project MCP server name" })).toHaveLength(
+      0,
+    );
   });
 });

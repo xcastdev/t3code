@@ -228,6 +228,7 @@ describe("searchSettings", () => {
       scope: "project-defaults",
     });
     expect(SETTINGS_SECTION_LABELS["/settings/commands"]).toBe("Commands");
+    expect(SETTINGS_SECTION_LABELS["/settings/resources"]).toBe("Resources");
     expect(searchSettings("slash commands").map((candidate) => candidate.id)).toContain(
       "managed-text-resources",
     );

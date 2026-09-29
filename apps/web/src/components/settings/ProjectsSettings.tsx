@@ -3,9 +3,14 @@ import { EnvironmentId } from "@t3tools/contracts";
 import { ProjectSettingsPanel } from "./ProjectSettingsPanel";
 import { useSettingsScope } from "./SettingsScopeContext";
 import { SettingsScopeNotice } from "./SettingsScopeNotice";
+import type { ResourceTarget } from "../../features/resources/resourceTarget";
 
 /** Project identity and checkout management for the selected project. */
-export function ProjectsSettings() {
+export function ProjectsSettings({
+  resourceTarget = null,
+}: {
+  readonly resourceTarget?: ResourceTarget | null;
+}) {
   const { search: value, scope } = useSettingsScope();
   // The panel follows remembered members when grouping replaces a project key.
   const projectScope =
@@ -20,6 +25,7 @@ export function ProjectsSettings() {
           projectKey={value.project}
           environmentId={value.machine ? EnvironmentId.make(value.machine) : null}
           checkoutKey={value.checkout ?? null}
+          resourceTarget={resourceTarget}
         />
       ) : scope.kind === "unavailable" ? (
         <p className="p-8 text-sm text-muted-foreground">{scope.message}</p>

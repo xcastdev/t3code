@@ -59,6 +59,7 @@ import {
 } from "./ProjectSettingsPanel.logic";
 import { useSettingsProjectGroups } from "./useSettingsProjectGroups";
 import { useScopedSettings } from "./useScopedSettings";
+import type { ResourceTarget } from "../../features/resources/resourceTarget";
 
 const ProjectIconPickerDialog = lazy(() =>
   import("./ProjectIconPickerDialog").then((module) => ({
@@ -91,10 +92,12 @@ export function ProjectSettingsPanel({
   projectKey,
   environmentId = null,
   checkoutKey = null,
+  resourceTarget = null,
 }: {
   projectKey: string;
   environmentId?: EnvironmentId | null;
   checkoutKey?: string | null;
+  resourceTarget?: ResourceTarget | null;
 }) {
   const groups = useSettingsProjectGroups();
   const navigate = useNavigate({ from: "/settings" });
@@ -183,6 +186,7 @@ export function ProjectSettingsPanel({
       key={`${selected.projectKey}:${environmentId ?? "all"}:${checkoutKey ?? "all"}`}
       group={scopedGroup}
       hasOtherMembers={members.length < selected.memberProjects.length}
+      resourceTarget={resourceTarget}
     />
   );
 }
@@ -190,9 +194,11 @@ export function ProjectSettingsPanel({
 function ProjectDetail({
   group,
   hasOtherMembers,
+  resourceTarget,
 }: {
   group: SidebarProjectSnapshot;
   hasOtherMembers: boolean;
+  resourceTarget: ResourceTarget | null;
 }) {
   const navigate = useNavigate({ from: "/settings" });
   const primaryEnvironmentId = usePrimaryEnvironmentId();
@@ -903,6 +909,7 @@ function ProjectDetail({
         <ProjectMcpSettings
           environmentId={representative.environmentId}
           projectId={representative.id}
+          resourceTarget={resourceTarget}
         />
         <SettingsSection title="Danger">
           <SettingsRow

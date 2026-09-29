@@ -16,6 +16,8 @@ export interface SettingsScopeSearch {
   project?: string | undefined;
   machine?: string | undefined;
   checkout?: string | undefined;
+  /** Validated again by the editor route that consumes this optional deep link. */
+  resource?: string | undefined;
 }
 
 type ScopeTargets = {
@@ -53,10 +55,12 @@ export function validateSettingsScopeSearch(raw: Record<string, unknown>): Setti
   const project = stringValue(raw.project);
   const machine = stringValue(raw.machine);
   const checkout = stringValue(raw.checkout);
+  const resource = stringValue(raw.resource);
   return {
     ...(project === undefined ? {} : { project }),
     ...(machine === undefined ? {} : { machine }),
     ...(checkout === undefined ? {} : { checkout }),
+    ...(resource === undefined ? {} : { resource }),
   };
 }
 

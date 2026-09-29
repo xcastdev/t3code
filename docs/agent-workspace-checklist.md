@@ -4,7 +4,8 @@ Status at the current checkout. This tracks the [workspace direction](https://gi
 
 1. **MCP management and shared resource catalog**
    - [x] Manage scoped MCP definitions, credentials, provider assignments, and session application through the [MCP catalog](../apps/server/src/mcp/McpCatalogService.ts) and [web settings](../apps/web/src/components/settings/McpCatalogSettings.tsx).
-   - [ ] Extend the catalog concept to the other agent resource types. The current MCP catalog and [skill catalog](../apps/server/src/skills/SkillCatalogService.ts) are separate services.
+   - [x] Provide a shared web and desktop inventory for managed MCP servers, skills, commands, and snippets through [Resources settings](../apps/web/src/features/resources/ResourcesSettings.tsx). The underlying MCP, skill, and text-resource catalogs remain separate services.
+   - [ ] Unify catalog services behind one cross-resource API. The current MCP catalog and [skill catalog](../apps/server/src/skills/SkillCatalogService.ts) remain separate services.
    - [ ] Add mobile editing for scoped MCP catalogs. Mobile currently consumes configured catalogs; see the [scope rules](internals/mcp-catalog-scopes.md#compatibility).
 
 2. **Durable project knowledge and tracked tasks, with MCP access**

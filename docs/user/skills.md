@@ -1,8 +1,8 @@
 # Skills
 
-Open **Settings > Skills** to create or import a T3-managed skill. A skill saved for an environment is available to its projects; a project override applies only to that project. In a thread, **Session skills** lets you use or disable a managed skill for that thread's provider. Changes to session delivery take effect when the provider starts a new session.
+Open **Settings > Resources** on web or desktop to find managed skills and open their editor. Choose **Skill** to create or import one. A skill saved for an environment is available to its projects; a project override applies only to that project. In a thread, **Session skills** lets you use or disable a managed skill for that thread's provider. Changes to session delivery take effect when the provider starts a new session.
 
-To keep a skill available outside T3, select it in **Settings > Skills**, choose a provider instance, and install it to a project or user directory. You can update or uninstall a T3-owned copy there. **Installed copies** also lets you remove a copy after its T3 source has been renamed or deleted. T3 will not replace a provider-owned skill or overwrite an installed copy changed outside T3. Installed skills are visible to other clients using the same provider directory.
+To keep a skill available outside T3, select it in **Settings > Resources**, open its editor, choose a provider instance, and install it to a project or user directory. You can update or uninstall a T3-owned copy there. **Installed copies** also lets you remove a copy after its T3 source has been renamed or deleted. T3 will not replace a provider-owned skill or overwrite an installed copy changed outside T3. Installed skills are visible to other clients using the same provider directory.
 
 The install choices show their exact directory and which providers read it. A provider-specific install uses that provider's native directory. Shared `.agents` installs use these readers:
 

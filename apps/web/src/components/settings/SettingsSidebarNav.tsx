@@ -20,6 +20,7 @@ import {
   KeyboardIcon,
   Link2Icon,
   PaletteIcon,
+  PackageOpenIcon,
   SearchIcon,
   SparklesIcon,
   Settings2Icon,
@@ -83,6 +84,7 @@ const SETTINGS_SECTION_ICONS: Readonly<
   "/settings/keybindings": KeyboardIcon,
   "/settings/snap-shot": SnapShotIcon,
   "/settings/providers": BotIcon,
+  "/settings/resources": PackageOpenIcon,
   "/settings/skills": SparklesIcon,
   "/settings/commands": FileTextIcon,
   "/settings/integrations": BlocksIcon,
@@ -101,6 +103,8 @@ const SETTINGS_NAV_ITEMS: ReadonlyArray<{
   icon: SETTINGS_SECTION_ICONS[to],
 }));
 
+const HIDDEN_SETTINGS_NAV_ITEMS = new Set<SettingsPath>(["/settings/skills", "/settings/commands"]);
+
 function SettingsSectionIcon({ to }: { to: SettingsPath }) {
   const Icon = SETTINGS_SECTION_ICONS[to];
   return <Icon className="mt-0.5 size-3.5 shrink-0 text-sidebar-muted-foreground/60" />;
@@ -112,7 +116,9 @@ export function SettingsSidebarNav({ pathname }: { pathname: string }) {
   const currentSearch = useLocation({ select: (location) => location.search });
   const scopeSearch = useMemo(() => validateSettingsScopeSearch(currentSearch), [currentSearch]);
   const navItems = SETTINGS_NAV_ITEMS.filter(
-    (item) => item.to !== "/settings/projects" || isSettingsOverviewVisible(scopeSearch),
+    (item) =>
+      !HIDDEN_SETTINGS_NAV_ITEMS.has(item.to) &&
+      (item.to !== "/settings/projects" || isSettingsOverviewVisible(scopeSearch)),
   );
   const { isMobile, setOpenMobile, open, setOpen } = useSidebar();
   const searchInputRef = useRef<HTMLInputElement>(null);

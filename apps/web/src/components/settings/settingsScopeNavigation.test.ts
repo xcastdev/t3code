@@ -9,6 +9,7 @@ import {
 import { describe, expect, it } from "vite-plus/test";
 
 import { resolveSettingsScope } from "./settingsScope";
+import { settingsTargetHashClearOptions } from "./settingsLayout";
 import { retainSettingsScope, validateSettingsRouteSearch } from "./settingsScopeNavigation";
 
 const checkoutSearch = {
@@ -32,6 +33,8 @@ function createSettingsRouter(initialEntry = "/settings/general") {
   });
   const general = createRoute({ getParentRoute: () => settings, path: "general" });
   const projects = createRoute({ getParentRoute: () => settings, path: "projects" });
+  const resources = createRoute({ getParentRoute: () => settings, path: "resources" });
+  const skills = createRoute({ getParentRoute: () => settings, path: "skills" });
   const integrations = createRoute({ getParentRoute: () => settings, path: "integrations" });
   const sourceControl = createRoute({ getParentRoute: () => settings, path: "source-control" });
   const providers = createRoute({
@@ -59,7 +62,15 @@ function createSettingsRouter(initialEntry = "/settings/general") {
   });
   return createRouter({
     routeTree: root.addChildren([
-      settings.addChildren([general, projects, integrations, sourceControl, providers]),
+      settings.addChildren([
+        general,
+        projects,
+        resources,
+        skills,
+        integrations,
+        sourceControl,
+        providers,
+      ]),
       legacyProject,
     ]),
     history: createMemoryHistory({ initialEntries: [initialEntry] }),
@@ -104,6 +115,33 @@ describe("settings scope navigation", () => {
     expect(router.state.location.hash).toBe("source-control-writing-style");
     await router.navigate({ to: "/settings/projects", hash: "project-defaults" });
     expect(router.state.location.search).toEqual(checkoutSearch);
+  });
+
+  it("keeps a resource target for its explicit editor link and drops it on category navigation", async () => {
+    const router = createSettingsRouter();
+    const resource = "t3-resource-v1:encoded-target";
+    const targetSearch = { ...checkoutSearch, resource };
+
+    await router.navigate({ to: "/settings/resources", search: targetSearch });
+    expect(router.state.location.search).toEqual(targetSearch);
+    await router.navigate({ to: "/settings/skills", search: targetSearch });
+    expect(router.state.location.search).toEqual(targetSearch);
+    await router.navigate({ to: "/settings/projects" });
+    expect(router.state.location.search).toEqual(checkoutSearch);
+  });
+
+  it("keeps a create target after the settings section consumes its hash", async () => {
+    const router = createSettingsRouter();
+    const resource = "t3-resource-v1:encoded-create-target";
+    await router.navigate({ to: "/settings/resources", search: { machine: "remote-server" } });
+    await router.navigate({
+      to: "/settings/skills",
+      search: { machine: "remote-server", resource },
+      hash: "create-managed-skill",
+    });
+    await router.navigate(settingsTargetHashClearOptions);
+    expect(router.state.location.search).toEqual({ machine: "remote-server", resource });
+    expect(router.state.location.hash).toBe("");
   });
 
   it.each(["/settings/projects", "/settings/integrations", "/settings/source-control"] as const)(

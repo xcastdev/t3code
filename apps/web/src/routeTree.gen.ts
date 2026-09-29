@@ -19,6 +19,7 @@ import { Route as ChatIndexRouteImport } from './routes/_chat.index'
 import { Route as SettingsSourceControlRouteImport } from './routes/settings.source-control'
 import { Route as SettingsSnapShotRouteImport } from './routes/settings.snap-shot'
 import { Route as SettingsSkillsRouteImport } from './routes/settings.skills'
+import { Route as SettingsResourcesRouteImport } from './routes/settings.resources'
 import { Route as SettingsProvidersRouteImport } from './routes/settings.providers'
 import { Route as SettingsProjectsRouteImport } from './routes/settings.projects'
 import { Route as SettingsOpenSourceLicensesRouteImport } from './routes/settings.open-source-licenses'
@@ -83,6 +84,11 @@ const SettingsSnapShotRoute = SettingsSnapShotRouteImport.update({
 const SettingsSkillsRoute = SettingsSkillsRouteImport.update({
   id: '/skills',
   path: '/skills',
+  getParentRoute: () => SettingsRoute,
+} as any)
+const SettingsResourcesRoute = SettingsResourcesRouteImport.update({
+  id: '/resources',
+  path: '/resources',
   getParentRoute: () => SettingsRoute,
 } as any)
 const SettingsProvidersRoute = SettingsProvidersRouteImport.update({
@@ -189,6 +195,7 @@ export interface FileRoutesByFullPath {
   '/settings/open-source-licenses': typeof SettingsOpenSourceLicensesRoute
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/providers': typeof SettingsProvidersRoute
+  '/settings/resources': typeof SettingsResourcesRoute
   '/settings/skills': typeof SettingsSkillsRoute
   '/settings/snap-shot': typeof SettingsSnapShotRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
@@ -215,6 +222,7 @@ export interface FileRoutesByTo {
   '/settings/open-source-licenses': typeof SettingsOpenSourceLicensesRoute
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/providers': typeof SettingsProvidersRoute
+  '/settings/resources': typeof SettingsResourcesRoute
   '/settings/skills': typeof SettingsSkillsRoute
   '/settings/snap-shot': typeof SettingsSnapShotRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
@@ -244,6 +252,7 @@ export interface FileRoutesById {
   '/settings/open-source-licenses': typeof SettingsOpenSourceLicensesRoute
   '/settings/projects': typeof SettingsProjectsRoute
   '/settings/providers': typeof SettingsProvidersRoute
+  '/settings/resources': typeof SettingsResourcesRoute
   '/settings/skills': typeof SettingsSkillsRoute
   '/settings/snap-shot': typeof SettingsSnapShotRoute
   '/settings/source-control': typeof SettingsSourceControlRoute
@@ -274,6 +283,7 @@ export interface FileRouteTypes {
     | '/settings/open-source-licenses'
     | '/settings/projects'
     | '/settings/providers'
+    | '/settings/resources'
     | '/settings/skills'
     | '/settings/snap-shot'
     | '/settings/source-control'
@@ -300,6 +310,7 @@ export interface FileRouteTypes {
     | '/settings/open-source-licenses'
     | '/settings/projects'
     | '/settings/providers'
+    | '/settings/resources'
     | '/settings/skills'
     | '/settings/snap-shot'
     | '/settings/source-control'
@@ -328,6 +339,7 @@ export interface FileRouteTypes {
     | '/settings/open-source-licenses'
     | '/settings/projects'
     | '/settings/providers'
+    | '/settings/resources'
     | '/settings/skills'
     | '/settings/snap-shot'
     | '/settings/source-control'
@@ -418,6 +430,13 @@ declare module '@tanstack/react-router' {
       path: '/skills'
       fullPath: '/settings/skills'
       preLoaderRoute: typeof SettingsSkillsRouteImport
+      parentRoute: typeof SettingsRoute
+    }
+    '/settings/resources': {
+      id: '/settings/resources'
+      path: '/resources'
+      fullPath: '/settings/resources'
+      preLoaderRoute: typeof SettingsResourcesRouteImport
       parentRoute: typeof SettingsRoute
     }
     '/settings/providers': {
@@ -563,6 +582,7 @@ interface SettingsRouteChildren {
   SettingsOpenSourceLicensesRoute: typeof SettingsOpenSourceLicensesRoute
   SettingsProjectsRoute: typeof SettingsProjectsRoute
   SettingsProvidersRoute: typeof SettingsProvidersRoute
+  SettingsResourcesRoute: typeof SettingsResourcesRoute
   SettingsSkillsRoute: typeof SettingsSkillsRoute
   SettingsSnapShotRoute: typeof SettingsSnapShotRoute
   SettingsSourceControlRoute: typeof SettingsSourceControlRoute
@@ -580,6 +600,7 @@ const SettingsRouteChildren: SettingsRouteChildren = {
   SettingsOpenSourceLicensesRoute: SettingsOpenSourceLicensesRoute,
   SettingsProjectsRoute: SettingsProjectsRoute,
   SettingsProvidersRoute: SettingsProvidersRoute,
+  SettingsResourcesRoute: SettingsResourcesRoute,
   SettingsSkillsRoute: SettingsSkillsRoute,
   SettingsSnapShotRoute: SettingsSnapShotRoute,
   SettingsSourceControlRoute: SettingsSourceControlRoute,

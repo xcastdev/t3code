@@ -1,10 +1,11 @@
 # Project MCP servers
 
-Add MCP servers for a project checkout in **Settings → Integrations → MCP servers** on web or
-desktop. Configured servers run through the selected environment.
+On web or desktop, open **Settings → Resources** to find MCP servers for the selected environment
+or project checkout. Choose an entry to open its existing editor, or choose **MCP server** to add
+one. Configured servers run through the selected environment.
 
-For environments that advertise the scoped catalog, the **MCP catalog** section is also
-available in Integrations and project settings. Global definitions are inherited by projects;
+For environments that advertise the scoped catalog, the **MCP catalog** editor is available in
+Integrations and project settings. Global definitions are inherited by projects;
 project-local definitions and overrides are shown separately. A running thread exposes its
 session catalog from the thread action menu, where you can review desired/applied revisions and
 reset to the current project baseline. Unsaved editor drafts stay local while another device

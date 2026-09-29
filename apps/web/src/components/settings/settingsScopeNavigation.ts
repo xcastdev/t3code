@@ -4,11 +4,17 @@ import { validateSettingsScopeSearch, type SettingsScopeSearch } from "./setting
 
 /** Accept legacy provider links without replacing an explicit settings scope. */
 export function validateSettingsRouteSearch(raw: Record<string, unknown>) {
-  return validateSettingsScopeSearch(
+  const scope = validateSettingsScopeSearch(
     typeof raw.environmentId === "string" && raw.machine === undefined && raw.project === undefined
       ? { ...raw, machine: raw.environmentId }
       : raw,
   );
+  return {
+    ...scope,
+    ...(typeof raw.resource === "string" && raw.resource.length > 0
+      ? { resource: raw.resource }
+      : {}),
+  };
 }
 
 const SCOPE_KEYS = [
@@ -28,5 +34,6 @@ export const retainSettingsScope: SearchMiddleware<SettingsScopeSearch> = ({ sea
   const previousScope = Object.fromEntries(
     SCOPE_KEYS.filter((key) => search[key] !== undefined).map((key) => [key, search[key]]),
   );
-  return { ...previousScope, ...result };
+  const { resource: _resource, ...categorySearch } = result;
+  return { ...previousScope, ...categorySearch };
 };

@@ -130,7 +130,7 @@ transcription or cancellation; only the message text is sent when you submit.
 
 ## Commands, snippets, and skills
 
-Create reusable commands and snippets in **Settings → Commands** on web and desktop, or
+Find and edit reusable commands and snippets in **Settings → Resources** on web and desktop, or
 **Settings → Configuration → Commands & snippets** on mobile. Environment entries are
 available to every project. A project can replace or disable an inherited entry;
 thread settings can enable or disable the resulting entry for that thread.

@@ -17,7 +17,7 @@ import {
   type ProjectMcpTransportDraft,
   parseProjectMcpOAuthAuthorizationUrl,
 } from "@t3tools/contracts";
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { deriveProviderInstanceEntries } from "../../providerInstances";
 import type { ProviderInstanceEntry } from "../../providerInstances";
@@ -29,6 +29,7 @@ import { Button } from "../ui/button";
 import { Input } from "../ui/input";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
 import { providerSettingsFieldTargetId } from "./ProviderSettingsForm";
+import type { ResourceTarget } from "../../features/resources/resourceTarget";
 
 type ProviderSettingsSnapshot = Pick<ServerSettings, "providers" | "providerInstances">;
 
@@ -161,9 +162,11 @@ export function CatalogCredentialFields({
 export function McpCatalogSettings({
   environmentId,
   providers,
+  resourceTarget = null,
 }: {
   readonly environmentId: EnvironmentId;
   readonly providers: ReadonlyArray<ServerProvider>;
+  readonly resourceTarget?: ResourceTarget | null;
 }) {
   const state = useEnvironmentQuery(
     mcpCatalogEnvironment.globalState({
@@ -199,6 +202,15 @@ export function McpCatalogSettings({
   const [dirty, setDirty] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const targetKey = resourceTarget ? JSON.stringify(resourceTarget) : null;
+  const [dismissedTargetKey, setDismissedTargetKey] = useState<string | null>(null);
+  const [appliedTargetKey, setAppliedTargetKey] = useState<string | null>(null);
+  const previousTargetKey = useRef(targetKey);
+  const targetRequested = resourceTarget !== null && dismissedTargetKey !== targetKey;
+  const targetMatches =
+    resourceTarget?.kind === "mcp" &&
+    resourceTarget.scope === "environment" &&
+    resourceTarget.scopeId === environmentId;
   const nextArgumentKey = useRef(0);
   const providerEntries = useMemo(() => deriveProviderInstanceEntries(providers), [providers]);
   const unavailableProviderIds = selectedProviders.filter(
@@ -206,6 +218,117 @@ export function McpCatalogSettings({
   );
   const definitions = state.data?.definitions ?? [];
   const editing = definitions.find((definition) => definition.definitionId === editingId);
+  const loadDefinition = (definition: (typeof definitions)[number]) => {
+    setEditingId(definition.definitionId);
+    setName(definition.name);
+    setUrl(definition.transport.type === "stdio" ? "" : definition.transport.url);
+    setCommand(definition.transport.type === "stdio" ? definition.transport.command : "");
+    setArgs(
+      definition.transport.type === "stdio"
+        ? definition.transport.args.map((value) => ({ key: nextArgumentKey.current++, value }))
+        : [],
+    );
+    setCwd(definition.transport.type === "stdio" ? (definition.transport.cwd ?? "") : "");
+    setHeaders(
+      definition.transport.type === "stdio"
+        ? []
+        : definition.transport.headers.map((header) => ({
+            ...newCatalogCredential(header.credential),
+            name: header.name,
+          })),
+    );
+    setEnv(
+      definition.transport.type === "stdio"
+        ? definition.transport.env.map((variable) => ({
+            ...newCatalogCredential(variable.credential),
+            name: variable.name,
+          }))
+        : [],
+    );
+    setAuthorization(
+      definition.transport.type === "stdio" ? "none" : definition.transport.authorization.type,
+    );
+    setOauthRegistration(
+      definition.transport.type !== "stdio" && definition.transport.authorization.type === "oauth"
+        ? definition.transport.authorization.registration.type
+        : "automatic",
+    );
+    setOauthClientId(
+      definition.transport.type !== "stdio" &&
+        definition.transport.authorization.type === "oauth" &&
+        definition.transport.authorization.registration.type === "pre-registered"
+        ? definition.transport.authorization.registration.clientId
+        : "",
+    );
+    setOauthClientSecret(
+      definition.transport.type !== "stdio" &&
+        definition.transport.authorization.type === "oauth" &&
+        definition.transport.authorization.registration.type === "pre-registered" &&
+        definition.transport.authorization.registration.clientSecret !== undefined
+        ? newCatalogCredential(definition.transport.authorization.registration.clientSecret)
+        : newCatalogCredential(),
+    );
+    setTransportType(definition.transport.type === "stdio" ? "stdio" : definition.transport.type);
+    setSelectedProviders(definition.providerInstanceIds);
+    setDirty(true);
+  };
+  const targetDefinition =
+    targetRequested &&
+    targetMatches &&
+    resourceTarget?.kind === "mcp" &&
+    resourceTarget.intent === "item" &&
+    resourceTarget.identity === "definition"
+      ? (definitions.find((definition) => definition.definitionId === resourceTarget.id) ?? null)
+      : null;
+  const targetMissing =
+    targetRequested &&
+    (!targetMatches ||
+      (resourceTarget?.intent === "item" &&
+        !state.isPending &&
+        !state.error &&
+        targetDefinition === null));
+  useEffect(() => {
+    if (previousTargetKey.current === targetKey) return;
+    previousTargetKey.current = targetKey;
+    setDismissedTargetKey(null);
+    setAppliedTargetKey(null);
+  }, [targetKey]);
+  useEffect(() => {
+    if (!targetRequested || !targetMatches || !state.data || appliedTargetKey === targetKey) {
+      return;
+    }
+    if (resourceTarget?.intent === "create") {
+      setName("");
+      setUrl("");
+      setCommand("");
+      setArgs([]);
+      setCwd("");
+      setHeaders([]);
+      setEnv([]);
+      setAuthorization("none");
+      setOauthRegistration("automatic");
+      setOauthClientId("");
+      setOauthClientSecret(newCatalogCredential());
+      setTransportType("streamable-http");
+      setSelectedProviders([]);
+      setEditingId(null);
+      setDirty(false);
+      setError(null);
+    } else if (targetDefinition) {
+      loadDefinition(targetDefinition);
+    } else {
+      return;
+    }
+    setAppliedTargetKey(targetKey);
+  }, [
+    appliedTargetKey,
+    resourceTarget,
+    targetDefinition,
+    targetKey,
+    targetMatches,
+    targetRequested,
+    state.data,
+  ]);
   const save = async () => {
     setError(null);
     const persistedHeaders = headers
@@ -340,373 +463,323 @@ export function McpCatalogSettings({
   };
   return (
     <SettingsSection id="mcp-catalog" title="MCP catalog">
-      <SettingsRow
-        title="Global MCP servers"
-        description="Shared definitions inherited by projects and provider sessions."
-      >
-        <div className="grid gap-2 sm:grid-cols-[1fr_2fr_auto]">
-          <Input
-            aria-label="MCP server name"
-            value={name}
-            onChange={(event) => {
-              setName(event.target.value);
-              setDirty(true);
-            }}
-            placeholder="Name"
-          />
-          <Input
-            aria-label="MCP server URL"
-            value={url}
-            onChange={(event) => {
-              setUrl(event.target.value);
-              setDirty(true);
-            }}
-            placeholder="https://example.com/mcp"
-            disabled={transportType === "stdio"}
-          />
-          <select
-            aria-label="MCP transport type"
-            value={transportType}
-            onChange={(event) =>
-              setTransportType(event.target.value as "streamable-http" | "legacy-sse" | "stdio")
-            }
-            className="h-9 rounded-md border bg-background px-2 text-sm"
-          >
-            <option value="streamable-http">Streamable HTTP</option>
-            <option value="legacy-sse">Legacy SSE</option>
-            <option value="stdio">Local command (stdio)</option>
-          </select>
-          {transportType === "stdio" ? (
+      {targetRequested && (state.isPending || state.error) ? (
+        <div className="grid gap-2 p-4 text-sm text-muted-foreground" role="status">
+          {state.error ? (
+            <>
+              <p>The MCP catalog could not be read.</p>
+              <Button type="button" size="xs" variant="outline" onClick={state.refresh}>
+                Retry
+              </Button>
+            </>
+          ) : (
+            <p>Reading the MCP catalog to find the requested server…</p>
+          )}
+        </div>
+      ) : targetMissing ? (
+        <p className="p-4 text-sm text-muted-foreground" role="status">
+          This MCP server target is no longer available in the selected environment.
+        </p>
+      ) : (
+        <SettingsRow
+          title="Global MCP servers"
+          description="Shared definitions inherited by projects and provider sessions."
+        >
+          <div className="grid gap-2 sm:grid-cols-[1fr_2fr_auto]">
             <Input
-              aria-label="MCP command"
-              value={command}
+              aria-label="MCP server name"
+              value={name}
               onChange={(event) => {
-                setCommand(event.target.value);
+                setName(event.target.value);
                 setDirty(true);
               }}
-              placeholder="Command"
+              placeholder="Name"
             />
-          ) : null}
-          <Button
-            size="sm"
-            onClick={() => void save()}
-            disabled={
-              !name.trim() ||
-              (transportType === "stdio" ? !command.trim() : !url.trim()) ||
-              state.isPending
-            }
-          >
-            {editing ? "Save" : "Add"}
-          </Button>
-          {editing ? (
+            <Input
+              aria-label="MCP server URL"
+              value={url}
+              onChange={(event) => {
+                setUrl(event.target.value);
+                setDirty(true);
+              }}
+              placeholder="https://example.com/mcp"
+              disabled={transportType === "stdio"}
+            />
+            <select
+              aria-label="MCP transport type"
+              value={transportType}
+              onChange={(event) =>
+                setTransportType(event.target.value as "streamable-http" | "legacy-sse" | "stdio")
+              }
+              className="h-9 rounded-md border bg-background px-2 text-sm"
+            >
+              <option value="streamable-http">Streamable HTTP</option>
+              <option value="legacy-sse">Legacy SSE</option>
+              <option value="stdio">Local command (stdio)</option>
+            </select>
+            {transportType === "stdio" ? (
+              <Input
+                aria-label="MCP command"
+                value={command}
+                onChange={(event) => {
+                  setCommand(event.target.value);
+                  setDirty(true);
+                }}
+                placeholder="Command"
+              />
+            ) : null}
             <Button
               size="sm"
-              type="button"
-              variant="ghost"
-              onClick={() => {
-                setEditingId(null);
-                setName("");
-                setUrl("");
-                setCommand("");
-                setArgs([]);
-                setCwd("");
-                setHeaders([]);
-                setEnv([]);
-                setAuthorization("none");
-                setOauthRegistration("automatic");
-                setOauthClientId("");
-                setOauthClientSecret(newCatalogCredential());
-                setTransportType("streamable-http");
-                setSelectedProviders([]);
-                setDirty(false);
-              }}
+              onClick={() => void save()}
+              disabled={
+                !name.trim() ||
+                (transportType === "stdio" ? !command.trim() : !url.trim()) ||
+                state.isPending
+              }
             >
-              Cancel
+              {editing ? "Save" : "Add"}
             </Button>
-          ) : null}
-        </div>
-        {transportType === "stdio" ? (
-          <div className="mt-2 grid gap-2">
-            <label className="grid gap-1 text-sm font-medium">
-              Working directory
-              <Input
-                value={cwd}
-                aria-label="MCP working directory"
-                onChange={(event) => {
-                  setCwd(event.target.value);
+            {editing ? (
+              <Button
+                size="sm"
+                type="button"
+                variant="ghost"
+                onClick={() => {
+                  setEditingId(null);
+                  setName("");
+                  setUrl("");
+                  setCommand("");
+                  setArgs([]);
+                  setCwd("");
+                  setHeaders([]);
+                  setEnv([]);
+                  setAuthorization("none");
+                  setOauthRegistration("automatic");
+                  setOauthClientId("");
+                  setOauthClientSecret(newCatalogCredential());
+                  setTransportType("streamable-http");
+                  setSelectedProviders([]);
+                  setDirty(false);
+                }}
+              >
+                Cancel
+              </Button>
+            ) : null}
+          </div>
+          {transportType === "stdio" ? (
+            <div className="mt-2 grid gap-2">
+              <label className="grid gap-1 text-sm font-medium">
+                Working directory
+                <Input
+                  value={cwd}
+                  aria-label="MCP working directory"
+                  onChange={(event) => {
+                    setCwd(event.target.value);
+                    setDirty(true);
+                  }}
+                />
+              </label>
+              <fieldset className="grid gap-2">
+                <legend className="text-sm font-medium">Arguments</legend>
+                {args.map((argument, index) => (
+                  <div key={argument.key} className="flex gap-1">
+                    <Input
+                      aria-label={`MCP argument ${index + 1}`}
+                      value={argument.value}
+                      onChange={(event) => {
+                        setArgs(
+                          args.map((current) =>
+                            current.key === argument.key
+                              ? { ...current, value: event.target.value }
+                              : current,
+                          ),
+                        );
+                        setDirty(true);
+                      }}
+                    />
+                    <Button
+                      type="button"
+                      size="xs"
+                      variant="ghost"
+                      onClick={() => {
+                        setArgs(args.filter((current) => current.key !== argument.key));
+                        setDirty(true);
+                      }}
+                    >
+                      Remove
+                    </Button>
+                  </div>
+                ))}
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="outline"
+                  className="justify-self-start"
+                  onClick={() => {
+                    setArgs([...args, { key: nextArgumentKey.current++, value: "" }]);
+                    setDirty(true);
+                  }}
+                >
+                  Add argument
+                </Button>
+              </fieldset>
+              <CatalogCredentialFields
+                label="Environment variable"
+                entries={env}
+                onChange={(next) => {
+                  setEnv(next);
                   setDirty(true);
                 }}
               />
-            </label>
-            <fieldset className="grid gap-2">
-              <legend className="text-sm font-medium">Arguments</legend>
-              {args.map((argument, index) => (
-                <div key={argument.key} className="flex gap-1">
-                  <Input
-                    aria-label={`MCP argument ${index + 1}`}
-                    value={argument.value}
-                    onChange={(event) => {
-                      setArgs(
-                        args.map((current) =>
-                          current.key === argument.key
-                            ? { ...current, value: event.target.value }
-                            : current,
-                        ),
-                      );
-                      setDirty(true);
-                    }}
+            </div>
+          ) : (
+            <div className="mt-2 grid gap-2">
+              <CatalogCredentialFields
+                label="HTTP header"
+                entries={headers}
+                onChange={(next) => {
+                  setHeaders(next);
+                  setDirty(true);
+                }}
+              />
+              <fieldset className="grid gap-2">
+                <legend className="text-sm font-medium">Authorization</legend>
+                <select
+                  aria-label="MCP authorization"
+                  value={authorization}
+                  onChange={(event) => {
+                    setAuthorization(event.target.value as "none" | "oauth");
+                    setDirty(true);
+                  }}
+                >
+                  <option value="none">None</option>
+                  <option value="oauth">OAuth</option>
+                </select>
+                {authorization === "oauth" ? (
+                  <>
+                    <select
+                      aria-label="MCP OAuth registration"
+                      value={oauthRegistration}
+                      onChange={(event) => {
+                        setOauthRegistration(event.target.value as "automatic" | "pre-registered");
+                        setDirty(true);
+                      }}
+                    >
+                      <option value="automatic">Automatic registration</option>
+                      <option value="pre-registered">Pre-registered client</option>
+                    </select>
+                    {oauthRegistration === "pre-registered" ? (
+                      <>
+                        <Input
+                          aria-label="MCP OAuth client ID"
+                          value={oauthClientId}
+                          placeholder="Client ID"
+                          onChange={(event) => {
+                            setOauthClientId(event.target.value);
+                            setDirty(true);
+                          }}
+                        />
+                        <CatalogCredentialFields
+                          label="OAuth client secret"
+                          entries={[oauthClientSecret]}
+                          onChange={(next) => {
+                            setOauthClientSecret(next[0] ?? newCatalogCredential());
+                            setDirty(true);
+                          }}
+                        />
+                      </>
+                    ) : null}
+                  </>
+                ) : null}
+              </fieldset>
+            </div>
+          )}
+          {error ? <p className="text-sm text-destructive">{error}</p> : null}
+          <fieldset className="mt-2 flex flex-wrap gap-2 text-xs" disabled={state.isPending}>
+            <legend className="sr-only">MCP providers</legend>
+            {providerEntries.map((entry) => {
+              const id = entry.instanceId as ProviderInstanceId;
+              return (
+                <label key={entry.instanceId} className="flex items-center gap-1">
+                  <input
+                    type="checkbox"
+                    checked={selectedProviders.includes(id)}
+                    onChange={(event) =>
+                      setSelectedProviders(
+                        event.target.checked
+                          ? [...selectedProviders, id]
+                          : selectedProviders.filter((item) => item !== id),
+                      )
+                    }
                   />
-                  <Button
-                    type="button"
-                    size="xs"
-                    variant="ghost"
-                    onClick={() => {
-                      setArgs(args.filter((current) => current.key !== argument.key));
-                      setDirty(true);
-                    }}
-                  >
-                    Remove
-                  </Button>
-                </div>
-              ))}
-              <Button
-                type="button"
-                size="xs"
-                variant="outline"
-                className="justify-self-start"
-                onClick={() => {
-                  setArgs([...args, { key: nextArgumentKey.current++, value: "" }]);
-                  setDirty(true);
-                }}
-              >
-                Add argument
-              </Button>
-            </fieldset>
-            <CatalogCredentialFields
-              label="Environment variable"
-              entries={env}
-              onChange={(next) => {
-                setEnv(next);
-                setDirty(true);
-              }}
-            />
-          </div>
-        ) : (
-          <div className="mt-2 grid gap-2">
-            <CatalogCredentialFields
-              label="HTTP header"
-              entries={headers}
-              onChange={(next) => {
-                setHeaders(next);
-                setDirty(true);
-              }}
-            />
-            <fieldset className="grid gap-2">
-              <legend className="text-sm font-medium">Authorization</legend>
-              <select
-                aria-label="MCP authorization"
-                value={authorization}
-                onChange={(event) => {
-                  setAuthorization(event.target.value as "none" | "oauth");
-                  setDirty(true);
-                }}
-              >
-                <option value="none">None</option>
-                <option value="oauth">OAuth</option>
-              </select>
-              {authorization === "oauth" ? (
-                <>
-                  <select
-                    aria-label="MCP OAuth registration"
-                    value={oauthRegistration}
-                    onChange={(event) => {
-                      setOauthRegistration(event.target.value as "automatic" | "pre-registered");
-                      setDirty(true);
-                    }}
-                  >
-                    <option value="automatic">Automatic registration</option>
-                    <option value="pre-registered">Pre-registered client</option>
-                  </select>
-                  {oauthRegistration === "pre-registered" ? (
-                    <>
-                      <Input
-                        aria-label="MCP OAuth client ID"
-                        value={oauthClientId}
-                        placeholder="Client ID"
-                        onChange={(event) => {
-                          setOauthClientId(event.target.value);
-                          setDirty(true);
-                        }}
-                      />
-                      <CatalogCredentialFields
-                        label="OAuth client secret"
-                        entries={[oauthClientSecret]}
-                        onChange={(next) => {
-                          setOauthClientSecret(next[0] ?? newCatalogCredential());
-                          setDirty(true);
-                        }}
-                      />
-                    </>
-                  ) : null}
-                </>
-              ) : null}
-            </fieldset>
-          </div>
-        )}
-        {error ? <p className="text-sm text-destructive">{error}</p> : null}
-        <fieldset className="mt-2 flex flex-wrap gap-2 text-xs" disabled={state.isPending}>
-          <legend className="sr-only">MCP providers</legend>
-          {providerEntries.map((entry) => {
-            const id = entry.instanceId as ProviderInstanceId;
-            return (
-              <label key={entry.instanceId} className="flex items-center gap-1">
+                  {entry.displayName}
+                </label>
+              );
+            })}
+            {unavailableProviderIds.map((id) => (
+              <label key={id} className="flex items-center gap-1 text-muted-foreground">
                 <input
                   type="checkbox"
-                  checked={selectedProviders.includes(id)}
-                  onChange={(event) =>
-                    setSelectedProviders(
-                      event.target.checked
-                        ? [...selectedProviders, id]
-                        : selectedProviders.filter((item) => item !== id),
-                    )
+                  checked
+                  aria-label={`Select unavailable provider ${id}`}
+                  onChange={() =>
+                    setSelectedProviders(selectedProviders.filter((item) => item !== id))
                   }
                 />
-                {entry.displayName}
+                {id} (Unavailable)
               </label>
-            );
-          })}
-          {unavailableProviderIds.map((id) => (
-            <label key={id} className="flex items-center gap-1 text-muted-foreground">
-              <input
-                type="checkbox"
-                checked
-                aria-label={`Select unavailable provider ${id}`}
-                onChange={() =>
-                  setSelectedProviders(selectedProviders.filter((item) => item !== id))
-                }
-              />
-              {id} (Unavailable)
-            </label>
-          ))}
-        </fieldset>
-        {definitions.length > 0 ? (
-          <ul className="mt-3 space-y-1 text-sm text-muted-foreground">
-            {definitions.map((definition) => (
-              <li key={definition.definitionId} className="flex items-center justify-between gap-2">
-                <span>
-                  {definition.name}
-                  {definition.enabled ? "" : " (disabled)"}
-                </span>
-                <span className="flex gap-1">
-                  <Button
-                    size="xs"
-                    type="button"
-                    variant="ghost"
-                    onClick={() => {
-                      setEditingId(definition.definitionId);
-                      setName(definition.name);
-                      setUrl(definition.transport.type === "stdio" ? "" : definition.transport.url);
-                      setCommand(
-                        definition.transport.type === "stdio" ? definition.transport.command : "",
-                      );
-                      setArgs(
-                        definition.transport.type === "stdio"
-                          ? definition.transport.args.map((value) => ({
-                              key: nextArgumentKey.current++,
-                              value,
-                            }))
-                          : [],
-                      );
-                      setCwd(
-                        definition.transport.type === "stdio"
-                          ? (definition.transport.cwd ?? "")
-                          : "",
-                      );
-                      setHeaders(
-                        definition.transport.type === "stdio"
-                          ? []
-                          : definition.transport.headers
-                              .map((header) => newCatalogCredential(header.credential))
-                              .map((credential, index) => ({
-                                ...credential,
-                                name:
-                                  definition.transport.type === "stdio"
-                                    ? ""
-                                    : definition.transport.headers[index]!.name,
-                              })),
-                      );
-                      setEnv(
-                        definition.transport.type === "stdio"
-                          ? definition.transport.env.map((variable) => ({
-                              ...newCatalogCredential(variable.credential),
-                              name: variable.name,
-                            }))
-                          : [],
-                      );
-                      setAuthorization(
-                        definition.transport.type === "stdio"
-                          ? "none"
-                          : definition.transport.authorization.type,
-                      );
-                      setOauthRegistration(
-                        definition.transport.type !== "stdio" &&
-                          definition.transport.authorization.type === "oauth"
-                          ? definition.transport.authorization.registration.type
-                          : "automatic",
-                      );
-                      setOauthClientId(
-                        definition.transport.type !== "stdio" &&
-                          definition.transport.authorization.type === "oauth" &&
-                          definition.transport.authorization.registration.type === "pre-registered"
-                          ? definition.transport.authorization.registration.clientId
-                          : "",
-                      );
-                      setOauthClientSecret(
-                        definition.transport.type !== "stdio" &&
-                          definition.transport.authorization.type === "oauth" &&
-                          definition.transport.authorization.registration.type ===
-                            "pre-registered" &&
-                          definition.transport.authorization.registration.clientSecret !== undefined
-                          ? newCatalogCredential(
-                              definition.transport.authorization.registration.clientSecret,
-                            )
-                          : newCatalogCredential(),
-                      );
-                      setTransportType(
-                        definition.transport.type === "stdio" ? "stdio" : definition.transport.type,
-                      );
-                      setSelectedProviders(definition.providerInstanceIds);
-                      setDirty(true);
-                    }}
-                  >
-                    Edit
-                  </Button>
-                  <Button
-                    size="xs"
-                    type="button"
-                    variant="ghost"
-                    onClick={() => void toggle(definition)}
-                    disabled={state.isPending}
-                  >
-                    {definition.enabled ? "Disable" : "Enable"}
-                  </Button>
-                  <Button
-                    size="xs"
-                    type="button"
-                    variant="ghost"
-                    onClick={() => void deleteDefinition(definition)}
-                    disabled={state.isPending}
-                  >
-                    Remove
-                  </Button>
-                </span>
-              </li>
             ))}
-          </ul>
-        ) : (
-          <p className="mt-3 text-sm text-muted-foreground">No global MCP servers yet.</p>
-        )}
-      </SettingsRow>
+          </fieldset>
+          {definitions.length > 0 ? (
+            <ul className="mt-3 space-y-1 text-sm text-muted-foreground">
+              {definitions.map((definition) => (
+                <li
+                  key={definition.definitionId}
+                  className={`flex items-center justify-between gap-2 ${targetDefinition?.definitionId === definition.definitionId ? "rounded bg-accent/70 px-1 ring-1 ring-inset ring-ring" : ""}`}
+                >
+                  <span>
+                    {definition.name}
+                    {definition.enabled ? "" : " (disabled)"}
+                  </span>
+                  <span className="flex gap-1">
+                    <Button
+                      size="xs"
+                      type="button"
+                      variant="ghost"
+                      onClick={() => {
+                        if (targetKey) setDismissedTargetKey(targetKey);
+                        loadDefinition(definition);
+                      }}
+                    >
+                      Edit
+                    </Button>
+                    <Button
+                      size="xs"
+                      type="button"
+                      variant="ghost"
+                      onClick={() => void toggle(definition)}
+                      disabled={state.isPending}
+                    >
+                      {definition.enabled ? "Disable" : "Enable"}
+                    </Button>
+                    <Button
+                      size="xs"
+                      type="button"
+                      variant="ghost"
+                      onClick={() => void deleteDefinition(definition)}
+                      disabled={state.isPending}
+                    >
+                      Remove
+                    </Button>
+                  </span>
+                </li>
+              ))}
+            </ul>
+          ) : (
+            <p className="mt-3 text-sm text-muted-foreground">No global MCP servers yet.</p>
+          )}
+        </SettingsRow>
+      )}
     </SettingsSection>
   );
 }
@@ -717,6 +790,7 @@ export function McpCatalogProjectSettings({
   projectId,
   providers,
   settings,
+  resourceTarget = null,
   canOverride = true,
   canMutate = true,
 }: {
@@ -724,6 +798,7 @@ export function McpCatalogProjectSettings({
   readonly projectId: ProjectId;
   readonly providers: ReadonlyArray<ServerProvider>;
   readonly settings?: ProviderSettingsSnapshot | undefined;
+  readonly resourceTarget?: ResourceTarget | null;
   readonly canOverride?: boolean;
   readonly canMutate?: boolean;
 }) {
@@ -786,6 +861,15 @@ export function McpCatalogProjectSettings({
     readonly definitionId: McpDefinitionId;
     readonly url: string;
   } | null>(null);
+  const targetKey = resourceTarget ? JSON.stringify(resourceTarget) : null;
+  const [dismissedTargetKey, setDismissedTargetKey] = useState<string | null>(null);
+  const [appliedTargetKey, setAppliedTargetKey] = useState<string | null>(null);
+  const previousTargetKey = useRef(targetKey);
+  const targetRequested = resourceTarget !== null && dismissedTargetKey !== targetKey;
+  const targetMatches =
+    resourceTarget?.kind === "mcp" &&
+    resourceTarget.scope === "project" &&
+    resourceTarget.scopeId === projectId;
   const nextArgumentKey = useRef(0);
   const resetDraft = () => {
     setDraft({ name: "", url: "" });
@@ -975,6 +1059,53 @@ export function McpCatalogProjectSettings({
   const inherited = state.data?.globalDefinitions ?? [];
   const local = state.data?.projectDefinitions ?? [];
   const overrides = state.data?.projectOverrides ?? [];
+  const targetDefinition =
+    targetRequested &&
+    targetMatches &&
+    resourceTarget?.kind === "mcp" &&
+    resourceTarget.intent === "item" &&
+    resourceTarget.identity === "definition"
+      ? ([...inherited, ...local].find(
+          (definition) => definition.definitionId === resourceTarget.id,
+        ) ?? null)
+      : null;
+  const targetOverride =
+    targetRequested &&
+    targetMatches &&
+    resourceTarget?.kind === "mcp" &&
+    resourceTarget.intent === "item" &&
+    (resourceTarget.identity === "override" || resourceTarget.identity === "orphan-override")
+      ? (overrides.find((entry) => entry.id === resourceTarget.id) ?? null)
+      : null;
+  const targetIsOrphan =
+    targetRequested &&
+    resourceTarget?.kind === "mcp" &&
+    resourceTarget.intent === "item" &&
+    resourceTarget.identity === "orphan-override" &&
+    targetOverride !== null &&
+    !inherited.some((definition) => definition.logicalServerId === targetOverride.targetId);
+  const targetItemExists =
+    resourceTarget?.intent === "create" ||
+    (resourceTarget?.kind === "mcp" &&
+      resourceTarget.intent === "item" &&
+      (resourceTarget.identity === "definition"
+        ? targetDefinition !== null
+        : targetOverride !== null &&
+          (resourceTarget.identity === "orphan-override"
+            ? targetIsOrphan
+            : inherited.some(
+                (definition) => definition.logicalServerId === targetOverride.targetId,
+              ))));
+  const targetMissing =
+    targetRequested &&
+    (!targetMatches ||
+      (resourceTarget?.intent === "item" && !state.isPending && !state.error && !targetItemExists));
+  useEffect(() => {
+    if (previousTargetKey.current === targetKey) return;
+    previousTargetKey.current = targetKey;
+    setDismissedTargetKey(null);
+    setAppliedTargetKey(null);
+  }, [targetKey]);
   const editLocal = async (definition: (typeof local)[number]) => {
     loadDraft(definition);
   };
@@ -1079,6 +1210,45 @@ export function McpCatalogProjectSettings({
       else setAuthorizationLink({ definitionId: definition.definitionId, url });
     }
   };
+  useEffect(() => {
+    if (!targetRequested || !targetMatches || !state.data || appliedTargetKey === targetKey) {
+      return;
+    }
+    if (resourceTarget?.intent === "create") {
+      resetDraft();
+    } else if (resourceTarget?.kind === "mcp" && resourceTarget.identity === "definition") {
+      const definition = targetDefinition;
+      if (!definition) return;
+      if (inherited.some((entry) => entry.definitionId === definition.definitionId)) {
+        createOverride(definition);
+      } else {
+        editLocal(definition);
+      }
+    } else if (resourceTarget?.kind === "mcp" && resourceTarget.identity === "override") {
+      if (!targetOverride) return;
+      editOverride(targetOverride);
+    } else if (
+      resourceTarget?.kind !== "mcp" ||
+      resourceTarget.identity !== "orphan-override" ||
+      !targetOverride
+    ) {
+      return;
+    }
+    setAppliedTargetKey(targetKey);
+  }, [
+    appliedTargetKey,
+    createOverride,
+    editLocal,
+    editOverride,
+    inherited,
+    resourceTarget,
+    state.data,
+    targetDefinition,
+    targetKey,
+    targetMatches,
+    targetOverride,
+    targetRequested,
+  ]);
   return (
     <SettingsSection id="mcp-catalog-project" title="MCP catalog">
       <SettingsRow
@@ -1116,7 +1286,10 @@ export function McpCatalogProjectSettings({
         {inherited.length > 0 ? (
           <ul className="mt-2 space-y-1 text-sm text-muted-foreground">
             {inherited.map((entry) => (
-              <li key={entry.definitionId} className="flex items-center justify-between gap-2">
+              <li
+                key={entry.definitionId}
+                className={`flex items-center justify-between gap-2 ${targetDefinition?.definitionId === entry.definitionId ? "rounded bg-accent/70 px-1 ring-1 ring-inset ring-ring" : ""}`}
+              >
                 <span>{entry.name}</span>
                 <span className="flex gap-1">
                   {entry.transport.type !== "stdio" &&
@@ -1171,262 +1344,295 @@ export function McpCatalogProjectSettings({
             ))}
           </ul>
         ) : null}
-        <div className="mt-2 grid gap-2 sm:grid-cols-[1fr_2fr_auto]">
-          <Input
-            aria-label="Project MCP server name"
-            value={draft.name}
-            onChange={(event) => {
-              setDraft({ ...draft, name: event.target.value });
-              setDirty(true);
-            }}
-            placeholder="Name"
-            disabled={!canMutate || state.isPending}
-          />
-          <Input
-            aria-label="Project MCP server URL"
-            value={draft.url}
-            onChange={(event) => {
-              setDraft({ ...draft, url: event.target.value });
-              setDirty(true);
-            }}
-            placeholder="https://example.com/mcp"
-            disabled={!canMutate || state.isPending || transportType === "stdio"}
-          />
-          <select
-            aria-label="Project MCP transport type"
-            value={transportType}
-            onChange={(event) => {
-              setTransportType(event.target.value as "streamable-http" | "legacy-sse" | "stdio");
-              setDirty(true);
-            }}
-            disabled={!canMutate || state.isPending}
-            className="h-9 rounded-md border bg-background px-2 text-sm"
-          >
-            <option value="streamable-http">Streamable HTTP</option>
-            <option value="legacy-sse">Legacy SSE</option>
-            <option value="stdio">Local command (stdio)</option>
-          </select>
-          {transportType === "stdio" ? (
-            <>
+        {targetRequested && (state.isPending || state.error) ? (
+          <div className="mt-2 grid gap-2 text-sm text-muted-foreground" role="status">
+            {state.error ? (
+              <>
+                <p>The project MCP catalog could not be read.</p>
+                <Button type="button" size="xs" variant="outline" onClick={state.refresh}>
+                  Retry
+                </Button>
+              </>
+            ) : (
+              <p>Reading the project MCP catalog to find the requested server…</p>
+            )}
+          </div>
+        ) : targetMissing ? (
+          <p className="mt-2 text-sm text-muted-foreground" role="status">
+            This MCP server target is no longer available in the selected project.
+          </p>
+        ) : targetIsOrphan ? (
+          <p className="mt-2 text-sm text-muted-foreground" role="status">
+            This override points to an inherited server that was removed. Remove the orphaned
+            override from the list below to clean it up.
+          </p>
+        ) : (
+          <>
+            <div className="mt-2 grid gap-2 sm:grid-cols-[1fr_2fr_auto]">
               <Input
-                aria-label="Project MCP command"
-                value={command}
+                aria-label="Project MCP server name"
+                value={draft.name}
                 onChange={(event) => {
-                  setCommand(event.target.value);
+                  setDraft({ ...draft, name: event.target.value });
                   setDirty(true);
                 }}
-                placeholder="Command"
+                placeholder="Name"
                 disabled={!canMutate || state.isPending}
               />
-              <fieldset className="grid gap-2">
-                <legend className="text-sm font-medium">Arguments</legend>
-                {args.map((argument, index) => (
-                  <div key={argument.key} className="flex items-center gap-2">
-                    <Input
-                      aria-label={`Project MCP argument ${index + 1}`}
-                      value={argument.value}
-                      onChange={(event) => {
-                        setArgs(
-                          args.map((current) =>
-                            current.key === argument.key
-                              ? { ...current, value: event.target.value }
-                              : current,
-                          ),
-                        );
-                        setDirty(true);
-                      }}
-                      disabled={!canMutate || state.isPending}
-                    />
+              <Input
+                aria-label="Project MCP server URL"
+                value={draft.url}
+                onChange={(event) => {
+                  setDraft({ ...draft, url: event.target.value });
+                  setDirty(true);
+                }}
+                placeholder="https://example.com/mcp"
+                disabled={!canMutate || state.isPending || transportType === "stdio"}
+              />
+              <select
+                aria-label="Project MCP transport type"
+                value={transportType}
+                onChange={(event) => {
+                  setTransportType(
+                    event.target.value as "streamable-http" | "legacy-sse" | "stdio",
+                  );
+                  setDirty(true);
+                }}
+                disabled={!canMutate || state.isPending}
+                className="h-9 rounded-md border bg-background px-2 text-sm"
+              >
+                <option value="streamable-http">Streamable HTTP</option>
+                <option value="legacy-sse">Legacy SSE</option>
+                <option value="stdio">Local command (stdio)</option>
+              </select>
+              {transportType === "stdio" ? (
+                <>
+                  <Input
+                    aria-label="Project MCP command"
+                    value={command}
+                    onChange={(event) => {
+                      setCommand(event.target.value);
+                      setDirty(true);
+                    }}
+                    placeholder="Command"
+                    disabled={!canMutate || state.isPending}
+                  />
+                  <fieldset className="grid gap-2">
+                    <legend className="text-sm font-medium">Arguments</legend>
+                    {args.map((argument, index) => (
+                      <div key={argument.key} className="flex items-center gap-2">
+                        <Input
+                          aria-label={`Project MCP argument ${index + 1}`}
+                          value={argument.value}
+                          onChange={(event) => {
+                            setArgs(
+                              args.map((current) =>
+                                current.key === argument.key
+                                  ? { ...current, value: event.target.value }
+                                  : current,
+                              ),
+                            );
+                            setDirty(true);
+                          }}
+                          disabled={!canMutate || state.isPending}
+                        />
+                        <Button
+                          type="button"
+                          size="xs"
+                          variant="ghost"
+                          onClick={() => {
+                            setArgs(args.filter((current) => current.key !== argument.key));
+                            setDirty(true);
+                          }}
+                          disabled={!canMutate || state.isPending}
+                        >
+                          Remove
+                        </Button>
+                      </div>
+                    ))}
                     <Button
                       type="button"
                       size="xs"
-                      variant="ghost"
+                      variant="outline"
+                      className="justify-self-start"
                       onClick={() => {
-                        setArgs(args.filter((current) => current.key !== argument.key));
+                        setArgs([...args, { key: nextArgumentKey.current++, value: "" }]);
                         setDirty(true);
                       }}
                       disabled={!canMutate || state.isPending}
                     >
-                      Remove
+                      Add argument
                     </Button>
-                  </div>
-                ))}
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="outline"
-                  className="justify-self-start"
-                  onClick={() => {
-                    setArgs([...args, { key: nextArgumentKey.current++, value: "" }]);
-                    setDirty(true);
-                  }}
-                  disabled={!canMutate || state.isPending}
-                >
-                  Add argument
-                </Button>
-              </fieldset>
-              <Input
-                aria-label="Project MCP working directory"
-                value={cwd}
-                onChange={(event) => {
-                  setCwd(event.target.value);
-                  setDirty(true);
-                }}
-                placeholder="Working directory (optional)"
-                disabled={!canMutate || state.isPending}
-              />
-              <CatalogCredentialFields
-                label="Environment variable"
-                entries={env}
-                onChange={(next) => {
-                  setEnv(next);
-                  setDirty(true);
-                }}
-              />
-            </>
-          ) : (
-            <>
-              <CatalogCredentialFields
-                label="HTTP header"
-                entries={headers}
-                onChange={(next) => {
-                  setHeaders(next);
-                  setDirty(true);
-                }}
-              />
-              <select
-                aria-label="Project MCP authorization"
-                value={authorization}
-                onChange={(event) => {
-                  setAuthorization(event.target.value as "none" | "oauth");
-                  setDirty(true);
-                }}
-                disabled={!canMutate || state.isPending}
-              >
-                <option value="none">No authorization</option>
-                <option value="oauth">OAuth</option>
-              </select>
-              {authorization === "oauth" ? (
-                <>
-                  <select
-                    aria-label="Project MCP OAuth registration"
-                    value={oauthRegistration}
+                  </fieldset>
+                  <Input
+                    aria-label="Project MCP working directory"
+                    value={cwd}
                     onChange={(event) => {
-                      setOauthRegistration(event.target.value as "automatic" | "pre-registered");
+                      setCwd(event.target.value);
+                      setDirty(true);
+                    }}
+                    placeholder="Working directory (optional)"
+                    disabled={!canMutate || state.isPending}
+                  />
+                  <CatalogCredentialFields
+                    label="Environment variable"
+                    entries={env}
+                    onChange={(next) => {
+                      setEnv(next);
+                      setDirty(true);
+                    }}
+                  />
+                </>
+              ) : (
+                <>
+                  <CatalogCredentialFields
+                    label="HTTP header"
+                    entries={headers}
+                    onChange={(next) => {
+                      setHeaders(next);
+                      setDirty(true);
+                    }}
+                  />
+                  <select
+                    aria-label="Project MCP authorization"
+                    value={authorization}
+                    onChange={(event) => {
+                      setAuthorization(event.target.value as "none" | "oauth");
                       setDirty(true);
                     }}
                     disabled={!canMutate || state.isPending}
                   >
-                    <option value="automatic">Automatic OAuth registration</option>
-                    <option value="pre-registered">Pre-registered OAuth client</option>
+                    <option value="none">No authorization</option>
+                    <option value="oauth">OAuth</option>
                   </select>
-                  {oauthRegistration === "pre-registered" ? (
+                  {authorization === "oauth" ? (
                     <>
-                      <Input
-                        aria-label="Project MCP OAuth client ID"
-                        value={oauthClientId}
+                      <select
+                        aria-label="Project MCP OAuth registration"
+                        value={oauthRegistration}
                         onChange={(event) => {
-                          setOauthClientId(event.target.value);
-                          setDirty(true);
-                        }}
-                        placeholder="OAuth client ID"
-                        disabled={!canMutate || state.isPending}
-                      />
-                      <CatalogCredentialFields
-                        label="OAuth client secret"
-                        entries={[oauthClientSecret]}
-                        onChange={(next) => {
-                          setOauthClientSecret(
-                            next[0] ?? newCatalogCredential({ name: "OAuth client secret" }),
+                          setOauthRegistration(
+                            event.target.value as "automatic" | "pre-registered",
                           );
                           setDirty(true);
                         }}
-                      />
+                        disabled={!canMutate || state.isPending}
+                      >
+                        <option value="automatic">Automatic OAuth registration</option>
+                        <option value="pre-registered">Pre-registered OAuth client</option>
+                      </select>
+                      {oauthRegistration === "pre-registered" ? (
+                        <>
+                          <Input
+                            aria-label="Project MCP OAuth client ID"
+                            value={oauthClientId}
+                            onChange={(event) => {
+                              setOauthClientId(event.target.value);
+                              setDirty(true);
+                            }}
+                            placeholder="OAuth client ID"
+                            disabled={!canMutate || state.isPending}
+                          />
+                          <CatalogCredentialFields
+                            label="OAuth client secret"
+                            entries={[oauthClientSecret]}
+                            onChange={(next) => {
+                              setOauthClientSecret(
+                                next[0] ?? newCatalogCredential({ name: "OAuth client secret" }),
+                              );
+                              setDirty(true);
+                            }}
+                          />
+                        </>
+                      ) : null}
                     </>
                   ) : null}
                 </>
-              ) : null}
-            </>
-          )}
-          <fieldset
-            className="flex flex-wrap gap-2 text-xs"
-            disabled={!canMutate || state.isPending}
-          >
-            <legend className="sr-only">Project MCP providers</legend>
-            {providerEntries.map((entry) => {
-              const id = entry.instanceId as ProviderInstanceId;
-              return (
-                <label key={entry.instanceId} className="flex items-center gap-1">
-                  <input
-                    type="checkbox"
-                    checked={selectedProviders.includes(id)}
-                    onChange={(event) =>
-                      setSelectedProviders(
-                        event.target.checked
-                          ? [...selectedProviders, id]
-                          : selectedProviders.filter((item) => item !== id),
-                      )
-                    }
-                  />
-                  {entry.displayName}
-                </label>
-              );
-            })}
-            {unavailableProviderIds.map((id) => (
-              <label key={id} className="flex items-center gap-1 text-muted-foreground">
+              )}
+              <fieldset
+                className="flex flex-wrap gap-2 text-xs"
+                disabled={!canMutate || state.isPending}
+              >
+                <legend className="sr-only">Project MCP providers</legend>
+                {providerEntries.map((entry) => {
+                  const id = entry.instanceId as ProviderInstanceId;
+                  return (
+                    <label key={entry.instanceId} className="flex items-center gap-1">
+                      <input
+                        type="checkbox"
+                        checked={selectedProviders.includes(id)}
+                        onChange={(event) =>
+                          setSelectedProviders(
+                            event.target.checked
+                              ? [...selectedProviders, id]
+                              : selectedProviders.filter((item) => item !== id),
+                          )
+                        }
+                      />
+                      {entry.displayName}
+                    </label>
+                  );
+                })}
+                {unavailableProviderIds.map((id) => (
+                  <label key={id} className="flex items-center gap-1 text-muted-foreground">
+                    <input
+                      type="checkbox"
+                      checked
+                      aria-label={`Select unavailable provider ${id}`}
+                      onChange={() =>
+                        setSelectedProviders(selectedProviders.filter((item) => item !== id))
+                      }
+                    />
+                    {id} (Unavailable)
+                  </label>
+                ))}
+              </fieldset>
+              <label className="flex items-center gap-2 text-sm">
                 <input
                   type="checkbox"
-                  checked
-                  aria-label={`Select unavailable provider ${id}`}
-                  onChange={() =>
-                    setSelectedProviders(selectedProviders.filter((item) => item !== id))
-                  }
+                  aria-label="Project MCP enabled"
+                  checked={enabled}
+                  onChange={(event) => {
+                    setEnabled(event.target.checked);
+                    setDirty(true);
+                  }}
+                  disabled={!canMutate || state.isPending}
                 />
-                {id} (Unavailable)
+                Enabled
               </label>
-            ))}
-          </fieldset>
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              aria-label="Project MCP enabled"
-              checked={enabled}
-              onChange={(event) => {
-                setEnabled(event.target.checked);
-                setDirty(true);
-              }}
-              disabled={!canMutate || state.isPending}
-            />
-            Enabled
-          </label>
-          <Button
-            size="sm"
-            onClick={() => void add()}
-            disabled={
-              !canMutate ||
-              !draft.name.trim() ||
-              (transportType === "stdio" ? !command.trim() : !draft.url.trim()) ||
-              state.isPending
-            }
-          >
-            {editingOverrideId ? "Save override" : editingId ? "Save local" : "Add local"}
-          </Button>
-          {editingId ? (
-            <Button type="button" size="sm" variant="ghost" onClick={resetDraft}>
-              Cancel
-            </Button>
-          ) : null}
-          {editingOverrideId ? (
-            <Button type="button" size="sm" variant="ghost" onClick={resetDraft}>
-              Cancel override
-            </Button>
-          ) : null}
-        </div>
-        {error ? <p className="text-sm text-destructive">{error}</p> : null}
+              <Button
+                size="sm"
+                onClick={() => void add()}
+                disabled={
+                  !canMutate ||
+                  !draft.name.trim() ||
+                  (transportType === "stdio" ? !command.trim() : !draft.url.trim()) ||
+                  state.isPending
+                }
+              >
+                {editingOverrideId ? "Save override" : editingId ? "Save local" : "Add local"}
+              </Button>
+              {editingId ? (
+                <Button type="button" size="sm" variant="ghost" onClick={resetDraft}>
+                  Cancel
+                </Button>
+              ) : null}
+              {editingOverrideId ? (
+                <Button type="button" size="sm" variant="ghost" onClick={resetDraft}>
+                  Cancel override
+                </Button>
+              ) : null}
+            </div>
+            {error ? <p className="text-sm text-destructive">{error}</p> : null}
+          </>
+        )}
         {local.length > 0 ? (
           <ul className="mt-3 space-y-1 text-sm text-muted-foreground">
             {local.map((entry) => (
-              <li key={entry.definitionId} className="flex items-center justify-between gap-2">
+              <li
+                key={entry.definitionId}
+                className={`flex items-center justify-between gap-2 ${targetDefinition?.definitionId === entry.definitionId ? "rounded bg-accent/70 px-1 ring-1 ring-inset ring-ring" : ""}`}
+              >
                 <span>
                   {entry.name}
                   {entry.enabled ? "" : " (disabled)"}
@@ -1519,7 +1725,10 @@ export function McpCatalogProjectSettings({
                       }
                     : null;
                 return (
-                  <li key={entry.id} className="flex items-center justify-between gap-2">
+                  <li
+                    key={entry.id}
+                    className={`flex items-center justify-between gap-2 ${targetOverride?.id === entry.id ? "rounded bg-accent/70 px-1 ring-1 ring-inset ring-ring" : ""}`}
+                  >
                     <span>
                       {entry.name ?? entry.targetId}
                       {entry.enabled === false ? " (disabled)" : ""}
@@ -1557,15 +1766,24 @@ export function McpCatalogProjectSettings({
                             </Button>
                           </>
                         ) : null}
-                        <Button
-                          size="xs"
-                          type="button"
-                          variant="ghost"
-                          onClick={() => editOverride(entry)}
-                          disabled={!canMutate || state.isPending}
-                        >
-                          Edit override
-                        </Button>
+                        {target ? (
+                          <Button
+                            size="xs"
+                            type="button"
+                            variant="ghost"
+                            onClick={() => {
+                              if (targetKey) setDismissedTargetKey(targetKey);
+                              editOverride(entry);
+                            }}
+                            disabled={!canMutate || state.isPending}
+                          >
+                            Edit override
+                          </Button>
+                        ) : (
+                          <span className="text-xs text-muted-foreground">
+                            Inherited server removed
+                          </span>
+                        )}
                         <Button
                           size="xs"
                           type="button"

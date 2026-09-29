@@ -27,7 +27,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { isElectron } from "../../env";
 import { usePrimarySessionState } from "../../environments/primary";
 import { deriveProviderInstanceEntries } from "../../providerInstances";
-import { usePrimaryEnvironmentId } from "../../state/environments";
+import { useEnvironments, usePrimaryEnvironmentId } from "../../state/environments";
 import { projectMcpEnvironment } from "../../state/projects";
 import {
   CatalogCredentialFields,
@@ -69,6 +69,7 @@ import {
   resolveRemoteOperateAccess,
 } from "./ProviderSettingsPanel.logic";
 import { SettingsRow, SettingsSection } from "./settingsLayout";
+import type { ResourceTarget } from "../../features/resources/resourceTarget";
 
 type CatalogEntry = ProjectMcpServer | ProjectMcpManagedServer;
 
@@ -1257,6 +1258,7 @@ function PrimarySessionProjectMcpSettings({
   projectId,
   providers,
   settings,
+  resourceTarget,
   scoped = false,
   canOverride = true,
 }: {
@@ -1264,6 +1266,7 @@ function PrimarySessionProjectMcpSettings({
   readonly projectId: ProjectId;
   readonly providers: ReadonlyArray<ServerProvider>;
   readonly settings?: Pick<ServerSettings, "providers" | "providerInstances"> | undefined;
+  readonly resourceTarget?: ResourceTarget | null;
   readonly scoped?: boolean;
   readonly canOverride?: boolean;
 }) {
@@ -1283,6 +1286,7 @@ function PrimarySessionProjectMcpSettings({
         projectId={projectId}
         providers={providers}
         settings={settings}
+        resourceTarget={resourceTarget ?? null}
         canOverride={canOverride}
         canMutate={operateAccess === "granted"}
       />
@@ -1303,6 +1307,7 @@ function RemoteSessionProjectMcpSettings({
   projectId,
   providers,
   settings,
+  resourceTarget,
   scoped = false,
   canOverride = true,
 }: {
@@ -1310,6 +1315,7 @@ function RemoteSessionProjectMcpSettings({
   readonly projectId: ProjectId;
   readonly providers: ReadonlyArray<ServerProvider>;
   readonly settings?: Pick<ServerSettings, "providers" | "providerInstances"> | undefined;
+  readonly resourceTarget?: ResourceTarget | null;
   readonly scoped?: boolean;
   readonly canOverride?: boolean;
 }) {
@@ -1327,6 +1333,7 @@ function RemoteSessionProjectMcpSettings({
         projectId={projectId}
         providers={providers}
         settings={settings}
+        resourceTarget={resourceTarget ?? null}
         canOverride={canOverride}
         canMutate={operateAccess === "granted"}
       />
@@ -1359,12 +1366,28 @@ export function projectMcpSettingsMode(capabilities: {
 export function ProjectMcpSettings({
   environmentId,
   projectId,
+  resourceTarget = null,
 }: {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
+  readonly resourceTarget?: ResourceTarget | null;
 }) {
+  const { environments } = useEnvironments();
+  const selectedEnvironment = environments.find((entry) => entry.environmentId === environmentId);
   const config = useAtomValue(serverEnvironment.configValueAtom(environmentId));
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  if (
+    selectedEnvironment?.connection.phase !== "connected" ||
+    selectedEnvironment.serverConfig === null
+  ) {
+    return (
+      <SettingsSection id="project-mcp-unavailable" title="Project MCP servers">
+        <p className="text-sm text-muted-foreground">
+          Reconnect this checkout&apos;s environment to open MCP settings.
+        </p>
+      </SettingsSection>
+    );
+  }
   if (!config) return null;
   const mode = projectMcpSettingsMode(config.environment.capabilities);
   if (mode === null) return null;
@@ -1376,6 +1399,7 @@ export function ProjectMcpSettings({
         projectId={projectId}
         providers={config.providers}
         settings={config.settings}
+        resourceTarget={resourceTarget}
       />
     ) : (
       <RemoteSessionProjectMcpSettings
@@ -1384,6 +1408,7 @@ export function ProjectMcpSettings({
         projectId={projectId}
         providers={config.providers}
         settings={config.settings}
+        resourceTarget={resourceTarget}
       />
     );
   }
@@ -1395,6 +1420,7 @@ export function ProjectMcpSettings({
         projectId={projectId}
         providers={config.providers}
         settings={config.settings}
+        resourceTarget={resourceTarget}
         scoped
         canOverride={config.environment.capabilities.projectMcpOverrides === true}
       />
@@ -1407,6 +1433,7 @@ export function ProjectMcpSettings({
       projectId={projectId}
       providers={config.providers}
       settings={config.settings}
+      resourceTarget={resourceTarget}
       scoped
       canOverride={config.environment.capabilities.projectMcpOverrides === true}
     />
