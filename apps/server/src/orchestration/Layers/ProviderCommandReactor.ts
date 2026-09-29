@@ -5,6 +5,7 @@ import {
   ApprovalRequestId,
   type ModelSelection,
   type OrchestrationEvent,
+  type OrchestrationTurnProvenance,
   ProviderDriverKind,
   type ProjectId,
   type OrchestrationSession,
@@ -24,9 +25,11 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
+import * as Exit from "effect/Exit";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
@@ -38,6 +41,7 @@ import {
   ProviderAdapterRequestError,
   ProviderAdapterValidationError,
   ProviderWorkspaceMissingError,
+  ProviderValidationError,
 } from "../../provider/Errors.ts";
 import type { ProviderServiceError } from "../../provider/Errors.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
@@ -46,6 +50,9 @@ import { ProviderService } from "../../provider/Services/ProviderService.ts";
 import { ProviderRegistry } from "../../provider/Services/ProviderRegistry.ts";
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
+import { ProjectionTerminalCompletionWakeRepository } from "../../persistence/Services/ProjectionTerminalCompletionWakes.ts";
+import { ProjectTerminalWakeService } from "../Services/ProjectTerminalWakeService.ts";
 import {
   ProviderCommandReactor,
   type ProviderCommandReactorShape,
@@ -66,6 +73,7 @@ import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
 const isProviderAdapterValidationError = Schema.is(ProviderAdapterValidationError);
 const isProviderWorkspaceMissingError = Schema.is(ProviderWorkspaceMissingError);
+const isProviderValidationError = Schema.is(ProviderValidationError);
 const isProviderDriverKind = Schema.is(ProviderDriverKind);
 
 type ProviderIntentEvent = Extract<
@@ -82,7 +90,9 @@ type ProviderIntentEvent = Extract<
       | "thread.user-input-response-requested"
       | "thread.session-stop-requested"
       | "thread.settled"
-      | "thread.session-set";
+      | "thread.session-set"
+      | "thread.terminal-completion-requested"
+      | "thread.terminal-completion-continuation-started";
   }
 >;
 
@@ -212,6 +222,13 @@ const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+  const projectionTurnRepository = yield* ProjectionTurnRepository;
+  const terminalCompletionWakes = yield* ProjectionTerminalCompletionWakeRepository;
+  const terminalWakeService = yield* Effect.serviceOption(ProjectTerminalWakeService);
+  const terminalWakeServerRunIds = new Map<ThreadId, string>();
+  const currentTerminalWakeServerRunId = (threadId: ThreadId) =>
+    terminalWakeServerRunIds.get(threadId) ??
+    (Option.isSome(terminalWakeService) ? terminalWakeService.value.serverRunId : undefined);
   const providerAuthService = yield* ProviderAuthService;
   const providerService = yield* ProviderService;
   const providerRegistry = yield* ProviderRegistry;
@@ -251,6 +268,32 @@ const make = Effect.gen(function* () {
   type QueuedTurnStart = Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>;
   // Turn starts received while a thread compacts, replayed in order once its session is restored.
   const turnsAfterCompaction = new Map<ThreadId, Array<QueuedTurnStart>>();
+  const userTurnStartsInFlight = new Map<ThreadId, TurnId | "starting">();
+  const userTurnResumptionsInFlight = new Set<ThreadId>();
+  const terminalCompletionTurnsInFlight = new Map<ThreadId, TurnId | "starting">();
+  const terminalWakeRetriesBlocked = new Set<ThreadId>();
+  const userTurnsAfterTerminalCompletion = new Map<ThreadId, Array<QueuedTurnStart>>();
+  type UserTurnResumeRequest =
+    | {
+        readonly type: "resume";
+        readonly threadId: ThreadId;
+        readonly completed: Deferred.Deferred<void>;
+      }
+    | { readonly type: "barrier"; readonly completed: Deferred.Deferred<void> };
+  const userTurnResumeRequests = yield* Queue.unbounded<UserTurnResumeRequest>();
+  let userTurnResumeWorkerStarted = false;
+  const scheduleUserTurnResume = (threadId: ThreadId) =>
+    Effect.gen(function* () {
+      const completed = yield* Deferred.make<void>();
+      yield* Queue.offer(userTurnResumeRequests, { type: "resume", threadId, completed });
+      yield* Deferred.await(completed);
+    });
+  const drainUserTurnResumeRequests = Effect.gen(function* () {
+    if (!userTurnResumeWorkerStarted) return;
+    const completed = yield* Deferred.make<void>();
+    yield* Queue.offer(userTurnResumeRequests, { type: "barrier", completed });
+    yield* Deferred.await(completed);
+  });
   // Replay command id → the queued turn start it re-requests. `sent` settles once the replay's
   // provider send finishes, which is what lets the next queued turn follow it in order.
   const resumedTurnStarts = new Map<
@@ -565,6 +608,7 @@ const make = Effect.gen(function* () {
   const setThreadSession = (input: {
     readonly threadId: ThreadId;
     readonly session: OrchestrationSession;
+    readonly turnProvenance?: OrchestrationTurnProvenance;
     readonly createdAt: string;
   }) =>
     serverCommandId("provider-session-set").pipe(
@@ -573,11 +617,37 @@ const make = Effect.gen(function* () {
           type: "thread.session.set",
           commandId,
           threadId: input.threadId,
+          ...(input.turnProvenance !== undefined ? { turnProvenance: input.turnProvenance } : {}),
           session: input.session,
           createdAt: input.createdAt,
         }),
       ),
     );
+
+  const restoreSessionAfterTerminalDispatch = Effect.fn("restoreSessionAfterTerminalDispatch")(
+    function* (threadId: ThreadId) {
+      const thread = yield* resolveThreadShell(threadId);
+      if (!thread?.session || thread.session.status !== "starting") return;
+      const runtimeSession = (yield* providerService.listSessions()).find(
+        (session) => String(session.threadId) === String(threadId),
+      );
+      if (!runtimeSession) return;
+      yield* setThreadSession({
+        threadId,
+        session: {
+          ...thread.session,
+          status: mapProviderSessionStatusToOrchestrationStatus(runtimeSession.status),
+          activeTurnId: runtimeSession.activeTurnId ?? null,
+          providerName: runtimeSession.provider,
+          providerInstanceId:
+            runtimeSession.providerInstanceId ?? thread.session.providerInstanceId,
+          lastError: runtimeSession.lastError ?? null,
+          updatedAt: runtimeSession.updatedAt,
+        },
+        createdAt: runtimeSession.updatedAt,
+      });
+    },
+  );
 
   const setThreadSessionErrorOnTurnStartFailure = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
@@ -1378,11 +1448,18 @@ const make = Effect.gen(function* () {
   const processTurnStartRequested = Effect.fn("processTurnStartRequested")(function* (
     receivedEvent: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
   ) {
+    terminalWakeRetriesBlocked.delete(receivedEvent.payload.threadId);
     const resumed =
       receivedEvent.commandId !== null ? resumedTurnStarts.get(receivedEvent.commandId) : undefined;
     const event = resumed ? { ...receivedEvent, payload: resumed.event.payload } : receivedEvent;
     const key = turnStartKeyForEvent(event);
     if (yield* hasHandledTurnStartRecently(key)) {
+      return;
+    }
+    if (terminalCompletionTurnsInFlight.has(event.payload.threadId)) {
+      const queued = userTurnsAfterTerminalCompletion.get(event.payload.threadId) ?? [];
+      queued.push(event);
+      userTurnsAfterTerminalCompletion.set(event.payload.threadId, queued);
       return;
     }
 
@@ -1654,6 +1731,24 @@ const make = Effect.gen(function* () {
       turnsAfterCompaction.set(event.payload.threadId, queued);
       return;
     }
+    const pendingStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+      threadId: thread.id,
+    });
+    if (
+      Option.isNone(pendingStart) ||
+      String(pendingStart.value.messageId) !== String(event.payload.messageId)
+    ) {
+      yield* orchestrationEngine.dispatch({
+        type: "thread.turn.start.admit",
+        commandId: yield* serverCommandId("turn-start-admit"),
+        threadId: thread.id,
+        messageId: event.payload.messageId,
+        ...(event.payload.sourceProposedPlan === undefined
+          ? {}
+          : { sourceProposedPlan: event.payload.sourceProposedPlan }),
+        requestedAt: event.payload.createdAt,
+      });
+    }
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: event.payload.threadId,
       messageText: projectComposerContextForProvider({
@@ -1675,15 +1770,574 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const send = providerService
-      .sendTurn(sendTurnRequest.value)
-      .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure));
+    userTurnStartsInFlight.set(event.payload.threadId, "starting");
+    const send = providerService.sendTurn(sendTurnRequest.value).pipe(
+      Effect.tap((turn) => recordUserTurnStartAcknowledgement(event.payload.threadId, turn.turnId)),
+      Effect.asVoid,
+      Effect.catchCause((cause) =>
+        recoverTurnStartFailure(cause).pipe(
+          Effect.ensuring(
+            Effect.sync(() => void userTurnStartsInFlight.delete(event.payload.threadId)),
+          ),
+        ),
+      ),
+    );
     // The forked send settles `sent` from here on, so drop the entry the post-processing hook uses.
     if (resumed && event.commandId !== null) resumedTurnStarts.delete(event.commandId);
     yield* send.pipe(
       Effect.ensuring(resumed ? Deferred.succeed(resumed.sent, undefined) : Effect.void),
       Effect.forkScoped,
     );
+  });
+
+  const resumeOneUserTurnAfterTerminalCompletion = Effect.fn(
+    "resumeOneUserTurnAfterTerminalCompletion",
+  )(function* (threadId: ThreadId) {
+    const queued = userTurnsAfterTerminalCompletion.get(threadId);
+    const event = queued?.shift();
+    if (event === undefined) {
+      userTurnsAfterTerminalCompletion.delete(threadId);
+      return;
+    }
+    if (queued?.length === 0) userTurnsAfterTerminalCompletion.delete(threadId);
+    const commandId = yield* serverCommandId("after-terminal-completion");
+    userTurnResumptionsInFlight.add(threadId);
+    yield* processTurnStartRequested({ ...event, commandId }).pipe(
+      Effect.ensuring(Effect.sync(() => void userTurnResumptionsInFlight.delete(threadId))),
+    );
+  });
+
+  const setWakeKeysStatus = Effect.fn("setWakeKeysStatus")(function* (input: {
+    readonly wakeKeys: ReadonlyArray<string>;
+    readonly status: "pending" | "delivered" | "canceled" | "unknown";
+  }) {
+    const updatedAt = DateTime.formatIso(yield* DateTime.now);
+    yield* Effect.forEach(
+      input.wakeKeys,
+      (dedupeKey) =>
+        terminalCompletionWakes.setStatus({
+          dedupeKey,
+          status: input.status,
+          updatedAt,
+        }),
+      { concurrency: 1, discard: true },
+    );
+  });
+
+  const clearPendingTerminalTurnStart = Effect.fn("clearPendingTerminalTurnStart")(
+    function* (input: {
+      readonly threadId: ThreadId;
+      readonly wakeKey: string;
+      readonly attemptId: string;
+    }) {
+      const commandId = CommandId.make(
+        `terminal-completion-continuation-cancel:${input.attemptId}:${input.wakeKey}`,
+      );
+      yield* orchestrationEngine
+        .dispatch({
+          type: "thread.terminal-completion.continuation.cancel",
+          commandId,
+          threadId: input.threadId,
+          wakeKey: input.wakeKey,
+          createdAt: DateTime.formatIso(yield* DateTime.now),
+        })
+        .pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.interrupt
+              : Effect.logWarning("failed to clear pending terminal completion turn identity", {
+                  threadId: input.threadId,
+                  wakeKey: input.wakeKey,
+                  cause: Cause.pretty(cause),
+                }),
+          ),
+        );
+    },
+  );
+
+  const appendUnknownTerminalWakeActivity = Effect.fn("appendUnknownTerminalWakeActivity")(
+    function* (input: {
+      readonly threadId: ThreadId;
+      readonly wakeKeys: ReadonlyArray<string>;
+      readonly createdAt: string;
+    }) {
+      yield* Effect.forEach(
+        input.wakeKeys,
+        (wakeKey) => {
+          const stableId = `terminal-completion-wake-unknown:${wakeKey}`;
+          return orchestrationEngine
+            .dispatch({
+              type: "thread.activity.append",
+              commandId: CommandId.make(stableId),
+              threadId: input.threadId,
+              activity: {
+                id: EventId.make(stableId),
+                tone: "error",
+                kind: "terminal.project.wake.unknown",
+                summary: "Terminal completion wake outcome is unknown",
+                payload: {
+                  wakeKey,
+                  detail: "The provider outcome could not be confirmed. This wake was not resent.",
+                },
+                turnId: null,
+                createdAt: input.createdAt,
+              },
+              createdAt: input.createdAt,
+            })
+            .pipe(
+              Effect.catchCause((cause) =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.interrupt
+                  : Effect.logWarning("failed to record unknown terminal completion wake", {
+                      threadId: input.threadId,
+                      wakeKey,
+                      cause: Cause.pretty(cause),
+                    }),
+              ),
+            );
+        },
+        { concurrency: 1, discard: true },
+      );
+    },
+  );
+
+  const terminalWakeTargetState = Effect.fn("terminalWakeTargetState")(function* (
+    threadId: ThreadId,
+    options?: { readonly allowDispatchReservation?: boolean },
+  ) {
+    const thread = yield* resolveThreadShell(threadId);
+    if (!thread || thread.archivedAt !== null) return "removed";
+    const dispatchReservation = terminalCompletionTurnsInFlight.get(threadId);
+    const isOwnDispatchReservation =
+      options?.allowDispatchReservation === true && dispatchReservation === "starting";
+    if (userTurnResumptionsInFlight.has(threadId)) return "busy";
+    const userTurnStart = userTurnStartsInFlight.get(threadId);
+    if (userTurnStart === "starting") return "busy";
+    if (dispatchReservation !== undefined && !isOwnDispatchReservation) return "busy";
+    const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+      threadId,
+    });
+    if (Option.isSome(pendingTurnStart) && pendingTurnStart.value.messageId !== null) {
+      return "busy";
+    }
+    const reservedIdleDispatch =
+      isOwnDispatchReservation &&
+      thread.session?.status === "starting" &&
+      thread.session.activeTurnId === null;
+    const activeTurnForSteer =
+      thread.session?.status === "running" ? thread.session.activeTurnId : null;
+    if (
+      userTurnStart !== undefined &&
+      (activeTurnForSteer === null || String(userTurnStart) !== String(activeTurnForSteer))
+    ) {
+      return "busy";
+    }
+    if (dispatchReservation !== undefined && !reservedIdleDispatch && activeTurnForSteer == null) {
+      return "busy";
+    }
+    if (
+      !reservedIdleDispatch &&
+      activeTurnForSteer == null &&
+      (!thread.session || thread.session.status !== "ready")
+    ) {
+      return thread.session?.status === "starting" || thread.session?.status === "running"
+        ? "busy"
+        : "unavailable";
+    }
+    const runtimeSession = (yield* providerService.listSessions()).find(
+      (session) => String(session.threadId) === String(threadId),
+    );
+    if (
+      !runtimeSession ||
+      runtimeSession.status === "closed" ||
+      runtimeSession.status === "error"
+    ) {
+      return "unavailable";
+    }
+    if (activeTurnForSteer != null) {
+      if (dispatchReservation !== undefined && !isOwnDispatchReservation) {
+        return "busy";
+      }
+      if (
+        runtimeSession.status !== "running" ||
+        runtimeSession.activeTurnId == null ||
+        String(runtimeSession.activeTurnId) !== String(activeTurnForSteer)
+      ) {
+        return "busy";
+      }
+      if (thread.session?.providerInstanceId == null) return "busy";
+      const capabilities = yield* providerService.getCapabilities(
+        thread.session.providerInstanceId,
+      );
+      return capabilities.activeTurnSteer === true ? "steer" : "busy";
+    }
+    if (reservedIdleDispatch) {
+      return runtimeSession.status === "ready" ? "ready" : "busy";
+    }
+    if (runtimeSession.status !== "ready") return "busy";
+    return "ready";
+  });
+
+  const makeTerminalCompletionPrompt = (
+    wakes: ReadonlyArray<{
+      readonly projectId: ProjectId;
+      readonly terminalId: string;
+      readonly label: string;
+      readonly status: "exited" | "killed";
+      readonly exitCode: number | null;
+      readonly exitSignal: number | null;
+    }>,
+  ): string => {
+    const summaries = wakes.map((wake) => {
+      const label = wake.label.replace(/[\r\n\t]+/g, " ").slice(0, 160);
+      const terminalId = wake.terminalId.replace(/[\r\n\t]+/g, " ").slice(0, 128);
+      const outcome =
+        wake.status === "killed"
+          ? "killed"
+          : wake.exitSignal !== null
+            ? `exited on signal ${wake.exitSignal}`
+            : `exited with code ${wake.exitCode ?? "unknown"}`;
+      return `- ${label} (terminal ${terminalId}): ${outcome}. Read logs with terminal_read using projectId ${wake.projectId} and terminalId ${terminalId}.`;
+    });
+    return [
+      "A project terminal you subscribed to has completed.",
+      ...summaries,
+      "Review the terminal output with terminal_read if it is relevant to the current work.",
+    ].join("\n");
+  };
+
+  const processPendingTerminalCompletionWakes = Effect.fn("processPendingTerminalCompletionWakes")(
+    function* (input: { readonly threadId: ThreadId; readonly serverRunId: string }) {
+      if (terminalWakeRetriesBlocked.has(input.threadId)) return;
+      const thread = yield* resolveThreadShell(input.threadId);
+      if (!thread || thread.archivedAt !== null) {
+        yield* terminalCompletionWakes.cancelThread({
+          threadId: input.threadId,
+          updatedAt: DateTime.formatIso(yield* DateTime.now),
+        });
+        return;
+      }
+      const targetState = yield* terminalWakeTargetState(input.threadId);
+      if (targetState === "busy") return;
+      if (targetState === "removed" || targetState === "unavailable") {
+        yield* terminalCompletionWakes.cancelThread({
+          threadId: input.threadId,
+          updatedAt: DateTime.formatIso(yield* DateTime.now),
+        });
+        return;
+      }
+
+      const pending = yield* terminalCompletionWakes.listPendingByThread({
+        threadId: input.threadId,
+        serverRunId: input.serverRunId,
+      });
+      if (pending.length === 0) return;
+      const claimed: Array<(typeof pending)[number]> = [];
+      const updatedAt = DateTime.formatIso(yield* DateTime.now);
+      for (const wake of pending) {
+        const row = yield* terminalCompletionWakes.claim({
+          dedupeKey: wake.dedupeKey,
+          serverRunId: input.serverRunId,
+          updatedAt,
+        });
+        if (row !== null) claimed.push(row);
+      }
+      if (claimed.length === 0) return;
+
+      const latestState = yield* terminalWakeTargetState(input.threadId);
+      if (latestState !== "ready" && latestState !== "steer") {
+        const status =
+          latestState === "removed" || latestState === "unavailable" ? "canceled" : "pending";
+        yield* setWakeKeysStatus({
+          wakeKeys: claimed.map((wake) => wake.dedupeKey),
+          status,
+        });
+        return;
+      }
+
+      const wakeKeys = claimed.map((wake) => wake.dedupeKey);
+      const admissionCommandId = yield* serverCommandId("terminal-completion-continuation");
+      const deliveryMode = latestState === "ready" ? "idle" : "steer";
+      yield* orchestrationEngine
+        .dispatch({
+          type: "thread.terminal-completion.continuation.start",
+          commandId: admissionCommandId,
+          threadId: input.threadId,
+          projectId: thread.projectId,
+          deliveryMode,
+          serverRunId: input.serverRunId,
+          wakeKeys,
+          prompt: makeTerminalCompletionPrompt(claimed),
+          createdAt: DateTime.formatIso(yield* DateTime.now),
+        })
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              const afterFailure = yield* terminalWakeTargetState(input.threadId);
+              const status =
+                afterFailure === "removed" || afterFailure === "unavailable"
+                  ? "canceled"
+                  : "pending";
+              yield* setWakeKeysStatus({ wakeKeys, status });
+              if (status === "canceled") {
+                yield* clearPendingTerminalTurnStart({
+                  threadId: input.threadId,
+                  wakeKey: wakeKeys[0]!,
+                  attemptId: admissionCommandId,
+                });
+              }
+              if (!Cause.hasInterruptsOnly(cause)) {
+                yield* Effect.logWarning("failed to admit terminal completion continuation", {
+                  threadId: input.threadId,
+                  cause: Cause.pretty(cause),
+                });
+              }
+            }),
+          ),
+        );
+    },
+  );
+
+  const resumeUserTurnOrPendingTerminalWake = Effect.fn("resumeUserTurnOrPendingTerminalWake")(
+    function* (threadId: ThreadId) {
+      if ((userTurnsAfterTerminalCompletion.get(threadId)?.length ?? 0) > 0) {
+        yield* resumeOneUserTurnAfterTerminalCompletion(threadId);
+        return;
+      }
+      const serverRunId = currentTerminalWakeServerRunId(threadId);
+      if (serverRunId !== undefined) {
+        yield* processPendingTerminalCompletionWakes({ threadId, serverRunId });
+      }
+    },
+  );
+
+  const processUserTurnResumeRequests = Effect.forever(
+    Queue.take(userTurnResumeRequests).pipe(
+      Effect.flatMap((request) =>
+        request.type === "barrier"
+          ? Deferred.succeed(request.completed, undefined)
+          : resumeUserTurnOrPendingTerminalWake(request.threadId).pipe(
+              Effect.catchCause((cause) =>
+                Cause.hasInterruptsOnly(cause)
+                  ? Effect.failCause(cause)
+                  : Effect.logWarning("provider command reactor failed to resume after user turn", {
+                      threadId: request.threadId,
+                      cause: Cause.pretty(cause),
+                    }),
+              ),
+              Effect.ensuring(Deferred.succeed(request.completed, undefined)),
+            ),
+      ),
+    ),
+  );
+
+  const recordUserTurnStartAcknowledgement = Effect.fn("recordUserTurnStartAcknowledgement")(
+    function* (threadId: ThreadId, turnId: TurnId) {
+      const reservation = userTurnStartsInFlight.get(threadId);
+      if (reservation !== "starting" && reservation !== turnId) return;
+
+      const recordedTurn = yield* projectionTurnRepository.getByTurnId({ threadId, turnId });
+      if (Option.isSome(recordedTurn) && recordedTurn.value.state !== "running") {
+        userTurnStartsInFlight.delete(threadId);
+        yield* scheduleUserTurnResume(threadId);
+        return;
+      }
+      userTurnStartsInFlight.set(threadId, turnId);
+    },
+  );
+
+  const processTerminalCompletionRequested = (
+    event: Extract<ProviderIntentEvent, { type: "thread.terminal-completion-requested" }>,
+  ) => {
+    terminalWakeServerRunIds.set(event.payload.threadId, event.payload.serverRunId);
+    return processPendingTerminalCompletionWakes({
+      threadId: event.payload.threadId,
+      serverRunId: event.payload.serverRunId,
+    });
+  };
+
+  type TerminalContinuationEvent = Extract<
+    ProviderIntentEvent,
+    { type: "thread.terminal-completion-continuation-started" }
+  >;
+  const processTerminalCompletionContinuationDispatch = Effect.fn(
+    "processTerminalCompletionContinuationDispatch",
+  )(function* (event: TerminalContinuationEvent) {
+    yield* Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const targetState = yield* terminalWakeTargetState(event.payload.threadId, {
+          allowDispatchReservation: true,
+        });
+        const targetMode = targetState === "ready" ? "idle" : targetState;
+        const deliveryMode = event.payload.deliveryMode;
+        if (targetMode !== deliveryMode) {
+          const status =
+            targetState === "removed" || targetState === "unavailable" ? "canceled" : "pending";
+          yield* setWakeKeysStatus({ wakeKeys: event.payload.wakeKeys, status });
+          yield* clearPendingTerminalTurnStart({
+            threadId: event.payload.threadId,
+            wakeKey: event.payload.wakeKeys[0]!,
+            attemptId: String(event.commandId ?? event.eventId),
+          });
+          terminalCompletionTurnsInFlight.delete(event.payload.threadId);
+          yield* restoreSessionAfterTerminalDispatch(event.payload.threadId);
+          yield* resumeUserTurnOrPendingTerminalWake(event.payload.threadId);
+          return;
+        }
+
+        const thread = yield* resolveThreadShell(event.payload.threadId);
+        if (!thread?.session) {
+          yield* setWakeKeysStatus({ wakeKeys: event.payload.wakeKeys, status: "canceled" });
+          yield* clearPendingTerminalTurnStart({
+            threadId: event.payload.threadId,
+            wakeKey: event.payload.wakeKeys[0]!,
+            attemptId: String(event.commandId ?? event.eventId),
+          });
+          terminalCompletionTurnsInFlight.delete(event.payload.threadId);
+          yield* resumeUserTurnOrPendingTerminalWake(event.payload.threadId);
+          return;
+        }
+
+        const result = yield* restore(
+          providerService
+            .continueFromTerminalCompletion({
+              threadId: event.payload.threadId,
+              prompt: event.payload.prompt,
+            })
+            .pipe(Effect.exit),
+        );
+        if (Exit.isFailure(result)) {
+          const failure = result.cause.reasons.find(Cause.isFailReason)?.error;
+          if (isProviderValidationError(failure) || isProviderAdapterValidationError(failure)) {
+            yield* setWakeKeysStatus({ wakeKeys: event.payload.wakeKeys, status: "pending" });
+            yield* clearPendingTerminalTurnStart({
+              threadId: event.payload.threadId,
+              wakeKey: event.payload.wakeKeys[0]!,
+              attemptId: String(event.commandId ?? event.eventId),
+            });
+            if (deliveryMode === "idle") {
+              terminalWakeRetriesBlocked.add(event.payload.threadId);
+            }
+            terminalCompletionTurnsInFlight.delete(event.payload.threadId);
+            yield* restoreSessionAfterTerminalDispatch(event.payload.threadId);
+            yield* resumeUserTurnOrPendingTerminalWake(event.payload.threadId);
+            return;
+          }
+
+          yield* setWakeKeysStatus({ wakeKeys: event.payload.wakeKeys, status: "unknown" });
+          yield* appendUnknownTerminalWakeActivity({
+            threadId: event.payload.threadId,
+            wakeKeys: event.payload.wakeKeys,
+            createdAt: DateTime.formatIso(yield* DateTime.now),
+          });
+          yield* clearPendingTerminalTurnStart({
+            threadId: event.payload.threadId,
+            wakeKey: event.payload.wakeKeys[0]!,
+            attemptId: String(event.commandId ?? event.eventId),
+          });
+          terminalCompletionTurnsInFlight.delete(event.payload.threadId);
+          yield* restoreSessionAfterTerminalDispatch(event.payload.threadId);
+          yield* resumeUserTurnOrPendingTerminalWake(event.payload.threadId);
+          return;
+        }
+
+        const createdAt = DateTime.formatIso(yield* DateTime.now);
+        const turn = result.value;
+        terminalCompletionTurnsInFlight.set(event.payload.threadId, turn.turnId);
+        yield* setWakeKeysStatus({ wakeKeys: event.payload.wakeKeys, status: "delivered" });
+
+        const recordedTurn = yield* projectionTurnRepository.getByTurnId({
+          threadId: event.payload.threadId,
+          turnId: turn.turnId,
+        });
+        const turnAlreadySettled =
+          Option.isSome(recordedTurn) && recordedTurn.value.state !== "running";
+        if (turnAlreadySettled) {
+          terminalCompletionTurnsInFlight.delete(event.payload.threadId);
+          yield* resumeUserTurnOrPendingTerminalWake(event.payload.threadId);
+          return;
+        }
+
+        const currentThread = yield* resolveThreadShell(event.payload.threadId);
+        if (!currentThread?.session) {
+          terminalCompletionTurnsInFlight.delete(event.payload.threadId);
+          return;
+        }
+        yield* setThreadSession({
+          threadId: event.payload.threadId,
+          session: {
+            ...currentThread.session,
+            status: "running",
+            activeTurnId: turn.turnId,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          turnProvenance: {
+            turnId: turn.turnId,
+            terminalCompletionWakeKey: event.payload.wakeKeys[0]!,
+          },
+          createdAt,
+        });
+      }),
+    );
+  });
+
+  const processTerminalCompletionContinuationSafely = (event: TerminalContinuationEvent) =>
+    processTerminalCompletionContinuationDispatch(event).pipe(
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.interrupt
+          : Effect.gen(function* () {
+              yield* setWakeKeysStatus({ wakeKeys: event.payload.wakeKeys, status: "unknown" });
+              yield* appendUnknownTerminalWakeActivity({
+                threadId: event.payload.threadId,
+                wakeKeys: event.payload.wakeKeys,
+                createdAt: DateTime.formatIso(yield* DateTime.now),
+              });
+              yield* clearPendingTerminalTurnStart({
+                threadId: event.payload.threadId,
+                wakeKey: event.payload.wakeKeys[0]!,
+                attemptId: String(event.commandId ?? event.eventId),
+              });
+              terminalCompletionTurnsInFlight.delete(event.payload.threadId);
+              yield* restoreSessionAfterTerminalDispatch(event.payload.threadId);
+              yield* Effect.logWarning("terminal completion provider dispatch failed", {
+                threadId: event.payload.threadId,
+                cause: Cause.pretty(cause),
+              });
+              yield* resumeUserTurnOrPendingTerminalWake(event.payload.threadId);
+            }),
+      ),
+    );
+  const terminalCompletionDispatchWorker = yield* makeDrainableWorker(
+    processTerminalCompletionContinuationSafely,
+  );
+
+  const processTerminalCompletionContinuationStarted = Effect.fn(
+    "processTerminalCompletionContinuationStarted",
+  )(function* (event: TerminalContinuationEvent) {
+    const alreadyReserved = terminalCompletionTurnsInFlight.has(event.payload.threadId);
+    if (!alreadyReserved) {
+      terminalCompletionTurnsInFlight.set(event.payload.threadId, "starting");
+    }
+    const targetState = yield* terminalWakeTargetState(event.payload.threadId, {
+      allowDispatchReservation: true,
+    });
+    const targetMode = targetState === "ready" ? "idle" : targetState;
+    if (targetMode !== event.payload.deliveryMode) {
+      const status =
+        targetState === "removed" || targetState === "unavailable" ? "canceled" : "pending";
+      yield* setWakeKeysStatus({ wakeKeys: event.payload.wakeKeys, status });
+      yield* clearPendingTerminalTurnStart({
+        threadId: event.payload.threadId,
+        wakeKey: event.payload.wakeKeys[0]!,
+        attemptId: String(event.commandId ?? event.eventId),
+      });
+      terminalCompletionTurnsInFlight.delete(event.payload.threadId);
+      yield* restoreSessionAfterTerminalDispatch(event.payload.threadId);
+      return;
+    }
+    yield* terminalCompletionDispatchWorker.enqueue(event);
   });
 
   const processTurnInterruptRequested = Effect.fn("processTurnInterruptRequested")(function* (
@@ -2188,8 +2842,86 @@ const make = Effect.gen(function* () {
           yield* maybeRefineThreadTitle(event.payload.threadId);
         return;
       case "thread.session-set":
-        if (event.payload.session.status === "ready")
+        if (event.payload.session.status === "ready") {
           yield* maybeRefineThreadTitle(event.payload.threadId);
+          if (event.payload.session.activeTurnId === null) {
+            const terminalTurnId = terminalCompletionTurnsInFlight.get(event.payload.threadId);
+            let terminalTurnSettled = terminalTurnId === undefined;
+            if (terminalTurnId !== undefined && terminalTurnId !== "starting") {
+              const terminalTurn = yield* projectionTurnRepository.getByTurnId({
+                threadId: event.payload.threadId,
+                turnId: terminalTurnId,
+              });
+              terminalTurnSettled =
+                Option.isSome(terminalTurn) && terminalTurn.value.state !== "running";
+            }
+            if (terminalTurnSettled && terminalTurnId !== undefined) {
+              terminalCompletionTurnsInFlight.delete(event.payload.threadId);
+            }
+            if (!terminalTurnSettled) return;
+            const userTurnState = userTurnStartsInFlight.get(event.payload.threadId);
+            let userTurnSettled = userTurnState === undefined;
+            if (userTurnState === "starting") {
+              userTurnSettled = false;
+            } else if (userTurnState !== undefined) {
+              const userTurn = yield* projectionTurnRepository.getByTurnId({
+                threadId: event.payload.threadId,
+                turnId: userTurnState,
+              });
+              userTurnSettled = Option.isSome(userTurn) && userTurn.value.state !== "running";
+            }
+            if (userTurnSettled && userTurnState !== undefined) {
+              userTurnStartsInFlight.delete(event.payload.threadId);
+            }
+            if (!userTurnSettled || userTurnResumptionsInFlight.has(event.payload.threadId)) return;
+            if (
+              !terminalCompletionTurnsInFlight.has(event.payload.threadId) &&
+              !userTurnStartsInFlight.has(event.payload.threadId)
+            ) {
+              const queued = userTurnsAfterTerminalCompletion.get(event.payload.threadId);
+              if (queued && queued.length > 0) {
+                yield* resumeOneUserTurnAfterTerminalCompletion(event.payload.threadId);
+              } else {
+                const serverRunId = currentTerminalWakeServerRunId(event.payload.threadId);
+                if (serverRunId !== undefined) {
+                  yield* processPendingTerminalCompletionWakes({
+                    threadId: event.payload.threadId,
+                    serverRunId,
+                  });
+                }
+              }
+            }
+          }
+        } else if (
+          event.payload.session.status === "error" ||
+          event.payload.session.status === "stopped"
+        ) {
+          userTurnStartsInFlight.delete(event.payload.threadId);
+          const terminalTurnId = terminalCompletionTurnsInFlight.get(event.payload.threadId);
+          if (terminalTurnId !== undefined && terminalTurnId !== "starting") {
+            const terminalTurn = yield* projectionTurnRepository.getByTurnId({
+              threadId: event.payload.threadId,
+              turnId: terminalTurnId,
+            });
+            if (Option.isSome(terminalTurn) && terminalTurn.value.state !== "running") {
+              terminalCompletionTurnsInFlight.delete(event.payload.threadId);
+            }
+          }
+          if (terminalCompletionTurnsInFlight.has(event.payload.threadId)) return;
+          const serverRunId = currentTerminalWakeServerRunId(event.payload.threadId);
+          if (serverRunId !== undefined) {
+            yield* processPendingTerminalCompletionWakes({
+              threadId: event.payload.threadId,
+              serverRunId,
+            });
+          }
+        }
+        return;
+      case "thread.terminal-completion-requested":
+        yield* processTerminalCompletionRequested(event);
+        return;
+      case "thread.terminal-completion-continuation-started":
+        yield* processTerminalCompletionContinuationStarted(event);
         return;
       case "thread.runtime-mode-set": {
         const thread = yield* resolveThreadShell(event.payload.threadId);
@@ -2270,6 +3002,10 @@ const make = Effect.gen(function* () {
   const worker = yield* makeDrainableWorker(processDomainEventSafely);
 
   const start: ProviderCommandReactorShape["start"] = Effect.fn("start")(function* () {
+    if (!userTurnResumeWorkerStarted) {
+      yield* forkParked(processUserTurnResumeRequests);
+      userTurnResumeWorkerStarted = true;
+    }
     const pendingTitles = yield* findPendingThreadTitles().pipe(
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
@@ -2287,6 +3023,11 @@ const make = Effect.gen(function* () {
           (event.payload.regenerateTitle === true ||
             event.payload.titleState?.needsRefinement === true)) ||
         (event.type === "thread.session-set" && event.payload.session.status === "ready") ||
+        (event.type === "thread.session-set" &&
+          (event.payload.session.status === "error" ||
+            event.payload.session.status === "stopped")) ||
+        event.type === "thread.terminal-completion-requested" ||
+        event.type === "thread.terminal-completion-continuation-started" ||
         event.type === "thread.runtime-mode-set" ||
         event.type === "thread.turn-start-requested" ||
         event.type === "thread.turn-interrupt-requested" ||
@@ -2356,6 +3097,13 @@ const make = Effect.gen(function* () {
     start,
     drain: Effect.gen(function* () {
       yield* worker.drain;
+      yield* terminalCompletionDispatchWorker.drain;
+      yield* drainUserTurnResumeRequests;
+      yield* worker.drain;
+      yield* terminalCompletionDispatchWorker.drain;
+      yield* drainUserTurnResumeRequests;
+      yield* worker.drain;
+      yield* drainUserTurnResumeRequests;
       yield* threadTitleRegenerationWorker.drain;
     }),
   } satisfies ProviderCommandReactorShape;

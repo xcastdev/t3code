@@ -247,6 +247,7 @@ import {
 import { BranchToolbar, type BranchToolbarHandle } from "./BranchToolbar";
 import { resolveShortcutCommand, shortcutLabelForCommand } from "../keybindings";
 import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
+import { ProjectTerminalDockView } from "./ProjectTerminalDockView";
 import {
   AlarmClockIcon,
   CheckCircle2Icon,
@@ -339,7 +340,11 @@ import { type ReviewCommentContext } from "../reviewCommentContext";
 import { environmentCatalog } from "../connection/catalog";
 import { isDesktopLocalConnectionTarget } from "../connection/desktopLocal";
 import { useEnvironmentDisconnectDelay } from "../hooks/useEnvironmentDisconnectDelay";
-import { selectThreadTerminalUiState, useTerminalUiStateStore } from "../terminalUiStateStore";
+import {
+  selectProjectTerminalUiState,
+  selectThreadTerminalUiState,
+  useTerminalUiStateStore,
+} from "../terminalUiStateStore";
 import { useKnownTerminalSessions, useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { useEnvironmentQuery } from "../state/query";
 import { orchestrationEnvironment } from "../state/orchestration";
@@ -846,10 +851,26 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
       ? scopeProjectRef(draftThread.environmentId, draftThread.projectId)
       : null;
   const project = useProject(projectRef);
+  const serverConfig = useAtomValue(serverEnvironment.configValueAtom(threadRef.environmentId));
+  const projectTerminalEnabled =
+    serverConfig?.environment.capabilities.projectTerminalAttachment === true;
+  const projectTerminalUiState = useTerminalUiStateStore((state) =>
+    selectProjectTerminalUiState(
+      state.projectTerminalUiStateByKey,
+      threadRef.environmentId,
+      project?.id ?? null,
+    ),
+  );
+  const openProjectTerminalDock = useTerminalUiStateStore((state) => state.openProjectTerminalDock);
+  const setProjectTerminalDockOpen = useTerminalUiStateStore(
+    (state) => state.setProjectTerminalDockOpen,
+  );
   const terminalUiState = useTerminalUiStateStore((state) =>
     selectThreadTerminalUiState(state.terminalUiStateByThreadKey, threadRef),
   );
   const visible = active && terminalUiState.terminalOpen;
+  const showProjectTerminalDock =
+    active && projectTerminalEnabled && projectTerminalUiState.open && project !== null;
   const knownTerminalSessions = useKnownTerminalSessions({
     environmentId: threadRef.environmentId,
     threadId,
@@ -1119,43 +1140,64 @@ const PersistentThreadTerminalDrawer = memo(function PersistentThreadTerminalDra
     <div
       className={cn(
         "grid shrink-0 overflow-clip",
-        active ? (visible ? "grid-rows-[1fr]" : "grid-rows-[0fr]") : "hidden",
+        active
+          ? visible || showProjectTerminalDock
+            ? "grid-rows-[1fr]"
+            : "grid-rows-[0fr]"
+          : "hidden",
         active &&
           "[[data-panel-animations=true]_&]:transition-[grid-template-rows] [[data-panel-animations=true]_&]:[transition-duration:var(--panel-animation-duration)] [[data-panel-animations=true]_&]:ease-out",
         active && visible && "[[data-panel-animations=true]_&]:starting:grid-rows-[0fr]!",
       )}
     >
       <div className="min-h-0 overflow-clip">
-        <ThreadTerminalDrawer
-          threadRef={threadRef}
-          threadId={threadId}
-          cwd={cwd}
-          worktreePath={effectiveWorktreePath}
-          runtimeEnv={runtimeEnv}
-          visible={visible}
-          height={terminalUiState.terminalHeight}
-          // Known-session order is MRU and changes on focus; persisted store order keeps sidebar labels stable.
-          terminalIds={terminalUiState.terminalIds}
-          activeTerminalId={terminalUiState.activeTerminalId}
-          terminalGroups={terminalUiState.terminalGroups}
-          activeTerminalGroupId={terminalUiState.activeTerminalGroupId}
-          focusRequestId={focusRequestId + localFocusRequestId + (visible ? 1 : 0)}
-          onSplitTerminal={splitTerminal}
-          onSplitTerminalVertical={splitTerminalVertical}
-          onNewTerminal={createNewTerminal}
-          splitShortcutLabel={visible ? splitShortcutLabel : undefined}
-          splitVerticalShortcutLabel={visible ? splitVerticalShortcutLabel : undefined}
-          newShortcutLabel={visible ? newShortcutLabel : undefined}
-          closeShortcutLabel={visible ? closeShortcutLabel : undefined}
-          keybindings={keybindings}
-          onActiveTerminalChange={activateTerminal}
-          onCloseTerminal={closeTerminal}
-          onCollapse={() => useTerminalUiStateStore.getState().setTerminalOpen(threadRef, false)}
-          onHeightChange={setTerminalHeight}
-          onAddTerminalContext={handleAddTerminalContext}
-          terminalLabelsById={terminalLabelsById}
-          terminalLaunchLocationsById={terminalLaunchLocationsById}
-        />
+        {showProjectTerminalDock ? (
+          <ProjectTerminalDockView
+            key={JSON.stringify([threadRef.environmentId, project.id])}
+            environmentId={threadRef.environmentId}
+            projectId={project.id}
+            height={terminalUiState.terminalHeight}
+            visible
+            onShowThreadTerminals={() =>
+              setProjectTerminalDockOpen(threadRef.environmentId, project.id, false)
+            }
+          />
+        ) : (
+          <ThreadTerminalDrawer
+            threadRef={threadRef}
+            threadId={threadId}
+            cwd={cwd}
+            worktreePath={effectiveWorktreePath}
+            runtimeEnv={runtimeEnv}
+            visible={visible}
+            height={terminalUiState.terminalHeight}
+            // Known-session order is MRU and changes on focus; persisted store order keeps sidebar labels stable.
+            terminalIds={terminalUiState.terminalIds}
+            activeTerminalId={terminalUiState.activeTerminalId}
+            terminalGroups={terminalUiState.terminalGroups}
+            activeTerminalGroupId={terminalUiState.activeTerminalGroupId}
+            focusRequestId={focusRequestId + localFocusRequestId + (visible ? 1 : 0)}
+            onSplitTerminal={splitTerminal}
+            onSplitTerminalVertical={splitTerminalVertical}
+            onNewTerminal={createNewTerminal}
+            splitShortcutLabel={visible ? splitShortcutLabel : undefined}
+            splitVerticalShortcutLabel={visible ? splitVerticalShortcutLabel : undefined}
+            newShortcutLabel={visible ? newShortcutLabel : undefined}
+            closeShortcutLabel={visible ? closeShortcutLabel : undefined}
+            keybindings={keybindings}
+            onActiveTerminalChange={activateTerminal}
+            onCloseTerminal={closeTerminal}
+            onCollapse={() => useTerminalUiStateStore.getState().setTerminalOpen(threadRef, false)}
+            onHeightChange={setTerminalHeight}
+            onAddTerminalContext={handleAddTerminalContext}
+            terminalLabelsById={terminalLabelsById}
+            terminalLaunchLocationsById={terminalLaunchLocationsById}
+            projectTerminalDockEnabled={projectTerminalEnabled}
+            onOpenProjectTerminalDock={() =>
+              openProjectTerminalDock(threadRef.environmentId, project.id)
+            }
+          />
+        )}
       </div>
     </div>
   );
@@ -1794,8 +1836,16 @@ export default function ChatView(props: ChatViewProps) {
   const rightPanelOpen = rightPanelState.isOpen;
   const { active: panelAnimationsActive, durationMs: panelAnimationDurationMs } =
     usePanelAnimationSettings();
+  const activeProjectTerminalDockOpen = useTerminalUiStateStore(
+    (state) =>
+      selectProjectTerminalUiState(
+        state.projectTerminalUiStateByKey,
+        activeThread?.environmentId ?? null,
+        activeThread?.projectId ?? null,
+      ).open,
+  );
   const activeTerminalDrawerPresence = usePanelPresence(
-    Boolean(activeThreadKey && terminalUiState.terminalOpen),
+    Boolean(activeThreadKey && (terminalUiState.terminalOpen || activeProjectTerminalDockOpen)),
     true,
     panelAnimationsActive,
     activeThreadKey,
@@ -1963,6 +2013,24 @@ export default function ChatView(props: ChatViewProps) {
     [activeThread?.environmentId, activeThread?.projectId],
   );
   const activeProject = useProject(activeProjectRef);
+  const activeProjectTerminalUiState = useTerminalUiStateStore((state) =>
+    selectProjectTerminalUiState(
+      state.projectTerminalUiStateByKey,
+      activeThreadEnvironmentId,
+      activeThread?.projectId ?? null,
+    ),
+  );
+  const activeProjectTerminalEnabled =
+    activeThreadServerConfig?.environment.capabilities.projectTerminalAttachment === true;
+  const storeSetProjectTerminalDockOpen = useTerminalUiStateStore(
+    (state) => state.setProjectTerminalDockOpen,
+  );
+  const storeSelectProjectTerminal = useTerminalUiStateStore(
+    (state) => state.selectProjectTerminal,
+  );
+  const storeOpenProjectTerminalDock = useTerminalUiStateStore(
+    (state) => state.openProjectTerminalDock,
+  );
   // Environment settings with the active project's overrides applied.
   const activeProjectSettings = useMemo(
     () => resolveProjectSettings(settings, activeProject?.id ?? null, activeProject ?? undefined),
@@ -3515,6 +3583,13 @@ export default function ChatView(props: ChatViewProps) {
       });
     };
   }, [activeThreadRef, storeEnsureTerminal, worktreeSetup]);
+  const onOpenProjectTerminal = useCallback(
+    (projectId: string, terminalId: string) => {
+      if (!activeThreadRef) return;
+      storeOpenProjectTerminalDock(activeThreadRef.environmentId, projectId, terminalId);
+    },
+    [activeThreadRef, storeOpenProjectTerminalDock],
+  );
   const [dockedDraftHeroThreadKey, setDockedDraftHeroThreadKey] = useState<string | null>(null);
   const draftHeroDockRequested =
     activeThreadKey !== null && dockedDraftHeroThreadKey === activeThreadKey;
@@ -3947,6 +4022,11 @@ export default function ChatView(props: ChatViewProps) {
   );
   const toggleTerminalVisibility = useCallback(() => {
     if (!activeThreadRef) return;
+    if (activeProjectTerminalEnabled && activeProject && activeProjectTerminalUiState.open) {
+      storeSetProjectTerminalDockOpen(activeThreadRef.environmentId, activeProject.id, false);
+      setTerminalOpen(false);
+      return;
+    }
     const nextOpen = !terminalUiState.terminalOpen;
     if (nextOpen && terminalUiState.terminalIds.length === 0) {
       if (!activeThreadId || !activeProject) {
@@ -3975,6 +4055,8 @@ export default function ChatView(props: ChatViewProps) {
     }
     setTerminalOpen(nextOpen);
   }, [
+    activeProjectTerminalEnabled,
+    activeProjectTerminalUiState.open,
     activeProject,
     activeThreadId,
     activeThreadRef,
@@ -3985,6 +4067,7 @@ export default function ChatView(props: ChatViewProps) {
     openTerminal,
     setTerminalOpen,
     storeEnsureTerminal,
+    storeSetProjectTerminalDockOpen,
     terminalUiState.terminalIds.length,
     terminalUiState.terminalOpen,
   ]);
@@ -6503,12 +6586,21 @@ export default function ChatView(props: ChatViewProps) {
   const getShortcutContext = useCallback(
     () => ({
       terminalFocus: getTerminalFocusOwner() !== null,
-      terminalOpen: Boolean(terminalUiState.terminalOpen),
+      terminalOpen: Boolean(
+        terminalUiState.terminalOpen ||
+        (activeProjectTerminalEnabled && activeProjectTerminalUiState.open),
+      ),
       previewFocus: isPreviewFocused(),
       previewOpen: previewPanelOpen,
       modelPickerOpen: composerRef.current?.isModelPickerOpen() ?? false,
     }),
-    [composerRef, previewPanelOpen, terminalUiState.terminalOpen],
+    [
+      activeProjectTerminalEnabled,
+      activeProjectTerminalUiState.open,
+      composerRef,
+      previewPanelOpen,
+      terminalUiState.terminalOpen,
+    ],
   );
 
   useEffect(() => {
@@ -6632,6 +6724,14 @@ export default function ChatView(props: ChatViewProps) {
       if (command === "terminal.split") {
         event.preventDefault();
         event.stopPropagation();
+        if (
+          activeProjectTerminalEnabled &&
+          activeProject &&
+          activeProjectTerminalUiState.open &&
+          activeThreadRef
+        ) {
+          storeSetProjectTerminalDockOpen(activeThreadRef.environmentId, activeProject.id, false);
+        }
         if (!terminalUiState.terminalOpen) {
           setTerminalOpen(true);
         }
@@ -6642,6 +6742,14 @@ export default function ChatView(props: ChatViewProps) {
       if (command === "terminal.splitVertical") {
         event.preventDefault();
         event.stopPropagation();
+        if (
+          activeProjectTerminalEnabled &&
+          activeProject &&
+          activeProjectTerminalUiState.open &&
+          activeThreadRef
+        ) {
+          storeSetProjectTerminalDockOpen(activeThreadRef.environmentId, activeProject.id, false);
+        }
         if (!terminalUiState.terminalOpen) {
           setTerminalOpen(true);
         }
@@ -6652,6 +6760,11 @@ export default function ChatView(props: ChatViewProps) {
       if (command === "terminal.close") {
         event.preventDefault();
         event.stopPropagation();
+        if (activeProjectTerminalEnabled && activeProject && activeProjectTerminalUiState.open) {
+          if (!activeThreadRef) return;
+          storeSelectProjectTerminal(activeThreadRef.environmentId, activeProject.id, null);
+          return;
+        }
         if (!terminalUiState.terminalOpen) return;
         requestCloseTerminal(terminalUiState.activeTerminalId);
         return;
@@ -6660,6 +6773,14 @@ export default function ChatView(props: ChatViewProps) {
       if (command === "terminal.new") {
         event.preventDefault();
         event.stopPropagation();
+        if (
+          activeProjectTerminalEnabled &&
+          activeProject &&
+          activeProjectTerminalUiState.open &&
+          activeThreadRef
+        ) {
+          storeSetProjectTerminalDockOpen(activeThreadRef.environmentId, activeProject.id, false);
+        }
         if (!terminalUiState.terminalOpen) {
           setTerminalOpen(true);
         }
@@ -6763,6 +6884,8 @@ export default function ChatView(props: ChatViewProps) {
     return () => window.removeEventListener("keydown", handler, true);
   }, [
     activeProject,
+    activeProjectTerminalEnabled,
+    activeProjectTerminalUiState.open,
     activeRightPanelSurface,
     activeProjectScripts,
     activeThreadRef,
@@ -6795,6 +6918,8 @@ export default function ChatView(props: ChatViewProps) {
     toggleSecondaryPaneMaximized,
     secondaryPaneOpen,
     toggleTerminalVisibility,
+    storeSelectProjectTerminal,
+    storeSetProjectTerminalDockOpen,
     composerRef,
   ]);
 
@@ -9316,6 +9441,9 @@ export default function ChatView(props: ChatViewProps) {
                 onCancelWorktreeSetup={onCancelWorktreeSetup}
                 {...(draftId ? { onWorktreeSetupWorkLocally } : {})}
                 {...(onOpenWorktreeSetupTerminal ? { onOpenWorktreeSetupTerminal } : {})}
+                {...(activeProjectTerminalEnabled && !paintOnlyDisplayedTimeline
+                  ? { onOpenProjectTerminal }
+                  : {})}
                 listRef={legendListRef}
                 timelineEntries={displayedTimeline.entries}
                 latestTurn={paintOnlyDisplayedTimeline ? null : activeLatestTurn}

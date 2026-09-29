@@ -43,6 +43,7 @@ import { afterEach, describe, expect, it } from "vite-plus/test";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import {
   ProviderService,
   type ProviderServiceShape,
@@ -123,6 +124,7 @@ function createProviderServiceHarness() {
   const service: ProviderServiceShape = {
     startSession: () => unsupported(),
     sendTurn: () => unsupported(),
+    continueFromTerminalCompletion: () => unsupported(),
     messageAgent: () => unsupported(),
     stopAgent: () => unsupported(),
     getAgentCapabilities: () => unsupported(),
@@ -241,7 +243,10 @@ async function waitForThread(
 
 describe("ProviderRuntimeIngestion", () => {
   let runtime: ManagedRuntime.ManagedRuntime<
-    OrchestrationEngineService | ProviderRuntimeIngestionService | ProjectionSnapshotQuery,
+    | OrchestrationEngineService
+    | ProviderRuntimeIngestionService
+    | ProjectionSnapshotQuery
+    | ProjectionTurnRepository,
     unknown
   > | null = null;
   let scope: Scope.Closeable | null = null;
@@ -283,7 +288,7 @@ describe("ProviderRuntimeIngestion", () => {
     const sqlCounter = makeSqlStatementCounter();
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
-      Layer.provide(OrchestrationProjectionPipelineLive),
+      Layer.provideMerge(OrchestrationProjectionPipelineLive),
       Layer.provide(OrchestrationEventStoreLive),
       Layer.provide(OrchestrationCommandReceiptRepositoryLive),
       Layer.provide(RepositoryIdentityResolver.layer),
@@ -342,6 +347,9 @@ describe("ProviderRuntimeIngestion", () => {
     const engine = await testRuntime.runPromise(Effect.service(OrchestrationEngineService));
     const snapshotQuery = await testRuntime.runPromise(Effect.service(ProjectionSnapshotQuery));
     const ingestion = await testRuntime.runPromise(Effect.service(ProviderRuntimeIngestionService));
+    const projectionTurnRepository = await testRuntime.runPromise(
+      Effect.service(ProjectionTurnRepository),
+    );
     scope = await Effect.runPromise(Scope.make("sequential"));
     await testRuntime.runPromise(ingestion.start().pipe(Scope.provide(scope)));
     const drain = () => testRuntime.runPromise(ingestion.drain);
@@ -415,6 +423,12 @@ describe("ProviderRuntimeIngestion", () => {
             .getThreadShellById(asThreadId("thread-1"))
             .pipe(Effect.map(Option.getOrThrow)),
         ),
+      readProjectionTurn: (turnId: TurnId) =>
+        testRuntime.runPromise(
+          projectionTurnRepository
+            .getByTurnId({ threadId: asThreadId("thread-1"), turnId })
+            .pipe(Effect.map((turn) => (Option.isSome(turn) ? turn.value : null))),
+        ),
       emit: provider.emit,
       advanceClock: (ms: number) => {
         clockOffsetMs += ms;
@@ -466,6 +480,82 @@ describe("ProviderRuntimeIngestion", () => {
     );
     expect(thread.session?.status).toBe("error");
     expect(thread.session?.lastError).toBe("turn failed");
+  });
+
+  it("ingests a terminal-origin continuation without creating a user message", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("terminal-origin-turn");
+    const now = "2026-01-01T00:00:00.000Z";
+    const wakeKey = "project-1:terminal-1:generation-1";
+
+    await harness.dispatch({
+      type: "thread.terminal-completion.continuation.start",
+      commandId: CommandId.make("cmd-terminal-origin-continuation-start"),
+      threadId,
+      projectId: asProjectId("project-1"),
+      deliveryMode: "idle",
+      serverRunId: "server-run-terminal-origin-test",
+      wakeKeys: [wakeKey],
+      prompt: "A project terminal has completed. Review its output if relevant.",
+      createdAt: now,
+    });
+
+    await harness.emitAndDrain([
+      {
+        type: "turn.started",
+        eventId: asEventId("evt-terminal-origin-turn-started"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: now,
+        threadId,
+        turnId,
+      },
+      {
+        type: "content.delta",
+        eventId: asEventId("evt-terminal-origin-content"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: now,
+        threadId,
+        turnId,
+        itemId: asItemId("terminal-origin-assistant-item"),
+        payload: { streamKind: "assistant_text", delta: "Build complete." },
+      },
+      {
+        type: "item.completed",
+        eventId: asEventId("evt-terminal-origin-item-completed"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: now,
+        threadId,
+        turnId,
+        itemId: asItemId("terminal-origin-assistant-item"),
+        payload: { itemType: "assistant_message", status: "completed" },
+      },
+      {
+        type: "turn.completed",
+        eventId: asEventId("evt-terminal-origin-turn-completed"),
+        provider: ProviderDriverKind.make("codex"),
+        createdAt: now,
+        threadId,
+        turnId,
+        payload: { state: "completed" },
+      },
+    ]);
+
+    const thread = (await harness.readModel()).threads.find((entry) => entry.id === threadId);
+    expect(await harness.readProjectionTurn(turnId)).toMatchObject({
+      pendingMessageId: null,
+      terminalCompletionWakeKey: wakeKey,
+      state: "completed",
+      assistantMessageId: "assistant:terminal-origin-assistant-item",
+    });
+    expect(thread?.messages).toMatchObject([
+      {
+        id: "assistant:terminal-origin-assistant-item",
+        role: "assistant",
+        text: "Build complete.",
+      },
+    ]);
+    expect(thread?.messages.some((message) => message.role === "user")).toBe(false);
   });
 
   it("carries turn.started model and effort through to the turn record", async () => {

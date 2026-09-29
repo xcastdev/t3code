@@ -29,6 +29,8 @@ import {
 import { serializeAssistantCitation } from "@t3tools/shared/assistantCitations";
 import * as Effect from "effect/Effect";
 import * as Deferred from "effect/Deferred";
+import * as Context from "effect/Context";
+import * as DateTime from "effect/DateTime";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
 import * as ManagedRuntime from "effect/ManagedRuntime";
@@ -44,11 +46,14 @@ import { deriveServerPaths, ServerConfig } from "../../config.ts";
 import { TextGenerationError } from "@t3tools/contracts";
 import {
   ProviderAdapterRequestError,
+  ProviderAdapterValidationError,
   ProviderWorkspaceMissingError,
   type ProviderServiceError,
 } from "../../provider/Errors.ts";
 import { OrchestrationEventStoreLive } from "../../persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../../persistence/Layers/OrchestrationCommandReceipts.ts";
+import { ProjectionTerminalCompletionWakeRepositoryLive } from "../../persistence/Layers/ProjectionTerminalCompletionWakes.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { SqlitePersistenceMemory } from "../../persistence/Layers/Sqlite.ts";
 import {
   ProviderService,
@@ -70,12 +75,19 @@ import {
 import { OrchestrationEngineService } from "../Services/OrchestrationEngine.ts";
 import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
 import { ProjectionSnapshotQuery } from "../Services/ProjectionSnapshotQuery.ts";
+import { ProjectTerminalWakeService } from "../Services/ProjectTerminalWakeService.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as Clock from "effect/Clock";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { ServerActivation } from "../../serverActivation.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import * as GitWorkflowService from "../../git/GitWorkflowService.ts";
+import * as TerminalManager from "../../terminal/Manager.ts";
+import {
+  ProjectTerminalCompletionService,
+  ProjectTerminalCompletionServiceLive,
+} from "../../terminal/ProjectTerminalCompletionService.ts";
+import type { ProjectTerminalRuntimeEvent } from "../../terminal/RuntimeTypes.ts";
 
 const asProjectId = (value: string): ProjectId => ProjectId.make(value);
 const asApprovalRequestId = (value: string): ApprovalRequestId => ApprovalRequestId.make(value);
@@ -138,6 +150,7 @@ describe("ProviderCommandReactor", () => {
     | OrchestrationEngineService
     | ProviderCommandReactor
     | ProjectionSnapshotQuery
+    | ProjectTerminalWakeService
     | SqlClient.SqlClient,
     unknown
   > | null = null;
@@ -196,10 +209,15 @@ describe("ProviderCommandReactor", () => {
     readonly titleRegenerationBeforeStart?: "one" | "two";
     readonly serverActivation?: Effect.Effect<void>;
     readonly beforeReadySessionDispatch?: () => Effect.Effect<void>;
+    readonly beforeTerminalContinuationDispatch?: () => Effect.Effect<void>;
     readonly beforeTurnStartDispatch?: () => Effect.Effect<void>;
     readonly afterTurnStartDispatch?: () => Effect.Effect<void>;
     readonly compactThreadEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly interruptTurnEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
+    readonly sendTurnEffect?: ProviderServiceShape["sendTurn"];
+    readonly continueFromTerminalCompletionEffect?: ProviderServiceShape["continueFromTerminalCompletion"];
+    readonly activeTurnSteer?: boolean;
+    readonly dispatchTerminalWakeRequests?: boolean;
     readonly stopSessionEffect?: () => Effect.Effect<void, ProviderAdapterRequestError>;
     readonly messageAgentEffect?: ProviderServiceShape["messageAgent"];
     readonly stopAgentEffect?: ProviderServiceShape["stopAgent"];
@@ -286,11 +304,20 @@ describe("ProviderCommandReactor", () => {
         ),
       );
     });
-    const sendTurn = vi.fn((_: unknown) =>
-      Effect.succeed({
-        threadId: ThreadId.make("thread-1"),
-        turnId: asTurnId("turn-1"),
-      }),
+    const sendTurn = vi.fn<ProviderServiceShape["sendTurn"]>(
+      (turnInput) =>
+        input?.sendTurnEffect?.(turnInput) ??
+        Effect.succeed({ threadId: turnInput.threadId, turnId: asTurnId("turn-1") }),
+    );
+    const continueFromTerminalCompletion = vi.fn<
+      ProviderServiceShape["continueFromTerminalCompletion"]
+    >(
+      (continuationInput) =>
+        input?.continueFromTerminalCompletionEffect?.(continuationInput) ??
+        (sendTurn({
+          threadId: continuationInput.threadId,
+          input: continuationInput.prompt,
+        }) as ReturnType<ProviderServiceShape["continueFromTerminalCompletion"]>),
     );
     const compactThread = vi.fn((_: ThreadId) => input?.compactThreadEffect?.() ?? Effect.void);
     const interruptTurn = vi.fn((_: unknown) => input?.interruptTurnEffect?.() ?? Effect.void);
@@ -381,11 +408,13 @@ describe("ProviderCommandReactor", () => {
           : {}),
       },
     ];
+    let dispatchWakeRequest: ProjectTerminalWakeService["Service"]["request"] = () => Effect.void;
 
     const unsupported = () => Effect.die(new Error("Unsupported provider call in test")) as never;
     const service: ProviderServiceShape = {
       startSession: startSession as ProviderServiceShape["startSession"],
       sendTurn: sendTurn as ProviderServiceShape["sendTurn"],
+      continueFromTerminalCompletion,
       compactThread,
       interruptTurn: interruptTurn as ProviderServiceShape["interruptTurn"],
       respondToRequest: respondToRequest as ProviderServiceShape["respondToRequest"],
@@ -403,6 +432,7 @@ describe("ProviderCommandReactor", () => {
       getCapabilities: (_provider) =>
         Effect.succeed({
           sessionModelSwitch: input?.sessionModelSwitch ?? "in-session",
+          ...(input?.activeTurnSteer === true ? { activeTurnSteer: true } : {}),
         }),
       assertConversationRollbackSupported: () => unsupported(),
       getInstanceInfo: (instanceId) => {
@@ -476,11 +506,13 @@ describe("ProviderCommandReactor", () => {
               command.type === "thread.turn.start" &&
               command.commandId.startsWith("server:after-compaction:");
             const before =
-              command.type === "thread.session.set" && command.session.status === "ready"
-                ? input?.beforeReadySessionDispatch
-                : isReplay
-                  ? input?.beforeTurnStartDispatch
-                  : undefined;
+              command.type === "thread.terminal-completion.continuation.start"
+                ? input?.beforeTerminalContinuationDispatch
+                : command.type === "thread.session.set" && command.session.status === "ready"
+                  ? input?.beforeReadySessionDispatch
+                  : isReplay
+                    ? input?.beforeTurnStartDispatch
+                    : undefined;
             return (before?.() ?? Effect.void).pipe(
               Effect.andThen(engine.dispatch(command)),
               Effect.tap(() =>
@@ -497,8 +529,16 @@ describe("ProviderCommandReactor", () => {
       }),
     ).pipe(Layer.provide(orchestrationLayer));
     const layer = ProviderCommandReactorLive.pipe(
+      Layer.provideMerge(ProjectionTerminalCompletionWakeRepositoryLive),
+      Layer.provideMerge(ProjectionTurnRepositoryLive),
       Layer.provideMerge(reactorOrchestrationLayer),
       Layer.provideMerge(projectionSnapshotLayer),
+      Layer.provideMerge(
+        Layer.succeed(ProjectTerminalWakeService, {
+          serverRunId: "test-server-run",
+          request: (wake) => dispatchWakeRequest(wake),
+        }),
+      ),
       Layer.provideMerge(Layer.succeed(ProviderService, service)),
       Layer.provide(Layer.mock(ProviderAuthService, { tryHandlePromptCommand })),
       Layer.provideMerge(makeProviderRegistryLayer(providerSnapshots as never)),
@@ -536,6 +576,31 @@ describe("ProviderCommandReactor", () => {
     const engine = await runtime.runPromise(Effect.service(OrchestrationEngineService));
     const snapshotQuery = await runtime.runPromise(Effect.service(ProjectionSnapshotQuery));
     const reactor = await runtime.runPromise(Effect.service(ProviderCommandReactor));
+    const wakeService = await runtime.runPromise(Effect.service(ProjectTerminalWakeService));
+    if (input?.dispatchTerminalWakeRequests === true) {
+      dispatchWakeRequest = (wake) => {
+        const dedupeKey = [wake.projectId, wake.terminalId, wake.generation]
+          .map((part) => `${String(part).length}:${String(part)}`)
+          .join("");
+        return Effect.gen(function* () {
+          yield* engine.dispatch({
+            type: "thread.terminal-completion.request",
+            commandId: CommandId.make(`terminal-completion-wake:${dedupeKey}`),
+            threadId: wake.threadId,
+            projectId: wake.projectId,
+            terminalId: wake.terminalId,
+            generation: wake.generation,
+            serverRunId: "test-server-run",
+            dedupeKey,
+            label: wake.label,
+            status: wake.status,
+            exitCode: wake.exitCode,
+            exitSignal: wake.exitSignal,
+            createdAt: DateTime.formatIso(yield* DateTime.now),
+          });
+        }).pipe(Effect.catchCause(() => Effect.void));
+      };
+    }
     const runEffect = <A, E>(effect: Effect.Effect<A, E>) => runtime!.runPromise(effect);
 
     await Effect.runPromise(
@@ -634,6 +699,7 @@ describe("ProviderCommandReactor", () => {
     return {
       engine,
       snapshotQuery,
+      wakeService,
       readModel: () => Effect.runPromise(snapshotQuery.getSnapshot()),
       readPendingTurnStarts: () =>
         runtime!.runPromise(
@@ -646,9 +712,62 @@ describe("ProviderCommandReactor", () => {
             `;
           }),
         ),
+      readPendingTurnIdentity: (threadId: ThreadId) =>
+        runtime!.runPromise(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            return yield* sql<{
+              readonly messageId: string | null;
+              readonly terminalCompletionWakeKey: string | null;
+            }>`
+              SELECT
+                pending_message_id AS "messageId",
+                pending_terminal_completion_wake_key AS "terminalCompletionWakeKey"
+              FROM projection_turns
+              WHERE thread_id = ${threadId}
+                AND turn_id IS NULL
+                AND state = 'pending'
+                AND checkpoint_turn_count IS NULL
+              ORDER BY requested_at DESC
+              LIMIT 1
+            `;
+          }),
+        ),
+      readTurnIdentity: (threadId: ThreadId, turnId: TurnId) =>
+        runtime!.runPromise(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            return yield* sql<{
+              readonly pendingMessageId: string | null;
+              readonly terminalCompletionWakeKey: string | null;
+              readonly state: string;
+            }>`
+              SELECT
+                pending_message_id AS "pendingMessageId",
+                pending_terminal_completion_wake_key AS "terminalCompletionWakeKey",
+                state
+              FROM projection_turns
+              WHERE thread_id = ${threadId} AND turn_id = ${turnId}
+              LIMIT 1
+            `;
+          }),
+        ),
+      readTerminalWakeStatus: (dedupeKey: string) =>
+        runtime!.runPromise(
+          Effect.gen(function* () {
+            const sql = yield* SqlClient.SqlClient;
+            return yield* sql<{ readonly deliveryStatus: string }>`
+              SELECT delivery_status AS "deliveryStatus"
+              FROM terminal_completion_wakes
+              WHERE dedupe_key = ${dedupeKey}
+              LIMIT 1
+            `;
+          }),
+        ),
       tryHandlePromptCommand,
       startSession,
       sendTurn,
+      continueFromTerminalCompletion,
       compactThread,
       interruptTurn,
       respondToRequest,
@@ -672,6 +791,856 @@ describe("ProviderCommandReactor", () => {
       },
     };
   }
+
+  let sessionCommandSequence = 0;
+  const setProviderSession = (
+    harness: Awaited<ReturnType<typeof createHarness>>,
+    threadId: ThreadId,
+    status: "ready" | "running",
+    activeTurnId: TurnId | null,
+    createdAt: string,
+  ) => {
+    const providerInstanceId = ProviderInstanceId.make("codex");
+    const runtimeSession: ProviderSession = {
+      provider: ProviderDriverKind.make("codex"),
+      providerInstanceId,
+      status,
+      runtimeMode: "approval-required",
+      threadId,
+      ...(activeTurnId === null ? {} : { activeTurnId }),
+      resumeCursor: { opaque: `resume-${threadId}` },
+      createdAt,
+      updatedAt: createdAt,
+    };
+    const runtimeSessionIndex = harness.runtimeSessions.findIndex(
+      (session) => String(session.threadId) === String(threadId),
+    );
+    if (runtimeSessionIndex < 0) harness.runtimeSessions.push(runtimeSession);
+    else harness.runtimeSessions[runtimeSessionIndex] = runtimeSession;
+    return harness.engine.dispatch({
+      type: "thread.session.set",
+      commandId: CommandId.make(
+        `cmd-session-${threadId}-${status}-${createdAt}-${++sessionCommandSequence}`,
+      ),
+      threadId,
+      session: {
+        threadId,
+        status,
+        providerName: "codex",
+        providerInstanceId,
+        runtimeMode: "approval-required",
+        activeTurnId,
+        lastError: null,
+        updatedAt: createdAt,
+      },
+      createdAt,
+    });
+  };
+
+  const requestTerminalCompletion = (
+    harness: Awaited<ReturnType<typeof createHarness>>,
+    input: {
+      readonly threadId: ThreadId;
+      readonly terminalId: string;
+      readonly generation: string;
+      readonly dedupeKey: string;
+      readonly createdAt: string;
+    },
+  ) =>
+    harness.engine.dispatch({
+      type: "thread.terminal-completion.request",
+      commandId: CommandId.make(`terminal-completion-request:${input.dedupeKey}`),
+      threadId: input.threadId,
+      projectId: asProjectId("project-1"),
+      terminalId: input.terminalId,
+      generation: input.generation,
+      serverRunId: "test-server-run",
+      dedupeKey: input.dedupeKey,
+      label: "Build terminal",
+      status: "exited",
+      exitCode: 0,
+      exitSignal: null,
+      createdAt: input.createdAt,
+    });
+
+  effectIt.effect("routes a persisted completion-service wake through the provider reactor", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({ dispatchTerminalWakeRequests: true }),
+      );
+      const threadId = ThreadId.make("thread-1");
+      const projectId = asProjectId("project-1");
+      const terminalId = "terminal-from-completion";
+      const generation = "generation-from-completion";
+      const now = "2026-09-01T00:00:00.000Z";
+      yield* setProviderSession(harness, threadId, "ready", null, now);
+      const listeners = new Set<(event: ProjectTerminalRuntimeEvent) => Effect.Effect<void>>();
+      const terminalSnapshot = {
+        projectId,
+        terminalId,
+        creatingThreadId: threadId,
+        label: "Build terminal",
+        status: "running" as const,
+        cols: 120,
+        rows: 30,
+        exitCode: null,
+        exitSignal: null,
+        updatedAt: now,
+      };
+      const terminalManager = {
+        getProjectCompletionSnapshot: () =>
+          Effect.succeed({ generation, terminal: terminalSnapshot }),
+        subscribeProjectEvents: (
+          listener: (event: ProjectTerminalRuntimeEvent) => Effect.Effect<void>,
+        ) =>
+          Effect.sync(() => {
+            listeners.add(listener);
+            return () => {
+              listeners.delete(listener);
+            };
+          }),
+      } as unknown as TerminalManager.TerminalManager["Service"];
+      const completionLayer = ProjectTerminalCompletionServiceLive.pipe(
+        Layer.provide(Layer.succeed(TerminalManager.TerminalManager, terminalManager)),
+        Layer.provide(Layer.succeed(OrchestrationEngineService, harness.engine)),
+        Layer.provide(Layer.succeed(ProjectionSnapshotQuery, harness.snapshotQuery)),
+        Layer.provide(Layer.succeed(ProjectTerminalWakeService, harness.wakeService)),
+      );
+
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const context = yield* Layer.build(completionLayer);
+          const completion = Context.get(context, ProjectTerminalCompletionService);
+          yield* completion.start();
+          yield* completion.subscribe({
+            projectId,
+            terminalId,
+            threadId,
+            mode: "noticeAndWake",
+          });
+          const exited: ProjectTerminalRuntimeEvent = {
+            type: "exited",
+            target: { owner: { kind: "project", projectId }, terminalId },
+            generation,
+            sequence: 4,
+            status: "exited",
+            label: "Build terminal",
+            creatingThreadId: threadId,
+            updatedAt: now,
+            exitCode: 1,
+            exitSignal: null,
+          };
+          yield* Effect.forEach([...listeners], (listener) => listener(exited), {
+            concurrency: 1,
+            discard: true,
+          });
+          yield* completion.drain;
+        }),
+      );
+      yield* Effect.promise(() => harness.drain());
+
+      const dedupeKey = [projectId, terminalId, generation]
+        .map((part) => `${String(part).length}:${String(part)}`)
+        .join("");
+      expect(harness.continueFromTerminalCompletion).toHaveBeenCalledWith(
+        expect.objectContaining({
+          threadId,
+          prompt: expect.stringContaining(
+            "Build terminal (terminal terminal-from-completion): exited with code 1",
+          ),
+        }),
+      );
+      expect(yield* Effect.promise(() => harness.readTerminalWakeStatus(dedupeKey))).toEqual([
+        { deliveryStatus: "delivered" },
+      ]);
+      const thread = (yield* Effect.promise(() => harness.readModel())).threads.find(
+        (entry) => entry.id === threadId,
+      );
+      expect(thread?.activities).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "terminal.project.completed",
+            summary: "Project terminal finished: Build terminal",
+          }),
+        ]),
+      );
+    }),
+  );
+
+  effectIt.effect.each(["archive", "delete"] as const)(
+    "preserves a provider outcome after it has started and the origin thread is %s",
+    (operation) =>
+      Effect.gen(function* () {
+        const continuationStarted = yield* Deferred.make<void>();
+        const releaseContinuation = yield* Deferred.make<void>();
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            continueFromTerminalCompletionEffect: ({ threadId }) =>
+              Deferred.succeed(continuationStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseContinuation)),
+                Effect.as({ threadId, turnId: asTurnId(`terminal-${operation}-turn`) }),
+              ),
+          }),
+        );
+        const threadId = ThreadId.make("thread-1");
+        const wakeKey = `wake-origin-${operation}-during-send`;
+        const now = "2026-09-01T00:00:00.000Z";
+        yield* setProviderSession(harness, threadId, "ready", null, now);
+        yield* requestTerminalCompletion(harness, {
+          threadId,
+          terminalId: `terminal-${operation}`,
+          generation: `generation-${operation}`,
+          dedupeKey: wakeKey,
+          createdAt: now,
+        });
+        yield* Deferred.await(continuationStarted);
+        expect(yield* Effect.promise(() => harness.readTerminalWakeStatus(wakeKey))).toEqual([
+          { deliveryStatus: "claimed" },
+        ]);
+
+        yield* harness.engine.dispatch({
+          type: operation === "archive" ? "thread.archive" : "thread.delete",
+          commandId: CommandId.make(`cmd-${operation}-${wakeKey}`),
+          threadId,
+        });
+        expect(yield* Effect.promise(() => harness.readTerminalWakeStatus(wakeKey))).toEqual([
+          { deliveryStatus: "claimed" },
+        ]);
+
+        yield* Deferred.succeed(releaseContinuation, undefined);
+        yield* Effect.promise(() => harness.drain());
+        expect(yield* Effect.promise(() => harness.readTerminalWakeStatus(wakeKey))).toEqual([
+          { deliveryStatus: "delivered" },
+        ]);
+        expect(harness.continueFromTerminalCompletion).toHaveBeenCalledTimes(1);
+      }),
+  );
+
+  effectIt.effect(
+    "keeps provider intents responsive while a terminal continuation send is pending",
+    () =>
+      Effect.gen(function* () {
+        const continuationStarted = yield* Deferred.make<void>();
+        const releaseContinuation = yield* Deferred.make<void>();
+        const unrelatedInterrupt = yield* Deferred.make<void>();
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            continueFromTerminalCompletionEffect: ({ threadId }) =>
+              Deferred.succeed(continuationStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseContinuation)),
+                Effect.as({ threadId, turnId: asTurnId("terminal-turn") }),
+              ),
+            interruptTurnEffect: () => Deferred.succeed(unrelatedInterrupt, undefined),
+          }),
+        );
+        const now = "2026-01-01T00:00:00.000Z";
+        const secondThreadId = ThreadId.make("thread-2");
+        yield* harness.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("cmd-create-second-thread"),
+          threadId: secondThreadId,
+          projectId: asProjectId("project-1"),
+          title: "Second thread",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          createdAt: now,
+        });
+        yield* setProviderSession(harness, ThreadId.make("thread-1"), "ready", null, now);
+        yield* setProviderSession(harness, secondThreadId, "running", asTurnId("second-turn"), now);
+        yield* requestTerminalCompletion(harness, {
+          threadId: ThreadId.make("thread-1"),
+          terminalId: "terminal-1",
+          generation: "generation-1",
+          dedupeKey: "wake-nonblocking",
+          createdAt: now,
+        });
+        yield* Deferred.await(continuationStarted);
+
+        yield* harness.engine.dispatch({
+          type: "thread.turn.interrupt",
+          commandId: CommandId.make("cmd-interrupt-second-thread"),
+          threadId: secondThreadId,
+          turnId: asTurnId("second-turn"),
+          createdAt: now,
+        });
+        yield* Deferred.await(unrelatedInterrupt);
+        expect(harness.interruptTurn).toHaveBeenCalledWith({ threadId: secondThreadId });
+
+        yield* Deferred.succeed(releaseContinuation, undefined);
+        yield* Effect.promise(() => harness.drain());
+      }),
+  );
+
+  effectIt.effect(
+    "keeps terminal provenance through a user start and a completion before send acknowledgement",
+    () =>
+      Effect.gen(function* () {
+        const continuationStarted = yield* Deferred.make<void>();
+        const releaseContinuation = yield* Deferred.make<void>();
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            continueFromTerminalCompletionEffect: ({ threadId }) =>
+              Deferred.succeed(continuationStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseContinuation)),
+                Effect.as({ threadId, turnId: asTurnId("terminal-turn") }),
+              ),
+          }),
+        );
+        const now = "2026-01-01T00:00:00.000Z";
+        const threadId = ThreadId.make("thread-1");
+        const wakeKey = "wake-user-turn-race";
+        yield* setProviderSession(harness, threadId, "ready", null, now);
+        yield* requestTerminalCompletion(harness, {
+          threadId,
+          terminalId: "terminal-race",
+          generation: "generation-race",
+          dedupeKey: wakeKey,
+          createdAt: now,
+        });
+        yield* Deferred.await(continuationStarted);
+
+        yield* harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-user-during-terminal-send"),
+          threadId,
+          message: {
+            messageId: asMessageId("user-during-terminal-send"),
+            role: "user",
+            text: "Please also check this",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: now,
+        });
+        expect(yield* Effect.promise(() => harness.readPendingTurnIdentity(threadId))).toEqual([
+          { messageId: null, terminalCompletionWakeKey: wakeKey },
+        ]);
+
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("server:provider-session-set:terminal-turn-started"),
+          threadId,
+          session: {
+            threadId,
+            status: "running",
+            providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            runtimeMode: "approval-required",
+            activeTurnId: asTurnId("terminal-turn"),
+            lastError: null,
+            updatedAt: now,
+          },
+          turnProvenance: {
+            turnId: asTurnId("terminal-turn"),
+            terminalCompletionWakeKey: wakeKey,
+          },
+          createdAt: now,
+        });
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("server:provider-session-set:terminal-turn-completed"),
+          threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+          createdAt: now,
+        });
+
+        yield* Deferred.succeed(releaseContinuation, undefined);
+        yield* Effect.promise(() => harness.drain());
+        const readModel = yield* Effect.promise(() => harness.readModel());
+        const thread = readModel.threads.find((entry) => entry.id === threadId);
+        expect(thread?.session?.status).toBe("starting");
+        expect(thread?.session?.activeTurnId).toBeNull();
+        expect(
+          yield* Effect.promise(() =>
+            harness.readTurnIdentity(threadId, asTurnId("terminal-turn")),
+          ),
+        ).toEqual([
+          {
+            pendingMessageId: null,
+            terminalCompletionWakeKey: wakeKey,
+            state: "completed",
+          },
+        ]);
+        expect(harness.continueFromTerminalCompletion).toHaveBeenCalledTimes(1);
+        expect(harness.sendTurn).toHaveBeenCalledWith(
+          expect.objectContaining({ threadId, input: "Please also check this" }),
+        );
+      }),
+  );
+
+  effectIt.effect(
+    "resumes pending terminal wakes after a user turn completes before send acknowledgement",
+    () =>
+      Effect.gen(function* () {
+        const userSendStarted = yield* Deferred.make<void>();
+        const releaseUserSend = yield* Deferred.make<void>();
+        const continuationStarted = yield* Deferred.make<void>();
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            sendTurnEffect: ({ threadId }) =>
+              Deferred.succeed(userSendStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseUserSend)),
+                Effect.as({ threadId, turnId: asTurnId("late-user-turn") }),
+              ),
+            continueFromTerminalCompletionEffect: ({ threadId }) =>
+              Deferred.succeed(continuationStarted, undefined).pipe(
+                Effect.as({ threadId, turnId: asTurnId("after-user-turn") }),
+              ),
+          }),
+        );
+        const now = "2026-01-01T00:00:00.000Z";
+        const threadId = ThreadId.make("thread-1");
+        const wakeKey = "wake-after-late-user-ack";
+
+        yield* harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-late-user-send"),
+          threadId,
+          message: {
+            messageId: asMessageId("user-message-late-ack"),
+            role: "user",
+            text: "Run the requested work",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: now,
+        });
+        yield* Deferred.await(userSendStarted);
+
+        yield* setProviderSession(harness, threadId, "running", asTurnId("late-user-turn"), now);
+        yield* requestTerminalCompletion(harness, {
+          threadId,
+          terminalId: "terminal-after-user",
+          generation: "generation-after-user",
+          dedupeKey: wakeKey,
+          createdAt: now,
+        });
+        yield* setProviderSession(harness, threadId, "ready", null, now);
+        yield* Effect.promise(() => harness.drain());
+
+        expect(yield* Effect.promise(() => harness.readTerminalWakeStatus(wakeKey))).toEqual([
+          { deliveryStatus: "pending" },
+        ]);
+        expect(
+          yield* Effect.promise(() =>
+            harness.readTurnIdentity(threadId, asTurnId("late-user-turn")),
+          ),
+        ).toEqual([
+          {
+            pendingMessageId: "user-message-late-ack",
+            terminalCompletionWakeKey: null,
+            state: "completed",
+          },
+        ]);
+
+        yield* Deferred.succeed(releaseUserSend, undefined);
+        yield* Effect.promise(() => harness.drain());
+
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        expect(harness.continueFromTerminalCompletion).toHaveBeenCalledTimes(1);
+        expect(yield* Effect.promise(() => harness.readTerminalWakeStatus(wakeKey))).toEqual([
+          { deliveryStatus: "delivered" },
+        ]);
+        yield* Deferred.await(continuationStarted);
+      }),
+  );
+
+  effectIt.effect(
+    "resumes queued user turns before terminal wakes after a late user acknowledgement",
+    () =>
+      Effect.gen(function* () {
+        const continuationStarted = yield* Deferred.make<void>();
+        const releaseContinuation = yield* Deferred.make<void>();
+        const firstUserSendStarted = yield* Deferred.make<void>();
+        const releaseFirstUserSend = yield* Deferred.make<void>();
+        const secondUserSendStarted = yield* Deferred.make<void>();
+        const secondThreadInterruptHandled = yield* Deferred.make<void>();
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            interruptTurnEffect: () => Deferred.succeed(secondThreadInterruptHandled, undefined),
+            sendTurnEffect: ({ threadId, input }) => {
+              if (input === "First queued user turn") {
+                return Deferred.succeed(firstUserSendStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseFirstUserSend)),
+                  Effect.as({ threadId, turnId: asTurnId("queued-user-turn-1") }),
+                );
+              }
+              if (input === "Second queued user turn") {
+                return Deferred.succeed(secondUserSendStarted, undefined).pipe(
+                  Effect.as({ threadId, turnId: asTurnId("queued-user-turn-2") }),
+                );
+              }
+              return Effect.succeed({ threadId, turnId: asTurnId("unexpected-user-turn") });
+            },
+            continueFromTerminalCompletionEffect: ({ threadId }) =>
+              Deferred.succeed(continuationStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseContinuation)),
+                Effect.as({ threadId, turnId: asTurnId("terminal-turn-before-queued-users") }),
+              ),
+          }),
+        );
+        const now = "2026-01-01T00:00:00.000Z";
+        const threadId = ThreadId.make("thread-1");
+        const secondThreadId = ThreadId.make("thread-2");
+        yield* harness.engine.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make("cmd-create-terminal-queued-user-second-thread"),
+          threadId: secondThreadId,
+          projectId: asProjectId("project-1"),
+          title: "Second thread",
+          modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "gpt-5-codex" },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          branch: null,
+          worktreePath: null,
+          createdAt: now,
+        });
+        yield* setProviderSession(harness, threadId, "ready", null, now);
+        yield* setProviderSession(harness, secondThreadId, "running", asTurnId("second-turn"), now);
+        yield* requestTerminalCompletion(harness, {
+          threadId,
+          terminalId: "terminal-with-queued-users",
+          generation: "generation-with-queued-users",
+          dedupeKey: "wake-before-two-users",
+          createdAt: now,
+        });
+        yield* Deferred.await(continuationStarted);
+
+        const dispatchQueuedUser = (messageId: string, text: string, createdAt: string) =>
+          harness.engine.dispatch({
+            type: "thread.turn.start",
+            commandId: CommandId.make(`cmd-${messageId}`),
+            threadId,
+            message: {
+              messageId: asMessageId(messageId),
+              role: "user",
+              text,
+              attachments: [],
+            },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            createdAt,
+          });
+        yield* dispatchQueuedUser("queued-user-message-1", "First queued user turn", now);
+        yield* dispatchQueuedUser("queued-user-message-2", "Second queued user turn", now);
+        yield* harness.engine.dispatch({
+          type: "thread.turn.interrupt",
+          commandId: CommandId.make("cmd-drain-terminal-queued-users"),
+          threadId: secondThreadId,
+          turnId: asTurnId("second-turn"),
+          createdAt: now,
+        });
+        yield* Deferred.await(secondThreadInterruptHandled);
+
+        yield* setProviderSession(
+          harness,
+          threadId,
+          "running",
+          asTurnId("terminal-turn-before-queued-users"),
+          now,
+        );
+        yield* setProviderSession(harness, threadId, "ready", null, now);
+        yield* Deferred.succeed(releaseContinuation, undefined);
+        yield* Deferred.await(firstUserSendStarted);
+
+        yield* setProviderSession(
+          harness,
+          threadId,
+          "running",
+          asTurnId("queued-user-turn-1"),
+          now,
+        );
+        yield* setProviderSession(harness, threadId, "ready", null, now);
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+
+        yield* Deferred.succeed(releaseFirstUserSend, undefined);
+        yield* Deferred.await(secondUserSendStarted);
+        expect(harness.sendTurn).toHaveBeenCalledTimes(2);
+      }),
+  );
+
+  effectIt.effect("uses active-turn steering only when the provider capability allows it", () =>
+    Effect.gen(function* () {
+      const userTurnSent = yield* Deferred.make<void>();
+      const continuationStarted = yield* Deferred.make<void>();
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          activeTurnSteer: true,
+          sendTurnEffect: ({ threadId }) =>
+            Deferred.succeed(userTurnSent, undefined).pipe(
+              Effect.as({ threadId, turnId: asTurnId("user-turn") }),
+            ),
+          continueFromTerminalCompletionEffect: ({ threadId }) =>
+            Deferred.succeed(continuationStarted, undefined).pipe(
+              Effect.as({ threadId, turnId: asTurnId("steered-turn") }),
+            ),
+        }),
+      );
+      const now = "2026-01-01T00:00:00.000Z";
+      const threadId = ThreadId.make("thread-1");
+      yield* harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-active-steer-user-turn"),
+        threadId,
+        message: {
+          messageId: asMessageId("user-turn-before-steer"),
+          role: "user",
+          text: "Do the initial work",
+          attachments: [],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      });
+      yield* Deferred.await(userTurnSent);
+      yield* setProviderSession(harness, threadId, "running", asTurnId("user-turn"), now);
+      yield* requestTerminalCompletion(harness, {
+        threadId,
+        terminalId: "terminal-steer",
+        generation: "generation-steer",
+        dedupeKey: "wake-steer",
+        createdAt: now,
+      });
+      yield* Deferred.await(continuationStarted);
+      yield* Effect.promise(() => harness.drain());
+      expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+      expect(harness.continueFromTerminalCompletion).toHaveBeenCalledWith(
+        expect.objectContaining({ threadId }),
+      );
+    }),
+  );
+
+  effectIt.effect.each(["archive", "delete"] as const)(
+    "cancels a claimed wake when the origin thread is %s before provider dispatch",
+    (operation) =>
+      Effect.gen(function* () {
+        const admissionStarted = yield* Deferred.make<void>();
+        const releaseAdmission = yield* Deferred.make<void>();
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            beforeTerminalContinuationDispatch: () =>
+              Deferred.succeed(admissionStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseAdmission)),
+              ),
+          }),
+        );
+        const threadId = ThreadId.make("thread-1");
+        const wakeKey = `wake-origin-${operation}-before-send`;
+        const now = "2026-09-01T00:00:00.000Z";
+        yield* setProviderSession(harness, threadId, "ready", null, now);
+        yield* requestTerminalCompletion(harness, {
+          threadId,
+          terminalId: `terminal-before-${operation}`,
+          generation: `generation-before-${operation}`,
+          dedupeKey: wakeKey,
+          createdAt: now,
+        });
+        yield* Deferred.await(admissionStarted);
+        expect(yield* Effect.promise(() => harness.readTerminalWakeStatus(wakeKey))).toEqual([
+          { deliveryStatus: "claimed" },
+        ]);
+
+        yield* harness.engine.dispatch({
+          type: operation === "archive" ? "thread.archive" : "thread.delete",
+          commandId: CommandId.make(`cmd-${operation}-${wakeKey}`),
+          threadId,
+        });
+        yield* Deferred.succeed(releaseAdmission, undefined);
+        yield* Effect.promise(() => harness.drain());
+
+        expect(yield* Effect.promise(() => harness.readTerminalWakeStatus(wakeKey))).toEqual([
+          { deliveryStatus: "canceled" },
+        ]);
+        expect(harness.continueFromTerminalCompletion).not.toHaveBeenCalled();
+      }),
+  );
+
+  effectIt.effect("schedules another pending wake after a terminal send is acknowledged late", () =>
+    Effect.gen(function* () {
+      const firstSendStarted = yield* Deferred.make<void>();
+      const releaseFirstSend = yield* Deferred.make<void>();
+      const secondSendStarted = yield* Deferred.make<void>();
+      let sendCount = 0;
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          continueFromTerminalCompletionEffect: ({ threadId }) => {
+            sendCount += 1;
+            return sendCount === 1
+              ? Deferred.succeed(firstSendStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseFirstSend)),
+                  Effect.as({ threadId, turnId: asTurnId("first-terminal-turn") }),
+                )
+              : Deferred.succeed(secondSendStarted, undefined).pipe(
+                  Effect.as({ threadId, turnId: asTurnId("second-terminal-turn") }),
+                );
+          },
+        }),
+      );
+      const now = "2026-01-01T00:00:00.000Z";
+      const threadId = ThreadId.make("thread-1");
+      const firstWakeKey = "wake-before-late-ack";
+      const secondWakeKey = "wake-queued-during-send";
+      yield* setProviderSession(harness, threadId, "ready", null, now);
+      yield* requestTerminalCompletion(harness, {
+        threadId,
+        terminalId: "terminal-first",
+        generation: "generation-first",
+        dedupeKey: firstWakeKey,
+        createdAt: now,
+      });
+      yield* Deferred.await(firstSendStarted);
+      yield* requestTerminalCompletion(harness, {
+        threadId,
+        terminalId: "terminal-second",
+        generation: "generation-second",
+        dedupeKey: secondWakeKey,
+        createdAt: now,
+      });
+
+      yield* harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("server:provider-session-set:first-terminal-started"),
+        threadId,
+        session: {
+          threadId,
+          status: "running",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: asTurnId("first-terminal-turn"),
+          lastError: null,
+          updatedAt: now,
+        },
+        turnProvenance: {
+          turnId: asTurnId("first-terminal-turn"),
+          terminalCompletionWakeKey: firstWakeKey,
+        },
+        createdAt: now,
+      });
+      yield* harness.engine.dispatch({
+        type: "thread.session.set",
+        commandId: CommandId.make("server:provider-session-set:first-terminal-completed"),
+        threadId,
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          runtimeMode: "approval-required",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+        createdAt: now,
+      });
+      yield* Deferred.succeed(releaseFirstSend, undefined);
+      yield* Deferred.await(secondSendStarted);
+      yield* Effect.promise(() => harness.drain());
+
+      expect(yield* Effect.promise(() => harness.readTerminalWakeStatus(firstWakeKey))).toEqual([
+        { deliveryStatus: "delivered" },
+      ]);
+      expect(yield* Effect.promise(() => harness.readTerminalWakeStatus(secondWakeKey))).toEqual([
+        { deliveryStatus: "delivered" },
+      ]);
+      expect(harness.continueFromTerminalCompletion).toHaveBeenCalledTimes(2);
+    }),
+  );
+
+  effectIt.effect("records an ambiguous terminal send as unknown without retrying it", () =>
+    Effect.gen(function* () {
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          continueFromTerminalCompletionEffect: () =>
+            Effect.fail(
+              new ProviderAdapterRequestError({
+                provider: "codex",
+                method: "terminal.completion.continue",
+                detail: "connection closed after request write",
+              }),
+            ),
+        }),
+      );
+      const now = "2026-01-01T00:00:00.000Z";
+      const threadId = ThreadId.make("thread-1");
+      const wakeKey = "wake-unknown-result";
+      yield* setProviderSession(harness, threadId, "ready", null, now);
+      yield* requestTerminalCompletion(harness, {
+        threadId,
+        terminalId: "terminal-unknown",
+        generation: "generation-unknown",
+        dedupeKey: wakeKey,
+        createdAt: now,
+      });
+      yield* Effect.promise(() => harness.drain());
+
+      const thread = (yield* Effect.promise(() => harness.readModel())).threads.find(
+        (entry) => entry.id === threadId,
+      );
+      expect(thread?.activities).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: "terminal.project.wake.unknown",
+            summary: "Terminal completion wake outcome is unknown",
+          }),
+        ]),
+      );
+      expect(yield* Effect.promise(() => harness.readTerminalWakeStatus(wakeKey))).toEqual([
+        { deliveryStatus: "unknown" },
+      ]);
+      expect(harness.continueFromTerminalCompletion).toHaveBeenCalledTimes(1);
+    }),
+  );
+
+  effectIt.effect(
+    "returns a proven terminal validation rejection to pending without retrying in place",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            continueFromTerminalCompletionEffect: () =>
+              Effect.fail(
+                new ProviderAdapterValidationError({
+                  provider: "codex",
+                  operation: "terminal.completion.continue",
+                  issue: "the session cannot accept a continuation",
+                }),
+              ),
+          }),
+        );
+        const now = "2026-01-01T00:00:00.000Z";
+        const threadId = ThreadId.make("thread-1");
+        const wakeKey = "wake-rejected-result";
+        yield* setProviderSession(harness, threadId, "ready", null, now);
+        yield* requestTerminalCompletion(harness, {
+          threadId,
+          terminalId: "terminal-rejected",
+          generation: "generation-rejected",
+          dedupeKey: wakeKey,
+          createdAt: now,
+        });
+        yield* Effect.promise(() => harness.drain());
+        expect(yield* Effect.promise(() => harness.readTerminalWakeStatus(wakeKey))).toEqual([
+          { deliveryStatus: "pending" },
+        ]);
+        expect(harness.continueFromTerminalCompletion).toHaveBeenCalledTimes(1);
+      }),
+  );
 
   effectIt.effect("dispatches child message and stop intents through the provider worker", () =>
     Effect.gen(function* () {
@@ -1490,6 +2459,12 @@ describe("ProviderCommandReactor", () => {
         ).toEqual([]);
         expect(yield* Effect.promise(() => harness.readPendingTurnStarts())).toEqual([
           { threadId: "thread-1" },
+        ]);
+        expect(yield* Effect.promise(() => harness.readPendingTurnIdentity(threadId))).toEqual([
+          {
+            messageId: "user-message-blocked-compact",
+            terminalCompletionWakeKey: null,
+          },
         ]);
 
         yield* Deferred.succeed(releaseReadyDispatch, undefined);

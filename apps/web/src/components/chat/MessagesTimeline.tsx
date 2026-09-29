@@ -282,6 +282,7 @@ interface TimelineRowSharedState {
   onCancelWorktreeSetup: (() => void) | null;
   onWorktreeSetupWorkLocally: (() => void) | null;
   onOpenWorktreeSetupTerminal: ((terminalId: string) => void) | null;
+  onOpenProjectTerminal: ((projectId: string, terminalId: string) => void) | null;
   /** Persisted terminal turn records, keyed to avoid widening virtualized rows. */
   turnSummaryByAssistantMessageId: ReadonlyMap<MessageId, OrchestrationTurnSummary>;
 }
@@ -388,6 +389,7 @@ interface MessagesTimelineProps {
   onCancelWorktreeSetup?: () => void;
   onWorktreeSetupWorkLocally?: () => void;
   onOpenWorktreeSetupTerminal?: (terminalId: string) => void;
+  onOpenProjectTerminal?: (projectId: string, terminalId: string) => void;
   listRef: React.RefObject<LegendListRef | null>;
   timelineEntries: ReturnType<typeof deriveTimelineEntries>;
   latestTurn: TimelineLatestTurn | null;
@@ -454,6 +456,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onCancelWorktreeSetup,
   onWorktreeSetupWorkLocally,
   onOpenWorktreeSetupTerminal,
+  onOpenProjectTerminal,
   isPreparingWorktree = false,
   isCompacting = false,
   activeTurnStartedAt,
@@ -959,6 +962,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onCancelWorktreeSetup: onCancelWorktreeSetup ?? null,
       onWorktreeSetupWorkLocally: onWorktreeSetupWorkLocally ?? null,
       onOpenWorktreeSetupTerminal: onOpenWorktreeSetupTerminal ?? null,
+      onOpenProjectTerminal: onOpenProjectTerminal ?? null,
       turnSummaryByAssistantMessageId,
     }),
     [
@@ -990,6 +994,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       onCancelWorktreeSetup,
       onWorktreeSetupWorkLocally,
       onOpenWorktreeSetupTerminal,
+      onOpenProjectTerminal,
       turnSummaryByAssistantMessageId,
     ],
   );
@@ -4168,7 +4173,7 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
   onToggleEntry?: ((collapsed: boolean) => void) | undefined;
 }) {
   const { workEntry, workspaceRoot, isExpandedToolGroupEntry, displayLabel } = props;
-  const { threadRef, onImageExpand } = use(TimelineRowCtx);
+  const { threadRef, onImageExpand, onOpenProjectTerminal } = use(TimelineRowCtx);
   const groupView = use(WorkGroupViewCtx);
   const [expanded, setExpanded] = useState(
     () => groupView?.state.expandedEntries.has(workEntry.id) ?? false,
@@ -4197,6 +4202,7 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
       ? undefined
       : (workEntry.toolIcon ?? workEntry.toolSource?.icon);
   const previewText = displayLabel ?? workEntryDisplayLabel(workEntry, workspaceRoot);
+  const projectTerminal = workEntry.projectTerminal;
   const answerPreview = workEntry.questionAnswer
     ? getQuestionAnswerPreview(workEntry.questionAnswer)
     : null;
@@ -4340,6 +4346,19 @@ const PlainWorkEntryRow = memo(function PlainWorkEntryRow(props: {
               )}
             />
           </span>
+          {projectTerminal && onOpenProjectTerminal ? (
+            <button
+              type="button"
+              className="shrink-0 rounded px-1.5 py-0.5 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
+              onClick={(event) => {
+                event.stopPropagation();
+                onOpenProjectTerminal(projectTerminal.projectId, projectTerminal.terminalId);
+              }}
+              onPointerDown={stopRowToggle}
+            >
+              Open in dock
+            </button>
+          ) : null}
         </div>
       </div>
       {expanded && viewedImage && threadRef ? (

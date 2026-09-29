@@ -3,6 +3,7 @@ import {
   AuthOrchestrationReadScope,
   AuthRelayReadScope,
   AuthRelayWriteScope,
+  AuthTerminalOperateScope,
   ORCHESTRATION_WS_METHODS,
   WS_METHODS,
   WsRpcGroup,
@@ -50,6 +51,18 @@ describe("RPC authorization scopes", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.providerUploadFeedback)).toBe(
       AuthOrchestrationOperateScope,
     );
+  });
+
+  it("requires terminal operation scope for every project terminal RPC", () => {
+    for (const method of [
+      WS_METHODS.projectTerminalAttach,
+      WS_METHODS.projectTerminalMetadata,
+      WS_METHODS.projectTerminalList,
+      WS_METHODS.projectTerminalWrite,
+      WS_METHODS.projectTerminalResize,
+    ]) {
+      expect(requiredScopeForRpcMethod(method)).toBe(AuthTerminalOperateScope);
+    }
   });
 
   it("keeps subagent history read-only and child actions under orchestration operate scope", () => {

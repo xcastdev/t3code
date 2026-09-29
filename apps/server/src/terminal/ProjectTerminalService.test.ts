@@ -343,6 +343,7 @@ describe("ProjectTerminalService", () => {
       yield* harness.publishProjectTerminalEvent({
         type: "output",
         target: { owner: { kind: "project", projectId }, terminalId: terminal.terminalId },
+        generation: "generation-1",
         sequence: 1,
         data: "ready\n",
       });

@@ -542,6 +542,10 @@ export interface GhosttyTerminalSurfaceOptions {
   readonly font?: GhosttyTerminalFont;
   /** Read after font and WASM loading. Hosts can supply a getter for the latest value. */
   readonly visible?: boolean;
+  /** Keep the PTY's current dimensions when the renderer viewport changes. */
+  readonly fixedGrid?: boolean;
+  /** Initial PTY dimensions for fixed-grid views. */
+  readonly initialGrid?: { readonly cols: number; readonly rows: number };
   readonly onData: (data: string) => void;
   readonly onResize: (cols: number, rows: number) => void;
   readonly onSelectionChange: () => void;
@@ -567,6 +571,7 @@ export class GhosttyTerminalSurface {
   private readonly core: GhosttyTerminalCore;
   private readonly options: GhosttyTerminalSurfaceOptions;
   private visible: boolean;
+  private fixedGrid: boolean;
   private hasSize = false;
   private metrics: GhosttyCellMetrics;
   private fontFamily: string;
@@ -661,6 +666,10 @@ export class GhosttyTerminalSurface {
     this.metrics = metrics;
     this.options = options;
     this.visible = options.visible ?? true;
+    this.fixedGrid = options.fixedGrid ?? false;
+    this.cols = options.initialGrid?.cols ?? 1;
+    this.rows = options.initialGrid?.rows ?? 1;
+    this.resizeNotified = options.initialGrid !== undefined;
     this.theme = options.theme;
     this.fontFamily = fontFamily;
     this.requestedFontFamily = options.font?.family;
@@ -721,7 +730,13 @@ export class GhosttyTerminalSurface {
     }
     const fontFamily = await loadTerminalFontFamily(options.font?.family, fontSize);
     const metrics = measureGhosttyCell(context, fontSize, fontFamily);
-    const grid = terminalGridSize(mount.clientWidth, mount.clientHeight, metrics, CONTENT_PADDING);
+    const measuredGrid = terminalGridSize(
+      mount.clientWidth,
+      mount.clientHeight,
+      metrics,
+      CONTENT_PADDING,
+    );
+    const grid = options.initialGrid ?? measuredGrid;
     const core = await GhosttyTerminalCore.create(
       grid.cols,
       grid.rows,
@@ -759,6 +774,29 @@ export class GhosttyTerminalSurface {
       return;
     }
     this.fit();
+  }
+
+  /** Follow the remote PTY grid without echoing a resize back to its owner. */
+  setRemoteGrid(cols: number, rows: number): void {
+    if (this.disposed || cols < 1 || rows < 1 || (cols === this.cols && rows === this.rows)) return;
+    this.cols = cols;
+    this.rows = rows;
+    this.resizeNotified = true;
+    this.core.resize(cols, rows, this.metrics.width, this.metrics.height);
+    this.forceFullRender = true;
+    this.scrollbarDirty = true;
+    this.requestRender();
+  }
+
+  /** Toggle automatic PTY resize while preserving canvas fitting in view mode. */
+  setFixedGrid(fixed: boolean): void {
+    if (this.disposed || this.fixedGrid === fixed) return;
+    this.fixedGrid = fixed;
+    if (fixed && this.resizeNotifyTimer !== null) {
+      window.clearTimeout(this.resizeNotifyTimer);
+      this.resizeNotifyTimer = null;
+    }
+    if (!fixed) this.fit();
   }
 
   write(data: string): void {
@@ -890,7 +928,10 @@ export class GhosttyTerminalSurface {
     this.mountHeight = height;
     // onResize is the only PTY resize channel, so the first successful fit must
     // notify even when the measured grid equals the 1x1 construction sentinel.
-    if (grid.cols !== this.cols || grid.rows !== this.rows || !this.resizeNotified) {
+    if (
+      !this.fixedGrid &&
+      (grid.cols !== this.cols || grid.rows !== this.rows || !this.resizeNotified)
+    ) {
       this.cols = grid.cols;
       this.rows = grid.rows;
       this.core.resize(grid.cols, grid.rows, this.metrics.width, this.metrics.height);
@@ -916,7 +957,7 @@ export class GhosttyTerminalSurface {
     if (this.resizeNotifyTimer !== null) window.clearTimeout(this.resizeNotifyTimer);
     this.resizeNotifyTimer = window.setTimeout(() => {
       this.resizeNotifyTimer = null;
-      if (!this.disposed) this.options.onResize(this.cols, this.rows);
+      if (!this.disposed && !this.fixedGrid) this.options.onResize(this.cols, this.rows);
     }, 150);
   }
 
@@ -1033,7 +1074,7 @@ export class GhosttyTerminalSurface {
       this.resizeNotifyTimer = null;
       // Flush the settled dimensions so the PTY keeps the final size even when
       // the surface unmounts inside the debounce window.
-      this.options.onResize(this.cols, this.rows);
+      if (!this.fixedGrid) this.options.onResize(this.cols, this.rows);
     }
     this.cancelRender();
     if (this.compositionSuppressionTimer !== null) {

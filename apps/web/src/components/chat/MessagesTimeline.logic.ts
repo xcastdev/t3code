@@ -1147,6 +1147,7 @@ export function deriveMessagesTimelineRows(input: {
     if (timelineEntry.kind === "work") {
       if (
         timelineEntry.entry.agentSpawn !== undefined ||
+        timelineEntry.entry.projectTerminal !== undefined ||
         timelineEntry.entry.questionAnswer !== undefined ||
         timelineEntry.entry.tone === "error"
       ) {

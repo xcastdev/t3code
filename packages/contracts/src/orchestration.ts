@@ -1869,8 +1869,62 @@ export const OrchestrationTurnProvenance = Schema.Struct({
   turnId: TurnId,
   model: Schema.optional(TrimmedNonEmptyString),
   effort: Schema.optional(TrimmedNonEmptyString),
+  terminalCompletionWakeKey: Schema.optional(TrimmedNonEmptyString),
 });
 export type OrchestrationTurnProvenance = typeof OrchestrationTurnProvenance.Type;
+
+const ThreadTerminalCompletionRequestCommand = Schema.Struct({
+  type: Schema.Literal("thread.terminal-completion.request"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  projectId: ProjectId,
+  terminalId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  generation: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  serverRunId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  dedupeKey: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+  label: TrimmedNonEmptyString.check(Schema.isMaxLength(160)),
+  status: Schema.Literals(["exited", "killed"]),
+  exitCode: Schema.NullOr(Schema.Int),
+  exitSignal: Schema.NullOr(Schema.Int),
+  createdAt: IsoDateTime,
+});
+
+const ThreadTerminalCompletionContinuationStartCommand = Schema.Struct({
+  type: Schema.Literal("thread.terminal-completion.continuation.start"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  projectId: ProjectId,
+  deliveryMode: Schema.Literals(["idle", "steer"]),
+  serverRunId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  wakeKeys: Schema.Array(TrimmedNonEmptyString.check(Schema.isMaxLength(512))).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(8),
+  ),
+  prompt: TrimmedNonEmptyString.check(Schema.isMaxLength(8_000)),
+  createdAt: IsoDateTime,
+});
+
+const ThreadTerminalCompletionContinuationCancelCommand = Schema.Struct({
+  type: Schema.Literal("thread.terminal-completion.continuation.cancel"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  wakeKey: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+  createdAt: IsoDateTime,
+});
+
+const ThreadTurnStartAdmitCommand = Schema.Struct({
+  type: Schema.Literal("thread.turn.start.admit"),
+  commandId: CommandId,
+  threadId: ThreadId,
+  messageId: MessageId,
+  sourceProposedPlan: Schema.optional(
+    Schema.Struct({
+      threadId: ThreadId,
+      planId: OrchestrationProposedPlanId,
+    }),
+  ),
+  requestedAt: IsoDateTime,
+});
 
 const ThreadSessionSetCommand = Schema.Struct({
   type: Schema.Literal("thread.session.set"),
@@ -2035,6 +2089,10 @@ const InternalOrchestrationCommand = Schema.Union([
   ThreadProposedPlanUpsertCommand,
   ThreadTurnDiffCompleteCommand,
   ThreadActivityAppendCommand,
+  ThreadTerminalCompletionRequestCommand,
+  ThreadTerminalCompletionContinuationStartCommand,
+  ThreadTerminalCompletionContinuationCancelCommand,
+  ThreadTurnStartAdmitCommand,
   ThreadRevertCompleteCommand,
   ThreadTitleRegenerationCompleteCommand,
   ThreadTitleGenerateCompleteCommand,
@@ -2084,6 +2142,10 @@ export const OrchestrationEventType = Schema.Literals([
   "thread.interaction-mode-set",
   "thread.message-sent",
   "thread.turn-start-requested",
+  "thread.turn-start-admitted",
+  "thread.terminal-completion-requested",
+  "thread.terminal-completion-continuation-started",
+  "thread.terminal-completion-continuation-canceled",
   "thread.turn-interrupt-requested",
   "thread.agent-message-requested",
   "thread.agent-stop-requested",
@@ -2442,6 +2504,22 @@ export const ThreadTurnStartRequestedPayload = Schema.Struct({
   createdAt: IsoDateTime,
 });
 
+export const ThreadTerminalCompletionRequestedPayload = Schema.Struct({
+  threadId: ThreadId,
+  projectId: ProjectId,
+  terminalId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  generation: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  serverRunId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+  dedupeKey: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+  label: TrimmedNonEmptyString.check(Schema.isMaxLength(160)),
+  status: Schema.Literals(["exited", "killed"]),
+  exitCode: Schema.NullOr(Schema.Int),
+  exitSignal: Schema.NullOr(Schema.Int),
+  createdAt: IsoDateTime,
+});
+export type ThreadTerminalCompletionRequestedPayload =
+  typeof ThreadTerminalCompletionRequestedPayload.Type;
+
 export const ThreadTurnInterruptRequestedPayload = Schema.Struct({
   threadId: ThreadId,
   turnId: Schema.optional(TurnId),
@@ -2748,6 +2826,47 @@ export const OrchestrationEvent = Schema.Union([
     ...EventBaseFields,
     type: Schema.Literal("thread.turn-start-requested"),
     payload: ThreadTurnStartRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.terminal-completion-requested"),
+    payload: ThreadTerminalCompletionRequestedPayload,
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.terminal-completion-continuation-started"),
+    payload: Schema.Struct({
+      threadId: ThreadId,
+      projectId: ProjectId,
+      deliveryMode: Schema.Literals(["idle", "steer"]),
+      serverRunId: TrimmedNonEmptyString.check(Schema.isMaxLength(128)),
+      wakeKeys: Schema.Array(TrimmedNonEmptyString.check(Schema.isMaxLength(512))).check(
+        Schema.isMinLength(1),
+        Schema.isMaxLength(8),
+      ),
+      prompt: TrimmedNonEmptyString.check(Schema.isMaxLength(8_000)),
+      createdAt: IsoDateTime,
+    }),
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.terminal-completion-continuation-canceled"),
+    payload: Schema.Struct({
+      threadId: ThreadId,
+      wakeKey: TrimmedNonEmptyString.check(Schema.isMaxLength(512)),
+      createdAt: IsoDateTime,
+    }),
+  }),
+  Schema.Struct({
+    ...EventBaseFields,
+    type: Schema.Literal("thread.turn-start-admitted"),
+    payload: Schema.Struct({
+      threadId: ThreadId,
+      messageId: MessageId,
+      sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
+      sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
+      requestedAt: IsoDateTime,
+    }),
   }),
   Schema.Struct({
     ...EventBaseFields,

@@ -145,6 +145,7 @@ function createProviderServiceHarness(
   const service: ProviderServiceShape = {
     startSession,
     sendTurn: () => unsupported(),
+    continueFromTerminalCompletion: () => unsupported(),
     messageAgent: () => unsupported(),
     stopAgent: () => unsupported(),
     getAgentCapabilities: () => unsupported(),
@@ -691,6 +692,92 @@ describe("CheckpointReactor", () => {
         ),
       ).toBe("v2\n");
     }),
+  );
+
+  effectIt.effect(
+    "captures a checkpoint for a terminal-origin continuation without a user message",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* Effect.promise(() =>
+          createHarness({ seedFilesystemCheckpoints: false }),
+        );
+        const threadId = ThreadId.make("thread-1");
+        const turnId = asTurnId("terminal-origin-checkpoint-turn");
+        const createdAt = "2026-01-01T00:00:00.000Z";
+
+        yield* harness.engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-terminal-checkpoint-session-ready"),
+          threadId,
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: createdAt,
+          },
+          createdAt,
+        });
+        yield* harness.engine.dispatch({
+          type: "thread.terminal-completion.continuation.start",
+          commandId: CommandId.make("cmd-terminal-origin-checkpoint-start"),
+          threadId,
+          projectId: asProjectId("project-1"),
+          deliveryMode: "idle",
+          serverRunId: "server-run-checkpoint-test",
+          wakeKeys: ["project-1:terminal-checkpoint:generation-1"],
+          prompt: "A project terminal completed. Review its output if useful.",
+          createdAt,
+        });
+        expect(yield* harness.nextReceipt).toMatchObject({
+          type: "checkpoint.baseline.captured",
+          threadId,
+          checkpointTurnCount: 0,
+        });
+
+        harness.provider.emit({
+          type: "turn.started",
+          eventId: EventId.make("evt-terminal-origin-checkpoint-started"),
+          provider: ProviderDriverKind.make("codex"),
+          createdAt,
+          threadId,
+          turnId,
+        });
+        yield* Effect.promise(harness.drain);
+        NodeFS.writeFileSync(NodePath.join(harness.cwd, "README.md"), "terminal result\n", "utf8");
+        harness.provider.emit({
+          type: "turn.completed",
+          eventId: EventId.make("evt-terminal-origin-checkpoint-completed"),
+          provider: ProviderDriverKind.make("codex"),
+          createdAt,
+          threadId,
+          turnId,
+          payload: { state: "completed" },
+        });
+
+        expect(yield* harness.nextReceipt).toMatchObject({
+          type: "checkpoint.diff.finalized",
+          threadId,
+          turnId,
+          checkpointTurnCount: 1,
+        });
+        yield* Effect.promise(harness.drain);
+
+        const thread = (yield* Effect.promise(harness.readModel)).threads.find(
+          (entry) => entry.id === threadId,
+        );
+        expect(thread?.messages).toEqual([]);
+        expect(thread?.checkpoints).toMatchObject([
+          {
+            turnId,
+            checkpointTurnCount: 1,
+            status: "ready",
+            files: [{ path: "README.md", kind: "modified" }],
+          },
+        ]);
+      }),
   );
 
   effectIt.effect("captures and reverts checkpoints from a nested Git workspace", () =>

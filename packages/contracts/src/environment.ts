@@ -97,6 +97,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   sourceControlWorkspace: Schema.optionalKey(Schema.Boolean),
   /** Server supports bounded, snapshot-paged working-tree file listings. */
   gitWorkingTreePagination: Schema.optionalKey(Schema.Boolean),
+  /** Server exposes project-owned terminal discovery and attachment RPCs. */
+  projectTerminalAttachment: Schema.optionalKey(Schema.Boolean),
   /** Server exposes project-scoped remote HTTP MCP catalog RPCs. */
   projectMcpCatalog: Schema.optionalKey(Schema.Boolean),
   /** Server exposes environment-global MCP definition RPCs. */

@@ -78,6 +78,7 @@ export interface WorkLogEntry {
   toolLifecycleStatus?: WorkLogToolLifecycleStatus;
   /** Originating orchestration activity kind (e.g. `user-input.requested`) for row chrome. */
   sourceActivityKind?: OrchestrationThreadActivity["kind"];
+  projectTerminal?: { readonly projectId: string; readonly terminalId: string };
   /** Grouping key for subagent lifecycle rows (one row per agent). */
   taskId?: string;
   /** Agent role (subagent_type) for labeled timeline rows. */
@@ -585,6 +586,14 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
           : activity.tone,
     sourceActivityKind: activity.kind,
   };
+  if (
+    activity.kind === "terminal.project.created" ||
+    activity.kind === "terminal.project.completed"
+  ) {
+    const projectId = asTrimmedString(payload?.projectId);
+    const terminalId = asTrimmedString(payload?.terminalId);
+    if (projectId && terminalId) entry.projectTerminal = { projectId, terminalId };
+  }
   if (activity.kind === "user-input.answer-submitted") {
     const answer = decodeQuestionAttachmentAnswer(payload);
     if (Option.isSome(answer)) entry.questionAnswer = answer.value;

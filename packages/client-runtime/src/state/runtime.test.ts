@@ -556,6 +556,60 @@ describe("environment query lifecycle", () => {
 });
 
 describe("environment subscription lifecycle", () => {
+  it.effect("closes a project terminal attach stream when the last view detaches", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const opened = yield* Deferred.make<void>();
+        const closed = yield* Deferred.make<void>();
+        const harness = yield* makeEnvironmentQueryHarness(Effect.never);
+        const family = createEnvironmentSubscriptionAtomFamily(harness.runtime, {
+          label: "environment-data:terminal:project-attach",
+          idleTtlMs: 0,
+          subscribe: () =>
+            Stream.fromEffect(Deferred.succeed(opened, undefined)).pipe(
+              Stream.drain,
+              Stream.concat(Stream.never),
+              Stream.ensuring(Deferred.succeed(closed, undefined)),
+            ),
+        });
+        const atom = family({
+          environmentId: QUERY_ENVIRONMENT.environmentId,
+          input: { projectId: "project-1" as never, terminalId: "terminal-1" as never },
+        });
+        const registry = AtomRegistry.make();
+        const unmount = registry.mount(atom);
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            unmount();
+            registry.dispose();
+          }),
+        );
+
+        yield* Deferred.await(opened).pipe(
+          Effect.timeoutOption("5 seconds"),
+          TestClock.withLive,
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.die(new Error("Project terminal attach stream did not open.")),
+              onSome: Effect.succeed,
+            }),
+          ),
+        );
+        unmount();
+        yield* Deferred.await(closed).pipe(
+          Effect.timeoutOption("5 seconds"),
+          TestClock.withLive,
+          Effect.flatMap(
+            Option.match({
+              onNone: () => Effect.die(new Error("Detached project terminal stream stayed open.")),
+              onSome: Effect.succeed,
+            }),
+          ),
+        );
+      }),
+    ),
+  );
+
   it.effect("does not restore a buffered value from a replaced RPC session", () =>
     Effect.scoped(
       Effect.gen(function* () {

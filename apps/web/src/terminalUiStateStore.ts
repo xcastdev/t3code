@@ -26,12 +26,20 @@ interface ThreadTerminalUiState {
   activeTerminalGroupId: string;
 }
 
+export interface ProjectTerminalUiState {
+  readonly open: boolean;
+  readonly selectedTerminalId: string | null;
+  readonly selectionInitialized: boolean;
+  readonly mode: "view" | "interactive";
+}
+
 // Keep the old storage key so existing drawer layout preferences migrate.
 const TERMINAL_UI_STATE_STORAGE_KEY = "t3code:terminal-state:v1";
 
 interface PersistedTerminalUiStateStoreState {
   terminalUiStateByThreadKey?: Record<string, ThreadTerminalUiState>;
   terminalStateByThreadKey?: Record<string, ThreadTerminalUiState>;
+  projectTerminalUiStateByKey?: Record<string, ProjectTerminalUiState>;
 }
 
 export function migratePersistedTerminalUiStateStoreState(
@@ -39,7 +47,7 @@ export function migratePersistedTerminalUiStateStoreState(
   _version: number,
 ): PersistedTerminalUiStateStoreState {
   if (!persistedState || typeof persistedState !== "object") {
-    return { terminalUiStateByThreadKey: {} };
+    return { terminalUiStateByThreadKey: {}, projectTerminalUiStateByKey: {} };
   }
 
   const candidate = persistedState as PersistedTerminalUiStateStoreState;
@@ -51,7 +59,50 @@ export function migratePersistedTerminalUiStateStoreState(
     ),
   );
 
-  return { terminalUiStateByThreadKey };
+  const projectTerminalUiStateByKey = Object.fromEntries(
+    Object.entries(candidate.projectTerminalUiStateByKey ?? {}).filter(([key, value]) => {
+      try {
+        const parsed: unknown = JSON.parse(key);
+        return (
+          Array.isArray(parsed) &&
+          parsed.length === 2 &&
+          parsed.every((entry) => typeof entry === "string" && entry.length > 0) &&
+          value !== null &&
+          typeof value === "object" &&
+          typeof value.open === "boolean" &&
+          (value.selectedTerminalId === null || typeof value.selectedTerminalId === "string") &&
+          typeof value.selectionInitialized === "boolean" &&
+          (value.mode === "view" || value.mode === "interactive")
+        );
+      } catch {
+        return false;
+      }
+    }),
+  );
+
+  return { terminalUiStateByThreadKey, projectTerminalUiStateByKey };
+}
+
+const DEFAULT_PROJECT_TERMINAL_UI_STATE: ProjectTerminalUiState = Object.freeze({
+  open: false,
+  selectedTerminalId: null,
+  selectionInitialized: false,
+  mode: "view",
+});
+
+export function projectTerminalUiKey(environmentId: string, projectId: string): string {
+  return JSON.stringify([environmentId, projectId]);
+}
+
+export function selectProjectTerminalUiState(
+  stateByKey: Record<string, ProjectTerminalUiState>,
+  environmentId: string | null | undefined,
+  projectId: string | null | undefined,
+): ProjectTerminalUiState {
+  if (!environmentId || !projectId) return DEFAULT_PROJECT_TERMINAL_UI_STATE;
+  return (
+    stateByKey[projectTerminalUiKey(environmentId, projectId)] ?? DEFAULT_PROJECT_TERMINAL_UI_STATE
+  );
 }
 
 function createTerminalUiStateStorage() {
@@ -562,6 +613,7 @@ function removeRecordEntry<T>(record: Record<string, T>, key: string): Record<st
 
 interface TerminalUiStateStoreState {
   terminalUiStateByThreadKey: Record<string, ThreadTerminalUiState>;
+  projectTerminalUiStateByKey: Record<string, ProjectTerminalUiState>;
   /** Closed ids hidden from stale server metadata until that id is explicitly opened again. */
   suppressedTerminalIdsByThreadKey: Record<string, string[]>;
   setTerminalOpen: (threadRef: ScopedThreadRef, open: boolean) => void;
@@ -584,6 +636,18 @@ interface TerminalUiStateStoreState {
   clearTerminalUiState: (threadRef: ScopedThreadRef) => void;
   removeTerminalUiState: (threadRef: ScopedThreadRef) => void;
   removeOrphanedTerminalUiStates: (activeThreadKeys: Set<string>) => void;
+  openProjectTerminalDock: (environmentId: string, projectId: string, terminalId?: string) => void;
+  setProjectTerminalDockOpen: (environmentId: string, projectId: string, open: boolean) => void;
+  selectProjectTerminal: (
+    environmentId: string,
+    projectId: string,
+    terminalId: string | null,
+  ) => void;
+  setProjectTerminalMode: (
+    environmentId: string,
+    projectId: string,
+    mode: "view" | "interactive",
+  ) => void;
 }
 
 export const useTerminalUiStateStore = create<TerminalUiStateStoreState>()(
@@ -628,6 +692,7 @@ export const useTerminalUiStateStore = create<TerminalUiStateStoreState>()(
 
       return {
         terminalUiStateByThreadKey: {},
+        projectTerminalUiStateByKey: {},
         suppressedTerminalIdsByThreadKey: {},
         setTerminalOpen: (threadRef, open) => {
           const terminalState = selectThreadTerminalUiState(
@@ -780,6 +845,91 @@ export const useTerminalUiStateStore = create<TerminalUiStateStoreState>()(
               suppressedTerminalIdsByThreadKey: nextSuppressedTerminalIdsByThreadKey,
             };
           }),
+        openProjectTerminalDock: (environmentId, projectId, terminalId) =>
+          set((state) => {
+            const key = projectTerminalUiKey(environmentId, projectId);
+            const previous = selectProjectTerminalUiState(
+              state.projectTerminalUiStateByKey,
+              environmentId,
+              projectId,
+            );
+            const next: ProjectTerminalUiState = {
+              ...previous,
+              open: true,
+              selectedTerminalId: terminalId ?? previous.selectedTerminalId,
+              selectionInitialized: terminalId === undefined ? previous.selectionInitialized : true,
+            };
+            if (
+              previous.open === next.open &&
+              previous.selectedTerminalId === next.selectedTerminalId &&
+              previous.selectionInitialized === next.selectionInitialized
+            )
+              return state;
+            return {
+              projectTerminalUiStateByKey: {
+                ...state.projectTerminalUiStateByKey,
+                [key]: next,
+              },
+            };
+          }),
+        setProjectTerminalDockOpen: (environmentId, projectId, open) =>
+          set((state) => {
+            const key = projectTerminalUiKey(environmentId, projectId);
+            const previous = selectProjectTerminalUiState(
+              state.projectTerminalUiStateByKey,
+              environmentId,
+              projectId,
+            );
+            if (previous.open === open) return state;
+            return {
+              projectTerminalUiStateByKey: {
+                ...state.projectTerminalUiStateByKey,
+                [key]: { ...previous, open },
+              },
+            };
+          }),
+        selectProjectTerminal: (environmentId, projectId, terminalId) =>
+          set((state) => {
+            const key = projectTerminalUiKey(environmentId, projectId);
+            const previous = selectProjectTerminalUiState(
+              state.projectTerminalUiStateByKey,
+              environmentId,
+              projectId,
+            );
+            if (
+              previous.selectedTerminalId === terminalId &&
+              previous.selectionInitialized &&
+              previous.open
+            )
+              return state;
+            return {
+              projectTerminalUiStateByKey: {
+                ...state.projectTerminalUiStateByKey,
+                [key]: {
+                  ...previous,
+                  open: true,
+                  selectedTerminalId: terminalId,
+                  selectionInitialized: true,
+                },
+              },
+            };
+          }),
+        setProjectTerminalMode: (environmentId, projectId, mode) =>
+          set((state) => {
+            const key = projectTerminalUiKey(environmentId, projectId);
+            const previous = selectProjectTerminalUiState(
+              state.projectTerminalUiStateByKey,
+              environmentId,
+              projectId,
+            );
+            if (previous.mode === mode) return state;
+            return {
+              projectTerminalUiStateByKey: {
+                ...state.projectTerminalUiStateByKey,
+                [key]: { ...previous, mode },
+              },
+            };
+          }),
       };
     },
     {
@@ -789,6 +939,7 @@ export const useTerminalUiStateStore = create<TerminalUiStateStoreState>()(
       migrate: migratePersistedTerminalUiStateStoreState,
       partialize: (state) => ({
         terminalUiStateByThreadKey: state.terminalUiStateByThreadKey,
+        projectTerminalUiStateByKey: state.projectTerminalUiStateByKey,
       }),
     },
   ),

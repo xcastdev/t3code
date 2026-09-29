@@ -5,6 +5,8 @@ import {
   type TerminalAttachStreamEvent,
   type TerminalEvent,
   type TerminalMetadataStreamEvent,
+  type ProjectTerminalAttachStreamEvent,
+  type ProjectTerminalMetadataStreamEvent,
   type TerminalOpenInput,
   type TerminalRestartInput,
   ProjectId,
@@ -627,6 +629,404 @@ it.layer(
         args: ["--flag"],
       });
       expect(yield* manager.listProject(projectId)).toHaveLength(0);
+    }),
+  );
+
+  it.effect("attaches to an existing project terminal without starting or resizing it", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const projectId = ProjectId.make("project-attach-existing");
+      const terminalId = "shared";
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      yield* manager.open(openInput({ threadId: projectId, terminalId }));
+      const projectProcess = ptyAdapter.processes[0];
+      expect(projectProcess).toBeDefined();
+      if (!projectProcess) return;
+
+      projectProcess.emitData("retained project output\n");
+      yield* waitFor(
+        manager
+          .readProject({ projectId, terminalId, tailLines: 1 })
+          .pipe(Effect.map((result) => result.kind === "stream" && result.output.length > 0)),
+      );
+
+      const attachedEvents = yield* Ref.make<ReadonlyArray<ProjectTerminalAttachStreamEvent>>([]);
+      const outputSeen = yield* Deferred.make<void>();
+      const unsubscribe = yield* manager.attachProjectStream({ projectId, terminalId }, (event) =>
+        Ref.update(attachedEvents, (events) => [...events, event]).pipe(
+          Effect.andThen(
+            event.type === "output" ? Deferred.succeed(outputSeen, undefined) : Effect.void,
+          ),
+        ),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+      expect(yield* Ref.get(attachedEvents)).toMatchObject([
+        {
+          type: "snapshot",
+          snapshot: {
+            terminal: { projectId, terminalId },
+            history: "retained project output\n",
+            cols: 120,
+            rows: 30,
+          },
+        },
+      ]);
+      expect(ptyAdapter.spawnInputs).toHaveLength(2);
+      expect(projectProcess.resizeCalls).toHaveLength(0);
+      expect(projectProcess.killed).toBe(false);
+
+      const unknownHandle = yield* Effect.exit(
+        manager.attachProjectStream({ projectId, terminalId: "missing" }, () => Effect.void),
+      );
+      expect(unknownHandle._tag).toBe("Failure");
+
+      projectProcess.emitData("live output\n");
+      yield* Deferred.await(outputSeen);
+      expect(
+        (yield* Ref.get(attachedEvents)).some(
+          (event) =>
+            event.type === "output" &&
+            event.handle.projectId === projectId &&
+            event.handle.terminalId === terminalId &&
+            event.data === "live output\n",
+        ),
+      ).toBe(true);
+
+      projectProcess.emitExit({ exitCode: 0, signal: null });
+      yield* waitFor(
+        manager
+          .listProject(projectId)
+          .pipe(Effect.map((terminals) => terminals[0]?.status === "exited")),
+      );
+      const exitedEvents = yield* Ref.make<ReadonlyArray<ProjectTerminalAttachStreamEvent>>([]);
+      const unsubscribeExited = yield* manager.attachProjectStream(
+        { projectId, terminalId },
+        (event) => Ref.update(exitedEvents, (events) => [...events, event]),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribeExited));
+      expect(yield* Ref.get(exitedEvents)).toMatchObject([
+        {
+          type: "snapshot",
+          snapshot: {
+            terminal: { status: "exited" },
+            history: "retained project output\nlive output\n",
+          },
+        },
+      ]);
+      expect(ptyAdapter.spawnInputs).toHaveLength(2);
+    }),
+  );
+
+  it.effect("reconciles output and resize racing the project attach snapshot", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const projectId = ProjectId.make("project-attach-race");
+      const terminalId = "race";
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
+
+      const events = yield* Ref.make<ReadonlyArray<ProjectTerminalAttachStreamEvent>>([]);
+      const snapshotStarted = yield* Deferred.make<void>();
+      const releaseSnapshot = yield* Deferred.make<void>();
+      const attachFiber = yield* manager
+        .attachProjectStream({ projectId, terminalId }, (event) =>
+          Effect.gen(function* () {
+            yield* Ref.update(events, (current) => [...current, event]);
+            if (event.type === "snapshot") {
+              yield* Deferred.succeed(snapshotStarted, undefined);
+              yield* Deferred.await(releaseSnapshot);
+            }
+          }),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(snapshotStarted);
+
+      ptyProcess.emitData("during attach\n");
+      yield* waitFor(
+        manager
+          .readProject({ projectId, terminalId, tailLines: 1 })
+          .pipe(Effect.map((result) => result.kind === "stream" && result.output.length > 0)),
+      );
+      yield* manager.resizeProject({ projectId, terminalId, cols: 88, rows: 21 });
+      yield* Deferred.succeed(releaseSnapshot, undefined);
+      const unsubscribe = yield* Fiber.join(attachFiber);
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+      yield* waitFor(
+        Ref.get(events).pipe(
+          Effect.map((current) => current.some((event) => event.type === "resized")),
+        ),
+      );
+
+      const recorded = yield* Ref.get(events);
+      expect(recorded.map((event) => event.type)).toEqual(["snapshot", "output", "resized"]);
+      const sequences = recorded.map((event) =>
+        event.type === "snapshot" ? event.snapshot.sequence : event.sequence,
+      );
+      expect(sequences).toEqual(sequences.toSorted((left, right) => left - right));
+    }),
+  );
+
+  it.effect("pages compact metadata and publishes resize without output deltas", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const projectId = ProjectId.make("project-dock-pages");
+      for (const terminalId of ["c", "a", "b"]) {
+        yield* manager.createProject({
+          projectId,
+          terminalId,
+          creatingThreadId: ThreadId.make("creator"),
+          cwd: process.cwd(),
+          command: "secret-command",
+          args: ["secret-argument"],
+        });
+      }
+
+      const page = yield* manager.listProjectDockSummaries(projectId, undefined, 2);
+      expect(page.terminals.map((terminal) => terminal.terminalId)).toEqual(["a", "b"]);
+      expect(page.nextCursor).toBe("b");
+      expect(page.terminals[0]).not.toHaveProperty("command");
+      expect(page.terminals[0]).not.toHaveProperty("args");
+      expect(page.terminals[0]).not.toHaveProperty("history");
+
+      const events = yield* Ref.make<ReadonlyArray<ProjectTerminalMetadataStreamEvent>>([]);
+      const resized = yield* Deferred.make<void>();
+      const unsubscribe = yield* manager.subscribeProjectMetadata(projectId, (event) =>
+        Ref.update(events, (current) => [...current, event]).pipe(
+          Effect.andThen(
+            event.type === "upsert" && event.terminal.terminalId === "a"
+              ? Deferred.succeed(resized, undefined)
+              : Effect.void,
+          ),
+        ),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+      const firstProcess = ptyAdapter.processes[0];
+      expect(firstProcess).toBeDefined();
+      if (!firstProcess) return;
+      firstProcess.emitData("metadata excludes output\n");
+      yield* manager.resizeProject({ projectId, terminalId: "a", cols: 90, rows: 22 });
+      yield* Deferred.await(resized);
+
+      const recorded = yield* Ref.get(events);
+      expect(recorded[0]).toMatchObject({
+        type: "snapshot",
+        terminals: [{ terminalId: "a" }, { terminalId: "b" }, { terminalId: "c" }],
+      });
+      expect(recorded).toHaveLength(2);
+      expect(recorded[1]).toMatchObject({
+        type: "upsert",
+        terminal: { terminalId: "a", cols: 90, rows: 22 },
+      });
+    }),
+  );
+
+  it.effect("pages every terminal beyond the first hundred without repeats", () =>
+    Effect.gen(function* () {
+      const { manager } = yield* createManager();
+      const projectId = ProjectId.make("project-dock-over-one-hundred");
+      const terminalIds = Array.from(
+        { length: 105 },
+        (_, index) => `terminal-${String(index).padStart(3, "0")}`,
+      );
+      for (const terminalId of terminalIds) {
+        yield* manager.createProject({
+          projectId,
+          terminalId,
+          creatingThreadId: ThreadId.make("creator"),
+          cwd: process.cwd(),
+        });
+      }
+
+      const firstPage = yield* manager.listProjectDockSummaries(projectId, undefined, 100);
+      expect(firstPage.terminals.map((terminal) => terminal.terminalId)).toEqual(
+        terminalIds.slice(0, 100),
+      );
+      expect(firstPage.nextCursor).toBe(terminalIds[99]);
+      const lastPage = yield* manager.listProjectDockSummaries(
+        projectId,
+        firstPage.nextCursor ?? undefined,
+        100,
+      );
+      expect(lastPage.terminals.map((terminal) => terminal.terminalId)).toEqual(
+        terminalIds.slice(100),
+      );
+      expect(lastPage.nextCursor).toBeNull();
+    }),
+  );
+
+  it.effect("resnapshots metadata after a slow listener overflows its bounded queue", () =>
+    Effect.gen(function* () {
+      const { manager } = yield* createManager();
+      const projectId = ProjectId.make("project-dock-slow-client");
+      const terminalId = "slow-client";
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+
+      const events = yield* Ref.make<ReadonlyArray<ProjectTerminalMetadataStreamEvent>>([]);
+      const firstUpsertStarted = yield* Deferred.make<void>();
+      const releaseFirstUpsert = yield* Deferred.make<void>();
+      const resnapshotDelivered = yield* Deferred.make<void>();
+      let blockedFirstUpsert = false;
+      let snapshotCount = 0;
+      const unsubscribe = yield* manager.subscribeProjectMetadata(projectId, (event) =>
+        Effect.gen(function* () {
+          yield* Ref.update(events, (current) => [...current, event]);
+          if (event.type === "snapshot") {
+            snapshotCount += 1;
+            if (snapshotCount === 2) yield* Deferred.succeed(resnapshotDelivered, undefined);
+          } else if (event.type === "upsert" && !blockedFirstUpsert) {
+            blockedFirstUpsert = true;
+            yield* Deferred.succeed(firstUpsertStarted, undefined);
+            yield* Deferred.await(releaseFirstUpsert);
+          }
+        }),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+      yield* manager.resizeProject({ projectId, terminalId, cols: 79, rows: 24 });
+      yield* Deferred.await(firstUpsertStarted);
+      for (let index = 0; index < 65; index += 1) {
+        yield* manager.resizeProject({
+          projectId,
+          terminalId,
+          cols: 80 + index,
+          rows: 24,
+        });
+      }
+      yield* Deferred.succeed(releaseFirstUpsert, undefined);
+      yield* Deferred.await(resnapshotDelivered);
+
+      const recorded = yield* Ref.get(events);
+      const snapshots = recorded.filter((event) => event.type === "snapshot");
+      expect(snapshots).toHaveLength(2);
+      expect(snapshots[1]).toMatchObject({
+        type: "snapshot",
+        terminals: [{ terminalId, cols: 144 }],
+      });
+    }),
+  );
+
+  it.effect("reports reconnect after slow output delivery overflows, including exit races", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const projectId = ProjectId.make("project-attach-slow-output");
+      const terminalId = "slow-output";
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
+
+      const events = yield* Ref.make<ReadonlyArray<ProjectTerminalAttachStreamEvent>>([]);
+      const firstOutputStarted = yield* Deferred.make<void>();
+      const releaseFirstOutput = yield* Deferred.make<void>();
+      const reconnectDelivered = yield* Deferred.make<void>();
+      let blockedFirstOutput = false;
+      const unsubscribe = yield* manager.attachProjectStream({ projectId, terminalId }, (event) =>
+        Effect.gen(function* () {
+          yield* Ref.update(events, (current) => [...current, event]);
+          if (event.type === "reconnect") yield* Deferred.succeed(reconnectDelivered, undefined);
+          if (event.type === "output" && !blockedFirstOutput) {
+            blockedFirstOutput = true;
+            yield* Deferred.succeed(firstOutputStarted, undefined);
+            yield* Deferred.await(releaseFirstOutput);
+          }
+        }),
+      );
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+
+      ptyProcess.emitData("first output");
+      yield* Deferred.await(firstOutputStarted);
+      for (let index = 0; index < 70; index += 1) {
+        ptyProcess.emitData(`buffered-${index}\n`);
+      }
+      const cleanup = yield* manager
+        .killProjectTerminal({ projectId, terminalId, cleanup: true })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(ptyProcess.firstKillSignal);
+      ptyProcess.emitExit({ exitCode: 0, signal: null });
+      yield* Fiber.join(cleanup);
+      yield* Deferred.succeed(releaseFirstOutput, undefined);
+      yield* Deferred.await(reconnectDelivered);
+
+      const recorded = yield* Ref.get(events);
+      expect(recorded.map((event) => event.type)).toEqual(["snapshot", "output", "reconnect"]);
+      expect(recorded.at(-1)).toMatchObject({
+        type: "reconnect",
+        handle: { projectId, terminalId },
+      });
+    }),
+  );
+
+  it.effect("delivers terminal exit and cleanup that race the attach snapshot", () =>
+    Effect.gen(function* () {
+      const { manager, ptyAdapter } = yield* createManager();
+      const projectId = ProjectId.make("project-attach-exit-race");
+      const terminalId = "exit-race";
+      yield* manager.createProject({
+        projectId,
+        terminalId,
+        creatingThreadId: ThreadId.make("creator"),
+        cwd: process.cwd(),
+      });
+      const ptyProcess = ptyAdapter.processes[0];
+      expect(ptyProcess).toBeDefined();
+      if (!ptyProcess) return;
+
+      const events = yield* Ref.make<ReadonlyArray<ProjectTerminalAttachStreamEvent>>([]);
+      const snapshotStarted = yield* Deferred.make<void>();
+      const releaseSnapshot = yield* Deferred.make<void>();
+      const cleanupDelivered = yield* Deferred.make<void>();
+      const attachFiber = yield* manager
+        .attachProjectStream({ projectId, terminalId }, (event) =>
+          Effect.gen(function* () {
+            yield* Ref.update(events, (current) => [...current, event]);
+            if (event.type === "snapshot") {
+              yield* Deferred.succeed(snapshotStarted, undefined);
+              yield* Deferred.await(releaseSnapshot);
+            }
+            if (event.type === "closed") yield* Deferred.succeed(cleanupDelivered, undefined);
+          }),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(snapshotStarted);
+
+      const cleanup = yield* manager
+        .killProjectTerminal({ projectId, terminalId, cleanup: true })
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(ptyProcess.firstKillSignal);
+      ptyProcess.emitExit({ exitCode: 0, signal: null });
+      yield* Fiber.join(cleanup);
+      yield* Deferred.succeed(releaseSnapshot, undefined);
+      const unsubscribe = yield* Fiber.join(attachFiber);
+      yield* Effect.addFinalizer(() => Effect.sync(unsubscribe));
+      yield* Deferred.await(cleanupDelivered);
+
+      const recorded = yield* Ref.get(events);
+      expect(recorded.map((event) => event.type)).toEqual(["snapshot", "exited", "closed"]);
+      expect(recorded[1]).toMatchObject({ type: "exited", exitCode: 0 });
     }),
   );
 

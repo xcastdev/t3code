@@ -61,4 +61,14 @@ describe("ExecutionEnvironmentDescriptor", () => {
       }).capabilities.fileAttachments,
     ).toEqual({ maxUploadBytes: 50 * 1024 * 1024 });
   });
+
+  it("treats project terminal attachment as optional under version skew", () => {
+    expect(decodeDescriptor(descriptor).capabilities.projectTerminalAttachment).toBeUndefined();
+    expect(
+      decodeDescriptor({
+        ...descriptor,
+        capabilities: { ...descriptor.capabilities, projectTerminalAttachment: true },
+      }).capabilities.projectTerminalAttachment,
+    ).toBe(true);
+  });
 });

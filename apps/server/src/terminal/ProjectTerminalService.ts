@@ -2,6 +2,8 @@ import {
   ProjectId,
   TerminalToolError,
   type ProjectTerminalCreateInput,
+  type ProjectTerminalSubscribeCompletionInput,
+  type ProjectTerminalUnsubscribeCompletionInput,
   type ProjectTerminalKillInput,
   type ProjectTerminalListResult,
   type ProjectTerminalResizeInput,
@@ -25,6 +27,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as TerminalManager from "./Manager.ts";
+import * as ProjectTerminalCompletion from "./ProjectTerminalCompletionService.ts";
 
 export interface ProjectTerminalSpawnInput {
   readonly cwd?: string;
@@ -102,6 +105,24 @@ export interface ProjectTerminalServiceShape {
     | TerminalToolError,
     McpInvocationContext.McpInvocationContext
   >;
+  readonly subscribeCompletion: (
+    input: ProjectTerminalSubscribeCompletionInput,
+  ) => Effect.Effect<
+    void,
+    | McpInvocationContext.McpCapabilityError<"terminal">
+    | ProjectTerminalAccessUnavailableError
+    | TerminalToolError,
+    McpInvocationContext.McpInvocationContext
+  >;
+  readonly unsubscribeCompletion: (
+    input: ProjectTerminalUnsubscribeCompletionInput,
+  ) => Effect.Effect<
+    void,
+    | McpInvocationContext.McpCapabilityError<"terminal">
+    | ProjectTerminalAccessUnavailableError
+    | TerminalToolError,
+    McpInvocationContext.McpInvocationContext
+  >;
   /** Internal lifecycle hook. It deliberately does not require MCP invocation context. */
   readonly closeProject: (projectId: ProjectId) => Effect.Effect<void, TerminalToolError>;
 }
@@ -110,7 +131,16 @@ export interface ProjectTerminalServiceShape {
 export class ProjectTerminalAccessUnavailableError extends Schema.TaggedError<ProjectTerminalAccessUnavailableError>()(
   "ProjectTerminalAccessUnavailableError",
   {
-    operation: Schema.Literals(["spawn", "list", "read", "write", "resize", "kill"]),
+    operation: Schema.Literals([
+      "spawn",
+      "list",
+      "read",
+      "write",
+      "resize",
+      "kill",
+      "subscribeCompletion",
+      "unsubscribeCompletion",
+    ]),
   },
 ) {
   override get message(): string {
@@ -129,7 +159,16 @@ interface ProjectLifecycleLockEntry {
 }
 
 const operationError = (
-  operation: "spawn" | "list" | "read" | "write" | "resize" | "kill" | "close",
+  operation:
+    | "spawn"
+    | "list"
+    | "read"
+    | "write"
+    | "resize"
+    | "kill"
+    | "close"
+    | "subscribeCompletion"
+    | "unsubscribeCompletion",
   projectId: ProjectId,
   terminalId?: string,
 ) =>
@@ -142,6 +181,9 @@ const operationError = (
 
 const make = Effect.gen(function* () {
   const manager = yield* TerminalManager.TerminalManager;
+  const completionService = yield* Effect.serviceOption(
+    ProjectTerminalCompletion.ProjectTerminalCompletionService,
+  );
   const snapshots = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
   const crypto = yield* Crypto.Crypto;
   const projectLocks = yield* SynchronizedRef.make(new Map<ProjectId, ProjectLifecycleLockEntry>());
@@ -185,7 +227,15 @@ const make = Effect.gen(function* () {
     );
 
   const requireCallerProject = Effect.fn("ProjectTerminalService.requireCallerProject")(function* (
-    operation: "spawn" | "list" | "read" | "write" | "resize" | "kill",
+    operation:
+      | "spawn"
+      | "list"
+      | "read"
+      | "write"
+      | "resize"
+      | "kill"
+      | "subscribeCompletion"
+      | "unsubscribeCompletion",
   ) {
     const invocation = yield* McpInvocationContext.requireMcpCapability("terminal");
     const thread = yield* snapshots
@@ -218,7 +268,13 @@ const make = Effect.gen(function* () {
   const checkHandleProject = (
     requestedProjectId: ProjectId | undefined,
     currentProjectId: ProjectId,
-    operation: "read" | "write" | "resize" | "kill",
+    operation:
+      | "read"
+      | "write"
+      | "resize"
+      | "kill"
+      | "subscribeCompletion"
+      | "unsubscribeCompletion",
     terminalId: string,
   ) =>
     requestedProjectId === undefined || requestedProjectId === currentProjectId
@@ -367,8 +423,56 @@ const make = Effect.gen(function* () {
       });
     });
 
+  const subscribeCompletion: ProjectTerminalServiceShape["subscribeCompletion"] = (input) =>
+    Effect.gen(function* () {
+      const { invocation, project } = yield* requireCallerProject("subscribeCompletion");
+      yield* checkHandleProject(
+        input.projectId,
+        project.id,
+        "subscribeCompletion",
+        input.terminalId,
+      );
+      if (completionService._tag === "None") {
+        return yield* operationError("subscribeCompletion", project.id, input.terminalId);
+      }
+      yield* completionService.value.subscribe({
+        projectId: project.id,
+        terminalId: input.terminalId,
+        threadId: invocation.threadId,
+        mode: input.mode,
+      });
+    });
+
+  const unsubscribeCompletion: ProjectTerminalServiceShape["unsubscribeCompletion"] = (input) =>
+    Effect.gen(function* () {
+      const { invocation, project } = yield* requireCallerProject("unsubscribeCompletion");
+      yield* checkHandleProject(
+        input.projectId,
+        project.id,
+        "unsubscribeCompletion",
+        input.terminalId,
+      );
+      const terminal = yield* manager.getProjectCompletionSnapshot(input);
+      if (!terminal) {
+        return yield* operationError("unsubscribeCompletion", project.id, input.terminalId);
+      }
+      if (completionService._tag === "Some") {
+        yield* completionService.value.unsubscribe({
+          projectId: project.id,
+          terminalId: input.terminalId,
+          threadId: invocation.threadId,
+        });
+      }
+    });
+
   const closeProject: ProjectTerminalServiceShape["closeProject"] = (projectId) =>
-    withProjectLifecycleLock(projectId, manager.closeProject(projectId));
+    withProjectLifecycleLock(
+      projectId,
+      (completionService._tag === "Some"
+        ? completionService.value.closeProject(projectId)
+        : Effect.void
+      ).pipe(Effect.andThen(manager.closeProject(projectId))),
+    );
 
   return {
     spawn,
@@ -377,6 +481,8 @@ const make = Effect.gen(function* () {
     write,
     resize,
     kill,
+    subscribeCompletion,
+    unsubscribeCompletion,
     closeProject,
   } satisfies ProjectTerminalServiceShape;
 });

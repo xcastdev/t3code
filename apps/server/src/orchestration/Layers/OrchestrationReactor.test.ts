@@ -10,6 +10,8 @@ import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
 import { ProviderRuntimeIngestionService } from "../Services/ProviderRuntimeIngestion.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import { ProjectTerminalReactor } from "../Services/ProjectTerminalReactor.ts";
+import { ProjectTerminalActivityReactor } from "../Services/ProjectTerminalActivityReactor.ts";
+import { ProjectTerminalCompletionService } from "../../terminal/ProjectTerminalCompletionService.ts";
 import * as ThreadSettlementReactor from "../ThreadSettlementReactor.ts";
 import * as PullRequestSyncReactor from "../PullRequestSyncReactor.ts";
 import * as ThreadPullRequestReactor from "../ThreadPullRequestReactor.ts";
@@ -40,7 +42,9 @@ describe("OrchestrationReactor", () => {
               started.push("provider-runtime-ingestion");
               return Effect.void;
             },
-            drain: Effect.void,
+            drain: Effect.sync(() => {
+              drained.push("provider-runtime-ingestion");
+            }),
           }),
         ),
         Layer.provideMerge(
@@ -49,7 +53,9 @@ describe("OrchestrationReactor", () => {
               started.push("provider-command-reactor");
               return Effect.void;
             },
-            drain: Effect.void,
+            drain: Effect.sync(() => {
+              drained.push("provider-command-reactor");
+            }),
           }),
         ),
         Layer.provideMerge(
@@ -58,7 +64,9 @@ describe("OrchestrationReactor", () => {
               started.push("checkpoint-reactor");
               return Effect.void;
             },
-            drain: Effect.void,
+            drain: Effect.sync(() => {
+              drained.push("checkpoint-reactor");
+            }),
           }),
         ),
         Layer.provideMerge(
@@ -80,6 +88,31 @@ describe("OrchestrationReactor", () => {
             drain: Effect.sync(() => {
               drained.push("project-terminal-reactor");
             }),
+          }),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(ProjectTerminalActivityReactor, {
+            start: () => {
+              started.push("project-terminal-activity-reactor");
+              return Effect.void;
+            },
+            drain: Effect.sync(() => {
+              drained.push("project-terminal-activity-reactor");
+            }),
+          }),
+        ),
+        Layer.provideMerge(
+          Layer.succeed(ProjectTerminalCompletionService, {
+            start: () => {
+              started.push("project-terminal-completion-service");
+              return Effect.void;
+            },
+            drain: Effect.sync(() => {
+              drained.push("project-terminal-completion-service");
+            }),
+            subscribe: () => Effect.void,
+            unsubscribe: () => Effect.void,
+            closeProject: () => Effect.void,
           }),
         ),
         Layer.provideMerge(
@@ -141,6 +174,8 @@ describe("OrchestrationReactor", () => {
       "checkpoint-reactor",
       "thread-deletion-reactor",
       "project-terminal-reactor",
+      "project-terminal-activity-reactor",
+      "project-terminal-completion-service",
       "thread-pull-request-reactor",
       "thread-settlement-reactor",
       "pull-request-sync-reactor",
@@ -149,7 +184,14 @@ describe("OrchestrationReactor", () => {
     ]);
 
     await runtime!.runPromise(reactor.drain);
-    expect(drained).toEqual(["project-terminal-reactor"]);
+    expect(drained).toEqual([
+      "project-terminal-reactor",
+      "project-terminal-activity-reactor",
+      "project-terminal-completion-service",
+      "provider-runtime-ingestion",
+      "provider-command-reactor",
+      "checkpoint-reactor",
+    ]);
 
     await Effect.runPromise(Scope.close(scope, Exit.void));
   });

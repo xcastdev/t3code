@@ -2204,6 +2204,7 @@ export function makeGrokAdapter(grokSettings: GrokSettings, options?: GrokAdapte
       provider: PROVIDER,
       capabilities: {
         sessionModelSwitch: "in-session",
+        activeTurnSteer: false,
         supportsConversationRollback: false,
         remoteHttpMcp: "next-session",
         projectMcpProxy: "next-session",

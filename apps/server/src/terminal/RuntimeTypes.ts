@@ -11,20 +11,58 @@ export interface TerminalTarget {
 
 export type ProjectTerminalRuntimeEvent =
   | {
+      readonly type: "created";
+      readonly target: TerminalTarget;
+      readonly generation: string;
+      readonly sequence: number;
+      readonly creatingThreadId: string;
+      readonly label: string;
+      readonly status: "running";
+      readonly cols: number;
+      readonly rows: number;
+      readonly exitCode: null;
+      readonly exitSignal: null;
+      readonly updatedAt: string;
+    }
+  | {
       readonly type: "output";
       readonly target: TerminalTarget;
+      readonly generation: string;
       readonly sequence: number;
       readonly data: string;
     }
   | {
+      readonly type: "resized";
+      readonly target: TerminalTarget;
+      readonly generation: string;
+      readonly sequence: number;
+      readonly cols: number;
+      readonly rows: number;
+    }
+  | {
+      readonly type: "status";
+      readonly target: TerminalTarget;
+      readonly generation: string;
+      readonly sequence: number;
+    }
+  | {
       readonly type: "exited";
       readonly target: TerminalTarget;
+      readonly generation: string;
       readonly sequence: number;
       readonly status: "exited" | "killed";
+      readonly label: string;
+      readonly creatingThreadId: string;
+      readonly updatedAt: string;
       readonly exitCode: number | null;
       readonly exitSignal: number | null;
     }
-  | { readonly type: "closed"; readonly target: TerminalTarget; readonly sequence: number };
+  | {
+      readonly type: "closed";
+      readonly target: TerminalTarget;
+      readonly generation: string;
+      readonly sequence: number;
+    };
 
 export const threadTerminalTarget = (threadId: string, terminalId: string): TerminalTarget => ({
   owner: { kind: "thread", threadId },

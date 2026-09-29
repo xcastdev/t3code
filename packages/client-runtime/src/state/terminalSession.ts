@@ -1,5 +1,9 @@
 import type {
   EnvironmentId,
+  ProjectTerminalAttachSnapshot,
+  ProjectTerminalAttachStreamEvent,
+  ProjectTerminalDockSummary,
+  ProjectTerminalMetadataStreamEvent,
   TerminalAttachStreamEvent,
   TerminalMetadataStreamEvent,
   TerminalSessionSnapshot,
@@ -44,6 +48,26 @@ export interface TerminalBufferState {
   readonly lifecycleVersion: number;
 }
 
+export interface ProjectTerminalBufferState {
+  readonly terminal: ProjectTerminalDockSummary | null;
+  readonly output: TerminalOutputState;
+  readonly status: ProjectTerminalDockSummary["status"] | "closed";
+  readonly cols: number;
+  readonly rows: number;
+  readonly sequence: number;
+  readonly error: string | null;
+  readonly version: number;
+}
+
+export interface ProjectTerminalMetadataState {
+  readonly terminals: ReadonlyArray<ProjectTerminalDockSummary>;
+  readonly nextCursor: string | null;
+  readonly snapshotVersion: number;
+  /** Advances on every snapshot or delta so an in-flight page can be discarded. */
+  readonly revision: number;
+  readonly removedTerminalIds: ReadonlyArray<string>;
+}
+
 export interface KnownTerminalSessionTarget {
   readonly environmentId: EnvironmentId;
   readonly threadId: ThreadId;
@@ -81,6 +105,17 @@ export const EMPTY_TERMINAL_SESSION_STATE = Object.freeze<TerminalSessionState>(
   updatedAt: null,
   version: 0,
   lifecycleVersion: 0,
+});
+
+export const EMPTY_PROJECT_TERMINAL_BUFFER_STATE = Object.freeze<ProjectTerminalBufferState>({
+  terminal: null,
+  output: EMPTY_TERMINAL_OUTPUT_STATE,
+  status: "closed",
+  cols: 80,
+  rows: 24,
+  sequence: 0,
+  error: null,
+  version: 0,
 });
 
 let terminalAttachGeneration = 0;
@@ -189,6 +224,118 @@ export function applyTerminalAttachStreamEvent(
     case "activity":
       return current;
   }
+}
+
+export function applyProjectTerminalAttachStreamEvent(
+  current: ProjectTerminalBufferState,
+  event: ProjectTerminalAttachStreamEvent,
+  maxBufferBytes = DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
+): ProjectTerminalBufferState {
+  switch (event.type) {
+    case "snapshot": {
+      const snapshot: ProjectTerminalAttachSnapshot = event.snapshot;
+      return {
+        terminal: snapshot.terminal,
+        output: resetOutput(current.output, snapshot.history, maxBufferBytes),
+        status: snapshot.terminal.status,
+        cols: snapshot.cols,
+        rows: snapshot.rows,
+        sequence: snapshot.sequence,
+        error: null,
+        version: current.version + 1,
+      };
+    }
+    case "output":
+      if (event.sequence <= current.sequence) return current;
+      return {
+        ...current,
+        output: appendOutput(current.output, event.data, maxBufferBytes),
+        sequence: event.sequence,
+        version: current.version + 1,
+      };
+    case "resized":
+      if (event.sequence <= current.sequence) return current;
+      return {
+        ...current,
+        cols: event.cols,
+        rows: event.rows,
+        sequence: event.sequence,
+        version: current.version + 1,
+      };
+    case "exited":
+      if (event.sequence <= current.sequence) return current;
+      return {
+        ...current,
+        status: event.status,
+        terminal: current.terminal
+          ? {
+              ...current.terminal,
+              status: event.status,
+              exitCode: event.exitCode,
+              exitSignal: event.exitSignal,
+            }
+          : null,
+        sequence: event.sequence,
+        version: current.version + 1,
+      };
+    case "closed":
+      if (event.sequence <= current.sequence) return current;
+      return {
+        ...current,
+        status: "closed",
+        sequence: event.sequence,
+        version: current.version + 1,
+      };
+    case "reconnect":
+      return {
+        ...current,
+        error: "Terminal output fell behind. Reconnecting…",
+        version: current.version + 1,
+      };
+  }
+}
+
+export function applyProjectTerminalMetadataStreamEvent(
+  current: ProjectTerminalMetadataState,
+  event: ProjectTerminalMetadataStreamEvent,
+): ProjectTerminalMetadataState {
+  if (event.type === "snapshot") {
+    return {
+      terminals: event.terminals,
+      nextCursor: event.nextCursor,
+      snapshotVersion: current.snapshotVersion + 1,
+      revision: current.revision + 1,
+      removedTerminalIds: [],
+    };
+  }
+  if (event.type === "remove") {
+    return {
+      ...current,
+      revision: current.revision + 1,
+      terminals: current.terminals.filter(
+        (terminal) =>
+          terminal.projectId !== event.projectId || terminal.terminalId !== event.terminalId,
+      ),
+      removedTerminalIds: current.removedTerminalIds.includes(event.terminalId)
+        ? current.removedTerminalIds
+        : [...current.removedTerminalIds, event.terminalId],
+    };
+  }
+  const next = current.terminals.filter(
+    (terminal) =>
+      terminal.projectId !== event.terminal.projectId ||
+      terminal.terminalId !== event.terminal.terminalId,
+  );
+  return {
+    ...current,
+    revision: current.revision + 1,
+    removedTerminalIds: current.removedTerminalIds.filter(
+      (terminalId) => terminalId !== event.terminal.terminalId,
+    ),
+    terminals: [...next, event.terminal].sort((left, right) =>
+      left.terminalId.localeCompare(right.terminalId),
+    ),
+  };
 }
 
 export function applyTerminalMetadataStreamEvent(

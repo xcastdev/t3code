@@ -86,6 +86,8 @@ export interface ProviderAdapterCapabilities {
   /** Starts a resumed turn with no synthetic user prompt. Omitted means the
       adapter needs an explicit continuation instruction. */
   readonly promptlessTurnContinuation?: boolean;
+  /** Safe delivery into a running turn. Omitted means busy turns must be queued. */
+  readonly activeTurnSteer?: boolean;
   /** False when native conversation history cannot be rewound. */
   readonly supportsConversationRollback?: boolean;
 }

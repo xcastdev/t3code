@@ -2072,6 +2072,13 @@ const make = Effect.gen(function* () {
                   turnId: nextActiveTurnId,
                   ...(event.payload?.model === undefined ? {} : { model: event.payload.model }),
                   ...(event.payload?.effort === undefined ? {} : { effort: event.payload.effort }),
+                  ...(Option.isSome(pendingTurnStart) &&
+                  pendingTurnStart.value.messageId === null &&
+                  pendingTurnStart.value.terminalCompletionWakeKey
+                    ? {
+                        terminalCompletionWakeKey: pendingTurnStart.value.terminalCompletionWakeKey,
+                      }
+                    : {}),
                 }
               : undefined;
 
@@ -2539,7 +2546,8 @@ const make = Effect.gen(function* () {
         DateTime.isGreaterThanOrEqualTo(
           DateTime.makeUnsafe(event.createdAt),
           DateTime.makeUnsafe(pendingTurnStart.value.requestedAt),
-        )
+        ) &&
+        pendingTurnStart.value.messageId !== null
       ) {
         const pendingMessage = yield* getThreadMessageById(
           thread.id,

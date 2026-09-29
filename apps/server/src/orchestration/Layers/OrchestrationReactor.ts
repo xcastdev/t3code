@@ -10,6 +10,8 @@ import { ProviderCommandReactor } from "../Services/ProviderCommandReactor.ts";
 import { ProviderRuntimeIngestionService } from "../Services/ProviderRuntimeIngestion.ts";
 import { ThreadDeletionReactor } from "../Services/ThreadDeletionReactor.ts";
 import { ProjectTerminalReactor } from "../Services/ProjectTerminalReactor.ts";
+import { ProjectTerminalActivityReactor } from "../Services/ProjectTerminalActivityReactor.ts";
+import { ProjectTerminalCompletionService } from "../../terminal/ProjectTerminalCompletionService.ts";
 import * as ThreadSettlementReactor from "../ThreadSettlementReactor.ts";
 import * as PullRequestSyncReactor from "../PullRequestSyncReactor.ts";
 import * as ThreadPullRequestReactor from "../ThreadPullRequestReactor.ts";
@@ -24,6 +26,8 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
   const checkpointReactor = yield* CheckpointReactor;
   const threadDeletionReactor = yield* ThreadDeletionReactor;
   const projectTerminalReactor = yield* ProjectTerminalReactor;
+  const projectTerminalActivityReactor = yield* ProjectTerminalActivityReactor;
+  const projectTerminalCompletionService = yield* ProjectTerminalCompletionService;
   const threadSettlementReactor = yield* ThreadSettlementReactor.ThreadSettlementReactor;
   const pullRequestSyncReactor = yield* PullRequestSyncReactor.PullRequestSyncReactor;
   const threadPullRequestReactor = yield* ThreadPullRequestReactor.ThreadPullRequestReactor;
@@ -43,6 +47,8 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
     yield* checkpointReactor.start();
     yield* threadDeletionReactor.start();
     yield* projectTerminalReactor.start();
+    yield* projectTerminalActivityReactor.start();
+    yield* projectTerminalCompletionService.start();
     yield* threadPullRequestReactor.start();
     yield* threadSettlementReactor.start();
     yield* pullRequestSyncReactor.start();
@@ -56,16 +62,25 @@ export const makeOrchestrationReactor = Effect.gen(function* () {
 
   return {
     start,
-    drain: Effect.all(
-      [
-        projectTerminalReactor.drain,
+    drain: projectTerminalReactor.drain.pipe(
+      // Terminal cleanup is the lifecycle producer; creation activity and
+      // downstream provider work must drain only after its events are queued.
+      Effect.andThen(projectTerminalActivityReactor.drain),
+      Effect.andThen(projectTerminalCompletionService.drain),
+      Effect.andThen(providerRuntimeIngestion.drain),
+      Effect.andThen(providerCommandReactor.drain),
+      Effect.andThen(checkpointReactor.drain),
+      Effect.andThen(
         mcpCatalogReactor._tag === "Some" ? mcpCatalogReactor.value.drain : Effect.void,
+      ),
+      Effect.andThen(
         skillApplicationReactor._tag === "Some" ? skillApplicationReactor.value.drain : Effect.void,
+      ),
+      Effect.andThen(
         skillCatalogApplicationReactor._tag === "Some"
           ? skillCatalogApplicationReactor.value.drain
           : Effect.void,
-      ],
-      { discard: true },
+      ),
     ),
   } satisfies OrchestrationReactorShape;
 });

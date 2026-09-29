@@ -3531,6 +3531,137 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       return [unsettledEvent, activityAppendedEvent];
     }
 
+    case "thread.terminal-completion.request": {
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      if (thread.projectId !== command.projectId) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Project terminal '${command.terminalId}' does not belong to thread '${command.threadId}'.`,
+        });
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.terminal-completion-requested",
+        payload: {
+          threadId: command.threadId,
+          projectId: command.projectId,
+          terminalId: command.terminalId,
+          generation: command.generation,
+          serverRunId: command.serverRunId,
+          dedupeKey: command.dedupeKey,
+          label: command.label,
+          status: command.status,
+          exitCode: command.exitCode,
+          exitSignal: command.exitSignal,
+          createdAt: command.createdAt,
+        },
+      };
+    }
+
+    case "thread.terminal-completion.continuation.start": {
+      const thread = yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      if (thread.projectId !== command.projectId) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Project terminal completion does not belong to thread '${command.threadId}'.`,
+        });
+      }
+      if (thread.archivedAt !== null) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Archived thread '${command.threadId}' cannot be woken by a project terminal.`,
+        });
+      }
+      const session = thread.session;
+      const admissionMatchesSession =
+        command.deliveryMode === "idle"
+          ? session?.status === "ready" && session.activeTurnId === null
+          : session?.status === "running" && session.activeTurnId !== null;
+      if (!admissionMatchesSession) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `Thread '${command.threadId}' no longer matches the requested terminal completion delivery mode.`,
+        });
+      }
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.terminal-completion-continuation-started",
+        payload: {
+          threadId: command.threadId,
+          projectId: command.projectId,
+          deliveryMode: command.deliveryMode,
+          serverRunId: command.serverRunId,
+          wakeKeys: command.wakeKeys,
+          prompt: command.prompt,
+          createdAt: command.createdAt,
+        },
+      };
+    }
+
+    case "thread.turn.start.admit": {
+      yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.requestedAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.turn-start-admitted",
+        payload: {
+          threadId: command.threadId,
+          messageId: command.messageId,
+          sourceProposedPlanThreadId: command.sourceProposedPlan?.threadId ?? null,
+          sourceProposedPlanId: command.sourceProposedPlan?.planId ?? null,
+          requestedAt: command.requestedAt,
+        },
+      };
+    }
+
+    case "thread.terminal-completion.continuation.cancel": {
+      yield* requireThread({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt: command.createdAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.terminal-completion-continuation-canceled",
+        payload: {
+          threadId: command.threadId,
+          wakeKey: command.wakeKey,
+          createdAt: command.createdAt,
+        },
+      };
+    }
+
     default: {
       command satisfies never;
       const fallback = command as never as { type: string };

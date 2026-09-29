@@ -67,7 +67,8 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           command_count,
           tool_call_count,
           subagent_count,
-          changed_file_count
+          changed_file_count,
+          pending_terminal_completion_wake_key
         )
         VALUES (
           ${row.threadId},
@@ -89,7 +90,8 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           ${row.commandCount},
           ${row.toolCallCount},
           ${row.subagentCount},
-          ${row.changedFileCount}
+          ${row.changedFileCount},
+          ${row.terminalCompletionWakeKey ?? null}
         )
         ON CONFLICT (thread_id, turn_id)
         DO UPDATE SET
@@ -110,7 +112,8 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           command_count = excluded.command_count,
           tool_call_count = excluded.tool_call_count,
           subagent_count = excluded.subagent_count,
-          changed_file_count = excluded.changed_file_count
+          changed_file_count = excluded.changed_file_count,
+          pending_terminal_completion_wake_key = excluded.pending_terminal_completion_wake_key
       `,
   });
 
@@ -150,7 +153,8 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           command_count,
           tool_call_count,
           subagent_count,
-          changed_file_count
+          changed_file_count,
+          pending_terminal_completion_wake_key
         )
         VALUES (
           ${row.threadId},
@@ -172,7 +176,8 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           NULL,
           NULL,
           NULL,
-          NULL
+          NULL,
+          ${row.terminalCompletionWakeKey ?? null}
         )
       `,
   });
@@ -185,6 +190,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
         SELECT
           thread_id AS "threadId",
           pending_message_id AS "messageId",
+          pending_terminal_completion_wake_key AS "terminalCompletionWakeKey",
           source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
           source_proposed_plan_id AS "sourceProposedPlanId",
           requested_at AS "requestedAt"
@@ -192,7 +198,10 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
         WHERE thread_id = ${threadId}
           AND turn_id IS NULL
           AND state = 'pending'
-          AND pending_message_id IS NOT NULL
+          AND (
+            pending_message_id IS NOT NULL OR
+            pending_terminal_completion_wake_key IS NOT NULL
+          )
           AND checkpoint_turn_count IS NULL
         ORDER BY requested_at DESC
         LIMIT 1
@@ -224,7 +233,8 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           command_count AS "commandCount",
           tool_call_count AS "toolCallCount",
           subagent_count AS "subagentCount",
-          changed_file_count AS "changedFileCount"
+          changed_file_count AS "changedFileCount",
+          pending_terminal_completion_wake_key AS "terminalCompletionWakeKey"
         FROM projection_turns
         WHERE thread_id = ${threadId}
         ORDER BY
@@ -263,7 +273,8 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           command_count AS "commandCount",
           tool_call_count AS "toolCallCount",
           subagent_count AS "subagentCount",
-          changed_file_count AS "changedFileCount"
+          changed_file_count AS "changedFileCount",
+          pending_terminal_completion_wake_key AS "terminalCompletionWakeKey"
         FROM projection_turns
         WHERE thread_id = ${threadId}
           AND turn_id = ${turnId}

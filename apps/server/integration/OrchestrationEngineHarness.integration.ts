@@ -29,6 +29,8 @@ import * as ThreadHistoryArchive from "../src/persistence/ThreadHistoryArchive.t
 import { TextGeneration } from "../src/textGeneration/TextGeneration.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../src/persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../src/persistence/Layers/OrchestrationEventStore.ts";
+import { ProjectionTerminalCompletionWakeRepositoryLive } from "../src/persistence/Layers/ProjectionTerminalCompletionWakes.ts";
+import { ProjectionTurnRepositoryLive } from "../src/persistence/Layers/ProjectionTurns.ts";
 import { ProjectionCheckpointRepositoryLive } from "../src/persistence/Layers/ProjectionCheckpoints.ts";
 import { ProjectionPendingApprovalRepositoryLive } from "../src/persistence/Layers/ProjectionPendingApprovals.ts";
 import * as ProviderSessionRuntime from "../src/persistence/ProviderSessionRuntime.ts";
@@ -68,6 +70,8 @@ import {
 } from "../src/orchestration/Services/OrchestrationEngine.ts";
 import { ThreadDeletionReactor } from "../src/orchestration/Services/ThreadDeletionReactor.ts";
 import { ProjectTerminalReactor } from "../src/orchestration/Services/ProjectTerminalReactor.ts";
+import { ProjectTerminalActivityReactor } from "../src/orchestration/Services/ProjectTerminalActivityReactor.ts";
+import { ProjectTerminalCompletionService } from "../src/terminal/ProjectTerminalCompletionService.ts";
 import { ProjectTerminalReactorLive } from "../src/orchestration/Layers/ProjectTerminalReactor.ts";
 import * as ThreadSettlementReactor from "../src/orchestration/ThreadSettlementReactor.ts";
 import * as PullRequestSyncReactor from "../src/orchestration/PullRequestSyncReactor.ts";
@@ -467,6 +471,8 @@ export const makeOrchestrationIntegrationHarness = (
       generateThreadTitle: () => Effect.succeed({ title: "New thread" }),
     } as unknown as TextGeneration["Service"]);
     const providerCommandReactorLayer = ProviderCommandReactorLive.pipe(
+      Layer.provideMerge(ProjectionTerminalCompletionWakeRepositoryLive),
+      Layer.provideMerge(ProjectionTurnRepositoryLive),
       Layer.provide(
         Layer.mock(ProviderAuthService)({
           tryHandlePromptCommand: () => Effect.succeed(false),
@@ -521,6 +527,21 @@ export const makeOrchestrationIntegrationHarness = (
       Layer.provideMerge(checkpointReactorLayer),
       Layer.provideMerge(threadDeletionReactorLayer),
       Layer.provideMerge(projectTerminalReactorLayer),
+      Layer.provideMerge(
+        Layer.succeed(ProjectTerminalActivityReactor, {
+          start: () => Effect.void,
+          drain: Effect.void,
+        }),
+      ),
+      Layer.provideMerge(
+        Layer.succeed(ProjectTerminalCompletionService, {
+          start: () => Effect.void,
+          drain: Effect.void,
+          subscribe: () => Effect.void,
+          unsubscribe: () => Effect.void,
+          closeProject: () => Effect.void,
+        }),
+      ),
       Layer.provideMerge(
         Layer.succeed(ThreadPullRequestReactor.ThreadPullRequestReactor, {
           start: () => Effect.void,

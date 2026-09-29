@@ -105,6 +105,9 @@ import {
   type TerminalError,
   type TerminalEvent,
   type TerminalMetadataStreamEvent,
+  type ProjectTerminalAttachStreamEvent,
+  type ProjectTerminalMetadataStreamEvent,
+  type TerminalToolError,
   type PullRequestRef,
   type ProjectWorkApprovalRequest,
   type ProjectWorkReadIntent,
@@ -124,6 +127,8 @@ import {
   WsManagedTextResourcesProjectSetOverrideRpc,
   WsManagedTextResourcesThreadResetRpc,
   WsManagedTextResourcesThreadSetEnabledRpc,
+  WsBaseRpcGroup,
+  WsProjectTerminalRpcGroup,
   WsRpcGroup,
 } from "@t3tools/contracts";
 import { resolveServerBackgroundActivitySettings } from "@t3tools/shared/backgroundActivitySettings";
@@ -182,6 +187,7 @@ import { makeSkillDeploymentService } from "./skills/SkillDeploymentService.ts";
 import { selectSkillDeploymentChange } from "./skills/SkillDeploymentRpc.ts";
 import * as ExternalNotificationDispatcher from "./notifications/ExternalNotificationDispatcher.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
+import { makeProjectTerminalClientAccess } from "./terminal/ProjectTerminalClientAccess.ts";
 
 import { withTerminalOutputWindow } from "./terminal/OutputProtocol.ts";
 import * as PreviewAutomationBroker from "./mcp/PreviewAutomationBroker.ts";
@@ -278,7 +284,7 @@ const HistoryArchiveWsRpcGroup = RpcGroup.make(
   WsOrchestrationListHistoryArchivesRpc,
   WsOrchestrationGetHistoryArchiveRpc,
 );
-const WsCoreRpcGroup = WsRpcGroup.omit(
+const WsCoreRpcGroup = WsBaseRpcGroup.omit(
   ORCHESTRATION_WS_METHODS.listHistoryArchives,
   ORCHESTRATION_WS_METHODS.getHistoryArchive,
   WS_METHODS.managedTextResourcesCatalogList,
@@ -364,6 +370,114 @@ export const resolveFileManagerRevealKindForConfig = <E, R>(
 function unexpectedCompatibilityError(error: never): never {
   throw new Error(`Unhandled compatibility error: ${String(error)}`);
 }
+
+const makeWsProjectTerminalRpcLayer = (currentSession: EnvironmentAuth.AuthenticatedSession) =>
+  WsProjectTerminalRpcGroup.toLayer(
+    Effect.gen(function* () {
+      const snapshots = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+      const terminals = yield* TerminalManager.TerminalManager;
+      const access = makeProjectTerminalClientAccess(snapshots, terminals);
+      const authorizationError = (requiredScope: AuthEnvironmentScope) =>
+        new EnvironmentAuthorizationError({
+          message: `The authenticated token is missing required scope: ${requiredScope}.`,
+          requiredScope,
+        });
+      const authorizeEffect = <A, E, R>(
+        method: string,
+        effect: Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E | EnvironmentAuthorizationError, R> => {
+        const requiredScope = requiredScopeForRpcMethod(method);
+        return currentSession.scopes.includes(requiredScope)
+          ? effect
+          : Effect.fail(authorizationError(requiredScope));
+      };
+      const authorizeStream = <A, E, R>(
+        method: string,
+        stream: Stream.Stream<A, E, R>,
+      ): Stream.Stream<A, E | EnvironmentAuthorizationError, R> => {
+        const requiredScope = requiredScopeForRpcMethod(method);
+        return currentSession.scopes.includes(requiredScope)
+          ? stream
+          : Stream.fail(authorizationError(requiredScope));
+      };
+      const observeEffect = <A, E, R>(method: string, effect: Effect.Effect<A, E, R>) =>
+        instrumentRpcEffect(method, authorizeEffect(method, effect), {
+          "rpc.aggregate": "terminal",
+        });
+      const observeStream = <A, E, R>(method: string, stream: Stream.Stream<A, E, R>) =>
+        instrumentRpcStream(method, authorizeStream(method, stream), {
+          "rpc.aggregate": "terminal",
+        });
+
+      return WsProjectTerminalRpcGroup.of({
+        [WS_METHODS.projectTerminalAttach]: (input) =>
+          observeStream(
+            WS_METHODS.projectTerminalAttach,
+            Stream.callback<ProjectTerminalAttachStreamEvent, TerminalToolError>(
+              (queue) =>
+                access.requireExisting(input, "attach").pipe(
+                  Effect.andThen(
+                    Effect.acquireRelease(
+                      terminals.attachProjectStream(input, (event) =>
+                        Queue.offer(queue, event).pipe(
+                          Effect.tap(() =>
+                            event.type === "reconnect" ? Queue.end(queue) : Effect.void,
+                          ),
+                        ),
+                      ),
+                      (unsubscribe) => Effect.sync(unsubscribe),
+                    ),
+                  ),
+                ),
+              { bufferSize: 64, strategy: "suspend" },
+            ),
+          ),
+        [WS_METHODS.projectTerminalMetadata]: (projectId) =>
+          observeStream(
+            WS_METHODS.projectTerminalMetadata,
+            Stream.callback<ProjectTerminalMetadataStreamEvent, TerminalToolError>(
+              (queue) =>
+                access.requireProject(projectId).pipe(
+                  Effect.andThen(
+                    Effect.acquireRelease(
+                      terminals.subscribeProjectMetadata(projectId, (event) =>
+                        Queue.offer(queue, event),
+                      ),
+                      (unsubscribe) => Effect.sync(unsubscribe),
+                    ),
+                  ),
+                ),
+              { bufferSize: 16, strategy: "suspend" },
+            ),
+          ),
+        [WS_METHODS.projectTerminalList]: (input) =>
+          observeEffect(
+            WS_METHODS.projectTerminalList,
+            access
+              .requireProject(input.projectId)
+              .pipe(
+                Effect.andThen(
+                  terminals.listProjectDockSummaries(input.projectId, input.after, input.limit),
+                ),
+              ),
+          ),
+        [WS_METHODS.projectTerminalWrite]: (input) =>
+          observeEffect(
+            WS_METHODS.projectTerminalWrite,
+            access
+              .requireExisting(input, "write")
+              .pipe(Effect.andThen(terminals.writeProject(input))),
+          ),
+        [WS_METHODS.projectTerminalResize]: (input) =>
+          observeEffect(
+            WS_METHODS.projectTerminalResize,
+            access
+              .requireExisting(input, "resize")
+              .pipe(Effect.andThen(terminals.resizeProject(input))),
+          ),
+      });
+    }),
+  );
 
 /** Preserve the setup runner's broader pre-refactor message normalization. */
 function legacySetupFailureDescription(cause: unknown): string {
@@ -6942,8 +7056,11 @@ export const websocketRpcRouteLayer = Layer.unwrap(
                 requestOrigin,
               ),
               Layer.merge(
-                makeWsManagedTextResourceRpcLayer(session),
-                makeWsHistoryArchiveRpcLayer(),
+                makeWsProjectTerminalRpcLayer(session),
+                Layer.merge(
+                  makeWsManagedTextResourceRpcLayer(session),
+                  makeWsHistoryArchiveRpcLayer(),
+                ),
               ),
             ).pipe(
               Layer.provideMerge(RpcSerialization.layerJson),

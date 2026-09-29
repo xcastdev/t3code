@@ -48,6 +48,15 @@ import type {
   TerminalSessionSnapshot,
   TerminalWriteInput,
 } from "./terminal.ts";
+import type {
+  ProjectTerminalAttachStreamEvent,
+  ProjectTerminalDockListInput,
+  ProjectTerminalDockListResult,
+  ProjectTerminalHandle,
+  ProjectTerminalMetadataStreamEvent,
+  ProjectTerminalResizeInput,
+  ProjectTerminalWriteInput,
+} from "./terminalToolkit.ts";
 import * as Schema from "effect/Schema";
 import type {
   DiscoveredLocalServerList,
@@ -1524,6 +1533,19 @@ export interface EnvironmentApi {
         onResubscribe?: () => void;
       },
     ) => () => void;
+    projectList: (input: ProjectTerminalDockListInput) => Promise<ProjectTerminalDockListResult>;
+    projectAttach: (
+      input: ProjectTerminalHandle,
+      callback: (event: ProjectTerminalAttachStreamEvent) => void,
+      options?: { onResubscribe?: () => void },
+    ) => () => void;
+    projectMetadata: (
+      projectId: string,
+      callback: (event: ProjectTerminalMetadataStreamEvent) => void,
+      options?: { onResubscribe?: () => void },
+    ) => () => void;
+    projectWrite: (input: ProjectTerminalWriteInput) => Promise<void>;
+    projectResize: (input: ProjectTerminalResizeInput) => Promise<void>;
   };
   projects: {
     listEntries: (input: ProjectListEntriesInput) => Promise<ProjectListEntriesResult>;
