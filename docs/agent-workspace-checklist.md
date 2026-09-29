@@ -4,8 +4,8 @@ Status at the current checkout. This tracks the [workspace direction](https://gi
 
 1. **MCP management and shared resource catalog**
    - [x] Manage scoped MCP definitions, credentials, provider assignments, and session application through the [MCP catalog](../apps/server/src/mcp/McpCatalogService.ts) and [web settings](../apps/web/src/components/settings/McpCatalogSettings.tsx).
-   - [x] Provide a shared web and desktop inventory for managed MCP servers, skills, commands, and snippets through [Resources settings](../apps/web/src/features/resources/ResourcesSettings.tsx). The underlying MCP, skill, and text-resource catalogs remain separate services.
-   - [ ] Unify catalog services behind one cross-resource API. The current MCP catalog and [skill catalog](../apps/server/src/skills/SkillCatalogService.ts) remain separate services.
+   - [x] List managed MCP servers, skills, commands, and snippets for a selected environment or project checkout in web and desktop [Resources settings](../apps/web/src/features/resources/ResourcesSettings.tsx). Search and filter the combined list, then open an item or add a new one in its existing editor. Project entries include inherited resources and reported overrides, disabled entries, and diagnostics.
+   - [ ] Unify the underlying catalogs behind one cross-resource API. Resources currently combines reads from the separate [MCP](../apps/server/src/mcp/McpCatalogService.ts), [skill](../apps/server/src/skills/SkillCatalogService.ts), and [text-resource](../apps/server/src/managedTextResources/ManagedTextResourceCatalogService.ts) services in the web client.
    - [ ] Add mobile editing for scoped MCP catalogs. Mobile currently consumes configured catalogs; see the [scope rules](internals/mcp-catalog-scopes.md#compatibility).
 
 2. **Durable project knowledge and tracked tasks, with MCP access**
