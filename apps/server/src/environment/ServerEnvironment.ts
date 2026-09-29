@@ -222,6 +222,7 @@ export const make = Effect.gen(function* () {
       gitIndexWorkflow: true,
       sourceControlWorkspace: true,
       gitWorkingTreePagination: true,
+      projectTerminalAttachment: true,
       projectMcpCatalog: true,
       globalMcpCatalog: true,
       projectMcpOverrides: true,

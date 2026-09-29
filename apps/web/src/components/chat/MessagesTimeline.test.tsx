@@ -277,6 +277,50 @@ function buildSnapShotTimelineEntry(previewUrl?: string) {
 }
 
 describe("MessagesTimeline", () => {
+  it("opens the project dock from a terminal activity action", async () => {
+    vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+    vi.stubGlobal("requestAnimationFrame", () => 0);
+    vi.stubGlobal("cancelAnimationFrame", () => {});
+    const openProjectTerminal = vi.fn();
+    let renderer: ReactTestRenderer | undefined;
+    try {
+      await act(() => {
+        renderer = create(
+          <MessagesTimeline
+            {...buildProps()}
+            onOpenProjectTerminal={openProjectTerminal}
+            timelineEntries={[
+              {
+                id: "activity-entry",
+                kind: "work",
+                createdAt: MESSAGE_CREATED_AT,
+                entry: {
+                  id: "activity-terminal",
+                  createdAt: MESSAGE_CREATED_AT,
+                  label: "Project terminal started: Build task",
+                  tone: "info",
+                  projectTerminal: {
+                    projectId: "project-activity",
+                    terminalId: "terminal-activity",
+                  },
+                },
+              },
+            ]}
+          />,
+        );
+      });
+      const action = renderer!.root
+        .findAllByType("button")
+        .find((button) => button.props.children === "Open in dock");
+      expect(action).toBeDefined();
+      await act(() => action!.props.onClick({ stopPropagation: vi.fn() }));
+      expect(openProjectTerminal).toHaveBeenCalledWith("project-activity", "terminal-activity");
+    } finally {
+      if (renderer) await act(() => renderer!.unmount());
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("renders previous and next controls with the minimap", () => {
     const first = buildUserTimelineEntry("First turn");
     const secondBase = buildUserTimelineEntry("Second turn");

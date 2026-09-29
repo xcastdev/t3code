@@ -1040,6 +1040,7 @@ it.layer(OpenCodeAdapterTestLayer)("OpenCodeAdapterLive", (it) => {
   it.effect("reuses a configured OpenCode server URL instead of spawning a local server", () =>
     Effect.gen(function* () {
       const adapter = yield* OpenCodeAdapter;
+      NodeAssert.equal(adapter.capabilities.activeTurnSteer, false);
 
       const session = yield* adapter.startSession({
         provider: ProviderDriverKind.make("opencode"),

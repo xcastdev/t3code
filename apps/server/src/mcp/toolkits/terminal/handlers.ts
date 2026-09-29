@@ -48,6 +48,18 @@ const handlers = {
       yield* terminals.kill(input);
       return { requested: true as const, cleanup: input.cleanup ?? false };
     }),
+  terminal_subscribe_completion: (input) =>
+    Effect.gen(function* () {
+      const terminals = yield* ProjectTerminalService.ProjectTerminalService;
+      yield* terminals.subscribeCompletion(input);
+      return { subscribed: true as const };
+    }),
+  terminal_unsubscribe_completion: (input) =>
+    Effect.gen(function* () {
+      const terminals = yield* ProjectTerminalService.ProjectTerminalService;
+      yield* terminals.unsubscribeCompletion(input);
+      return { unsubscribed: true as const };
+    }),
 } satisfies Parameters<typeof TerminalToolkit.toLayer>[0];
 
 export const TerminalToolkitHandlersLive = TerminalToolkit.toLayer(handlers);

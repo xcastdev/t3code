@@ -1012,6 +1012,8 @@ interface ThreadTerminalDrawerProps {
   onCollapse: () => void;
   onHeightChange: (height: number) => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
+  projectTerminalDockEnabled?: boolean;
+  onOpenProjectTerminalDock?: () => void;
   keybindings: ResolvedKeybindingsConfig;
   /** Prefer server-provided tab titles when present (e.g. active subprocess name). */
   terminalLabelsById?: ReadonlyMap<string, string>;
@@ -1084,6 +1086,8 @@ export default function ThreadTerminalDrawer({
   onCollapse,
   onHeightChange,
   onAddTerminalContext,
+  projectTerminalDockEnabled = false,
+  onOpenProjectTerminalDock,
   keybindings,
   terminalLabelsById,
   terminalLaunchLocationsById,
@@ -1424,6 +1428,11 @@ export default function ThreadTerminalDrawer({
           <Button size="xs" variant="outline" onClick={onNewTerminalAction}>
             {newTerminalActionLabel}
           </Button>
+          {projectTerminalDockEnabled && onOpenProjectTerminalDock ? (
+            <Button size="xs" variant="outline" onClick={onOpenProjectTerminalDock}>
+              Project terminals
+            </Button>
+          ) : null}
         </div>
       </aside>
     );
@@ -1487,6 +1496,15 @@ export default function ThreadTerminalDrawer({
             >
               <Trash2 className="size-3.25" />
             </TerminalActionButton>
+            {projectTerminalDockEnabled && onOpenProjectTerminalDock ? (
+              <TerminalActionButton
+                className="border-l border-border/80 p-1 text-foreground/90 transition-colors hover:bg-accent"
+                onClick={onOpenProjectTerminalDock}
+                label="Project terminals"
+              >
+                <TerminalSquare className="size-3.25" />
+              </TerminalActionButton>
+            ) : null}
             <div className="h-4 w-px bg-border/80" />
             <TerminalActionButton
               className="p-1 text-foreground/90 transition-colors hover:bg-accent"
@@ -1637,6 +1655,15 @@ export default function ThreadTerminalDrawer({
                   >
                     <Trash2 className="size-3.25" />
                   </TerminalActionButton>
+                  {projectTerminalDockEnabled && onOpenProjectTerminalDock ? (
+                    <TerminalActionButton
+                      className="inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors hover:bg-accent/70"
+                      onClick={onOpenProjectTerminalDock}
+                      label="Project terminals"
+                    >
+                      <TerminalSquare className="size-3.25" />
+                    </TerminalActionButton>
+                  ) : null}
                   <TerminalActionButton
                     className="inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors hover:bg-accent/70"
                     onClick={terminalControls.collapse}

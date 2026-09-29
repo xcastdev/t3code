@@ -29,6 +29,8 @@ import { ServerConfig } from "../config.ts";
 import { GitWorkflowService } from "../git/GitWorkflowService.ts";
 import { OrchestrationCommandReceiptRepositoryLive } from "../persistence/Layers/OrchestrationCommandReceipts.ts";
 import { OrchestrationEventStoreLive } from "../persistence/Layers/OrchestrationEventStore.ts";
+import { ProjectionTerminalCompletionWakeRepositoryLive } from "../persistence/Layers/ProjectionTerminalCompletionWakes.ts";
+import { ProjectionTurnRepositoryLive } from "../persistence/Layers/ProjectionTurns.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
 import { OrchestrationEngineLive } from "../orchestration/Layers/OrchestrationEngine.ts";
@@ -567,6 +569,8 @@ const integrationLayer = Layer.mergeAll(
   ),
   OrchestrationProjectionSnapshotQueryLive,
   integrationRuntimeRepository,
+  ProjectionTerminalCompletionWakeRepositoryLive,
+  ProjectionTurnRepositoryLive,
   ProviderSessionDirectoryLive.pipe(Layer.provide(integrationRuntimeRepository)),
   Layer.succeed(AgentSessionScanner.AgentSessionScanner, integrationScanner),
 ).pipe(

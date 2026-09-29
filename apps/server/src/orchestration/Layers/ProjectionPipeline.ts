@@ -54,6 +54,7 @@ import {
   ProjectionTurnRepository,
 } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProjectionThreadRepository } from "../../persistence/Services/ProjectionThreads.ts";
+import { ProjectionTerminalCompletionWakeRepository } from "../../persistence/Services/ProjectionTerminalCompletionWakes.ts";
 import { ProjectionPendingApprovalRepositoryLive } from "../../persistence/Layers/ProjectionPendingApprovals.ts";
 import { ProjectionProjectRepositoryLive } from "../../persistence/Layers/ProjectionProjects.ts";
 import { ProjectionStateRepositoryLive } from "../../persistence/Layers/ProjectionState.ts";
@@ -63,6 +64,7 @@ import { ProjectionThreadProposedPlanRepositoryLive } from "../../persistence/La
 import { ProjectionThreadSessionRepositoryLive } from "../../persistence/Layers/ProjectionThreadSessions.ts";
 import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
 import { ProjectionThreadRepositoryLive } from "../../persistence/Layers/ProjectionThreads.ts";
+import { ProjectionTerminalCompletionWakeRepositoryLive } from "../../persistence/Layers/ProjectionTerminalCompletionWakes.ts";
 import { ServerConfig } from "../../config.ts";
 import {
   OrchestrationProjectionPipeline,
@@ -88,6 +90,7 @@ export const ORCHESTRATION_PROJECTOR_NAMES = {
   pendingApprovals: "projection.pending-approvals",
   mcpCatalog: "projection.mcp-catalog",
   skillApplications: "projection.skill-applications",
+  terminalCompletionWakes: "projection.terminal-completion-wakes",
 } as const;
 
 const encodeProviderInstanceIds = Schema.encodeSync(
@@ -517,6 +520,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
     const projectionThreadActivityRepository = yield* ProjectionThreadActivityRepository;
     const projectionThreadSessionRepository = yield* ProjectionThreadSessionRepository;
     const projectionTurnRepository = yield* ProjectionTurnRepository;
+    const terminalCompletionWakeRepository = yield* ProjectionTerminalCompletionWakeRepository;
     const projectionPendingApprovalRepository = yield* ProjectionPendingApprovalRepository;
 
     const fileSystem = yield* FileSystem.FileSystem;
@@ -1831,6 +1835,48 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         });
         return;
       }
+      if (event.type === "thread.turn-start-requested") {
+        const message = yield* projectionThreadMessageRepository.getByMessageId({
+          messageId: event.payload.messageId,
+        });
+        if (
+          Option.isSome(message) &&
+          message.value.role === "user" &&
+          (message.value.attachments?.length ?? 0) === 0 &&
+          message.value.text.trim().toLowerCase() === "/compact"
+        ) {
+          return;
+        }
+        const current = yield* projectionThreadSessionRepository.getByThreadId({
+          threadId: event.payload.threadId,
+        });
+        if (Option.isSome(current) && current.value.status === "ready") {
+          yield* projectionThreadSessionRepository.upsert({
+            ...current.value,
+            status: "starting",
+            activeTurnId: null,
+            updatedAt: event.occurredAt,
+          });
+        }
+        return;
+      }
+      if (
+        event.type === "thread.terminal-completion-continuation-started" &&
+        event.payload.deliveryMode === "idle"
+      ) {
+        const current = yield* projectionThreadSessionRepository.getByThreadId({
+          threadId: event.payload.threadId,
+        });
+        if (Option.isSome(current) && current.value.status === "ready") {
+          yield* projectionThreadSessionRepository.upsert({
+            ...current.value,
+            status: "starting",
+            activeTurnId: null,
+            updatedAt: event.occurredAt,
+          });
+        }
+        return;
+      }
       if (event.type !== "thread.session-set") {
         return;
       }
@@ -1965,7 +2011,24 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
             threadId: event.payload.threadId,
           });
-          if (Option.isSome(pendingTurnStart)) {
+          const existingTurns = yield* projectionTurnRepository.listByThreadId({
+            threadId: event.payload.threadId,
+          });
+          const terminalTurnIsRunning = existingTurns.some(
+            (turn) =>
+              turn.state === "running" &&
+              turn.terminalCompletionWakeKey !== null &&
+              turn.terminalCompletionWakeKey !== undefined,
+          );
+          if (
+            terminalTurnIsRunning ||
+            (Option.isSome(pendingTurnStart) &&
+              pendingTurnStart.value.messageId === null &&
+              pendingTurnStart.value.terminalCompletionWakeKey != null)
+          ) {
+            return;
+          }
+          if (Option.isSome(pendingTurnStart) && pendingTurnStart.value.messageId !== null) {
             const pendingMessage = yield* projectionThreadMessageRepository.getByMessageId({
               messageId: pendingTurnStart.value.messageId,
             });
@@ -1981,10 +2044,57 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           yield* projectionTurnRepository.replacePendingTurnStart({
             threadId: event.payload.threadId,
             messageId: event.payload.messageId,
+            terminalCompletionWakeKey: null,
             sourceProposedPlanThreadId: event.payload.sourceProposedPlan?.threadId ?? null,
             sourceProposedPlanId: event.payload.sourceProposedPlan?.planId ?? null,
             requestedAt: event.payload.createdAt,
           });
+          return;
+        }
+
+        case "thread.turn-start-admitted": {
+          yield* projectionTurnRepository.replacePendingTurnStart({
+            threadId: event.payload.threadId,
+            messageId: event.payload.messageId,
+            terminalCompletionWakeKey: null,
+            sourceProposedPlanThreadId: event.payload.sourceProposedPlanThreadId,
+            sourceProposedPlanId: event.payload.sourceProposedPlanId,
+            requestedAt: event.payload.requestedAt,
+          });
+          return;
+        }
+
+        case "thread.terminal-completion-continuation-started": {
+          const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+            threadId: event.payload.threadId,
+          });
+          if (Option.isSome(pendingTurnStart) && pendingTurnStart.value.messageId !== null) {
+            return;
+          }
+          yield* projectionTurnRepository.replacePendingTurnStart({
+            threadId: event.payload.threadId,
+            messageId: null,
+            terminalCompletionWakeKey: event.payload.wakeKeys[0] ?? null,
+            sourceProposedPlanThreadId: null,
+            sourceProposedPlanId: null,
+            requestedAt: event.payload.createdAt,
+          });
+          return;
+        }
+
+        case "thread.terminal-completion-continuation-canceled": {
+          const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+            threadId: event.payload.threadId,
+          });
+          if (
+            Option.isSome(pendingTurnStart) &&
+            pendingTurnStart.value.messageId === null &&
+            pendingTurnStart.value.terminalCompletionWakeKey === event.payload.wakeKey
+          ) {
+            yield* projectionTurnRepository.deletePendingTurnStartByThreadId({
+              threadId: event.payload.threadId,
+            });
+          }
           return;
         }
 
@@ -2159,6 +2269,11 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
                 (Option.isSome(pendingTurnStart)
                   ? pendingTurnStart.value.sourceProposedPlanId
                   : null),
+              terminalCompletionWakeKey:
+                existingTurn.value.terminalCompletionWakeKey ??
+                (Option.isSome(pendingTurnStart)
+                  ? pendingTurnStart.value.terminalCompletionWakeKey
+                  : null),
               ...turnProvenanceColumns,
               startedAt:
                 existingTurn.value.startedAt ??
@@ -2183,6 +2298,9 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
                 : null,
               sourceProposedPlanId: Option.isSome(pendingTurnStart)
                 ? pendingTurnStart.value.sourceProposedPlanId
+                : null,
+              terminalCompletionWakeKey: Option.isSome(pendingTurnStart)
+                ? pendingTurnStart.value.terminalCompletionWakeKey
                 : null,
               assistantMessageId: null,
               state: "running",
@@ -2720,6 +2838,24 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
         name: ORCHESTRATION_PROJECTOR_NAMES.threads,
         apply: applyThreadsProjection,
       },
+      {
+        name: ORCHESTRATION_PROJECTOR_NAMES.terminalCompletionWakes,
+        apply: (event) => {
+          if (event.type === "thread.terminal-completion-requested") {
+            return terminalCompletionWakeRepository.recordRequest({
+              ...event.payload,
+              createdAt: event.occurredAt,
+            });
+          }
+          if (event.type === "thread.archived" || event.type === "thread.deleted") {
+            return terminalCompletionWakeRepository.cancelThread({
+              threadId: event.payload.threadId,
+              updatedAt: event.occurredAt,
+            });
+          }
+          return Effect.void;
+        },
+      },
     ];
 
     const applyAttachmentSideEffects = Effect.fn("applyAttachmentSideEffects")(
@@ -2948,6 +3084,7 @@ export const OrchestrationProjectionPipelineLive = Layer.effect(
 ).pipe(
   Layer.provideMerge(ProjectionProjectRepositoryLive),
   Layer.provideMerge(ProjectionThreadRepositoryLive),
+  Layer.provideMerge(ProjectionTerminalCompletionWakeRepositoryLive),
   Layer.provideMerge(ProjectionThreadMessageRepositoryLive),
   Layer.provideMerge(ProjectionThreadProposedPlanRepositoryLive),
   Layer.provideMerge(ProjectionThreadPullRequests.layer),

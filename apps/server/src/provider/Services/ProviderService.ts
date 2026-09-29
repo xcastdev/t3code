@@ -61,6 +61,12 @@ export interface ProviderServiceShape {
     input: ProviderSendTurnInput,
   ) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
 
+  /** Start a provider continuation with explicit bounded content and no user message. */
+  readonly continueFromTerminalCompletion: (input: {
+    readonly threadId: ThreadId;
+    readonly prompt: string;
+  }) => Effect.Effect<ProviderTurnStartResult, ProviderServiceError>;
+
   readonly messageAgent?: (input: {
     readonly threadId: ThreadId;
     readonly agentKey: RuntimeAgentKey;

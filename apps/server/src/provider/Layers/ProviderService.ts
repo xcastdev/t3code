@@ -3047,6 +3047,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
     );
   });
 
+  const continueFromTerminalCompletion: ProviderServiceMethod<"continueFromTerminalCompletion"> =
+    Effect.fn("continueFromTerminalCompletion")(function* (input) {
+      return yield* sendTurn({
+        threadId: input.threadId,
+        input: input.prompt,
+      });
+    });
+
   const messageAgent: ProviderServiceMethod<"messageAgent"> = Effect.fn("messageAgent")(
     function* (input) {
       const routed = yield* resolveRoutableSession({
@@ -3927,6 +3935,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
   return {
     startSession,
     sendTurn,
+    continueFromTerminalCompletion,
     messageAgent,
     stopAgent,
     getAgentCapabilities,

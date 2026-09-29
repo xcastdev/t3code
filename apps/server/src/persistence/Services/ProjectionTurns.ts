@@ -55,6 +55,7 @@ export const ProjectionTurn = Schema.Struct({
   toolCallCount: Schema.NullOr(NonNegativeInt),
   subagentCount: Schema.NullOr(NonNegativeInt),
   changedFileCount: Schema.NullOr(NonNegativeInt),
+  terminalCompletionWakeKey: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
 });
 export type ProjectionTurn = typeof ProjectionTurn.Type;
 
@@ -79,12 +80,14 @@ export const ProjectionTurnById = Schema.Struct({
   toolCallCount: Schema.NullOr(NonNegativeInt),
   subagentCount: Schema.NullOr(NonNegativeInt),
   changedFileCount: Schema.NullOr(NonNegativeInt),
+  terminalCompletionWakeKey: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
 });
 export type ProjectionTurnById = typeof ProjectionTurnById.Type;
 
 export const ProjectionPendingTurnStart = Schema.Struct({
   threadId: ThreadId,
-  messageId: MessageId,
+  messageId: Schema.NullOr(MessageId),
+  terminalCompletionWakeKey: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
   sourceProposedPlanThreadId: Schema.NullOr(ThreadId),
   sourceProposedPlanId: Schema.NullOr(OrchestrationProposedPlanId),
   requestedAt: IsoDateTime,

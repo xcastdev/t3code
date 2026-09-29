@@ -99,6 +99,11 @@ import { CheckpointReactorLive } from "./orchestration/Layers/CheckpointReactor.
 import * as ThreadHistoryArchive from "./persistence/ThreadHistoryArchive.ts";
 import { ThreadDeletionReactorLive } from "./orchestration/Layers/ThreadDeletionReactor.ts";
 import { ProjectTerminalReactorLive } from "./orchestration/Layers/ProjectTerminalReactor.ts";
+import { ProjectTerminalActivityReactorLive } from "./terminal/ProjectTerminalActivityReactor.ts";
+import { ProjectTerminalCompletionServiceLive } from "./terminal/ProjectTerminalCompletionService.ts";
+import { ProjectTerminalWakeServiceLive } from "./orchestration/Services/ProjectTerminalWakeService.ts";
+import { ProjectionTerminalCompletionWakeRepositoryLive } from "./persistence/Layers/ProjectionTerminalCompletionWakes.ts";
+import { ProjectionTurnRepositoryLive } from "./persistence/Layers/ProjectionTurns.ts";
 import * as ThreadSettlementReactor from "./orchestration/ThreadSettlementReactor.ts";
 import * as PullRequestSyncReactor from "./orchestration/PullRequestSyncReactor.ts";
 import * as ThreadPullRequestReactor from "./orchestration/ThreadPullRequestReactor.ts";
@@ -310,16 +315,28 @@ const ProductionOrchestrationReactorLive = OrchestrationReactorRequiredLive.pipe
   Layer.provideMerge(SkillApplicationReactorLayerLive),
   Layer.provideMerge(SkillCatalogApplicationReactorLayerLive),
 );
+const ProjectTerminalWakeLayerLive = ProjectTerminalWakeServiceLive.pipe(
+  Layer.provideMerge(ProjectionTerminalCompletionWakeRepositoryLive),
+);
+const ProjectTerminalCompletionLayerLive = ProjectTerminalCompletionServiceLive.pipe(
+  Layer.provideMerge(ProjectTerminalWakeLayerLive),
+);
 
 const ReactorLayerLive = Layer.empty.pipe(
   Layer.provideMerge(ProductionOrchestrationReactorLive),
   Layer.provideMerge(ProviderRuntimeIngestionLive),
+  Layer.provideMerge(ProjectionTurnRepositoryLive),
   Layer.provideMerge(ProviderCommandReactorLive),
   Layer.provideMerge(CheckpointReactorLive.pipe(Layer.provide(ThreadHistoryArchive.layer))),
   Layer.provideMerge(ThreadDeletionReactorLive.pipe(Layer.provide(ThreadHistoryArchive.layer))),
   Layer.provideMerge(
-    ProjectTerminalReactorLive.pipe(Layer.provideMerge(ProjectTerminalServiceLive)),
+    ProjectTerminalReactorLive.pipe(
+      Layer.provideMerge(
+        ProjectTerminalServiceLive.pipe(Layer.provideMerge(ProjectTerminalCompletionLayerLive)),
+      ),
+    ),
   ),
+  Layer.provideMerge(ProjectTerminalActivityReactorLive),
   Layer.provideMerge(SkillApplicationReactorLayerLive),
   Layer.provideMerge(SkillCatalogApplicationReactorLayerLive),
   Layer.provideMerge(ThreadSettlementReactor.layer),

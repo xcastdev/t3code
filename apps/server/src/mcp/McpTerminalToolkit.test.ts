@@ -11,6 +11,7 @@ import {
   type TerminalReadResult,
   type ProjectTerminalSummary,
   type ProjectTerminalCreateInput,
+  type ProjectTerminalDockSummary,
 } from "@t3tools/contracts";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
@@ -28,6 +29,7 @@ import * as PreviewAutomationBroker from "./PreviewAutomationBroker.ts";
 import * as ProjectionSnapshotQuery from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import * as TerminalManager from "../terminal/Manager.ts";
 import * as ProjectTerminalService from "../terminal/ProjectTerminalService.ts";
+import * as ProjectTerminalCompletionService from "../terminal/ProjectTerminalCompletionService.ts";
 
 const projectId = ProjectId.make("project-mcp-terminal-test");
 const threadId = ThreadId.make("thread-mcp-terminal-test");
@@ -73,6 +75,17 @@ const makeHarness = () => {
   const writes: Array<{ terminalId: string; data: string }> = [];
   const resizes: Array<{ terminalId: string; cols: number; rows: number }> = [];
   const kills: Array<{ projectId: string; terminalId: string; cleanup: boolean }> = [];
+  const completionSubscriptions: Array<{
+    readonly projectId: ProjectId;
+    readonly terminalId: string;
+    readonly threadId: ThreadId;
+    readonly mode: "notice" | "noticeAndWake";
+  }> = [];
+  const completionUnsubscriptions: Array<{
+    readonly projectId: ProjectId;
+    readonly terminalId: string;
+    readonly threadId: ThreadId;
+  }> = [];
 
   const unavailable = (operation: "write" | "resize" | "kill", terminalId: string) =>
     new TerminalToolError({ operation, reason: "unavailable", projectId, terminalId });
@@ -102,6 +115,26 @@ const makeHarness = () => {
       }),
     listProject: (id: string) =>
       Effect.succeed([...terminals.values()].filter((terminal) => terminal.projectId === id)),
+    getProjectCompletionSnapshot: (input: {
+      readonly projectId: ProjectId;
+      readonly terminalId: string;
+    }) => {
+      const terminal = terminals.get(input.terminalId);
+      if (!terminal || terminal.projectId !== input.projectId) return Effect.succeed(null);
+      const dockTerminal: ProjectTerminalDockSummary = {
+        projectId: terminal.projectId,
+        terminalId: terminal.terminalId,
+        creatingThreadId: terminal.creatingThreadId,
+        label: terminal.label,
+        status: terminal.status,
+        cols: 96,
+        rows: 32,
+        exitCode: terminal.exitCode,
+        exitSignal: terminal.exitSignal,
+        updatedAt: terminal.updatedAt,
+      };
+      return Effect.succeed({ generation: "generation-1", terminal: dockTerminal });
+    },
     readProject: (input: TerminalReadInput) => {
       const terminal = terminals.get(input.terminalId);
       return terminal
@@ -175,12 +208,30 @@ const makeHarness = () => {
     digest: (_algorithm, data) => Effect.succeed(data),
   });
 
+  const completionService = {
+    subscribe: (input: (typeof completionSubscriptions)[number]) =>
+      Effect.sync(() => {
+        completionSubscriptions.push(input);
+      }),
+    unsubscribe: (input: (typeof completionUnsubscriptions)[number]) =>
+      Effect.sync(() => {
+        completionUnsubscriptions.push(input);
+      }),
+    closeProject: () => Effect.void,
+    start: () => Effect.void,
+    drain: Effect.void,
+  } satisfies ProjectTerminalCompletionService.ProjectTerminalCompletionServiceShape;
+
   const serviceLayer = ProjectTerminalService.ProjectTerminalServiceLive.pipe(
     Layer.provide(
       Layer.mergeAll(
         Layer.succeed(TerminalManager.TerminalManager, manager),
         Layer.succeed(ProjectionSnapshotQuery.ProjectionSnapshotQuery, snapshots),
         Layer.succeed(Crypto.Crypto, crypto),
+        Layer.succeed(
+          ProjectTerminalCompletionService.ProjectTerminalCompletionService,
+          completionService,
+        ),
       ),
     ),
   );
@@ -190,7 +241,18 @@ const makeHarness = () => {
     Layer.provide(serviceLayer),
   );
 
-  return { layer, serviceLayer, terminals, outputs, createInputs, writes, resizes, kills };
+  return {
+    layer,
+    serviceLayer,
+    terminals,
+    outputs,
+    createInputs,
+    writes,
+    resizes,
+    kills,
+    completionSubscriptions,
+    completionUnsubscriptions,
+  };
 };
 
 type McpServerService = McpServer.McpServer["Service"];
@@ -257,7 +319,7 @@ const makeAuthenticatedMcpLayer = (
     Layer.provide(Layer.succeed(McpSessionRegistry.McpSessionRegistry, registry)),
   );
 
-it.effect("registers six object-shaped tools with read and lifecycle annotations", () => {
+it.effect("registers project completion tools with read and lifecycle annotations", () => {
   const harness = makeHarness();
   return Effect.gen(function* () {
     const server = yield* McpServer.McpServer;
@@ -268,6 +330,8 @@ it.effect("registers six object-shaped tools with read and lifecycle annotations
       "terminal_read",
       "terminal_resize",
       "terminal_spawn",
+      "terminal_subscribe_completion",
+      "terminal_unsubscribe_completion",
       "terminal_write",
     ]);
 
@@ -323,6 +387,21 @@ it.effect(
         terminalId: (spawned.structuredContent as ProjectTerminalSummary).terminalId,
       };
 
+      const subscribed = yield* callTool(server, "terminal_subscribe_completion", {
+        ...handle,
+        mode: "noticeAndWake",
+      });
+      expect(subscribed.isError).toBe(false);
+      expect(subscribed.structuredContent).toMatchObject({ subscribed: true });
+      expect(harness.completionSubscriptions).toEqual([
+        { ...handle, threadId, mode: "noticeAndWake" },
+      ]);
+
+      const unsubscribed = yield* callTool(server, "terminal_unsubscribe_completion", handle);
+      expect(unsubscribed.isError).toBe(false);
+      expect(unsubscribed.structuredContent).toMatchObject({ unsubscribed: true });
+      expect(harness.completionUnsubscriptions).toEqual([{ ...handle, threadId }]);
+
       const listed = yield* callTool(server, "terminal_list", { limit: 20 });
       expect(listed.isError).toBe(false);
       expect(listed.structuredContent).toMatchObject({ terminals: [handle] });
@@ -376,6 +455,17 @@ it.effect("rejects missing capability and unavailable handles without spawning",
       { type: "text", text: "MCP credential does not grant the terminal capability." },
     ]);
     expect(harness.createInputs).toHaveLength(0);
+
+    const deniedCompletion = yield* callTool(
+      server,
+      "terminal_subscribe_completion",
+      { projectId, terminalId: "unknown-terminal", mode: "notice" },
+      [],
+    );
+    expect(deniedCompletion.isError).toBe(true);
+    expect(deniedCompletion.content).toEqual([
+      { type: "text", text: "MCP credential does not grant the terminal capability." },
+    ]);
 
     const unavailable = yield* callTool(server, "terminal_write", {
       projectId,

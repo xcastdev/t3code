@@ -27,6 +27,11 @@ import {
   type OrchestrationThreadShell,
   type OrchestrationAgentTranscriptPage,
   TerminalNotRunningError,
+  TerminalToolError,
+  EnvironmentAuthorizationError,
+  type ProjectTerminalAttachStreamEvent,
+  type ProjectTerminalDockSummary,
+  type ProjectTerminalMetadataStreamEvent,
   type OrchestrationCommand,
   type OrchestrationEvent,
   ORCHESTRATION_WS_METHODS,
@@ -326,6 +331,7 @@ const testEnvironmentDescriptor = {
   serverVersion: "0.0.0-test",
   capabilities: {
     repositoryIdentity: true,
+    projectTerminalAttachment: true,
   },
 };
 const makeDefaultOrchestrationReadModel = () => {
@@ -2145,6 +2151,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
 
       assert.equal(response.status, 200);
       assert.deepEqual(body, testEnvironmentDescriptor);
+      assert.equal(body.capabilities.projectTerminalAttachment, true);
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 
@@ -12640,6 +12647,194 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
           }),
         ),
       );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("routes scoped project terminal RPCs through the environment manager", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-terminal-rpc");
+      const terminalId = "project-term-1";
+      const handle = { projectId, terminalId };
+      const summary: ProjectTerminalDockSummary = {
+        ...handle,
+        creatingThreadId: defaultThreadId,
+        label: "Build task",
+        status: "running",
+        cols: 80,
+        rows: 24,
+        exitCode: null,
+        exitSignal: null,
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      };
+      const projectShell = {
+        id: projectId,
+        title: "Project terminal RPC test",
+        workspaceRoot: "/tmp/project-terminal-rpc",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      };
+      const attachSnapshot: ProjectTerminalAttachStreamEvent = {
+        type: "snapshot",
+        snapshot: { terminal: summary, history: "hello\n", cols: 80, rows: 24, sequence: 3 },
+      };
+      const metadataSnapshot: ProjectTerminalMetadataStreamEvent = {
+        type: "snapshot",
+        projectId,
+        terminals: [summary],
+        nextCursor: null,
+      };
+      const writes: Array<{ projectId: ProjectId; terminalId: string; data: string }> = [];
+      const resizes: Array<{
+        projectId: ProjectId;
+        terminalId: string;
+        cols: number;
+        rows: number;
+      }> = [];
+
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getProjectShellById: (target) =>
+              Effect.succeed(target === projectId ? Option.some(projectShell) : Option.none()),
+          },
+          terminalManager: {
+            getProjectDockSummary: (target) =>
+              Effect.succeed(
+                target.projectId === projectId && target.terminalId === terminalId ? summary : null,
+              ),
+            listProjectDockSummaries: () =>
+              Effect.succeed({ terminals: [summary], nextCursor: null }),
+            attachProjectStream: (_target, listener) =>
+              Effect.map(listener(attachSnapshot), () => () => {}),
+            subscribeProjectMetadata: (_target, listener) =>
+              Effect.map(listener(metadataSnapshot), () => () => {}),
+            writeProject: (input) => Effect.sync(() => writes.push(input)),
+            resizeProject: (input) => Effect.sync(() => resizes.push(input)),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.gen(function* () {
+            const attachEvents = yield* client[WS_METHODS.projectTerminalAttach](handle).pipe(
+              Stream.take(1),
+              Stream.runCollect,
+            );
+            const metadataEvents = yield* client[WS_METHODS.projectTerminalMetadata](
+              projectId,
+            ).pipe(Stream.take(1), Stream.runCollect);
+            const listed = yield* client[WS_METHODS.projectTerminalList]({ projectId, limit: 25 });
+            yield* client[WS_METHODS.projectTerminalWrite]({ ...handle, data: "echo ok\\n" });
+            yield* client[WS_METHODS.projectTerminalResize]({ ...handle, cols: 100, rows: 32 });
+            return { attachEvents, metadataEvents, listed };
+          }),
+        ),
+      );
+
+      assert.deepEqual(result.attachEvents, [attachSnapshot]);
+      assert.deepEqual(result.metadataEvents, [metadataSnapshot]);
+      assert.deepEqual(result.listed, { terminals: [summary], nextCursor: null });
+      assert.deepEqual(writes, [{ ...handle, data: "echo ok\\n" }]);
+      assert.deepEqual(resizes, [{ ...handle, cols: 100, rows: 32 }]);
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("rejects project terminal handles that do not resolve to an existing project PTY", () =>
+    Effect.gen(function* () {
+      const projectId = ProjectId.make("project-terminal-existing");
+      const projectShell = {
+        id: projectId,
+        title: "Existing project",
+        workspaceRoot: "/tmp/project-terminal-existing",
+        defaultModelSelection: null,
+        scripts: [],
+        createdAt: "2026-01-01T00:00:00.000Z",
+        updatedAt: "2026-01-01T00:00:00.000Z",
+      };
+      yield* buildAppUnderTest({
+        layers: {
+          projectionSnapshotQuery: {
+            getProjectShellById: (target) =>
+              Effect.succeed(target === projectId ? Option.some(projectShell) : Option.none()),
+          },
+          terminalManager: {
+            getProjectDockSummary: () => Effect.succeed(null),
+          },
+        },
+      });
+
+      const wsUrl = yield* getWsServerUrl("/ws");
+      const result = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          client[WS_METHODS.projectTerminalWrite]({
+            projectId,
+            terminalId: "thread-owned-term-1",
+            data: "echo blocked\\n",
+          }).pipe(Effect.result),
+        ),
+      );
+      assertFailure(
+        result,
+        new TerminalToolError({
+          operation: "write",
+          reason: "unavailable",
+          projectId,
+          terminalId: "thread-owned-term-1",
+        }),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+
+  it.effect("requires terminal scope on every project terminal RPC for a remote-style client", () =>
+    Effect.gen(function* () {
+      yield* buildAppUnderTest({ config: { host: "0.0.0.0" } });
+      const ownerCookie = yield* getAuthenticatedSessionCookieHeader();
+      const pairingResponse = yield* HttpClient.post("/api/auth/pairing-token", {
+        headers: { cookie: ownerCookie },
+        body: yield* HttpBody.json({ scopes: ["orchestration:read"] }),
+      });
+      assert.equal(pairingResponse.status, 200);
+      const pairing = (yield* pairingResponse.json) as { readonly credential: string };
+      const wsUrl = yield* getWsServerUrl("/ws?connectionMethod=relay", {
+        credential: pairing.credential,
+      });
+      const projectId = ProjectId.make("project-terminal-unauthorized");
+      const handle = { projectId, terminalId: "project-term-unauthorized" };
+      const expectedError = new EnvironmentAuthorizationError({
+        message: "The authenticated token is missing required scope: terminal:operate.",
+        requiredScope: "terminal:operate",
+      });
+      const results = yield* Effect.scoped(
+        withWsRpcClient(wsUrl, (client) =>
+          Effect.all([
+            client[WS_METHODS.projectTerminalAttach](handle).pipe(Stream.runHead, Effect.result),
+            client[WS_METHODS.projectTerminalMetadata](projectId).pipe(
+              Stream.runHead,
+              Effect.result,
+            ),
+            client[WS_METHODS.projectTerminalList]({ projectId }).pipe(Effect.result),
+            client[WS_METHODS.projectTerminalWrite]({ ...handle, data: "echo denied\\n" }).pipe(
+              Effect.result,
+            ),
+            client[WS_METHODS.projectTerminalResize]({ ...handle, cols: 80, rows: 24 }).pipe(
+              Effect.result,
+            ),
+          ]),
+        ),
+      );
+      for (const result of results) {
+        assert.equal(result._tag, "Failure");
+        if (result._tag === "Failure") {
+          assert.isTrue(Schema.is(EnvironmentAuthorizationError)(result.failure));
+          if (Schema.is(EnvironmentAuthorizationError)(result.failure)) {
+            assert.equal(result.failure.requiredScope, expectedError.requiredScope);
+          }
+        }
+      }
     }).pipe(Effect.provide(NodeHttpServer.layerTest)),
   );
 

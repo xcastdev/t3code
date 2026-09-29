@@ -6554,6 +6554,7 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
     provider: PROVIDER,
     capabilities: {
       sessionModelSwitch: "in-session",
+      activeTurnSteer: false,
       remoteHttpMcp: "next-session",
       projectMcpProxy: "next-session",
       managedPreviewMcp: "next-session",

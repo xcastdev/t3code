@@ -5,9 +5,12 @@ import { EnvironmentId, TerminalSessionSnapshot, ThreadId } from "@t3tools/contr
 import {
   applyTerminalAttachStreamEvent,
   applyTerminalMetadataStreamEvent,
+  applyProjectTerminalAttachStreamEvent,
+  applyProjectTerminalMetadataStreamEvent,
   combineTerminalSessionState,
   DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
   EMPTY_TERMINAL_BUFFER_STATE,
+  EMPTY_PROJECT_TERMINAL_BUFFER_STATE,
   INITIAL_TERMINAL_OUTPUT_CURSOR,
   nextTerminalAttachSeedState,
   readTerminalOutputUpdate,
@@ -36,6 +39,97 @@ const BASE_SNAPSHOT: TerminalSessionSnapshot = {
 };
 
 describe("terminal session reducers", () => {
+  it("reduces project attach events by sequence and retains exited output", () => {
+    const terminal = {
+      projectId: "project-1" as never,
+      terminalId: "term-1",
+      creatingThreadId: ThreadId.make("creator"),
+      label: "Build terminal",
+      status: "running" as const,
+      cols: 90,
+      rows: 30,
+      exitCode: null,
+      exitSignal: null,
+      updatedAt: "2026-04-01T00:00:00.000Z",
+    };
+    const snapshot = applyProjectTerminalAttachStreamEvent(EMPTY_PROJECT_TERMINAL_BUFFER_STATE, {
+      type: "snapshot",
+      snapshot: { terminal, history: "hello", cols: 90, rows: 30, sequence: 4 },
+    });
+    const output = applyProjectTerminalAttachStreamEvent(snapshot, {
+      type: "output",
+      handle: { projectId: terminal.projectId, terminalId: terminal.terminalId },
+      sequence: 5,
+      data: " world",
+    });
+    const staleResize = applyProjectTerminalAttachStreamEvent(output, {
+      type: "resized",
+      handle: { projectId: terminal.projectId, terminalId: terminal.terminalId },
+      sequence: 4,
+      cols: 1,
+      rows: 1,
+    });
+    const exited = applyProjectTerminalAttachStreamEvent(staleResize, {
+      type: "exited",
+      handle: { projectId: terminal.projectId, terminalId: terminal.terminalId },
+      sequence: 6,
+      status: "exited",
+      exitCode: 0,
+      exitSignal: null,
+    });
+
+    expect(exited.cols).toBe(90);
+    expect(exited.status).toBe("exited");
+    expect(terminalOutputText(exited.output)).toBe("hello world");
+  });
+
+  it("keeps metadata cursor for bounded paging and updates without output payloads", () => {
+    const first = {
+      projectId: "project-1" as never,
+      terminalId: "term-1",
+      creatingThreadId: ThreadId.make("creator"),
+      label: "Build terminal",
+      status: "running" as const,
+      cols: 80,
+      rows: 24,
+      exitCode: null,
+      exitSignal: null,
+      updatedAt: "2026-04-01T00:00:00.000Z",
+    };
+    const second = { ...first, terminalId: "term-2", label: "Test terminal" };
+    const snapshot = applyProjectTerminalMetadataStreamEvent(
+      {
+        terminals: [],
+        nextCursor: null,
+        snapshotVersion: 0,
+        revision: 0,
+        removedTerminalIds: [],
+      },
+      {
+        type: "snapshot",
+        projectId: first.projectId,
+        terminals: [first],
+        nextCursor: first.terminalId,
+      },
+    );
+    const updated = applyProjectTerminalMetadataStreamEvent(snapshot, {
+      type: "upsert",
+      terminal: second,
+    });
+    expect(updated.terminals.map((terminal) => terminal.terminalId)).toEqual(["term-1", "term-2"]);
+    expect(updated.nextCursor).toBe("term-1");
+    expect(snapshot.revision).toBe(1);
+    expect(updated.revision).toBe(2);
+    expect("history" in updated.terminals[0]!).toBe(false);
+    const removed = applyProjectTerminalMetadataStreamEvent(updated, {
+      type: "remove",
+      projectId: first.projectId,
+      terminalId: second.terminalId,
+    });
+    expect(removed.revision).toBe(3);
+    expect(removed.removedTerminalIds).toEqual([second.terminalId]);
+  });
+
   it("prefers live attach status over stale metadata after the attach stream starts", () => {
     const summary = applyTerminalMetadataStreamEvent([], {
       type: "snapshot",

@@ -5615,6 +5615,7 @@ export function makeOpenCodeAdapter(
       provider: PROVIDER,
       capabilities: {
         sessionModelSwitch: "in-session",
+        activeTurnSteer: false,
         remoteHttpMcp:
           openCodeSettings.serverUrl && !openCodeSettings.manageExternalMcp
             ? "unsupported"

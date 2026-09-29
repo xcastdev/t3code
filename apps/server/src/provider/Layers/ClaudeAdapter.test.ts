@@ -337,6 +337,7 @@ describe("ClaudeAdapterLive", () => {
     const harness = makeHarness();
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
+      assert.equal(adapter.capabilities.activeTurnSteer, false);
       const result = yield* adapter
         .startSession({
           threadId: THREAD_ID,

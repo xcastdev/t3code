@@ -36,6 +36,26 @@ layer("fork migration sequence", (it) => {
       const columns = yield* sql<{ readonly name: string }>`
         SELECT name FROM pragma_table_info('projection_turns') WHERE name = 'model'`;
       assert.equal(columns.length, 1);
+      const wakeTable = yield* sql<{ readonly name: string }>`
+        SELECT name FROM pragma_table_info('terminal_completion_wakes')`;
+      assert.deepEqual(
+        wakeTable.map((column) => column.name),
+        [
+          "dedupe_key",
+          "thread_id",
+          "project_id",
+          "terminal_id",
+          "generation",
+          "server_run_id",
+          "label",
+          "exit_status",
+          "exit_code",
+          "exit_signal",
+          "delivery_status",
+          "created_at",
+          "updated_at",
+        ],
+      );
     }),
   );
 });

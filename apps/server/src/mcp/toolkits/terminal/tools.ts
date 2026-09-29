@@ -4,6 +4,8 @@ import {
   ProjectTerminalKillInput,
   ProjectTerminalListInput,
   ProjectTerminalListResult,
+  ProjectTerminalSubscribeCompletionInput,
+  ProjectTerminalUnsubscribeCompletionInput,
   ProjectTerminalResizeInput,
   ProjectTerminalSummary,
   ProjectTerminalWriteInput,
@@ -85,6 +87,13 @@ const TerminalKillResult = Schema.Struct({
     description: "Termination was requested; the terminal may still be stopping.",
   }),
   cleanup: Schema.Boolean,
+});
+
+const TerminalCompletionSubscriptionResult = Schema.Struct({
+  subscribed: Schema.Literal(true),
+});
+const TerminalCompletionUnsubscriptionResult = Schema.Struct({
+  unsubscribed: Schema.Literal(true),
 });
 
 export const TerminalToolkitError = Schema.Union([
@@ -177,6 +186,33 @@ const TerminalKillTool = Tool.make("terminal_kill", {
   .annotate(Tool.Idempotent, false)
   .annotate(Tool.OpenWorld, true);
 
+const TerminalSubscribeCompletionTool = Tool.make("terminal_subscribe_completion", {
+  description:
+    "Receive one activity in the terminal's originating thread when a shared project terminal exits. Use noticeAndWake to also ask that thread's agent to review the result; supported providers can receive the prompt during a turn, while other providers wait until the turn settles. Subscriptions last only for this server process and allow at most 32 subscribing threads per terminal.",
+  parameters: ProjectTerminalSubscribeCompletionInput,
+  success: TerminalCompletionSubscriptionResult,
+  failure: TerminalToolkitError,
+  dependencies,
+})
+  .annotate(Tool.Title, "Watch shared terminal completion")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, false);
+
+const TerminalUnsubscribeCompletionTool = Tool.make("terminal_unsubscribe_completion", {
+  description: "Stop this thread's one-shot completion subscription for a shared terminal.",
+  parameters: ProjectTerminalUnsubscribeCompletionInput,
+  success: TerminalCompletionUnsubscriptionResult,
+  failure: TerminalToolkitError,
+  dependencies,
+})
+  .annotate(Tool.Title, "Stop watching terminal completion")
+  .annotate(Tool.Readonly, false)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true)
+  .annotate(Tool.OpenWorld, false);
+
 export const TerminalToolkit = Toolkit.make(
   TerminalSpawnTool,
   TerminalListTool,
@@ -184,4 +220,6 @@ export const TerminalToolkit = Toolkit.make(
   TerminalWriteTool,
   TerminalResizeTool,
   TerminalKillTool,
+  TerminalSubscribeCompletionTool,
+  TerminalUnsubscribeCompletionTool,
 );

@@ -12,6 +12,12 @@ Writes send exactly the supplied text, so include a newline when the shell shoul
 run a command. All agents in the project share control of a terminal and can send
 conflicting input.
 
+Open **Project terminals** from a thread's terminal dock to browse and attach to
+terminals created by agents in the same project. New terminals appear in the
+creating thread with an **Open in dock** action, and remain discoverable from
+other threads in the project. The dock opens in read-only view; switch to
+Interactive to send input or resize the shared terminal.
+
 Terminals belong to the project, not the thread that created them. They remain
 available when an agent exits or a thread is archived or deleted, and another
 agent in the project can continue using them. Project deletion and environment
@@ -30,6 +36,15 @@ completion notification. Output is terminal text, not a rendered screen.
 so another agent can inspect them. Pass `cleanup: true` to remove the stopped
 terminal and its saved history. Ended terminal history can also be evicted when
 T3 reaches its retention limit.
+
+An agent can call `terminal_subscribe_completion` to receive one completion
+notice in the thread that created the terminal. Choose `notice` to record the
+result without resuming the agent, or `noticeAndWake` to also ask it to continue
+when the terminal exits. Busy threads queue the wake until their current turn
+settles. Call `terminal_unsubscribe_completion` to remove the subscription before
+completion; it cannot retract a notice or wake that has already been delivered.
+Subscriptions last only for the current server run. Restarting the server stops
+its terminals, so there is no later completion notice or wake to recover.
 
 # Terminal history
 

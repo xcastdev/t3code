@@ -80,6 +80,56 @@ describe("project terminal contracts", () => {
     expect(decodes(resize, { ...handle, cols: 120, rows: 501 })).toBe(false);
   });
 
+  it("keeps project dock metadata bounded and free of launch details", () => {
+    const dockSummary = exportedSchema("ProjectTerminalDockSummary");
+    const dockList = exportedSchema("ProjectTerminalDockListInput");
+    const attachEvent = exportedSchema("ProjectTerminalAttachStreamEvent");
+    expect(dockSummary).toBeDefined();
+    expect(dockList).toBeDefined();
+    expect(attachEvent).toBeDefined();
+    if (!dockSummary || !dockList || !attachEvent) return;
+
+    const summary = {
+      projectId: "project-1",
+      terminalId: "terminal-1",
+      creatingThreadId: "thread-1",
+      label: "Agent shell",
+      status: "running",
+      cols: 120,
+      rows: 30,
+      exitCode: null,
+      exitSignal: null,
+      updatedAt: "2026-09-28T00:00:00Z",
+    };
+    expect(decodes(dockSummary, summary)).toBe(true);
+    expect(decodes(dockSummary, { ...summary, label: "x".repeat(129) })).toBe(false);
+    expect(decodes(dockList, { projectId: "project-1", limit: 100 })).toBe(true);
+    expect(decodes(dockList, { projectId: "project-1", limit: 101 })).toBe(false);
+    expect(
+      decodes(attachEvent, {
+        type: "output",
+        handle: { projectId: "project-1", terminalId: "terminal-1" },
+        sequence: 1,
+        data: "x".repeat(65_537),
+      }),
+    ).toBe(false);
+  });
+
+  it("validates one-shot completion subscription handles and modes", () => {
+    const subscribe = exportedSchema("ProjectTerminalSubscribeCompletionInput");
+    const unsubscribe = exportedSchema("ProjectTerminalUnsubscribeCompletionInput");
+    expect(subscribe).toBeDefined();
+    expect(unsubscribe).toBeDefined();
+    if (!subscribe || !unsubscribe) return;
+
+    const handle = { projectId: "project-1", terminalId: "terminal-1" };
+    expect(decodes(subscribe, { ...handle, mode: "notice" })).toBe(true);
+    expect(decodes(subscribe, { ...handle, mode: "noticeAndWake" })).toBe(true);
+    expect(decodes(subscribe, { ...handle, mode: "wake" })).toBe(false);
+    expect(decodes(unsubscribe, handle)).toBe(true);
+    expect(decodes(unsubscribe, { terminalId: "terminal-1" })).toBe(false);
+  });
+
   it("represents failed terminal cleanup as a typed tool error", () => {
     const error = exportedSchema("TerminalToolError");
     expect(error).toBeDefined();

@@ -314,6 +314,7 @@ it.layer(layer)("AntigravityAdapter", (it) => {
     Effect.gen(function* () {
       const h = yield* makeHarness();
       const terminalSession = installTerminalOnlyMcpSession(threadId, instanceId);
+      expect(h.adapter.capabilities.activeTurnSteer).toBe(false);
       yield* h.adapter.startSession({ threadId, cwd: process.cwd(), runtimeMode: "full-access" });
 
       const server = h.launches[0]?.mcpServers?.find((entry) => entry.name === "t3-code");

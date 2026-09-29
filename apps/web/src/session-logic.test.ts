@@ -477,6 +477,29 @@ describe("workEntryIndicatesToolNeutralStatus", () => {
 });
 
 describe("deriveWorkLogEntries", () => {
+  it("preserves the project terminal handle for an Open in dock activity action", () => {
+    const [entry] = deriveWorkLogEntries([
+      makeActivity({
+        kind: "terminal.project.created",
+        summary: "Project terminal started: Build task",
+        payload: {
+          projectId: "project-activity",
+          terminalId: "terminal-activity",
+          label: "Build task",
+          status: "running",
+        },
+      }),
+    ]);
+
+    expect(entry).toMatchObject({
+      label: "Project terminal started: Build task",
+      projectTerminal: {
+        projectId: "project-activity",
+        terminalId: "terminal-activity",
+      },
+    });
+  });
+
   it("keeps the latest task progress without emitting plan-update log entries", () => {
     const activities = [
       makeActivity({ id: "before", kind: "tool.completed", summary: "Read files", sequence: 0 }),

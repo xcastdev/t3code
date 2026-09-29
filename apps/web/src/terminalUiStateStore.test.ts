@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it } from "vite-plus/test";
 
 import {
   migratePersistedTerminalUiStateStoreState,
+  selectProjectTerminalUiState,
   selectThreadTerminalUiState,
   useTerminalUiStateStore,
 } from "./terminalUiStateStore";
@@ -19,6 +20,7 @@ describe("terminalUiStateStore actions", () => {
     useTerminalUiStateStore.persist.clearStorage();
     useTerminalUiStateStore.setState({
       terminalUiStateByThreadKey: {},
+      projectTerminalUiStateByKey: {},
       suppressedTerminalIdsByThreadKey: {},
     });
     useRightPanelStore.setState({
@@ -40,6 +42,66 @@ describe("terminalUiStateStore actions", () => {
       activeTerminalId: "",
       terminalGroups: [],
       activeTerminalGroupId: "",
+    });
+  });
+
+  it("keeps project terminal selection and mode scoped by environment and project", () => {
+    const store = useTerminalUiStateStore.getState();
+    expect(
+      selectProjectTerminalUiState(
+        useTerminalUiStateStore.getState().projectTerminalUiStateByKey,
+        "environment-a",
+        "project-a",
+      ),
+    ).toEqual({
+      open: false,
+      selectedTerminalId: null,
+      selectionInitialized: false,
+      mode: "view",
+    });
+
+    store.openProjectTerminalDock("environment-a", "project-a", "term-a");
+    store.setProjectTerminalMode("environment-a", "project-a", "interactive");
+    store.openProjectTerminalDock("environment-b", "project-a", "term-a");
+    store.openProjectTerminalDock("environment-a", "project-b", "term-a");
+
+    const stateByKey = useTerminalUiStateStore.getState().projectTerminalUiStateByKey;
+    expect(selectProjectTerminalUiState(stateByKey, "environment-a", "project-a")).toEqual({
+      open: true,
+      selectedTerminalId: "term-a",
+      selectionInitialized: true,
+      mode: "interactive",
+    });
+    expect(selectProjectTerminalUiState(stateByKey, "environment-b", "project-a")).toEqual({
+      open: true,
+      selectedTerminalId: "term-a",
+      selectionInitialized: true,
+      mode: "view",
+    });
+    expect(selectProjectTerminalUiState(stateByKey, "environment-a", "project-b")).toEqual({
+      open: true,
+      selectedTerminalId: "term-a",
+      selectionInitialized: true,
+      mode: "view",
+    });
+  });
+
+  it("detaches a selected project tab by changing selection without a terminal mutation", () => {
+    const store = useTerminalUiStateStore.getState();
+    store.openProjectTerminalDock("environment-a", "project-a", "term-a");
+    store.selectProjectTerminal("environment-a", "project-a", null);
+
+    expect(
+      selectProjectTerminalUiState(
+        useTerminalUiStateStore.getState().projectTerminalUiStateByKey,
+        "environment-a",
+        "project-a",
+      ),
+    ).toMatchObject({
+      open: true,
+      selectedTerminalId: null,
+      selectionInitialized: true,
+      mode: "view",
     });
   });
 
@@ -205,6 +267,7 @@ describe("terminalUiStateStore actions", () => {
     );
 
     expect(migrated).toEqual({
+      projectTerminalUiStateByKey: {},
       terminalUiStateByThreadKey: {
         [scopedThreadKey(THREAD_REF)]: {
           terminalOpen: true,

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { GhosttyTerminalCore, type GhosttyCell, type GhosttyRow } from "./core";
+import { createProjectTerminalTransport } from "../../components/projectTerminalTransport";
 import {
   DEFAULT_TERMINAL_FONT_FAMILY,
   DEFAULT_TERMINAL_FONT_SIZE,
@@ -245,6 +246,71 @@ describe("GhosttyTerminalSurface visibility", () => {
     expect(harness.renderedSnapshot.rowData[0]?.text).toContain("hidden");
     expect(harness.paint.mock.calls).toContainEqual(["fillRect", [84, 4, 8, 16]]);
     expect(harness.frames.size).toBe(0);
+  });
+
+  it("keeps a fixed remote PTY grid while fitting the local canvas", async () => {
+    const harness = createHarness();
+    const resizeCore = vi.spyOn(GhosttyTerminalCore.prototype, "resize");
+    const onResize = vi.fn();
+    const surface = await harness.create({
+      fixedGrid: true,
+      initialGrid: { cols: 80, rows: 24 },
+      onResize,
+    });
+    resizeCore.mockClear();
+
+    harness.mount.clientWidth = 240;
+    harness.mount.clientHeight = 160;
+    harness.resize();
+    surface.fit();
+
+    expect(surface.cols).toBe(80);
+    expect(surface.rows).toBe(24);
+    expect(resizeCore).not.toHaveBeenCalled();
+    expect(onResize).not.toHaveBeenCalled();
+
+    surface.setRemoteGrid(100, 40);
+    expect(surface.cols).toBe(100);
+    expect(surface.rows).toBe(40);
+    expect(resizeCore).toHaveBeenCalledTimes(1);
+    expect(onResize).not.toHaveBeenCalled();
+  });
+
+  it("resumes automatic local-grid resize when a fixed surface becomes interactive", async () => {
+    const harness = createHarness();
+    const onResize = vi.fn();
+    const surface = await harness.create({
+      fixedGrid: true,
+      initialGrid: { cols: 80, rows: 24 },
+      onResize,
+    });
+
+    surface.setFixedGrid(false);
+    vi.advanceTimersByTime(150);
+
+    expect(onResize).toHaveBeenCalledTimes(1);
+    expect(onResize).toHaveBeenCalledWith(surface.cols, surface.rows);
+  });
+
+  it("gates ANSI device replies from Ghostty at the project transport in view mode", async () => {
+    const harness = createHarness();
+    let mode: "view" | "interactive" = "view";
+    const write = vi.fn();
+    const transport = createProjectTerminalTransport({
+      mode: () => mode,
+      focused: () => true,
+      write,
+      resize() {},
+    });
+    const surface = await harness.create({ onData: transport.onData });
+
+    surface.write("\u001b[5n\u001b[6n");
+    expect(write).not.toHaveBeenCalled();
+
+    mode = "interactive";
+    surface.write("\u001b[5n\u001b[6n");
+    expect(write).toHaveBeenCalledWith("\u001b[0n");
+    expect(write).toHaveBeenCalledWith("\u001b[1;1R");
   });
 
   it("keeps the selection on reveal and applies a hidden selection clear", async () => {

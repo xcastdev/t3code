@@ -21,7 +21,7 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import type * as PlatformError from "effect/PlatformError";
 import * as Stream from "effect/Stream";
-import { isDeepStrictEqual } from "node:util";
+import * as NodeUtil from "node:util";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 import { isTemporaryWorktreeBranch } from "@t3tools/shared/git";
 
@@ -738,7 +738,12 @@ const make = Effect.gen(function* () {
   )(function* (
     event: Extract<
       OrchestrationEvent,
-      { type: "thread.turn-start-requested" | "thread.message-sent" }
+      {
+        type:
+          | "thread.turn-start-requested"
+          | "thread.message-sent"
+          | "thread.terminal-completion-continuation-started";
+      }
     >,
   ) {
     if (event.type === "thread.message-sent") {
@@ -1368,7 +1373,7 @@ const make = Effect.gen(function* () {
     const forkFromLiveSource =
       event.payload.archiveId === undefined ||
       (Option.isSome(sourceBinding) &&
-        isDeepStrictEqual(sourceBinding.value.resumeCursor, archivedSession.resumeCursor));
+        NodeUtil.isDeepStrictEqual(sourceBinding.value.resumeCursor, archivedSession.resumeCursor));
     let created = false;
     yield* Effect.gen(function* () {
       if (forkFromLiveSource && targetCount > 0 && !providerService.forkConversation) {
@@ -1475,8 +1480,17 @@ const make = Effect.gen(function* () {
   });
 
   const processDomainEvent = Effect.fn("processDomainEvent")(function* (event: OrchestrationEvent) {
-    if (event.type === "thread.turn-start-requested" || event.type === "thread.message-sent") {
-      if (event.type === "thread.turn-start-requested") pending.add(event.payload.threadId);
+    if (
+      event.type === "thread.turn-start-requested" ||
+      event.type === "thread.message-sent" ||
+      event.type === "thread.terminal-completion-continuation-started"
+    ) {
+      if (
+        event.type === "thread.turn-start-requested" ||
+        event.type === "thread.terminal-completion-continuation-started"
+      ) {
+        pending.add(event.payload.threadId);
+      }
       yield* ensurePreTurnBaselineFromDomainTurnStart(event);
       return;
     }
@@ -1620,6 +1634,7 @@ const make = Effect.gen(function* () {
         if (
           event.type !== "thread.turn-start-requested" &&
           event.type !== "thread.message-sent" &&
+          event.type !== "thread.terminal-completion-continuation-started" &&
           event.type !== "thread.checkpoint-revert-requested" &&
           event.type !== "thread.history-restore-requested" &&
           event.type !== "thread.history-fork-requested"

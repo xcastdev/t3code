@@ -49,6 +49,21 @@ export const ProjectTerminalHandle = Schema.Struct({
 });
 export type ProjectTerminalHandle = typeof ProjectTerminalHandle.Type;
 
+export const ProjectTerminalCompletionMode = Schema.Literals(["notice", "noticeAndWake"]);
+export type ProjectTerminalCompletionMode = typeof ProjectTerminalCompletionMode.Type;
+
+export const ProjectTerminalSubscribeCompletionInput = Schema.Struct({
+  projectId: ProjectId,
+  terminalId: TerminalToolkitId,
+  mode: ProjectTerminalCompletionMode,
+});
+export type ProjectTerminalSubscribeCompletionInput =
+  typeof ProjectTerminalSubscribeCompletionInput.Type;
+
+export const ProjectTerminalUnsubscribeCompletionInput = ProjectTerminalHandle;
+export type ProjectTerminalUnsubscribeCompletionInput =
+  typeof ProjectTerminalUnsubscribeCompletionInput.Type;
+
 export const ProjectTerminalStatus = Schema.Literals([
   "starting",
   "running",
@@ -75,6 +90,95 @@ export const ProjectTerminalSummary = Schema.Struct({
   updatedAt: Schema.String,
 });
 export type ProjectTerminalSummary = typeof ProjectTerminalSummary.Type;
+
+/** Metadata safe to show in a dock or activity row. It deliberately omits launch inputs. */
+export const ProjectTerminalDockSummary = Schema.Struct({
+  projectId: ProjectId,
+  terminalId: TerminalToolkitId,
+  creatingThreadId: ThreadId,
+  label: TerminalTitle,
+  status: ProjectTerminalStatus,
+  cols: TerminalCols,
+  rows: TerminalRows,
+  exitCode: Schema.NullOr(Schema.Int),
+  exitSignal: Schema.NullOr(Schema.Int),
+  updatedAt: Schema.String,
+});
+export type ProjectTerminalDockSummary = typeof ProjectTerminalDockSummary.Type;
+
+export const ProjectTerminalDockListInput = Schema.Struct({
+  projectId: ProjectId,
+  after: Schema.optional(TerminalToolkitId),
+  limit: Schema.optional(Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: 100 }))),
+});
+export type ProjectTerminalDockListInput = typeof ProjectTerminalDockListInput.Type;
+
+export const ProjectTerminalDockListResult = Schema.Struct({
+  terminals: Schema.Array(ProjectTerminalDockSummary).check(Schema.isMaxLength(100)),
+  nextCursor: Schema.NullOr(TerminalToolkitId),
+});
+export type ProjectTerminalDockListResult = typeof ProjectTerminalDockListResult.Type;
+
+export const ProjectTerminalAttachSnapshot = Schema.Struct({
+  terminal: ProjectTerminalDockSummary,
+  history: Schema.String.check(Schema.isMaxLength(8 * 1024 * 1024)),
+  cols: TerminalCols,
+  rows: TerminalRows,
+  sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+});
+export type ProjectTerminalAttachSnapshot = typeof ProjectTerminalAttachSnapshot.Type;
+
+export const ProjectTerminalAttachStreamEvent = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("snapshot"), snapshot: ProjectTerminalAttachSnapshot }),
+  Schema.Struct({
+    type: Schema.Literal("output"),
+    handle: ProjectTerminalHandle,
+    sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+    data: Schema.String.check(Schema.isMaxLength(65_536)),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("resized"),
+    handle: ProjectTerminalHandle,
+    sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+    cols: TerminalCols,
+    rows: TerminalRows,
+  }),
+  Schema.Struct({
+    type: Schema.Literal("exited"),
+    handle: ProjectTerminalHandle,
+    sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+    status: Schema.Literals(["exited", "killed", "error"]),
+    exitCode: Schema.NullOr(Schema.Int),
+    exitSignal: Schema.NullOr(Schema.Int),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("closed"),
+    handle: ProjectTerminalHandle,
+    sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  }),
+  Schema.Struct({
+    type: Schema.Literal("reconnect"),
+    handle: ProjectTerminalHandle,
+    sequence: Schema.Int.check(Schema.isGreaterThanOrEqualTo(0)),
+  }),
+]);
+export type ProjectTerminalAttachStreamEvent = typeof ProjectTerminalAttachStreamEvent.Type;
+
+export const ProjectTerminalMetadataStreamEvent = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("snapshot"),
+    projectId: ProjectId,
+    terminals: Schema.Array(ProjectTerminalDockSummary).check(Schema.isMaxLength(100)),
+    nextCursor: Schema.NullOr(TerminalToolkitId),
+  }),
+  Schema.Struct({ type: Schema.Literal("upsert"), terminal: ProjectTerminalDockSummary }),
+  Schema.Struct({
+    type: Schema.Literal("remove"),
+    projectId: ProjectId,
+    terminalId: TerminalToolkitId,
+  }),
+]);
+export type ProjectTerminalMetadataStreamEvent = typeof ProjectTerminalMetadataStreamEvent.Type;
 
 export const ProjectTerminalCreateInput = Schema.Struct({
   ...ProjectTerminalHandle.fields,
@@ -210,7 +314,18 @@ export type TerminalReadResult = typeof TerminalReadResult.Type;
 export class TerminalToolError extends Schema.TaggedError<TerminalToolError>()(
   "TerminalToolError",
   {
-    operation: Schema.Literals(["spawn", "list", "read", "write", "resize", "kill", "close"]),
+    operation: Schema.Literals([
+      "spawn",
+      "list",
+      "read",
+      "attach",
+      "write",
+      "resize",
+      "kill",
+      "close",
+      "subscribeCompletion",
+      "unsubscribeCompletion",
+    ]),
     reason: Schema.Literals([
       "unavailable",
       "invalid-cwd",
@@ -223,6 +338,7 @@ export class TerminalToolError extends Schema.TaggedError<TerminalToolError>()(
       "invalid-cursor",
       "invalid-search-cursor",
       "invalid-budget",
+      "subscription-limit",
     ]),
     projectId: ProjectId,
     terminalId: Schema.optional(TerminalToolkitId),

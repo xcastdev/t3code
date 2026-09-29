@@ -307,6 +307,7 @@ validationLayer("CodexAdapterLive validation", (it) => {
     Effect.gen(function* () {
       validationRuntimeFactory.factory.mockClear();
       const adapter = yield* CodexAdapter;
+      NodeAssert.equal(adapter.capabilities.activeTurnSteer, false);
 
       yield* adapter.startSession({
         provider: ProviderDriverKind.make("codex"),

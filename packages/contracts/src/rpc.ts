@@ -273,6 +273,16 @@ import {
   TerminalWriteInput,
 } from "./terminal.ts";
 import {
+  ProjectTerminalAttachStreamEvent,
+  ProjectTerminalDockListInput,
+  ProjectTerminalDockListResult,
+  ProjectTerminalHandle,
+  ProjectTerminalMetadataStreamEvent,
+  ProjectTerminalResizeInput,
+  ProjectTerminalWriteInput,
+  TerminalToolError,
+} from "./terminalToolkit.ts";
+import {
   DiscoveredLocalServerList,
   ConfiguredLocalServerUrls,
   PreviewCloseInput,
@@ -532,6 +542,11 @@ export const WS_METHODS = {
   terminalClear: "terminal.clear",
   terminalRestart: "terminal.restart",
   terminalClose: "terminal.close",
+  projectTerminalAttach: "projectTerminal.attach",
+  projectTerminalMetadata: "projectTerminal.metadata",
+  projectTerminalList: "projectTerminal.list",
+  projectTerminalWrite: "projectTerminal.write",
+  projectTerminalResize: "projectTerminal.resize",
 
   // Preview methods
   previewOpen: "preview.open",
@@ -1875,6 +1890,36 @@ const WsTerminalCloseRpc = Rpc.make(WS_METHODS.terminalClose, {
   error: Schema.Union([TerminalError, EnvironmentAuthorizationError]),
 });
 
+const WsProjectTerminalAttachRpc = Rpc.make(WS_METHODS.projectTerminalAttach, {
+  payload: ProjectTerminalHandle,
+  success: ProjectTerminalAttachStreamEvent,
+  error: Schema.Union([TerminalToolError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
+const WsProjectTerminalMetadataRpc = Rpc.make(WS_METHODS.projectTerminalMetadata, {
+  payload: ProjectTerminalDockListInput.fields.projectId,
+  success: ProjectTerminalMetadataStreamEvent,
+  error: Schema.Union([TerminalToolError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
+const WsProjectTerminalListRpc = Rpc.make(WS_METHODS.projectTerminalList, {
+  payload: ProjectTerminalDockListInput,
+  success: ProjectTerminalDockListResult,
+  error: Schema.Union([TerminalToolError, EnvironmentAuthorizationError]),
+});
+
+const WsProjectTerminalWriteRpc = Rpc.make(WS_METHODS.projectTerminalWrite, {
+  payload: ProjectTerminalWriteInput,
+  error: Schema.Union([TerminalToolError, EnvironmentAuthorizationError]),
+});
+
+const WsProjectTerminalResizeRpc = Rpc.make(WS_METHODS.projectTerminalResize, {
+  payload: ProjectTerminalResizeInput,
+  error: Schema.Union([TerminalToolError, EnvironmentAuthorizationError]),
+});
+
 const WsPreviewOpenRpc = Rpc.make(WS_METHODS.previewOpen, {
   payload: PreviewOpenInput,
   success: PreviewSessionSnapshot,
@@ -2146,7 +2191,15 @@ const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeResourceTel
   stream: true,
 });
 
-export const WsRpcGroup = RpcGroup.make(
+export const WsProjectTerminalRpcGroup = RpcGroup.make(
+  WsProjectTerminalAttachRpc,
+  WsProjectTerminalMetadataRpc,
+  WsProjectTerminalListRpc,
+  WsProjectTerminalWriteRpc,
+  WsProjectTerminalResizeRpc,
+);
+
+export const WsBaseRpcGroup = RpcGroup.make(
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerGetProviderCatalogRpc,
@@ -2374,3 +2427,5 @@ export const WsRpcGroup = RpcGroup.make(
   WsOrchestrationSubscribeThreadRpc,
   WsOrchestrationGetAgentTranscriptPageRpc,
 );
+
+export const WsRpcGroup = WsBaseRpcGroup.merge(WsProjectTerminalRpcGroup);

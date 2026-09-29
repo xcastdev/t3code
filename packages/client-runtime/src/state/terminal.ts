@@ -1,4 +1,10 @@
-import { type TerminalSummary, WS_METHODS } from "@t3tools/contracts";
+import {
+  type ProjectId,
+  type ProjectTerminalHandle,
+  type ProjectTerminalDockSummary,
+  type TerminalSummary,
+  WS_METHODS,
+} from "@t3tools/contracts";
 import * as Stream from "effect/Stream";
 import { Atom } from "effect/unstable/reactivity";
 
@@ -13,6 +19,9 @@ import { subscribe, type EnvironmentRpcInput } from "../rpc/client.ts";
 import {
   applyTerminalAttachStreamEvent,
   applyTerminalMetadataStreamEvent,
+  applyProjectTerminalAttachStreamEvent,
+  applyProjectTerminalMetadataStreamEvent,
+  EMPTY_PROJECT_TERMINAL_BUFFER_STATE,
   nextTerminalAttachSeedState,
 } from "./terminalSession.ts";
 
@@ -36,6 +45,26 @@ export function createTerminalEnvironmentAtoms<R, E>(
     readonly input: { readonly threadId: string; readonly terminalId?: string | undefined };
   }) => JSON.stringify([environmentId, input.threadId, input.terminalId ?? null]);
   const lifecycleConcurrency = { mode: "serial" as const, key: terminalThreadKey };
+  const subscribeProjectAttach = (input: {
+    readonly projectId: ProjectId;
+    readonly terminalId: ProjectTerminalHandle["terminalId"];
+    readonly attachmentGeneration?: number;
+  }) =>
+    subscribe(WS_METHODS.projectTerminalAttach, {
+      projectId: input.projectId,
+      terminalId: input.terminalId,
+    }).pipe(
+      Stream.scan(
+        {
+          ...EMPTY_PROJECT_TERMINAL_BUFFER_STATE,
+          output: {
+            ...EMPTY_PROJECT_TERMINAL_BUFFER_STATE.output,
+            generation: input.attachmentGeneration ?? 0,
+          },
+        },
+        applyProjectTerminalAttachStreamEvent,
+      ),
+    );
   return {
     attach: createEnvironmentSubscriptionAtomFamily(runtime, {
       label: "environment-data:terminal:attach",
@@ -56,6 +85,49 @@ export function createTerminalEnvironmentAtoms<R, E>(
         subscribe(WS_METHODS.subscribeTerminalMetadata, {}).pipe(
           Stream.scan([] as ReadonlyArray<TerminalSummary>, applyTerminalMetadataStreamEvent),
         ),
+    }),
+    projectMetadata: createEnvironmentSubscriptionAtomFamily(runtime, {
+      label: "environment-data:terminal:project-metadata",
+      subscribe: (input: { readonly projectId: ProjectId }) =>
+        subscribe(WS_METHODS.projectTerminalMetadata, input.projectId).pipe(
+          Stream.scan(
+            {
+              terminals: [] as ReadonlyArray<ProjectTerminalDockSummary>,
+              nextCursor: null,
+              snapshotVersion: 0,
+              revision: 0,
+              removedTerminalIds: [],
+            },
+            applyProjectTerminalMetadataStreamEvent,
+          ),
+        ),
+    }),
+    projectAttach: createEnvironmentSubscriptionAtomFamily(runtime, {
+      label: "environment-data:terminal:project-attach",
+      idleTtlMs: 0,
+      subscribe: (input: {
+        readonly projectId: ProjectId;
+        readonly terminalId: ProjectTerminalHandle["terminalId"];
+        readonly attachmentGeneration?: number;
+      }) => Stream.suspend(() => subscribeProjectAttach(input)),
+    }),
+    projectList: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:terminal:project-list",
+      tag: WS_METHODS.projectTerminalList,
+    }),
+    projectWrite: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:terminal:project-write",
+      tag: WS_METHODS.projectTerminalWrite,
+    }),
+    projectResize: createEnvironmentRpcCommand(runtime, {
+      label: "environment-data:terminal:project-resize",
+      tag: WS_METHODS.projectTerminalResize,
+      scheduler: resizeScheduler,
+      concurrency: {
+        mode: "latest",
+        key: ({ environmentId, input }) =>
+          JSON.stringify([environmentId, input.projectId, input.terminalId]),
+      },
     }),
     open: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:terminal:open",
