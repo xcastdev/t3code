@@ -7,10 +7,10 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-09-30 22:55 UTC. **Implementation resumed after the restart.**
+Last updated: 2026-09-30 23:04 UTC. **Implementation resumed after the restart.**
 The harness now provides eleven active slots: the coordinator plus ten subagents.
-Five implementation owners and the existing P7 reviewer are active; the remaining
-slots are available for independent work and reviews. Existing reviewers are reused for their repair gates.
+Five implementation owners and three reviewers hold eight subagent slots; two
+slots remain available for independent work and reviews. Existing reviewers are reused for their repair gates.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
@@ -21,35 +21,36 @@ slots are available for independent work and reviews. Existing reviewers are reu
 - **Done:** P1 bounded dependency/runtime/isolation/packaging and memory-selection
   proofs are reviewed and landed. Production pi and memory integration remain later work.
 - **P2:** reviewed and merged into wave2, awaiting the combined P2/P3 gate and main merge.
-- **P3:** the unapproved `2d3a4481` candidate has a confirmed cancellation gap while
-  legacy-token withdrawal waits for SQL. The approved repair moves exact managed
-  identity withdrawal into the existing validated run-binding producer transaction.
-  The owner is proving atomic commit/rollback, cancellation, retirement, replay and
-  file-backed restart. No migration, startup service or broad cancellation mask is approved.
+- **P3:** repaired candidate `56eaf75e` passes 13 focused cases, 280 affected tests
+  and the normal server compiler. The coordinator verifies all 95 evidence hashes,
+  32 committed source/archive matches and 17 drained scopes. Exact legacy withdrawal
+  now commits with validated binding events; rollback/cancellation and file-backed
+  restart controls pass. Its same reviewer is independently rechecking the candidate.
+  Five unchanged Lifecycle lint errors remain baseline failures.
 - **P4 preparatory policy:** a separate owner is proposing a pure gate/dependency
-  policy against reviewed P2 schemas. Source edits await coordinator agreement;
-  full P4 remains dependent on P3.
+  policy against reviewed P2 schemas. The agreed narrow gate/dependency leaf passes 70 cases and the normal compiler;
+  final scoped checks/commit are underway. Full P4 remains dependent on P3.
 - **P5 preparatory transport:** `7d9a345fa84c71bd16ec9d724dea3be89ce16273`
   receives APPROVE from its same sole xhigh reviewer. All 66 affected tests and seven
   independent probe groups pass. Helper `05172c6` is separately approved. These branches
   remain isolated; full P5 sync, persistence, lifecycle dependencies and real API gates
   remain open.
-- **P7 preparatory skills:** the invalid custom-map cleanup repair passes all 67
-  affected tests, the exact reviewer probes and normal two-file compiler.
-  Repair `24fae0c5` is committed; the coordinator verifies all 48 evidence hashes,
-  14 committed source/archive matches and 12 drained scopes. The same reviewer is
-  rechecking the exact candidate read-only.
-  Shared materializer files and ordinary adapters remain unchanged.
-  A separate owner is implementing the agreed private protocol from P1 proofs.
-- **P10 preparatory memory adapter:** a separate owner is inspecting the selected
-  Mem0 proof and current source contracts to propose the smallest concrete adapter
-  boundary. Source edits await coordinator agreement; full P10 still needs P8–P9.
-- **P11 preparatory evidence policy:** its owner corrected ignored dependency links;
-  the meaningful behavior control fails 23/24 cases against the permissive stub and
-  all 24 cases pass on the policy. Normal two-file compiler and scoped checks pass;
-  the owner is preparing its exact two-path commit.
-  The earlier zero-test loader failure is setup
-  evidence, not a behavior test. No commit, review, wiring or parent completion is claimed.
+- **P7 preparatory skills:** `24fae0c5` passes its 67 affected tests, but the same
+  reviewer finds a destructive wrong-target cleanup case: a custom returned root
+  causes identity-based disposal to delete an earlier valid default generation.
+  The coordinator reproduces it. A minimal repair removes only the exact pinned
+  returned root, preserving the prior generation; its owner waits briefly while
+  the reviewer seals the old candidate report. The separate private protocol owner
+  passes 39 focused cases and its normal compiler; final causal/scoped gates remain.
+- **P10 preparatory memory adapter:** the agreed five-file leaf implements the
+  native selected Mem0 vector adapter, concrete serialized dispatcher and durable
+  derived namespace/deletion fences. It consumes prepared vectors and frozen T3
+  records; extraction, service wiring and full P8–P9-dependent integration remain open.
+- **P11 preparatory evidence policy:** candidate `090589f4` passes 24 focused cases,
+  normal two-file compiler and scoped checks. The coordinator verifies 42 evidence
+  hashes, six committed source/archive matches and nine drained scopes. Its one
+  fresh xhigh reviewer is inspecting the exact candidate. The earlier zero-test
+  loader failure remains distinct from the meaningful 23/24-failing behavior control.
 - **Left:** P6, P8–P9 and P12–P14 (6 steps not started), the remaining active-step
   implementation, all 19 acceptance criteria and both final audits.
 - **Next gate:** inspect/review the P3 repair, then validate/review the combined P2/P3
@@ -70,22 +71,22 @@ transitions. Finished agents release their seat; a repair returns to its existin
 reviewer. Branches below have isolated worktrees under
 `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                          | State                         | Assignment / branch                                         | Next gate                                                                  |
-| ---- | ------------------------------ | ----------------------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------- |
-| 1    | `p3_authorization_resume_high` | Implementing                  | P3 producer-atomic withdrawal; `pi-teams/p3-authorization`  | Focused SQL cancellation/rollback/restart proof, then existing P3 reviewer |
-| 2    | `review_p7_skills_slice`       | Reviewing read-only           | P7 cleanup candidate `24fae0c5`; `pi-teams/p7-skills-slice` | Same reviewer rechecks R2 and original interruption/ownership controls     |
-| 3    | `p5_intake_transport_high`     | Committing verified leaf      | P11 pure evidence policy; `pi-teams/p11-evidence-leaf`      | Coordinator inspection, then one fresh review                              |
-| 4    | `p7_worker_protocol_high`      | Implementing agreed interface | P7 private protocol; `pi-teams/p7-worker-protocol`          | Bounded wire/state tests, scoped commit and review                         |
-| 5    | `p10_backend_adapter_high`     | Preparing interface           | P10 selected memory adapter; `pi-teams/p10-backend-adapter` | Coordinator agrees concrete backend boundary before source edits           |
-| 6    | `p4_policy_leaf_high`          | Preparing interface           | P4 pure lifecycle policy; `pi-teams/p4-policy-leaf`         | Coordinator agrees reviewed-schema boundary before source edits            |
-| 7    | —                              | Available                     | Independent work or review                                  | Assign when prerequisites and writable scope are settled                   |
-| 8    | —                              | Available                     | Independent work or review                                  | Assign when prerequisites and writable scope are settled                   |
-| 9    | —                              | Available                     | Independent work or review                                  | Assign when prerequisites and writable scope are settled                   |
-| 10   | —                              | Available                     | Independent work or review                                  | Assign when prerequisites and writable scope are settled                   |
+| Slot | Agent                      | State                                 | Assignment / branch                                             | Next gate                                                                  |
+| ---- | -------------------------- | ------------------------------------- | --------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| 1    | `review_p3_authority`      | Reviewing read-only                   | P3 authority candidate `56eaf75e`; `pi-teams/p3-authorization`  | Same reviewer verifies producer atomicity and all prior authority findings |
+| 2    | `review_p7_skills_slice`   | Reviewing read-only                   | P7 cleanup candidate `24fae0c5`; `pi-teams/p7-skills-slice`     | Same reviewer rechecks R2 and original interruption/ownership controls     |
+| 3    | `review_p11_evidence_leaf` | Reviewing read-only                   | P11 evidence candidate `090589f4`; `pi-teams/p11-evidence-leaf` | Independent applicability/failure review                                   |
+| 4    | `p7_worker_protocol_high`  | Final focused checks                  | P7 private protocol; `pi-teams/p7-worker-protocol`              | Causal wire/state gates, scoped commit and one fresh review                |
+| 5    | `p10_backend_adapter_high` | Implementing agreed interface         | P10 native index adapter; `pi-teams/p10-backend-adapter`        | Native store crash/deletion/namespace controls, scoped commit and review   |
+| 6    | `p4_policy_leaf_high`      | Final focused checks                  | P4 pure lifecycle policy; `pi-teams/p4-policy-leaf`             | Exact-byte compiler, scoped commit and one fresh review                    |
+| 7    | `p7_skills_slice_high`     | Waiting for old review report to seal | P7 wrong-target cleanup repair; `pi-teams/p7-skills-slice`      | Fixture ownership correction, focused gate, existing reviewer recheck      |
+| 8    | `p5_sync_leaf_high`        | Preparing interface                   | P5 intake sync; `pi-teams/p5-sync-leaf`                         | Coordinator agrees reviewed-cursor/cache boundary before edits             |
+| 9    | —                          | Available                             | Independent work or review                                      | Assign when prerequisites and writable scope are settled                   |
+| 10   | —                          | Available                             | Independent work or review                                      | Assign when prerequisites and writable scope are settled                   |
 
 Coordinator: updating this record, inspecting committed candidates, agreeing shared
 interfaces, reserving one normal compiler at a time and preparing wave2 integration.
-P3, P7 and P11 normal compilers have passed and drained; the reservation is free. No model or
+P4 holds the final-byte compiler reservation; earlier P3/P7/P11 compilers drained. No model or
 client runtime proof is running.
 
 Primary branch: `t3code/implement-pi-project-teams`; restart checkpoint commit
@@ -93,7 +94,8 @@ Primary branch: `t3code/implement-pi-project-teams`; restart checkpoint commit
 `26934dd5eea672be47ee7f537d210d30723f4464`, reconciled with earlier main `4933715`;
 354 source files remain byte-identical. Reconcile newer documentation commits before
 its main merge. No P3, P5, P7 or P11 source has landed on main. New protocol and memory
-adapter worktrees start at the exact wave2 commit. Historical pause evidence remains
+adapter and P4 policy worktrees start at the exact wave2 commit. The P5 sync leaf
+starts at approved transport candidate `7d9a345f`. Historical pause evidence remains
 below and in `/home/user/.cache/pi-project-teams-11b7e351/pause-20260930/RESUME.md`.
 
 ## Goal
