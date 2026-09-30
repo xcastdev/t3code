@@ -7,74 +7,108 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-09-30 22:14 UTC. Implementation has resumed. The coordinator
-maintains this section at assignments, check results, reviews, and integration
-gates; detailed evidence and historical checkpoints are below.
+Last updated: 2026-09-30 23:15 UTC. **Implementation resumed after the restart.**
+The harness now provides eleven active slots: the coordinator plus ten subagents.
+Three implementation owners and four reviewers hold seven subagent slots; three
+slots remain available for independent work and reviews. Existing reviewers are reused for their repair gates.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
-| Implementation steps        | 1    | 4      | 9    | 14    |
+| Implementation steps        | 1    | 7      | 6    | 14    |
 | Product acceptance criteria | 0    | 0      | 19   | 19    |
 | Final independent audits    | 0    | 0      | 2    | 2     |
 
-- **Done:** P1 dependency proofs and memory selection landed. Regenerated bounded
-  pi runtime, Linux isolation/packaging, and remote memory evidence is reviewed.
-- **Active:** P2 is reviewed and merged into wave2, awaiting combined integration.
-  P3 withdrawal-repair candidate `614329d713b952ac88d71c4b3297c31f17d9fb57`
-  passes 272 affected tests, the unchanged normal server-entry compiler and
-  scoped checks. Coordinator inspection verifies all 93 new evidence artifacts
-  and 32 source/archive hashes. Server-scoped Knip passes on this exact commit.
-  The same xhigh reviewer confirms the earlier cases but finds concurrent binding
-  creation between withdrawal and discovery. The coordinator reproduces that race;
-  the same owner is repairing it. A short transaction fixes the binding race but
-  cancellation rolls withdrawal back; two retained controls confirm the old
-  bearer and held guard survive restart. The owner is testing a single-observation
-  withdrawal boundary. P3 remains unapproved.
-  Five unchanged Lifecycle baseline lint errors
-  remain failed evidence; no unrelated cleanup is claimed.
-- **Active preparatory slice:** P5 transport repair is committed as
-  `7d9a345fa84c71bd16ec9d724dea3be89ce16273`, with 66 affected tests, normal
-  focused compiler, lint, format and diff passing. Its helper `05172c6` is
-  independently approved. Coordinator inspection verifies all 53 new artifacts,
-  seven current/committed/archive source paths and 13 drained scopes. The same
-  xhigh reviewer is rechecking numeric pagination, header-first quota pauses and
-  the one-minute fallback. Conditional-read identity postchecks remain a limitation.
-  Full P5 persistence, authorization, sync and dispatch wiring, P2–P4 prerequisites
-  and intake/integration gates remain open.
-- **Active preparatory slice:** P7 skill cleanup repair is committed as
-  `a38c13ac7b8a1098755fd2cde926c75458d0a63a`, with 63 affected tests, normal
-  focused compiler, lint, format and diff passing. The original reviewer's three
-  cancellation probes now pass; four causal controls detect leaks or foreign-file
-  deletion. Coordinator inspection verifies 65 new artifacts, 14 source/archive
-  paths, the exact four-file repair and 21 drained scopes. The same xhigh reviewer
-  is rechecking. Full P7 runtime, authorization wiring, isolation and packaging
+- **Done:** P1 bounded dependency/runtime/isolation/packaging and memory-selection
+  proofs are reviewed and landed. Production pi and memory integration remain later work.
+- **P2:** reviewed and merged into wave2, awaiting the combined P2/P3 gate and main merge.
+- **P3:** repaired candidate `56eaf75e` passes 13 focused cases, 280 affected tests
+  and the normal server compiler. The coordinator verifies all 95 evidence hashes,
+  32 committed source/archive matches and 17 drained scopes. Exact legacy withdrawal
+  now commits with validated binding events; rollback/cancellation and file-backed
+  restart controls pass. Its same reviewer is independently rechecking the candidate after a review-runner
+  rejection; no approval is inferred from the runner error.
+  Five unchanged Lifecycle lint errors remain baseline failures.
+- **P4 preparatory policy:** a separate owner is proposing a pure gate/dependency
+  policy against reviewed P2 schemas. The agreed narrow gate/dependency leaf passes 70 cases and the normal compiler;
+  candidate `76089058` is committed and its sole fresh reviewer is checking it. Full P4 remains dependent on P3.
+- **P5 preparatory transport:** `7d9a345fa84c71bd16ec9d724dea3be89ce16273`
+  receives APPROVE from its same sole xhigh reviewer. All 66 affected tests and seven
+  independent probe groups pass. Helper `05172c6` is separately approved. The pure sync/intake leaf starts from
+  reconciled base `9bdd1872`; all P2 source and four approved transport/helper files
+  match their reviewed candidates, and six combined files pass 78 tests. These branches
+  remain isolated; full P5 sync, persistence, lifecycle dependencies and real API gates
   remain open.
-- **Left:** P4, P6 and P8–P14 (9 steps not started), the rest of P5/P7, all 19
-  product acceptance criteria, and both final audits. After P2/P3 lands, full P7
-  can run alongside P4; full P5 follows P4.
-- **Current gate:** finish and review P3, validate/review the combined P2/P3 wave,
-  reconcile the main worktree, then merge locally. Dependent implementation waits
-  on this gate; bounded independent preparatory slices may overlap under the
-  strategy below. Backend helper tests do not establish real client compatibility.
-- **Team:** Sol high implementation staffing has no plan-level limit; dispatch
-  ready independent scopes within available harness slots, including safe work
-  across multiple phases or independent parts of phases simultaneously.
-  One xhigh reviewer per piece of work, reused for repairs; two fresh final
-  reviewers. One owner retains shared contracts, migrations, wiring and dependencies.
-- **Permissions/evidence still needed:** browser/device permission when integrated
-  clients are ready; explicit disposable GitHub fixture-write permission for the
-  required real issue-to-PR proof. No local models, push, or PR is authorized. The
-  exhausted eight-call P1 proof budget must not be reused.
+- **P7 preparatory skills:** repaired candidate `ce7bc036` passes 14 focused cases,
+  71 affected tests and the normal compiler. The coordinator verifies 76 evidence
+  hashes, 14 committed source/archive matches and a direct consumer proof: cleanup
+  removes the pinned returned root and preserves the earlier valid generation.
+  Its same reviewer is rechecking it. The earlier malformed-probe finalizer failure
+  and lost premature raw log remain explicit limitations, not passing evidence.
+- **P7 protocol:** candidate `f9cce4f0` passes 41 focused tests, five causal mutations
+  and its normal compiler. The coordinator verifies 79 artifacts and the exact patch;
+  its one fresh reviewer is checking duplicate ACK and lifecycle-ordering cases.
+- **P7 managed process:** a separate owner implements the agreed three-file Linux
+  launch boundary using P1's proven systemd/bwrap/pidfd prerequisites. Ownership must
+  be established before setup or worker startup. Unproved hosts fail closed; real
+  disposable Linux process checks remain required, with packaging/wiring still later.
+- **P10 preparatory memory adapter:** the agreed five-file leaf implements the
+  native selected Mem0 vector adapter, concrete serialized dispatcher and durable
+  derived namespace/deletion fences. It consumes prepared vectors and frozen T3
+  records; extraction, service wiring and full P8–P9-dependent integration remain open.
+- **P11 preparatory evidence policy:** candidate `090589f4` passes 24 focused cases,
+  normal two-file compiler and scoped checks. The coordinator verifies 42 evidence
+  hashes, six committed source/archive matches and nine drained scopes. Its one
+  fresh xhigh reviewer returns APPROVE on the exact candidate; 12 independent probe
+  groups and five causal controls pass, and all 25 review artifact hashes verify.
+  The leaf is held for dependency-ordered integration; full P11 remains incomplete. The earlier zero-test
+  loader failure remains distinct from the meaningful 23/24-failing behavior control.
+- **Left:** P6, P8–P9 and P12–P14 (6 steps not started), the remaining active-step
+  implementation, all 19 acceptance criteria and both final audits.
+- **Next gate:** inspect/review the P3 repair, then validate/review the combined P2/P3
+  wave and merge locally. Independent reviewed preparatory slices continue in parallel.
+- **Team:** Sol high implementation owners across safe independent phase slices;
+  one xhigh reviewer per piece reused for repairs, then two fresh final reviewers.
+  One owner retains shared contracts, migrations, wiring and dependencies.
+- **Outstanding permissions/evidence:** integrated browser/device permission when ready;
+  explicit disposable GitHub fixture-write permission for the real issue-to-PR proof.
+  No local models, OpenAI runtime/proof services, push or PR creation. The exhausted
+  eight-call P1 proof budget must not be reused. Development repair limits remain waived.
 
-Main baseline for this resumption: `0e40a230a2560e79da3baf06f2a1154175d0b910`.
-Wave2 is `5fa23d306dc3a83140a8452c772fe7bf318b9127`, after reconciling the main
-documentation commit `3f42e53`; 196 foundation source files remain byte-identical.
-P3's worktree is
-`/home/user/.cache/pi-project-teams-11b7e351/p3-authorization`, branch
-`pi-teams/p3-authorization`, base `c3ed6d3d4c606f66b9c07000246f16682df035af`.
-Its committed repair candidate is `614329d713b952ac88d71c4b3297c31f17d9fb57`;
-it remains isolated and has not merged. Fresh repair evidence is retained in
-`/home/user/.cache/pi-project-teams-11b7e351/p3-withdrawal-repair-evidence/`.
+### Live agent slots
+
+This table tracks the ten subagent seats, not a limit on cumulative assignments.
+The coordinator updates it at dispatch, waiting, review, commit and integration
+transitions. Finished agents release their seat; a repair returns to its existing
+reviewer. Branches below have isolated worktrees under
+`/home/user/.cache/pi-project-teams-11b7e351/`.
+
+| Slot | Agent                                | State                         | Assignment / branch                                                | Next gate                                                                          |
+| ---- | ------------------------------------ | ----------------------------- | ------------------------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| 1    | `review_p3_authority`                | Reviewing read-only           | P3 authority candidate `56eaf75e`; `pi-teams/p3-authorization`     | Same reviewer verifies producer atomicity and all prior authority findings         |
+| 2    | `review_p7_worker_protocol`          | Reviewing read-only           | P7 protocol candidate `f9cce4f0`; `pi-teams/p7-worker-protocol`    | Independent wire/barrier/duplicate-message review                                  |
+| 3    | — (last: `review_p11_evidence_leaf`) | Available; P11 leaf APPROVE   | P11 `090589f4` held for later integration                          | Assign independent ready work or a wave review                                     |
+| 4    | — (last: `p7_worker_protocol_high`)  | Available; protocol committed | P7 `f9cce4f0` under review in slot 2                               | Assign independent ready work or a review                                          |
+| 5    | `p10_backend_adapter_high`           | Final native/adapter checks   | P10 native index adapter; `pi-teams/p10-backend-adapter`           | Crash/deletion/namespace controls, scoped commit and review                        |
+| 6    | `review_p4_policy_leaf`              | Reviewing read-only           | P4 gate/dependency candidate `76089058`; `pi-teams/p4-policy-leaf` | Independent exact-gate and completion review                                       |
+| 7    | `review_p7_skills_slice`             | Reviewing read-only           | P7 cleanup candidate `ce7bc036`; `pi-teams/p7-skills-slice`        | Same reviewer checks R3 repair and prior interruption/ownership controls           |
+| 8    | `p5_sync_leaf_high`                  | Implementing agreed pure leaf | P5 intake sync; `pi-teams/p5-sync-leaf`                            | Bounded snapshot/fence/stable-identity tests; persistence remains root integration |
+| 9    | `p7_managed_process_high`            | Implementing agreed interface | P7 Linux owned launcher; `pi-teams/p7-managed-process`             | Ownership before launch, real disposable process drains, scoped review             |
+| 10   | —                                    | Available                     | Independent work or review                                         | Assign when prerequisites and writable scope are settled                           |
+
+Coordinator: updating this record, inspecting committed candidates, agreeing shared
+interfaces, reserving one normal compiler at a time and preparing wave2 integration.
+The normal compiler reservation is free; completed P3/P4/P7/P11 and memory-adapter
+compiler scopes have drained. Owners request it before the next final-byte check. No model or
+client runtime proof is running.
+
+Primary branch: `t3code/implement-pi-project-teams`; restart checkpoint commit
+`238126a8b8567cd93bac894e3ef1cf7a8f609f3a`. Wave2 remains
+`26934dd5eea672be47ee7f537d210d30723f4464`, reconciled with earlier main `4933715`;
+354 source files remain byte-identical. Reconcile newer documentation commits before
+its main merge. No P3, P5, P7 or P11 source has landed on main. New protocol and memory
+adapter and P4 policy worktrees start at the exact wave2 commit. The P5 sync leaf
+starts at reconciled approved foundation/transport base `9bdd1872`. Historical pause evidence remains
+below and in `/home/user/.cache/pi-project-teams-11b7e351/pause-20260930/RESUME.md`.
 
 ## Goal
 
@@ -316,8 +350,10 @@ There is no fixed worker count or cumulative limit on implementation subagents.
 Use all available slots for ready, independent scopes and dispatch more work as
 slots become available. Respect the harness's actual active-agent limit, including
 the lead and reviewers; unlimited staffing does not override that limit. Free an
-implementation slot before starting a reviewer when needed. Do not change harness
-limits or the product's runtime concurrency policy. The stage assignments below
+implementation slot before starting a reviewer when needed. The user authorizes
+raising the Codex harness configuration to 10 subagents; the resumed session
+confirms eleven active agents including the coordinator. Maintain the live slot table
+above as assignments change. Do not change the product's runtime concurrency policy. The stage assignments below
 identify dependency groups, not fixed seats; split each group into additional
 independent slices only after agreeing explicit scopes, interfaces, and checks.
 
@@ -2401,3 +2437,71 @@ interpretation or later denial, with no enclosing rollback transaction. The publ
 one-argument discover interface remains unchanged. Actual observation-timing and
 post-UPDATE cancellation controls must pass before the same P3 reviewer rechecks.
 No P3 approval or integration is inferred from passing earlier cases.
+
+### Restart checkpoint, 2026-09-30
+
+The user asks to pause immediately and checkpoint everything for a Codex restart.
+The coordinator interrupts the active P3 owner and P11 evidence-policy owner;
+P5 review has completed and P7 review finishes with its formal verdict. There are
+no worker-owned servers or model processes to stop. All 49 captured current task
+scopes are checked drained, and no known task scope is running. No implementation
+continues during the checkpoint. Preserve every branch, commit and unfinished file.
+
+| Worktree under `/home/user/.cache/pi-project-teams-11b7e351/` | Exact HEAD                                 | State                                                 |
+| ------------------------------------------------------------- | ------------------------------------------ | ----------------------------------------------------- |
+| `wave2`                                                       | `26934dd5eea672be47ee7f537d210d30723f4464` | Clean, P2 only; combined gate waits for P3            |
+| `p3-authorization`                                            | `2d3a4481b0d34c2f057ae833b40e8ca7de9b5e2b` | Clean, valid later failure blocks approval            |
+| `p5-intake-transport`                                         | `7d9a345fa84c71bd16ec9d724dea3be89ce16273` | Clean, leaf review APPROVE; unmerged                  |
+| `p7-skills-slice`                                             | `a38c13ac7b8a1098755fd2cde926c75458d0a63a` | Clean, leaf review REQUEST_CHANGES; unmerged          |
+| `p11-evidence-leaf`                                           | `5fa23d306dc3a83140a8452c772fe7bf318b9127` | Two untracked assigned files; no checks/commit/review |
+
+P5's same-reviewer repair report is
+`review-p5-intake-transport/repair-7d9a345f/review.md`: 20-artifact manifest SHA256
+`d84a7a1a7749782a4cf363946de1bd65f427f377950b07ef886a6375f5fc8689`.
+It independently reruns 66 affected tests and seven full-consumer probe groups;
+matching normal compiler evidence is inspected and reused. Approval covers the
+bounded leaf only. It does not establish real GitHub snapshot/API behavior.
+
+P7's same-reviewer repair report is
+`review-p7-skills-slice/repair-a38c13ac/review.md`: 30-artifact JSON manifest SHA256
+`6e07ba67bffbf1568f7c7323e3d07fa158ae5406f7a6770336587cc0abeb6e96`.
+R1 passes; R2 remains: malformed custom output rejects before fallback ownership
+is pinned, leaving its real matching-marker owned root behind. Root's exact replay
+and revocation control are in `root-p7-custom-verification/`; no repair is started.
+The same worker and reviewer must continue this piece when work resumes.
+
+P3's clean new candidate passes the earlier observation-race and completed-UPDATE
+cancellation controls, but the coordinator asks for the distinct interval between
+nonempty SELECT observation and UPDATE acquiring the connection. The owner proves
+it unsafe using the actual SQL client: a competing transaction owns the permit,
+issuance requests UPDATE then is interrupted, and after owner release/purge/fresh
+same-key Auth the raw bearer and held guard both succeed, with one callback.
+`p3-binding-race-repair-evidence/observed-binding-queued-update-observations.json`
+and the external probe/results retain this failure. The owner's narrow critical
+section proposal is pending coordinator assessment, not an approved fix. Earlier
+failed transaction variants and successful checks remain intact. No review approval
+or combined-wave run is claimed for this candidate.
+
+P11's independent slice has settled P2 schema prerequisites only; full P11 retains
+P4–P5/P8–P10 dependencies. Exclusive scope is the two new evidence-policy files,
+base `5fa23d3`, branch `pi-teams/p11-evidence-leaf`. Its self-contained brief is
+`p11-evidence-leaf-preparation.txt`. The worker formerly assigned P5 implements
+this new leaf only; completed P5 paths are no longer writable. Source is unverified.
+
+The external `pause-20260930/` checkpoint records all five worktrees, their heads
+and status, scope checks, and restart instructions. It archives and hashes both
+untracked P11 source files. It also snapshots 136 files (790,022 bytes) of the
+unsealed P3 repair evidence, with an inventory; this snapshot is preservation,
+not a passing final evidence manifest. Existing reviewed evidence is left unchanged.
+The main checkpoint commit covers only this record. No reset, history rewrite,
+source integration, push, PR, browser/device use or live-state write occurs.
+
+On resumption: read the complete current record and shared delivery contract first;
+retain the user's waived development repair limits and safe cross-phase staffing
+instructions. Verify the new session's actual concurrency. Inspect the saved P3
+failure and assess its pending proposal before editing. Resume the P7 fallback
+ordering repair and P11 leaf within their exclusive scopes when slots allow.
+Reuse each existing piece's reviewer after repairs. Root must inspect complete
+candidate evidence and check findings before merging. P3 approval precedes the
+combined P2/P3 gate; reconcile any main advancement before local integration.
+Real-runtime/platform/client gates and all 19 acceptance criteria remain open.
