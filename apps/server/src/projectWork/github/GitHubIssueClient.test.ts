@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "@effect/vitest";
+import * as Clock from "effect/Clock";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
@@ -15,6 +16,7 @@ const account = { host: "github.com", credentialFingerprint: "fingerprint-a", no
 const repository = { host: "github.com", nodeId: "R_a", nameWithOwner: "owner/repo" };
 const input = { cwd: "/repo", account, repository, since: "2026-09-01T00:00:00Z", pageSize: 2 };
 const rawRepository = {
+  id: 1300192,
   node_id: "R_a",
   full_name: "owner/repo",
   url: "https://api.github.com/repos/owner/repo",
@@ -787,5 +789,271 @@ describe("bounded GitHub issue transport", () => {
           );
         }),
       ),
+  );
+  it.effect(
+    "P5-T1 accepts verified numeric issues/comments Link routes without exposing or executing them",
+    () =>
+      provide(
+        Effect.gen(function* () {
+          const client = yield* Client.GitHubIssueClient;
+          serve(
+            response([issue()], {
+              Link: '<https://api.github.com/repositories/1300192/issues?state=all&sort=updated&direction=asc&since=2026-09-01T00%3A00%3A00Z&per_page=2&page=2>; rel="next"',
+            }),
+          );
+          const first = yield* client.readIssuesPage(input);
+          expect(first).toMatchObject({ status: "changed", nextPage: 2, repository });
+          expect(first.repository).toEqual(repository);
+          serve(response([issue(2)]));
+          expect((yield* client.readIssuesPage({ ...input, page: 2 })).status).toBe("changed");
+          serve(
+            response([comment()], {
+              Link: '<https://api.github.com/repositories/1300192/issues/1/comments?per_page=2&page=2>; rel="next"',
+            }),
+          );
+          expect(
+            yield* client.readCommentsPage({
+              cwd: input.cwd,
+              account,
+              repository,
+              issue: { nodeId: "I_1", number: 1 },
+              pageSize: 2,
+            }),
+          ).toMatchObject({ status: "changed", nextPage: 2, repository });
+          const lookup = yield* client.lookupRepository({
+            cwd: input.cwd,
+            account,
+            repository: "owner/repo",
+            expectedRepositoryNodeId: "R_a",
+          });
+          if (lookup.status === "changed") {
+            expect(Object.keys(lookup).sort()).toEqual(["data", "etag", "status"]);
+            expect(Object.keys(lookup.data).sort()).toEqual([
+              "host",
+              "nameWithOwner",
+              "nodeId",
+              "updatedAt",
+              "url",
+            ]);
+          }
+          expect(
+            run.mock.calls.every(([request]) => !request.args.at(-1)?.includes("repositories/")),
+          ).toBe(true);
+        }),
+      ),
+  );
+
+  it.effect("P5-T1 validates enterprise numeric pagination against the verified API prefix", () =>
+    provide(
+      Effect.gen(function* () {
+        const host = "git.enterprise.test";
+        const prefix = `https://${host}/api/v3`;
+        const enterpriseAccount = { ...account, host };
+        const enterpriseRepository = { ...repository, host };
+        const repo = {
+          ...rawRepository,
+          url: `${prefix}/repos/owner/repo`,
+          html_url: `https://${host}/owner/repo`,
+        };
+        run.mockImplementation((request) => {
+          const endpoint = request.args.at(-1)!;
+          const headers: Record<string, string> = endpoint.includes("issues?")
+            ? {
+                Link: `<${prefix}/repositories/1300192/issues?state=all&sort=updated&direction=asc&since=2026-09-01T00%3A00%3A00Z&per_page=2&page=2>; rel="next"`,
+              }
+            : endpoint.includes("comments?")
+              ? {
+                  Link: `<${prefix}/repositories/1300192/issues/1/comments?per_page=2&page=2>; rel="next"`,
+                }
+              : {};
+          const record = {
+            ...issue(),
+            url: `${repo.url}/issues/1`,
+            repository_url: repo.url,
+            html_url: `${repo.html_url}/issues/1`,
+          };
+          const body =
+            endpoint === "user"
+              ? { node_id: account.nodeId }
+              : endpoint.includes("comments?")
+                ? [
+                    {
+                      ...comment(),
+                      issue_url: record.url,
+                      html_url: `${record.html_url}#issuecomment-1`,
+                    },
+                  ]
+                : endpoint.includes("issues?")
+                  ? [record]
+                  : endpoint.endsWith("issues/1")
+                    ? record
+                    : repo;
+          return Effect.succeed(output(response(body, headers)));
+        });
+        const client = yield* Client.GitHubIssueClient;
+        const read = Effect.gen(function* () {
+          expect(
+            yield* client.readIssuesPage({
+              ...input,
+              account: enterpriseAccount,
+              repository: enterpriseRepository,
+            }),
+          ).toMatchObject({ status: "changed", nextPage: 2 });
+          expect(
+            yield* client.readCommentsPage({
+              cwd: input.cwd,
+              account: enterpriseAccount,
+              repository: enterpriseRepository,
+              issue: { nodeId: "I_1", number: 1 },
+              pageSize: 2,
+            }),
+          ).toMatchObject({ status: "changed", nextPage: 2 });
+        });
+        yield* read.pipe(
+          Effect.provideService(GitHubCli.PinnedGitHubCredential, { ...pinned, host }),
+        );
+      }),
+    ),
+  );
+
+  it.effect("P5-T1 rejects other numeric IDs, endpoints and query identities", () =>
+    provide(
+      Effect.gen(function* () {
+        const client = yield* Client.GitHubIssueClient;
+        const valid =
+          "https://api.github.com/repositories/1300192/issues?state=all&sort=updated&direction=asc&since=2026-09-01T00%3A00%3A00Z&per_page=2&page=2";
+        for (const url of [
+          valid.replace("1300192", "1300193"),
+          valid.replace("/issues?", "/issues/1/comments?"),
+          valid.replace("direction=asc", "direction=desc"),
+          valid + "&page=2",
+          valid.replace("/repositories/", "/api/v3/repositories/"),
+        ]) {
+          serve(response([issue()], { Link: `<${url}>; rel="next"` }));
+          expect((yield* client.readIssuesPage(input).pipe(Effect.flip)).reason).toBe(
+            "invalid-response",
+          );
+        }
+        serve(
+          response([comment()], {
+            Link: '<https://api.github.com/repositories/1300193/issues/1/comments?per_page=2&page=2>; rel="next"',
+          }),
+        );
+        expect(
+          (yield* client
+            .readCommentsPage({
+              cwd: input.cwd,
+              account,
+              repository,
+              issue: { nodeId: "I_1", number: 1 },
+              pageSize: 2,
+            })
+            .pipe(Effect.flip)).reason,
+        ).toBe("invalid-response");
+      }),
+    ),
+  );
+
+  for (const malformedBody of ["{}", "{"]) {
+    it.effect(`P5-T2 pauses on decisive headers before decoding ${malformedBody}`, () =>
+      provide(
+        Effect.gen(function* () {
+          const client = yield* Client.GitHubIssueClient;
+          const now = yield* Clock.currentTimeMillis;
+          serve(
+            response({}, { "X-RateLimit-Remaining": "0", "Retry-After": "60" }, 403).slice(0, -2) +
+              malformedBody,
+          );
+          expect((yield* client.readIssuesPage(input).pipe(Effect.flip)).reason).toBe(
+            "rate-limited",
+          );
+          const count = run.mock.calls.length;
+          const paused = yield* client.readIssuesPage(input).pipe(Effect.flip);
+          expect(paused).toMatchObject({ reason: "rate-paused", retryAt: now + 60000 });
+          expect(run).toHaveBeenCalledTimes(count);
+        }),
+      ),
+    );
+  }
+
+  it.effect("P5-T2 respects header-only Retry-After and quota-reset guidance", () =>
+    provide(
+      Effect.gen(function* () {
+        const client = yield* Client.GitHubIssueClient;
+        const now = yield* Clock.currentTimeMillis;
+        serve(response({}, { "Retry-After": "90" }, 403));
+        expect((yield* client.readIssuesPage(input).pipe(Effect.flip)).reason).toBe("rate-limited");
+        expect((yield* client.readIssuesPage(input).pipe(Effect.flip)).retryAt).toBe(now + 90000);
+        yield* TestClock.adjust("91 seconds");
+        const later = yield* Clock.currentTimeMillis;
+        serve(
+          response(
+            {},
+            { "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": String((later + 300000) / 1000) },
+            403,
+          ),
+        );
+        expect((yield* client.readIssuesPage(input).pipe(Effect.flip)).reason).toBe("rate-limited");
+        expect((yield* client.readIssuesPage(input).pipe(Effect.flip)).retryAt).toBe(
+          later + 300000,
+        );
+      }),
+    ),
+  );
+
+  it.effect("P5-T3 preserves one-minute minimum, later backoff and success reset", () =>
+    provide(
+      Effect.gen(function* () {
+        const client = yield* Client.GitHubIssueClient;
+        const rates = yield* RateLimit.SourceControlRateLimit;
+        const key = { provider: "github", host: account.host } as const;
+        for (const [index, delay] of [60000, 60000, 120000, 240000].entries()) {
+          run.mockReturnValue(
+            Effect.succeed(output(response({ message: "secondary rate limit" }, {}, 403), 1)),
+          );
+          const now = yield* Clock.currentTimeMillis;
+          expect((yield* client.readIssuesPage(input).pipe(Effect.flip)).reason).toBe(
+            "rate-limited",
+          );
+          expect(yield* rates.check(key, { allowPaused: true })).toBe(index + 1);
+          const paused = yield* rates.check(key).pipe(Effect.flip);
+          expect(paused.retryAt).toBe(now + delay);
+          const calls = run.mock.calls.length;
+          yield* TestClock.adjust(delay - 1000);
+          expect((yield* client.readIssuesPage(input).pipe(Effect.flip)).reason).toBe(
+            "rate-paused",
+          );
+          expect(run).toHaveBeenCalledTimes(calls);
+          yield* TestClock.adjust("1001 millis");
+        }
+        serve(response([]));
+        expect((yield* client.readIssuesPage(input)).status).toBe("changed");
+        run.mockReturnValue(
+          Effect.succeed(output(response({ message: "secondary rate limit" }, {}, 403), 1)),
+        );
+        const now = yield* Clock.currentTimeMillis;
+        expect((yield* client.readIssuesPage(input).pipe(Effect.flip)).reason).toBe("rate-limited");
+        expect((yield* rates.check(key).pipe(Effect.flip)).retryAt).toBe(now + 60000);
+      }),
+    ),
+  );
+
+  it.effect("P5-T3 floor extension preserves a newer concurrent pause and generation", () =>
+    provide(
+      Effect.gen(function* () {
+        const rates = yield* RateLimit.SourceControlRateLimit;
+        const key = { provider: "github", host: account.host } as const;
+        const now = yield* Clock.currentTimeMillis;
+        run.mockImplementation(() =>
+          rates
+            .recordRateLimit({ ...key, lease: 0, retryAt: now + 300000 })
+            .pipe(Effect.as(output(response({ message: "secondary rate limit" }, {}, 403), 1))),
+        );
+        const client = yield* Client.GitHubIssueClient;
+        expect((yield* client.readIssuesPage(input).pipe(Effect.flip)).reason).toBe("rate-limited");
+        expect(yield* rates.check(key, { allowPaused: true })).toBe(1);
+        expect((yield* rates.check(key).pipe(Effect.flip)).retryAt).toBe(now + 300000);
+      }),
+    ),
   );
 });

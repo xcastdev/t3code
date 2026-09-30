@@ -58,6 +58,7 @@ const CommentsInput = Schema.Struct({
   issue: Schema.Struct({ nodeId: NonEmpty, number: PositiveInt }),
 });
 const RawRepository = Schema.Struct({
+  id: PositiveInt,
   node_id: NonEmpty,
   full_name: RepositoryName,
   url: NonEmpty,
@@ -230,6 +231,7 @@ function validApiUrl(value: string, host: string, endpoint: string) {
 function pageContinuation(
   link: string | undefined,
   host: string,
+  repositoryId: number,
   endpoint: string,
   page: number,
   count: number,
@@ -239,6 +241,12 @@ function pageContinuation(
   const seen = new Set<string>();
   let last: number | null = null;
   const expected = new URL(`${apiOrigin(host)}${apiPath(host, endpoint)}`);
+  // GitHub's Link header can use the REST ID instead of owner/name.
+  const numericEndpoint = endpoint.replace(
+    /^repos\/[^/]+\/[^/]+(?=\/)/u,
+    `repositories/${repositoryId}`,
+  );
+  const numericPath = new URL(`${apiOrigin(host)}${apiPath(host, numericEndpoint)}`).pathname;
   for (const part of link.split(/,\s*(?=<)/u)) {
     const match = /^<([^<>\s]+)>;\s*rel="(next|prev|first|last)"$/u.exec(part.trim());
     if (!match || seen.has(match[2]!)) throw failure("invalid-response", host);
@@ -246,7 +254,7 @@ function pageContinuation(
     const url = new URL(match[1]!);
     if (
       url.origin !== expected.origin ||
-      url.pathname !== expected.pathname ||
+      (url.pathname !== expected.pathname && url.pathname !== numericPath) ||
       url.username ||
       url.password ||
       url.hash
@@ -286,6 +294,24 @@ function pageContinuation(
 export const make = Effect.gen(function* () {
   const gh = yield* GitHubCli.GitHubCli;
   const rates = yield* RateLimit.SourceControlRateLimit;
+
+  const recordPause = Effect.fn("GitHubIssueClient.recordPause")(function* (
+    host: string,
+    lease: number,
+    retryAt?: number,
+  ) {
+    const key = { provider: "github", host } as const;
+    if (retryAt !== undefined) yield* rates.recordRateLimit({ ...key, lease, retryAt });
+    else {
+      const now = yield* Clock.currentTimeMillis;
+      yield* rates.recordRateLimit({ ...key, lease });
+      // Keep the default backoff attempt; the same stale lease only extends its minimum.
+      yield* rates.recordRateLimit({ ...key, lease, retryAt: now + 60_000 });
+    }
+    return yield* rates
+      .check(key)
+      .pipe(Effect.match({ onFailure: (error) => error.retryAt, onSuccess: () => undefined }));
+  });
 
   const request = Effect.fn("GitHubIssueClient.request")(function* (
     cwd: string,
@@ -334,8 +360,12 @@ export const make = Effect.gen(function* () {
         Effect.catch(
           Effect.fn(function* (error) {
             if (error._tag === "GitHubCliRateLimitError") {
-              yield* rates.recordRateLimit({ ...key, lease });
-              return yield* failure("rate-limited", account.host);
+              const retryAt = yield* recordPause(account.host, lease);
+              return yield* new GitHubIssueClientError({
+                reason: "rate-limited",
+                host: account.host,
+                retryAt,
+              });
             }
             return yield* failure(
               error._tag === "GitHubCliAuthenticationError"
@@ -361,33 +391,49 @@ export const make = Effect.gen(function* () {
       catch: () => failure("invalid-response", account.host),
     });
     const now = yield* Clock.currentTimeMillis;
+    const exhausted = envelope.headers.get("x-ratelimit-remaining") === "0";
     const reset = envelope.headers.get("x-ratelimit-reset");
-    const retryAt =
-      RateLimit.retryAtFromHeader(envelope.headers.get("retry-after"), now) ??
-      (reset !== undefined && /^\d+$/u.test(reset) && Number.isSafeInteger(Number(reset) * 1000)
+    const retryHeader = RateLimit.retryAtFromHeader(envelope.headers.get("retry-after"), now);
+    const resetAt =
+      exhausted &&
+      reset !== undefined &&
+      /^\d+$/u.test(reset) &&
+      Number.isSafeInteger(Number(reset) * 1000)
         ? Number(reset) * 1000
-        : undefined);
-    const errorMessage =
-      envelope.status === 403
-        ? yield* decodeBody(Schema.Struct({ message: Schema.String }), envelope.body, account.host)
-        : null;
-    const limited =
+        : undefined;
+    const retryAt =
+      retryHeader !== undefined && retryHeader > now
+        ? retryHeader
+        : resetAt !== undefined && resetAt > now
+          ? resetAt
+          : undefined;
+    const decisive =
       envelope.status === 429 ||
-      (envelope.status === 403 &&
-        (envelope.headers.get("x-ratelimit-remaining") === "0" ||
-          envelope.headers.has("retry-after") ||
-          (errorMessage !== null &&
-            /secondary rate limit|rate limit exceeded|api rate limit/iu.test(
-              errorMessage.message,
-            ))));
-    if (limited || envelope.headers.get("x-ratelimit-remaining") === "0")
-      yield* rates.recordRateLimit({ ...key, lease, retryAt });
-    if (limited)
+      (envelope.status === 403 && (exhausted || envelope.headers.has("retry-after")));
+    // Quota headers remain authoritative even when an optional error message is malformed.
+    const recordedRetryAt =
+      decisive || exhausted ? yield* recordPause(account.host, lease, retryAt) : undefined;
+    if (decisive)
       return yield* new GitHubIssueClientError({
         reason: "rate-limited",
         host: account.host,
-        ...(retryAt === undefined ? {} : { retryAt }),
+        retryAt: recordedRetryAt,
       });
+    if (envelope.status === 403) {
+      const errorMessage = yield* decodeBody(
+        Schema.Struct({ message: Schema.String }),
+        envelope.body,
+        account.host,
+      );
+      if (/secondary rate limit|rate limit exceeded|api rate limit/iu.test(errorMessage.message)) {
+        const recordedRetryAt = yield* recordPause(account.host, lease, retryAt);
+        return yield* new GitHubIssueClientError({
+          reason: "rate-limited",
+          host: account.host,
+          retryAt: recordedRetryAt,
+        });
+      }
+    }
     if (envelope.status === 401 || envelope.status === 403)
       return yield* failure("authentication", account.host);
     if (envelope.status === 304) {
@@ -442,6 +488,7 @@ export const make = Effect.gen(function* () {
     return {
       status: "changed",
       etag: response.etag,
+      restId: raw.id,
       data: {
         host: account.host,
         nodeId: raw.node_id,
@@ -460,9 +507,12 @@ export const make = Effect.gen(function* () {
     const read = yield* repositoryRead(cwd, account, expected.nameWithOwner, expected.nodeId);
     if (read.status !== "changed") return yield* failure("invalid-response", account.host);
     return {
-      host: read.data.host,
-      nodeId: read.data.nodeId,
-      nameWithOwner: read.data.nameWithOwner,
+      restId: read.restId,
+      repository: {
+        host: read.data.host,
+        nodeId: read.data.nodeId,
+        nameWithOwner: read.data.nameWithOwner,
+      },
     };
   });
   const lookupRepository: GitHubIssueClient["Service"]["lookupRepository"] = Effect.fn(
@@ -480,20 +530,23 @@ export const make = Effect.gen(function* () {
         valid.repository,
         valid.expectedRepositoryNodeId,
       );
-    return yield* repositoryRead(
+    const read = yield* repositoryRead(
       valid.cwd,
       valid.account,
       valid.repository,
       valid.expectedRepositoryNodeId,
       valid.etag,
     );
+    if (read.status === "not-modified") return read;
+    return { status: read.status, etag: read.etag, data: read.data };
   });
   const readIssuesPage: GitHubIssueClient["Service"]["readIssuesPage"] = Effect.fn(
     "GitHubIssueClient.readIssuesPage",
   )(function* (input) {
     const valid = yield* decodeInput(IssuesInput, input);
     yield* verifyAccount(valid.cwd, valid.account);
-    const repository = yield* verifyRepository(valid.cwd, valid.account, valid.repository);
+    const verified = yield* verifyRepository(valid.cwd, valid.account, valid.repository);
+    const { repository } = verified;
     const page = valid.page ?? 1,
       pageSize = valid.pageSize ?? 100;
     const endpoint = `repos/${repository.nameWithOwner}/issues?state=all&sort=updated&direction=asc&since=${encodeURIComponent(valid.since)}&per_page=${pageSize}&page=${page}`;
@@ -542,6 +595,7 @@ export const make = Effect.gen(function* () {
         pageContinuation(
           response.headers.get("link"),
           repository.host,
+          verified.restId,
           endpoint,
           page,
           rows.length,
@@ -564,7 +618,8 @@ export const make = Effect.gen(function* () {
   )(function* (input) {
     const valid = yield* decodeInput(CommentsInput, input);
     yield* verifyAccount(valid.cwd, valid.account);
-    const repository = yield* verifyRepository(valid.cwd, valid.account, valid.repository);
+    const verified = yield* verifyRepository(valid.cwd, valid.account, valid.repository);
+    const { repository } = verified;
     const issueEndpoint = `repos/${repository.nameWithOwner}/issues/${valid.issue.number}`;
     const issueResponse = yield* request(valid.cwd, valid.account, issueEndpoint);
     const issue = yield* decodeBody(RawIssue, issueResponse.body, repository.host);
@@ -612,6 +667,7 @@ export const make = Effect.gen(function* () {
         pageContinuation(
           response.headers.get("link"),
           repository.host,
+          verified.restId,
           endpoint,
           page,
           rows.length,
