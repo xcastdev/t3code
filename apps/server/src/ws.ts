@@ -235,7 +235,13 @@ import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as RemoteOpenTargets from "./environment/RemoteOpenTargets.ts";
 import * as BackgroundPolicy from "./background/BackgroundPolicy.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
-import { requiredScopeForRpcMethod } from "./auth/RpcAuthorization.ts";
+import {
+  requiredScopeForRpcMethod,
+  authorizeRpcSession,
+  guardRpcEffect,
+  guardRpcStream,
+  guardRpcStreamEffect,
+} from "./auth/RpcAuthorization.ts";
 import * as ProcessDiagnostics from "./diagnostics/ProcessDiagnostics.ts";
 import * as ProcessResourceMonitor from "./diagnostics/ProcessResourceMonitor.ts";
 import * as ResourceTelemetry from "./resourceTelemetry/ResourceTelemetry.ts";
@@ -377,11 +383,16 @@ const makeWsProjectTerminalRpcLayer = (currentSession: EnvironmentAuth.Authentic
       const snapshots = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const terminals = yield* TerminalManager.TerminalManager;
       const access = makeProjectTerminalClientAccess(snapshots, terminals);
+      const auth = yield* Effect.serviceOption(EnvironmentAuth.EnvironmentAuth);
       const authorizationError = (requiredScope: AuthEnvironmentScope) =>
         new EnvironmentAuthorizationError({
           message: `The authenticated token is missing required scope: ${requiredScope}.`,
           requiredScope,
         });
+      const validateRpcSession = (method: string) =>
+        authorizeRpcSession(method, currentSession, Option.isSome(auth) ? auth.value : {}).pipe(
+          Effect.mapError(() => authorizationError(requiredScopeForRpcMethod(method))),
+        );
       const authorizeEffect = <A, E, R>(
         method: string,
         effect: Effect.Effect<A, E, R>,
@@ -401,13 +412,21 @@ const makeWsProjectTerminalRpcLayer = (currentSession: EnvironmentAuth.Authentic
           : Stream.fail(authorizationError(requiredScope));
       };
       const observeEffect = <A, E, R>(method: string, effect: Effect.Effect<A, E, R>) =>
-        instrumentRpcEffect(method, authorizeEffect(method, effect), {
-          "rpc.aggregate": "terminal",
-        });
+        instrumentRpcEffect(
+          method,
+          authorizeEffect(method, guardRpcEffect(validateRpcSession(method), effect)),
+          {
+            "rpc.aggregate": "terminal",
+          },
+        );
       const observeStream = <A, E, R>(method: string, stream: Stream.Stream<A, E, R>) =>
-        instrumentRpcStream(method, authorizeStream(method, stream), {
-          "rpc.aggregate": "terminal",
-        });
+        instrumentRpcStream(
+          method,
+          authorizeStream(method, guardRpcStream(validateRpcSession(method), stream)),
+          {
+            "rpc.aggregate": "terminal",
+          },
+        );
 
       return WsProjectTerminalRpcGroup.of({
         [WS_METHODS.projectTerminalAttach]: (input) =>
@@ -784,6 +803,7 @@ const makeWsManagedTextResourceRpcLayer = (currentSession: EnvironmentAuth.Authe
       const serverEnvironment = yield* ServerEnvironment.ServerEnvironment;
       const managedTextResources =
         yield* ManagedTextResourceCatalogService.ManagedTextResourceCatalogService;
+      const auth = yield* Effect.serviceOption(EnvironmentAuth.EnvironmentAuth);
       const authorizationError = (requiredScope: AuthEnvironmentScope) =>
         new EnvironmentAuthorizationError({
           message: `The authenticated token is missing required scope: ${requiredScope}.`,
@@ -798,11 +818,20 @@ const makeWsManagedTextResourceRpcLayer = (currentSession: EnvironmentAuth.Authe
           ? effect
           : Effect.fail(authorizationError(requiredScope));
       };
+      const validateRpcSession = (method: string) =>
+        authorizeRpcSession(method, currentSession, Option.isSome(auth) ? auth.value : {}).pipe(
+          Effect.mapError(() => authorizationError(requiredScopeForRpcMethod(method))),
+        );
       const observeRpcEffect = <A, E, R>(
         method: string,
         effect: Effect.Effect<A, E, R>,
         traceAttributes?: Readonly<Record<string, unknown>>,
-      ) => instrumentRpcEffect(method, authorizeEffect(method, effect), traceAttributes);
+      ) =>
+        instrumentRpcEffect(
+          method,
+          authorizeEffect(method, guardRpcEffect(validateRpcSession(method), effect)),
+          traceAttributes,
+        );
       const observeRpcStreamEffect = <A, StreamError, StreamContext, EffectError, EffectContext>(
         method: string,
         effect: Effect.Effect<
@@ -811,7 +840,12 @@ const makeWsManagedTextResourceRpcLayer = (currentSession: EnvironmentAuth.Authe
           EffectContext
         >,
         traceAttributes?: Readonly<Record<string, unknown>>,
-      ) => instrumentRpcStreamEffect(method, authorizeEffect(method, effect), traceAttributes);
+      ) =>
+        instrumentRpcStreamEffect(
+          method,
+          authorizeEffect(method, guardRpcStreamEffect(validateRpcSession(method), effect)),
+          traceAttributes,
+        );
       const resolveContext = (input: {
         readonly threadId?: ThreadId | undefined;
         readonly projectId?: ProjectId | undefined;
@@ -1242,6 +1276,10 @@ const makeWsRpcLayer = (
           message: `The authenticated token is missing required scope: ${requiredScope}.`,
           requiredScope,
         });
+      const validateRpcSession = (method: string) =>
+        authorizeRpcSession(method, currentSession, serverAuth).pipe(
+          Effect.mapError(() => authorizationError(requiredScopeForRpcMethod(method))),
+        );
       const authorizeEffect = <A, E, R>(
         requiredScope: AuthEnvironmentScope,
         effect: Effect.Effect<A, E, R>,
@@ -1263,7 +1301,10 @@ const makeWsRpcLayer = (
       ) =>
         instrumentRpcEffect(
           method,
-          authorizeEffect(requiredScopeForRpcMethod(method), effect),
+          authorizeEffect(
+            requiredScopeForRpcMethod(method),
+            guardRpcEffect(validateRpcSession(method), effect),
+          ),
           traceAttributes,
         );
       const observeRpcStream = <A, E, R>(
@@ -1273,7 +1314,10 @@ const makeWsRpcLayer = (
       ) =>
         instrumentRpcStream(
           method,
-          authorizeStream(requiredScopeForRpcMethod(method), stream),
+          authorizeStream(
+            requiredScopeForRpcMethod(method),
+            guardRpcStream(validateRpcSession(method), stream),
+          ),
           traceAttributes,
         );
       const observeRpcStreamEffect = <A, StreamError, StreamContext, EffectError, EffectContext>(
@@ -1287,7 +1331,10 @@ const makeWsRpcLayer = (
       ) =>
         instrumentRpcStreamEffect(
           method,
-          authorizeEffect(requiredScopeForRpcMethod(method), effect),
+          authorizeEffect(
+            requiredScopeForRpcMethod(method),
+            guardRpcStreamEffect(validateRpcSession(method), effect),
+          ),
           traceAttributes,
         );
       const toDispatchCommandError = (cause: unknown, fallbackMessage: string) =>
@@ -6096,7 +6143,17 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             WS_METHODS.projectWorkRead,
             Option.isSome(projectWorkGateway)
-              ? projectWorkGateway.value.read(input)
+              ? authorizeRpcSession(WS_METHODS.projectWorkRead, currentSession, serverAuth).pipe(
+                  Effect.flatMap((session) =>
+                    projectWorkGateway.value.read(input, {
+                      actor: {
+                        kind: session.identity.kind === "agent" ? "agent" : "human",
+                        id: session.identity.id,
+                      },
+                      ...(session.managed === undefined ? {} : { managed: session.managed }),
+                    }),
+                  ),
+                )
               : Effect.die(new ProjectWorkGateway.ProjectWorkGatewayUnavailableError({})),
             { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
           ),
@@ -6121,6 +6178,15 @@ const makeWsRpcLayer = (
                           ? "desktop"
                           : "web",
                     id: currentSession.identity.id,
+                  },
+                  {
+                    actor: {
+                      kind: currentSession.identity.kind === "agent" ? "agent" : "human",
+                      id: currentSession.identity.id,
+                    },
+                    ...(currentSession.managed === undefined
+                      ? {}
+                      : { managed: currentSession.managed }),
                   },
                 )
               : Effect.die(new ProjectWorkGateway.ProjectWorkGatewayUnavailableError({})),
@@ -6153,7 +6219,15 @@ const makeWsRpcLayer = (
           observeRpcStreamEffect(
             WS_METHODS.projectWorkSubscribe,
             Option.isSome(projectWorkStream)
-              ? projectWorkStream.value.stream(input)
+              ? projectWorkStream.value.stream(input, {
+                  actor: {
+                    kind: currentSession.identity.kind === "agent" ? "agent" : "human",
+                    id: currentSession.identity.id,
+                  },
+                  ...(currentSession.managed === undefined
+                    ? {}
+                    : { managed: currentSession.managed }),
+                })
               : Effect.die(
                   new ProjectWorkStream.ProjectWorkStreamError({
                     reason: "read-failed",

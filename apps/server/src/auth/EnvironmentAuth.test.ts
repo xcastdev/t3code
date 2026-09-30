@@ -639,3 +639,132 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
       ),
   );
 });
+
+import * as TeamAuthorization from "../projectWork/ProjectTeamAuthorization.ts";
+import { ProjectWorkRepositoryLive } from "../projectWork/ProjectWorkRepository.ts";
+import {
+  seed as seedTeam,
+  decodeRecord as decodeTeamRecord,
+} from "../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+import {
+  authorizeRpcSession,
+  guardRpcEffect,
+  guardRpcStream,
+  guardRpcStreamEffect,
+} from "./RpcAuthorization.ts";
+import { WS_METHODS, ORCHESTRATION_WS_METHODS } from "@t3tools/contracts";
+import * as Stream from "effect/Stream";
+
+const managedAuthLayer = Layer.mergeAll(EnvironmentAuth.layer, ProjectWorkRepositoryLive).pipe(
+  Layer.provideMerge(TeamAuthorization.layer),
+  Layer.provide(ServerSecretStore.layer),
+  Layer.provide(ServerEnvironment.identityLayer),
+  Layer.provide(makeServerConfigLayer()),
+  Layer.provideMerge(SqlitePersistenceMemory),
+  Layer.provide(NodeServices.layer),
+);
+it.effect(
+  "enforces current SQL credentials before managed RPC side effects and every stream payload",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const legacy = yield* auth.issueSession({
+        identity: { kind: "agent", id: "agent:mcp:pi:authorization-thread" },
+      });
+      const legacySession = yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token));
+      expect(legacySession.managed).toBeUndefined();
+      const f = yield* seedTeam("implementer");
+      expect(
+        (yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token)).pipe(Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* auth.issueSession({ subject: "agent:project-team:forged" }).pipe(Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* auth
+          .createPairingLink({ subject: "agent:project-team:forged" })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      const issued = yield* auth.issueSession({ managed: f.principal.managed });
+      const session = yield* auth.authenticateHttpRequest(makeBearerRequest(issued.token));
+      expect(session.managed).toEqual(f.principal.managed);
+      let effects = 0;
+      for (const method of [
+        WS_METHODS.terminalOpen,
+        WS_METHODS.gitCommitIndex,
+        WS_METHODS.gitRunStackedAction,
+        ORCHESTRATION_WS_METHODS.dispatchCommand,
+        WS_METHODS.projectWorkRequestApproval,
+      ]) {
+        const result = yield* guardRpcEffect(
+          authorizeRpcSession(method, session, auth),
+          Effect.sync(() => effects++),
+        ).pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+      }
+      expect(effects).toBe(0);
+      yield* guardRpcEffect(
+        authorizeRpcSession(WS_METHODS.projectWorkRead, session, auth),
+        Effect.sync(() => effects++),
+      );
+      expect(effects).toBe(1);
+      const validation = authorizeRpcSession(WS_METHODS.projectWorkSubscribe, session, auth);
+      const received: string[] = [];
+      const values = Stream.fromIterable(["allowed", "must-not-leak"]).pipe(
+        Stream.mapEffect((value) =>
+          value === "allowed"
+            ? Effect.succeed(value)
+            : f
+                .change(decodeTeamRecord({ ...f.binding, revision: 1, status: "revoked" }))
+                .pipe(Effect.as(value)),
+        ),
+      );
+      const result = yield* guardRpcStream(validation, values).pipe(
+        Stream.runForEach((value) => Effect.sync(() => received.push(value))),
+        Effect.result,
+      );
+      expect(result._tag).toBe("Failure");
+      expect(received).toEqual(["allowed"]);
+      let constructed = false;
+      expect(
+        (yield* guardRpcStreamEffect(
+          validation,
+          Effect.sync(() => {
+            constructed = true;
+            return Stream.make("secret");
+          }),
+        ).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(constructed).toBe(false);
+      expect(
+        (yield* auth.authenticateHttpRequest(makeBearerRequest(issued.token)).pipe(Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      yield* f.sql`DELETE FROM project_team_run_binding WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_events WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${f.principal.managed.projectId}`;
+      expect((yield* auth.validateCurrentSession!(legacySession).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      expect((yield* auth.validateCurrentSession!(session).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      const restartedAuth = yield* EnvironmentAuth.EnvironmentAuth.pipe(
+        Effect.provide(
+          EnvironmentAuth.layer.pipe(
+            Layer.provide(Layer.fresh(TeamAuthorization.layer)),
+            Layer.provide(ServerSecretStore.layer),
+            Layer.provide(ServerEnvironment.identityLayer),
+            Layer.provide(makeServerConfigLayer()),
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      );
+      expect(
+        (yield* restartedAuth.validateCurrentSession!(legacySession).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+    }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+);

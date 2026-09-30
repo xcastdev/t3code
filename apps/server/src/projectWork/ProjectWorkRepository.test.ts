@@ -32,6 +32,40 @@ const layer = it.layer(Layer.fresh(Layer.mergeAll(NodeSqliteClient.layerMemory()
 
 layer("ProjectWorkRepository", (it) => {
   it.effect(
+    "revalidates live authority before duplicate receipts without consuming approval twice",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations();
+        const repository = yield* ProjectWorkRepository;
+        const command = {
+          type: "project-work.task.create" as const,
+          projectId: ProjectId.make("live-authority-project"),
+          taskId: ProjectWorkTaskId.make("live-authority-task"),
+          commandId: CommandId.make("live-authority-duplicate"),
+          title: "Live authority",
+          createdAt: at,
+        };
+        let consumed = 0;
+        let live = true;
+        const execute = () =>
+          repository.executeAuthorized(
+            command,
+            () => {
+              consumed++;
+              return Effect.succeed(command);
+            },
+            () => (live ? Effect.void : Effect.fail("credential-revoked")),
+          );
+        yield* execute();
+        yield* execute();
+        expect(consumed).toBe(1);
+        live = false;
+        expect((yield* execute().pipe(Effect.result))._tag).toBe("Failure");
+        expect(consumed).toBe(1);
+      }).pipe(Effect.provide(ProjectWorkRepositoryLive)),
+  );
+
+  it.effect(
     "persists server-owned criterion revisions through checkpoints, FTS, and rebuilds",
     () =>
       Effect.gen(function* () {

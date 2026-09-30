@@ -1,11 +1,13 @@
 import * as Effect from "effect/Effect";
 
+import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as ProjectTerminalService from "../../../terminal/ProjectTerminalService.ts";
 import { TerminalToolkit } from "./tools.ts";
 
 const handlers = {
   terminal_spawn: (input) =>
     Effect.gen(function* () {
+      yield* McpInvocationContext.requireMcpCapability("terminal");
       const terminals = yield* ProjectTerminalService.ProjectTerminalService;
       return yield* terminals.spawn({
         ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
@@ -19,6 +21,7 @@ const handlers = {
     }),
   terminal_list: (input) =>
     Effect.gen(function* () {
+      yield* McpInvocationContext.requireMcpCapability("terminal");
       const terminals = yield* ProjectTerminalService.ProjectTerminalService;
       return yield* terminals.list({
         ...(input.after === undefined ? {} : { after: input.after }),
@@ -27,35 +30,41 @@ const handlers = {
     }),
   terminal_read: (input) =>
     Effect.gen(function* () {
+      yield* McpInvocationContext.requireMcpCapability("terminal");
       const terminals = yield* ProjectTerminalService.ProjectTerminalService;
       return yield* terminals.read(input);
     }),
   terminal_write: (input) =>
     Effect.gen(function* () {
+      yield* McpInvocationContext.requireMcpCapability("terminal");
       const terminals = yield* ProjectTerminalService.ProjectTerminalService;
       yield* terminals.write(input);
       return { acknowledged: true as const };
     }),
   terminal_resize: (input) =>
     Effect.gen(function* () {
+      yield* McpInvocationContext.requireMcpCapability("terminal");
       const terminals = yield* ProjectTerminalService.ProjectTerminalService;
       yield* terminals.resize(input);
       return { resized: true as const };
     }),
   terminal_kill: (input) =>
     Effect.gen(function* () {
+      yield* McpInvocationContext.requireMcpCapability("terminal");
       const terminals = yield* ProjectTerminalService.ProjectTerminalService;
       yield* terminals.kill(input);
       return { requested: true as const, cleanup: input.cleanup ?? false };
     }),
   terminal_subscribe_completion: (input) =>
     Effect.gen(function* () {
+      yield* McpInvocationContext.requireMcpCapability("terminal");
       const terminals = yield* ProjectTerminalService.ProjectTerminalService;
       yield* terminals.subscribeCompletion(input);
       return { subscribed: true as const };
     }),
   terminal_unsubscribe_completion: (input) =>
     Effect.gen(function* () {
+      yield* McpInvocationContext.requireMcpCapability("terminal");
       const terminals = yield* ProjectTerminalService.ProjectTerminalService;
       yield* terminals.unsubscribeCompletion(input);
       return { unsubscribed: true as const };

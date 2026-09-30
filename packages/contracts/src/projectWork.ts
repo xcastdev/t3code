@@ -1,4 +1,8 @@
-import { ProjectTeamRecord, ProjectTeamRecordRead } from "./projectTeams.ts";
+import {
+  ProjectTeamRecord,
+  ProjectTeamRecordRead,
+  ProjectTeamWriteIntent,
+} from "./projectTeams.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
@@ -1140,8 +1144,8 @@ export const ProjectWorkCommand = Schema.Union([
 export type ProjectWorkCommand = typeof ProjectWorkCommand.Type;
 
 /** Names used by RPC and MCP adapters when referring to the command union. */
-export const ProjectWorkWriteIntent = ProjectWorkCommand;
-export type ProjectWorkWriteIntent = ProjectWorkCommand;
+export const ProjectWorkWriteIntent = Schema.Union([ProjectWorkCommand, ProjectTeamWriteIntent]);
+export type ProjectWorkWriteIntent = typeof ProjectWorkWriteIntent.Type;
 
 export const ProjectWorkReadRecord = Schema.Union([
   ProjectWorkTaskRead,

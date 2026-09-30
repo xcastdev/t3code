@@ -4,9 +4,11 @@ import {
   PreviewAutomationUnavailableError,
   type ProviderInstanceId,
   type ThreadId,
+  type ProjectTeamCredential,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as ProjectTeamAuthorization from "../projectWork/ProjectTeamAuthorization.ts";
 
 export type McpCapability = "preview" | "terminal" | "device" | "pull-requests" | "project";
 
@@ -17,6 +19,7 @@ export interface McpInvocationScope {
   readonly providerInstanceId: ProviderInstanceId;
   readonly capabilities: ReadonlySet<McpCapability>;
   readonly issuedAt: number;
+  readonly managed?: ProjectTeamCredential;
   /** Stable agent identity; old test and plugin scopes may omit this field. */
   readonly identity?: {
     readonly kind: "agent";
@@ -52,13 +55,49 @@ const missingCapability = (
 
 export const requireMcpCapability = <const C extends McpCapability>(
   capability: C,
+  projectId?: string,
 ): Effect.Effect<McpInvocationScope, McpCapabilityError<C>, McpInvocationContext> =>
-  Effect.flatMap(McpInvocationContext, (invocation) =>
-    invocation.capabilities.has(capability)
-      ? Effect.succeed(invocation)
-      : // The conditional type narrows what the literal argument decided at runtime.
-        Effect.fail(missingCapability(invocation, capability) as McpCapabilityError<C>),
-  ).pipe(Effect.withSpan("mcp.requireCapability"));
+  Effect.gen(function* () {
+    const invocation = yield* McpInvocationContext;
+    const authorization = yield* Effect.serviceOption(
+      ProjectTeamAuthorization.ProjectTeamAuthorization,
+    );
+    if (invocation.managed !== undefined && authorization._tag === "None")
+      return yield* Effect.fail(missingCapability(invocation, capability) as McpCapabilityError<C>);
+    if (authorization._tag === "Some") {
+      if (
+        invocation.managed === undefined &&
+        (yield* authorization.value
+          .discover({
+            providerInstanceId: invocation.providerInstanceId,
+            threadId: invocation.threadId,
+          })
+          .pipe(
+            Effect.mapError(
+              () => missingCapability(invocation, capability) as McpCapabilityError<C>,
+            ),
+          )) !== undefined
+      )
+        return yield* Effect.fail(
+          missingCapability(invocation, capability) as McpCapabilityError<C>,
+        );
+      yield* authorization.value
+        .capability(
+          {
+            actor: projectWorkActorForInvocation(invocation),
+            ...(invocation.managed === undefined ? {} : { managed: invocation.managed }),
+          },
+          capability,
+          projectId,
+        )
+        .pipe(
+          Effect.mapError(() => missingCapability(invocation, capability) as McpCapabilityError<C>),
+        );
+    }
+    if (!invocation.capabilities.has(capability))
+      return yield* Effect.fail(missingCapability(invocation, capability) as McpCapabilityError<C>);
+    return invocation;
+  }).pipe(Effect.withSpan("mcp.requireCapability"));
 
 export const projectWorkActorForInvocation = (
   invocation: McpInvocationScope,

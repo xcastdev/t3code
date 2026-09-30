@@ -1001,3 +1001,44 @@ it.effect("bridges legacy upstream server requests to a modern downstream client
     ]);
   }),
 );
+
+import {
+  seed as seedTeam,
+  scoped as teamScoped,
+  threadId as managedThreadId,
+} from "../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+import { runMigrations } from "../persistence/Migrations.ts";
+it.effect(
+  "rejects actual proxy registration and old endpoint invocations after thread becomes managed",
+  () =>
+    teamScoped(
+      Effect.gen(function* () {
+        yield* runMigrations();
+        let connected = 0;
+        const registry = yield* makeRegistry(async () => {
+          connected++;
+          return connection(async () => undefined);
+        });
+        const [legacy] = yield* registry.registerSession({
+          providerSessionId: "legacy",
+          threadId: managedThreadId,
+          servers: [server],
+        });
+        yield* seedTeam("implementer");
+        expect(
+          (yield* registry
+            .registerSession({
+              providerSessionId: "new",
+              threadId: managedThreadId,
+              servers: [server],
+            })
+            .pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        const result = yield* registry
+          .handle("legacy", legacy!.endpointHandle, new Request(String(legacy!.endpoint)))
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        expect(connected).toBe(0);
+      }),
+    ),
+);

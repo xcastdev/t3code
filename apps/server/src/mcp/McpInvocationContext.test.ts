@@ -112,3 +112,30 @@ it("binds project-work attribution to provider and thread, not a renewed session
   expect(firstSource.uri).toContain("session-first");
   expect(renewedSource.uri).toContain("session-renewed");
 });
+
+it.effect("fails closed when an issued managed credential lacks the authority service", () => {
+  const managed = {
+    projectId: "project" as never,
+    bindingId: "binding",
+    generation: 0,
+    providerInstanceId: ProviderInstanceId.make("pi"),
+    threadId: ThreadId.make("thread"),
+  };
+  const scope: McpInvocationContext.McpInvocationScope = {
+    environmentId: EnvironmentId.make("environment"),
+    providerInstanceId: managed.providerInstanceId,
+    threadId: managed.threadId,
+    providerSessionId: "issued",
+    managed,
+    capabilities: new Set(["project", "terminal"]),
+    issuedAt: 0,
+  };
+  return Effect.gen(function* () {
+    expect(
+      (yield* McpInvocationContext.requireMcpCapability("project").pipe(
+        Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+        Effect.result,
+      ))._tag,
+    ).toBe("Failure");
+  });
+});

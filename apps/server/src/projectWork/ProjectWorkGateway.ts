@@ -1,10 +1,14 @@
+import * as NodeCrypto from "node:crypto";
 import {
   type ProjectWorkActor,
+  type ProjectWorkWriteIntent,
+  ProjectTeamWriteIntent,
   type ProjectWorkAttribution,
   type ProjectWorkCommand,
   type ProjectWorkCriterion,
   type ProjectWorkReadIntent,
   type ProjectWorkWriteResult,
+  canonicalProjectWorkPayload,
   projectWorkPayloadFingerprint,
   projectWorkProtectedRevisionIntentFingerprintPayload,
   projectWorkProtectedRevisionFingerprintPayload,
@@ -18,6 +22,7 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
+import * as ProjectTeamAuthorization from "./ProjectTeamAuthorization.ts";
 import * as ProjectWorkBriefing from "./ProjectWorkBriefing.ts";
 import * as ProjectWorkNarrative from "./ProjectWorkNarrative.ts";
 import * as ProjectWorkAttentionReactor from "./ProjectWorkAttentionReactor.ts";
@@ -95,13 +100,19 @@ export type ProjectWorkWriteReceipt = ProjectWorkWriteResult;
 export interface ProjectWorkGatewayShape {
   readonly read: (
     input: ProjectWorkReadIntent,
-  ) => Effect.Effect<unknown, ProjectionRepositoryError>;
+    principal?: ProjectTeamAuthorization.ProjectTeamPrincipal,
+  ) => Effect.Effect<
+    unknown,
+    ProjectionRepositoryError | ProjectTeamAuthorization.ProjectTeamAuthorizationError
+  >;
   readonly write: (
-    command: ProjectWorkCommand,
+    command: ProjectWorkWriteIntent,
     actor: ProjectWorkActor,
     source: ProjectWorkAttribution["source"],
+    principal?: ProjectTeamAuthorization.ProjectTeamPrincipal,
   ) => Effect.Effect<
     ProjectWorkWriteReceipt,
+    | ProjectTeamAuthorization.ProjectTeamAuthorizationError
     | ProjectWorkRepository.ProjectWorkRepositoryError
     | ProjectWorkAuthorizationError
     | ProjectWorkContentRejectedError
@@ -113,6 +124,9 @@ export class ProjectWorkGateway extends Context.Service<
   ProjectWorkGateway,
   ProjectWorkGatewayShape
 >()("t3/projectWork/ProjectWorkGateway") {}
+
+const isTeamAuthorizationError = Schema.is(ProjectTeamAuthorization.ProjectTeamAuthorizationError);
+const isTeamIntent = Schema.is(ProjectTeamWriteIntent);
 
 const sensitiveAgentIntent = (command: ProjectWorkCommand): boolean =>
   command.type === "project-work.task.cancel" ||
@@ -309,8 +323,11 @@ const makeProjectWorkGateway = Effect.gen(function* () {
   const projectLifecycle = yield* Effect.serviceOption(ProjectLifecycle.ProjectLifecycle);
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const sql = yield* SqlClient.SqlClient;
+  const teamAuthorization = yield* Effect.serviceOption(
+    ProjectTeamAuthorization.ProjectTeamAuthorization,
+  );
 
-  const read: ProjectWorkGatewayShape["read"] = (input) => {
+  const readRaw = (input: ProjectWorkReadIntent) => {
     const base = { projectId: String(input.projectId) };
     const requestedLimit =
       input.limit === undefined || !Number.isFinite(input.limit)
@@ -595,8 +612,31 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     );
   };
 
-  const write: ProjectWorkGatewayShape["write"] = (command, actor, source) =>
+  const writeCommand = (
+    command: ProjectWorkCommand,
+    actor: ProjectWorkActor,
+    source: ProjectWorkAttribution["source"],
+    principal?: ProjectTeamAuthorization.ProjectTeamPrincipal,
+  ) =>
     Effect.gen(function* () {
+      const caller = principal ?? { actor };
+      if (caller.actor.kind !== actor.kind || caller.actor.id !== actor.id)
+        return yield* new ProjectWorkAuthorizationError({ reason: "spoofed-attribution" });
+      if (caller.managed !== undefined && teamAuthorization._tag === "None")
+        return yield* new ProjectTeamAuthorization.ProjectTeamAuthorizationError({
+          reason: "Managed authority unavailable",
+        });
+      const executeAuthorized = <E>(
+        input: ProjectWorkCommand,
+        authorize: (input: {
+          readonly commandFingerprint: string;
+        }) => Effect.Effect<ProjectWorkCommand, E>,
+      ) =>
+        repository.executeAuthorized(input, authorize, () =>
+          teamAuthorization._tag === "Some"
+            ? teamAuthorization.value.write(caller, command)
+            : Effect.void,
+        );
       const settings = yield* serverSettings.getSettings.pipe(
         Effect.mapError(
           () =>
@@ -732,63 +772,61 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             reason: "invalid-approval",
           });
         }
-        const approval = yield* repository
-          .executeAuthorized(authorizedCommand, () =>
-            Effect.gen(function* () {
-              yield* fence;
-              const consumed = yield* auth.consumeProjectWorkApproval({
-                ...approvalInput,
-                payloadFingerprint: requestedFingerprint,
+        const approval = yield* executeAuthorized(authorizedCommand, () =>
+          Effect.gen(function* () {
+            yield* fence;
+            const consumed = yield* auth.consumeProjectWorkApproval({
+              ...approvalInput,
+              payloadFingerprint: requestedFingerprint,
+            });
+            if (
+              consumed.approvalId !== command.approval.approvalId ||
+              consumed.taskId !== command.approval.taskId ||
+              consumed.specRevision !== command.approval.specRevision
+            ) {
+              return yield* new ProjectWorkAuthorizationError({
+                reason: "invalid-approval",
               });
-              if (
-                consumed.approvalId !== command.approval.approvalId ||
-                consumed.taskId !== command.approval.taskId ||
-                consumed.specRevision !== command.approval.specRevision
-              ) {
-                return yield* new ProjectWorkAuthorizationError({
-                  reason: "invalid-approval",
-                });
+            }
+            const expectedFingerprint = projectWorkPayloadFingerprint(
+              projectWorkProtectedRevisionFingerprintPayload({
+                ...(authorizedCommand as Extract<
+                  ProjectWorkCommand,
+                  {
+                    readonly type: "project-work.task.revise-protected-specification";
+                  }
+                >),
+                approval: consumed,
+              }),
+            );
+            const protectedCommand = authorizedCommand as Extract<
+              ProjectWorkCommand,
+              {
+                readonly type: "project-work.task.revise-protected-specification";
               }
-              const expectedFingerprint = projectWorkPayloadFingerprint(
-                projectWorkProtectedRevisionFingerprintPayload({
-                  ...(authorizedCommand as Extract<
-                    ProjectWorkCommand,
-                    {
-                      readonly type: "project-work.task.revise-protected-specification";
-                    }
-                  >),
-                  approval: consumed,
-                }),
-              );
-              const protectedCommand = authorizedCommand as Extract<
-                ProjectWorkCommand,
-                {
-                  readonly type: "project-work.task.revise-protected-specification";
-                }
-              >;
-              const { approvalToken: _approvalToken, ...withoutToken } = protectedCommand;
-              return {
-                ...withoutToken,
-                approval: {
-                  ...consumed,
-                  payloadFingerprint: expectedFingerprint,
-                },
-              } as ProjectWorkCommand;
-            }),
-          )
-          .pipe(
-            Effect.mapError((cause) => {
-              if (
-                Schema.is(ProjectWorkAuthorizationError)(cause) ||
-                Schema.is(EnvironmentAuth.ServerAuthProjectWorkApprovalError)(cause) ||
-                cause instanceof ProjectWorkPolicyError ||
-                isPersistenceError(cause)
-              ) {
-                return cause;
-              }
-              return toPersistenceSqlError("ProjectWorkGateway.write")(cause);
-            }),
-          );
+            >;
+            const { approvalToken: _approvalToken, ...withoutToken } = protectedCommand;
+            return {
+              ...withoutToken,
+              approval: {
+                ...consumed,
+                payloadFingerprint: expectedFingerprint,
+              },
+            } as ProjectWorkCommand;
+          }),
+        ).pipe(
+          Effect.mapError((cause) => {
+            if (
+              Schema.is(ProjectWorkAuthorizationError)(cause) ||
+              Schema.is(EnvironmentAuth.ServerAuthProjectWorkApprovalError)(cause) ||
+              cause instanceof ProjectWorkPolicyError ||
+              isPersistenceError(cause)
+            ) {
+              return cause;
+            }
+            return toPersistenceSqlError("ProjectWorkGateway.write")(cause);
+          }),
+        );
         if (Option.isSome(attention))
           yield* attention.value.onCommitted({
             projectId: String(command.projectId),
@@ -799,44 +837,42 @@ const makeProjectWorkGateway = Effect.gen(function* () {
       }
       const result =
         actor.kind === "agent" && sensitiveAgentIntent(command)
-          ? yield* repository
-              .executeAuthorized(authorizedCommand, ({ commandFingerprint }) =>
-                Effect.gen(function* () {
-                  yield* fence;
-                  const approvalToken =
-                    "approvalToken" in authorizedCommand
-                      ? authorizedCommand.approvalToken
-                      : undefined;
-                  if (approvalToken === undefined) {
-                    return yield* new ProjectWorkAuthorizationError({
-                      reason: "agent-approval-required",
-                    });
-                  }
-                  yield* auth.consumeProjectWorkApproval({
-                    token: approvalToken,
-                    projectId: String(command.projectId),
-                    taskId: approvalTaskIdFor(command),
-                    specRevision: approvalSpecRevisionFor(command),
-                    payloadFingerprint: commandFingerprint,
-                    agentId: actor.id ?? "anonymous-agent",
+          ? yield* executeAuthorized(authorizedCommand, ({ commandFingerprint }) =>
+              Effect.gen(function* () {
+                yield* fence;
+                const approvalToken =
+                  "approvalToken" in authorizedCommand
+                    ? authorizedCommand.approvalToken
+                    : undefined;
+                if (approvalToken === undefined) {
+                  return yield* new ProjectWorkAuthorizationError({
+                    reason: "agent-approval-required",
                   });
-                  return withoutApprovalToken(authorizedCommand);
-                }),
-              )
-              .pipe(
-                Effect.mapError((cause) => {
-                  if (
-                    Schema.is(ProjectWorkAuthorizationError)(cause) ||
-                    Schema.is(EnvironmentAuth.ServerAuthProjectWorkApprovalError)(cause) ||
-                    cause instanceof ProjectWorkPolicyError ||
-                    isPersistenceError(cause)
-                  ) {
-                    return cause;
-                  }
-                  return toPersistenceSqlError("ProjectWorkGateway.write")(cause);
-                }),
-              )
-          : yield* repository.executeAuthorized(authorizedCommand, () =>
+                }
+                yield* auth.consumeProjectWorkApproval({
+                  token: approvalToken,
+                  projectId: String(command.projectId),
+                  taskId: approvalTaskIdFor(command),
+                  specRevision: approvalSpecRevisionFor(command),
+                  payloadFingerprint: commandFingerprint,
+                  agentId: actor.id ?? "anonymous-agent",
+                });
+                return withoutApprovalToken(authorizedCommand);
+              }),
+            ).pipe(
+              Effect.mapError((cause) => {
+                if (
+                  Schema.is(ProjectWorkAuthorizationError)(cause) ||
+                  Schema.is(EnvironmentAuth.ServerAuthProjectWorkApprovalError)(cause) ||
+                  cause instanceof ProjectWorkPolicyError ||
+                  isPersistenceError(cause)
+                ) {
+                  return cause;
+                }
+                return toPersistenceSqlError("ProjectWorkGateway.write")(cause);
+              }),
+            )
+          : yield* executeAuthorized(authorizedCommand, () =>
               fence.pipe(Effect.as(authorizedCommand)),
             );
       if (Option.isSome(attention))
@@ -848,6 +884,87 @@ const makeProjectWorkGateway = Effect.gen(function* () {
       return sanitizePublicValue(result.writeResult) as ProjectWorkWriteReceipt;
     });
 
+  const read: ProjectWorkGatewayShape["read"] = (input, principal) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          if (principal?.managed !== undefined && teamAuthorization._tag === "None")
+            return yield* new ProjectTeamAuthorization.ProjectTeamAuthorizationError({
+              reason: "Managed authority unavailable",
+            });
+          if (principal !== undefined && teamAuthorization._tag === "Some")
+            yield* teamAuthorization.value.read(principal, input);
+          return yield* readRaw(input);
+        }),
+      )
+      .pipe(
+        Effect.mapError((cause) =>
+          isTeamAuthorizationError(cause)
+            ? cause
+            : toPersistenceSqlError("ProjectWorkGateway.read")(cause),
+        ),
+      );
+  const write: ProjectWorkGatewayShape["write"] = (input, actor, source, principal) => {
+    if (!isTeamIntent(input)) return writeCommand(input, actor, source, principal);
+    return Effect.gen(function* () {
+      if (teamAuthorization._tag === "None")
+        return yield* new ProjectTeamAuthorization.ProjectTeamAuthorizationError({
+          reason: "Team authorization unavailable",
+        });
+      const caller = principal ?? { actor };
+      if (caller.actor.kind !== actor.kind || caller.actor.id !== actor.id)
+        return yield* new ProjectWorkAuthorizationError({ reason: "spoofed-attribution" });
+      const settings = yield* serverSettings.getSettings.pipe(
+        Effect.mapError(
+          () => new ProjectWorkAuthorizationError({ reason: "project-work-disabled" }),
+        ),
+      );
+      if (!settings.projectWorkEnabled)
+        return yield* new ProjectWorkAuthorizationError({ reason: "project-work-disabled" });
+      const now = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+      const attribution = attributionFor(actor, source, now);
+      const fingerprint =
+        "project-team-intent:" +
+        NodeCrypto.createHash("sha256")
+          .update(
+            canonicalProjectWorkPayload({
+              intent: input,
+              actor: { kind: actor.kind, id: actor.id },
+              source: { kind: source.kind, id: source.id },
+              managed: caller.managed ?? null,
+            }),
+          )
+          .digest("hex");
+      const envelope: ProjectWorkCommand = {
+        type: "project-work.foundation.commit",
+        commandId: input.commandId,
+        projectId: input.projectId,
+        expectedRevision: input.expectedRevision,
+        attribution,
+        records: [],
+        committedAt: now,
+      };
+      const result = yield* repository.executeAuthorized(
+        envelope,
+        () =>
+          Effect.gen(function* () {
+            yield* assertProjectAcceptsMutations(sql, input.projectId).pipe(
+              Effect.mapError(
+                (cause) =>
+                  new ProjectWorkAuthorizationError({
+                    reason: cause.reason === "storage" ? "unknown-project" : cause.reason,
+                  }),
+              ),
+            );
+            return yield* teamAuthorization.value.intent(caller, input, attribution, false);
+          }),
+        ({ duplicate }) =>
+          teamAuthorization.value.intent(caller, input, attribution, duplicate).pipe(Effect.asVoid),
+        fingerprint,
+      );
+      return sanitizePublicValue(result.writeResult) as ProjectWorkWriteReceipt;
+    });
+  };
   return { read, write } satisfies ProjectWorkGatewayShape;
 });
 

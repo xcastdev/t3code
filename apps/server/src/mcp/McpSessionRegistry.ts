@@ -1,5 +1,7 @@
 import {
+  canonicalProjectWorkPayload,
   ProviderInstanceId,
+  type ProjectTeamCredential,
   ThreadId,
   type McpServerId,
   type ResolvedProjectMcpServer,
@@ -11,9 +13,11 @@ import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import { HttpServer } from "effect/unstable/http";
 
+import * as ProjectTeamAuthorization from "../projectWork/ProjectTeamAuthorization.ts";
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as McpInvocationContext from "./McpInvocationContext.ts";
 import * as McpProviderSession from "./McpProviderSession.ts";
@@ -23,6 +27,7 @@ import * as ProjectMcpSecretStore from "./ProjectMcpSecretStore.ts";
 export interface McpCredentialRequest {
   readonly threadId: ThreadId;
   readonly providerInstanceId: ProviderInstanceId;
+  readonly managed?: ProjectTeamCredential;
   readonly capabilities?: ReadonlySet<McpInvocationContext.McpCapability>;
   /**
    * Project MCP may remain available when the managed browser preview is
@@ -100,6 +105,7 @@ export interface McpSessionRegistryOptions {
  * stack and is reachable on whatever host the server binds to, so this token is
  * the only thing guarding the `t3-code` toolkits on a remote-reachable server.
  */
+const encodeUnknownJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const DEFAULT_LIVENESS_WINDOW_MS = 24 * 60 * 60 * 1_000;
 
 const bytesToHex = (bytes: Uint8Array): string =>
@@ -131,6 +137,10 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
   const environmentId = yield* environment.getEnvironmentId;
   const httpServer = yield* HttpServer.HttpServer;
   const projectProxy = yield* Effect.serviceOption(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry);
+  const authorization = yield* Effect.serviceOption(
+    ProjectTeamAuthorization.ProjectTeamAuthorization,
+  );
+  const managedHistory = new Map<string, ProjectTeamCredential>();
   const state = yield* SynchronizedRef.make<RegistryState>({ records: new Map() });
   const expiryFibers = new Map<string, Fiber.Fiber<void, never>>();
   const expiryTokens = new Map<string, symbol>();
@@ -186,6 +196,40 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
       );
       yield* cleanupExpiredProjectSessions(resolved.expired);
       if (resolved.scope !== undefined) {
+        if (authorization._tag === "Some") {
+          const valid = yield* authorization.value
+            .resolve({
+              actor: McpInvocationContext.projectWorkActorForInvocation(resolved.scope),
+              ...(resolved.scope.managed === undefined ? {} : { managed: resolved.scope.managed }),
+            })
+            .pipe(Effect.result);
+          if (
+            valid._tag === "Failure" ||
+            (resolved.scope.managed === undefined && valid.success !== undefined)
+          ) {
+            if (resolved.scope.managed !== undefined) {
+              const pending = yield* authorization.value
+                .issueCredential({ ...resolved.scope.managed })
+                .pipe(Effect.result);
+              if (
+                pending._tag === "Success" &&
+                pending.success?.binding.status === "reserved" &&
+                canonicalProjectWorkPayload(pending.success.credential) ===
+                  canonicalProjectWorkPayload(resolved.scope.managed)
+              )
+                return undefined;
+            }
+            yield* revokeAndCleanup(
+              (record) => record.scope.providerSessionId === resolved.scope!.providerSessionId,
+            );
+            return undefined;
+          }
+        } else if (resolved.scope.managed !== undefined) {
+          yield* revokeAndCleanup(
+            (record) => record.scope.providerSessionId === resolved.scope!.providerSessionId,
+          );
+          return undefined;
+        }
         yield* scheduleExpiry(resolved.scope.providerSessionId);
       }
       return resolved.scope;
@@ -194,6 +238,23 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
 
   const touch: McpSessionRegistryShape["touch"] = Effect.fn("McpSessionRegistry.touch")(
     function* (threadId) {
+      const records = yield* SynchronizedRef.get(state);
+      for (const record of records.records.values())
+        if (record.scope.threadId === threadId && record.scope.managed !== undefined) {
+          const valid =
+            authorization._tag === "Some"
+              ? yield* authorization.value
+                  .resolve({
+                    actor: McpInvocationContext.projectWorkActorForInvocation(record.scope),
+                    managed: record.scope.managed,
+                  })
+                  .pipe(Effect.result)
+              : undefined;
+          if (valid === undefined || valid._tag === "Failure")
+            yield* revokeAndCleanup(
+              (candidate) => candidate.scope.providerSessionId === record.scope.providerSessionId,
+            );
+        }
       const timestamp = yield* currentTimeMillis;
       const result = yield* SynchronizedRef.modify(state, ({ records }) => {
         const pruned = pruneDead(records, timestamp);
@@ -307,6 +368,49 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
 
   const issue: McpSessionRegistryShape["issue"] = Effect.fn("McpSessionRegistry.issue")(
     function* (request) {
+      const key = encodeUnknownJson([request.providerInstanceId, request.threadId]);
+      const issuedAuthority =
+        authorization._tag === "Some"
+          ? yield* authorization.value
+              .issueCredential({
+                ...request,
+                ...(request.managed === undefined ? {} : { bindingId: request.managed.bindingId }),
+              })
+              .pipe(Effect.orDie)
+          : undefined;
+      const discovered = issuedAuthority?.credential;
+      const known = managedHistory.get(key);
+      if (
+        known !== undefined &&
+        discovered !== undefined &&
+        (known.bindingId !== discovered.bindingId || known.generation !== discovered.generation) &&
+        request.managed === undefined
+      )
+        return yield* Effect.die(
+          new Error("Reassigned managed credential requires trusted issuance"),
+        );
+      const managed = request.managed ?? discovered ?? known;
+      let managedCapabilities: ReadonlySet<McpInvocationContext.McpCapability> | undefined;
+      if (managed !== undefined) {
+        if (authorization._tag === "None")
+          return yield* Effect.die(new Error("Managed authority unavailable"));
+        if (
+          discovered === undefined ||
+          canonicalProjectWorkPayload(managed) !== canonicalProjectWorkPayload(discovered)
+        )
+          return yield* Effect.die(
+            new Error("Managed marker does not match durable issuance authority"),
+          );
+        managedHistory.set(key, managed);
+        yield* revokeAndCleanup(
+          (record) =>
+            record.scope.managed === undefined &&
+            record.scope.providerInstanceId === request.providerInstanceId &&
+            record.scope.threadId === request.threadId,
+        );
+        const grants = new Set<McpInvocationContext.McpCapability>(["project"]);
+        managedCapabilities = grants;
+      }
       const issuedAt = yield* currentTimeMillis;
       const providerSessionId = yield* crypto.randomUUIDv4.pipe(Effect.orDie);
       const rawToken = yield* crypto.randomBytes(32).pipe(Effect.map(tokenFromBytes), Effect.orDie);
@@ -316,6 +420,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
         let completed = false;
         return Effect.gen(function* () {
           const projectEndpoints =
+            managed === undefined &&
             request.projectMcpServers &&
             request.projectMcpServers.length > 0 &&
             projectProxy._tag === "Some"
@@ -323,6 +428,7 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
                   projectProxy.value.registerSession({
                     providerSessionId,
                     threadId: request.threadId,
+                    providerInstanceId: request.providerInstanceId,
                     servers: request.projectMcpServers,
                     ...(request.resolveProjectMcpSecret === undefined
                       ? {}
@@ -338,15 +444,18 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
             threadId: ThreadId.make(request.threadId),
             providerSessionId,
             providerInstanceId: ProviderInstanceId.make(request.providerInstanceId),
-            capabilities: new Set<McpInvocationContext.McpCapability>([
-              "pull-requests",
-              "terminal",
-              ...(request.capabilities ?? []),
-              ...((request.includePreview ?? request.capabilities?.has("preview") ?? true)
-                ? ["preview" as const]
-                : []),
-              ...(projectEndpoints.length > 0 ? ["project" as const] : []),
-            ]),
+            ...(managed === undefined ? {} : { managed }),
+            capabilities:
+              managedCapabilities ??
+              new Set<McpInvocationContext.McpCapability>([
+                "pull-requests",
+                "terminal",
+                ...(request.capabilities ?? []),
+                ...((request.includePreview ?? request.capabilities?.has("preview") ?? true)
+                  ? ["preview" as const]
+                  : []),
+                ...(projectEndpoints.length > 0 ? ["project" as const] : []),
+              ]),
             identity: {
               kind: "agent",
               // The bearer credential is renewable. Durable attribution must
