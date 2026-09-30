@@ -147,8 +147,7 @@ Evaluate Mem0 and Graphiti against representative project history; select one
 engine based on recall, project isolation, correction/deletion, provenance,
 recovery, and operating cost. The reviewed P1 memory slice selects Mem0 as a
 derived dense-only index; configuration, evidence, and remaining production
-obligations are recorded under Implementation progress. The full P1 exit gate
-and subsequent memory integration remain incomplete.
+obligations are recorded under Implementation progress. The P1 exit gate has passed; production memory integration remains P10 work.
 
 - [Mem0 self-hosted overview](https://docs.mem0.ai/open-source/overview)
 - [Graphiti temporal memory and provenance](https://github.com/getzep/graphiti)
@@ -411,7 +410,7 @@ prior verdict does not certify the new parallel assignments.
 
 ### Ordered steps
 
-- [ ] **P1 — Prove dependency boundaries and select one memory engine.**
+- [x] **P1 — Prove dependency boundaries and select one memory engine.**
       Dependencies: none. Covers AC-5, AC-6, AC-9–AC-12; validation V1.
       Read `.repos/effect-smol/LLMS.md` before writing Effect code. Verify the official
       pi repository/package scope and pin a released SDK version; do not assume older
@@ -1019,7 +1018,7 @@ Wave 1 assignments all start at
 Their worktrees and disposable probe directories are below
 `/tmp/pi-project-teams-11b7e351/`; integration is on `pi-teams/wave1`.
 No production dependency, contract, or managed execution path has been changed.
-P1 and all 19 acceptance criteria remain unchecked while proofs run.
+At that initial stage, P1 and all 19 acceptance criteria remained unchecked.
 
 ### P1 earlier probes and superseded blockers
 
@@ -1480,3 +1479,34 @@ Linux ownership, and packaging proof sources are unchanged; their reviewed evide
 is retained. No additional runtime/model/API calls, local model work, browser/device
 use, push, PR, or live T3 database write occurred. P1 remains unchecked until the
 wave's required checks and fresh review pass and it lands on this main worktree.
+
+### P1 landed; foundation wave starts
+
+Fresh GPT-6.1-Sol xhigh final wave review approves exact
+`a7ec65f70ba94f071dc8db860a7c2a365daf066d` against the reconciled main
+`063de7584956fb711b40fb80ccc137823d523da9`, with no remaining blocking finding or
+unchecked P1 feasibility item. It independently verifies 420 artifact digests
+across 16 manifests, thirteen candidate hashes, the closed 146-node SDK graph,
+seven causal Linux cleanup outcomes, both exact native memory recovery sets, and
+npm/ASAR/SEA enabled-resource/tool outcomes.
+
+The coordinator's combined scoped Knip audit at that exact candidate exits 0 with
+`{"issues":[]}` in 2.212 seconds, under a verified 2 GiB cap, 402,673,664-byte
+peak, and zero OOM events. `wave1-validation/manifest-final-knip.sha256` retains
+six combined/baseline artifacts. All eleven V1/compiler code/dependency hashes
+and the four real Linux fixture hashes are unchanged; their passing reviewed
+evidence remains applicable. Full multi-workspace CI exports were not run, and
+the matched scoped baseline findings remain explicit.
+
+Main was clean and had not advanced. The approved wave lands by ordinary local
+merge `1825ba53f902fe498bb2cdd299b3cf157fd872a7`, preserving history and unrelated
+work. P1 is complete. This record-only completion commit is the base for wave 2,
+P2–P3. One medium foundation owner receives contracts, persistence, migrations,
+and then authorization; other implementation slots remain idle until those
+interfaces are stable. Each part is independently reviewed before wave integration.
+
+P2–P14 and all 19 product acceptance criteria remain incomplete. The documented
+production runtime, isolation, memory, packaging, and client gates still apply.
+The user removed development repair-count limits for this entire implementation;
+product teams retain the specification's configured repair allowances. No push
+or PR has occurred, and no local model has been loaded or hosted.
