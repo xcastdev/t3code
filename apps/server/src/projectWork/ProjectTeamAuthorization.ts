@@ -95,17 +95,26 @@ export const layer = Layer.effect(
       return yield* readCurrentState(sql, projectId);
     });
     const discover = Effect.fn("ProjectTeamAuthorization.discover")(
-      function* (identity: {
-        readonly providerInstanceId: ProviderInstanceId;
-        readonly threadId: ThreadId;
-        readonly bindingId?: string;
-      }) {
+      function* (
+        identity: {
+          readonly providerInstanceId: ProviderInstanceId;
+          readonly threadId: ThreadId;
+          readonly bindingId?: string;
+        },
+        withdrawLegacy = false,
+      ) {
         const rows = yield* sql<{
           projectId: string;
         }>`SELECT DISTINCT project_id AS projectId FROM project_team_run_binding WHERE provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}`;
         if (rows.length === 0) return undefined;
         managedIdentities.add(managedActorId(identity));
         managedThreads.add(identity.threadId);
+        if (withdrawLegacy) {
+          // The observed binding owns this identity even if later validation or cancellation refuses issuance.
+          const revokedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+          yield* sql`UPDATE auth_sessions SET revoked_at=${revokedAt}
+            WHERE subject=${managedActorId(identity)} AND revoked_at IS NULL`;
+        }
         const bindings: Binding[] = [];
         for (const row of rows) {
           const state = yield* stateFor(row.projectId);
@@ -658,18 +667,12 @@ export const layer = Layer.effect(
         ),
       );
     return ProjectTeamAuthorization.of({
-      discover,
+      discover: (identity) => discover(identity),
       hasManagedThread,
       issueCredential: (identity) =>
         guard(
           Effect.gen(function* () {
-            // Known managed identities lose old bearers even when replacement issuance is refused.
-            const revokedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
-            yield* sql`UPDATE auth_sessions SET revoked_at=${revokedAt}
-              WHERE subject=${managedActorId(identity)} AND revoked_at IS NULL
-              AND EXISTS (SELECT record_id FROM project_team_run_binding
-                WHERE provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId})`;
-            const credential = yield* discover(identity);
+            const credential = yield* discover(identity, true);
             return credential === undefined
               ? undefined
               : yield* resolve(

@@ -985,3 +985,257 @@ it.effect("preserves a valid managed environment bearer through repeated trusted
     }
   }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
 );
+
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+
+for (const timing of ["before", "queued", "interrupted"] as const)
+  it.effect(`keeps binding observation and withdrawal consistent for ${timing} issuance`, () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const config = yield* ServerConfig.ServerConfig;
+      const sql = yield* SqlClient.SqlClient;
+      const legacy = yield* auth.issueSession({
+        identity: { kind: "agent", id: "agent:mcp:pi:authorization-thread" },
+      });
+      const held = yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token));
+      const preseed =
+        timing === "queued"
+          ? undefined
+          : yield* seedTeam("implementer", "running", { issueCredential: false });
+      const completed = yield* Deferred.make<{
+        readonly inTransaction: boolean;
+        readonly bindingCount: number;
+      }>();
+      const release = yield* Deferred.make<void>();
+      const issuedAuthority = yield* Deferred.make<
+        TeamAuthorization.ProjectTeamAuthority | undefined
+      >();
+      let intercepted = false;
+      // Preserve SQL execution/results while holding the first binding observation or withdrawal receipt.
+      const racingSql = new Proxy(sql, {
+        apply(target, _receiver, args) {
+          const statement = target(args[0], ...args.slice(1));
+          if (!Array.isArray(args[0]) || !("raw" in args[0])) return statement;
+          const bindingObservation = statement
+            .compile()[0]
+            .includes("SELECT DISTINCT project_id AS projectId FROM project_team_run_binding");
+          if (
+            !intercepted &&
+            (statement.compile()[0].includes("UPDATE auth_sessions SET revoked_at=") ||
+              (timing !== "interrupted" && bindingObservation))
+          ) {
+            intercepted = true;
+            return statement.pipe(
+              Effect.tap((observedRows) =>
+                Effect.gen(function* () {
+                  const transaction = yield* Effect.serviceOption(sql.transactionService);
+                  const rows = bindingObservation
+                    ? observedRows
+                    : yield* sql`SELECT record_id FROM project_team_run_binding WHERE provider_instance_id='pi' AND thread_id='authorization-thread'`;
+                  yield* Deferred.succeed(completed, {
+                    inTransaction: transaction._tag === "Some",
+                    bindingCount: rows.length,
+                  });
+                  yield* Deferred.await(release);
+                }),
+              ),
+            );
+          }
+          return statement;
+        },
+      });
+      const authorization = yield* TeamAuthorization.ProjectTeamAuthorization.pipe(
+        Effect.provide(
+          Layer.fresh(TeamAuthorization.layer).pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, racingSql)),
+          ),
+        ),
+      );
+      const registry = yield* McpSessionRegistry.__testing.make({ now: () => 1000 }).pipe(
+        Effect.provideService(
+          TeamAuthorization.ProjectTeamAuthorization,
+          TeamAuthorization.ProjectTeamAuthorization.of({
+            ...authorization,
+            // Observe the actual returned authority without changing it.
+            issueCredential: (identity) =>
+              authorization
+                .issueCredential(identity)
+                .pipe(Effect.tap((authority) => Deferred.succeed(issuedAuthority, authority))),
+          }),
+        ),
+        Effect.provideService(
+          HttpServer.HttpServer,
+          HttpServer.HttpServer.of({
+            address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: 43123 },
+            serve: () => Effect.void,
+          }),
+        ),
+        Effect.provideService(
+          ServerEnvironment.ServerEnvironment,
+          ServerEnvironment.ServerEnvironment.of({
+            getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+            getDescriptor: Effect.die("unused"),
+          }),
+        ),
+      );
+      const request = {
+        providerInstanceId: ProviderInstanceId.make("pi"),
+        threadId: ThreadId.make("authorization-thread"),
+      };
+      const pending = yield* registry.issue(request).pipe(Effect.forkScoped);
+      const receipt = yield* Deferred.await(completed);
+      expect(receipt.bindingCount).toBe(timing === "queued" ? 0 : 1);
+      if (timing === "interrupted") {
+        yield* Fiber.interrupt(pending);
+        expect((yield* Fiber.await(pending))._tag).toBe("Failure");
+      } else if (timing === "queued") {
+        const attempted = yield* Deferred.make<void>();
+        const writerSql = new Proxy(sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            if (!Array.isArray(args[0]) || !("raw" in args[0])) return statement;
+            Deferred.doneUnsafe(attempted, Effect.void);
+            return statement;
+          },
+        });
+        const writer = yield* seedTeam("implementer", "running", { issueCredential: false }).pipe(
+          Effect.provideService(SqlClient.SqlClient, writerSql),
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(attempted);
+        if (receipt.inTransaction) {
+          // The real SQLite writer waits on the issuance transaction's owned connection.
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(pending);
+          expect(yield* Deferred.await(issuedAuthority)).toBeUndefined();
+          yield* Fiber.join(writer);
+        } else {
+          // The unrepaired boundary permits the writer to finish before discovery resumes.
+          yield* Fiber.join(writer);
+          yield* Deferred.succeed(release, undefined);
+          yield* Fiber.join(pending);
+          expect(yield* Deferred.await(issuedAuthority)).toBeUndefined();
+        }
+        const managed = yield* registry.issue(request);
+        expect(
+          (yield* registry.resolve(managed.config.authorizationHeader.replace("Bearer ", "")))
+            ?.managed,
+        ).toBeDefined();
+      } else {
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(pending);
+        expect((yield* Deferred.await(issuedAuthority))?.credential).toEqual(
+          preseed!.principal.managed,
+        );
+      }
+      // These ordinary statements also prove interruption/release returned the SQL permit.
+      const withdrawn =
+        yield* sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+      yield* sql`DELETE FROM project_team_run_binding WHERE project_id='authorization-project'`;
+      yield* sql`DELETE FROM project_work_events WHERE project_id='authorization-project'`;
+      yield* sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id='authorization-project'`;
+      const restarted = yield* EnvironmentAuth.EnvironmentAuth.pipe(
+        Effect.provide(
+          EnvironmentAuth.layer.pipe(
+            Layer.provide(Layer.fresh(TeamAuthorization.layer)),
+            Layer.provide(ServerSecretStore.layer),
+            Layer.provide(ServerEnvironment.identityLayer),
+            Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      );
+      let effects = 0;
+      const guarded = yield* guardRpcEffect(
+        authorizeRpcSession(WS_METHODS.terminalOpen, held, restarted),
+        Effect.sync(() => effects++),
+      ).pipe(Effect.result);
+      const bearer = yield* restarted
+        .authenticateHttpRequest(makeBearerRequest(legacy.token))
+        .pipe(Effect.result);
+      expect({
+        withdrawn: withdrawn[0]?.revokedAt !== null,
+        guarded: guarded._tag,
+        bearer: bearer._tag,
+        effects,
+      }).toEqual({
+        withdrawn: true,
+        guarded: "Failure",
+        bearer: "Failure",
+        effects: 0,
+      });
+      yield* registry.revokeAll;
+    }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+  );
+
+it.effect(
+  "cancels trusted issuance waiting for SQL ownership without retaining the connection",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const legacy = yield* auth.issueSession({
+        identity: { kind: "agent", id: "agent:mcp:pi:authorization-thread" },
+      });
+      const held = yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token));
+      const f = yield* seedTeam("implementer", "running", { issueCredential: false });
+      const owned = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const requested = yield* Deferred.make<void>();
+      const owner = yield* f.sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* Deferred.succeed(owned, undefined);
+            yield* Deferred.await(release);
+          }),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(owned);
+      let observed = false;
+      const waitingSql = new Proxy(f.sql, {
+        apply(target, _receiver, args) {
+          const statement = target(args[0], ...args.slice(1));
+          if (!Array.isArray(args[0]) || !("raw" in args[0])) return statement;
+          if (
+            !observed &&
+            statement
+              .compile()[0]
+              .includes("SELECT DISTINCT project_id AS projectId FROM project_team_run_binding")
+          ) {
+            observed = true;
+            return Deferred.succeed(requested, undefined).pipe(Effect.andThen(statement));
+          }
+          return statement;
+        },
+      });
+      const authorization = yield* TeamAuthorization.ProjectTeamAuthorization.pipe(
+        Effect.provide(
+          Layer.fresh(TeamAuthorization.layer).pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, waitingSql)),
+          ),
+        ),
+      );
+      const pending = yield* authorization
+        .issueCredential(f.principal.managed)
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(requested);
+      // Cancellation must settle while the other real SQL owner still holds its permit.
+      yield* Fiber.interrupt(pending);
+      expect((yield* Fiber.await(pending))._tag).toBe("Failure");
+      expect(yield* Deferred.isDone(release)).toBe(false);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(owner);
+      const untouched =
+        yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+      expect(untouched[0]?.revokedAt).toBeNull();
+      expect(yield* authorization.issueCredential(f.principal.managed)).toBeDefined();
+      const withdrawn =
+        yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+      expect(withdrawn[0]?.revokedAt).not.toBeNull();
+      expect(
+        (yield* authorizeRpcSession(WS_METHODS.terminalOpen, held, auth).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+    }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+);
