@@ -7,7 +7,7 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-09-30 20:03 UTC. Implementation has resumed. The coordinator
+Last updated: 2026-09-30 20:16 UTC. Implementation has resumed. The coordinator
 maintains this section at assignments, check results, reviews, and integration
 gates; detailed evidence and historical checkpoints are below.
 
@@ -20,9 +20,14 @@ gates; detailed evidence and historical checkpoints are below.
 - **Done:** P1 dependency proofs and memory selection landed. Regenerated bounded
   pi runtime, Linux isolation/packaging, and remote memory evidence is reviewed.
 - **Active:** P2 is reviewed and merged into wave2, awaiting combined integration.
-  P3's Sol high owner is repairing three compiler issues in its preserved isolated
-  worktree before its one independent xhigh review. The checkpoint passed 250
-  focused tests; those results must be rechecked where the repair affects them.
+  P3's Sol high owner repaired all three compiler issues and committed candidate
+  `c6a38aaaba0278c71c8c764748aed51855ae626c`. Its one independent xhigh review is
+  active. Fresh final checks pass 250 tests plus 28 focused repair regressions,
+  the normal server-entry and contracts compilers, and scoped lint/format/diff
+  checks. Coordinator inspection verified the exact commit and evidence; the
+  server-scoped Knip files/dependencies check also passes with no issues.
+  Five unchanged Lifecycle baseline lint errors
+  remain failed evidence; no unrelated cleanup is claimed.
 - **Left:** P4–P14 (11 steps), all 19 product acceptance criteria, and the final
   verifier and validator. After P2/P3 lands, P7 can run alongside P4 followed by P5.
 - **Current gate:** finish and review P3, validate/review the combined P2/P3 wave,
@@ -41,6 +46,7 @@ Main baseline for this resumption: `0e40a230a2560e79da3baf06f2a1154175d0b910`.
 Wave2 remains `8e44ffe67516decfd19df454382848ea029c8738`. P3's worktree is
 `/home/user/.cache/pi-project-teams-11b7e351/p3-authorization`, branch
 `pi-teams/p3-authorization`, base `c3ed6d3d4c606f66b9c07000246f16682df035af`.
+Its clean candidate HEAD is `c6a38aaaba0278c71c8c764748aed51855ae626c`.
 Fresh repair evidence is retained separately in
 `/home/user/.cache/pi-project-teams-11b7e351/p3-resume-high-evidence/`.
 
@@ -1994,3 +2000,47 @@ Evidence is below `/home/user/.cache/pi-project-teams-11b7e351/`. Development
 repair limits remain waived. No local model, weight download, browser/device,
 live T3 write, push or PR occurs. P2–P14 and all 19 acceptance criteria remain
 open.
+
+### Resumed P3 candidate and independent review
+
+The user requested continuation, continuous progress updates, and a top-level
+tally. Implementation resumed with one Sol high P3 owner; other implementation
+slots wait for the foundation dependency gate. The main documentation commits
+`0e40a230a2560e79da3baf06f2a1154175d0b910` and
+`41ebb90db4d82fcad97dec1d3aec0b51e531b869` change staffing and progress only.
+
+P3 candidate `c6a38aaaba0278c71c8c764748aed51855ae626c` is clean on
+`pi-teams/p3-authorization`, based on
+`c3ed6d3d4c606f66b9c07000246f16682df035af`, with exactly 32 assigned paths.
+Only `ProjectWorkGateway.test.ts` and `ProjectWorkRuntime.ts` differ from the
+frozen pause source. Removing the duplicated retry payload key and preserving
+the supplied layer's actual output/error/context types fix all three compiler
+issues without casts, compiler substitutions, or production wiring changes.
+
+Fresh checks pass 28 focused Gateway/Runtime regressions, V3 66 tests, affected
+authorization/proxy 51, host/runtime/export 39, V2 contracts 65, and V2 storage 29.
+The unchanged normal server-entry compiler changes from five diagnostics to
+exit 0 in 22.389 seconds, peak 3,522,576,384 bytes under a verified 4 GiB cap and
+zero swap/OOM. The normal contracts compiler and 32-path lint/format/diff checks
+pass. Exactly five unchanged Lifecycle baseline lint failures remain recorded.
+Actual WebSocket transport and integrated clients remain unproved.
+
+Evidence is `p3-resume-high-evidence/` below
+`/home/user/.cache/pi-project-teams-11b7e351/`; `exact-commands.json`,
+`fresh-final-results.json`, source hashes, the complete patch, archive, and
+handoff retain the exact tested candidate. The 58-artifact manifest SHA256 is
+`56b2b3d4495c9447c8852ede2666bd68b72502f18258a78002baed608f6f5d82`;
+full candidate diff SHA256 is
+`e18ce9c774c83be8e1e480fe5408c6691f1bace6dc5634516e76a0a19e07cfba`.
+The coordinator verifies all 58 artifacts, all 32 source paths against the clean
+commit, the full diff, matching check source hashes, and all 14 owned scopes
+drained, recorded in `root-p3-resume-inspection/inspection.json`.
+The one independent reviewer, `review_p3_authority`, examines this exact commit
+read-only without implementer conversation history; it will handle any repair
+rechecks itself. No P3 or combined wave approval or main code merge is claimed.
+
+The coordinator additionally runs server-scoped Knip on exact `c6a38aa`:
+`node --max-old-space-size=512 node_modules/knip/bin/knip.js --workspace apps/server --include files,dependencies --no-config-hints --reporter json`.
+It returns `{"issues":[]}`, exit 0 in 2.891 seconds, peak 489,689,088 bytes under
+2 GiB zero swap/OOM. Exact receipt and log are in `root-p3-resume-inspection/`
+with prefix `p3-candidate-knip-files-deps`; no repository-wide or export audit ran.
