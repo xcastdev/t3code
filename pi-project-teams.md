@@ -7,7 +7,7 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-09-30 20:16 UTC. Implementation has resumed. The coordinator
+Last updated: 2026-09-30 20:41 UTC. Implementation has resumed. The coordinator
 maintains this section at assignments, check results, reviews, and integration
 gates; detailed evidence and historical checkpoints are below.
 
@@ -22,7 +22,9 @@ gates; detailed evidence and historical checkpoints are below.
 - **Active:** P2 is reviewed and merged into wave2, awaiting combined integration.
   P3's Sol high owner repaired all three compiler issues and committed candidate
   `c6a38aaaba0278c71c8c764748aed51855ae626c`. Its one independent xhigh review is
-  active. Fresh final checks pass 250 tests plus 28 focused repair regressions,
+  active and has found legacy credential/proxy revival and delegation-depth
+  defects. The coordinator is independently verifying them before repair.
+  Fresh candidate checks pass 250 tests plus 28 focused repair regressions,
   the normal server-entry and contracts compilers, and scoped lint/format/diff
   checks. Coordinator inspection verified the exact commit and evidence; the
   server-scoped Knip files/dependencies check also passes with no issues.
@@ -32,10 +34,12 @@ gates; detailed evidence and historical checkpoints are below.
   verifier and validator. After P2/P3 lands, P7 can run alongside P4 followed by P5.
 - **Current gate:** finish and review P3, validate/review the combined P2/P3 wave,
   reconcile the main worktree, then merge locally. Dependent implementation waits
-  on this gate. Backend helper tests do not establish real client compatibility.
+  on this gate; bounded independent preparatory slices may overlap under the
+  strategy below. Backend helper tests do not establish real client compatibility.
 - **Team:** Sol high implementation staffing has no plan-level limit; dispatch
-  ready independent scopes within available harness slots. One xhigh reviewer per
-  piece of work, reused for repairs; two fresh final reviewers. One owner retains
+  ready independent scopes within available harness slots, including safe work
+  across multiple phases or independent parts of phases simultaneously.
+  One xhigh reviewer per piece of work, reused for repairs; two fresh final reviewers. One owner retains
   shared contracts, migrations, wiring, and dependencies.
 - **Permissions/evidence still needed:** browser/device permission when integrated
   clients are ready; explicit disposable GitHub fixture-write permission for the
@@ -295,6 +299,16 @@ limits or the product's runtime concurrency policy. The stage assignments below
 identify dependency groups, not fixed seats; split each group into additional
 independent slices only after agreeing explicit scopes, interfaces, and checks.
 
+Safe parallelism may span multiple phases or independent parts of phases; waves
+do not require unrelated ready work to wait for every earlier assignment. Start
+a complete step only after its listed prerequisites pass. A bounded preparatory
+slice may overlap other phases when its own dependencies and interfaces are
+settled; record the slice and its limits before dispatch, and keep its parent
+step incomplete until all parent prerequisites, checks, and integration gates
+pass. Reassess available independent work whenever a dependency or review gate
+clears. Preserve one writable owner for shared boundaries, exclusive scopes,
+explicit base commits, and review before integration across every overlap.
+
 | Stage                                | Concurrent assignments                                                                                                                                                                                        | Exit gate                                                                                                     |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
 | 1. Dependency proofs, P1             | Parallel scopes prove pi sessions/tools/cancellation, isolation/packaging, and memory engines against agreed fixtures. Further independent proof slices may overlap. The lead settles integration boundaries. | Required runtime and memory behaviors have concrete evidence; unresolved P1 constraints block dependent work. |
@@ -337,6 +351,8 @@ Base: <integrated commit>
 Required behavior: <specific acceptance criteria>
 Writable scope: <explicit files/directories>
 Dependencies: <approved contracts and completed steps>
+Parallel work: <other phase/slice assignments and shared-interface owners>
+Completion boundary: <slice acceptance; unfinished parent prerequisites/gates>
 Checks: <focused commands from this plan>
 
 Report shared-interface changes to the lead before implementing them.
