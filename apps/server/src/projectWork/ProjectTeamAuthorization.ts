@@ -12,6 +12,7 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
+import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
@@ -89,6 +90,7 @@ export const layer = Layer.effect(
   Effect.gen(function* () {
     const sql = yield* SqlClient.SqlClient;
     const managedIdentities = new Set<string>();
+    const managedThreads = new Set<string>();
     const stateFor = Effect.fn("ProjectTeamAuthorization.stateFor")(function* (projectId: string) {
       return yield* readCurrentState(sql, projectId);
     });
@@ -103,6 +105,7 @@ export const layer = Layer.effect(
         }>`SELECT DISTINCT project_id AS projectId FROM project_team_run_binding WHERE provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}`;
         if (rows.length === 0) return undefined;
         managedIdentities.add(managedActorId(identity));
+        managedThreads.add(identity.threadId);
         const bindings: Binding[] = [];
         for (const row of rows) {
           const state = yield* stateFor(row.projectId);
@@ -134,9 +137,13 @@ export const layer = Layer.effect(
     );
     const hasManagedThread = Effect.fn("ProjectTeamAuthorization.hasManagedThread")(
       function* (threadId: ThreadId) {
+        if (managedThreads.has(threadId)) return true;
         const rows =
           yield* sql`SELECT record_id FROM project_team_run_binding WHERE thread_id=${threadId} LIMIT 1`;
-        return rows.length > 0;
+        if (rows.length === 0) return false;
+        // Retained proxy/catalog leases must stay fenced after history is purged.
+        managedThreads.add(threadId);
+        return true;
       },
       Effect.mapError(() => deny("Managed history unavailable")),
     );
@@ -155,6 +162,7 @@ export const layer = Layer.effect(
           if (rows.length > 1) return yield* deny("Managed identity is ambiguous");
           if (rows.length > 0) {
             managedIdentities.add(principal.actor.id);
+            for (const row of rows) managedThreads.add(row.thread);
             return yield* deny("Managed principal requires an issued binding marker");
           }
         }
@@ -174,6 +182,7 @@ export const layer = Layer.effect(
           yield* sql`SELECT record_id FROM project_team_run_binding WHERE record_id=${credential.bindingId} AND project_id=${credential.projectId} AND generation=${credential.generation} AND provider_instance_id=${credential.providerInstanceId} AND thread_id=${credential.threadId}`;
         if (retained.length !== 1) return yield* deny("Managed binding missing or changed");
         managedIdentities.add(managedActorId(credential));
+        managedThreads.add(credential.threadId);
         const state = yield* stateFor(credential.projectId);
         const binding = state.foundationRecords?.find(
           (r) => r.kind === "run-binding" && r.recordId === credential.bindingId,
@@ -465,6 +474,7 @@ export const layer = Layer.effect(
         )
           return yield* deny("Frozen profile denies delegation");
         let depth = 0;
+        let delegationDepth = authority.role.delegationDepth;
         let parent = authority.binding;
         const seen = new Set<string>();
         while (parent.parentRunId !== undefined) {
@@ -491,11 +501,18 @@ export const layer = Layer.effect(
             managed: parentCredential,
           });
           if (currentParent === undefined) return yield* deny("Missing parent authority");
+          if (
+            currentParent.role.role !== "coordinator" ||
+            !currentParent.role.tools.includes("project-work.delegate") ||
+            !currentParent.binding.configuration.toolIds.includes("project-work.delegate")
+          )
+            return yield* deny("Frozen ancestor profile denies delegation");
+          // A descendant's wider profile cannot increase the frozen tree budget.
+          delegationDepth = Math.min(delegationDepth, currentParent.role.delegationDepth);
           parent = currentParent.binding;
           depth++;
         }
-        if (depth >= authority.role.delegationDepth)
-          return yield* deny("Delegation depth exhausted");
+        if (depth >= delegationDepth) return yield* deny("Delegation depth exhausted");
         const recipient = records.find(
           (r) => r.kind === "member" && r.recordId === input.recipientId,
         );
@@ -645,15 +662,20 @@ export const layer = Layer.effect(
       hasManagedThread,
       issueCredential: (identity) =>
         guard(
-          Effect.gen(function* () {
-            const credential = yield* discover(identity);
-            return credential === undefined
-              ? undefined
-              : yield* resolve(
-                  { actor: { kind: "agent", id: managedActorId(credential) }, managed: credential },
-                  true,
-                );
-          }),
+          sql.withTransaction(
+            Effect.gen(function* () {
+              const credential = yield* discover(identity);
+              if (credential === undefined) return undefined;
+              const authority = yield* resolve(
+                { actor: { kind: "agent", id: managedActorId(credential) }, managed: credential },
+                true,
+              );
+              // Trusted issuance withdraws old environment bearers even when only MCP is issued.
+              const revokedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+              yield* sql`UPDATE auth_sessions SET revoked_at=${revokedAt} WHERE subject=${managedActorId(credential)} AND revoked_at IS NULL`;
+              return authority;
+            }),
+          ),
         ),
       resolve: (p) => guard(resolve(p)),
       capability: (p, c, id) => guard(capability(p, c, id)),

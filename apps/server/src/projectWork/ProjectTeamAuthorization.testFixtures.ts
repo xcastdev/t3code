@@ -44,6 +44,7 @@ export const seed = Effect.fn("authorizationTest.seed")(function* (
     readonly roleTools?: ReadonlyArray<string>;
     readonly toolIds?: ReadonlyArray<string>;
     readonly nativeSessionId?: string | null;
+    readonly delegationDepth?: number;
   } = {},
 ) {
   yield* runMigrations();
@@ -116,7 +117,7 @@ export const seed = Effect.fn("authorizationTest.seed")(function* (
     tools: options.roleTools ?? tools,
     model: "test",
     memoryAccess: "none",
-    delegationDepth: 2,
+    delegationDepth: options.delegationDepth ?? 2,
   });
   const member = decodeRecord({
     ...common,

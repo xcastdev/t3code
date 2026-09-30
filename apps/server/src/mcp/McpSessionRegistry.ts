@@ -408,6 +408,8 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
             record.scope.providerInstanceId === request.providerInstanceId &&
             record.scope.threadId === request.threadId,
         );
+        // Catalog consumers own private proxy IDs, so retire all leases for the thread.
+        if (projectProxy._tag === "Some") yield* projectProxy.value.revokeThread(request.threadId);
         const grants = new Set<McpInvocationContext.McpCapability>(["project"]);
         managedCapabilities = grants;
       }

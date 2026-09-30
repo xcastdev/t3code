@@ -659,9 +659,9 @@ const managedAuthLayer = Layer.mergeAll(EnvironmentAuth.layer, ProjectWorkReposi
   Layer.provideMerge(TeamAuthorization.layer),
   Layer.provide(ServerSecretStore.layer),
   Layer.provide(ServerEnvironment.identityLayer),
-  Layer.provide(makeServerConfigLayer()),
+  Layer.provideMerge(makeServerConfigLayer()),
   Layer.provideMerge(SqlitePersistenceMemory),
-  Layer.provide(NodeServices.layer),
+  Layer.provideMerge(NodeServices.layer),
 );
 it.effect(
   "enforces current SQL credentials before managed RPC side effects and every stream payload",
@@ -767,4 +767,96 @@ it.effect(
         (yield* restartedAuth.validateCurrentSession!(legacySession).pipe(Effect.result))._tag,
       ).toBe("Failure");
     }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+);
+
+import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
+import { HttpServer } from "effect/unstable/http";
+import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+
+it.effect("permanently withdraws old environment bearers on MCP-only managed issuance", () =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const auth = yield* EnvironmentAuth.EnvironmentAuth;
+    const config = yield* ServerConfig.ServerConfig;
+    const legacy = yield* auth.issueSession({
+      identity: { kind: "agent", id: "agent:mcp:pi:authorization-thread" },
+    });
+    const ordinary = yield* auth.issueSession({
+      identity: { kind: "agent", id: "agent:ordinary" },
+    });
+    const held = yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token));
+    const f = yield* seedTeam("implementer");
+    const registry = yield* McpSessionRegistry.__testing.make({ now: () => 1000 }).pipe(
+      Effect.provideService(
+        HttpServer.HttpServer,
+        HttpServer.HttpServer.of({
+          address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: 43123 },
+          serve: () => Effect.void,
+        }),
+      ),
+      Effect.provideService(
+        ServerEnvironment.ServerEnvironment,
+        ServerEnvironment.ServerEnvironment.of({
+          getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+          getDescriptor: Effect.die("unused"),
+        }),
+      ),
+    );
+    const managedMcp = yield* registry.issue({
+      threadId: ThreadId.make("authorization-thread"),
+      providerInstanceId: ProviderInstanceId.make("pi"),
+    });
+    expect(
+      yield* registry.resolve(managedMcp.config.authorizationHeader.replace("Bearer ", "")),
+    ).toBeDefined();
+    expect(
+      (yield* authorizeRpcSession(WS_METHODS.terminalOpen, held, auth).pipe(Effect.result))._tag,
+    ).toBe("Failure");
+    yield* f.sql`DELETE FROM project_team_run_binding WHERE project_id=${f.principal.managed.projectId}`;
+    yield* f.sql`DELETE FROM project_work_events WHERE project_id=${f.principal.managed.projectId}`;
+    yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${f.principal.managed.projectId}`;
+    const restarted = yield* EnvironmentAuth.EnvironmentAuth.pipe(
+      Effect.provide(
+        EnvironmentAuth.layer.pipe(
+          Layer.provide(Layer.fresh(TeamAuthorization.layer)),
+          Layer.provide(ServerSecretStore.layer),
+          Layer.provide(ServerEnvironment.identityLayer),
+          Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+    );
+    let effects = 0;
+    const result = yield* guardRpcEffect(
+      authorizeRpcSession(WS_METHODS.terminalOpen, held, restarted),
+      Effect.sync(() => effects++),
+    ).pipe(Effect.result);
+    expect(result._tag).toBe("Failure");
+    expect(effects).toBe(0);
+    expect(
+      (yield* restarted
+        .authenticateHttpRequest(makeBearerRequest(legacy.token))
+        .pipe(Effect.result))._tag,
+    ).toBe("Failure");
+    expect(
+      (yield* restarted.authenticateHttpRequest(makeBearerRequest(ordinary.token))).identity.id,
+    ).toBe("agent:ordinary");
+    const revoked =
+      yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+    expect(revoked[0]?.revokedAt).not.toBeNull();
+    yield* registry.revokeAll;
+  }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+);
+
+it.effect("preserves a valid managed environment bearer through repeated trusted issuance", () =>
+  Effect.gen(function* () {
+    const f = yield* seedTeam("implementer");
+    const auth = yield* EnvironmentAuth.EnvironmentAuth;
+    const bearer = yield* auth.issueSession({ managed: f.principal.managed });
+    for (let n = 0; n < 3; n++) {
+      yield* f.auth.issueCredential(f.principal.managed);
+      const session = yield* auth.authenticateHttpRequest(makeBearerRequest(bearer.token));
+      yield* authorizeRpcSession(WS_METHODS.projectWorkRead, session, auth);
+    }
+  }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
 );

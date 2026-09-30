@@ -523,6 +523,11 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
         }),
       );
     }
+    if (
+      authorization._tag === "Some" &&
+      (yield* authorization.value.hasManagedThread(input.threadId).pipe(Effect.orDie))
+    )
+      return yield* Effect.die(new ProjectMcpProxyUnauthorizedError());
     sessions.set(input.providerSessionId, {
       providerSessionId: input.providerSessionId,
       threadId: input.threadId,

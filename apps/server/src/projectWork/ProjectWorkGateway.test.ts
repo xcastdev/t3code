@@ -2118,3 +2118,245 @@ for (const invalidation of ["expired", "reassigned"] as const)
       expect((yield* f.auth.resolve(principal))!.state.revision).toBe(state.revision);
     }).pipe(Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer)))),
   );
+
+import { ThreadId, type ProjectTeamCredential } from "@t3tools/contracts";
+
+const seedDelegationChain = Effect.fn("authorizationTest.seedDelegationChain")(function* (
+  rootLimit: number,
+  middleLimit: number,
+  leafLimit: number,
+  missingGrant?: "roleTools" | "toolIds",
+) {
+  const f = yield* seedTeam("coordinator", "running", {
+    delegationDepth: rootLimit,
+    ...(missingGrant === undefined ? {} : { [missingGrant]: ["project-work.read-project"] }),
+  });
+  const projectId = f.principal.managed.projectId;
+  let parentRunId = f.binding.recordId;
+  let credential: ProjectTeamCredential = f.principal.managed;
+  for (const n of [1, 2]) {
+    const taskId = ProjectWorkTaskId.make(`descendant-task-${n}`);
+    const criterionId = ProjectWorkCriterionId.make(`descendant-criterion-${n}`);
+    const attemptId = ProjectWorkAttemptId.make(`descendant-attempt-${n}`);
+    yield* f.repo.execute({
+      type: "project-work.task.create",
+      projectId,
+      taskId,
+      commandId: CommandId.make(`descendant-create-${n}`),
+      title: "Descendant",
+      createdAt: at,
+    });
+    yield* f.repo.execute({
+      type: "project-work.criterion.upsert",
+      projectId,
+      taskId,
+      commandId: CommandId.make(`descendant-criterion-${n}`),
+      criterion: {
+        criterionId,
+        taskId,
+        description: "Child scope",
+        required: false,
+        status: "unsatisfied",
+        satisfiedByEvidenceIds: [],
+        revision: 0,
+        updatedAt: at,
+      },
+      updatedAt: at,
+    });
+    yield* f.repo.execute({
+      type: "project-work.task.specify",
+      projectId,
+      taskId,
+      commandId: CommandId.make(`descendant-spec-${n}`),
+      specification: {
+        objective: "Child scope",
+        scopeIn: "Child",
+        scopeOut: "Parent",
+        criterionIds: [criterionId],
+        revision: 1,
+        protected: false,
+      },
+      updatedAt: at,
+    });
+    yield* f.repo.execute({
+      type: "project-work.task.ready",
+      projectId,
+      taskId,
+      commandId: CommandId.make(`descendant-ready-${n}`),
+      updatedAt: at,
+    });
+    yield* f.repo.execute({
+      type: "project-work.task.claim",
+      projectId,
+      taskId,
+      commandId: CommandId.make(`descendant-claim-${n}`),
+      attemptId,
+      leaseToken: `descendant-lease-${n}`,
+      leasedUntil: "2035-01-01T00:00:00.000Z",
+      claimedAt: at,
+    });
+    const roleId = `descendant-role-${n}`;
+    yield* f.change(
+      decodeTeamFixture({
+        ...f.role,
+        recordId: roleId,
+        roleId,
+        delegationDepth: n === 1 ? middleLimit : leafLimit,
+        tools: ["project-work.delegate"],
+      }),
+    );
+    const memberId = `descendant-member-${n}`;
+    yield* f.change(
+      decodeTeamFixture({
+        ...f.member,
+        recordId: memberId,
+        coordinator: false,
+        roleRevisionId: roleId,
+      }),
+    );
+    const threadId = ThreadId.make(`descendant-thread-${n}`);
+    const binding = decodeTeamFixture({
+      ...f.binding,
+      recordId: `descendant-binding-${n}`,
+      taskId,
+      attemptId,
+      memberId,
+      roleRevisionId: roleId,
+      parentRunId,
+      threadId,
+      sessionId: `native-descendant-${n}`,
+      configuration: {
+        instructionsHash: "hash",
+        toolIds: ["project-work.delegate"],
+        skillIds: [],
+        runtimeVersion: "test",
+        maxTokens: 1000,
+        maxDurationMs: 1000,
+        paidFallback: false,
+      },
+    });
+    yield* f.change(binding);
+    parentRunId = binding.recordId;
+    credential = (yield* f.auth.issueCredential({
+      providerInstanceId: credential.providerInstanceId,
+      threadId,
+    }))!.credential;
+  }
+  yield* f.change(
+    decodeTeamFixture({ ...f.member, recordId: "depth-recipient", coordinator: false }),
+  );
+  const principal = {
+    actor: { kind: "agent" as const, id: TeamAuthorization.managedActorId(credential) },
+    managed: credential,
+  };
+  const state = (yield* f.auth.resolve(principal))!.state;
+  const taskId = (yield* f.auth.resolve(principal))!.binding.taskId;
+  const input = {
+    type: "project-team.delegation.request" as const,
+    projectId,
+    taskId,
+    commandId: CommandId.make("depth-request"),
+    expectedRevision: state.revision,
+    expectedTaskRevision: state.tasks.find((t) => t.taskId === taskId)!.revision,
+    specRevision: 1,
+    planRevision: 0,
+    requestId: "depth-request",
+    recipientId: "depth-recipient",
+    objective: "Bounded descendant delegation",
+  };
+  return { f, principal, input };
+});
+
+for (const scenario of [
+  { name: "root is stricter", root: 2, middle: 8, leaf: 8, allowed: false },
+  { name: "leaf is stricter", root: 8, middle: 8, leaf: 2, allowed: false },
+  { name: "intermediate is stricter", root: 8, middle: 2, leaf: 8, allowed: false },
+  { name: "all frozen budgets permit the child", root: 8, middle: 8, leaf: 8, allowed: true },
+])
+  it.effect(`checks every frozen delegation budget when ${scenario.name}`, () =>
+    Effect.gen(function* () {
+      const { f, principal, input } = yield* seedDelegationChain(
+        scenario.root,
+        scenario.middle,
+        scenario.leaf,
+      );
+      const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+      const source = { kind: "mcp" as const, id: "descendant" };
+      const result = yield* gateway
+        .write(input, principal.actor, source, principal)
+        .pipe(Effect.result);
+      expect(result._tag).toBe(scenario.allowed ? "Success" : "Failure");
+      const state = (yield* f.auth.resolve(principal))!.state;
+      expect(state.foundationRecords?.some((r) => r.recordId === input.requestId)).toBe(
+        scenario.allowed,
+      );
+      expect(state.foundationRecords?.some((r) => r.kind === "effect")).toBe(false);
+      if (result._tag === "Success") {
+        yield* f.change(
+          decodeTeamFixture({
+            ...f.role,
+            recordId: "current-member-role",
+            roleId: "current-member-role",
+            delegationDepth: 0,
+          }),
+        );
+        yield* f.change(
+          decodeTeamFixture({ ...f.member, revision: 1, roleRevisionId: "current-member-role" }),
+        );
+        expect((yield* gateway.write(input, principal.actor, source, principal)).receipt).toEqual(
+          result.success.receipt,
+        );
+        yield* f.change(decodeTeamFixture({ ...f.role, revision: 1, status: "retired" }));
+        expect(
+          (yield* gateway.write(input, principal.actor, source, principal).pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+      }
+    }).pipe(Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer)))),
+  );
+
+for (const missing of ["roleTools", "toolIds"] as const)
+  it.effect(`checks ancestor frozen ${missing} before descendant delegation`, () =>
+    Effect.gen(function* () {
+      const { principal, input } = yield* seedDelegationChain(8, 8, 8, missing);
+      const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+      expect(
+        (yield* gateway
+          .write(input, principal.actor, { kind: "mcp", id: "descendant" }, principal)
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+    }).pipe(Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer)))),
+  );
+
+const encodeDelegationCheckpoint = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+it.effect("rejects a recovered delegation ancestry cycle without writing a message", () =>
+  Effect.gen(function* () {
+    const { f, principal, input } = yield* seedDelegationChain(8, 8, 8);
+    const state = (yield* f.auth.resolve(principal))!.state;
+    const recovered = {
+      ...state,
+      foundationRecords: state.foundationRecords?.map((record) =>
+        record.recordId === f.binding.recordId
+          ? { ...record, parentRunId: "descendant-binding-2" }
+          : record,
+      ),
+    };
+    yield* f.sql`UPDATE project_work_reducer_checkpoints SET state_json=${encodeDelegationCheckpoint(recovered)} WHERE project_id=${input.projectId}`;
+    const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+    expect(
+      (yield* gateway
+        .write(
+          { ...input, expectedRevision: state.revision },
+          principal.actor,
+          { kind: "mcp", id: "descendant" },
+          principal,
+        )
+        .pipe(Effect.result))._tag,
+    ).toBe("Failure");
+    expect(
+      (yield* f.auth.resolve(principal))!.state.foundationRecords?.some(
+        (r) => r.recordId === input.requestId,
+      ),
+    ).toBe(false);
+  }).pipe(Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer)))),
+);

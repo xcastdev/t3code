@@ -1042,3 +1042,218 @@ it.effect(
       }),
     ),
 );
+
+import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
+import { HttpServer } from "effect/unstable/http";
+import { EnvironmentId, McpCatalogSessionId, ProviderInstanceId } from "@t3tools/contracts";
+import * as McpCatalogGateway from "./McpCatalogGateway.ts";
+import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
+import * as TeamAuthorization from "../projectWork/ProjectTeamAuthorization.ts";
+import { providerInstanceId as managedProvider } from "../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+
+class CatalogConsumerRequestError extends Schema.TaggedError<CatalogConsumerRequestError>()(
+  "CatalogConsumerRequestError",
+  { cause: Schema.Defect() },
+) {}
+
+it.effect(
+  "withdraws a retained catalog private proxy lease on managed issuance and after purge",
+  () =>
+    teamScoped(
+      Effect.gen(function* () {
+        yield* runMigrations();
+        let effects = 0;
+        let closed = 0;
+        const proxy = yield* makeRegistry(async () => ({
+          ...connection(async () => {
+            closed++;
+          }),
+          discoverResult: {
+            protocolVersion: "2026-07-28",
+            supportedVersions: ["2026-07-28"],
+            capabilities: { tools: {} },
+            serverInfo: { name: "fixture", version: "1" },
+          },
+          client: {
+            ...clientForFixture(),
+            callTool: async () => {
+              effects++;
+              return { content: [{ type: "text", text: "executed" }] };
+            },
+          },
+        }));
+        const registry = yield* McpSessionRegistry.__testing.make({ now: () => 1000 }).pipe(
+          Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, proxy),
+          Effect.provideService(
+            HttpServer.HttpServer,
+            HttpServer.HttpServer.of({
+              address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: 43123 },
+              serve: () => Effect.void,
+            }),
+          ),
+          Effect.provideService(
+            ServerEnvironment.ServerEnvironment,
+            ServerEnvironment.ServerEnvironment.of({
+              getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+              getDescriptor: Effect.die("unused"),
+            }),
+          ),
+        );
+        const legacy = yield* registry.issue({
+          threadId: managedThreadId,
+          providerInstanceId: managedProvider,
+        });
+        const catalog = yield* McpCatalogGateway.__testing.make.pipe(
+          Effect.provideService(ProjectMcpProxyRegistry.ProjectMcpProxyRegistry, proxy),
+        );
+        const catalogSessionId = McpCatalogSessionId.make("retained-catalog");
+        yield* catalog.registerCatalogSession({
+          catalogSessionId,
+          providerSessionId: legacy.config.providerSessionId,
+          providerInstanceId: managedProvider,
+          threadId: managedThreadId,
+          revision: 1,
+          entries: [
+            {
+              logicalServerId: serverId,
+              transportDefinitionId: McpDefinitionId.make("definition"),
+              name: "Write fixture",
+              transport,
+              providerInstanceId: managedProvider,
+              scope: "project",
+              scopeId: "authorization-project",
+            },
+          ],
+        });
+        const fetch = yield* makeScopedFetch((request) =>
+          catalog.handle(legacy.config.providerSessionId, catalogSessionId, request),
+        );
+        const client = new Client(
+          { name: "catalog-consumer", version: "1" },
+          {
+            versionNegotiation: { mode: { pin: "2026-07-28" } },
+          },
+        );
+        yield* Effect.promise(() =>
+          client.connect(
+            new StreamableHTTPClientTransport(new URL("http://catalog.example.test/mcp"), {
+              fetch,
+            }),
+          ),
+        );
+        const tools = yield* Effect.promise(() => client.listTools());
+        const name = tools.tools[0]!.name;
+        expect(
+          (yield* Effect.promise(() => client.callTool({ name, arguments: {} }))).isError,
+        ).not.toBe(true);
+        expect(effects).toBe(1);
+        const f = yield* seedTeam("implementer");
+        yield* registry.issue({ threadId: managedThreadId, providerInstanceId: managedProvider });
+        const call = () =>
+          Effect.tryPromise({
+            try: () => client.callTool({ name, arguments: {} }),
+            catch: (cause) => new CatalogConsumerRequestError({ cause }),
+          }).pipe(Effect.result);
+        const during = yield* call();
+        expect(during._tag === "Failure" || during.success.isError === true).toBe(true);
+        expect(effects).toBe(1);
+        yield* f.sql`DELETE FROM project_team_run_binding WHERE project_id=${f.principal.managed.projectId}`;
+        yield* f.sql`DELETE FROM project_work_events WHERE project_id=${f.principal.managed.projectId}`;
+        yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${f.principal.managed.projectId}`;
+        const after = yield* call();
+        expect(after._tag === "Failure" || after.success.isError === true).toBe(true);
+        expect(effects).toBe(1);
+        expect(closed).toBe(1);
+        expect(
+          yield* registry.resolve(legacy.config.authorizationHeader.replace("Bearer ", "")),
+        ).toBeUndefined();
+        expect(
+          (yield* proxy
+            .registerSession({
+              providerSessionId: "new-private-id",
+              threadId: managedThreadId,
+              servers: [server],
+            })
+            .pipe(Effect.exit))._tag,
+        ).toBe("Failure");
+        expect(
+          yield* proxy.registerSession({
+            providerSessionId: "ordinary",
+            threadId: ThreadId.make("never-managed"),
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            servers: [server],
+          }),
+        ).toHaveLength(1);
+        yield* Effect.promise(() => client.close());
+        yield* catalog.revokeAll;
+        yield* registry.revokeAll;
+        yield* proxy.revokeAll;
+      }),
+    ),
+);
+
+it.effect("retains a managed thread fence when only hasManagedThread observed its binding", () =>
+  teamScoped(
+    Effect.gen(function* () {
+      const f = yield* seedTeam("implementer");
+      const observer = yield* TeamAuthorization.ProjectTeamAuthorization.pipe(
+        Effect.provide(Layer.fresh(TeamAuthorization.layer)),
+      );
+      expect(yield* observer.hasManagedThread(managedThreadId)).toBe(true);
+      yield* f.sql`DELETE FROM project_team_run_binding WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_events WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${f.principal.managed.projectId}`;
+      const proxy = yield* makeRegistry(async () => connection(async () => undefined)).pipe(
+        Effect.provideService(TeamAuthorization.ProjectTeamAuthorization, observer),
+      );
+      expect(
+        (yield* proxy
+          .registerSession({
+            providerSessionId: "private-after-purge",
+            threadId: managedThreadId,
+            servers: [server],
+          })
+          .pipe(Effect.exit))._tag,
+      ).toBe("Failure");
+      expect(yield* observer.hasManagedThread(managedThreadId)).toBe(true);
+      expect(yield* observer.hasManagedThread(ThreadId.make("never-managed"))).toBe(false);
+    }),
+  ),
+);
+
+import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
+it.effect("refuses a proxy registration suspended across the managed transition", () =>
+  teamScoped(
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const crypto = yield* Crypto.Crypto;
+      const started = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const proxy = yield* makeRegistry(async () => connection(async () => undefined)).pipe(
+        Effect.provideService(
+          Crypto.Crypto,
+          Crypto.Crypto.of({
+            ...crypto,
+            randomUUIDv4: Deferred.succeed(started, undefined).pipe(
+              Effect.andThen(Deferred.await(release)),
+              Effect.andThen(crypto.randomUUIDv4),
+            ),
+          }),
+        ),
+      );
+      const pending = yield* proxy
+        .registerSession({
+          providerSessionId: "suspended-private-id",
+          threadId: managedThreadId,
+          servers: [server],
+        })
+        .pipe(Effect.exit, Effect.forkScoped);
+      yield* Deferred.await(started);
+      yield* seedTeam("implementer");
+      yield* Deferred.succeed(release, undefined);
+      expect((yield* Fiber.join(pending))._tag).toBe("Failure");
+    }),
+  ),
+);
