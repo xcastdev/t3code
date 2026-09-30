@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
+import * as NodeFSP from "node:fs/promises";
 
 import {
   type ProviderDriverKind,
@@ -14,7 +15,6 @@ import {
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
-import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
@@ -30,6 +30,7 @@ import {
 } from "./ProviderSkillAdapter.ts";
 import {
   SkillMaterializationService,
+  withSkillMaterializationCleanup,
   type SkillMaterializationServiceShape,
 } from "./SkillMaterializationService.ts";
 import { SKILL_BODY_FILE } from "./SkillPackage.ts";
@@ -231,6 +232,15 @@ const PiSkillPrepareRequest = Schema.Struct({
 });
 const decodePiRequest = Schema.decodeUnknownEffect(PiSkillPrepareRequest);
 const decodePiRuntime = Schema.decodeUnknownEffect(PiRuntimeIdentity);
+const PiOwnershipMarker = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  sessionId: Schema.String,
+  providerInstanceId: ProviderInstanceId,
+  desiredRevision: SkillCatalogRevision,
+});
+const decodePiOwnershipMarker = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(PiOwnershipMarker),
+);
 const decodePiAllowedKeys = Schema.decodeUnknownEffect(Schema.ReadonlySet(ManagedSkillKey));
 
 /** The runtime must authorize the current managed binding and frozen role/configuration. */
@@ -317,56 +327,118 @@ export function makePiSkillAdapter(input: {
           sourcePath: skill.packagePath,
         })),
       };
-      return yield* Effect.uninterruptibleMask((restore) =>
+      let fallbackCleanup: Effect.Effect<void> = Effect.void;
+      return yield* withSkillMaterializationCleanup(
         Effect.gen(function* () {
-          const materialized = yield* restore(
-            input.materialization.materialize(materializationInput),
-          ).pipe(
-            Effect.mapError((cause) => adapterError("materialization_failed", cause.detail, cause)),
-          );
-          return yield* restore(
+          const materialized = yield* input.materialization
+            .materialize(materializationInput)
+            .pipe(
+              Effect.mapError((cause) =>
+                adapterError("materialization_failed", cause.detail, cause),
+              ),
+            );
+          if (
+            !NodePath.isAbsolute(materialized.root) ||
+            NodePath.resolve(materialized.root) !== materialized.root ||
+            materialized.skillPaths.size !== prepared.skills.length ||
+            prepared.skills.some(
+              (skill) =>
+                materialized.skillPaths.get(skill.key) !==
+                NodePath.join(materialized.root, skill.key),
+            )
+          ) {
+            return yield* adapterError(
+              "invalid_materialization",
+              "Pi skill delivery returned paths outside the exact managed selection.",
+            );
+          }
+
+          // Custom materializers may not register the private cleanup owner. Once
+          // their result arrives, retain only a real matching-marker inode for fallback disposal.
+          yield* Effect.uninterruptible(
             Effect.gen(function* () {
-              if (
-                !NodePath.isAbsolute(materialized.root) ||
-                NodePath.resolve(materialized.root) !== materialized.root ||
-                materialized.skillPaths.size !== prepared.skills.length ||
-                prepared.skills.some(
-                  (skill) =>
-                    materialized.skillPaths.get(skill.key) !==
-                    NodePath.join(materialized.root, skill.key),
-                )
-              ) {
-                return yield* adapterError(
-                  "invalid_materialization",
-                  "Pi skill delivery returned paths outside the exact managed selection.",
-                );
+              const pinned = yield* Effect.tryPromise({
+                try: async () => {
+                  const info = await NodeFSP.lstat(materialized.root, { bigint: true });
+                  const markerPath = NodePath.join(materialized.root, ".t3-owned.json");
+                  const markerInfo = await NodeFSP.lstat(markerPath);
+                  if (
+                    !info.isDirectory() ||
+                    info.isSymbolicLink() ||
+                    !markerInfo.isFile() ||
+                    markerInfo.isSymbolicLink()
+                  )
+                    return undefined;
+                  const marker = await NodeFSP.readFile(markerPath, "utf8");
+                  const current = await NodeFSP.lstat(materialized.root, { bigint: true });
+                  if (info.dev !== current.dev || info.ino !== current.ino) return undefined;
+                  return { root: materialized.root, dev: info.dev, ino: info.ino, marker };
+                },
+                catch: (cause) =>
+                  adapterError(
+                    "cleanup_failed",
+                    "Could not retain materialization ownership.",
+                    cause,
+                  ),
+              }).pipe(Effect.option);
+              if (pinned._tag === "Some" && pinned.value !== undefined) {
+                const owned = pinned.value;
+                const marker = yield* decodePiOwnershipMarker(owned.marker).pipe(Effect.option);
+                if (
+                  marker._tag === "Some" &&
+                  marker.value.sessionId === materializationInput.sessionId &&
+                  marker.value.providerInstanceId === materializationInput.providerInstanceId &&
+                  marker.value.desiredRevision === materializationInput.desiredRevision
+                ) {
+                  fallbackCleanup = Effect.tryPromise({
+                    try: async () => {
+                      const current = await NodeFSP.lstat(owned.root, { bigint: true });
+                      const markerPath = NodePath.join(owned.root, ".t3-owned.json");
+                      const markerInfo = await NodeFSP.lstat(markerPath);
+                      return (
+                        current.dev === owned.dev &&
+                        current.ino === owned.ino &&
+                        !current.isSymbolicLink() &&
+                        markerInfo.isFile() &&
+                        !markerInfo.isSymbolicLink() &&
+                        (await NodeFSP.readFile(markerPath, "utf8")) === owned.marker
+                      );
+                    },
+                    catch: (cause) =>
+                      adapterError(
+                        "cleanup_failed",
+                        "Could not verify materialization ownership.",
+                        cause,
+                      ),
+                  }).pipe(
+                    Effect.flatMap((matches) =>
+                      matches ? input.materialization.dispose(materializationInput) : Effect.void,
+                    ),
+                    Effect.ignore,
+                  );
+                }
               }
-              // Copying can outlast a lease or role revocation; do not return a stale plan.
-              yield* authorize(prepared);
-              const payload: PiManagedSkillsPayload = {
-                kind: "pi-managed-skills",
-                root: materialized.root,
-                skills: prepared.skills.map((skill) => ({
-                  key: skill.key,
-                  path: NodePath.join(materialized.root, skill.key, SKILL_BODY_FILE),
-                })),
-              };
-              return {
-                providerInstanceId: input.providerInstanceId,
-                desiredRevision: prepared.desiredRevision,
-                applicationMode: "new_session_required",
-                skillKeys: prepared.skills.map((skill) => skill.key),
-                payload,
-              } satisfies ProviderSkillPlan;
             }),
-          ).pipe(
-            Effect.onExit((exit) =>
-              Exit.isFailure(exit)
-                ? input.materialization.dispose(materializationInput).pipe(Effect.ignore)
-                : Effect.void,
-            ),
           );
+          // Copying can outlast a lease or role revocation; do not return a stale plan.
+          yield* authorize(prepared);
+          const payload: PiManagedSkillsPayload = {
+            kind: "pi-managed-skills",
+            root: materialized.root,
+            skills: prepared.skills.map((skill) => ({
+              key: skill.key,
+              path: NodePath.join(materialized.root, skill.key, SKILL_BODY_FILE),
+            })),
+          };
+          return {
+            providerInstanceId: input.providerInstanceId,
+            desiredRevision: prepared.desiredRevision,
+            applicationMode: "new_session_required",
+            skillKeys: prepared.skills.map((skill) => skill.key),
+            payload,
+          } satisfies ProviderSkillPlan;
         }),
+        Effect.suspend(() => fallbackCleanup),
       );
     }),
     disposeSession: Effect.fn("PiSkillAdapter.disposeSession")(function* (runtime) {

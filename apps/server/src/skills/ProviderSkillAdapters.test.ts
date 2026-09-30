@@ -11,6 +11,7 @@ import * as Path from "effect/Path";
 import * as Layer from "effect/Layer";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
+import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
 
 import * as ServerConfig from "../config.ts";
@@ -33,6 +34,7 @@ import {
 } from "./ProviderSkillAdapters.ts";
 import { CODEX_MATERIALIZED_EXTENSION_PATH } from "../provider/Drivers/CodexSkillMaterializer.ts";
 
+const encodeFixtureJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 const instanceId = ProviderInstanceId.make("codex");
 
 describe("ProviderSkillAdapters", () => {
@@ -274,7 +276,7 @@ const writePiManifest = Effect.fn("ProviderSkillAdapters.test.writePiManifest")(
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const hash = yield* hashSkillPackage(source);
-  const encoded = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))({
+  const encoded = yield* encodeFixtureJson({
     schemaVersion: 1,
     kind: "managed-skill",
     id: "pi-review",
@@ -318,6 +320,275 @@ const piFixture = Effect.fn("ProviderSkillAdapters.test.piFixture")(function* ()
 
 describe("Pi managed skill delivery", () => {
   it.layer(PiTestLayer)("enforces managed authorization", (it) => {
+    for (const foreign of [false, true]) {
+      it.effect(
+        `fallback cleanup for an unregistered materializer ${foreign ? "retains a foreign replacement" : "removes its acquired owned generation"}`,
+        () =>
+          Effect.gen(function* () {
+            const fixture = yield* piFixture();
+            const entered = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            let copied = false;
+            const materialization: SkillMaterializationServiceShape = {
+              ...fixture.materialization,
+              materialize: (input) =>
+                Effect.gen(function* () {
+                  const root = fixture.path.join(
+                    fixture.config.skillRuntimeDir,
+                    input.sessionId,
+                    String(input.desiredRevision),
+                    input.providerInstanceId,
+                  );
+                  yield* fixture.fs.makeDirectory(root, { recursive: true });
+                  const skillPaths = new Map<ManagedSkillKey, string>();
+                  for (const item of input.packages) {
+                    const target = fixture.path.join(root, item.key);
+                    yield* fixture.fs.copy(item.sourcePath, target);
+                    skillPaths.set(item.key, target);
+                  }
+                  const marker = yield* encodeFixtureJson({
+                    schemaVersion: 1,
+                    sessionId: input.sessionId,
+                    providerInstanceId: input.providerInstanceId,
+                    desiredRevision: input.desiredRevision,
+                  });
+                  yield* fixture.fs.writeFileString(
+                    fixture.path.join(root, ".t3-owned.json"),
+                    marker,
+                  );
+                  copied = true;
+                  return { root, skillPaths };
+                }).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new Materialization.SkillMaterializationError({
+                        code: "materialization_failed",
+                        detail: "Custom materializer failed.",
+                        cause,
+                      }),
+                  ),
+                ),
+            };
+            const authorizeManagedRequest: PiManagedSkillAuthorization = () =>
+              copied
+                ? Deferred.succeed(entered, undefined).pipe(
+                    Effect.andThen(Deferred.await(release)),
+                    Effect.as(new Set([piKey])),
+                  )
+                : Effect.succeed(new Set([piKey]));
+            const adapter = makePiSkillAdapter({
+              providerInstanceId: piInstanceId,
+              materialization,
+              discoverCandidates: () => Effect.succeed([]),
+              authorizeManagedRequest,
+            });
+            const fiber = yield* adapter.prepareSession(fixture.request).pipe(Effect.forkChild);
+            yield* Deferred.await(entered);
+            const root = fixture.path.join(
+              fixture.config.skillRuntimeDir,
+              fixture.request.runtime.sessionId,
+              "2",
+              "pi-team",
+            );
+            if (foreign) {
+              const retained = yield* fixture.fs.makeTempDirectoryScoped({
+                prefix: "pi-fallback-retained-",
+              });
+              yield* fixture.fs.rename(root, fixture.path.join(retained, "original"));
+              yield* fixture.fs.copy(fixture.path.join(retained, "original"), root);
+              yield* fixture.fs.writeFileString(
+                fixture.path.join(root, "foreign.txt"),
+                "Retain fallback foreign inode.",
+              );
+            }
+            yield* Fiber.interrupt(fiber);
+            assert.isTrue(Exit.isFailure(yield* Fiber.await(fiber)));
+            assert.equal(yield* fixture.fs.exists(root), foreign);
+            if (foreign)
+              assert.equal(
+                yield* fixture.fs.readFileString(fixture.path.join(root, "foreign.txt")),
+                "Retain fallback foreign inode.",
+              );
+          }),
+      );
+    }
+
+    it.effect("concurrent preparations retain separate cleanup owners", () =>
+      Effect.gen(function* () {
+        const fixture = yield* piFixture();
+        const canceled = yield* Deferred.make<void>();
+        const successful = yield* Deferred.make<void>();
+        const cancelGate = yield* Deferred.make<void>();
+        const successGate = yield* Deferred.make<void>();
+        const materialization: SkillMaterializationServiceShape = {
+          ...fixture.materialization,
+          materialize: (input) =>
+            fixture.materialization.materialize(input).pipe(
+              Effect.flatMap((result) => {
+                const cancel = input.sessionId.endsWith("-cancel");
+                return Deferred.succeed(cancel ? canceled : successful, undefined).pipe(
+                  Effect.andThen(Deferred.await(cancel ? cancelGate : successGate)),
+                  Effect.as(result),
+                );
+              }),
+            ),
+        };
+        const adapter = makePiSkillAdapter({
+          providerInstanceId: piInstanceId,
+          materialization,
+          discoverCandidates: () => Effect.succeed([]),
+          authorizeManagedRequest: () => Effect.succeed(new Set([piKey])),
+        });
+        const cancelRuntime = {
+          ...fixture.request.runtime,
+          sessionId: fixture.request.runtime.sessionId + "-cancel",
+        };
+        const successRuntime = {
+          ...fixture.request.runtime,
+          sessionId: fixture.request.runtime.sessionId + "-success",
+        };
+        const cancelFiber = yield* adapter
+          .prepareSession({ ...fixture.request, runtime: cancelRuntime })
+          .pipe(Effect.forkChild);
+        const successFiber = yield* adapter
+          .prepareSession({ ...fixture.request, runtime: successRuntime })
+          .pipe(Effect.forkChild);
+        yield* Deferred.await(canceled);
+        yield* Deferred.await(successful);
+        yield* Fiber.interrupt(cancelFiber);
+        assert.isTrue(Exit.isFailure(yield* Fiber.await(cancelFiber)));
+        assert.isFalse(
+          yield* fixture.fs.exists(
+            fixture.path.join(
+              fixture.config.skillRuntimeDir,
+              cancelRuntime.sessionId,
+              "2",
+              "pi-team",
+            ),
+          ),
+        );
+        assert.isTrue(
+          yield* fixture.fs.exists(
+            fixture.path.join(
+              fixture.config.skillRuntimeDir,
+              successRuntime.sessionId,
+              "2",
+              "pi-team",
+            ),
+          ),
+        );
+        yield* Deferred.succeed(successGate, undefined);
+        assert.isTrue(Exit.isSuccess(yield* Fiber.await(successFiber)));
+        yield* adapter.disposeSession(successRuntime);
+      }),
+    );
+
+    for (const replace of [false, true]) {
+      it.effect(
+        `canceled post-return handoff ${replace ? "preserves a foreign replacement inode" : "removes only its published generation"}`,
+        () =>
+          Effect.gen(function* () {
+            const fixture = yield* piFixture();
+            const entered = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            const earlier = yield* fixture.materialization.materialize({
+              sessionId: fixture.request.runtime.sessionId,
+              providerInstanceId: piInstanceId,
+              desiredRevision: 1,
+              packages: [],
+            });
+            const materialization: SkillMaterializationServiceShape = {
+              ...fixture.materialization,
+              materialize: (input) =>
+                fixture.materialization
+                  .materialize(input)
+                  .pipe(
+                    Effect.flatMap((result) =>
+                      Deferred.succeed(entered, undefined).pipe(
+                        Effect.andThen(Deferred.await(release)),
+                        Effect.as(result),
+                      ),
+                    ),
+                  ),
+            };
+            const adapter = makePiSkillAdapter({
+              providerInstanceId: piInstanceId,
+              materialization,
+              discoverCandidates: () => Effect.succeed([]),
+              authorizeManagedRequest: () => Effect.succeed(new Set([piKey])),
+            });
+            const fiber = yield* adapter.prepareSession(fixture.request).pipe(Effect.forkChild);
+            yield* Deferred.await(entered);
+            const root = fixture.path.join(
+              fixture.config.skillRuntimeDir,
+              fixture.request.runtime.sessionId,
+              "2",
+              "pi-team",
+            );
+            if (replace) {
+              const retained = yield* fixture.fs.makeTempDirectoryScoped({
+                prefix: "pi-handoff-retained-",
+              });
+              yield* fixture.fs.rename(root, fixture.path.join(retained, "original"));
+              yield* fixture.fs.copy(fixture.path.join(retained, "original"), root);
+              yield* fixture.fs.writeFileString(
+                fixture.path.join(root, "foreign.txt"),
+                "Retain foreign same-marker replacement.",
+              );
+            }
+            yield* Fiber.interrupt(fiber);
+            const exit = yield* Fiber.await(fiber);
+            assert.isTrue(Exit.isFailure(exit));
+            assert.equal(yield* fixture.fs.exists(root), replace);
+            if (replace)
+              assert.equal(
+                yield* fixture.fs.readFileString(fixture.path.join(root, "foreign.txt")),
+                "Retain foreign same-marker replacement.",
+              );
+            assert.isTrue(yield* fixture.fs.exists(earlier.root));
+            assert.include(
+              yield* fixture.fs.readFileString(fixture.path.join(fixture.source, "SKILL.md")),
+              "Review the assigned change.",
+            );
+          }),
+      );
+    }
+
+    it.effect(
+      "cancellation before acquisition preserves an existing same-generation materialization",
+      () =>
+        Effect.gen(function* () {
+          const fixture = yield* piFixture();
+          const owned = yield* fixture.materialization.materialize({
+            sessionId: fixture.request.runtime.sessionId,
+            providerInstanceId: piInstanceId,
+            desiredRevision: 2,
+            packages: [],
+          });
+          const entered = yield* Deferred.make<void>();
+          const gate = yield* Deferred.make<void>();
+          const materialization: SkillMaterializationServiceShape = {
+            ...fixture.materialization,
+            materialize: () =>
+              Deferred.succeed(entered, undefined).pipe(
+                Effect.andThen(Deferred.await(gate)),
+                Effect.as({ root: owned.root, skillPaths: new Map() }),
+              ),
+          };
+          const adapter = makePiSkillAdapter({
+            providerInstanceId: piInstanceId,
+            materialization,
+            discoverCandidates: () => Effect.succeed([]),
+            authorizeManagedRequest: () => Effect.succeed(new Set([piKey])),
+          });
+          const fiber = yield* adapter.prepareSession(fixture.request).pipe(Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* Fiber.interrupt(fiber);
+          assert.isTrue(Exit.isFailure(yield* Fiber.await(fiber)));
+          assert.deepEqual(yield* fixture.fs.readDirectory(owned.root), [".t3-owned.json"]);
+        }),
+    );
+
     it.effect("copies only selected managed packages even when native discovery collides", () =>
       Effect.gen(function* () {
         const fixture = yield* piFixture();
