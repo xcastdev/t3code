@@ -1,0 +1,163 @@
+{
+  "fixtureId": "project-history-v1",
+  "description": "Synthetic history grounded in T3 project isolation, durable receipts, and remote client constraints. Contains no real user data.",
+  "observations": [
+    {
+      "id": "atlas-transport",
+      "projectId": "atlas",
+      "sourceId": "investigation-transport",
+      "revision": 1,
+      "generation": 1,
+      "status": "current",
+      "body": "Atlas clients use a single origin. Vite proxies HTTP and WebSocket requests so remote browsers connect to the same host.",
+      "provenance": {
+        "recordKind": "investigation",
+        "recordId": "investigation-transport",
+        "evidenceId": "transport-test-1"
+      }
+    },
+    {
+      "id": "atlas-receipts",
+      "projectId": "atlas",
+      "sourceId": "investigation-receipts",
+      "revision": 1,
+      "generation": 1,
+      "status": "current",
+      "body": "Atlas tests wait for typed receipts and worker drains. Sleeps do not prove completion of asynchronous effects.",
+      "provenance": {
+        "recordKind": "investigation",
+        "recordId": "investigation-receipts",
+        "evidenceId": "receipt-test-1"
+      }
+    },
+    {
+      "id": "atlas-storage-old",
+      "projectId": "atlas",
+      "sourceId": "decision-storage-old",
+      "revision": 1,
+      "generation": 1,
+      "status": "superseded",
+      "body": "Atlas stored workflow state in PostgreSQL before the migration. This historical decision is superseded by decision-storage-current.",
+      "provenance": {
+        "recordKind": "decision",
+        "recordId": "decision-storage-old",
+        "evidenceId": "migration-plan-1"
+      }
+    },
+    {
+      "id": "atlas-storage-current",
+      "projectId": "atlas",
+      "sourceId": "decision-storage-current",
+      "revision": 2,
+      "generation": 2,
+      "status": "current",
+      "body": "Atlas now stores authoritative workflow state in SQLite. The accepted migration decision supersedes the old PostgreSQL decision.",
+      "provenance": {
+        "recordKind": "decision",
+        "recordId": "decision-storage-current",
+        "evidenceId": "migration-test-2"
+      }
+    },
+    {
+      "id": "atlas-cache-investigator",
+      "projectId": "atlas",
+      "sourceId": "investigation-cache-a",
+      "revision": 1,
+      "generation": 1,
+      "status": "conflicted",
+      "body": "Atlas investigator A measured a cache expiry of thirty seconds. This conflicts with investigator B and is not an accepted decision.",
+      "provenance": {
+        "recordKind": "investigation",
+        "recordId": "investigation-cache-a",
+        "evidenceId": "cache-test-a"
+      }
+    },
+    {
+      "id": "atlas-cache-reviewer",
+      "projectId": "atlas",
+      "sourceId": "investigation-cache-b",
+      "revision": 1,
+      "generation": 1,
+      "status": "conflicted",
+      "body": "Atlas investigator B measured a cache expiry of sixty seconds. This conflicts with investigator A and is not an accepted decision.",
+      "provenance": {
+        "recordKind": "investigation",
+        "recordId": "investigation-cache-b",
+        "evidenceId": "cache-test-b"
+      }
+    },
+    {
+      "id": "atlas-deleted",
+      "projectId": "atlas",
+      "sourceId": "investigation-retracted",
+      "revision": 2,
+      "generation": 2,
+      "status": "deleted",
+      "body": "Atlas deployed an obsolete amber gateway. This observation was retracted and must not be returned, including while backend deletion is delayed.",
+      "provenance": {
+        "recordKind": "investigation",
+        "recordId": "investigation-retracted",
+        "evidenceId": "retraction-2"
+      }
+    },
+    {
+      "id": "borealis-storage",
+      "projectId": "borealis",
+      "sourceId": "decision-storage-current",
+      "revision": 1,
+      "generation": 1,
+      "status": "current",
+      "body": "Borealis stores authoritative workflow state in PostgreSQL. Borealis has no sharing grant with Atlas.",
+      "provenance": {
+        "recordKind": "decision",
+        "recordId": "decision-storage-current",
+        "evidenceId": "borealis-storage-test-1"
+      }
+    }
+  ],
+  "queries": [
+    {
+      "id": "transport-literal",
+      "projectId": "atlas",
+      "query": "WebSocket",
+      "relevantIds": ["atlas-transport"]
+    },
+    {
+      "id": "transport-semantic",
+      "projectId": "atlas",
+      "query": "How can a phone reach the development app over the tailnet?",
+      "relevantIds": ["atlas-transport"]
+    },
+    {
+      "id": "completion-literal",
+      "projectId": "atlas",
+      "query": "receipts",
+      "relevantIds": ["atlas-receipts"]
+    },
+    {
+      "id": "completion-semantic",
+      "projectId": "atlas",
+      "query": "How do we know an asynchronous operation has actually finished?",
+      "relevantIds": ["atlas-receipts"]
+    },
+    {
+      "id": "current-storage",
+      "projectId": "atlas",
+      "query": "authoritative workflow state",
+      "relevantIds": ["atlas-storage-current"]
+    },
+    {
+      "id": "conflict",
+      "projectId": "atlas",
+      "query": "cache expiry",
+      "relevantIds": ["atlas-cache-investigator", "atlas-cache-reviewer"]
+    },
+    { "id": "deleted", "projectId": "atlas", "query": "amber gateway", "relevantIds": [] },
+    {
+      "id": "other-project",
+      "projectId": "borealis",
+      "query": "authoritative workflow state",
+      "relevantIds": ["borealis-storage"]
+    }
+  ]
+}
