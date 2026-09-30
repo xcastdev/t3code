@@ -7,7 +7,7 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-09-30 20:49 UTC. Implementation has resumed. The coordinator
+Last updated: 2026-09-30 21:01 UTC. Implementation has resumed. The coordinator
 maintains this section at assignments, check results, reviews, and integration
 gates; detailed evidence and historical checkpoints are below.
 
@@ -22,17 +22,21 @@ gates; detailed evidence and historical checkpoints are below.
 - **Active:** P2 is reviewed and merged into wave2, awaiting combined integration.
   P3's Sol high owner repaired all three compiler issues and committed candidate
   `c6a38aaaba0278c71c8c764748aed51855ae626c`. Its one independent xhigh review is
-  active and has found legacy credential/proxy revival and delegation-depth
-  defects. The coordinator is independently verifying them before repair.
+  finished with REQUEST_CHANGES on three defects: legacy credential/proxy
+  revival and ancestor delegation depth. All three are independently reproduced;
+  the same P3 owner is repairing them and the same reviewer will recheck.
   Fresh candidate checks pass 250 tests plus 28 focused repair regressions,
   the normal server-entry and contracts compilers, and scoped lint/format/diff
   checks. Coordinator inspection verified the exact commit and evidence; the
   server-scoped Knip files/dependencies check also passes with no issues.
   Five unchanged Lifecycle baseline lint errors
   remain failed evidence; no unrelated cleanup is claimed.
-- **Active preparatory slice:** P5 read-only GitHub transport is assigned separately
-  while P3 is reviewed/repaired. It owns two new leaf files only, with no runtime,
-  persistence, authorization, or dispatch wiring. P5 remains incomplete; its full
+- **Active preparatory slice:** P5 read-only GitHub transport has a two-file WIP
+  and 17 focused cases; its final gate waits for the coordinator-owned conditional
+  HTTP output helper. Helper candidate `05172c6` passes 28 affected tests, normal
+  focused compiler, lint, format and diff; fresh review is pending. The leaf worker
+  checkpoints to free a reviewer slot. There is no runtime, persistence,
+  authorization, or dispatch wiring. P5 remains incomplete; its full
   P2–P4 prerequisites and intake/integration gates remain open.
 - **Left:** P4 and P6–P14 (10 steps not started), the rest of P5, all 19 product
   acceptance criteria, and the final verifier and validator. After P2/P3 lands,
@@ -2111,3 +2115,40 @@ socket or external MCP transport proof is claimed; the proxy case exercises the
 retained service consumer with a synthetic upstream. Delegation creates only a
 message and no execution effect. P3 remains unapproved pending scoped repair
 and recheck by its same independent reviewer.
+
+### P3 repair and GitHub transport prerequisite
+
+P3's one independent reviewer returns **REQUEST_CHANGES** with the same three
+root-reproduced findings. It independently passes 66 V3 tests, 55 focused
+compatibility tests and four causal probes, preserving all 11 drained scopes.
+The coordinator verifies its 62-artifact manifest, SHA256
+`91efde0b2afaa3c8d43886a19e36ea015be8ac2b6bd2e00262f001d39ddabbea`.
+The same Sol high owner repairs on base `c6a38aa` in the existing P3 worktree;
+the same reviewer will recheck. No approval or code merge has occurred.
+
+The P5 leaf owner discovers that actual `gh api --include` emits HTTP 304 headers
+but exits nonzero, while the existing GitHubCli wrapper loses that stdout.
+Official gh v2.99.0 source confirms this behavior:
+[processResponse](https://github.com/cli/cli/blob/v2.99.0/pkg/cmd/api/api.go#L433).
+The coordinator owns a minimal shared-helper part on branch
+`pi-teams/p5-github-http-output`, worktree
+`/home/user/.cache/pi-project-teams-11b7e351/p5-github-http-output`, base
+`19335d47743d92fe0f7ea0b0bcb61f84df59a299`, candidate
+`05172c635ea8636bffc99d9745adf596dd3a2454`. Its exact two paths are
+`sourceControl/GitHubCli.ts` and `GitHubCli.test.ts` under server `src/`. The
+optional server-local `allowNonZeroExit` forwards to the existing VcsProcess
+option; default and explicit-false callers retain existing error behavior.
+Callers opting in must validate returned HTTP and process statuses.
+
+A controlled ProcessRunner response through actual VcsProcess/GitHubCli fails
+before the patch and retains the conditional headers plus exit 1 afterward.
+All 28 GitHubCli/VcsProcess tests pass. The normal unchanged server-config
+focused compiler passes in 1.252 seconds, peak 614,342,656 bytes; exact-path
+lint, format and diff pass. Initial wrong compiler command and missing plugin
+dependency fail and remain recorded; correcting only tool/worktree setup gives
+the final checks. No actual GitHub response or full P5 completion is claimed.
+Evidence is `p5-github-http-output-evidence/`, 27-artifact manifest SHA256
+`5f0fa9e5826af9b28906cc50de7e3534f86c635da361b48c0622d4b7ad33ce61`.
+Fresh helper review must pass before the leaf consumes this commit. A reviewer
+launch encounters the harness thread limit; the waiting P5 worker checkpoints
+to free its slot. This does not waive the review gate.
