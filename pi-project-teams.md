@@ -1510,3 +1510,47 @@ production runtime, isolation, memory, packaging, and client gates still apply.
 The user removed development repair-count limits for this entire implementation;
 product teams retain the specification's configured repair allowances. No push
 or PR has occurred, and no local model has been loaded or hosted.
+
+### Foundation progress and resumed proof evidence
+
+P2 is isolated on `pi-teams/p2-foundation` in
+`/home/user/.cache/pi-project-teams-11b7e351/p2-foundation`, based on main
+`5ac775af2f1118396294db8020224838b6e7cd82`. One medium foundation owner holds
+contracts, migration 019, existing Project Work persistence, bounded reads, and
+export adaptations. P3 remains gated on P2 checks, coordinator inspection, and
+fresh independent part review. P2 is uncommitted and has not entered wave 2.
+
+Draft checks recorded 193 contracts, 22 persistence, and 19 gateway/export/stream
+passes. These are interim results; changed source requires final checks and
+matching source/diff hashes before review. A missing ignored dependency link
+prevented the patched Effect test package from resolving the already-installed
+Vite+ package; restoring that link allowed the normal contracts compiler to pass.
+No dependency declaration, substitute type declaration, or compiler alias changed.
+
+After the user requested continuation, the prior worker was no longer active. A
+replacement medium worker resumes the preserved draft under the same exclusive
+assignment. Disposable `/tmp/pi-project-teams-11b7e351/` worktrees and probe files
+are now absent. Their committed source and historical review verdicts remain;
+durable integration logs and manifests under the home cache survive. Several raw
+runtime/isolation/packaging and memory artifacts from the P1 review are unavailable
+for a new independent inspection. The earlier 420-digest verdict records what was
+verified then; it does not establish those files are retained now.
+
+Two independent medium workers inventory and recover or regenerate missing
+evidence in persistent home-cache directories. Their separate branches/worktrees
+start at the same `5ac775af2` base: `pi-teams/p1-runtime-evidence-recovery` and
+`pi-teams/p1-memory-evidence-recovery`. Their writable scopes are external evidence
+and disposable probes only; repository source stays read-only unless separately
+assigned. They do not delegate, launch clients, or merge. The pinned SDK remains
+available. The runtime worker may run the committed offline portable and Linux
+proofs with owned processes; fresh native isolation/packaging and remote memory
+proofs first require concrete bounded configurations. Missing historical files
+will not be reconstructed with invented original hashes. New proof source,
+commands, versions, limits, and results stay distinct from historical evidence.
+
+Runtime/memory rollout and final closure require inspectable retained evidence
+and fresh review of regenerated proofs. P2 can finish its isolated storage work;
+no product acceptance criterion is complete. Normal tool memory caps may increase
+when needed; all local model loading, hosting, inference, and weight downloads
+remain prohibited. No push, PR, browser/device use, or live T3 database write has
+occurred. Development repair-count limits remain waived for the entire plan.
