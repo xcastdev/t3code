@@ -803,7 +803,8 @@ for (const issuance of [
       const f = yield* seedTeam("implementer", "running", { issueCredential: false });
       const before =
         yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
-      expect(before[0]?.revokedAt).toBeNull();
+      // Trusted binding storage withdraws the old bearer before any credential issuance.
+      expect(before[0]?.revokedAt).not.toBeNull();
       if (issuance === "retired-role")
         yield* f.change(decodeTeamRecord({ ...f.role, revision: 1, status: "retired" }));
       else if (issuance === "settled-binding")
@@ -978,6 +979,7 @@ it.effect("preserves a valid managed environment bearer through repeated trusted
     const f = yield* seedTeam("implementer");
     const auth = yield* EnvironmentAuth.EnvironmentAuth;
     const bearer = yield* auth.issueSession({ managed: f.principal.managed });
+    yield* f.change(decodeTeamRecord({ ...f.binding, revision: 1 }));
     for (let n = 0; n < 3; n++) {
       yield* f.auth.issueCredential(f.principal.managed);
       const session = yield* auth.authenticateHttpRequest(makeBearerRequest(bearer.token));
@@ -989,7 +991,7 @@ it.effect("preserves a valid managed environment bearer through repeated trusted
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 
-for (const timing of ["before", "queued", "interrupted"] as const)
+for (const timing of ["before", "queued", "interrupted", "queued-update"] as const)
   it.effect(`keeps binding observation and withdrawal consistent for ${timing} issuance`, () =>
     Effect.gen(function* () {
       yield* runMigrations();
@@ -1009,6 +1011,7 @@ for (const timing of ["before", "queued", "interrupted"] as const)
         readonly bindingCount: number;
       }>();
       const release = yield* Deferred.make<void>();
+      const updateRequested = yield* Deferred.make<void>();
       const issuedAuthority = yield* Deferred.make<
         TeamAuthorization.ProjectTeamAuthority | undefined
       >();
@@ -1043,6 +1046,11 @@ for (const timing of ["before", "queued", "interrupted"] as const)
               ),
             );
           }
+          if (
+            timing === "queued-update" &&
+            statement.compile()[0].includes("UPDATE auth_sessions SET revoked_at=")
+          )
+            return Deferred.succeed(updateRequested, undefined).pipe(Effect.andThen(statement));
           return statement;
         },
       });
@@ -1087,7 +1095,26 @@ for (const timing of ["before", "queued", "interrupted"] as const)
       const pending = yield* registry.issue(request).pipe(Effect.forkScoped);
       const receipt = yield* Deferred.await(completed);
       expect(receipt.bindingCount).toBe(timing === "queued" ? 0 : 1);
-      if (timing === "interrupted") {
+      if (timing === "queued-update") {
+        const ownerHeld = yield* Deferred.make<void>();
+        const ownerRelease = yield* Deferred.make<void>();
+        const owner = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* Deferred.succeed(ownerHeld, undefined);
+              yield* Deferred.await(ownerRelease);
+            }),
+          )
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(ownerHeld);
+        yield* Deferred.succeed(release, undefined);
+        yield* Deferred.await(updateRequested);
+        yield* Fiber.interrupt(pending);
+        expect((yield* Fiber.await(pending))._tag).toBe("Failure");
+        expect(yield* Deferred.isDone(ownerRelease)).toBe(false);
+        yield* Deferred.succeed(ownerRelease, undefined);
+        yield* Fiber.join(owner);
+      } else if (timing === "interrupted") {
         yield* Fiber.interrupt(pending);
         expect((yield* Fiber.await(pending))._tag).toBe("Failure");
       } else if (timing === "queued") {
@@ -1229,7 +1256,7 @@ it.effect(
       yield* Fiber.join(owner);
       const untouched =
         yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
-      expect(untouched[0]?.revokedAt).toBeNull();
+      expect(untouched[0]?.revokedAt).not.toBeNull();
       expect(yield* authorization.issueCredential(f.principal.managed)).toBeDefined();
       const withdrawn =
         yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;

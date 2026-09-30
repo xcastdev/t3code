@@ -483,6 +483,19 @@ const makeProjectWorkRepository = Effect.gen(function* () {
               event.type === "project-work.foundation.recorded" ? [event.record] : [],
             ),
           );
+          // Binding ownership and withdrawal commit together; rebuilds never revoke credentials.
+          for (const event of events) {
+            if (
+              event.type !== "project-work.foundation.recorded" ||
+              event.record.kind !== "run-binding"
+            )
+              continue;
+            const binding = event.record;
+            const revokedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+            yield* sql`UPDATE auth_sessions SET revoked_at=${revokedAt}
+              WHERE subject=${`agent:mcp:${binding.providerInstanceId}:${binding.threadId}`}
+                AND revoked_at IS NULL`;
+          }
           const next = applyProjectWorkEvents(current, events);
           const normalized = project(next);
           const latestSequenceRows = yield* sql<Record<string, unknown>>`
