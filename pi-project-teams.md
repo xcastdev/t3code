@@ -227,19 +227,24 @@ Grounded in `/home/user/Projects/t3code` at commit
 checkout. Paths marked **new** are proposed files, not claims about existing code.
 Execute steps according to their dependencies and the parallel-agent execution
 strategy below. Contracts, authorization, and state transitions have one writable
-owner at a time. Astra reviews integrated candidates read-only.
+owner at a time. GPT-6.1-Sol xhigh reviews implementation candidates read-only.
 
 ### Parallel-agent execution strategy
 
-Use one lead/integrator and two or three implementation workers. The user owns
-priorities and product decisions; the lead owns assignments, dependencies, and
-integration. Assign one worker per independent writable scope. Roles change by
-stage rather than remaining permanent seats.
+Use one GPT-6.1-Sol high lead/integrator and as many GPT-6.1-Sol high implementation
+workers as available agent slots and independent work permit. Optimize for finishing
+the plan quickly and correctly. The user owns priorities and product decisions;
+the lead owns assignments, dependencies, and integration. Assign one worker per
+exclusive writable scope. Split work only when interfaces and dependencies are
+settled and the split avoids conflicting edits or unnecessary integration work.
+Leave slots idle when dependencies or shared ownership prevent useful parallelism.
 
-The planning session supports four active agents total, including the lead.
-Use at most three concurrent workers, and give Astra a freed worker slot at
-review gates. This development-team limit does not change the product's runtime
-concurrency policy.
+There is no fixed three-worker policy. Respect the harness's actual active-agent
+limit, including the lead and reviewers; the current harness allows four active
+agents total. Free an implementation slot before starting a reviewer when needed.
+Do not change harness limits or the product's runtime concurrency policy. The
+stage assignments below are dependency examples, not a cap on implementation
+workers; additional independent slices require explicit scopes and interfaces.
 
 | Stage                                | Concurrent assignments                                                                                                                                                                            | Exit gate                                                                                                     |
 | ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
@@ -265,8 +270,9 @@ otherwise idle worker slot.
 - Lead: shared contracts and exports, migration sequence, server registration,
   shared client APIs, dependency/lockfile changes, and final integration. During
   P2–P3, the lead may delegate the whole foundation scope to one owner.
-- Astra: read-only adversarial review of an integrated candidate, with findings
-  tied to acceptance criteria and reproducible failure cases.
+- Review agent: GPT-6.1-Sol xhigh, read-only adversarial review, with findings tied
+  to acceptance criteria and reproducible failure cases. Assign at most one
+  review agent to each task or piece of work, including each combined wave.
 
 Give every implementation worker a separate worktree and branch based on an
 explicit integrated revision. One owner edits each shared boundary at a time.
@@ -297,12 +303,24 @@ Workers run focused tests. The lead owns integrated verification; no repo-wide
 checks or worker-owned dev servers. Browser/device interaction requires the
 permission specified by repository instructions.
 
-Use Astra after the foundation, after dispatch/recovery, and before declaring the
-first complete workflow ready. Each gate reviews its integrated candidate. Ask
-it to challenge duplicate dispatch, stale approvals, surviving worker processes,
-cross-project memory leakage, and PR head changes after review. Separate branches
-passing independently do not establish that their boundaries agree. Apply the
-shared workflow's repair limits to each validation candidate.
+For each task or piece of work, assign one independent GPT-6.1-Sol xhigh reviewer
+in a fresh session without the implementer's conversation history. Reuse that
+same review agent for findings and repair rechecks; do not spawn additional
+review agents for that work. The lead inspects the diff and evidence, verifies
+findings, and ensures affected checks and review pass before wave integration.
+Each combined wave is a separate piece of work with one review agent and checks
+before main integration. Review duplicate dispatch, stale approvals, surviving
+workers/setup processes, recovery, uncertain external effects, memory isolation
+and deletion, duplicate messages, stale evidence, PR head changes, and client
+compatibility. Separate branches passing independently do not establish that
+their boundaries agree. Repair-count limits remain waived for this plan.
+
+After all waves land, assign exactly two fresh GPT-6.1-Sol xhigh final reviewers:
+one verifier checks all 19 acceptance criteria and required evidence; one
+validator audits the complete implementation against the specification. Both
+inspect the same exact main commit, work read-only, and do not delegate. Fix
+verified findings through the scoped branch, review, and integration process,
+then have these same final reviewers recheck the resulting exact commit.
 
 First dispatch: pi feasibility and memory evaluation in parallel, with the lead
 settling common interfaces. This resolves the dependencies most likely to force
@@ -1036,9 +1054,10 @@ Failed intermediate checks and deliberate negative controls remain preserved.
 
 On resumption, repair the three compiler issues in the same isolated P3 scope,
 run focused regressions and affected gates including the normal compiler, then
-make a scoped commit. Inspect it and obtain a fresh xhigh P3 review before
-merging to wave2. Run combined V2/V3 and affected compatibility checks, obtain a
-fresh wave review, reconcile the advanced main worktree, and repeat affected
+make a scoped commit. Inspect it and assign P3's one independent xhigh reviewer
+before merging to wave2; reuse that reviewer for any repair rechecks. Run combined
+V2/V3 and affected compatibility checks, obtain the wave's one independent review,
+reconcile the advanced main worktree, and repeat affected
 checks before the local main merge. Start P7 alongside P4 followed by P5 only
 after that merge. P2/P3 completion boxes remain unchecked until their combined
 main integration gate passes. P4–P14, all 19 acceptance criteria, and both final
@@ -1060,9 +1079,14 @@ Implementation began on 2026-09-29 in branch
 commit `6cc1a0ffad2f61a707a4b18971e187ea216f6f17`, whose only change is this record.
 The complete 969-line specification/plan was read before assignments.
 
-The user's execution instructions select GPT-6.1-Sol high for coordination,
-three GPT-6.1-Sol medium implementation workers, fresh GPT-6.1-Sol xhigh reviewers
-at each part/wave gate, and separate fresh xhigh final verifier and validator.
+The user's updated execution instructions select GPT-6.1-Sol high for coordination
+and all implementation workers. Use as many independent workers as available
+slots safely support, rather than a fixed three-worker team. Assign at most one
+GPT-6.1-Sol xhigh review agent per task or piece of work, reusing it for repairs,
+and two fresh xhigh final reviewers after implementation is complete. These rules
+supersede the earlier medium-worker and repeated fresh-review assignments recorded
+below; historical evidence and verdicts remain unchanged. Implementation remains
+paused at the checkpoint above until the user requests resumption.
 Workers do not delegate. Each has a separate branch/worktree and an explicit base.
 The coordinator owns shared contracts, migrations, server wiring, dependency
 changes, this record, and integrated client verification. No push or PR creation
@@ -1077,9 +1101,10 @@ Dependency-ordered waves retain the saved strategy:
 5. P9, then complete P10, then P11, with only independent agreed slices parallel.
 6. P12 and bounded P13 presentation work, then P13 completion and P14 integration.
 
-Each part requires coordinator inspection and fresh read-only adversarial review
-before merge to its wave branch. Each combined wave requires checks and another
-fresh review before landing here. Final verification/audit inspect the same exact
+Each part requires coordinator inspection and its one independent read-only
+adversarial review before merge to its wave branch. Each combined wave requires
+checks and its one independent review before landing here. Repair rechecks use
+the same assigned review agent. The two final reviewers inspect the same exact
 main-worktree commit. Unavailable real-runtime/platform evidence remains unchecked.
 
 Wave 1 assignments all start at
