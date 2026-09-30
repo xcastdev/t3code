@@ -7,13 +7,13 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-09-30 20:41 UTC. Implementation has resumed. The coordinator
+Last updated: 2026-09-30 20:49 UTC. Implementation has resumed. The coordinator
 maintains this section at assignments, check results, reviews, and integration
 gates; detailed evidence and historical checkpoints are below.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
-| Implementation steps        | 1    | 2      | 11   | 14    |
+| Implementation steps        | 1    | 3      | 10   | 14    |
 | Product acceptance criteria | 0    | 0      | 19   | 19    |
 | Final independent audits    | 0    | 0      | 2    | 2     |
 
@@ -30,8 +30,13 @@ gates; detailed evidence and historical checkpoints are below.
   server-scoped Knip files/dependencies check also passes with no issues.
   Five unchanged Lifecycle baseline lint errors
   remain failed evidence; no unrelated cleanup is claimed.
-- **Left:** P4–P14 (11 steps), all 19 product acceptance criteria, and the final
-  verifier and validator. After P2/P3 lands, P7 can run alongside P4 followed by P5.
+- **Active preparatory slice:** P5 read-only GitHub transport is assigned separately
+  while P3 is reviewed/repaired. It owns two new leaf files only, with no runtime,
+  persistence, authorization, or dispatch wiring. P5 remains incomplete; its full
+  P2–P4 prerequisites and intake/integration gates remain open.
+- **Left:** P4 and P6–P14 (10 steps not started), the rest of P5, all 19 product
+  acceptance criteria, and the final verifier and validator. After P2/P3 lands,
+  P7 can run alongside P4; full P5 follows P4.
 - **Current gate:** finish and review P3, validate/review the combined P2/P3 wave,
   reconcile the main worktree, then merge locally. Dependent implementation waits
   on this gate; bounded independent preparatory slices may overlap under the
@@ -2060,3 +2065,49 @@ The coordinator additionally runs server-scoped Knip on exact `c6a38aa`:
 It returns `{"issues":[]}`, exit 0 in 2.891 seconds, peak 489,689,088 bytes under
 2 GiB zero swap/OOM. Exact receipt and log are in `root-p3-resume-inspection/`
 with prefix `p3-candidate-knip-files-deps`; no repository-wide or export audit ran.
+
+### Safe cross-phase preparatory assignment
+
+The user permits safe simultaneous work across phases and phase slices. The
+coordinator applies this to a bounded P5 transport slice while P3 is under review
+and repair. Its dependency is the existing GitHubCli/pinned-credential/rate-limit
+interface already in main; it does not depend on unfinished team lifecycle or
+authorization contracts. The worker first proposes its server-local typed page
+interface to the coordinator. Shared contracts, persistence, runtime wiring,
+dependencies, and the plan stay coordinator-owned.
+
+The slice branch is `pi-teams/p5-intake-transport`, worktree
+`/home/user/.cache/pi-project-teams-11b7e351/p5-intake-transport`, explicit base
+`4003588f6` (the complete hash is recorded in its assignment). Exclusive writable
+scope: new `apps/server/src/projectWork/github/GitHubIssueClient.ts` and
+`GitHubIssueClient.test.ts`. Acceptance is bounded authenticated read transport,
+repository identity/account checks, issues/comments pages, conditional reads,
+PR filtering, and rate-limit/error behavior. No synchronization, human actions,
+model dispatch, or completion of P5 is claimed. Review and integration wait for
+its own checks and the applicable parent dependency gates. Future P5 workers
+must consume this interface and leave these two paths to this owner.
+
+### P3 independent findings verified before repair
+
+The coordinator independently reproduces three defects on clean candidate
+`c6a38aaaba0278c71c8c764748aed51855ae626c`, using copied review probes outside
+the worktree. An MCP-only managed issuance leaves a preceding WebSocket session
+unrevoked in SQL: it is denied during management and after purge by the retained
+auth service, but a fresh service with the same signing key permits the original
+bearer and guarded terminal side effect. A retained production catalog's private
+proxy lease executes after complete binding/event/checkpoint purge even though
+the old raw MCP token remains revoked. A depth-two descendant with a frozen
+depth-eight profile can enqueue third-level delegation despite its root's frozen
+depth-two limit; a depth-two leaf profile correctly denies the same request.
+
+The root reproductions pass as defect controls, not product acceptance. Exact
+commands, observations, source hashes, and receipts are in
+`root-p3-review-verification/` below the external evidence root. They take 2.983,
+3.066, and 3.507 seconds respectively, peak 569,716,736 / 554,508,288 /
+429,121,536 bytes under 2 GiB zero swap/OOM, with all owned scopes drained.
+Initial copied-probe runs fail module resolution and remain preserved; correcting
+only the external dependency link enables the causal runs. No actual WebSocket
+socket or external MCP transport proof is claimed; the proxy case exercises the
+retained service consumer with a synthetic upstream. Delegation creates only a
+message and no execution effect. P3 remains unapproved pending scoped repair
+and recheck by its same independent reviewer.
