@@ -123,6 +123,8 @@ describe("MemoryBackendContract evaluation fixtures", () => {
       expect(results.find((result) => result.queryId === "transport-semantic")?.recall).toBe(0);
       expect(results.find((result) => result.queryId === "completion-semantic")?.recall).toBe(0);
       expect(results.find((result) => result.queryId === "conflict")?.recall).toBe(1);
+      // Keep the probe measurement in test output without introducing an Effect runtime.
+      // @effect-diagnostics-next-line globalConsole:off
       console.info(
         JSON.stringify({
           fixtureId: history.fixtureId,
