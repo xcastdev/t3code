@@ -1,6 +1,6 @@
 import * as NodeFSP from "node:fs/promises";
 import * as NodeReadline from "node:readline";
-const [auditPath] = process.argv.slice(2);
+const [auditPath, negativeControl] = process.argv.slice(2);
 await NodeFSP.writeFile(auditPath + ".pid", String(process.pid));
 for await (const line of NodeReadline.createInterface({ input: process.stdin })) {
   const request = JSON.parse(line);
@@ -8,6 +8,7 @@ for await (const line of NodeReadline.createInterface({ input: process.stdin }))
   let result;
   switch (request.method) {
     case "initialize":
+      if (negativeControl === "mcp-startup-stall") await new Promise(() => {});
       result = {
         protocolVersion: "2024-11-05",
         capabilities: { tools: {} },

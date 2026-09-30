@@ -6,6 +6,61 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
+const ownedUnit = process.env.PI_RUNTIME_CONTRACT_OWNED_UNIT;
+NodeAssert.ok(ownedUnit, "Linux systemd owned service is required before SDK startup");
+const cgroupEntry = (await NodeFSP.readFile("/proc/self/cgroup", "utf8"))
+  .trim()
+  .split("\n")
+  .find((line) => line.startsWith("0::"));
+NodeAssert.ok(cgroupEntry);
+const ownedPath = "/sys/fs/cgroup" + cgroupEntry.slice(3);
+const controller = await new Promise((resolve, reject) =>
+  NodeChildProcess.execFile(
+    "systemctl",
+    [
+      "--user",
+      "show",
+      ownedUnit,
+      "-p",
+      "ControlGroup",
+      "-p",
+      "KillMode",
+      "-p",
+      "RuntimeMaxUSec",
+      "-p",
+      "TimeoutStopUSec",
+    ],
+    { timeout: 2000 },
+    (error, stdout) => (error ? reject(error) : resolve(stdout)),
+  ),
+);
+const policy = Object.fromEntries(
+  controller
+    .trim()
+    .split("\n")
+    .map((line) => line.split("=")),
+);
+const readOwned = (name) =>
+  NodeFSP.readFile(NodePath.join(ownedPath, name), "utf8").then((text) => text.trim());
+const owner = {
+  unit: ownedUnit,
+  path: ownedPath,
+  policy,
+  max: await readOwned("memory.max"),
+  swapMax: await readOwned("memory.swap.max"),
+  oomGroup: await readOwned("memory.oom.group"),
+};
+NodeAssert.equal(ownedPath, "/sys/fs/cgroup" + policy.ControlGroup);
+NodeAssert.ok(ownedPath.endsWith("/" + ownedUnit));
+NodeAssert.equal(policy.KillMode, "control-group");
+NodeAssert.equal(policy.RuntimeMaxUSec, "10s");
+NodeAssert.equal(policy.TimeoutStopUSec, "1s");
+NodeAssert.equal(owner.max, "536870912");
+NodeAssert.equal(owner.swapMax, "0");
+NodeAssert.equal(owner.oomGroup, "1");
+console.log("P1_OWNER:" + JSON.stringify(owner));
+const ownedMembers = async () =>
+  (await readOwned("cgroup.procs")).split("\n").filter(Boolean).map(Number);
 const sdkRoot = process.env.PI_RUNTIME_CONTRACT_SDK_ROOT;
 NodeAssert.ok(
   sdkRoot,
@@ -49,7 +104,17 @@ const capturedPids = new Set();
 const activeReceipts = new Set();
 const cleanupReceipts = [];
 const negativeControl = process.env.PI_RUNTIME_CONTRACT_NEGATIVE_CONTROL;
-NodeAssert.ok(!negativeControl || ["descendant-abort", "mcp-shutdown"].includes(negativeControl));
+NodeAssert.ok(
+  !negativeControl ||
+    [
+      "descendant-abort",
+      "mcp-shutdown",
+      "mcp-startup-stall",
+      "shell-pre-receipt-stall",
+      "cleanup-abort-stall",
+      "cleanup-shutdown-stall",
+    ].includes(negativeControl),
+);
 const records = [];
 const usage = {
   input: 0,
@@ -166,7 +231,9 @@ const toolCall = (name, argumentsValue = {}) => ({
 async function run(name, action) {
   if (
     negativeControl &&
-    !(negativeControl === "descendant-abort"
+    !(["descendant-abort", "shell-pre-receipt-stall", "cleanup-abort-stall"].includes(
+      negativeControl,
+    )
       ? name.includes("abort terminates")
       : name.includes("trusted MCP"))
   )
@@ -390,6 +457,7 @@ async function executeCases() {
                   "--max-old-space-size=128",
                   NodePath.join(directory, "p1-runtime-mcp.mjs"),
                   auditPath,
+                  negativeControl ?? "",
                 ],
                 cwd,
                 exposure: "direct",
@@ -421,6 +489,11 @@ async function executeCases() {
       });
       await resourceLoader.reload();
       const session = await create({ resourceLoader, tools: undefined, noTools: "builtin" });
+      if (negativeControl === "cleanup-shutdown-stall") {
+        const emit = session.extensionRunner.emit.bind(session.extensionRunner);
+        session.extensionRunner.emit = (event) =>
+          event.type === "session_shutdown" ? new Promise(() => {}) : emit(event);
+      }
       await session.bindExtensions({});
       session.subscribe((event) => events.push(event.type));
       replies = [
@@ -457,6 +530,7 @@ async function executeCases() {
     // oxlint-disable-next-line t3code/no-global-process-runtime
     NodeAssert.equal(NodeOS.platform(), "linux", "This process-tree proof requires Linux pidfd");
     const session = await create({ tools: ["bash"] });
+    if (negativeControl === "cleanup-abort-stall") session.abort = () => new Promise(() => {});
     let ready;
     const started = new Promise((resolve) => {
       ready = resolve;
@@ -478,7 +552,7 @@ async function executeCases() {
     const quote = (value) => "'" + value.replaceAll("'", "'\\''") + "'";
     replies = [
       toolCall("bash", {
-        command: `${quote(process.execPath)} --max-old-space-size=128 ${quote(script)} $$; :`,
+        command: `${quote(process.execPath)} --max-old-space-size=128 ${quote(script)} $$ ${quote(NodePath.join(scratch, "shell-owned.json"))} ${quote(negativeControl ?? "")}; :`,
       }),
     ];
     const prompt = session.prompt("Start captured descendants");
@@ -496,41 +570,78 @@ async function executeCases() {
   });
 }
 let failure;
+let cleanupCause;
+let membersBeforeCleanup;
+let membersAfterCleanup;
 try {
   await Promise.race([executeCases(), watchdog]);
 } catch (error) {
   failure = error;
 } finally {
-  clearTimeout(deadline);
-  // Cleanup uses only pidfds bound before cancellation, including on watchdog failure.
-  await Promise.all([...activeReceipts].map((owner) => owner.cleanup()));
-  for (const session of sessions) {
-    await session.abort();
-    await session.extensionRunner?.emit({ type: "session_shutdown", reason: "exit" });
-    session.dispose();
+  membersBeforeCleanup = await ownedMembers();
+  let cleanupTimer;
+  const cleanupDeadline = new Promise((resolve, reject) => {
+    cleanupTimer = setTimeout(
+      () => reject(new Error("CLEANUP_DEADLINE: SDK abort or shutdown did not complete")),
+      1500,
+    );
+  });
+  const cleanup = (async () => {
+    await Promise.all([...activeReceipts].map((owner) => owner.cleanup()));
+    for (const session of sessions) {
+      await session.abort();
+      await session.extensionRunner?.emit({ type: "session_shutdown", reason: "exit" });
+      session.dispose();
+    }
+    await NodeFSP.rm(scratch, { recursive: true, force: true });
+  })();
+  try {
+    // Preserve the main deadline through cleanup; use a fresh bound after it already failed.
+    await Promise.race(failure ? [cleanup, cleanupDeadline] : [cleanup, cleanupDeadline, watchdog]);
+    membersAfterCleanup = await ownedMembers();
+    if (!failure)
+      NodeAssert.deepEqual(
+        membersAfterCleanup,
+        [process.pid],
+        "SDK left an owned child alive after successful cleanup",
+      );
+  } catch (error) {
+    cleanupCause = error.message;
+    failure ??= error;
+  } finally {
+    clearTimeout(deadline);
+    clearTimeout(cleanupTimer);
   }
-  await NodeFSP.rm(scratch, { recursive: true, force: true });
 }
-if (failure) {
-  console.error(
-    JSON.stringify({
+const report = failure
+  ? {
       status: "failed",
       cause: failure.message,
+      cleanupCause,
       negativeControl,
       cleanupReceipts,
+      ownedMembersBeforeCleanup: membersBeforeCleanup,
+      ownedMembersAfterCleanup: membersAfterCleanup,
+      ownedPeak: await readOwned("memory.peak"),
       remoteCalls: 0,
-    }),
-  );
-  process.exitCode = 1;
-} else {
-  console.log(
-    JSON.stringify({
+    }
+  : {
       pin: metadata.version,
       remoteCalls: 0,
       callbackCount: requestCount,
-      resources: { nodeMaxRssKiB: process.resourceUsage().maxRSS, nodeHeapLimitMiB: 128 },
+      resources: {
+        nodeMaxRssKiB: process.resourceUsage().maxRSS,
+        nodeHeapLimitMiB: 128,
+        ownedPeak: await readOwned("memory.peak"),
+      },
       records,
       cleanupReceipts,
-    }),
-  );
-}
+      ownedMembersBeforeCleanup: membersBeforeCleanup,
+      ownedMembersAfterCleanup: membersAfterCleanup,
+    };
+await new Promise((resolve) =>
+  (failure ? process.stderr : process.stdout).write(JSON.stringify(report) + "\n", resolve),
+);
+// The independent, pre-existing service owns any opening/unacknowledged child; its
+// KillMode and external deadline remain authoritative after this fixture exits.
+process.exit(failure ? (cleanupCause ? 2 : 1) : 0);
