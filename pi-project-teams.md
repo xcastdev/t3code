@@ -5,6 +5,70 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 # Pi project teams
 
+## Progress dashboard
+
+Last updated: 2026-09-30 21:12 UTC. Implementation has resumed. The coordinator
+maintains this section at assignments, check results, reviews, and integration
+gates; detailed evidence and historical checkpoints are below.
+
+| Tally                       | Done | Active | Left | Total |
+| --------------------------- | ---- | ------ | ---- | ----- |
+| Implementation steps        | 1    | 4      | 9    | 14    |
+| Product acceptance criteria | 0    | 0      | 19   | 19    |
+| Final independent audits    | 0    | 0      | 2    | 2     |
+
+- **Done:** P1 dependency proofs and memory selection landed. Regenerated bounded
+  pi runtime, Linux isolation/packaging, and remote memory evidence is reviewed.
+- **Active:** P2 is reviewed and merged into wave2, awaiting combined integration.
+  P3's Sol high owner repaired all three compiler issues and committed candidate
+  `c6a38aaaba0278c71c8c764748aed51855ae626c`. Its one independent xhigh review is
+  finished with REQUEST_CHANGES on three defects: legacy credential/proxy
+  revival and ancestor delegation depth. All three are independently reproduced;
+  the same P3 owner is repairing them and the same reviewer will recheck.
+  Pre-review candidate checks pass 250 tests plus 28 focused repair regressions,
+  the normal server-entry and contracts compilers, and scoped lint/format/diff
+  checks. Coordinator inspection verified the exact commit and evidence; the
+  server-scoped Knip files/dependencies check also passes with no issues.
+  Five unchanged Lifecycle baseline lint errors
+  remain failed evidence; no unrelated cleanup is claimed.
+- **Active preparatory slice:** P5 read-only GitHub transport has a two-file WIP
+  and 17 focused cases; its final gate waits for the coordinator-owned conditional
+  HTTP output helper. Helper candidate `05172c6` passes 28 affected tests, normal
+  focused compiler, lint, format and diff; its fresh review APPROVES. The leaf
+  worker has resumed from this reviewed helper base with its WIP preserved.
+  There is no runtime, persistence,
+  authorization, or dispatch wiring. P5 remains incomplete; its full
+  P2–P4 prerequisites and intake/integration gates remain open.
+- **Active preparatory slice:** P7 skill delivery is assigned to its own Sol high
+  owner, using existing skill/materializer interfaces and a required server-owned
+  authorization callback. It owns two skill-adapter files only; full P7 runtime,
+  authorization wiring, isolation and packaging remain open.
+- **Left:** P4, P6 and P8–P14 (9 steps not started), the rest of P5/P7, all 19
+  product acceptance criteria, and both final audits. After P2/P3 lands, full P7
+  can run alongside P4; full P5 follows P4.
+- **Current gate:** finish and review P3, validate/review the combined P2/P3 wave,
+  reconcile the main worktree, then merge locally. Dependent implementation waits
+  on this gate; bounded independent preparatory slices may overlap under the
+  strategy below. Backend helper tests do not establish real client compatibility.
+- **Team:** Sol high implementation staffing has no plan-level limit; dispatch
+  ready independent scopes within available harness slots, including safe work
+  across multiple phases or independent parts of phases simultaneously.
+  One xhigh reviewer per piece of work, reused for repairs; two fresh final reviewers. One owner retains
+  shared contracts, migrations, wiring, and dependencies.
+- **Permissions/evidence still needed:** browser/device permission when integrated
+  clients are ready; explicit disposable GitHub fixture-write permission for the
+  required real issue-to-PR proof. No local models, push, or PR is authorized. The
+  exhausted eight-call P1 proof budget must not be reused.
+
+Main baseline for this resumption: `0e40a230a2560e79da3baf06f2a1154175d0b910`.
+Wave2 remains `8e44ffe67516decfd19df454382848ea029c8738`. P3's worktree is
+`/home/user/.cache/pi-project-teams-11b7e351/p3-authorization`, branch
+`pi-teams/p3-authorization`, base `c3ed6d3d4c606f66b9c07000246f16682df035af`.
+Its committed pre-repair candidate is `c6a38aaaba0278c71c8c764748aed51855ae626c`;
+the P3 repair WIP is isolated there and has not merged.
+Fresh repair evidence is retained separately in
+`/home/user/.cache/pi-project-teams-11b7e351/p3-resume-high-evidence/`.
+
 ## Goal
 
 Make T3 a project-management workspace for directing pi teams across multiple
@@ -227,28 +291,47 @@ Grounded in `/home/user/Projects/t3code` at commit
 checkout. Paths marked **new** are proposed files, not claims about existing code.
 Execute steps according to their dependencies and the parallel-agent execution
 strategy below. Contracts, authorization, and state transitions have one writable
-owner at a time. Astra reviews integrated candidates read-only.
+owner at a time. GPT-6.1-Sol xhigh reviews implementation candidates read-only.
 
 ### Parallel-agent execution strategy
 
-Use one lead/integrator and two or three implementation workers. The user owns
-priorities and product decisions; the lead owns assignments, dependencies, and
-integration. Assign one worker per independent writable scope. Roles change by
-stage rather than remaining permanent seats.
+Implementation staffing is unlimited at the plan level: use one GPT-6.1-Sol high
+lead/integrator and as many GPT-6.1-Sol high implementation subagents as can work
+independently without disrupting another agent's work or creating unnecessary
+conflicts. Optimize for finishing the plan quickly and correctly. The user owns
+priorities and product decisions;
+the lead owns assignments, dependencies, and integration. Assign one worker per
+exclusive writable scope. Split work only when interfaces and dependencies are
+settled and the split avoids conflicting edits or unnecessary integration work.
+Leave slots idle when dependencies or shared ownership prevent useful parallelism.
 
-The planning session supports four active agents total, including the lead.
-Use at most three concurrent workers, and give Astra a freed worker slot at
-review gates. This development-team limit does not change the product's runtime
-concurrency policy.
+There is no fixed worker count or cumulative limit on implementation subagents.
+Use all available slots for ready, independent scopes and dispatch more work as
+slots become available. Respect the harness's actual active-agent limit, including
+the lead and reviewers; unlimited staffing does not override that limit. Free an
+implementation slot before starting a reviewer when needed. Do not change harness
+limits or the product's runtime concurrency policy. The stage assignments below
+identify dependency groups, not fixed seats; split each group into additional
+independent slices only after agreeing explicit scopes, interfaces, and checks.
 
-| Stage                                | Concurrent assignments                                                                                                                                                                            | Exit gate                                                                                                     |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| 1. Dependency proofs, P1             | Worker A proves pi sessions, tools, cancellation, isolation, and packaging. Worker B evaluates memory engines against the same project-context fixtures. The lead settles integration boundaries. | Required runtime and memory behaviors have concrete evidence; unresolved P1 constraints block dependent work. |
-| 2. Foundation, P2–P3                 | One owner implements contracts, persistence, and authorization. Other workers may finish isolated probes and prepare fixtures without changing shared contracts.                                  | Stable interfaces and passing persistence/authorization checks.                                               |
-| 3. Runtime and lifecycle             | Worker A implements P7 pi integration. Worker B implements P4 guided lifecycle, then P5 GitHub intake. The lead owns shared wiring.                                                               | Both branches integrated and tested against the foundation.                                                   |
-| 4. Supervised execution              | Worker A implements P8 scheduler/recovery. Worker B implements P6 initial human workflow. Worker C may build only the selected P10 memory backend adapter against an agreed interface.            | Durable dispatch/recovery and usable human approval controls.                                                 |
-| 5. Coordination and delivery         | Complete P9 mailboxes, then P10 context/memory integration, then P11 review/PR delivery. Independent adapter work may overlap where contracts and writable scopes are settled.                    | A guided task reaches a reviewable PR with recorded evidence.                                                 |
-| 6. Client supervision and validation | After backend and shared client APIs are stable, P12 web and P13 mobile presentation work may overlap. The lead performs final integration and P14 checks.                                        | Integrated client behavior, failure recovery, and required real-workflow evidence.                            |
+Safe parallelism may span multiple phases or independent parts of phases; waves
+do not require unrelated ready work to wait for every earlier assignment. Start
+a complete step only after its listed prerequisites pass. A bounded preparatory
+slice may overlap other phases when its own dependencies and interfaces are
+settled; record the slice and its limits before dispatch, and keep its parent
+step incomplete until all parent prerequisites, checks, and integration gates
+pass. Reassess available independent work whenever a dependency or review gate
+clears. Preserve one writable owner for shared boundaries, exclusive scopes,
+explicit base commits, and review before integration across every overlap.
+
+| Stage                                | Concurrent assignments                                                                                                                                                                                        | Exit gate                                                                                                     |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| 1. Dependency proofs, P1             | Parallel scopes prove pi sessions/tools/cancellation, isolation/packaging, and memory engines against agreed fixtures. Further independent proof slices may overlap. The lead settles integration boundaries. | Required runtime and memory behaviors have concrete evidence; unresolved P1 constraints block dependent work. |
+| 2. Foundation, P2–P3                 | One owner implements contracts, persistence, and authorization. Other workers may finish isolated probes and prepare fixtures without changing shared contracts.                                              | Stable interfaces and passing persistence/authorization checks.                                               |
+| 3. Runtime and lifecycle             | P7 pi integration runs alongside P4 guided lifecycle, then P5 GitHub intake. Each may use additional independent slices against settled interfaces. The lead owns shared wiring.                              | Runtime and lifecycle slices integrated and tested against the foundation.                                    |
+| 4. Supervised execution              | P8 scheduler/recovery runs alongside P6 initial human workflow and a bounded selected P10 memory backend adapter. Split independent scopes further only against agreed interfaces.                            | Durable dispatch/recovery and usable human approval controls.                                                 |
+| 5. Coordination and delivery         | Complete P9 mailboxes, then P10 context/memory integration, then P11 review/PR delivery. Independent adapter work may overlap where contracts and writable scopes are settled.                                | A guided task reaches a reviewable PR with recorded evidence.                                                 |
+| 6. Client supervision and validation | After backend and shared client APIs are stable, P12 web and P13 mobile presentation work may overlap. The lead performs final integration and P14 checks.                                                    | Integrated client behavior, failure recovery, and required real-workflow evidence.                            |
 
 These assignments preserve each step's dependency and acceptance gates. An early
 adapter or presentation slice is preparatory work, not completion of its parent
@@ -265,8 +348,9 @@ otherwise idle worker slot.
 - Lead: shared contracts and exports, migration sequence, server registration,
   shared client APIs, dependency/lockfile changes, and final integration. During
   P2–P3, the lead may delegate the whole foundation scope to one owner.
-- Astra: read-only adversarial review of an integrated candidate, with findings
-  tied to acceptance criteria and reproducible failure cases.
+- Review agent: GPT-6.1-Sol xhigh, read-only adversarial review, with findings tied
+  to acceptance criteria and reproducible failure cases. Assign at most one
+  review agent to each task or piece of work, including each combined wave.
 
 Give every implementation worker a separate worktree and branch based on an
 explicit integrated revision. One owner edits each shared boundary at a time.
@@ -282,6 +366,8 @@ Base: <integrated commit>
 Required behavior: <specific acceptance criteria>
 Writable scope: <explicit files/directories>
 Dependencies: <approved contracts and completed steps>
+Parallel work: <other phase/slice assignments and shared-interface owners>
+Completion boundary: <slice acceptance; unfinished parent prerequisites/gates>
 Checks: <focused commands from this plan>
 
 Report shared-interface changes to the lead before implementing them.
@@ -297,12 +383,24 @@ Workers run focused tests. The lead owns integrated verification; no repo-wide
 checks or worker-owned dev servers. Browser/device interaction requires the
 permission specified by repository instructions.
 
-Use Astra after the foundation, after dispatch/recovery, and before declaring the
-first complete workflow ready. Each gate reviews its integrated candidate. Ask
-it to challenge duplicate dispatch, stale approvals, surviving worker processes,
-cross-project memory leakage, and PR head changes after review. Separate branches
-passing independently do not establish that their boundaries agree. Apply the
-shared workflow's repair limits to each validation candidate.
+For each task or piece of work, assign one independent GPT-6.1-Sol xhigh reviewer
+in a fresh session without the implementer's conversation history. Reuse that
+same review agent for findings and repair rechecks; do not spawn additional
+review agents for that work. The lead inspects the diff and evidence, verifies
+findings, and ensures affected checks and review pass before wave integration.
+Each combined wave is a separate piece of work with one review agent and checks
+before main integration. Review duplicate dispatch, stale approvals, surviving
+workers/setup processes, recovery, uncertain external effects, memory isolation
+and deletion, duplicate messages, stale evidence, PR head changes, and client
+compatibility. Separate branches passing independently do not establish that
+their boundaries agree. Repair-count limits remain waived for this plan.
+
+After all waves land, assign exactly two fresh GPT-6.1-Sol xhigh final reviewers:
+one verifier checks all 19 acceptance criteria and required evidence; one
+validator audits the complete implementation against the specification. Both
+inspect the same exact main commit, work read-only, and do not delegate. Fix
+verified findings through the scoped branch, review, and integration process,
+then have these same final reviewers recheck the resulting exact commit.
 
 First dispatch: pi feasibility and memory evaluation in parallel, with the lead
 settling common interfaces. This resolves the dependencies most likely to force
@@ -978,15 +1076,97 @@ READY_TO_IMPLEMENT (begin with P1; dependent steps remain gated).
 
 ## Implementation progress
 
+### Preserved pause checkpoint (2026-09-30; subsequently resumed)
+
+This records the pause before P3's independent review and wave integration.
+The user subsequently requested resumption; the progress dashboard above is
+current. The frozen pause evidence below remains unchanged.
+
+- Main worktree before this documentation checkpoint:
+  `f2514af881393f52e1610058af95bfa2ba7f9a32` on
+  `t3code/implement-pi-project-teams`. P2/P3 code has not landed here.
+- Wave integration: `pi-teams/wave2` at
+  `8e44ffe67516decfd19df454382848ea029c8738`, in
+  `/home/user/.cache/pi-project-teams-11b7e351/wave2`. Reviewed P2 candidate
+  `6d19799a6861090f67960e31da3adc2ae8c461d8` is integrated only there; its fresh
+  review approved P2 only. The combined wave gate remains open.
+- P3 checkpoint: `pi-teams/p3-authorization`, worktree
+  `/home/user/.cache/pi-project-teams-11b7e351/p3-authorization`, exact HEAD/base
+  `c3ed6d3d4c606f66b9c07000246f16682df035af`. Its 32 assigned changed paths
+  (28 tracked and four new files) are preserved as uncommitted WIP. The index is
+  empty. No P3 commit, independent review, or integration has occurred.
+
+P3's final focused checks passed 250 tests: exact V3 66, affected authorization
+and MCP proxy 51, host/runtime/export 39, exact V2 contracts 65, and exact V2
+storage 29. The normal contracts compiler, scoped lint and format, and
+`git diff --check` passed. The normal server-entry compiler failed with three
+unresolved issues, producing five diagnostics:
+
+1. `ProjectWorkGateway.test.ts:1587` repeats `gateId` in the reordered retry test
+   (`TS2783`).
+2. `ProjectWorkRuntime.test.ts:252` hides the required Authorization service in
+   the test layer's output (`TS2375` and `TS377004`).
+3. `server.ts:605` passes a production layer to `ProjectWorkRuntime.withCore`
+   whose parameter fixes its error/context types too narrowly (`TS2379` and
+   `TS377034`).
+
+The compiler ran under a verified 4 GiB limit, zero swap, `GOMEMLIMIT=3GiB`, and
+a 180-second timeout; peak memory was 3,478,720,512 bytes with zero cgroup OOM
+events. Five unchanged `ProjectLifecycle.test.ts` baseline lint errors remain
+failed evidence. No repair was started after the requested pause boundary.
+Backend tests exercise actual SQL, authorization helpers, toolkits, services,
+and stream publication. They do not establish WebSocket transport, browser,
+desktop, or mobile compatibility.
+
+Frozen P3 evidence is in
+`/home/user/.cache/pi-project-teams-11b7e351/p3-authorization-evidence/`.
+`final-commands.json` and `final-results.json` retain exact commands and results;
+`checkpoint.json`, `source-hashes.json`, `source-snapshot.tar.gz`, and
+`full-diff.binary.patch` preserve the checkpoint. The 95-artifact manifest's
+SHA256 is `0b737421d7e1939ff9081b30f0869f41d38e1b8c1392c8454ea47ad015bbb204`;
+the full patch's SHA256 is
+`eaa2aea7cf82b2145259e177f5f569ce093cca351352a5e78a17577988bdb014`.
+The coordinator verified all 95 artifacts, all 32 current source hashes and
+archive files, the tracked patch, the empty index, and all 38 captured scopes
+drained. This inspection is recorded in
+`/home/user/.cache/pi-project-teams-11b7e351/root-pause-verification/p3-checkpoint-inspection.json`.
+Failed intermediate checks and deliberate negative controls remain preserved.
+
+On resumption, repair the three compiler issues in the same isolated P3 scope,
+run focused regressions and affected gates including the normal compiler, then
+make a scoped commit. Inspect it and assign P3's one independent xhigh reviewer
+before merging to wave2; reuse that reviewer for any repair rechecks. Run combined
+V2/V3 and affected compatibility checks, obtain the wave's one independent review,
+reconcile the advanced main worktree, and repeat affected
+checks before the local main merge. Start P7 alongside P4 followed by P5 only
+after that merge. P2/P3 completion boxes remain unchecked until their combined
+main integration gate passes. P4–P14, all 19 acceptance criteria, and both final
+independent audits remain open.
+
+Regenerated bounded P1 runtime, isolation/packaging, and memory evidence received
+fresh approvals as recorded below; these do not certify later runtime or
+platform gates. The eight-call live P1 ledger is exhausted and must not be reused.
+Repair limits remain waived when work resumes. No local model work, additional
+model calls, dev servers, browser/device use, live T3 state writes, push, or PR
+creation was performed for this pause. Browser/device permission remains
+outstanding for eventual integrated client verification. This checkpoint commits
+only this record; the P3 WIP and wave branches remain preserved without further
+integration during the pause.
+
 Implementation began on 2026-09-29 in branch
 `t3code/implement-pi-project-teams`. The worktree was clean at
 `91b7c87b4656dbe467a7043bab1e91045311d4da`; it was fast-forwarded to the saved-plan
 commit `6cc1a0ffad2f61a707a4b18971e187ea216f6f17`, whose only change is this record.
 The complete 969-line specification/plan was read before assignments.
 
-The user's execution instructions select GPT-6.1-Sol high for coordination,
-three GPT-6.1-Sol medium implementation workers, fresh GPT-6.1-Sol xhigh reviewers
-at each part/wave gate, and separate fresh xhigh final verifier and validator.
+The user's updated execution instructions select GPT-6.1-Sol high for coordination
+and all implementation workers. Use as many independent workers as available
+slots safely support, rather than a fixed three-worker team. Assign at most one
+GPT-6.1-Sol xhigh review agent per task or piece of work, reusing it for repairs,
+and two fresh xhigh final reviewers after implementation is complete. These rules
+supersede the earlier medium-worker and repeated fresh-review assignments recorded
+below; historical evidence and verdicts remain unchanged. The user subsequently
+requested resumption and a continuously maintained progress dashboard at the top.
 Workers do not delegate. Each has a separate branch/worktree and an explicit base.
 The coordinator owns shared contracts, migrations, server wiring, dependency
 changes, this record, and integrated client verification. No push or PR creation
@@ -1001,9 +1181,10 @@ Dependency-ordered waves retain the saved strategy:
 5. P9, then complete P10, then P11, with only independent agreed slices parallel.
 6. P12 and bounded P13 presentation work, then P13 completion and P14 integration.
 
-Each part requires coordinator inspection and fresh read-only adversarial review
-before merge to its wave branch. Each combined wave requires checks and another
-fresh review before landing here. Final verification/audit inspect the same exact
+Each part requires coordinator inspection and its one independent read-only
+adversarial review before merge to its wave branch. Each combined wave requires
+checks and its one independent review before landing here. Repair rechecks use
+the same assigned review agent. The two final reviewers inspect the same exact
 main-worktree commit. Unavailable real-runtime/platform evidence remains unchecked.
 
 Wave 1 assignments all start at
@@ -1850,3 +2031,166 @@ Evidence is below `/home/user/.cache/pi-project-teams-11b7e351/`. Development
 repair limits remain waived. No local model, weight download, browser/device,
 live T3 write, push or PR occurs. P2–P14 and all 19 acceptance criteria remain
 open.
+
+### Resumed P3 candidate and independent review
+
+The user requested continuation, continuous progress updates, and a top-level
+tally. Implementation resumed with one Sol high P3 owner; other implementation
+slots wait for the foundation dependency gate. The main documentation commits
+`0e40a230a2560e79da3baf06f2a1154175d0b910` and
+`41ebb90db4d82fcad97dec1d3aec0b51e531b869` change staffing and progress only.
+
+P3 candidate `c6a38aaaba0278c71c8c764748aed51855ae626c` is clean on
+`pi-teams/p3-authorization`, based on
+`c3ed6d3d4c606f66b9c07000246f16682df035af`, with exactly 32 assigned paths.
+Only `ProjectWorkGateway.test.ts` and `ProjectWorkRuntime.ts` differ from the
+frozen pause source. Removing the duplicated retry payload key and preserving
+the supplied layer's actual output/error/context types fix all three compiler
+issues without casts, compiler substitutions, or production wiring changes.
+
+Fresh checks pass 28 focused Gateway/Runtime regressions, V3 66 tests, affected
+authorization/proxy 51, host/runtime/export 39, V2 contracts 65, and V2 storage 29.
+The unchanged normal server-entry compiler changes from five diagnostics to
+exit 0 in 22.389 seconds, peak 3,522,576,384 bytes under a verified 4 GiB cap and
+zero swap/OOM. The normal contracts compiler and 32-path lint/format/diff checks
+pass. Exactly five unchanged Lifecycle baseline lint failures remain recorded.
+Actual WebSocket transport and integrated clients remain unproved.
+
+Evidence is `p3-resume-high-evidence/` below
+`/home/user/.cache/pi-project-teams-11b7e351/`; `exact-commands.json`,
+`fresh-final-results.json`, source hashes, the complete patch, archive, and
+handoff retain the exact tested candidate. The 58-artifact manifest SHA256 is
+`56b2b3d4495c9447c8852ede2666bd68b72502f18258a78002baed608f6f5d82`;
+full candidate diff SHA256 is
+`e18ce9c774c83be8e1e480fe5408c6691f1bace6dc5634516e76a0a19e07cfba`.
+The coordinator verifies all 58 artifacts, all 32 source paths against the clean
+commit, the full diff, matching check source hashes, and all 14 owned scopes
+drained, recorded in `root-p3-resume-inspection/inspection.json`.
+The one independent reviewer, `review_p3_authority`, examines this exact commit
+read-only without implementer conversation history; it will handle any repair
+rechecks itself. No P3 or combined wave approval or main code merge is claimed.
+
+The coordinator additionally runs server-scoped Knip on exact `c6a38aa`:
+`node --max-old-space-size=512 node_modules/knip/bin/knip.js --workspace apps/server --include files,dependencies --no-config-hints --reporter json`.
+It returns `{"issues":[]}`, exit 0 in 2.891 seconds, peak 489,689,088 bytes under
+2 GiB zero swap/OOM. Exact receipt and log are in `root-p3-resume-inspection/`
+with prefix `p3-candidate-knip-files-deps`; no repository-wide or export audit ran.
+
+### Safe cross-phase preparatory assignment
+
+The user permits safe simultaneous work across phases and phase slices. The
+coordinator applies this to a bounded P5 transport slice while P3 is under review
+and repair. Its dependency is the existing GitHubCli/pinned-credential/rate-limit
+interface already in main; it does not depend on unfinished team lifecycle or
+authorization contracts. The worker first proposes its server-local typed page
+interface to the coordinator. Shared contracts, persistence, runtime wiring,
+dependencies, and the plan stay coordinator-owned.
+
+The slice branch is `pi-teams/p5-intake-transport`, worktree
+`/home/user/.cache/pi-project-teams-11b7e351/p5-intake-transport`, explicit base
+`4003588f6` (the complete hash is recorded in its assignment). Exclusive writable
+scope: new `apps/server/src/projectWork/github/GitHubIssueClient.ts` and
+`GitHubIssueClient.test.ts`. Acceptance is bounded authenticated read transport,
+repository identity/account checks, issues/comments pages, conditional reads,
+PR filtering, and rate-limit/error behavior. No synchronization, human actions,
+model dispatch, or completion of P5 is claimed. Review and integration wait for
+its own checks and the applicable parent dependency gates. Future P5 workers
+must consume this interface and leave these two paths to this owner.
+
+### P3 independent findings verified before repair
+
+The coordinator independently reproduces three defects on clean candidate
+`c6a38aaaba0278c71c8c764748aed51855ae626c`, using copied review probes outside
+the worktree. An MCP-only managed issuance leaves a preceding WebSocket session
+unrevoked in SQL: it is denied during management and after purge by the retained
+auth service, but a fresh service with the same signing key permits the original
+bearer and guarded terminal side effect. A retained production catalog's private
+proxy lease executes after complete binding/event/checkpoint purge even though
+the old raw MCP token remains revoked. A depth-two descendant with a frozen
+depth-eight profile can enqueue third-level delegation despite its root's frozen
+depth-two limit; a depth-two leaf profile correctly denies the same request.
+
+The root reproductions pass as defect controls, not product acceptance. Exact
+commands, observations, source hashes, and receipts are in
+`root-p3-review-verification/` below the external evidence root. They take 2.983,
+3.066, and 3.507 seconds respectively, peak 569,716,736 / 554,508,288 /
+429,121,536 bytes under 2 GiB zero swap/OOM, with all owned scopes drained.
+Initial copied-probe runs fail module resolution and remain preserved; correcting
+only the external dependency link enables the causal runs. No actual WebSocket
+socket or external MCP transport proof is claimed; the proxy case exercises the
+retained service consumer with a synthetic upstream. Delegation creates only a
+message and no execution effect. P3 remains unapproved pending scoped repair
+and recheck by its same independent reviewer.
+
+### P3 repair and GitHub transport prerequisite
+
+P3's one independent reviewer returns **REQUEST_CHANGES** with the same three
+root-reproduced findings. It independently passes 66 V3 tests, 55 focused
+compatibility tests and four causal probes, preserving all 11 drained scopes.
+The coordinator verifies its 62-artifact manifest, SHA256
+`91efde0b2afaa3c8d43886a19e36ea015be8ac2b6bd2e00262f001d39ddabbea`.
+The same Sol high owner repairs on base `c6a38aa` in the existing P3 worktree;
+the same reviewer will recheck. No approval or code merge has occurred.
+
+The P5 leaf owner discovers that actual `gh api --include` emits HTTP 304 headers
+but exits nonzero, while the existing GitHubCli wrapper loses that stdout.
+Official gh v2.99.0 source confirms this behavior:
+[processResponse](https://github.com/cli/cli/blob/v2.99.0/pkg/cmd/api/api.go#L433).
+The coordinator owns a minimal shared-helper part on branch
+`pi-teams/p5-github-http-output`, worktree
+`/home/user/.cache/pi-project-teams-11b7e351/p5-github-http-output`, base
+`19335d47743d92fe0f7ea0b0bcb61f84df59a299`, candidate
+`05172c635ea8636bffc99d9745adf596dd3a2454`. Its exact two paths are
+`sourceControl/GitHubCli.ts` and `GitHubCli.test.ts` under server `src/`. The
+optional server-local `allowNonZeroExit` forwards to the existing VcsProcess
+option; default and explicit-false callers retain existing error behavior.
+Callers opting in must validate returned HTTP and process statuses.
+
+A controlled ProcessRunner response through actual VcsProcess/GitHubCli fails
+before the patch and retains the conditional headers plus exit 1 afterward.
+All 28 GitHubCli/VcsProcess tests pass. The normal unchanged server-config
+focused compiler passes in 1.252 seconds, peak 614,342,656 bytes; exact-path
+lint, format and diff pass. Initial wrong compiler command and missing plugin
+dependency fail and remain recorded; correcting only tool/worktree setup gives
+the final checks. No actual GitHub response or full P5 completion is claimed.
+Evidence is `p5-github-http-output-evidence/`, 27-artifact manifest SHA256
+`5f0fa9e5826af9b28906cc50de7e3534f86c635da361b48c0622d4b7ad33ce61`.
+Fresh helper review must pass before the leaf consumes this commit. A reviewer
+launch encounters the harness thread limit; the waiting P5 worker checkpoints
+to free its slot. This does not waive the review gate.
+
+### Assigned independent P7 skill-delivery slice
+
+A separate P7 skill slice can consume the existing ProviderSkillAdapter and owned
+SkillMaterializationService interfaces without unfinished team contracts. The
+coordinator prepares branch `pi-teams/p7-skills-slice`, worktree
+`/home/user/.cache/pi-project-teams-11b7e351/p7-skills-slice`, base
+`e18528baf66d38ed53c697d8b175ae95857fc0f7`. Its two exclusive writable paths
+are `apps/server/src/skills/ProviderSkillAdapters.ts` and
+`ProviderSkillAdapters.test.ts`, adding only the pi factory and its checks.
+The factory requires a server-owned authorization callback returning the allowed
+skill keys for the request. It validates identity/keys, uses existing owned
+materialization, and returns explicit managed skill paths with no implicit native
+sources or live application. The future PiDriver must bind the callback to current
+run authority and frozen role/configuration; that wiring remains an unfinished
+full P7 gate. Real worker mounts, extensions, provider registration, native session
+behavior, and packaging are outside this slice. The runtime worker's prepared
+scope reserves these paths if this assignment starts; no two workers own them.
+Sol high owner `p7_skills_slice_high` is dispatched after the earlier worker slot
+was freed. P7 skill preparation is active; full P7 remains incomplete.
+The agreed local payload carries only root and explicit keyed skill paths;
+authorization is required before and after copying. The future runtime owner
+must consume this factory and leave these two paths to this owner.
+
+The GitHub helper's one fresh xhigh review **APPROVES** exact `05172c6`, replaying
+28 tests and 14 independent behavioral checks with a copied-old-wrapper failure.
+The coordinator verifies all 12 review artifacts, manifest SHA256
+`e768105f31e3a3b1405079388733b1df28883dfabf071942b4b3e1fb6c915ec4`.
+Three fresh scopes drain under 2 GiB zero swap/OOM. Approval covers the shared
+helper only. The coordinator advances the P5 leaf branch from `4003588f6` to
+this reviewed prerequisite, proving the two uncommitted leaf files are unchanged
+byte-for-byte. The same high leaf owner resumes focused verification from exact
+`05172c635ea8636bffc99d9745adf596dd3a2454`. Neither helper nor P5/P7 leaf code
+has landed in the main worktree. Three implementation owners now work in
+exclusive P3, P5-transport and P7-skill scopes within the harness limit; a slot
+will be freed before review.
