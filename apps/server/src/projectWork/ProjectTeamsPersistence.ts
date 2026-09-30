@@ -35,6 +35,53 @@ const projectionKinds = [
 const authorityKinds = ["reservation", "effect", "intake-cursor"] as const;
 const table = (kind: TeamRecord["kind"]) => "project_team_" + kind.replaceAll("-", "_");
 const allKinds = [...projectionKinds, ...authorityKinds];
+export const PROJECT_TEAM_TABLES = allKinds.map(table);
+
+export const isProjectWorkTombstoned = Effect.fn("isProjectWorkTombstoned")(function* (
+  sql: SqlClient.SqlClient,
+  projectId: string,
+) {
+  const tables =
+    yield* sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'project_lifecycle'`;
+  if (tables.length === 0) return false;
+  const rows =
+    yield* sql`SELECT project_id FROM project_lifecycle WHERE project_id = ${projectId} AND state = 'tombstoned'`;
+  return rows.length > 0;
+});
+
+/** The canonical repository cursor survives only while another active project still owns intake. */
+export const purgeProjectTeamRecords = Effect.fn("purgeProjectTeamRecords")(function* (
+  sql: SqlClient.SqlClient,
+  projectId: string,
+) {
+  // P5 will own explicit repository bindings. P2 can only transfer against retained issue identity.
+  const cursors = yield* sql<{
+    recordId: string;
+    payload: string;
+  }>`SELECT record_id AS recordId, payload_json AS payload FROM project_team_intake_cursor WHERE project_id = ${projectId}`;
+  for (const row of cursors) {
+    const cursor = yield* decodeTeamRecordJson(row.payload);
+    if (cursor.kind !== "intake-cursor" || cursor.status === "detached") continue;
+    const owners = yield* sql<{ projectId: string }>`SELECT DISTINCT issue.project_id AS projectId
+      FROM project_team_issue AS issue
+      JOIN projection_projects AS project ON project.project_id = issue.project_id
+      LEFT JOIN project_lifecycle AS lifecycle ON lifecycle.project_id = issue.project_id
+      WHERE issue.project_id != ${projectId} AND issue.status != 'detached'
+        AND project.deleted_at IS NULL AND (lifecycle.state IS NULL OR lifecycle.state = 'active')
+        AND json_extract(issue.payload_json, '$.identity.host') = ${cursor.host}
+        AND json_extract(issue.payload_json, '$.identity.repositoryNodeId') = ${cursor.repositoryNodeId}
+      ORDER BY issue.project_id LIMIT 1`;
+    const owner = owners[0];
+    if (owner !== undefined) {
+      yield* sql`UPDATE project_team_intake_cursor SET project_id = ${owner.projectId},
+        payload_json = ${json({ ...cursor, projectId: owner.projectId })}
+        WHERE record_id = ${row.recordId} AND project_id = ${projectId}`;
+    }
+  }
+  for (const name of PROJECT_TEAM_TABLES)
+    yield* sql`DELETE FROM ${sql(name)} WHERE project_id = ${projectId}`;
+});
+
 const json = (value: unknown) => JSON.stringify(value);
 
 /** Production migration and pre-migration focused fixtures share exactly one definition. */
@@ -148,6 +195,7 @@ export const readProjectTeamRecords = Effect.fn("readProjectTeamRecords")(functi
   projectId: string,
 ) {
   const records: Array<TeamRecord> = [];
+  if (yield* isProjectWorkTombstoned(sql, projectId)) return records;
   for (const kind of allKinds) {
     const rows = yield* sql<{
       payload: string;
@@ -161,6 +209,7 @@ export const readProjectTeamPage = Effect.fn("readProjectTeamPage")(function* (
   sql: SqlClient.SqlClient,
   input: { projectId: string; cursor?: string; limit?: number; kinds?: ReadonlyArray<string> },
 ) {
+  if (yield* isProjectWorkTombstoned(sql, input.projectId)) return { items: [] };
   const limit = Math.min(
     128,
     Math.max(1, Number.isFinite(input.limit) ? Math.floor(input.limit!) : 50),

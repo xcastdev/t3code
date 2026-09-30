@@ -1,5 +1,7 @@
+import { ProjectLifecycle, ProjectLifecycleLive } from "../project/ProjectLifecycle.ts";
 import {
   ProjectTeamRecord,
+  ProjectTeamRecordRead,
   ProjectWorkFoundationCommitCommand,
   CommandId,
   EnvironmentId,
@@ -37,6 +39,9 @@ import * as ProjectWorkSearch from "./ProjectWorkSearch.ts";
 import * as ServerSettings from "../serverSettings.ts";
 
 const decodeFoundationCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+const decodeFoundationPage = Schema.decodeUnknownEffect(
+  Schema.Struct({ items: Schema.Array(ProjectTeamRecordRead) }),
+);
 const decodeTeamRecord = Schema.decodeUnknownEffect(ProjectTeamRecord);
 
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
@@ -172,6 +177,357 @@ layer("ProjectWorkGateway", (it) => {
       });
       expect(encodeUnknownJson(v2)).toContain("project-work.foundation.recorded");
     }).pipe(Effect.provide(gatewayLayer)),
+  );
+
+  it.effect(
+    "preserves all known foundation variants and numeric budgets while removing credentials",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations();
+        const sql = yield* SqlClient.SqlClient;
+        const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+        const attribution = {
+          actor: { kind: "system", id: "foundation" },
+          source: { kind: "system", id: "foundation" },
+          recordedAt: at,
+        };
+        const variants = [
+          {
+            kind: "mission",
+            status: "draft",
+            title: "Mission",
+            objective: "Scope",
+            requiredTaskIds: [],
+          },
+          {
+            kind: "task-membership",
+            status: "active",
+            taskId,
+            executionKind: "managed",
+            deliverableKind: "code",
+          },
+          {
+            kind: "role-revision",
+            status: "available",
+            roleId: "role",
+            roleRevision: 0,
+            role: "implementer",
+            instructions: "Work",
+            skills: [],
+            tools: [],
+            model: "ling",
+            memoryAccess: "project",
+            delegationDepth: 2,
+          },
+          {
+            kind: "member",
+            status: "active",
+            name: "Worker",
+            coordinator: false,
+            roleRevisionId: "role",
+          },
+          {
+            kind: "plan-revision",
+            status: "proposed",
+            taskId,
+            specRevision: 0,
+            planRevision: 0,
+            content: "Plan",
+            contentHash: "hash",
+            dependencyTaskIds: [],
+          },
+          {
+            kind: "gate",
+            status: "pending",
+            taskId,
+            gate: "plan",
+            specRevision: 0,
+            planRevision: 0,
+            contentHash: "hash",
+            attribution,
+            evidenceIds: [],
+          },
+          {
+            kind: "run-binding",
+            status: "running",
+            taskId,
+            attemptId: "attempt",
+            memberId: "member",
+            roleRevisionId: "role",
+            providerInstanceId: "pi",
+            threadId: "thread",
+            environmentId: "environment",
+            model: "ling",
+            configuration: {
+              instructionsHash: "hash",
+              toolIds: [],
+              skillIds: [],
+              runtimeVersion: "0.99.1",
+              maxTokens: 1000,
+              maxDurationMs: 1000,
+              paidFallback: false,
+            },
+            worktree: "/workspace",
+            branch: "branch",
+            leaseGeneration: 0,
+            specRevision: 0,
+            planRevision: 0,
+          },
+          {
+            kind: "message",
+            status: "delivered",
+            commandId: "command",
+            senderId: "sender",
+            recipientId: "recipient",
+            taskId,
+            body: "Finding",
+            evidenceIds: [],
+            deliveryGeneration: 0,
+            deliveryCursor: 1,
+          },
+          {
+            kind: "question",
+            status: "pending",
+            taskId,
+            senderId: "sender",
+            targetGateId: "gate",
+            targetRevision: 0,
+            body: "Which?",
+            choices: [],
+          },
+          {
+            kind: "evidence-applicability",
+            status: "current",
+            taskId,
+            evidenceId: "evidence",
+            specRevision: 0,
+            planRevision: 0,
+            repository: "repo",
+            worktree: "/workspace",
+            testedTree: "tree",
+            baseSha: "base",
+            headSha: "head",
+            command: "test",
+            exitCode: 0,
+            artifactId: "artifact",
+            environmentSummary: "Linux",
+            integration: false,
+          },
+          {
+            kind: "repair-episode",
+            status: "active",
+            taskId,
+            failureFingerprint: "failure",
+            relevantRevision: "tree",
+            allowance: 2,
+            semanticRepairs: 0,
+            transportRetries: 0,
+            timeoutCount: 0,
+            attemptIds: [],
+          },
+          {
+            kind: "limits",
+            status: "configured",
+            environmentModelCalls: 2,
+            projectWritableWorkers: 1,
+            modelCalls: 2,
+            delegationDepth: 2,
+            repairAllowance: 2,
+            model: "ling",
+            tokenLimit: 1000,
+            durationLimitMs: 1000,
+          },
+          {
+            kind: "reservation",
+            status: "held",
+            environmentId: "environment",
+            scope: "environment",
+            resourceKey: "model",
+            slot: 0,
+            runId: "run",
+            taskId,
+            attemptId: "attempt",
+            maximumTokens: 1000,
+            consumedTokens: 321,
+          },
+          {
+            kind: "effect",
+            status: "pending",
+            effectId: "effect",
+            effectKind: "publication",
+            targetId: "issue",
+            payload: { recordIds: [], expectedRevision: 0 },
+            claimGeneration: 0,
+            availableAt: at,
+          },
+          {
+            kind: "issue",
+            status: "open",
+            identity: {
+              host: "github.com",
+              repositoryNodeId: "repo",
+              issueNodeId: "issue",
+              number: 1,
+            },
+            repositoryName: "owner/repo",
+            title: "Issue",
+            body: "Scope",
+            sourceRevision: "revision",
+            observedAt: at,
+          },
+          {
+            kind: "intake-cursor",
+            status: "ready",
+            host: "github.com",
+            repositoryNodeId: "repo",
+            accountId: "account",
+            overlapSince: at,
+          },
+          {
+            kind: "memory-source",
+            status: "current",
+            sourceKind: "finding",
+            sourceId: "artifact",
+            sourceRevision: 1,
+            content: "Finding",
+            contentHash: "hash",
+            attribution,
+            sharedWithProjectIds: [],
+          },
+          {
+            kind: "memory-extraction",
+            status: "extracted",
+            engine: "mem0",
+            engineVersion: "2.2.1",
+            sourceId: "source",
+            sourceRevision: 1,
+            sourceGeneration: 0,
+            extractionModel: "ling",
+            embeddingModel: "nvidia",
+            embeddingDimensions: 2048,
+            expectedObservationIds: ["observation"],
+            completedObservationIds: [],
+            extractionHash: "hash",
+          },
+          {
+            kind: "memory-observation",
+            status: "current",
+            sourceId: "source",
+            sourceRevision: 1,
+            sourceGeneration: 0,
+            extractionId: "extraction",
+            observationKey: "one",
+            body: "Finding",
+            provenance: attribution,
+          },
+        ];
+        const expected = [];
+        for (const variant of variants) {
+          const record = yield* decodeTeamRecord({
+            ...variant,
+            recordId: "public-" + variant.kind,
+            projectId,
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+          });
+          expected.push(record);
+          const payload = encodeUnknownJson({
+            ...record,
+            credentials: { password: "private-value" },
+            apiKey: "private-key",
+            authToken: "private-token",
+            extra: { tokenLimit: "credential-shaped-string", secret: "private-secret" },
+          });
+          yield* sql`INSERT INTO ${sql("project_team_" + record.kind.replaceAll("-", "_"))} (record_id, project_id, status, revision, generation, updated_at, payload_json) VALUES (${record.recordId}, ${projectId}, ${record.status}, 0, 0, ${at}, ${payload})`;
+        }
+        const publicPage = yield* gateway.read({
+          projectId,
+          operation: "foundation-records",
+          limit: 128,
+        });
+        const page = yield* decodeFoundationPage(publicPage);
+        expect(page.items).toHaveLength(19);
+        for (const record of expected)
+          expect(page.items.find((entry) => entry.recordId === record.recordId)).toEqual(record);
+        const encoded = encodeUnknownJson(publicPage);
+        for (const secret of [
+          "private-value",
+          "private-key",
+          "private-token",
+          "private-secret",
+          "credential-shaped-string",
+        ])
+          expect(encoded).not.toContain(secret);
+        const credential = "ghp_" + "0123456789abcdef".repeat(3);
+        const mission = expected.find((entry) => entry.kind === "mission")!;
+        yield* sql`UPDATE project_team_mission SET payload_json = ${encodeUnknownJson({ ...mission, objective: "Legacy secret " + credential })} WHERE record_id = ${mission.recordId}`;
+        const redactedPage = yield* gateway.read({
+          projectId,
+          operation: "foundation-records",
+          recordKinds: ["mission"],
+        });
+        expect(encodeUnknownJson(redactedPage)).not.toContain(credential);
+        expect(redactedPage).toMatchObject({
+          items: [{ objective: "Legacy secret [REDACTED_SECRET]" }],
+        });
+      }).pipe(Effect.provide(gatewayLayer)),
+  );
+
+  it.effect("does not expose deleted foundation records through the public gateway", () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const sql = yield* SqlClient.SqlClient;
+      const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+      const repo = yield* ProjectWorkRepository.ProjectWorkRepository;
+      const lifecycle = yield* ProjectLifecycle;
+      yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (${projectId}, 'Project', '/workspace', '[]', ${at}, ${at})`;
+      const attribution = {
+        actor: { kind: "system", id: "foundation" },
+        source: { kind: "system", id: "foundation" },
+        recordedAt: at,
+      };
+      const mission = yield* decodeTeamRecord({
+        kind: "mission",
+        recordId: "gateway-deleted-mission",
+        projectId,
+        status: "draft",
+        revision: 0,
+        generation: 0,
+        updatedAt: at,
+        title: "Mission",
+        objective: "Scope",
+        requiredTaskIds: [],
+      });
+      const command = yield* decodeFoundationCommit({
+        type: "project-work.foundation.commit",
+        commandId: "gateway-deleted-command",
+        projectId,
+        expectedRevision: 0,
+        attribution,
+        records: [mission],
+        committedAt: at,
+      });
+      yield* repo.execute(command);
+      expect(yield* gateway.read({ projectId, operation: "foundation-records" })).toMatchObject({
+        items: [mission],
+      });
+      yield* lifecycle.permanentDelete({
+        projectId,
+        commandId: CommandId.make("gateway-delete"),
+        workspaceRoot: "/workspace",
+        confirmation: "permanent-local-delete",
+      });
+      expect(yield* gateway.read({ projectId, operation: "foundation-records" })).toMatchObject({
+        revision: 0,
+        items: [],
+      });
+      expect((yield* repo.execute(command).pipe(Effect.result))._tag).toBe("Failure");
+      yield* (yield* ProjectWorkProjection.ProjectWorkProjection).rebuild(String(projectId));
+      expect(yield* gateway.read({ projectId, operation: "foundation-records" })).toMatchObject({
+        items: [],
+      });
+    }).pipe(Effect.provide(ProjectLifecycleLive.pipe(Layer.provideMerge(gatewayLayer)))),
   );
 
   it.effect("keeps reads available while disabled and restores writes after re-enable", () =>

@@ -21,6 +21,8 @@ import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import { purgeProjectTeamRecords } from "../projectWork/ProjectTeamsPersistence.ts";
+
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as RepositoryIdentityResolver from "./RepositoryIdentityResolver.ts";
 import { toPersistenceSqlError, type ProjectionRepositoryError } from "../persistence/Errors.ts";
@@ -516,6 +518,7 @@ const makeProjectLifecycle = Effect.gen(function* () {
           ON CONFLICT(project_id) DO UPDATE SET state = 'tombstoned', revision = excluded.revision,
             changed_at = excluded.changed_at, tombstone_json = excluded.tombstone_json
         `;
+          yield* purgeProjectTeamRecords(sql, String(input.projectId));
           // Remove only local durable work/projection rows.  The lifecycle row is
           // intentionally retained so stale clients cannot recreate this ID.
           for (const table of [

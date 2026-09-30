@@ -1,3 +1,4 @@
+import { isProjectWorkTombstoned } from "./ProjectTeamsPersistence.ts";
 import {
   ensureProjectTeamsTables,
   persistProjectTeamProjections,
@@ -932,6 +933,7 @@ const makeProjectWorkProjection = Effect.gen(function* () {
         .withTransaction(
           Effect.gen(function* () {
             yield* ensureProjectWorkTables(sql);
+            if (yield* isProjectWorkTombstoned(sql, projectId)) return;
             // A rebuild only consumes the append-only repository log. Read it
             // in this transaction so the rows projected below are one exact
             // authoritative snapshot, never caller-supplied input.

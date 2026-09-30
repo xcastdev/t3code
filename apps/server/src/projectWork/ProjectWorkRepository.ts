@@ -1,3 +1,4 @@
+import { isProjectWorkTombstoned } from "./ProjectTeamsPersistence.ts";
 import {
   commitProjectTeamAuthority,
   PROJECT_WORK_CHECKPOINT_VERSION,
@@ -305,6 +306,10 @@ const makeProjectWorkRepository = Effect.gen(function* () {
       .withTransaction(
         Effect.gen(function* () {
           yield* ensureProjectWorkTables(sql);
+          if (yield* isProjectWorkTombstoned(sql, projectId))
+            return yield* Effect.fail(
+              new ProjectWorkPolicyError("invalid-state", "Project is permanently deleted"),
+            );
           const contentCheck =
             contentGuard._tag === "Some"
               ? contentGuard.value

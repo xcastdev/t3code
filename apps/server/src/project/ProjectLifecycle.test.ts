@@ -1,4 +1,24 @@
-import { CommandId, ProjectId } from "@t3tools/contracts";
+import { it as effectIt } from "@effect/vitest";
+import {
+  PROJECT_TEAM_TABLES,
+  readProjectTeamPage,
+} from "../projectWork/ProjectTeamsPersistence.ts";
+import {
+  ProjectWorkRepository,
+  ProjectWorkRepositoryLive,
+} from "../projectWork/ProjectWorkRepository.ts";
+import {
+  ProjectWorkProjection,
+  ProjectWorkProjectionLive,
+} from "../projectWork/ProjectWorkProjection.ts";
+import {
+  CommandId,
+  ProjectId,
+  ProjectWorkFoundationCommitCommand,
+  ProjectTeamRecord,
+  ProjectWorkTaskId,
+  ProjectWorkAttemptId,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
@@ -16,12 +36,178 @@ import {
   relocationDecision,
 } from "./ProjectLifecycle.ts";
 
+const encodeJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
+const decodeTeamRecordEffect = Schema.decodeUnknownEffect(ProjectTeamRecord);
+const decodeCommitEffect = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+
 const lifecycleLayer = ProjectLifecycleLive.pipe(
   Layer.provideMerge(NodeSqliteClient.layerMemory()),
   Layer.provideMerge(FileSystem.layerNoop({})),
 );
 
 describe("ProjectLifecycle", () => {
+  effectIt.effect(
+    "purges every foundation table, transfers a shared cursor and fences stale writes and rebuilds",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations();
+        const sql = yield* SqlClient.SqlClient;
+        const lifecycle = yield* ProjectLifecycle;
+        const repo = yield* ProjectWorkRepository;
+        const projection = yield* ProjectWorkProjection;
+        const at = "2026-01-01T00:00:00.000Z";
+        const projectId = ProjectId.make("foundation-deleted");
+        const survivor = ProjectId.make("foundation-survivor");
+        for (const id of [
+          projectId,
+          survivor,
+          "foundation-archived",
+          "foundation-detached",
+          "foundation-other-repo",
+        ]) {
+          yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (${id}, 'Project', '/workspace', '[]', ${at}, ${at})`;
+        }
+        yield* sql`INSERT INTO project_lifecycle (project_id, state, workspace_root, revision, changed_at) VALUES ('foundation-archived', 'archived', '/workspace', 1, ${at})`;
+        const attribution = {
+          actor: { kind: "system", id: "foundation" },
+          source: { kind: "system", id: "foundation" },
+          recordedAt: at,
+        };
+        const mission = yield* decodeTeamRecordEffect({
+          kind: "mission",
+          recordId: "deleted-mission",
+          projectId,
+          status: "draft",
+          revision: 0,
+          generation: 0,
+          updatedAt: at,
+          title: "Mission",
+          objective: "Scope",
+          requiredTaskIds: [],
+        });
+        const command = yield* decodeCommitEffect({
+          type: "project-work.foundation.commit",
+          projectId,
+          commandId: "deleted-foundation",
+          expectedRevision: 0,
+          attribution,
+          committedAt: at,
+          records: [mission],
+        });
+        yield* repo.execute(command);
+        for (const table of PROJECT_TEAM_TABLES.filter(
+          (name) => name !== "project_team_mission" && name !== "project_team_intake_cursor",
+        )) {
+          yield* sql`INSERT INTO ${sql(table)} (record_id, project_id, status, revision, generation, updated_at, payload_json) VALUES (${table + "-deleted"}, ${projectId}, 'held', 0, 0, ${at}, '{}')`;
+        }
+        const cursor = yield* decodeTeamRecordEffect({
+          kind: "intake-cursor",
+          recordId: "shared-cursor",
+          projectId,
+          status: "ready",
+          revision: 0,
+          generation: 0,
+          updatedAt: at,
+          host: "github.com",
+          repositoryNodeId: "repo",
+          accountId: "same-account",
+          cursor: "page-two",
+          etag: "same-etag",
+          overlapSince: at,
+          lastSuccessfulPageAt: at,
+        });
+        yield* sql`INSERT INTO project_team_intake_cursor (record_id, project_id, status, revision, generation, updated_at, unique_key, payload_json) VALUES (${cursor.recordId}, ${projectId}, ${cursor.status}, 0, 0, ${at}, ${encodeJson(["github.com", "repo"])}, ${encodeJson(cursor)})`;
+        for (const [id, status, repositoryNodeId] of [
+          [survivor, "open", "repo"],
+          ["foundation-archived", "open", "repo"],
+          ["foundation-detached", "detached", "repo"],
+          ["foundation-other-repo", "open", "other"],
+        ]) {
+          const issue = {
+            kind: "issue",
+            recordId: "issue-" + id,
+            projectId: id,
+            status,
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            identity: {
+              host: "github.com",
+              repositoryNodeId,
+              issueNodeId: "issue-" + id,
+              number: 1,
+            },
+            repositoryName: "owner/repo",
+            title: "Issue",
+            body: "Scope",
+            sourceRevision: "revision",
+            observedAt: at,
+          };
+          yield* sql`INSERT INTO project_team_issue (record_id, project_id, status, revision, generation, updated_at, payload_json) VALUES (${issue.recordId}, ${id}, ${status}, 0, 0, ${at}, ${encodeJson(issue)})`;
+        }
+        const input = {
+          commandId: CommandId.make("delete-foundation"),
+          projectId,
+          workspaceRoot: "/workspace",
+          confirmation: "permanent-local-delete" as const,
+        };
+        yield* lifecycle.permanentDelete(input);
+        for (const table of PROJECT_TEAM_TABLES)
+          expect(
+            (yield* sql`SELECT record_id FROM ${sql(table)} WHERE project_id = ${projectId}`)
+              .length,
+          ).toBe(0);
+        expect(
+          (yield* readProjectTeamPage(sql, { projectId: survivor, kinds: ["intake-cursor"] }))
+            .items,
+        ).toEqual([{ ...cursor, projectId: survivor }]);
+        expect((yield* readProjectTeamPage(sql, { projectId })).items).toEqual([]);
+        for (const stale of [
+          command,
+          { ...command, commandId: CommandId.make("stale-effect"), records: [cursor] },
+        ])
+          expect((yield* repo.execute(stale).pipe(Effect.result))._tag).toBe("Failure");
+        expect(
+          (yield* repo
+            .execute({
+              type: "project-work.task.claim",
+              commandId: CommandId.make("stale-claim"),
+              projectId,
+              taskId: ProjectWorkTaskId.make("deleted-task"),
+              attemptId: ProjectWorkAttemptId.make("deleted-attempt"),
+              leaseToken: "opaque",
+              leasedUntil: at,
+              claimedAt: at,
+            })
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        yield* projection.rebuild(projectId);
+        expect(
+          (yield* sql`SELECT * FROM project_work_events WHERE project_id = ${projectId}`).length,
+        ).toBe(0);
+        expect(
+          (yield* sql`SELECT * FROM project_work_projection_state WHERE projector = ${"project-work:" + projectId}`)
+            .length,
+        ).toBe(0);
+        expect((yield* readProjectTeamPage(sql, { projectId })).items).toEqual([]);
+        expect(yield* lifecycle.permanentDelete(input)).toMatchObject({
+          project: { state: "tombstoned" },
+        });
+        yield* lifecycle.permanentDelete({
+          ...input,
+          projectId: survivor,
+          commandId: CommandId.make("delete-last-owner"),
+        });
+        expect((yield* sql`SELECT * FROM project_team_intake_cursor`).length).toBe(0);
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(ProjectWorkRepositoryLive, ProjectWorkProjectionLive).pipe(
+            Layer.provideMerge(lifecycleLayer),
+          ),
+        ),
+      ),
+  );
+
   it("requires a real directory and rejects a repository identity mismatch", () => {
     expect(
       relocationDecision({

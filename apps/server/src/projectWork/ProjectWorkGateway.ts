@@ -256,7 +256,13 @@ const PUBLIC_MAX_ARRAY_ITEMS = 1_000;
 const PUBLIC_MAX_OBJECT_KEYS = 256;
 const PUBLIC_MAX_DEPTH = 12;
 const PUBLIC_SENSITIVE_KEY = /(token|secret|password|credential|authorization|api[-_]?key)/i;
-const sanitizePublicValue = (value: unknown, depth = 0): unknown => {
+const PUBLIC_TOKEN_BUDGET_KEYS = new Set([
+  "tokenLimit",
+  "maxTokens",
+  "maximumTokens",
+  "consumedTokens",
+]);
+const sanitizePublicValue = (value: unknown, depth = 0, foundation = false): unknown => {
   if (depth > PUBLIC_MAX_DEPTH) return "[omitted: maximum output depth]";
   if (typeof value === "string") {
     return value.length > PUBLIC_MAX_STRING_LENGTH
@@ -266,14 +272,18 @@ const sanitizePublicValue = (value: unknown, depth = 0): unknown => {
   if (Array.isArray(value)) {
     return value
       .slice(0, PUBLIC_MAX_ARRAY_ITEMS)
-      .map((entry) => sanitizePublicValue(entry, depth + 1));
+      .map((entry) => sanitizePublicValue(entry, depth + 1, foundation));
   }
   if (value === null || typeof value !== "object") return value;
   return Object.fromEntries(
     Object.entries(value)
       .slice(0, PUBLIC_MAX_OBJECT_KEYS)
-      .filter(([key]) => !PUBLIC_SENSITIVE_KEY.test(key))
-      .map(([key, entry]) => [key, sanitizePublicValue(entry, depth + 1)]),
+      .filter(
+        ([key, entry]) =>
+          !PUBLIC_SENSITIVE_KEY.test(key) ||
+          (foundation && PUBLIC_TOKEN_BUDGET_KEYS.has(key) && typeof entry === "number"),
+      )
+      .map(([key, entry]) => [key, sanitizePublicValue(entry, depth + 1, foundation)]),
   );
 };
 
@@ -569,8 +579,18 @@ const makeProjectWorkGateway = Effect.gen(function* () {
         contentGuard._tag === "Some"
           ? contentGuard.value
               .redact(value)
-              .pipe(Effect.map(({ value: redacted }) => sanitizePublicValue(redacted)))
-          : Effect.succeed(sanitizePublicValue(redactProjectWorkContent(value).value)),
+              .pipe(
+                Effect.map(({ value: redacted }) =>
+                  sanitizePublicValue(redacted, 0, boundedInput.operation === "foundation-records"),
+                ),
+              )
+          : Effect.succeed(
+              sanitizePublicValue(
+                redactProjectWorkContent(value).value,
+                0,
+                boundedInput.operation === "foundation-records",
+              ),
+            ),
       ),
     );
   };

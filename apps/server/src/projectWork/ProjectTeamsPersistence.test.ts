@@ -1,3 +1,8 @@
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import { validateProjectTeamRecord } from "./ProjectTeamFoundationRecords.ts";
+import { emptyProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import { it } from "@effect/vitest";
 import { expect } from "vite-plus/test";
 import * as Effect from "effect/Effect";
@@ -492,6 +497,204 @@ layer("teams foundation persistence", (it) => {
       }).pipe(Effect.provide(services)),
   );
 
+  it.effect(
+    "freezes effect identity and semantic payload and retains uncertainty across replay",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations();
+        const repo = yield* ProjectWorkRepository;
+        const projection = yield* ProjectWorkProjection;
+        const query = yield* ProjectWorkQuery;
+        const project = "immutable-effects";
+        const effect = record(project, "effect", "immutable-effect", {
+          status: "pending",
+          effectId: "external-once",
+          effectKind: "publication",
+          targetId: "issue",
+          payload: { recordIds: [], expectedRevision: 0, summary: "Once" },
+          claimGeneration: 0,
+          availableAt: at,
+        });
+        yield* repo.execute(commit(project, "effect-create", 0, [effect]));
+        for (const [i, change] of [
+          { effectId: "renamed" },
+          { targetId: "other" },
+          { effectKind: "setup" },
+          { payload: { ...effect.payload, summary: "Different" } },
+        ].entries()) {
+          expect(
+            (yield* repo
+              .execute(
+                commit(project, "effect-mutate-" + i, 1, [
+                  yield* decodeTeamRecordEffect({ ...effect, revision: 1, ...change }),
+                ]),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        const uncertain = { ...effect, revision: 1, status: "uncertain" as const };
+        yield* repo.execute(commit(project, "effect-uncertain", 1, [uncertain]));
+        yield* projection.rebuild(project);
+        for (const status of ["failed", "pending", "claimed", "succeeded"] as const) {
+          expect(
+            (yield* repo
+              .execute(
+                commit(project, "escape-uncertain-" + status, 2, [
+                  { ...uncertain, revision: 2, status, outcome: "untyped claim of reconciliation" },
+                ]),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        expect(
+          (yield* repo
+            .execute(
+              commit(project, "duplicate-original-effect", 2, [
+                { ...effect, recordId: "another-effect" },
+              ]),
+            )
+            .pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect((yield* query.listFoundationRecords({ projectId: project })).items).toEqual([
+          uncertain,
+        ]);
+      }).pipe(Effect.provide(services)),
+  );
+
+  it.effect("reopens immutable memory payloads and checks the complete source tuple", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-foundation-memory-" });
+        const database = () =>
+          services.pipe(
+            Layer.provideMerge(
+              Layer.fresh(
+                NodeSqliteClient.layer({ filename: path.join(directory, "state.sqlite") }),
+              ),
+            ),
+          );
+        const project = "reopened-memory";
+        const source = record(project, "memory-source", "reopen-source", {
+          status: "current",
+          sourceKind: "finding",
+          sourceId: "artifact",
+          sourceRevision: 1,
+          content: "Original",
+          contentHash: "same-hash",
+          attribution,
+          sharedWithProjectIds: [],
+        });
+        const other = { ...source, recordId: "reopen-other", sourceId: "other-artifact" };
+        const extraction = record(project, "memory-extraction", "reopen-extraction", {
+          status: "extracted",
+          engine: "mem0",
+          engineVersion: "2.2.1",
+          sourceId: source.recordId,
+          sourceRevision: 1,
+          sourceGeneration: 0,
+          extractionModel: "ling",
+          embeddingModel: "nvidia",
+          embeddingDimensions: 2048,
+          expectedObservationIds: ["reopen-observation"],
+          completedObservationIds: [],
+          extractionHash: "frozen-hash",
+        });
+        const observation = record(project, "memory-observation", "reopen-observation", {
+          status: "current",
+          sourceId: source.recordId,
+          sourceRevision: 1,
+          sourceGeneration: 0,
+          extractionId: extraction.recordId,
+          observationKey: "one",
+          body: "Original fact",
+          provenance: attribution,
+        });
+        const indexed = {
+          ...extraction,
+          revision: 1,
+          status: "indexed" as const,
+          completedObservationIds: [observation.recordId],
+        };
+        // A matching UUID/revision/generation from a different source cannot prove completion.
+        expect(() =>
+          validateProjectTeamRecord(
+            {
+              ...emptyProjectWorkReducerState(project),
+              foundationRecords: [source, other, { ...observation, sourceId: other.recordId }],
+            },
+            { ...indexed, revision: 0 },
+            attribution,
+          ),
+        ).toThrow();
+        yield* Effect.gen(function* () {
+          yield* runMigrations();
+          const repo = yield* ProjectWorkRepository;
+          yield* repo.execute(
+            commit(project, "reopen-initial", 0, [source, other, extraction, observation]),
+          );
+          yield* repo.execute(commit(project, "reopen-index", 4, [indexed]));
+        }).pipe(Effect.provide(database()));
+        yield* Effect.gen(function* () {
+          const repo = yield* ProjectWorkRepository;
+          const projection = yield* ProjectWorkProjection;
+          for (const [i, change] of [
+            { sourceId: other.recordId },
+            { extractionModel: "changed" },
+          ].entries())
+            expect(
+              (yield* repo
+                .execute(
+                  commit(project, "reopen-retarget-" + i, 5, [
+                    yield* decodeTeamRecordEffect({ ...indexed, revision: 2, ...change }),
+                  ]),
+                )
+                .pipe(Effect.result))._tag,
+            ).toBe("Failure");
+          expect(
+            (yield* repo
+              .execute(
+                commit(project, "reopen-mutate-body", 5, [
+                  { ...observation, revision: 1, body: "Changed" },
+                ]),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          yield* projection.rebuild(project);
+          expect(
+            (yield* projection.state(project)).foundationRecords?.find(
+              (entry) => entry.recordId === observation.recordId,
+            ),
+          ).toEqual(observation);
+          const corrected = {
+            ...source,
+            revision: 1,
+            generation: 1,
+            content: "Corrected",
+            attribution: { ...attribution, actor: { kind: "human" as const, id: "corrector" } },
+          };
+          yield* repo.execute(commit(project, "reopen-correction", 5, [corrected]));
+          expect(
+            (yield* repo
+              .execute(
+                commit(project, "reopen-stale-extraction", 6, [
+                  { ...extraction, recordId: "late-extraction" },
+                ]),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          yield* projection.rebuild(project);
+          expect(
+            (yield* projection.state(project)).foundationRecords?.find(
+              (entry) => entry.recordId === source.recordId,
+            ),
+          ).toEqual(corrected);
+        }).pipe(Effect.provide(database()));
+      }).pipe(Effect.provide(NodeServices.layer)),
+    ),
+  );
+
   it.effect("rejects global record collisions without committing divergent events", () =>
     Effect.gen(function* () {
       yield* runMigrations();
@@ -644,6 +847,61 @@ layer("teams foundation persistence", (it) => {
           observationKey: "second",
         };
         yield* repo.execute(commit(project, "complete-manifest", 3, [secondObservation, indexed]));
+        for (const [i, change] of [
+          { sourceId: "other-source" },
+          { sourceRevision: 2 },
+          { sourceGeneration: 1 },
+          { extractionModel: "different" },
+          { embeddingModel: "different" },
+          { extractionHash: "different" },
+          { expectedObservationIds: ["different"] },
+        ].entries()) {
+          expect(
+            (yield* repo
+              .execute(
+                commit(project, "mutate-extraction-" + i, 5, [
+                  yield* decodeTeamRecordEffect({ ...indexed, revision: 2, ...change }),
+                ]),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        for (const [i, change] of [
+          { body: "Changed original UUID" },
+          { provenance: { ...attribution, actor: { kind: "human", id: "other" } } },
+          { observationKey: "different" },
+        ].entries()) {
+          expect(
+            (yield* repo
+              .execute(
+                commit(project, "mutate-observation-" + i, 5, [
+                  yield* decodeTeamRecordEffect({ ...observation, revision: 1, ...change }),
+                ]),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        for (const [i, change] of [
+          { content: "Different content with same caller hash" },
+          { attribution: { ...attribution, actor: { kind: "human", id: "other" } } },
+          { sourceKind: "decision" },
+        ].entries()) {
+          expect(
+            (yield* repo
+              .execute(
+                commit(project, "unfenced-source-payload-" + i, 5, [
+                  yield* decodeTeamRecordEffect({ ...source, revision: 1, ...change }),
+                ]),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        yield* projection.rebuild(project);
+        expect(
+          (yield* projection.state(project)).foundationRecords?.find(
+            (entry) => entry.recordId === observation.recordId,
+          ),
+        ).toEqual(observation);
         const tombstone = yield* decodeTeamRecordEffect({
           ...source,
           revision: 1,
@@ -827,6 +1085,27 @@ layer("teams foundation persistence", (it) => {
             { ...message, revision: 1, status: "delivered", deliveryCursor: 1 },
           ]),
         );
+        for (const [i, change] of [
+          { commandId: "renamed" },
+          { recipientId: sender.recordId },
+          { body: "Different" },
+          { evidenceIds: ["different"] },
+        ].entries()) {
+          expect(
+            (yield* repo
+              .execute(
+                commit(project, "mutate-message-" + i, 9, [
+                  yield* decodeTeamRecordEffect({
+                    ...message,
+                    status: "delivered",
+                    revision: 2,
+                    ...change,
+                  }),
+                ]),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
         yield* repo.execute(
           commit(project, "question-seen", 9, [{ ...question, revision: 1, seenAt: at }]),
         );
@@ -868,6 +1147,35 @@ layer("teams foundation persistence", (it) => {
           "delivered",
         );
         expect((yield* repo.replay(project)).length).toBe(11);
+        yield* repo.execute(
+          commit(project, "message-acknowledged", 11, [
+            {
+              ...message,
+              revision: 2,
+              status: "acknowledged",
+              deliveryCursor: 1,
+              acknowledgedAt: at,
+            },
+          ]),
+        );
+        yield* repo.execute(
+          commit(project, "message-resolved", 12, [
+            {
+              ...message,
+              revision: 3,
+              status: "resolved",
+              deliveryCursor: 1,
+              acknowledgedAt: at,
+              resolvedAt: at,
+            },
+          ]),
+        );
+        yield* projection.rebuild(project);
+        expect(
+          (yield* projection.state(project)).foundationRecords?.find(
+            (entry) => entry.recordId === message.recordId,
+          )?.status,
+        ).toBe("resolved");
       }).pipe(Effect.provide(services)),
   );
 });

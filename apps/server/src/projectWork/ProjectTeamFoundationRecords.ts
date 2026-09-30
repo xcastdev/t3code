@@ -16,6 +16,25 @@ const stable = (record: TeamRecord) => {
   const mutable = new Set(["status", "revision", "generation", "updatedAt"]);
   if (record.kind === "run-binding") mutable.add("sessionId");
   if (record.kind === "gate") mutable.add("attribution");
+  if (record.kind === "message") {
+    mutable.add("deliveryGeneration");
+    mutable.add("deliveryCursor");
+    mutable.add("acknowledgedAt");
+    mutable.add("resolvedAt");
+  }
+  if (record.kind === "effect") {
+    mutable.add("claimGeneration");
+    mutable.add("availableAt");
+    mutable.add("outcome");
+  }
+  if (record.kind === "memory-extraction") {
+    mutable.add("completedObservationIds");
+    mutable.add("error");
+  }
+  if (record.kind === "memory-observation") {
+    mutable.add("supersedes");
+    mutable.add("tombstonedAt");
+  }
   return canonicalProjectWorkPayload(
     Object.fromEntries(Object.entries(record).filter(([key]) => !mutable.has(key))),
   );
@@ -135,6 +154,8 @@ export const validateProjectTeamRecord = (
         reject("Merge gate requires exact remote revision and method");
       break;
     case "message":
+      if (old?.kind === "message" && stable(old) !== stable(r))
+        reject("Message identity and semantic envelope are immutable");
       requireRecord(r.senderId, "member");
       requireRecord(r.recipientId, "member");
       if (r.taskId === undefined && r.missionId === undefined)
@@ -212,7 +233,12 @@ export const validateProjectTeamRecord = (
         old?.kind === "memory-source" &&
         (r.sourceId !== old.sourceId ||
           r.sourceRevision < old.sourceRevision ||
-          ((r.sourceRevision !== old.sourceRevision || r.contentHash !== old.contentHash) &&
+          ((r.sourceRevision !== old.sourceRevision ||
+            r.contentHash !== old.contentHash ||
+            r.content !== old.content ||
+            r.sourceKind !== old.sourceKind ||
+            canonicalProjectWorkPayload(r.attribution) !==
+              canonicalProjectWorkPayload(old.attribution)) &&
             r.generation <= old.generation))
       )
         reject("Source change requires generation fencing");
@@ -228,6 +254,30 @@ export const validateProjectTeamRecord = (
       )
         reject("Memory source is stale or retracted");
       if (r.kind === "memory-extraction") {
+        if (
+          old?.kind === "memory-extraction" &&
+          canonicalProjectWorkPayload([
+            old.sourceId,
+            old.sourceRevision,
+            old.sourceGeneration,
+            old.engine,
+            old.engineVersion,
+            old.extractionModel,
+            old.embeddingModel,
+            old.embeddingDimensions,
+          ]) !==
+            canonicalProjectWorkPayload([
+              r.sourceId,
+              r.sourceRevision,
+              r.sourceGeneration,
+              r.engine,
+              r.engineVersion,
+              r.extractionModel,
+              r.embeddingModel,
+              r.embeddingDimensions,
+            ])
+        )
+          reject("Extraction source and model tuple is immutable");
         if (
           new Set(r.expectedObservationIds).size !== r.expectedObservationIds.length ||
           new Set(r.completedObservationIds).size !== r.completedObservationIds.length ||
@@ -258,6 +308,7 @@ export const validateProjectTeamRecord = (
                   entry.kind === "memory-observation" &&
                   entry.recordId === id &&
                   entry.extractionId === r.recordId &&
+                  entry.sourceId === r.sourceId &&
                   entry.sourceRevision === r.sourceRevision &&
                   entry.sourceGeneration === r.sourceGeneration,
               ),
@@ -267,12 +318,12 @@ export const validateProjectTeamRecord = (
         if (
           old?.kind === "memory-extraction" &&
           old.extractionHash !== undefined &&
-          (r.extractionHash !== old.extractionHash ||
-            canonicalProjectWorkPayload(r.expectedObservationIds) !==
-              canonicalProjectWorkPayload(old.expectedObservationIds))
+          stable(old) !== stable(r)
         )
           reject("Durable extraction manifest is immutable");
       } else {
+        if (old?.kind === "memory-observation" && stable(old) !== stable(r))
+          reject("Observation payload and provenance are immutable");
         const extraction = requireRecord(r.extractionId, "memory-extraction");
         if (
           extraction.kind !== "memory-extraction" ||
@@ -286,6 +337,8 @@ export const validateProjectTeamRecord = (
       break;
     }
     case "effect":
+      if (old?.kind === "effect" && stable(old) !== stable(r))
+        reject("Effect identity and semantic envelope are immutable");
       if (r.runId !== undefined) requireRecord(r.runId, "run-binding");
       if (r.sourceId !== undefined) {
         const source = requireRecord(r.sourceId, "memory-source");
@@ -293,8 +346,18 @@ export const validateProjectTeamRecord = (
       }
       if (old?.kind === "effect" && (old.status === "succeeded" || old.status === "canceled"))
         reject("Completed effect cannot be retried");
-      if (old?.kind === "effect" && old.status === "uncertain" && r.status === "pending")
-        reject("Uncertain effect requires reconciliation, not blind retry");
+      // A text outcome cannot prove reconciliation. P11 will add the typed receipt path.
+      if (
+        old?.kind === "effect" &&
+        old.status === "uncertain" &&
+        r.status !== "uncertain" &&
+        r.status !== "canceled"
+      )
+        reject("Uncertain effect requires durable reconciliation");
+      if (old?.kind === "effect" && old.status === "claimed" && r.status === "pending")
+        reject("Claimed effect cannot return to dispatch without a recorded outcome");
+      if ((r.status === "succeeded" || r.status === "failed") && r.outcome === undefined)
+        reject("Settled effect requires a recorded outcome");
       break;
     default:
       break;
