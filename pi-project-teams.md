@@ -1335,8 +1335,9 @@ bytes and does not include those sibling service cgroups. Both checks make zero
 model calls. Logs, exact command arrays, resource counters, seven outcome records,
 and eleven combined source hashes are retained at
 `/home/user/.cache/pi-project-teams-11b7e351/wave1-validation/`, with suffix
-`bbe8cba1`. The worker's scoped lint, format, strict narrow TypeScript, syntax, and
-whitespace checks pass at the same source hashes. Initial launcher failures and
+`bbe8cba1`. The worker's scoped lint, format, syntax, and whitespace checks pass at the
+same source hashes. Its original narrow TypeScript result used a private Vitest
+alias and is superseded by the normal compiler proof below. Initial launcher failures and
 compiler diagnostics remain separate from passing evidence. The worker's unnecessary
 environment dump displayed secret values in tool output; no values were copied
 into evidence, and subsequent manager checks use selected properties only.
@@ -1347,3 +1348,45 @@ runtime, memory, isolation, and packaging evidence is unchanged. Linux prerequis
 unproved-host disablement, buffered auth-broker streaming, exact full-application
 packaging, bounded production reads, and complete memory reconciliation remain
 explicit P3/P7/P8/P10/P14 obligations. No product acceptance criterion is complete.
+
+### Combined P1 normal compiler repair
+
+Fresh xhigh combined review of `f9363d1641c76a5b64529354b3fd9181a0243359`
+found that the runtime test imported undeclared `vitest`. A private alias in the
+worker's narrow compiler config masked the normal server error. The coordinator
+reproduced TS2307 and TS7006 with the unchanged server compiler and no aliases.
+The same compiler applied to the promoted memory test revealed TS1543 for the
+JSON import and TS377064 for its intentional measurement log. These changes form
+the second and final combined-candidate repair round.
+
+Runtime repair `92e01515af286f6b1ba27554d82bcc4151322193` changes only the import
+to the repository's `vite-plus/test`. Memory repair
+`9058f2b43042bf65900126112e5002987c43fa7f` adds the NodeNext JSON import attribute
+and a justified next-line Effect console diagnostic directive. Separate fresh
+xhigh part reviewers approve both exact commits. The memory reviewer verified
+source/diff hashes directly; that part has no artifact manifest. Both parts retain
+all assertions and test bodies, and the history fixture is byte-identical.
+
+The approved parts are integrated at
+`2de52a213ca7e35f20ac594d91e4a647452bfbd2`. The coordinator reran:
+
+```sh
+vp test run apps/server/src/provider/pi/PiRuntimeContract.test.ts apps/server/src/projectWork/memory/MemoryBackendContract.test.ts
+node_modules/.bin/tsc --noEmit --project /home/user/.cache/pi-project-teams-11b7e351/wave1-validation/tsconfig.p1-promoted-no-alias.json
+```
+
+Tests pass 21/21 in 1.842 seconds, with a verified 1 GiB cap, 421,871,616-byte
+kernel peak, and zero OOM events. Strict compilation passes in 1.169 seconds,
+with a verified 1 GiB cap, 568,504,320-byte peak, and zero OOM events. The external
+compiler config extends the unchanged normal server configuration, restricts
+files to the two promoted tests, and supplies cached Node type roots. It has no
+aliases, substitute declarations, or disabled compiler plugins. Both checks use
+a 128 MiB Node heap setting, zero swap, and zero model calls. Exact commands, logs,
+counters, and source hashes are retained in `wave1-validation/` with suffix
+`2de52a21`. All four Linux ownership fixture source hashes are unchanged from
+`bbe8cba1`; its seven real Linux outcomes remain applicable and were not replayed.
+
+The final fresh combined review remains pending. P1 is unchecked and P2 has not
+started. Normal build/test memory limits may increase when measured need justifies
+it; the user's prohibition concerns all local model loading, hosting, and inference.
+No Ollama, llama, local model, model weight download, push, or PR is authorized.
