@@ -87,6 +87,7 @@ import ForkMigration0016 from "./Migrations/fork/016_SkillSessionOverlays.ts";
 import ForkMigration0017 from "./Migrations/fork/017_ThreadHistoryArchives.ts";
 import ForkMigration0019 from "./Migrations/fork/019_ProjectTeamsFoundation.ts";
 import ForkMigration0018 from "./Migrations/fork/018_TerminalCompletionWakes.ts";
+import ForkMigration0020 from "./Migrations/fork/020_ProjectTeamIdentityFences.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -174,6 +175,7 @@ export const forkMigrationEntries = [
   [17, "ThreadHistoryArchives", ForkMigration0017],
   [18, "TerminalCompletionWakes", ForkMigration0018],
   [19, "ProjectTeamsFoundation", ForkMigration0019],
+  [20, "ProjectTeamIdentityFences", ForkMigration0020],
 ] as const;
 
 export const FORK_MIGRATIONS_TABLE = "t3_fork_migrations";
