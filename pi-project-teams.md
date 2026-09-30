@@ -7,7 +7,7 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-09-30 21:56 UTC. Implementation has resumed. The coordinator
+Last updated: 2026-09-30 22:14 UTC. Implementation has resumed. The coordinator
 maintains this section at assignments, check results, reviews, and integration
 gates; detailed evidence and historical checkpoints are below.
 
@@ -26,30 +26,29 @@ gates; detailed evidence and historical checkpoints are below.
   and 32 source/archive hashes. Server-scoped Knip passes on this exact commit.
   The same xhigh reviewer confirms the earlier cases but finds concurrent binding
   creation between withdrawal and discovery. The coordinator reproduces that race;
-  the same owner is assigned another scoped repair. P3 remains unapproved.
+  the same owner is repairing it. A short transaction fixes the binding race but
+  cancellation rolls withdrawal back; two retained controls confirm the old
+  bearer and held guard survive restart. The owner is testing a single-observation
+  withdrawal boundary. P3 remains unapproved.
   Five unchanged Lifecycle baseline lint errors
   remain failed evidence; no unrelated cleanup is claimed.
-- **Active preparatory slice:** P5 read-only GitHub transport is committed as
-  `567978db2aea46f833523c61add9059f8bf64fab`, with 58 affected tests, normal
-  focused compiler, lint, format and diff passing. Its coordinator-owned helper
-  `05172c6` is independently approved. Coordinator inspection verifies the exact
-  source and all 46 evidence artifacts. Its one fresh review returns
-  REQUEST_CHANGES on documented numeric pagination, malformed quota-response
-  handling and a too-short secondary-limit pause. The coordinator reproduces
-  all three; the same owner is repairing and the same reviewer will recheck.
-  Conditional-read identity postchecks remain an observed limitation.
-  There is no runtime, persistence, authorization or dispatch wiring. P5 remains
-  incomplete; its full
-  P2–P4 prerequisites and intake/integration gates remain open.
-- **Active preparatory slice:** P7 skill delivery is committed as
-  `43d6c69db26a2a310bb8bc6989ab8845b99489cb`, with 45 affected tests, normal
-  focused compiler, lint, format and diff passing. Six causal controls and a dry
-  pinned-SDK skill loader check are preserved. Coordinator inspection verifies
-  all 81 evidence artifacts and 12 source/archive paths. Its one fresh review
-  returns REQUEST_CHANGES. The coordinator reproduces interruption leaving copied
-  pending or published skill files. The same owner is repairing; its exclusive scope
-  now includes the shared materializer and tests, with interfaces unchanged.
-  Full P7 runtime, authorization wiring, isolation and packaging remain open.
+- **Active preparatory slice:** P5 transport repair is committed as
+  `7d9a345fa84c71bd16ec9d724dea3be89ce16273`, with 66 affected tests, normal
+  focused compiler, lint, format and diff passing. Its helper `05172c6` is
+  independently approved. Coordinator inspection verifies all 53 new artifacts,
+  seven current/committed/archive source paths and 13 drained scopes. The same
+  xhigh reviewer is rechecking numeric pagination, header-first quota pauses and
+  the one-minute fallback. Conditional-read identity postchecks remain a limitation.
+  Full P5 persistence, authorization, sync and dispatch wiring, P2–P4 prerequisites
+  and intake/integration gates remain open.
+- **Active preparatory slice:** P7 skill cleanup repair is committed as
+  `a38c13ac7b8a1098755fd2cde926c75458d0a63a`, with 63 affected tests, normal
+  focused compiler, lint, format and diff passing. The original reviewer's three
+  cancellation probes now pass; four causal controls detect leaks or foreign-file
+  deletion. Coordinator inspection verifies 65 new artifacts, 14 source/archive
+  paths, the exact four-file repair and 21 drained scopes. The same xhigh reviewer
+  is rechecking. Full P7 runtime, authorization wiring, isolation and packaging
+  remain open.
 - **Left:** P4, P6 and P8–P14 (9 steps not started), the rest of P5/P7, all 19
   product acceptance criteria, and both final audits. After P2/P3 lands, full P7
   can run alongside P4; full P5 follows P4.
@@ -2353,3 +2352,52 @@ No replacement reviewer or approval is inferred. The same P3 owner resumes from
 `614329d` in its existing scope; new evidence goes to
 `p3-binding-race-repair-evidence/`. P3 still blocks wave2 integration while
 independent P5/P7 repairs continue.
+
+### Committed cross-phase repairs awaiting review
+
+The coordinator inspects P5 repair `7d9a345fa84c71bd16ec9d724dea3be89ce16273`
+from `567978db` and P7 repair `a38c13ac7b8a1098755fd2cde926c75458d0a63a`
+from `43d6c69`. Both worktrees are clean and remain isolated. Their same sole
+xhigh reviewers are assigned read-only rechecks; neither repair is approved or
+merged yet. This applies the standing cross-phase parallel rule while P3's
+foundation repair continues. Root, one P3 owner and the two reviewers use the
+four available harness slots. Workers do not delegate.
+
+P5 changes only its two assigned client paths. It accepts numeric pagination
+only for the verified repository's REST ID, records decisive quota headers before
+optional body parsing, and preserves exponential backoff while imposing a
+one-minute fallback. All 66 affected tests and the normal two-file compiler pass;
+exact-path lint, format and diff checks pass. The 53-artifact manifest SHA256 is
+`54456ffd357c4761938e8b9a28b74af67660e4ac76e09f5a6a7259d9e499724e` in
+`/home/user/.cache/pi-project-teams-11b7e351/p5-transport-repair-evidence/`.
+The coordinator verifies seven current, committed and archived source hashes,
+five final check stamps, both exact patch and retained RED archive against its
+own RED hashes, and 13 drained scopes. An initial compiler fixture error remains
+preserved; final tests and checks ran after its correction. Transport evidence is
+synthetic; real GitHub sync and snapshot guarantees remain unproved.
+
+P7 changes exactly the four approved adapter/materializer source and test paths.
+A private cleanup owner retains the created inode through held success receipts;
+copy and publication remain interruptible. All 63 affected tests, normal four-file
+compiler and exact-path checks pass. The byte-identical reviewer probes for copy,
+rename and post-return cancellation now drain without releasing the held receipt.
+Four causal mutations discriminate missing cleanup, publication tracking, handoff
+ownership and inode guards. The 65-artifact JSON manifest SHA256 is
+`e6b7cc92aa90e7afbc8f1b94dc16703390cf88908440349acf69d48c27901c88` in
+`/home/user/.cache/pi-project-teams-11b7e351/p7-skills-repair-evidence/`.
+The coordinator verifies every artifact, 14 current/committed/archive source
+hashes, the exact four-file patch and 21 drained scopes. Ordinary factory bodies
+and the public materialization service shape are unchanged. Real filesystem proof
+supports this leaf; it does not establish full pi runtime or caller authorization.
+
+P3's competing-binding probe motivates a short withdrawal/discovery transaction.
+That variant passes the creation-race controls but cancellation after UPDATE rolls
+back withdrawal: after purge and fresh same-key Auth, both the raw bearer and held
+privileged guard succeed. Capturing the local batch Exit still exhibits the same
+failure. Both failed controls remain recorded. The coordinator approves a small
+private alternative: one exact provider/thread observation governs withdrawal;
+nonempty observed rows trigger committed exact-subject revocation before binding
+interpretation or later denial, with no enclosing rollback transaction. The public
+one-argument discover interface remains unchanged. Actual observation-timing and
+post-UPDATE cancellation controls must pass before the same P3 reviewer rechecks.
+No P3 approval or integration is inferred from passing earlier cases.
