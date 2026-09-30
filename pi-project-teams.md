@@ -1,5 +1,5 @@
 Github Tracked: false
-Status: blocked
+Status: in_progress
 Github Issue: none
 Plan review: READY_WITH_EXPLICIT_GATES
 
@@ -1016,10 +1016,11 @@ P1 and all 19 acceptance criteria remain unchecked while proofs run.
 
 The user subsequently selected CommandCode, prohibited further OpenAI model
 calls and all Ollama use, and prohibited memory-intensive work on this machine.
-Further proof work here is limited to lightweight inspection and bounded remote
-API calls. Local model loading is prohibited; resource-intensive backend and
-packaging proofs require a different environment. No prerequisite or acceptance criterion was
-weakened to accommodate these constraints.
+The user later clarified that normal tests and builds may use higher memory
+limits; the intent was to prohibit hosting models locally. All model calls remain
+remote. Ollama, llama, and other local models remain prohibited. Probes retain
+explicit resource limits and captured process ownership. No prerequisite or
+acceptance criterion is weakened.
 
 **Runtime.** Pi was upgraded from 0.84.2 to the pinned
 `@earendil-works/pi-coding-agent@0.99.1`; the official
@@ -1098,8 +1099,9 @@ proves the existing remote embedding route, not either backend or recall/recover
 Fresh xhigh review verified all five artifact hashes, all three finite vectors,
 returned indexes, token/cost evidence, and the two total remote requests. It
 confirmed the route-only claim with no new blocking finding.
-An environment compatible with the user's resource constraints is still required
-for the remaining real backend/lifecycle and packaging checks.
+The existing file-backed Qdrant and SQLite components permit a small remote-only
+Mem0 candidate without a local model service. Its resource use and full lifecycle
+matrix still need proof. Graphiti has no configured remote graph database here.
 
 **Isolation and packaging.** Linux x64 bubblewrap 0.12.0 fixtures passed seven
 actual isolation/process/layout checks, including npm setup descendants,
@@ -1144,3 +1146,107 @@ preserved. Worker restart/spawn attempts also encountered an agent-thread limit;
 the coordinator performed the narrow runtime withdrawal repair, and fresh review
 capacity became available after workers finished. No repository-wide checks,
 browser/device use, live T3 writes, pushes, or PR creation occurred.
+
+### Resumed P1 work
+
+After the user reiterated implementation, the complete current record was read
+again. Three medium workers resumed in the existing isolated branches from:
+memory at `cfbcfdb80e2b04f89a6e00abc59769c678500e8b`, runtime at
+`479c5285ee24ba8735d56cd074db84b68bc347a5`, and isolation at
+`6cc1a0ffad2f61a707a4b18971e187ea216f6f17`. The current main base is
+`e346e4055af964c72bfff98f225180204ed33761`; its advances are record-only.
+Their exclusive scopes remain those assigned above. Existing evidence is retained;
+new probes use new artifact names. Workers neither delegate nor merge.
+
+The memory worker evaluated a native dense-only Mem0 candidate with hosted
+CommandCode completions and OpenRouter NVIDIA embeddings, explicit request budgets,
+and a hard subprocess resource limit before imports. The runtime worker proved
+actual session tool dispatch and role restrictions. The isolation worker checked
+enabled text-tool resources in the existing package layouts without a full rebuild.
+Images and codemode may be explicitly unavailable in the initial managed profile;
+this does not permit advertising those capabilities as supported. These are ongoing
+proofs, not completed P1 gates. Unsupported-host execution remains disabled under
+the saved deployment policy. P2–P14 remain gated.
+
+The first resumed proof reviews found actionable gaps. Current repair evidence:
+
+- Runtime commit `467cd7c41e1e1be21b100169e043ed9e980e4c87` adds four actual SDK
+  consumer/test files. Six cases passed with 13 synthetic callbacks and no new
+  remote call; a private service recorded a 113,135,616-byte kernel memory peak.
+  Fresh review requires cancellation to fail on watchdog expiry and cleanup to
+  retain process identity rather than kill a reused numeric PID. The repair's
+  negative controls now reject omitted abort/shutdown and confirm pidfd cleanup.
+  Repair commit `0a7d611cb7c06dd6415cbef6ff2d20b25e1220b7` removes child self-expiry
+  and numeric-PID cleanup. Actual pnpm-installed SDK checks pass 3/3; both omitted
+  cleanup negative controls fail with watchdog receipts and bound-identity cleanup.
+  The focused check's kernel peak is 285,429,760 bytes under a 512 MiB cap. The
+  owned-service causal proof peaks at 122,200,064 bytes with zero OOM events.
+  All six pi packages resolve to 0.99.1. Fresh review accepts those causal fixes
+  but finds a remaining startup-cleanup gap: ownership is armed after dispatch,
+  and cleanup clears its watchdog before awaiting potentially hanging SDK shutdown.
+  The coordinator verified the control flow. A focused second repair must acquire
+  process ownership before startup and prove bounded startup-failure cleanup.
+- Memory commit `6cc8c7a80e5ffdaf2fd826fa962217099cf428c6` passed fresh review as
+  a preparatory source-briefing consumer change, with 9/9 tests. The remote corpus
+  completed all eight sources/searches: qualified source recall 1.0 versus FTS
+  5/7, 10 LLM attempts, 34 embedding requests, and approximately 131 MiB peak RSS.
+  Raw superseded hits, invented wording, and duplicate native writes remain
+  visible. Review rejected reconciliation that acknowledges any matching record
+  as complete. The focused repair has crashed real multi-observation extraction
+  between native writes and recovered only the missing original UUID. Repair
+  commit `66e8f1c2539de8e74bea46e355190596631a1a89` passes 11/11 focused tests.
+  Actual two-observation ingestion crashes after one native point, reopens pending
+  at 1/2, and restores the missing original UUID without another model call. A
+  separate actual embedding transport timeout leaves 0/2 pending; recovery reuses
+  the durable extraction and verifies both native records before completion.
+  Receipt replay performs no new request or write. Aggregate counters are 12 LLM
+  attempts and 40 embedding attempts; peak RSS is 132.719 MiB under pre-import
+  resource bounds. Native Mem0 history rows skipped by the crash remain empty;
+  source/extraction records and complete-set manifests persist. This is derived
+  index recovery evidence, not a claim to recover every SDK internal transaction.
+  Fresh selection/recovery review is pending. No production integration or final
+  engine selection is claimed.
+- New text-tool and parent-auth fixtures passed their actual native consumers.
+  Fresh review then found implicit append-prompt/file discovery and character
+  counts used as byte limits. One focused text repair excludes those discovery
+  paths, constructs the read tool before the session, and checks bytes before
+  accumulation. Both copied-runtime and actual ASAR consumers passed. Fresh xhigh
+  re-review approves Linux text-profile isolation/auth feasibility and confirms
+  the discovery, Git authority, framing, and stderr findings resolved in their
+  stated scopes. The auth stderr correction is source-only offline
+  evidence; it does not retroactively certify the earlier live broker source.
+  Fresh packaging review approves enabled native write/edit/read/bash consumers
+  in actual npm-packed/extracted, Electron 44.1.0 ASAR, and minified SEA layouts.
+  All 108 artifact hashes match; package resources match byte for byte across
+  layouts. The standalone executable embeds its JS and runs without SDK source
+  or node_modules mounts. Its build peaks at 1,239,146,496 bytes under the user's
+  authorized 2 GiB cap, with all captured processes exited. The prior unminified
+  1 GiB OOM remains recorded. Node 26.8.1 differs from the repository's SEA pin
+  26.8.2; exact full-application packaging remains a P7/P14 obligation. The read
+  guard validates one buffer after reading, so it is not a hard 64 KiB allocation
+  bound. Linux bubblewrap prerequisites and disabled execution on unproved hosts
+  remain explicit. This approval covers the bounded packaging proof, not all P1.
+
+Coordinator-owned dependency commit `81ee24e3d` is isolated on
+`pi-teams/p1-dependencies`, based on
+`e346e4055af964c72bfff98f225180204ed33761`. It adds the exact SDK test dependency,
+116 new package/snapshot pairs, and eight exact release-age exceptions. Existing
+importers, packages, snapshots, overrides, and patches are preserved. The frozen
+lockfile/supply-chain check passed all 2,297 entries with a 512 MiB cap; the earlier
+256 MiB failure remains recorded. A standalone install of the exact pinned
+dependency graph passed under a 1 GiB cap with scripts disabled. Scoped format
+and whitespace checks passed. Fresh xhigh dependency review approves the pin,
+closed graph, integrity hashes, preserved prior entries, and frozen checks; this
+commit has not landed in the wave or main worktree.
+
+The NVIDIA publisher's fixed model card revision
+`c0c9fea93ea424587517f2c59e20db9f1d6bf615` identifies OpenMDW 1.1. Only metadata
+and Markdown were fetched; no weights were downloaded. Evidence and SHA-256
+values are in the coordinator's external cache. The exact OpenRouter serving
+variant remains unpinned. See the
+[publisher model card](https://huggingface.co/nvidia/Nemotron-3-Embed-1B-BF16/blob/c0c9fea93ea424587517f2c59e20db9f1d6bf615/README.md)
+and [OpenRouter terms](https://openrouter.ai/terms), dated 2026-08-31.
+
+All part repairs, combined P1 validation, and the fresh wave review must pass
+before P1 is checked or P2 starts. No pushes, PRs, browsers, devices, or live T3
+database writes have occurred.
