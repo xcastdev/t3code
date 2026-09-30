@@ -605,6 +605,7 @@ const ProjectWorkServicesLive = Layer.mergeAll(
 ).pipe(Layer.provideMerge(ProjectWorkContentGuardLive), Layer.provideMerge(PersistenceLayerLive));
 
 const ProjectLifecycleLive = ProjectLifecycle.ProjectLifecycleLive.pipe(
+  Layer.provideMerge(ProjectWorkRuntime.coreLayer),
   Layer.provideMerge(PersistenceLayerLive),
   Layer.provideMerge(ServerEnvironmentLayerLive),
 );

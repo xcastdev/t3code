@@ -120,6 +120,145 @@ layer("teams foundation persistence", (it) => {
     }).pipe(Effect.provide(services)),
   );
 
+  it.effect(
+    "preserves canonical issue and cursor identities while accepting display and progress edits",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations();
+        const repo = yield* ProjectWorkRepository;
+        const project = "identity-project";
+        const issue = record(project, "issue", "immutable-issue", {
+          status: "open",
+          identity: {
+            host: "github.com",
+            repositoryNodeId: "identity-repo",
+            issueNodeId: "identity-issue",
+            number: 1,
+          },
+          repositoryName: "owner/repo",
+          title: "Original",
+          body: "Original",
+          sourceRevision: "one",
+          observedAt: at,
+        });
+        const cursor = record(project, "intake-cursor", "immutable-cursor", {
+          status: "ready",
+          host: "github.com",
+          repositoryNodeId: "identity-repo",
+          accountId: "original-account",
+          cursor: "page-two",
+          etag: "original-etag",
+          overlapSince: at,
+          lastSuccessfulPageAt: at,
+        });
+        yield* repo.execute(commit(project, "identity-create", 0, [issue, cursor]));
+        for (const [field, value] of Object.entries({
+          host: "other.host",
+          repositoryNodeId: "other-repo",
+          issueNodeId: "other-issue",
+          number: 2,
+        })) {
+          expect(
+            (yield* repo
+              .execute(
+                commit(project, "issue-change-" + field, 2, [
+                  { ...issue, revision: 1, identity: { ...issue.identity, [field]: value } },
+                ]),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        for (const [field, value] of Object.entries({
+          host: "other.host",
+          repositoryNodeId: "other-repo",
+          accountId: "other-account",
+        })) {
+          expect(
+            (yield* repo
+              .execute(
+                commit(project, "cursor-change-" + field, 2, [
+                  { ...cursor, revision: 1, [field]: value },
+                ]),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        for (const original of [issue, cursor]) {
+          expect(
+            (yield* repo
+              .execute(
+                commit(project, "identity-reinsert-" + original.kind, 2, [
+                  { ...original, recordId: original.recordId + "-duplicate" },
+                ]),
+              )
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        }
+        const result = yield* repo.execute(
+          commit(project, "identity-legitimate-edit", 2, [
+            {
+              ...issue,
+              revision: 1,
+              repositoryName: "renamed/repo",
+              title: "Edited",
+              body: "Edited",
+              sourceRevision: "two",
+            },
+            { ...cursor, revision: 1, generation: 1, cursor: "page-three", etag: "next-etag" },
+          ]),
+        );
+        expect(result.state.foundationRecords).toContainEqual({
+          ...issue,
+          revision: 1,
+          repositoryName: "renamed/repo",
+          title: "Edited",
+          body: "Edited",
+          sourceRevision: "two",
+        });
+        expect(result.state.foundationRecords).toContainEqual({
+          ...cursor,
+          revision: 1,
+          generation: 1,
+          cursor: "page-three",
+          etag: "next-etag",
+        });
+      }).pipe(Effect.provide(services)),
+  );
+
+  it.effect("rejects retained authority collisions without overlaying missing replay history", () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const repo = yield* ProjectWorkRepository;
+      const sql = yield* SqlClient.SqlClient;
+      const project = "retained-authority";
+      const cursor = record(project, "intake-cursor", "retained-cursor", {
+        status: "ready",
+        host: "github.com",
+        repositoryNodeId: "retained-repo",
+        accountId: "retained-account",
+        cursor: "page-three",
+        etag: "retained-etag",
+        overlapSince: at,
+      });
+      yield* repo.execute(commit(project, "retained-create", 0, [cursor]));
+      const retained = { ...cursor, revision: 1, generation: 1 };
+      yield* repo.execute(commit(project, "retained-progress", 1, [retained]));
+      yield* sql`DELETE FROM project_work_events WHERE project_id = ${project}`;
+      yield* sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id = ${project}`;
+      expect(
+        (yield* repo
+          .execute(commit(project, "retained-reset", 0, [{ ...cursor, cursor: "page-one" }]))
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect((yield* repo.replay(project)).length).toBe(0);
+      const rows = yield* sql<{
+        revision: number;
+        generation: number;
+      }>`SELECT revision, generation FROM project_team_intake_cursor WHERE record_id = ${cursor.recordId}`;
+      expect(rows).toEqual([{ revision: 1, generation: 1 }]);
+    }).pipe(Effect.provide(services)),
+  );
+
   it.effect("keeps immutable roles, one coordinator, bounded pages, receipts and replay", () =>
     Effect.gen(function* () {
       yield* runMigrations();

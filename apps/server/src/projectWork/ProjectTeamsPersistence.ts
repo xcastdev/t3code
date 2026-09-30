@@ -1,4 +1,5 @@
 import {
+  ProjectId,
   ProjectTeamRecord,
   ProjectTeamRecordRead,
   type ProjectTeamRecord as TeamRecord,
@@ -54,6 +55,7 @@ export const purgeProjectTeamRecords = Effect.fn("purgeProjectTeamRecords")(func
   sql: SqlClient.SqlClient,
   projectId: string,
 ) {
+  const transferred: Array<Extract<TeamRecord, { kind: "intake-cursor" }>> = [];
   // P5 will own explicit repository bindings. P2 can only transfer against retained issue identity.
   const cursors = yield* sql<{
     recordId: string;
@@ -73,6 +75,7 @@ export const purgeProjectTeamRecords = Effect.fn("purgeProjectTeamRecords")(func
       ORDER BY issue.project_id LIMIT 1`;
     const owner = owners[0];
     if (owner !== undefined) {
+      transferred.push({ ...cursor, projectId: ProjectId.make(owner.projectId) });
       yield* sql`UPDATE project_team_intake_cursor SET project_id = ${owner.projectId},
         payload_json = ${json({ ...cursor, projectId: owner.projectId })}
         WHERE record_id = ${row.recordId} AND project_id = ${projectId}`;
@@ -80,6 +83,7 @@ export const purgeProjectTeamRecords = Effect.fn("purgeProjectTeamRecords")(func
   }
   for (const name of PROJECT_TEAM_TABLES)
     yield* sql`DELETE FROM ${sql(name)} WHERE project_id = ${projectId}`;
+  return transferred;
 });
 
 const json = (value: unknown) => JSON.stringify(value);
@@ -176,15 +180,24 @@ export const commitProjectTeamAuthority = Effect.fn("commitProjectTeamAuthority"
   for (const r of records) {
     const owners = allKinds.map(
       (kind) =>
-        sql`SELECT project_id AS projectId, ${kind} AS kind FROM ${sql(table(kind))} WHERE record_id = ${r.recordId}`,
+        sql`SELECT project_id AS projectId, ${kind} AS kind, revision FROM ${sql(table(kind))} WHERE record_id = ${r.recordId}`,
     );
     const owner = yield* sql<{
       projectId: string;
       kind: string;
+      revision: number;
     }>`SELECT * FROM (${sql.join(" UNION ALL ")(owners)}) LIMIT 1`;
     if (owner[0] !== undefined && (owner[0].projectId !== r.projectId || owner[0].kind !== r.kind))
       return yield* Effect.fail(
         new ProjectWorkPolicyError("invalid-state", "Foundation record belongs to another project"),
+      );
+    if (
+      (authorityKinds as ReadonlyArray<string>).includes(r.kind) &&
+      owner[0] !== undefined &&
+      r.revision !== Number(owner[0].revision) + 1
+    )
+      return yield* Effect.fail(
+        new ProjectWorkPolicyError("invalid-state", "Persisted foundation revision is stale"),
       );
     if ((authorityKinds as ReadonlyArray<string>).includes(r.kind)) yield* writeRecord(sql, r);
   }

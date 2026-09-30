@@ -1,3 +1,4 @@
+import { decodeProjectWorkEvent, readProjectWorkEvents } from "./ProjectWorkEventStore.ts";
 import { isProjectWorkTombstoned } from "./ProjectTeamsPersistence.ts";
 import {
   commitProjectTeamAuthority,
@@ -86,36 +87,6 @@ export class ProjectWorkRepository extends Context.Service<
   ProjectWorkRepositoryShape
 >()("t3/projectWork/ProjectWorkRepository") {}
 
-const decodeEvent = (value: unknown): ProjectWorkEvent => {
-  if (value === null || typeof value !== "object")
-    throw new Error("project-work event is not an object");
-  const event = value as Record<string, unknown>;
-  if (
-    typeof event.eventId !== "string" ||
-    typeof event.projectId !== "string" ||
-    typeof event.type !== "string"
-  )
-    throw new Error("project-work event is missing metadata");
-  return event as unknown as ProjectWorkEvent;
-};
-
-const readEvents = (sql: SqlClient.SqlClient, projectId?: string, afterSequence = 0) =>
-  Effect.gen(function* () {
-    const rows = yield* sql<Record<string, unknown>>`
-    SELECT payload_json AS payloadJson
-    FROM project_work_events
-    ${
-      projectId === undefined
-        ? afterSequence === 0
-          ? sql``
-          : sql`WHERE sequence > ${afterSequence}`
-        : sql`WHERE project_id = ${projectId} AND sequence > ${afterSequence}`
-    }
-    ORDER BY sequence ASC
-  `;
-    return rows.map((row) => decodeEvent(JSON.parse(String(row.payloadJson))));
-  });
-
 const readCurrentState = (sql: SqlClient.SqlClient, projectId: string) =>
   Effect.gen(function* () {
     const rows = yield* sql<Record<string, unknown>>`
@@ -126,7 +97,7 @@ const readCurrentState = (sql: SqlClient.SqlClient, projectId: string) =>
     `;
     const checkpoint = rows[0];
     if (checkpoint === undefined) {
-      const events = yield* readEvents(sql, projectId);
+      const events = yield* readProjectWorkEvents(sql, projectId);
       return applyProjectWorkEvents(emptyProjectWorkReducerState(projectId), events);
     }
     let state: ProjectWorkReducerState;
@@ -134,7 +105,7 @@ const readCurrentState = (sql: SqlClient.SqlClient, projectId: string) =>
       // @effect-diagnostics-next-line preferSchemaOverJson:off -- validated derived checkpoint with event-log fallback.
       state = JSON.parse(String(checkpoint.stateJson)) as ProjectWorkReducerState;
     } catch {
-      const events = yield* readEvents(sql, projectId);
+      const events = yield* readProjectWorkEvents(sql, projectId);
       return applyProjectWorkEvents(emptyProjectWorkReducerState(projectId), events);
     }
     if (
@@ -143,10 +114,10 @@ const readCurrentState = (sql: SqlClient.SqlClient, projectId: string) =>
       state.projectId !== projectId ||
       !Array.isArray(state.tasks)
     ) {
-      const events = yield* readEvents(sql, projectId);
+      const events = yield* readProjectWorkEvents(sql, projectId);
       return applyProjectWorkEvents(emptyProjectWorkReducerState(projectId), events);
     }
-    const tail = yield* readEvents(sql, projectId, Number(checkpoint.lastSequence));
+    const tail = yield* readProjectWorkEvents(sql, projectId, Number(checkpoint.lastSequence));
     return applyProjectWorkEvents(state, tail);
   });
 
@@ -271,12 +242,12 @@ const makeProjectWorkRepository = Effect.gen(function* () {
 
   const replay: ProjectWorkRepositoryShape["replay"] = (projectId) =>
     ensureProjectWorkTables(sql).pipe(
-      Effect.flatMap(() => readEvents(sql, projectId)),
+      Effect.flatMap(() => readProjectWorkEvents(sql, projectId)),
       Effect.mapError(toPersistenceSqlError("ProjectWorkRepository.replay")),
     );
   const replayAll: ProjectWorkRepositoryShape["replayAll"] = () =>
     ensureProjectWorkTables(sql).pipe(
-      Effect.flatMap(() => readEvents(sql)),
+      Effect.flatMap(() => readProjectWorkEvents(sql)),
       Effect.mapError(toPersistenceSqlError("ProjectWorkRepository.replayAll")),
     );
   const getAttempt: ProjectWorkRepositoryShape["getAttempt"] = (attemptId) =>
@@ -390,7 +361,7 @@ const makeProjectWorkRepository = Effect.gen(function* () {
           `;
           if (priorCommandRows.length > 0) {
             const priorEvents = priorCommandRows.map((row) =>
-              decodeEvent(JSON.parse(String(row.payloadJson))),
+              decodeProjectWorkEvent(JSON.parse(String(row.payloadJson))),
             );
             const normalized = project(current);
             const priorResult =

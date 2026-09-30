@@ -73,6 +73,22 @@ export const validateProjectTeamRecord = (
   )
     reject("Unknown task in foundation record");
   switch (r.kind) {
+    case "issue":
+      if (
+        old?.kind === "issue" &&
+        canonicalProjectWorkPayload(old.identity) !== canonicalProjectWorkPayload(r.identity)
+      )
+        reject("Canonical issue identity is immutable");
+      break;
+    case "intake-cursor":
+      if (
+        old?.kind === "intake-cursor" &&
+        (old.host !== r.host ||
+          old.repositoryNodeId !== r.repositoryNodeId ||
+          old.accountId !== r.accountId)
+      )
+        reject("Canonical cursor repository and account are immutable");
+      break;
     case "mission":
       if (
         new Set(r.requiredTaskIds).size !== r.requiredTaskIds.length ||
