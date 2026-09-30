@@ -107,6 +107,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   projectMcpOverrides: Schema.optionalKey(Schema.Boolean),
   /** Server exposes the bounded project-work delta stream. */
   projectWorkStream: Schema.optionalKey(Schema.Boolean),
+  projectTeamFoundationReads: Schema.optionalKey(Schema.Boolean),
+  projectTeamExecution: Schema.optionalKey(Schema.Boolean),
   /** Server exposes active logical-session MCP catalog RPCs. */
   sessionMcpCatalog: Schema.optionalKey(Schema.Boolean),
   /** Server understands canonical inline context links plus their message context records.

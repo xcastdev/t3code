@@ -1,8 +1,11 @@
-import { ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+import { ProjectTeamRecord, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import { buildProjectWorkJsonExport, buildProjectWorkMarkdownExport } from "./ProjectWorkExport.ts";
 import type { ProjectWorkSnapshot } from "./ProjectWorkQuery.ts";
+
+const decodeTeamRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
 
 const projectId = ProjectId.make("export-project");
 const snapshot = {
@@ -145,4 +148,45 @@ describe("ProjectWorkExport", () => {
     expect(exported.contents).toContain("Export task");
     expect(exported.contents).toContain("A safe summary");
   });
+});
+
+it("V1 preserves ordinary history and V2 includes sanitized authoritative foundation records", () => {
+  const mission = decodeTeamRecord({
+    kind: "mission",
+    recordId: "mission",
+    projectId,
+    revision: 0,
+    generation: 0,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    status: "draft",
+    title: "Mission",
+    objective: "contains synthetic-known-secret",
+    requiredTaskIds: [],
+  });
+  const history = [
+    { type: "project-work.task.created", task: snapshot.tasks[0], leaseToken: "opaque" },
+    { type: "project-work.foundation.recorded", record: mission, authorization: "opaque" },
+  ];
+  const v1 = buildProjectWorkJsonExport(snapshot, {
+    environmentId: "environment",
+    history,
+    foundationRecords: [mission],
+  });
+  expect(v1.schemaVersion).toBe(1);
+  expect(v1.tasks).toHaveLength(1);
+  expect(v1.history).toHaveLength(1);
+  expect(v1).not.toHaveProperty("foundationRecords");
+  const v2 = buildProjectWorkJsonExport(snapshot, {
+    environmentId: "environment",
+    version: 2,
+    history,
+    foundationRecords: [mission],
+    knownSecrets: ["synthetic-known-secret"],
+  });
+  expect(v2.schemaVersion).toBe(2);
+  expect(v2.history).toHaveLength(2);
+  expect(v2).toHaveProperty("foundationRecords");
+  expect(JSON.stringify(v2)).not.toContain("synthetic-known-secret");
+  expect(JSON.stringify(v2)).not.toContain("opaque");
+  expect(v2.tasks).toEqual(v1.tasks);
 });

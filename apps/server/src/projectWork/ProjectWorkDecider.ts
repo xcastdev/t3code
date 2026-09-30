@@ -1,3 +1,5 @@
+import type { ProjectTeamRecord } from "@t3tools/contracts";
+import { validateProjectTeamRecord } from "./ProjectTeamFoundationRecords.ts";
 import {
   EventId,
   ProjectWorkAttemptId,
@@ -82,6 +84,7 @@ export interface ProjectWorkHistoryEntry {
 }
 
 export interface ProjectWorkReducerState extends ProjectWorkState {
+  foundationRecords?: Array<ProjectTeamRecord>;
   history?: Array<ProjectWorkHistoryEntry>;
   resultInvalidations?: Array<ProjectWorkResultInvalidation>;
   checkpoints?: Array<ProjectWorkCheckpoint>;
@@ -93,6 +96,7 @@ export interface ProjectWorkReducerState extends ProjectWorkState {
 
 export const emptyProjectWorkReducerState = (projectId: string): ProjectWorkReducerState => ({
   projectId,
+  foundationRecords: [],
   revision: 0,
   tasks: [],
   attempts: [],
@@ -118,6 +122,10 @@ type EventBase = {
 };
 
 export type ProjectWorkEvent =
+  | (EventBase & {
+      readonly type: "project-work.foundation.recorded";
+      readonly record: ProjectTeamRecord;
+    })
   | (EventBase & { readonly type: "project-work.task.created"; readonly task: ProjectWorkTask })
   | (EventBase & {
       readonly type: "project-work.task.specified";
@@ -566,6 +574,7 @@ const withEventMetadata = (
 export function decideProjectWorkCommand(
   state: ProjectWorkState,
   command: ProjectWorkCommand,
+  internalFoundation = false,
 ): ReadonlyArray<ProjectWorkEvent> {
   // Keep the pre-P4 direct-decider contract deterministic for un-attributed
   // legacy callers. Repository callers supply attribution for lifecycle
@@ -589,6 +598,40 @@ export function decideProjectWorkCommand(
     withEventMetadata(commandId, state.projectId, state.revision + index + 1, index, draft);
 
   switch (command.type) {
+    case "project-work.foundation.commit": {
+      let working = mutableState(state);
+      const events: Array<ProjectWorkEvent> = [];
+      if (command.claim !== undefined) {
+        if (
+          command.claim.projectId !== command.projectId ||
+          command.claim.commandId !== command.commandId
+        )
+          throw new ProjectWorkPolicyError(
+            "invalid-state",
+            "Atomic claim must use the enclosing command identity",
+          );
+        const claimed = decideProjectWorkCommand(working, command.claim, true);
+        events.push(...claimed);
+        working = applyProjectWorkEvents(working, claimed);
+      }
+      const seen = new Set<string>();
+      for (const input of command.records) {
+        if (seen.has(input.recordId))
+          throw new ProjectWorkPolicyError(
+            "duplicate-record",
+            "One foundation transaction cannot write the same record twice",
+          );
+        seen.add(input.recordId);
+        const record = validateProjectTeamRecord(working, input, command.attribution);
+        const recorded = event(
+          { type: "project-work.foundation.recorded", record, occurredAt: command.committedAt },
+          events.length,
+        );
+        events.push(recorded);
+        working = applyProjectWorkEvents(working, [recorded]);
+      }
+      return events;
+    }
     case "project-work.task.create": {
       assertUniqueId(
         state.tasks.map((entry) => String(entry.taskId)),
@@ -834,6 +877,20 @@ export function decideProjectWorkCommand(
       ];
     }
     case "project-work.task.claim": {
+      if (
+        !internalFoundation &&
+        ((state as ProjectWorkReducerState).foundationRecords ?? []).some(
+          (record) =>
+            record.kind === "task-membership" &&
+            record.taskId === command.taskId &&
+            record.executionKind === "managed" &&
+            record.status === "active",
+        )
+      )
+        throw new ProjectWorkPolicyError(
+          "authority-required",
+          "Managed tasks require server-created run authority",
+        );
       const task = currentTask(state, command.taskId);
       const policy = deriveProjectWorkTaskPolicy(state, command.taskId, command.claimedAt);
       if (!policy.claimability.claimable) {
@@ -1929,6 +1986,7 @@ const mutableState = (state: ProjectWorkState): ProjectWorkReducerState => ({
     ...blocker,
     referenceIds: [...blocker.referenceIds],
   })),
+  foundationRecords: [...((state as ProjectWorkReducerState).foundationRecords ?? [])],
   attention: [...state.attention],
   history: [...((state as ProjectWorkReducerState).history ?? [])],
   resultInvalidations: [...((state as ProjectWorkReducerState).resultInvalidations ?? [])],
@@ -2059,6 +2117,15 @@ export function applyProjectWorkEvents(
       },
     ];
     switch (event.type) {
+      case "project-work.foundation.recorded": {
+        next.foundationRecords = [
+          ...(next.foundationRecords ?? []).filter(
+            (entry) => entry.recordId !== event.record.recordId,
+          ),
+          event.record,
+        ];
+        break;
+      }
       case "project-work.task.created":
         next.tasks.push(event.task);
         break;

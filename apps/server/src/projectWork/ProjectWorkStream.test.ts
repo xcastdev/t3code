@@ -1,8 +1,11 @@
-import { EventId, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
+import { ProjectTeamRecord, EventId, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
 import { boundProjectWorkReplay, projectWorkDeltaForEvent } from "./ProjectWorkStream.ts";
 import type { ProjectWorkEvent } from "./ProjectWorkDecider.ts";
+
+const decodeTeamRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
 
 const projectId = ProjectId.make("stream-project");
 const event = {
@@ -66,4 +69,29 @@ describe("ProjectWorkStream", () => {
       }).resync,
     ).toBe("replay-too-large");
   });
+});
+
+it("invalidates foundation record IDs with a legacy kind and advances durable cursor", () => {
+  const record = decodeTeamRecord({
+    kind: "mission",
+    recordId: "mission-1",
+    projectId,
+    revision: 0,
+    generation: 0,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    status: "draft",
+    title: "Mission",
+    objective: "Bounded",
+    requiredTaskIds: [],
+  });
+  const delta = projectWorkDeltaForEvent(
+    { ...event, type: "project-work.foundation.recorded", record },
+    28,
+  );
+  expect(delta.kind).toBe("task");
+  expect(delta.recordId).toBe("mission-1");
+  expect(
+    boundProjectWorkReplay({ afterCursor: 27, headCursor: 28, rows: [{ cursor: 28, delta }] })
+      .cursor,
+  ).toBe(28);
 });

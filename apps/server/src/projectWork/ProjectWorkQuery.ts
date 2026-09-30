@@ -1,6 +1,9 @@
+import { readProjectTeamPage } from "./ProjectTeamsPersistence.ts";
+import { ProjectTeamRunBinding, ProjectTeamRecordRead } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { SqlError } from "effect/unstable/sql/SqlError";
@@ -33,6 +36,11 @@ import {
 } from "../persistence/Errors.ts";
 import { type ProjectWorkActivity, type ProjectWorkCheckpoint } from "./ProjectWorkProjection.ts";
 import { deriveProjectWorkTaskPolicy } from "./ProjectWorkPolicy.ts";
+
+const encodeFoundationPage = Schema.encodeEffect(
+  Schema.fromJsonString(Schema.Array(ProjectTeamRecordRead)),
+);
+const decodeRunBindingJson = Schema.decodeEffect(Schema.fromJsonString(ProjectTeamRunBinding));
 
 export interface ProjectWorkTaskQuery extends ProjectWorkRecordQuery {
   readonly state?: string;
@@ -71,10 +79,30 @@ export interface ProjectWorkSnapshot {
 
 export interface ProjectWorkExportSnapshot {
   readonly snapshot: ProjectWorkSnapshot;
+  readonly foundationRecords?: ReadonlyArray<ProjectTeamRecordRead>;
   readonly history?: ReadonlyArray<unknown>;
 }
 
 export interface ProjectWorkQueryShape {
+  readonly getRunBindingForSession: (input: {
+    providerInstanceId: string;
+    threadId: string;
+    sessionId: string;
+  }) => Effect.Effect<Option.Option<typeof ProjectTeamRunBinding.Type>, ProjectionRepositoryError>;
+  readonly listFoundationRecords: (input: {
+    projectId: string;
+    cursor?: string;
+    limit?: number;
+    kinds?: ReadonlyArray<string>;
+  }) => Effect.Effect<
+    {
+      items: ReadonlyArray<ProjectTeamRecordRead>;
+      nextCursor?: string;
+      revision: number;
+      projectId: string;
+    },
+    ProjectionRepositoryError
+  >;
   readonly getProjectRevision: (
     projectId: string,
   ) => Effect.Effect<number, ProjectionRepositoryError>;
@@ -165,6 +193,7 @@ export interface ProjectWorkQueryShape {
   readonly exportSnapshot: (
     projectId: string,
     includeHistory: boolean,
+    includeFoundation?: boolean,
   ) => Effect.Effect<ProjectWorkExportSnapshot, ProjectionRepositoryError>;
 }
 
@@ -770,12 +799,34 @@ const makeProjectWorkQuery = Effect.gen(function* () {
         ),
       );
 
-  const exportSnapshot: ProjectWorkQueryShape["exportSnapshot"] = (projectId, includeHistory) =>
+  const exportSnapshot: ProjectWorkQueryShape["exportSnapshot"] = (
+    projectId,
+    includeHistory,
+    includeFoundation = false,
+  ) =>
     sql
       .withTransaction(
         Effect.gen(function* () {
           const current = yield* readSnapshot(projectId);
-          if (!includeHistory) return { snapshot: current };
+          const foundationRecords: Array<ProjectTeamRecordRead> = [];
+          if (includeFoundation) {
+            let cursor: string | undefined;
+            let bytes = 0;
+            do {
+              const page = yield* readProjectTeamPage(sql, {
+                projectId,
+                limit: 128,
+                ...(cursor === undefined ? {} : { cursor }),
+              });
+              bytes += Buffer.byteLength(yield* encodeFoundationPage(page.items));
+              if (foundationRecords.length + page.items.length > 10_000 || bytes > 16 * 1024 * 1024)
+                throw new Error("Foundation export exceeds bounded export size");
+              foundationRecords.push(...page.items);
+              cursor = page.nextCursor;
+            } while (cursor !== undefined);
+          }
+          const foundation = includeFoundation ? { foundationRecords } : {};
+          if (!includeHistory) return { snapshot: current, ...foundation };
           const rows = yield* sql<Record<string, unknown>>`
             SELECT payload_json AS payloadJson
             FROM project_work_events
@@ -789,7 +840,7 @@ const makeProjectWorkQuery = Effect.gen(function* () {
               const record = event as Record<string, unknown>;
               return typeof record.revision === "number" && record.revision <= current.revision;
             });
-          return { snapshot: current, history };
+          return { snapshot: current, history, ...foundation };
         }),
       )
       .pipe(
@@ -885,7 +936,28 @@ const makeProjectWorkQuery = Effect.gen(function* () {
         Effect.mapError((cause) => toPersistenceSqlError("ProjectWorkQuery.getTaskContext")(cause)),
       );
 
+  const listFoundationRecords: ProjectWorkQueryShape["listFoundationRecords"] = (input) =>
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          const revision = yield* getProjectRevision(input.projectId);
+          const page = yield* readProjectTeamPage(sql, input);
+          return { ...page, projectId: input.projectId, revision };
+        }),
+      )
+      .pipe(Effect.mapError(toPersistenceSqlError("ProjectWorkQuery.listFoundationRecords")));
+  const getRunBindingForSession: ProjectWorkQueryShape["getRunBindingForSession"] = (input) =>
+    Effect.gen(function* () {
+      const rows = yield* sql<{
+        payload: string;
+      }>`SELECT binding.payload_json AS payload FROM project_team_run_binding binding JOIN project_work_attempts attempt ON attempt.attempt_id = binding.attempt_id AND attempt.project_id = binding.project_id AND attempt.task_id = binding.task_id
+      WHERE binding.provider_instance_id = ${input.providerInstanceId} AND binding.thread_id = ${input.threadId} AND binding.session_id = ${input.sessionId} AND binding.status = 'running' AND attempt.state IN ('leased', 'running') AND CAST(json_extract(binding.payload_json, '$.leaseGeneration') AS INTEGER) = binding.generation AND EXISTS (SELECT 1 FROM project_work_tasks task WHERE task.task_id = binding.task_id AND task.project_id = binding.project_id AND task.active_attempt_id = binding.attempt_id) ORDER BY binding.record_id LIMIT 2`;
+      if (rows.length !== 1) return Option.none();
+      return Option.some(yield* decodeRunBindingJson(rows[0]!.payload));
+    }).pipe(Effect.mapError(toPersistenceSqlError("ProjectWorkQuery.getRunBindingForSession")));
   return {
+    getRunBindingForSession,
+    listFoundationRecords,
     getProjectRevision,
     withProjectRevision,
     getTask,

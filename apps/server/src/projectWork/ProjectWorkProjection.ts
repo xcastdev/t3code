@@ -1,3 +1,10 @@
+import { isProjectWorkTombstoned } from "./ProjectTeamsPersistence.ts";
+import {
+  ensureProjectTeamsTables,
+  persistProjectTeamProjections,
+  readProjectTeamRecords,
+  PROJECT_WORK_CHECKPOINT_VERSION,
+} from "./ProjectTeamsPersistence.ts";
 import {
   EventId,
   ProjectWorkTaskId,
@@ -88,6 +95,7 @@ const readJson = <A>(value: unknown, fallback: A): A => {
 
 export const ensureProjectWorkTables = (sql: SqlClient.SqlClient) =>
   Effect.all([
+    ensureProjectTeamsTables(sql),
     sql`CREATE TABLE IF NOT EXISTS project_work_activity (activity_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT, attempt_id TEXT, kind TEXT NOT NULL, summary TEXT NOT NULL, detail TEXT, occurred_at TEXT NOT NULL, revision INTEGER NOT NULL, attribution_json TEXT)`,
     sql`CREATE TABLE IF NOT EXISTS project_work_checkpoints (checkpoint_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, task_id TEXT NOT NULL, attempt_id TEXT NOT NULL, ref TEXT, captured_at TEXT NOT NULL, revision INTEGER NOT NULL, attribution_json TEXT)`,
     sql`CREATE TABLE IF NOT EXISTS project_work_projection_state (projector TEXT PRIMARY KEY, last_applied_sequence INTEGER NOT NULL DEFAULT 0, rebuild_generation INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL)`,
@@ -435,6 +443,7 @@ export const readProjectWorkState = (sql: SqlClient.SqlClient, projectId: string
       ...state.tasks.map((entry) => entry.revision),
       ...state.attempts.map((entry) => entry.revision),
     );
+    state.foundationRecords = yield* readProjectTeamRecords(sql, projectId);
     return state;
   });
 
@@ -466,7 +475,10 @@ export const persistProjectWorkTaskCreated = (
     yield* sql`INSERT INTO project_work_search_fts (project_id, record_kind, record_id, title, body, provenance_json, revision) VALUES (${event.projectId}, ${"activity"}, ${activity.activityId}, ${activity.kind}, ${activity.summary + (activity.detail === undefined ? "" : ` ${activity.detail}`)}, ${activity.attribution === undefined ? json({ taskId: activity.taskId ?? null, attemptId: activity.attemptId ?? null }) : json({ ...activity.attribution, taskId: activity.taskId ?? null, attemptId: activity.attemptId ?? null })}, ${activity.revision})`;
     yield* sql`INSERT INTO project_work_projection_state (projector, last_applied_sequence, rebuild_generation, updated_at) VALUES (${"project-work:" + event.projectId}, ${lastAppliedSequence}, 0, ${event.occurredAt}) ON CONFLICT(projector) DO UPDATE SET last_applied_sequence = excluded.last_applied_sequence, updated_at = excluded.updated_at`;
     // @effect-diagnostics-next-line preferSchemaOverJson:off -- typed reducer state checkpoint.
-    const stateJson = JSON.stringify(state);
+    const stateJson = JSON.stringify({
+      ...state,
+      checkpointVersion: PROJECT_WORK_CHECKPOINT_VERSION,
+    });
     yield* sql`INSERT INTO project_work_reducer_checkpoints (project_id, last_sequence, state_json, updated_at) VALUES (${event.projectId}, ${lastAppliedSequence}, ${stateJson}, ${event.occurredAt}) ON CONFLICT(project_id) DO UPDATE SET last_sequence = excluded.last_sequence, state_json = excluded.state_json, updated_at = excluded.updated_at`;
   });
 
@@ -829,8 +841,17 @@ export const persistProjectWorkState = (
         ${previous === undefined ? sql`` : sql`AND EXISTS (SELECT 1 FROM project_work_changed_fts changed WHERE changed.record_kind = 'activity' AND changed.record_id = activity_id)`}
     `;
     yield* sql`INSERT INTO project_work_projection_state (projector, last_applied_sequence, rebuild_generation, updated_at) VALUES (${"project-work:" + projectId}, ${options.lastAppliedSequence ?? state.revision}, 0, ${options.updatedAt ?? state.history?.at(-1)?.occurredAt ?? "1970-01-01T00:00:00.000Z"}) ON CONFLICT(projector) DO UPDATE SET last_applied_sequence = excluded.last_applied_sequence, updated_at = excluded.updated_at`;
+    yield* persistProjectTeamProjections(
+      sql,
+      projectId,
+      nextState.foundationRecords ?? [],
+      options.previousState?.foundationRecords,
+    );
     // @effect-diagnostics-next-line preferSchemaOverJson:off -- state is produced by the typed reducer.
-    const stateJson = JSON.stringify(nextState);
+    const stateJson = JSON.stringify({
+      ...nextState,
+      checkpointVersion: PROJECT_WORK_CHECKPOINT_VERSION,
+    });
     yield* sql`
       INSERT INTO project_work_reducer_checkpoints
         (project_id, last_sequence, state_json, updated_at)
@@ -912,6 +933,7 @@ const makeProjectWorkProjection = Effect.gen(function* () {
         .withTransaction(
           Effect.gen(function* () {
             yield* ensureProjectWorkTables(sql);
+            if (yield* isProjectWorkTombstoned(sql, projectId)) return;
             // A rebuild only consumes the append-only repository log. Read it
             // in this transaction so the rows projected below are one exact
             // authoritative snapshot, never caller-supplied input.

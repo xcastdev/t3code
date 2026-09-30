@@ -1,4 +1,5 @@
 import {
+  type ProjectTeamRecordRead,
   type EnvironmentId,
   ProjectWorkExport as ProjectWorkJsonExport,
   ProjectWorkMarkdownExport,
@@ -23,6 +24,8 @@ import * as ProjectWorkContentGuard from "./ProjectWorkContentGuard.ts";
 import type { ProjectWorkSnapshot } from "./ProjectWorkQuery.ts";
 
 export interface ProjectWorkExportOptions {
+  readonly version?: 1 | 2;
+  readonly foundationRecords?: ReadonlyArray<ProjectTeamRecordRead>;
   readonly environmentId: EnvironmentId | string;
   readonly exportedAt?: string;
   readonly knownSecrets?: ReadonlyArray<string>;
@@ -61,13 +64,31 @@ export const buildProjectWorkJsonExport = (
   const redacted = ProjectWorkContentGuard.redactProjectWorkExportContent(
     {
       ...source,
-      ...(options.history === undefined ? {} : { history: options.history }),
+      ...(options.history === undefined
+        ? {}
+        : {
+            history:
+              options.version === 2
+                ? options.history
+                : options.history.filter(
+                    (event) =>
+                      event === null ||
+                      typeof event !== "object" ||
+                      !("type" in event) ||
+                      event.type !== "project-work.foundation.recorded",
+                  ),
+          }),
+      ...(options.version === 2 ? { foundationRecords: options.foundationRecords ?? [] } : {}),
     },
     options.knownSecrets,
   );
-  const value = redacted.value as typeof source & { readonly history?: ReadonlyArray<unknown> };
+  const value = redacted.value as typeof source & {
+    readonly history?: ReadonlyArray<unknown>;
+    readonly foundationRecords?: ReadonlyArray<ProjectTeamRecordRead>;
+  };
   const candidate = {
-    schemaVersion: 1,
+    schemaVersion: options.version ?? 1,
+    ...(options.version === 2 ? { foundationRecords: value.foundationRecords ?? [] } : {}),
     format: "json",
     environmentId: options.environmentId as EnvironmentId,
     projectId: snapshot.projectId as ProjectWorkJsonExport["projectId"],

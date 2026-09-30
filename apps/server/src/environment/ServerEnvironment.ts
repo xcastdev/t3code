@@ -227,6 +227,8 @@ export const make = Effect.gen(function* () {
       globalMcpCatalog: true,
       projectMcpOverrides: true,
       projectWorkStream: true,
+      projectTeamFoundationReads: true,
+      projectTeamExecution: false,
       sessionMcpCatalog: true,
       inlineMessageContext: true,
       threadSettlement: true,
