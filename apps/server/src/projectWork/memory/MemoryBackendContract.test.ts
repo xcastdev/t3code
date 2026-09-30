@@ -8,6 +8,7 @@ import {
   evaluateMemoryHits,
   fixtureHit,
   history,
+  reconcileFixtureMemoryIndex,
 } from "./fixtures/evaluateMemoryHits.ts";
 
 const observation = (id: string) => {
@@ -184,5 +185,72 @@ describe("MemoryBackendContract authoritative source briefing", () => {
         backendIds: ["first-native-id", "second-native-id"],
       },
     ]);
+  });
+});
+
+describe("MemoryBackendContract complete extraction receipt", () => {
+  const source = fixtureHit(observation("borealis-storage"));
+  const expected = [
+    {
+      key: "storage-fact",
+      backendId: "native-first",
+      source,
+      observation: "Borealis uses PostgreSQL.",
+    },
+    {
+      key: "sharing-fact",
+      backendId: "native-second",
+      source,
+      observation: "Borealis has no sharing grant.",
+    },
+  ];
+  const hits = expected.map((item) => ({
+    ...source,
+    backendId: item.backendId,
+    observation: item.observation,
+  }));
+
+  it("keeps a partially committed multi-observation source pending until the full set is present", () => {
+    expect(reconcileFixtureMemoryIndex(expected, hits.slice(0, 1))).toEqual({
+      complete: false,
+      missingKeys: ["sharing-fact"],
+      invalidKeys: [],
+      unexpectedBackendIds: [],
+    });
+    expect(reconcileFixtureMemoryIndex(expected, [])).toMatchObject({
+      complete: false,
+      missingKeys: ["storage-fact", "sharing-fact"],
+    });
+    expect(reconcileFixtureMemoryIndex(expected, hits).complete).toBe(true);
+  });
+
+  it("rejects unbound, duplicated, altered, or stale records instead of minting completion", () => {
+    const first = hits[0];
+    const second = hits[1];
+    if (!first || !second) throw new Error("Two expected observations are required");
+    for (const damaged of [
+      { ...second, observation: "Invented replacement" },
+      { ...second, generation: 0 },
+      { ...second, provenance: {} },
+      { ...second, projectId: "atlas" },
+    ])
+      expect(reconcileFixtureMemoryIndex(expected, [first, damaged])).toMatchObject({
+        complete: false,
+        invalidKeys: ["sharing-fact"],
+      });
+    expect(reconcileFixtureMemoryIndex(expected, [...hits, second]).complete).toBe(false);
+    expect(
+      reconcileFixtureMemoryIndex(expected, [
+        ...hits,
+        { ...second, backendId: "duplicate-new-id" },
+      ]),
+    ).toMatchObject({ complete: false, unexpectedBackendIds: ["duplicate-new-id"] });
+    expect(
+      reconcileFixtureMemoryIndex(
+        expected.map((item) => ({ ...item, backendId: null })),
+        hits,
+      ).complete,
+    ).toBe(false);
+    expect(reconcileFixtureMemoryIndex([], []).complete).toBe(false);
   });
 });

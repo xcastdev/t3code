@@ -95,3 +95,59 @@ export const assembleFixtureMemoryBriefing = (
   }
   return Array.from(selected.values());
 };
+
+export interface FrozenMemoryObservation {
+  readonly key: string;
+  readonly backendId: string | null;
+  readonly source: ProbeHit;
+  readonly observation: string;
+}
+
+/** A matching source alone is not a completion receipt: every frozen observation
+ * needs its original native handle, exact content, and source generation. */
+export const reconcileFixtureMemoryIndex = (
+  expected: ReadonlyArray<FrozenMemoryObservation>,
+  hits: ReadonlyArray<BackendObservationHit>,
+) => {
+  const missingKeys: Array<string> = [];
+  const invalidKeys: Array<string> = [];
+  const seenKeys = new Set<string>();
+  const seenIds = new Set<string>();
+  for (const item of expected) {
+    if (seenKeys.has(item.key) || (item.backendId !== null && seenIds.has(item.backendId)))
+      invalidKeys.push(item.key);
+    seenKeys.add(item.key);
+    if (item.backendId !== null) seenIds.add(item.backendId);
+    const matches = hits.filter((hit) => hit.backendId === item.backendId);
+    if (matches.length === 0) {
+      missingKeys.push(item.key);
+      continue;
+    }
+    const hit = matches[0];
+    if (
+      !hit ||
+      matches.length !== 1 ||
+      hit.observation !== item.observation ||
+      hit.id !== item.source.id ||
+      hit.projectId !== item.source.projectId ||
+      hit.sourceId !== item.source.sourceId ||
+      hit.revision !== item.source.revision ||
+      hit.generation !== item.source.generation ||
+      Object.entries(item.source.provenance).some(([key, value]) => hit.provenance[key] !== value)
+    )
+      invalidKeys.push(item.key);
+  }
+  const unexpectedBackendIds = hits
+    .filter((hit) => !seenIds.has(hit.backendId))
+    .map((hit) => hit.backendId);
+  return {
+    complete:
+      expected.length > 0 &&
+      missingKeys.length === 0 &&
+      invalidKeys.length === 0 &&
+      unexpectedBackendIds.length === 0,
+    missingKeys,
+    invalidKeys,
+    unexpectedBackendIds,
+  };
+};
