@@ -1,5 +1,5 @@
 Github Tracked: false
-Status: in_progress
+Status: blocked
 Github Issue: none
 Plan review: READY_WITH_EXPLICIT_GATES
 
@@ -1011,3 +1011,136 @@ Their worktrees and disposable probe directories are below
 `/tmp/pi-project-teams-11b7e351/`; integration is on `pi-teams/wave1`.
 No production dependency, contract, or managed execution path has been changed.
 P1 and all 19 acceptance criteria remain unchecked while proofs run.
+
+### P1 evidence and current blockers
+
+The user subsequently selected CommandCode, prohibited further OpenAI model
+calls and all Ollama use, and prohibited memory-intensive work on this machine.
+Further proof work here is limited to lightweight inspection and bounded remote
+API calls. Local model loading is prohibited; resource-intensive backend and
+packaging proofs require a different environment. No prerequisite or acceptance criterion was
+weakened to accommodate these constraints.
+
+**Runtime.** Pi was upgraded from 0.84.2 to the pinned
+`@earendil-works/pi-coding-agent@0.99.1`; the official
+`@commandcode/pi-commandcode-provider@0.3.0` extension was installed in the user's
+pi configuration. Settings backups are outside the worktree. The existing Cursor
+endpoint refused connections. A CommandCode Haiku call failed with HTTP 403
+`MODEL_NOT_IN_PLAN`: GOAT supports API calls, but Haiku requires Pro or extra
+credits. The saved pi key takes precedence over the different ambient key.
+
+In `/tmp/pi-project-teams-11b7e351/probes-runtime/`:
+
+- `node live-commandcode-free-probe.mjs`: actual SDK plus CommandCode
+  `inclusionai/ling-3.1-flash:free` streaming, settlement, persistence, and native
+  reopen passed. Its compaction failed at the 128-token output cap; the combined
+  result correctly remains blocked.
+- `node commandcode-compaction-probe.mjs`: one focused real compaction request
+  with a 2048-token cap succeeded and persisted its compaction entry. Its original
+  summary-marker assertion was rejected as insufficient.
+- `node verify-commandcode-compaction-context.mjs`: no additional model call;
+  actual SDK session reopen/context assembly retains four complete synthetic
+  assignment/decision/question/limit facts in the recent user message. This is
+  native context evidence, not AC-12's authoritative T3 context proof.
+
+Fresh xhigh review independently reproduced the offline context checks. The
+original static-JSON tests in runtime commit
+`54204be2ee9ce565b6413ecfa04f90e4abecd034` were rejected because they exercised no
+SDK or consumer. Coordinator repair commit
+`479c5285ee24ba8735d56cd074db84b68bc347a5` withdrew those files without rewriting
+history; the reviewer approved the withdrawal. That branch's tree equals its
+original base, so there is no runtime implementation to merge.
+`commandcode-evidence.md` and `commandcode-sha256.txt` retain commands, current
+artifact digests, and the distinction between the live and revised offline
+assertions. Earlier OpenAI-route evidence predates the prohibition and does not
+qualify the currently selected route.
+
+**Memory.** Worker commit `cfbcfdb80e2b04f89a6e00abc59769c678500e8b` contains only
+the assigned evaluation oracle, labeled fixture, and real SQLite FTS comparator.
+`vp test run apps/server/src/projectWork/memory/MemoryBackendContract.test.ts`
+passed 7/7; scoped lint, format, and `git diff --check` passed. These checks do not
+certify a memory backend. The fixture FTS macro recall is 5/7 nonempty query groups.
+Fresh xhigh review passed this preparatory three-file commit only; the required
+backend exit gate remains blocked, so the branch has not been integrated.
+
+Actual pinned Mem0 2.2.1 and Graphiti 0.30.2 probes are preserved in
+`/tmp/pi-project-teams-11b7e351/probes-memory/report.md` and raw result files.
+Graphiti completed eight ingestions and eight searches: semantic recall improved,
+but conflict-source recall was 0.5, a failed gate. Mem0 completed only its first
+extraction in 226.351 seconds and invented an assistant attribution for a user-only
+source. Its full corpus and both engines' delayed deletion, restart, repeated
+requests, T3 outage fallback, and consistent restore matrix remain unverified.
+Neither engine is selected.
+The reviewer additionally found that Graphiti labeled an unaccepted observation
+a decision, wrongly invalidated unrelated transport/receipt facts, and returned
+those facts with empty temporal filters. Repeatedly returning the same sources
+also means the semantic recall improvement does not establish selective retrieval.
+The source/provenance oracle cannot detect invented wording or incorrect temporal
+semantics; scratch deduplication cannot certify duplicate-free native results.
+
+Those earlier probes used disposable Ollama inference/embeddings and Neo4j before
+the subsequent prohibitions. Both captured owned container IDs were stopped and
+confirmed `Running=false`, PID 0; evidence/stores were preserved. A later
+standalone FastEmbed package installation completed before the resource steering,
+but no embedding weights were downloaded, loaded, or used. The worker confirms no
+provisioning, download, local model, inference, or embedding process remains.
+CommandCode memory setup made zero completion requests. CommandCode's documented
+API has no embedding endpoint. The user then identified pi's OpenRouter support;
+its saved API key was present, and an authenticated remote catalog listed
+`nvidia/nemotron-3-embed-1b:free` with zero pricing.
+`node openrouter-embedding-smoke.mjs` received HTTP 200 but rejected the returned
+internal model identity. One focused repair accepted only the exact observed
+NVIDIA alias; `node openrouter-embedding-smoke-repair1.mjs` passed with three finite
+2048-dimensional vectors, 30 input tokens, and reported cost 0. Provider fallback
+was disabled. Scripts/results/raw synthetic response are retained in the memory
+probe directory; no local model was downloaded or loaded for these calls. This
+proves the existing remote embedding route, not either backend or recall/recovery.
+Fresh xhigh review verified all five artifact hashes, all three finite vectors,
+returned indexes, token/cost evidence, and the two total remote requests. It
+confirmed the route-only claim with no new blocking finding.
+An environment compatible with the user's resource constraints is still required
+for the remaining real backend/lifecycle and packaging checks.
+
+**Isolation and packaging.** Linux x64 bubblewrap 0.12.0 fixtures passed seven
+actual isolation/process/layout checks, including npm setup descendants,
+captured-process cancellation, and parent death. Minimal SDK initialization and
+native reopen passed in extracted npm, actual Electron 44.1.0 ASAR, and Node
+26.8.1 SEA layouts. These used empty tools/resources; they do not establish full
+T3 packaging or enabled lazy-resource closure. The SDK still needs explicit
+trusted metadata, WASM/image/codemode worker resources, and platform variants.
+
+Fresh xhigh review rejected the original parent Git broker's authority claim:
+worker-writable Git metadata and ambient host Git configuration were unsafe.
+It also found that readline framed data before checking size. Separate retained
+repair evidence at `probes-isolation/repair1/report.md` fixes trusted metadata,
+read-only Git pointer, constructed Git environment, and incremental byte limits
+within a newly initialized, known-clean Git-status fixture. The reviewer verified
+all 11 hashes, unchanged configuration provenance, three successful broker
+invocations, and 11 framing categories/15 assertions. Model responses were
+explicitly simulated. Those original findings are resolved only within this
+fixture; production authorization, imported/included configuration, TOCTOU,
+privileged Git writes, leases/revocation/recovery, and real model/auth brokerage
+remain unproved. Four source revisions exceeded the skill's two automatic repair
+allowance; no further automatic repairs or reruns proceeded. Memory peak was not
+measured, and no builds ran after the resource constraint arrived. All captured
+worker processes exited. The isolation branch remains clean with no commits.
+
+Linux requires installed bubblewrap and kernel/container namespace permissions;
+this deployment prerequisite is not established by existing T3 packaging.
+macOS/Windows isolation remains unproved. A supported-host deployment decision
+and full resource/runtime evidence remain required before dependent work.
+
+**Integration state.** P1's exit gate has not passed. No worker implementation
+has been merged into `pi-teams/wave1` or this main worktree; production dependencies,
+contracts, migrations, wiring, and clients remain unchanged. P2–P14 and all 19
+acceptance criteria remain unchecked. No combined-wave approval, integrated
+client/browser/device gate, final acceptance verifier, or final independent audit
+has been claimed. Those final agents must inspect the same exact completed
+implementation commit after all required waves land.
+
+An attempted pinned dev-dependency addition failed the existing pnpm virtual-store
+and unused-patch guards without changing tracked files; unrelated patches were
+preserved. Worker restart/spawn attempts also encountered an agent-thread limit;
+the coordinator performed the narrow runtime withdrawal repair, and fresh review
+capacity became available after workers finished. No repository-wide checks,
+browser/device use, live T3 writes, pushes, or PR creation occurred.
