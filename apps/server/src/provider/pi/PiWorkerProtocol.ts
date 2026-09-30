@@ -41,10 +41,22 @@ const envelope = {
 export const PiWorkerFrame = Schema.Struct({
   ...envelope,
   message: Schema.Union([
-    Schema.Struct({ type: Schema.Literal("request"), requestId: RequestId, body: RequestBody }),
-    Schema.Struct({ type: Schema.Literal("ack"), requestId: RequestId }),
+    Schema.Struct({
+      type: Schema.Literal("request"),
+      requestId: RequestId,
+      lifecycleId: RequestId,
+      body: RequestBody,
+    }),
+    Schema.Struct({
+      type: Schema.Literal("ack"),
+      requestId: RequestId,
+      chunkSequence: SafeInteger,
+    }),
     Schema.Struct({ type: Schema.Literal("cancel"), requestId: RequestId }),
-    Schema.Struct({ type: Schema.Literals(["agent_start", "agent_end", "agent_settled"]) }),
+    Schema.Struct({
+      type: Schema.Literals(["agent_start", "agent_end", "agent_settled"]),
+      lifecycleId: RequestId,
+    }),
     Schema.Struct({ type: Schema.Literal("done") }),
     Schema.Struct({ type: Schema.Literal("worker-failure"), code: Token }),
   ]),
@@ -174,7 +186,7 @@ export function makePiWorkerLineFramer(consume: (raw: string) => void) {
 interface PendingRequest {
   id: number;
   headers: boolean;
-  unacked: boolean;
+  unacked: number | undefined;
   bytes: number;
   terminal: "end" | "error" | undefined;
 }
@@ -187,14 +199,19 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity) {
   let lastRequestId = 0;
   let pending: PendingRequest | undefined;
   let lastOutcome: "end" | "error" | undefined;
-  let agentRunning = false;
-  let agentStarted = false;
-  let settled = false;
+  let lifecycle: "not-started" | "running" | "ended" | "settled" = "not-started";
+  let lifecycleId = 0;
+  let lifecycleHasRequest = false;
   let canceled = false;
   let terminal: "done" | "failed" | undefined;
 
   const canFinishSuccessfully = () =>
-    terminal === undefined && !pending && settled && !canceled && lastOutcome === "end";
+    terminal === undefined &&
+    !pending &&
+    lifecycle === "settled" &&
+    lifecycleHasRequest &&
+    !canceled &&
+    lastOutcome === "end";
   const checkEnvelope = (frame: PiParentFrame | PiWorkerFrame, sequence: number) => {
     if (terminal !== undefined) fail("WORKER_TERMINAL");
     if (frame.workerId !== expected.workerId || frame.generation !== expected.generation)
@@ -206,7 +223,7 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity) {
     return pending;
   };
   const drain = () => {
-    if (pending?.terminal && !pending.unacked) {
+    if (pending?.terminal && pending.unacked === undefined) {
       lastOutcome = pending.terminal;
       pending = undefined;
     }
@@ -228,11 +245,11 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity) {
             break;
           case "chunk": {
             if (!active.headers) fail("HEADERS_REQUIRED");
-            if (active.unacked) fail("CHUNK_ACK_REQUIRED");
+            if (active.unacked !== undefined) fail("CHUNK_ACK_REQUIRED");
             const size = Buffer.from(message.data, "base64").length;
             if (active.bytes + size > PI_WORKER_MAX_RESPONSE_BYTES) fail("RESPONSE_BYTE_LIMIT");
             active.bytes += size;
-            active.unacked = true;
+            active.unacked = frame.sequence;
             break;
           }
           case "end":
@@ -258,22 +275,25 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity) {
         switch (message.type) {
           case "request":
             if (pending || canceled) fail("REQUEST_BARRIER");
+            if (lifecycle !== "running" || message.lifecycleId !== lifecycleId)
+              fail("REQUEST_LIFECYCLE");
             if (message.requestId <= lastRequestId) fail("REQUEST_ID_REUSE");
             lastRequestId = message.requestId;
             pending = {
               id: message.requestId,
               headers: false,
-              unacked: false,
+              unacked: undefined,
               bytes: 0,
               terminal: undefined,
             };
             lastOutcome = undefined;
-            settled = false;
+            lifecycleHasRequest = true;
             break;
           case "ack": {
             const active = request(message.requestId);
-            if (!active.unacked) fail("UNEXPECTED_ACK");
-            active.unacked = false;
+            if (active.unacked === undefined || message.chunkSequence !== active.unacked)
+              fail("UNEXPECTED_ACK");
+            active.unacked = undefined;
             drain();
             break;
           }
@@ -283,18 +303,22 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity) {
             canceled = true;
             break;
           case "agent_start":
-            if (agentRunning || canceled) fail("UNEXPECTED_AGENT_START");
-            agentRunning = true;
-            agentStarted = true;
-            settled = false;
+            if (lifecycle === "running" || canceled) fail("UNEXPECTED_AGENT_START");
+            if (message.lifecycleId <= lifecycleId) fail("LIFECYCLE_ID_REUSE");
+            lifecycle = "running";
+            lifecycleId = message.lifecycleId;
+            lifecycleHasRequest = false;
+            lastOutcome = undefined;
             break;
           case "agent_end":
-            if (!agentRunning) fail("UNEXPECTED_AGENT_END");
-            agentRunning = false;
+            if (lifecycle !== "running" || message.lifecycleId !== lifecycleId)
+              fail("UNEXPECTED_AGENT_END");
+            lifecycle = "ended";
             break;
           case "agent_settled":
-            if (!agentStarted || agentRunning || settled) fail("UNEXPECTED_AGENT_SETTLED");
-            settled = true;
+            if (lifecycle !== "ended" || message.lifecycleId !== lifecycleId)
+              fail("UNEXPECTED_AGENT_SETTLED");
+            lifecycle = "settled";
             break;
           case "done":
             if (!canFinishSuccessfully()) fail("SUCCESS_BARRIER");
@@ -311,7 +335,7 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity) {
       }
     },
     get canStartRequest() {
-      return terminal === undefined && !pending && !canceled;
+      return terminal === undefined && !pending && !canceled && lifecycle === "running";
     },
     get canFinishSuccessfully() {
       return canFinishSuccessfully();

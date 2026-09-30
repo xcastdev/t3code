@@ -48,7 +48,9 @@ function peers() {
       workerFramer.push(encodePiWorkerFrame(workerFrame(message, workerSequence++)));
     },
     parent(message: PiParentFrame["message"]) {
-      parentFramer.push(encodePiParentFrame(parentFrame(message, parentSequence++)));
+      const frame = parentFrame(message, parentSequence++);
+      parentFramer.push(encodePiParentFrame(frame));
+      return frame;
     },
     finish() {
       workerFramer.finish();
@@ -58,18 +60,18 @@ function peers() {
 }
 
 function start(peer: ReturnType<typeof peers>) {
-  peer.worker({ type: "agent_start" });
-  peer.worker({ type: "request", requestId: 1, body: "{}" });
+  peer.worker({ type: "agent_start", lifecycleId: 1 });
+  peer.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" });
   peer.parent({ type: "headers", requestId: 1, status: 200 });
 }
-function settle(peer: ReturnType<typeof peers>) {
-  peer.worker({ type: "agent_end" });
-  peer.worker({ type: "agent_settled" });
+function settle(peer: ReturnType<typeof peers>, lifecycleId = 1) {
+  peer.worker({ type: "agent_end", lifecycleId });
+  peer.worker({ type: "agent_settled", lifecycleId });
 }
 
 describe("private worker wire bounds", () => {
   it("round-trips exact allowed envelopes and rejects unknown nested and outer fields", () => {
-    const frame = workerFrame({ type: "request", requestId: 1, body: "{}" });
+    const frame = workerFrame({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" });
     expect(decodePiWorkerFrame(encodePiWorkerFrame(frame).toString().trimEnd())).toEqual(frame);
     for (const invalid of [
       { ...frame, credential: "forbidden" },
@@ -92,7 +94,9 @@ describe("private worker wire bounds", () => {
   it("rejects invalid request IDs, worker tokens and response statuses", () => {
     for (const requestId of [0, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
       expect(() =>
-        decodePiWorkerFrame(json(workerFrame({ type: "request", requestId, body: "{}" }))),
+        decodePiWorkerFrame(
+          json(workerFrame({ type: "request", lifecycleId: 1, requestId, body: "{}" })),
+        ),
       ).toThrow("INVALID_WORKER_FRAME");
     }
     for (const workerId of ["", "x".repeat(129), "worker with spaces"]) {
@@ -126,7 +130,8 @@ describe("private worker wire bounds", () => {
     expect(() => decodePiWorkerFrame("😀".repeat(PI_WORKER_MAX_FRAME_BYTES / 4))).toThrow(
       "FRAME_BYTE_LIMIT",
     );
-    const request = (body: string) => workerFrame({ type: "request", requestId: 1, body });
+    const request = (body: string) =>
+      workerFrame({ type: "request", lifecycleId: 1, requestId: 1, body });
     expect(() =>
       encodePiWorkerFrame(request("x".repeat(PI_WORKER_MAX_REQUEST_BYTES))),
     ).not.toThrow();
@@ -163,7 +168,7 @@ describe("private worker wire bounds", () => {
 
 describe("incremental LF framing", () => {
   it("handles every UTF8 split and coalesced frames without buffering completed frames", () => {
-    const frame = workerFrame({ type: "request", requestId: 1, body: "😀é" });
+    const frame = workerFrame({ type: "request", lifecycleId: 1, requestId: 1, body: "😀é" });
     const wire = encodePiWorkerFrame(frame);
     for (let split = 0; split <= wire.length; split++) {
       const received: PiWorkerFrame[] = [];
@@ -224,16 +229,160 @@ describe("incremental LF framing", () => {
 });
 
 describe("SDK settlement and parent drain barrier", () => {
+  describe("review regressions", () => {
+    it("requires an explicit safe ACK chunk sequence and lifecycle identity", () => {
+      const messages = [
+        { type: "ack", requestId: 1 },
+        { type: "request", requestId: 1, body: "{}" },
+        ...["agent_start", "agent_end", "agent_settled"].map((type) => ({ type })),
+      ];
+      for (const message of messages) {
+        expect(() =>
+          decodePiWorkerFrame(json({ ...workerFrame({ type: "done" }), message })),
+        ).toThrow("INVALID_WORKER_FRAME");
+      }
+      for (const value of [-1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(() =>
+          decodePiWorkerFrame(
+            json(workerFrame({ type: "ack", requestId: 1, chunkSequence: value })),
+          ),
+        ).toThrow("INVALID_WORKER_FRAME");
+      }
+      for (const lifecycleId of [0, -1, 0.5, Number.MAX_SAFE_INTEGER + 1]) {
+        expect(() =>
+          decodePiWorkerFrame(json(workerFrame({ type: "agent_start", lifecycleId }))),
+        ).toThrow("INVALID_WORKER_FRAME");
+      }
+    });
+
+    it("rejects repeated ACK for the prior chunk at a fresh worker sequence", () => {
+      const peer = peers();
+      start(peer);
+      const firstChunk = peer.parent({ type: "chunk", requestId: 1, data: chunk });
+      const ack = { type: "ack", requestId: 1, chunkSequence: firstChunk.sequence } as const;
+      peer.worker(ack);
+      peer.parent({ type: "chunk", requestId: 1, data: chunk });
+      expect(() => peer.worker(ack)).toThrow("UNEXPECTED_ACK");
+      expect(peer.protocol.successful).toBe(false);
+    });
+
+    it("rejects a request using an already settled SDK lifecycle", () => {
+      const peer = peers();
+      start(peer);
+      peer.parent({ type: "end", requestId: 1 });
+      settle(peer);
+      expect(() =>
+        peer.worker({ type: "request", lifecycleId: 1, requestId: 2, body: "{}" }),
+      ).toThrow("REQUEST_LIFECYCLE");
+      expect(peer.protocol.successful).toBe(false);
+    });
+
+    it("does not reuse old transport success for an empty fresh SDK cycle", () => {
+      const peer = peers();
+      start(peer);
+      peer.parent({ type: "end", requestId: 1 });
+      settle(peer);
+      peer.worker({ type: "agent_start", lifecycleId: 2 });
+      settle(peer, 2);
+      expect(() => peer.worker({ type: "done" })).toThrow("SUCCESS_BARRIER");
+      expect(peer.protocol.successful).toBe(false);
+    });
+
+    it.each(["agent_end", "agent_settled"] as const)(
+      "rejects delayed old %s at a fresh worker sequence during a new lifecycle",
+      (type) => {
+        const peer = peers();
+        start(peer);
+        peer.parent({ type: "end", requestId: 1 });
+        settle(peer);
+        peer.worker({ type: "agent_start", lifecycleId: 2 });
+        peer.worker({ type: "request", lifecycleId: 2, requestId: 2, body: "{}" });
+        peer.parent({ type: "headers", requestId: 2, status: 200 });
+        peer.parent({ type: "end", requestId: 2 });
+        if (type === "agent_settled") peer.worker({ type: "agent_end", lifecycleId: 2 });
+        expect(() => peer.worker({ type, lifecycleId: 1 })).toThrow(
+          type === "agent_end" ? "UNEXPECTED_AGENT_END" : "UNEXPECTED_AGENT_SETTLED",
+        );
+        expect(peer.protocol.successful).toBe(false);
+      },
+    );
+
+    it("rejects a stale request lifecycle and reused lifecycle start", () => {
+      for (const reuse of [false, true]) {
+        const peer = peers();
+        start(peer);
+        peer.parent({ type: "end", requestId: 1 });
+        settle(peer);
+        if (reuse) {
+          expect(() => peer.worker({ type: "agent_start", lifecycleId: 1 })).toThrow(
+            "LIFECYCLE_ID_REUSE",
+          );
+        } else {
+          peer.worker({ type: "agent_start", lifecycleId: 2 });
+          expect(() =>
+            peer.worker({ type: "request", lifecycleId: 1, requestId: 2, body: "{}" }),
+          ).toThrow("REQUEST_LIFECYCLE");
+        }
+      }
+    });
+
+    it("does not reuse a previous lifecycle's delayed transport end for an empty cycle", () => {
+      const peer = peers();
+      start(peer);
+      settle(peer);
+      peer.worker({ type: "agent_start", lifecycleId: 2 });
+      peer.parent({ type: "end", requestId: 1 });
+      settle(peer, 2);
+      expect(() => peer.worker({ type: "done" })).toThrow("SUCCESS_BARRIER");
+      expect(peer.protocol.successful).toBe(false);
+    });
+
+    it("allows a fresh complete lifecycle and a transport retry within a running lifecycle", () => {
+      const peer = peers();
+      start(peer);
+      peer.parent({ type: "end", requestId: 1 });
+      settle(peer);
+      expect(peer.protocol.canStartRequest).toBe(false);
+      peer.worker({ type: "agent_start", lifecycleId: 2 });
+      for (const requestId of [2, 3]) {
+        peer.worker({ type: "request", lifecycleId: 2, requestId, body: "{}" });
+        peer.parent({ type: "headers", requestId, status: 200 });
+        if (requestId === 2) peer.parent({ type: "error", requestId, code: "TRANSIENT" });
+        else {
+          const received = peer.parent({ type: "chunk", requestId, data: chunk });
+          peer.worker({ type: "ack", requestId, chunkSequence: received.sequence });
+          peer.parent({ type: "end", requestId });
+        }
+      }
+      settle(peer, 2);
+      peer.worker({ type: "done" });
+      expect(peer.protocol.successful).toBe(true);
+    });
+
+    it("allows the matching ACK for the next chunk after the prior ACK was consumed", () => {
+      const peer = peers();
+      start(peer);
+      for (let count = 0; count < 2; count++) {
+        const received = peer.parent({ type: "chunk", requestId: 1, data: chunk });
+        peer.worker({ type: "ack", requestId: 1, chunkSequence: received.sequence });
+      }
+      peer.parent({ type: "end", requestId: 1 });
+      settle(peer);
+      peer.worker({ type: "done" });
+      expect(peer.protocol.successful).toBe(true);
+    });
+  });
+
   it("accepts early SDK settlement but waits for parent end, final ACK and done", () => {
     const peer = peers();
     start(peer);
-    peer.parent({ type: "chunk", requestId: 1, data: chunk });
+    const received = peer.parent({ type: "chunk", requestId: 1, data: chunk });
     settle(peer);
     expect(peer.protocol.canFinishSuccessfully).toBe(false);
     expect(peer.protocol.canStartRequest).toBe(false);
     peer.parent({ type: "end", requestId: 1 });
     expect(peer.protocol.canFinishSuccessfully).toBe(false);
-    peer.worker({ type: "ack", requestId: 1 });
+    peer.worker({ type: "ack", requestId: 1, chunkSequence: received.sequence });
     expect(peer.protocol.canFinishSuccessfully).toBe(true);
     expect(peer.protocol.successful).toBe(false);
     peer.worker({ type: "done" });
@@ -246,19 +395,20 @@ describe("SDK settlement and parent drain barrier", () => {
     (control) => {
       const peer = peers();
       start(peer);
-      peer.parent({ type: "chunk", requestId: 1, data: chunk });
-      peer.worker({ type: "agent_end" });
-      if (control !== "agent-end-only") peer.worker({ type: "agent_settled" });
+      const received = peer.parent({ type: "chunk", requestId: 1, data: chunk });
+      peer.worker({ type: "agent_end", lifecycleId: 1 });
+      if (control !== "agent-end-only") peer.worker({ type: "agent_settled", lifecycleId: 1 });
       if (control === "error")
         peer.parent({ type: "error", requestId: 1, code: "TRANSPORT_FAILED" });
       else if (control !== "missing-end") peer.parent({ type: "end", requestId: 1 });
-      if (control !== "missing-ack") peer.worker({ type: "ack", requestId: 1 });
+      if (control !== "missing-ack")
+        peer.worker({ type: "ack", requestId: 1, chunkSequence: received.sequence });
       expect(() => peer.worker({ type: "done" })).toThrow("SUCCESS_BARRIER");
       expect(peer.protocol.successful).toBe(false);
-      expect(() => peer.worker({ type: "agent_start" })).toThrow("FRAMER_CLOSED");
-      expect(() => peer.protocol.acceptWorker(workerFrame({ type: "agent_start" }))).toThrow(
-        "WORKER_TERMINAL",
-      );
+      expect(() => peer.worker({ type: "agent_start", lifecycleId: 1 })).toThrow("FRAMER_CLOSED");
+      expect(() =>
+        peer.protocol.acceptWorker(workerFrame({ type: "agent_start", lifecycleId: 1 })),
+      ).toThrow("WORKER_TERMINAL");
     },
   );
 
@@ -266,18 +416,18 @@ describe("SDK settlement and parent drain barrier", () => {
     const peer = peers();
     start(peer);
     peer.parent({ type: "error", requestId: 1, code: "TRANSIENT_ERROR" });
-    peer.worker({ type: "agent_end" });
+    peer.worker({ type: "agent_end", lifecycleId: 1 });
     expect(peer.protocol.canFinishSuccessfully).toBe(false);
-    peer.worker({ type: "agent_start" });
+    peer.worker({ type: "agent_start", lifecycleId: 2 });
     for (const requestId of [2, 3]) {
-      peer.worker({ type: "request", requestId, body: "{}" });
+      peer.worker({ type: "request", lifecycleId: 2, requestId, body: "{}" });
       peer.parent({ type: "headers", requestId, status: 200 });
-      peer.parent({ type: "chunk", requestId, data: chunk });
-      peer.worker({ type: "ack", requestId });
+      const received = peer.parent({ type: "chunk", requestId, data: chunk });
+      peer.worker({ type: "ack", requestId, chunkSequence: received.sequence });
       peer.parent({ type: "end", requestId });
       expect(peer.protocol.canFinishSuccessfully).toBe(false);
     }
-    settle(peer);
+    settle(peer, 2);
     peer.worker({ type: "done" });
     expect(peer.protocol.successful).toBe(true);
   });
@@ -286,39 +436,39 @@ describe("SDK settlement and parent drain barrier", () => {
     const peer = peers();
     start(peer);
     settle(peer);
-    expect(() => peer.worker({ type: "request", requestId: 2, body: "{}" })).toThrow(
-      "REQUEST_BARRIER",
-    );
+    expect(() =>
+      peer.worker({ type: "request", lifecycleId: 1, requestId: 2, body: "{}" }),
+    ).toThrow("REQUEST_BARRIER");
   });
 
   it("cancellation consumes end and ACK drain but cannot become success or dispatch again", () => {
     const peer = peers();
     start(peer);
-    peer.parent({ type: "chunk", requestId: 1, data: chunk });
+    const received = peer.parent({ type: "chunk", requestId: 1, data: chunk });
     peer.worker({ type: "cancel", requestId: 1 });
     settle(peer);
     peer.parent({ type: "end", requestId: 1 });
-    peer.worker({ type: "ack", requestId: 1 });
+    peer.worker({ type: "ack", requestId: 1, chunkSequence: received.sequence });
     expect(peer.protocol.canFinishSuccessfully).toBe(false);
     expect(peer.protocol.canStartRequest).toBe(false);
     peer.worker({ type: "worker-failure", code: "CANCELED" });
     expect(peer.protocol.successful).toBe(false);
-    expect(() => peer.worker({ type: "request", requestId: 2, body: "{}" })).toThrow(
-      "WORKER_TERMINAL",
-    );
+    expect(() =>
+      peer.worker({ type: "request", lifecycleId: 1, requestId: 2, body: "{}" }),
+    ).toThrow("WORKER_TERMINAL");
   });
 
   it("rejects request reuse and late receipts for the previous request", () => {
     const reused = peers();
     start(reused);
     reused.parent({ type: "end", requestId: 1 });
-    expect(() => reused.worker({ type: "request", requestId: 1, body: "{}" })).toThrow(
-      "REQUEST_ID_REUSE",
-    );
+    expect(() =>
+      reused.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" }),
+    ).toThrow("REQUEST_ID_REUSE");
     const delayed = peers();
     start(delayed);
     delayed.parent({ type: "end", requestId: 1 });
-    delayed.worker({ type: "request", requestId: 2, body: "{}" });
+    delayed.worker({ type: "request", lifecycleId: 1, requestId: 2, body: "{}" });
     expect(() => delayed.parent({ type: "error", requestId: 1, code: "OLD_ERROR" })).toThrow(
       "UNEXPECTED_REQUEST_ID",
     );
@@ -329,8 +479,8 @@ describe("SDK settlement and parent drain barrier", () => {
     start(peer);
     const data = Buffer.alloc(PI_WORKER_MAX_CHUNK_BYTES).toString("base64");
     for (let bytes = 0; bytes < PI_WORKER_MAX_RESPONSE_BYTES; bytes += PI_WORKER_MAX_CHUNK_BYTES) {
-      peer.parent({ type: "chunk", requestId: 1, data });
-      peer.worker({ type: "ack", requestId: 1 });
+      const received = peer.parent({ type: "chunk", requestId: 1, data });
+      peer.worker({ type: "ack", requestId: 1, chunkSequence: received.sequence });
     }
     expect(() => peer.parent({ type: "chunk", requestId: 1, data: chunk })).toThrow(
       "RESPONSE_BYTE_LIMIT",
@@ -341,11 +491,14 @@ describe("SDK settlement and parent drain barrier", () => {
 describe("identity, ordering and lifecycle failures", () => {
   it("rejects duplicate sequence numbers independently in each direction", () => {
     const worker = makePiWorkerProtocol(identity);
-    const startFrame = workerFrame({ type: "agent_start" });
+    const startFrame = workerFrame({ type: "agent_start", lifecycleId: 1 });
     worker.acceptWorker(startFrame);
     expect(() => worker.acceptWorker(startFrame)).toThrow("FRAME_ORDER");
     const parent = makePiWorkerProtocol(identity);
-    parent.acceptWorker(workerFrame({ type: "request", requestId: 1, body: "{}" }));
+    parent.acceptWorker(workerFrame({ type: "agent_start", lifecycleId: 1 }));
+    parent.acceptWorker(
+      workerFrame({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" }, 1),
+    );
     const headers = parentFrame({ type: "headers", requestId: 1, status: 200 });
     parent.acceptParent(headers);
     expect(() => parent.acceptParent(headers)).toThrow("FRAME_ORDER");
@@ -357,10 +510,16 @@ describe("identity, ordering and lifecycle failures", () => {
         const protocol = makePiWorkerProtocol(identity);
         if (direction === "worker") {
           expect(() =>
-            protocol.acceptWorker({ ...workerFrame({ type: "agent_start" }), ...override }),
+            protocol.acceptWorker({
+              ...workerFrame({ type: "agent_start", lifecycleId: 1 }),
+              ...override,
+            }),
           ).toThrow();
         } else {
-          protocol.acceptWorker(workerFrame({ type: "request", requestId: 1, body: "{}" }));
+          protocol.acceptWorker(workerFrame({ type: "agent_start", lifecycleId: 1 }));
+          protocol.acceptWorker(
+            workerFrame({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" }, 1),
+          );
           expect(() =>
             protocol.acceptParent({
               ...parentFrame({ type: "headers", requestId: 1, status: 200 }),
@@ -383,7 +542,8 @@ describe("identity, ordering and lifecycle failures", () => {
     "duplicate-cancel",
   ] as const)("rejects %s", (control) => {
     const peer = peers();
-    peer.worker({ type: "request", requestId: 1, body: "{}" });
+    peer.worker({ type: "agent_start", lifecycleId: 1 });
+    peer.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" });
     if (control !== "missing-headers") peer.parent({ type: "headers", requestId: 1, status: 200 });
     if (control === "duplicate-headers")
       expect(() => peer.parent({ type: "headers", requestId: 1, status: 200 })).toThrow(
@@ -400,7 +560,9 @@ describe("identity, ordering and lifecycle failures", () => {
       );
     }
     if (control === "unexpected-ack")
-      expect(() => peer.worker({ type: "ack", requestId: 1 })).toThrow("UNEXPECTED_ACK");
+      expect(() => peer.worker({ type: "ack", requestId: 1, chunkSequence: 0 })).toThrow(
+        "UNEXPECTED_ACK",
+      );
     if (control === "duplicate-end") {
       peer.parent({ type: "end", requestId: 1 });
       expect(() => peer.parent({ type: "end", requestId: 1 })).toThrow("UNEXPECTED_REQUEST_ID");
@@ -414,7 +576,7 @@ describe("identity, ordering and lifecycle failures", () => {
   it("requires paired agent lifecycle and prevents resurrection after done or failure", () => {
     for (const type of ["agent_end", "agent_settled"] as const) {
       const peer = peers();
-      expect(() => peer.worker({ type })).toThrow();
+      expect(() => peer.worker({ type, lifecycleId: 1 })).toThrow();
     }
     for (const succeeded of [true, false]) {
       const peer = peers();
