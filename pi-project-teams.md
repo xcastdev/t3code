@@ -5,6 +5,45 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 # Pi project teams
 
+## Progress dashboard
+
+Last updated: 2026-09-30 20:03 UTC. Implementation has resumed. The coordinator
+maintains this section at assignments, check results, reviews, and integration
+gates; detailed evidence and historical checkpoints are below.
+
+| Tally                       | Done | Active | Left | Total |
+| --------------------------- | ---- | ------ | ---- | ----- |
+| Implementation steps        | 1    | 2      | 11   | 14    |
+| Product acceptance criteria | 0    | 0      | 19   | 19    |
+| Final independent audits    | 0    | 0      | 2    | 2     |
+
+- **Done:** P1 dependency proofs and memory selection landed. Regenerated bounded
+  pi runtime, Linux isolation/packaging, and remote memory evidence is reviewed.
+- **Active:** P2 is reviewed and merged into wave2, awaiting combined integration.
+  P3's Sol high owner is repairing three compiler issues in its preserved isolated
+  worktree before its one independent xhigh review. The checkpoint passed 250
+  focused tests; those results must be rechecked where the repair affects them.
+- **Left:** P4–P14 (11 steps), all 19 product acceptance criteria, and the final
+  verifier and validator. After P2/P3 lands, P7 can run alongside P4 followed by P5.
+- **Current gate:** finish and review P3, validate/review the combined P2/P3 wave,
+  reconcile the main worktree, then merge locally. Dependent implementation waits
+  on this gate. Backend helper tests do not establish real client compatibility.
+- **Team:** Sol high implementation staffing has no plan-level limit; dispatch
+  ready independent scopes within available harness slots. One xhigh reviewer per
+  piece of work, reused for repairs; two fresh final reviewers. One owner retains
+  shared contracts, migrations, wiring, and dependencies.
+- **Permissions/evidence still needed:** browser/device permission when integrated
+  clients are ready; explicit disposable GitHub fixture-write permission for the
+  required real issue-to-PR proof. No local models, push, or PR is authorized. The
+  exhausted eight-call P1 proof budget must not be reused.
+
+Main baseline for this resumption: `0e40a230a2560e79da3baf06f2a1154175d0b910`.
+Wave2 remains `8e44ffe67516decfd19df454382848ea029c8738`. P3's worktree is
+`/home/user/.cache/pi-project-teams-11b7e351/p3-authorization`, branch
+`pi-teams/p3-authorization`, base `c3ed6d3d4c606f66b9c07000246f16682df035af`.
+Fresh repair evidence is retained separately in
+`/home/user/.cache/pi-project-teams-11b7e351/p3-resume-high-evidence/`.
+
 ## Goal
 
 Make T3 a project-management workspace for directing pi teams across multiple
@@ -1000,11 +1039,11 @@ READY_TO_IMPLEMENT (begin with P1; dependent steps remain gated).
 
 ## Implementation progress
 
-### Current checkpoint — paused at user request (2026-09-30)
+### Preserved pause checkpoint (2026-09-30; subsequently resumed)
 
-Work is paused before P3's independent review and wave integration. The record
-remains `in_progress`; the requested pause is not completion. No worker remains
-active. Preserve the worktrees and evidence below until resumption.
+This records the pause before P3's independent review and wave integration.
+The user subsequently requested resumption; the progress dashboard above is
+current. The frozen pause evidence below remains unchanged.
 
 - Main worktree before this documentation checkpoint:
   `f2514af881393f52e1610058af95bfa2ba7f9a32` on
@@ -1089,8 +1128,8 @@ slots safely support, rather than a fixed three-worker team. Assign at most one
 GPT-6.1-Sol xhigh review agent per task or piece of work, reusing it for repairs,
 and two fresh xhigh final reviewers after implementation is complete. These rules
 supersede the earlier medium-worker and repeated fresh-review assignments recorded
-below; historical evidence and verdicts remain unchanged. Implementation remains
-paused at the checkpoint above until the user requests resumption.
+below; historical evidence and verdicts remain unchanged. The user subsequently
+requested resumption and a continuously maintained progress dashboard at the top.
 Workers do not delegate. Each has a separate branch/worktree and an explicit base.
 The coordinator owns shared contracts, migrations, server wiring, dependency
 changes, this record, and integrated client verification. No push or PR creation
