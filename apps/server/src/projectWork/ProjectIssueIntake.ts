@@ -23,7 +23,7 @@ const Observation = Schema.Struct({
       Schema.isGreaterThanOrEqualTo(1),
       Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
     ),
-    title: Text,
+    title: ProjectIssueIntake.fields.title,
     body: Schema.String.check(Schema.isMaxLength(32_000)),
     state: Schema.Literals(["open", "closed"]),
     updatedAt: Timestamp,

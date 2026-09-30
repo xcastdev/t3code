@@ -1,6 +1,14 @@
 import { ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
-import { describe, expect, it } from "vite-plus/test";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as Redacted from "effect/Redacted";
+import { ChildProcessSpawner } from "effect/unstable/process";
+import { describe, expect, it } from "@effect/vitest";
 import { mergeIssueObservation, selectIssueProject } from "./ProjectIssueIntake.ts";
+import * as Client from "./github/GitHubIssueClient.ts";
+import { acceptPage, planPage } from "./github/GitHubIssueSync.ts";
+import * as GitHubCli from "../sourceControl/GitHubCli.ts";
+import * as RateLimit from "../sourceControl/SourceControlRateLimit.ts";
 
 const repository = { host: "github.com", nodeId: "R_1", nameWithOwner: "owner/repo" };
 const issue = {
@@ -28,6 +36,106 @@ function record() {
   if (result.status !== "changed") throw new Error("Fixture issue rejected");
   return result.record;
 }
+
+const clientObservation = Effect.fn("clientObservation")(function* (
+  title: string,
+  nameWithOwner = repository.nameWithOwner,
+) {
+  const account = {
+    host: repository.host,
+    nodeId: "U_1",
+    credentialFingerprint: "synthetic-generation",
+  };
+  const currentRepository = { ...repository, nameWithOwner };
+  const fence = { generation: 1, leaseId: "synthetic-read" };
+  const request = {
+    ...fence,
+    repository: currentRepository,
+    account,
+    page: 1,
+    query: {
+      since: "2026-09-01T00:00:00Z",
+      pageSize: 2,
+      state: "all",
+      sort: "updated",
+      direction: "asc",
+    },
+  };
+  const planned = planPage({ request, currentFence: fence });
+  if (planned.status !== "ready") throw new Error("Synthetic read rejected");
+  const rawRepository = {
+    id: 1,
+    node_id: repository.nodeId,
+    full_name: nameWithOwner,
+    url: `https://api.github.com/repos/${nameWithOwner}`,
+    html_url: `https://github.com/${nameWithOwner}`,
+    updated_at: request.query.since,
+  };
+  const rawIssue = {
+    node_id: issue.nodeId,
+    number: issue.number,
+    title,
+    body: issue.body,
+    state: issue.state,
+    comments: 0,
+    updated_at: issue.updatedAt,
+    closed_at: null,
+    url: `${rawRepository.url}/issues/${issue.number}`,
+    html_url: `${rawRepository.html_url}/issues/${issue.number}`,
+    repository_url: rawRepository.url,
+  };
+  const gh = Layer.mock(GitHubCli.GitHubCli)({
+    execute: (call) => {
+      const endpoint = call.args.at(-1);
+      const data =
+        endpoint === "user"
+          ? { node_id: account.nodeId }
+          : endpoint === `repos/${nameWithOwner}`
+            ? rawRepository
+            : [rawIssue];
+      return Effect.succeed({
+        stdout: `HTTP/2.0 200 OK\nContent-Type: application/json\r\n\r\n${JSON.stringify(data)}`,
+        stderr: "",
+        exitCode: ChildProcessSpawner.ExitCode(0),
+        stdoutTruncated: false,
+        stderrTruncated: false,
+      });
+    },
+  });
+  const page = yield* Effect.gen(function* () {
+    const client = yield* Client.make;
+    return yield* client.readIssuesPage({
+      cwd: "/synthetic-intake",
+      account,
+      repository: currentRepository,
+      since: planned.request.query.since,
+      pageSize: planned.request.query.pageSize,
+      page: planned.request.page,
+    });
+  }).pipe(
+    Effect.provide(Layer.mergeAll(gh, RateLimit.layer)),
+    Effect.provideService(GitHubCli.PinnedGitHubCredential, {
+      host: account.host,
+      credentialFingerprint: account.credentialFingerprint,
+      token: Redacted.make("synthetic-token"),
+    }),
+  );
+  const accepted = acceptPage({
+    request: planned.request,
+    currentFence: fence,
+    response: page,
+    observedAt: input.observedAt,
+  });
+  if (accepted.status !== "accepted" || accepted.snapshot.entries[0] === undefined)
+    throw new Error("Synthetic page rejected");
+  expect(accepted.snapshot.entries[0].title).toBe(title);
+  return {
+    ...input,
+    repository: accepted.snapshot.repository,
+    issue: accepted.snapshot.entries[0],
+  };
+});
+
 describe("pure project issue intake", () => {
   it("captures an external observation without task creation or dispatch", () => {
     expect(mergeIssueObservation(input)).toEqual({
@@ -55,6 +163,81 @@ describe("pure project issue intake", () => {
       status: "unchanged",
       record: existing,
     });
+  });
+  it.effect(
+    "deduplicates the same padded title from the actual client through sync and intake",
+    () =>
+      Effect.gen(function* () {
+        const observation = yield* clientObservation("  A padded title  ");
+        const imported = mergeIssueObservation(observation);
+        expect(imported).toMatchObject({ status: "changed", record: { title: "A padded title" } });
+        if (imported.status !== "changed") throw new Error("Expected import");
+        const existing = {
+          ...imported.record,
+          taskId: ProjectWorkTaskId.make("task-a"),
+          missionId: "mission-a",
+          revision: 3,
+          generation: 4,
+        };
+        expect(mergeIssueObservation({ ...observation, existing })).toEqual({
+          status: "unchanged",
+          record: existing,
+        });
+      }),
+  );
+  it.effect(
+    "accepts a same-source canonical rename for padded client titles without losing local history",
+    () =>
+      Effect.gen(function* () {
+        const observation = yield* clientObservation("  A padded title  ");
+        const imported = mergeIssueObservation(observation);
+        if (imported.status !== "changed") throw new Error("Expected import");
+        const existing = {
+          ...imported.record,
+          taskId: ProjectWorkTaskId.make("task-a"),
+          missionId: "mission-a",
+          revision: 3,
+          generation: 4,
+        };
+        const renamed = yield* clientObservation("  A padded title  ", "renamed/repo");
+        expect(mergeIssueObservation({ ...renamed, existing })).toEqual({
+          status: "changed",
+          record: { ...existing, repositoryName: "renamed/repo", revision: 4 },
+        });
+      }),
+  );
+  it("compares titles using the intake contract's whitespace normalization", () => {
+    const existing = record();
+    for (const title of [
+      " \tIssue\n",
+      "\u00a0Issue\u00a0",
+      "\u2003Issue\u2003",
+      "\ufeffIssue\ufeff",
+    ]) {
+      expect(mergeIssueObservation({ ...input, existing, issue: { ...issue, title } })).toEqual({
+        status: "unchanged",
+        record: existing,
+      });
+    }
+    for (const title of ["", " \t\n", "\u00a0\u2003\ufeff"]) {
+      expect(mergeIssueObservation({ ...input, issue: { ...issue, title } })).toEqual({
+        status: "rejected",
+        reason: "invalid-input",
+      });
+    }
+  });
+  it("retains genuine same-source title, body and state conflicts after title normalization", () => {
+    const existing = record();
+    for (const revised of [
+      { ...issue, title: "  Different  " },
+      { ...issue, title: "  Is sue  " },
+      { ...issue, title: "  Issue  ", body: "Different" },
+      { ...issue, title: "  Issue  ", state: "closed" },
+    ])
+      expect(mergeIssueObservation({ ...input, existing, issue: revised })).toEqual({
+        status: "rejected",
+        reason: "source-conflict",
+      });
   });
   it("preserves local task, mission and generation through close and reopen", () => {
     const existing = {
