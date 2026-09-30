@@ -1,5 +1,5 @@
 Github Tracked: false
-Status: blocked
+Status: in_progress
 Github Issue: none
 Plan review: READY_WITH_EXPLICIT_GATES
 
@@ -1391,7 +1391,7 @@ started. Normal build/test memory limits may increase when measured need justifi
 it; the user's prohibition concerns all local model loading, hosting, and inference.
 No Ollama, llama, local model, model weight download, push, or PR is authorized.
 
-### Current P1 blocker and preserved state
+### P1 CI blocker and superseded repair pause
 
 Fresh xhigh final wave review of
 `7af9ed41a9cda1fb4335d6449c9779466b9c554d` returns **REQUEST_CHANGES** for one
@@ -1433,3 +1433,50 @@ record and must be reconciled into the wave before a later authorized merge.
 P1–P14 and all 19 acceptance criteria remain unchecked. Normal build/test memory
 caps may increase as needed; local model loading, inference, hosting, and downloads
 remain prohibited. No push, PR, browser/device use, or live T3 database write occurred.
+
+### Authorized P1 repair and plan-wide execution policy
+
+On 2026-09-30 the user authorized the prepared Knip repair, then explicitly
+instructed: "Ignore repair limits for this entire plan implementation, go until
+completion." Automatic repair-count limits no longer stop this plan. Dependency
+gates, independent part/wave reviews, focused checks, real evidence requirements,
+process ownership, and the prohibition on local models remain in effect.
+
+The main record advance `063de7584956fb711b40fb80ccc137823d523da9` is reconciled
+into the wave at `d41fa29cff0b06b7e49152d9e18370d8c358b1e0`. Its progress-file
+conflict was resolved to the complete main record; all eleven tested code/dependency
+hashes remain unchanged. The isolated medium worker's exact repair commit
+`ab0b874873daa65fdd5f33d2c228279ef0a02027` changes only four lines in `knip.jsonc`.
+The required server-scoped files/dependencies audit reports `{"issues":[]}` and
+exits 0 in 2.471 seconds, with a 2 GiB cap, 477,777,920-byte peak, and zero OOM
+events. Scoped format and whitespace checks pass. Tested source/diff hashes match
+the clean commit, and the coordinator verifies all 21 artifact hashes at
+`/home/user/.cache/pi-project-teams-11b7e351/knip-entry-repair-evidence/`.
+
+An additional server-scoped export check initially could not load the declared
+TypeScript 6.0.3 alias because ignored `scripts/node_modules` was omitted from
+worktree setup. Copying the existing declared links fixes resolution without an
+install or tracked dependency change. The 512 MiB and 1 GiB heaps then exhausted;
+these failures remain preserved. At a 4 GiB Node heap under a 6 GiB cap, analysis
+completes in 14.832 seconds with a 2,893,524,992-byte peak and zero kernel OOM
+events. It exits 1 with 58 export findings and three duplicate groups across
+34 existing server files, none in the new pi/memory fixture scopes.
+
+The coordinator runs the identical scoped export command on the clean main base
+`063de7584956fb711b40fb80ccc137823d523da9`, before P1 source/configuration changes.
+That control exits 1 in 15.585 seconds, peaks at 2,814,910,464 bytes under the same
+heap/cgroup limits, and has zero OOM events. All 34 full file-keyed issue payloads
+match exactly; only outer array order differs, and all 34 file hashes are unchanged.
+Evidence is `wave1-validation/knip-exports-main-control{.log,-result.json}` and
+`knip-exports-baseline-comparison.json`. This establishes the scoped findings as
+baseline findings; it does not claim the full multi-workspace CI export gate passed.
+No unrelated source cleanup or repository-wide check was performed.
+
+Fresh xhigh part review approves exact `ab0b874873daa65fdd5f33d2c228279ef0a02027`
+and independently verifies the four-line scope, passing audit, all manifest
+hashes, and matched export control. The final combined wave gate remains pending.
+Runtime, memory,
+Linux ownership, and packaging proof sources are unchanged; their reviewed evidence
+is retained. No additional runtime/model/API calls, local model work, browser/device
+use, push, PR, or live T3 database write occurred. P1 remains unchecked until the
+wave's required checks and fresh review pass and it lands on this main worktree.
