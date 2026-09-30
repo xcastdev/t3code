@@ -145,7 +145,10 @@ briefings. Pending extraction catches up without duplication.
 
 Evaluate Mem0 and Graphiti against representative project history; select one
 engine based on recall, project isolation, correction/deletion, provenance,
-recovery, and operating cost. No engine has been selected or reliability-tested.
+recovery, and operating cost. The reviewed P1 memory slice selects Mem0 as a
+derived dense-only index; configuration, evidence, and remaining production
+obligations are recorded under Implementation progress. The full P1 exit gate
+and subsequent memory integration remain incomplete.
 
 - [Mem0 self-hosted overview](https://docs.mem0.ai/open-source/overview)
 - [Graphiti temporal memory and provenance](https://github.com/getzep/graphiti)
@@ -1204,8 +1207,19 @@ The first resumed proof reviews found actionable gaps. Current repair evidence:
   resource bounds. Native Mem0 history rows skipped by the crash remain empty;
   source/extraction records and complete-set manifests persist. This is derived
   index recovery evidence, not a claim to recover every SDK internal transaction.
-  Fresh selection/recovery review is pending. No production integration or final
-  engine selection is claimed.
+  Fresh xhigh selection/recovery review approves this slice and independently
+  verifies both original UUID sets, payloads, and vectors, all 74 artifact hashes,
+  and unchanged prior budget counters. Mem0 2.2.1 is selected as a derived dense-only
+  index behind T3's authoritative source/extraction ledger. Its configuration uses
+  CommandCode Ling free extraction and remote OpenRouter NVIDIA 2048-dimensional
+  embeddings with provider fallback disabled. Production must preserve complete
+  expected-set manifests, exhaustive reconciliation beyond this prototype's
+  100-point listing, source/tombstone fencing, explicit valid no-facts outcomes,
+  and T3-owned audit/context. It must not present native history as complete.
+  Historical Graphiti fails conflict preservation on the same fixtures, but
+  different models prevent a matched provider-cost conclusion. NVIDIA reports
+  zero cost; CommandCode dollar cost is unreported. No P10 integration or AC
+  completion is claimed.
 - New text-tool and parent-auth fixtures passed their actual native consumers.
   Fresh review then found implicit append-prompt/file discovery and character
   counts used as byte limits. One focused text repair excludes those discovery
@@ -1237,7 +1251,15 @@ lockfile/supply-chain check passed all 2,297 entries with a 512 MiB cap; the ear
 dependency graph passed under a 1 GiB cap with scripts disabled. Scoped format
 and whitespace checks passed. Fresh xhigh dependency review approves the pin,
 closed graph, integrity hashes, preserved prior entries, and frozen checks; this
-commit has not landed in the wave or main worktree.
+commit is now integrated only into the wave branch described below.
+
+The coordinator advanced `pi-teams/wave1` to the main record commit
+`7e7d7101e` without rewriting history, then merged only approved parts:
+dependency merge `62a9d6f2a` and memory merge `f3cb1bc98`. Their scopes do not overlap;
+main advances since their bases are record-only. Whitespace checks and clean
+worktree checks pass. The runtime part is still excluded pending startup-cleanup
+repair/review. Combined V1 and fresh wave review remain pending; the wave has not
+landed on this main worktree.
 
 The NVIDIA publisher's fixed model card revision
 `c0c9fea93ea424587517f2c59e20db9f1d6bf615` identifies OpenMDW 1.1. Only metadata
