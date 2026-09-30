@@ -7,13 +7,13 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-09-30 21:01 UTC. Implementation has resumed. The coordinator
+Last updated: 2026-09-30 21:12 UTC. Implementation has resumed. The coordinator
 maintains this section at assignments, check results, reviews, and integration
 gates; detailed evidence and historical checkpoints are below.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
-| Implementation steps        | 1    | 3      | 10   | 14    |
+| Implementation steps        | 1    | 4      | 9    | 14    |
 | Product acceptance criteria | 0    | 0      | 19   | 19    |
 | Final independent audits    | 0    | 0      | 2    | 2     |
 
@@ -25,7 +25,7 @@ gates; detailed evidence and historical checkpoints are below.
   finished with REQUEST_CHANGES on three defects: legacy credential/proxy
   revival and ancestor delegation depth. All three are independently reproduced;
   the same P3 owner is repairing them and the same reviewer will recheck.
-  Fresh candidate checks pass 250 tests plus 28 focused repair regressions,
+  Pre-review candidate checks pass 250 tests plus 28 focused repair regressions,
   the normal server-entry and contracts compilers, and scoped lint/format/diff
   checks. Coordinator inspection verified the exact commit and evidence; the
   server-scoped Knip files/dependencies check also passes with no issues.
@@ -34,13 +34,18 @@ gates; detailed evidence and historical checkpoints are below.
 - **Active preparatory slice:** P5 read-only GitHub transport has a two-file WIP
   and 17 focused cases; its final gate waits for the coordinator-owned conditional
   HTTP output helper. Helper candidate `05172c6` passes 28 affected tests, normal
-  focused compiler, lint, format and diff; fresh review is pending. The leaf worker
-  checkpoints to free a reviewer slot. There is no runtime, persistence,
+  focused compiler, lint, format and diff; its fresh review APPROVES. The leaf
+  worker has resumed from this reviewed helper base with its WIP preserved.
+  There is no runtime, persistence,
   authorization, or dispatch wiring. P5 remains incomplete; its full
   P2–P4 prerequisites and intake/integration gates remain open.
-- **Left:** P4 and P6–P14 (10 steps not started), the rest of P5, all 19 product
-  acceptance criteria, and the final verifier and validator. After P2/P3 lands,
-  P7 can run alongside P4; full P5 follows P4.
+- **Active preparatory slice:** P7 skill delivery is assigned to its own Sol high
+  owner, using existing skill/materializer interfaces and a required server-owned
+  authorization callback. It owns two skill-adapter files only; full P7 runtime,
+  authorization wiring, isolation and packaging remain open.
+- **Left:** P4, P6 and P8–P14 (9 steps not started), the rest of P5/P7, all 19
+  product acceptance criteria, and both final audits. After P2/P3 lands, full P7
+  can run alongside P4; full P5 follows P4.
 - **Current gate:** finish and review P3, validate/review the combined P2/P3 wave,
   reconcile the main worktree, then merge locally. Dependent implementation waits
   on this gate; bounded independent preparatory slices may overlap under the
@@ -59,7 +64,8 @@ Main baseline for this resumption: `0e40a230a2560e79da3baf06f2a1154175d0b910`.
 Wave2 remains `8e44ffe67516decfd19df454382848ea029c8738`. P3's worktree is
 `/home/user/.cache/pi-project-teams-11b7e351/p3-authorization`, branch
 `pi-teams/p3-authorization`, base `c3ed6d3d4c606f66b9c07000246f16682df035af`.
-Its clean candidate HEAD is `c6a38aaaba0278c71c8c764748aed51855ae626c`.
+Its committed pre-repair candidate is `c6a38aaaba0278c71c8c764748aed51855ae626c`;
+the P3 repair WIP is isolated there and has not merged.
 Fresh repair evidence is retained separately in
 `/home/user/.cache/pi-project-teams-11b7e351/p3-resume-high-evidence/`.
 
@@ -2152,3 +2158,39 @@ Evidence is `p5-github-http-output-evidence/`, 27-artifact manifest SHA256
 Fresh helper review must pass before the leaf consumes this commit. A reviewer
 launch encounters the harness thread limit; the waiting P5 worker checkpoints
 to free its slot. This does not waive the review gate.
+
+### Assigned independent P7 skill-delivery slice
+
+A separate P7 skill slice can consume the existing ProviderSkillAdapter and owned
+SkillMaterializationService interfaces without unfinished team contracts. The
+coordinator prepares branch `pi-teams/p7-skills-slice`, worktree
+`/home/user/.cache/pi-project-teams-11b7e351/p7-skills-slice`, base
+`e18528baf66d38ed53c697d8b175ae95857fc0f7`. Its two exclusive writable paths
+are `apps/server/src/skills/ProviderSkillAdapters.ts` and
+`ProviderSkillAdapters.test.ts`, adding only the pi factory and its checks.
+The factory requires a server-owned authorization callback returning the allowed
+skill keys for the request. It validates identity/keys, uses existing owned
+materialization, and returns explicit managed skill paths with no implicit native
+sources or live application. The future PiDriver must bind the callback to current
+run authority and frozen role/configuration; that wiring remains an unfinished
+full P7 gate. Real worker mounts, extensions, provider registration, native session
+behavior, and packaging are outside this slice. The runtime worker's prepared
+scope reserves these paths if this assignment starts; no two workers own them.
+Sol high owner `p7_skills_slice_high` is dispatched after the earlier worker slot
+was freed. P7 skill preparation is active; full P7 remains incomplete.
+The agreed local payload carries only root and explicit keyed skill paths;
+authorization is required before and after copying. The future runtime owner
+must consume this factory and leave these two paths to this owner.
+
+The GitHub helper's one fresh xhigh review **APPROVES** exact `05172c6`, replaying
+28 tests and 14 independent behavioral checks with a copied-old-wrapper failure.
+The coordinator verifies all 12 review artifacts, manifest SHA256
+`e768105f31e3a3b1405079388733b1df28883dfabf071942b4b3e1fb6c915ec4`.
+Three fresh scopes drain under 2 GiB zero swap/OOM. Approval covers the shared
+helper only. The coordinator advances the P5 leaf branch from `4003588f6` to
+this reviewed prerequisite, proving the two uncommitted leaf files are unchanged
+byte-for-byte. The same high leaf owner resumes focused verification from exact
+`05172c635ea8636bffc99d9745adf596dd3a2454`. Neither helper nor P5/P7 leaf code
+has landed in the main worktree. Three implementation owners now work in
+exclusive P3, P5-transport and P7-skill scopes within the harness limit; a slot
+will be freed before review.
