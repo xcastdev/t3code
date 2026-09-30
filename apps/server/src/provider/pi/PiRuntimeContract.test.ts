@@ -1,214 +1,172 @@
-import * as NodeChildProcess from "node:child_process";
-import * as NodeCrypto from "node:crypto";
+// @effect-diagnostics nodeBuiltinImport:off globalTimers:off - The standalone SDK fixture uses captured Node process handles and an independent deadline.
 import * as NodeFSP from "node:fs/promises";
-import * as NodeOS from "node:os";
+import * as NodeChildProcess from "node:child_process";
 import * as NodePath from "node:path";
+import * as NodeStringDecoder from "node:string_decoder";
 import * as NodeURL from "node:url";
-import * as NodeUtil from "node:util";
 import { expect, it } from "vitest";
 
-const execute = NodeUtil.promisify(NodeChildProcess.execFile);
-
 function sdkRoot() {
-  return (
-    process.env.PI_RUNTIME_CONTRACT_SDK_ROOT ??
-    (() => {
-      try {
-        return NodePath.resolve(
-          NodePath.dirname(
-            NodeURL.fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")),
-          ),
-          "..",
-        );
-      } catch {
-        throw new Error(
-          "Pi runtime contract requires @earendil-works/pi-coding-agent@0.99.1. Install the pinned test dependency or set PI_RUNTIME_CONTRACT_SDK_ROOT; missing SDK is not a passing skip.",
-        );
-      }
-    })()
-  );
-}
-
-async function executeFixture(negativeControl = "") {
-  // A user service owns every descendant before SDK startup, including detached shells.
-  // Linux + a functional systemd user manager are explicit proof-harness prerequisites.
-  const cache = NodePath.join(NodeOS.homedir(), ".cache", "t3-pi-runtime-contract");
-  await NodeFSP.mkdir(cache, { recursive: true });
-  const scratch = await NodeFSP.mkdtemp(NodePath.join(cache, "owned-"));
-  const unit = `pi-runtime-contract-${NodeCrypto.randomUUID()}.service`;
-  const source = NodeURL.fileURLToPath(new URL("./fixtures/", import.meta.url));
-  const names = ["p1-runtime-sdk.mjs", "p1-runtime-mcp.mjs", "p1-runtime-descendants.mjs"];
-  let stdout = "";
-  let stderr = "";
-  let code = 0;
-  let unitResult: Record<string, string> = {};
+  if (process.env.PI_RUNTIME_CONTRACT_SDK_ROOT) return process.env.PI_RUNTIME_CONTRACT_SDK_ROOT;
   try {
-    await Promise.all(
-      names.map((name) =>
-        NodeFSP.copyFile(NodePath.join(source, name), NodePath.join(scratch, name)),
+    return NodePath.resolve(
+      NodePath.dirname(
+        NodeURL.fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent")),
       ),
+      "..",
     );
-    try {
-      const output = await execute(
-        "systemd-run",
-        [
-          "--user",
-          "--wait",
-          "--pipe",
-          "--quiet",
-          `--unit=${unit}`,
-          "-p",
-          "MemoryMax=512M",
-          "-p",
-          "MemorySwapMax=0",
-          "-p",
-          "OOMPolicy=kill",
-          "-p",
-          "KillMode=control-group",
-          "-p",
-          "RuntimeMaxSec=10s",
-          "-p",
-          "TimeoutStopSec=1s",
-          `--setenv=PI_RUNTIME_CONTRACT_OWNED_UNIT=${unit}`,
-          `--setenv=PI_RUNTIME_CONTRACT_SDK_ROOT=${await NodeFSP.realpath(sdkRoot())}`,
-          `--setenv=PI_RUNTIME_CONTRACT_NEGATIVE_CONTROL=${negativeControl}`,
-          process.execPath,
-          "--max-old-space-size=128",
-          NodePath.join(scratch, "p1-runtime-sdk.mjs"),
-        ],
-        { timeout: 16_000, maxBuffer: 1024 * 1024 },
-      );
-      stdout = output.stdout;
-      stderr = output.stderr;
-    } catch (error) {
-      if (
-        !(error instanceof Error) ||
-        !("stdout" in error) ||
-        !("stderr" in error) ||
-        typeof error.stdout !== "string" ||
-        typeof error.stderr !== "string"
-      )
-        throw error;
-      stdout = error.stdout;
-      stderr = error.stderr;
-      code = "code" in error && typeof error.code === "number" ? error.code : -1;
-    } finally {
-      try {
-        const receipt = await execute(
-          "systemctl",
-          ["--user", "show", unit, "--property=Result,ExecMainStatus,ActiveState,SubState"],
-          { timeout: 3000 },
-        );
-        unitResult = Object.fromEntries(
-          receipt.stdout
-            .trim()
-            .split("\n")
-            .map((line) => line.split("=")),
-        );
-      } finally {
-        // Stop only the unit identity allocated above; never discover processes by PID/name.
-        await execute("systemctl", ["--user", "stop", unit], { timeout: 3000 }).catch(() => {});
-      }
-    }
-    const lines = stdout.trim().split("\n");
-    const ownerLine = lines.find((line) => line.startsWith("P1_OWNER:"));
-    if (!ownerLine)
-      throw new Error(`Owned Linux SDK fixture failed before its startup boundary: ${stderr}`);
-    const owner = JSON.parse(ownerLine.slice("P1_OWNER:".length));
-    expect(owner.unit).toBe(unit);
-    expect(owner.policy.KillMode).toBe("control-group");
-    expect(owner.policy.RuntimeMaxUSec).toBe("10s");
-    expect(owner.policy.TimeoutStopUSec).toBe("1s");
-    expect(owner.max).toBe("536870912");
-    expect(owner.swapMax).toBe("0");
-    expect(owner.oomGroup).toBe("1");
-    expect(owner.path).toBe(`/sys/fs/cgroup${owner.policy.ControlGroup}`);
-    expect(owner.path.endsWith(`/${unit}`)).toBe(true);
-    const kernel = await NodeFSP.readFile(NodePath.join(owner.path, "cgroup.events"), "utf8").catch(
-      (error) => {
-        if (error.code === "ENOENT") return "removed";
-        throw error;
-      },
+  } catch {
+    throw new Error(
+      "Pi runtime contract requires @earendil-works/pi-coding-agent@0.99.1. Install the pinned test dependency or set PI_RUNTIME_CONTRACT_SDK_ROOT; missing SDK is not a passing skip.",
     );
-    // The kernel cannot remove a populated cgroup. A retained cgroup must be empty.
-    expect(kernel === "removed" || kernel.split("\n").includes("populated 0")).toBe(true);
-    const text =
-      code === 0
-        ? lines.find((line) => !line.startsWith("P1_OWNER:") && line.startsWith("{"))
-        : stderr
-            .trim()
-            .split("\n")
-            .findLast((line) => line.startsWith("{"));
-    if (!text)
-      throw new Error(`Owned fixture failed without a causal receipt (exit ${code}): ${stderr}`);
-    const report = JSON.parse(text);
-    expect(unitResult.ExecMainStatus).toBe(String(code));
-    expect(unitResult.Result).toBe(code === 0 ? "success" : "exit-code");
-    expect(unitResult.ActiveState).toBe(code === 0 ? "inactive" : "failed");
-    const outcome = { code, report, owner, unitResult, ownedExit: { kernel, confirmed: true } };
-    const evidence = process.env.PI_RUNTIME_CONTRACT_EVIDENCE_DIR;
-    if (evidence) {
-      await NodeFSP.mkdir(evidence, { recursive: true });
-      await NodeFSP.writeFile(
-        NodePath.join(evidence, `${negativeControl || "success"}.json`),
-        JSON.stringify({ ...outcome, stdout, stderr }, null, 2),
-      );
-    }
-    return outcome;
-  } finally {
-    await execute("systemctl", ["--user", "reset-failed", unit], { timeout: 3000 }).catch(() => {});
-    await NodeFSP.rm(scratch, { recursive: true, force: true });
   }
 }
 
-it("exercises pinned AgentSession tools, authorization, continuation, and descendant abort", async () => {
-  const result = await executeFixture();
-  expect(result.code).toBe(0);
-  expect(result.report.remoteCalls).toBe(0);
-  expect(result.report.records).toHaveLength(6);
-  expect(
-    result.report.cleanupReceipts.every((receipt: { cleanup: boolean }) => !receipt.cleanup),
-  ).toBe(true);
-}, 25_000);
+async function executePortable(
+  negativeControl = "",
+  args = ["--portable"],
+  root = sdkRoot(),
+  ownedUnit = "",
+) {
+  const env = {
+    ...process.env,
+    PATH: "",
+    PI_RUNTIME_CONTRACT_SDK_ROOT: root,
+    PI_RUNTIME_CONTRACT_NEGATIVE_CONTROL: negativeControl,
+    PI_RUNTIME_CONTRACT_OWNED_UNIT: ownedUnit,
+  };
+  // No platform command is available. Only this directly captured Node child may run.
+  const child = NodeChildProcess.spawn(
+    process.execPath,
+    [
+      "--max-old-space-size=128",
+      NodeURL.fileURLToPath(new URL("./fixtures/p1-runtime-sdk.mjs", import.meta.url)),
+      ...args,
+    ],
+    { env, stdio: ["ignore", "pipe", "pipe"] },
+  );
+  let stdout = "";
+  let stderr = "";
+  let failure: Error | undefined;
+  let stdoutBytes = 0;
+  let stderrBytes = 0;
+  const stdoutDecoder = new NodeStringDecoder.StringDecoder("utf8");
+  const stderrDecoder = new NodeStringDecoder.StringDecoder("utf8");
+  const completion = new Promise<{ code: number | null; stdout: string; stderr: string }>(
+    (resolve, reject) => {
+      const deadline = setTimeout(() => {
+        failure = new Error("Portable SDK fixture deadline expired");
+        child.kill("SIGKILL");
+      }, 10_000);
+      child.on("error", (error) => {
+        failure = error;
+      });
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (failure) return;
+        if (stdoutBytes + chunk.byteLength > 1024 * 1024) {
+          failure = new Error("Portable output bound exceeded");
+          child.kill("SIGKILL");
+          return;
+        }
+        stdoutBytes += chunk.byteLength;
+        stdout += stdoutDecoder.write(chunk);
+      });
+      child.stderr.on("data", (chunk: Buffer) => {
+        if (failure) return;
+        if (stderrBytes + chunk.byteLength > 1024 * 1024) {
+          failure = new Error("Portable output bound exceeded");
+          child.kill("SIGKILL");
+          return;
+        }
+        stderrBytes += chunk.byteLength;
+        stderr += stderrDecoder.write(chunk);
+      });
+      child.on("close", (code) => {
+        clearTimeout(deadline);
+        if (failure) reject(failure);
+        else
+          resolve({
+            code,
+            stdout: stdout + stdoutDecoder.end(),
+            stderr: stderr + stderrDecoder.end(),
+          });
+      });
+    },
+  );
+  return { ...(await completion), pid: child.pid };
+}
 
-it.each(["descendant-abort", "mcp-shutdown"])(
-  "rejects when the actual %s consumer is disabled and drains the owned subtree",
-  async (negativeControl) => {
-    const result = await executeFixture(negativeControl);
-    expect(result.code).toBe(1);
-    expect(result.report.status).toBe("failed");
-    expect(result.report.cause).toMatch(/^WATCHDOG:/);
-    expect(result.report.negativeControl).toBe(negativeControl);
-    expect(result.report.cleanupReceipts).toHaveLength(1);
-    expect(result.report.cleanupReceipts[0].complete).toBe(true);
-    expect(result.report.cleanupReceipts[0].cleanup).toBe(true);
-    expect(result.report.cleanupReceipts[0].pids).toHaveLength(
-      negativeControl === "descendant-abort" ? 3 : 1,
+it("exercises four actual pinned SDK consumers without Linux commands or child trees", async () => {
+  const result = await executePortable();
+  expect(result.stderr).toBe("");
+  expect(result.code).toBe(0);
+  const report = JSON.parse(result.stdout.trim());
+  expect(report.mode).toBe("portable");
+  expect(report.pin).toBe("0.99.1");
+  expect(report.fixturePid).toBe(result.pid);
+  expect(report.remoteCalls).toBe(0);
+  expect(report.callbackCount).toBe(9);
+  expect(report.records.map((record: { name: string }) => record.name)).toEqual([
+    "AgentSession dispatch resolves assigned cwd and trusted resources",
+    "Advertised custom tool enforces role denial in its handler",
+    "Steering and follow-up drain before true settlement",
+    "Transient failure cannot settle before successful retry",
+  ]);
+  expect(report.cleanupReceipts).toEqual([]);
+  const evidence = process.env.PI_RUNTIME_CONTRACT_EVIDENCE_DIR;
+  if (evidence) {
+    await NodeFSP.mkdir(evidence, { recursive: true });
+    await NodeFSP.writeFile(
+      NodePath.join(evidence, "portable-success.json"),
+      JSON.stringify(result, null, 2),
     );
-  },
-  25_000,
-);
+  }
+}, 15_000);
 
 it.each([
+  "descendant-abort",
+  "mcp-shutdown",
   "mcp-startup-stall",
   "shell-pre-receipt-stall",
   "cleanup-abort-stall",
   "cleanup-shutdown-stall",
 ])(
-  "bounds %s before SDK receipts or through hanging cleanup",
-  async (negativeControl) => {
-    const result = await executeFixture(negativeControl);
+  "portable mode refuses process negative control %s before SDK startup",
+  async (control) => {
+    const result = await executePortable(control);
     expect(result.code).not.toBe(0);
-    expect(result.report.status).toBe("failed");
-    expect(result.report.negativeControl).toBe(negativeControl);
-    expect(result.report.cause).toMatch(/^WATCHDOG:/);
-    expect(result.report.remoteCalls).toBe(0);
-    expect(result.report.ownedMembersBeforeCleanup.length).toBeGreaterThanOrEqual(
-      negativeControl.includes("abort") || negativeControl.includes("shell") ? 4 : 2,
-    );
-    if (negativeControl.startsWith("cleanup-"))
-      expect(result.report.cleanupCause).toMatch(/^CLEANUP_DEADLINE:/);
-    expect(result.ownedExit.confirmed).toBe(true);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("Portable mode forbids process negative controls");
   },
-  25_000,
+  15_000,
 );
+
+it("portable mode cannot select the Linux process cases or fall back to ownership", async () => {
+  const result = await executePortable("", ["--portable", "--linux-ownership"]);
+  expect(result.code).not.toBe(0);
+  expect(result.stdout).toBe("");
+  expect(result.stderr).toContain("Select exactly --portable or --linux-ownership");
+}, 15_000);
+
+it("portable mode refuses an inherited Linux owner before any platform access", async () => {
+  const result = await executePortable(
+    "",
+    ["--portable"],
+    sdkRoot(),
+    "forbidden-inherited-owner.service",
+  );
+  expect(result.code).not.toBe(0);
+  expect(result.stdout).toBe("");
+  expect(result.stderr).toContain("Portable mode forbids Linux ownership fallback");
+}, 15_000);
+
+it("missing pinned SDK remains a hard failure", async () => {
+  const result = await executePortable(
+    "",
+    ["--portable"],
+    NodePath.join(NodePath.dirname(process.execPath), "missing-pi-sdk"),
+  );
+  expect(result.code).not.toBe(0);
+  expect(result.stdout).toBe("");
+  expect(result.stderr).toContain("ENOENT");
+}, 15_000);
