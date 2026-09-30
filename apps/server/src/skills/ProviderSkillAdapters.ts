@@ -1,14 +1,21 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
+import * as NodePath from "node:path";
 
 import {
   type ProviderDriverKind,
-  type ProviderInstanceId,
+  ProviderInstanceId,
+  ManagedSkillKey,
+  SkillCatalogRevision,
+  ThreadId,
+  TrimmedNonEmptyString,
   type SkillNativeDiscoveryResult,
   type SkillNativeObservation,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Schema from "effect/Schema";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
@@ -19,6 +26,7 @@ import {
   ProviderSkillAdapterError,
   type ProviderSkillAdapter,
   type ProviderSkillPlan,
+  type ProviderSkillPrepareRequest,
 } from "./ProviderSkillAdapter.ts";
 import {
   SkillMaterializationService,
@@ -197,6 +205,189 @@ export function makeCodexSkillAdapter(input: {
           providerInstanceId: input.providerInstanceId,
         })
         .pipe(Effect.mapError((cause) => adapterError("cleanup_failed", cause.detail, cause))),
+  };
+}
+
+export interface PiManagedSkillsPayload {
+  readonly kind: "pi-managed-skills";
+  readonly root: string;
+  readonly skills: ReadonlyArray<{ readonly key: ManagedSkillKey; readonly path: string }>;
+}
+
+export type PiManagedSkillAuthorization = (
+  request: ProviderSkillPrepareRequest,
+) => Effect.Effect<ReadonlySet<ManagedSkillKey>, ProviderSkillAdapterError>;
+
+const PiRuntimeIdentity = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  sessionId: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9_-]*$/)),
+  threadId: ThreadId,
+  cwd: TrimmedNonEmptyString,
+});
+const PiSkillPrepareRequest = Schema.Struct({
+  runtime: PiRuntimeIdentity,
+  desiredRevision: SkillCatalogRevision,
+  skills: Schema.Array(Schema.Struct({ key: ManagedSkillKey, packagePath: TrimmedNonEmptyString })),
+});
+const decodePiRequest = Schema.decodeUnknownEffect(PiSkillPrepareRequest);
+const decodePiRuntime = Schema.decodeUnknownEffect(PiRuntimeIdentity);
+const decodePiAllowedKeys = Schema.decodeUnknownEffect(Schema.ReadonlySet(ManagedSkillKey));
+
+/** The runtime must authorize the current managed binding and frozen role/configuration. */
+export function makePiSkillAdapter(input: {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly discoverCandidates: CandidateDiscovery;
+  readonly materialization: SkillMaterializationServiceShape;
+  readonly authorizeManagedRequest: PiManagedSkillAuthorization;
+}): ProviderSkillAdapter {
+  const authorize = Effect.fn("PiSkillAdapter.authorize")(function* (
+    request: ProviderSkillPrepareRequest,
+  ) {
+    if (typeof input.authorizeManagedRequest !== "function") {
+      return yield* adapterError(
+        "managed_authorization_required",
+        "Pi skill delivery requires managed run authorization.",
+      );
+    }
+    const allowed = yield* input.authorizeManagedRequest(request);
+    const keys = yield* decodePiAllowedKeys(allowed).pipe(
+      Effect.mapError((cause) =>
+        adapterError(
+          "managed_authorization_invalid",
+          "Managed skill authorization returned invalid keys.",
+          cause,
+        ),
+      ),
+    );
+    if (request.skills.some((skill) => !keys.has(skill.key))) {
+      return yield* adapterError(
+        "managed_skill_not_allowed",
+        "A requested skill is outside the managed run's frozen selection.",
+      );
+    }
+  });
+
+  return {
+    discoverNative: (cwd) => discover(input.providerInstanceId, cwd, input.discoverCandidates),
+    evaluateCompatibility: () => ({
+      ...supportedCompatibility(input.providerInstanceId),
+      support: "supported_with_limitations",
+      reasons: [
+        {
+          code: "managed-team-runs-only",
+          message:
+            "Pi skill delivery requires a current managed team run and an explicit resource loader. Skill changes require a new session; native discovery is advisory.",
+        },
+      ],
+    }),
+    prepareSession: Effect.fn("PiSkillAdapter.prepareSession")(function* (request) {
+      const prepared = yield* decodePiRequest(request).pipe(
+        Effect.mapError((cause) =>
+          adapterError(
+            "invalid_managed_request",
+            "Pi skill runtime identity or selection is invalid.",
+            cause,
+          ),
+        ),
+      );
+      if (prepared.runtime.providerInstanceId !== input.providerInstanceId) {
+        return yield* adapterError(
+          "provider_instance_mismatch",
+          "The runtime belongs to another provider instance.",
+        );
+      }
+      if (new Set(prepared.skills.map((skill) => skill.key)).size !== prepared.skills.length) {
+        return yield* adapterError(
+          "duplicate_skill_keys",
+          "Pi skill delivery contains duplicate managed keys.",
+        );
+      }
+      // Keep the authorization and copied package selection stable across async boundaries.
+      Object.freeze(prepared.runtime);
+      for (const skill of prepared.skills) Object.freeze(skill);
+      Object.freeze(prepared.skills);
+      Object.freeze(prepared);
+      yield* authorize(prepared);
+      const materializationInput = {
+        sessionId: prepared.runtime.sessionId,
+        providerInstanceId: input.providerInstanceId,
+        desiredRevision: prepared.desiredRevision,
+        packages: prepared.skills.map((skill) => ({
+          key: skill.key,
+          sourcePath: skill.packagePath,
+        })),
+      };
+      return yield* Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const materialized = yield* restore(
+            input.materialization.materialize(materializationInput),
+          ).pipe(
+            Effect.mapError((cause) => adapterError("materialization_failed", cause.detail, cause)),
+          );
+          return yield* restore(
+            Effect.gen(function* () {
+              if (
+                !NodePath.isAbsolute(materialized.root) ||
+                NodePath.resolve(materialized.root) !== materialized.root ||
+                materialized.skillPaths.size !== prepared.skills.length ||
+                prepared.skills.some(
+                  (skill) =>
+                    materialized.skillPaths.get(skill.key) !==
+                    NodePath.join(materialized.root, skill.key),
+                )
+              ) {
+                return yield* adapterError(
+                  "invalid_materialization",
+                  "Pi skill delivery returned paths outside the exact managed selection.",
+                );
+              }
+              // Copying can outlast a lease or role revocation; do not return a stale plan.
+              yield* authorize(prepared);
+              const payload: PiManagedSkillsPayload = {
+                kind: "pi-managed-skills",
+                root: materialized.root,
+                skills: prepared.skills.map((skill) => ({
+                  key: skill.key,
+                  path: NodePath.join(materialized.root, skill.key, SKILL_BODY_FILE),
+                })),
+              };
+              return {
+                providerInstanceId: input.providerInstanceId,
+                desiredRevision: prepared.desiredRevision,
+                applicationMode: "new_session_required",
+                skillKeys: prepared.skills.map((skill) => skill.key),
+                payload,
+              } satisfies ProviderSkillPlan;
+            }),
+          ).pipe(
+            Effect.onExit((exit) =>
+              Exit.isFailure(exit)
+                ? input.materialization.dispose(materializationInput).pipe(Effect.ignore)
+                : Effect.void,
+            ),
+          );
+        }),
+      );
+    }),
+    disposeSession: Effect.fn("PiSkillAdapter.disposeSession")(function* (runtime) {
+      const validated = yield* decodePiRuntime(runtime).pipe(
+        Effect.mapError((cause) =>
+          adapterError("invalid_managed_request", "Pi skill runtime identity is invalid.", cause),
+        ),
+      );
+      if (validated.providerInstanceId !== input.providerInstanceId) {
+        return yield* adapterError(
+          "provider_instance_mismatch",
+          "The runtime belongs to another provider instance.",
+        );
+      }
+      yield* input.materialization
+        .disposeSession({
+          sessionId: validated.sessionId,
+          providerInstanceId: input.providerInstanceId,
+        })
+        .pipe(Effect.mapError((cause) => adapterError("cleanup_failed", cause.detail, cause)));
+    }),
   };
 }
 
