@@ -978,6 +978,82 @@ READY_TO_IMPLEMENT (begin with P1; dependent steps remain gated).
 
 ## Implementation progress
 
+### Current checkpoint — paused at user request (2026-09-30)
+
+Work is paused before P3's independent review and wave integration. The record
+remains `in_progress`; the requested pause is not completion. No worker remains
+active. Preserve the worktrees and evidence below until resumption.
+
+- Main worktree before this documentation checkpoint:
+  `f2514af881393f52e1610058af95bfa2ba7f9a32` on
+  `t3code/implement-pi-project-teams`. P2/P3 code has not landed here.
+- Wave integration: `pi-teams/wave2` at
+  `8e44ffe67516decfd19df454382848ea029c8738`, in
+  `/home/user/.cache/pi-project-teams-11b7e351/wave2`. Reviewed P2 candidate
+  `6d19799a6861090f67960e31da3adc2ae8c461d8` is integrated only there; its fresh
+  review approved P2 only. The combined wave gate remains open.
+- P3 checkpoint: `pi-teams/p3-authorization`, worktree
+  `/home/user/.cache/pi-project-teams-11b7e351/p3-authorization`, exact HEAD/base
+  `c3ed6d3d4c606f66b9c07000246f16682df035af`. Its 32 assigned changed paths
+  (28 tracked and four new files) are preserved as uncommitted WIP. The index is
+  empty. No P3 commit, independent review, or integration has occurred.
+
+P3's final focused checks passed 250 tests: exact V3 66, affected authorization
+and MCP proxy 51, host/runtime/export 39, exact V2 contracts 65, and exact V2
+storage 29. The normal contracts compiler, scoped lint and format, and
+`git diff --check` passed. The normal server-entry compiler failed with three
+unresolved issues, producing five diagnostics:
+
+1. `ProjectWorkGateway.test.ts:1587` repeats `gateId` in the reordered retry test
+   (`TS2783`).
+2. `ProjectWorkRuntime.test.ts:252` hides the required Authorization service in
+   the test layer's output (`TS2375` and `TS377004`).
+3. `server.ts:605` passes a production layer to `ProjectWorkRuntime.withCore`
+   whose parameter fixes its error/context types too narrowly (`TS2379` and
+   `TS377034`).
+
+The compiler ran under a verified 4 GiB limit, zero swap, `GOMEMLIMIT=3GiB`, and
+a 180-second timeout; peak memory was 3,478,720,512 bytes with zero cgroup OOM
+events. Five unchanged `ProjectLifecycle.test.ts` baseline lint errors remain
+failed evidence. No repair was started after the requested pause boundary.
+Backend tests exercise actual SQL, authorization helpers, toolkits, services,
+and stream publication. They do not establish WebSocket transport, browser,
+desktop, or mobile compatibility.
+
+Frozen P3 evidence is in
+`/home/user/.cache/pi-project-teams-11b7e351/p3-authorization-evidence/`.
+`final-commands.json` and `final-results.json` retain exact commands and results;
+`checkpoint.json`, `source-hashes.json`, `source-snapshot.tar.gz`, and
+`full-diff.binary.patch` preserve the checkpoint. The 95-artifact manifest's
+SHA256 is `0b737421d7e1939ff9081b30f0869f41d38e1b8c1392c8454ea47ad015bbb204`;
+the full patch's SHA256 is
+`eaa2aea7cf82b2145259e177f5f569ce093cca351352a5e78a17577988bdb014`.
+The coordinator verified all 95 artifacts, all 32 current source hashes and
+archive files, the tracked patch, the empty index, and all 38 captured scopes
+drained. This inspection is recorded in
+`/home/user/.cache/pi-project-teams-11b7e351/root-pause-verification/p3-checkpoint-inspection.json`.
+Failed intermediate checks and deliberate negative controls remain preserved.
+
+On resumption, repair the three compiler issues in the same isolated P3 scope,
+run focused regressions and affected gates including the normal compiler, then
+make a scoped commit. Inspect it and obtain a fresh xhigh P3 review before
+merging to wave2. Run combined V2/V3 and affected compatibility checks, obtain a
+fresh wave review, reconcile the advanced main worktree, and repeat affected
+checks before the local main merge. Start P7 alongside P4 followed by P5 only
+after that merge. P2/P3 completion boxes remain unchecked until their combined
+main integration gate passes. P4–P14, all 19 acceptance criteria, and both final
+independent audits remain open.
+
+Regenerated bounded P1 runtime, isolation/packaging, and memory evidence received
+fresh approvals as recorded below; these do not certify later runtime or
+platform gates. The eight-call live P1 ledger is exhausted and must not be reused.
+Repair limits remain waived when work resumes. No local model work, additional
+model calls, dev servers, browser/device use, live T3 state writes, push, or PR
+creation was performed for this pause. Browser/device permission remains
+outstanding for eventual integrated client verification. This checkpoint commits
+only this record; the P3 WIP and wave branches remain preserved without further
+integration during the pause.
+
 Implementation began on 2026-09-29 in branch
 `t3code/implement-pi-project-teams`. The worktree was clean at
 `91b7c87b4656dbe467a7043bab1e91045311d4da`; it was fast-forwarded to the saved-plan
