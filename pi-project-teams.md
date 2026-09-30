@@ -231,29 +231,33 @@ owner at a time. GPT-6.1-Sol xhigh reviews implementation candidates read-only.
 
 ### Parallel-agent execution strategy
 
-Use one GPT-6.1-Sol high lead/integrator and as many GPT-6.1-Sol high implementation
-workers as available agent slots and independent work permit. Optimize for finishing
-the plan quickly and correctly. The user owns priorities and product decisions;
+Implementation staffing is unlimited at the plan level: use one GPT-6.1-Sol high
+lead/integrator and as many GPT-6.1-Sol high implementation subagents as can work
+independently without disrupting another agent's work or creating unnecessary
+conflicts. Optimize for finishing the plan quickly and correctly. The user owns
+priorities and product decisions;
 the lead owns assignments, dependencies, and integration. Assign one worker per
 exclusive writable scope. Split work only when interfaces and dependencies are
 settled and the split avoids conflicting edits or unnecessary integration work.
 Leave slots idle when dependencies or shared ownership prevent useful parallelism.
 
-There is no fixed three-worker policy. Respect the harness's actual active-agent
-limit, including the lead and reviewers; the current harness allows four active
-agents total. Free an implementation slot before starting a reviewer when needed.
-Do not change harness limits or the product's runtime concurrency policy. The
-stage assignments below are dependency examples, not a cap on implementation
-workers; additional independent slices require explicit scopes and interfaces.
+There is no fixed worker count or cumulative limit on implementation subagents.
+Use all available slots for ready, independent scopes and dispatch more work as
+slots become available. Respect the harness's actual active-agent limit, including
+the lead and reviewers; unlimited staffing does not override that limit. Free an
+implementation slot before starting a reviewer when needed. Do not change harness
+limits or the product's runtime concurrency policy. The stage assignments below
+identify dependency groups, not fixed seats; split each group into additional
+independent slices only after agreeing explicit scopes, interfaces, and checks.
 
-| Stage                                | Concurrent assignments                                                                                                                                                                            | Exit gate                                                                                                     |
-| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
-| 1. Dependency proofs, P1             | Worker A proves pi sessions, tools, cancellation, isolation, and packaging. Worker B evaluates memory engines against the same project-context fixtures. The lead settles integration boundaries. | Required runtime and memory behaviors have concrete evidence; unresolved P1 constraints block dependent work. |
-| 2. Foundation, P2–P3                 | One owner implements contracts, persistence, and authorization. Other workers may finish isolated probes and prepare fixtures without changing shared contracts.                                  | Stable interfaces and passing persistence/authorization checks.                                               |
-| 3. Runtime and lifecycle             | Worker A implements P7 pi integration. Worker B implements P4 guided lifecycle, then P5 GitHub intake. The lead owns shared wiring.                                                               | Both branches integrated and tested against the foundation.                                                   |
-| 4. Supervised execution              | Worker A implements P8 scheduler/recovery. Worker B implements P6 initial human workflow. Worker C may build only the selected P10 memory backend adapter against an agreed interface.            | Durable dispatch/recovery and usable human approval controls.                                                 |
-| 5. Coordination and delivery         | Complete P9 mailboxes, then P10 context/memory integration, then P11 review/PR delivery. Independent adapter work may overlap where contracts and writable scopes are settled.                    | A guided task reaches a reviewable PR with recorded evidence.                                                 |
-| 6. Client supervision and validation | After backend and shared client APIs are stable, P12 web and P13 mobile presentation work may overlap. The lead performs final integration and P14 checks.                                        | Integrated client behavior, failure recovery, and required real-workflow evidence.                            |
+| Stage                                | Concurrent assignments                                                                                                                                                                                        | Exit gate                                                                                                     |
+| ------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| 1. Dependency proofs, P1             | Parallel scopes prove pi sessions/tools/cancellation, isolation/packaging, and memory engines against agreed fixtures. Further independent proof slices may overlap. The lead settles integration boundaries. | Required runtime and memory behaviors have concrete evidence; unresolved P1 constraints block dependent work. |
+| 2. Foundation, P2–P3                 | One owner implements contracts, persistence, and authorization. Other workers may finish isolated probes and prepare fixtures without changing shared contracts.                                              | Stable interfaces and passing persistence/authorization checks.                                               |
+| 3. Runtime and lifecycle             | P7 pi integration runs alongside P4 guided lifecycle, then P5 GitHub intake. Each may use additional independent slices against settled interfaces. The lead owns shared wiring.                              | Runtime and lifecycle slices integrated and tested against the foundation.                                    |
+| 4. Supervised execution              | P8 scheduler/recovery runs alongside P6 initial human workflow and a bounded selected P10 memory backend adapter. Split independent scopes further only against agreed interfaces.                            | Durable dispatch/recovery and usable human approval controls.                                                 |
+| 5. Coordination and delivery         | Complete P9 mailboxes, then P10 context/memory integration, then P11 review/PR delivery. Independent adapter work may overlap where contracts and writable scopes are settled.                                | A guided task reaches a reviewable PR with recorded evidence.                                                 |
+| 6. Client supervision and validation | After backend and shared client APIs are stable, P12 web and P13 mobile presentation work may overlap. The lead performs final integration and P14 checks.                                                    | Integrated client behavior, failure recovery, and required real-workflow evidence.                            |
 
 These assignments preserve each step's dependency and acceptance gates. An early
 adapter or presentation slice is preparatory work, not completion of its parent
