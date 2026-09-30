@@ -7,65 +7,94 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-09-30 22:31 UTC. **Paused at the user's request for a Codex restart.**
-All implementation agents are interrupted; the review agents have finished.
-No implementation, review, test or merge work is running. The coordinator checked
-49 captured task scopes and found no processes; no known task scope remains running.
+Last updated: 2026-09-30 22:55 UTC. **Implementation resumed after the restart.**
+The harness now provides eleven active slots: the coordinator plus ten subagents.
+Five implementation owners and the existing P7 reviewer are active; the remaining
+slots are available for independent work and reviews. Existing reviewers are reused for their repair gates.
 
-| Tally                       | Done | Active (paused) | Left | Total |
-| --------------------------- | ---- | --------------- | ---- | ----- |
-| Implementation steps        | 1    | 5               | 8    | 14    |
-| Product acceptance criteria | 0    | 0               | 19   | 19    |
-| Final independent audits    | 0    | 0               | 2    | 2     |
+| Tally                       | Done | Active | Left | Total |
+| --------------------------- | ---- | ------ | ---- | ----- |
+| Implementation steps        | 1    | 7      | 6    | 14    |
+| Product acceptance criteria | 0    | 0      | 19   | 19    |
+| Final independent audits    | 0    | 0      | 2    | 2     |
 
 - **Done:** P1 bounded dependency/runtime/isolation/packaging and memory-selection
   proofs are reviewed and landed. Production pi and memory integration remain later work.
 - **P2:** reviewed and merged into wave2, awaiting the combined P2/P3 gate and main merge.
-- **P3:** isolated candidate `2d3a4481b0d34c2f057ae833b40e8ca7de9b5e2b`.
-  Its owner reports 276 affected tests, nine focused controls and normal server-entry
-  compiler passing; five unchanged Lifecycle lint failures remain baseline evidence.
-  A later real-SQL probe proves a remaining failure: cancellation after observing a
-  binding but while UPDATE waits for the connection leaves the old bearer and held
-  guard usable after purge/restart. The candidate is unapproved; evidence is not sealed.
-  The owner's proposed narrow withdrawal mask has **not** been approved or implemented.
+- **P3:** the unapproved `2d3a4481` candidate has a confirmed cancellation gap while
+  legacy-token withdrawal waits for SQL. The approved repair moves exact managed
+  identity withdrawal into the existing validated run-binding producer transaction.
+  The owner is proving atomic commit/rollback, cancellation, retirement, replay and
+  file-backed restart. No migration, startup service or broad cancellation mask is approved.
+- **P4 preparatory policy:** a separate owner is proposing a pure gate/dependency
+  policy against reviewed P2 schemas. Source edits await coordinator agreement;
+  full P4 remains dependent on P3.
 - **P5 preparatory transport:** `7d9a345fa84c71bd16ec9d724dea3be89ce16273`
   receives APPROVE from its same sole xhigh reviewer. All 66 affected tests and seven
   independent probe groups pass. Helper `05172c6` is separately approved. These branches
   remain isolated; full P5 sync, persistence, lifecycle dependencies and real API gates
   remain open.
-- **P7 preparatory skills:** `a38c13ac7b8a1098755fd2cde926c75458d0a63a`
-  resolves the original interruption leak; 63 tests and the three original probes pass.
-  Its same sole reviewer returns REQUEST_CHANGES for invalid custom path-map output
-  failing before fallback cleanup is registered. The coordinator reproduces the leak
-  and successful cleanup control. No further repair has started; full P7 remains open.
-- **P11 preparatory evidence policy:** a high worker started only the two new pure
-  `ProjectWorkEvidencePolicy.ts/.test.ts` files, consuming the reviewed P2 schema.
-  Both files are untracked, unverified and preserved in its isolated worktree plus an
-  external archive. No commit, review, wiring or parent completion is claimed.
-- **Left:** P4, P6, P8–P10 and P12–P14 (8 steps not started), the remaining P5/P7/P11
+- **P7 preparatory skills:** the invalid custom-map cleanup repair passes all 67
+  affected tests, the exact reviewer probes and normal two-file compiler.
+  Repair `24fae0c5` is committed; the coordinator verifies all 48 evidence hashes,
+  14 committed source/archive matches and 12 drained scopes. The same reviewer is
+  rechecking the exact candidate read-only.
+  Shared materializer files and ordinary adapters remain unchanged.
+  A separate owner is implementing the agreed private protocol from P1 proofs.
+- **P10 preparatory memory adapter:** a separate owner is inspecting the selected
+  Mem0 proof and current source contracts to propose the smallest concrete adapter
+  boundary. Source edits await coordinator agreement; full P10 still needs P8–P9.
+- **P11 preparatory evidence policy:** its owner corrected ignored dependency links;
+  the meaningful behavior control fails 23/24 cases against the permissive stub and
+  all 24 cases pass on the policy. Normal two-file compiler and scoped checks pass;
+  the owner is preparing its exact two-path commit.
+  The earlier zero-test loader failure is setup
+  evidence, not a behavior test. No commit, review, wiring or parent completion is claimed.
+- **Left:** P6, P8–P9 and P12–P14 (6 steps not started), the remaining active-step
   implementation, all 19 acceptance criteria and both final audits.
-- **Next gate:** resolve P3's observed-binding/queued-UPDATE failure, inspect/review the
-  repair with its existing reviewer, then validate/review the combined P2/P3 wave and
-  merge locally. Safe independent slices may continue after the user resumes work.
-- **Team:** unlimited plan-level Sol high workers, safe across phases or phase parts;
+- **Next gate:** inspect/review the P3 repair, then validate/review the combined P2/P3
+  wave and merge locally. Independent reviewed preparatory slices continue in parallel.
+- **Team:** Sol high implementation owners across safe independent phase slices;
   one xhigh reviewer per piece reused for repairs, then two fresh final reviewers.
   One owner retains shared contracts, migrations, wiring and dependencies.
-- **Agent configuration:** the user requested a limit of 10. The coordinator sets
-  `agents.max_threads = 10` in `/home/user/.config/codex/config.toml`, preserving other
-  settings and a private backup. The documented setting excludes the coordinator.
-  The old running session still exposes four total slots; after restart, verify the
-  harness's actual slots before dispatch. No T3 server or Codex session was restarted.
 - **Outstanding permissions/evidence:** integrated browser/device permission when ready;
   explicit disposable GitHub fixture-write permission for the real issue-to-PR proof.
   No local models, OpenAI runtime/proof services, push or PR creation. The exhausted
   eight-call P1 proof budget must not be reused. Development repair limits remain waived.
 
-Primary branch: `t3code/implement-pi-project-teams`; pre-checkpoint main commit
-`4933715d53e1906a27adc08b8b752bdffa2bcea7`. Wave2 is
-`26934dd5eea672be47ee7f537d210d30723f4464`, reconciled with that main commit;
-354 source files remain byte-identical. No P3, P5, P7 or P11 source has landed on main.
-Checkpoint details and exact restart instructions are below and in
-`/home/user/.cache/pi-project-teams-11b7e351/pause-20260930/RESUME.md`.
+### Live agent slots
+
+This table tracks the ten subagent seats, not a limit on cumulative assignments.
+The coordinator updates it at dispatch, waiting, review, commit and integration
+transitions. Finished agents release their seat; a repair returns to its existing
+reviewer. Branches below have isolated worktrees under
+`/home/user/.cache/pi-project-teams-11b7e351/`.
+
+| Slot | Agent                          | State                         | Assignment / branch                                         | Next gate                                                                  |
+| ---- | ------------------------------ | ----------------------------- | ----------------------------------------------------------- | -------------------------------------------------------------------------- |
+| 1    | `p3_authorization_resume_high` | Implementing                  | P3 producer-atomic withdrawal; `pi-teams/p3-authorization`  | Focused SQL cancellation/rollback/restart proof, then existing P3 reviewer |
+| 2    | `review_p7_skills_slice`       | Reviewing read-only           | P7 cleanup candidate `24fae0c5`; `pi-teams/p7-skills-slice` | Same reviewer rechecks R2 and original interruption/ownership controls     |
+| 3    | `p5_intake_transport_high`     | Committing verified leaf      | P11 pure evidence policy; `pi-teams/p11-evidence-leaf`      | Coordinator inspection, then one fresh review                              |
+| 4    | `p7_worker_protocol_high`      | Implementing agreed interface | P7 private protocol; `pi-teams/p7-worker-protocol`          | Bounded wire/state tests, scoped commit and review                         |
+| 5    | `p10_backend_adapter_high`     | Preparing interface           | P10 selected memory adapter; `pi-teams/p10-backend-adapter` | Coordinator agrees concrete backend boundary before source edits           |
+| 6    | `p4_policy_leaf_high`          | Preparing interface           | P4 pure lifecycle policy; `pi-teams/p4-policy-leaf`         | Coordinator agrees reviewed-schema boundary before source edits            |
+| 7    | —                              | Available                     | Independent work or review                                  | Assign when prerequisites and writable scope are settled                   |
+| 8    | —                              | Available                     | Independent work or review                                  | Assign when prerequisites and writable scope are settled                   |
+| 9    | —                              | Available                     | Independent work or review                                  | Assign when prerequisites and writable scope are settled                   |
+| 10   | —                              | Available                     | Independent work or review                                  | Assign when prerequisites and writable scope are settled                   |
+
+Coordinator: updating this record, inspecting committed candidates, agreeing shared
+interfaces, reserving one normal compiler at a time and preparing wave2 integration.
+P3, P7 and P11 normal compilers have passed and drained; the reservation is free. No model or
+client runtime proof is running.
+
+Primary branch: `t3code/implement-pi-project-teams`; restart checkpoint commit
+`238126a8b8567cd93bac894e3ef1cf7a8f609f3a`. Wave2 remains
+`26934dd5eea672be47ee7f537d210d30723f4464`, reconciled with earlier main `4933715`;
+354 source files remain byte-identical. Reconcile newer documentation commits before
+its main merge. No P3, P5, P7 or P11 source has landed on main. New protocol and memory
+adapter worktrees start at the exact wave2 commit. Historical pause evidence remains
+below and in `/home/user/.cache/pi-project-teams-11b7e351/pause-20260930/RESUME.md`.
 
 ## Goal
 
@@ -308,8 +337,9 @@ Use all available slots for ready, independent scopes and dispatch more work as
 slots become available. Respect the harness's actual active-agent limit, including
 the lead and reviewers; unlimited staffing does not override that limit. Free an
 implementation slot before starting a reviewer when needed. The user authorizes
-raising the Codex harness configuration to 10 subagents; verify the actual running
-session limit after restart. Do not change the product's runtime concurrency policy. The stage assignments below
+raising the Codex harness configuration to 10 subagents; the resumed session
+confirms eleven active agents including the coordinator. Maintain the live slot table
+above as assignments change. Do not change the product's runtime concurrency policy. The stage assignments below
 identify dependency groups, not fixed seats; split each group into additional
 independent slices only after agreeing explicit scopes, interfaces, and checks.
 
