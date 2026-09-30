@@ -2,8 +2,6 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeReadline from "node:readline";
 const [auditPath] = process.argv.slice(2);
 await NodeFSP.writeFile(auditPath + ".pid", String(process.pid));
-const deadline = setTimeout(() => process.exit(124), 15000);
-deadline.unref();
 for await (const line of NodeReadline.createInterface({ input: process.stdin })) {
   const request = JSON.parse(line);
   if (request.id === undefined) continue;

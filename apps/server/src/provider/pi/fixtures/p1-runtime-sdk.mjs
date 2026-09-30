@@ -6,11 +6,12 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
-const sdkPackage = process.env.PI_RUNTIME_CONTRACT_SDK_ROOT;
+const sdkRoot = process.env.PI_RUNTIME_CONTRACT_SDK_ROOT;
 NodeAssert.ok(
-  sdkPackage,
+  sdkRoot,
   "PI_RUNTIME_CONTRACT_SDK_ROOT must point to the pinned installed SDK package",
 );
+const sdkPackage = await NodeFSP.realpath(sdkRoot);
 const metadata = JSON.parse(
   await NodeFSP.readFile(NodePath.join(sdkPackage, "package.json"), "utf8"),
 );
@@ -44,8 +45,11 @@ await NodeFSP.writeFile(
   "throw Error('untrusted extension executed')",
 );
 const sessions = new Set();
-const children = new Set();
 const capturedPids = new Set();
+const activeReceipts = new Set();
+const cleanupReceipts = [];
+const negativeControl = process.env.PI_RUNTIME_CONTRACT_NEGATIVE_CONTROL;
+NodeAssert.ok(!negativeControl || ["descendant-abort", "mcp-shutdown"].includes(negativeControl));
 const records = [];
 const usage = {
   input: 0,
@@ -160,6 +164,13 @@ const toolCall = (name, argumentsValue = {}) => ({
   ],
 });
 async function run(name, action) {
+  if (
+    negativeControl &&
+    !(negativeControl === "descendant-abort"
+      ? name.includes("abort terminates")
+      : name.includes("trusted MCP"))
+  )
+    return;
   const start = requestCount;
   const events = [];
   const details = await action(events);
@@ -177,49 +188,100 @@ async function armExitReceipt(pids) {
     "/usr/bin/python3",
     [
       "-c",
-      "import os,select,sys,json\nfds=[os.pidfd_open(p) for p in json.loads(sys.argv[1])]\np=select.poll()\nfor f in fds:p.register(f,select.POLLIN)\nprint('ready',flush=True)\nremaining=set(fds)\nwhile remaining:\n for f,event in p.poll(10000):\n  remaining.discard(f);p.unregister(f)\nprint('exited',flush=True)",
+      String.raw`
+import os,select,sys,json,signal
+pids=json.loads(sys.argv[1])
+fds={os.pidfd_open(pid):pid for pid in pids}
+poller=select.poll()
+for fd in fds: poller.register(fd,select.POLLIN)
+poller.register(0,select.POLLIN|select.POLLHUP)
+print('ready',flush=True)
+remaining=set(fds)
+cleanup=False
+while remaining:
+ for fd,event in poller.poll():
+  if fd==0:
+   os.read(0,4096)
+   cleanup=True
+   poller.unregister(0)
+   for target in remaining:
+    try: signal.pidfd_send_signal(target,signal.SIGKILL)
+    except ProcessLookupError: pass
+  else:
+   remaining.discard(fd)
+   poller.unregister(fd)
+   print(json.dumps({'exited':fds[fd]}),flush=True)
+print(json.dumps({'complete':True,'cleanup':cleanup,'pids':pids}),flush=True)
+for fd in fds: os.close(fd)
+`,
       JSON.stringify(pids),
     ],
-    { stdio: ["ignore", "pipe", "pipe"] },
+    { stdio: ["pipe", "pipe", "pipe"] },
   );
-  children.add(observer);
+  observer.stdin.on("error", () => {});
   let opened;
   let failed;
-  const pidfdsReady = new Promise((resolve, reject) => {
+  const ready = new Promise((resolve, reject) => {
     opened = resolve;
     failed = reject;
   });
   let diagnostic = "";
+  let output = "";
+  let buffered = "";
+  let complete;
   observer.stderr.on("data", (chunk) => {
     diagnostic += chunk;
   });
+  observer.on("error", failed);
   observer.on("exit", (code) => {
     if (code !== 0) failed(new Error(diagnostic));
   });
-  let output = "";
   observer.stdout.on("data", (chunk) => {
     output += chunk;
-    if (output.includes("ready\n")) opened();
+    buffered += chunk;
+    let newline;
+    while ((newline = buffered.indexOf("\n")) >= 0) {
+      const line = buffered.slice(0, newline);
+      buffered = buffered.slice(newline + 1);
+      if (line === "ready") {
+        opened();
+        continue;
+      }
+      const receipt = JSON.parse(line);
+      // Retire the numeric identity immediately upon kernel-confirmed exit.
+      if (receipt.exited !== undefined) capturedPids.delete(receipt.exited);
+      if (receipt.complete) {
+        complete = receipt;
+        activeReceipts.delete(owner);
+        cleanupReceipts.push(receipt);
+      }
+    }
   });
-  const exited = NodeEvents.once(observer, "exit");
-  await pidfdsReady;
+  const exited = NodeEvents.once(observer, "close");
+  const owner = {
+    cleanup: async () => {
+      if (!complete) observer.stdin.end("cleanup\n");
+      await exited;
+      NodeAssert.ok(complete, "pidfd cleanup did not produce a complete exit receipt");
+    },
+  };
+  activeReceipts.add(owner);
+  await ready;
   return async () => {
     NodeAssert.deepEqual(await exited, [0, null]);
-    NodeAssert.match(output, /exited/);
-    return output;
+    NodeAssert.ok(complete, "kernel exit receipt missing");
+    NodeAssert.equal(complete.cleanup, false, "WATCHDOG_CLEANUP cannot satisfy SDK termination");
+    return { output, receipt: complete };
   };
 }
-const deadline = setTimeout(() => {
-  for (const session of sessions) void session.abort();
-  for (const pid of capturedPids) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {}
-  }
-  for (const child of children) if (child.exitCode === null) child.kill("SIGKILL");
-  process.exit(124);
-}, 20000);
-try {
+let deadline;
+const watchdog = new Promise((resolve, reject) => {
+  deadline = setTimeout(
+    () => reject(new Error("WATCHDOG: SDK consumer did not terminate captured processes")),
+    negativeControl ? 1500 : 20000,
+  );
+});
+async function executeCases() {
   await run("AgentSession dispatch resolves assigned cwd and trusted resources", async (events) => {
     const session = await create({ tools: ["read"] });
     session.subscribe((event) => events.push(event.type));
@@ -384,9 +446,9 @@ try {
       const pid = Number(await NodeFSP.readFile(auditPath + ".pid", "utf8"));
       capturedPids.add(pid);
       const waitForExit = await armExitReceipt([pid]);
-      await session.extensionRunner.emit({ type: "session_shutdown", reason: "exit" });
+      if (negativeControl !== "mcp-shutdown")
+        await session.extensionRunner.emit({ type: "session_shutdown", reason: "exit" });
       const exitNotification = await waitForExit();
-      capturedPids.delete(pid);
       return { audit, results, pid, exitNotification };
     },
   );
@@ -424,28 +486,43 @@ try {
     NodeAssert.equal(capturedPids.size, 3);
     // Open pidfds before cancellation, then wait on kernel exit notifications.
     const waitForExit = await armExitReceipt([...capturedPids]);
-    await session.abort();
-    await prompt;
-    await session.waitForIdle();
+    if (negativeControl !== "descendant-abort") await session.abort();
+    if (!negativeControl) await prompt;
+    if (!negativeControl) await session.waitForIdle();
     const output = await waitForExit();
-    for (const pid of capturedPids) {
-      const status = await NodeFSP.readFile(`/proc/${pid}/stat`, "utf8").catch((error) => {
-        if (error.code === "ENOENT") return "";
-        throw error;
-      });
-      if (status)
-        NodeAssert.match(
-          status.slice(status.lastIndexOf(")") + 1),
-          /^\s+Z\s/,
-          `captured process ${pid} is still live`,
-        );
-    }
     NodeAssert.ok(session.isIdle);
     NodeAssert.equal(events.at(-1), "agent_settled");
-    const pids = [...capturedPids];
-    capturedPids.clear();
-    return { pids, exitNotification: output, liveProcessesAfterAbort: 0 };
+    return { pids: output.receipt.pids, exitNotification: output, liveProcessesAfterAbort: 0 };
   });
+}
+let failure;
+try {
+  await Promise.race([executeCases(), watchdog]);
+} catch (error) {
+  failure = error;
+} finally {
+  clearTimeout(deadline);
+  // Cleanup uses only pidfds bound before cancellation, including on watchdog failure.
+  await Promise.all([...activeReceipts].map((owner) => owner.cleanup()));
+  for (const session of sessions) {
+    await session.abort();
+    await session.extensionRunner?.emit({ type: "session_shutdown", reason: "exit" });
+    session.dispose();
+  }
+  await NodeFSP.rm(scratch, { recursive: true, force: true });
+}
+if (failure) {
+  console.error(
+    JSON.stringify({
+      status: "failed",
+      cause: failure.message,
+      negativeControl,
+      cleanupReceipts,
+      remoteCalls: 0,
+    }),
+  );
+  process.exitCode = 1;
+} else {
   console.log(
     JSON.stringify({
       pin: metadata.version,
@@ -453,20 +530,7 @@ try {
       callbackCount: requestCount,
       resources: { nodeMaxRssKiB: process.resourceUsage().maxRSS, nodeHeapLimitMiB: 128 },
       records,
+      cleanupReceipts,
     }),
   );
-} finally {
-  clearTimeout(deadline);
-  for (const session of sessions) {
-    await session.abort();
-    await session.extensionRunner?.emit({ type: "session_shutdown", reason: "exit" });
-    session.dispose();
-  }
-  for (const child of children) if (child.exitCode === null) child.kill("SIGKILL");
-  for (const pid of capturedPids) {
-    try {
-      process.kill(pid, "SIGKILL");
-    } catch {}
-  }
-  await NodeFSP.rm(scratch, { recursive: true, force: true });
 }
