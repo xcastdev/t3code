@@ -339,13 +339,7 @@ export function makePiSkillAdapter(input: {
             );
           if (
             !NodePath.isAbsolute(materialized.root) ||
-            NodePath.resolve(materialized.root) !== materialized.root ||
-            materialized.skillPaths.size !== prepared.skills.length ||
-            prepared.skills.some(
-              (skill) =>
-                materialized.skillPaths.get(skill.key) !==
-                NodePath.join(materialized.root, skill.key),
-            )
+            NodePath.resolve(materialized.root) !== materialized.root
           ) {
             return yield* adapterError(
               "invalid_materialization",
@@ -420,6 +414,20 @@ export function makePiSkillAdapter(input: {
               }
             }),
           );
+          // Pin custom owned output before rejecting its map so failed preparation cleans it.
+          if (
+            materialized.skillPaths.size !== prepared.skills.length ||
+            prepared.skills.some(
+              (skill) =>
+                materialized.skillPaths.get(skill.key) !==
+                NodePath.join(materialized.root, skill.key),
+            )
+          ) {
+            return yield* adapterError(
+              "invalid_materialization",
+              "Pi skill delivery returned paths outside the exact managed selection.",
+            );
+          }
           // Copying can outlast a lease or role revocation; do not return a stale plan.
           yield* authorize(prepared);
           const payload: PiManagedSkillsPayload = {

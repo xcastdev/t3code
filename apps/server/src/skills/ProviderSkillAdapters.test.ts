@@ -320,6 +320,98 @@ const piFixture = Effect.fn("ProviderSkillAdapters.test.piFixture")(function* ()
 
 describe("Pi managed skill delivery", () => {
   it.layer(PiTestLayer)("enforces managed authorization", (it) => {
+    for (const ownership of [
+      "owned",
+      "foreign-marker",
+      "prior-generation",
+      "other-prepare",
+    ] as const) {
+      it.effect(
+        `invalid custom path map ${ownership === "owned" ? "cleans its acquired generation" : `preserves ${ownership} output`}`,
+        () =>
+          Effect.gen(function* () {
+            const fixture = yield* piFixture();
+            const earlier = yield* fixture.materialization.materialize({
+              sessionId: fixture.request.runtime.sessionId,
+              providerInstanceId: piInstanceId,
+              desiredRevision: 1,
+              packages: [{ key: piKey, sourcePath: fixture.source }],
+            });
+            const other = yield* fixture.materialization.materialize({
+              sessionId: fixture.request.runtime.sessionId + "-other",
+              providerInstanceId: piInstanceId,
+              desiredRevision: 2,
+              packages: [{ key: piKey, sourcePath: fixture.source }],
+            });
+            const root =
+              ownership === "prior-generation"
+                ? earlier.root
+                : ownership === "other-prepare"
+                  ? other.root
+                  : fixture.path.join(
+                      fixture.config.skillRuntimeDir,
+                      fixture.request.runtime.sessionId,
+                      "2",
+                      "pi-team",
+                    );
+            let disposals = 0;
+            const materialization: SkillMaterializationServiceShape = {
+              ...fixture.materialization,
+              materialize: (input) =>
+                Effect.gen(function* () {
+                  if (ownership === "owned" || ownership === "foreign-marker") {
+                    yield* fixture.fs.makeDirectory(root, { recursive: true });
+                    yield* fixture.fs.copy(fixture.source, fixture.path.join(root, piKey));
+                    const marker = yield* encodeFixtureJson({
+                      schemaVersion: 1,
+                      sessionId: input.sessionId,
+                      providerInstanceId:
+                        ownership === "foreign-marker" ? "other-pi" : input.providerInstanceId,
+                      desiredRevision: input.desiredRevision,
+                    });
+                    yield* fixture.fs.writeFileString(
+                      fixture.path.join(root, ".t3-owned.json"),
+                      marker,
+                    );
+                  }
+                  return { root, skillPaths: new Map<ManagedSkillKey, string>() };
+                }).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new Materialization.SkillMaterializationError({
+                        code: "materialization_failed",
+                        detail: "Custom output fixture failed.",
+                        cause,
+                      }),
+                  ),
+                ),
+              dispose: (input) =>
+                Effect.sync(() => {
+                  disposals++;
+                }).pipe(Effect.andThen(fixture.materialization.dispose(input))),
+            };
+            const adapter = makePiSkillAdapter({
+              providerInstanceId: piInstanceId,
+              materialization,
+              discoverCandidates: () => Effect.succeed([]),
+              authorizeManagedRequest: () => Effect.succeed(new Set([piKey])),
+            });
+            const result = yield* adapter.prepareSession(fixture.request).pipe(Effect.result);
+            assert.equal(result._tag, "Failure");
+            if (result._tag === "Failure")
+              assert.equal(result.failure.code, "invalid_materialization");
+            assert.equal(yield* fixture.fs.exists(root), ownership !== "owned");
+            assert.equal(disposals, ownership === "owned" ? 1 : 0);
+            assert.isTrue(yield* fixture.fs.exists(earlier.root));
+            assert.isTrue(yield* fixture.fs.exists(other.root));
+            assert.include(
+              yield* fixture.fs.readFileString(fixture.path.join(fixture.source, "SKILL.md")),
+              "Review the assigned change.",
+            );
+          }),
+      );
+    }
+
     for (const foreign of [false, true]) {
       it.effect(
         `fallback cleanup for an unregistered materializer ${foreign ? "retains a foreign replacement" : "removes its acquired owned generation"}`,
