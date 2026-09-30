@@ -1,4 +1,4 @@
-import history from "./projectHistory.json";
+import history from "./projectHistory.json" with { type: "json" };
 
 export { history };
 export type FixtureObservation = (typeof history.observations)[number];
