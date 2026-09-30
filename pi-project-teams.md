@@ -1647,10 +1647,14 @@ Regenerated offline runtime/isolation/packaging evidence contains 257 verified
 artifacts, manifest SHA-256
 `97c23ec7fc10955cdc9c743c0be528f96f8060fbccabdf0a7484677c946b137d`.
 It includes actual pinned-SDK portable/Linux consumers, privilege controls,
-setup/descendant cleanup, and npm/Electron-ASAR/ESM-SEA probes. A fresh xhigh
-review is assigned to this frozen offline scope; it excludes lost historical
-live evidence and the new live proof. Full T3 packaging and supported-client
-verification remain later gates.
+setup/descendant cleanup, and npm/Electron-ASAR/ESM-SEA probes. Fresh xhigh
+review independently **APPROVES** this frozen offline scope.
+The reviewer verifies all 257 artifacts, 2,222 bundled inputs and eight copied
+consumer/control replays; all owned cgroups drain with zero OOM. Its 563-file
+manifest SHA-256 is
+`043f319347561f245c14c1ccfb6a637aaa58af35234fe2e0ceaeb21e45a7f43f`.
+This excludes lost historical live evidence and the new live proof. Full T3
+packaging and supported-client verification remain later gates.
 
 The new live preparation passes 22 guard and 25 owned broker controls, including
 actual compiled SDK synthetic fresh-session/compaction/reopen/resume consumers.
@@ -1674,3 +1678,76 @@ All paths above are below `/home/user/.cache/pi-project-teams-11b7e351/`.
 P2–P14 and all 19 product acceptance criteria remain incomplete. Development
 repair-count limits remain waived. No push, PR, browser/device use, live T3
 state write, local model loading/hosting/inference or weight download occurred.
+
+### P2 second repair candidate and live frame diagnosis
+
+P2 second repair candidate is `163bc0650595b0672e623dd8c444d1d846459448`,
+clean on `pi-teams/p2-foundation-repair2`, with 32 authorized paths. The
+coordinator verifies all 125 artifacts, 45 tested source hashes, and the exact
+full candidate diff, SHA-256
+`7b82cc81735c142f36cfd8801d886749ccb09b5452b3df062bacf4bbd0ecb3d2`.
+Canonical issue/cursor identity and account remain immutable; cursor deletion
+transfer preserves survivor event authority, restart/rebuild progress and normal
+next revisions. A discriminating rollback/retry/duplicate test also finds and
+fixes retained publication state when executing the same deletion Effect again.
+The final affected gate passes 45 tests. Normal server-entry compilation passes
+in a 4 GiB zero-swap scope with `GOMEMLIMIT=3GiB`, peak 3,830,841,344 bytes and
+zero OOM. Format and whitespace pass; scoped lint retains exactly five verified
+baseline errors. Earlier native-Go compiler OOM receipts remain retained.
+Fresh xhigh review in `review-p2-foundation-repair2-fresh/` returns
+**REQUEST_CHANGES** for one new receipt collision, P2-R7; R1–R6 pass within P2.
+Its 21-file manifest SHA-256 is
+`3432b4079b5fc198ca2a928dca8f617aef78b4257e235fa5bd32950ea2ddf03a`.
+An internal cursor-transfer event has no bound command receipt: a public caller
+reusing its ID receives accepted status without a created task. A caller claiming
+the future transfer ID first also causes two operations to share one receipt.
+The coordinator independently reproduces both through migrated SQLite and the
+public Gateway; the latter peaks at 145,035,264 bytes under a 1 GiB zero-swap
+scope with zero OOM. Exact commands and results are in
+`root-p2-review-verification/`. A medium owner repairs only the assigned
+foundation scope in `pi-teams/p2-foundation-repair3`, based on exact `163bc065`,
+with transactional transfer-ID collision checks and bound receipts. Focused causal
+checks and another fresh independent review precede integration. No P2
+implementation has merged into wave 2 or main. P3 remains gated.
+
+Three additional isolated real pi requests reach HTTP 200 but fail native
+frame checks. Attempt 2 shows plain `inclusionai/ling-3.1-flash` in content
+frames; attempt 3 shows that name followed by requested free-model identity.
+Attempt 4 disproves the prepared empty-choice terminal hypothesis: after 93
+matching plain-model frames, a free-model usage-bearing frame has one choice.
+No successful completion/compaction/resume pass is claimed. Four failed requests
+retain full charges of 80,000 input and 2,048 output tokens; all owned 512 MiB
+zero-swap cgroups drain with zero OOM. The exact outgoing route remains
+`inclusionai/ling-3.1-flash:free` on CommandCode. Primary catalog/page snapshots
+in `root-commandcode-route-metadata/` confirm that route and context size;
+published free pricing, SDK estimates and unreported per-request billing remain
+distinct. Separate copied diagnostic sources and preparation/failure manifests
+preserve every earlier artifact and reservation. A fifth isolated request
+recognizes the one-choice stop frame but rejects a subsequent usage-only frame.
+The first reports zero token usage; the later frame has empty choices and its
+usage values remain unaccepted. Five failed requests now retain 100,000 input
+and 2,560 output reservations. The 13-file attempt-5 manifest SHA-256 is
+`f5c77064dd7342e042844d1a5fc92e990244d42d31f3e06ec145cc2bf40f7741`.
+A copied first-completion-only guard is being prepared to distinguish the
+preliminary zero-usage stop envelope from final native usage. No further call
+is authorized yet and no completion pass is claimed.
+
+All evidence paths above are below
+`/home/user/.cache/pi-project-teams-11b7e351/`. Development repair limits remain
+waived. No local models, weight downloads, browser/device use, live T3 writes,
+push or PR occurred. P2–P14 and all 19 product acceptance criteria remain open.
+
+P2-R7 repair is committed at `6d19799a6861090f67960e31da3adc2ae8c461d8`,
+clean in `pi-teams/p2-foundation-repair3`. It changes only lifecycle, lifecycle
+tests and Gateway tests. The coordinator verifies all 44 retained artifacts,
+45 tested source hashes and byte-exact full/repair diffs. The full 32-path
+candidate SHA-256 is
+`afe2bff7b00ac8a99285569a4676f48bc4c3df1e68d79c20711bd85bf085a732`;
+manifest SHA-256 is
+`0acc8e5c95ccae26655c0763e32e686b8a6d4bc67f4ab246b47ab52e821ef80a`.
+Focused 39, V2 contracts 64, V2 storage 27 and affected-server 189 tests pass.
+Contracts and normal server-entry compilation pass; server peak is 3,818,319,872
+bytes under 4 GiB zero swap with `GOMEMLIMIT=3GiB` and zero OOM. Formatting and
+whitespace pass; exactly five verified baseline lint errors remain. A fresh
+xhigh reviewer checks the exact candidate in
+`review-p2-foundation-repair3-fresh/`. No implementation merge has occurred.
