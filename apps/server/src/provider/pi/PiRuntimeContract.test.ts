@@ -4,7 +4,7 @@ import * as NodeChildProcess from "node:child_process";
 import * as NodePath from "node:path";
 import * as NodeStringDecoder from "node:string_decoder";
 import * as NodeURL from "node:url";
-import { expect, it } from "vitest";
+import { expect, it } from "vite-plus/test";
 
 function sdkRoot() {
   if (process.env.PI_RUNTIME_CONTRACT_SDK_ROOT) return process.env.PI_RUNTIME_CONTRACT_SDK_ROOT;
