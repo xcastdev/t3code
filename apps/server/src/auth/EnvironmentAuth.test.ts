@@ -771,82 +771,207 @@ it.effect(
 
 import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
 import { HttpServer } from "effect/unstable/http";
-import { EnvironmentId, ProviderInstanceId, ThreadId } from "@t3tools/contracts";
+import {
+  EnvironmentId,
+  ProviderInstanceId,
+  ThreadId,
+  CommandId,
+  ProjectWorkTaskId,
+  ProjectWorkAttemptId,
+  ProjectWorkCriterionId,
+} from "@t3tools/contracts";
+import { at } from "../projectWork/ProjectTeamAuthorization.testFixtures.ts";
 
-it.effect("permanently withdraws old environment bearers on MCP-only managed issuance", () =>
-  Effect.gen(function* () {
-    yield* runMigrations();
-    const auth = yield* EnvironmentAuth.EnvironmentAuth;
-    const config = yield* ServerConfig.ServerConfig;
-    const legacy = yield* auth.issueSession({
-      identity: { kind: "agent", id: "agent:mcp:pi:authorization-thread" },
-    });
-    const ordinary = yield* auth.issueSession({
-      identity: { kind: "agent", id: "agent:ordinary" },
-    });
-    const held = yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token));
-    const f = yield* seedTeam("implementer");
-    const registry = yield* McpSessionRegistry.__testing.make({ now: () => 1000 }).pipe(
-      Effect.provideService(
-        HttpServer.HttpServer,
-        HttpServer.HttpServer.of({
-          address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: 43123 },
-          serve: () => Effect.void,
-        }),
-      ),
-      Effect.provideService(
-        ServerEnvironment.ServerEnvironment,
-        ServerEnvironment.ServerEnvironment.of({
-          getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
-          getDescriptor: Effect.die("unused"),
-        }),
-      ),
-    );
-    const managedMcp = yield* registry.issue({
-      threadId: ThreadId.make("authorization-thread"),
-      providerInstanceId: ProviderInstanceId.make("pi"),
-    });
-    expect(
-      yield* registry.resolve(managedMcp.config.authorizationHeader.replace("Bearer ", "")),
-    ).toBeDefined();
-    expect(
-      (yield* authorizeRpcSession(WS_METHODS.terminalOpen, held, auth).pipe(Effect.result))._tag,
-    ).toBe("Failure");
-    yield* f.sql`DELETE FROM project_team_run_binding WHERE project_id=${f.principal.managed.projectId}`;
-    yield* f.sql`DELETE FROM project_work_events WHERE project_id=${f.principal.managed.projectId}`;
-    yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${f.principal.managed.projectId}`;
-    const restarted = yield* EnvironmentAuth.EnvironmentAuth.pipe(
-      Effect.provide(
-        EnvironmentAuth.layer.pipe(
-          Layer.provide(Layer.fresh(TeamAuthorization.layer)),
-          Layer.provide(ServerSecretStore.layer),
-          Layer.provide(ServerEnvironment.identityLayer),
-          Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
-          Layer.provide(NodeServices.layer),
+for (const issuance of [
+  "successful",
+  "retired-role",
+  "settled-binding",
+  "ambiguous-bindings",
+] as const)
+  it.effect(`permanently withdraws old environment bearers on MCP-only ${issuance} issuance`, () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const config = yield* ServerConfig.ServerConfig;
+      const legacy = yield* auth.issueSession({
+        identity: { kind: "agent", id: "agent:mcp:pi:authorization-thread" },
+      });
+      const ordinary = yield* auth.issueSession({
+        identity: { kind: "agent", id: "agent:ordinary" },
+      });
+      const held = yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token));
+      const f = yield* seedTeam("implementer", "running", { issueCredential: false });
+      const before =
+        yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+      expect(before[0]?.revokedAt).toBeNull();
+      if (issuance === "retired-role")
+        yield* f.change(decodeTeamRecord({ ...f.role, revision: 1, status: "retired" }));
+      else if (issuance === "settled-binding")
+        yield* f.change(decodeTeamRecord({ ...f.binding, revision: 1, status: "settled" }));
+      else if (issuance === "ambiguous-bindings") {
+        const otherTask = ProjectWorkTaskId.make("other-task");
+        const otherAttempt = ProjectWorkAttemptId.make("other-attempt");
+        const criterion = ProjectWorkCriterionId.make("other-criterion");
+        yield* f.repo.execute({
+          type: "project-work.task.create",
+          projectId: f.principal.managed.projectId,
+          taskId: otherTask,
+          commandId: CommandId.make("other-create"),
+          title: "Other task",
+          createdAt: at,
+        });
+        yield* f.repo.execute({
+          type: "project-work.criterion.upsert",
+          projectId: f.principal.managed.projectId,
+          taskId: otherTask,
+          commandId: CommandId.make("other-criterion"),
+          criterion: {
+            criterionId: criterion,
+            taskId: otherTask,
+            description: "Other scope",
+            required: false,
+            status: "unsatisfied",
+            satisfiedByEvidenceIds: [],
+            revision: 0,
+            updatedAt: at,
+          },
+          updatedAt: at,
+        });
+        yield* f.repo.execute({
+          type: "project-work.task.specify",
+          projectId: f.principal.managed.projectId,
+          taskId: otherTask,
+          commandId: CommandId.make("other-spec"),
+          specification: {
+            objective: "Other scope",
+            scopeIn: "Other",
+            scopeOut: "Assigned task",
+            criterionIds: [criterion],
+            revision: 1,
+            protected: false,
+          },
+          updatedAt: at,
+        });
+        yield* f.repo.execute({
+          type: "project-work.task.ready",
+          projectId: f.principal.managed.projectId,
+          taskId: otherTask,
+          commandId: CommandId.make("other-ready"),
+          updatedAt: at,
+        });
+        yield* f.repo.execute({
+          type: "project-work.task.claim",
+          projectId: f.principal.managed.projectId,
+          taskId: otherTask,
+          commandId: CommandId.make("other-claim"),
+          attemptId: otherAttempt,
+          leaseToken: "other-lease",
+          leasedUntil: "2030-01-01T00:00:00.000Z",
+          claimedAt: at,
+        });
+        yield* f.change(
+          decodeTeamRecord({
+            ...f.binding,
+            recordId: "other-binding",
+            taskId: otherTask,
+            attemptId: otherAttempt,
+          }),
+        );
+      }
+      const registry = yield* McpSessionRegistry.__testing.make({ now: () => 1000 }).pipe(
+        Effect.provideService(
+          HttpServer.HttpServer,
+          HttpServer.HttpServer.of({
+            address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: 43123 },
+            serve: () => Effect.void,
+          }),
         ),
-      ),
-    );
-    let effects = 0;
-    const result = yield* guardRpcEffect(
-      authorizeRpcSession(WS_METHODS.terminalOpen, held, restarted),
-      Effect.sync(() => effects++),
-    ).pipe(Effect.result);
-    expect(result._tag).toBe("Failure");
-    expect(effects).toBe(0);
-    expect(
-      (yield* restarted
-        .authenticateHttpRequest(makeBearerRequest(legacy.token))
-        .pipe(Effect.result))._tag,
-    ).toBe("Failure");
-    expect(
-      (yield* restarted.authenticateHttpRequest(makeBearerRequest(ordinary.token))).identity.id,
-    ).toBe("agent:ordinary");
-    const revoked =
-      yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
-    expect(revoked[0]?.revokedAt).not.toBeNull();
-    yield* registry.revokeAll;
-  }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
-);
+        Effect.provideService(
+          ServerEnvironment.ServerEnvironment,
+          ServerEnvironment.ServerEnvironment.of({
+            getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+            getDescriptor: Effect.die("unused"),
+          }),
+        ),
+      );
+      for (const identity of [
+        {
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          threadId: ThreadId.make("authorization-thread"),
+        },
+        {
+          providerInstanceId: ProviderInstanceId.make("pi"),
+          threadId: ThreadId.make("ordinary-thread"),
+        },
+      ]) {
+        const bearer = yield* auth.issueSession({
+          identity: { kind: "agent", id: TeamAuthorization.managedActorId(identity) },
+        });
+        expect(
+          (yield* registry.issue({ ...identity, managed: f.principal.managed }).pipe(Effect.exit))
+            ._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* auth.authenticateHttpRequest(makeBearerRequest(bearer.token))).identity.id,
+        ).toBe(TeamAuthorization.managedActorId(identity));
+      }
+      const managedMcp = yield* registry
+        .issue({
+          threadId: ThreadId.make("authorization-thread"),
+          providerInstanceId: ProviderInstanceId.make("pi"),
+        })
+        .pipe(Effect.exit);
+      expect(managedMcp._tag).toBe(issuance === "successful" ? "Success" : "Failure");
+      const withdrawn =
+        yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+      expect(withdrawn[0]?.revokedAt).not.toBeNull();
+      if (managedMcp._tag === "Success")
+        expect(
+          yield* registry.resolve(
+            managedMcp.value.config.authorizationHeader.replace("Bearer ", ""),
+          ),
+        ).toBeDefined();
+      expect(
+        (yield* authorizeRpcSession(WS_METHODS.terminalOpen, held, auth).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      yield* f.sql`DELETE FROM project_team_run_binding WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_events WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${f.principal.managed.projectId}`;
+      expect(
+        (yield* authorizeRpcSession(WS_METHODS.terminalOpen, held, auth).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      const restarted = yield* EnvironmentAuth.EnvironmentAuth.pipe(
+        Effect.provide(
+          EnvironmentAuth.layer.pipe(
+            Layer.provide(Layer.fresh(TeamAuthorization.layer)),
+            Layer.provide(ServerSecretStore.layer),
+            Layer.provide(ServerEnvironment.identityLayer),
+            Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      );
+      let effects = 0;
+      const result = yield* guardRpcEffect(
+        authorizeRpcSession(WS_METHODS.terminalOpen, held, restarted),
+        Effect.sync(() => effects++),
+      ).pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      expect(effects).toBe(0);
+      expect(
+        (yield* restarted
+          .authenticateHttpRequest(makeBearerRequest(legacy.token))
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* restarted.authenticateHttpRequest(makeBearerRequest(ordinary.token))).identity.id,
+      ).toBe("agent:ordinary");
+      const revoked =
+        yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+      expect(revoked[0]?.revokedAt).not.toBeNull();
+      yield* registry.revokeAll;
+    }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+  );
 
 it.effect("preserves a valid managed environment bearer through repeated trusted issuance", () =>
   Effect.gen(function* () {

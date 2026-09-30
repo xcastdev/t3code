@@ -662,20 +662,21 @@ export const layer = Layer.effect(
       hasManagedThread,
       issueCredential: (identity) =>
         guard(
-          sql.withTransaction(
-            Effect.gen(function* () {
-              const credential = yield* discover(identity);
-              if (credential === undefined) return undefined;
-              const authority = yield* resolve(
-                { actor: { kind: "agent", id: managedActorId(credential) }, managed: credential },
-                true,
-              );
-              // Trusted issuance withdraws old environment bearers even when only MCP is issued.
-              const revokedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
-              yield* sql`UPDATE auth_sessions SET revoked_at=${revokedAt} WHERE subject=${managedActorId(credential)} AND revoked_at IS NULL`;
-              return authority;
-            }),
-          ),
+          Effect.gen(function* () {
+            // Known managed identities lose old bearers even when replacement issuance is refused.
+            const revokedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+            yield* sql`UPDATE auth_sessions SET revoked_at=${revokedAt}
+              WHERE subject=${managedActorId(identity)} AND revoked_at IS NULL
+              AND EXISTS (SELECT record_id FROM project_team_run_binding
+                WHERE provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId})`;
+            const credential = yield* discover(identity);
+            return credential === undefined
+              ? undefined
+              : yield* resolve(
+                  { actor: { kind: "agent", id: managedActorId(credential) }, managed: credential },
+                  true,
+                );
+          }),
         ),
       resolve: (p) => guard(resolve(p)),
       capability: (p, c, id) => guard(capability(p, c, id)),

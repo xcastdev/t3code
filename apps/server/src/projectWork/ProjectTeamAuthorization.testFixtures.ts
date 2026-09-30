@@ -45,6 +45,7 @@ export const seed = Effect.fn("authorizationTest.seed")(function* (
     readonly toolIds?: ReadonlyArray<string>;
     readonly nativeSessionId?: string | null;
     readonly delegationDepth?: number;
+    readonly issueCredential?: boolean;
   } = {},
 ) {
   yield* runMigrations();
@@ -191,9 +192,21 @@ export const seed = Effect.fn("authorizationTest.seed")(function* (
     }),
   );
   const auth = yield* Authorization.ProjectTeamAuthorization;
-  const issued = yield* auth.issueCredential({ providerInstanceId, threadId });
-  expect(issued).toBeDefined();
-  const managed = issued!.credential;
+  const issued =
+    options.issueCredential === false
+      ? undefined
+      : yield* auth.issueCredential({ providerInstanceId, threadId });
+  if (options.issueCredential !== false) expect(issued).toBeDefined();
+  const managed =
+    options.issueCredential === false
+      ? {
+          projectId,
+          bindingId: binding.recordId,
+          generation: binding.generation,
+          providerInstanceId,
+          threadId,
+        }
+      : issued!.credential;
   const principal = {
     actor: { kind: "agent" as const, id: Authorization.managedActorId(managed) },
     managed,
