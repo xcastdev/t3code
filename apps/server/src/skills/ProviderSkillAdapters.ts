@@ -347,8 +347,8 @@ export function makePiSkillAdapter(input: {
             );
           }
 
-          // Custom materializers may not register the private cleanup owner. Once
-          // their result arrives, retain only a real matching-marker inode for fallback disposal.
+          // Trusted custom materializers must return their acquired generation with its marker.
+          // Pin that returned inode; identity-based dispose may resolve a different completed root.
           yield* Effect.uninterruptible(
             Effect.gen(function* () {
               const pinned = yield* Effect.tryPromise({
@@ -389,14 +389,14 @@ export function makePiSkillAdapter(input: {
                       const current = await NodeFSP.lstat(owned.root, { bigint: true });
                       const markerPath = NodePath.join(owned.root, ".t3-owned.json");
                       const markerInfo = await NodeFSP.lstat(markerPath);
-                      return (
+                      const matches =
                         current.dev === owned.dev &&
                         current.ino === owned.ino &&
                         !current.isSymbolicLink() &&
                         markerInfo.isFile() &&
                         !markerInfo.isSymbolicLink() &&
-                        (await NodeFSP.readFile(markerPath, "utf8")) === owned.marker
-                      );
+                        (await NodeFSP.readFile(markerPath, "utf8")) === owned.marker;
+                      if (matches) await NodeFSP.rm(owned.root, { recursive: true });
                     },
                     catch: (cause) =>
                       adapterError(
@@ -404,12 +404,7 @@ export function makePiSkillAdapter(input: {
                         "Could not verify materialization ownership.",
                         cause,
                       ),
-                  }).pipe(
-                    Effect.flatMap((matches) =>
-                      matches ? input.materialization.dispose(materializationInput) : Effect.void,
-                    ),
-                    Effect.ignore,
-                  );
+                  }).pipe(Effect.ignore);
                 }
               }
             }),
