@@ -1189,6 +1189,22 @@ The first resumed proof reviews found actionable gaps. Current repair evidence:
   and cleanup clears its watchdog before awaiting potentially hanging SDK shutdown.
   The coordinator verified the control flow. A focused second repair must acquire
   process ownership before startup and prove bounded startup-failure cleanup.
+  Second repair `c5b511efe2579539a8132456b1a3ebf4fe2cf093` changes exactly four
+  assigned files. Seven actual SDK tests pass in 15.46 seconds, including six
+  original success cases and six failure controls. Each fixture's uniquely owned
+  service exists before SDK import; actual cgroup limits and control-group cleanup
+  are verified. MCP initialization stall, shell pre-receipt stall, and hanging
+  abort/shutdown fail with causal receipts; all seven service cgroups are removed.
+  Positive SDK cleanup leaves only the fixture PID before external service drain.
+  Per-service peaks are 79,069,184–96,120,832 bytes under a 512 MiB cap. Scoped
+  lint, format, whitespace, clean-tree checks, and all 15 manifest hashes pass.
+  Native MCP shutdown still leaves an opening child alive; the independently
+  owned service terminates it. Production must own the entire worker tree before
+  startup. A functional Linux systemd user manager is this proof harness's
+  prerequisite, not a new production dependency; CI manager availability is
+  unchecked. Fresh xhigh review approves this exact commit, verifies the causal
+  controls and source hashes, and finds no blocking runtime-slice finding.
+  Combined P1 validation and review are still required.
 - Memory commit `6cc8c7a80e5ffdaf2fd826fa962217099cf428c6` passed fresh review as
   a preparatory source-briefing consumer change, with 9/9 tests. The remote corpus
   completed all eight sources/searches: qualified source recall 1.0 versus FTS
@@ -1257,9 +1273,9 @@ The coordinator advanced `pi-teams/wave1` to the main record commit
 `7e7d7101e` without rewriting history, then merged only approved parts:
 dependency merge `62a9d6f2a` and memory merge `f3cb1bc98`. Their scopes do not overlap;
 main advances since their bases are record-only. Whitespace checks and clean
-worktree checks pass. The runtime part is still excluded pending startup-cleanup
-repair/review. Combined V1 and fresh wave review remain pending; the wave has not
-landed on this main worktree.
+worktree checks pass. The approved runtime part is merged at `8679c7fc7` after
+reconciling the main record advance `a0621857e` into the wave. Combined V1 and
+fresh wave review remain pending; the wave has not landed on this main worktree.
 
 The NVIDIA publisher's fixed model card revision
 `c0c9fea93ea424587517f2c59e20db9f1d6bf615` identifies OpenMDW 1.1. Only metadata
