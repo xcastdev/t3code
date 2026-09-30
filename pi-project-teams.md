@@ -1,5 +1,5 @@
 Github Tracked: false
-Status: in_progress
+Status: blocked
 Github Issue: none
 Plan review: READY_WITH_EXPLICIT_GATES
 
@@ -1021,7 +1021,7 @@ Their worktrees and disposable probe directories are below
 No production dependency, contract, or managed execution path has been changed.
 P1 and all 19 acceptance criteria remain unchecked while proofs run.
 
-### P1 evidence and current blockers
+### P1 earlier probes and superseded blockers
 
 The user subsequently selected CommandCode, prohibited further OpenAI model
 calls and all Ollama use, and prohibited memory-intensive work on this machine.
@@ -1390,3 +1390,46 @@ The final fresh combined review remains pending. P1 is unchecked and P2 has not
 started. Normal build/test memory limits may increase when measured need justifies
 it; the user's prohibition concerns all local model loading, hosting, and inference.
 No Ollama, llama, local model, model weight download, push, or PR is authorized.
+
+### Current P1 blocker and preserved state
+
+Fresh xhigh final wave review of
+`7af9ed41a9cda1fb4335d6449c9779466b9c554d` returns **REQUEST_CHANGES** for one
+verified high-priority CI finding. The reviewer ran this focused read-only check:
+
+```sh
+node --max-old-space-size=512 node_modules/knip/bin/knip.js --workspace apps/server --include files,dependencies --no-config-hints --reporter json
+```
+
+It exits 1 and identifies only the new `p1-runtime-descendants.mjs`,
+`p1-runtime-linux-proof.mjs`, and `p1-runtime-mcp.mjs` as unused. Their consumers
+launch by dynamic paths or explicit runner invocation; `knip.jsonc` registers the
+older `src/provider/testFixtures/*.mjs` entry but omits these files. CI runs this
+files/dependencies gate. The coordinator inspected the source and captured result
+and verified both evidence digests at
+`/home/user/.cache/pi-project-teams-11b7e351/final-review-7af9ed41/`.
+
+The reviewer reports no other verified finding. It independently verifies the
+combined source hashes, recorded 21/21 tests, normal strict compiler pass, unchanged
+Linux proof source hashes, all selected manifests including 74 memory and 108
+packaging artifacts, and both original native UUID/vector/payload recovery sets.
+These findings support P1 feasibility with its documented production obligations;
+the outstanding CI finding prevents approval, landing, or marking P1 complete.
+The reviewer did not replay tests, remote calls, or Linux proofs.
+
+The prepared repair adds one explanatory comment and three exact fixture entries
+to `knip.jsonc`. It is retained outside the worktree at
+`/home/user/.cache/pi-project-teams-11b7e351/wave1-validation/proposed-knip-entry-repair.patch`;
+`git apply --check` passes. It has not been applied. The shared delivery contract
+at `/home/user/.agents/skills/delivery-core/CONTRACT.md` limits automatic repairs
+to two and says, "Stop after the second repair attempt or the final permitted
+full-validation failure." Both combined-candidate rounds are consumed. The
+coordinator requested explicit authorization for this additional scoped repair,
+focused Knip check, and fresh review; dependent implementation remains gated.
+
+The wave stays clean at `7af9ed41a9cda1fb4335d6449c9779466b9c554d`; it has not
+merged into this main worktree. This main advance updates only this progress
+record and must be reconciled into the wave before a later authorized merge.
+P1–P14 and all 19 acceptance criteria remain unchecked. Normal build/test memory
+caps may increase as needed; local model loading, inference, hosting, and downloads
+remain prohibited. No push, PR, browser/device use, or live T3 database write occurred.
