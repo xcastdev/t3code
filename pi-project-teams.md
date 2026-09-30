@@ -7,7 +7,7 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-09-30 21:37 UTC. Implementation has resumed. The coordinator
+Last updated: 2026-09-30 21:56 UTC. Implementation has resumed. The coordinator
 maintains this section at assignments, check results, reviews, and integration
 gates; detailed evidence and historical checkpoints are below.
 
@@ -20,32 +20,36 @@ gates; detailed evidence and historical checkpoints are below.
 - **Done:** P1 dependency proofs and memory selection landed. Regenerated bounded
   pi runtime, Linux isolation/packaging, and remote memory evidence is reviewed.
 - **Active:** P2 is reviewed and merged into wave2, awaiting combined integration.
-  P3 repair candidate `838e46623e88b1be04cd25c87b77bc692e685f88` passes
-  269 affected tests, the normal server-entry compiler and scoped checks.
-  Coordinator inspection verifies its 156 evidence artifacts and 32 source hashes.
-  The same xhigh reviewer confirms the three original repair cases, but finds
-  another legacy-bearer revival case when trusted credential issuance fails.
-  The coordinator independently reproduces that finding; the same P3 owner is
-  repairing it and the same reviewer will recheck. P3 remains unapproved.
-  The earlier server-scoped Knip check passes on `c6a38aa`; it must
-  be repeated for changed source before integration.
+  P3 withdrawal-repair candidate `614329d713b952ac88d71c4b3297c31f17d9fb57`
+  passes 272 affected tests, the unchanged normal server-entry compiler and
+  scoped checks. Coordinator inspection verifies all 93 new evidence artifacts
+  and 32 source/archive hashes. Server-scoped Knip passes on this exact commit.
+  The same xhigh reviewer confirms the earlier cases but finds concurrent binding
+  creation between withdrawal and discovery. The coordinator reproduces that race;
+  the same owner is assigned another scoped repair. P3 remains unapproved.
   Five unchanged Lifecycle baseline lint errors
   remain failed evidence; no unrelated cleanup is claimed.
 - **Active preparatory slice:** P5 read-only GitHub transport is committed as
   `567978db2aea46f833523c61add9059f8bf64fab`, with 58 affected tests, normal
   focused compiler, lint, format and diff passing. Its coordinator-owned helper
   `05172c6` is independently approved. Coordinator inspection verifies the exact
-  source and all 46 evidence artifacts; its one fresh review is active.
-  There is no runtime, persistence,
-  authorization, or dispatch wiring. P5 remains incomplete; its full
+  source and all 46 evidence artifacts. Its one fresh review returns
+  REQUEST_CHANGES on documented numeric pagination, malformed quota-response
+  handling and a too-short secondary-limit pause. The coordinator reproduces
+  all three; the same owner is repairing and the same reviewer will recheck.
+  Conditional-read identity postchecks remain an observed limitation.
+  There is no runtime, persistence, authorization or dispatch wiring. P5 remains
+  incomplete; its full
   P2–P4 prerequisites and intake/integration gates remain open.
 - **Active preparatory slice:** P7 skill delivery is committed as
   `43d6c69db26a2a310bb8bc6989ab8845b99489cb`, with 45 affected tests, normal
   focused compiler, lint, format and diff passing. Six causal controls and a dry
   pinned-SDK skill loader check are preserved. Coordinator inspection verifies
-  all 81 evidence artifacts and 12 source/archive paths. Its one fresh review is
-  active; full P7 runtime, authorization wiring, isolation
-  and packaging remain open.
+  all 81 evidence artifacts and 12 source/archive paths. Its one fresh review
+  returns REQUEST_CHANGES. The coordinator reproduces interruption leaving copied
+  pending or published skill files. The same owner is repairing; its exclusive scope
+  now includes the shared materializer and tests, with interfaces unchanged.
+  Full P7 runtime, authorization wiring, isolation and packaging remain open.
 - **Left:** P4, P6 and P8–P14 (9 steps not started), the rest of P5/P7, all 19
   product acceptance criteria, and both final audits. After P2/P3 lands, full P7
   can run alongside P4; full P5 follows P4.
@@ -56,8 +60,8 @@ gates; detailed evidence and historical checkpoints are below.
 - **Team:** Sol high implementation staffing has no plan-level limit; dispatch
   ready independent scopes within available harness slots, including safe work
   across multiple phases or independent parts of phases simultaneously.
-  One xhigh reviewer per piece of work, reused for repairs; two fresh final reviewers. One owner retains
-  shared contracts, migrations, wiring, and dependencies.
+  One xhigh reviewer per piece of work, reused for repairs; two fresh final
+  reviewers. One owner retains shared contracts, migrations, wiring and dependencies.
 - **Permissions/evidence still needed:** browser/device permission when integrated
   clients are ready; explicit disposable GitHub fixture-write permission for the
   required real issue-to-PR proof. No local models, push, or PR is authorized. The
@@ -69,9 +73,9 @@ documentation commit `3f42e53`; 196 foundation source files remain byte-identica
 P3's worktree is
 `/home/user/.cache/pi-project-teams-11b7e351/p3-authorization`, branch
 `pi-teams/p3-authorization`, base `c3ed6d3d4c606f66b9c07000246f16682df035af`.
-Its committed repair candidate is `838e46623e88b1be04cd25c87b77bc692e685f88`;
+Its committed repair candidate is `614329d713b952ac88d71c4b3297c31f17d9fb57`;
 it remains isolated and has not merged. Fresh repair evidence is retained in
-`/home/user/.cache/pi-project-teams-11b7e351/p3-authority-repair-evidence/`.
+`/home/user/.cache/pi-project-teams-11b7e351/p3-withdrawal-repair-evidence/`.
 
 ## Goal
 
@@ -2268,3 +2272,84 @@ Wave2 reconciles main documentation through `3f42e53` at commit
 source hashes unchanged. Combined checks/review and main integration still wait
 for P3 approval. No model calls, local model work, browser/device interaction,
 live T3 writes, push or PR occurs during this continuation.
+
+### Independent review repairs running across phases
+
+P3 commits withdrawal repair `614329d713b952ac88d71c4b3297c31f17d9fb57` from
+`838e466`, changing three existing P3 paths. Strict real-SQL/MCP cases first fail
+on the prior source for retired-role, settled-binding and ambiguous-binding
+issuance, while the successful control passes. The final focused gate passes
+five cases; 272 unfiltered affected tests pass on the same source. Normal
+server-entry compilation passes in 26.062 seconds, peak 4,053,917,696 bytes under
+4 GiB, zero swap/OOM. Exact three-path lint, format and diff pass; the five
+unchanged Lifecycle lint failures remain recorded. The coordinator verifies all
+93 artifacts, 32 current committed/archive source hashes, repair/full patches
+and 18 drained scopes. New manifest SHA256:
+`49aa112f2b5271ef143e4618b9441d4be0d01803a4ac6cace11f3be2a867e987`.
+Coordinator server-scoped Knip files/dependencies passes with `{"issues":[]}`
+in 3.631 seconds, peak 467,750,912 bytes under 2 GiB zero swap/OOM. The same P3
+reviewer is active on this exact candidate. It has not merged.
+
+P5's one xhigh reviewer returns **REQUEST_CHANGES** on `567978d` after 58
+candidate tests and 19 independent controls. Its three findings are documented
+numeric repository pagination being rejected, malformed 403 bodies preventing
+authoritative quota headers from pausing the host, and a 30-second headerless
+secondary-limit fallback where GitHub specifies at least 60 seconds. The
+coordinator inspects the current primary
+[pagination](https://docs.github.com/en/rest/using-the-rest-api/using-pagination-in-the-rest-api)
+and [rate-limit](https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api)
+guidance and reproduces all 19 controls in 0.444 seconds, peak 144,896,000 bytes,
+2 GiB zero swap/OOM with the scope drained. The reviewer explicitly treats
+modeled conditional-read identity changes and sequential snapshot uncertainty
+as limitations, not additional verified GitHub failures. All 27 review artifacts
+are verified, manifest SHA256
+`7c19d23a922eaa495c321528bc8855c7263d9cbbba70f569f9486494c48c9cad`.
+The same owner repairs the same two leaf files from `567978d`; verified numeric
+REST identity stays private and shared rate-limit defaults stay unchanged. New
+evidence is `p5-transport-repair-evidence/`; the same reviewer will recheck.
+
+P7's one xhigh reviewer returns **REQUEST_CHANGES** on `43d6c69`: materialization
+interruption can leave a copied pending directory or a published generation.
+It passes 45 affected tests plus normal-completion/post-copy interruption
+controls, while three acquisition/handoff and two raw materializer probes
+expose the leak. All 10 reviewer scopes drain with zero swap/OOM; its 37-artifact
+manifest is verified, SHA256
+`20462cbe8be40f207e7028e0f9060b2634cc4341d13ce5595d89045dbdebb77a`.
+The coordinator reproduces the exact copy, rename and post-return cases: all
+three fail the cleanup assertions in 0.445 / 0.429 / 0.442 seconds, peak
+160,428,032 / 143,482,880 / 160,346,112 bytes under 2 GiB zero swap/OOM, drained.
+The unchanged shared materializer is the acquisition boundary the new pi
+factory depends on. The same owner exclusively adds
+`skills/SkillMaterializationService.ts` and its test to the two adapter paths.
+Only ownership-safe cancellation/staging/publication/handoff cleanup and its
+checks are authorized; service inputs/results and public contracts remain
+unchanged. A small private cleanup boundary is approved to carry owned cleanup
+from acquisition through plan return. Copying and held filesystem receipts must
+remain interruptible, and foreign paths/inodes/markers and other generations
+must remain protected. New evidence is `p7-skills-repair-evidence/`; the same
+reviewer will recheck. Ordinary factories and full P7 integration remain separate
+compatibility/runtime gates.
+
+This concurrent P3 review, P5 transport repair and P7 skill repair applies the
+updated cross-phase strategy within the actual four-agent harness limit. No
+parent dependency or required integration gate is counted complete early.
+
+The P3 reviewer then observes a remaining concurrency case on `614329d`: when a
+binding is committed between the completed withdrawal statement and discovery,
+issuance succeeds while the preceding legacy bearer remains unrevoked. The
+coordinator copies the exact SQL-receipt/Deferred-controlled probe and reproduces
+both timings in 1.782 seconds, peak 578,789,376 bytes under 2 GiB zero swap/OOM,
+drained. A binding present before withdrawal denies the old bearer after purge
+and restart with zero callbacks; the between-statements case permits one callback.
+The wrapper executes actual SQL unchanged and only delays its completed receipt;
+there is no sleep, fabricated SQL result or replacement authority service.
+Evidence is `root-p3-binding-race-verification/root-verification.json`.
+The reviewer turn encounters another runner rejection for possible cybersecurity
+risk. The same agent is retried with a narrower local source/test reporting
+request succeeds. It returns REQUEST_CHANGES, preserves two drained scopes and
+six earlier passing denial probes, and produces a verified 41-artifact manifest,
+SHA256 `77a26dcd92e8478e4926eb065ff08b966ddb2692597a9d3fc459560c0a775b80`.
+No replacement reviewer or approval is inferred. The same P3 owner resumes from
+`614329d` in its existing scope; new evidence goes to
+`p3-binding-race-repair-evidence/`. P3 still blocks wave2 integration while
+independent P5/P7 repairs continue.
