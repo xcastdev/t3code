@@ -1,4 +1,8 @@
 import {
+  commitProjectTeamAuthority,
+  PROJECT_WORK_CHECKPOINT_VERSION,
+} from "./ProjectTeamsPersistence.ts";
+import {
   type ProjectWorkMutationDelta,
   type ProjectWorkWriteResult,
   projectWorkPayloadFingerprint,
@@ -132,7 +136,12 @@ const readCurrentState = (sql: SqlClient.SqlClient, projectId: string) =>
       const events = yield* readEvents(sql, projectId);
       return applyProjectWorkEvents(emptyProjectWorkReducerState(projectId), events);
     }
-    if (state.projectId !== projectId || !Array.isArray(state.tasks)) {
+    if (
+      (state as ProjectWorkReducerState & { checkpointVersion?: number }).checkpointVersion !==
+        PROJECT_WORK_CHECKPOINT_VERSION ||
+      state.projectId !== projectId ||
+      !Array.isArray(state.tasks)
+    ) {
       const events = yield* readEvents(sql, projectId);
       return applyProjectWorkEvents(emptyProjectWorkReducerState(projectId), events);
     }
@@ -151,6 +160,7 @@ const project = (state: ProjectWorkReducerState): ProjectWorkProjectionState => 
 });
 
 const changedFieldsForEvent = (type: string): ReadonlyArray<string> => {
+  if (type.includes("foundation")) return ["foundationRecords"];
   if (type.includes("criterion")) return ["criteria", "tasks"];
   if (type.includes("evidence")) return ["evidence", "criteria", "tasks"];
   if (type.includes("relationship")) return ["relationships", "tasks"];
@@ -470,6 +480,12 @@ const makeProjectWorkRepository = Effect.gen(function* () {
             )
           `;
           }
+          yield* commitProjectTeamAuthority(
+            sql,
+            events.flatMap((event) =>
+              event.type === "project-work.foundation.recorded" ? [event.record] : [],
+            ),
+          );
           const next = applyProjectWorkEvents(current, events);
           const normalized = project(next);
           const latestSequenceRows = yield* sql<Record<string, unknown>>`

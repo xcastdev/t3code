@@ -321,6 +321,13 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     };
     const result: Effect.Effect<unknown, ProjectionRepositoryError> = (() => {
       switch (boundedInput.operation) {
+        case "foundation-records":
+          return query.listFoundationRecords({
+            ...base,
+            ...(boundedInput.cursor === undefined ? {} : { cursor: boundedInput.cursor }),
+            ...(boundedInput.limit === undefined ? {} : { limit: boundedInput.limit }),
+            ...(boundedInput.recordKinds === undefined ? {} : { kinds: boundedInput.recordKinds }),
+          });
         case "snapshot":
           return query.snapshot(base.projectId);
         case "task":
@@ -492,6 +499,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             const exported = yield* query.exportSnapshot(
               base.projectId,
               boundedInput.includeHistory === true,
+              boundedInput.exportVersion === 2,
             );
             const environmentId =
               environmentIdentity._tag === "Some"
@@ -502,10 +510,18 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             if (exporter._tag === "Some")
               return yield* exporter.value.json(exported.snapshot, {
                 environmentId,
+                version: boundedInput.exportVersion ?? 1,
+                ...(exported.foundationRecords === undefined
+                  ? {}
+                  : { foundationRecords: exported.foundationRecords }),
                 ...(exported.history === undefined ? {} : { history: exported.history }),
               });
             return ProjectWorkExport.buildProjectWorkJsonExport(exported.snapshot, {
               environmentId,
+              version: boundedInput.exportVersion ?? 1,
+              ...(exported.foundationRecords === undefined
+                ? {}
+                : { foundationRecords: exported.foundationRecords }),
               ...(exported.history === undefined ? {} : { history: exported.history }),
             });
           });
@@ -574,6 +590,8 @@ const makeProjectWorkGateway = Effect.gen(function* () {
           reason: "project-work-disabled",
         });
       }
+      if (command.type === "project-work.foundation.commit")
+        return yield* new ProjectWorkAuthorizationError({ reason: "project-work-disabled" });
       const fence = assertProjectAcceptsMutations(sql, String(command.projectId)).pipe(
         Effect.mapError(
           (cause) =>

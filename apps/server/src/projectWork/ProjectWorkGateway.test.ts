@@ -1,4 +1,6 @@
 import {
+  ProjectTeamRecord,
+  ProjectWorkFoundationCommitCommand,
   CommandId,
   EnvironmentId,
   ProjectId,
@@ -33,6 +35,9 @@ import * as ProjectWorkQuery from "./ProjectWorkQuery.ts";
 import * as ProjectWorkRepository from "./ProjectWorkRepository.ts";
 import * as ProjectWorkSearch from "./ProjectWorkSearch.ts";
 import * as ServerSettings from "../serverSettings.ts";
+
+const decodeFoundationCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+const decodeTeamRecord = Schema.decodeUnknownEffect(ProjectTeamRecord);
 
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
@@ -90,6 +95,85 @@ const gatewayLayer = makeGatewayLayer();
 const layer = it.layer(NodeServices.layer);
 
 layer("ProjectWorkGateway", (it) => {
+  it.effect("denies internal foundation writes while negotiating new reads and V2 export", () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (${String(projectId)}, 'Gateway project', '/workspace/gateway', '[]', ${at}, ${at})`;
+      const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+      const repo = yield* ProjectWorkRepository.ProjectWorkRepository;
+      const mission = yield* decodeTeamRecord({
+        kind: "mission",
+        recordId: "gateway-mission",
+        projectId,
+        revision: 0,
+        generation: 0,
+        updatedAt: at,
+        status: "draft",
+        title: "Mission",
+        objective: "Bounded",
+        requiredTaskIds: [],
+      });
+      const command = yield* decodeFoundationCommit({
+        type: "project-work.foundation.commit",
+        commandId: "gateway-foundation",
+        projectId,
+        expectedRevision: 0,
+        attribution: {
+          actor: { kind: "system", id: "foundation" },
+          source: { kind: "system", id: "foundation" },
+          recordedAt: at,
+        },
+        records: [mission],
+        committedAt: at,
+      });
+      for (const actor of [
+        { kind: "human", id: "human" },
+        { kind: "agent", id: "agent" },
+      ] as const) {
+        expect(
+          (yield* gateway.write(command, actor, { kind: "web", id: actor.id }).pipe(Effect.result))
+            ._tag,
+        ).toBe("Failure");
+      }
+      expect(
+        (yield* sql`SELECT * FROM project_work_events WHERE project_id = ${projectId}`).length,
+      ).toBe(0);
+      yield* repo.execute(command);
+      yield* repo.execute({
+        type: "project-work.task.create",
+        commandId: CommandId.make("gateway-legacy"),
+        projectId,
+        taskId,
+        title: "Ordinary",
+        createdAt: at,
+      });
+      expect(
+        yield* gateway.read({ projectId, operation: "foundation-records", limit: 1 }),
+      ).toMatchObject({
+        projectId,
+        revision: 2,
+        items: [{ kind: "mission", recordId: "gateway-mission" }],
+      });
+      const v1 = yield* gateway.read({ projectId, operation: "export-json", includeHistory: true });
+      expect(v1).toMatchObject({ schemaVersion: 1, tasks: [{ taskId }] });
+      expect(v1).not.toHaveProperty("foundationRecords");
+      expect(encodeUnknownJson(v1)).not.toContain("project-work.foundation.recorded");
+      const v2 = yield* gateway.read({
+        projectId,
+        operation: "export-json",
+        includeHistory: true,
+        exportVersion: 2,
+      });
+      expect(v2).toMatchObject({
+        schemaVersion: 2,
+        tasks: [{ taskId }],
+        foundationRecords: [{ recordId: "gateway-mission" }],
+      });
+      expect(encodeUnknownJson(v2)).toContain("project-work.foundation.recorded");
+    }).pipe(Effect.provide(gatewayLayer)),
+  );
+
   it.effect("keeps reads available while disabled and restores writes after re-enable", () =>
     Effect.gen(function* () {
       yield* runMigrations({ toForkMigrationInclusive: 8 });

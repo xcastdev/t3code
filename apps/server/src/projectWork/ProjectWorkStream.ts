@@ -51,6 +51,7 @@ const boundedLimit = (limit: number | undefined): number =>
   );
 
 const eventRecordId = (event: ProjectWorkEvent): string => {
+  if (event.type === "project-work.foundation.recorded") return event.record.recordId;
   const value = event as unknown as Record<string, unknown>;
   const direct = [
     "taskId",
