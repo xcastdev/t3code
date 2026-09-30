@@ -1801,10 +1801,50 @@ context preserves all four complete assignment/decision/question/limit facts.
 The worker then receives SIGKILL before ordinal 8 is reserved or sent. The owned
 cgroup drains with zero OOM; peak is 133,562,368 bytes. Full continuation is not
 passing. Retained artifacts suggest a response-drain/next-request race; exact
-rejection cause is unavailable. An isolated local stream-replay control must
-prove the cause before any repair or further real call. Current ledger has seven
-attempts, 140,000 reserved input and 5,120 reserved output. No unchanged live
-retry is authorized. Fresh live-scope review remains required.
+rejection cause is unavailable. Separate local exact-SSE replay demonstrates
+that native completion can precede the parent end receipt: delayed-end and
+coalesced controls fail before the next reservation, while split-final succeeds.
+Its 75-artifact manifest SHA-256 is
+`22602f0f51813cefc8bdd3e0fd73d654053e01a40e1197f1b0960db6aff800be`.
+The coalesced race is timing-sensitive; these controls do not reconstruct the
+original missing IPC trace.
+
+A separately prepared worker adds a bounded per-request parent end/error receipt
+barrier before the next dispatch and final success. Strict concurrency and the
+native accounting guard remain unchanged. Preparation manifest SHA-256 is
+`b2480b25f2e33c6d75ec3513bf8e4bbafdfbe0ddc7c78be1dfe4969cc0ecfb69`
+for 872 artifacts; 59 guard, 46 owned and three repaired causal controls pass.
+A separate exact 60-second missing-parent-receipt control fails safely without
+success, another request or surviving process. Its 31-artifact manifest is
+`b96470fe5663f1b2629a9e026556237ba97629d98b51fe673f9f190a00958dec`.
+
+After exact source, budget, native-prefix and control inspection, the coordinator
+authorizes only ordinal 8: one resume capped at 512 output, no fresh completion,
+recompaction, retry or fallback. It **PASSES**. The actual 20-artifact manifest is
+`28a590d042c93ac5ab40d368ab689df13ebf63b66a11f69d889d97e13950b4be`.
+The coordinator verifies each hash and the native chain directly. The final
+session preserves the exact 25 prior entries, pending user ID once, one distinct
+recovery prompt and a native stopped assistant. All four complete facts survive
+reopen. Pi emits 19 text deltas and `agent_settled`; final worker success waits
+for the parent receipt and drain. Usage is 1,007 input and 483 output. Peak is
+127,180,800 bytes under 512 MiB zero swap, zero OOM and fully drained.
+
+Fresh xhigh review in `review-p1-live-recovery-fresh/` **APPROVES this bounded P1
+live proof**, verifying 2,414 selected manifest entries and the three native
+bundle closures before and after seven copied actual-SDK probes. Delayed-end
+reproduces the old race; repaired delayed/coalesced consumers and final resume
+pass. The review's coalesced old consumer happens to pass, with premature worker
+`done` still visible; it remains a recorded timing-sensitive result. Invalid
+native usage fails with full reservation and no success. All owned review
+cgroups drain with zero OOM. The 195-artifact review manifest is
+`249f4fe943f3187c32658e8be1654b579d8bc6aee468559dd7dca6bb7ef23045`.
+The coordinator independently verifies that manifest and the complete report.
+Ordinal 7 remains a failed partial invocation. Reservations now exhaust the
+original eight-call ceilings at 160,000 input and 5,632 output; charged totals
+are 103,204 input and 4,041 output, retaining five failed full charges and known
+6/7/8 usage. No further remote proof call is authorized. Actual billing and
+hidden upstream routing remain unproved. P7, P14 and product acceptance remain
+separate gates.
 
 Evidence is below `/home/user/.cache/pi-project-teams-11b7e351/`. Development
 repair limits remain waived. No local model, weight download, browser/device,
