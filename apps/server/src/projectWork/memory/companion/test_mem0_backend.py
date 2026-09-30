@@ -133,6 +133,59 @@ class Mem0BackendTest(unittest.TestCase):
         self.call("delete-project")
         self.assertEqual(dispatch(self.root, self.request("search", vector=self.entry()["vector"], limit=10))["error"]["code"], "fenced")
 
+    def test_project_cleanup_removes_corrupt_payload_text_across_repeated_crashes(self):
+        from mem0_backend import COLLECTION, native_store, scan
+        from qdrant_client import models
+        data = self.index_input(observations=[self.entry(f"corrupt-{i}") for i in range(130)])
+        self.call("index", **data)
+        for scope in ({"environmentId": "environment-b"}, {"projectId": "project-b"}):
+            self.call("index", **self.index_input(), **scope)
+        directory = namespace_path(self.root, Scope(environmentId="environment-a", projectId="project-a"))
+        native = native_store(directory)
+        try:
+            points = list(scan(native, {}))
+            ids = [str(point.id) for point in points]
+            native.client.delete_payload(COLLECTION, keys=["projectId"], points=models.PointIdsList(points=ids[:45]))
+            native.client.delete_payload(COLLECTION, keys=["environmentId"], points=models.PointIdsList(points=ids[45:90]))
+            native.client.set_payload(COLLECTION, payload={"environmentId": "wrong-environment", "projectId": "wrong-project"},
+                                      points=models.PointIdsList(points=ids[90:]))
+            corrupted = list(scan(native, {}))
+            self.assertEqual(len(corrupted), 130)
+            self.assertTrue(all(point.payload.get("environmentId") != "environment-a"
+                                or point.payload.get("projectId") != "project-a" for point in corrupted))
+            self.assertTrue(all(point.payload["data"] == "Retained source observation" for point in corrupted))
+        finally:
+            native.client.close()
+        self.crash("delete-project", "after-delete-point")
+        self.crash("delete-project", "after-delete-point")
+        self.assertTrue(self.call("delete-project")["cleanupComplete"])
+        self.assertTrue(self.call("delete-project")["cleanupComplete"])
+        native = native_store(directory)
+        try:
+            # Check physical storage, not the already-suppressed search projection.
+            self.assertEqual(list(scan(native, {})), [])
+        finally:
+            native.client.close()
+        self.assertEqual(dispatch(self.root, self.request("index", **data))["error"]["code"], "fenced")
+        for scope in ({"environmentId": "environment-b"}, {"projectId": "project-b"}):
+            self.assertTrue(self.call("reconcile", **self.index_input(), **scope)["complete"])
+
+    def test_source_cleanup_retains_other_source_in_same_namespace(self):
+        from mem0_backend import native_store, scan
+        first = self.index_input()
+        second = self.index_input(sourceRecordId="memory-source-b", extractionId="extraction-b",
+                                  observations=[self.entry("observation-b")])
+        self.call("index", **first)
+        self.call("index", **second)
+        self.call("delete-source", sourceRecordId="memory-source-a", sourceRevision=1, sourceGeneration=1)
+        self.assertTrue(self.call("reconcile", **second)["complete"])
+        directory = namespace_path(self.root, Scope(environmentId="environment-a", projectId="project-a"))
+        native = native_store(directory)
+        try:
+            self.assertEqual([point.payload["sourceRecordId"] for point in scan(native, {})], ["memory-source-b"])
+        finally:
+            native.client.close()
+
     def test_generation_crash_before_cleanup_never_replays_old_generation(self):
         old = self.index_input()
         self.call("index", **old)

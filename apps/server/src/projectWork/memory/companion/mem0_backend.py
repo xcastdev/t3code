@@ -296,6 +296,9 @@ def execute(directory, fence_path, fence, store, operation, input, checkpoint):
         filters = scoped(input)
         if operation == "delete-project":
             fence.deleted = True
+            # The locked directory already identifies the owned namespace. Damaged
+            # payload scope cannot exempt retained source text from physical cleanup.
+            filters = {}
         else:
             old = fence.sources.get(input.sourceRecordId)
             fence.sources[input.sourceRecordId] = SourceFence(

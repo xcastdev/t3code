@@ -119,61 +119,69 @@ const nativeTransport =
         new MemoryBackendError({ code: "unavailable", message: "Native memory transport failed" }),
     });
 
-describe("Mem0Backend serialized boundary", () => {
-  it.effect(
-    "uses actual pinned native index, recovery receipt, search and namespace deletion",
-    () =>
-      Effect.gen(function* () {
-        const directory = yield* Effect.acquireRelease(
-          Effect.promise(() => NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-mem0-adapter-"))),
-          (path) => Effect.promise(() => NodeFSP.rm(path, { recursive: true, force: true })),
-        );
-        const backend = makeMem0Backend(nativeTransport(directory));
-        expect(yield* backend.health("health", scope)).toMatchObject({
-          engineVersion: "2.2.1",
-          qdrantVersion: "1.19.1",
-        });
-        expect(yield* backend.index("index", manifest)).toEqual({
-          writtenObservationIds: ["observation-a"],
-        });
-        expect(yield* backend.index("replay", manifest)).toEqual({ writtenObservationIds: [] });
-        expect(yield* backend.reconcile("receipt", manifest)).toEqual({
-          complete: true,
-          missingObservationIds: [],
-          invalidObservationIds: [],
-          unexpectedBackendIds: [],
-        });
-        const search = yield* backend.search("search", { ...scope, vector, limit: 10 });
-        expect(search.candidates).toHaveLength(1);
-        expect(search.candidates[0]).toMatchObject({
-          ...scope,
-          observationId: "observation-a",
-          sourceRecordId: "memory-source-a",
-        });
-        expect(search.candidates[0]).not.toHaveProperty("body");
-        expect(search.candidates[0]).not.toHaveProperty("data");
-        expect(
-          yield* backend.search("other-environment", {
+// Ordinary discovery exercises the portable boundary. Native proof is explicitly
+// selected, and selection still requires the exact external interpreter pins.
+if (process.env.T3_MEM0_NATIVE_TEST === "1") {
+  describe("Mem0Backend required native proof", () => {
+    it.effect(
+      "uses actual pinned native index, recovery receipt, search and namespace deletion",
+      () =>
+        Effect.gen(function* () {
+          const directory = yield* Effect.acquireRelease(
+            Effect.promise(() =>
+              NodeFSP.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-mem0-adapter-")),
+            ),
+            (path) => Effect.promise(() => NodeFSP.rm(path, { recursive: true, force: true })),
+          );
+          const backend = makeMem0Backend(nativeTransport(directory));
+          expect(yield* backend.health("health", scope)).toMatchObject({
+            engineVersion: "2.2.1",
+            qdrantVersion: "1.19.1",
+          });
+          expect(yield* backend.index("index", manifest)).toEqual({
+            writtenObservationIds: ["observation-a"],
+          });
+          expect(yield* backend.index("replay", manifest)).toEqual({ writtenObservationIds: [] });
+          expect(yield* backend.reconcile("receipt", manifest)).toEqual({
+            complete: true,
+            missingObservationIds: [],
+            invalidObservationIds: [],
+            unexpectedBackendIds: [],
+          });
+          const search = yield* backend.search("search", { ...scope, vector, limit: 10 });
+          expect(search.candidates).toHaveLength(1);
+          expect(search.candidates[0]).toMatchObject({
             ...scope,
-            environmentId: "environment-b",
-            vector,
-            limit: 10,
-          }),
-        ).toEqual({ candidates: [] });
-        yield* backend.deleteSource("delete", {
-          ...scope,
-          sourceRecordId: manifest.sourceRecordId,
-          sourceRevision: 1,
-          sourceGeneration: 1,
-        });
-        expect(yield* failureCode(backend.index("late", manifest))).toBe("fenced");
-        yield* backend.deleteProject("project-delete", scope);
-        expect(yield* failureCode(backend.search("deleted", { ...scope, vector, limit: 10 }))).toBe(
-          "fenced",
-        );
-      }),
-  );
+            observationId: "observation-a",
+            sourceRecordId: "memory-source-a",
+          });
+          expect(search.candidates[0]).not.toHaveProperty("body");
+          expect(search.candidates[0]).not.toHaveProperty("data");
+          expect(
+            yield* backend.search("other-environment", {
+              ...scope,
+              environmentId: "environment-b",
+              vector,
+              limit: 10,
+            }),
+          ).toEqual({ candidates: [] });
+          yield* backend.deleteSource("delete", {
+            ...scope,
+            sourceRecordId: manifest.sourceRecordId,
+            sourceRevision: 1,
+            sourceGeneration: 1,
+          });
+          expect(yield* failureCode(backend.index("late", manifest))).toBe("fenced");
+          yield* backend.deleteProject("project-delete", scope);
+          expect(
+            yield* failureCode(backend.search("deleted", { ...scope, vector, limit: 10 })),
+          ).toBe("fenced");
+        }),
+    );
+  });
+}
 
+describe("Mem0Backend portable serialized boundary", () => {
   it.effect(
     "rejects extra fields, invalid vectors, limits, repeated IDs and request IDs before transport",
     () =>
