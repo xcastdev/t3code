@@ -1554,3 +1554,39 @@ no product acceptance criterion is complete. Normal tool memory caps may increas
 when needed; all local model loading, hosting, inference, and weight downloads
 remain prohibited. No push, PR, browser/device use, or live T3 database write has
 occurred. Development repair-count limits remain waived for the entire plan.
+
+### P2 independent findings and scoped repair
+
+The initial P2 candidate is committed at
+`ee5be040c0c5b1f82fbb30d708712af5eeebd88a`, with 28 assigned files. Final focused
+checks pass 193 contract tests, 23 storage tests, and 40 affected server tests;
+normal contracts and narrow server compilation, scoped lint/format, and whitespace
+checks pass. The coordinator verifies all 80 retained artifact hashes, 40 tested
+source hashes, and the exact tested diff in `p2-foundation-evidence/` under
+`/home/user/.cache/pi-project-teams-11b7e351/`.
+
+Fresh GPT-6.1-Sol xhigh review returns **REQUEST_CHANGES** for four independently
+reproduced SQLite/Gateway defects: mutable effect/message deduplication identities
+and uncertainty retry fences; mutable frozen memory provenance/payloads; removal
+of legitimate numeric token budgets from public reads; and foundation records
+surviving permanent project deletion. The coordinator inspects the causal source
+and reproduction results and accepts these findings. Review evidence is retained
+in `review-p2-foundation/`; the candidate has not merged into wave 2 or main.
+
+A medium worker repairs this candidate on `pi-teams/p2-foundation-repair1`, based
+on exact `ee5be040`, in the matching home-cache worktree. Its exclusive scope is
+the initial P2 files plus `ProjectLifecycle.ts` and its focused tests for local
+foundation cleanup. It must preserve a shared repository cursor for a verified
+surviving project binding without changing its GitHub account or dispatching work.
+Focused causal regression checks precede final checks and a fresh independent
+review. P3 remains gated on approved P2 integration; development repair limits
+remain waived. Root main advances since the P2 base affect this record only and
+must be reconciled before wave integration.
+
+Fresh runtime/isolation/packaging and remote-only memory proof collection is
+underway in persistent `runtime-evidence-recovery-artifacts/` and
+`memory-evidence-recovery-artifacts/`. New artifacts do not replace lost historical
+hashes or certify a completed production runtime. They require coordinator
+inspection and fresh review before dependent rollout. P2–P14 and all 19 product
+acceptance criteria remain incomplete. No push, PR, browser/device use, live T3
+database write, or local model work has occurred.
