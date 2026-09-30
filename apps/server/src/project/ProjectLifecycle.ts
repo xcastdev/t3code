@@ -463,9 +463,11 @@ const makeProjectLifecycle = Effect.gen(function* () {
       } satisfies ProjectLifecycleRelocationCheckResult;
     }).pipe(Effect.mapError(toPersistenceSqlError("ProjectLifecycle.checkRelocation")));
 
-  const permanentDelete: ProjectLifecycleShape["permanentDelete"] = (input) => {
+  const permanentDelete: ProjectLifecycleShape["permanentDelete"] = Effect.fn(
+    "ProjectLifecycle.permanentDelete",
+  )(function* (input: ProjectLifecyclePermanentDeleteInput) {
     const transferredEvents: Array<ProjectWorkEvent> = [];
-    return sql
+    return yield* sql
       .withTransaction(
         Effect.gen(function* () {
           yield* ensureProjectLifecycleTables(sql);
@@ -630,7 +632,7 @@ const makeProjectLifecycle = Effect.gen(function* () {
             : toPersistenceSqlError("ProjectLifecycle.permanentDelete")(cause),
         ),
       );
-  };
+  });
 
   return {
     get,

@@ -418,9 +418,8 @@ describe("ProjectLifecycle", () => {
             const lifecycle = yield* ProjectLifecycle;
             const repo = yield* ProjectWorkRepository;
             yield* sql`CREATE TRIGGER fail_delete_receipt BEFORE INSERT ON project_lifecycle_operations BEGIN SELECT RAISE(ABORT, 'late failure'); END`;
-            expect((yield* lifecycle.permanentDelete(input).pipe(Effect.result))._tag).toBe(
-              "Failure",
-            );
+            const deletion = lifecycle.permanentDelete(input);
+            expect((yield* deletion.pipe(Effect.result))._tag).toBe("Failure");
             expect(published).toEqual([]);
             expect(
               (yield* readProjectTeamPage(sql, { projectId: owner, kinds: ["intake-cursor"] }))
@@ -431,7 +430,7 @@ describe("ProjectLifecycle", () => {
               (yield* sql`SELECT * FROM project_lifecycle WHERE project_id = ${owner}`).length,
             ).toBe(0);
             yield* sql`DROP TRIGGER fail_delete_receipt`;
-            yield* lifecycle.permanentDelete(input);
+            yield* deletion;
             expect(published).toHaveLength(1);
             const sequence = (yield* sql<{
               sequence: number;
@@ -456,7 +455,7 @@ describe("ProjectLifecycle", () => {
               revision: 2,
               record: { ...progressed, projectId: survivor },
             });
-            yield* lifecycle.permanentDelete(input);
+            yield* deletion;
             expect(published).toHaveLength(1);
             for (const table of ["project_team_effect", "project_team_reservation"])
               expect((yield* sql`SELECT * FROM ${sql(table)}`).length).toBe(0);
