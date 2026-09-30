@@ -6,61 +6,80 @@ import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import * as NodeURL from "node:url";
-const ownedUnit = process.env.PI_RUNTIME_CONTRACT_OWNED_UNIT;
-NodeAssert.ok(ownedUnit, "Linux systemd owned service is required before SDK startup");
-const cgroupEntry = (await NodeFSP.readFile("/proc/self/cgroup", "utf8"))
-  .trim()
-  .split("\n")
-  .find((line) => line.startsWith("0::"));
-NodeAssert.ok(cgroupEntry);
-const ownedPath = "/sys/fs/cgroup" + cgroupEntry.slice(3);
-const controller = await new Promise((resolve, reject) =>
-  NodeChildProcess.execFile(
-    "systemctl",
-    [
-      "--user",
-      "show",
-      ownedUnit,
-      "-p",
-      "ControlGroup",
-      "-p",
-      "KillMode",
-      "-p",
-      "RuntimeMaxUSec",
-      "-p",
-      "TimeoutStopUSec",
-    ],
-    { timeout: 2000 },
-    (error, stdout) => (error ? reject(error) : resolve(stdout)),
-  ),
+const args = process.argv.slice(2);
+NodeAssert.ok(
+  args.length === 1 && ["--portable", "--linux-ownership"].includes(args[0]),
+  "Select exactly --portable or --linux-ownership",
 );
-const policy = Object.fromEntries(
-  controller
+const portable = args[0] === "--portable";
+const negativeControl = process.env.PI_RUNTIME_CONTRACT_NEGATIVE_CONTROL;
+const ownedUnit = process.env.PI_RUNTIME_CONTRACT_OWNED_UNIT;
+if (portable) {
+  NodeAssert.ok(!negativeControl, "Portable mode forbids process negative controls");
+  NodeAssert.ok(!ownedUnit, "Portable mode forbids Linux ownership fallback");
+}
+async function acquireLinuxOwnership() {
+  NodeAssert.ok(ownedUnit, "Linux systemd owned service is required before SDK startup");
+  const cgroupEntry = (await NodeFSP.readFile("/proc/self/cgroup", "utf8"))
     .trim()
     .split("\n")
-    .map((line) => line.split("=")),
-);
-const readOwned = (name) =>
-  NodeFSP.readFile(NodePath.join(ownedPath, name), "utf8").then((text) => text.trim());
-const owner = {
-  unit: ownedUnit,
-  path: ownedPath,
-  policy,
-  max: await readOwned("memory.max"),
-  swapMax: await readOwned("memory.swap.max"),
-  oomGroup: await readOwned("memory.oom.group"),
-};
-NodeAssert.equal(ownedPath, "/sys/fs/cgroup" + policy.ControlGroup);
-NodeAssert.ok(ownedPath.endsWith("/" + ownedUnit));
-NodeAssert.equal(policy.KillMode, "control-group");
-NodeAssert.equal(policy.RuntimeMaxUSec, "10s");
-NodeAssert.equal(policy.TimeoutStopUSec, "1s");
-NodeAssert.equal(owner.max, "536870912");
-NodeAssert.equal(owner.swapMax, "0");
-NodeAssert.equal(owner.oomGroup, "1");
-console.log("P1_OWNER:" + JSON.stringify(owner));
-const ownedMembers = async () =>
-  (await readOwned("cgroup.procs")).split("\n").filter(Boolean).map(Number);
+    .find((line) => line.startsWith("0::"));
+  NodeAssert.ok(cgroupEntry);
+  const ownedPath = "/sys/fs/cgroup" + cgroupEntry.slice(3);
+  const controller = await new Promise((resolve, reject) =>
+    NodeChildProcess.execFile(
+      "systemctl",
+      [
+        "--user",
+        "show",
+        ownedUnit,
+        "-p",
+        "ControlGroup",
+        "-p",
+        "KillMode",
+        "-p",
+        "RuntimeMaxUSec",
+        "-p",
+        "TimeoutStopUSec",
+      ],
+      { timeout: 2000 },
+      (error, stdout) => (error ? reject(error) : resolve(stdout)),
+    ),
+  );
+  const policy = Object.fromEntries(
+    controller
+      .trim()
+      .split("\n")
+      .map((line) => line.split("=")),
+  );
+  const readOwned = (name) =>
+    NodeFSP.readFile(NodePath.join(ownedPath, name), "utf8").then((text) => text.trim());
+  const owner = {
+    unit: ownedUnit,
+    path: ownedPath,
+    policy,
+    max: await readOwned("memory.max"),
+    swapMax: await readOwned("memory.swap.max"),
+    oomGroup: await readOwned("memory.oom.group"),
+  };
+  NodeAssert.equal(ownedPath, "/sys/fs/cgroup" + policy.ControlGroup);
+  NodeAssert.ok(ownedPath.endsWith("/" + ownedUnit));
+  NodeAssert.equal(policy.KillMode, "control-group");
+  NodeAssert.equal(policy.RuntimeMaxUSec, "10s");
+  NodeAssert.equal(policy.TimeoutStopUSec, "1s");
+  NodeAssert.equal(owner.max, "536870912");
+  NodeAssert.equal(owner.swapMax, "0");
+  NodeAssert.equal(owner.oomGroup, "1");
+  console.log("P1_OWNER:" + JSON.stringify(owner));
+  return {
+    readOwned,
+    ownedMembers: async () =>
+      (await readOwned("cgroup.procs")).split("\n").filter(Boolean).map(Number),
+  };
+}
+const ownership = portable ? undefined : await acquireLinuxOwnership();
+const ownedMembers = () => ownership?.ownedMembers();
+const readOwned = (name) => ownership?.readOwned(name);
 const sdkRoot = process.env.PI_RUNTIME_CONTRACT_SDK_ROOT;
 NodeAssert.ok(
   sdkRoot,
@@ -103,7 +122,6 @@ const sessions = new Set();
 const capturedPids = new Set();
 const activeReceipts = new Set();
 const cleanupReceipts = [];
-const negativeControl = process.env.PI_RUNTIME_CONTRACT_NEGATIVE_CONTROL;
 NodeAssert.ok(
   !negativeControl ||
     [
@@ -251,6 +269,7 @@ async function run(name, action) {
   });
 }
 async function armExitReceipt(pids) {
+  NodeAssert.ok(!portable, "Portable mode cannot own process trees");
   const observer = NodeChildProcess.spawn(
     "/usr/bin/python3",
     [
@@ -440,6 +459,8 @@ async function executeCases() {
     NodeAssert.equal(events.at(-1), "agent_settled");
     return { messages: session.messages };
   });
+  // The portable contract ends before either native child-process consumer can dispatch.
+  if (portable) return;
   await run(
     "Explicit trusted MCP invokes allowed and denied advertised handlers",
     async (events) => {
@@ -599,7 +620,7 @@ try {
     // Preserve the main deadline through cleanup; use a fresh bound after it already failed.
     await Promise.race(failure ? [cleanup, cleanupDeadline] : [cleanup, cleanupDeadline, watchdog]);
     membersAfterCleanup = await ownedMembers();
-    if (!failure)
+    if (!failure && !portable)
       NodeAssert.deepEqual(
         membersAfterCleanup,
         [process.pid],
@@ -626,7 +647,9 @@ const report = failure
       remoteCalls: 0,
     }
   : {
+      mode: portable ? "portable" : "linux-ownership",
       pin: metadata.version,
+      fixturePid: process.pid,
       remoteCalls: 0,
       callbackCount: requestCount,
       resources: {
