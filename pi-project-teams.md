@@ -1518,7 +1518,8 @@ P2 is isolated on `pi-teams/p2-foundation` in
 `5ac775af2f1118396294db8020224838b6e7cd82`. One medium foundation owner holds
 contracts, migration 019, existing Project Work persistence, bounded reads, and
 export adaptations. P3 remains gated on P2 checks, coordinator inspection, and
-fresh independent part review. P2 is uncommitted and has not entered wave 2.
+fresh independent part review. This describes the earlier draft; committed and
+reviewed repair candidates are recorded below. No P2 candidate has entered wave 2.
 
 Draft checks recorded 193 contracts, 22 persistence, and 19 gateway/export/stream
 passes. These are interim results; changed source requires final checks and
@@ -1590,3 +1591,86 @@ hashes or certify a completed production runtime. They require coordinator
 inspection and fresh review before dependent rollout. P2–P14 and all 19 product
 acceptance criteria remain incomplete. No push, PR, browser/device use, live T3
 database write, or local model work has occurred.
+
+### Regenerated proof reviews and P2 continuation
+
+The first P2 repair is committed at
+`68ee4ae8b487eb403dc66522fd8344d96d10e3d8`. Final evidence records 193 contract,
+25 storage, and 51 affected-server passes; normal contracts and narrow server
+compilation, scoped formatting, and whitespace pass. The coordinator verifies
+all 65 repair artifacts, 42 tested source hashes, and the exact full diff against
+`5ac775af2`; its SHA-256 is
+`767f5c8feeabfd9b6b43310d00b9dc656e6e414061ac6dfadbe7d20a596231e2`.
+Scoped lint exits 1 with five unchanged `ProjectLifecycle.test.ts` baseline
+errors, verified against the pre-repair source; it is not a green lint result.
+
+Fresh xhigh review resolves the original four findings but returns
+**REQUEST_CHANGES** for two additional storage defects. Existing issue/cursor
+updates can retarget canonical identity or silently change the cursor account.
+Permanent deletion transfers a shared cursor SQL row without transferring its
+authoritative event/reducer history: a normal next revision fails, while a
+revision-zero replacement resets progress. The coordinator reproduces both with
+actual migrated SQLite and repository/lifecycle services. Exact command and
+results are retained in `root-p2-review-verification/`; peak memory is
+147,910,656 bytes under a 1 GiB, zero-swap scope with zero OOM events. Review and
+causal probes are in `review-p2-foundation-repaired/`.
+
+A new medium foundation owner repairs these findings in
+`pi-teams/p2-foundation-repair2`, based on exact `68ee4ae8`, in the matching
+home-cache worktree. Ordinary canonical identity/account updates must reject;
+legitimate content and cursor progress changes must remain valid. Cursor transfer
+must atomically preserve record revision/generation, account and progress in
+survivor event authority, public reads, restart and rebuild. The owner retains
+the existing P2 scope and may extract a minimal internal event reader into
+`ProjectWorkEventStore.ts` to avoid a repository/persistence import cycle. No
+public generic foundation mutation, execution enablement or external dispatch is
+authorized by this repair. Focused causal gates, final affected checks, and a
+fresh independent review precede integration. P3 remains gated.
+
+The regenerated remote memory proof is independently **APPROVED** within P1's
+bounded proof scope. All 168 artifact hashes match; manifest SHA-256 is
+`fd225cea84edeec171a4fa6f8d9cf751a21f9cce7f94a5ade1e0de9083a5eeab`.
+Fresh review in `review-p1-memory-recovery-fresh/` verifies exact native
+UUID/payload/float32 recovery sets, request budgets, copied-store native search,
+SQLite FTS fallback, and 11 causal rejection controls. Actual calls are 10
+CommandCode Ling extraction attempts and 31 OpenRouter NVIDIA embedding attempts;
+charged usage is 87,895 input and 2,791 output tokens, retaining unknown-failure
+reservations. The largest verified probe peak is 163,708,928 bytes, with no OOM
+or surviving owned cgroup. Qualified source recall is 1.0 versus FTS 5/7;
+macro source precision is about 0.383. Native correctness/selectivity, positive
+sharing/revocation, exhaustive production reconciliation and P10/P14 completion
+remain unproved. Historical missing evidence is not recertified. An earlier
+standalone fresh review stopped on model capacity without a verdict; its partial
+checks were not accepted as approval.
+
+Regenerated offline runtime/isolation/packaging evidence contains 257 verified
+artifacts, manifest SHA-256
+`97c23ec7fc10955cdc9c743c0be528f96f8060fbccabdf0a7484677c946b137d`.
+It includes actual pinned-SDK portable/Linux consumers, privilege controls,
+setup/descendant cleanup, and npm/Electron-ASAR/ESM-SEA probes. A fresh xhigh
+review is assigned to this frozen offline scope; it excludes lost historical
+live evidence and the new live proof. Full T3 packaging and supported-client
+verification remain later gates.
+
+The new live preparation passes 22 guard and 25 owned broker controls, including
+actual compiled SDK synthetic fresh-session/compaction/reopen/resume consumers.
+All 567 preparation artifacts match manifest SHA-256
+`c90b57a86e9c856e1d5e3eb56f819580edc3649ba1d373b0f689e77641b288b8`.
+After source/budget/isolation inspection, the coordinator authorizes one concrete
+bounded invocation against the existing CommandCode Ling free route. It fails
+on its first HTTP 200 response before accepting native model/usage evidence.
+The failed raw stream was removed by the prepared failure policy; exact cause is
+unavailable. No automatic retry occurs. Full reservations remain charged at
+20,000 input and 512 output; SDK error usage zeros are not provider usage.
+The 512 MiB, zero-swap owned cgroup peaks at 162,750,464 bytes with zero OOM and
+fully drains. The failed-attempt manifest has 15 new files and SHA-256
+`49571a40336f4106cb99c31615b8097c657025a33c8627b32160793f0c889e99`.
+The coordinator inspects a separate safe diagnostic patch and authorizes
+preparation on copies for one isolated SDK completion, carrying the charged
+ledger. No further remote call is authorized yet, and no live
+streaming/compaction proof pass is claimed.
+
+All paths above are below `/home/user/.cache/pi-project-teams-11b7e351/`.
+P2–P14 and all 19 product acceptance criteria remain incomplete. Development
+repair-count limits remain waived. No push, PR, browser/device use, live T3
+state write, local model loading/hosting/inference or weight download occurred.
