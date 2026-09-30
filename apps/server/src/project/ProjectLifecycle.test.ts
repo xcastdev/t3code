@@ -67,9 +67,11 @@ describe("ProjectLifecycle", () => {
         const at = "2026-01-01T00:00:00.000Z";
         const projectId = ProjectId.make("foundation-deleted");
         const survivor = ProjectId.make("foundation-survivor");
+        const third = ProjectId.make("foundation-third");
         for (const id of [
           projectId,
           survivor,
+          third,
           "foundation-archived",
           "foundation-detached",
           "foundation-other-repo",
@@ -140,6 +142,7 @@ describe("ProjectLifecycle", () => {
         });
         for (const [id, status, repositoryNodeId] of [
           [survivor, "open", "repo"],
+          [third, "open", "repo"],
           ["foundation-archived", "open", "repo"],
           ["foundation-detached", "detached", "repo"],
           ["foundation-other-repo", "open", "other"],
@@ -164,12 +167,12 @@ describe("ProjectLifecycle", () => {
             sourceRevision: "revision",
             observedAt: at,
           };
-          if (id === survivor) {
+          if (id === survivor || id === third) {
             yield* repo.execute(
               yield* decodeCommitEffect({
                 ...command,
                 projectId: id,
-                commandId: "survivor-issue",
+                commandId: "survivor-issue-" + id,
                 expectedRevision: 0,
                 records: [issue],
               }),
@@ -267,6 +270,23 @@ describe("ProjectLifecycle", () => {
           ...input,
           projectId: survivor,
           commandId: CommandId.make("delete-last-owner"),
+        });
+        expect(
+          (yield* readProjectTeamPage(sql, { projectId: third, kinds: ["intake-cursor"] })).items,
+        ).toEqual([{ ...update, projectId: third }]);
+        const thirdNext = { ...update, projectId: third, revision: 3, cursor: "page-five" };
+        const thirdResult = yield* repo.execute({
+          ...command,
+          projectId: third,
+          commandId: CommandId.make("third-continue"),
+          expectedRevision: 2,
+          records: [thirdNext],
+        });
+        expect(thirdResult.revision).toBe(3);
+        yield* lifecycle.permanentDelete({
+          ...input,
+          projectId: third,
+          commandId: CommandId.make("delete-final-owner"),
         });
         expect((yield* sql`SELECT * FROM project_team_intake_cursor`).length).toBe(0);
       }).pipe(
@@ -426,6 +446,10 @@ describe("ProjectLifecycle", () => {
                 .items,
             ).toEqual([progressed]);
             expect((yield* repo.replay(survivor)).length).toBe(1);
+            expect(
+              (yield* sql`SELECT * FROM project_work_command_receipts WHERE project_id = ${survivor} AND actor_id = 'project-lifecycle'`)
+                .length,
+            ).toBe(0);
             expect(
               (yield* sql`SELECT * FROM project_lifecycle WHERE project_id = ${owner}`).length,
             ).toBe(0);
