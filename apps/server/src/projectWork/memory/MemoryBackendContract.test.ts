@@ -3,7 +3,12 @@ import * as NodeSqlite from "node:sqlite";
 import * as NodePerfHooks from "node:perf_hooks";
 
 import { toProjectWorkFtsQuery } from "../ProjectWorkSearch.ts";
-import { evaluateMemoryHits, fixtureHit, history } from "./fixtures/evaluateMemoryHits.ts";
+import {
+  assembleFixtureMemoryBriefing,
+  evaluateMemoryHits,
+  fixtureHit,
+  history,
+} from "./fixtures/evaluateMemoryHits.ts";
 
 const observation = (id: string) => {
   const source = history.observations.find((item) => item.id === id);
@@ -16,7 +21,7 @@ const query = (id: string) => {
   return item;
 };
 
-// These tests verify the evaluation oracle and FTS comparator. They do not
+// These tests verify the evaluation oracle, source briefing consumer, and FTS comparator. They do not
 // exercise Mem0/Graphiti or certify backend reliability, recovery, or model recall.
 describe("MemoryBackendContract evaluation fixtures", () => {
   it("rejects namespace leakage even when two projects use the same source ID", () => {
@@ -127,5 +132,57 @@ describe("MemoryBackendContract evaluation fixtures", () => {
     } finally {
       database.close();
     }
+  });
+});
+
+describe("MemoryBackendContract authoritative source briefing", () => {
+  it("retains source content and decision status when extracted wording invents facts", () => {
+    const current = observation("atlas-storage-current");
+    const conflict = observation("atlas-cache-investigator");
+    const before = JSON.stringify(history.observations);
+    const briefing = assembleFixtureMemoryBriefing("atlas", history.observations, [
+      {
+        ...fixtureHit(current),
+        backendId: "native-storage-id",
+        observation: "As of September 30, 2026, SQLite is accepted forever.",
+      },
+      {
+        ...fixtureHit(conflict),
+        backendId: "native-cache-id",
+        observation: "The accepted cache decision is thirty seconds.",
+      },
+    ]);
+    expect(briefing).toEqual([
+      { source: current, backendIds: ["native-storage-id"] },
+      { source: conflict, backendIds: ["native-cache-id"] },
+    ]);
+    expect(JSON.stringify(briefing)).not.toContain("September 30");
+    expect(briefing[1]?.source.provenance.recordKind).toBe("investigation");
+    expect(briefing[1]?.source.status).toBe("conflicted");
+    expect(JSON.stringify(history.observations)).toBe(before);
+  });
+
+  it("fences invalid sources before grouping and retains all native handles for audit", () => {
+    const current = fixtureHit(observation("atlas-transport"));
+    const hit = { ...current, backendId: "first-native-id", observation: "backend wording" };
+    const briefing = assembleFixtureMemoryBriefing("atlas", history.observations, [
+      hit,
+      { ...hit, backendId: "second-native-id" },
+      { ...hit, generation: 0, backendId: "stale-native-id" },
+      { ...hit, provenance: {}, backendId: "unsourced-native-id" },
+      { ...hit, ...fixtureHit(observation("atlas-deleted")), backendId: "deleted-native-id" },
+      {
+        ...hit,
+        ...fixtureHit(observation("atlas-storage-old")),
+        backendId: "superseded-native-id",
+      },
+      { ...hit, ...fixtureHit(observation("borealis-storage")), backendId: "foreign-native-id" },
+    ]);
+    expect(briefing).toEqual([
+      {
+        source: observation("atlas-transport"),
+        backendIds: ["first-native-id", "second-native-id"],
+      },
+    ]);
   });
 });

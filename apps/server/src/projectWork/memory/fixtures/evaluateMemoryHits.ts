@@ -60,3 +60,38 @@ export const fixtureHit = (observation: FixtureObservation): ProbeHit => ({
   generation: observation.generation,
   provenance: observation.provenance,
 });
+
+export interface BackendObservationHit extends ProbeHit {
+  readonly backendId: string;
+  readonly observation: string;
+}
+
+/** Prototype D8 consumer: backend wording selects sources, while briefing content
+ * and decision status come from the authoritative ledger. Raw evaluation must run
+ * separately before this source grouping or it could conceal backend failures. */
+export const assembleFixtureMemoryBriefing = (
+  projectId: string,
+  sources: ReadonlyArray<FixtureObservation>,
+  hits: ReadonlyArray<BackendObservationHit>,
+) => {
+  const selected = new Map<string, { source: FixtureObservation; backendIds: Array<string> }>();
+  for (const hit of hits) {
+    const source = sources.find(
+      (candidate) => candidate.projectId === projectId && candidate.sourceId === hit.sourceId,
+    );
+    if (
+      !source ||
+      hit.projectId !== projectId ||
+      source.id !== hit.id ||
+      (source.status !== "current" && source.status !== "conflicted") ||
+      source.revision !== hit.revision ||
+      source.generation !== hit.generation ||
+      Object.entries(source.provenance).some(([key, value]) => hit.provenance[key] !== value)
+    )
+      continue;
+    const entry = selected.get(source.id);
+    if (entry) entry.backendIds.push(hit.backendId);
+    else selected.set(source.id, { source, backendIds: [hit.backendId] });
+  }
+  return Array.from(selected.values());
+};
