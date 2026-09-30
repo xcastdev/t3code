@@ -1748,6 +1748,65 @@ manifest SHA-256 is
 Focused 39, V2 contracts 64, V2 storage 27 and affected-server 189 tests pass.
 Contracts and normal server-entry compilation pass; server peak is 3,818,319,872
 bytes under 4 GiB zero swap with `GOMEMLIMIT=3GiB` and zero OOM. Formatting and
-whitespace pass; exactly five verified baseline lint errors remain. A fresh
-xhigh reviewer checks the exact candidate in
-`review-p2-foundation-repair3-fresh/`. No implementation merge has occurred.
+whitespace pass; exactly five verified baseline lint errors remain. Fresh
+xhigh review in `review-p2-foundation-repair3-fresh/` **APPROVES P2 only**.
+The coordinator verifies its 55-file manifest with SHA-256
+`de742b0d2a2cf3d6182747b1881309c2f371a7e3884fa1cf2e962e728ff9a583`.
+Seven independent positive SQLite/Gateway probes pass under 1 GiB zero swap,
+including collision, rollback, file-backed restart, competing capacity and
+bounded export. The same collision consumer fails on unrepaired `163bc065`.
+Peak is 250,114,048 bytes; all owned cgroups drain with zero OOM. Three retained
+scratch-harness failures remain identified as failures.
+
+The coordinator merges reviewed `6d19799` only into `pi-teams/wave2` at
+`c3ed6d3d4c606f66b9c07000246f16682df035af`; all 32 approved files are
+byte-identical after the merge. The sole foundation owner starts P3 from that
+exact base in `pi-teams/p3-authorization`, with exclusive auth/MCP/ProjectWork
+boundaries, additive typed intents and narrow production authorization-layer
+registration. Migrations, dependencies and other wiring remain coordinator-owned.
+P3 interfaces are approved before contract edits. P2/P3 completion still requires
+combined V2/V3 checks and fresh wave review before this main worktree receives
+implementation. No product acceptance criterion is checked.
+
+### Native pi streaming and continuation progress
+
+Actual ordinal 6 passes native SDK streaming through the CommandCode Ling free
+route. Its 17-artifact manifest SHA-256 is
+`7381d0a992d883100904aa56ca24ae3b27c3459d27a015c586195b54e07a1658`.
+The coordinator verifies every artifact. Native session SHA-256 is
+`00a8c2293d2d8bd62898d81c01327ca9a14d71a7461b2b9698afda0de28d1dbe`.
+The response confirms plain-model content, a free-model preliminary zero-usage
+stop envelope and a separate free-model final accounting frame. Native usage is
+219 input, 376 output, 595 total, including 192 cached input tokens. The SDK emits
+11 text deltas, successful native assistant stop and `agent_settled`.
+The owned 512 MiB zero-swap cgroup peaks at 132,354,048 bytes and drains with
+zero OOM. Actual dollar billing is unreported; published free prices and SDK
+zero-cost estimates do not establish actual billing. Five earlier failed calls
+retain full charges; reservations remain 120,000 input and 3,072 output.
+
+A separately frozen continuation opens that exact native file, without another
+fresh completion. Preparation passes 59 guard controls and 45 owned controls,
+including actual SDK compaction/reopen/resume under synthetic transport. The
+633-artifact manifest SHA-256 is
+`41b29b4961d9e786bedb637d3d255b6607d5c7328efb64fe9154a56be4709a66`.
+The coordinator verifies all artifacts and exact unchanged guard/source/carry
+boundaries, then authorizes one invocation with ordinal 7 compaction capped at
+2,048 output and ordinal 8 resume capped at 512 output. The request byte bound
+stays 12,288; aggregate ceilings stay eight calls, 160,000 reserved input and
+5,632 reserved output. Earlier ledger entries remain unchanged.
+
+Ordinal 7's real stream completes with 1,978 input and 622 output tokens. The
+retained native session contains a real compaction entry and reopened recent
+context preserves all four complete assignment/decision/question/limit facts.
+The worker then receives SIGKILL before ordinal 8 is reserved or sent. The owned
+cgroup drains with zero OOM; peak is 133,562,368 bytes. Full continuation is not
+passing. Retained artifacts suggest a response-drain/next-request race; exact
+rejection cause is unavailable. An isolated local stream-replay control must
+prove the cause before any repair or further real call. Current ledger has seven
+attempts, 140,000 reserved input and 5,120 reserved output. No unchanged live
+retry is authorized. Fresh live-scope review remains required.
+
+Evidence is below `/home/user/.cache/pi-project-teams-11b7e351/`. Development
+repair limits remain waived. No local model, weight download, browser/device,
+live T3 write, push or PR occurs. P2–P14 and all 19 acceptance criteria remain
+open.
