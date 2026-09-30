@@ -1,5 +1,5 @@
 Github Tracked: false
-Status: planned
+Status: in_progress
 Github Issue: none
 Plan review: READY_WITH_EXPLICIT_GATES
 
@@ -967,3 +967,47 @@ explicit request. The prior planning checks and review describe their original
 candidate; they do not claim implementation validation.
 
 READY_TO_IMPLEMENT (begin with P1; dependent steps remain gated).
+
+## Implementation progress
+
+Implementation began on 2026-09-29 in branch
+`t3code/implement-pi-project-teams`. The worktree was clean at
+`91b7c87b4656dbe467a7043bab1e91045311d4da`; it was fast-forwarded to the saved-plan
+commit `6cc1a0ffad2f61a707a4b18971e187ea216f6f17`, whose only change is this record.
+The complete 969-line specification/plan was read before assignments.
+
+The user's execution instructions select GPT-6.1-Sol high for coordination,
+three GPT-6.1-Sol medium implementation workers, fresh GPT-6.1-Sol xhigh reviewers
+at each part/wave gate, and separate fresh xhigh final verifier and validator.
+Workers do not delegate. Each has a separate branch/worktree and an explicit base.
+The coordinator owns shared contracts, migrations, server wiring, dependency
+changes, this record, and integrated client verification. No push or PR creation
+is authorized. Scoped commits and local integration merges are authorized.
+
+Dependency-ordered waves retain the saved strategy:
+
+1. P1: pi runtime, memory comparison, and isolation/packaging proofs in parallel.
+2. P2–P3: one foundation owner, after all P1 exit conditions pass.
+3. P7 alongside P4 followed by P5, then combined runtime/lifecycle validation.
+4. P8 alongside P6; a bounded selected-memory adapter slice may overlap.
+5. P9, then complete P10, then P11, with only independent agreed slices parallel.
+6. P12 and bounded P13 presentation work, then P13 completion and P14 integration.
+
+Each part requires coordinator inspection and fresh read-only adversarial review
+before merge to its wave branch. Each combined wave requires checks and another
+fresh review before landing here. Final verification/audit inspect the same exact
+main-worktree commit. Unavailable real-runtime/platform evidence remains unchecked.
+
+Wave 1 assignments all start at
+`6cc1a0ffad2f61a707a4b18971e187ea216f6f17`:
+
+| Worker | Branch                  | Exclusive repository scope                                                                                                  |
+| ------ | ----------------------- | --------------------------------------------------------------------------------------------------------------------------- |
+| A      | `pi-teams/p1-runtime`   | `apps/server/src/provider/pi/PiRuntimeContract.test.ts` and its uniquely named deterministic fixtures                       |
+| B      | `pi-teams/p1-memory`    | `apps/server/src/projectWork/memory/MemoryBackendContract.test.ts` and its deterministic fixtures                           |
+| C      | `pi-teams/p1-isolation` | `apps/server/src/provider/pi/PiIsolationContract.test.ts`, `PiPackagingContract.test.ts`, and their uniquely named fixtures |
+
+Their worktrees and disposable probe directories are below
+`/tmp/pi-project-teams-11b7e351/`; integration is on `pi-teams/wave1`.
+No production dependency, contract, or managed execution path has been changed.
+P1 and all 19 acceptance criteria remain unchecked while proofs run.
