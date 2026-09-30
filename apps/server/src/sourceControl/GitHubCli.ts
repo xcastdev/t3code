@@ -274,6 +274,8 @@ export class GitHubCli extends Context.Service<
       readonly stdin?: string;
       readonly env?: NodeJS.ProcessEnv;
       readonly maxOutputBytes?: number;
+      /** Preserve HTTP error/conditional output for callers that validate its status. */
+      readonly allowNonZeroExit?: boolean;
     }) => Effect.Effect<VcsProcess.VcsProcessOutput, GitHubCliError>;
 
     readonly listOpenPullRequests: (input: {
@@ -411,6 +413,9 @@ export const make = Effect.gen(function* () {
           ...(input.stdin !== undefined ? { stdin: input.stdin } : {}),
           ...(env !== undefined ? { env } : {}),
           ...(input.maxOutputBytes !== undefined ? { maxOutputBytes: input.maxOutputBytes } : {}),
+          ...(input.allowNonZeroExit !== undefined
+            ? { allowNonZeroExit: input.allowNonZeroExit }
+            : {}),
         })
         .pipe(Effect.mapError((error) => fromVcsError({ command: "gh", cwd: input.cwd }, error)));
     },
