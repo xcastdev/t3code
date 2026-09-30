@@ -1,5 +1,5 @@
 Github Tracked: false
-Status: in_progress
+Status: blocked
 Github Issue: none
 Plan review: READY_WITH_EXPLICIT_GATES
 
@@ -730,6 +730,7 @@ drains, controlled clocks, and captured worker exits rather than test sleeps.
 
 ```sh
 vp test run apps/server/src/provider/pi/PiRuntimeContract.test.ts apps/server/src/projectWork/memory/MemoryBackendContract.test.ts
+node apps/server/src/provider/pi/fixtures/p1-runtime-linux-proof.mjs
 ```
 
 The deterministic cases cover protocol validation; P1 also records exact
@@ -737,6 +738,11 @@ version-pinned disposable probe commands and results in this record before P7 or
 P10 proceeds. Live dependency probes must fail clearly rather than pass as skipped
 when the required engine/runtime is absent. No product dependency is installed as
 part of this planning task.
+Ordinary test discovery runs portable actual-SDK consumers. The separately invoked
+Linux runner is a required P1 ownership proof, requiring the pinned SDK, a functional
+systemd user manager, cgroup v2, and Python pidfd support. Missing prerequisites are
+hard failures. This separation preserves the process proof without imposing Linux
+service management on ordinary server tests.
 
 ### V2 — Contracts and durable storage (P2)
 
@@ -1015,7 +1021,7 @@ Their worktrees and disposable probe directories are below
 No production dependency, contract, or managed execution path has been changed.
 P1 and all 19 acceptance criteria remain unchecked while proofs run.
 
-### P1 evidence and current blockers
+### P1 earlier probes and superseded blockers
 
 The user subsequently selected CommandCode, prohibited further OpenAI model
 calls and all Ollama use, and prohibited memory-intensive work on this machine.
@@ -1288,3 +1294,142 @@ and [OpenRouter terms](https://openrouter.ai/terms), dated 2026-08-31.
 All part repairs, combined P1 validation, and the fresh wave review must pass
 before P1 is checked or P2 starts. No pushes, PRs, browsers, devices, or live T3
 database writes have occurred.
+
+### Combined P1 candidate and portable-test repair
+
+Combined candidate `e208851025244081870c0e0859f426874b2ef7a3` passed the original
+18/18 V1 tests. Its fresh xhigh wave reviewer found one integration blocker:
+ordinary test discovery unconditionally required Linux systemd user services.
+CI does not provision or verify that prerequisite; actual CI manager availability
+remains unchecked. The coordinator verified the finding against the source.
+
+One scoped repair was assigned from that exact base to a medium worker on
+`pi-teams/p1-portable-contracts`, in
+`/home/user/.cache/pi-project-teams-11b7e351/portable-contracts`. Commit
+`723f3996bd793c763d109ddccbded7ebd4d9fdf8` changes only the runtime test and SDK
+fixture, and adds the explicit Linux proof runner. Four actual SDK semantic cases
+run with empty PATH; process controls and ownership fallback are rejected before
+startup, and missing SDK remains a hard error. The Linux runner retains six
+positive cases and six causal failure controls, including the native opening MCP
+child surviving SDK cleanup before the independently owned service drains it.
+Portable output is bounded in bytes before retention, and cleanup uses captured
+process handles. Fresh xhigh part review approves the exact commit and independently
+verifies all 47 artifact hashes and five source hashes.
+
+The approved repair is integrated into wave commit
+`bbe8cba1e352a4c6b9cd065fe356d38829218b5f`. Coordinator commands from the wave
+worktree, with `PI_RUNTIME_CONTRACT_SDK_ROOT` pointing to the installed pinned SDK
+under `/home/user/.cache/pi-project-teams-11b7e351/sdk-lock-proof/node_modules/`:
+
+```sh
+vp test run apps/server/src/provider/pi/PiRuntimeContract.test.ts apps/server/src/projectWork/memory/MemoryBackendContract.test.ts
+node --max-old-space-size=128 apps/server/src/provider/pi/fixtures/p1-runtime-linux-proof.mjs
+```
+
+The combined tests pass 21/21 in 1.458 seconds, with a verified 1 GiB cgroup cap,
+128 MiB Node heap cap, 526,860,288-byte kernel peak, and zero OOM events. The Linux
+runner passes all seven outcomes in 17.624 seconds; each owned fixture service has
+a verified 512 MiB cap, causal exit status, and removed cgroup. Service peaks are
+76,918,784–100,294,656 bytes. The runner's separate outer scope peaks at 30,113,792
+bytes and does not include those sibling service cgroups. Both checks make zero
+model calls. Logs, exact command arrays, resource counters, seven outcome records,
+and eleven combined source hashes are retained at
+`/home/user/.cache/pi-project-teams-11b7e351/wave1-validation/`, with suffix
+`bbe8cba1`. The worker's scoped lint, format, syntax, and whitespace checks pass at the
+same source hashes. Its original narrow TypeScript result used a private Vitest
+alias and is superseded by the normal compiler proof below. Initial launcher failures and
+compiler diagnostics remain separate from passing evidence. The worker's unnecessary
+environment dump displayed secret values in tool output; no values were copied
+into evidence, and subsequent manager checks use selected properties only.
+
+The fresh combined-wave review is pending. P1 remains unchecked, the wave has not
+landed on this main worktree, and P2–P14 remain gated. Previously reviewed live
+runtime, memory, isolation, and packaging evidence is unchanged. Linux prerequisites,
+unproved-host disablement, buffered auth-broker streaming, exact full-application
+packaging, bounded production reads, and complete memory reconciliation remain
+explicit P3/P7/P8/P10/P14 obligations. No product acceptance criterion is complete.
+
+### Combined P1 normal compiler repair
+
+Fresh xhigh combined review of `f9363d1641c76a5b64529354b3fd9181a0243359`
+found that the runtime test imported undeclared `vitest`. A private alias in the
+worker's narrow compiler config masked the normal server error. The coordinator
+reproduced TS2307 and TS7006 with the unchanged server compiler and no aliases.
+The same compiler applied to the promoted memory test revealed TS1543 for the
+JSON import and TS377064 for its intentional measurement log. These changes form
+the second and final combined-candidate repair round.
+
+Runtime repair `92e01515af286f6b1ba27554d82bcc4151322193` changes only the import
+to the repository's `vite-plus/test`. Memory repair
+`9058f2b43042bf65900126112e5002987c43fa7f` adds the NodeNext JSON import attribute
+and a justified next-line Effect console diagnostic directive. Separate fresh
+xhigh part reviewers approve both exact commits. The memory reviewer verified
+source/diff hashes directly; that part has no artifact manifest. Both parts retain
+all assertions and test bodies, and the history fixture is byte-identical.
+
+The approved parts are integrated at
+`2de52a213ca7e35f20ac594d91e4a647452bfbd2`. The coordinator reran:
+
+```sh
+vp test run apps/server/src/provider/pi/PiRuntimeContract.test.ts apps/server/src/projectWork/memory/MemoryBackendContract.test.ts
+node_modules/.bin/tsc --noEmit --project /home/user/.cache/pi-project-teams-11b7e351/wave1-validation/tsconfig.p1-promoted-no-alias.json
+```
+
+Tests pass 21/21 in 1.842 seconds, with a verified 1 GiB cap, 421,871,616-byte
+kernel peak, and zero OOM events. Strict compilation passes in 1.169 seconds,
+with a verified 1 GiB cap, 568,504,320-byte peak, and zero OOM events. The external
+compiler config extends the unchanged normal server configuration, restricts
+files to the two promoted tests, and supplies cached Node type roots. It has no
+aliases, substitute declarations, or disabled compiler plugins. Both checks use
+a 128 MiB Node heap setting, zero swap, and zero model calls. Exact commands, logs,
+counters, and source hashes are retained in `wave1-validation/` with suffix
+`2de52a21`. All four Linux ownership fixture source hashes are unchanged from
+`bbe8cba1`; its seven real Linux outcomes remain applicable and were not replayed.
+
+The final fresh combined review remains pending. P1 is unchecked and P2 has not
+started. Normal build/test memory limits may increase when measured need justifies
+it; the user's prohibition concerns all local model loading, hosting, and inference.
+No Ollama, llama, local model, model weight download, push, or PR is authorized.
+
+### Current P1 blocker and preserved state
+
+Fresh xhigh final wave review of
+`7af9ed41a9cda1fb4335d6449c9779466b9c554d` returns **REQUEST_CHANGES** for one
+verified high-priority CI finding. The reviewer ran this focused read-only check:
+
+```sh
+node --max-old-space-size=512 node_modules/knip/bin/knip.js --workspace apps/server --include files,dependencies --no-config-hints --reporter json
+```
+
+It exits 1 and identifies only the new `p1-runtime-descendants.mjs`,
+`p1-runtime-linux-proof.mjs`, and `p1-runtime-mcp.mjs` as unused. Their consumers
+launch by dynamic paths or explicit runner invocation; `knip.jsonc` registers the
+older `src/provider/testFixtures/*.mjs` entry but omits these files. CI runs this
+files/dependencies gate. The coordinator inspected the source and captured result
+and verified both evidence digests at
+`/home/user/.cache/pi-project-teams-11b7e351/final-review-7af9ed41/`.
+
+The reviewer reports no other verified finding. It independently verifies the
+combined source hashes, recorded 21/21 tests, normal strict compiler pass, unchanged
+Linux proof source hashes, all selected manifests including 74 memory and 108
+packaging artifacts, and both original native UUID/vector/payload recovery sets.
+These findings support P1 feasibility with its documented production obligations;
+the outstanding CI finding prevents approval, landing, or marking P1 complete.
+The reviewer did not replay tests, remote calls, or Linux proofs.
+
+The prepared repair adds one explanatory comment and three exact fixture entries
+to `knip.jsonc`. It is retained outside the worktree at
+`/home/user/.cache/pi-project-teams-11b7e351/wave1-validation/proposed-knip-entry-repair.patch`;
+`git apply --check` passes. It has not been applied. The shared delivery contract
+at `/home/user/.agents/skills/delivery-core/CONTRACT.md` limits automatic repairs
+to two and says, "Stop after the second repair attempt or the final permitted
+full-validation failure." Both combined-candidate rounds are consumed. The
+coordinator requested explicit authorization for this additional scoped repair,
+focused Knip check, and fresh review; dependent implementation remains gated.
+
+The wave stays clean at `7af9ed41a9cda1fb4335d6449c9779466b9c554d`; it has not
+merged into this main worktree. This main advance updates only this progress
+record and must be reconciled into the wave before a later authorized merge.
+P1–P14 and all 19 acceptance criteria remain unchecked. Normal build/test memory
+caps may increase as needed; local model loading, inference, hosting, and downloads
+remain prohibited. No push, PR, browser/device use, or live T3 database write occurred.
