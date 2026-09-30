@@ -730,6 +730,7 @@ drains, controlled clocks, and captured worker exits rather than test sleeps.
 
 ```sh
 vp test run apps/server/src/provider/pi/PiRuntimeContract.test.ts apps/server/src/projectWork/memory/MemoryBackendContract.test.ts
+node apps/server/src/provider/pi/fixtures/p1-runtime-linux-proof.mjs
 ```
 
 The deterministic cases cover protocol validation; P1 also records exact
@@ -737,6 +738,11 @@ version-pinned disposable probe commands and results in this record before P7 or
 P10 proceeds. Live dependency probes must fail clearly rather than pass as skipped
 when the required engine/runtime is absent. No product dependency is installed as
 part of this planning task.
+Ordinary test discovery runs portable actual-SDK consumers. The separately invoked
+Linux runner is a required P1 ownership proof, requiring the pinned SDK, a functional
+systemd user manager, cgroup v2, and Python pidfd support. Missing prerequisites are
+hard failures. This separation preserves the process proof without imposing Linux
+service management on ordinary server tests.
 
 ### V2 — Contracts and durable storage (P2)
 
@@ -1288,3 +1294,56 @@ and [OpenRouter terms](https://openrouter.ai/terms), dated 2026-08-31.
 All part repairs, combined P1 validation, and the fresh wave review must pass
 before P1 is checked or P2 starts. No pushes, PRs, browsers, devices, or live T3
 database writes have occurred.
+
+### Combined P1 candidate and portable-test repair
+
+Combined candidate `e208851025244081870c0e0859f426874b2ef7a3` passed the original
+18/18 V1 tests. Its fresh xhigh wave reviewer found one integration blocker:
+ordinary test discovery unconditionally required Linux systemd user services.
+CI does not provision or verify that prerequisite; actual CI manager availability
+remains unchecked. The coordinator verified the finding against the source.
+
+One scoped repair was assigned from that exact base to a medium worker on
+`pi-teams/p1-portable-contracts`, in
+`/home/user/.cache/pi-project-teams-11b7e351/portable-contracts`. Commit
+`723f3996bd793c763d109ddccbded7ebd4d9fdf8` changes only the runtime test and SDK
+fixture, and adds the explicit Linux proof runner. Four actual SDK semantic cases
+run with empty PATH; process controls and ownership fallback are rejected before
+startup, and missing SDK remains a hard error. The Linux runner retains six
+positive cases and six causal failure controls, including the native opening MCP
+child surviving SDK cleanup before the independently owned service drains it.
+Portable output is bounded in bytes before retention, and cleanup uses captured
+process handles. Fresh xhigh part review approves the exact commit and independently
+verifies all 47 artifact hashes and five source hashes.
+
+The approved repair is integrated into wave commit
+`bbe8cba1e352a4c6b9cd065fe356d38829218b5f`. Coordinator commands from the wave
+worktree, with `PI_RUNTIME_CONTRACT_SDK_ROOT` pointing to the installed pinned SDK
+under `/home/user/.cache/pi-project-teams-11b7e351/sdk-lock-proof/node_modules/`:
+
+```sh
+vp test run apps/server/src/provider/pi/PiRuntimeContract.test.ts apps/server/src/projectWork/memory/MemoryBackendContract.test.ts
+node --max-old-space-size=128 apps/server/src/provider/pi/fixtures/p1-runtime-linux-proof.mjs
+```
+
+The combined tests pass 21/21 in 1.458 seconds, with a verified 1 GiB cgroup cap,
+128 MiB Node heap cap, 526,860,288-byte kernel peak, and zero OOM events. The Linux
+runner passes all seven outcomes in 17.624 seconds; each owned fixture service has
+a verified 512 MiB cap, causal exit status, and removed cgroup. Service peaks are
+76,918,784–100,294,656 bytes. The runner's separate outer scope peaks at 30,113,792
+bytes and does not include those sibling service cgroups. Both checks make zero
+model calls. Logs, exact command arrays, resource counters, seven outcome records,
+and eleven combined source hashes are retained at
+`/home/user/.cache/pi-project-teams-11b7e351/wave1-validation/`, with suffix
+`bbe8cba1`. The worker's scoped lint, format, strict narrow TypeScript, syntax, and
+whitespace checks pass at the same source hashes. Initial launcher failures and
+compiler diagnostics remain separate from passing evidence. The worker's unnecessary
+environment dump displayed secret values in tool output; no values were copied
+into evidence, and subsequent manager checks use selected properties only.
+
+The fresh combined-wave review is pending. P1 remains unchecked, the wave has not
+landed on this main worktree, and P2–P14 remain gated. Previously reviewed live
+runtime, memory, isolation, and packaging evidence is unchanged. Linux prerequisites,
+unproved-host disablement, buffered auth-broker streaming, exact full-application
+packaging, bounded production reads, and complete memory reconciliation remain
+explicit P3/P7/P8/P10/P14 obligations. No product acceptance criterion is complete.
