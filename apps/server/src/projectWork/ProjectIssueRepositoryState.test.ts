@@ -355,6 +355,108 @@ it.effect("rebind retires the last old owner atomically and rolls back its targe
   ),
 );
 
+const claimSnapshot = Effect.fn("issueRepositoryTest.claimSnapshot")(function* (
+  sql: SqlClient.SqlClient,
+) {
+  return {
+    repositories: yield* sql`SELECT * FROM project_issue_repository`,
+    bindings: yield* sql`SELECT * FROM project_issue_binding ORDER BY project_id`,
+    changes: yield* sql`SELECT total_changes() AS changes`,
+  };
+});
+
+it.effect("a matching prepared revision claims its exact authority once", () =>
+  run(
+    Effect.gen(function* () {
+      const sql = yield* setup;
+      yield* bind(sql);
+      yield* bind(sql, "b");
+      const prepared = (yield* readIssueRepositoryState(sql, key))!;
+      const leased = yield* claimIssueRepositoryRead(sql, key, {
+        leaseId: "prepared",
+        durationMs: 1000,
+        sweepStartedAt: at,
+        expectedRevision: prepared.revision,
+      });
+      expect(leased).toMatchObject({
+        revision: prepared.revision + 1,
+        authorityGeneration: prepared.authorityGeneration,
+        credentialEpoch: prepared.credentialEpoch,
+        lease: { id: "prepared", bindings: [{ projectId: "a" }, { projectId: "b" }] },
+      });
+      expect(yield* readIssueRepositoryState(sql, key)).toEqual(leased);
+      const before = yield* claimSnapshot(sql);
+      expect(
+        yield* claimIssueRepositoryRead(sql, key, {
+          leaseId: "duplicate",
+          durationMs: 1000,
+          sweepStartedAt: at,
+          expectedRevision: prepared.revision,
+        }),
+      ).toBeUndefined();
+      expect(yield* claimSnapshot(sql)).toEqual(before);
+    }),
+  ),
+);
+
+it.effect("a stale prepared revision cannot claim newly rotated ready authority", () =>
+  run(
+    Effect.gen(function* () {
+      const sql = yield* setup;
+      yield* bind(sql);
+      const prepared = (yield* readIssueRepositoryState(sql, key))!;
+      const current = yield* rotateIssueRepositoryCredential(sql, key, {
+        accountNodeId: prepared.accountNodeId,
+        credentialEpoch: "rotated",
+        expectedRevision: prepared.revision,
+      });
+      const before = yield* claimSnapshot(sql);
+      expect(
+        yield* claimIssueRepositoryRead(sql, key, {
+          leaseId: "stale",
+          durationMs: 1000,
+          sweepStartedAt: at,
+          expectedRevision: prepared.revision,
+        }),
+      ).toBeUndefined();
+      expect(yield* claimSnapshot(sql)).toEqual(before);
+      expect(
+        (yield* claimIssueRepositoryRead(sql, key, {
+          leaseId: "current",
+          durationMs: 1000,
+          sweepStartedAt: at,
+          expectedRevision: current.revision,
+        }))?.lease?.credentialEpoch,
+      ).toBe("rotated");
+    }),
+  ),
+);
+
+for (const expectedRevision of [
+  -1,
+  0.5,
+  Number.NaN,
+  Number.POSITIVE_INFINITY,
+  Number.MAX_SAFE_INTEGER + 1,
+])
+  it.effect(`invalid prepared revision ${expectedRevision} fails without SQL mutation`, () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        yield* bind(sql);
+        const before = yield* claimSnapshot(sql);
+        const result = yield* claimIssueRepositoryRead(sql, key, {
+          leaseId: "invalid",
+          durationMs: 1000,
+          sweepStartedAt: at,
+          expectedRevision,
+        }).pipe(Effect.result);
+        expect(result).toMatchObject({ _tag: "Failure", failure: { reason: "invalid-input" } });
+        expect(yield* claimSnapshot(sql)).toEqual(before);
+      }),
+    ),
+  );
+
 it.effect(
   "shared bindings have one canonical read and reject account or stale binding changes",
   () =>

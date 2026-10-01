@@ -399,7 +399,7 @@ export const rebindIssueRepositoryProject = Effect.fn("rebindIssueRepositoryProj
 export const claimIssueRepositoryRead = Effect.fn("claimIssueRepositoryRead")(function* (
   sql: SqlClient.SqlClient,
   key: IssueRepositoryKey,
-  input: { leaseId: string; durationMs: number; sweepStartedAt: string },
+  input: { leaseId: string; durationMs: number; sweepStartedAt: string; expectedRevision?: number },
 ) {
   return yield* sql.withTransaction(
     Effect.gen(function* () {
@@ -410,12 +410,15 @@ export const claimIssueRepositoryRead = Effect.fn("claimIssueRepositoryRead")(fu
         !Number.isSafeInteger(input.durationMs) ||
         input.durationMs < 1 ||
         input.durationMs > 60000 ||
-        !Number.isSafeInteger(now + input.durationMs)
+        !Number.isSafeInteger(now + input.durationMs) ||
+        (input.expectedRevision !== undefined &&
+          (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0))
       )
         return yield* fail("invalid-input");
       const state = yield* readIssueRepositoryState(sql, key);
       if (
         state === undefined ||
+        (input.expectedRevision !== undefined && state.revision !== input.expectedRevision) ||
         state.status !== "ready" ||
         state.credentialEpoch.length === 0 ||
         state.repositoryName.length === 0 ||
