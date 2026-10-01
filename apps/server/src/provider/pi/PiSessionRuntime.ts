@@ -97,6 +97,8 @@ export interface PiSessionRuntimeOptions {
   ) => Promise<typeof PiWorkerToolOutput.Type>;
   readonly persistNative: (frame: PiWorkerFrame, signal: AbortSignal) => Promise<void>;
   readonly onSdkEvent: (frame: PiWorkerFrame, signal: AbortSignal) => Promise<void>;
+  // Observations are sequential. Never await later frames or model completion here.
+  readonly onWorkerFrame?: (frame: PiWorkerFrame, signal: AbortSignal) => Promise<void>;
   readonly persistControl: (
     receipt: {
       readonly identity: PiWorkerIdentity;
@@ -204,6 +206,7 @@ function captureOptions(input: PiSessionRuntimeOptions) {
     input.cleanupDeadlineMs < 1 ||
     input.cleanupDeadlineMs > 30_000 ||
     !input.persistence ||
+    (input.onWorkerFrame !== undefined && typeof input.onWorkerFrame !== "function") ||
     [
       input.authorizeCurrent,
       input.executeBridgeTool,
@@ -485,6 +488,8 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
           const dispatch = async (raw: string) => {
             const frame = freezeJson(decodePiWorkerFrame(raw));
             protocol.acceptWorker(frame);
+            const observer = callbacks.onWorkerFrame;
+            if (observer) await callback(() => observer(frame, controller.signal));
             const message = frame.message;
             switch (message.type) {
               case "request": {
