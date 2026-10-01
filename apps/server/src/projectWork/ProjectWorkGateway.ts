@@ -25,6 +25,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ProjectTeamAuthorization from "./ProjectTeamAuthorization.ts";
 import * as ProjectWorkBriefing from "./ProjectWorkBriefing.ts";
+import * as IssueComments from "./ProjectIssueComments.ts";
 import * as ProjectWorkNarrative from "./ProjectWorkNarrative.ts";
 import * as ProjectWorkAttentionReactor from "./ProjectWorkAttentionReactor.ts";
 import * as ProjectWorkExport from "./ProjectWorkExport.ts";
@@ -104,7 +105,9 @@ export interface ProjectWorkGatewayShape {
     principal?: ProjectTeamAuthorization.ProjectTeamPrincipal,
   ) => Effect.Effect<
     unknown,
-    ProjectionRepositoryError | ProjectTeamAuthorization.ProjectTeamAuthorizationError
+    | ProjectionRepositoryError
+    | ProjectTeamAuthorization.ProjectTeamAuthorizationError
+    | IssueComments.IssueCommentsError
   >;
   readonly write: (
     command: ProjectWorkWriteIntent,
@@ -127,6 +130,7 @@ export class ProjectWorkGateway extends Context.Service<
 >()("t3/projectWork/ProjectWorkGateway") {}
 
 const isTeamAuthorizationError = Schema.is(ProjectTeamAuthorization.ProjectTeamAuthorizationError);
+const isIssueCommentsError = Schema.is(IssueComments.IssueCommentsError);
 const isTeamIntent = Schema.is(ProjectTeamWriteIntent);
 const isGuidedIntent = Schema.is(ProjectTeamGuidedIntent);
 
@@ -305,6 +309,7 @@ const sanitizePublicValue = (value: unknown, depth = 0, foundation = false): unk
 
 const makeProjectWorkGateway = Effect.gen(function* () {
   const auth = yield* EnvironmentAuth.EnvironmentAuth;
+  const issueComments = yield* Effect.serviceOption(IssueComments.ProjectIssueComments);
   const repository = yield* ProjectWorkRepository.ProjectWorkRepository;
   const query = yield* ProjectWorkQuery.ProjectWorkQuery;
   const search = yield* ProjectWorkSearch.ProjectWorkSearch;
@@ -350,6 +355,12 @@ const makeProjectWorkGateway = Effect.gen(function* () {
     };
     const result: Effect.Effect<unknown, ProjectionRepositoryError> = (() => {
       switch (boundedInput.operation) {
+        case "issue-comments":
+          return Effect.fail(
+            toPersistenceSqlError("ProjectWorkGateway.read")(
+              new IssueComments.IssueCommentsError({ reason: "unavailable" }),
+            ),
+          );
         case "foundation-records":
           return query.listFoundationRecords({
             ...base,
@@ -893,8 +904,44 @@ const makeProjectWorkGateway = Effect.gen(function* () {
       return sanitizePublicValue(result.writeResult) as ProjectWorkWriteReceipt;
     });
 
-  const read: ProjectWorkGatewayShape["read"] = (input, principal) =>
-    sql
+  const read: ProjectWorkGatewayShape["read"] = (input, principal) => {
+    if (input.operation === "issue-comments")
+      return Effect.gen(function* () {
+        const authorize = sql.withTransaction(
+          Effect.gen(function* () {
+            if (principal?.managed !== undefined && teamAuthorization._tag === "None")
+              return yield* new ProjectTeamAuthorization.ProjectTeamAuthorizationError({
+                reason: "Managed authority unavailable",
+              });
+            if (principal !== undefined && teamAuthorization._tag === "Some")
+              yield* teamAuthorization.value.read(principal, input);
+          }),
+        );
+        yield* authorize;
+        if (issueComments._tag === "None")
+          return yield* new IssueComments.IssueCommentsError({ reason: "unavailable" });
+        if (input.issueRecordId === undefined || input.expectedIssueRevision === undefined)
+          return yield* new IssueComments.IssueCommentsError({ reason: "invalid-input" });
+        const page = yield* issueComments.value.read({
+          projectId: String(input.projectId),
+          issueRecordId: input.issueRecordId,
+          expectedRevision: input.expectedIssueRevision,
+          ...(input.issueCommentPage === undefined ? {} : { page: input.issueCommentPage }),
+        });
+        yield* authorize;
+        const publicPage =
+          contentGuard._tag === "Some"
+            ? (yield* contentGuard.value.redact(page)).value
+            : redactProjectWorkContent(page).value;
+        return sanitizePublicValue(publicPage);
+      }).pipe(
+        Effect.mapError((cause) =>
+          isTeamAuthorizationError(cause) || isIssueCommentsError(cause)
+            ? cause
+            : toPersistenceSqlError("ProjectWorkGateway.read")(cause),
+        ),
+      );
+    return sql
       .withTransaction(
         Effect.gen(function* () {
           if (principal?.managed !== undefined && teamAuthorization._tag === "None")
@@ -913,6 +960,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             : toPersistenceSqlError("ProjectWorkGateway.read")(cause),
         ),
       );
+  };
   const write: ProjectWorkGatewayShape["write"] = (input, actor, source, principal) => {
     if (!isTeamIntent(input) && !isGuidedIntent(input))
       return writeCommand(input, actor, source, principal);

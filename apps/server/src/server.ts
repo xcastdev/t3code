@@ -132,10 +132,13 @@ import * as ProjectWorkBriefing from "./projectWork/ProjectWorkBriefing.ts";
 import * as ProjectWorkNarrative from "./projectWork/ProjectWorkNarrative.ts";
 import * as ProjectTeamAuthorization from "./projectWork/ProjectTeamAuthorization.ts";
 import * as ProjectWorkGateway from "./projectWork/ProjectWorkGateway.ts";
+import * as ProjectIssueBindingGateway from "./projectWork/ProjectIssueBindingGateway.ts";
 import * as ProjectWorkAttentionReactor from "./projectWork/ProjectWorkAttentionReactor.ts";
 import * as ProjectWorkContentGuard from "./projectWork/ProjectWorkContentGuard.ts";
 import * as ProjectWorkExport from "./projectWork/ProjectWorkExport.ts";
 import * as ProjectWorkRuntime from "./projectWork/ProjectWorkRuntime.ts";
+import * as GitHubIssueClient from "./projectWork/github/GitHubIssueClient.ts";
+import * as IssueCredentialSnapshot from "./projectWork/ProjectIssueCredentialSnapshot.ts";
 import * as ProjectLifecycle from "./project/ProjectLifecycle.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "./vcs/VcsDriverRegistry.ts";
@@ -601,8 +604,26 @@ const ProjectWorkCoreLive = ProjectWorkRuntime.coreLayer.pipe(
   Layer.provide(ProjectTeamAuthorizationLive),
 );
 
+const ProjectIssueClientLive = GitHubIssueClient.layer.pipe(
+  Layer.provide(GitHubCli.layer),
+  Layer.provide(SourceControlRateLimit.layer),
+);
+const ProjectIssueCredentialsLive = Layer.effect(
+  IssueCredentialSnapshot.ProjectIssueCredentialSnapshot,
+  IssueCredentialSnapshot.make,
+).pipe(Layer.provide(GitHubCli.layer), Layer.provide(ProcessRunner.layer));
+const ProjectIssueServicesLive = ProjectWorkRuntime.issueCommentsLayer.pipe(
+  Layer.provide(ProjectIssueClientLive),
+  Layer.provide(ProjectIssueCredentialsLive),
+  Layer.provide(RepositoryIdentityResolverLayerLive),
+  Layer.provide(ProjectWorkCoreLive),
+  Layer.provide(ServerSettingsLayerLive),
+);
+
 const ProjectWorkServicesLive = Layer.mergeAll(
   ProjectWorkRuntime.withCore(ProjectWorkCoreLive),
+  ProjectIssueServicesLive,
+  ProjectIssueBindingGateway.layer.pipe(Layer.provide(ProjectIssueServicesLive)),
   ProjectWorkProjection.ProjectWorkProjectionLive,
   ProjectWorkQuery.ProjectWorkQueryLive,
   ProjectWorkSearch.ProjectWorkSearchLive,

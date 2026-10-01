@@ -13,6 +13,7 @@ import * as GitHubCli from "../sourceControl/GitHubCli.ts";
 import { commitIssueRepositoryPage } from "./ProjectIssueIntakeService.ts";
 import {
   claimIssueRepositoryRead,
+  readIssueRepositoryState,
   recordIssueRepositoryReadFailure,
   type IssueRepositoryKey,
   type IssueRepositoryState,
@@ -34,6 +35,10 @@ export class IssueSyncCredentialError extends Schema.TaggedError<IssueSyncCreden
   { reason: Schema.Literals(["unavailable", "authentication"]) },
 ) {}
 export interface IssueSyncWorkerOptions {
+  /** Paginated verification can defer a row without allocating a lease or rejecting its account. */
+  readonly prepareCredential?: (
+    state: IssueRepositoryState,
+  ) => Effect.Effect<IssueSyncCredential | undefined, IssueSyncCredentialError>;
   readonly resolveCredential: (
     state: IssueRepositoryState,
   ) => Effect.Effect<IssueSyncCredential | undefined, IssueSyncCredentialError>;
@@ -138,10 +143,31 @@ export const make = Effect.fn("ProjectIssueSyncWorker.make")(function* (
     key: IssueRepositoryKey,
   ): Effect.fn.Return<IssueSyncReceipt> {
     if (stopped) return { status: "obsolete", key };
+    let preparedCredential: IssueSyncCredential | undefined;
+    let expectedRevision: number | undefined;
+    if (options.prepareCredential !== undefined) {
+      const candidate = yield* readIssueRepositoryState(sql, key).pipe(Effect.result);
+      if (candidate._tag === "Failure") return { status: "failure", key, reason: "storage" };
+      if (candidate.success === undefined || candidate.success.status !== "ready")
+        return { status: "no-claim", key };
+      const prepared = yield* options.prepareCredential(candidate.success).pipe(Effect.result);
+      if (
+        prepared._tag === "Failure" ||
+        prepared.success === undefined ||
+        prepared.success.host !== candidate.success.host ||
+        prepared.success.accountNodeId !== candidate.success.accountNodeId ||
+        prepared.success.credentialEpoch !== candidate.success.credentialEpoch
+      )
+        return { status: "no-claim", key };
+      preparedCredential = prepared.success;
+      expectedRevision = candidate.success.revision;
+    }
+    if (stopped) return { status: "obsolete", key };
     const claimed = yield* claimIssueRepositoryRead(sql, key, {
       leaseId: `${owner}:${++sequence}`,
       durationMs: 60_000,
       sweepStartedAt: seconds(yield* DateTime.now),
+      ...(expectedRevision === undefined ? {} : { expectedRevision }),
     }).pipe(Effect.result);
     if (claimed._tag === "Failure") return { status: "failure", key, reason: "storage" };
     const state = claimed.success;
@@ -169,9 +195,11 @@ export const make = Effect.fn("ProjectIssueSyncWorker.make")(function* (
         : { status: "obsolete", key };
     });
     const attempt = Effect.gen(function* () {
-      const credential = yield* options
-        .resolveCredential(state)
-        .pipe(Effect.catch(() => Effect.succeed(undefined)));
+      const credential =
+        preparedCredential ??
+        (yield* options
+          .resolveCredential(state)
+          .pipe(Effect.catch(() => Effect.succeed(undefined))));
       if (
         credential === undefined ||
         credential.host !== state.host ||

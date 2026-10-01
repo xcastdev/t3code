@@ -2,6 +2,19 @@ import * as Effect from "effect/Effect";
 import * as DateTime from "effect/DateTime";
 import type * as Duration from "effect/Duration";
 import * as Layer from "effect/Layer";
+import * as Context from "effect/Context";
+import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
+import * as Exit from "effect/Exit";
+import * as Option from "effect/Option";
+import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { ServerSettingsService } from "../serverSettings.ts";
+import * as IssueManager from "./ProjectIssueRepositoryManager.ts";
+import * as IssueSync from "./ProjectIssueSyncWorker.ts";
+import * as IssueComments from "./ProjectIssueComments.ts";
+import * as IssueHumanBinding from "./ProjectIssueHumanBinding.ts";
 import * as Schedule from "effect/Schedule";
 
 import * as ProjectWorkEventBus from "./ProjectWorkEventBus.ts";
@@ -61,3 +74,233 @@ export const withCore = <ROut, E, RIn>(providedCore: Layer.Layer<ROut, E, RIn>) 
     }),
   ).pipe(Layer.provideMerge(leases));
 };
+
+export type ProjectIssueRuntimeState = "disabled" | "ready" | "unavailable" | "stopped";
+export class ProjectIssueRuntime extends Context.Service<
+  ProjectIssueRuntime,
+  {
+    readonly ready: Effect.Effect<void>;
+    readonly refresh: Effect.Effect<{
+      readonly repositories: ReadonlyArray<IssueManager.IssueRepositoryRefreshReceipt>;
+      readonly pages: ReadonlyArray<IssueSync.IssueSyncReceipt>;
+    }>;
+    readonly readComments: IssueComments.ProjectIssueComments["Service"]["read"];
+    readonly bindRepository: IssueHumanBinding.ProjectIssueHumanBinding["Service"]["bind"];
+    readonly stop: Effect.Effect<void>;
+  }
+>()("t3/projectWork/ProjectWorkRuntime/ProjectIssueRuntime") {}
+
+/** Feature changes own the same child scope as repository refresh, page sync and comment readers. */
+export const makeProjectIssueRuntime = Effect.fn("ProjectIssueRuntime.make")(function* (
+  onState: (state: ProjectIssueRuntimeState) => Effect.Effect<void> = () => Effect.void,
+) {
+  const sql = yield* SqlClient.SqlClient;
+  if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+    return yield* new IssueComments.IssueCommentsError({ reason: "unavailable" });
+  const settings = yield* ServerSettingsService;
+  const watcherScope = yield* Scope.make();
+  const initialized = yield* Deferred.make<void>();
+  let stopped = false;
+  let child: Scope.Closeable | undefined;
+  let active:
+    | {
+        readonly manager: IssueManager.ProjectIssueRepositoryManagerShape;
+        readonly workerReady: Effect.Effect<IssueSync.ProjectIssueSyncWorkerShape | undefined>;
+        readonly comments: IssueComments.ProjectIssueComments["Service"];
+        readonly binding: IssueHumanBinding.ProjectIssueHumanBinding["Service"];
+        readonly scope: Scope.Closeable;
+      }
+    | undefined;
+  const close = Effect.uninterruptible(
+    Effect.gen(function* () {
+      active = undefined;
+      const closing = child;
+      child = undefined;
+      if (closing !== undefined) yield* Scope.close(closing, Exit.void);
+    }),
+  );
+  // Register ownership before settings subscription construction can fail or be interrupted.
+  yield* Effect.addFinalizer(() =>
+    Scope.close(watcherScope, Exit.void).pipe(Effect.andThen(close)),
+  );
+  const changes = yield* settings.subscribeChanges.pipe(
+    Effect.provideService(Scope.Scope, watcherScope),
+  );
+  const transition = Effect.fn("ProjectIssueRuntime.transition")(function* (enabled: boolean) {
+    if (stopped) return;
+    if (!enabled) {
+      yield* close;
+      yield* onState("disabled");
+      return;
+    }
+    if (active !== undefined) return;
+    child = yield* Scope.make();
+    const serviceScope = child;
+    const services = yield* Effect.gen(function* () {
+      let worker: IssueSync.ProjectIssueSyncWorkerShape | undefined;
+      let pendingWake = false;
+      const manager = yield* IssueManager.make({
+        onReady: Effect.suspend(() =>
+          worker === undefined
+            ? Effect.sync(() => {
+                pendingWake = true;
+              })
+            : worker.wake,
+        ),
+      });
+      const workerInitialized = yield* Deferred.make<
+        IssueSync.ProjectIssueSyncWorkerShape | undefined
+      >();
+      yield* Effect.addFinalizer(() => Deferred.succeed(workerInitialized, undefined));
+      yield* Effect.forkScoped(
+        Effect.gen(function* () {
+          // Verification must precede the sync claim: a claim changes the manager's payload fence.
+          yield* manager.ready;
+          worker = yield* IssueSync.make({
+            prepareCredential: manager.resolveCredential,
+            resolveCredential: manager.resolveCredential,
+          });
+          yield* Deferred.succeed(workerInitialized, worker);
+          if (pendingWake) yield* worker.wake;
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.failCause(cause)
+              : Effect.logWarning("project issue sync startup failed", cause),
+          ),
+          Effect.ensuring(Deferred.succeed(workerInitialized, undefined)),
+        ),
+      );
+      const comments = yield* IssueComments.make({
+        resolveCredential: (state) =>
+          manager.ready.pipe(
+            Effect.andThen(manager.resolveCredential(state)),
+            Effect.mapError(
+              () => new IssueComments.IssueCommentsError({ reason: "credential-mismatch" }),
+            ),
+            Effect.flatMap((credential) =>
+              credential === undefined
+                ? Effect.fail(
+                    new IssueComments.IssueCommentsError({ reason: "credential-mismatch" }),
+                  )
+                : Effect.succeed({
+                    cwd: credential.cwd,
+                    host: credential.host,
+                    accountNodeId: credential.accountNodeId,
+                    credentialEpoch: credential.credentialEpoch,
+                    token: credential.token,
+                  }),
+            ),
+          ),
+      });
+      const binding = yield* IssueHumanBinding.make;
+      return {
+        manager,
+        workerReady: Deferred.await(workerInitialized),
+        comments,
+        binding,
+        scope: serviceScope,
+      };
+    }).pipe(Effect.provideService(Scope.Scope, child));
+    if (stopped) {
+      yield* close;
+      return;
+    }
+    active = services;
+    yield* onState("ready");
+  });
+  yield* Effect.forkScoped(
+    Stream.concat(Stream.fromEffect(settings.getSettings), changes).pipe(
+      Stream.runForEach((value) =>
+        transition(value.projectWorkEnabled).pipe(
+          Effect.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause)
+              ? Effect.failCause(cause)
+              : close.pipe(Effect.andThen(onState("unavailable"))),
+          ),
+          Effect.ensuring(Deferred.succeed(initialized, undefined)),
+        ),
+      ),
+      Effect.catchCause((cause) =>
+        Cause.hasInterruptsOnly(cause)
+          ? Effect.failCause(cause)
+          : close.pipe(Effect.andThen(onState("unavailable"))),
+      ),
+      Effect.ensuring(Deferred.succeed(initialized, undefined)),
+    ),
+  ).pipe(Effect.provideService(Scope.Scope, watcherScope));
+  const stop = Effect.uninterruptible(
+    Effect.gen(function* () {
+      if (stopped) return;
+      stopped = true;
+      yield* Scope.close(watcherScope, Exit.void);
+      yield* close;
+      yield* Deferred.succeed(initialized, undefined);
+      yield* onState("stopped");
+    }),
+  );
+  yield* Effect.addFinalizer(() => stop);
+  const refresh = Effect.gen(function* () {
+    yield* Deferred.await(initialized);
+    const current = active;
+    if (stopped || current === undefined) return { repositories: [], pages: [] };
+    const worker = yield* current.workerReady;
+    if (stopped || active !== current || worker === undefined)
+      return { repositories: [], pages: [] };
+    const repositories = yield* current.manager.refresh;
+    if (stopped || active !== current) return { repositories: [], pages: [] };
+    const pages = yield* worker.drain;
+    return { repositories, pages };
+  });
+  const readComments: IssueComments.ProjectIssueComments["Service"]["read"] = (input) =>
+    Effect.gen(function* () {
+      yield* Deferred.await(initialized);
+      const current = active;
+      if (stopped || current === undefined)
+        return yield* new IssueComments.IssueCommentsError({ reason: "unavailable" });
+      return yield* current.comments.read(input);
+    });
+  const bindRepository: IssueHumanBinding.ProjectIssueHumanBinding["Service"]["bind"] = (
+    input,
+    authorization,
+  ) =>
+    Effect.gen(function* () {
+      yield* Deferred.await(initialized);
+      const current = active;
+      if (stopped || current === undefined)
+        return yield* new IssueHumanBinding.IssueHumanBindingError({ reason: "feature-disabled" });
+      const receipt = yield* current.binding.bind(input, authorization);
+      // Binding is already committed. Refresh is owned by the same feature scope and cannot retract its receipt.
+      if (!stopped && active === current)
+        yield* Effect.forkIn(
+          current.manager.refresh.pipe(
+            Effect.asVoid,
+            Effect.catchCause((cause) =>
+              Cause.hasInterruptsOnly(cause)
+                ? Effect.failCause(cause)
+                : Effect.logWarning("project repository binding refresh failed", cause),
+            ),
+          ),
+          current.scope,
+        );
+      return receipt;
+    });
+  return ProjectIssueRuntime.of({
+    ready: Deferred.await(initialized),
+    refresh,
+    readComments,
+    bindRepository,
+    stop,
+  });
+});
+export const issueRuntimeLayer = Layer.effect(ProjectIssueRuntime, makeProjectIssueRuntime());
+export const issueCommentsLayer = Layer.effect(
+  IssueComments.ProjectIssueComments,
+  Effect.gen(function* () {
+    const runtime = yield* ProjectIssueRuntime;
+    return IssueComments.ProjectIssueComments.of({
+      read: runtime.readComments,
+      stop: runtime.stop,
+    });
+  }),
+).pipe(Layer.provideMerge(issueRuntimeLayer));
