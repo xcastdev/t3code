@@ -491,6 +491,8 @@ const makeProjectWorkRepository = Effect.gen(function* () {
             )
               continue;
             const binding = event.record;
+            yield* sql`INSERT OR IGNORE INTO project_team_identity_fences
+              (provider_instance_id,thread_id) VALUES (${binding.providerInstanceId},${binding.threadId})`;
             const revokedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
             yield* sql`UPDATE auth_sessions SET revoked_at=${revokedAt}
               WHERE subject=${`agent:mcp:${binding.providerInstanceId}:${binding.threadId}`}

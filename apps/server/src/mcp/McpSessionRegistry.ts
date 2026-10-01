@@ -240,17 +240,22 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
     function* (threadId) {
       const records = yield* SynchronizedRef.get(state);
       for (const record of records.records.values())
-        if (record.scope.threadId === threadId && record.scope.managed !== undefined) {
+        if (record.scope.threadId === threadId) {
           const valid =
             authorization._tag === "Some"
               ? yield* authorization.value
                   .resolve({
                     actor: McpInvocationContext.projectWorkActorForInvocation(record.scope),
-                    managed: record.scope.managed,
+                    ...(record.scope.managed === undefined
+                      ? {}
+                      : { managed: record.scope.managed }),
                   })
                   .pipe(Effect.result)
               : undefined;
-          if (valid === undefined || valid._tag === "Failure")
+          if (
+            (valid === undefined && record.scope.managed !== undefined) ||
+            valid?._tag === "Failure"
+          )
             yield* revokeAndCleanup(
               (candidate) => candidate.scope.providerSessionId === record.scope.providerSessionId,
             );
@@ -468,6 +473,16 @@ const makeWithOptions = Effect.fn("McpSessionRegistry.make")(function* (
             },
             issuedAt,
           };
+          if (managed === undefined && authorization._tag === "Some") {
+            // Issuance may have observed absence before ownership committed. Denial also survives purge.
+            yield* restore(
+              authorization.value
+                .resolve({
+                  actor: McpInvocationContext.projectWorkActorForInvocation(scope),
+                })
+                .pipe(Effect.orDie),
+            );
+          }
           const expiredProviderSessionIds = yield* SynchronizedRef.modify(
             state,
             ({ records }): readonly [ReadonlyArray<string>, RegistryState] => {

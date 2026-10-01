@@ -1,3 +1,4 @@
+import { ProviderInstanceId, ThreadId } from "@t3tools/contracts";
 import {
   ProjectId,
   ProjectWorkTaskId,
@@ -746,7 +747,12 @@ const insertBindingSession = Effect.fn("repositoryTest.insertBindingSession")(fu
     VALUES (${id},${subject},'[]','bearer-access-token',${at},'2030-01-01T00:00:00.000Z')`;
 });
 
-for (const failure of ["projection-failure", "interruption"] as const)
+for (const failure of [
+  "projection-failure",
+  "interruption",
+  "receipt-failure",
+  "withdrawal-interruption",
+] as const)
   it.effect(`withdraws legacy credentials atomically with binding after ${failure} rollback`, () =>
     Effect.gen(function* () {
       yield* runMigrations();
@@ -763,10 +769,12 @@ for (const failure of ["projection-failure", "interruption"] as const)
           const statement = target(args[0], ...args.slice(1));
           if (!Array.isArray(args[0]) || !("raw" in args[0])) return statement;
           if (
-            failure === "interruption" &&
             !intercepted &&
-            statement.compile()[0].includes("INSERT INTO") &&
-            statement.compile()[0].includes("project_team_run_binding")
+            ((failure === "interruption" &&
+              statement.compile()[0].includes("INSERT INTO") &&
+              statement.compile()[0].includes("project_team_run_binding")) ||
+              (failure === "withdrawal-interruption" &&
+                statement.compile()[0].includes("UPDATE auth_sessions")))
           ) {
             intercepted = true;
             return statement.pipe(
@@ -814,10 +822,13 @@ for (const failure of ["projection-failure", "interruption"] as const)
       if (failure === "projection-failure")
         yield* sql`CREATE TRIGGER reject_binding BEFORE INSERT ON project_team_run_binding
           BEGIN SELECT RAISE(ABORT,'binding projection failure'); END`;
+      if (failure === "receipt-failure")
+        yield* sql`CREATE TRIGGER reject_receipt BEFORE INSERT ON project_work_command_receipts
+          WHEN NEW.command_id='dispatch' BEGIN SELECT RAISE(ABORT,'binding receipt failure'); END`;
       const setup = seedTeam("implementer", "running", { issueCredential: false }).pipe(
         Effect.provideService(ProjectWorkRepository, observed),
       );
-      if (failure === "projection-failure")
+      if (failure === "projection-failure" || failure === "receipt-failure")
         expect((yield* setup.pipe(Effect.result))._tag).toBe("Failure");
       else {
         const pending = yield* setup.pipe(Effect.forkScoped);
@@ -831,6 +842,7 @@ for (const failure of ["projection-failure", "interruption"] as const)
       for (const name of [
         "project_team_run_binding",
         "project_team_effect",
+        "project_team_identity_fences",
         "project_work_attempts",
       ])
         expect(yield* sql`SELECT * FROM ${sql(name)}`).toHaveLength(0);
@@ -838,6 +850,7 @@ for (const failure of ["projection-failure", "interruption"] as const)
         expect(yield* sql`SELECT * FROM ${sql(name)} WHERE command_id='dispatch'`).toHaveLength(0);
       expect(dispatch).toBeDefined();
       if (failure === "projection-failure") yield* sql`DROP TRIGGER reject_binding`;
+      if (failure === "receipt-failure") yield* sql`DROP TRIGGER reject_receipt`;
       const committed = yield* repository.execute(dispatch!);
       expect(publications).toBe(beforeDispatch + committed.events.length);
       expect((yield* repository.execute(dispatch!)).duplicate).toBe(true);
@@ -846,6 +859,9 @@ for (const failure of ["projection-failure", "interruption"] as const)
         WHERE revoked_at IS NOT NULL ORDER BY session_id`;
       expect(revoked.map((row) => row.id)).toEqual(["legacy-a", "legacy-b"]);
       expect(yield* sql`SELECT * FROM project_team_run_binding`).toHaveLength(1);
+      expect(yield* sql`SELECT * FROM project_team_identity_fences`).toEqual([
+        { provider_instance_id: "pi", thread_id: "authorization-thread" },
+      ]);
       expect(
         yield* sql`SELECT * FROM project_work_command_receipts WHERE command_id='dispatch'`,
       ).toHaveLength(1);
@@ -874,8 +890,14 @@ it.effect(
         );
       yield* Effect.scoped(
         Effect.gen(function* () {
-          yield* runMigrations();
+          yield* runMigrations({ toForkMigrationInclusive: 19 });
           yield* insertBindingSession("created");
+          expect(yield* runForkMigrations()).toEqual([[20, "ProjectTeamIdentityFences"]]);
+          const upgradedSql = yield* SqlClient.SqlClient;
+          expect(
+            (yield* upgradedSql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id='created'`)[0]
+              ?.revokedAt,
+          ).toBeNull();
           const f = yield* seedTeam("implementer", "running", { issueCredential: false });
           expect(
             (yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id='created'`)[0]
@@ -899,12 +921,28 @@ it.effect(
             }),
           );
           yield* insertBindingSession("rebuild-only", "agent:mcp:codex:replacement-thread");
+          yield* f.sql`DELETE FROM project_team_identity_fences WHERE provider_instance_id='codex'`;
           const projection = yield* ProjectWorkProjection;
           yield* projection.rebuild("authorization-project");
           expect(
             (yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id='rebuild-only'`)[0]
               ?.revokedAt,
           ).toBeNull();
+          expect(yield* f.sql`SELECT * FROM project_team_identity_fences`).toEqual([
+            { provider_instance_id: "pi", thread_id: "authorization-thread" },
+          ]);
+          yield* f.change(
+            decodeRecord({
+              ...f.binding,
+              recordId: "replacement-binding",
+              providerInstanceId: "codex",
+              threadId: "replacement-thread",
+              revision: 1,
+            }),
+          );
+          yield* f.sql`DELETE FROM project_team_run_binding`;
+          yield* f.sql`DELETE FROM project_work_events`;
+          yield* f.sql`DELETE FROM project_work_reducer_checkpoints`;
         }).pipe(Effect.provide(database())),
       );
       yield* Effect.scoped(
@@ -917,13 +955,42 @@ it.effect(
           expect(rows.map((row) => [row.id, row.revokedAt !== null])).toEqual([
             ["created", true],
             ["invalid", false],
-            ["rebuild-only", false],
+            ["rebuild-only", true],
             ["replacement", true],
             ["retired", true],
           ]);
           expect(
             yield* sql`SELECT * FROM project_team_run_binding WHERE status='running'`,
-          ).toHaveLength(1);
+          ).toHaveLength(0);
+          const fresh = yield* TeamAuthorization.ProjectTeamAuthorization;
+          for (const identity of [
+            {
+              providerInstanceId: ProviderInstanceId.make("pi"),
+              threadId: ThreadId.make("authorization-thread"),
+            },
+            {
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: ThreadId.make("replacement-thread"),
+            },
+          ]) {
+            expect((yield* fresh.issueCredential(identity).pipe(Effect.result))._tag).toBe(
+              "Failure",
+            );
+            expect(
+              (yield* fresh
+                .resolve({
+                  actor: { kind: "agent", id: TeamAuthorization.managedActorId(identity) },
+                })
+                .pipe(Effect.result))._tag,
+            ).toBe("Failure");
+            expect(yield* fresh.hasManagedThread(identity.threadId)).toBe(true);
+          }
+          expect(
+            yield* fresh.discover({
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              threadId: ThreadId.make("authorization-thread"),
+            }),
+          ).toBeUndefined();
         }).pipe(Effect.provide(database())),
       );
     }).pipe(Effect.provide(NodeServices.layer)),

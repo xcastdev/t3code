@@ -106,7 +106,12 @@ export const layer = Layer.effect(
         const rows = yield* sql<{
           projectId: string;
         }>`SELECT DISTINCT project_id AS projectId FROM project_team_run_binding WHERE provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}`;
-        if (rows.length === 0) return undefined;
+        if (rows.length === 0) {
+          const fences = yield* sql`SELECT thread_id FROM project_team_identity_fences
+            WHERE provider_instance_id=${identity.providerInstanceId} AND thread_id=${identity.threadId}`;
+          if (fences.length > 0) return yield* deny("Managed identity has no current binding");
+          return undefined;
+        }
         managedIdentities.add(managedActorId(identity));
         managedThreads.add(identity.threadId);
         if (withdrawLegacy) {
@@ -148,7 +153,8 @@ export const layer = Layer.effect(
       function* (threadId: ThreadId) {
         if (managedThreads.has(threadId)) return true;
         const rows =
-          yield* sql`SELECT record_id FROM project_team_run_binding WHERE thread_id=${threadId} LIMIT 1`;
+          yield* sql`SELECT thread_id FROM project_team_identity_fences WHERE thread_id=${threadId}
+            UNION ALL SELECT thread_id FROM project_team_run_binding WHERE thread_id=${threadId} LIMIT 1`;
         if (rows.length === 0) return false;
         // Retained proxy/catalog leases must stay fenced after history is purged.
         managedThreads.add(threadId);
@@ -167,7 +173,8 @@ export const layer = Layer.effect(
           const rows = yield* sql<{
             provider: string;
             thread: string;
-          }>`SELECT DISTINCT provider_instance_id AS provider, thread_id AS thread FROM project_team_run_binding WHERE ('agent:mcp:' || provider_instance_id || ':' || thread_id)=${principal.actor.id}`;
+          }>`SELECT DISTINCT provider_instance_id AS provider, thread_id AS thread FROM project_team_run_binding WHERE ('agent:mcp:' || provider_instance_id || ':' || thread_id)=${principal.actor.id}
+            UNION SELECT provider_instance_id AS provider,thread_id AS thread FROM project_team_identity_fences WHERE ('agent:mcp:' || provider_instance_id || ':' || thread_id)=${principal.actor.id}`;
           if (rows.length > 1) return yield* deny("Managed identity is ambiguous");
           if (rows.length > 0) {
             managedIdentities.add(principal.actor.id);

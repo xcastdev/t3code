@@ -1092,7 +1092,7 @@ for (const timing of ["before", "queued", "interrupted", "queued-update"] as con
         providerInstanceId: ProviderInstanceId.make("pi"),
         threadId: ThreadId.make("authorization-thread"),
       };
-      const pending = yield* registry.issue(request).pipe(Effect.forkScoped);
+      const pending = yield* registry.issue(request).pipe(Effect.exit, Effect.forkScoped);
       const receipt = yield* Deferred.await(completed);
       expect(receipt.bindingCount).toBe(timing === "queued" ? 0 : 1);
       if (timing === "queued-update") {
@@ -1132,19 +1132,12 @@ for (const timing of ["before", "queued", "interrupted", "queued-update"] as con
           Effect.forkScoped,
         );
         yield* Deferred.await(attempted);
-        if (receipt.inTransaction) {
-          // The real SQLite writer waits on the issuance transaction's owned connection.
-          yield* Deferred.succeed(release, undefined);
-          yield* Fiber.join(pending);
-          expect(yield* Deferred.await(issuedAuthority)).toBeUndefined();
-          yield* Fiber.join(writer);
-        } else {
-          // The unrepaired boundary permits the writer to finish before discovery resumes.
-          yield* Fiber.join(writer);
-          yield* Deferred.succeed(release, undefined);
-          yield* Fiber.join(pending);
-          expect(yield* Deferred.await(issuedAuthority)).toBeUndefined();
-        }
+        // The completed empty SELECT owns no transaction; the committed fence refuses stale fallback.
+        expect(receipt.inTransaction).toBe(false);
+        yield* Fiber.join(writer);
+        yield* Deferred.succeed(release, undefined);
+        expect((yield* Fiber.join(pending))._tag).toBe("Failure");
+        expect(yield* Deferred.isDone(issuedAuthority)).toBe(false);
         const managed = yield* registry.issue(request);
         expect(
           (yield* registry.resolve(managed.config.authorizationHeader.replace("Bearer ", "")))
@@ -1264,5 +1257,55 @@ it.effect(
       expect(
         (yield* authorizeRpcSession(WS_METHODS.terminalOpen, held, auth).pipe(Effect.result))._tag,
       ).toBe("Failure");
+    }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+);
+
+it.effect(
+  "durable identity fence denies a late legacy environment bearer after purge and fresh auth",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* seedTeam("implementer", "running", { issueCredential: false });
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const config = yield* ServerConfig.ServerConfig;
+      // An internal raw-subject caller can publish after withdrawal; current authorization must still refuse it.
+      const late = yield* auth.issueSession({ subject: "agent:mcp:pi:authorization-thread" });
+      expect(
+        (yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${late.sessionId}`)[0]
+          ?.revokedAt,
+      ).toBeNull();
+      yield* f.sql`DELETE FROM project_team_run_binding WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_events WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${f.principal.managed.projectId}`;
+      const restarted = yield* EnvironmentAuth.EnvironmentAuth.pipe(
+        Effect.provide(
+          EnvironmentAuth.layer.pipe(
+            Layer.provide(Layer.fresh(TeamAuthorization.layer)),
+            Layer.provide(ServerSecretStore.layer),
+            Layer.provide(ServerEnvironment.identityLayer),
+            Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      );
+      expect(
+        (yield* restarted
+          .authenticateHttpRequest(makeBearerRequest(late.token))
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* restarted
+          .issueSession({ identity: { kind: "agent", id: "agent:mcp:pi:authorization-thread" } })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      for (const id of [
+        "agent:mcp:codex:authorization-thread",
+        "agent:mcp:pi:other-thread",
+        "agent:ordinary",
+      ]) {
+        const issued = yield* restarted.issueSession({ identity: { kind: "agent", id } });
+        expect(
+          (yield* restarted.authenticateHttpRequest(makeBearerRequest(issued.token))).identity.id,
+        ).toBe(id);
+      }
     }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
 );

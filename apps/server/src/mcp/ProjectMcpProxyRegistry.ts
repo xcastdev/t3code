@@ -544,21 +544,28 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
     return [...endpointMap.values()];
   });
 
-  const resolve: ProjectMcpProxyRegistryShape["resolve"] = (providerSessionId, endpointHandle) =>
-    Effect.sync(() => {
-      const session = sessions.get(providerSessionId);
-      const server = session?.servers.get(endpointHandle);
-      if (session?.managed !== undefined) return undefined;
-      return server &&
-        session &&
-        !session.revoked &&
-        !session.revokedServerIds.has(server.id) &&
-        !session.revokedOAuthStorageIds.has(
-          ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId),
-        )
-        ? { server, threadId: session.threadId }
-        : undefined;
-    });
+  const resolve: ProjectMcpProxyRegistryShape["resolve"] = Effect.fn(
+    "ProjectMcpProxyRegistry.resolve",
+  )(function* (providerSessionId, endpointHandle) {
+    const session = sessions.get(providerSessionId);
+    if (
+      session !== undefined &&
+      authorization._tag === "Some" &&
+      (yield* authorization.value.hasManagedThread(session.threadId).pipe(Effect.orDie))
+    )
+      return undefined;
+    const server = session?.servers.get(endpointHandle);
+    if (session?.managed !== undefined) return undefined;
+    return server &&
+      session &&
+      !session.revoked &&
+      !session.revokedServerIds.has(server.id) &&
+      !session.revokedOAuthStorageIds.has(
+        ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId),
+      )
+      ? { server, threadId: session.threadId }
+      : undefined;
+  });
 
   const getConnection = (session: SessionRecord, endpointHandle: string) => {
     const existing = session.connections.get(endpointHandle);
