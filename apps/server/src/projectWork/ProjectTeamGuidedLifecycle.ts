@@ -23,6 +23,7 @@ import {
   projectTeamPlanHash,
   projectTeamScopeHash,
   assertProjectTeamRunAuthority,
+  assertProjectTeamAssignmentAuthorization,
   projectTeamDerivedRecordId,
 } from "./ProjectTeamPolicy.ts";
 
@@ -91,6 +92,7 @@ export const decideProjectTeamGuidedLifecycle = (
   if (task.revision !== intent.expectedTaskRevision)
     throw new ProjectWorkPolicyError("stale-revision", "Guided task revision changed");
   let binding: Binding | undefined;
+  let plannerAssignment: Membership | undefined;
   if (command.attribution.actor.kind !== "human") {
     binding = records().find(
       (r): r is Binding => r.kind === "run-binding" && r.recordId === guided.bindingId,
@@ -98,7 +100,7 @@ export const decideProjectTeamGuidedLifecycle = (
     const attempt = state.attempts.find((entry) => entry.attemptId === binding?.attemptId);
     if (
       binding === undefined ||
-      binding.taskId !== task.taskId ||
+      (binding.taskId !== task.taskId && intent.type !== "project-team.plan.propose") ||
       binding.generation !== guided.generation ||
       binding.leaseGeneration !== guided.generation ||
       binding.status !== "running" ||
@@ -106,7 +108,7 @@ export const decideProjectTeamGuidedLifecycle = (
       (attempt.state !== "leased" && attempt.state !== "running") ||
       attempt.leasedUntil === undefined ||
       attempt.leasedUntil <= at ||
-      task.activeAttemptId !== binding.attemptId
+      state.tasks.find((t) => t.taskId === binding!.taskId)?.activeAttemptId !== binding.attemptId
     )
       reject("Guided managed identity is no longer current");
     const member = records().find((r) => r.kind === "member" && r.recordId === binding!.memberId);
@@ -121,6 +123,25 @@ export const decideProjectTeamGuidedLifecycle = (
     )
       reject("Guided member or frozen role is no longer active");
     assertProjectTeamRunAuthority(state, binding!, role, false);
+    if (binding.taskId !== task.taskId) {
+      const child = records().find(
+        (r): r is Membership => r.kind === "task-membership" && r.taskId === binding!.taskId,
+      );
+      const authorization = records().find(
+        (r): r is Gate => r.kind === "gate" && r.recordId === binding!.authorizationGateId,
+      );
+      if (
+        intent.type !== "project-team.plan.propose" ||
+        role.role !== "planner" ||
+        child?.parentTaskId !== task.taskId ||
+        child.assignment?.authorizationGateId !== authorization?.recordId ||
+        (authorization?.gate !== "assignment" && authorization?.gate !== "repair") ||
+        authorization.assignmentAuthorization?.assignmentKind !== "planning" ||
+        authorization.assignmentAuthorization.parentTaskId !== task.taskId
+      )
+        reject("Planner proposal requires exact inherited parent authorization");
+      plannerAssignment = child;
+    }
     if (
       intent.type !== "project-team.assignment.report" &&
       !(
@@ -282,6 +303,31 @@ export const decideProjectTeamGuidedLifecycle = (
         record({ ...r, status: "stale", revision: r.revision + 1, updatedAt: at });
     }
     stop(targetId, reason);
+    const descendants = new Set([targetId]);
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const m of records()) {
+        if (
+          m.kind !== "task-membership" ||
+          m.parentTaskId === undefined ||
+          !descendants.has(m.parentTaskId) ||
+          descendants.has(m.taskId)
+        )
+          continue;
+        descendants.add(m.taskId);
+        changed = true;
+      }
+    }
+    for (const childId of descendants) {
+      if (childId === targetId) continue;
+      for (const r of records()) {
+        if (r.kind === "gate" && r.taskId === childId && r.status !== "invalidated")
+          record({ ...r, status: "invalidated", revision: r.revision + 1, updatedAt: at });
+        if (r.kind === "evidence-applicability" && r.taskId === childId && r.status === "current")
+          record({ ...r, status: "stale", revision: r.revision + 1, updatedAt: at });
+      }
+      stop(childId, reason);
+    }
   };
   const gate = (
     suffix: string,
@@ -307,10 +353,14 @@ export const decideProjectTeamGuidedLifecycle = (
     return r;
   };
   switch (intent.type) {
+    case "project-team.assignment.start":
     case "project-team.investigation.start": {
       if (task.state === "completed" || task.state === "canceled")
         reject("Terminal work must be reopened before investigation");
-      if (intent.issueRecordId !== undefined) {
+      if (
+        intent.type === "project-team.investigation.start" &&
+        intent.issueRecordId !== undefined
+      ) {
         const issue = records().find(
           (r) => r.kind === "issue" && r.recordId === intent.issueRecordId,
         );
@@ -318,7 +368,81 @@ export const decideProjectTeamGuidedLifecycle = (
           reject("Investigation issue revision changed");
       }
       ensureMembership(task);
-      const childId = ProjectWorkTaskId.make(id("research"));
+      const inherited = intent.type === "project-team.assignment.start";
+      let assignmentAuthorization: Gate["assignmentAuthorization"];
+      if (inherited) {
+        if (intent.assignmentKind === "planning" && intent.outputDescriptions.length !== 1)
+          reject("Planning requires exactly one proposed plan artifact output");
+        if (task.specification === undefined || task.specRevision !== intent.specRevision)
+          reject("Assignment requires current approved parent specification");
+        const spec = records().find(
+          (r): r is Gate => r.kind === "gate" && r.recordId === intent.specificationGateId,
+        );
+        const hash = projectTeamSpecificationHash(state, task.taskId);
+        if (
+          spec?.revision !== intent.expectedSpecificationGateRevision ||
+          !evaluateProjectTeamGate(spec, {
+            projectId: task.projectId,
+            taskId: task.taskId,
+            gate: "specification",
+            specRevision: task.specRevision,
+            planRevision: 0,
+            contentHash: hash,
+            evidenceIds: [],
+          }).available
+        )
+          reject("Parent specification approval changed");
+        const plan = currentPlan(task.taskId);
+        if (intent.parentPlan === undefined) {
+          if (intent.assignmentKind === "review" || plan !== undefined)
+            reject("Assignment requires exact current approved parent plan");
+          dependencies(task);
+        } else {
+          if (
+            plan === undefined ||
+            plan.recordId !== intent.parentPlan.recordId ||
+            plan.revision !== intent.parentPlan.expectedRecordRevision ||
+            plan.planRevision !== intent.parentPlan.planRevision
+          )
+            reject("Parent plan target changed");
+          const planGate = records().find(
+            (r): r is Gate => r.kind === "gate" && r.recordId === intent.parentPlan!.gateId,
+          );
+          if (
+            planGate?.revision !== intent.parentPlan.expectedGateRevision ||
+            !evaluateProjectTeamGate(planGate, {
+              projectId: task.projectId,
+              taskId: task.taskId,
+              gate: "plan",
+              specRevision: task.specRevision,
+              planRevision: plan.planRevision,
+              contentHash: plan.contentHash,
+              evidenceIds: [],
+            }).available
+          )
+            reject("Parent plan approval changed");
+          anchors(task, plan);
+        }
+        assignmentAuthorization = {
+          assignmentKind: intent.assignmentKind,
+          parentTaskId: task.taskId,
+          parentSpecRevision: task.specRevision,
+          parentSpecificationGateId: spec!.recordId,
+          parentSpecificationHash: hash,
+          parentScopeHash: projectTeamScopeHash(state, task.taskId, plan),
+          ...(plan === undefined
+            ? {}
+            : {
+                parentPlan: {
+                  recordId: plan.recordId,
+                  planRevision: plan.planRevision,
+                  contentHash: plan.contentHash,
+                  gateId: intent.parentPlan!.gateId,
+                },
+              }),
+        };
+      }
+      const childId = ProjectWorkTaskId.make(id(inherited ? intent.assignmentKind : "research"));
       const criterionIds = intent.outputDescriptions.map((_, index) =>
         ProjectWorkCriterionId.make(id(`output:${index}`)),
       );
@@ -328,7 +452,7 @@ export const decideProjectTeamGuidedLifecycle = (
         task: {
           taskId: childId,
           projectId: command.projectId,
-          title: `Investigate: ${task.title}`,
+          title: `${inherited ? (intent.assignmentKind === "planning" ? "Plan" : "Review") : "Investigate"}: ${task.title}`,
           summary: intent.objective,
           state: "draft",
           watchers: [],
@@ -372,14 +496,20 @@ export const decideProjectTeamGuidedLifecycle = (
         },
       });
       const child = assertKnownTask(state, childId);
-      const authorization = gate(
-        "investigation",
-        child,
-        "investigation",
-        projectTeamScopeHash(state, childId),
-        0,
-        "approved",
-      );
+      const authorization: Gate = {
+        ...fields(inherited ? "assignment" : "investigation"),
+        kind: "gate",
+        status: "approved",
+        taskId: childId,
+        gate: inherited ? "assignment" : "investigation",
+        contentHash: projectTeamScopeHash(state, childId),
+        specRevision: child.specRevision,
+        planRevision: 0,
+        evidenceIds: [],
+        attribution: command.attribution,
+        ...(assignmentAuthorization === undefined ? {} : { assignmentAuthorization }),
+      };
+      record(authorization);
       record({
         ...fields("research-membership"),
         kind: "task-membership",
@@ -387,7 +517,11 @@ export const decideProjectTeamGuidedLifecycle = (
         taskId: childId,
         parentTaskId: task.taskId,
         executionKind: "managed",
-        deliverableKind: "research",
+        deliverableKind: inherited
+          ? intent.assignmentKind === "review"
+            ? "review"
+            : "plan"
+          : "research",
         controlState: "active",
         assignment: {
           authorizationGateId: authorization.recordId,
@@ -400,10 +534,20 @@ export const decideProjectTeamGuidedLifecycle = (
         status: "available",
         roleId: id("investigator"),
         roleRevision: 0,
-        role: "investigator",
+        role: inherited
+          ? intent.assignmentKind === "planning"
+            ? "planner"
+            : "reviewer"
+          : "investigator",
         instructions: intent.objective,
         skills: [],
-        tools: ["read", "search", "project-work", "project-work.report"],
+        tools: [
+          "read",
+          "search",
+          "project-work",
+          "project-work.report",
+          ...(inherited && intent.assignmentKind === "planning" ? ["project-work.plan"] : []),
+        ],
         model: "unconfigured",
         memoryAccess: "project",
         delegationDepth: 0,
@@ -490,6 +634,49 @@ export const decideProjectTeamGuidedLifecycle = (
         )
       )
         reject("Plan requires known distinct dependencies");
+      if (plannerAssignment !== undefined) {
+        const child = assertKnownTask(state, plannerAssignment.taskId);
+        const criteria = state.criteria.filter(
+          (c) =>
+            c.taskId === child.taskId &&
+            (c.required || child.specification?.criterionIds.includes(c.criterionId)),
+        );
+        if (criteria.length !== 1)
+          reject("Planner assignment requires exactly one retained plan output criterion");
+        record({
+          ...plannerAssignment,
+          controlState: "paused",
+          revision: plannerAssignment.revision + 1,
+          updatedAt: at,
+        });
+        const criterion = criteria[0]!;
+        emit({
+          type: "project-work.evidence.added",
+          addedAt: at,
+          occurredAt: at,
+          evidence: {
+            evidenceId: ProjectWorkEvidenceId.make(id("plan-output:0")),
+            taskId: child.taskId,
+            criterionId: criterion.criterionId,
+            kind: "artifact",
+            summary: criterion.description,
+            detail: intent.content,
+            scopeHash: projectTeamScopeHash(state, child.taskId),
+            recordedAt: at,
+            revision: 0,
+            attribution: command.attribution,
+          },
+        });
+        emit({
+          type: "project-work.task.completed",
+          taskId: child.taskId,
+          attemptId: binding!.attemptId,
+          satisfiedCriterionIds: criteria.map((c) => c.criterionId),
+          completedAt: at,
+          occurredAt: at,
+        });
+        stop(child.taskId, "Planner proposal retained; await authoritative process drain");
+      }
       invalidate(task.taskId, "Plan changed", false);
       if (previous !== undefined)
         record({ ...previous, status: "retired", revision: previous.revision + 1, updatedAt: at });
@@ -620,8 +807,40 @@ export const decideProjectTeamGuidedLifecycle = (
       if (action === "resume" || action === "reopen" || action === "resolve-failure") {
         if (records().some((r) => unresolvedWriter(r) && "taskId" in r && r.taskId === task.taskId))
           reject("Prior writer has not authoritatively drained");
+        if (
+          state.attempts.some(
+            (attempt) =>
+              attempt.taskId === task.taskId &&
+              !records().some(
+                (r) =>
+                  r.kind === "run-binding" &&
+                  r.attemptId === attempt.attemptId &&
+                  r.status === "settled",
+              ),
+          )
+        )
+          reject("Prior attempt has no authoritative drain proof");
         const plan = currentPlan(task.taskId);
-        let renewedResearchGrant: Gate | undefined;
+        let renewedGrant: Gate | undefined;
+        const ancestors = new Set<string>();
+        let rootTaskId: string = task.taskId;
+        while (membership(rootTaskId)?.parentTaskId !== undefined) {
+          if (ancestors.has(rootTaskId)) reject("Task lineage has a cycle");
+          ancestors.add(rootTaskId);
+          rootTaskId = membership(rootTaskId)!.parentTaskId!;
+        }
+        if (
+          action !== "resolve-failure" &&
+          (task.state === "failed" ||
+            task.state === "blocked" ||
+            records().some(
+              (r) =>
+                r.kind === "repair-episode" &&
+                (r.rootTaskId ?? r.taskId) === rootTaskId &&
+                r.status === "exhausted",
+            ))
+        )
+          reject("Failed or exhausted work requires exact failure resolution before resume");
         if (action === "reopen" && task.specification === undefined) {
           dependencies(task);
         } else if (
@@ -630,29 +849,77 @@ export const decideProjectTeamGuidedLifecycle = (
           task.specRevision === 0
         ) {
           dependencies(task);
-        } else if (m.assignment !== undefined && m.deliverableKind === "research") {
-          const g = records().find(
-            (r): r is Gate => r.kind === "gate" && r.recordId === m.assignment!.authorizationGateId,
-          );
-          if (
-            g === undefined ||
-            g.contentHash !== projectTeamScopeHash(state, task.taskId) ||
-            g.attribution.actor.kind !== "human"
-          )
-            reject("Investigation grant is no longer current");
-          if (action === "reopen" && g.status === "invalidated")
-            renewedResearchGrant = gate(
-              "reopened-investigation",
-              task,
-              "investigation",
-              g.contentHash,
-              0,
-              "approved",
-            );
-          else if (g.status !== "approved") reject("Investigation grant is no longer current");
         } else {
-          if (plan === undefined) reject("Resume requires approved plan");
-          anchors(task, plan);
+          const prior = records().find(
+            (r): r is Gate => r.kind === "gate" && r.recordId === m.assignment?.authorizationGateId,
+          );
+          const inherited =
+            prior?.assignmentAuthorization !== undefined &&
+            (prior.gate === "assignment" || prior.gate === "repair");
+          const research = m.deliverableKind === "research";
+          if (inherited) {
+            if (plan !== undefined)
+              reject("Inherited assignment cannot have its own implementation plan");
+            assertProjectTeamAssignmentAuthorization(state, prior);
+            dependencies(task);
+          } else if (research) dependencies(task);
+          else {
+            if (plan === undefined) reject("Resume requires approved plan");
+            anchors(task, plan);
+          }
+          if (m.assignment !== undefined && action !== "resolve-failure") {
+            const scopeHash = projectTeamScopeHash(
+              state,
+              task.taskId,
+              research || inherited ? undefined : plan,
+            );
+            const targetKind = inherited ? "assignment" : research ? "investigation" : "execution";
+            if (
+              prior === undefined ||
+              prior.projectId !== task.projectId ||
+              prior.taskId !== task.taskId ||
+              prior.specRevision !== task.specRevision ||
+              prior.planRevision !== (research || inherited ? 0 : plan!.planRevision) ||
+              prior.contentHash !== scopeHash ||
+              prior.evidenceIds.length !== 0 ||
+              prior.attribution.actor.kind !== "human" ||
+              (prior.gate !== targetKind && prior.gate !== "repair")
+            )
+              reject("Assignment grant is no longer current");
+            if (
+              prior.status === "consumed" ||
+              (action === "reopen" && prior.status === "invalidated")
+            ) {
+              if (
+                prior.status === "consumed" &&
+                !records().some(
+                  (r) =>
+                    r.kind === "run-binding" &&
+                    r.recordId === prior.consumedByRunId &&
+                    r.taskId === task.taskId &&
+                    r.authorizationGateId === prior.recordId &&
+                    r.status === "settled",
+                )
+              )
+                reject("Consumed predecessor grant lacks authoritative drain proof");
+              renewedGrant = {
+                ...fields("resumed-authorization"),
+                kind: "gate",
+                status: "approved",
+                taskId: task.taskId,
+                gate: targetKind,
+                specRevision: task.specRevision,
+                planRevision: research || inherited ? 0 : plan!.planRevision,
+                contentHash: scopeHash,
+                evidenceIds: [],
+                attribution: prior.attribution,
+                ...(prior.assignmentAuthorization === undefined
+                  ? {}
+                  : { assignmentAuthorization: prior.assignmentAuthorization }),
+              };
+              record(renewedGrant);
+            } else if (prior.status !== "approved") reject("Assignment grant is no longer current");
+          }
         }
         if (action === "resolve-failure") {
           const episode = records().find(
@@ -682,12 +949,12 @@ export const decideProjectTeamGuidedLifecycle = (
           revision: m.revision + 1,
           updatedAt: at,
           controlState: "active",
-          ...(renewedResearchGrant === undefined
+          ...(renewedGrant === undefined
             ? {}
             : {
                 assignment: {
                   ...m.assignment!,
-                  authorizationGateId: renewedResearchGrant.recordId,
+                  authorizationGateId: renewedGrant.recordId,
                 },
               }),
         });
@@ -707,7 +974,7 @@ export const decideProjectTeamGuidedLifecycle = (
             state:
               task.specification === undefined
                 ? "draft"
-                : action === "resolve-failure" || renewedResearchGrant !== undefined
+                : action === "resolve-failure" || renewedGrant !== undefined
                   ? "ready"
                   : "specified",
             occurredAt: at,
@@ -790,6 +1057,8 @@ export const decideProjectTeamGuidedLifecycle = (
         if (e === undefined) reject("Report references missing retained evidence");
         if (e.scopeHash !== projectTeamScopeHash(state, task.taskId, plan))
           reject("Report evidence scope is stale");
+        if (e.detail === undefined || e.detail.trim().length === 0)
+          reject("Report references evidence without actual retained detail");
         return e;
       });
       unique((intent.outputs ?? []).map((output) => output.criterionId));
@@ -819,18 +1088,39 @@ export const decideProjectTeamGuidedLifecycle = (
         });
         evidence.push(retained);
       }
-      for (const artifactId of intent.outputArtifactIds)
-        if (
-          !state.evidence.some(
-            (e) =>
-              e.evidenceId === artifactId &&
-              e.taskId === task.taskId &&
-              e.kind === "artifact" &&
-              e.detail !== undefined &&
-              e.detail.trim().length > 0,
-          )
-        )
-          reject("Output must identify actual retained artifact detail");
+      for (const artifactId of intent.outputArtifactIds) {
+        const artifact = state.evidence.find(
+          (e) =>
+            e.evidenceId === artifactId &&
+            e.taskId === task.taskId &&
+            e.kind === "artifact" &&
+            e.detail !== undefined &&
+            e.detail.trim().length > 0,
+        );
+        if (artifact === undefined) reject("Output must identify actual retained artifact detail");
+        if (artifact.scopeHash !== projectTeamScopeHash(state, task.taskId, plan))
+          reject("Report artifact scope is stale");
+        if (!evidence.some((e) => e.evidenceId === artifactId)) evidence.push(artifact);
+      }
+      emit({
+        type: "project-work.evidence.added",
+        addedAt: at,
+        occurredAt: at,
+        evidence: {
+          evidenceId: ProjectWorkEvidenceId.make(id("report-evidence")),
+          taskId: task.taskId,
+          kind: "observation",
+          summary: intent.summary,
+          detail: intent.summary,
+          outputArtifactIds: intent.outputArtifactIds.map((value) =>
+            ProjectWorkEvidenceId.make(value),
+          ),
+          scopeHash: projectTeamScopeHash(state, task.taskId, plan),
+          recordedAt: at,
+          revision: 0,
+          attribution: command.attribution,
+        },
+      });
       emit({
         type: "project-work.comment.added",
         occurredAt: at,
@@ -1010,6 +1300,13 @@ export const assertProjectTeamGuidedReplayCurrent = (
         reject("Replay criterion target changed");
     }
     if (
+      event.type === "project-work.evidence.added" &&
+      !state.evidence.some(
+        (e) => canonicalProjectWorkPayload(e) === canonicalProjectWorkPayload(event.evidence),
+      )
+    )
+      reject("Replay report evidence is no longer retained");
+    if (
       event.type === "project-work.comment.added" &&
       !state.comments?.some(
         (c) => canonicalProjectWorkPayload(c) === canonicalProjectWorkPayload(event.comment),
@@ -1071,13 +1368,15 @@ export const assertProjectTeamGuidedReplayCurrent = (
     if (
       target.specRevision !== input.specRevision ||
       (plan?.planRevision ?? 0) !== input.planRevision ||
-      input.evidenceIds.some(
+      [...input.evidenceIds, ...input.outputArtifactIds].some(
         (id) =>
           !state.evidence.some(
             (e) =>
               e.evidenceId === id &&
               e.taskId === input.taskId &&
               e.detail !== undefined &&
+              e.detail.trim().length > 0 &&
+              (!input.outputArtifactIds.includes(id) || e.kind === "artifact") &&
               e.scopeHash === projectTeamScopeHash(state, input.taskId, plan),
           ),
       )

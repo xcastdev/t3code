@@ -250,3 +250,188 @@ it("new base/head evidence invalidates retained old proof and merge approval wit
     headSha: "new-head",
   });
 });
+
+// These service tests use disposable migrated SQLite; no worker is launched.
+import { it as effectIt } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { ProjectWorkEvidenceId, type ProjectTeamGuidedIntent } from "@t3tools/contracts";
+import { runMigrations } from "../persistence/Migrations.ts";
+import { gatewayRuntime } from "./ProjectTeamAuthorization.testFixtures.ts";
+import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
+import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
+import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
+const reportFixture = (applicability: "current" | "stale" = "current") =>
+  Effect.gen(function* () {
+    yield* runMigrations();
+    const sql = yield* SqlClient.SqlClient;
+    yield* sql`INSERT INTO projection_projects (project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES (${projectId},'Guided report fixture','/fixture','[]',${at},${at})`;
+    const repository = yield* ProjectWorkRepository;
+    const gateway = yield* ProjectWorkGateway;
+    yield* repository.execute({
+      type: "project-work.task.create",
+      projectId,
+      taskId,
+      commandId: CommandId.make("report-capture"),
+      title: "Report task",
+      createdAt: at,
+    });
+    let state = yield* readCurrentState(sql, projectId);
+    yield* gateway.write(
+      {
+        type: "project-team.investigation.start",
+        projectId,
+        taskId,
+        commandId: CommandId.make("report-investigate"),
+        expectedRevision: state.revision,
+        expectedTaskRevision: 0,
+        objective: "Read and retain findings",
+        outputDescriptions: ["Retained findings"],
+      },
+      human.actor,
+      human.source,
+      { actor: human.actor },
+    );
+    state = yield* readCurrentState(sql, projectId);
+    const child = state.tasks.find((t) => t.taskId !== taskId)!;
+    const membership = state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "task-membership" }> =>
+        r.kind === "task-membership" && r.taskId === child.taskId,
+    )!;
+    const outputId = ProjectWorkEvidenceId.make("retained-output");
+    const scopeHash = projectTeamScopeHash(state, child.taskId);
+    yield* repository.execute({
+      type: "project-work.evidence.add",
+      projectId,
+      commandId: CommandId.make("report-artifact"),
+      addedAt: at,
+      attribution: human,
+      evidence: {
+        evidenceId: outputId,
+        taskId: child.taskId,
+        kind: "artifact",
+        summary: "Retained finding",
+        detail: "The source and finding are retained for this assignment",
+        scopeHash: applicability === "current" ? scopeHash : "old-scope",
+        recordedAt: at,
+        revision: 0,
+        attribution: human,
+      },
+    });
+    state = yield* readCurrentState(sql, projectId);
+    const intent: Extract<ProjectTeamGuidedIntent, { type: "project-team.assignment.report" }> = {
+      type: "project-team.assignment.report",
+      projectId,
+      taskId: child.taskId,
+      commandId: CommandId.make("typed-report"),
+      expectedRevision: state.revision,
+      expectedTaskRevision: child.revision,
+      assignmentId: membership.recordId,
+      expectedAssignmentRevision: membership.revision,
+      specRevision: 1,
+      planRevision: 0,
+      summary: "These retained outputs explain the finding",
+      evidenceIds: [],
+      outputArtifactIds: [outputId],
+      outcome: "findings",
+    };
+    return { sql, repository, gateway, state, intent, outputId, scopeHash };
+  });
+effectIt.effect(
+  "guided artifact reports retain references once and reject stale replay atomically",
+  () =>
+    Effect.gen(function* () {
+      const { sql, gateway, state, intent, outputId, scopeHash } = yield* reportFixture();
+      const write = () => gateway.write(intent, human.actor, human.source, { actor: human.actor });
+      const first = yield* write();
+      expect((yield* write()).receipt).toEqual(first.receipt);
+      const after = yield* readCurrentState(sql, projectId);
+      expect(after.revision).toBe(first.revision);
+      expect(after.evidence.filter((e) => e.outputArtifactIds?.includes(outputId))).toHaveLength(1);
+      expect(after.evidence.find((e) => e.outputArtifactIds?.includes(outputId))).toMatchObject({
+        taskId: intent.taskId,
+        summary: intent.summary,
+        scopeHash,
+        attribution: expect.objectContaining({ actor: human.actor }),
+      });
+      expect(after.comments?.filter((c) => c.body === intent.summary)).toHaveLength(1);
+      expect(
+        yield* sql`SELECT command_id FROM project_work_command_receipts WHERE command_id=${intent.commandId}`,
+      ).toHaveLength(1);
+      const criterion = after.criteria.find((c) => c.taskId === intent.taskId)!;
+      const target = after.tasks.find((t) => t.taskId === intent.taskId)!;
+      yield* gateway.write(
+        {
+          type: "project-team.specification.propose",
+          projectId,
+          taskId: intent.taskId,
+          commandId: CommandId.make("changed-report-scope"),
+          expectedRevision: after.revision,
+          expectedTaskRevision: target.revision,
+          expectedSpecRevision: 1,
+          specification: {
+            ...target.specification!,
+            objective: "Changed investigation scope",
+            revision: 2,
+          },
+          criterionSnapshots: [{ ...criterion, status: "unsatisfied", satisfiedByEvidenceIds: [] }],
+        },
+        human.actor,
+        human.source,
+        { actor: human.actor },
+      );
+      const changed = yield* readCurrentState(sql, projectId);
+      const retry = yield* write().pipe(Effect.result);
+      expect(retry._tag).toBe("Failure");
+      expect(yield* readCurrentState(sql, projectId)).toEqual(changed);
+      expect(state.evidence).toHaveLength(1);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+effectIt.effect(
+  "stale guided artifact report rolls back all evidence, comments and command receipts",
+  () =>
+    Effect.gen(function* () {
+      const { sql, gateway, state, intent } = yield* reportFixture("stale");
+      const result = yield* gateway
+        .write(intent, human.actor, human.source, { actor: human.actor })
+        .pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      expect(yield* readCurrentState(sql, projectId)).toEqual(state);
+      expect(
+        yield* sql`SELECT command_id FROM project_work_command_receipts WHERE command_id=${intent.commandId}`,
+      ).toHaveLength(0);
+      expect(
+        yield* sql`SELECT event_id FROM project_work_events WHERE command_id=${intent.commandId}`,
+      ).toHaveLength(0);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);
+
+effectIt.effect(
+  "report evidence failure rolls back its whole SQL transaction and can retry once",
+  () =>
+    Effect.gen(function* () {
+      const { sql, gateway, state, intent, outputId } = yield* reportFixture();
+      yield* sql.unsafe(
+        `CREATE TRIGGER fail_retained_report BEFORE INSERT ON project_work_evidence WHEN NEW.evidence_id <> '${outputId}' BEGIN SELECT RAISE(ABORT,'report evidence rollback'); END`,
+      );
+      const write = () => gateway.write(intent, human.actor, human.source, { actor: human.actor });
+      expect((yield* write().pipe(Effect.result))._tag).toBe("Failure");
+      expect(yield* readCurrentState(sql, projectId)).toEqual(state);
+      expect(
+        yield* sql`SELECT command_id FROM project_work_command_receipts WHERE command_id=${intent.commandId}`,
+      ).toHaveLength(0);
+      expect(
+        yield* sql`SELECT event_id FROM project_work_events WHERE command_id=${intent.commandId}`,
+      ).toHaveLength(0);
+      yield* sql.unsafe("DROP TRIGGER fail_retained_report");
+      const first = yield* write();
+      expect(first.receipt.status).toBe("accepted");
+      expect((yield* write()).receipt).toEqual(first.receipt);
+      expect(
+        (yield* readCurrentState(sql, projectId)).evidence.filter((e) =>
+          e.outputArtifactIds?.includes(outputId),
+        ),
+      ).toHaveLength(1);
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);

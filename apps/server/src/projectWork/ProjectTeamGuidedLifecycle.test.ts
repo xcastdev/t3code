@@ -1034,7 +1034,7 @@ describe("guided lifecycle", () => {
       ],
       outcome: "complete",
     });
-    expect(next.evidence).toHaveLength(1);
+    expect(next.evidence.filter((e) => e.criterionId !== undefined)).toHaveLength(1);
     expect(next.evidence[0]!.scopeHash).toBe(projectTeamScopeHash(state, child.taskId));
     expect(next.tasks.find((t) => t.taskId === child.taskId)!.state).toBe("completed");
   });
@@ -1128,5 +1128,732 @@ describe("ongoing frozen run authority", () => {
         false,
       ),
     ).toThrow("dependency changed");
+  });
+});
+
+// Pure trusted state fixtures exercise policy only; P8 owns actual process drain receipts.
+const trustedDrain = (state: ProjectWorkReducerState): ProjectWorkReducerState => ({
+  ...state,
+  tasks: state.tasks.map((t) => {
+    if (t.activeAttemptId === undefined) return t;
+    const { activeAttemptId: _attempt, ...rest } = t;
+    return { ...rest, state: "ready" as const };
+  }),
+  attempts: state.attempts.map((a) => ({ ...a, state: "expired" as const })),
+  foundationRecords: state.foundationRecords!.map((r) =>
+    r.kind === "run-binding" ? { ...r, status: "settled" as const } : r,
+  ),
+});
+const nextClaim = (
+  state: ProjectWorkReducerState,
+  original: Extract<ProjectWorkCommand, { type: "project-work.foundation.commit" }>,
+  label: string,
+  memberId?: string,
+) => {
+  const t = original.transition;
+  if (t?.kind !== "claim") throw new Error("Claim fixture required");
+  const assignment = state.foundationRecords!.find(
+    (r): r is Extract<ProjectTeamRecord, { kind: "task-membership" }> =>
+      r.kind === "task-membership" && r.taskId === t.taskId,
+  )!;
+  const grant = state.foundationRecords!.find(
+    (r): r is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+      r.kind === "gate" && r.recordId === assignment.assignment!.authorizationGateId,
+  )!;
+  const commandId = CommandId.make(label);
+  const attemptId = ProjectWorkAttemptId.make(`${label}-attempt`);
+  return {
+    ...original,
+    commandId,
+    expectedRevision: state.revision,
+    transition: {
+      ...t,
+      expectedTaskRevision: state.tasks.find((task) => task.taskId === t.taskId)!.revision,
+      authorizationGateId: grant.recordId,
+      expectedGateRevision: grant.revision,
+      claim: { ...t.claim, commandId, attemptId },
+      binding: {
+        ...t.binding,
+        recordId: `${label}-run`,
+        attemptId,
+        authorizationGateId: grant.recordId,
+        generation: 1,
+        leaseGeneration: 1,
+        ...(memberId === undefined ? {} : { memberId }),
+      },
+    },
+  };
+};
+
+describe("review regressions for successor authorization and retained reports", () => {
+  it("pause and trusted drain permit one fresh exact execution grant without reusing consumption", () => {
+    const fixture = activeRun();
+    const original = fixture.state.foundationRecords!.find(
+      (r) => r.recordId === fixture.binding.authorizationGateId,
+    )!;
+    let state = run(fixture.state, {
+      ...envelope(fixture.state, "pause-for-resume"),
+      type: "project-team.task.control",
+      control: { action: "pause", reason: "Pause work" },
+    });
+    expect(() =>
+      run(state, {
+        ...envelope(state, "resume-before-drain"),
+        type: "project-team.task.control",
+        control: { action: "resume", reason: "Resume" },
+      }),
+    ).toThrow("authoritatively drained");
+    state = trustedDrain(state);
+    const resumed = run(state, {
+      ...envelope(state, "resume-after-drain"),
+      type: "project-team.task.control",
+      control: { action: "resume", reason: "Resume unchanged work" },
+    });
+    const assignment = resumed.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "task-membership" }> =>
+        r.kind === "task-membership" && r.taskId === taskId,
+    )!;
+    expect(assignment.assignment!.authorizationGateId).not.toBe(original.recordId);
+    expect(resumed.foundationRecords!.find((r) => r.recordId === original.recordId)).toEqual(
+      original,
+    );
+    const renewed = resumed.foundationRecords!.find(
+      (r) => r.recordId === assignment.assignment!.authorizationGateId,
+    )!;
+    expect(renewed).toMatchObject({
+      kind: "gate",
+      gate: "execution",
+      status: "approved",
+      specRevision: 1,
+      planRevision: 1,
+      contentHash: fixture.binding.scopeHash,
+      attribution,
+    });
+    expect(resumed.foundationRecords!.filter((r) => r.kind === "repair-episode")).toEqual(
+      state.foundationRecords!.filter((r) => r.kind === "repair-episode"),
+    );
+    const claimed = applyProjectWorkEvents(
+      resumed,
+      decideProjectWorkCommand(resumed, nextClaim(resumed, fixture.command, "resumed")),
+    );
+    expect(claimed.foundationRecords!.find((r) => r.recordId === renewed.recordId)).toMatchObject({
+      status: "consumed",
+      consumedByRunId: "resumed-run",
+      consumedByCommandId: "resumed",
+    });
+    expect(() =>
+      decideProjectWorkCommand(claimed, nextClaim(claimed, fixture.command, "second-writer")),
+    ).toThrow();
+  });
+  it("resume cannot erase an exhausted canonical repair budget or an unbound prior attempt", () => {
+    const fixture = activeRun();
+    const failure = internal(fixture.state, "resume-failure", {
+      kind: "failure",
+      bindingId: fixture.binding.recordId,
+      generation: 0,
+      expectedBindingRevision: 1,
+      failureFingerprint: "persistent-cause",
+      relevantRevision: "tree-1",
+      failureKind: "semantic",
+      summary: "Actual failure receipt",
+    });
+    const episode = failure.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
+        r.kind === "repair-episode",
+    )!;
+    const paused = run(failure, {
+      ...envelope(failure, "pause-failure"),
+      type: "project-team.task.control",
+      control: { action: "pause", reason: "Pause failed work" },
+    });
+    const exhausted = {
+      ...trustedDrain(paused),
+      foundationRecords: trustedDrain(paused).foundationRecords!.map((r) =>
+        r.recordId === episode.recordId
+          ? { ...episode, status: "exhausted" as const, semanticRepairs: 2 }
+          : r,
+      ),
+    };
+    expect(() =>
+      run(exhausted, {
+        ...envelope(exhausted, "resume-exhausted"),
+        type: "project-team.task.control",
+        control: { action: "resume", reason: "Try ordinary resume" },
+      }),
+    ).toThrow("exhausted");
+    expect(exhausted.foundationRecords!.find((r) => r.recordId === episode.recordId)).toMatchObject(
+      { semanticRepairs: 2, status: "exhausted", failureFingerprint: "persistent-cause" },
+    );
+    const missingDrain = {
+      ...exhausted,
+      foundationRecords: exhausted.foundationRecords!.filter(
+        (r) => r.recordId !== fixture.binding.recordId,
+      ),
+    };
+    expect(() =>
+      run(missingDrain, {
+        ...envelope(missingDrain, "resume-unbound"),
+        type: "project-team.task.control",
+        control: { action: "resume", reason: "Try without receipt" },
+      }),
+    ).toThrow("drain proof");
+  });
+  it("reassignment denies the original member and consumes only the requested current successor", () => {
+    const fixture = activeRun();
+    const original = fixture.preClaim.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "member" }> => r.kind === "member",
+    )!;
+    let state = applyProjectWorkEvents(
+      fixture.preClaim,
+      decideProjectWorkCommand(fixture.preClaim, {
+        type: "project-work.foundation.commit",
+        projectId,
+        commandId: CommandId.make("successor"),
+        expectedRevision: fixture.preClaim.revision,
+        attribution,
+        committedAt: at,
+        records: [{ ...original, recordId: "successor" }],
+      }),
+    );
+    state = run(state, {
+      ...envelope(state, "reassign-original"),
+      type: "project-team.task.control",
+      control: {
+        action: "reassign",
+        reason: "New owner",
+        recipientMemberId: "successor",
+        expectedMemberRevision: 0,
+      },
+    });
+    state = run(state, {
+      ...envelope(state, "resume-successor"),
+      type: "project-team.task.control",
+      control: { action: "resume", reason: "Resume successor" },
+    });
+    expect(() =>
+      decideProjectWorkCommand(state, nextClaim(state, fixture.command, "wrong-member")),
+    ).toThrow("requested successor");
+    const inactive = {
+      ...state,
+      foundationRecords: state.foundationRecords!.map((r) =>
+        r.kind === "member" && r.recordId === "successor" ? { ...r, status: "paused" as const } : r,
+      ),
+    };
+    expect(() =>
+      decideProjectWorkCommand(
+        inactive,
+        nextClaim(inactive, fixture.command, "inactive-member", "successor"),
+      ),
+    ).toThrow("current member");
+    const claimed = applyProjectWorkEvents(
+      state,
+      decideProjectWorkCommand(
+        state,
+        nextClaim(state, fixture.command, "right-member", "successor"),
+      ),
+    );
+    expect(claimed.foundationRecords!.find((r) => r.recordId === "right-member-run")).toMatchObject(
+      {
+        memberId: "successor",
+        roleRevisionId: fixture.binding.roleRevisionId,
+        configuration: fixture.binding.configuration,
+      },
+    );
+  });
+  it("retains exact current artifact references in a typed report and rejects stale artifacts", () => {
+    let state = investigate();
+    const child = state.tasks.find((t) => t.taskId !== taskId)!;
+    const assignment = state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "task-membership" }> =>
+        r.kind === "task-membership" && r.taskId === child.taskId,
+    )!;
+    const outputId = ProjectWorkEvidenceId.make("retained-output");
+    state = {
+      ...state,
+      evidence: [
+        {
+          evidenceId: outputId,
+          taskId: child.taskId,
+          kind: "artifact",
+          summary: "Actual retained finding",
+          detail: "Source and finding belong to this assignment",
+          scopeHash: projectTeamScopeHash(state, child.taskId),
+          recordedAt: at,
+          revision: 0,
+          attribution,
+        },
+      ],
+    };
+    const intent: ProjectTeamGuidedIntent = {
+      ...envelope(state, "report-artifact", child.taskId),
+      type: "project-team.assignment.report",
+      assignmentId: assignment.recordId,
+      expectedAssignmentRevision: assignment.revision,
+      specRevision: 1,
+      planRevision: 0,
+      summary: "These are my findings",
+      evidenceIds: [],
+      outputArtifactIds: [outputId],
+      outcome: "findings",
+    };
+    expect(() =>
+      run(
+        { ...state, evidence: state.evidence.map((e) => ({ ...e, scopeHash: "old-scope" })) },
+        intent,
+      ),
+    ).toThrow("scope is stale");
+    const events = decideProjectWorkCommand(state, compile(intent));
+    const next = applyProjectWorkEvents(state, events);
+    expect(next.evidence.find((e) => e.outputArtifactIds?.includes(outputId))).toMatchObject({
+      taskId: child.taskId,
+      kind: "observation",
+      summary: intent.summary,
+      scopeHash: state.evidence[0]!.scopeHash,
+      attribution,
+    });
+    expect(() => assertProjectTeamGuidedReplayCurrent(next, intent, events)).not.toThrow();
+    expect(() => run(state, { ...intent, outcome: "complete" })).toThrow("required criterion");
+  });
+});
+
+const inheritedStart = (
+  state: ProjectWorkReducerState,
+  kind: "planning" | "review",
+  label: string,
+): Extract<ProjectTeamGuidedIntent, { type: "project-team.assignment.start" }> => {
+  const spec = state.foundationRecords!.find(
+    (r): r is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+      r.kind === "gate" && r.gate === "specification" && r.status === "approved",
+  )!;
+  const plan = state.foundationRecords!.find(
+    (r): r is Extract<ProjectTeamRecord, { kind: "plan-revision" }> =>
+      r.kind === "plan-revision" && r.status === "proposed",
+  );
+  const planGate = state.foundationRecords!.find(
+    (r): r is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+      r.kind === "gate" && r.gate === "plan" && r.status === "approved",
+  );
+  return {
+    ...envelope(state, label),
+    type: "project-team.assignment.start",
+    assignmentKind: kind,
+    objective: kind === "planning" ? "Propose a bounded plan" : "Review the bounded approved scope",
+    outputDescriptions: [
+      kind === "planning" ? "Retained proposed plan" : "Sourced review findings",
+    ],
+    specRevision: 1,
+    specificationGateId: spec.recordId,
+    expectedSpecificationGateRevision: spec.revision,
+    ...(plan === undefined || planGate === undefined
+      ? {}
+      : {
+          parentPlan: {
+            recordId: plan.recordId,
+            expectedRecordRevision: plan.revision,
+            planRevision: plan.planRevision,
+            gateId: planGate.recordId,
+            expectedGateRevision: planGate.revision,
+          },
+        }),
+  };
+};
+const childRun = (input: ProjectWorkReducerState, childId: ProjectWorkTaskId) => {
+  const template = activeRun().command;
+  if (template.transition?.kind !== "claim") throw new Error("Claim template missing");
+  const generatedRole = input.foundationRecords!.find(
+    (r): r is Extract<ProjectTeamRecord, { kind: "role-revision" }> =>
+      r.kind === "role-revision" && r.model === "unconfigured",
+  )!;
+  const role = { ...generatedRole, recordId: "configured-child-role", model: "fixture-model" };
+  let state = applyProjectWorkEvents(
+    input,
+    decideProjectWorkCommand(input, {
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: CommandId.make("configure-child"),
+      expectedRevision: input.revision,
+      records: [
+        role,
+        {
+          recordId: "child-member",
+          projectId,
+          kind: "member",
+          status: "active",
+          revision: 0,
+          generation: 0,
+          updatedAt: at,
+          name: "Child worker",
+          coordinator: false,
+          roleRevisionId: role.recordId,
+        },
+      ],
+      attribution,
+      committedAt: at,
+    }),
+  );
+  const grant = state.foundationRecords!.find(
+    (r): r is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+      r.kind === "gate" && r.taskId === childId,
+  )!;
+  const { specificationGateId: _spec, planGateId: _plan, ...base } = template.transition.binding;
+  const binding = {
+    ...base,
+    recordId: "child-run",
+    taskId: childId,
+    attemptId: ProjectWorkAttemptId.make("child-attempt"),
+    memberId: "child-member",
+    roleRevisionId: role.recordId,
+    model: role.model,
+    configuration: { ...base.configuration, toolIds: role.tools },
+    specRevision: 1,
+    planRevision: 0,
+    authorizationGateId: grant.recordId,
+    scopeHash: projectTeamScopeHash(state, childId),
+  };
+  const command = {
+    ...template,
+    commandId: CommandId.make("child-claim"),
+    expectedRevision: state.revision,
+    transition: {
+      ...template.transition,
+      taskId: childId,
+      expectedTaskRevision: state.tasks.find((t) => t.taskId === childId)!.revision,
+      authorizationGateId: grant.recordId,
+      expectedGateRevision: grant.revision,
+      binding,
+      claim: {
+        ...template.transition.claim,
+        commandId: CommandId.make("child-claim"),
+        taskId: childId,
+        attemptId: binding.attemptId,
+      },
+    },
+  };
+  const preClaim = state;
+  state = applyProjectWorkEvents(state, decideProjectWorkCommand(state, command));
+  const running = { ...binding, status: "running" as const, revision: 1 };
+  state = applyProjectWorkEvents(
+    state,
+    decideProjectWorkCommand(state, {
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: CommandId.make("child-running"),
+      expectedRevision: state.revision,
+      records: [running],
+      attribution,
+      committedAt: at,
+    }),
+  );
+  return { state, preClaim, command, binding: running, role };
+};
+describe("bounded inherited planning and review assignments", () => {
+  it("creates a planner before the first plan only from an exact approved Human specification", () => {
+    const approved = approveGates(propose());
+    const intent = inheritedStart(approved, "planning", "start-planner");
+    expect(() =>
+      run(approved, {
+        ...intent,
+        expectedSpecificationGateRevision: intent.expectedSpecificationGateRevision + 1,
+      }),
+    ).toThrow("approval changed");
+    expect(() =>
+      run(approved, { ...intent, outputDescriptions: ["Plan", "Other output"] }),
+    ).toThrow("exactly one");
+    const state = run(approved, intent);
+    const child = state.tasks.find((t) => t.taskId !== taskId)!;
+    expect(state.tasks.find((t) => t.taskId === taskId)!.activeAttemptId).toBeUndefined();
+    expect(state.foundationRecords!.find((r) => r.kind === "role-revision")).toMatchObject({
+      role: "planner",
+      tools: ["read", "search", "project-work", "project-work.report", "project-work.plan"],
+      delegationDepth: 0,
+      model: "unconfigured",
+    });
+    expect(
+      state.foundationRecords!.find((r) => r.kind === "gate" && r.taskId === child.taskId),
+    ).toMatchObject({
+      gate: "assignment",
+      status: "approved",
+      assignmentAuthorization: {
+        assignmentKind: "planning",
+        parentTaskId: taskId,
+        parentSpecificationGateId: intent.specificationGateId,
+        parentScopeHash: projectTeamScopeHash(approved, taskId),
+      },
+    });
+    const fixture = childRun(state, child.taskId);
+    expect(() =>
+      assertProjectTeamRunAuthority(fixture.state, fixture.binding, fixture.role, false),
+    ).not.toThrow();
+    const scopeChanged = {
+      ...fixture.preClaim,
+      tasks: fixture.preClaim.tasks.map((t) =>
+        t.taskId === taskId ? { ...t, specRevision: t.specRevision + 1 } : t,
+      ),
+    };
+    expect(() => decideProjectWorkCommand(scopeChanged, fixture.command)).toThrow();
+    const dependencyId = ProjectWorkTaskId.make("parent-dependency");
+    const dependencyChanged = {
+      ...fixture.state,
+      tasks: [
+        ...fixture.state.tasks,
+        { ...fixture.state.tasks[0]!, taskId: dependencyId, state: "canceled" as const },
+      ],
+      relationships: [
+        ...fixture.state.relationships,
+        {
+          relationshipId: ProjectWorkRelationshipId.make("parent-dependency-link"),
+          projectId,
+          fromTaskId: taskId,
+          toTaskId: dependencyId,
+          kind: "depends-on" as const,
+          revision: 0,
+          createdAt: at,
+        },
+      ],
+    };
+    expect(() =>
+      assertProjectTeamRunAuthority(dependencyChanged, fixture.binding, fixture.role, false),
+    ).toThrow("dependency");
+  });
+  it("retains the planner's actual parent proposal, completes and fences the child before replacing scope", () => {
+    const approved = approveGates(propose());
+    const started = run(approved, inheritedStart(approved, "planning", "planner-proposal"));
+    const child = started.tasks.find((t) => t.taskId !== taskId)!;
+    const fixture = childRun(started, child.taskId);
+    const intent: ProjectTeamGuidedIntent = {
+      ...envelope(fixture.state, "managed-parent-plan"),
+      type: "project-team.plan.propose",
+      specRevision: 1,
+      content:
+        "Inspect actual source, implement one behavior, and run the focused acceptance checks.",
+      dependencyTaskIds: [],
+    };
+    const command = {
+      ...compile(intent),
+      attribution: {
+        actor: { kind: "agent" as const, id: "child-worker" },
+        source: { kind: "system" as const, id: "runtime" },
+        recordedAt: at,
+      },
+      guided: { intent, bindingId: fixture.binding.recordId, generation: 0 },
+    };
+    const events = decideProjectWorkCommand(fixture.state, command);
+    const next = applyProjectWorkEvents(fixture.state, events);
+    expect(next.tasks.find((t) => t.taskId === child.taskId)!.state).toBe("completed");
+    const childMembership = next.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "task-membership" }> =>
+        r.kind === "task-membership" && r.taskId === child.taskId,
+    )!;
+    expect(childMembership.controlState).toBe("paused");
+    expect(() => assertProjectTeamGuidedReplayCurrent(next, intent, events)).not.toThrow();
+    const replaced = {
+      ...next,
+      foundationRecords: next.foundationRecords!.map((r) =>
+        r.recordId === childMembership.recordId
+          ? {
+              ...childMembership,
+              revision: childMembership.revision + 1,
+              controlState: "active" as const,
+              assignment: {
+                ...childMembership.assignment!,
+                authorizationGateId: "new-child-grant",
+              },
+            }
+          : r,
+      ),
+    };
+    expect(() => assertProjectTeamGuidedReplayCurrent(replaced, intent, events)).toThrow(
+      "semantic authority target changed",
+    );
+
+    expect(next.evidence.filter((e) => e.taskId === child.taskId)).toHaveLength(1);
+    expect(next.evidence.find((e) => e.taskId === child.taskId)).toMatchObject({
+      kind: "artifact",
+      detail: intent.content,
+      scopeHash: fixture.binding.scopeHash,
+    });
+    expect(
+      next.foundationRecords!.find((r) => r.kind === "plan-revision" && r.taskId === taskId),
+    ).toMatchObject({ content: intent.content, status: "proposed" });
+    expect(
+      next.foundationRecords!.find((r) => r.recordId === fixture.binding.recordId),
+    ).toMatchObject({ status: "stopping" });
+    expect(events.findIndex((e) => e.type === "project-work.task.completed")).toBeLessThan(
+      events.findIndex(
+        (e) => e.type === "project-work.foundation.recorded" && e.record.kind === "plan-revision",
+      ),
+    );
+    expect(() =>
+      assertProjectTeamRunAuthority(next, fixture.binding, fixture.role, false),
+    ).toThrow();
+    expect(() =>
+      decideProjectWorkCommand(next, {
+        ...command,
+        commandId: CommandId.make("planner-replay-new"),
+        expectedRevision: next.revision,
+        guided: {
+          ...command.guided,
+          intent: { ...intent, ...envelope(next, "planner-replay-new") },
+        },
+      }),
+    ).toThrow();
+  });
+  it("requires review's exact current parent plan and stops dependent children when parent scope changes", () => {
+    const approved = planned();
+    const intent = inheritedStart(approved, "review", "start-review");
+    const { parentPlan: _plan, ...missingPlan } = intent;
+    expect(() => run(approved, missingPlan)).toThrow("approved parent plan");
+    const started = run(approved, intent);
+    const child = started.tasks.find((t) => t.taskId !== taskId)!;
+    const fixture = childRun(started, child.taskId);
+    expect(fixture.role).toMatchObject({
+      role: "reviewer",
+      tools: ["read", "search", "project-work", "project-work.report"],
+    });
+    const previous = fixture.state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "plan-revision" }> =>
+        r.kind === "plan-revision" && r.taskId === taskId && r.status === "proposed",
+    )!;
+    const next = run(fixture.state, {
+      ...envelope(fixture.state, "replace-parent-plan"),
+      type: "project-team.plan.propose",
+      specRevision: 1,
+      previousPlanId: previous.recordId,
+      expectedPreviousPlanRevision: previous.revision,
+      content: "A changed bounded plan",
+      dependencyTaskIds: [],
+    });
+    expect(
+      next.foundationRecords!.find((r) => r.recordId === fixture.binding.recordId),
+    ).toMatchObject({ status: "stopping" });
+    expect(
+      next.foundationRecords!.find((r) => r.kind === "gate" && r.taskId === child.taskId),
+    ).toMatchObject({ status: "invalidated" });
+    expect(
+      next.foundationRecords!.find(
+        (r) => r.kind === "effect" && r.effectKind === "stop" && r.taskId === child.taskId,
+      ),
+    ).toMatchObject({ status: "pending" });
+    expect(() =>
+      assertProjectTeamRunAuthority(next, fixture.binding, fixture.role, false),
+    ).toThrow();
+  });
+  it("renews a consumed investigation after trusted drain without a semantic repair debit", () => {
+    const investigated = investigate();
+    const child = investigated.tasks.find((t) => t.taskId !== taskId)!;
+    const fixture = childRun(investigated, child.taskId);
+    let state = run(fixture.state, {
+      ...envelope(fixture.state, "pause-research", child.taskId),
+      type: "project-team.task.control",
+      control: { action: "pause", reason: "Pause research" },
+    });
+    state = trustedDrain(state);
+    const next = run(state, {
+      ...envelope(state, "resume-research", child.taskId),
+      type: "project-team.task.control",
+      control: { action: "resume", reason: "Resume unchanged research" },
+    });
+    const claimed = applyProjectWorkEvents(
+      next,
+      decideProjectWorkCommand(next, nextClaim(next, fixture.command, "research-successor")),
+    );
+    expect(
+      claimed.foundationRecords!.find((r) => r.recordId === "research-successor-run"),
+    ).toMatchObject({ planRevision: 0, scopeHash: fixture.binding.scopeHash });
+    expect(claimed.foundationRecords!.filter((r) => r.kind === "repair-episode")).toEqual([]);
+  });
+});
+
+describe("inherited successor grants", () => {
+  it.each(["planning", "review"] as const)(
+    "renews %s only with unchanged current parent approvals",
+    (kind) => {
+      const approved = kind === "planning" ? approveGates(propose()) : planned();
+      const started = run(approved, inheritedStart(approved, kind, `resumable-${kind}`));
+      const child = started.tasks.find((t) => t.taskId !== taskId)!;
+      const fixture = childRun(started, child.taskId);
+      let state = run(fixture.state, {
+        ...envelope(fixture.state, `pause-${kind}`, child.taskId),
+        type: "project-team.task.control",
+        control: { action: "pause", reason: "Pause bounded assignment" },
+      });
+      state = trustedDrain(state);
+      const next = run(state, {
+        ...envelope(state, `resume-${kind}`, child.taskId),
+        type: "project-team.task.control",
+        control: { action: "resume", reason: "Resume exact inherited scope" },
+      });
+      const claimed = applyProjectWorkEvents(
+        next,
+        decideProjectWorkCommand(next, nextClaim(next, fixture.command, `${kind}-successor`)),
+      );
+      const binding = claimed.foundationRecords!.find(
+        (r): r is Extract<ProjectTeamRecord, { kind: "run-binding" }> =>
+          r.kind === "run-binding" && r.recordId === `${kind}-successor-run`,
+      )!;
+      const newGrant = claimed.foundationRecords!.find(
+        (r) => r.recordId === binding.authorizationGateId,
+      )!;
+      expect(newGrant).toMatchObject({
+        gate: "assignment",
+        status: "consumed",
+        assignmentAuthorization: { assignmentKind: kind, parentTaskId: taskId },
+      });
+      expect(
+        claimed.foundationRecords!.find((r) => r.recordId === fixture.binding.authorizationGateId),
+      ).toMatchObject({ status: "consumed", consumedByRunId: fixture.binding.recordId });
+    },
+  );
+  it("a typed inherited repair claim preserves parent authority and debits the canonical episode once", () => {
+    const approved = approveGates(propose());
+    const started = run(approved, inheritedStart(approved, "planning", "repairable-planner"));
+    const child = started.tasks.find((t) => t.taskId !== taskId)!;
+    const fixture = childRun(started, child.taskId);
+    const failed = internal(fixture.state, "child-semantic-failure", {
+      kind: "failure",
+      bindingId: fixture.binding.recordId,
+      generation: 0,
+      expectedBindingRevision: 1,
+      failureFingerprint: "planner-semantic-cause",
+      relevantRevision: "parent-tree-1",
+      failureKind: "semantic",
+      summary: "Actual planner failure receipt",
+    });
+    const episode = failed.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
+        r.kind === "repair-episode",
+    )!;
+    const state = trustedDrain(failed);
+    const template = nextClaim(state, fixture.command, "planner-repair-successor");
+    if (template.transition?.kind !== "claim") throw new Error("Claim required");
+    const command = {
+      ...template,
+      transition: {
+        ...template.transition,
+        repair: { episodeId: episode.recordId, expectedEpisodeRevision: episode.revision },
+        binding: { ...template.transition.binding, repairEpisodeId: episode.recordId },
+      },
+    };
+    const next = applyProjectWorkEvents(state, decideProjectWorkCommand(state, command));
+    const binding = next.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "run-binding" }> =>
+        r.kind === "run-binding" && r.recordId === "planner-repair-successor-run",
+    )!;
+    expect(
+      next.foundationRecords!.find((r) => r.recordId === binding.authorizationGateId),
+    ).toMatchObject({
+      gate: "repair",
+      assignmentAuthorization: { assignmentKind: "planning", parentTaskId: taskId },
+      repairAuthorization: {
+        inheritedGateId: fixture.binding.authorizationGateId,
+        episodeId: episode.recordId,
+        semanticRepairNumber: 1,
+      },
+    });
+    expect(next.foundationRecords!.find((r) => r.recordId === episode.recordId)).toMatchObject({
+      rootTaskId: taskId,
+      semanticRepairs: 1,
+    });
+    expect(() => assertProjectTeamRunAuthority(next, binding, fixture.role, true)).not.toThrow();
   });
 });

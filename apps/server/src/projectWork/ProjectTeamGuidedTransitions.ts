@@ -250,6 +250,11 @@ export const decideProjectTeamGuidedTransition = (
       )
         reject("Claim assignment is not active managed work");
       if (
+        m.requestedSuccessorMemberId !== undefined &&
+        run.memberId !== m.requestedSuccessorMemberId
+      )
+        reject("Claim must use the exact requested successor member");
+      if (
         records().some(
           (r) => r.kind === "run-binding" && r.taskId === task.taskId && r.status !== "settled",
         )
@@ -322,7 +327,11 @@ export const decideProjectTeamGuidedTransition = (
         projectId: task.projectId,
         taskId: task.taskId,
         gate:
-          m.deliverableKind === "research" ? ("investigation" as const) : ("execution" as const),
+          grant?.gate === "assignment"
+            ? ("assignment" as const)
+            : m.deliverableKind === "research"
+              ? ("investigation" as const)
+              : ("execution" as const),
         specRevision: task.specRevision,
         planRevision: plan?.planRevision ?? 0,
         contentHash: run.scopeHash!,
@@ -377,6 +386,9 @@ export const decideProjectTeamGuidedTransition = (
           attribution: grant.attribution,
           consumedByRunId: run.recordId,
           consumedByCommandId: command.commandId,
+          ...(grant.assignmentAuthorization === undefined
+            ? {}
+            : { assignmentAuthorization: grant.assignmentAuthorization }),
           repairAuthorization: {
             episodeId: episode.recordId,
             failureFingerprint: episode.failureFingerprint,
