@@ -764,6 +764,20 @@ describe("guided lifecycle", () => {
       timeoutCount: 1,
       allowance: 2,
     });
+    state = internal(state, "semantic-failure-2", {
+      kind: "failure",
+      bindingId: binding.recordId,
+      generation: 0,
+      expectedBindingRevision: 1,
+      failureFingerprint: "same-cause",
+      relevantRevision: "tree-2",
+      failureKind: "semantic",
+      summary: "Second actual product failure",
+    });
+    episode = state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
+        r.kind === "repair-episode",
+    )!;
     state = internal(state, "repair-2", {
       kind: "repair.consume",
       episodeId: episode.recordId,
@@ -824,7 +838,7 @@ describe("guided lifecycle", () => {
         generation: 0,
         relevantRevision: "same-tree",
       }),
-    ).toThrow(/relevant change/);
+    ).toThrow(/pending semantic failure|relevant change/);
     state = internal(state, "same-failure", {
       kind: "failure",
       bindingId: binding.recordId,
@@ -1855,5 +1869,383 @@ describe("inherited successor grants", () => {
       semanticRepairs: 1,
     });
     expect(() => assertProjectTeamRunAuthority(next, binding, fixture.role, true)).not.toThrow();
+  });
+});
+
+describe("canonical failure successor authorization", () => {
+  it("does not convert a first semantic failure into ordinary successor authority through pause and drain", () => {
+    const fixture = activeRun();
+    let state = internal(fixture.state, "pending-semantic-failure", {
+      kind: "failure",
+      bindingId: fixture.binding.recordId,
+      generation: 0,
+      expectedBindingRevision: 1,
+      failureFingerprint: "pending-product-cause",
+      relevantRevision: "tree-1",
+      failureKind: "semantic",
+      summary: "Product assertion failed",
+    });
+    state = run(state, {
+      ...envelope(state, "pause-pending-semantic"),
+      type: "project-team.task.control",
+      control: { action: "pause", reason: "Pause failed semantic work" },
+    });
+    state = trustedDrain(state);
+    const intent: ProjectTeamGuidedIntent = {
+      ...envelope(state, "resume-pending-semantic"),
+      type: "project-team.task.control",
+      control: { action: "resume", reason: "Resume without a repair debit" },
+    };
+    const resumed = run(state, intent);
+    const before = state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "task-membership" }> =>
+        r.kind === "task-membership" && r.taskId === taskId,
+    )!;
+    expect(resumed.foundationRecords!.find((r) => r.recordId === before.recordId)).toMatchObject({
+      controlState: "active",
+      assignment: before.assignment,
+    });
+    expect(resumed.foundationRecords!.filter((r) => r.kind === "gate")).toEqual(
+      state.foundationRecords!.filter((r) => r.kind === "gate"),
+    );
+    expect(() =>
+      decideProjectWorkCommand(
+        resumed,
+        nextClaim(resumed, fixture.command, "pending-ordinary-successor"),
+      ),
+    ).toThrow(/semantic.*repair/i);
+    expect(() =>
+      run(resumed, { ...startIntent(resumed), ...envelope(resumed, "pending-execution-start") }),
+    ).toThrow(/semantic.*repair/i);
+    const episode = resumed.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
+        r.kind === "repair-episode",
+    )!;
+    const ordinary = nextClaim(resumed, fixture.command, "pending-exact-repair");
+    if (ordinary.transition?.kind !== "claim") throw new Error("Claim required");
+    const repair = {
+      ...ordinary,
+      transition: {
+        ...ordinary.transition,
+        repair: { episodeId: episode.recordId, expectedEpisodeRevision: episode.revision },
+        binding: { ...ordinary.transition.binding, repairEpisodeId: episode.recordId },
+      },
+    };
+    const repaired = applyProjectWorkEvents(resumed, decideProjectWorkCommand(resumed, repair));
+    expect(repaired.foundationRecords!.find((r) => r.recordId === episode.recordId)).toMatchObject({
+      pendingSemanticRepair: false,
+      semanticRepairs: 1,
+    });
+
+    expect(state.foundationRecords!.find((r) => r.kind === "repair-episode")).toMatchObject({
+      semanticRepairs: 0,
+      transportRetries: 0,
+      timeoutCount: 0,
+    });
+  });
+  it("transport-only pause and drain keeps ordinary successor authority without a semantic debit", () => {
+    const fixture = activeRun();
+    let state = internal(fixture.state, "transport-failure-resume", {
+      kind: "failure",
+      bindingId: fixture.binding.recordId,
+      generation: 0,
+      expectedBindingRevision: 1,
+      failureFingerprint: "provider-transport-cause",
+      relevantRevision: "tree-1",
+      failureKind: "transport",
+      summary: "Transport disconnected",
+    });
+    state = run(state, {
+      ...envelope(state, "pause-transport"),
+      type: "project-team.task.control",
+      control: { action: "pause", reason: "Pause disconnected work" },
+    });
+    state = trustedDrain(state);
+    const resumed = run(state, {
+      ...envelope(state, "resume-transport"),
+      type: "project-team.task.control",
+      control: { action: "resume", reason: "Retry transport" },
+    });
+    const next = applyProjectWorkEvents(
+      resumed,
+      decideProjectWorkCommand(resumed, nextClaim(resumed, fixture.command, "transport-successor")),
+    );
+    expect(next.foundationRecords!.find((r) => r.kind === "repair-episode")).toMatchObject({
+      semanticRepairs: 0,
+      transportRetries: 1,
+      timeoutCount: 0,
+    });
+  });
+});
+
+describe("semantic marker provenance", () => {
+  it("preserves a pending semantic failure across transport and clears it only on its exact debit", () => {
+    const fixture = activeRun();
+    const transition = {
+      kind: "failure" as const,
+      bindingId: fixture.binding.recordId,
+      generation: 0,
+      expectedBindingRevision: 1,
+      failureFingerprint: "shared-cause",
+      relevantRevision: "tree-1",
+      failureKind: "semantic" as const,
+      summary: "Actual semantic failure",
+    };
+    let state = internal(fixture.state, "marker-semantic", transition);
+    state = internal(state, "marker-transport", {
+      ...transition,
+      failureKind: "transport",
+      relevantRevision: "tree-2",
+    });
+    const episode = state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
+        r.kind === "repair-episode",
+    )!;
+    expect(episode).toMatchObject({
+      pendingSemanticRepair: true,
+      semanticRepairs: 0,
+      transportRetries: 1,
+      relevantRevision: "tree-2",
+    });
+    state = internal(state, "marker-debit", {
+      kind: "repair.consume",
+      bindingId: fixture.binding.recordId,
+      generation: 0,
+      episodeId: episode.recordId,
+      expectedEpisodeRevision: episode.revision,
+      relevantRevision: episode.relevantRevision,
+    });
+    const cleared = state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
+        r.kind === "repair-episode",
+    )!;
+    expect(cleared).toMatchObject({
+      pendingSemanticRepair: false,
+      semanticRepairs: 1,
+      lastSemanticRevision: "tree-2",
+      transportRetries: 1,
+    });
+    expect(() =>
+      internal(state, "duplicate-semantic-debit", {
+        kind: "repair.consume",
+        bindingId: fixture.binding.recordId,
+        generation: 0,
+        episodeId: cleared.recordId,
+        expectedEpisodeRevision: cleared.revision,
+        relevantRevision: cleared.relevantRevision,
+      }),
+    ).toThrow("pending semantic failure");
+  });
+  it("legacy active episodes cannot become ordinary successors or automatic repair without an exact Human exception", () => {
+    const fixture = activeRun();
+    let state = internal(fixture.state, "legacy-transport", {
+      kind: "failure",
+      bindingId: fixture.binding.recordId,
+      generation: 0,
+      expectedBindingRevision: 1,
+      failureFingerprint: "legacy-cause",
+      relevantRevision: "legacy-tree",
+      failureKind: "transport",
+      summary: "Legacy classification",
+    });
+    state = {
+      ...state,
+      foundationRecords: state.foundationRecords!.map((r) => {
+        if (r.kind !== "repair-episode") return r;
+        const { pendingSemanticRepair: _marker, ...legacy } = r;
+        return legacy;
+      }),
+    };
+    const episode = state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
+        r.kind === "repair-episode",
+    )!;
+    expect(() =>
+      internal(state, "legacy-automatic", {
+        kind: "repair.consume",
+        bindingId: fixture.binding.recordId,
+        generation: 0,
+        episodeId: episode.recordId,
+        expectedEpisodeRevision: episode.revision,
+        relevantRevision: episode.relevantRevision,
+      }),
+    ).toThrow("pending semantic failure");
+    state = run(state, {
+      ...envelope(state, "legacy-pause"),
+      type: "project-team.task.control",
+      control: { action: "pause", reason: "Pause unknown classification" },
+    });
+    state = trustedDrain(state);
+    state = run(state, {
+      ...envelope(state, "legacy-resume"),
+      type: "project-team.task.control",
+      control: { action: "resume", reason: "Restore controls without authorizing semantic work" },
+    });
+    expect(() =>
+      decideProjectWorkCommand(state, nextClaim(state, fixture.command, "legacy-ordinary")),
+    ).toThrow(/semantic.*repair/i);
+    state = run(state, {
+      ...envelope(state, "legacy-human-repair"),
+      type: "project-team.repair.resolve",
+      episodeId: episode.recordId,
+      expectedEpisodeRevision: episode.revision,
+      failureFingerprint: episode.failureFingerprint,
+      relevantRevision: episode.relevantRevision,
+      decision: "approve-one-repair",
+      reason: "Authorize exactly one repair of this retained failure",
+    });
+    const current = state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
+        r.kind === "repair-episode",
+    )!;
+    const exception = state.foundationRecords!.find(
+      (r): r is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+        r.kind === "gate" && r.recordId === current.exceptionGrantId,
+    )!;
+    const ordinary = nextClaim(state, fixture.command, "legacy-exact-repair");
+    if (ordinary.transition?.kind !== "claim") throw new Error("Claim required");
+    const repaired = applyProjectWorkEvents(
+      state,
+      decideProjectWorkCommand(state, {
+        ...ordinary,
+        transition: {
+          ...ordinary.transition,
+          repair: {
+            episodeId: current.recordId,
+            expectedEpisodeRevision: current.revision,
+            exceptionGateId: exception.recordId,
+            expectedExceptionGateRevision: exception.revision,
+          },
+          binding: { ...ordinary.transition.binding, repairEpisodeId: current.recordId },
+        },
+      }),
+    );
+    expect(repaired.foundationRecords!.find((r) => r.recordId === current.recordId)).toMatchObject({
+      pendingSemanticRepair: false,
+      semanticRepairs: 1,
+      transportRetries: 1,
+    });
+  });
+});
+
+it("an exact Human exception above the exhausted allowance permits only its debited run's semantic report", () => {
+  const fixture = activeRun();
+  let state = fixture.state;
+  for (let n = 1; n <= 3; n++) {
+    state = internal(state, `exhausted-exception-failure-${n}`, {
+      kind: "failure",
+      bindingId: fixture.binding.recordId,
+      generation: 0,
+      expectedBindingRevision: 1,
+      failureFingerprint: "exhausted-same-cause",
+      relevantRevision: `tree-${n}`,
+      failureKind: "semantic",
+      summary: "Actual product failure",
+    });
+    if (n < 3) {
+      const episode = state.foundationRecords!.find(
+        (r): r is Extract<ProjectTeamRecord, { kind: "repair-episode" }> =>
+          r.kind === "repair-episode",
+      )!;
+      state = internal(state, `exhausted-exception-debit-${n}`, {
+        kind: "repair.consume",
+        bindingId: fixture.binding.recordId,
+        generation: 0,
+        episodeId: episode.recordId,
+        expectedEpisodeRevision: episode.revision,
+        relevantRevision: episode.relevantRevision,
+      });
+    }
+  }
+  let episode = state.foundationRecords!.find(
+    (r): r is Extract<ProjectTeamRecord, { kind: "repair-episode" }> => r.kind === "repair-episode",
+  )!;
+  state = run(state, {
+    ...envelope(state, "authorize-exhausted-exception"),
+    type: "project-team.repair.resolve",
+    episodeId: episode.recordId,
+    expectedEpisodeRevision: episode.revision,
+    failureFingerprint: episode.failureFingerprint,
+    relevantRevision: episode.relevantRevision,
+    decision: "approve-one-repair",
+    reason: "Approve this exact third repair once",
+  });
+  state = trustedDrain(state);
+  state = run(state, {
+    ...envelope(state, "resolve-exhausted-exception"),
+    type: "project-team.task.control",
+    control: { action: "resolve-failure", reason: "Use this exact granted exception" },
+  });
+  episode = state.foundationRecords!.find(
+    (r): r is Extract<ProjectTeamRecord, { kind: "repair-episode" }> => r.kind === "repair-episode",
+  )!;
+  const exception = state.foundationRecords!.find(
+    (r): r is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+      r.kind === "gate" && r.recordId === episode.exceptionGrantId,
+  )!;
+  const ordinary = nextClaim(state, fixture.command, "above-allowance-run");
+  if (ordinary.transition?.kind !== "claim") throw new Error("Claim required");
+  const command = {
+    ...ordinary,
+    transition: {
+      ...ordinary.transition,
+      repair: {
+        episodeId: episode.recordId,
+        expectedEpisodeRevision: episode.revision,
+        exceptionGateId: exception.recordId,
+        expectedExceptionGateRevision: exception.revision,
+      },
+      binding: { ...ordinary.transition.binding, repairEpisodeId: episode.recordId },
+    },
+  };
+  state = applyProjectWorkEvents(state, decideProjectWorkCommand(state, command));
+  const reserved = state.foundationRecords!.find(
+    (r): r is Extract<ProjectTeamRecord, { kind: "run-binding" }> =>
+      r.kind === "run-binding" && r.recordId === "above-allowance-run-run",
+  )!;
+  state = applyProjectWorkEvents(
+    state,
+    decideProjectWorkCommand(state, {
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: CommandId.make("above-allowance-running"),
+      expectedRevision: state.revision,
+      records: [{ ...reserved, status: "running", revision: reserved.revision + 1 }],
+      attribution,
+      committedAt: at,
+    }),
+  );
+  const assignment = state.foundationRecords!.find(
+    (r): r is Extract<ProjectTeamRecord, { kind: "task-membership" }> =>
+      r.kind === "task-membership" && r.taskId === taskId,
+  )!;
+  const intent: ProjectTeamGuidedIntent = {
+    ...envelope(state, "above-allowance-report"),
+    type: "project-team.assignment.report",
+    assignmentId: assignment.recordId,
+    expectedAssignmentRevision: assignment.revision,
+    specRevision: 1,
+    planRevision: 1,
+    summary: "The exact authorized repair retained its progress",
+    evidenceIds: [],
+    outputArtifactIds: [],
+    outcome: "findings",
+  };
+  const report = {
+    ...compile(intent),
+    attribution: {
+      actor: { kind: "agent" as const, id: "worker" },
+      source: { kind: "system" as const, id: "runtime" },
+      recordedAt: at,
+    },
+    guided: { intent, bindingId: reserved.recordId, generation: reserved.generation },
+  };
+  const next = applyProjectWorkEvents(state, decideProjectWorkCommand(state, report));
+  expect(next.evidence.find((e) => e.summary === intent.summary)).toBeDefined();
+  expect(next.foundationRecords!.find((r) => r.recordId === episode.recordId)).toMatchObject({
+    semanticRepairs: 3,
+    allowance: 2,
+    status: "exhausted",
+    pendingSemanticRepair: false,
   });
 });

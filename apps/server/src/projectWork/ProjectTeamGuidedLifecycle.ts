@@ -22,8 +22,10 @@ import {
   projectTeamSpecificationHash,
   projectTeamPlanHash,
   projectTeamScopeHash,
-  assertProjectTeamRunAuthority,
+  assertProjectTeamSemanticWork,
   assertProjectTeamAssignmentAuthorization,
+  assertProjectTeamOrdinarySuccessor,
+  projectTeamRequiresSemanticRepair,
   projectTeamDerivedRecordId,
 } from "./ProjectTeamPolicy.ts";
 
@@ -122,7 +124,7 @@ export const decideProjectTeamGuidedLifecycle = (
       role.status !== "available"
     )
       reject("Guided member or frozen role is no longer active");
-    assertProjectTeamRunAuthority(state, binding!, role, false);
+    assertProjectTeamSemanticWork(state, binding, role);
     if (binding.taskId !== task.taskId) {
       const child = records().find(
         (r): r is Membership => r.kind === "task-membership" && r.taskId === binding!.taskId,
@@ -696,6 +698,7 @@ export const decideProjectTeamGuidedLifecycle = (
       break;
     }
     case "project-team.execution.start": {
+      assertProjectTeamOrdinarySuccessor(state, task.taskId);
       const m = ensureMembership(task);
       if (m.controlState !== undefined && m.controlState !== "active")
         reject("Controlled task cannot start execution");
@@ -821,6 +824,7 @@ export const decideProjectTeamGuidedLifecycle = (
         )
           reject("Prior attempt has no authoritative drain proof");
         const plan = currentPlan(task.taskId);
+        const requiresSemanticRepair = projectTeamRequiresSemanticRepair(state, task.taskId);
         let renewedGrant: Gate | undefined;
         const ancestors = new Set<string>();
         let rootTaskId: string = task.taskId;
@@ -886,6 +890,8 @@ export const decideProjectTeamGuidedLifecycle = (
               (prior.gate !== targetKind && prior.gate !== "repair")
             )
               reject("Assignment grant is no longer current");
+            if (requiresSemanticRepair && prior.status !== "consumed")
+              reject("Pending semantic repair requires its exact consumed predecessor grant");
             if (
               prior.status === "consumed" ||
               (action === "reopen" && prior.status === "invalidated")
@@ -902,22 +908,24 @@ export const decideProjectTeamGuidedLifecycle = (
                 )
               )
                 reject("Consumed predecessor grant lacks authoritative drain proof");
-              renewedGrant = {
-                ...fields("resumed-authorization"),
-                kind: "gate",
-                status: "approved",
-                taskId: task.taskId,
-                gate: targetKind,
-                specRevision: task.specRevision,
-                planRevision: research || inherited ? 0 : plan!.planRevision,
-                contentHash: scopeHash,
-                evidenceIds: [],
-                attribution: prior.attribution,
-                ...(prior.assignmentAuthorization === undefined
-                  ? {}
-                  : { assignmentAuthorization: prior.assignmentAuthorization }),
-              };
-              record(renewedGrant);
+              if (!requiresSemanticRepair) {
+                renewedGrant = {
+                  ...fields("resumed-authorization"),
+                  kind: "gate",
+                  status: "approved",
+                  taskId: task.taskId,
+                  gate: targetKind,
+                  specRevision: task.specRevision,
+                  planRevision: research || inherited ? 0 : plan!.planRevision,
+                  contentHash: scopeHash,
+                  evidenceIds: [],
+                  attribution: prior.attribution,
+                  ...(prior.assignmentAuthorization === undefined
+                    ? {}
+                    : { assignmentAuthorization: prior.assignmentAuthorization }),
+                };
+                record(renewedGrant);
+              }
             } else if (prior.status !== "approved") reject("Assignment grant is no longer current");
           }
         }

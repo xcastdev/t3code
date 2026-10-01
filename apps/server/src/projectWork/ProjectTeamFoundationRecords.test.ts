@@ -435,3 +435,59 @@ effectIt.effect(
       ).toHaveLength(1);
     }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
 );
+
+it("pending semantic repair cannot be erased or cleared without exactly one canonical debit", () => {
+  const episode: Extract<ProjectTeamRecord, { kind: "repair-episode" }> = {
+    ...fields,
+    kind: "repair-episode",
+    status: "active",
+    taskId,
+    rootTaskId: taskId,
+    failureFingerprint: "retained-cause",
+    relevantRevision: "current-tree",
+    allowance: 2,
+    semanticRepairs: 0,
+    transportRetries: 1,
+    timeoutCount: 0,
+    attemptIds: [],
+    pendingSemanticRepair: true,
+  };
+  const state = { ...initial(), foundationRecords: [episode] };
+  expect(() =>
+    validateProjectTeamRecord(
+      state,
+      { ...episode, revision: 1, pendingSemanticRepair: false },
+      human,
+    ),
+  ).toThrow("canonical debit");
+  expect(() =>
+    validateProjectTeamRecord(
+      state,
+      {
+        ...episode,
+        revision: 1,
+        pendingSemanticRepair: false,
+        semanticRepairs: 1,
+        lastSemanticRevision: "stale-tree",
+      },
+      human,
+    ),
+  ).toThrow("canonical debit");
+  const { pendingSemanticRepair: _marker, ...missing } = episode;
+  expect(() => validateProjectTeamRecord(state, { ...missing, revision: 1 }, human)).toThrow(
+    "cannot be discarded",
+  );
+  expect(
+    validateProjectTeamRecord(
+      state,
+      {
+        ...episode,
+        revision: 1,
+        pendingSemanticRepair: false,
+        semanticRepairs: 1,
+        lastSemanticRevision: episode.relevantRevision,
+      },
+      human,
+    ),
+  ).toMatchObject({ pendingSemanticRepair: false, semanticRepairs: 1, transportRetries: 1 });
+});

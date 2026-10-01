@@ -14,6 +14,7 @@ import {
 } from "./ProjectWorkPolicy.ts";
 import {
   assertProjectTeamRunAuthority,
+  assertProjectTeamOrdinarySuccessor,
   evaluateProjectTeamGate,
   evaluateProjectTeamDependency,
   projectTeamScopeHash,
@@ -200,7 +201,9 @@ export const decideProjectTeamGuidedTransition = (
         },
         { runId: run.recordId, commandId: command.commandId },
       );
-    } else if (
+    } else if (episode.pendingSemanticRepair !== true)
+      reject("Automatic repair requires a current pending semantic failure");
+    else if (
       episode.status !== "active" ||
       episode.semanticRepairs >= episode.allowance ||
       episode.lastSemanticRevision === episode.relevantRevision
@@ -209,6 +212,7 @@ export const decideProjectTeamGuidedTransition = (
     record({
       ...episode,
       semanticRepairs: episode.semanticRepairs + 1,
+      pendingSemanticRepair: false,
       lastSemanticRevision: episode.relevantRevision,
       status: episode.semanticRepairs + 1 > episode.allowance ? "exhausted" : "active",
       revision: episode.revision + 1,
@@ -254,6 +258,7 @@ export const decideProjectTeamGuidedTransition = (
         run.memberId !== m.requestedSuccessorMemberId
       )
         reject("Claim must use the exact requested successor member");
+      if (t.repair === undefined) assertProjectTeamOrdinarySuccessor(state, task.taskId);
       if (
         records().some(
           (r) => r.kind === "run-binding" && r.taskId === task.taskId && r.status !== "settled",
@@ -483,12 +488,14 @@ export const decideProjectTeamGuidedTransition = (
               relevantRevision: t.relevantRevision,
               allowance: 2,
               semanticRepairs: 0,
+              pendingSemanticRepair: t.failureKind === "semantic",
               transportRetries: 0,
               timeoutCount: 0,
               attemptIds: [run.attemptId],
             }
           : {
               ...old,
+              ...(t.failureKind === "semantic" ? { pendingSemanticRepair: true } : {}),
               taskId: run.taskId,
               relevantRevision: t.relevantRevision,
               revision: old.revision + 1,
