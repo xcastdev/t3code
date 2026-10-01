@@ -15,6 +15,10 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { afterEach, beforeEach, describe, expect } from "vite-plus/test";
 import {
   acquirePiManagedProcess,
+  preallocatePiManagedProcess,
+  reconcilePiManagedProcess,
+  PiManagedProcessError,
+  type PiManagedProcessPersistence,
   validatePiManagedLaunch,
   type PiManagedLaunch,
   type PiManagedProcessOwner,
@@ -163,6 +167,78 @@ describe("managed launch filesystem boundary", () => {
   );
 });
 
+describe("managed runtime mount validation", () => {
+  check("pins separate native state and protected Git entries", () =>
+    Effect.gen(function* () {
+      const state = NodePath.join(scratch, "native-state");
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(state);
+        await NodeFSP.writeFile(
+          NodePath.join(input.workspaceRoot, ".git"),
+          "gitdir: /unmounted/common.git",
+        );
+      });
+      const result = yield* validate({
+        ...input,
+        nativeStateRoot: state,
+        workspaceAccess: "readonly",
+        protectedWorkspaceEntries: [".git"],
+      });
+      expect(result.nativeState?.path).toBe(state);
+      expect(result.workspaceAccess).toBe("readonly");
+      expect(result.protectedWorkspaceEntries[0]?.target).toBe("/workspace/.git");
+    }),
+  );
+  check("rejects state overlap with workspace protected data and runtime", () =>
+    Effect.gen(function* () {
+      for (const state of [input.workspaceRoot, scratch, input.protectedRoots[0]!])
+        yield* rejects({ ...input, nativeStateRoot: state }, "separately owned");
+      const state = NodePath.join(scratch, "native-state");
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(state);
+        await NodeFSP.writeFile(NodePath.join(state, "runtime"), "program");
+      });
+      yield* rejects(
+        {
+          ...input,
+          nativeStateRoot: state,
+          runtimeFiles: [{ source: NodePath.join(state, "runtime"), target: "/runtime/program" }],
+        },
+        "overlap",
+      );
+    }),
+  );
+  check("rejects state aliases and protected entry traversal aliases and overlaps", () =>
+    Effect.gen(function* () {
+      const state = NodePath.join(scratch, "state");
+      const alias = NodePath.join(scratch, "state-alias");
+      yield* Effect.promise(async () => {
+        await NodeFSP.mkdir(state);
+        await NodeFSP.symlink(state, alias);
+        await NodeFSP.mkdir(NodePath.join(input.workspaceRoot, "metadata"));
+        await NodeFSP.writeFile(NodePath.join(input.workspaceRoot, "metadata", "file"), "pinned");
+        await NodeFSP.symlink("metadata", NodePath.join(input.workspaceRoot, "alias"));
+      });
+      yield* rejects({ ...input, nativeStateRoot: alias }, "canonical");
+      for (const entry of [
+        "../protected",
+        "/metadata",
+        "metadata/../file",
+        "metadata/./file",
+        "metadata//file",
+        "metadata\\file",
+      ])
+        yield* rejects({ ...input, protectedWorkspaceEntries: [entry] }, "relative");
+      yield* rejects({ ...input, protectedWorkspaceEntries: ["alias/file"] }, "symlink");
+      yield* rejects(
+        { ...input, protectedWorkspaceEntries: ["metadata", "metadata/file"] },
+        "overlap",
+      );
+      yield* rejects({ ...input, protectedWorkspaceEntries: Array(17).fill("metadata") }, "bound");
+    }),
+  );
+});
+
 // Required separately: PI_MANAGED_PROCESS_LINUX_GATE=1 vp test run <this file>.
 // Ordinary discovery never launches systemd or claims a Linux containment proof.
 describe.runIf(process.env.PI_MANAGED_PROCESS_LINUX_GATE === "1")(
@@ -188,11 +264,15 @@ describe.runIf(process.env.PI_MANAGED_PROCESS_LINUX_GATE === "1")(
     const closure = Effect.promise(async () => {
       const files = [
         { source: "/usr/bin/bash", target: "/bin/bash" },
+        { source: "/usr/bin/rm", target: "/bin/rm" },
+        { source: "/usr/bin/mv", target: "/bin/mv" },
         ...[
           "/lib64/ld-linux-x86-64.so.2",
           "/usr/lib/libc.so.6",
           "/usr/lib/libreadline.so.8",
           "/usr/lib/libncursesw.so.6",
+          "/usr/lib/libacl.so.1",
+          "/usr/lib/libattr.so.1",
         ].map((source) => ({ source, target: source })),
       ];
       for (const file of files) await NodeFSP.stat(file.source);
@@ -202,6 +282,7 @@ describe.runIf(process.env.PI_MANAGED_PROCESS_LINUX_GATE === "1")(
       argv: ReadonlyArray<string>,
       overrides: Partial<PiManagedLaunch> = {},
       properties: ReadonlyArray<string> = [],
+      persistence?: PiManagedProcessPersistence,
     ) =>
       Effect.gen(function* () {
         const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -254,16 +335,488 @@ describe.runIf(process.env.PI_MANAGED_PROCESS_LINUX_GATE === "1")(
             ),
           );
         });
-        return yield* acquirePiManagedProcess({
-          ...input,
-          runtimeFiles: yield* closure,
-          argv,
-          ...overrides,
-        }).pipe(
+        return yield* acquirePiManagedProcess(
+          {
+            ...input,
+            runtimeFiles: yield* closure,
+            argv,
+            ...overrides,
+          },
+          persistence,
+        ).pipe(
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed),
           Effect.tap(retainOwned),
         );
       });
+    const runtimeLaunch = (argv: ReadonlyArray<string>, overrides: Partial<PiManagedLaunch> = {}) =>
+      Effect.gen(function* () {
+        return { ...input, runtimeFiles: yield* closure, argv, ...overrides };
+      });
+    check("enforces readonly workspace against actual shell writes", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const child = yield* acquire(
+            [
+              "/bin/bash",
+              "-c",
+              "if printf forbidden > /workspace/readonly-proof 2>/dev/null; then exit 9; fi; printf readonly",
+            ],
+            { workspaceAccess: "readonly" },
+          );
+          yield* child.start;
+          const [out] = yield* Effect.all(
+            [
+              child.stdout.pipe(Stream.decodeText(), Stream.runCollect),
+              child.stderr.pipe(Stream.runDrain),
+            ],
+            { concurrency: "unbounded" },
+          );
+          expect(Array.from(out).join("")).toBe("readonly");
+          expect((yield* child.awaitExit).childExitCode).toBe(0);
+          yield* absent(NodePath.join(input.workspaceRoot, "readonly-proof"));
+        }),
+      ),
+    );
+    check("mounts only owned state writable and excludes sibling state protected resources", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const state = NodePath.join(scratch, "state");
+          const sibling = NodePath.join(scratch, "sibling-state");
+          yield* Effect.promise(async () => {
+            await NodeFSP.mkdir(state);
+            await NodeFSP.mkdir(sibling);
+            await NodeFSP.writeFile(NodePath.join(sibling, "secret"), "other-thread");
+            await NodeFSP.writeFile(NodePath.join(scratch, "protected", "secret"), "protected");
+          });
+          const child = yield* acquire(
+            [
+              "/bin/bash",
+              "-c",
+              `set -e; test ! -e '${sibling}/secret'; test ! -e '${scratch}/protected/secret'; printf own > /state/native; printf state`,
+            ],
+            { nativeStateRoot: state, workspaceAccess: "readonly" },
+          );
+          yield* child.start;
+          const out = yield* child.stdout.pipe(Stream.decodeText(), Stream.runCollect);
+          expect(Array.from(out).join("")).toBe("state");
+          expect((yield* child.awaitExit).childExitCode).toBe(0);
+          expect(
+            yield* Effect.promise(() => NodeFSP.readFile(NodePath.join(state, "native"), "utf8")),
+          ).toBe("own");
+          expect(
+            yield* Effect.promise(() => NodeFSP.readFile(NodePath.join(sibling, "secret"), "utf8")),
+          ).toBe("other-thread");
+        }),
+      ),
+    );
+    for (const directory of [false, true])
+      check(
+        `keeps Git ${directory ? "directory" : "pointer"} immutable in writable workspace`,
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const git = NodePath.join(input.workspaceRoot, ".git");
+              yield* Effect.promise(async () => {
+                if (directory) {
+                  await NodeFSP.mkdir(git);
+                  await NodeFSP.writeFile(NodePath.join(git, "config"), "protected-config");
+                } else await NodeFSP.writeFile(git, "gitdir: /unmounted/common.git");
+              });
+              const child = yield* acquire(
+                [
+                  "/bin/bash",
+                  "-c",
+                  `set -e; test ! -e /unmounted/common.git; if printf changed > /workspace/.git${directory ? "/config" : ""} 2>/dev/null; then exit 9; fi; if /bin/bash -c 'exec 3>/workspace/.git' 2>/dev/null; then exit 8; fi; if /bin/rm -rf /workspace/.git 2>/dev/null; then exit 7; fi; if /bin/mv /workspace/.git /workspace/replaced 2>/dev/null; then exit 6; fi; printf writable > /workspace/edit; printf git`,
+                ],
+                { protectedWorkspaceEntries: [".git"] },
+              );
+              yield* child.start;
+              const [out] = yield* Effect.all(
+                [
+                  child.stdout.pipe(Stream.decodeText(), Stream.runCollect),
+                  child.stderr.pipe(Stream.runDrain),
+                ],
+                { concurrency: "unbounded" },
+              );
+              expect(Array.from(out).join("")).toBe("git");
+              expect((yield* child.awaitExit).childExitCode).toBe(0);
+              expect(
+                yield* Effect.promise(() =>
+                  NodeFSP.readFile(directory ? NodePath.join(git, "config") : git, "utf8"),
+                ),
+              ).toBe(directory ? "protected-config" : "gitdir: /unmounted/common.git");
+              expect(
+                yield* Effect.promise(() =>
+                  NodeFSP.readFile(NodePath.join(input.workspaceRoot, "edit"), "utf8"),
+                ),
+              ).toBe("writable");
+            }),
+          ),
+      );
+    for (const target of ["state", "git"] as const)
+      for (const replacement of ["directory", "symlink"] as const)
+        check(`rejects ${target} ${replacement} identity replacement before START`, () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const state = NodePath.join(scratch, "state");
+              const git = NodePath.join(input.workspaceRoot, ".git");
+              yield* Effect.promise(async () => {
+                await NodeFSP.mkdir(state);
+                await NodeFSP.mkdir(git);
+              });
+              const child = yield* acquire(
+                ["/bin/bash", "-c", "printf forbidden > /workspace/swapped-runtime-proof"],
+                { nativeStateRoot: state, protectedWorkspaceEntries: [".git"] },
+              );
+              const original = target === "state" ? state : git;
+              yield* Effect.promise(async () => {
+                await NodeFSP.rename(original, original + "-original");
+                if (replacement === "symlink")
+                  await NodeFSP.symlink(original + "-original", original);
+                else await NodeFSP.mkdir(original);
+              });
+              expect((yield* child.start.pipe(Effect.flip)).phase).toBe("startup");
+              expect((yield* child.stop).kernel).toMatch(/removed|populated 0/);
+              yield* absent(NodePath.join(input.workspaceRoot, "swapped-runtime-proof"));
+            }),
+          ),
+        );
+    check(
+      "persists activation and full owner before exposing START, then recovers exact ownership",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const launch = yield* runtimeLaunch([
+              "/bin/bash",
+              "-c",
+              "printf ready; while :; do :; done",
+            ]);
+            const allocation = yield* preallocatePiManagedProcess(launch);
+            let claimed = false;
+            let saved: PiManagedProcessOwner | undefined;
+            const child = yield* acquire(launch.argv, {}, [], {
+              allocation,
+              claimActivation: () =>
+                Effect.sync(() => {
+                  expect(saved).toBeUndefined();
+                  claimed = true;
+                }),
+              beforeStart: (owner) =>
+                Effect.sync(() => {
+                  expect(claimed).toBe(true);
+                  saved = owner;
+                }),
+            });
+            expect(saved).toEqual(child.owner);
+            const inspected = yield* reconcilePiManagedProcess(
+              { allocation, activation: "owned", owner: child.owner },
+              { stop: false },
+            );
+            expect(inspected.state).toBe("owned");
+            yield* child.start;
+            yield* child.stdout.pipe(Stream.take(1), Stream.runDrain);
+            const drain = yield* reconcilePiManagedProcess(
+              { allocation, activation: "owned", owner: child.owner },
+              { stop: true },
+            );
+            expect(drain.state).toBe("drained");
+            expect(drain.kernel).toMatch(/removed|populated 0/);
+          }),
+        ),
+    );
+    check(
+      "quarantines stale invocation and policy without stopping the current owned service",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const launch = yield* runtimeLaunch([
+              "/bin/bash",
+              "-c",
+              "printf still-owned; while :; do :; done",
+            ]);
+            const allocation = yield* preallocatePiManagedProcess(launch);
+            const child = yield* acquire(launch.argv, {}, [], {
+              allocation,
+              claimActivation: () => Effect.void,
+              beforeStart: () => Effect.void,
+            });
+            for (const owner of [
+              { ...child.owner, invocation: "0".repeat(32) },
+              { ...child.owner, nonce: "foreign" },
+              { ...child.owner, cgroup: child.owner.cgroup + "/foreign" },
+            ])
+              expect(
+                (yield* reconcilePiManagedProcess(
+                  { allocation, activation: "owned", owner },
+                  { stop: true },
+                ).pipe(Effect.flip)).phase,
+              ).toBe("quarantine");
+            yield* child.start;
+            const out = yield* child.stdout.pipe(Stream.take(1), Stream.runCollect);
+            expect(Buffer.concat(Array.from(out)).toString()).toBe("still-owned");
+            yield* child.stop;
+          }),
+        ),
+    );
+    check("distinguishes unclaimed absence from uncertain claimed activation", () =>
+      Effect.gen(function* () {
+        const allocation = yield* preallocatePiManagedProcess(
+          yield* runtimeLaunch(["/bin/bash", "-c", "true"]),
+        );
+        expect(
+          (yield* reconcilePiManagedProcess(
+            { allocation, activation: "unlaunched" },
+            { stop: true },
+          )).state,
+        ).toBe("absent");
+        expect(
+          (yield* reconcilePiManagedProcess(
+            { allocation, activation: "claimed" },
+            { stop: true },
+          ).pipe(Effect.flip)).phase,
+        ).toBe("quarantine");
+      }),
+    );
+    for (const phase of ["claim", "owner"] as const)
+      check(`failed ${phase} persistence prevents actual workspace execution`, () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const launch = yield* runtimeLaunch([
+              "/bin/bash",
+              "-c",
+              "printf forbidden > /workspace/persist-proof",
+            ]);
+            const allocation = yield* preallocatePiManagedProcess(launch);
+            const error = new PiManagedProcessError({
+              phase: "startup",
+              message: "durable persistence rejected",
+            });
+            expect(
+              (yield* acquire(launch.argv, {}, [], {
+                allocation,
+                claimActivation: () => (phase === "claim" ? Effect.fail(error) : Effect.void),
+                beforeStart: () => (phase === "owner" ? Effect.fail(error) : Effect.void),
+              }).pipe(Effect.flip)).message,
+            ).toContain("persistence");
+            yield* absent(NodePath.join(input.workspaceRoot, "persist-proof"));
+          }),
+        ),
+      );
+    check("cancellation while owner persistence is held drains before any START", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const launch = yield* runtimeLaunch([
+            "/bin/bash",
+            "-c",
+            "printf forbidden > /workspace/persist-cancel-proof",
+          ]);
+          const allocation = yield* preallocatePiManagedProcess(launch);
+          const held = yield* Deferred.make<PiManagedProcessOwner>();
+          const fiber = yield* Effect.scoped(
+            acquire(launch.argv, {}, [], {
+              allocation,
+              claimActivation: () => Effect.void,
+              beforeStart: (owner) =>
+                Deferred.succeed(held, owner).pipe(Effect.andThen(Effect.never)),
+            }),
+          ).pipe(Effect.forkChild);
+          const owner = yield* Deferred.await(held);
+          yield* Fiber.interrupt(fiber);
+          yield* absent(owner.cgroup);
+          yield* absent(NodePath.join(input.workspaceRoot, "persist-cancel-proof"));
+          yield* retain({ ...owner, kernel: "removed" });
+        }),
+      ),
+    );
+    check("held owner persistence leaves the workspace untouched until the receipt commits", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const launch = yield* runtimeLaunch([
+            "/bin/bash",
+            "-c",
+            "printf committed > /workspace/persist-held-proof",
+          ]);
+          const allocation = yield* preallocatePiManagedProcess(launch);
+          const held = yield* Deferred.make<PiManagedProcessOwner>();
+          const release = yield* Deferred.make<void>();
+          const fiber = yield* acquire(launch.argv, {}, [], {
+            allocation,
+            claimActivation: () => Effect.void,
+            beforeStart: (owner) =>
+              Deferred.succeed(held, owner).pipe(Effect.andThen(Deferred.await(release))),
+          }).pipe(Effect.forkChild);
+          yield* Deferred.await(held).pipe(Effect.timeout("3 seconds"));
+          yield* absent(NodePath.join(input.workspaceRoot, "persist-held-proof"));
+          yield* Deferred.succeed(release, undefined);
+          const child = yield* Fiber.join(fiber);
+          yield* child.start;
+          yield* child.stdout.pipe(Stream.runDrain);
+          expect((yield* child.awaitExit).childExitCode).toBe(0);
+          expect(
+            yield* Effect.promise(() =>
+              NodeFSP.readFile(NodePath.join(input.workspaceRoot, "persist-held-proof"), "utf8"),
+            ),
+          ).toBe("committed");
+        }),
+      ),
+    );
+    check("calls the upstream single-use activation claim for every preallocated acquire", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const launch = yield* runtimeLaunch(["/bin/bash", "-c", "printf once"]);
+          const allocation = yield* preallocatePiManagedProcess(launch);
+          let claimed = false;
+          let attempts = 0;
+          const persistence = {
+            allocation,
+            claimActivation: () =>
+              Effect.suspend(() => {
+                attempts++;
+                if (claimed)
+                  return Effect.fail(
+                    new PiManagedProcessError({
+                      phase: "startup",
+                      message: "activation already claimed",
+                    }),
+                  );
+                claimed = true;
+                return Effect.void;
+              }),
+            beforeStart: () => Effect.void,
+          };
+          const child = yield* acquire(launch.argv, {}, [], persistence);
+          yield* child.stop;
+          expect(
+            (yield* acquire(launch.argv, {}, [], persistence).pipe(Effect.flip)).message,
+          ).toContain("already claimed");
+          expect(attempts).toBe(2);
+          expect(
+            (yield* reconcilePiManagedProcess(
+              { allocation, activation: "owned", owner: child.owner },
+              { stop: false },
+            )).state,
+          ).toBe("drained");
+        }),
+      ),
+    );
+    check("rejects preallocated inode and unknown field changes before claiming activation", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const launch = yield* runtimeLaunch([
+            "/bin/bash",
+            "-c",
+            "printf forbidden > /workspace/changed-allocation-proof",
+          ]);
+          const allocation = yield* preallocatePiManagedProcess(launch);
+          let claims = 0;
+          const claimActivation = () =>
+            Effect.sync(() => {
+              claims++;
+            });
+          const beforeStart = () => Effect.void;
+          const changed = {
+            ...allocation,
+            launch: {
+              ...allocation.launch,
+              workspace: {
+                ...allocation.launch.workspace,
+                ino: allocation.launch.workspace.ino + 1,
+              },
+            },
+          };
+          expect(
+            (yield* acquire(launch.argv, {}, [], {
+              allocation: changed,
+              claimActivation,
+              beforeStart,
+            }).pipe(Effect.flip)).phase,
+          ).toBe("validation");
+          const unknown = { ...allocation, env: { arbitrary: "forbidden" } };
+          expect(
+            (yield* acquire(launch.argv, {}, [], {
+              allocation: unknown,
+              claimActivation,
+              beforeStart,
+            }).pipe(Effect.flip)).phase,
+          ).toBe("validation");
+          expect(claims).toBe(0);
+          yield* absent(NodePath.join(input.workspaceRoot, "changed-allocation-proof"));
+        }),
+      ),
+    );
+    check(
+      "refuses a foreign service reusing the exact unit without signalling its captured process",
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const launch = yield* runtimeLaunch(["/bin/bash", "-c", "printf original"]);
+            const allocation = yield* preallocatePiManagedProcess(launch);
+            const child = yield* acquire(launch.argv, {}, [], {
+              allocation,
+              claimActivation: () => Effect.void,
+              beforeStart: () => Effect.void,
+            });
+            yield* child.stop;
+            const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+            const foreign = yield* spawner.spawn(
+              ChildProcess.make(
+                "/usr/bin/systemd-run",
+                [
+                  "--user",
+                  "--wait",
+                  "--pipe",
+                  "--quiet",
+                  `--unit=${allocation.unit}`,
+                  "--description=Foreign recovery control",
+                  "-p",
+                  "MemoryMax=536870912",
+                  "-p",
+                  "MemorySwapMax=0",
+                  "-p",
+                  "OOMPolicy=kill",
+                  "-p",
+                  "KillMode=control-group",
+                  "-p",
+                  "RuntimeMaxSec=10s",
+                  "/usr/bin/bash",
+                  "-c",
+                  "printf foreign-ready; IFS= read -r value; printf foreign-survived",
+                ],
+                {
+                  env: {
+                    PATH: "/usr/bin:/bin",
+                    XDG_RUNTIME_DIR: `/run/user/${process.getuid!()}`,
+                    DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${process.getuid!()}/bus`,
+                  },
+                  extendEnv: false,
+                  shell: false,
+                },
+              ),
+            );
+            const done = yield* Deferred.make<void>();
+            const observed = foreign.stdout.pipe(
+              Stream.tap(() => Deferred.succeed(done, undefined)),
+              Stream.decodeText(),
+              Stream.runCollect,
+              Effect.forkChild,
+            );
+            const reader = yield* observed;
+            yield* Deferred.await(done);
+            expect(
+              (yield* reconcilePiManagedProcess(
+                { allocation, activation: "owned", owner: child.owner },
+                { stop: true },
+              ).pipe(Effect.flip)).phase,
+            ).toBe("quarantine");
+            yield* Stream.make(Buffer.from("release\n")).pipe(Stream.run(foreign.stdin));
+            expect(Array.from(yield* Fiber.join(reader)).join("")).toBe(
+              "foreign-readyforeign-survived",
+            );
+            expect(Number(yield* foreign.exitCode)).toBe(0);
+            yield* retain({ ...child.owner, kernel: "foreign-service-exited-from-owned-input" });
+          }),
+        ),
+    );
     for (const seconds of [59, 60, 61, 120, 3600])
       check(`accepts the exact numeric runtime policy for ${seconds} seconds`, () =>
         Effect.scoped(
