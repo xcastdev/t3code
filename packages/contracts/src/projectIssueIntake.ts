@@ -51,3 +51,50 @@ export const ProjectIssueRepositoryCursorRead = Schema.Struct({
   ...ProjectIssueRepositoryCursor.fields,
   status: Text,
 });
+
+const BindingText = TrimmedNonEmptyString.check(
+  Schema.isMaxLength(1024),
+  Schema.makeFilter((value) => !/\p{Cc}/u.test(value)),
+);
+const BindingCounter = NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER));
+const BindingLogin = Schema.String.check(
+  Schema.isMaxLength(39),
+  Schema.isPattern(/^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$/u),
+);
+export const ProjectIssueRepositoryKey = Schema.Struct({
+  host: BindingText.check(
+    Schema.isMaxLength(253),
+    Schema.isPattern(
+      /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/u,
+    ),
+  ),
+  repositoryNodeId: BindingText,
+});
+export const ProjectIssueRepositoryBindInput = Schema.Struct({
+  projectId: ProjectId,
+  expectedRepositoryKey: ProjectIssueRepositoryKey,
+  expectedTargetBindingRevision: Schema.NullOr(BindingCounter),
+  accountLogin: BindingLogin,
+  previous: Schema.optionalKey(
+    Schema.Struct({ key: ProjectIssueRepositoryKey, expectedBindingRevision: BindingCounter }),
+  ),
+});
+export type ProjectIssueRepositoryBindInput = typeof ProjectIssueRepositoryBindInput.Type;
+export const ProjectIssueRepositoryBindReceipt = Schema.Struct({
+  ...ProjectIssueRepositoryKey.fields,
+  bindingRevision: BindingCounter,
+  status: Schema.Literal("ready"),
+});
+export const ProjectIssueRepositoryBindingsInput = Schema.Struct({ projectId: ProjectId });
+export type ProjectIssueRepositoryBindingsInput = typeof ProjectIssueRepositoryBindingsInput.Type;
+export const ProjectIssueRepositoryBindingRead = Schema.Struct({
+  ...ProjectIssueRepositoryKey.fields,
+  bindingRevision: BindingCounter,
+  status: Schema.Literals(["active", "detached"]),
+  repositoryName: Schema.String.check(Schema.isMaxLength(1024)),
+  accountLogin: Schema.optionalKey(BindingLogin),
+});
+export const ProjectIssueRepositoryBindingsRead = Schema.Struct({
+  items: Schema.Array(ProjectIssueRepositoryBindingRead).check(Schema.isMaxLength(32)),
+});
+export type ProjectIssueRepositoryBindingsRead = typeof ProjectIssueRepositoryBindingsRead.Type;
