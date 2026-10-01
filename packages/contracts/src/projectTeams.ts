@@ -143,6 +143,16 @@ export const ProjectTeamGate = Schema.Struct({
   evidenceIds: Ids,
   consumedByRunId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
   consumedByCommandId: Schema.optionalKey(CommandId),
+  repairAuthorization: Schema.optionalKey(
+    Schema.Struct({
+      episodeId: Text.check(Schema.isMaxLength(256)),
+      failureFingerprint: Text,
+      relevantRevision: Text,
+      semanticRepairNumber: NonNegativeInt,
+      inheritedGateId: Text.check(Schema.isMaxLength(256)),
+      exceptionGateId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
+    }),
+  ),
 });
 export const ProjectTeamRunBinding = Schema.Struct({
   ...Fields,
