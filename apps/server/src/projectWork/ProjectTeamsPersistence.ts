@@ -8,6 +8,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import { retireProjectIssueRepositories } from "./ProjectIssueRepositoryLifecycle.ts";
 
 const decodeTeamRecordJson = Schema.decodeUnknownEffect(Schema.fromJsonString(ProjectTeamRecord));
 const decodeTeamRecordReadJson = Schema.decodeUnknownEffect(
@@ -56,7 +57,6 @@ export const purgeProjectTeamRecords = Effect.fn("purgeProjectTeamRecords")(func
   projectId: string,
 ) {
   const transferred: Array<Extract<TeamRecord, { kind: "intake-cursor" }>> = [];
-  // P5 will own explicit repository bindings. P2 can only transfer against retained issue identity.
   const cursors = yield* sql<{
     recordId: string;
     payload: string;
@@ -64,15 +64,15 @@ export const purgeProjectTeamRecords = Effect.fn("purgeProjectTeamRecords")(func
   for (const row of cursors) {
     const cursor = yield* decodeTeamRecordJson(row.payload);
     if (cursor.kind !== "intake-cursor" || cursor.status === "detached") continue;
-    const owners = yield* sql<{ projectId: string }>`SELECT DISTINCT issue.project_id AS projectId
-      FROM project_team_issue AS issue
-      JOIN projection_projects AS project ON project.project_id = issue.project_id
-      LEFT JOIN project_lifecycle AS lifecycle ON lifecycle.project_id = issue.project_id
-      WHERE issue.project_id != ${projectId} AND issue.status != 'detached'
+    const owners = yield* sql<{ projectId: string }>`SELECT binding.project_id AS projectId
+      FROM project_issue_binding AS binding
+      JOIN projection_projects AS project ON project.project_id = binding.project_id
+      LEFT JOIN project_lifecycle AS lifecycle ON lifecycle.project_id = binding.project_id
+      WHERE binding.project_id != ${projectId} AND binding.status = 'active'
         AND project.deleted_at IS NULL AND (lifecycle.state IS NULL OR lifecycle.state = 'active')
-        AND json_extract(issue.payload_json, '$.identity.host') = ${cursor.host}
-        AND json_extract(issue.payload_json, '$.identity.repositoryNodeId') = ${cursor.repositoryNodeId}
-      ORDER BY issue.project_id LIMIT 1`;
+        AND binding.host = ${cursor.host} AND binding.repository_node_id = ${cursor.repositoryNodeId}
+        AND binding.account_node_id = ${cursor.accountId}
+      ORDER BY binding.project_id LIMIT 1`;
     const owner = owners[0];
     if (owner !== undefined) {
       transferred.push({ ...cursor, projectId: ProjectId.make(owner.projectId) });
@@ -81,6 +81,7 @@ export const purgeProjectTeamRecords = Effect.fn("purgeProjectTeamRecords")(func
         WHERE record_id = ${row.recordId} AND project_id = ${projectId}`;
     }
   }
+  yield* retireProjectIssueRepositories(sql, projectId, true);
   for (const name of PROJECT_TEAM_TABLES)
     yield* sql`DELETE FROM ${sql(name)} WHERE project_id = ${projectId}`;
   return transferred;

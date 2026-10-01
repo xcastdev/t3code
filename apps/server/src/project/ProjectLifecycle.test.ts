@@ -37,6 +37,7 @@ import { describe, expect, it } from "vite-plus/test";
 
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { runForkMigrations, runMigrations } from "../persistence/Migrations.ts";
+import { bindIssueRepositoryProject } from "../projectWork/ProjectIssueRepositoryState.ts";
 
 import {
   ProjectLifecycle,
@@ -48,6 +49,21 @@ import {
 const encodeJson = Schema.encodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeTeamRecordEffect = Schema.decodeUnknownEffect(ProjectTeamRecord);
 const decodeCommitEffect = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
+const bindRepository = (
+  sql: SqlClient.SqlClient,
+  projectId: string,
+  repositoryNodeId: string,
+  accountNodeId: string,
+) =>
+  bindIssueRepositoryProject(sql, {
+    key: { host: "github.com", repositoryNodeId },
+    projectId,
+    accountNodeId,
+    repositoryName: "owner/repo",
+    credentialEpoch: "lifecycle-verified-epoch",
+    since: "2026-01-01T00:00:00Z",
+    expectedBindingRevision: null,
+  });
 
 const lifecycleLayer = ProjectLifecycleLive.pipe(
   Layer.provideMerge(NodeSqliteClient.layerMemory()),
@@ -79,6 +95,8 @@ describe("ProjectLifecycle", () => {
           yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (${id}, 'Project', '/workspace', '[]', ${at}, ${at})`;
         }
         yield* sql`INSERT INTO project_lifecycle (project_id, state, workspace_root, revision, changed_at) VALUES ('foundation-archived', 'archived', '/workspace', 1, ${at})`;
+        for (const id of [projectId, survivor, third])
+          yield* bindRepository(sql, id, "repo", "same-account");
         const attribution = {
           actor: { kind: "system", id: "foundation" },
           source: { kind: "system", id: "foundation" },
@@ -411,6 +429,8 @@ describe("ProjectLifecycle", () => {
             const repo = yield* ProjectWorkRepository;
             for (const id of [owner, survivor])
               yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (${id}, 'Project', '/workspace', '[]', ${at}, ${at})`;
+            for (const id of [owner, survivor])
+              yield* bindRepository(sql, id, "disk-repo", "disk-account");
             yield* repo.execute(yield* commit(owner, "disk-cursor-create", 0, [cursor]));
             yield* repo.execute(yield* commit(owner, "disk-cursor-progress", 1, [progressed]));
             yield* repo.execute(yield* commit(survivor, "disk-issue-create", 0, [issue]));
@@ -543,6 +563,8 @@ describe("ProjectLifecycle", () => {
         const survivor = ProjectId.make("stream-survivor");
         for (const id of [owner, survivor])
           yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (${id}, 'Project', '/workspace', '[]', ${at}, ${at})`;
+        for (const id of [owner, survivor])
+          yield* bindRepository(sql, id, "stream-repo", "stream-account");
         const cursor = yield* decodeTeamRecordEffect({
           kind: "intake-cursor",
           recordId: "stream-cursor",
