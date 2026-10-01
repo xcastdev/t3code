@@ -1093,15 +1093,145 @@ export const ProjectWorkAttentionSeenCommand = Schema.Struct({
   seenAt: IsoDateTime,
 });
 
+const GuidedText = TrimmedNonEmptyString.check(Schema.isMaxLength(4_000));
+const GuidedBody = TrimmedNonEmptyString.check(Schema.isMaxLength(32_000));
+const GuidedId = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
+const GuidedFields = {
+  commandId: CommandId,
+  projectId: ProjectId,
+  taskId: ProjectWorkTaskId,
+  expectedRevision: NonNegativeInt,
+  expectedTaskRevision: NonNegativeInt,
+};
+
+/** Guided intent inputs describe a requested change, never caller-created authority. */
+export const ProjectTeamGuidedIntent = Schema.Union([
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.investigation.start"),
+    objective: GuidedBody,
+    outputDescriptions: Schema.Array(GuidedText).check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(16),
+    ),
+    issueRecordId: Schema.optionalKey(GuidedId),
+    expectedIssueRevision: Schema.optionalKey(NonNegativeInt),
+  }).check(
+    Schema.makeFilter(
+      (input) =>
+        (input.issueRecordId === undefined) === (input.expectedIssueRevision === undefined),
+      { message: "An issue target requires its expected revision" },
+    ),
+  ),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.specification.propose"),
+    expectedSpecRevision: NonNegativeInt,
+    specification: ProjectWorkSpecification,
+    criterionSnapshots: Schema.Array(ProjectWorkCriterion).check(Schema.isMaxLength(64)),
+  }),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.plan.propose"),
+    specRevision: NonNegativeInt,
+    content: GuidedBody,
+    dependencyTaskIds: Schema.Array(ProjectWorkTaskId).check(Schema.isMaxLength(64)),
+    previousPlanId: Schema.optionalKey(GuidedId),
+    expectedPreviousPlanRevision: Schema.optionalKey(NonNegativeInt),
+  }).check(
+    Schema.makeFilter(
+      (input) =>
+        (input.previousPlanId === undefined) === (input.expectedPreviousPlanRevision === undefined),
+      { message: "A previous plan target requires its expected record revision" },
+    ),
+  ),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.execution.start"),
+    specRevision: NonNegativeInt,
+    planRevision: NonNegativeInt,
+    specGateId: GuidedId,
+    expectedSpecGateRevision: NonNegativeInt,
+    planId: GuidedId,
+    expectedPlanRecordRevision: NonNegativeInt,
+    planGateId: GuidedId,
+    expectedPlanGateRevision: NonNegativeInt,
+  }),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.task.control"),
+    control: Schema.Union([
+      Schema.Struct({
+        action: Schema.Literals([
+          "defer",
+          "reopen",
+          "pause",
+          "resume",
+          "cancel",
+          "resolve-failure",
+        ]),
+        reason: GuidedText,
+      }),
+      Schema.Struct({
+        action: Schema.Literal("reassign"),
+        reason: GuidedText,
+        recipientMemberId: GuidedId,
+        expectedMemberRevision: NonNegativeInt,
+      }),
+    ]),
+  }),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.assignment.report"),
+    specRevision: NonNegativeInt,
+    planRevision: NonNegativeInt,
+    assignmentId: GuidedId,
+    expectedAssignmentRevision: NonNegativeInt,
+    summary: GuidedBody,
+    evidenceIds: Schema.Array(GuidedId).check(Schema.isMaxLength(64)),
+    outputArtifactIds: Schema.Array(GuidedId).check(Schema.isMaxLength(64)),
+    outcome: Schema.Literals(["findings", "review-ready", "complete"]),
+  }),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.repair.resolve"),
+    episodeId: GuidedId,
+    expectedEpisodeRevision: NonNegativeInt,
+    failureFingerprint: GuidedText,
+    relevantRevision: GuidedText,
+    decision: Schema.Literals(["diagnose", "approve-one-repair", "revise-scope", "abandon"]),
+    reason: GuidedText,
+  }),
+]);
+export type ProjectTeamGuidedIntent = typeof ProjectTeamGuidedIntent.Type;
+
+/** Private gateway compilation; raw foundation commands remain denied by transports. */
+export const ProjectWorkGuidedTransition = Schema.Struct({
+  intent: ProjectTeamGuidedIntent,
+  bindingId: Schema.optionalKey(GuidedId),
+  generation: Schema.optionalKey(NonNegativeInt),
+}).check(
+  Schema.makeFilter(
+    (input) => (input.bindingId === undefined) === (input.generation === undefined),
+    { message: "A compiled managed identity requires its generation" },
+  ),
+);
+export type ProjectWorkGuidedTransition = typeof ProjectWorkGuidedTransition.Type;
+
 export const ProjectWorkFoundationCommitCommand = Schema.Struct({
   ...ProjectWorkCommandFields,
   type: Schema.Literal("project-work.foundation.commit"),
   expectedRevision: NonNegativeInt,
   attribution: ProjectWorkAttribution,
-  records: Schema.Array(ProjectTeamRecord).check(Schema.isMinLength(1), Schema.isMaxLength(64)),
+  records: Schema.Array(ProjectTeamRecord).check(Schema.isMaxLength(64)),
   claim: Schema.optionalKey(ProjectWorkTaskClaimCommand),
+  guided: Schema.optionalKey(ProjectWorkGuidedTransition),
   committedAt: IsoDateTime,
-});
+}).check(
+  Schema.makeFilter((command) => command.records.length > 0 || command.guided !== undefined, {
+    message: "A foundation transaction requires records or a guided transition",
+  }),
+);
 
 export const ProjectWorkCommand = Schema.Union([
   ProjectWorkFoundationCommitCommand,

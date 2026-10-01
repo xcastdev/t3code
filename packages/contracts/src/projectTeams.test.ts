@@ -7,11 +7,19 @@ import {
   ProjectTeamRecordRead,
   PROJECT_TEAM_DEFAULT_LIMITS,
 } from "./projectTeams.ts";
+import {
+  ProjectTeamGuidedIntent,
+  ProjectWorkFoundationCommitCommand,
+  ProjectWorkWriteIntent,
+} from "./projectWork.ts";
 
 const decodeCredential = Schema.decodeUnknownSync(ProjectTeamCredential);
 const decodeIntent = Schema.decodeUnknownSync(ProjectTeamWriteIntent);
 const decodeTeamRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
 const decodeTeamRecordRead = Schema.decodeUnknownSync(ProjectTeamRecordRead);
+const decodeGuided = Schema.decodeUnknownSync(ProjectTeamGuidedIntent);
+const decodeFoundation = Schema.decodeUnknownSync(ProjectWorkFoundationCommitCommand);
+const decodePublicWrite = Schema.decodeUnknownSync(ProjectWorkWriteIntent);
 const member = {
   kind: "member",
   recordId: "member",
@@ -78,4 +86,82 @@ it("accepts an exact managed marker and only typed public gate responses", () =>
   expect(decodeIntent(intent)).toEqual(intent);
   expect(() => decodeIntent({ ...intent, response: "consumed" })).toThrow();
   expect(() => decodeIntent({ ...intent, expectedGateRevision: -1 })).toThrow();
+});
+
+describe("guided contract preparation", () => {
+  const investigation = {
+    type: "project-team.investigation.start",
+    commandId: "investigate",
+    projectId: "project",
+    taskId: "task",
+    expectedRevision: 0,
+    expectedTaskRevision: 0,
+    objective: "Investigate the reported failure",
+    outputDescriptions: ["Reproduction and bounded findings"],
+  };
+
+  it("represents pre-spec investigation without invented approval revisions", () => {
+    expect(decodeGuided(investigation)).toEqual(investigation);
+    expect(() => decodeGuided({ ...investigation, expectedTaskRevision: undefined })).toThrow();
+    expect(() => decodeGuided({ ...investigation, outputDescriptions: [] })).toThrow();
+    expect(() =>
+      decodeGuided({ ...investigation, outputDescriptions: Array(17).fill("Output") }),
+    ).toThrow();
+    expect(() => decodeGuided({ ...investigation, objective: "x".repeat(32_001) })).toThrow();
+    expect(() => decodeGuided({ ...investigation, issueRecordId: "issue" })).toThrow();
+    expect(() => decodeGuided({ ...investigation, expectedIssueRevision: 0 })).toThrow();
+  });
+
+  it("keeps unwired guided intents outside the public write union", () => {
+    expect(() => decodePublicWrite(investigation)).toThrow();
+  });
+
+  it("retains the nonempty raw foundation invariant", () => {
+    const command = {
+      type: "project-work.foundation.commit",
+      commandId: "investigate",
+      projectId: "project",
+      expectedRevision: 0,
+      attribution: {
+        actor: { kind: "human", id: "user" },
+        source: { kind: "web", id: "client" },
+        recordedAt: "2026-01-01T00:00:00.000Z",
+      },
+      records: [],
+      committedAt: "2026-01-01T00:00:00.000Z",
+    };
+    expect(() => decodeFoundation(command)).toThrow();
+    expect(
+      decodeFoundation({ ...command, guided: { intent: investigation } }).guided?.intent,
+    ).toEqual(investigation);
+  });
+
+  it("requires a concrete successor and report target", () => {
+    const fields = {
+      commandId: "control",
+      projectId: "project",
+      taskId: "task",
+      expectedRevision: 0,
+      expectedTaskRevision: 0,
+    };
+    expect(() =>
+      decodeGuided({
+        ...fields,
+        type: "project-team.task.control",
+        control: { action: "reassign", reason: "Replace the stopped worker" },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeGuided({
+        ...fields,
+        type: "project-team.assignment.report",
+        specRevision: 0,
+        planRevision: 0,
+        summary: "Findings",
+        evidenceIds: [],
+        outputArtifactIds: [],
+        outcome: "complete",
+      }),
+    ).toThrow();
+  });
 });
