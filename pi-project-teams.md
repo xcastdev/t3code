@@ -7,10 +7,10 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-09-30 23:58 UTC. **Implementation resumed after the restart.**
-The harness now provides eleven active slots: the coordinator plus ten subagents.
-Three implementation owners and two reviewers hold five subagent slots; five
-remain available for independent work and reviews. Existing reviewers are reused for their repair gates.
+Last updated: 2026-10-01 00:21 UTC. Implementation is running. The harness permits
+**ten subagents plus the coordinator**. Three agents are running: one preparation owner and two reviewers. Seven
+seats are available. Reviewers return to their existing
+piece after repairs.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
@@ -18,122 +18,67 @@ remain available for independent work and reviews. Existing reviewers are reused
 | Product acceptance criteria | 0    | 0      | 19   | 19    |
 | Final independent audits    | 0    | 0      | 2    | 2     |
 
-- **Done:** P1 bounded dependency/runtime/isolation/packaging and memory-selection
-  proofs are reviewed and landed. Production pi and memory integration remain later work.
-- **P2:** reviewed and merged into wave2, awaiting the combined P2/P3 gate and main merge.
-- **P3:** the environment-bearer transaction repair passes, but the same reviewer
-  proves a late MCP credential can survive a stale empty lookup followed by managed
-  history deletion. The coordinator independently reproduces it. Root-owned fork
-  migration 020 in `7fd54f99` adds a denial-only provider/thread fence retained after
-  deletion; focused migration/storage checks pass. The owner passes 29 focused cases covering both late-credential races,
-  post-purge/restart denial, rollback and cancellation, plus changed-path lint.
-  Final entry compilation and affected checks precede the same reviewer's recheck. No P3 or foundation-wave approval is claimed.
-- **P4 preparatory policy:** candidate `76089058` receives APPROVE from its sole
-  reviewer: 70 candidate tests, 713 independent checks and three discriminating
-  controls pass. The coordinator verifies all 24 review artifacts. The pure helper
-  is held for later integration; full P4 remains dependent on P3. A separate
-  read-only owner is has prepared the guided command/record proposal while foundation repairs
-  finish; root contract decisions and dependent implementation wait for P3's gate.
-- **P5 preparatory transport:** `7d9a345f` and helper `05172c6` remain approved
-  and isolated. Reconciled P2/transport base `9bdd1872` passes 78 combined tests.
-  New pure sync/intake candidate `b17b23eb` passes 75 affected tests and its normal
-  compiler; the coordinator verifies 56 artifacts and four exact committed/archive
-  sources. Its sole reviewer reproduces a normalized-title replay conflict; the coordinator
-  independently confirms both replay and rename failures. The sealed review has 22 verified artifacts; the owner is repairing consistent
-  title normalization in its two intake files. Repair `42663135` passes 79
-  affected tests and all 17 original review probes; the coordinator verifies 58
-  artifacts/four committed/archive source matches. The same reviewer is rechecking it. Durable cache/lease authority, wiring and real API gates remain.
-- **P7 preparatory skills:** `ce7bc036` passes 71 tests, but the same reviewer proves
-  cleanup can delete a replacement inode after an awaited marker read. The coordinator
-  independently reproduces it. The owner repairs this with a private detached cleanup path and passes 46
-  focused cases plus normal compilation. Final lint changes require affected
-  checks and final-byte compilation before the same reviewer rechecks.
-- **P7 protocol:** the reviewer proves repeated ACK and reused lifecycle settlement
-  failures on `f9cce4f0`. The agreed repair adds exact chunk sequence acknowledgments
-  and monotonic lifecycle IDs. Its owner passes 51 tests, six causal mutations and
-  the normal compiler. Repair `df620a4a` is committed; the coordinator verifies
-  83 artifacts, two committed/archive sources and 15 drains. Its existing reviewer
-  returns APPROVE after 51 tests and 14 independent wire-probe groups. All
-  ten new review artifacts verify. The leaf is held for later P7 integration.
-- **P7 managed process:** the owner implements the agreed three-file Linux launch
-  boundary using P1's systemd/bwrap/pidfd prerequisites. Portable and disposable
-  process gates run without models. A strengthened shell assertion detects a leaked
-  owned mount descriptor. Consumed-FD binding repairs pass 18 portable and six
-  actual Linux cases, with three discriminating controls and six drained owned
-  units. Final-byte compiler/scoped checks and 25 cases pass (19 portable, six real
-  Linux). Two real EOF proofs before and after START also drain their owned
-  units. Candidate `7db547c70` is committed and sealed. The coordinator verifies
-  all 235 sealed artifacts and three committed/source
-  snapshot matches verify; a fresh sole reviewer is checking the exact candidate.
-  Full runtime integration remains open.
-- **P10 preparatory memory adapter:** candidate `f5777a35` passes 16 native and
-  15 TypeScript/contract tests plus the normal compiler. The coordinator reads its
-  complete production source and verifies 27 artifacts/five committed/archive
-  sources. Its sole fresh reviewer seals REQUEST_CHANGES after checking native
-  idempotence, namespace fences, deletion and recovery. Native vector-normalization controls pass; the reviewer
-  also reproduces a missing-interpreter CI prerequisite and a deletion receipt
-  that claims completion while retaining a corrupt-metadata point. The coordinator
-  independently confirms both findings and verifies all 24 sealed review artifacts.
-  The owner is repairing project-namespace cleanup and explicit native-proof selection;
-  absent pins must still fail the selected native gate. Ordinary portable discovery
-  and the required real native proof are recorded separately.
-  Model extraction, authorized hydration, context and full
-  P8–P9-dependent integration remain open; no inference runs locally.
-- **P11 preparatory evidence policy:** candidate `090589f4` passes 24 focused cases,
-  normal two-file compiler and scoped checks. The coordinator verifies 42 evidence
-  hashes, six committed source/archive matches and nine drained scopes. Its one
-  fresh xhigh reviewer returns APPROVE on the exact candidate; 12 independent probe
-  groups and five causal controls pass, and all 25 review artifact hashes verify.
-  The leaf is held for dependency-ordered integration; full P11 remains incomplete. The earlier zero-test
-  loader failure remains distinct from the meaningful 23/24-failing behavior control.
-- **Left:** P6, P8–P9 and P12–P14 (6 steps not started), the remaining active-step
-  implementation, all 19 acceptance criteria and both final audits.
-- **Next gate:** inspect/review the P3 repair, then validate/review the combined P2/P3
-  wave and merge locally. Independent reviewed preparatory slices continue in parallel.
-- **Team:** Sol high implementation owners across safe independent phase slices;
-  one xhigh reviewer per piece reused for repairs, then two fresh final reviewers.
-  One owner retains shared contracts, migrations, wiring and dependencies.
-- **Outstanding permissions/evidence:** integrated browser/device permission when ready;
-  explicit disposable GitHub fixture-write permission for the real issue-to-PR proof.
-  No local models, OpenAI runtime/proof services, push or PR creation. The exhausted
-  eight-call P1 proof budget must not be reused. Development repair limits remain waived.
+- **Finished on main:** P1's bounded runtime, isolation, packaging and memory-choice proofs.
+- **Next main integration:** P2 is approved in wave2. P3's durable identity fence
+  passes 293 focused/affected cases and final entry compilation. Its owner is
+  finished `81a0ccf16`; its existing reviewer is checking that exact candidate
+  before the combined wave gate.
+- **P4:** pure policy leaf `76089058` is approved. Guided workflow interfaces are
+  prepared; dependent implementation waits for the foundation gate.
+- **P5:** transport and pure sync/intake leaves are approved. Title repair
+  `42663135` passes 79 tests and independent replay/rename/conflict checks.
+  A read-only owner is preparing durable sync authority; refinement, wiring
+  and real GitHub evidence remain.
+- **P7:** protocol `df620a4a` is approved. Skills repair `4168f789` is approved after its existing review. Linux process `7db547c70` passes real lifecycle/EOF checks, but
+  its reviewer finds duration parsing, ambient Python startup and full-duplex
+  pipe deadlock defects; the review is finishing. Runtime interfaces are prepared.
+- **P10:** native adapter repair `2a88e791` is approved after real deletion,
+  recovery and explicit native-proof checks. Extraction, authorized hydration,
+  context and integration remain dependent work.
+- **P11:** pure evidence policy `090589f4` is approved and held for integration.
+- **Not started:** P6, P8, P9, P12, P13 and P14. Seven steps have active or
+  preparatory work; only landed, fully gated steps count as finished.
+
+All 19 product criteria and both final audits remain open. Approved preparatory
+leaves do not complete their parent phases. Shared contracts, migrations, wiring
+and dependencies retain one owner. Development repair limits are waived.
+
+No local models, Ollama/llama inference, OpenAI runtime/proof services, push or PR
+creation. The exhausted eight-call P1 proof budget is closed. Integrated
+browser/device permission and disposable GitHub fixture-write permission remain
+required when those concrete proofs are ready.
 
 ### Live agent slots
 
-This table tracks the ten subagent seats, not a limit on cumulative assignments.
-The coordinator updates it at dispatch, waiting, review, commit and integration
-transitions. Finished agents release their seat; a repair returns to its existing
-reviewer. Branches below have isolated worktrees under
+Each row is one subagent seat, with its owner, work and next gate. Finished agents
+release their seat. Worktrees live under
 `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                                  | State                                       | Assignment / branch                                             | Next gate                                          |
-| ---- | -------------------------------------- | ------------------------------------------- | --------------------------------------------------------------- | -------------------------------------------------- |
-| 1    | `p3_authorization_resume_high`         | Final authority checks/compiler             | P3 denial fence; `pi-teams/p3-authorization`                    | 29 focused cases pass; same reviewer after commit  |
-| 2    | — (last: `review_p7_worker_protocol`)  | Available; repair APPROVE                   | P7 `df620a4a` held for integration                              | Assign ready independent work or review            |
-| 3    | — (last: `review_p10_backend_adapter`) | Available; findings sealed                  | P10 `f5777a35` under owner repair                               | Same reviewer returns after repair                 |
-| 4    | `review_p5_sync_leaf`                  | Re-reviewing repair read-only               | P5 `42663135`; `pi-teams/p5-sync-leaf`                          | Replay/rename/conflict independent verdict         |
-| 5    | `p10_backend_adapter_high`             | Verified repair; waiting compiler           | P10 deletion/native proof gates; `pi-teams/p10-backend-adapter` | Final compiler, commit, same reviewer              |
-| 6    | — (last: `p4_guided_preparation_high`) | Available; proposal ready                   | P4 interface proposal; `pi-teams/p4-guided-preparation`         | Root contracts after foundation gate               |
-| 7    | `p7_skills_slice_high`                 | Final lint correction/checks                | P7 detached cleanup; `pi-teams/p7-skills-slice`                 | Focused/affected checks, compiler, same reviewer   |
-| 8    | — (last: `p5_sync_leaf_high`)          | Available; repair under review              | P5 `42663135`                                                   | Assign ready independent work                      |
-| 9    | — (last: `p7_managed_process_high`)    | Available; committed candidate under review | P7 `7db547c70`                                                  | Resume only verified repair after review seals     |
-| 10   | `review_p7_managed_process`            | Fresh review read-only                      | P7 `7db547c70`; `pi-teams/p7-managed-process`                   | Linux ownership, prereqs, EOF/drain, failure cases |
+| Slot | Agent                                    | State                                | Assignment / branch                                         | Next gate                                                    |
+| ---- | ---------------------------------------- | ------------------------------------ | ----------------------------------------------------------- | ------------------------------------------------------------ |
+| 1    | — (last: `p3_authorization_resume_high`) | Available; repair under review       | P3 `81a0ccf16` committed and sealed                         | Resume verified repair after review seals                    |
+| 2    | — (last: `p7_worker_protocol_high`)      | Available; runtime proposal ready    | P7 read-only proposal complete                              | Root interfaces after foundation gate                        |
+| 3    | — (last: `review_p10_backend_adapter`)   | Available; repair APPROVE            | P10 `2a88e791` held for integration                         | Ready independent work or review                             |
+| 4    | — (last: `review_p5_sync_leaf`)          | Available; repair APPROVE            | P5 `42663135` held for integration                          | Ready independent work or review                             |
+| 5    | `p5_sync_leaf_high`                      | Read-only sync-authority preparation | P5 `pi-teams/p5-sync-authority-preparation` base `42663135` | Root snapshot/cache/lease interface proposal                 |
+| 6    | `review_p3_authority`                    | Re-reviewing sealed repair           | P3 `81a0ccf16`; `pi-teams/p3-authorization`                 | Credential races, durable denial, rollback and compatibility |
+| 7    | — (last: `review_p7_skills_slice`)       | Available; repair APPROVE            | P7 skills `4168f789` held for integration                   | Ready independent work or review                             |
+| 8    | — (last: `p5_sync_leaf_high`)            | Available                            | P5 repair committed and approved                            | Ready independent work                                       |
+| 9    | — (last: `p7_managed_process_high`)      | Available; candidate under review    | P7 process `7db547c70`                                      | Verified repairs after review seals                          |
+| 10   | `review_p7_managed_process`              | Reviewing read-only                  | P7 process; `pi-teams/p7-managed-process`                   | Duration, startup, transport and drain failures              |
 
-Coordinator: updating this record, inspecting committed candidates, agreeing shared
-interfaces, reserving one normal compiler at a time and preparing wave2 integration.
-The normal compiler reservation is held by `p10_backend_adapter_high` after
-the first P3 entry check reports two new typing errors. P3 is correcting them;
-the skills owner waits. One normal compiler runs at a time. No model or
-client runtime proof is running.
+Coordinator: keeping this record current, inspecting sealed candidates and
+preparing dependency-ordered integration. The normal compiler reservation is
+free; completed scopes have drained. Only one normal compiler runs at a time.
+No model or integrated client proof is running.
 
-Primary branch: `t3code/implement-pi-project-teams`; restart checkpoint commit
-`238126a8b8567cd93bac894e3ef1cf7a8f609f3a`. Wave2 remains
-`9da4de1dd` after reconciliation with main `8e2412d7`;
-354 source files remain byte-identical. Reconcile newer documentation commits before
-its main merge. No P3, P5, P7 or P11 source has landed on main. Protocol, memory adapter, P4 policy and managed-process worktrees start at earlier
-wave2 `26934dd5`. The P5 sync leaf
-starts at reconciled approved foundation/transport base `9bdd1872`. Historical pause evidence remains
-below and in `/home/user/.cache/pi-project-teams-11b7e351/pause-20260930/RESUME.md`.
+Primary branch: `t3code/implement-pi-project-teams`. Latest saved dashboard commit:
+`57e58ece5`; historical restart checkpoint: `238126a8`. Wave2 `ec72aa758`
+reconciles that saved dashboard; its source is unchanged from `9da4de1dd`.
+Reconcile subsequent main advances before merging. Main still contains only P1
+product source. Preparatory branches retain their explicit earlier bases;
+P5 sync uses reconciled P2/transport base `9bdd1872`. Historical pause evidence
+remains below and in `pause-20260930/RESUME.md` under the worktree cache.
 
 ## Goal
 
@@ -2530,3 +2475,56 @@ Reuse each existing piece's reviewer after repairs. Root must inspect complete
 candidate evidence and check findings before merging. P3 approval precedes the
 combined P2/P3 gate; reconcile any main advancement before local integration.
 Real-runtime/platform/client gates and all 19 acceptance criteria remain open.
+
+### Resumed candidate and review evidence (2026-10-01)
+
+The dashboard reports current assignments; these records retain exact evidence
+for approved leaves and repairs awaiting integration. No parent-step completion
+or product acceptance is inferred from these bounded leaves.
+
+- P3 root migration `7fd54f99de09d9d8c4fc0d88caa6717ea6f45fea` adds the retained,
+  denial-only provider/thread fence. The final owner gate has 293 passing cases
+  and normal server-entry compilation: 22.912 s, peak 3,986,886,656 bytes,
+  4 GiB cap, zero swap/OOM. Repair `81a0ccf1643564a886e75dc44ba66ca3b4bf3b40`
+  is sealed with 273 coordinator-verified artifacts, manifest
+  `60f2fbed91ebcd734b698801dffb46a0569d12f22f15c2eae16201f1f05d7179`,
+  34 exact source/archive matches and three exact patches. Same-reviewer recheck
+  is running; earlier
+  failed typing, causal and harness receipts remain distinct from passing gates.
+- P5 repair `42663135fb672504f3a961b1cdfff232e927329d`: 58 producer artifacts,
+  manifest `ee836a0705ef55dc0445b9d83f891cc2daeca91d8dcb9e13dc6f80db7d0ed1a2`.
+  Same-reviewer APPROVE: 26 verified review artifacts, manifest
+  `b2b4dd619d31ba09262d23ef4918d153530ff71f1fb5558ceb80edf87c5bf8ec`;
+  79 tests, 17 original probes and six fresh boundary groups pass.
+- P7 protocol `df620a4a106ce1bf3bd42e0c3417988ef6300ab6`: 83 verified producer
+  artifacts, manifest `914d994278b9cfc6b70fd0632fb3af29ae88690e5ac3d90caf718a14a9c409e1`.
+  Same-reviewer APPROVE: ten verified repair-review artifacts, manifest
+  `f7cdb6e0ec0043336c088f2d055aae6249ec9e327bb36f618bd6fd28b148b464`;
+  51 tests and 14 independent wire groups pass.
+- P7 skills `4168f7896e3bb202c9d7e695480137a11b02168b`: 121 producer artifacts,
+  manifest `0e7ade3fbf0e908027fc996c2f18482b394a4227a916e50ae82fa53c6b18cd7c`.
+  Coordinator verifies 14 committed/current/archive matches and exact patch;
+  46 focused/85 affected tests, original R1–R4 probes and final normal compiler
+  pass. Same-reviewer APPROVE has 47 coordinator-verified artifacts, manifest
+  `7e17703dfebc520d1b74021a78542c3580e06f1390f539150b0295592de5dc06`;
+  85 affected tests, original probes and 22 independent boundary cases pass.
+  Eight earlier bundles remain unchanged.
+- P7 Linux process `7db547c7043a7c71bc5c7557c4fe73a0cd75c8bc`: 235 verified
+  artifacts, seal `4b5ad7a509d1fe5c8d8ef98ba183d27a6aa31af0e957f7e3876b647fa707213e`;
+  all three committed/current snapshots match. 19 portable/six actual Linux
+  cases and two actual EOF proofs pass. Review is pending: accepted durations
+  at least 60 seconds fail formatted-property comparison; a service-local
+  PYTHONPATH control executes workspace startup code before ownership/START.
+  Concurrent 1 MiB output and sixteen valid input chunks also deadlock in actual
+  pipe writes, while receipt-ordered and small-output controls pass.
+  No main merge or whole-runtime/packaging approval is claimed.
+- P10 native adapter `2a88e791802fea4244e3368ae0ee67b3519b62b0`: 30 producer
+  artifacts, manifest `02d3ca657c2485d4f9e505801ee6ce97efa8cf59b5c1d2460d862934792c6ea3`.
+  Same-reviewer APPROVE: 34 verified artifacts, manifest
+  `030f146ec88cb29f71916e9675e73beb283aefd31fee5cc6187e6d0e29e751ac`.
+  18 actual Python/15 explicitly selected TS-contract cases pass. Ordinary
+  no-Python discovery passes 14 cases and never counts as native proof;
+  selected missing/wrong pins fail. All original seals remain unchanged.
+- P4 read-only interface proposal: SHA
+  `650e14f157d7b9aa7a17f83ebb7b02983e11e072d05bb108af509a3d8b7c6faa`.
+  It changes no repository source and completes no dependency or acceptance gate.
