@@ -668,19 +668,37 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             Effect.flatMap((session) => validateSession(session, hints.threadId)),
           );
           yield* checkHints(session, hints);
-          const current = yield* owned(hints.threadId);
-          if (
-            current !== context ||
-            context.active ||
-            context.session !== previousSession ||
-            context.lastOperationId !== previousOperationId
-          )
-            return yield* invalid(
-              "startSession",
-              "Pi session changed while its committed state was being read. Retry with current session hints.",
-            );
-          context.session = session;
-          return session;
+          // Check ownership and publish together: even a synchronous Effect helper can auto-yield.
+          return yield* Effect.suspend(() => {
+            if (shuttingDown)
+              return Effect.fail(
+                new ProviderAdapterSessionClosedError({ provider, threadId: hints.threadId }),
+              );
+            const current = sessions.get(hints.threadId);
+            if (!current)
+              return Effect.fail(
+                new ProviderAdapterSessionNotFoundError({ provider, threadId: hints.threadId }),
+              );
+            if (current.closing)
+              return Effect.fail(
+                new ProviderAdapterSessionClosedError({ provider, threadId: hints.threadId }),
+              );
+            if (current.failure) return Effect.fail(current.failure);
+            if (
+              current !== context ||
+              context.active ||
+              context.session !== previousSession ||
+              context.lastOperationId !== previousOperationId
+            )
+              return Effect.fail(
+                invalid(
+                  "startSession",
+                  "Pi session changed while its committed state was being read. Retry with current session hints.",
+                ),
+              );
+            context.session = session;
+            return Effect.succeed(session);
+          });
         }
         const context: SessionContext = { threadId: hints.threadId, closing: false };
         sessions.set(hints.threadId, context);

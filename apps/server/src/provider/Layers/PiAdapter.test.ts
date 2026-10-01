@@ -17,6 +17,7 @@ import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
+import * as Tracer from "effect/Tracer";
 import {
   PiManagedRuntimeError,
   type PiManagedEventObserver,
@@ -849,6 +850,89 @@ for (const race of [
       }
     }),
   );
+
+// The default scheduler yields after 2048 operations, including returns from Effect helpers.
+it.live("repair read R1 scheduler boundary cannot publish a snapshot after stop begins", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const returning = yield* Deferred.make<void>();
+    const stopRelease = yield* Deferred.make<void>();
+    let reusing = false;
+    let sawReadOwnership = false;
+    let sawClosingOwnership = false;
+    const nativeTracer = yield* Effect.tracer;
+    // Observe helper returns without replacing the scheduler or changing adapter state.
+    const tracer: Tracer.Tracer = {
+      span(options) {
+        return nativeTracer.span(options);
+      },
+      context(primitive, fiber) {
+        if (
+          reusing &&
+          "_tag" in primitive &&
+          primitive._tag === "Success" &&
+          "value" in primitive
+        ) {
+          const value = primitive.value;
+          if (
+            typeof value === "object" &&
+            value !== null &&
+            "threadId" in value &&
+            value.threadId === threadId &&
+            "closing" in value &&
+            typeof value.closing === "boolean"
+          ) {
+            sawReadOwnership = true;
+            if (value.closing) sawClosingOwnership = true;
+          }
+        }
+        return primitive["~effect/Effect/evaluate"](fiber);
+      },
+    };
+    const snapshot = { ...initialSession(), updatedAt: "2026-10-01T01:00:00.000Z" };
+    const runtime: PiManagedRuntimeInstance = {
+      ...fake.runtime,
+      readSession: () =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+          // On the old adapter this read tail reaches the final ownership helper at operation 2047.
+          for (let index = 0; index < 2001; index++) yield* Effect.sync(() => undefined);
+          yield* Deferred.succeed(returning, undefined);
+          yield* Effect.withFiber(() => Effect.sync(() => undefined));
+          return snapshot;
+        }),
+      requestStop: () => Deferred.await(stopRelease),
+    };
+    return yield* Effect.gen(function* () {
+      const adapter = yield* makePiAdapter({ instanceId, runtime });
+      const original = yield* adapter.startSession(startInput);
+      reusing = true;
+      const stopping = yield* Effect.forkScoped(
+        Deferred.await(returning).pipe(
+          Effect.andThen(Effect.yieldNow),
+          Effect.andThen(adapter.stopSession(threadId)),
+        ),
+        { startImmediately: true },
+      );
+      const reading = yield* Effect.forkScoped(Effect.exit(adapter.startSession(startInput)), {
+        startImmediately: true,
+      });
+      yield* Deferred.await(entered);
+      yield* Deferred.succeed(release, undefined);
+      const read = yield* Fiber.join(reading);
+      const sessions = yield* adapter.listSessions();
+      yield* Deferred.succeed(stopRelease, undefined);
+      yield* Fiber.join(stopping);
+      expect(sawReadOwnership).toBe(true);
+      expect(Exit.isSuccess(read) && sawClosingOwnership).toBe(false);
+      expect(sessions).toEqual([Exit.isSuccess(read) ? snapshot : original]);
+      expect(yield* adapter.hasSession(threadId)).toBe(false);
+    }).pipe(Effect.provideService(Tracer.Tracer, tracer));
+  }),
+);
 
 const reportedReceipt = (
   requestId: number,
