@@ -369,7 +369,7 @@ export const rebindIssueRepositoryProject = Effect.fn("rebindIssueRepositoryProj
       const binding = rows[0];
       if (
         binding === undefined ||
-        binding.status !== "active" ||
+        (binding.status !== "active" && binding.status !== "detached") ||
         binding.revision !== input.expectedPreviousBindingRevision
       )
         return yield* fail("stale-state");

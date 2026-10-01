@@ -249,6 +249,72 @@ it.effect(
     ),
 );
 
+it.effect(
+  "explicit rebind of a detached source requires its current revision and preserves history",
+  () =>
+    run(
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        yield* bind(sql);
+        yield* bind(sql, "b");
+        const leased = (yield* claim(sql))!;
+        yield* sql`INSERT INTO project_issue_external VALUES(${key.host},${key.repositoryNodeId},'I_original',1,${at},'{}')`;
+        yield* sql.withTransaction(
+          sql`UPDATE project_issue_binding SET status='detached',revision=revision+1,generation=generation+1 WHERE project_id='a' AND host=${key.host} AND repository_node_id=${key.repositoryNodeId}`,
+        );
+        const target = {
+          key: { host: "github.com", repositoryNodeId: "R_new" },
+          projectId: "a",
+          expectedBindingRevision: null,
+          accountNodeId: "U_other",
+          repositoryName: "owner/new",
+          credentialEpoch: "new-epoch",
+          since: at,
+        };
+        expect(
+          (yield* rebindIssueRepositoryProject(sql, {
+            previousKey: key,
+            expectedPreviousBindingRevision: 0,
+            target,
+          }).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(yield* readIssueRepositoryState(sql, target.key)).toBeUndefined();
+        yield* rebindIssueRepositoryProject(sql, {
+          previousKey: key,
+          expectedPreviousBindingRevision: 1,
+          target,
+        });
+        expect(
+          yield* sql`SELECT project_id,status,revision,generation FROM project_issue_binding WHERE repository_node_id=${key.repositoryNodeId} ORDER BY project_id`,
+        ).toEqual([
+          { project_id: "a", status: "detached", revision: 2, generation: 2 },
+          { project_id: "b", status: "active", revision: 0, generation: 0 },
+        ]);
+        expect((yield* readIssueRepositoryState(sql, key))?.status).toBe("ready");
+        expect((yield* readIssueRepositoryState(sql, target.key))?.accountNodeId).toBe("U_other");
+        expect(
+          yield* recordIssueRepositoryReadFailure(sql, key, leased.lease!, {
+            retryAt: 200,
+            error: "transport",
+          }),
+        ).toBe(false);
+        expect(yield* sql`SELECT issue_node_id FROM project_issue_external`).toEqual([
+          { issue_node_id: "I_original" },
+        ]);
+        expect(
+          (yield* rebindIssueRepositoryProject(sql, {
+            previousKey: key,
+            expectedPreviousBindingRevision: 1,
+            target,
+          }).pipe(Effect.result))._tag,
+        ).toBe("Failure");
+        expect(
+          yield* sql`SELECT count(*) AS count FROM project_issue_binding WHERE project_id='a' AND status='active'`,
+        ).toEqual([{ count: 1 }]);
+      }),
+    ),
+);
+
 it.effect("rebind retires the last old owner atomically and rolls back its target on failure", () =>
   run(
     Effect.gen(function* () {
