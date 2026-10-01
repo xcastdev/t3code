@@ -1,5 +1,6 @@
 """Own the proven Linux cage before starting a worker or a setup command."""
 import base64
+import collections
 import json
 import os
 import pathlib
@@ -10,6 +11,7 @@ import sys
 
 MAX_FRAME = 65536
 CHUNK = 8192
+MAX_INPUT = 32 * CHUNK
 
 
 def emit(value):
@@ -78,6 +80,12 @@ def main():
     pending = bytearray()
     child = None
     pidfd = None
+    input_fd = None
+    input_chunks = collections.deque()
+    input_offset = 0
+    input_bytes = 0
+    writing = False
+    end_input = False
     try:
         while True:
             for fd, events in poller.poll():
@@ -94,20 +102,55 @@ def main():
                         request = json.loads(line)
                         if request == {"type": "start"} and child is None:
                             child, pidfd = launch(spec)
+                            input_fd = child.stdin.fileno()
+                            os.set_blocking(input_fd, False)
                             poller.register(pidfd, select.POLLIN)
                             poller.register(child.stdout.fileno(), select.POLLIN | select.POLLHUP)
                             poller.register(child.stderr.fileno(), select.POLLIN | select.POLLHUP)
                             emit({"type": "started", "pid": child.pid})
-                        elif request.get("type") == "input" and child is not None and set(request) == {"type", "data"}:
+                        elif request.get("type") == "input" and child is not None and not end_input and set(request) == {"type", "data"}:
                             chunk = base64.b64decode(request["data"], validate=True)
                             if len(chunk) > CHUNK:
                                 raise RuntimeError("child input chunk bound")
-                            child.stdin.write(chunk)
-                            child.stdin.flush()
-                        elif request == {"type": "end"} and child is not None:
-                            child.stdin.close()
+                            if input_bytes + len(chunk) > MAX_INPUT:
+                                raise RuntimeError("child input queue bound")
+                            if chunk:
+                                input_chunks.append(chunk)
+                                input_bytes += len(chunk)
+                                if not writing:
+                                    poller.register(input_fd, select.POLLOUT)
+                                    writing = True
+                        elif request == {"type": "end"} and child is not None and not end_input:
+                            end_input = True
+                            if not input_chunks:
+                                child.stdin.close()
                         else:
                             raise RuntimeError("unexpected owner control")
+                elif fd == input_fd:
+                    # Never block this loop on the worker's stdin: stdout, pidfd and
+                    # parent EOF must progress while a worker delays reading input.
+                    try:
+                        count = os.write(input_fd, input_chunks[0][input_offset:])
+                    except BlockingIOError:
+                        continue
+                    except BrokenPipeError:
+                        poller.unregister(input_fd)
+                        writing = False
+                        end_input = True
+                        input_chunks.clear()
+                        input_bytes = 0
+                        child.stdin.close()
+                        continue
+                    input_offset += count
+                    input_bytes -= count
+                    if input_offset == len(input_chunks[0]):
+                        input_chunks.popleft()
+                        input_offset = 0
+                    if not input_chunks:
+                        poller.unregister(input_fd)
+                        writing = False
+                        if end_input:
+                            child.stdin.close()
                 elif fd == pidfd:
                     code = child.wait()
                     # Read bytes already available before the pidfd receipt; descendants

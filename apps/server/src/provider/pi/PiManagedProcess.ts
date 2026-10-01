@@ -214,9 +214,61 @@ const ShowSchema = Schema.Struct({
   KillMode: Schema.String,
   RuntimeMaxUSec: Schema.String,
   TimeoutStopUSec: Schema.String,
+  UnsetEnvironment: Schema.String,
+  Environment: Schema.String,
 });
 
 const decodeShow = Schema.decodeUnknownEffect(ShowSchema);
+
+// The user manager also supplies service environment. Remove native loader hooks before
+// Python starts; isolated interpreter startup then excludes workspace/user Python hooks.
+const unsetEnvironment = [
+  "LD_PRELOAD",
+  "LD_AUDIT",
+  "LD_LIBRARY_PATH",
+  "LD_DEBUG",
+  "LD_DEBUG_OUTPUT",
+  "LD_PROFILE",
+  "LD_PROFILE_OUTPUT",
+  "LD_ORIGIN_PATH",
+  "LD_HWCAP_MASK",
+  "LD_SHOW_AUXV",
+  "LD_TRACE_LOADED_OBJECTS",
+  "LD_BIND_NOT",
+  "LD_BIND_NOW",
+  "LD_DYNAMIC_WEAK",
+  "LD_PREFER_MAP_32BIT_EXEC",
+  "LD_VERBOSE",
+  "LD_WARN",
+  "GLIBC_TUNABLES",
+  "GCONV_PATH",
+  "LOCPATH",
+  "MALLOC_TRACE",
+];
+const unsetPolicy = [...unsetEnvironment].sort().join(" ");
+
+// systemctl renders minute/hour boundaries as compound durations, not seconds.
+const durationUsec = (text: string) => {
+  const factors: Record<string, number> = {
+    h: 3600000000,
+    min: 60000000,
+    s: 1000000,
+    ms: 1000,
+    us: 1,
+  };
+  let value = 0;
+  let previous = Infinity;
+  for (const token of text.split(" ")) {
+    const match = /^(\d+)(h|min|s|ms|us)$/.exec(token);
+    if (!match) return undefined;
+    const factor = factors[match[2]!];
+    if (factor === undefined || factor >= previous) return undefined;
+    previous = factor;
+    value += Number(match[1]) * factor;
+    if (!Number.isSafeInteger(value)) return undefined;
+  }
+  return value;
+};
 
 // The caller's Scope owns the unique service from spawn through confirmed kernel drain.
 // Acquiring does not start untrusted code. start acknowledges verified ownership once.
@@ -335,7 +387,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
       "--user",
       "show",
       unit,
-      "--property=Description,InvocationID,ControlGroup,ActiveState,KillMode,RuntimeMaxUSec,TimeoutStopUSec",
+      "--property=Description,InvocationID,ControlGroup,ActiveState,KillMode,RuntimeMaxUSec,TimeoutStopUSec,UnsetEnvironment,Environment",
     ]);
     if (result.code !== 0) return yield* fail("startup", "Managed service receipt is unavailable.");
     return yield* decodeShow(
@@ -383,7 +435,13 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
               `RuntimeMaxSec=${launch.runtimeSeconds}s`,
               "-p",
               "TimeoutStopSec=2s",
+              "-p",
+              `UnsetEnvironment=${unsetEnvironment.join(" ")}`,
+              "-p",
+              "Environment=LC_ALL=C LANG=C",
               "/usr/bin/python3",
+              "-I",
+              "-S",
               helper,
               spec,
             ],
@@ -632,8 +690,11 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         policy.InvocationID !== verified.invocation ||
         `/sys/fs/cgroup${policy.ControlGroup}` !== verified.cgroup ||
         policy.KillMode !== "control-group" ||
-        policy.RuntimeMaxUSec !== `${launch.runtimeSeconds}s` ||
-        policy.TimeoutStopUSec !== "2s"
+        durationUsec(policy.RuntimeMaxUSec) !== launch.runtimeSeconds * 1000000 ||
+        durationUsec(policy.TimeoutStopUSec) !== 2000000 ||
+        policy.UnsetEnvironment.split(" ").filter(Boolean).sort().join(" ") !== unsetPolicy ||
+        !policy.Environment.split(" ").includes("LC_ALL=C") ||
+        !policy.Environment.split(" ").includes("LANG=C")
       )
         return yield* fail(
           "startup",

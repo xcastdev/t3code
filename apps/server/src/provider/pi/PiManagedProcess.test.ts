@@ -9,6 +9,8 @@ import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Schema from "effect/Schema";
+import * as ChildProcess from "effect/unstable/process/ChildProcess";
+import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { afterEach, beforeEach, describe, expect } from "vite-plus/test";
 import {
@@ -196,14 +198,189 @@ describe.runIf(process.env.PI_MANAGED_PROCESS_LINUX_GATE === "1")(
       for (const file of files) await NodeFSP.stat(file.source);
       return files;
     });
-    const acquire = (argv: ReadonlyArray<string>) =>
+    const acquire = (
+      argv: ReadonlyArray<string>,
+      overrides: Partial<PiManagedLaunch> = {},
+      properties: ReadonlyArray<string> = [],
+    ) =>
       Effect.gen(function* () {
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const directory = process.env.PI_MANAGED_PROCESS_EVIDENCE_DIR;
+        const observed = ChildProcessSpawner.make((command) => {
+          if (command._tag !== "StandardCommand" || command.command !== "/usr/bin/systemd-run")
+            return spawner.spawn(command);
+          const args = [...command.args];
+          args.splice(
+            args.indexOf("/usr/bin/python3"),
+            0,
+            ...properties.flatMap((value) => ["-p", value]),
+          );
+          const unit = args.find((arg) => arg.startsWith("--unit="))!.slice(7);
+          let pending = Buffer.alloc(0);
+          let retained = false;
+          return spawner.spawn(ChildProcess.make(command.command, args, command.options)).pipe(
+            Effect.tap((handle) =>
+              Effect.promise(async () => {
+                if (!directory) return;
+                await NodeFSP.mkdir(directory, { recursive: true });
+                await NodeFSP.writeFile(
+                  NodePath.join(directory, unit + ".launch.json"),
+                  encodeEvidence({ unit, launcherPid: Number(handle.pid), args }),
+                );
+              }),
+            ),
+            Effect.map((handle) =>
+              ChildProcessSpawner.makeHandle({
+                ...handle,
+                stdout: handle.stdout.pipe(
+                  Stream.tap((chunk) =>
+                    Effect.promise(async () => {
+                      if (!directory || retained) return;
+                      if (pending.byteLength + chunk.byteLength > 65536)
+                        throw new Error("Bootstrap evidence exceeded its bound");
+                      pending = Buffer.concat([pending, chunk]);
+                      const newline = pending.indexOf(10);
+                      if (newline < 0) return;
+                      retained = true;
+                      await NodeFSP.writeFile(
+                        NodePath.join(directory, unit + ".bootstrap.json"),
+                        pending.subarray(0, newline),
+                      );
+                      pending = Buffer.alloc(0);
+                    }),
+                  ),
+                ),
+              }),
+            ),
+          );
+        });
         return yield* acquirePiManagedProcess({
           ...input,
           runtimeFiles: yield* closure,
           argv,
-        }).pipe(Effect.tap(retainOwned));
+          ...overrides,
+        }).pipe(
+          Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed),
+          Effect.tap(retainOwned),
+        );
       });
+    for (const seconds of [59, 60, 61, 120, 3600])
+      check(`accepts the exact numeric runtime policy for ${seconds} seconds`, () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const child = yield* acquire(["/bin/bash", "-c", "printf duration"], {
+              runtimeSeconds: seconds,
+            });
+            yield* child.start;
+            const output = yield* child.stdout.pipe(Stream.decodeText(), Stream.runCollect);
+            const receipt = yield* child.awaitExit;
+            expect(Array.from(output).join("")).toBe("duration");
+            expect(receipt.childExitCode).toBe(0);
+          }),
+        ),
+      );
+    check("rejects a numerically different runtime service policy before START", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const error = yield* acquire(
+            ["/bin/bash", "-c", "printf forbidden > /workspace/wrong-policy"],
+            { runtimeSeconds: 60 },
+            ["RuntimeMaxSec=61s"],
+          ).pipe(Effect.flip);
+          expect(error.phase).toBe("startup");
+          yield* absent(NodePath.join(input.workspaceRoot, "wrong-policy"));
+        }),
+      ),
+    );
+    check("isolates Python startup from writable workspace sitecustomize before START", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const secret = NodePath.join(scratch, "protected", "secret");
+          const marker = NodePath.join(input.workspaceRoot, "python-startup-proof");
+          yield* Effect.promise(async () => {
+            await NodeFSP.writeFile(secret, "synthetic-protected");
+            await NodeFSP.writeFile(
+              NodePath.join(input.workspaceRoot, "sitecustomize.py"),
+              `with open(${encodeEvidence(secret)}) as source, open(${encodeEvidence(marker)}, "w") as target:\n target.write(source.read())\n`,
+            );
+          });
+          const child = yield* acquire(["/bin/bash", "-c", "printf okay"], {}, [
+            "Environment=PYTHONPATH=" + input.workspaceRoot,
+          ]);
+          yield* absent(marker);
+          yield* child.stop;
+        }),
+      ),
+    );
+    check("removes native-loader output injection before the trusted helper starts", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const prefix = NodePath.join(input.workspaceRoot, "loader-startup-proof");
+          const child = yield* acquire(["/bin/bash", "-c", "printf okay"], {}, [
+            "Environment=LD_DEBUG=libs LD_DEBUG_OUTPUT=" + prefix,
+          ]);
+          const names = yield* Effect.promise(() => NodeFSP.readdir(input.workspaceRoot));
+          expect(names.filter((name) => name.startsWith("loader-startup-proof"))).toEqual([]);
+          yield* child.stop;
+        }),
+      ),
+    );
+    for (const outputBytes of [4096, 1048576])
+      check(
+        `streams ${outputBytes} output bytes while queued input preserves byte order through EOF`,
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const script = `set -e; printf '%${outputBytes}s' x; for letter in a b c d e f g h i j k l m n o p; do IFS= read -r -N8192 value; printf -v expected '%8192s' ''; expected=\${expected// /$letter}; if test "$letter" = p; then expected=\${expected:0:8191}$'\\n'; fi; test "$value" = "$expected"; done; if IFS= read -r extra; then exit 7; fi; printf consumed`;
+              const child = yield* acquire(["/bin/bash", "--noprofile", "--norc", "-c", script]);
+              yield* child.start;
+              const sender = Effect.gen(function* () {
+                for (let n = 0; n < 16; n++) {
+                  const bytes = Buffer.alloc(8192, 97 + n);
+                  if (n === 15) bytes[8191] = 10;
+                  yield* child.send(bytes);
+                }
+                yield* child.endInput;
+              });
+              const output = child.stdout.pipe(
+                Stream.runFold(
+                  () => Buffer.alloc(0),
+                  (total, bytes) => Buffer.concat([total, bytes]),
+                ),
+              );
+              const [bytes] = yield* Effect.all([output, sender], {
+                concurrency: "unbounded",
+              }).pipe(Effect.timeout("3 seconds"));
+              expect(bytes.subarray(0, outputBytes).toString()).toBe(
+                " ".repeat(outputBytes - 1) + "x",
+              );
+              expect(bytes.subarray(outputBytes).toString()).toBe("consumed");
+              const receipt = yield* child.awaitExit;
+              expect(receipt.childExitCode).toBe(0);
+            }),
+          ),
+      );
+    check("fails closed when a worker refuses input beyond the bounded queue", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const child = yield* acquire(["/bin/bash", "-c", "printf ready; while :; do :; done"]);
+          yield* child.start;
+          const ready = yield* child.stdout.pipe(Stream.take(1), Stream.runCollect);
+          expect(Buffer.concat(Array.from(ready)).toString()).toBe("ready");
+          yield* Effect.gen(function* () {
+            for (let n = 0; n < 64; n++) yield* child.send(Buffer.alloc(8192, 120));
+          }).pipe(Effect.forkScoped);
+          const error = yield* child.stdout.pipe(
+            Stream.runDrain,
+            Effect.flip,
+            Effect.timeout("3 seconds"),
+          );
+          expect(error._tag).toBe("PiManagedProcessError");
+          const receipt = yield* child.stop;
+          expect(receipt.kernel).toMatch(/removed|populated 0/);
+        }),
+      ),
+    );
     check(
       "runs a setup shell after ownership and keeps protected data, environment and descriptors inaccessible",
       () =>
@@ -283,6 +460,7 @@ describe.runIf(process.env.PI_MANAGED_PROCESS_LINUX_GATE === "1")(
           yield* child.start;
           const chunks = yield* child.stdout.pipe(Stream.take(1), Stream.runCollect);
           expect(Buffer.concat(Array.from(chunks)).toString()).toBe("ready");
+          for (let n = 0; n < 16; n++) yield* child.send(Buffer.alloc(8192, 120));
           const receipt = yield* child.stop;
           const error = yield* child.send(Buffer.from("late input")).pipe(Effect.flip);
           expect(error.phase).toBe("transport");
