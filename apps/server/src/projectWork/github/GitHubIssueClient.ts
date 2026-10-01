@@ -51,7 +51,10 @@ const Repository = Schema.Struct({ host: Host, nodeId: NonEmpty, nameWithOwner: 
 export type GitHubIssueAccount = typeof Account.Type;
 export type GitHubIssueRepository = typeof Repository.Type;
 
-const Common = { cwd: NonEmpty, account: Account };
+const Common = {
+  cwd: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096)),
+  account: Account,
+};
 const Paging = {
   ...Common,
   repository: Repository,

@@ -1142,3 +1142,34 @@ describe("bounded GitHub issue transport", () => {
     ),
   );
 });
+
+for (const length of [1024, 1100, 4096]) {
+  it.effect(`accepts the full workspace cwd bound (${length}) for verified lookup`, () =>
+    provide(
+      Effect.gen(function* () {
+        serve(response([]));
+        const cwd = "/" + "x".repeat(length - 1);
+        const result = yield* (yield* Client.GitHubIssueClient).lookupRepository({
+          cwd,
+          account,
+          repository: "owner/repo",
+        });
+        expect(result.status).toBe("changed");
+        expect(run.mock.calls.some(([request]) => request.cwd === cwd)).toBe(true);
+      }),
+    ),
+  );
+}
+it.effect("rejects workspace cwd beyond4096 before GitHub effects", () =>
+  provide(
+    Effect.gen(function* () {
+      serve(response([]));
+      const before = run.mock.calls.length;
+      const result = yield* (yield* Client.GitHubIssueClient)
+        .lookupRepository({ cwd: "/" + "x".repeat(4096), account, repository: "owner/repo" })
+        .pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      expect(run.mock.calls).toHaveLength(before);
+    }),
+  ),
+);
