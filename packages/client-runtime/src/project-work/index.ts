@@ -4,7 +4,8 @@ import type {
   ProjectWorkAttentionRead,
   ProjectWorkBriefingRead,
   ProjectWorkBoundedReadEnvelope,
-  ProjectWorkCommand,
+  ProjectWorkWriteIntent,
+  ProjectTeamRecordRead,
   ProjectWorkKnowledgeRead,
   ProjectWorkReadIntent,
   ProjectWorkStreamInput,
@@ -13,10 +14,12 @@ import type {
   ProjectWorkTaskContext,
   ProjectWorkWriteResult,
 } from "@t3tools/contracts";
-import { WS_METHODS } from "@t3tools/contracts";
+import { ProjectTeamRecordPage, WS_METHODS } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Duration from "effect/Duration";
 import * as Stream from "effect/Stream";
+import * as Schema from "effect/Schema";
+import * as Option from "effect/Option";
 import { Atom } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
@@ -92,7 +95,7 @@ export interface ProjectWorkPage<T> {
 
 export type ProjectWorkWriteTarget = {
   readonly environmentId: EnvironmentId;
-  readonly input: ProjectWorkCommand;
+  readonly input: ProjectWorkWriteIntent;
 };
 
 export type ProjectWorkReadCollection =
@@ -154,6 +157,105 @@ export function asProjectWorkTaskContext(value: unknown): ProjectWorkTaskContext
     candidate.policy !== undefined
     ? (value as ProjectWorkTaskContext)
     : null;
+}
+
+const decodeFoundationPage = Schema.decodeUnknownOption(ProjectTeamRecordPage);
+// The shared Text codec trims strings; pagination tokens must remain opaque.
+const decodeFoundationCursor = Schema.decodeUnknownOption(
+  Schema.Struct({
+    nextCursor: Schema.optionalKey(Schema.String.check(Schema.isMaxLength(4_000))),
+  }),
+);
+
+/** Validate every record before a foundation page can participate in a snapshot. */
+export function asProjectWorkFoundationPage(
+  value: unknown,
+  projectId: ProjectId,
+): typeof ProjectTeamRecordPage.Type | null {
+  const decoded = decodeFoundationPage(value);
+  if (Option.isNone(decoded)) return null;
+  const page = decoded.value;
+  if (
+    page.projectId !== projectId ||
+    !Number.isSafeInteger(page.revision) ||
+    page.items.some(
+      (record) =>
+        record.projectId !== projectId ||
+        !Number.isSafeInteger(record.revision) ||
+        record.revision > page.revision,
+    )
+  ) {
+    return null;
+  }
+  const cursor = decodeFoundationCursor(value);
+  if (Option.isNone(cursor)) return null;
+  return { ...page, ...cursor.value };
+}
+
+type ProjectWorkFoundationPageError =
+  | "invalid-page"
+  | "revision-changed"
+  | "duplicate-record"
+  | "invalid-cursor-chain"
+  | "limit-exceeded";
+
+export interface ProjectWorkFoundationSnapshot {
+  readonly records: ReadonlyArray<ProjectTeamRecordRead>;
+  readonly revision: number | null;
+  readonly complete: boolean;
+  readonly nextCursor: string | null;
+  readonly error: ProjectWorkFoundationPageError | null;
+}
+
+/** Only a complete, coherent cursor chain is eligible for guided write decisions. */
+export function combineProjectWorkFoundationPages(input: {
+  readonly projectId: ProjectId;
+  readonly pages: ReadonlyArray<{ readonly cursor?: string; readonly value: unknown }>;
+}): ProjectWorkFoundationSnapshot {
+  const fail = (error: ProjectWorkFoundationPageError): ProjectWorkFoundationSnapshot => ({
+    records: [],
+    revision: null,
+    complete: false,
+    nextCursor: null,
+    error,
+  });
+  if (input.pages.length > 16) return fail("limit-exceeded");
+  const records: ProjectTeamRecordRead[] = [];
+  const recordIds = new Set<string>();
+  const cursors = new Set<string>();
+  let revision: number | null = null;
+  let nextCursor: string | null = null;
+  for (const [index, requested] of input.pages.entries()) {
+    if (
+      index === 0
+        ? requested.cursor !== undefined
+        : nextCursor === null || requested.cursor !== nextCursor
+    ) {
+      return fail("invalid-cursor-chain");
+    }
+    const page = asProjectWorkFoundationPage(requested.value, input.projectId);
+    if (page === null) return fail("invalid-page");
+    if (revision !== null && revision !== page.revision) return fail("revision-changed");
+    revision = page.revision;
+    if (records.length + page.items.length > 2048) return fail("limit-exceeded");
+    for (const record of page.items) {
+      if (recordIds.has(record.recordId)) return fail("duplicate-record");
+      recordIds.add(record.recordId);
+      records.push(record);
+    }
+    nextCursor = page.nextCursor ?? null;
+    if (nextCursor !== null) {
+      if (cursors.has(nextCursor)) return fail("invalid-cursor-chain");
+      cursors.add(nextCursor);
+    }
+  }
+  return {
+    records,
+    revision,
+    complete: revision !== null && nextCursor === null,
+    nextCursor,
+    error: null,
+  };
 }
 
 export interface ProjectWorkStreamState {
@@ -254,6 +356,24 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
   const exportJson = read("environment-data:project-work:export-json");
   const exportMarkdown = read("environment-data:project-work:export-markdown");
 
+  const foundationRead = read("environment-data:project-work:foundation-page");
+  const foundationFamily = Atom.family((key: string) => {
+    const [environmentId, projectId, cursor] = JSON.parse(key) as [
+      EnvironmentId,
+      ProjectId,
+      string | null,
+    ];
+    return foundationRead({
+      environmentId,
+      input: {
+        projectId,
+        operation: "foundation-records",
+        limit: 128,
+        ...(cursor === null ? {} : { cursor }),
+      },
+    });
+  });
+
   const pageRead = read("environment-data:project-work:page");
   const pageFamily = Atom.family((key: string) => {
     const [environmentId, projectId, collection, offset] = JSON.parse(key) as [
@@ -281,6 +401,7 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
     const [environmentId, input] = JSON.parse(key) as [EnvironmentId, ProjectWorkReadIntent];
     return pollingView(taskContext({ environmentId, input }));
   });
+  const pollingFoundation = Atom.family((key: string) => pollingView(foundationFamily(key)));
   const pollingPage = Atom.family((key: string) => pollingView(pageFamily(key)));
   const pollingSearch = Atom.family((key: string) => {
     const [environmentId, input] = JSON.parse(key) as [EnvironmentId, ProjectWorkReadIntent];
@@ -402,6 +523,12 @@ export function createProjectWorkEnvironmentAtoms<R, E>(
         environmentId: target.environmentId,
         input: inputFor(target.projectId, "export-markdown"),
       }),
+    foundationPage: (
+      target: ProjectWorkReadTarget & { readonly cursor?: string; readonly poll?: boolean },
+    ) => {
+      const key = JSON.stringify([target.environmentId, target.projectId, target.cursor ?? null]);
+      return target.poll === false ? foundationFamily(key) : pollingFoundation(key);
+    },
     page: (target: ProjectWorkPageTarget) => {
       const key = projectWorkPageTargetKey(target);
       return target.poll === false ? pageFamily(key) : pollingPage(key);

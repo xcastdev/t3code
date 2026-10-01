@@ -2087,6 +2087,10 @@ export function GeneralSettingsPanel() {
   // needs exactly one environment.
   const environmentId = environment?.environmentId ?? null;
   const isEnvironmentScope = scope.environmentIds.length === 1 && environmentId !== null;
+  const workProject =
+    (scope.kind === "project" || scope.kind === "checkout") && scope.members.length === 1
+      ? scope.members[0]
+      : undefined;
   const hasServerTargets = connectedEnvironments.length > 0;
   const [backgroundActivityDialogOpen, setBackgroundActivityDialogOpen] = useState(false);
   const [tokenStreamingWarningOpen, setTokenStreamingWarningOpen] = useState(false);
@@ -2758,6 +2762,22 @@ export function GeneralSettingsPanel() {
           {...searchableSetting("project-work")}
           title="Project Work"
           description="Opt in to durable tasks, knowledge, and project briefings for this environment."
+          status={
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={!workProject || !settings.projectWorkEnabled}
+              onClick={() => {
+                if (!workProject || !settings.projectWorkEnabled) return;
+                void navigate({
+                  to: "/work/$environmentId/$projectId",
+                  params: { environmentId: workProject.environmentId, projectId: workProject.id },
+                });
+              }}
+            >
+              Open Work
+            </Button>
+          }
           control={
             <ScopedSwitch
               settingKeys={["projectWorkEnabled"]}
