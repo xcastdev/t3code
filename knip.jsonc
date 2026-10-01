@@ -28,6 +28,8 @@
         "src/provider/pi/fixtures/p1-runtime-descendants.mjs",
         "src/provider/pi/fixtures/p1-runtime-linux-proof.mjs",
         "src/provider/pi/fixtures/p1-runtime-mcp.mjs",
+        "src/provider/pi/fixtures/p7-sdk-worker-child.mjs",
+        "src/provider/pi/fixtures/p7-sdk-worker-native.mjs",
       ],
       // Keep the transitive Effect runtime pinned for standalone npm installs.
       // Native msgpack acceleration and the Vite+ web build prerequisite.
