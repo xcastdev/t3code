@@ -10,13 +10,74 @@ import {
   evaluateProjectTeamDependency,
   evaluateProjectTeamGate,
   type ProjectTeamGateTarget,
+  assertProjectTeamAssignmentAuthorization,
+  projectTeamSpecificationHash,
+  projectTeamScopeHash,
+  projectTeamPlanHash,
+  assertProjectTeamOrdinarySuccessor,
 } from "./ProjectTeamPolicy.ts";
+import { emptyProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 
 type Gate = Extract<ProjectTeamRecord, { kind: "gate" }>;
 type Membership = Extract<ProjectTeamRecord, { kind: "task-membership" }>;
+type RepairEpisode = Extract<ProjectTeamRecord, { kind: "repair-episode" }>;
 const projectId = ProjectId.make("project-a");
 const taskId = ProjectWorkTaskId.make("task-a");
 const now = "2026-09-30T00:00:00.000Z";
+
+describe("ordinary successor repair fence", () => {
+  const episode: RepairEpisode = {
+    kind: "repair-episode",
+    recordId: "episode",
+    projectId,
+    taskId,
+    rootTaskId: taskId,
+    revision: 0,
+    generation: 0,
+    updatedAt: now,
+    status: "active",
+    failureFingerprint: "failure",
+    relevantRevision: "tree-a",
+    allowance: 2,
+    semanticRepairs: 0,
+    transportRetries: 0,
+    timeoutCount: 0,
+    attemptIds: [],
+  };
+  it.each([undefined, true])("denies pending or ambiguous semantic history %s", (pending) => {
+    const current =
+      pending === undefined ? episode : { ...episode, pendingSemanticRepair: pending };
+    const state = { ...emptyProjectWorkReducerState(projectId), foundationRecords: [current] };
+    expect(() => assertProjectTeamOrdinarySuccessor(state, taskId)).toThrow(
+      "exact repair authorization",
+    );
+  });
+  it("allows explicit transport-only or already debited history without resetting counters", () => {
+    const current = {
+      ...episode,
+      pendingSemanticRepair: false,
+      transportRetries: 3,
+      semanticRepairs: 1,
+    };
+    const state = { ...emptyProjectWorkReducerState(projectId), foundationRecords: [current] };
+    expect(() => assertProjectTeamOrdinarySuccessor(state, taskId)).not.toThrow();
+    expect(current.semanticRepairs).toBe(1);
+    expect(current.transportRetries).toBe(3);
+  });
+  it("denies exhausted history even after a prior debit", () => {
+    const state = {
+      ...emptyProjectWorkReducerState(projectId),
+      foundationRecords: [
+        { ...episode, status: "exhausted" as const, pendingSemanticRepair: false },
+      ],
+    };
+    expect(() => assertProjectTeamOrdinarySuccessor(state, taskId)).toThrow();
+  });
+  it("ignores another task's episode", () => {
+    const state = { ...emptyProjectWorkReducerState(projectId), foundationRecords: [episode] };
+    expect(() => assertProjectTeamOrdinarySuccessor(state, "other-task")).not.toThrow();
+  });
+});
 const gate = (overrides: Partial<Gate> = {}): Gate => ({
   kind: "gate",
   recordId: "execution-approval",
@@ -82,6 +143,132 @@ const membership = (overrides: Partial<Membership> = {}): Membership => ({
   executionKind: "managed",
   deliverableKind: "research",
   ...overrides,
+});
+
+describe("inherited assignment authorization", () => {
+  const fixture = () => {
+    const state = emptyProjectWorkReducerState(projectId);
+    state.tasks.push(
+      task({
+        state: "ready",
+        specification: {
+          objective: "Approved objective",
+          scopeIn: "One deliverable",
+          scopeOut: "Unapproved implementation",
+          criterionIds: [],
+          revision: 3,
+          protected: true,
+        },
+      }),
+    );
+    state.foundationRecords = [membership({ deliverableKind: "code" })];
+    const specificationHash = projectTeamSpecificationHash(state, taskId);
+    state.foundationRecords.push(
+      gate({
+        recordId: "specification",
+        gate: "specification",
+        contentHash: specificationHash,
+        planRevision: 0,
+        evidenceIds: [],
+      }),
+    );
+    const assignment = gate({
+      recordId: "planning",
+      taskId: ProjectWorkTaskId.make("child"),
+      gate: "assignment",
+      specRevision: 1,
+      planRevision: 0,
+      evidenceIds: [],
+      assignmentAuthorization: {
+        assignmentKind: "planning",
+        parentTaskId: taskId,
+        parentSpecRevision: 3,
+        parentSpecificationGateId: "specification",
+        parentSpecificationHash: specificationHash,
+        parentScopeHash: projectTeamScopeHash(state, taskId),
+      },
+    });
+    return { state, assignment };
+  };
+
+  it("permits first-plan drafting from the exact Human-approved specification", () => {
+    const { state, assignment } = fixture();
+    expect(assertProjectTeamAssignmentAuthorization(state, assignment)).toEqual(
+      assignment.assignmentAuthorization,
+    );
+  });
+
+  it("rejects stale, foreign, unapproved and paused parent authority", () => {
+    for (const change of ["specification", "approval", "pause", "project"] as const) {
+      const { state, assignment } = fixture();
+      if (change === "specification") state.tasks[0] = { ...state.tasks[0]!, specRevision: 4 };
+      if (change === "approval")
+        state.foundationRecords = state.foundationRecords!.map((record) =>
+          record.kind === "gate" ? { ...record, status: "invalidated" } : record,
+        );
+      if (change === "pause")
+        state.foundationRecords = state.foundationRecords!.map((record) =>
+          record.kind === "task-membership" ? { ...record, controlState: "paused" } : record,
+        );
+      if (change === "project")
+        state.tasks[0] = { ...state.tasks[0]!, projectId: ProjectId.make("foreign") };
+      expect(() => assertProjectTeamAssignmentAuthorization(state, assignment)).toThrow();
+    }
+  });
+
+  it("requires the review's exact approved parent plan and invalidates moved scope", () => {
+    const { state, assignment } = fixture();
+    const plan: Extract<ProjectTeamRecord, { kind: "plan-revision" }> = {
+      kind: "plan-revision",
+      recordId: "parent-plan",
+      projectId,
+      revision: 0,
+      generation: 0,
+      updatedAt: now,
+      status: "proposed",
+      taskId,
+      specRevision: 3,
+      planRevision: 1,
+      content: "Approved bounded plan",
+      dependencyTaskIds: [],
+      contentHash: projectTeamPlanHash({ content: "Approved bounded plan", dependencyTaskIds: [] }),
+    };
+    state.foundationRecords!.push(
+      plan,
+      gate({
+        recordId: "plan-approval",
+        gate: "plan",
+        contentHash: plan.contentHash,
+        specRevision: 3,
+        planRevision: 1,
+        evidenceIds: [],
+      }),
+    );
+    expect(() => assertProjectTeamAssignmentAuthorization(state, assignment)).toThrow();
+    const review = {
+      ...assignment,
+      assignmentAuthorization: {
+        ...assignment.assignmentAuthorization!,
+        assignmentKind: "review" as const,
+        parentScopeHash: projectTeamScopeHash(state, taskId, plan),
+        parentPlan: {
+          recordId: plan.recordId,
+          planRevision: 1,
+          contentHash: plan.contentHash,
+          gateId: "plan-approval",
+        },
+      },
+    };
+    expect(assertProjectTeamAssignmentAuthorization(state, review)).toEqual(
+      review.assignmentAuthorization,
+    );
+    state.foundationRecords = state.foundationRecords!.map((record) =>
+      record.recordId === plan.recordId && record.kind === "plan-revision"
+        ? { ...record, content: "Changed plan" }
+        : record,
+    );
+    expect(() => assertProjectTeamAssignmentAuthorization(state, review)).toThrow();
+  });
 });
 
 describe("evaluateProjectTeamGate", () => {

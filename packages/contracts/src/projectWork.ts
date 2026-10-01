@@ -1125,6 +1125,37 @@ const GuidedFields = {
 export const ProjectTeamGuidedIntent = Schema.Union([
   Schema.Struct({
     ...GuidedFields,
+    type: Schema.Literal("project-team.assignment.start"),
+    assignmentKind: Schema.Literals(["planning", "review"]),
+    objective: GuidedBody,
+    outputDescriptions: Schema.Array(GuidedText).check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(16),
+    ),
+    specRevision: NonNegativeInt,
+    specificationGateId: GuidedId,
+    expectedSpecificationGateRevision: NonNegativeInt,
+    parentPlan: Schema.optionalKey(
+      Schema.Struct({
+        recordId: GuidedId,
+        expectedRecordRevision: NonNegativeInt,
+        planRevision: NonNegativeInt,
+        gateId: GuidedId,
+        expectedGateRevision: NonNegativeInt,
+      }),
+    ),
+  }).check(
+    Schema.makeFilter(
+      (input) => input.assignmentKind !== "review" || input.parentPlan !== undefined,
+      { message: "A review assignment requires its exact approved parent plan" },
+    ),
+    Schema.makeFilter(
+      (input) => input.assignmentKind !== "planning" || input.outputDescriptions.length === 1,
+      { message: "A planning assignment has one proposed-plan output" },
+    ),
+  ),
+  Schema.Struct({
+    ...GuidedFields,
     type: Schema.Literal("project-team.investigation.start"),
     objective: GuidedBody,
     outputDescriptions: Schema.Array(GuidedText).check(
@@ -1240,7 +1271,7 @@ export const ProjectTeamGuidedIntent = Schema.Union([
     decision: Schema.Literals(["diagnose", "approve-one-repair", "revise-scope", "abandon"]),
     reason: GuidedText,
   }),
-]);
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type ProjectTeamGuidedIntent = typeof ProjectTeamGuidedIntent.Type;
 
 /** Private gateway compilation; raw foundation commands remain denied by transports. */

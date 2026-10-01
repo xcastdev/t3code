@@ -130,7 +130,15 @@ export const ProjectTeamGate = Schema.Struct({
     "consumed",
   ]),
   taskId: ProjectWorkTaskId,
-  gate: Schema.Literals(["investigation", "specification", "plan", "execution", "merge", "repair"]),
+  gate: Schema.Literals([
+    "investigation",
+    "assignment",
+    "specification",
+    "plan",
+    "execution",
+    "merge",
+    "repair",
+  ]),
   specRevision: NonNegativeInt,
   planRevision: NonNegativeInt,
   contentHash: Text,
@@ -143,6 +151,24 @@ export const ProjectTeamGate = Schema.Struct({
   evidenceIds: Ids,
   consumedByRunId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
   consumedByCommandId: Schema.optionalKey(CommandId),
+  assignmentAuthorization: Schema.optionalKey(
+    Schema.Struct({
+      assignmentKind: Schema.Literals(["planning", "review"]),
+      parentTaskId: ProjectWorkTaskId,
+      parentSpecRevision: NonNegativeInt,
+      parentSpecificationGateId: Text.check(Schema.isMaxLength(256)),
+      parentSpecificationHash: Text,
+      parentScopeHash: Text,
+      parentPlan: Schema.optionalKey(
+        Schema.Struct({
+          recordId: Text.check(Schema.isMaxLength(256)),
+          planRevision: NonNegativeInt,
+          contentHash: Text,
+          gateId: Text.check(Schema.isMaxLength(256)),
+        }),
+      ),
+    }),
+  ),
   repairAuthorization: Schema.optionalKey(
     Schema.Struct({
       episodeId: Text.check(Schema.isMaxLength(256)),
@@ -261,6 +287,7 @@ export const ProjectTeamRepairEpisode = Schema.Struct({
   attemptIds: Schema.Array(ProjectWorkAttemptId).check(Schema.isMaxLength(64)),
   rootTaskId: Schema.optionalKey(ProjectWorkTaskId),
   lastSemanticRevision: Schema.optionalKey(Text),
+  pendingSemanticRepair: Schema.optionalKey(Schema.Boolean),
   exceptionGrantId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
 });
 export const ProjectTeamLimits = Schema.Struct({
@@ -446,5 +473,5 @@ export const ProjectTeamWriteIntent = Schema.Union([
     knowledgeId: Text,
     title: Text,
   }),
-]);
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type ProjectTeamWriteIntent = typeof ProjectTeamWriteIntent.Type;

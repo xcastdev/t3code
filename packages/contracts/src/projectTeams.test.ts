@@ -116,8 +116,99 @@ describe("guided contract preparation", () => {
     expect(() => decodeGuided({ ...investigation, expectedIssueRevision: 0 })).toThrow();
   });
 
+  it("bounds inherited planner and reviewer requests without allowing a self-approved grant", () => {
+    const planning = {
+      ...investigation,
+      type: "project-team.assignment.start",
+      assignmentKind: "planning",
+      specRevision: 1,
+      specificationGateId: "approved-spec",
+      expectedSpecificationGateRevision: 1,
+    };
+    expect(decodePublicWrite(planning)).toEqual(planning);
+    expect(() => decodeGuided({ ...planning, assignmentKind: "review" })).toThrow();
+    const review = {
+      ...planning,
+      assignmentKind: "review",
+      parentPlan: {
+        recordId: "plan",
+        expectedRecordRevision: 0,
+        planRevision: 1,
+        gateId: "approved-plan",
+        expectedGateRevision: 1,
+      },
+    };
+    expect(decodeGuided(review)).toEqual(review);
+    expect(() => decodeGuided({ ...planning, assignmentKind: "implementer" })).toThrow();
+    expect(() => decodeGuided({ ...planning, assignmentAuthorization: {} })).toThrow();
+    expect(() => decodeGuided({ ...planning, objective: "x".repeat(32_001) })).toThrow();
+    expect(() => decodeGuided({ ...planning, outputDescriptions: [] })).toThrow();
+    expect(() =>
+      decodeGuided({ ...planning, outputDescriptions: ["Plan", "Another output"] }),
+    ).toThrow();
+    expect(() =>
+      decodeGuided({ ...review, parentPlan: { ...review.parentPlan, actor: "human" } }),
+    ).toThrow();
+  });
+
   it("accepts the bounded public intent without caller-created authority", () => {
     expect(decodePublicWrite(investigation)).toEqual(investigation);
+  });
+
+  it("rejects excess authority at the default public decoder before it can strip fields", () => {
+    for (const authority of [
+      { actor: { kind: "human", id: "invented" } },
+      { bindingId: "invented" },
+      { generation: 99 },
+      { authorizationGateId: "invented" },
+    ]) {
+      expect(() => decodePublicWrite({ ...investigation, ...authority })).toThrow();
+      expect(() => decodeGuided({ ...investigation, ...authority })).toThrow();
+    }
+    expect(() =>
+      decodePublicWrite({
+        type: "project-team.task.control",
+        commandId: "control",
+        projectId: "project",
+        taskId: "task",
+        expectedRevision: 0,
+        expectedTaskRevision: 0,
+        control: { action: "pause", reason: "Stop", generation: 99 },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodePublicWrite({
+        type: "project-team.gate.respond",
+        commandId: "approve",
+        projectId: "project",
+        taskId: "task",
+        expectedRevision: 0,
+        expectedTaskRevision: 0,
+        specRevision: 1,
+        planRevision: 0,
+        gateId: "gate",
+        expectedGateRevision: 0,
+        response: "approved",
+        actor: { kind: "human", id: "invented" },
+      }),
+    ).toThrow();
+  });
+
+  it("preserves legitimate legacy command attribution through the public decoder", () => {
+    const command = {
+      type: "project-work.task.create",
+      commandId: "legacy-create",
+      projectId: "project",
+      taskId: "legacy-task",
+      title: "Legacy capture",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      attribution: {
+        actor: { kind: "human", id: "user" },
+        source: { kind: "web", id: "browser" },
+        recordedAt: "2026-01-01T00:00:00.000Z",
+      },
+    };
+    expect(decodePublicWrite(command)).toEqual(command);
   });
 
   it("retains the nonempty raw foundation invariant", () => {
@@ -256,4 +347,31 @@ describe("guided contract preparation", () => {
     expect(() => decodeGuided({ ...report, outputs })).toThrow();
     expect(() => decodeGuided({ ...report, outputs: [{ ...outputs[0], detail: " " }] })).toThrow();
   });
+});
+
+it("retains explicit semantic repair state and accepts legacy missing metadata", () => {
+  const legacy = {
+    kind: "repair-episode",
+    recordId: "episode-codec",
+    projectId: "project",
+    taskId: "task",
+    revision: 0,
+    generation: 0,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    status: "active",
+    failureFingerprint: "failure",
+    relevantRevision: "tree",
+    allowance: 2,
+    semanticRepairs: 0,
+    transportRetries: 0,
+    timeoutCount: 0,
+    attemptIds: [],
+  };
+  expect(decodeTeamRecord(legacy)).not.toHaveProperty("pendingSemanticRepair");
+  for (const pendingSemanticRepair of [false, true])
+    expect(decodeTeamRecord({ ...legacy, pendingSemanticRepair })).toHaveProperty(
+      "pendingSemanticRepair",
+      pendingSemanticRepair,
+    );
+  expect(() => decodeTeamRecord({ ...legacy, pendingSemanticRepair: "false" })).toThrow();
 });
