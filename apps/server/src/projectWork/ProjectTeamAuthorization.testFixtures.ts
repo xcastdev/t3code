@@ -94,6 +94,9 @@ export const createManagedAssignment = Effect.fn("authorizationTest.createManage
     readonly status: string;
     readonly configuration: Binding["configuration"];
     readonly sessionId?: string;
+    readonly memberId?: string;
+    readonly parentRunId?: string;
+    readonly leasedUntil?: string;
   }) {
     const sql = yield* SqlClient.SqlClient;
     const repo = yield* ProjectWorkRepository;
@@ -240,7 +243,8 @@ export const createManagedAssignment = Effect.fn("authorizationTest.createManage
       status: "reserved",
       taskId: input.taskId,
       attemptId: input.attemptId,
-      memberId: "member",
+      memberId: input.memberId ?? "member",
+      ...(input.parentRunId === undefined ? {} : { parentRunId: input.parentRunId }),
       roleRevisionId: input.role.recordId,
       providerInstanceId: input.providerInstanceId,
       threadId: input.threadId,
@@ -283,7 +287,7 @@ export const createManagedAssignment = Effect.fn("authorizationTest.createManage
             commandId: input.commandId,
             attemptId: input.attemptId,
             leaseToken: `${input.recordId}-lease`,
-            leasedUntil: "2030-01-01T00:00:00.000Z",
+            leasedUntil: input.leasedUntil ?? "2030-01-01T00:00:00.000Z",
             claimedAt: at,
           },
         },
@@ -387,7 +391,7 @@ export const seed = Effect.fn("authorizationTest.seed")(function* (
     role,
     configuration: {
       instructionsHash: "hash",
-      toolIds: options.toolIds ?? tools,
+      toolIds: options.toolIds ?? options.roleTools ?? tools,
       skillIds: [],
       runtimeVersion: "test",
       maxTokens: 1000,
