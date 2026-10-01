@@ -35,6 +35,8 @@ const seed = Effect.fn("seedLegacyIssueCursor")(function* (
     accountId?: string;
     cursor?: string;
     status?: "ready" | "syncing" | "unavailable" | "detached";
+    overlapSince?: string;
+    lastSuccessfulPageAt?: string;
   } = {},
 ) {
   const cursor = yield* decodeCursor({
@@ -50,8 +52,8 @@ const seed = Effect.fn("seedLegacyIssueCursor")(function* (
     accountId: input.accountId ?? "U_legacy",
     cursor: input.cursor ?? "opaque-page-9",
     etag: "old-etag",
-    overlapSince: at,
-    lastSuccessfulPageAt: "2026-10-01T00:00:01.987Z",
+    overlapSince: input.overlapSince ?? at,
+    lastSuccessfulPageAt: input.lastSuccessfulPageAt ?? "2026-10-01T00:00:01.987Z",
     error: "previous transport failure",
   });
   const payload = yield* encodeJson(cursor);
@@ -105,6 +107,82 @@ it.effect("migration retains exact legacy progress and cannot grant a read epoch
       expect(yield* readIssueRepositoryState(sql, key)).toEqual(state);
     }),
   ),
+);
+
+for (const recordId of ["", null])
+  it.effect(
+    `invalid physical ${recordId === null ? "null" : "empty"} key cannot register a partial import`,
+    () =>
+      memory(
+        Effect.gen(function* () {
+          const sql = yield* setup;
+          yield* seed(sql, { recordId: "first", repositoryNodeId: "R_first" });
+          yield* seed(sql, { recordId: "corrupt", repositoryNodeId: "R_corrupt" });
+          yield* sql`UPDATE project_team_intake_cursor SET record_id=${recordId},payload_json='broken-json' WHERE record_id='corrupt'`;
+          const source = yield* sql`SELECT * FROM project_team_intake_cursor ORDER BY record_id`;
+          expect((yield* runMigrations().pipe(Effect.exit))._tag).toBe("Failure");
+          expect(yield* sql`SELECT * FROM t3_fork_migrations WHERE migration_id=22`).toEqual([]);
+          expect(
+            yield* sql`SELECT name FROM sqlite_master WHERE name LIKE 'project_issue_%'`,
+          ).toEqual([]);
+          expect(yield* sql`SELECT * FROM project_team_intake_cursor ORDER BY record_id`).toEqual(
+            source,
+          );
+        }),
+      ),
+  );
+
+for (const field of ["overlapSince", "lastSuccessfulPageAt"] as const)
+  it.effect(`unsupported legacy ${field} is retained without binding or read authority`, () =>
+    memory(
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        const source = yield* seed(sql, { [field]: "not-a-timestamp" });
+        yield* runMigrations();
+        expect(
+          yield* sql`SELECT payload_json,import_status FROM project_issue_repository_legacy`,
+        ).toEqual([{ payload_json: source.payload, import_status: "unsupported" }]);
+        expect(yield* sql`SELECT payload_json FROM project_team_intake_cursor`).toEqual([
+          { payload_json: source.payload },
+        ]);
+        expect(yield* sql`SELECT * FROM project_issue_repository`).toEqual([]);
+        expect(yield* sql`SELECT * FROM project_issue_binding`).toEqual([]);
+        expect(yield* sql`SELECT * FROM t3_fork_migrations WHERE migration_id=22`).toHaveLength(1);
+      }),
+    ),
+  );
+
+it.effect(
+  "an already archived legacy owner cannot block another project's freshly verified reads",
+  () =>
+    memory(
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        const source = yield* seed(sql);
+        yield* sql`INSERT INTO project_lifecycle(project_id,state,workspace_root,revision,changed_at) VALUES('a','archived','/unused',1,${at})`;
+        yield* runMigrations();
+        expect(yield* sql`SELECT * FROM project_issue_binding`).toEqual([]);
+        expect(yield* sql`SELECT payload_json FROM project_issue_repository_legacy`).toEqual([
+          { payload_json: source.payload },
+        ]);
+        yield* bindIssueRepositoryProject(sql, {
+          key,
+          projectId: "b",
+          repositoryName: "verified/repository",
+          accountNodeId: "U_legacy",
+          credentialEpoch: "fresh-verified",
+          since: "2026-10-01T00:00:00Z",
+          expectedBindingRevision: null,
+        });
+        expect(
+          (yield* claimIssueRepositoryRead(sql, key, {
+            leaseId: "fresh-read",
+            durationMs: 1000,
+            sweepStartedAt: "2026-10-01T00:00:00Z",
+          }))?.lease?.bindings.map((binding) => binding.projectId),
+        ).toEqual(["b"]);
+      }),
+    ),
 );
 
 it.effect(
@@ -204,18 +282,30 @@ it.effect(
       const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-issue-migration-" });
       const filename = path.join(directory, "state.sqlite");
       let saved: string | undefined;
+      let unsupported: string | undefined;
       yield* Effect.gen(function* () {
         const sql = yield* setup;
         saved = (yield* seed(sql)).payload;
+        unsupported = (yield* seed(sql, {
+          recordId: "unsupported",
+          repositoryNodeId: "R_unsupported",
+          overlapSince: "not-a-timestamp",
+        })).payload;
         yield* runMigrations();
       }).pipe(Effect.provide(NodeSqliteClient.layer({ filename })));
       yield* Effect.gen(function* () {
         const sql = yield* SqlClient.SqlClient;
         expect(yield* runMigrations()).toEqual([]);
         expect((yield* readIssueRepositoryState(sql, key))?.credentialEpoch).toBe("");
-        expect(yield* sql`SELECT payload_json FROM project_issue_repository_legacy`).toEqual([
-          { payload_json: saved },
-        ]);
+        expect(
+          yield* sql`SELECT payload_json FROM project_issue_repository_legacy ORDER BY record_id`,
+        ).toEqual([{ payload_json: saved }, { payload_json: unsupported }]);
+        expect(
+          yield* readIssueRepositoryState(sql, { ...key, repositoryNodeId: "R_unsupported" }),
+        ).toBeUndefined();
+        expect(
+          yield* sql`SELECT import_status FROM project_issue_repository_legacy WHERE record_id='unsupported'`,
+        ).toEqual([{ import_status: "unsupported" }]);
         expect(
           yield* claimIssueRepositoryRead(sql, key, {
             leaseId: "after-restart",
