@@ -48,6 +48,7 @@ import * as ProjectWorkQuery from "./ProjectWorkQuery.ts";
 import * as ProjectWorkRepository from "./ProjectWorkRepository.ts";
 import * as ProjectWorkSearch from "./ProjectWorkSearch.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { bindIssueRepositoryProject } from "./ProjectIssueRepositoryState.ts";
 
 const decodeWriteResult = Schema.decodeUnknownEffect(ProjectWorkWriteResult);
 const decodeFoundationCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
@@ -570,6 +571,16 @@ layer("ProjectWorkGateway", (it) => {
               .digest("hex");
           for (const id of [owner, survivor])
             yield* sql`INSERT INTO projection_projects (project_id, title, workspace_root, scripts_json, created_at, updated_at) VALUES (${id}, 'Project', '/workspace', '[]', ${at}, ${at})`;
+          // Persisted bindings, rather than imported issue projections, own intake.
+          yield* bindIssueRepositoryProject(sql, {
+            key: { host: "github.com", repositoryNodeId: "collision-repo-" + timing },
+            projectId: survivor,
+            accountNodeId: "same-account",
+            repositoryName: "owner/repo",
+            credentialEpoch: "collision-verified-epoch",
+            since: "2026-01-01T00:00:00Z",
+            expectedBindingRevision: null,
+          });
           const cursor = yield* decodeTeamRecord({
             kind: "intake-cursor",
             recordId: cursorId,

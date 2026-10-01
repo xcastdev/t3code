@@ -98,6 +98,91 @@ function serve(data: string | ((endpoint: string) => string)) {
 }
 afterEach(() => run.mockReset());
 
+it.effect("pins comment reads to the captured issue source revision before fetching comments", () =>
+  provide(
+    Effect.gen(function* () {
+      serve(response([comment()]));
+      const commentsInput = {
+        cwd: input.cwd,
+        account,
+        repository,
+        issue: { nodeId: "I_1", number: 1 },
+        pageSize: 2,
+      };
+      const client = yield* Client.GitHubIssueClient;
+      expect(
+        (yield* client.readCommentsPage({
+          ...commentsInput,
+          expectedSourceRevision: issue().updated_at,
+        })).status,
+      ).toBe("changed");
+      expect(
+        (yield* client.readCommentsPage({
+          ...commentsInput,
+          expectedSourceRevision: "2026-09-02T00:00:00.000Z",
+        })).status,
+      ).toBe("changed");
+      run.mockClear();
+      expect(
+        (yield* client
+          .readCommentsPage({ ...commentsInput, expectedSourceRevision: input.since })
+          .pipe(Effect.flip)).reason,
+      ).toBe("issue-mismatch");
+      expect(run.mock.calls.some(([request]) => request.args.at(-1)?.includes("comments?"))).toBe(
+        false,
+      );
+    }),
+  ),
+);
+
+for (const status of [200, 304] as const) {
+  it.effect(`rechecks a pinned issue after a ${status} comments response`, () =>
+    provide(
+      Effect.gen(function* () {
+        const client = yield* Client.GitHubIssueClient;
+        for (const edited of [false, true]) {
+          let issueReads = 0;
+          run.mockImplementation((request) => {
+            const endpoint = request.args.at(-1)!;
+            const body =
+              endpoint === "user"
+                ? response({ node_id: account.nodeId })
+                : endpoint === "repos/owner/repo"
+                  ? response(rawRepository)
+                  : endpoint === "repos/owner/repo/issues/1"
+                    ? response({
+                        ...issue(),
+                        updated_at:
+                          ++issueReads === 2 && edited
+                            ? "2026-09-03T00:00:00Z"
+                            : issue().updated_at,
+                      })
+                    : response([comment()], {}, status);
+            return Effect.succeed(
+              output(body, status === 304 && endpoint.includes("comments?") ? 1 : 0),
+            );
+          });
+          const read = client.readCommentsPage({
+            cwd: input.cwd,
+            account,
+            repository,
+            issue: { nodeId: "I_1", number: 1 },
+            expectedSourceRevision: issue().updated_at,
+            ...(status === 304 ? { etag: '"comments-page"' } : {}),
+            pageSize: 2,
+          });
+          if (edited) {
+            expect((yield* read.pipe(Effect.flip)).reason).toBe("issue-mismatch");
+          } else {
+            expect((yield* read).status).toBe(status === 304 ? "not-modified" : "changed");
+          }
+          expect(issueReads).toBe(2);
+        }
+      }),
+    ),
+  );
+}
+
 describe("bounded GitHub issue transport", () => {
   it.effect("keeps continuation on a PR-only page and includes close/reopen source versions", () =>
     provide(
@@ -1057,3 +1142,34 @@ describe("bounded GitHub issue transport", () => {
     ),
   );
 });
+
+for (const length of [1024, 1100, 4096]) {
+  it.effect(`accepts the full workspace cwd bound (${length}) for verified lookup`, () =>
+    provide(
+      Effect.gen(function* () {
+        serve(response([]));
+        const cwd = "/" + "x".repeat(length - 1);
+        const result = yield* (yield* Client.GitHubIssueClient).lookupRepository({
+          cwd,
+          account,
+          repository: "owner/repo",
+        });
+        expect(result.status).toBe("changed");
+        expect(run.mock.calls.some(([request]) => request.cwd === cwd)).toBe(true);
+      }),
+    ),
+  );
+}
+it.effect("rejects workspace cwd beyond4096 before GitHub effects", () =>
+  provide(
+    Effect.gen(function* () {
+      serve(response([]));
+      const before = run.mock.calls.length;
+      const result = yield* (yield* Client.GitHubIssueClient)
+        .lookupRepository({ cwd: "/" + "x".repeat(4096), account, repository: "owner/repo" })
+        .pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      expect(run.mock.calls).toHaveLength(before);
+    }),
+  ),
+);

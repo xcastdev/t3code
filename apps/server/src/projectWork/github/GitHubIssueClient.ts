@@ -25,6 +25,19 @@ const Timestamp = Schema.String.check(
     );
   }),
 );
+const SourceRevision = Schema.String.check(
+  Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{3})?Z$/u),
+  Schema.makeFilter((value) => {
+    const parsed = DateTime.make(value);
+    return (
+      Option.isSome(parsed) &&
+      DateTime.formatIso(parsed.value) ===
+        (value.includes(".") ? value : value.replace("Z", ".000Z"))
+    );
+  }),
+);
+const sourceTime = (value: string) =>
+  Option.getOrElse(DateTime.make(value).pipe(Option.map(DateTime.toEpochMillis)), () => -1);
 const PositiveInt = Schema.Int.check(
   Schema.isGreaterThanOrEqualTo(1),
   Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER),
@@ -38,7 +51,10 @@ const Repository = Schema.Struct({ host: Host, nodeId: NonEmpty, nameWithOwner: 
 export type GitHubIssueAccount = typeof Account.Type;
 export type GitHubIssueRepository = typeof Repository.Type;
 
-const Common = { cwd: NonEmpty, account: Account };
+const Common = {
+  cwd: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096)),
+  account: Account,
+};
 const Paging = {
   ...Common,
   repository: Repository,
@@ -56,6 +72,7 @@ const IssuesInput = Schema.Struct({ ...Paging, since: Timestamp });
 const CommentsInput = Schema.Struct({
   ...Paging,
   issue: Schema.Struct({ nodeId: NonEmpty, number: PositiveInt }),
+  expectedSourceRevision: Schema.optional(SourceRevision),
 });
 const RawRepository = Schema.Struct({
   id: PositiveInt,
@@ -621,23 +638,33 @@ export const make = Effect.gen(function* () {
     const verified = yield* verifyRepository(valid.cwd, valid.account, valid.repository);
     const { repository } = verified;
     const issueEndpoint = `repos/${repository.nameWithOwner}/issues/${valid.issue.number}`;
-    const issueResponse = yield* request(valid.cwd, valid.account, issueEndpoint);
-    const issue = yield* decodeBody(RawIssue, issueResponse.body, repository.host);
-    if (
-      issue.node_id !== valid.issue.nodeId ||
-      issue.number !== valid.issue.number ||
-      issue.pull_request !== undefined
-    )
-      return yield* failure("issue-mismatch", repository.host);
-    if (
-      !validApiUrl(issue.url, repository.host, issueEndpoint) ||
-      !validApiUrl(issue.repository_url, repository.host, `repos/${repository.nameWithOwner}`)
-    )
-      return yield* failure("invalid-response", repository.host);
+    const verifyIssue = Effect.fn("GitHubIssueClient.verifyCommentSource")(function* () {
+      const issueResponse = yield* request(valid.cwd, valid.account, issueEndpoint);
+      const issue = yield* decodeBody(RawIssue, issueResponse.body, repository.host);
+      if (
+        issue.node_id !== valid.issue.nodeId ||
+        issue.number !== valid.issue.number ||
+        issue.pull_request !== undefined ||
+        (valid.expectedSourceRevision !== undefined &&
+          sourceTime(issue.updated_at) !== sourceTime(valid.expectedSourceRevision))
+      )
+        return yield* failure("issue-mismatch", repository.host);
+      if (
+        !validApiUrl(issue.url, repository.host, issueEndpoint) ||
+        !validApiUrl(issue.repository_url, repository.host, `repos/${repository.nameWithOwner}`)
+      )
+        return yield* failure("invalid-response", repository.host);
+      return issue;
+    });
+    const issue = yield* verifyIssue();
     const page = valid.page ?? 1,
       pageSize = valid.pageSize ?? 100;
     const endpoint = `${issueEndpoint}/comments?per_page=${pageSize}&page=${page}`;
     const response = yield* request(valid.cwd, valid.account, endpoint, valid.etag);
+    if (valid.expectedSourceRevision !== undefined) {
+      yield* verifyRepository(valid.cwd, valid.account, repository);
+      yield* verifyIssue();
+    }
     if (response.status === 304) return { status: "not-modified", etag: response.etag, repository };
     const rows = yield* decodeBody(
       Schema.Array(RawComment).check(Schema.isMaxLength(pageSize)),
@@ -674,7 +701,8 @@ export const make = Effect.gen(function* () {
         ),
       catch: (e) => (isClientError(e) ? e : failure("invalid-response", repository.host)),
     });
-    yield* verifyRepository(valid.cwd, valid.account, repository);
+    if (valid.expectedSourceRevision === undefined)
+      yield* verifyRepository(valid.cwd, valid.account, repository);
     return {
       status: "changed",
       etag: response.etag,
