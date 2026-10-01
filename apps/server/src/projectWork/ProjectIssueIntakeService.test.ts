@@ -1025,3 +1025,60 @@ it.effect(
       }),
     ),
 );
+
+it.effect("persists terminal sweep delay with page progress and fences reads until it is due", () =>
+  memory(
+    Effect.gen(function* () {
+      const f = yield* setup();
+      yield* f.bind();
+      const claimed = yield* f.claim();
+      const result = yield* commitIssueRepositoryPage(f.sql, {
+        request: request(claimed),
+        lease: claimed.lease!,
+        response: response(),
+        nextSweepDelayMs: 60_000,
+      }).pipe(Effect.provideService(ProjectWorkRepository, f.repo));
+      expect(result.accepted).toBe(true);
+      const durable = yield* readIssueRepositoryState(f.sql, key);
+      expect(durable?.retryAt).toBe(nowMillis + 60_000);
+      expect(durable?.nextPage).toBe(1);
+      expect(durable?.sweepStartedAt).toBeNull();
+      const early = yield* claimIssueRepositoryRead(f.sql, key, {
+        leaseId: "early",
+        durationMs: 1_000,
+        sweepStartedAt: now,
+      });
+      expect(early).toBeUndefined();
+      yield* TestClock.adjust("60 seconds");
+      const due = yield* claimIssueRepositoryRead(f.sql, key, {
+        leaseId: "due",
+        durationMs: 1_000,
+        sweepStartedAt: "2026-10-01T01:01:00Z",
+      });
+      expect(due?.lease?.id).toBe("due");
+      expect(due?.since).toBe("2026-10-01T00:55:00Z");
+    }),
+  ),
+);
+
+it.effect("continues a nonterminal page immediately despite a requested terminal delay", () =>
+  memory(
+    Effect.gen(function* () {
+      const f = yield* setup();
+      yield* f.bind();
+      const claimed = yield* f.claim();
+      const result = yield* commitIssueRepositoryPage(f.sql, {
+        request: request(claimed),
+        lease: claimed.lease!,
+        response: response([issue], 2),
+        nextSweepDelayMs: 60_000,
+      }).pipe(Effect.provideService(ProjectWorkRepository, f.repo));
+      expect(result.accepted).toBe(true);
+      const durable = yield* readIssueRepositoryState(f.sql, key);
+      expect(durable?.retryAt).toBe(0);
+      expect(durable?.nextPage).toBe(2);
+      const due = yield* f.claim();
+      expect(due.nextPage).toBe(2);
+    }),
+  ),
+);

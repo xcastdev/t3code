@@ -12,6 +12,7 @@ import {
   ProjectWorkTask,
   ProjectWorkTaskRead,
   ProjectWorkTaskCreateCommand,
+  ProjectWorkIssueRefineCommand,
   ProjectWorkTaskSpecifyCommand,
   ProjectWorkTaskReviseProtectedSpecificationCommand,
   ProjectWorkDecisionSupersedeCommand,
@@ -22,6 +23,7 @@ import {
 import { DEFAULT_SERVER_SETTINGS, ServerSettings, ServerSettingsPatch } from "./settings.ts";
 
 const decodeTaskCreate = Schema.decodeUnknownSync(ProjectWorkTaskCreateCommand);
+const decodeIssueRefine = Schema.decodeUnknownSync(ProjectWorkIssueRefineCommand);
 const decodeTask = Schema.decodeUnknownSync(ProjectWorkTask);
 const decodeTaskRead = Schema.decodeUnknownSync(ProjectWorkTaskRead);
 const decodeClientCommand = Schema.decodeUnknownSync(ClientOrchestrationCommand);
@@ -39,6 +41,51 @@ describe("project work contracts", () => {
     expect(command.title).toBe("Capture the release checklist");
     expect(command.attribution).toBeUndefined();
     expect(command.summary).toBeUndefined();
+  });
+
+  it("requires exact project and issue revisions for each human refinement target", () => {
+    const common = {
+      type: "project-work.issue.refine",
+      commandId: "refine-1",
+      projectId: "project-1",
+      expectedRevision: 2,
+      issueRecordId: "issue-1",
+      expectedIssueRevision: 1,
+      refinedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const targets = [
+      { kind: "new-task", taskId: "task-1", title: "Investigate", deliverableKind: "code" },
+      { kind: "existing-task", taskId: "task-2", expectedTaskRevision: 3 },
+      { kind: "mission", title: "Release", objective: "Deliver the release" },
+    ];
+    for (const target of targets) {
+      expect(decodeIssueRefine({ ...common, target })).toMatchObject({ ...common, target });
+      expect(() => decodeIssueRefine({ ...common, expectedRevision: undefined, target })).toThrow();
+      expect(() =>
+        decodeIssueRefine({ ...common, expectedIssueRevision: undefined, target }),
+      ).toThrow();
+    }
+    expect(() =>
+      decodeIssueRefine({
+        ...common,
+        target: { kind: "existing-task", taskId: "task-2" },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeIssueRefine({
+        ...common,
+        target: { kind: "new-task", taskId: "task-1", title: "Investigate" },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeIssueRefine({
+        ...common,
+        target: { kind: "mission", title: "Release", objective: "x".repeat(32_001) },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeIssueRefine({ ...common, expectedIssueRevision: -1, target: targets[0] }),
+    ).toThrow();
   });
 
   it("accepts additive revision envelopes, task context reads, and search record kinds", () => {

@@ -40,6 +40,7 @@ import {
   assertKnownCriterion,
   assertKnownTask,
   assertNoActiveAttempt,
+  assertProjectWorkAttribution,
   assertProjectWorkExpectedRevision,
   assertTaskCanBeCompleted,
   assertTaskCanBeReady,
@@ -648,6 +649,98 @@ export function decideProjectWorkCommand(
   }
 
   switch (command.type) {
+    case "project-work.issue.refine": {
+      const origin = assertProjectWorkAttribution(command.attribution, command.type);
+      let working = mutableState(state);
+      const issue = working.foundationRecords?.find(
+        (record) => record.recordId === command.issueRecordId,
+      );
+      if (issue?.kind !== "issue" || issue.projectId !== command.projectId)
+        throw new ProjectWorkPolicyError("invalid-state", "Unknown issue in this project");
+      if (issue.revision !== command.expectedIssueRevision)
+        throw new ProjectWorkPolicyError("stale-revision", "Issue revision is stale");
+      if (issue.status === "detached")
+        throw new ProjectWorkPolicyError("invalid-state", "Detached issues cannot be refined");
+      if (issue.taskId !== undefined || issue.missionId !== undefined)
+        throw new ProjectWorkPolicyError("invalid-state", "Issue is already linked to work");
+
+      const events: Array<ProjectWorkEvent> = [];
+      const record = (input: ProjectTeamRecord) => {
+        const validated = validateProjectTeamRecord(working, input, origin);
+        const recorded = event(
+          {
+            type: "project-work.foundation.recorded",
+            record: validated,
+            occurredAt: command.refinedAt,
+          },
+          events.length,
+        );
+        events.push(recorded);
+        working = applyProjectWorkEvents(working, [recorded]);
+      };
+      const target = command.target;
+      if (target.kind === "mission") {
+        const missionId = projectTeamDerivedRecordId(command.commandId, "mission");
+        assertUniqueId(
+          (working.foundationRecords ?? []).map((entry) => entry.recordId),
+          missionId,
+          "Mission record",
+        );
+        record({
+          kind: "mission",
+          recordId: missionId,
+          projectId: command.projectId,
+          title: target.title,
+          objective: target.objective,
+          requiredTaskIds: [],
+          status: "draft",
+          revision: 0,
+          generation: 0,
+          updatedAt: command.refinedAt,
+        });
+        record({
+          ...issue,
+          missionId,
+          revision: issue.revision + 1,
+          updatedAt: command.refinedAt,
+        });
+      } else {
+        if (target.kind === "new-task") {
+          const created = decideProjectWorkCommand(working, {
+            type: "project-work.task.create",
+            commandId: command.commandId,
+            projectId: command.projectId,
+            expectedRevision: working.revision,
+            taskId: target.taskId,
+            title: target.title,
+            ...(target.summary === undefined ? {} : { summary: target.summary }),
+            deliverableKind: target.deliverableKind,
+            createdAt: command.refinedAt,
+            attribution: origin,
+          });
+          events.push(...created);
+          working = applyProjectWorkEvents(working, created);
+        } else {
+          const task = currentTask(working, target.taskId);
+          if (task.projectId !== command.projectId)
+            throw new ProjectWorkPolicyError("invalid-state", "Task belongs to another project");
+          if (task.revision !== target.expectedTaskRevision)
+            throw new ProjectWorkPolicyError("stale-revision", "Task revision is stale");
+          if (task.state === "completed" || task.state === "canceled")
+            throw new ProjectWorkPolicyError(
+              "invalid-state",
+              "Completed or canceled tasks cannot be linked by refinement",
+            );
+        }
+        record({
+          ...issue,
+          taskId: target.taskId,
+          revision: issue.revision + 1,
+          updatedAt: command.refinedAt,
+        });
+      }
+      return events;
+    }
     case "project-work.foundation.commit": {
       if (command.transition !== undefined)
         return decideProjectTeamGuidedTransition(
@@ -2228,12 +2321,10 @@ const reconcileTaskAttention = (
   const active = state.attention.find(
     (entry) => entry.taskId === taskId && entry.resolvedAt === undefined,
   );
-  // The projection table has one row per task. A newly active reason replaces
-  // a previously resolved row rather than leaving two rows for the same task.
-  if (desired !== undefined)
-    state.attention = state.attention.filter(
-      (entry) => entry.taskId !== taskId || entry.resolvedAt === undefined,
-    );
+  const previousRevision = state.attention.reduce(
+    (revision, entry) => (entry.taskId === taskId ? Math.max(revision, entry.revision) : revision),
+    -1,
+  );
   if (
     desired !== undefined &&
     active !== undefined &&
@@ -2251,15 +2342,57 @@ const reconcileTaskAttention = (
     );
   }
   if (desired !== undefined) {
-    state.attention = state.attention.filter(
-      (entry) => entry.taskId !== taskId || entry.resolvedAt === undefined,
-    );
+    // One projection row per task; reopening or changing the reason starts a
+    // new publication occurrence even when no task revision changed.
+    state.attention = state.attention.filter((entry) => entry.taskId !== taskId);
     const next: ProjectWorkAttention = {
       ...desired,
-      revision: desired.revision,
+      revision: Math.max(desired.revision, previousRevision + 1),
     };
     state.attention.push(next);
   }
+};
+
+const foundationAttentionTaskIds = (
+  state: ProjectWorkReducerState,
+  record: ProjectTeamRecord,
+): ReadonlySet<ProjectWorkTaskId> => {
+  const taskIds = new Set<ProjectWorkTaskId>();
+  const missionIds = new Set<string>();
+  const records = state.foundationRecords ?? [];
+  const collect = (entry: ProjectTeamRecord) => {
+    if (entry.projectId !== state.projectId) return;
+    if (entry.kind === "issue") {
+      if (entry.taskId !== undefined) taskIds.add(entry.taskId);
+      if (entry.missionId !== undefined) missionIds.add(entry.missionId);
+    } else if (entry.kind === "mission") {
+      missionIds.add(entry.recordId);
+      for (const taskId of entry.requiredTaskIds) taskIds.add(taskId);
+    } else if (entry.kind === "task-membership") taskIds.add(entry.taskId);
+  };
+  // Capture old edges before replacing the record, including detached/rebound
+  // issue links and tasks removed from a mission.
+  collect(record);
+  const old = records.find((entry) => entry.recordId === record.recordId);
+  if (old !== undefined) collect(old);
+  if (missionIds.size > 0)
+    for (const entry of records) {
+      if (entry.projectId !== state.projectId) continue;
+      if (entry.kind === "mission" && missionIds.has(entry.recordId))
+        for (const taskId of entry.requiredTaskIds) taskIds.add(taskId);
+      if (
+        entry.kind === "task-membership" &&
+        entry.status === "active" &&
+        entry.missionId !== undefined &&
+        missionIds.has(entry.missionId)
+      )
+        taskIds.add(entry.taskId);
+    }
+  if (taskIds.size === 0) return taskIds;
+  const localTaskIds = new Set(
+    state.tasks.filter((task) => task.projectId === state.projectId).map((task) => task.taskId),
+  );
+  return new Set([...taskIds].filter((taskId) => localTaskIds.has(taskId)));
 };
 
 const stateForReadiness = (
@@ -2328,12 +2461,14 @@ export function applyProjectWorkEvents(
     ];
     switch (event.type) {
       case "project-work.foundation.recorded": {
+        const taskIds = foundationAttentionTaskIds(next, event.record);
         next.foundationRecords = [
           ...(next.foundationRecords ?? []).filter(
             (entry) => entry.recordId !== event.record.recordId,
           ),
           event.record,
         ];
+        for (const taskId of taskIds) reconcileTaskAttention(next, taskId, event.occurredAt);
         break;
       }
       case "project-work.task.created":

@@ -252,6 +252,46 @@ function availability(available: boolean, reason?: string): ProjectWorkActionAva
   return available || reason === undefined ? { available } : { available, reason };
 }
 
+const closedIssueFor = (state: ProjectWorkState, task: ProjectWorkTask) => {
+  if (terminalStates.has(task.state)) return undefined;
+  const records = (state.foundationRecords ?? []).filter(
+    (record) => record.projectId === state.projectId,
+  );
+  const memberships = new Set(
+    records.flatMap((record) =>
+      record.kind === "task-membership" &&
+      record.status === "active" &&
+      record.taskId === task.taskId &&
+      record.missionId !== undefined
+        ? [record.missionId]
+        : [],
+    ),
+  );
+  const missions = new Set(
+    records.flatMap((record) =>
+      record.kind === "mission" &&
+      record.status !== "completed" &&
+      record.status !== "canceled" &&
+      (record.requiredTaskIds.includes(task.taskId) || memberships.has(record.recordId))
+        ? [record.recordId]
+        : [],
+    ),
+  );
+  let recordId: string | undefined;
+  for (const record of records) {
+    if (
+      record.kind === "issue" &&
+      record.status === "closed" &&
+      (record.taskId === task.taskId ||
+        (record.missionId !== undefined && missions.has(record.missionId))) &&
+      (recordId === undefined || record.recordId < recordId)
+    ) {
+      recordId = record.recordId;
+    }
+  }
+  return recordId;
+};
+
 function attentionFor(
   state: ProjectWorkState,
   task: ProjectWorkTask,
@@ -266,6 +306,11 @@ function attentionFor(
       revision: task.revision,
     });
   };
+  // Only one reason is persisted per task. Closure stays visible without changing
+  // execution authority; a stable bounded identity avoids notices for body edits.
+  const closedIssue = closedIssueFor(state, task);
+  if (closedIssue !== undefined)
+    add("external-issue-closed", `Linked issue '${closedIssue}' is closed.`);
   if (task.state === "blocked") add("blocked", task.blockerId);
   if (task.state === "failed") add("failed", task.failureKind);
   if (task.state === "in-review") add("needs-review");

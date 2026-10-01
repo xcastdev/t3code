@@ -96,6 +96,7 @@ const Lease = Schema.Struct({
 const Input = Schema.Struct({
   request: Request,
   lease: Lease,
+  nextSweepDelayMs: Schema.optionalKey(Positive.check(Schema.isLessThanOrEqualTo(3_600_000))),
   sentEtag: Schema.optionalKey(Etag),
   response: Schema.Union([
     Schema.Struct({
@@ -180,6 +181,7 @@ export const commitIssueRepositoryPage = Effect.fn("commitIssueRepositoryPage")(
     readonly lease: IssueRepositoryLease;
     readonly response: unknown;
     readonly sentEtag?: string;
+    readonly nextSweepDelayMs?: number;
   },
 ) {
   const validated = yield* decodeInput(input).pipe(Effect.mapError(() => fail("invalid-input")));
@@ -337,6 +339,9 @@ export const commitIssueRepositoryPage = Effect.fn("commitIssueRepositoryPage")(
           },
         };
       }),
+    validated.nextSweepDelayMs === undefined
+      ? undefined
+      : { nextSweepDelayMs: validated.nextSweepDelayMs },
   );
   // Neither a page sequence nor a project receipt is observable until the outer commit returns.
   return { ...result, ...(result.accepted && page !== undefined ? { page } : {}) };
