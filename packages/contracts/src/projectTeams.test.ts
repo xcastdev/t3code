@@ -116,8 +116,8 @@ describe("guided contract preparation", () => {
     expect(() => decodeGuided({ ...investigation, expectedIssueRevision: 0 })).toThrow();
   });
 
-  it("keeps unwired guided intents outside the public write union", () => {
-    expect(() => decodePublicWrite(investigation)).toThrow();
+  it("accepts the bounded public intent without caller-created authority", () => {
+    expect(decodePublicWrite(investigation)).toEqual(investigation);
   });
 
   it("retains the nonempty raw foundation invariant", () => {
@@ -228,5 +228,32 @@ describe("guided contract preparation", () => {
       decodeEvidence({ ...evidence, outputArtifactIds: Array(65).fill("artifact") }),
     ).toThrow();
     expect(() => decodeEvidence({ ...evidence, scopeHash: " " })).toThrow();
+  });
+
+  it("bounds retained findings by UTF-8 bytes across all declared outputs", () => {
+    const report = {
+      commandId: "report",
+      projectId: "project",
+      taskId: "task",
+      expectedRevision: 0,
+      expectedTaskRevision: 0,
+      type: "project-team.assignment.report",
+      specRevision: 1,
+      planRevision: 0,
+      assignmentId: "assignment",
+      expectedAssignmentRevision: 0,
+      summary: "Findings",
+      evidenceIds: [],
+      outputArtifactIds: [],
+      outcome: "findings",
+    };
+    const outputs = [0, 1, 2].map((index) => ({
+      criterionId: "criterion-" + index,
+      kind: "observation",
+      detail: "é".repeat(24_000),
+    }));
+    expect(decodeGuided({ ...report, outputs: outputs.slice(0, 2) }).type).toBe(report.type);
+    expect(() => decodeGuided({ ...report, outputs })).toThrow();
+    expect(() => decodeGuided({ ...report, outputs: [{ ...outputs[0], detail: " " }] })).toThrow();
   });
 });

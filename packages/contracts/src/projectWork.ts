@@ -3,6 +3,7 @@ import {
   ProjectTeamRecordRead,
   ProjectTeamWriteIntent,
   ProjectTeamRunBinding,
+  ProjectTeamDeliverableKind,
 } from "./projectTeams.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -683,6 +684,7 @@ export const ProjectWorkTaskCreateCommand = Schema.Struct({
   taskId: ProjectWorkTaskId,
   title: TrimmedNonEmptyString,
   summary: Schema.optionalKey(ProjectWorkSummary),
+  deliverableKind: Schema.optionalKey(ProjectTeamDeliverableKind),
   createdAt: IsoDateTime,
 });
 
@@ -1103,6 +1105,14 @@ export const ProjectWorkAttentionSeenCommand = Schema.Struct({
 const GuidedText = TrimmedNonEmptyString.check(Schema.isMaxLength(4_000));
 const GuidedBody = TrimmedNonEmptyString.check(Schema.isMaxLength(32_000));
 const GuidedId = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
+const utf8Length = (value: string) => {
+  let bytes = 0;
+  for (const character of value) {
+    const code = character.codePointAt(0)!;
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+};
 const GuidedFields = {
   commandId: CommandId,
   projectId: ProjectId,
@@ -1197,8 +1207,29 @@ export const ProjectTeamGuidedIntent = Schema.Union([
     summary: GuidedBody,
     evidenceIds: Schema.Array(GuidedId).check(Schema.isMaxLength(64)),
     outputArtifactIds: Schema.Array(GuidedId).check(Schema.isMaxLength(64)),
+    outputs: Schema.optionalKey(
+      Schema.Array(
+        Schema.Struct({
+          criterionId: ProjectWorkCriterionId,
+          detail: GuidedBody,
+          summary: Schema.optionalKey(GuidedText),
+          kind: Schema.Literals(["observation", "artifact"]),
+        }),
+      ).check(Schema.isMaxLength(64)),
+    ),
     outcome: Schema.Literals(["findings", "review-ready", "complete"]),
-  }),
+  }).check(
+    Schema.makeFilter(
+      (input) =>
+        utf8Length(input.summary) +
+          (input.outputs ?? []).reduce(
+            (total, output) => total + utf8Length(output.detail) + utf8Length(output.summary ?? ""),
+            0,
+          ) <=
+        131_072,
+      { message: "Retained report content exceeds its 128 KiB byte limit" },
+    ),
+  ),
   Schema.Struct({
     ...GuidedFields,
     type: Schema.Literal("project-team.repair.resolve"),
@@ -1235,6 +1266,21 @@ export const ProjectWorkTeamTransition = Schema.Union([
     expectedGateRevision: NonNegativeInt,
     claim: ProjectWorkTaskClaimCommand,
     binding: ProjectTeamRunBinding,
+    repair: Schema.optionalKey(
+      Schema.Struct({
+        episodeId: GuidedId,
+        expectedEpisodeRevision: NonNegativeInt,
+        exceptionGateId: Schema.optionalKey(GuidedId),
+        expectedExceptionGateRevision: Schema.optionalKey(NonNegativeInt),
+      }).check(
+        Schema.makeFilter(
+          (input) =>
+            (input.exceptionGateId === undefined) ===
+            (input.expectedExceptionGateRevision === undefined),
+          { message: "An exception gate requires its expected revision" },
+        ),
+      ),
+    ),
   }),
   Schema.Struct({
     kind: Schema.Literal("failure"),
@@ -1332,7 +1378,11 @@ export const ProjectWorkCommand = Schema.Union([
 export type ProjectWorkCommand = typeof ProjectWorkCommand.Type;
 
 /** Names used by RPC and MCP adapters when referring to the command union. */
-export const ProjectWorkWriteIntent = Schema.Union([ProjectWorkCommand, ProjectTeamWriteIntent]);
+export const ProjectWorkWriteIntent = Schema.Union([
+  ProjectWorkCommand,
+  ProjectTeamWriteIntent,
+  ProjectTeamGuidedIntent,
+]);
 export type ProjectWorkWriteIntent = typeof ProjectWorkWriteIntent.Type;
 
 export const ProjectWorkReadRecord = Schema.Union([
