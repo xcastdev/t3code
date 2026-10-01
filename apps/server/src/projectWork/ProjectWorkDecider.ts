@@ -1,5 +1,8 @@
 import type { ProjectTeamRecord } from "@t3tools/contracts";
 import { validateProjectTeamRecord } from "./ProjectTeamFoundationRecords.ts";
+import { decideProjectTeamGuidedLifecycle } from "./ProjectTeamGuidedLifecycle.ts";
+import { decideProjectTeamGuidedTransition } from "./ProjectTeamGuidedTransitions.ts";
+import { isGuidedProjectTeamTask, projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
 import {
   EventId,
   ProjectWorkAttemptId,
@@ -193,7 +196,7 @@ export type ProjectWorkEvent =
       readonly type: "project-work.task.reopened";
       readonly taskId: ProjectWorkTaskId;
       readonly reopenedAt: string;
-      readonly state: Extract<ProjectWorkTaskState, "specified" | "ready">;
+      readonly state: Extract<ProjectWorkTaskState, "draft" | "specified" | "ready">;
     })
   | (EventBase & {
       readonly type: "project-work.task.canceled";
@@ -574,7 +577,6 @@ const withEventMetadata = (
 export function decideProjectWorkCommand(
   state: ProjectWorkState,
   command: ProjectWorkCommand,
-  internalFoundation = false,
 ): ReadonlyArray<ProjectWorkEvent> {
   // Keep the pre-P4 direct-decider contract deterministic for un-attributed
   // legacy callers. Repository callers supply attribution for lifecycle
@@ -597,11 +599,86 @@ export function decideProjectWorkCommand(
   const event = <T extends EventDraft>(draft: T, index = 0): ProjectWorkEvent =>
     withEventMetadata(commandId, state.projectId, state.revision + index + 1, index, draft);
 
+  if (command.type !== "project-work.foundation.commit") {
+    const allowed = new Set([
+      "project-work.task.watch",
+      "project-work.task.unwatch",
+      "project-work.evidence.add",
+      "project-work.comment.add",
+      "project-work.attention.seen",
+      "project-work.attempt.renew",
+      "project-work.attempt.checkpoint",
+      "project-work.attempt.expire",
+    ]);
+    const targets =
+      "taskId" in command
+        ? [command.taskId]
+        : command.type === "project-work.relationship.link"
+          ? [command.relationship.fromTaskId, command.relationship.toTaskId]
+          : command.type === "project-work.relationship.unlink"
+            ? state.relationships
+                .filter((r) => r.relationshipId === command.relationshipId)
+                .flatMap((r) => [r.fromTaskId, r.toTaskId])
+            : [];
+    if (
+      !allowed.has(command.type) &&
+      targets.some((taskId) => isGuidedProjectTeamTask(state, taskId))
+    )
+      throw new ProjectWorkPolicyError(
+        "authority-required",
+        "Managed lifecycle requires an authenticated guided transition",
+      );
+    if (
+      (command.type === "project-work.attempt.renew" ||
+        command.type === "project-work.attempt.checkpoint") &&
+      isGuidedProjectTeamTask(state, command.taskId)
+    ) {
+      const bindings = (state.foundationRecords ?? []).filter(
+        (r) =>
+          r.kind === "run-binding" &&
+          r.taskId === command.taskId &&
+          r.attemptId === command.attemptId,
+      );
+      if (bindings.length !== 1 || bindings[0]?.status !== "running")
+        throw new ProjectWorkPolicyError(
+          "authority-required",
+          "Managed run is stopped or no longer current",
+        );
+    }
+  }
+
   switch (command.type) {
     case "project-work.foundation.commit": {
+      if (command.transition !== undefined)
+        return decideProjectTeamGuidedTransition(
+          mutableState(state),
+          command,
+          event,
+          applyProjectWorkEvents,
+        );
+      if (command.guided !== undefined)
+        return decideProjectTeamGuidedLifecycle(
+          mutableState(state),
+          command,
+          event,
+          applyProjectWorkEvents,
+        );
       let working = mutableState(state);
       const events: Array<ProjectWorkEvent> = [];
       if (command.claim !== undefined) {
+        if (
+          command.records.some(
+            (r) =>
+              (r.kind === "task-membership" &&
+                r.taskId === command.claim!.taskId &&
+                r.executionKind === "managed") ||
+              (r.kind === "run-binding" && r.taskId === command.claim!.taskId),
+          )
+        )
+          throw new ProjectWorkPolicyError(
+            "authority-required",
+            "Managed claim requires an exact grant transition",
+          );
         if (
           command.claim.projectId !== command.projectId ||
           command.claim.commandId !== command.commandId
@@ -610,12 +687,26 @@ export function decideProjectWorkCommand(
             "invalid-state",
             "Atomic claim must use the enclosing command identity",
           );
-        const claimed = decideProjectWorkCommand(working, command.claim, true);
+        const claimed = decideProjectWorkCommand(working, command.claim);
         events.push(...claimed);
         working = applyProjectWorkEvents(working, claimed);
       }
       const seen = new Set<string>();
       for (const input of command.records) {
+        if (
+          (input.kind === "gate" && input.status === "consumed") ||
+          (input.kind === "run-binding" &&
+            input.status === "settled" &&
+            working.foundationRecords?.find((r) => r.recordId === input.recordId)?.status !==
+              "settled") ||
+          (input.kind === "run-binding" &&
+            (input.status === "reserved" || input.status === "running") &&
+            !working.foundationRecords?.some((r) => r.recordId === input.recordId))
+        )
+          throw new ProjectWorkPolicyError(
+            "authority-required",
+            "Managed grant consumption and run creation require a typed transition",
+          );
         if (seen.has(input.recordId))
           throw new ProjectWorkPolicyError(
             "duplicate-record",
@@ -629,6 +720,50 @@ export function decideProjectWorkCommand(
         );
         events.push(recorded);
         working = applyProjectWorkEvents(working, [recorded]);
+        if (record.kind === "evidence-applicability" && record.status === "current") {
+          const moved = (working.foundationRecords ?? []).filter(
+            (r) =>
+              r.kind === "evidence-applicability" &&
+              r.taskId === record.taskId &&
+              r.recordId !== record.recordId &&
+              r.status === "current" &&
+              (r.baseSha !== record.baseSha || r.headSha !== record.headSha),
+          );
+          if (moved.length > 0) {
+            const affected = (working.foundationRecords ?? []).filter(
+              (r) =>
+                moved.some((old) => old.recordId === r.recordId) ||
+                (r.kind === "gate" &&
+                  r.taskId === record.taskId &&
+                  r.gate === "merge" &&
+                  r.status !== "invalidated"),
+            );
+            for (const old of affected) {
+              if (old.kind !== "gate" && old.kind !== "evidence-applicability") continue;
+              const changed = validateProjectTeamRecord(
+                working,
+                {
+                  ...(old.kind === "gate"
+                    ? { ...old, status: "invalidated" as const }
+                    : { ...old, status: "stale" as const }),
+                  revision: old.revision + 1,
+                  updatedAt: command.committedAt,
+                },
+                command.attribution,
+              );
+              const next = event(
+                {
+                  type: "project-work.foundation.recorded",
+                  record: changed,
+                  occurredAt: command.committedAt,
+                },
+                events.length,
+              );
+              events.push(next);
+              working = applyProjectWorkEvents(working, [next]);
+            }
+          }
+        }
       }
       return events;
     }
@@ -651,7 +786,41 @@ export function decideProjectWorkCommand(
         updatedAt: command.createdAt,
         ...(command.attribution === undefined ? {} : { attribution: command.attribution }),
       };
-      return [event({ type: "project-work.task.created", task, occurredAt: command.createdAt })];
+      const created = event({
+        type: "project-work.task.created",
+        task,
+        occurredAt: command.createdAt,
+      });
+      if (command.deliverableKind === undefined) return [created];
+      if (command.attribution?.actor.kind !== "human")
+        throw new ProjectWorkPolicyError(
+          "authority-required",
+          "Guided deliverable capture requires authenticated human attribution",
+        );
+      const record = validateProjectTeamRecord(
+        applyProjectWorkEvents(state, [created]),
+        {
+          recordId: projectTeamDerivedRecordId(command.commandId, "membership"),
+          kind: "task-membership",
+          projectId: command.projectId,
+          taskId: task.taskId,
+          deliverableKind: command.deliverableKind,
+          executionKind: command.deliverableKind === "code" ? "managed" : "human",
+          status: "active",
+          controlState: "active",
+          revision: 0,
+          generation: 0,
+          updatedAt: command.createdAt,
+        },
+        command.attribution,
+      );
+      return [
+        created,
+        event(
+          { type: "project-work.foundation.recorded", record, occurredAt: command.createdAt },
+          1,
+        ),
+      ];
     }
     case "project-work.task.specify": {
       const task = currentTask(state, command.taskId);
@@ -877,16 +1046,7 @@ export function decideProjectWorkCommand(
       ];
     }
     case "project-work.task.claim": {
-      if (
-        !internalFoundation &&
-        ((state as ProjectWorkReducerState).foundationRecords ?? []).some(
-          (record) =>
-            record.kind === "task-membership" &&
-            record.taskId === command.taskId &&
-            record.executionKind === "managed" &&
-            record.status === "active",
-        )
-      )
+      if (isGuidedProjectTeamTask(state, command.taskId))
         throw new ProjectWorkPolicyError(
           "authority-required",
           "Managed tasks require server-created run authority",
@@ -1568,7 +1728,7 @@ export function decideProjectWorkCommand(
         throw new ProjectWorkPolicyError("invalid-state", "The attempt lease has not expired.", {
           attemptId: command.attemptId,
         });
-      return [
+      const expiredEvents = [
         event({
           type: "project-work.attempt.expired",
           taskId: command.taskId,
@@ -1579,6 +1739,56 @@ export function decideProjectWorkCommand(
           occurredAt: command.expiredAt,
         }),
       ];
+      if (isGuidedProjectTeamTask(state, command.taskId)) {
+        let working = applyProjectWorkEvents(state, expiredEvents);
+        const at = command.expiredAt;
+        const origin = command.attribution ?? {
+          actor: { kind: "system" as const, id: "project-work-lease" },
+          source: { kind: "system" as const, id: "project-work-lease" },
+          recordedAt: at,
+        };
+        for (const run of state.foundationRecords ?? []) {
+          if (
+            run.kind !== "run-binding" ||
+            run.taskId !== command.taskId ||
+            run.attemptId !== command.attemptId ||
+            run.status === "settled"
+          )
+            continue;
+          const append = (input: ProjectTeamRecord) => {
+            const record = validateProjectTeamRecord(working, input, origin);
+            const next = event(
+              { type: "project-work.foundation.recorded", record, occurredAt: at },
+              expiredEvents.length,
+            );
+            expiredEvents.push(next);
+            working = applyProjectWorkEvents(working, [next]);
+          };
+          append({ ...run, status: "quarantined", revision: run.revision + 1, updatedAt: at });
+          append({
+            recordId: projectTeamDerivedRecordId(command.commandId, `lease-stop:${run.recordId}`),
+            projectId: command.projectId,
+            kind: "effect",
+            status: "pending",
+            revision: 0,
+            generation: 0,
+            updatedAt: at,
+            effectId: projectTeamDerivedRecordId(command.commandId, `lease-stop:${run.recordId}`),
+            effectKind: "stop",
+            taskId: run.taskId,
+            runId: run.recordId,
+            targetId: run.recordId,
+            payload: {
+              recordIds: [run.recordId],
+              expectedRevision: run.revision,
+              summary: command.reason,
+            },
+            claimGeneration: run.generation,
+            availableAt: at,
+          });
+        }
+      }
+      return expiredEvents;
     }
     case "project-work.attempt.reclaim": {
       const task = currentTask(state, command.taskId);

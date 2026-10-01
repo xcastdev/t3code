@@ -7,6 +7,7 @@ import {
 import * as Schema from "effect/Schema";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
+import { projectTeamSpecificationHash, projectTeamPlanHash } from "./ProjectTeamPolicy.ts";
 
 const decodeTeamRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
 const reject = (message: string): never => {
@@ -15,7 +16,11 @@ const reject = (message: string): never => {
 const stable = (record: TeamRecord) => {
   const mutable = new Set(["status", "revision", "generation", "updatedAt"]);
   if (record.kind === "run-binding") mutable.add("sessionId");
-  if (record.kind === "gate") mutable.add("attribution");
+  if (record.kind === "gate") {
+    mutable.add("attribution");
+    mutable.add("consumedByRunId");
+    mutable.add("consumedByCommandId");
+  }
   if (record.kind === "message") {
     mutable.add("deliveryGeneration");
     mutable.add("deliveryCursor");
@@ -44,6 +49,11 @@ export const validateProjectTeamRecord = (
   state: ProjectWorkReducerState,
   input: TeamRecord,
   origin: ProjectWorkAttribution,
+  consumption?: {
+    readonly runId: string;
+    readonly commandId: string;
+    readonly inheritedGateId?: string;
+  },
 ): TeamRecord => {
   const r = decodeTeamRecord(input);
   const records = state.foundationRecords ?? [];
@@ -97,9 +107,36 @@ export const validateProjectTeamRecord = (
         reject("Mission requires unique known tasks");
       break;
     case "task-membership":
+      if (
+        records.some(
+          (entry) =>
+            entry.kind === "task-membership" &&
+            entry.taskId === r.taskId &&
+            entry.recordId !== r.recordId,
+        )
+      )
+        reject("Task already has a durable membership");
+      if (
+        old?.kind === "task-membership" &&
+        (old.taskId !== r.taskId ||
+          old.executionKind !== r.executionKind ||
+          old.deliverableKind !== r.deliverableKind ||
+          old.parentTaskId !== r.parentTaskId)
+      )
+        reject("Task classification and lineage are immutable");
       if (r.missionId !== undefined) requireRecord(r.missionId, "mission");
       if (r.parentTaskId !== undefined && !state.tasks.some((t) => t.taskId === r.parentTaskId))
         reject("Unknown parent task");
+      if (r.parentTaskId === r.taskId) reject("Task cannot be its own parent");
+      if (r.assignment !== undefined) {
+        const grant = requireRecord(r.assignment.authorizationGateId, "gate");
+        if (
+          grant.kind !== "gate" ||
+          grant.taskId !== r.taskId ||
+          (grant.gate !== "investigation" && grant.gate !== "execution" && grant.gate !== "repair")
+        )
+          reject("Assignment requires its exact task grant");
+      }
       break;
     case "member":
       requireRecord(r.roleRevisionId, "role-revision");
@@ -117,6 +154,16 @@ export const validateProjectTeamRecord = (
         reject("Project already has a live coordinator");
       break;
     case "run-binding": {
+      if (
+        old?.kind === "run-binding" &&
+        old.status !== r.status &&
+        (old.status === "stopping" ||
+          old.status === "quarantined" ||
+          old.status === "revoked" ||
+          old.status === "settled") &&
+        (r.status === "running" || r.status === "reserved")
+      )
+        reject("Stopped run cannot regain writable authority");
       if (
         old?.kind === "run-binding" &&
         old.sessionId !== undefined &&
@@ -144,7 +191,36 @@ export const validateProjectTeamRecord = (
       if (r.dependencyTaskIds.some((id) => !state.tasks.some((t) => t.taskId === id)))
         reject("Unknown plan dependency");
       break;
-    case "gate":
+    case "gate": {
+      if (
+        old?.kind === "gate" &&
+        ((old.status === "consumed" && r.status !== "consumed" && r.status !== "invalidated") ||
+          (old.status === "invalidated" && r.status !== "invalidated"))
+      )
+        reject("Consumed or invalidated grant cannot be reapproved");
+      if (
+        r.status === "consumed" &&
+        (r.consumedByRunId === undefined || r.consumedByCommandId === undefined)
+      )
+        reject("Consumed grant requires exact run and command ownership");
+      const inherited =
+        consumption?.inheritedGateId === undefined
+          ? undefined
+          : records.find(
+              (entry) => entry.kind === "gate" && entry.recordId === consumption.inheritedGateId,
+            );
+      const inheritedConsumption =
+        old === undefined &&
+        r.status === "consumed" &&
+        inherited?.kind === "gate" &&
+        inherited.taskId === r.taskId &&
+        inherited.projectId === r.projectId &&
+        (inherited.status === "approved" || inherited.status === "consumed") &&
+        inherited.attribution.actor.kind === "human" &&
+        canonicalProjectWorkPayload(inherited.attribution) ===
+          canonicalProjectWorkPayload(r.attribution) &&
+        consumption?.runId === r.consumedByRunId &&
+        consumption?.commandId === r.consumedByCommandId;
       if (old?.kind === "gate") {
         if (stable(old) !== stable(r)) reject("Gate target revision cannot change");
         if (
@@ -156,9 +232,46 @@ export const validateProjectTeamRecord = (
       }
       if (
         (r.status === "approved" || r.status === "rejected" || r.status === "consumed") &&
-        (origin.actor.kind !== "human" || r.attribution.actor.kind !== "human")
+        ((origin.actor.kind !== "human" &&
+          !inheritedConsumption &&
+          !(
+            r.status === "consumed" &&
+            old?.kind === "gate" &&
+            old.status === "approved" &&
+            consumption?.runId === r.consumedByRunId &&
+            consumption?.commandId === r.consumedByCommandId
+          )) ||
+          r.attribution.actor.kind !== "human")
       )
         reject("Approval gate requires human attribution");
+      if (
+        old?.kind === "gate" &&
+        old.status === "consumed" &&
+        (r.consumedByRunId !== old.consumedByRunId ||
+          r.consumedByCommandId !== old.consumedByCommandId)
+      )
+        reject("Consumed grant ownership is immutable");
+      if (
+        r.status === "approved" &&
+        r.gate === "specification" &&
+        r.contentHash !== projectTeamSpecificationHash(state, r.taskId)
+      )
+        reject("Specification approval target is stale");
+      if (
+        r.status === "approved" &&
+        r.gate === "plan" &&
+        !records.some(
+          (entry) =>
+            entry.kind === "plan-revision" &&
+            entry.taskId === r.taskId &&
+            entry.status === "proposed" &&
+            entry.specRevision === r.specRevision &&
+            entry.planRevision === r.planRevision &&
+            entry.contentHash === r.contentHash &&
+            projectTeamPlanHash(entry) === r.contentHash,
+        )
+      )
+        reject("Plan approval target is stale");
       if (
         r.gate === "merge" &&
         (r.repository === undefined ||
@@ -169,6 +282,7 @@ export const validateProjectTeamRecord = (
       )
         reject("Merge gate requires exact remote revision and method");
       break;
+    }
     case "message":
       if (old?.kind === "message" && stable(old) !== stable(r))
         reject("Message identity and semantic envelope are immutable");
@@ -198,11 +312,35 @@ export const validateProjectTeamRecord = (
       if (
         old?.kind === "repair-episode" &&
         (r.allowance !== old.allowance ||
+          r.rootTaskId !== old.rootTaskId ||
+          r.failureFingerprint !== old.failureFingerprint ||
+          old.attemptIds.some((id) => !r.attemptIds.includes(id)) ||
           r.semanticRepairs < old.semanticRepairs ||
           r.transportRetries < old.transportRetries ||
           r.timeoutCount < old.timeoutCount)
       )
         reject("Repair episode limits cannot reset");
+      if (
+        r.rootTaskId !== undefined &&
+        records.some(
+          (entry) =>
+            entry.kind === "repair-episode" &&
+            entry.recordId !== r.recordId &&
+            entry.rootTaskId === r.rootTaskId &&
+            entry.failureFingerprint === r.failureFingerprint,
+        )
+      )
+        reject("Canonical failure already has a persistent repair episode");
+      break;
+    case "evidence-applicability":
+      if (old?.kind === "evidence-applicability" && stable(old) !== stable(r))
+        reject("Evidence applicability retains its original tested revision and payload");
+      if (
+        old?.kind === "evidence-applicability" &&
+        old.status !== "current" &&
+        r.status === "current"
+      )
+        reject("Stale evidence cannot be blessed for a later revision");
       break;
     case "reservation": {
       if (

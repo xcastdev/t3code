@@ -11,6 +11,7 @@ import {
   CommandId,
   type ProjectWorkAttribution,
   type ProjectWorkCommand,
+  type ProjectTeamGuidedIntent,
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -25,6 +26,7 @@ import { ProjectWorkRepository, ProjectWorkRepositoryLive } from "./ProjectWorkR
 import { ProjectWorkQuery, ProjectWorkQueryLive } from "./ProjectWorkQuery.ts";
 import { ProjectWorkProjection, ProjectWorkProjectionLive } from "./ProjectWorkProjection.ts";
 import { ProjectWorkSearch, ProjectWorkSearchLive } from "./ProjectWorkSearch.ts";
+import { applyProjectWorkEvents, emptyProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 
 const projectId = ProjectId.make("project-repository");
 const taskId = ProjectWorkTaskId.make("task-repository-append");
@@ -33,6 +35,167 @@ const at = "2026-01-01T00:00:00.000Z";
 const layer = it.layer(Layer.fresh(Layer.mergeAll(NodeSqliteClient.layerMemory())));
 
 layer("ProjectWorkRepository", (it) => {
+  it.effect(
+    "guided investigation rolls back every generated record and receipt, then commits once",
+    () =>
+      Effect.gen(function* () {
+        yield* runMigrations();
+        yield* runForkMigrations();
+        const repository = yield* ProjectWorkRepository;
+        const sql = yield* SqlClient.SqlClient;
+        const p = ProjectId.make("guided-atomic-sql");
+        const t = ProjectWorkTaskId.make("guided-parent-sql");
+        const human = {
+          actor: { kind: "human" as const, id: "maintainer" },
+          source: { kind: "web" as const, id: "sql-client" },
+          recordedAt: at,
+        };
+        yield* repository.execute({
+          type: "project-work.task.create",
+          projectId: p,
+          taskId: t,
+          commandId: CommandId.make("guided-capture-sql"),
+          title: "Unspecified capture",
+          createdAt: at,
+        });
+        const current = applyProjectWorkEvents(
+          emptyProjectWorkReducerState(p),
+          yield* repository.replay(p),
+        );
+        const intent: ProjectTeamGuidedIntent = {
+          type: "project-team.investigation.start",
+          projectId: p,
+          taskId: t,
+          commandId: CommandId.make("guided-investigate-sql"),
+          expectedRevision: current.revision,
+          expectedTaskRevision: 0,
+          objective: "Find the cause",
+          outputDescriptions: ["Retained findings"],
+        };
+        const command: ProjectWorkCommand = {
+          type: "project-work.foundation.commit",
+          projectId: p,
+          commandId: intent.commandId,
+          expectedRevision: current.revision,
+          attribution: human,
+          records: [],
+          guided: { intent },
+          committedAt: at,
+        };
+        yield* sql`CREATE TRIGGER p4_reject_generated_role BEFORE INSERT ON project_team_role_revision WHEN NEW.project_id='guided-atomic-sql' BEGIN SELECT RAISE(ABORT,'P4 rollback proof'); END`;
+        expect((yield* repository.execute(command).pipe(Effect.result))._tag).toBe("Failure");
+        expect(
+          (yield* sql`SELECT record_id FROM project_team_gate WHERE project_id=${p}`).length,
+        ).toBe(0);
+        expect(
+          (yield* sql`SELECT command_id FROM project_work_command_receipts WHERE project_id=${p} AND command_id=${intent.commandId}`)
+            .length,
+        ).toBe(0);
+        expect((yield* repository.replay(p)).length).toBe(1);
+        yield* sql`DROP TRIGGER p4_reject_generated_role`;
+        const result = yield* repository.execute(command);
+        const duplicate = yield* repository.execute(command);
+        expect(duplicate.duplicate).toBe(true);
+        expect(duplicate.writeResult).toEqual(result.writeResult);
+        const state = applyProjectWorkEvents(
+          emptyProjectWorkReducerState(p),
+          yield* repository.replay(p),
+        );
+        expect(state.tasks).toHaveLength(2);
+        expect(state.attempts).toEqual([]);
+        expect(state.tasks.find((entry) => entry.taskId === t)).toMatchObject({
+          state: "draft",
+          revision: 0,
+          specRevision: 0,
+        });
+        expect(
+          (yield* sql`SELECT record_id FROM project_team_gate WHERE project_id=${p}`).length,
+        ).toBe(1);
+        const childMembership = state.foundationRecords!.find(
+          (r) => r.kind === "task-membership" && r.parentTaskId === t,
+        )!;
+        yield* repository.execute({
+          type: "project-work.foundation.commit",
+          projectId: p,
+          commandId: CommandId.make("guided-pause-sql"),
+          expectedRevision: state.revision,
+          attribution: human,
+          records: [],
+          committedAt: at,
+          guided: {
+            intent: {
+              type: "project-team.task.control",
+              projectId: p,
+              taskId: ProjectWorkTaskId.make(
+                "taskId" in childMembership ? childMembership.taskId! : "missing",
+              ),
+              commandId: CommandId.make("guided-pause-sql"),
+              expectedRevision: state.revision,
+              expectedTaskRevision: state.tasks.find((entry) => entry.taskId !== t)!.revision,
+              control: { action: "pause", reason: "Human stops research" },
+            },
+          },
+        });
+        expect((yield* repository.execute(command).pipe(Effect.result))._tag).toBe("Failure");
+      }).pipe(Effect.provide(ProjectWorkRepositoryLive)),
+  );
+
+  it.effect("concurrent human investigation requests with one revision have one SQL winner", () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      yield* runForkMigrations();
+      const repository = yield* ProjectWorkRepository;
+      const p = ProjectId.make("guided-race-sql");
+      const t = ProjectWorkTaskId.make("guided-race-parent");
+      yield* repository.execute({
+        type: "project-work.task.create",
+        projectId: p,
+        taskId: t,
+        commandId: CommandId.make("guided-race-capture"),
+        title: "Capture",
+        createdAt: at,
+      });
+      const commands = ["first", "second"].map((suffix): ProjectWorkCommand => ({
+        type: "project-work.foundation.commit",
+        projectId: p,
+        commandId: CommandId.make(`guided-race-${suffix}`),
+        expectedRevision: 1,
+        records: [],
+        committedAt: at,
+        attribution: {
+          actor: { kind: "human", id: `device-${suffix}` },
+          source: { kind: "web", id: suffix },
+          recordedAt: at,
+        },
+        guided: {
+          intent: {
+            type: "project-team.investigation.start",
+            projectId: p,
+            taskId: t,
+            commandId: CommandId.make(`guided-race-${suffix}`),
+            expectedRevision: 1,
+            expectedTaskRevision: 0,
+            objective: "Investigate",
+            outputDescriptions: ["Findings"],
+          },
+        },
+      }));
+      const results = yield* Effect.forEach(
+        commands,
+        (command) => repository.execute(command).pipe(Effect.result),
+        { concurrency: "unbounded" },
+      );
+      expect(results.filter((result) => result._tag === "Success")).toHaveLength(1);
+      const state = applyProjectWorkEvents(
+        emptyProjectWorkReducerState(p),
+        yield* repository.replay(p),
+      );
+      expect(state.tasks).toHaveLength(2);
+      expect(
+        state.foundationRecords!.filter((r) => r.kind === "gate" && r.gate === "investigation"),
+      ).toHaveLength(1);
+    }).pipe(Effect.provide(ProjectWorkRepositoryLive)),
+  );
   it.effect(
     "revalidates live authority before duplicate receipts without consuming approval twice",
     () =>
@@ -746,6 +909,134 @@ const insertBindingSession = Effect.fn("repositoryTest.insertBindingSession")(fu
   yield* sql`INSERT INTO auth_sessions (session_id,subject,scopes,method,issued_at,expires_at)
     VALUES (${id},${subject},'[]','bearer-access-token',${at},'2030-01-01T00:00:00.000Z')`;
 });
+
+it.effect(
+  "guided assignment and retained outputs survive file-backed restart and projection rebuild",
+  () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const directory = yield* fs.makeTempDirectoryScoped({ prefix: "t3-p4-guided-restart-" });
+      const database = () =>
+        Layer.fresh(NodeSqliteClient.layer({ filename: path.join(directory, "state.sqlite") }));
+      const p = ProjectId.make("guided-restart");
+      const t = ProjectWorkTaskId.make("guided-restart-parent");
+      const human = {
+        actor: { kind: "human" as const, id: "maintainer" },
+        source: { kind: "web" as const, id: "restart-client" },
+        recordedAt: at,
+      };
+      const services = Layer.mergeAll(ProjectWorkRepositoryLive, ProjectWorkProjectionLive);
+      const before = yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* runMigrations();
+          yield* runForkMigrations();
+          const repository = yield* ProjectWorkRepository;
+          yield* repository.execute({
+            type: "project-work.task.create",
+            projectId: p,
+            taskId: t,
+            commandId: CommandId.make("restart-capture"),
+            title: "Captured issue",
+            createdAt: at,
+          });
+          yield* repository.execute({
+            type: "project-work.foundation.commit",
+            projectId: p,
+            commandId: CommandId.make("restart-investigation"),
+            expectedRevision: 1,
+            attribution: human,
+            records: [],
+            committedAt: at,
+            guided: {
+              intent: {
+                type: "project-team.investigation.start",
+                projectId: p,
+                taskId: t,
+                commandId: CommandId.make("restart-investigation"),
+                expectedRevision: 1,
+                expectedTaskRevision: 0,
+                objective: "Bounded research",
+                outputDescriptions: ["Retained source findings"],
+              },
+            },
+          });
+          let state = applyProjectWorkEvents(
+            emptyProjectWorkReducerState(p),
+            yield* repository.replay(p),
+          );
+          const child = state.tasks.find((task) => task.taskId !== t)!;
+          const assignment = state.foundationRecords!.find(
+            (r) => r.kind === "task-membership" && r.taskId === child.taskId,
+          )!;
+          yield* repository.execute({
+            type: "project-work.foundation.commit",
+            projectId: p,
+            commandId: CommandId.make("restart-report"),
+            expectedRevision: state.revision,
+            attribution: human,
+            records: [],
+            committedAt: at,
+            guided: {
+              intent: {
+                type: "project-team.assignment.report",
+                projectId: p,
+                taskId: child.taskId,
+                commandId: CommandId.make("restart-report"),
+                expectedRevision: state.revision,
+                expectedTaskRevision: child.revision,
+                assignmentId: assignment.recordId,
+                expectedAssignmentRevision: assignment.revision,
+                specRevision: 1,
+                planRevision: 0,
+                summary: "Source finding",
+                outputs: [
+                  {
+                    kind: "observation",
+                    criterionId: state.criteria[0]!.criterionId,
+                    detail: "Retained finding cites the actual project source.",
+                  },
+                ],
+                evidenceIds: [],
+                outputArtifactIds: [],
+                outcome: "complete",
+              },
+            },
+          });
+          state = applyProjectWorkEvents(
+            emptyProjectWorkReducerState(p),
+            yield* repository.replay(p),
+          );
+          return state;
+        }).pipe(Effect.provide(services), Effect.provide(database())),
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const repository = yield* ProjectWorkRepository;
+          const projection = yield* ProjectWorkProjection;
+          const sql = yield* SqlClient.SqlClient;
+          const after = applyProjectWorkEvents(
+            emptyProjectWorkReducerState(p),
+            yield* repository.replay(p),
+          );
+          expect(after).toEqual(before);
+          yield* sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${p}`;
+          yield* projection.rebuild(p);
+          const rebuilt = applyProjectWorkEvents(
+            emptyProjectWorkReducerState(p),
+            yield* repository.replay(p),
+          );
+          expect(rebuilt).toEqual(before);
+          expect(
+            (yield* sql`SELECT payload_json FROM project_team_task_membership WHERE project_id=${p}`)
+              .length,
+          ).toBe(2);
+          expect(rebuilt.evidence[0]!.detail).toContain("Retained finding");
+          expect(rebuilt.evidence[0]!.scopeHash).toMatch(/^[a-f0-9]{64}$/);
+        }).pipe(Effect.provide(services), Effect.provide(database())),
+      );
+    }).pipe(Effect.provide(NodeServices.layer)),
+);
 
 for (const failure of [
   "projection-failure",
