@@ -144,6 +144,9 @@ describe("guided contract preparation", () => {
     expect(() => decodeGuided({ ...planning, objective: "x".repeat(32_001) })).toThrow();
     expect(() => decodeGuided({ ...planning, outputDescriptions: [] })).toThrow();
     expect(() =>
+      decodeGuided({ ...planning, outputDescriptions: ["Plan", "Another output"] }),
+    ).toThrow();
+    expect(() =>
       decodeGuided({ ...review, parentPlan: { ...review.parentPlan, actor: "human" } }),
     ).toThrow();
   });

@@ -729,9 +729,20 @@ export const layer = Layer.effect(
       if (principal.actor.kind !== "human") {
         if (authority === undefined)
           return yield* deny("Guided agent requires current managed authority");
+        const inheritedPlanTarget =
+          intent.type === "project-team.plan.propose" &&
+          authority.role.role === "planner" &&
+          authority.state.foundationRecords?.some(
+            (record) =>
+              record.kind === "gate" &&
+              record.recordId === authority.binding.authorizationGateId &&
+              (record.gate === "assignment" || record.gate === "repair") &&
+              record.assignmentAuthorization?.assignmentKind === "planning" &&
+              record.assignmentAuthorization.parentTaskId === intent.taskId,
+          );
         if (
           authority.binding.projectId !== intent.projectId ||
-          authority.binding.taskId !== intent.taskId
+          (authority.binding.taskId !== intent.taskId && !inheritedPlanTarget)
         )
           return yield* deny("Guided intent must target the assigned task");
         const capability =

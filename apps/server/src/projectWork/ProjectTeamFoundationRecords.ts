@@ -7,7 +7,11 @@ import {
 import * as Schema from "effect/Schema";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
-import { projectTeamSpecificationHash, projectTeamPlanHash } from "./ProjectTeamPolicy.ts";
+import {
+  projectTeamSpecificationHash,
+  projectTeamPlanHash,
+  assertProjectTeamAssignmentAuthorization,
+} from "./ProjectTeamPolicy.ts";
 
 const decodeTeamRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
 const reject = (message: string): never => {
@@ -133,7 +137,10 @@ export const validateProjectTeamRecord = (
         if (
           grant.kind !== "gate" ||
           grant.taskId !== r.taskId ||
-          (grant.gate !== "investigation" && grant.gate !== "execution" && grant.gate !== "repair")
+          (grant.gate !== "investigation" &&
+            grant.gate !== "execution" &&
+            grant.gate !== "repair" &&
+            grant.gate !== "assignment")
         )
           reject("Assignment requires its exact task grant");
       }
@@ -192,6 +199,14 @@ export const validateProjectTeamRecord = (
         reject("Unknown plan dependency");
       break;
     case "gate": {
+      if (
+        r.gate === "assignment" ||
+        (r.gate === "repair" && r.assignmentAuthorization !== undefined)
+      ) {
+        if (r.status !== "invalidated" && r.status !== "rejected")
+          assertProjectTeamAssignmentAuthorization(state, r);
+      } else if (r.assignmentAuthorization !== undefined)
+        reject("Only a bounded assignment grant can carry inherited authority");
       if (
         old?.kind === "gate" &&
         ((old.status === "consumed" && r.status !== "consumed" && r.status !== "invalidated") ||

@@ -1149,6 +1149,10 @@ export const ProjectTeamGuidedIntent = Schema.Union([
       (input) => input.assignmentKind !== "review" || input.parentPlan !== undefined,
       { message: "A review assignment requires its exact approved parent plan" },
     ),
+    Schema.makeFilter(
+      (input) => input.assignmentKind !== "planning" || input.outputDescriptions.length === 1,
+      { message: "A planning assignment has one proposed-plan output" },
+    ),
   ),
   Schema.Struct({
     ...GuidedFields,

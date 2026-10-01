@@ -57,6 +57,119 @@ export const projectTeamScopeHash = (state: ProjectWorkState, taskId: string, pl
           },
   });
 
+/** A child grant retains its parent's exact approvals without approving the child's implementation. */
+export const assertProjectTeamAssignmentAuthorization = (state: ProjectWorkState, grant: Gate) => {
+  function deny(message: string): never {
+    throw new ProjectWorkPolicyError("authority-required", message);
+  }
+  const proof = grant.assignmentAuthorization;
+  const records = state.foundationRecords ?? [];
+  const inherited = records.find(
+    (record) =>
+      record.kind === "gate" && record.recordId === grant.repairAuthorization?.inheritedGateId,
+  );
+  const parent = state.tasks.find((task) => task.taskId === proof?.parentTaskId);
+  const membership = records.find(
+    (record) => record.kind === "task-membership" && record.taskId === parent?.taskId,
+  );
+  if (
+    (grant.gate !== "assignment" &&
+      !(
+        grant.gate === "repair" &&
+        inherited?.kind === "gate" &&
+        inherited.status === "consumed" &&
+        inherited.assignmentAuthorization !== undefined &&
+        canonicalProjectWorkPayload(inherited.assignmentAuthorization) ===
+          canonicalProjectWorkPayload(proof)
+      )) ||
+    proof === undefined ||
+    parent === undefined ||
+    parent.projectId !== grant.projectId ||
+    parent.taskId === grant.taskId ||
+    parent.state === "completed" ||
+    parent.state === "canceled" ||
+    parent.specification === undefined ||
+    parent.specRevision !== proof.parentSpecRevision ||
+    membership?.kind !== "task-membership" ||
+    membership.status !== "active" ||
+    (membership.controlState !== undefined && membership.controlState !== "active") ||
+    projectTeamSpecificationHash(state, parent.taskId) !== proof.parentSpecificationHash
+  )
+    deny("Inherited assignment parent specification or control changed");
+  const specificationGate = records.find(
+    (record): record is Gate =>
+      record.kind === "gate" && record.recordId === proof.parentSpecificationGateId,
+  );
+  const specification = evaluateProjectTeamGate(specificationGate, {
+    projectId: parent.projectId,
+    taskId: parent.taskId,
+    gate: "specification",
+    specRevision: proof.parentSpecRevision,
+    planRevision: 0,
+    contentHash: proof.parentSpecificationHash,
+    evidenceIds: [],
+  });
+  if (!specification.available) deny("Inherited assignment specification approval is stale");
+  const plan = records
+    .filter(
+      (record): record is Plan =>
+        record.kind === "plan-revision" &&
+        record.taskId === parent.taskId &&
+        record.status === "proposed",
+    )
+    .sort((a, b) => b.planRevision - a.planRevision)[0];
+  if (projectTeamScopeHash(state, parent.taskId, plan) !== proof.parentScopeHash)
+    deny("Inherited assignment parent scope changed");
+  const dependencies = new Set(plan?.dependencyTaskIds ?? []);
+  for (const relationship of state.relationships) {
+    if (relationship.kind === "depends-on" && relationship.fromTaskId === parent.taskId)
+      dependencies.add(relationship.toTaskId);
+    if (relationship.kind === "blocks" && relationship.toTaskId === parent.taskId)
+      dependencies.add(relationship.fromTaskId);
+  }
+  for (const taskId of dependencies) {
+    const dependency = evaluateProjectTeamDependency({
+      projectId: parent.projectId,
+      taskId,
+      task: state.tasks.find((task) => task.taskId === taskId),
+      memberships: records.filter(
+        (record): record is Membership => record.kind === "task-membership",
+      ),
+    });
+    if (!dependency.available)
+      deny(`Inherited assignment dependency changed: ${dependency.reason}`);
+  }
+  if (proof.parentPlan === undefined) {
+    if (proof.assignmentKind !== "planning" || plan !== undefined)
+      deny("Only first-plan drafting can omit a parent plan approval");
+  } else {
+    if (
+      plan === undefined ||
+      plan.recordId !== proof.parentPlan.recordId ||
+      plan.planRevision !== proof.parentPlan.planRevision ||
+      plan.specRevision !== parent.specRevision ||
+      plan.contentHash !== proof.parentPlan.contentHash ||
+      projectTeamPlanHash(plan) !== proof.parentPlan.contentHash
+    )
+      deny("Inherited assignment parent plan changed");
+    const planGate = records.find(
+      (record): record is Gate =>
+        record.kind === "gate" && record.recordId === proof.parentPlan!.gateId,
+    );
+    const approval = evaluateProjectTeamGate(planGate, {
+      projectId: parent.projectId,
+      taskId: parent.taskId,
+      gate: "plan",
+      specRevision: parent.specRevision,
+      planRevision: plan.planRevision,
+      contentHash: plan.contentHash,
+      evidenceIds: [],
+    });
+    if (!approval.available) deny("Inherited assignment plan approval is stale");
+  }
+  return proof;
+};
+
 /** Missing pre-guided anchors never grant new credentials or tool authority. */
 export const assertProjectTeamRunAuthority = (
   state: ProjectWorkState,
@@ -141,6 +254,29 @@ export const assertProjectTeamRunAuthority = (
     if (!result.available) deny(`Run dependency changed: ${result.reason}`);
   }
   if (
+    grant.gate === "assignment" ||
+    (grant.gate === "repair" && grant.assignmentAuthorization !== undefined)
+  ) {
+    const inherited = assertProjectTeamAssignmentAuthorization(state, grant);
+    if (
+      m?.parentTaskId !== inherited.parentTaskId ||
+      m.deliverableKind !== (inherited.assignmentKind === "planning" ? "plan" : "review") ||
+      role.role !== (inherited.assignmentKind === "planning" ? "planner" : "reviewer") ||
+      plan !== undefined ||
+      grant.contentHash !== binding.scopeHash ||
+      binding.configuration.toolIds.some(
+        (tool) =>
+          ![
+            "read",
+            "search",
+            "project-work",
+            "project-work.report",
+            ...(inherited.assignmentKind === "planning" ? ["project-work.plan"] : []),
+          ].includes(tool),
+      )
+    )
+      deny("Inherited assignment cannot grant writable implementation authority");
+  } else if (
     grant.gate === "investigation" ||
     (grant.gate === "repair" && m?.deliverableKind === "research" && plan === undefined)
   ) {
