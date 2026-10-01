@@ -7,7 +7,7 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-10-01 05:10 UTC. Implementation is running. **P3 is finished and merged**, alongside P1 and P2. Ten subagent seats plus the coordinator are available. Independent P4 and P7 work runs in parallel; prerequisite-dependent phases remain gated.
+Last updated: 2026-10-01 05:40 UTC. Implementation is running. **P1–P3 are finished on main. P4 passes its part review and the combined 656-test gate; fresh wave review is next.** Ten subagent seats plus the coordinator are available. Approved private Pi pieces and preparatory leaves do not complete their parent phases.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
@@ -17,9 +17,9 @@ Last updated: 2026-10-01 05:10 UTC. Implementation is running. **P3 is finished 
 
 - **Finished on main:** P1 bounded dependency proofs; P2 durable foundation; P3 current managed identity and protected command authorization. P2/P3 landed at `1346f50af` after 301 combined tests, three normal compilers, scoped checks and fresh wave APPROVE. All 56 reviewed source hashes match main.
 - **Why P3 took time:** independent checks exposed stale permissions, rollback and recovery races. Those fixes and their real-SQL proofs are complete. P3 is no longer blocking active work.
-- **P4:** combined candidate `8c4450b4a` is APPROVED by its same independent reviewer. All five original findings are resolved; 26 independent cases and 279 combined producer cases pass. Coordinator verifies all 34 recheck artifacts (manifest `a889328d…`) and merges only the approved scope into wave3 `4366093ea`, preserving root dependency work. P4 still awaits the combined wave gate and fresh wave review before main integration.
+- **P4:** reviewed candidate `8c4450b4a` is integrated into clean bounded wave `25f7bd6ae`. Combined checks pass 656/656 across 25 files, zero skips, normal strict/Effect-plugin compiler across 42 roots, and exact-path lint/format/Knip. All 149 captured units, 394 PIDs and 145 cgroups drain. Fresh combined wave review remains before main; P4 is not yet counted complete.
 - **P5:** transport and pure sync/intake leaves are approved. Title repair `42663135` passes 79 tests and independent replay/rename/conflict checks. Durable authority interfaces are prepared; refinement, wiring and real GitHub evidence remain dependent work.
-- **P7:** approved protocol `4e590177`, process `3215d26e`, broker `44166a927` and repaired SDK child `4b16a6ed9` are merged into isolated wave3 `720cbb44b`. SDK repairs pass 107 tests and 38 actual synthetic SDK operations, including receipt-controlled cancellation and sequential two-tool calls. The same reviewer APPROVES after rechecking both original defects; coordinator verified all 85 repair and 26 recheck artifacts. Parent runtime `fa9fc693a` passes 36 cases (31 actual Linux), normal strict compilation and four causal controls. Coordinator verified all 566 producer artifacts. Its sole reviewer verifies repaired `b5a3c3469`: 41 cases, three original probes and two admission controls pass. Coordinator verifies all 170 recheck artifacts and merges the approved parent into wave3 `61d90ac21`. Actual SDK parent integration remains active. Event translator `a9298c20e` passes 22 tests, including the actual pinned SDK stream, and normal strict compilation; coordinator verifies all 107 artifacts and both current/Git-object hashes. Its sole reviewer reproduces four client defects; the original owner repairs them in a separate worktree. Actual SDK-parent candidate `d5a9f44d2` passes all 11 required Linux cases, with 22 actual native operations and complete captured process drains; root verifies all 236 artifacts and starts its sole fresh review. Full-frame observer extension `91b11091b` passes 61 cases and is in same-parent-reviewer extension review. Full driver/runtime, durable accounting and platform/package gates remain open.
+- **P7:** approved protocol, contained process, governed broker, SDK worker, parent runtime, skills and runtime dependencies are in bounded wave `25f7bd6ae`. Actual SDK-parent slice `d5a9f44d2` and full-frame observer `91b11091b` are independently APPROVED and held for the next wave. Root verifies all 98 and 281 review artifacts. Event repair `082405770` passes 38 cases and normal compilation; all 135 artifacts are verified and the same reviewer rechecks four client findings. Host `49037a489` has three verified stdout shutdown/operation-alias findings, independently reproduced by root with actual SDK and no model calls; its owner repairs in a separate worktree. Driver/adapter interfaces are prepared. Durable SQL callbacks/accounting, production entry, registration and platform/package gates remain open.
 - **P6/P8:** human workflow and dispatch/recovery interfaces are prepared. Implementation depends on the required P4/P5 and P7 gates; preparation does not complete these phases.
 - **P10:** native adapter repair `2a88e791` is approved after real deletion, recovery and explicit native-proof checks. Extraction, authorized hydration, context and integration remain dependent work.
 - **P11:** pure evidence policy `090589f4` is approved and held for integration.
@@ -33,22 +33,22 @@ No local models, Ollama/llama inference, OpenAI runtime/proof services, push or 
 
 Each row is one subagent seat. Finished agents release their seat. Worktrees live under `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                                | State                          | Assignment / branch                                   | Next gate                                                              |
-| ---- | ------------------------------------ | ------------------------------ | ----------------------------------------------------- | ---------------------------------------------------------------------- |
-| 1    | `review_p7_runtime_dependencies`     | Active independent review      | Exact `a55cc0cc5`                                     | Pinned runtime importer/lock and fixture registration                  |
-| 2    | `p4_guided_core_high`                | Active independent P7 slice    | `pi-teams/p7-worker-host`, base `61d90ac21`           | 25 host/132 affected cases and compiler pass; commit/seal then review  |
-| 3    | `p7_event_translation_high`          | Active verified repair         | `pi-teams/p7-runtime-events-repair`, base `a9298c20e` | Four transcript identity/order/failure findings; same-reviewer recheck |
-| 4    | — (last: `review_p7_runtime_events`) | Available; REQUEST_CHANGES     | Exact original `a9298c20e`                            | Same reviewer handles repair recheck                                   |
-| 5    | `p7_driver_adapter_interfaces`       | Active read-only preparation   | Exact approved `61d90ac21`                            | Minimal durable port and model/auth/driver decisions                   |
-| 6    | — (last: `p7_session_runtime_high`)  | Available; extension committed | `91b11091b`, base `61d90ac21`                         | Same-parent-reviewer extension check                                   |
-| 7    | `review_p7_session_runtime`          | Active extension review        | Exact `91b11091b`                                     | Original admission controls plus full-frame observer failure/drains    |
-| 8    | — (last: `p5_sync_leaf_high`)        | Available; leaf APPROVE        | Sync/intake `42663135`                                | Await main P4 and root durable interfaces                              |
-| 9    | — (last: `p4_gateway_tests_high`)    | Available; scoped test APPROVE | `25becdf70` included in P4                            | Ready independent work                                                 |
-| 10   | `review_p7_sdk_parent_integration`   | Active independent review      | Exact `d5a9f44d2`                                     | Actual 11-case Linux SDK-parent closure, isolation and drain proof     |
+| Slot | Agent                                        | State                          | Assignment / branch                                | Next gate                                                      |
+| ---- | -------------------------------------------- | ------------------------------ | -------------------------------------------------- | -------------------------------------------------------------- |
+| 1    | — (last: `review_p7_runtime_dependencies`)   | Available; APPROVE             | `a55cc0cc5` merged into bounded wave               | Ready independent work                                         |
+| 2    | `p4_guided_core_high`                        | Active verified Pi host repair | `pi-teams/p7-worker-host-repair`, base `49037a489` | Three shutdown/alias findings, focused checks, scoped commit   |
+| 3    | — (last: `p7_event_translation_high`)        | Available; repair committed    | `082405770`, base `a9298c20e`                      | Same-reviewer recheck active                                   |
+| 4    | `review_p7_runtime_events`                   | Active repair review           | Exact `082405770`                                  | Four original client findings and controls                     |
+| 5    | — (last: `p7_driver_adapter_interfaces`)     | Available; proposal complete   | Exact base `61d90ac21`                             | Root freezes minimal private port/config before implementation |
+| 6    | — (last: `p7_session_runtime_high`)          | Available; observer APPROVE    | `91b11091b`, base `61d90ac21`                      | Hold for next Pi integration wave                              |
+| 7    | — (last: `review_p7_session_runtime`)        | Available; observer APPROVE    | Exact `91b11091b`                                  | Ready independent work                                         |
+| 8    | — (last: `p5_sync_leaf_high`)                | Available; leaf APPROVE        | Sync/intake `42663135`                             | Await main P4 and root durable interfaces                      |
+| 9    | — (last: `review_p7_worker_host`)            | Available; REQUEST_CHANGES     | Exact original `49037a489`                         | Same reviewer handles host repair recheck                      |
+| 10   | — (last: `review_p7_sdk_parent_integration`) | Available; SDK-parent APPROVE  | Exact `d5a9f44d2`                                  | Root registers two new fixtures before next-wave integration   |
 
-Coordinator: P4 is reviewed and merged into wave3 `4366093ea`. Root dependency candidate `a55cc0cc5` passes semantic complete lock/manifest equality, server-scoped Knip and exact-path formatting; its sole fresh reviewer is active. SDK-parent and parent-observer evidence are verified and in their prescribed reviews. The event owner repairs verified client findings while the host owner seals its passing slice. Root retains all shared contracts, migrations, wiring, dependencies and integrated client verification. Compiler reservation is free. No model or integrated client proof runs.
+Coordinator: clean bounded wave `25f7bd6ae67d627ef8b16faff7e4c8ce9ee1d373` passes the combined P4/private-Pi gate and captured process audit. Final evidence is being sealed for its sole fresh wave reviewer. New observer, SDK-parent, event repair and host leaves stay outside this frozen candidate. Root owns all shared contracts, migrations, wiring, dependencies and integrated client verification. Compiler reservation is free. No model or integrated client proof runs.
 
-Primary branch: `t3code/implement-pi-project-teams`. Main product commit: `1346f50af6f1361b0942fe1d42e636804e1ba9a0`. Reviewed foundation wave: `8defdcf1241caf9c3276528e07da076573aa2673`; documentation reconciliation: `04001e7578cf26a19842f400fa3be44f67b71cc8`. All 56 reviewed source hashes match main. Wave3 now `4366093ea4cb807cb38d84bf2d0eef81864e58e7` contains approved P4 policy, P7 protocol/skills/process leaves and shared guided contracts `eb71cf2b1` (36 focused checks and normal contracts compiler pass). The combined P4 candidate is isolated from wave integration until review; its base is `eb71cf2b1` and internal core cherry-pick `b8b08c532`, root wiring `f2f0d488e`, fixtures `dd26b819d` and approval regression `d2b6c64a6`. Root runtime dependency changes remain uncommitted in wave3 pending focused validation. Preparatory branches retain their explicit earlier bases; P5 sync uses reconciled P2/transport base `9bdd1872`. Historical pause evidence remains below and in `pause-20260930/RESUME.md` under the worktree cache.
+Primary branch: `t3code/implement-pi-project-teams`. Main product commit: `1346f50af6f1361b0942fe1d42e636804e1ba9a0`. Bounded wave base is that exact product commit; main has advanced only through plan updates, which will be preserved during local merge. Historical evidence and checkpoint notes remain below and in the worktree cache.
 
 ## Goal
 
@@ -68,19 +68,20 @@ GitHub integration.
 
 ## Confirmed decisions
 
-| Area          | Decision                                                                                                  |
-| ------------- | --------------------------------------------------------------------------------------------------------- |
-| Execution     | Pi runs the initial custom team. Roles and workflow are independent of the runtime.                       |
-| Environment   | One T3 environment serves multiple projects, accessible remotely.                                         |
-| Coordination  | One coordinator per project; the user sets cross-project priorities.                                      |
-| Autonomy      | Guided: human approval of specification, plan, and merge.                                                 |
-| Communication | Workers communicate directly through durable, task-linked messages.                                       |
-| Intake        | Issues from connected GitHub repositories automatically appear in T3.                                     |
-| Starting work | The user explicitly starts investigation or execution. Capture and synchronization never dispatch agents. |
-| Internal work | Research subtasks, conversations, attempts, and working notes stay in T3.                                 |
-| Memory        | Agents automatically capture sourced observations; accepted decisions remain protected.                   |
-| Deployment    | An established self-hosted memory engine may run alongside T3.                                            |
-| Authority     | T3 owns workflow state, decisions, and approvals. GitHub owns its issues, PRs, reviews, and checks.       |
+| Area           | Decision                                                                                                                                                                                   |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Execution      | Pi runs the initial custom team. Roles and workflow are independent of the runtime.                                                                                                        |
+| Provider focus | Prioritize Pi, OpenCode, Claude and Codex. Other providers receive shared-boundary compatibility checks; avoid substantial provider-specific work unless required for a shared regression. |
+| Environment    | One T3 environment serves multiple projects, accessible remotely.                                                                                                                          |
+| Coordination   | One coordinator per project; the user sets cross-project priorities.                                                                                                                       |
+| Autonomy       | Guided: human approval of specification, plan, and merge.                                                                                                                                  |
+| Communication  | Workers communicate directly through durable, task-linked messages.                                                                                                                        |
+| Intake         | Issues from connected GitHub repositories automatically appear in T3.                                                                                                                      |
+| Starting work  | The user explicitly starts investigation or execution. Capture and synchronization never dispatch agents.                                                                                  |
+| Internal work  | Research subtasks, conversations, attempts, and working notes stay in T3.                                                                                                                  |
+| Memory         | Agents automatically capture sourced observations; accepted decisions remain protected.                                                                                                    |
+| Deployment     | An established self-hosted memory engine may run alongside T3.                                                                                                                             |
+| Authority      | T3 owns workflow state, decisions, and approvals. GitHub owns its issues, PRs, reviews, and checks.                                                                                        |
 
 ## Scope
 
@@ -285,6 +286,8 @@ the lead owns assignments, dependencies, and integration. Assign one worker per
 exclusive writable scope. Split work only when interfaces and dependencies are
 settled and the split avoids conflicting edits or unnecessary integration work.
 Leave slots idle when dependencies or shared ownership prevent useful parallelism.
+
+Prioritize implementation and meaningful compatibility coverage for Pi, OpenCode, Claude and Codex. Preserve ordinary shared behavior for other providers, but do not spend substantial effort on their provider-specific support unless this plan causes a concrete shared regression. The custom team remains Pi-only initially.
 
 There is no fixed worker count or cumulative limit on implementation subagents.
 Use all available slots for ready, independent scopes and dispatch more work as
@@ -2743,3 +2746,13 @@ SDK-parent candidate `d5a9f44d25d65c0afd618399688b220dad5bbaab` owns only one ne
 Observer extension `91b11091b70bbaf61deeb71bb9ec808e4979dc09` changes only two existing parent files; root verifies all 435 artifacts and both current/Git-object hashes, manifest `a2fc13e40f23ab5f172cfd73175d77de88691dd5c6b8079d218cbe3e7c1c5dd8`. The runtime adds five lines; 61 cases and normal strict/compiler/style pass. All 130 captured units, 376 PIDs and 130 cgroups drain. Same parent reviewer checks the extension; original fa9/b5 seals stay unchanged.
 
 Event repair starts in separate `pi-teams/p7-runtime-events-repair` at frozen `a9298c20e`, owning the same two translator files. Root verifies all 106 reviewer artifacts (SHA-256 `a197f513b182f63ffd7b9db325b77832af40c8cb8a96b4e1bb06cd6de0a4e0fd`) and independently verifies causal client behavior before authorizing four repairs. Unsupported synthetic native IDs are omitted. Stable item order uses a required private, safe-integer operation ordinal allocated durably by root per provider/thread/agent, plus padded item-start sequence; actual allocator/wiring remain root integration prerequisites. Assistant completion waits for SDK stop reason; error/aborted and started-item cancellation remain visibly failed with bounded cancellation provenance. Turn/accounting/drain authority stays parent-owned. Same reviewer rechecks the exact repair; original source and seals remain frozen.
+
+### Bounded wave gate and provider priority (2026-10-01)
+
+Clean wave `25f7bd6ae67d627ef8b16faff7e4c8ce9ee1d373` includes complete reviewed P4 and approved private Pi protocol/process/broker/SDK/parent/skills/runtime-dependency leaves. Exact combined gate: 656/656 tests across 25 files, zero skips; normal strict server compiler with Effect plugins, 42 roots, 4 GiB/zero swap, peak 2,817,794,048 bytes; exact 50-path format and scoped Knip files/dependencies pass. Scoped lint passes with 14 retained baseline warnings and zero errors. Root verifies all 50 current/Git-object hashes and all 28 P4 approved source hashes. Captured drain audit checks 149 owned units, 394 PIDs and 145 cgroups, all drained. Evidence is in `wave3-bounded-final-evidence`; fresh wave review remains mandatory before main integration.
+
+Retained failed compiler output traces missing ignored dependency links, repaired by linking existing ignored dependencies without source/config changes. Initial test selection accidentally requested an invalid filename and omitted the policy test; it is explicitly incomplete (578 passes) and superseded by the corrected 656-case gate. Neither failed/incomplete run is counted as final proof.
+
+Root verifies all 135 event repair artifacts, 281 observer review artifacts, 98 SDK-parent review artifacts plus its sealed drain-status supplement, and 17 host review artifacts. Event same-reviewer recheck is active. Observer and SDK-parent are APPROVED, held outside the frozen bounded wave; root-owned Knip registration of the two new SDK-parent fixtures remains required. Root independently reproduces host R1 premature-success close, R2 undestroyed owned output and R3 mutable operation alias with actual pinned SDK and paired controls, zero model calls. Its owner repairs only two assigned files from frozen `49037a489` in a separate branch; the same reviewer will recheck.
+
+User priority: focus on Pi, OpenCode, Claude and Codex. Avoid substantial work specific to other providers unless necessary to preserve a shared path changed by this implementation. No ordinary-provider removal or silent team fallback is authorized.
