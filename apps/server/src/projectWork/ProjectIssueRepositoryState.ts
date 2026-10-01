@@ -23,6 +23,10 @@ const Timestamp = Text.check(
   }),
 );
 const RepositoryName = Text.check(Schema.isPattern(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/u));
+const AccountLogin = Schema.String.check(
+  Schema.isMaxLength(39),
+  Schema.isPattern(/^[A-Za-z0-9](?:[A-Za-z0-9_-]*[A-Za-z0-9])?$/u),
+);
 const Counter = Schema.Int.check(
   Schema.isBetween({ minimum: 0, maximum: Number.MAX_SAFE_INTEGER }),
 );
@@ -41,6 +45,7 @@ const State = Schema.Struct({
   repositoryNodeId: Text,
   repositoryName: Schema.Union([RepositoryName, Schema.Literal("")]),
   accountNodeId: Text,
+  accountLogin: Schema.optionalKey(AccountLogin),
   credentialEpoch: Schema.String.check(Schema.isMaxLength(1024)),
   revision: Counter,
   authorityGeneration: Counter,
@@ -199,6 +204,7 @@ export const bindIssueRepositoryProject = Effect.fn("bindIssueRepositoryProject"
     projectId: string;
     repositoryName: string;
     accountNodeId: string;
+    accountLogin?: string;
     credentialEpoch: string;
     since: string;
     expectedBindingRevision: number | null;
@@ -236,6 +242,7 @@ export const bindIssueRepositoryProject = Effect.fn("bindIssueRepositoryProject"
               ...input.key,
               repositoryName: input.repositoryName,
               accountNodeId: input.accountNodeId,
+              ...(input.accountLogin === undefined ? {} : { accountLogin: input.accountLogin }),
               credentialEpoch: input.credentialEpoch,
               revision: 0,
               authorityGeneration: 0,
@@ -252,6 +259,7 @@ export const bindIssueRepositoryProject = Effect.fn("bindIssueRepositoryProject"
             }
           : {
               ...state,
+              ...(input.accountLogin === undefined ? {} : { accountLogin: input.accountLogin }),
               repositoryName: input.repositoryName,
               credentialEpoch: input.credentialEpoch,
               status: "ready",
@@ -259,7 +267,7 @@ export const bindIssueRepositoryProject = Effect.fn("bindIssueRepositoryProject"
               authorityGeneration: yield* increment(state.authorityGeneration),
               lease: null,
               error: null,
-              retryAt: 0,
+              retryAt: state.error === null ? state.retryAt : 0,
             };
       yield* writeState(sql, state);
       yield* sql`INSERT INTO project_issue_binding(project_id,host,repository_node_id,account_node_id,status,revision,generation)
@@ -275,7 +283,12 @@ export const rotateIssueRepositoryCredential = Effect.fn("rotateIssueRepositoryC
   function* (
     sql: SqlClient.SqlClient,
     key: IssueRepositoryKey,
-    input: { accountNodeId: string; credentialEpoch: string; expectedRevision: number },
+    input: {
+      accountNodeId: string;
+      accountLogin?: string;
+      credentialEpoch: string;
+      expectedRevision: number;
+    },
   ) {
     return yield* sql.withTransaction(
       Effect.gen(function* () {
@@ -288,11 +301,12 @@ export const rotateIssueRepositoryCredential = Effect.fn("rotateIssueRepositoryC
           return yield* fail("invalid-input");
         const state: IssueRepositoryState = {
           ...current,
+          ...(input.accountLogin === undefined ? {} : { accountLogin: input.accountLogin }),
           credentialEpoch: input.credentialEpoch,
           status: "ready",
           lease: null,
           error: null,
-          retryAt: 0,
+          retryAt: current.error === null ? current.retryAt : 0,
           revision: yield* increment(current.revision),
           authorityGeneration: yield* increment(current.authorityGeneration),
         };
@@ -302,6 +316,84 @@ export const rotateIssueRepositoryCredential = Effect.fn("rotateIssueRepositoryC
     );
   },
 );
+
+/** The caller verifies the new name against the same remote node before requesting this rename. */
+export const renameIssueRepository = Effect.fn("renameIssueRepository")(function* (
+  sql: SqlClient.SqlClient,
+  key: IssueRepositoryKey,
+  input: { repositoryName: string; accountNodeId: string; expectedRevision: number },
+) {
+  return yield* sql.withTransaction(
+    Effect.gen(function* () {
+      const current = yield* readIssueRepositoryState(sql, key);
+      if (
+        current === undefined ||
+        current.status === "detached" ||
+        current.revision !== input.expectedRevision
+      )
+        return yield* fail("stale-state");
+      if (current.accountNodeId !== input.accountNodeId) return yield* fail("account-mismatch");
+      if (current.repositoryName === input.repositoryName) return current;
+      const state: IssueRepositoryState = {
+        ...current,
+        repositoryName: input.repositoryName,
+        revision: yield* increment(current.revision),
+        authorityGeneration: yield* increment(current.authorityGeneration),
+        lease: null,
+      };
+      yield* writeState(sql, state);
+      return state;
+    }),
+  );
+});
+
+/** Explicitly transfer one project binding; derived issue history and other owners survive. */
+export const rebindIssueRepositoryProject = Effect.fn("rebindIssueRepositoryProject")(function* (
+  sql: SqlClient.SqlClient,
+  input: {
+    previousKey: IssueRepositoryKey;
+    expectedPreviousBindingRevision: number;
+    target: Parameters<typeof bindIssueRepositoryProject>[1];
+  },
+) {
+  return yield* sql.withTransaction(
+    Effect.gen(function* () {
+      if (
+        input.previousKey.host === input.target.key.host &&
+        input.previousKey.repositoryNodeId === input.target.key.repositoryNodeId
+      )
+        return yield* fail("invalid-input");
+      const rows = yield* sql<{ revision: number; generation: number; status: string }>`
+      SELECT revision,generation,status FROM project_issue_binding WHERE project_id=${input.target.projectId}
+      AND host=${input.previousKey.host} AND repository_node_id=${input.previousKey.repositoryNodeId}`;
+      const binding = rows[0];
+      if (
+        binding === undefined ||
+        binding.status !== "active" ||
+        binding.revision !== input.expectedPreviousBindingRevision
+      )
+        return yield* fail("stale-state");
+      const previous = yield* readIssueRepositoryState(sql, input.previousKey);
+      if (previous === undefined) return yield* fail("stale-state");
+      const target = yield* bindIssueRepositoryProject(sql, input.target);
+      yield* sql`UPDATE project_issue_binding SET status='detached',revision=${yield* increment(binding.revision)},generation=${yield* increment(binding.generation)}
+      WHERE project_id=${input.target.projectId} AND host=${input.previousKey.host} AND repository_node_id=${input.previousKey.repositoryNodeId}`;
+      const owners = yield* sql`SELECT b.project_id FROM project_issue_binding b
+      JOIN projection_projects p ON p.project_id=b.project_id
+      LEFT JOIN project_lifecycle l ON l.project_id=b.project_id
+      WHERE b.host=${input.previousKey.host} AND b.repository_node_id=${input.previousKey.repositoryNodeId}
+      AND b.status='active' AND p.deleted_at IS NULL AND (l.state IS NULL OR l.state='active') LIMIT 1`;
+      yield* writeState(sql, {
+        ...previous,
+        status: owners.length === 0 ? "detached" : previous.status,
+        revision: yield* increment(previous.revision),
+        authorityGeneration: yield* increment(previous.authorityGeneration),
+        lease: null,
+      });
+      return target;
+    }),
+  );
+});
 
 /** Lease ids come from the server, never a client; successful progress is unchanged by a claim. */
 export const claimIssueRepositoryRead = Effect.fn("claimIssueRepositoryRead")(function* (
