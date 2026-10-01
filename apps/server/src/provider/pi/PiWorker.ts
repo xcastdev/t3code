@@ -388,6 +388,7 @@ export function makePiSdkWorker(options: PiSdkWorkerOptions) {
               ? schema.value
               : { type: "object", properties: {}, additionalProperties: false };
           return defineTool({
+            executionMode: "sequential",
             name: allowed.name,
             label: allowed.name,
             description: allowed.description,
@@ -429,10 +430,13 @@ export function makePiSdkWorker(options: PiSdkWorkerOptions) {
                   lifecycleId: active.lifecycleId,
                   event: { type: "tool_start", callId: active.id, toolName: allowed.name },
                 });
+                // Authorization and the tool_start receipt can both race accepted cancellation.
+                if (canceled || signal.aborted || failure) throw failure ?? Error("CANCELED");
                 const result =
                   allowed.execution === "local"
                     ? await options.localTools[allowed.name]!(args, signal)
                     : await active.result.promise;
+                if (canceled || signal.aborted || failure) throw failure ?? Error("CANCELED");
                 const outputText = encodeToolOutput(result);
                 if (
                   Buffer.byteLength(inputText) + Buffer.byteLength(outputText) >

@@ -35,7 +35,7 @@ async function operation(kind, native = null, scenario = "normal") {
     ],
     {
       cwd: scratch,
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: ["pipe", "pipe", "pipe", "ipc"],
       env: {
         PATH: process.env.PATH,
         HOME: scratch,
@@ -61,6 +61,24 @@ async function operation(kind, native = null, scenario = "normal") {
   const frames = [];
   const requests = [];
   const output = [];
+  const receipts = [];
+  let callbackObservation;
+  child.on("message", (receipt) => {
+    receipts.push(receipt);
+    if (receipt.type === "tool-start-write-held") {
+      NodeAssert.equal(receipt.callbackCount, 0);
+      if (scenario === "tool-start-control") child.send({ type: "release-tool-start" });
+      else send({ type: "interrupt", controlId: 1 });
+    } else if (receipt.type === "tool-callback-held") {
+      NodeAssert.equal(receipt.callbackCount, 1);
+      send({ type: "interrupt", controlId: 1 });
+    } else if (receipt.type === "interrupt-accepted") {
+      if (["tool-start-cancel", "tool-start-bridge-cancel"].includes(scenario)) {
+        NodeAssert.equal(receipt.callbackCount, 0);
+        child.send({ type: "release-tool-start" });
+      } else if (scenario === "tool-callback-cancel") child.send({ type: "release-tool-callback" });
+    } else if (receipt.type === "callback-observation") callbackObservation = receipt;
+  });
   let response;
   let heldEnd;
   let controlSent = false;
@@ -125,6 +143,13 @@ async function operation(kind, native = null, scenario = "normal") {
               }),
               chunk({}, "stop"),
             ];
+      if (scenario === "two-tool-calls" && requests.length === 1)
+        contents[0].choices[0].delta.tool_calls.push({
+          index: 1,
+          id: "call-2",
+          type: "function",
+          function: { name: "echo_assignment", arguments: '{"text":"bounded echo two"}' },
+        });
       if (scenario === "unsafe-native-id" && requests.length === 1)
         contents[0].choices[0].delta.tool_calls[0].id = "call:unsafe";
       contents.push({
@@ -146,12 +171,14 @@ async function operation(kind, native = null, scenario = "normal") {
       pushChunk();
     } else if (message.type === "ack") pushChunk();
     else if (message.type === "transfer-end" && message.transferId.startsWith("tool-input-")) {
+      const callId = Number(message.transferId.split("-").at(-1));
       const input = protocol.takeTransfer(message.transferId);
       NodeAssert.deepEqual(input, {
         purpose: "tool-input",
-        value: { arguments: { text: "bounded echo" } },
+        value: { arguments: { text: callId === 2 ? "bounded echo two" : "bounded echo" } },
       });
-      send({ type: "tool-authorized", callId: 1, allowed: scenario !== "tool-denied" });
+      if (scenario === "tool-input-cancel") send({ type: "interrupt", controlId: 1 });
+      else send({ type: "tool-authorized", callId, allowed: scenario !== "tool-denied" });
     } else if (message.type === "transfer-end" && message.transferId.startsWith("tool-output-")) {
       output.push(protocol.takeTransfer(message.transferId));
     } else if (
@@ -259,7 +286,9 @@ async function operation(kind, native = null, scenario = "normal") {
             {
               name: "echo_assignment",
               description: "Echo bounded text",
-              execution: scenario === "bridge" ? "bridge" : "local",
+              execution: ["bridge", "tool-start-bridge-cancel"].includes(scenario)
+                ? "bridge"
+                : "local",
               inputSchema: { transferId: "schema", totalBytes: Buffer.byteLength(parameters) },
             },
           ]
@@ -292,8 +321,23 @@ async function operation(kind, native = null, scenario = "normal") {
     send({ type: "transfer-end", transferId: "schema" });
   }
   const result = await exited.promise;
+  process.stderr.write(
+    JSON.stringify({
+      type: "operation-exit",
+      kind,
+      scenario,
+      pid: child.pid,
+      exit: result,
+      receipts,
+      callbackObservation,
+    }) + "\n",
+  );
   const expectedFailure = {
     interrupt: "CANCELED",
+    "tool-input-cancel": "CANCELED",
+    "tool-start-cancel": "CANCELED",
+    "tool-start-bridge-cancel": "CANCELED",
+    "tool-callback-cancel": "CANCELED",
     "late-interrupt": "CANCELED",
     "late-steer": "INVALID_INPUT",
     "tool-denied": "TOOL_DENIED",
@@ -304,6 +348,21 @@ async function operation(kind, native = null, scenario = "normal") {
     "persistence-loss": "PERSISTENCE_FAILURE",
     tiny: kind === "compact" ? "SDK_FAILURE" : undefined,
   }[scenario];
+  NodeAssert.ok(callbackObservation, "Actual child callback observation arrives before close");
+  if (["tool-input-cancel", "tool-start-cancel", "tool-start-bridge-cancel"].includes(scenario)) {
+    NodeAssert.equal(
+      callbackObservation.callbackCount,
+      0,
+      "No callback begins after accepted cancellation",
+    );
+    NodeAssert.deepEqual(callbackObservation.callbackSignals, []);
+    NodeAssert.deepEqual(output, [], "Canceled tools emit no output transfer");
+  }
+  if (scenario === "tool-callback-cancel") {
+    NodeAssert.equal(callbackObservation.callbackCount, 1);
+    NodeAssert.deepEqual(callbackObservation.callbackSignals, [false]);
+    NodeAssert.deepEqual(output, [], "Tool result after cancellation is not emitted");
+  }
   if (expectedFailure) {
     NodeAssert.deepEqual(result, { code: 1, signal: null }, stderr);
     NodeAssert.equal(protocol.successful, false);
@@ -313,7 +372,17 @@ async function operation(kind, native = null, scenario = "normal") {
     );
     NodeAssert.ok(!frames.some((f) => ["done", "native", "compacted"].includes(f.type)));
     if (scenario === "late-steer") NodeAssert.ok(!frames.some((f) => f.type === "control-receipt"));
-    evidence.push({ kind, scenario, pid: child.pid, exit: result, frames, requests, output });
+    evidence.push({
+      kind,
+      scenario,
+      pid: child.pid,
+      exit: result,
+      frames,
+      requests,
+      output,
+      receipts,
+      callbackObservation,
+    });
     return native;
   }
   NodeAssert.deepEqual(result, { code: 0, signal: null }, stderr);
@@ -335,9 +404,31 @@ async function operation(kind, native = null, scenario = "normal") {
   NodeAssert.ok(!JSON.stringify(entries).includes("AMBIENT_AUTH_SENTINEL"));
   NodeAssert.equal((await NodeFSP.readdir(scratch)).includes("auth.json"), false);
   if (kind === "prompt") {
-    NodeAssert.deepEqual(output, [
+    const expectedOutput = [
       { purpose: "tool-result", value: { kind: "text", text: "bounded echo" } },
-    ]);
+    ];
+    if (scenario === "two-tool-calls")
+      expectedOutput.push({
+        purpose: "tool-result",
+        value: { kind: "text", text: "bounded echo two" },
+      });
+    NodeAssert.deepEqual(output, expectedOutput);
+    NodeAssert.equal(
+      callbackObservation.callbackCount,
+      scenario === "bridge" ? 0 : scenario === "two-tool-calls" ? 2 : 1,
+    );
+    NodeAssert.ok(callbackObservation.callbackSignals.every((aborted) => aborted === false));
+    if (scenario === "two-tool-calls") {
+      const toolEvents = frames
+        .filter((f) => f.type === "sdk-event" && ["tool_start", "tool_end"].includes(f.event.type))
+        .map((f) => ({ type: f.event.type, callId: f.event.callId }));
+      NodeAssert.deepEqual(toolEvents, [
+        { type: "tool_start", callId: 1 },
+        { type: "tool_end", callId: 1 },
+        { type: "tool_start", callId: 2 },
+        { type: "tool_end", callId: 2 },
+      ]);
+    }
     NodeAssert.ok(frames.some((f) => f.type === "agent_start"));
     NodeAssert.ok(frames.some((f) => f.type === "agent_settled"));
     NodeAssert.ok(frames.some((f) => f.type === "sdk-event" && f.event.type === "tool_end"));
@@ -372,41 +463,65 @@ async function operation(kind, native = null, scenario = "normal") {
     NodeAssert.equal(receipt.sessionReference, native.sessionReference);
     NodeAssert.notEqual(receipt.leafId, native.leafId);
   }
-  evidence.push({ kind, scenario, pid: child.pid, exit: result, frames, requests, output });
+  evidence.push({
+    kind,
+    scenario,
+    pid: child.pid,
+    exit: result,
+    frames,
+    requests,
+    output,
+    receipts,
+    callbackObservation,
+  });
   return receipt;
 }
 try {
-  const native = await operation("initialize");
-  NodeAssert.equal(native.persisted, true);
-  const prompted = await operation("prompt", native);
-  const compacted = await operation("compact", prompted);
-  let latest = await operation("prompt", compacted);
-  latest = await operation("prompt", latest, "bridge");
-  latest = await operation("prompt", latest, "steer");
-  latest = await operation("prompt", latest, "follow-up");
-  latest = await operation("prompt", latest, "held-end");
-  // Each failure uses a fresh native session so a failed operation never spoofs a receipt
-  // for the mutated branch of a previous successful operation.
-  for (const scenario of [
-    "interrupt",
-    "late-interrupt",
-    "late-steer",
-    "tool-denied",
-    "accounting-error",
-    "unsafe-native-id",
-    "oversized-request",
-    "persistence-loss",
-    "tool-output-limit",
-  ]) {
-    const fresh = await operation(
-      "initialize",
-      null,
-      scenario === "oversized-request" ? scenario : "normal",
-    );
-    await operation("prompt", fresh, scenario);
+  const selected = process.argv.slice(2);
+  if (selected.length) {
+    for (const scenario of selected) {
+      const native = await operation("initialize");
+      await operation("prompt", native, scenario);
+    }
+  } else {
+    const native = await operation("initialize");
+    NodeAssert.equal(native.persisted, true);
+    const prompted = await operation("prompt", native);
+    const compacted = await operation("compact", prompted);
+    let latest = await operation("prompt", compacted);
+    latest = await operation("prompt", latest, "bridge");
+    latest = await operation("prompt", latest, "steer");
+    latest = await operation("prompt", latest, "follow-up");
+    latest = await operation("prompt", latest, "held-end");
+    latest = await operation("prompt", latest, "tool-start-control");
+    latest = await operation("prompt", latest, "two-tool-calls");
+    // Each failure uses a fresh native session so a failed operation never spoofs a receipt
+    // for the mutated branch of a previous successful operation.
+    for (const scenario of [
+      "interrupt",
+      "tool-input-cancel",
+      "tool-start-cancel",
+      "tool-start-bridge-cancel",
+      "tool-callback-cancel",
+      "late-interrupt",
+      "late-steer",
+      "tool-denied",
+      "accounting-error",
+      "unsafe-native-id",
+      "oversized-request",
+      "persistence-loss",
+      "tool-output-limit",
+    ]) {
+      const fresh = await operation(
+        "initialize",
+        null,
+        scenario === "oversized-request" ? scenario : "normal",
+      );
+      await operation("prompt", fresh, scenario);
+    }
+    const tiny = await operation("initialize", null, "tiny");
+    await operation("compact", tiny, "tiny");
   }
-  const tiny = await operation("initialize", null, "tiny");
-  await operation("compact", tiny, "tiny");
   process.stdout.write(JSON.stringify({ sdk: "0.99.1", remoteCalls: 0, evidence }) + "\n");
 } finally {
   await NodeFSP.rm(scratch, { recursive: true, force: true });
