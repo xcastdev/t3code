@@ -37,6 +37,7 @@ export type IssueRepositoryRefreshReceipt = {
     | "binding-conflict";
 };
 export interface ProjectIssueRepositoryManagerShape {
+  readonly ready: Effect.Effect<void>;
   readonly refresh: Effect.Effect<ReadonlyArray<IssueRepositoryRefreshReceipt>>;
   readonly resolveCredential: (
     state: IssueRepositoryState,
@@ -96,6 +97,7 @@ export const make = Effect.fn("ProjectIssueRepositoryManager.make")(function* (
   const snapshots = yield* ProjectIssueCredentialSnapshot;
   const github = yield* GitHubIssueClient;
   const crypto = yield* Crypto.Crypto;
+  const initialized = yield* Deferred.make<void>();
   const queue = yield* Queue.dropping<void>(1);
   const cache = new Map<
     string,
@@ -531,6 +533,7 @@ export const make = Effect.fn("ProjectIssueRepositoryManager.make")(function* (
         if (periodic) yield* Queue.poll(queue);
         const receipt = pending;
         const receipts = yield* reconcilePage();
+        yield* Deferred.succeed(initialized, undefined);
         if (periodic) nextAt = (yield* Clock.currentTimeMillis) + 30_000;
         if (receipt !== undefined) {
           pending = undefined;
@@ -544,6 +547,7 @@ export const make = Effect.fn("ProjectIssueRepositoryManager.make")(function* (
       stopped = true;
       cache.clear();
       yield* Fiber.interrupt(worker);
+      yield* Deferred.succeed(initialized, undefined);
       yield* Queue.shutdown(queue);
       if (pending !== undefined) yield* Deferred.succeed(pending, []);
       pending = undefined;
@@ -598,5 +602,10 @@ export const make = Effect.fn("ProjectIssueRepositoryManager.make")(function* (
     }
     return entry.snapshot;
   });
-  return ProjectIssueRepositoryManager.of({ refresh, resolveCredential, stop });
+  return ProjectIssueRepositoryManager.of({
+    ready: Deferred.await(initialized),
+    refresh,
+    resolveCredential,
+    stop,
+  });
 });

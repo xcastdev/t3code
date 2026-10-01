@@ -799,3 +799,66 @@ it.effect("counter exhaustion refuses detachment without changing history or aut
     }),
   ),
 );
+
+it.effect(
+  "initial readiness waits for the first verified sweep without duplicating remote reads",
+  () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* setup();
+        yield* f.project();
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const ready = yield* Deferred.make<void>();
+        f.setBoundary((input) =>
+          input.args.at(-1) === "repos/owner/repo"
+            ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+            : Effect.void,
+        );
+        const manager = yield* f.start();
+        yield* Effect.forkChild(
+          manager.ready.pipe(Effect.andThen(Deferred.succeed(ready, undefined))),
+        );
+        yield* Deferred.await(entered);
+        expect(yield* Deferred.isDone(ready)).toBe(false);
+        yield* Deferred.succeed(release, undefined);
+        yield* Deferred.await(ready);
+        const current = (yield* f.stored())!;
+        expect((yield* manager.resolveCredential(current))?.credentialEpoch).toBe(
+          current.credentialEpoch,
+        );
+        expect(f.calls.filter((call) => call.args.at(-1) === "repos/owner/repo")).toHaveLength(1);
+      }),
+    ),
+);
+
+it.effect("stop releases initial readiness only after joining its blocked verification", () =>
+  run(
+    Effect.gen(function* () {
+      const f = yield* setup();
+      yield* f.project();
+      const entered = yield* Deferred.make<void>();
+      const joined = yield* Deferred.make<void>();
+      const ready = yield* Deferred.make<void>();
+      f.setBoundary((input) =>
+        input.args[1] === "status"
+          ? Deferred.succeed(entered, undefined).pipe(
+              Effect.andThen(Effect.never),
+              Effect.ensuring(Deferred.succeed(joined, undefined)),
+            )
+          : Effect.void,
+      );
+      const manager = yield* f.start();
+      yield* Effect.forkChild(
+        manager.ready.pipe(Effect.andThen(Deferred.succeed(ready, undefined))),
+      );
+      yield* Deferred.await(entered);
+      expect(yield* Deferred.isDone(ready)).toBe(false);
+      yield* manager.stop;
+      yield* Deferred.await(ready);
+      expect(yield* Deferred.isDone(joined)).toBe(true);
+      expect(yield* manager.refresh).toEqual([]);
+      expect(yield* f.stored()).toBeUndefined();
+    }),
+  ),
+);
