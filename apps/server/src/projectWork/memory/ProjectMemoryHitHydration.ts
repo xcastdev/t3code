@@ -1,4 +1,12 @@
-import { ProjectId, ProjectMemoryObservation, ProjectMemorySource } from "@t3tools/contracts";
+import {
+  ProjectId,
+  EventId,
+  IsoDateTime,
+  ProjectTeamRecord,
+  ProjectMemoryObservation,
+  ProjectMemorySource,
+  canonicalProjectWorkPayload,
+} from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Predicate from "effect/Predicate";
@@ -89,6 +97,29 @@ const decodePayloads = Schema.decodeUnknownOption(
 const encodeUniqueKey = Schema.encodeSync(
   Schema.fromJsonString(Schema.Tuple([Schema.String, Version, Version, Schema.String])),
 );
+const FoundationEvent = Schema.Struct({
+  eventId: Schema.toType(EventId).check(Schema.isTrimmed(), Schema.isMaxLength(256)),
+  projectId: Input.fields.projectId,
+  revision: Version,
+  occurredAt: IsoDateTime,
+  type: Schema.Literal("project-work.foundation.recorded"),
+  record: ProjectTeamRecord,
+});
+const EventMetadata = Schema.Struct({
+  sequence: Version.check(Schema.isGreaterThan(0)),
+  eventId: FoundationEvent.fields.eventId,
+  projectId: FoundationEvent.fields.projectId,
+  type: FoundationEvent.fields.type,
+  occurredAt: FoundationEvent.fields.occurredAt,
+  bytes: Version,
+});
+const decodeEventMetadata = Schema.decodeUnknownOption(Schema.Array(EventMetadata));
+const decodeEventPayloads = Schema.decodeUnknownOption(
+  Schema.Array(Schema.Struct({ sequence: EventMetadata.fields.sequence, payload: Schema.String })),
+);
+const decodeEvent = Schema.decodeUnknownOption(Schema.fromJsonString(FoundationEvent), {
+  onExcessProperty: "error",
+});
 const maxPayloadBytes = 1_048_576;
 const maxTotalBytes = 16_777_216;
 
@@ -103,16 +134,74 @@ const denied = (reason: ProjectMemoryHydrationDenial) => ({
   selected: [] as ReadonlyArray<ProjectMemoryObservation>,
 });
 
+// The event index proves membership independently of the potentially corrupt
+// projection partition. Metadata bounds must pass before any event JSON is fetched.
+const readMembership = Effect.fn("ProjectMemoryHitHydration.readMembership")(function* (
+  sql: SqlClient.SqlClient,
+  owners: ReadonlyArray<string>,
+) {
+  const rows = yield* sql`SELECT sequence, event_id AS eventId, project_id AS projectId,
+    event_type AS type, occurred_at AS occurredAt, length(CAST(payload_json AS BLOB)) AS bytes
+    FROM project_work_events WHERE project_id IN ${sql.in(owners)}
+    AND event_type = 'project-work.foundation.recorded' ORDER BY sequence LIMIT 4097`;
+  if (rows.length > 4096) return denied("incomplete-authority");
+  const metadata = decodeEventMetadata(rows);
+  if (Option.isNone(metadata)) return denied("corruption");
+  if (
+    metadata.value.some((row) => row.bytes > maxPayloadBytes) ||
+    metadata.value.reduce((total, row) => total + row.bytes, 0) > maxTotalBytes
+  )
+    return denied("incomplete-authority");
+  const payloadRows = yield* sql`SELECT sequence,
+    CASE WHEN length(CAST(payload_json AS BLOB)) <= ${maxPayloadBytes} THEN payload_json ELSE NULL END AS payload
+    FROM project_work_events WHERE project_id IN ${sql.in(owners)}
+    AND event_type = 'project-work.foundation.recorded' ORDER BY sequence LIMIT 4097`;
+  const payloads = decodeEventPayloads(payloadRows);
+  if (Option.isNone(payloads) || payloads.value.length !== metadata.value.length)
+    return denied("corruption");
+  const latest = new Map<string, ProjectTeamRecord>();
+  for (const [index, payload] of payloads.value.entries()) {
+    const row = metadata.value[index];
+    const decoded = decodeEvent(payload.payload);
+    if (row === undefined || Option.isNone(decoded)) return denied("corruption");
+    const event = decoded.value;
+    const previous = latest.get(event.record.recordId);
+    if (
+      payload.sequence !== row.sequence ||
+      event.eventId !== row.eventId ||
+      event.projectId !== row.projectId ||
+      event.type !== row.type ||
+      event.occurredAt !== row.occurredAt ||
+      event.record.projectId !== row.projectId ||
+      Buffer.byteLength(payload.payload, "utf8") !== row.bytes ||
+      (previous !== undefined &&
+        (previous.projectId !== event.record.projectId || previous.kind !== event.record.kind))
+    )
+      return denied("corruption");
+    latest.set(event.record.recordId, event.record);
+  }
+  const sources = new Map<string, ProjectMemorySource>();
+  const observations = new Map<string, ProjectMemoryObservation>();
+  for (const record of latest.values()) {
+    if (record.kind === "memory-source") sources.set(record.recordId, record);
+    else if (record.kind === "memory-observation") observations.set(record.recordId, record);
+  }
+  return sources.size > 256 || observations.size > 256
+    ? denied("incomplete-authority")
+    : { status: "complete" as const, sources, observations };
+});
+
 const readMetadata = Effect.fn("ProjectMemoryHitHydration.readMetadata")(function* (
   sql: SqlClient.SqlClient,
   table: string,
   owners: ReadonlyArray<string>,
+  expectedIds: ReadonlyArray<string>,
 ) {
   const rows =
     yield* sql`SELECT record_id AS recordId, project_id AS projectId, status, revision, generation,
     updated_at AS updatedAt, source_id AS sourceId, unique_key AS uniqueKey,
     length(CAST(payload_json AS BLOB)) AS bytes FROM ${sql(table)}
-    WHERE project_id IN ${sql.in(owners)} ORDER BY record_id LIMIT 257`;
+    WHERE (project_id IN ${sql.in(owners)} OR record_id IN ${sql.in(expectedIds)}) ORDER BY record_id LIMIT 257`;
   return rows;
 });
 
@@ -149,13 +238,27 @@ const readSnapshot = Effect.fn("ProjectMemoryHitHydration.readSnapshot")(functio
   )
     return denied("current-access-gone");
 
-  const sourceRows = yield* readMetadata(sql, "project_team_memory_source", owners);
-  const observationRows = yield* readMetadata(sql, "project_team_memory_observation", owners);
+  const membership = yield* readMembership(sql, owners);
+  if (membership.status === "denied") return membership;
+  const sourceIds = [...membership.sources.keys()];
+  const observationIds = [...membership.observations.keys()];
+  const sourceRows = yield* readMetadata(sql, "project_team_memory_source", owners, sourceIds);
+  const observationRows = yield* readMetadata(
+    sql,
+    "project_team_memory_observation",
+    owners,
+    observationIds,
+  );
   if (sourceRows.length > 256 || observationRows.length > 256)
     return denied("incomplete-authority");
   const sourcesMetadata = decodeMetadata(sourceRows);
   const observationsMetadata = decodeMetadata(observationRows);
   if (Option.isNone(sourcesMetadata) || Option.isNone(observationsMetadata))
+    return denied("corruption");
+  if (
+    sourcesMetadata.value.length !== membership.sources.size ||
+    observationsMetadata.value.length !== membership.observations.size
+  )
     return denied("corruption");
   const metadata = [...sourcesMetadata.value, ...observationsMetadata.value];
   if (
@@ -167,13 +270,25 @@ const readSnapshot = Effect.fn("ProjectMemoryHitHydration.readSnapshot")(functio
   const sources: Array<ProjectMemorySource> = [];
   const observations: Array<ProjectMemoryObservation> = [];
   const ids = new Set<string>();
-  for (const [table, rows, decode] of [
-    ["project_team_memory_source", sourcesMetadata.value, decodeSource],
-    ["project_team_memory_observation", observationsMetadata.value, decodeObservation],
+  for (const [table, rows, decode, expected, expectedIds] of [
+    [
+      "project_team_memory_source",
+      sourcesMetadata.value,
+      decodeSource,
+      membership.sources,
+      sourceIds,
+    ],
+    [
+      "project_team_memory_observation",
+      observationsMetadata.value,
+      decodeObservation,
+      membership.observations,
+      observationIds,
+    ],
   ] as const) {
     const payloadRows = yield* sql`SELECT record_id AS recordId,
       CASE WHEN length(CAST(payload_json AS BLOB)) <= ${maxPayloadBytes} THEN payload_json ELSE NULL END AS payload
-      FROM ${sql(table)} WHERE project_id IN ${sql.in(owners)} ORDER BY record_id LIMIT 257`;
+      FROM ${sql(table)} WHERE (project_id IN ${sql.in(owners)} OR record_id IN ${sql.in(expectedIds)}) ORDER BY record_id LIMIT 257`;
     const payloads = decodePayloads(payloadRows);
     if (Option.isNone(payloads) || payloads.value.length !== rows.length)
       return denied("corruption");
@@ -186,6 +301,9 @@ const readSnapshot = Effect.fn("ProjectMemoryHitHydration.readSnapshot")(functio
       const record = decoded.value;
       if (
         ids.has(record.recordId) ||
+        !expected.has(record.recordId) ||
+        canonicalProjectWorkPayload(record) !==
+          canonicalProjectWorkPayload(expected.get(record.recordId)) ||
         payload.recordId !== row.recordId ||
         record.recordId !== row.recordId ||
         record.projectId !== row.projectId ||
@@ -224,7 +342,9 @@ const readSnapshot = Effect.fn("ProjectMemoryHitHydration.readSnapshot")(functio
 });
 
 /** The caller authorizes the target project/role/attempt and rechecks access before
- * delivering context. This reader establishes only current durable memory authority. */
+ * delivering context, including source/observation revisions and shares. This reader
+ * proves a bounded transaction snapshot; changes after the snapshot require a fresh
+ * caller check before delivery. It performs no SQL writes or authorization grants. */
 export const hydrateProjectMemoryHits = Effect.fn("hydrateProjectMemoryHits")(function* (
   sql: SqlClient.SqlClient,
   input: unknown,

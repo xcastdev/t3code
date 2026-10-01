@@ -16,6 +16,7 @@ import {
   ProjectMemorySource,
   ProjectMemoryObservation,
   ProjectMemoryExtraction,
+  ProjectTeamMission,
   ProjectWorkFoundationCommitCommand,
   type ProjectTeamRecord,
 } from "@t3tools/contracts";
@@ -39,6 +40,7 @@ const decodeSourceFixture = Schema.decodeSync(ProjectMemorySource);
 const decodeObservationFixture = Schema.decodeSync(ProjectMemoryObservation);
 const decodeCommitFixture = Schema.decodeEffect(ProjectWorkFoundationCommitCommand);
 const decodeExtractionFixture = Schema.decodeEffect(ProjectMemoryExtraction);
+const decodeMissionFixture = Schema.decodeEffect(ProjectTeamMission);
 const source = (projectId = "target", recordId = "source", changes: Record<string, unknown> = {}) =>
   decodeSourceFixture({
     kind: "memory-source",
@@ -533,6 +535,17 @@ for (const kind of ["source", "observation"] as const) {
           reason: "incomplete-authority",
           selected: [],
         });
+        yield* sql`DELETE FROM ${sql(table)} WHERE record_id = 'sentinel'`;
+        if (kind === "source") yield* commit([extra]);
+        else {
+          const newSource = source("target", "sentinel-source");
+          yield* addMemory(newSource, [observation(newSource, "sentinel")]);
+        }
+        expect(yield* hydrate(sql)).toEqual({
+          status: "denied",
+          reason: "incomplete-authority",
+          selected: [],
+        });
       }),
     ),
   );
@@ -761,3 +774,336 @@ for (const change of ["share-revocation", "target-deletion"] as const) {
       ).pipe(Effect.provide(NodeServices.layer)),
   );
 }
+
+for (const kind of ["source", "observation"] as const) {
+  it.effect(`canonical membership denies a misplaced non-hit ${kind} correction`, () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        yield* addProject("unrelated");
+        const s = source();
+        if (kind === "observation")
+          yield* addMemory(s, [
+            observation(s),
+            observation(s, "correction", { supersedes: "hit" }),
+          ]);
+        else {
+          yield* addMemory(s);
+          yield* commit([source("target", "correction", { supersedes: "source" })]);
+        }
+        const table =
+          kind === "source" ? "project_team_memory_source" : "project_team_memory_observation";
+        expect(yield* hydrate(sql)).toMatchObject({ status: "accepted", selected: [] });
+        const events = yield* sql`SELECT * FROM project_work_events ORDER BY sequence`;
+        const authority = yield* readCurrentState(sql, "target");
+        yield* sql`UPDATE ${sql(table)} SET project_id = 'unrelated' WHERE record_id = 'correction'`;
+        expect((yield* readCurrentState(sql, "target")).foundationRecords).toEqual(
+          authority.foundationRecords,
+        );
+        expect(yield* sql`SELECT * FROM project_work_events ORDER BY sequence`).toEqual(events);
+        expect(yield* hydrate(sql)).toEqual({
+          status: "denied",
+          reason: "corruption",
+          selected: [],
+        });
+        yield* sql`UPDATE ${sql(table)} SET project_id = 'target' WHERE record_id = 'correction'`;
+        expect(yield* hydrate(sql)).toMatchObject({ status: "accepted", selected: [] });
+        yield* sql`DELETE FROM ${sql(table)} WHERE record_id = 'correction'`;
+        expect(yield* hydrate(sql)).toEqual({
+          status: "denied",
+          reason: "corruption",
+          selected: [],
+        });
+      }),
+    ),
+  );
+}
+
+for (const field of ["supersedes", "body", "sharedWithProjectIds"] as const) {
+  it.effect(`denies altered non-hit ${field} despite consistent physical metadata`, () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        const s = source();
+        const correction = observation(s, "correction", { supersedes: "hit" });
+        yield* addMemory(s, [observation(s), correction]);
+        const table =
+          field === "sharedWithProjectIds"
+            ? "project_team_memory_source"
+            : "project_team_memory_observation";
+        const record = field === "sharedWithProjectIds" ? s : correction;
+        const altered =
+          field === "supersedes"
+            ? { ...correction, supersedes: undefined }
+            : field === "body"
+              ? { ...correction, body: "Unlogged correction" }
+              : { ...s, sharedWithProjectIds: ["unrelated"] };
+        yield* sql`UPDATE ${sql(table)} SET payload_json = ${encodeJson(altered)} WHERE record_id = ${record.recordId}`;
+        expect(yield* hydrate(sql)).toEqual({
+          status: "denied",
+          reason: "corruption",
+          selected: [],
+        });
+        // Canonical comparison accepts reordered JSON keys and insignificant whitespace.
+        const reordered = Object.fromEntries(Object.entries(record).toReversed());
+        yield* sql`UPDATE ${sql(table)} SET payload_json = ${encodeJson(reordered) + "  "} WHERE record_id = ${record.recordId}`;
+        expect(yield* hydrate(sql)).toMatchObject({ status: "accepted", selected: [] });
+      }),
+    ),
+  );
+}
+
+it.effect("denies an unlogged extra memory row and a missing canonical source", () =>
+  withDatabase(
+    Effect.gen(function* () {
+      const sql = yield* setup;
+      yield* addMemory();
+      const extra = source("target", "unlogged");
+      yield* sql`INSERT INTO project_team_memory_source (record_id,project_id,status,revision,generation,updated_at,source_id,payload_json)
+      VALUES (${extra.recordId},${extra.projectId},${extra.status},${extra.revision},${extra.generation},${extra.updatedAt},${extra.sourceId},${encodeJson(extra)})`;
+      expect(yield* hydrate(sql)).toEqual({ status: "denied", reason: "corruption", selected: [] });
+      yield* sql`DELETE FROM project_team_memory_source WHERE record_id = 'unlogged'`;
+      expect(yield* hydrate(sql)).toMatchObject({ status: "accepted", selected: [observation()] });
+      yield* sql`DELETE FROM project_team_memory_source WHERE record_id = 'source'`;
+      expect(yield* hydrate(sql)).toEqual({ status: "denied", reason: "corruption", selected: [] });
+    }),
+  ),
+);
+
+for (const [label, field, value] of [
+  ["event ID", "eventId", "wrong-event"],
+  ["outer owner", "projectId", "unrelated"],
+  ["event type", "type", "project-work.task.created"],
+  ["occurred-at", "occurredAt", "2026-09-01T00:00:00.000Z"],
+  ["record owner", "record.projectId", "unrelated"],
+  ["record ID", "record.recordId", "wrong-record"],
+] as const) {
+  it.effect(`denies canonical event ${label} mismatch`, () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        yield* addMemory();
+        yield* sql`UPDATE project_work_events SET payload_json = json_set(payload_json, ${`$.${field}`}, ${value})
+        WHERE project_id = 'target' AND event_type = 'project-work.foundation.recorded'
+        AND json_extract(payload_json, '$.record.recordId') = 'source'`;
+        expect(yield* hydrate(sql)).toEqual({
+          status: "denied",
+          reason: "corruption",
+          selected: [],
+        });
+      }),
+    ),
+  );
+}
+
+it.effect("denies malformed or excessive-field canonical event JSON", () =>
+  withDatabase(
+    Effect.gen(function* () {
+      const sql = yield* setup;
+      yield* addMemory();
+      const rows = yield* decodeEventRows(
+        yield* sql`SELECT event_id AS eventId, payload_json AS payload FROM project_work_events WHERE project_id = 'target' ORDER BY sequence LIMIT 1`,
+      );
+      const row = rows[0];
+      expect(row).toBeDefined();
+      if (row === undefined) return;
+      yield* sql`UPDATE project_work_events SET payload_json = json_set(payload_json, '$.authorityComplete', 1) WHERE event_id = ${row.eventId}`;
+      expect(yield* hydrate(sql)).toEqual({ status: "denied", reason: "corruption", selected: [] });
+      yield* sql`UPDATE project_work_events SET payload_json = '{' WHERE event_id = ${row.eventId}`;
+      expect(yield* hydrate(sql)).toEqual({ status: "denied", reason: "corruption", selected: [] });
+    }),
+  ),
+);
+
+const traceReader = Effect.fn("fixture.traceReader")(function* (sql: SqlClient.SqlClient) {
+  const reserved = yield* sql.reserve;
+  const reads: Array<{ query: string; params: ReadonlyArray<unknown> }> = [];
+  const connection: Connection = {
+    ...reserved,
+    execute(query, params, rowTransform) {
+      reads.push({ query, params });
+      return reserved.execute(query, params, rowTransform);
+    },
+  };
+  const reader = yield* SqlClient.make({
+    acquirer: Effect.succeed(connection),
+    transactionAcquirer: Effect.succeed(connection),
+    compiler: Statement.makeCompilerSqlite(),
+    spanAttributes: [],
+  }).pipe(Effect.provide(Reactivity.layer));
+  return { reader, reads };
+});
+const decodePlans = Schema.decodeUnknownEffect(
+  Schema.Array(Schema.Struct({ detail: Schema.String })),
+);
+const decodeEventRows = Schema.decodeUnknownEffect(
+  Schema.Array(Schema.Struct({ eventId: Schema.String, payload: Schema.String })),
+);
+
+it.effect("bounds individual canonical event bytes before fetching JSON, including non-ASCII", () =>
+  withDatabase(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        yield* addMemory();
+        const rows = yield* decodeEventRows(
+          yield* sql`SELECT event_id AS eventId, payload_json AS payload FROM project_work_events ORDER BY sequence LIMIT 1`,
+        );
+        const row = rows[0];
+        expect(row).toBeDefined();
+        if (row === undefined) return;
+        const { reader, reads } = yield* traceReader(sql);
+        const exact = row.payload + " ".repeat(1_048_576 - Buffer.byteLength(row.payload));
+        yield* reader`UPDATE project_work_events SET payload_json = ${exact} WHERE event_id = ${row.eventId}`;
+        expect(yield* hydrate(reader)).toMatchObject({
+          status: "accepted",
+          selected: [observation()],
+        });
+        for (const oversized of [exact + " ", "é".repeat(524_289)]) {
+          yield* reader`UPDATE project_work_events SET payload_json = ${oversized} WHERE event_id = ${row.eventId}`;
+          reads.length = 0;
+          expect(yield* hydrate(reader)).toEqual({
+            status: "denied",
+            reason: "incomplete-authority",
+            selected: [],
+          });
+          expect(reads.some(({ query }) => query.includes("AS payload"))).toBe(false);
+          expect(reads.some(({ query }) => query.includes("project_team_memory_source"))).toBe(
+            false,
+          );
+        }
+      }),
+    ),
+  ),
+);
+
+it.effect("bounds aggregate canonical event bytes before fetching JSON", () =>
+  withDatabase(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        yield* addMemory();
+        yield* commit(Array.from({ length: 15 }, (_, i) => source("target", `event-source-${i}`)));
+        const rows = yield* decodeEventRows(
+          yield* sql`SELECT event_id AS eventId, payload_json AS payload FROM project_work_events ORDER BY sequence`,
+        );
+        const rest = rows
+          .slice(16)
+          .reduce((total, row) => total + Buffer.byteLength(row.payload), 0);
+        for (const [index, row] of rows.slice(0, 16).entries()) {
+          const desired = 1_048_576 - (index === 15 ? rest : 0);
+          yield* sql`UPDATE project_work_events SET payload_json = ${row.payload + " ".repeat(desired - Buffer.byteLength(row.payload))} WHERE event_id = ${row.eventId}`;
+        }
+        const { reader, reads } = yield* traceReader(sql);
+        expect(yield* hydrate(reader)).toMatchObject({
+          status: "accepted",
+          selected: [observation()],
+        });
+        const last = rows[15];
+        expect(last).toBeDefined();
+        if (last === undefined) return;
+        yield* reader`UPDATE project_work_events SET payload_json = payload_json || ' ' WHERE event_id = ${last.eventId}`;
+        reads.length = 0;
+        expect(yield* hydrate(reader)).toEqual({
+          status: "denied",
+          reason: "incomplete-authority",
+          selected: [],
+        });
+        expect(reads.some(({ query }) => query.includes("AS payload"))).toBe(false);
+      }),
+    ),
+  ),
+);
+
+it.effect(
+  "accepts 4096 complete foundation events and denies the 4097 sentinel including non-memory history",
+  () =>
+    withDatabase(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const sql = yield* setup;
+          yield* addMemory();
+          yield* commit([
+            yield* decodeMissionFixture({
+              kind: "mission",
+              projectId: "target",
+              recordId: "mission",
+              revision: 0,
+              generation: 0,
+              updatedAt: at,
+              status: "active",
+              title: "History control",
+              objective: "Bound all foundation kinds",
+              requiredTaskIds: [],
+            }),
+          ]);
+          // Replicate a real, typed non-memory event without thousands of redundant
+          // repository commands or fabricated memory rows.
+          yield* sql`WITH RECURSIVE n(x) AS (VALUES (1) UNION ALL SELECT x + 1 FROM n WHERE x < 4092)
+      INSERT INTO project_work_events (event_id,project_id,event_type,occurred_at,command_id,payload_json)
+      SELECT 'history-' || n.x, e.project_id,e.event_type,e.occurred_at,'history-command-' || n.x,
+        json_set(e.payload_json, '$.eventId', 'history-' || n.x, '$.revision', n.x + 100)
+      FROM n JOIN project_work_events e ON json_extract(e.payload_json, '$.record.kind') = 'mission'`;
+          const { reader, reads } = yield* traceReader(sql);
+          expect(yield* hydrate(reader)).toMatchObject({
+            status: "accepted",
+            selected: [observation()],
+          });
+          yield* reader`INSERT INTO project_work_events (event_id,project_id,event_type,occurred_at,command_id,payload_json)
+      SELECT 'history-sentinel',project_id,event_type,occurred_at,'sentinel-command',json_set(payload_json, '$.eventId', 'history-sentinel')
+      FROM project_work_events WHERE event_id = 'history-1'`;
+          reads.length = 0;
+          expect(yield* hydrate(reader)).toEqual({
+            status: "denied",
+            reason: "incomplete-authority",
+            selected: [],
+          });
+          expect(reads.some(({ query }) => query.includes("AS payload"))).toBe(false);
+          expect(reads.filter(({ query }) => query.includes("project_work_events"))).toHaveLength(
+            1,
+          );
+        }),
+      ),
+    ),
+);
+
+it.effect("loads only indexed owner history; unrelated corrupt events are excluded", () =>
+  withDatabase(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        yield* addMemory();
+        yield* addProject("unrelated");
+        yield* addMemory(source("unrelated", "foreign-source"), [
+          observation(source("unrelated", "foreign-source"), "foreign-hit"),
+        ]);
+        yield* sql`UPDATE project_work_events SET payload_json = '{' WHERE project_id = 'unrelated'`;
+        const { reader, reads } = yield* traceReader(sql);
+        expect(yield* hydrate(reader)).toMatchObject({
+          status: "accepted",
+          selected: [observation()],
+        });
+        const historyReads = reads.filter(({ query }) => query.includes("project_work_events"));
+        expect(historyReads).toHaveLength(2);
+        for (const read of historyReads) {
+          expect(read.params).toContain("target");
+          expect(read.params).not.toContain("unrelated");
+          expect(read.query).toContain("event_type = 'project-work.foundation.recorded'");
+          const plans = yield* decodePlans(
+            yield* reader.unsafe("EXPLAIN QUERY PLAN " + read.query, read.params),
+          );
+          expect(
+            plans.some(({ detail }) =>
+              detail.includes(
+                "SEARCH project_work_events USING INDEX idx_project_work_events_project_type_sequence (project_id=? AND event_type=?)",
+              ),
+            ),
+          ).toBe(true);
+          expect(plans.some(({ detail }) => detail.startsWith("SCAN project_work_events"))).toBe(
+            false,
+          );
+        }
+      }),
+    ),
+  ),
+);
