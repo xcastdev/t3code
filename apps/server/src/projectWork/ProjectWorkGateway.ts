@@ -635,9 +635,11 @@ const makeProjectWorkGateway = Effect.gen(function* () {
         }) => Effect.Effect<ProjectWorkCommand, E>,
       ) =>
         repository.executeAuthorized(input, authorize, () =>
-          teamAuthorization._tag === "Some"
-            ? teamAuthorization.value.write(caller, command)
-            : Effect.void,
+          Effect.gen(function* () {
+            if (command.type === "project-work.issue.refine") yield* fence;
+            if (teamAuthorization._tag === "Some")
+              yield* teamAuthorization.value.write(caller, command);
+          }),
         );
       const settings = yield* serverSettings.getSettings.pipe(
         Effect.mapError(
@@ -654,6 +656,11 @@ const makeProjectWorkGateway = Effect.gen(function* () {
       }
       if (command.type === "project-work.foundation.commit")
         return yield* new ProjectWorkAuthorizationError({ reason: "project-work-disabled" });
+      if (
+        command.type === "project-work.issue.refine" &&
+        (actor.kind !== "human" || caller.managed !== undefined)
+      )
+        return yield* new ProjectWorkAuthorizationError({ reason: "agent-approval-required" });
       const fence = assertProjectAcceptsMutations(sql, String(command.projectId)).pipe(
         Effect.mapError(
           (cause) =>

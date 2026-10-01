@@ -62,12 +62,6 @@ export class ProjectWorkAttentionReactor extends Context.Service<
 const timestamp = (state: ProjectWorkProjectionState): string =>
   state.history?.at(-1)?.occurredAt ?? DateTime.formatIso(DateTime.nowUnsafe());
 
-const activeAttention = (
-  state: ProjectWorkProjectionState,
-  taskId: ProjectWorkTaskId,
-): ProjectWorkAttention | undefined =>
-  state.attention.find((entry) => entry.taskId === taskId && entry.resolvedAt === undefined);
-
 export const deriveProjectWorkAttention = (
   state: ProjectWorkProjectionState,
 ): ReadonlyArray<ProjectWorkAttention> =>
@@ -447,56 +441,88 @@ const makeProjectWorkAttentionReactor = Effect.gen(function* () {
   const reconcile: ProjectWorkAttentionReactorShape["reconcile"] = (projectId, state) =>
     Effect.gen(function* () {
       yield* ensureProjectWorkTables(sql);
-      const desired = deriveProjectWorkAttention(state);
-      const desiredByTask = new Map(desired.map((entry) => [String(entry.taskId), entry]));
-      const previousRows = yield* sql<Record<string, unknown>>`
-        SELECT task_id AS taskId, reason, detail, seen_at AS seenAt, resolved_at AS resolvedAt, revision
-        FROM project_work_attention WHERE project_id = ${projectId}
-      `;
-      const previousAttention: Array<ProjectWorkAttention> = previousRows.map((row) => ({
-        taskId: ProjectWorkTaskId.make(String(row.taskId)),
-        reason: String(row.reason) as ProjectWorkAttention["reason"],
-        ...(row.detail == null ? {} : { detail: String(row.detail) }),
-        ...(row.seenAt == null ? {} : { seenAt: String(row.seenAt) }),
-        ...(row.resolvedAt == null ? {} : { resolvedAt: String(row.resolvedAt) }),
-        revision: Number(row.revision),
-      }));
-      const changedAt = timestamp(state);
-      for (const attention of desired) {
-        const existing = activeAttention(
-          { ...state, attention: previousAttention },
-          attention.taskId,
-        );
-        yield* sql`
-          INSERT INTO project_work_attention
-            (project_id, task_id, reason, detail, seen_at, resolved_at, revision)
-          VALUES
-            (${projectId}, ${attention.taskId}, ${attention.reason}, ${attention.detail ?? null},
-             ${existing?.seenAt ?? null}, NULL, ${Math.max(existing?.revision ?? 0, attention.revision)})
-          ON CONFLICT(project_id, task_id) DO UPDATE SET
-            reason = excluded.reason, detail = excluded.detail,
-            seen_at = CASE WHEN project_work_attention.resolved_at IS NULL
-              THEN COALESCE(project_work_attention.seen_at, excluded.seen_at)
-              ELSE excluded.seen_at END,
-            resolved_at = NULL,
-            revision = MAX(project_work_attention.revision, excluded.revision)
+      const policyAttention = deriveProjectWorkAttention(state);
+      const readAttention = Effect.gen(function* () {
+        const rows = yield* sql<Record<string, unknown>>`
+          SELECT task_id AS taskId, reason, detail, seen_at AS seenAt, resolved_at AS resolvedAt, revision
+          FROM project_work_attention WHERE project_id = ${projectId}
         `;
-      }
-      for (const existing of previousAttention) {
-        if (existing.resolvedAt === undefined && !desiredByTask.has(String(existing.taskId))) {
-          yield* sql`
-            UPDATE project_work_attention
-            SET resolved_at = COALESCE(resolved_at, ${changedAt}), revision = revision + 1
-            WHERE project_id = ${projectId} AND task_id = ${existing.taskId} AND resolved_at IS NULL
-          `;
-        }
-      }
-      yield* enqueueProjectWorkAttentionPublication(
-        sql,
-        projectId,
-        { ...state, attention: previousAttention },
-        { ...state, attention: [...desired] },
-        changedAt,
+        return rows.map((row): ProjectWorkAttention => ({
+          taskId: ProjectWorkTaskId.make(String(row.taskId)),
+          reason: String(row.reason) as ProjectWorkAttention["reason"],
+          ...(row.detail == null ? {} : { detail: String(row.detail) }),
+          ...(row.seenAt == null ? {} : { seenAt: String(row.seenAt) }),
+          ...(row.resolvedAt == null ? {} : { resolvedAt: String(row.resolvedAt) }),
+          revision: Number(row.revision),
+        }));
+      });
+      const previousAttention = yield* readAttention;
+      const previousByTask = new Map(previousAttention.map((entry) => [entry.taskId, entry]));
+      const changedAt = timestamp(state);
+      const desired = yield* sql.withTransaction(
+        Effect.gen(function* () {
+          const currentAttention = yield* readAttention;
+          const currentByTask = new Map(currentAttention.map((entry) => [entry.taskId, entry]));
+          // A completed read may outlive an open/close cycle or a newer reason.
+          // Compare its version under the write permit; newer live rows win.
+          const unchangedSinceRead = (taskId: ProjectWorkTaskId) => {
+            const previous = previousByTask.get(taskId);
+            const current = currentByTask.get(taskId);
+            return previous === undefined
+              ? current === undefined
+              : current !== undefined &&
+                  previous.revision === current.revision &&
+                  previous.reason === current.reason &&
+                  previous.detail === current.detail &&
+                  previous.resolvedAt === current.resolvedAt;
+          };
+          const desiredByTask = new Map(policyAttention.map((entry) => [entry.taskId, entry]));
+          for (const attention of policyAttention) {
+            if (!unchangedSinceRead(attention.taskId)) continue;
+            const current = currentByTask.get(attention.taskId);
+            const unchanged =
+              current !== undefined &&
+              current.resolvedAt === undefined &&
+              current.reason === attention.reason &&
+              current.detail === attention.detail;
+            const revision = Math.max(
+              attention.revision,
+              (current?.revision ?? -1) + (unchanged ? 0 : 1),
+            );
+            yield* sql`
+              INSERT INTO project_work_attention
+                (project_id, task_id, reason, detail, seen_at, resolved_at, revision)
+              VALUES
+                (${projectId}, ${attention.taskId}, ${attention.reason}, ${attention.detail ?? null},
+                 ${unchanged ? (current.seenAt ?? null) : null}, NULL, ${revision})
+              ON CONFLICT(project_id, task_id) DO UPDATE SET
+                reason = excluded.reason, detail = excluded.detail, seen_at = excluded.seen_at,
+                resolved_at = NULL, revision = excluded.revision
+            `;
+          }
+          for (const current of currentAttention) {
+            if (
+              current.resolvedAt === undefined &&
+              !desiredByTask.has(current.taskId) &&
+              unchangedSinceRead(current.taskId)
+            ) {
+              yield* sql`
+                UPDATE project_work_attention
+                SET resolved_at = ${changedAt}, revision = revision + 1
+                WHERE project_id = ${projectId} AND task_id = ${current.taskId}
+              `;
+            }
+          }
+          const committedAttention = yield* readAttention;
+          yield* enqueueProjectWorkAttentionPublication(
+            sql,
+            projectId,
+            { ...state, attention: currentAttention },
+            { ...state, attention: committedAttention },
+            changedAt,
+          );
+          return committedAttention.filter((entry) => entry.resolvedAt === undefined);
+        }),
       );
       yield* onCommitted({ projectId, state, events: [] });
       return desired;

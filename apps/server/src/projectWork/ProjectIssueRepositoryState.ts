@@ -397,8 +397,16 @@ export const commitIssueRepositoryRead = Effect.fn("commitIssueRepositoryRead")(
     E,
     R
   >,
+  options?: { readonly nextSweepDelayMs: number },
 ) {
   const repository = yield* ProjectWorkRepository;
+  if (
+    options !== undefined &&
+    (!Number.isSafeInteger(options.nextSweepDelayMs) ||
+      options.nextSweepDelayMs < 1 ||
+      options.nextSweepDelayMs > 3_600_000)
+  )
+    return yield* fail("invalid-input");
   if ((yield* SqlClient.SqlClient) !== sql) return yield* fail("invalid-input");
   let accepted = false;
   let progress:
@@ -433,12 +441,18 @@ export const commitIssueRepositoryRead = Effect.fn("commitIssueRepositoryRead")(
       // Receipts can take time or change authority. Retain the lease until this final check.
       const current = yield* currentLease(sql, key, lease);
       if (current === undefined) return yield* fail("stale-state");
+      const now = yield* Clock.currentTimeMillis;
+      const retryAt =
+        progress.sweepStartedAt === null && options !== undefined
+          ? now + options.nextSweepDelayMs
+          : 0;
+      if (!Number.isSafeInteger(retryAt) || retryAt < 0) return yield* fail("invalid-input");
       yield* writeState(sql, {
         ...current,
         ...progress,
         lease: null,
         error: null,
-        retryAt: 0,
+        retryAt,
         revision: yield* increment(current.revision),
       });
       const finalNow = yield* Clock.currentTimeMillis;

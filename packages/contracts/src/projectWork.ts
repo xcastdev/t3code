@@ -352,6 +352,7 @@ export const ProjectWorkAttentionReason = Schema.Literals([
   "approval-required",
   "stale",
   "needs-review",
+  "external-issue-closed",
 ]);
 export type ProjectWorkAttentionReason = typeof ProjectWorkAttentionReason.Type;
 /** Read-only superset that preserves attention reasons introduced by newer servers. */
@@ -687,6 +688,36 @@ export const ProjectWorkTaskCreateCommand = Schema.Struct({
   deliverableKind: Schema.optionalKey(ProjectTeamDeliverableKind),
   createdAt: IsoDateTime,
 });
+
+/** Human refinement links the existing intake identity without approving execution. */
+export const ProjectWorkIssueRefineCommand = Schema.Struct({
+  ...ProjectWorkCommandFields,
+  type: Schema.Literal("project-work.issue.refine"),
+  expectedRevision: NonNegativeInt,
+  issueRecordId: TrimmedNonEmptyString.check(Schema.isMaxLength(256)),
+  expectedIssueRevision: NonNegativeInt,
+  target: Schema.Union([
+    Schema.Struct({
+      kind: Schema.Literal("new-task"),
+      taskId: ProjectWorkTaskId,
+      title: TrimmedNonEmptyString.check(Schema.isMaxLength(4_000)),
+      summary: Schema.optionalKey(ProjectWorkSummary),
+      deliverableKind: ProjectTeamDeliverableKind,
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("existing-task"),
+      taskId: ProjectWorkTaskId,
+      expectedTaskRevision: NonNegativeInt,
+    }),
+    Schema.Struct({
+      kind: Schema.Literal("mission"),
+      title: TrimmedNonEmptyString.check(Schema.isMaxLength(4_000)),
+      objective: Schema.String.check(Schema.isMaxLength(32_000)),
+    }),
+  ]),
+  refinedAt: IsoDateTime,
+});
+export type ProjectWorkIssueRefineCommand = typeof ProjectWorkIssueRefineCommand.Type;
 
 export const ProjectWorkTaskSpecifyCommand = Schema.Struct({
   ...ProjectWorkCommandFields,
@@ -1371,6 +1402,7 @@ export const ProjectWorkFoundationCommitCommand = Schema.Struct({
 export const ProjectWorkCommand = Schema.Union([
   ProjectWorkFoundationCommitCommand,
   ProjectWorkTaskCreateCommand,
+  ProjectWorkIssueRefineCommand,
   ProjectWorkTaskSpecifyCommand,
   ProjectWorkTaskReviseProtectedSpecificationCommand,
   ProjectWorkTaskReadyCommand,

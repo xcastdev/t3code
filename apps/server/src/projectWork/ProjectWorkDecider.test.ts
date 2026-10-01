@@ -1,5 +1,6 @@
 import {
   ProjectId,
+  EventId,
   CommandId,
   ProjectWorkAttemptId,
   ProjectWorkBlockerId,
@@ -11,6 +12,9 @@ import {
   ProjectWorkCommentId,
   ProjectWorkDecisionId,
   projectWorkPayloadFingerprint,
+  type ProjectIssueIntake,
+  type ProjectTeamRecord,
+  type ProjectWorkIssueRefineCommand,
   type ProjectWorkAttribution,
   type ProjectWorkCriterion,
   type ProjectWorkTask,
@@ -19,11 +23,14 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   applyProjectWorkEvents,
+  emptyProjectWorkReducerState,
   decideProjectWorkCommand,
   type ProjectWorkReducerState,
+  type ProjectWorkEvent,
   type ProjectWorkState,
 } from "./ProjectWorkDecider.ts";
 import { deriveProjectWorkTaskPolicy, ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
+import { projectTeamDerivedRecordId } from "./ProjectTeamPolicy.ts";
 
 const projectId = ProjectId.make("project-1");
 const attribution: ProjectWorkAttribution = {
@@ -875,5 +882,869 @@ describe("ProjectWorkDecider", () => {
     expect(attributedEvent).toMatchObject({
       replacement: { attribution: replacementAttribution },
     });
+  });
+});
+
+describe("human issue refinement", () => {
+  const refinedAt = "2026-01-02T00:00:00.000Z";
+  const issue = (patch: Partial<ProjectIssueIntake> = {}): ProjectIssueIntake => ({
+    kind: "issue",
+    recordId: "issue-1",
+    projectId,
+    revision: 4,
+    generation: 3,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    status: "open",
+    identity: {
+      host: "github.com",
+      repositoryNodeId: "repository-node-1",
+      issueNodeId: "issue-node-1",
+      number: 17,
+    },
+    repositoryName: "maintainers/renamed-repository",
+    title: "Original human title",
+    body: "Original human body\nwith findings preserved externally",
+    sourceRevision: "source-revision-9",
+    observedAt: "2026-01-01T00:01:00.000Z",
+    ...patch,
+  });
+  const stateWithIssue = (
+    record = issue(),
+    tasks: ReadonlyArray<ProjectWorkTask> = [],
+  ): ProjectWorkReducerState => ({
+    ...emptyProjectWorkReducerState(projectId),
+    tasks: [...tasks],
+    revision: 12,
+    foundationRecords: [record],
+    history: [
+      {
+        eventId: EventId.make("investigation-history"),
+        type: "project-work.foundation.recorded",
+        revision: 11,
+        occurredAt: "2026-01-01T00:02:00.000Z",
+      },
+    ],
+    comments: [
+      {
+        commentId: ProjectWorkCommentId.make("investigation-comment"),
+        projectId,
+        body: "Preserved internal investigation findings",
+        revision: 0,
+        createdAt: "2026-01-01T00:02:00.000Z",
+        attribution,
+      },
+    ],
+  });
+  const refine = (
+    target: ProjectWorkIssueRefineCommand["target"] = {
+      kind: "new-task",
+      taskId: ProjectWorkTaskId.make("refined-task"),
+      title: "Refined human title",
+      summary: "Agreed bounded work",
+      deliverableKind: "code",
+    },
+  ): ProjectWorkIssueRefineCommand => ({
+    type: "project-work.issue.refine",
+    commandId: CommandId.make("refine-issue"),
+    projectId,
+    expectedRevision: 12,
+    issueRecordId: "issue-1",
+    expectedIssueRevision: 4,
+    target,
+    refinedAt,
+    attribution,
+  });
+  const assertRejectedWithoutMutation = (
+    state: ProjectWorkReducerState,
+    command: ProjectWorkIssueRefineCommand,
+    message: RegExp,
+  ) => {
+    const before = structuredClone(state);
+    expect(() => decideProjectWorkCommand(state, command)).toThrow(message);
+    expect(state).toEqual(before);
+  };
+
+  it.each(["code", "research", "plan", "review", "reminder", "non-code"] as const)(
+    "creates a draft %s deliverable and links the original issue atomically",
+    (deliverableKind) => {
+      const state = stateWithIssue();
+      const before = structuredClone(state);
+      const command = refine({
+        kind: "new-task",
+        taskId: ProjectWorkTaskId.make("refined-task"),
+        title: "Refined human title",
+        summary: "Agreed bounded work",
+        deliverableKind,
+      });
+      const events = decideProjectWorkCommand(state, command);
+      expect(events.map((event) => event.type)).toEqual([
+        "project-work.task.created",
+        "project-work.foundation.recorded",
+        "project-work.foundation.recorded",
+      ]);
+      expect(events.map((event) => event.revision)).toEqual([13, 14, 15]);
+      expect(events.map((event) => event.eventId)).toEqual([
+        "refine-issue:project-work:0",
+        "refine-issue:project-work:1",
+        "refine-issue:project-work:2",
+      ]);
+      expect(
+        events.every((event) => event.projectId === projectId && event.occurredAt === refinedAt),
+      ).toBe(true);
+      expect(decideProjectWorkCommand(state, command)).toEqual(events);
+      expect(state).toEqual(before);
+      const next = applyProjectWorkEvents(state, events);
+      expect(next.tasks).toEqual([
+        {
+          taskId: "refined-task",
+          projectId,
+          title: "Refined human title",
+          summary: "Agreed bounded work",
+          state: "draft",
+          watchers: [],
+          revision: 0,
+          specRevision: 0,
+          createdAt: refinedAt,
+          updatedAt: refinedAt,
+          attribution,
+        },
+      ]);
+      expect(next.foundationRecords).toEqual([
+        {
+          recordId: projectTeamDerivedRecordId(command.commandId, "membership"),
+          kind: "task-membership",
+          projectId,
+          taskId: "refined-task",
+          deliverableKind,
+          executionKind: deliverableKind === "code" ? "managed" : "human",
+          status: "active",
+          controlState: "active",
+          revision: 0,
+          generation: 0,
+          updatedAt: refinedAt,
+        },
+        { ...issue(), taskId: "refined-task", revision: 5, updatedAt: refinedAt },
+      ]);
+      expect(next.attempts).toEqual([]);
+      expect(next.history?.slice(0, 1)).toEqual(before.history);
+      expect(next.comments).toEqual(before.comments);
+      assertRejectedWithoutMutation(next, command, /revision/i);
+    },
+  );
+
+  it("accepts an explicit closed-issue refinement and omits an absent task summary", () => {
+    const state = stateWithIssue(issue({ status: "closed" }));
+    const next = applyProjectWorkEvents(
+      state,
+      decideProjectWorkCommand(
+        state,
+        refine({
+          kind: "new-task",
+          taskId: ProjectWorkTaskId.make("refined-task"),
+          title: "A human chose to refine this closed issue",
+          deliverableKind: "non-code",
+        }),
+      ),
+    );
+    expect(next.tasks[0]?.summary).toBeUndefined();
+    expect(next.foundationRecords?.find((record) => record.kind === "issue")).toEqual({
+      ...issue({ status: "closed" }),
+      taskId: "refined-task",
+      revision: 5,
+      updatedAt: refinedAt,
+    });
+  });
+
+  it.each(["legacy", "managed", "human", "unclassified"] as const)(
+    "links an existing %s task without changing its state, specification, membership or approval",
+    (classification) => {
+      const existing = {
+        ...task("existing-task", "specified"),
+        revision: 7,
+        specRevision: 2,
+        specification: {
+          objective: "Existing scope",
+          scopeIn: "Existing work",
+          scopeOut: "Other work",
+          criterionIds: [],
+          protected: false,
+          revision: 2,
+        },
+      };
+      const state = stateWithIssue(issue(), [existing]);
+      if (classification !== "unclassified")
+        state.foundationRecords?.push({
+          kind: "task-membership",
+          recordId: "existing-membership",
+          projectId,
+          revision: 3,
+          generation: 2,
+          updatedAt: attribution.recordedAt,
+          status: "active",
+          taskId: existing.taskId,
+          executionKind: classification,
+          deliverableKind: classification === "human" ? "non-code" : "code",
+        });
+      state.foundationRecords?.push({
+        kind: "gate",
+        recordId: "existing-approval",
+        projectId,
+        revision: 1,
+        generation: 0,
+        updatedAt: attribution.recordedAt,
+        status: "approved",
+        taskId: existing.taskId,
+        gate: "specification",
+        specRevision: 2,
+        planRevision: 0,
+        contentHash: "existing-specification-hash",
+        evidenceIds: [],
+        attribution,
+      });
+      const before = structuredClone(state);
+      const events = decideProjectWorkCommand(
+        state,
+        refine({
+          kind: "existing-task",
+          taskId: existing.taskId,
+          expectedTaskRevision: 7,
+        }),
+      );
+      expect(events).toHaveLength(1);
+      expect(events[0]).toMatchObject({
+        type: "project-work.foundation.recorded",
+        eventId: "refine-issue:project-work:0",
+        revision: 13,
+        record: { ...issue(), taskId: existing.taskId, revision: 5, updatedAt: refinedAt },
+      });
+      const next = applyProjectWorkEvents(state, events);
+      expect(next.tasks).toEqual(before.tasks);
+      expect(next.foundationRecords?.filter((record) => record.kind !== "issue")).toEqual(
+        before.foundationRecords?.filter((record) => record.kind !== "issue"),
+      );
+      expect(next.comments).toEqual(before.comments);
+      expect(next.attempts).toEqual(before.attempts);
+      expect(state).toEqual(before);
+    },
+  );
+
+  it("creates only a draft mission and preserves source identity and internal findings", () => {
+    const state = stateWithIssue();
+    const command = refine({
+      kind: "mission",
+      title: "A larger mission",
+      objective: "Several eventual deliverables",
+    });
+    const events = decideProjectWorkCommand(state, command);
+    const missionId = projectTeamDerivedRecordId(command.commandId, "mission");
+    expect(events.map((event) => event.type)).toEqual([
+      "project-work.foundation.recorded",
+      "project-work.foundation.recorded",
+    ]);
+    expect(events.map((event) => event.eventId)).toEqual([
+      "refine-issue:project-work:0",
+      "refine-issue:project-work:1",
+    ]);
+    expect(events.map((event) => event.revision)).toEqual([13, 14]);
+    expect(decideProjectWorkCommand(state, command)).toEqual(events);
+    const next = applyProjectWorkEvents(state, events);
+    expect(next.foundationRecords).toEqual([
+      {
+        kind: "mission",
+        recordId: missionId,
+        projectId,
+        revision: 0,
+        generation: 0,
+        updatedAt: refinedAt,
+        status: "draft",
+        title: "A larger mission",
+        objective: "Several eventual deliverables",
+        requiredTaskIds: [],
+      },
+      { ...issue(), missionId, revision: 5, updatedAt: refinedAt },
+    ]);
+    expect(next.tasks).toEqual([]);
+    expect(next.attempts).toEqual([]);
+    expect(next.comments).toEqual(state.comments);
+    expect(next.history?.slice(0, 1)).toEqual(state.history);
+  });
+
+  it.each(["new-task", "existing-task", "mission"] as const)(
+    "requires human attribution before %s refinement",
+    (kind) => {
+      const target: ProjectWorkIssueRefineCommand["target"] =
+        kind === "mission"
+          ? { kind, title: "Mission", objective: "Objective" }
+          : kind === "existing-task"
+            ? { kind, taskId: ProjectWorkTaskId.make("existing-task"), expectedTaskRevision: 0 }
+            : {
+                kind,
+                taskId: ProjectWorkTaskId.make("refined-task"),
+                title: "Task",
+                deliverableKind: "code",
+              };
+      for (const actorKind of ["agent", "system", "adapter"] as const) {
+        assertRejectedWithoutMutation(
+          stateWithIssue(issue(), [task("existing-task")]),
+          {
+            ...refine(target),
+            attribution: { ...attribution, actor: { kind: actorKind, id: "other-actor" } },
+          },
+          /human|attribution/i,
+        );
+      }
+      const { attribution: _origin, ...unattributed } = refine(target);
+      assertRejectedWithoutMutation(
+        stateWithIssue(issue(), [task("existing-task")]),
+        unattributed,
+        /human|attribution/i,
+      );
+    },
+  );
+
+  it("rejects stale project and issue revisions", () => {
+    for (const expectedRevision of [0, 11, 13])
+      assertRejectedWithoutMutation(
+        stateWithIssue(),
+        {
+          ...refine(),
+          expectedRevision,
+        },
+        /revision/i,
+      );
+    for (const expectedIssueRevision of [0, 3, 5])
+      assertRejectedWithoutMutation(
+        stateWithIssue(),
+        {
+          ...refine(),
+          expectedIssueRevision,
+        },
+        /revision/i,
+      );
+  });
+
+  it("rejects missing, foreign and detached issues before creating records", () => {
+    assertRejectedWithoutMutation(
+      { ...stateWithIssue(), foundationRecords: [] },
+      refine(),
+      /issue/i,
+    );
+    assertRejectedWithoutMutation(
+      stateWithIssue(issue({ projectId: ProjectId.make("other-project") })),
+      refine(),
+      /project|issue/i,
+    );
+    assertRejectedWithoutMutation(
+      stateWithIssue(issue({ status: "detached" })),
+      refine(),
+      /detached/i,
+    );
+    assertRejectedWithoutMutation(
+      stateWithIssue(),
+      { ...refine(), projectId: ProjectId.make("other-project") },
+      /project/i,
+    );
+  });
+
+  it.each([{ taskId: ProjectWorkTaskId.make("already-linked") }, { missionId: "already-linked" }])(
+    "rejects an already linked issue %j even when the requested target matches",
+    (link) => {
+      const state = stateWithIssue(issue(link), [task("already-linked")]);
+      assertRejectedWithoutMutation(
+        state,
+        refine({
+          kind: "existing-task",
+          taskId: ProjectWorkTaskId.make("already-linked"),
+          expectedTaskRevision: 0,
+        }),
+        /linked/i,
+      );
+    },
+  );
+
+  it("rejects a record with the issue ID but another kind", () => {
+    const state = stateWithIssue();
+    state.foundationRecords = [
+      {
+        kind: "mission",
+        recordId: "issue-1",
+        projectId,
+        status: "draft",
+        revision: 4,
+        generation: 0,
+        updatedAt: refinedAt,
+        title: "Other record",
+        objective: "Other scope",
+        requiredTaskIds: [],
+      },
+    ];
+    assertRejectedWithoutMutation(state, refine(), /issue/i);
+  });
+
+  it("rejects a duplicate task ID or derived membership collision atomically", () => {
+    assertRejectedWithoutMutation(
+      stateWithIssue(issue(), [task("refined-task")]),
+      refine(),
+      /already|duplicate/i,
+    );
+    const state = stateWithIssue();
+    state.foundationRecords?.push({
+      kind: "mission",
+      recordId: projectTeamDerivedRecordId(refine().commandId, "membership"),
+      projectId,
+      status: "draft",
+      revision: 0,
+      generation: 0,
+      updatedAt: refinedAt,
+      title: "Collision",
+      objective: "Must survive",
+      requiredTaskIds: [],
+    });
+    assertRejectedWithoutMutation(state, refine(), /identity|kind|revision|already/i);
+  });
+
+  it("rejects a derived mission ID collision without overwriting the old record", () => {
+    const state = stateWithIssue();
+    const command = refine({ kind: "mission", title: "New", objective: "New" });
+    state.foundationRecords?.push({
+      kind: "mission",
+      recordId: projectTeamDerivedRecordId(command.commandId, "mission"),
+      projectId,
+      status: "draft",
+      revision: 0,
+      generation: 0,
+      updatedAt: refinedAt,
+      title: "Existing",
+      objective: "Existing",
+      requiredTaskIds: [],
+    });
+    assertRejectedWithoutMutation(state, command, /already|collision|duplicate/i);
+  });
+
+  it("rejects missing, foreign and stale existing tasks", () => {
+    const command = refine({
+      kind: "existing-task",
+      taskId: ProjectWorkTaskId.make("existing-task"),
+      expectedTaskRevision: 0,
+    });
+    assertRejectedWithoutMutation(stateWithIssue(), command, /task/i);
+    assertRejectedWithoutMutation(
+      stateWithIssue(issue(), [
+        { ...task("existing-task"), projectId: ProjectId.make("other-project") },
+      ]),
+      command,
+      /project|task/i,
+    );
+    assertRejectedWithoutMutation(
+      stateWithIssue(issue(), [{ ...task("existing-task"), revision: 1 }]),
+      command,
+      /revision/i,
+    );
+  });
+
+  it.each(["completed", "canceled"] as const)("rejects linking a %s existing task", (status) => {
+    assertRejectedWithoutMutation(
+      stateWithIssue(issue(), [task("existing-task", status)]),
+      refine({
+        kind: "existing-task",
+        taskId: ProjectWorkTaskId.make("existing-task"),
+        expectedTaskRevision: 0,
+      }),
+      /completed|canceled|terminal/i,
+    );
+  });
+
+  it("validates the final issue before returning any created-task events", () => {
+    const state = stateWithIssue(issue({ body: "x".repeat(32_001) }));
+    assertRejectedWithoutMutation(state, refine(), /body|32000|32,000|length/i);
+  });
+});
+
+describe("foundation attention reconciliation", () => {
+  const at = "2026-01-03T00:00:00.000Z";
+  const mission = (
+    recordId: string,
+    taskIds: ReadonlyArray<string> = [],
+  ): Extract<ProjectTeamRecord, { kind: "mission" }> => ({
+    kind: "mission",
+    recordId,
+    projectId,
+    status: "active",
+    revision: 0,
+    generation: 0,
+    updatedAt: at,
+    title: recordId,
+    objective: "Mission scope",
+    requiredTaskIds: taskIds.map((id) => ProjectWorkTaskId.make(id)),
+  });
+  const membership = (
+    taskId: string,
+    missionId: string,
+  ): Extract<ProjectTeamRecord, { kind: "task-membership" }> => ({
+    kind: "task-membership",
+    recordId: `membership-${taskId}`,
+    projectId,
+    status: "active",
+    revision: 0,
+    generation: 0,
+    updatedAt: at,
+    taskId: ProjectWorkTaskId.make(taskId),
+    missionId,
+    executionKind: "legacy",
+    deliverableKind: "code",
+  });
+  const issue = (taskId?: string, missionId?: string): ProjectIssueIntake => ({
+    kind: "issue",
+    recordId: "attention-issue",
+    projectId,
+    revision: 0,
+    generation: 0,
+    updatedAt: at,
+    status: "open",
+    title: "External issue",
+    body: "Human text",
+    sourceRevision: "source-1",
+    observedAt: at,
+    repositoryName: "maintainers/repository",
+    identity: { host: "github.com", repositoryNodeId: "repo", issueNodeId: "issue", number: 1 },
+    ...(taskId === undefined ? {} : { taskId: ProjectWorkTaskId.make(taskId) }),
+    ...(missionId === undefined ? {} : { missionId }),
+  });
+  const foundationEvent = (record: ProjectTeamRecord, ordinal = 0): ProjectWorkEvent => ({
+    type: "project-work.foundation.recorded",
+    eventId: EventId.make(`foundation-attention:${ordinal}`),
+    projectId,
+    revision: ordinal + 1,
+    occurredAt: at,
+    record,
+  });
+  const blockedState = (records: ReadonlyArray<ProjectTeamRecord>): ProjectWorkReducerState => ({
+    ...emptyProjectWorkReducerState(projectId),
+    tasks: [
+      task("old-task", "blocked"),
+      task("new-task", "blocked"),
+      task("member-task", "blocked"),
+      task("unrelated", "blocked"),
+    ],
+    foundationRecords: [...records],
+  });
+
+  it("reconciles old and new issue links plus the affected mission edges only", () => {
+    const state = blockedState([
+      issue("old-task"),
+      mission("mission", ["new-task"]),
+      membership("member-task", "mission"),
+    ]);
+    const next = applyProjectWorkEvents(state, [foundationEvent(issue(undefined, "mission"))]);
+    expect(next.attention.map((entry) => entry.taskId).sort()).toEqual([
+      "member-task",
+      "new-task",
+      "old-task",
+    ]);
+    expect(next.tasks).toEqual(state.tasks);
+    expect(state.attention).toEqual([]);
+  });
+
+  it("reconciles former issue edges when the issue becomes detached and loses links", () => {
+    const state = blockedState([issue("old-task")]);
+    const record = { ...issue(), status: "detached" as const };
+    const next = applyProjectWorkEvents(state, [foundationEvent(record)]);
+    expect(next.attention.map((entry) => entry.taskId)).toEqual(["old-task"]);
+  });
+
+  it("reconciles old and new required tasks and active memberships on mission updates", () => {
+    const state = blockedState([
+      mission("mission", ["old-task"]),
+      membership("member-task", "mission"),
+      { ...membership("unrelated", "mission"), status: "removed" },
+    ]);
+    const next = applyProjectWorkEvents(state, [
+      foundationEvent({ ...mission("mission", ["new-task"]), status: "completed" }),
+    ]);
+    expect(next.attention.map((entry) => entry.taskId).sort()).toEqual([
+      "member-task",
+      "new-task",
+      "old-task",
+    ]);
+  });
+
+  it("reconciles both membership task edges without touching unrelated tasks", () => {
+    const state = blockedState([membership("old-task", "mission")]);
+    const next = applyProjectWorkEvents(state, [
+      foundationEvent({
+        ...membership("new-task", "mission"),
+        recordId: "membership-old-task",
+        status: "removed",
+      }),
+    ]);
+    expect(next.attention.map((entry) => entry.taskId).sort()).toEqual(["new-task", "old-task"]);
+  });
+
+  it("does not derive attention from foreign foundation records or task rows", () => {
+    const foreign = ProjectId.make("foreign");
+    const state = blockedState([]);
+    state.tasks = state.tasks.map((entry) =>
+      entry.taskId === "old-task" ? { ...entry, projectId: foreign } : entry,
+    );
+    const next = applyProjectWorkEvents(state, [foundationEvent(issue("old-task"))]);
+    expect(next.attention).toEqual([]);
+    const foreignRecord = applyProjectWorkEvents(blockedState([]), [
+      foundationEvent({ ...issue("new-task"), projectId: foreign }),
+    ]);
+    expect(foreignRecord.attention).toEqual([]);
+  });
+
+  it("does not recompute task attention for an unrelated foundation record", () => {
+    const next = applyProjectWorkEvents(blockedState([]), [
+      foundationEvent({
+        kind: "intake-cursor",
+        recordId: "cursor",
+        projectId,
+        revision: 0,
+        generation: 0,
+        updatedAt: at,
+        status: "ready",
+        host: "github.com",
+        repositoryNodeId: "repo",
+        accountId: "account",
+        overlapSince: at,
+      }),
+    ]);
+    expect(next.attention).toEqual([]);
+  });
+
+  it("starts a fresh occurrence above the prior resolved revision without a task revision change", () => {
+    const state = blockedState([issue("old-task")]);
+    state.attention = [
+      {
+        taskId: ProjectWorkTaskId.make("old-task"),
+        reason: "blocked",
+        revision: 7,
+        seenAt: at,
+        resolvedAt: at,
+      },
+    ];
+    const next = applyProjectWorkEvents(state, [foundationEvent(issue("old-task"))]);
+    expect(next.attention).toEqual([{ taskId: "old-task", reason: "blocked", revision: 8 }]);
+    expect(next.tasks).toEqual(state.tasks);
+  });
+
+  it("clears seen state and advances occurrence when reason detail changes", () => {
+    const state = blockedState([issue("old-task")]);
+    state.attention = [
+      {
+        taskId: ProjectWorkTaskId.make("old-task"),
+        reason: "blocked",
+        detail: "old blocker",
+        revision: 7,
+        seenAt: at,
+      },
+    ];
+    const next = applyProjectWorkEvents(state, [foundationEvent(issue("old-task"))]);
+    expect(next.attention).toEqual([{ taskId: "old-task", reason: "blocked", revision: 8 }]);
+  });
+
+  it("preserves a seen occurrence when reason and detail are unchanged", () => {
+    const state = blockedState([issue("old-task")]);
+    state.attention = [
+      { taskId: ProjectWorkTaskId.make("old-task"), reason: "blocked", revision: 7, seenAt: at },
+    ];
+    const next = applyProjectWorkEvents(state, [foundationEvent(issue("old-task"))]);
+    expect(next.attention).toEqual(state.attention);
+  });
+
+  const markSeen = (state: ProjectWorkReducerState, taskId = "old-task") =>
+    applyProjectWorkEvents(
+      state,
+      decideProjectWorkCommand(state, {
+        type: "project-work.attention.seen",
+        commandId: CommandId.make(`mark-seen-${state.revision}`),
+        projectId,
+        taskId: ProjectWorkTaskId.make(taskId),
+        expectedRevision: state.revision,
+        seenAt: at,
+        attribution,
+      }),
+    );
+  const draftState = (records: ReadonlyArray<ProjectTeamRecord>): ProjectWorkReducerState => ({
+    ...emptyProjectWorkReducerState(projectId),
+    tasks: [task("old-task"), task("new-task"), task("member-task"), task("unrelated")],
+    foundationRecords: [...records],
+  });
+
+  it("resolves opening and creates an unread occurrence on reclose without changing task revisions", () => {
+    const state = draftState([issue("old-task")]);
+    const closed = applyProjectWorkEvents(state, [
+      foundationEvent({ ...issue("old-task"), status: "closed", revision: 1 }),
+    ]);
+    expect(closed.attention).toEqual([
+      {
+        taskId: "old-task",
+        reason: "external-issue-closed",
+        detail: "Linked issue 'attention-issue' is closed.",
+        revision: 0,
+      },
+    ]);
+    const seen = markSeen(closed);
+    expect(seen.attention[0]).toMatchObject({ seenAt: at, revision: 1 });
+    const opened = applyProjectWorkEvents(seen, [
+      foundationEvent({ ...issue("old-task"), revision: 2 }, 2),
+    ]);
+    expect(opened.attention[0]).toMatchObject({ resolvedAt: at, seenAt: at, revision: 2 });
+    const reclosed = applyProjectWorkEvents(opened, [
+      foundationEvent({ ...issue("old-task"), status: "closed", revision: 3 }, 3),
+    ]);
+    expect(reclosed.attention).toEqual([
+      {
+        taskId: "old-task",
+        reason: "external-issue-closed",
+        detail: "Linked issue 'attention-issue' is closed.",
+        revision: 3,
+      },
+    ]);
+    expect(reclosed.tasks).toEqual(state.tasks);
+    expect(reclosed.attempts).toEqual([]);
+    expect(reclosed.foundationRecords?.every((record) => record.kind === "issue")).toBe(true);
+  });
+
+  it("makes closure and recovered blocker reasons separate unread occurrences", () => {
+    const state = blockedState([issue("old-task")]);
+    const closed = markSeen(
+      applyProjectWorkEvents(state, [foundationEvent({ ...issue("old-task"), status: "closed" })]),
+    );
+    const opened = applyProjectWorkEvents(closed, [foundationEvent(issue("old-task"), 2)]);
+    expect(opened.attention).toEqual([{ taskId: "old-task", reason: "blocked", revision: 2 }]);
+    const seen = markSeen(opened);
+    expect(seen.attention[0]).toMatchObject({ seenAt: at, revision: 3 });
+    const reclosed = applyProjectWorkEvents(seen, [
+      foundationEvent({ ...issue("old-task"), status: "closed" }, 4),
+    ]);
+    expect(reclosed.attention).toEqual([
+      {
+        taskId: "old-task",
+        reason: "external-issue-closed",
+        detail: "Linked issue 'attention-issue' is closed.",
+        revision: 4,
+      },
+    ]);
+    expect(reclosed.tasks).toEqual(state.tasks);
+  });
+
+  it("preserves seen closure through source edits and clears it when the representative issue changes", () => {
+    const state = draftState([issue("old-task")]);
+    const closed = markSeen(
+      applyProjectWorkEvents(state, [foundationEvent({ ...issue("old-task"), status: "closed" })]),
+    );
+    const edited = applyProjectWorkEvents(closed, [
+      foundationEvent(
+        {
+          ...issue("old-task"),
+          status: "closed",
+          title: "Changed title",
+          body: "Changed body",
+          repositoryName: "maintainers/renamed",
+          sourceRevision: "source-2",
+          revision: 1,
+        },
+        2,
+      ),
+    ]);
+    expect(edited.attention).toEqual(closed.attention);
+    const changed = applyProjectWorkEvents(edited, [
+      foundationEvent(
+        {
+          ...issue("old-task"),
+          status: "closed",
+          recordId: "aaa-issue",
+          identity: { ...issue().identity, issueNodeId: "second-issue", number: 2 },
+        },
+        3,
+      ),
+    ]);
+    expect(changed.attention).toEqual([
+      {
+        taskId: "old-task",
+        reason: "external-issue-closed",
+        detail: "Linked issue 'aaa-issue' is closed.",
+        revision: 2,
+      },
+    ]);
+    expect(changed.tasks).toEqual(state.tasks);
+  });
+
+  it("resolves former direct issue links after rebinding and detachment", () => {
+    const state = draftState([issue("old-task")]);
+    const closed = applyProjectWorkEvents(state, [
+      foundationEvent({ ...issue("old-task"), status: "closed" }),
+    ]);
+    const rebound = applyProjectWorkEvents(closed, [
+      foundationEvent({ ...issue("new-task"), status: "closed", revision: 1 }, 1),
+    ]);
+    expect(rebound.attention).toEqual([
+      {
+        taskId: "old-task",
+        reason: "external-issue-closed",
+        detail: "Linked issue 'attention-issue' is closed.",
+        revision: 1,
+        resolvedAt: at,
+      },
+      {
+        taskId: "new-task",
+        reason: "external-issue-closed",
+        detail: "Linked issue 'attention-issue' is closed.",
+        revision: 0,
+      },
+    ]);
+    const detached = applyProjectWorkEvents(rebound, [
+      foundationEvent({ ...issue(), status: "detached", revision: 2 }, 2),
+    ]);
+    expect(detached.attention.every((entry) => entry.resolvedAt === at)).toBe(true);
+    expect(detached.attention.map((entry) => entry.revision)).toEqual([1, 1]);
+    expect(detached.tasks).toEqual(state.tasks);
+  });
+
+  it("refreshes closure for changed mission requirements, removed memberships and mission completion", () => {
+    const state = draftState([
+      issue(undefined, "mission"),
+      mission("mission", ["old-task"]),
+      membership("member-task", "mission"),
+    ]);
+    const closed = applyProjectWorkEvents(state, [
+      foundationEvent({ ...issue(undefined, "mission"), status: "closed" }),
+    ]);
+    expect(closed.attention.map((entry) => entry.taskId).sort()).toEqual([
+      "member-task",
+      "old-task",
+    ]);
+    const changed = applyProjectWorkEvents(closed, [
+      foundationEvent({ ...mission("mission", ["new-task"]), revision: 1 }, 1),
+    ]);
+    expect(changed.attention.find((entry) => entry.taskId === "old-task")).toMatchObject({
+      resolvedAt: at,
+      revision: 1,
+    });
+    expect(
+      changed.attention
+        .filter((entry) => entry.resolvedAt === undefined)
+        .map((entry) => entry.taskId)
+        .sort(),
+    ).toEqual(["member-task", "new-task"]);
+    const removed = applyProjectWorkEvents(changed, [
+      foundationEvent(
+        { ...membership("member-task", "mission"), status: "removed", revision: 1 },
+        2,
+      ),
+    ]);
+    expect(removed.attention.find((entry) => entry.taskId === "member-task")).toMatchObject({
+      resolvedAt: at,
+      revision: 1,
+    });
+    const completed = applyProjectWorkEvents(removed, [
+      foundationEvent({ ...mission("mission", ["new-task"]), status: "completed", revision: 2 }, 3),
+    ]);
+    expect(completed.attention.every((entry) => entry.resolvedAt === at)).toBe(true);
+    expect(completed.attention.some((entry) => entry.taskId === "unrelated")).toBe(false);
+    expect(completed.tasks).toEqual(state.tasks);
+    expect(completed.attempts).toEqual([]);
   });
 });
