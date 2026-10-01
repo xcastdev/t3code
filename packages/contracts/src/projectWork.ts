@@ -1240,7 +1240,7 @@ export const ProjectTeamGuidedIntent = Schema.Union([
     decision: Schema.Literals(["diagnose", "approve-one-repair", "revise-scope", "abandon"]),
     reason: GuidedText,
   }),
-]);
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type ProjectTeamGuidedIntent = typeof ProjectTeamGuidedIntent.Type;
 
 /** Private gateway compilation; raw foundation commands remain denied by transports. */

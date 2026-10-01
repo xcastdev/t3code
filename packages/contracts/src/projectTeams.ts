@@ -446,5 +446,5 @@ export const ProjectTeamWriteIntent = Schema.Union([
     knowledgeId: Text,
     title: Text,
   }),
-]);
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type ProjectTeamWriteIntent = typeof ProjectTeamWriteIntent.Type;

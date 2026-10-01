@@ -1,12 +1,15 @@
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   CommandId,
   ProjectId,
   ProjectWorkTaskId,
   ProjectWorkCriterionId,
+  WsRpcGroup,
+  ProjectWorkWriteIntent,
   type ProjectTeamRecord,
   type ProjectTeamWriteIntent,
   type ProjectTeamGuidedIntent,
@@ -15,12 +18,14 @@ import { runMigrations } from "../persistence/Migrations.ts";
 import { ProjectWorkGateway } from "./ProjectWorkGateway.ts";
 import { ProjectWorkRepository, readCurrentState } from "./ProjectWorkRepository.ts";
 import { gatewayRuntime } from "./ProjectTeamAuthorization.testFixtures.ts";
+import { ProjectWorkToolkit } from "../mcp/toolkits/projectWork/tools.ts";
 
 const projectId = ProjectId.make("guided-gateway-project");
 const taskId = ProjectWorkTaskId.make("guided-gateway-task");
 const human = { kind: "human", id: "authenticated-user" } as const;
 const source = { kind: "web", id: "authenticated-browser" } as const;
 const at = "2026-01-01T00:00:00.000Z";
+const decodePublicWrite = Schema.decodeUnknownEffect(ProjectWorkWriteIntent);
 const investigation: ProjectTeamGuidedIntent = {
   type: "project-team.investigation.start",
   commandId: CommandId.make("guided-investigation"),
@@ -50,6 +55,54 @@ const setup = Effect.gen(function* () {
 });
 const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   effect.pipe(Effect.provide(Layer.fresh(gatewayRuntime)));
+
+for (const boundary of ["rpc", "mcp"] as const) {
+  const decodeBoundary = Schema.decodeUnknownEffect(
+    boundary === "rpc"
+      ? WsRpcGroup.requests.get("projectWork.write")!.payloadSchema
+      : ProjectWorkToolkit.tools.project_work_write.parametersSchema,
+  );
+  it.effect(`${boundary} decoder rejects caller authority without receipts or SQL mutation`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const { sql, gateway } = yield* setup;
+        for (const injected of [
+          { actor: { kind: "human", id: "invented" } },
+          { bindingId: "invented" },
+          { generation: 99 },
+          { authorizationGateId: "invented" },
+        ]) {
+          const decoded = yield* decodeBoundary({
+            ...investigation,
+            ...injected,
+          }).pipe(Effect.result);
+          if (decoded._tag === "Success") {
+            const intent = yield* decodePublicWrite(decoded.success);
+            yield* gateway.write(intent, human, source, { actor: human });
+          }
+          expect(decoded._tag).toBe("Failure");
+        }
+        const state = yield* readCurrentState(sql, projectId);
+        expect(state.revision).toBe(1);
+        expect(state.tasks).toHaveLength(1);
+        expect(state.foundationRecords).toHaveLength(0);
+        expect(
+          yield* sql`SELECT command_id FROM project_work_command_receipts
+            WHERE project_id=${projectId} AND command_id=${investigation.commandId}`,
+        ).toHaveLength(0);
+
+        const decoded = yield* decodeBoundary(investigation);
+        const clean = yield* decodePublicWrite(decoded);
+        yield* gateway.write(clean, human, source, { actor: human });
+        expect((yield* readCurrentState(sql, projectId)).tasks).toHaveLength(2);
+        expect(
+          yield* sql`SELECT command_id FROM project_work_command_receipts
+            WHERE project_id=${projectId} AND command_id=${investigation.commandId}`,
+        ).toHaveLength(1);
+      }),
+    ),
+  );
+}
 
 it.effect(
   "starts one bounded investigation through the authenticated gateway and replays one receipt",

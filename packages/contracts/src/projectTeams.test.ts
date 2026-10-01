@@ -120,6 +120,62 @@ describe("guided contract preparation", () => {
     expect(decodePublicWrite(investigation)).toEqual(investigation);
   });
 
+  it("rejects excess authority at the default public decoder before it can strip fields", () => {
+    for (const authority of [
+      { actor: { kind: "human", id: "invented" } },
+      { bindingId: "invented" },
+      { generation: 99 },
+      { authorizationGateId: "invented" },
+    ]) {
+      expect(() => decodePublicWrite({ ...investigation, ...authority })).toThrow();
+      expect(() => decodeGuided({ ...investigation, ...authority })).toThrow();
+    }
+    expect(() =>
+      decodePublicWrite({
+        type: "project-team.task.control",
+        commandId: "control",
+        projectId: "project",
+        taskId: "task",
+        expectedRevision: 0,
+        expectedTaskRevision: 0,
+        control: { action: "pause", reason: "Stop", generation: 99 },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodePublicWrite({
+        type: "project-team.gate.respond",
+        commandId: "approve",
+        projectId: "project",
+        taskId: "task",
+        expectedRevision: 0,
+        expectedTaskRevision: 0,
+        specRevision: 1,
+        planRevision: 0,
+        gateId: "gate",
+        expectedGateRevision: 0,
+        response: "approved",
+        actor: { kind: "human", id: "invented" },
+      }),
+    ).toThrow();
+  });
+
+  it("preserves legitimate legacy command attribution through the public decoder", () => {
+    const command = {
+      type: "project-work.task.create",
+      commandId: "legacy-create",
+      projectId: "project",
+      taskId: "legacy-task",
+      title: "Legacy capture",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      attribution: {
+        actor: { kind: "human", id: "user" },
+        source: { kind: "web", id: "browser" },
+        recordedAt: "2026-01-01T00:00:00.000Z",
+      },
+    };
+    expect(decodePublicWrite(command)).toEqual(command);
+  });
+
   it("retains the nonempty raw foundation invariant", () => {
     const command = {
       type: "project-work.foundation.commit",
