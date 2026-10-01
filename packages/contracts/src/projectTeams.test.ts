@@ -348,3 +348,30 @@ describe("guided contract preparation", () => {
     expect(() => decodeGuided({ ...report, outputs: [{ ...outputs[0], detail: " " }] })).toThrow();
   });
 });
+
+it("retains explicit semantic repair state and accepts legacy missing metadata", () => {
+  const legacy = {
+    kind: "repair-episode",
+    recordId: "episode-codec",
+    projectId: "project",
+    taskId: "task",
+    revision: 0,
+    generation: 0,
+    updatedAt: "2026-01-01T00:00:00.000Z",
+    status: "active",
+    failureFingerprint: "failure",
+    relevantRevision: "tree",
+    allowance: 2,
+    semanticRepairs: 0,
+    transportRetries: 0,
+    timeoutCount: 0,
+    attemptIds: [],
+  };
+  expect(decodeTeamRecord(legacy)).not.toHaveProperty("pendingSemanticRepair");
+  for (const pendingSemanticRepair of [false, true])
+    expect(decodeTeamRecord({ ...legacy, pendingSemanticRepair })).toHaveProperty(
+      "pendingSemanticRepair",
+      pendingSemanticRepair,
+    );
+  expect(() => decodeTeamRecord({ ...legacy, pendingSemanticRepair: "false" })).toThrow();
+});

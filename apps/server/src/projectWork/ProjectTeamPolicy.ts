@@ -15,6 +15,39 @@ const scopeDigest = (value: unknown) =>
 export const projectTeamDerivedRecordId = (commandId: string, suffix: string) =>
   `guided:${scopeDigest([commandId, suffix])}`;
 
+/** Ordinary successors cannot replace the canonical semantic repair debit. */
+export const projectTeamRequiresSemanticRepair = (state: ProjectWorkState, taskId: string) => {
+  const records = state.foundationRecords ?? [];
+  const seen = new Set<string>();
+  let root = taskId;
+  while (true) {
+    if (seen.has(root))
+      throw new ProjectWorkPolicyError("authority-required", "Repair lineage has a cycle");
+    seen.add(root);
+    const membership = records.find(
+      (record) => record.kind === "task-membership" && record.taskId === root,
+    );
+    if (membership?.kind !== "task-membership" || membership.parentTaskId === undefined) break;
+    root = membership.parentTaskId;
+  }
+  return records.some(
+    (record) =>
+      record.kind === "repair-episode" &&
+      (record.rootTaskId ?? record.taskId) === root &&
+      (record.status === "exhausted" ||
+        (record.status === "active" && record.pendingSemanticRepair !== false)),
+  );
+};
+
+export const assertProjectTeamOrdinarySuccessor = (state: ProjectWorkState, taskId: string) => {
+  if (projectTeamRequiresSemanticRepair(state, taskId)) {
+    throw new ProjectWorkPolicyError(
+      "authority-required",
+      "Canonical semantic failure requires exact repair authorization",
+    );
+  }
+};
+
 /** Managed history remains a fence after assignment removal or run retirement. */
 export const isGuidedProjectTeamTask = (state: ProjectWorkState, taskId: string) =>
   (state.foundationRecords ?? []).some(

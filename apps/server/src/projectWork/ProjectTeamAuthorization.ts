@@ -25,6 +25,7 @@ import { decodeProjectWorkEvent } from "./ProjectWorkEventStore.ts";
 import { assertProjectTeamGuidedReplayCurrent } from "./ProjectTeamGuidedLifecycle.ts";
 import {
   assertProjectTeamRunAuthority,
+  assertProjectTeamOrdinarySuccessor,
   projectTeamSpecificationHash,
   projectTeamPlanHash,
 } from "./ProjectTeamPolicy.ts";
@@ -357,6 +358,18 @@ export const layer = Layer.effect(
             : command.type === "project-work.evidence.add"
               ? command.evidence.taskId
               : undefined;
+      if (
+        command.type !== "project-work.comment.add" &&
+        !(
+          command.type === "project-work.evidence.add" &&
+          command.evidence.kind === "observation" &&
+          command.evidence.criterionId === undefined
+        )
+      )
+        yield* Effect.try({
+          try: () => assertProjectTeamOrdinarySuccessor(authority.state, authority.binding.taskId),
+          catch: () => deny("Semantic work requires its canonical repair debit"),
+        });
       if (
         command.projectId !== authority.binding.projectId ||
         targetTaskId !== authority.binding.taskId
@@ -729,6 +742,10 @@ export const layer = Layer.effect(
       if (principal.actor.kind !== "human") {
         if (authority === undefined)
           return yield* deny("Guided agent requires current managed authority");
+        yield* Effect.try({
+          try: () => assertProjectTeamOrdinarySuccessor(authority.state, authority.binding.taskId),
+          catch: () => deny("Semantic work requires its canonical repair debit"),
+        });
         const inheritedPlanTarget =
           intent.type === "project-team.plan.propose" &&
           authority.role.role === "planner" &&

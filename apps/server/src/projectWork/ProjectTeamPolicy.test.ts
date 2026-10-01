@@ -14,14 +14,70 @@ import {
   projectTeamSpecificationHash,
   projectTeamScopeHash,
   projectTeamPlanHash,
+  assertProjectTeamOrdinarySuccessor,
 } from "./ProjectTeamPolicy.ts";
 import { emptyProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 
 type Gate = Extract<ProjectTeamRecord, { kind: "gate" }>;
 type Membership = Extract<ProjectTeamRecord, { kind: "task-membership" }>;
+type RepairEpisode = Extract<ProjectTeamRecord, { kind: "repair-episode" }>;
 const projectId = ProjectId.make("project-a");
 const taskId = ProjectWorkTaskId.make("task-a");
 const now = "2026-09-30T00:00:00.000Z";
+
+describe("ordinary successor repair fence", () => {
+  const episode: RepairEpisode = {
+    kind: "repair-episode",
+    recordId: "episode",
+    projectId,
+    taskId,
+    rootTaskId: taskId,
+    revision: 0,
+    generation: 0,
+    updatedAt: now,
+    status: "active",
+    failureFingerprint: "failure",
+    relevantRevision: "tree-a",
+    allowance: 2,
+    semanticRepairs: 0,
+    transportRetries: 0,
+    timeoutCount: 0,
+    attemptIds: [],
+  };
+  it.each([undefined, true])("denies pending or ambiguous semantic history %s", (pending) => {
+    const current =
+      pending === undefined ? episode : { ...episode, pendingSemanticRepair: pending };
+    const state = { ...emptyProjectWorkReducerState(projectId), foundationRecords: [current] };
+    expect(() => assertProjectTeamOrdinarySuccessor(state, taskId)).toThrow(
+      "exact repair authorization",
+    );
+  });
+  it("allows explicit transport-only or already debited history without resetting counters", () => {
+    const current = {
+      ...episode,
+      pendingSemanticRepair: false,
+      transportRetries: 3,
+      semanticRepairs: 1,
+    };
+    const state = { ...emptyProjectWorkReducerState(projectId), foundationRecords: [current] };
+    expect(() => assertProjectTeamOrdinarySuccessor(state, taskId)).not.toThrow();
+    expect(current.semanticRepairs).toBe(1);
+    expect(current.transportRetries).toBe(3);
+  });
+  it("denies exhausted history even after a prior debit", () => {
+    const state = {
+      ...emptyProjectWorkReducerState(projectId),
+      foundationRecords: [
+        { ...episode, status: "exhausted" as const, pendingSemanticRepair: false },
+      ],
+    };
+    expect(() => assertProjectTeamOrdinarySuccessor(state, taskId)).toThrow();
+  });
+  it("ignores another task's episode", () => {
+    const state = { ...emptyProjectWorkReducerState(projectId), foundationRecords: [episode] };
+    expect(() => assertProjectTeamOrdinarySuccessor(state, "other-task")).not.toThrow();
+  });
+});
 const gate = (overrides: Partial<Gate> = {}): Gate => ({
   kind: "gate",
   recordId: "execution-approval",

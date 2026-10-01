@@ -322,6 +322,20 @@ export const validateProjectTeamRecord = (
         reject("Answer requires human attribution");
       break;
     case "repair-episode":
+      if (
+        old?.kind === "repair-episode" &&
+        old.pendingSemanticRepair !== false &&
+        r.pendingSemanticRepair === false &&
+        (r.semanticRepairs !== old.semanticRepairs + 1 ||
+          r.lastSemanticRevision !== old.relevantRevision)
+      )
+        reject("Pending semantic repair requires its exact canonical debit");
+      if (
+        old?.kind === "repair-episode" &&
+        old.pendingSemanticRepair !== undefined &&
+        r.pendingSemanticRepair === undefined
+      )
+        reject("Semantic repair state cannot be discarded");
       if (r.semanticRepairs > r.allowance && r.status === "active")
         reject("Exhausted repair allowance must be visible");
       if (

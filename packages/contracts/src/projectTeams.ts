@@ -287,6 +287,7 @@ export const ProjectTeamRepairEpisode = Schema.Struct({
   attemptIds: Schema.Array(ProjectWorkAttemptId).check(Schema.isMaxLength(64)),
   rootTaskId: Schema.optionalKey(ProjectWorkTaskId),
   lastSemanticRevision: Schema.optionalKey(Text),
+  pendingSemanticRepair: Schema.optionalKey(Schema.Boolean),
   exceptionGrantId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
 });
 export const ProjectTeamLimits = Schema.Struct({
