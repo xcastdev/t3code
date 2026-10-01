@@ -116,6 +116,38 @@ describe("guided contract preparation", () => {
     expect(() => decodeGuided({ ...investigation, expectedIssueRevision: 0 })).toThrow();
   });
 
+  it("bounds inherited planner and reviewer requests without allowing a self-approved grant", () => {
+    const planning = {
+      ...investigation,
+      type: "project-team.assignment.start",
+      assignmentKind: "planning",
+      specRevision: 1,
+      specificationGateId: "approved-spec",
+      expectedSpecificationGateRevision: 1,
+    };
+    expect(decodePublicWrite(planning)).toEqual(planning);
+    expect(() => decodeGuided({ ...planning, assignmentKind: "review" })).toThrow();
+    const review = {
+      ...planning,
+      assignmentKind: "review",
+      parentPlan: {
+        recordId: "plan",
+        expectedRecordRevision: 0,
+        planRevision: 1,
+        gateId: "approved-plan",
+        expectedGateRevision: 1,
+      },
+    };
+    expect(decodeGuided(review)).toEqual(review);
+    expect(() => decodeGuided({ ...planning, assignmentKind: "implementer" })).toThrow();
+    expect(() => decodeGuided({ ...planning, assignmentAuthorization: {} })).toThrow();
+    expect(() => decodeGuided({ ...planning, objective: "x".repeat(32_001) })).toThrow();
+    expect(() => decodeGuided({ ...planning, outputDescriptions: [] })).toThrow();
+    expect(() =>
+      decodeGuided({ ...review, parentPlan: { ...review.parentPlan, actor: "human" } }),
+    ).toThrow();
+  });
+
   it("accepts the bounded public intent without caller-created authority", () => {
     expect(decodePublicWrite(investigation)).toEqual(investigation);
   });
