@@ -7,10 +7,10 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-10-01 00:21 UTC. Implementation is running. The harness permits
-**ten subagents plus the coordinator**. Three agents are running: one preparation owner and two reviewers. Seven
-seats are available. Reviewers return to their existing
-piece after repairs.
+Last updated: 2026-10-01 00:30 UTC. Implementation is running. The harness permits
+**ten subagents plus the coordinator**. All subagent seats are currently available;
+P3 has received approval and is entering combined integration. Reviewers return
+to their existing piece after repairs.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
@@ -20,18 +20,18 @@ piece after repairs.
 
 - **Finished on main:** P1's bounded runtime, isolation, packaging and memory-choice proofs.
 - **Next main integration:** P2 is approved in wave2. P3's durable identity fence
-  passes 293 focused/affected cases and final entry compilation. Its owner is
-  finished `81a0ccf16`; its existing reviewer is checking that exact candidate
-  before the combined wave gate.
+  passes 293 focused/affected cases and final entry compilation. Exact candidate `81a0ccf16` is independently approved: 154 candidate checks
+  and 10 causal/regression cases pass. Combined wave validation and review remain.
 - **P4:** pure policy leaf `76089058` is approved. Guided workflow interfaces are
   prepared; dependent implementation waits for the foundation gate.
 - **P5:** transport and pure sync/intake leaves are approved. Title repair
   `42663135` passes 79 tests and independent replay/rename/conflict checks.
-  A read-only owner is preparing durable sync authority; refinement, wiring
+  Durable sync authority interfaces are prepared; refinement, wiring
   and real GitHub evidence remain.
 - **P7:** protocol `df620a4a` is approved. Skills repair `4168f789` is approved after its existing review. Linux process `7db547c70` passes real lifecycle/EOF checks, but
   its reviewer finds duration parsing, ambient Python startup and full-duplex
-  pipe deadlock defects; the review is finishing. Runtime interfaces are prepared.
+  pipe deadlock defects in a sealed review. Root is verifying repairs before
+  returning them to the same owner/reviewer. Runtime interfaces are prepared.
 - **P10:** native adapter repair `2a88e791` is approved after real deletion,
   recovery and explicit native-proof checks. Extraction, authorized hydration,
   context and integration remain dependent work.
@@ -54,18 +54,18 @@ Each row is one subagent seat, with its owner, work and next gate. Finished agen
 release their seat. Worktrees live under
 `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                                    | State                                | Assignment / branch                                         | Next gate                                                    |
-| ---- | ---------------------------------------- | ------------------------------------ | ----------------------------------------------------------- | ------------------------------------------------------------ |
-| 1    | — (last: `p3_authorization_resume_high`) | Available; repair under review       | P3 `81a0ccf16` committed and sealed                         | Resume verified repair after review seals                    |
-| 2    | — (last: `p7_worker_protocol_high`)      | Available; runtime proposal ready    | P7 read-only proposal complete                              | Root interfaces after foundation gate                        |
-| 3    | — (last: `review_p10_backend_adapter`)   | Available; repair APPROVE            | P10 `2a88e791` held for integration                         | Ready independent work or review                             |
-| 4    | — (last: `review_p5_sync_leaf`)          | Available; repair APPROVE            | P5 `42663135` held for integration                          | Ready independent work or review                             |
-| 5    | `p5_sync_leaf_high`                      | Read-only sync-authority preparation | P5 `pi-teams/p5-sync-authority-preparation` base `42663135` | Root snapshot/cache/lease interface proposal                 |
-| 6    | `review_p3_authority`                    | Re-reviewing sealed repair           | P3 `81a0ccf16`; `pi-teams/p3-authorization`                 | Credential races, durable denial, rollback and compatibility |
-| 7    | — (last: `review_p7_skills_slice`)       | Available; repair APPROVE            | P7 skills `4168f789` held for integration                   | Ready independent work or review                             |
-| 8    | — (last: `p5_sync_leaf_high`)            | Available                            | P5 repair committed and approved                            | Ready independent work                                       |
-| 9    | — (last: `p7_managed_process_high`)      | Available; candidate under review    | P7 process `7db547c70`                                      | Verified repairs after review seals                          |
-| 10   | `review_p7_managed_process`              | Reviewing read-only                  | P7 process; `pi-teams/p7-managed-process`                   | Duration, startup, transport and drain failures              |
+| Slot | Agent                                    | State                               | Assignment / branch                             | Next gate                                |
+| ---- | ---------------------------------------- | ----------------------------------- | ----------------------------------------------- | ---------------------------------------- |
+| 1    | — (last: `p3_authorization_resume_high`) | Available; repair APPROVE           | P3 `81a0ccf16` committed and sealed             | Combined wave2 integration               |
+| 2    | — (last: `p7_worker_protocol_high`)      | Available; runtime proposal ready   | P7 read-only proposal complete                  | Root interfaces after foundation gate    |
+| 3    | — (last: `review_p10_backend_adapter`)   | Available; repair APPROVE           | P10 `2a88e791` held for integration             | Ready independent work or review         |
+| 4    | — (last: `review_p5_sync_leaf`)          | Available; repair APPROVE           | P5 `42663135` held for integration              | Ready independent work or review         |
+| 5    | — (last: `p5_sync_leaf_high`)            | Available; authority proposal ready | P5 read-only authority preparation complete     | Root contracts after P4 foundation       |
+| 6    | — (last: `review_p3_authority`)          | Available; exact-head APPROVE       | P3 `81a0ccf16`; 58 sealed review artifacts      | Fresh combined-wave review after checks  |
+| 7    | — (last: `review_p7_skills_slice`)       | Available; repair APPROVE           | P7 skills `4168f789` held for integration       | Ready independent work or review         |
+| 8    | — (last: `p5_sync_leaf_high`)            | Available                           | P5 repair committed and approved                | Ready independent work                   |
+| 9    | — (last: `p7_managed_process_high`)      | Available; repair pending           | P7 process `7db547c70`; three verified findings | Root replay then focused owner repair    |
+| 10   | — (last: `review_p7_managed_process`)    | Available; REQUEST_CHANGES          | P7 process; 166 sealed review artifacts         | Same reviewer after three scoped repairs |
 
 Coordinator: keeping this record current, inspecting sealed candidates and
 preparing dependency-ordered integration. The normal compiler reservation is
@@ -73,7 +73,7 @@ free; completed scopes have drained. Only one normal compiler runs at a time.
 No model or integrated client proof is running.
 
 Primary branch: `t3code/implement-pi-project-teams`. Latest saved dashboard commit:
-`57e58ece5`; historical restart checkpoint: `238126a8`. Wave2 `ec72aa758`
+`b1dba079d`; historical restart checkpoint: `238126a8`. Wave2 `ec72aa758`
 reconciles that saved dashboard; its source is unchanged from `9da4de1dd`.
 Reconcile subsequent main advances before merging. Main still contains only P1
 product source. Preparatory branches retain their explicit earlier bases;
@@ -2528,3 +2528,9 @@ or product acceptance is inferred from these bounded leaves.
 - P4 read-only interface proposal: SHA
   `650e14f157d7b9aa7a17f83ebb7b02983e11e072d05bb108af509a3d8b7c6faa`.
   It changes no repository source and completes no dependency or acceptance gate.
+
+### P3 approval and process review transition (2026-10-01)
+
+P3 exact `81a0ccf1643564a886e75dc44ba66ca3b4bf3b40` receives APPROVE. Root independently verifies all 58 review artifacts against manifest `08d2431f742b1087028367e7fccfb6633b706c70a0e0c979bc1d9404bf530fbe`. Five review scopes and 47 producer scopes drain; 154 candidate checks and ten external causal/regression cases pass. Compiler is inspected rather than rerun. Real transports/clients and combined integration remain open.
+
+P7 process exact `7db547c70` receives REQUEST_CHANGES for numeric duration normalization, ambient Python startup and blocking full-duplex input. Root verifies all 166 review artifacts against manifest `7233b51d6446e11f8009b5d5ff1e85e9efd1615d6c06a417cb9bdda962fe71b0`; root replay and three-file owner repairs remain next. The P5 read-only authority proposal is complete; no dependent implementation or parent completion is claimed.
