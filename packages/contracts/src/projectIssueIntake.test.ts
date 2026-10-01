@@ -1,5 +1,6 @@
 import { expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
+import { WsRpcGroup, WS_METHODS } from "./rpc.ts";
 import {
   ProjectIssueIdentity,
   ProjectIssueIntake,
@@ -91,4 +92,37 @@ it("returns bounded persisted binding history without credential fields", () => 
   ).toEqual({
     items: [binding],
   });
+});
+
+it("rejects excess authority fields through the registered public JSON binding codec", () => {
+  const rpc = WsRpcGroup.requests.get(WS_METHODS.projectWorkBindIssueRepository)!;
+  const decode = Schema.decodeUnknownSync(Schema.toCodecJson(rpc.payloadSchema));
+  const input = {
+    projectId: "project",
+    expectedRepositoryKey: { host: "github.com", repositoryNodeId: "R_repo" },
+    expectedTargetBindingRevision: null,
+    accountLogin: "alice",
+  };
+  expect(decode(input)).toEqual(input);
+  const previous = { key: input.expectedRepositoryKey, expectedBindingRevision: 0 };
+  expect(decode({ ...input, previous })).toEqual({ ...input, previous });
+  for (const forged of [
+    { ...input, actor: { kind: "human", id: "caller" } },
+    { ...input, authorization: { human: true } },
+    { ...input, credentialEpoch: "caller-epoch" },
+    {
+      ...input,
+      expectedRepositoryKey: { ...input.expectedRepositoryKey, credentialEpoch: "caller" },
+    },
+    { ...input, previous: { ...previous, authorization: true } },
+    { ...input, previous: { ...previous, key: { ...previous.key, accountLogin: "caller" } } },
+  ])
+    expect(() => decode(forged)).toThrow();
+});
+
+it("rejects excess input in the registered public binding-list JSON codec", () => {
+  const rpc = WsRpcGroup.requests.get(WS_METHODS.projectWorkRepositoryBindings)!;
+  const decode = Schema.decodeUnknownSync(Schema.toCodecJson(rpc.payloadSchema));
+  expect(decode({ projectId: "project" })).toEqual({ projectId: "project" });
+  expect(() => decode({ projectId: "project", actor: { kind: "human" } })).toThrow();
 });

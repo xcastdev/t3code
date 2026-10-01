@@ -159,10 +159,11 @@ const fixture = Effect.fn("bindingGatewayTest.fixture")(function* (enabled = tru
   );
   const state = yield* Ref.make({ ...DEFAULT_SERVER_SETTINGS, projectWorkEnabled: false });
   const changes = yield* PubSub.unbounded<typeof DEFAULT_SERVER_SETTINGS>();
+  const settingsBoundary = { boundary: Effect.void as Effect.Effect<void> };
   const settings = ServerSettingsService.of({
     start: Effect.void,
     ready: Effect.void,
-    getSettings: Ref.get(state),
+    getSettings: Ref.get(state).pipe(Effect.tap(() => settingsBoundary.boundary)),
     updateSettings: (patch) =>
       Ref.updateAndGet(state, (previous) => ({
         ...previous,
@@ -216,6 +217,7 @@ const fixture = Effect.fn("bindingGatewayTest.fixture")(function* (enabled = tru
     gateway,
     authorize,
     settings,
+    settingsBoundary,
     states,
     seed,
   };
@@ -659,3 +661,43 @@ it.effect("requires both captured and durable read scopes before exposing bindin
     }),
   ),
 );
+
+for (const expires of [false, true])
+  it.effect(`checks durable human authority after final settings receipt, expiry=${expires}`, () =>
+    run(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        yield* f.sql`UPDATE auth_sessions SET expires_at='2026-10-01T00:00:01Z'`;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        f.settingsBoundary.boundary = Effect.gen(function* () {
+          if (Option.isNone(yield* Effect.serviceOption(f.sql.transactionService))) return;
+          const rows =
+            yield* f.sql`SELECT revision FROM project_issue_binding WHERE project_id='a'`;
+          if (rows.length === 0) return;
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+        }).pipe(Effect.orDie);
+        const pending = yield* f.gateway
+          .bind(input, f.session)
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Deferred.await(entered);
+        if (expires) yield* TestClock.adjust("1 second");
+        yield* Deferred.succeed(release, undefined);
+        const result = yield* Fiber.join(pending);
+        const stored = yield* f.sql`SELECT project_id,status,revision FROM project_issue_binding`;
+        if (expires) {
+          expect(result).toMatchObject({ _tag: "Failure", failure: { reason: "human-required" } });
+          expect(stored).toEqual([]);
+          expect(yield* f.sql`SELECT repository_node_id FROM project_issue_repository`).toEqual([]);
+          expect(yield* f.sql`SELECT event_id FROM project_work_events`).toEqual([]);
+        } else {
+          expect(result).toMatchObject({
+            _tag: "Success",
+            success: { ...key, bindingRevision: 0, status: "ready" },
+          });
+          expect(stored).toEqual([{ project_id: "a", status: "active", revision: 0 }]);
+        }
+      }),
+    ),
+  );

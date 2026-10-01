@@ -388,8 +388,8 @@ export const make = Effect.gen(function* () {
             ),
           );
           yield* guard(deadline);
-          yield* authorization;
           yield* enabled;
+          yield* authorization;
           yield* guard(deadline);
           return {
             host: bound.state.host,
