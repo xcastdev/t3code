@@ -31,11 +31,8 @@ type Draft<T = ProjectWorkEvent> = T extends ProjectWorkEvent
 function reject(message: string): never {
   throw new ProjectWorkPolicyError("authority-required", message);
 }
-export const projectTeamRepairGrantId = (
-  commandId: string,
-  episodeId: string,
-  generation: number,
-) => projectTeamDerivedRecordId(commandId, `repair-grant:${episodeId}:${generation}`);
+const projectTeamRepairGrantId = (commandId: string, episodeId: string, generation: number) =>
+  projectTeamDerivedRecordId(commandId, `repair-grant:${episodeId}:${generation}`);
 
 /** The producer is private; exact persisted grants, scope and ownership remain mandatory. */
 export const decideProjectTeamGuidedTransition = (

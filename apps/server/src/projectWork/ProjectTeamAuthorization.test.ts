@@ -3,15 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import { HttpServer } from "effect/unstable/http";
-import {
-  CommandId,
-  ProjectWorkAttemptId,
-  ProjectWorkCriterionId,
-  ProjectId,
-  ProjectWorkTaskId,
-  EnvironmentId,
-  ThreadId,
-} from "@t3tools/contracts";
+import { ProjectId, ProjectWorkTaskId, EnvironmentId, ThreadId } from "@t3tools/contracts";
 import { runMigrations } from "../persistence/Migrations.ts";
 import * as Authorization from "./ProjectTeamAuthorization.ts";
 import * as Registry from "../mcp/McpSessionRegistry.ts";
