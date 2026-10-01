@@ -1,4 +1,5 @@
 import * as Schema from "effect/Schema";
+import * as Protocol from "./PiWorkerProtocol.ts";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
@@ -12,6 +13,7 @@ import {
   encodePiWorkerFrame,
   makePiWorkerLineFramer,
   makePiWorkerProtocol,
+  type PiWorkerOperation,
   type PiParentFrame,
   type PiWorkerFrame,
 } from "./PiWorkerProtocol.ts";
@@ -31,6 +33,683 @@ const parentFrame = (message: PiParentFrame["message"], sequence = 0): PiParentF
   message,
 });
 const chunk = Buffer.from("native text delta").toString("base64");
+
+const native = {
+  sessionId: "native-session",
+  sessionReference: "sessions/native-session.jsonl",
+  leafId: "leaf-1",
+  persisted: true,
+};
+const runtimeBootstrap = {
+  type: "bootstrap" as const,
+  executionMode: "managed" as const,
+  expectedCwd: "/workspace",
+  native: null,
+  context: { transferId: "context", totalBytes: 0 },
+  prompt: { transferId: "prompt", totalBytes: 0 },
+  model: {
+    provider: "commandcode",
+    modelId: "inclusionai/ling-3.1-flash:free",
+    api: "openai-completions" as const,
+    contextWindow: 32_768,
+    maxTokens: 512,
+    reasoning: false,
+  },
+  allowedTools: [{ name: "read", execution: "local" as const, description: "read text" }],
+};
+
+function runtimePeers(operationKind: PiWorkerOperation["operationKind"] = "prompt") {
+  const operation = { operationId: "operation-1", operationKind };
+  const protocol = makePiWorkerProtocol(identity, operation);
+  let workerSequence = 0;
+  let parentSequence = 0;
+  const workerFramer = makePiWorkerLineFramer((raw) =>
+    protocol.acceptWorker(decodePiWorkerFrame(raw)),
+  );
+  const parentFramer = makePiWorkerLineFramer((raw) =>
+    protocol.acceptParent(decodePiParentFrame(raw)),
+  );
+  return {
+    operation,
+    protocol,
+    worker(message: PiWorkerFrame["message"]) {
+      const frame = { ...workerFrame(message, workerSequence++), ...operation };
+      workerFramer.push(encodePiWorkerFrame(frame));
+      return frame;
+    },
+    parent(message: PiParentFrame["message"]) {
+      const frame = { ...parentFrame(message, parentSequence++), ...operation };
+      parentFramer.push(encodePiParentFrame(frame));
+      return frame;
+    },
+    bootstrap(overrides: Partial<Extract<PiParentFrame["message"], { type: "bootstrap" }>> = {}) {
+      this.parent({
+        ...runtimeBootstrap,
+        prompt: operationKind === "prompt" ? runtimeBootstrap.prompt : null,
+        ...overrides,
+      });
+      this.parent({ type: "transfer-end", transferId: "context" });
+      if (operationKind === "prompt") this.parent({ type: "transfer-end", transferId: "prompt" });
+      this.worker({ type: "ready", actualCwd: "/workspace", native });
+    },
+  };
+}
+
+describe("parent-bound native operations", () => {
+  it("initializes without inventing an agent or model request", () => {
+    const peer = runtimePeers("initialize");
+    peer.bootstrap();
+    expect(peer.protocol.successful).toBe(false);
+    peer.worker({ type: "initialized", native });
+    expect(peer.protocol.successful).toBe(true);
+    expect(() => peer.worker({ type: "agent_start", lifecycleId: 1 })).toThrow("WORKER_TERMINAL");
+  });
+
+  it("requires genuine compaction, persisted native receipt, idle and final request ACK", () => {
+    const peer = runtimePeers("compact");
+    peer.bootstrap();
+    peer.worker({ type: "compaction_start", lifecycleId: 1 });
+    peer.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" });
+    peer.parent({ type: "headers", requestId: 1, status: 200 });
+    const last = peer.parent({ type: "chunk", requestId: 1, data: chunk });
+    peer.parent({ type: "end", requestId: 1 });
+    peer.worker({ type: "compaction_end", lifecycleId: 1 });
+    peer.worker({ type: "compacted", lifecycleId: 1, native: { ...native, leafId: "leaf-2" } });
+    peer.worker({ type: "operation_settled", lifecycleId: 1, outcome: "success" });
+    expect(peer.protocol.canFinishSuccessfully).toBe(false);
+    peer.worker({ type: "ack", requestId: 1, chunkSequence: last.sequence });
+    expect(peer.protocol.canFinishSuccessfully).toBe(true);
+    peer.worker({ type: "done" });
+    expect(peer.protocol.successful).toBe(true);
+  });
+
+  it.each(["initialize", "compact"] as const)("rejects agent lifecycle in %s", (kind) => {
+    const peer = runtimePeers(kind);
+    peer.bootstrap();
+    expect(() => peer.worker({ type: "agent_start", lifecycleId: 1 })).toThrow("OPERATION_KIND");
+    expect(peer.protocol.successful).toBe(false);
+  });
+
+  it("requires the latest real prompt cycle, assistant success and native persistence", () => {
+    const peer = runtimePeers();
+    peer.bootstrap();
+    peer.worker({ type: "agent_start", lifecycleId: 1 });
+    peer.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" });
+    peer.parent({ type: "headers", requestId: 1, status: 200 });
+    peer.parent({ type: "end", requestId: 1 });
+    peer.worker({
+      type: "sdk-event",
+      lifecycleId: 1,
+      event: { type: "assistant_result", stopReason: "stop" },
+    });
+    peer.worker({ type: "native", lifecycleId: 1, native: { ...native, leafId: "leaf-2" } });
+    peer.worker({ type: "agent_end", lifecycleId: 1 });
+    peer.worker({ type: "agent_settled", lifecycleId: 1 });
+    expect(peer.protocol.canFinishSuccessfully).toBe(false);
+    peer.worker({ type: "operation_settled", lifecycleId: 1, outcome: "success" });
+    expect(peer.protocol.canFinishSuccessfully).toBe(true);
+    peer.worker({ type: "done" });
+    expect(peer.protocol.successful).toBe(true);
+  });
+
+  it("cannot use settlement alone as a manual compaction success", () => {
+    const peer = runtimePeers("compact");
+    peer.bootstrap();
+    expect(() =>
+      peer.worker({ type: "operation_settled", lifecycleId: 1, outcome: "success" }),
+    ).toThrow("SETTLEMENT_BARRIER");
+  });
+
+  it.each(["prompt", "compact"] as const)(
+    "requires fresh persisted native progress in every %s lifecycle",
+    (kind) => {
+      for (const secondLeaf of ["leaf-2", "leaf-3"]) {
+        const peer = runtimePeers(kind);
+        peer.bootstrap();
+        const cycle = (id: number, leafId: string) => {
+          peer.worker({
+            type: kind === "prompt" ? "agent_start" : "compaction_start",
+            lifecycleId: id,
+          });
+          peer.worker({ type: "request", lifecycleId: id, requestId: id, body: "{}" });
+          peer.parent({ type: "headers", requestId: id, status: 200 });
+          peer.parent({ type: "end", requestId: id });
+          if (kind === "prompt") {
+            peer.worker({
+              type: "sdk-event",
+              lifecycleId: id,
+              event: { type: "assistant_result", stopReason: "stop" },
+            });
+            peer.worker({ type: "native", lifecycleId: id, native: { ...native, leafId } });
+            peer.worker({ type: "agent_end", lifecycleId: id });
+            peer.worker({ type: "agent_settled", lifecycleId: id });
+          } else {
+            peer.worker({ type: "compaction_end", lifecycleId: id });
+            peer.worker({ type: "compacted", lifecycleId: id, native: { ...native, leafId } });
+          }
+        };
+        cycle(1, "leaf-2");
+        if (secondLeaf === "leaf-2") {
+          expect(() => cycle(2, secondLeaf)).toThrow("NATIVE_PERSISTENCE_BARRIER");
+          expect(peer.protocol.successful).toBe(false);
+        } else {
+          cycle(2, secondLeaf);
+          peer.worker({ type: "operation_settled", lifecycleId: 2, outcome: "success" });
+          peer.worker({ type: "done" });
+          expect(peer.protocol.successful).toBe(true);
+        }
+      }
+    },
+  );
+
+  it.each(["prompt", "compact"] as const)(
+    "rejects an unchanged persisted native leaf in %s",
+    (kind) => {
+      const peer = runtimePeers(kind);
+      peer.bootstrap();
+      peer.worker({ type: kind === "prompt" ? "agent_start" : "compaction_start", lifecycleId: 1 });
+      peer.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" });
+      peer.parent({ type: "headers", requestId: 1, status: 200 });
+      peer.parent({ type: "end", requestId: 1 });
+      if (kind === "compact") peer.worker({ type: "compaction_end", lifecycleId: 1 });
+      expect(() =>
+        peer.worker({ type: kind === "prompt" ? "native" : "compacted", lifecycleId: 1, native }),
+      ).toThrow("NATIVE_PERSISTENCE_BARRIER");
+      expect(peer.protocol.successful).toBe(false);
+    },
+  );
+
+  it.each(["prompt", "compact"] as const)(
+    "rejects a missing persisted native leaf in %s",
+    (kind) => {
+      const peer = runtimePeers(kind);
+      peer.bootstrap();
+      peer.worker({ type: kind === "prompt" ? "agent_start" : "compaction_start", lifecycleId: 1 });
+      if (kind === "compact") peer.worker({ type: "compaction_end", lifecycleId: 1 });
+      expect(() =>
+        peer.worker({
+          type: kind === "prompt" ? "native" : "compacted",
+          lifecycleId: 1,
+          native: { ...native, leafId: null },
+        }),
+      ).toThrow("NATIVE_PERSISTENCE_BARRIER");
+    },
+  );
+
+  it("rejects a foreign operation before native activity", () => {
+    const peer = runtimePeers();
+    peer.bootstrap();
+    const frame = {
+      ...workerFrame({ type: "agent_start", lifecycleId: 1 }, 1),
+      ...peer.operation,
+      operationId: "old-operation",
+    };
+    expect(() => peer.protocol.acceptWorker(decodePiWorkerFrame(json(frame)))).toThrow(
+      "OPERATION_IDENTITY_MISMATCH",
+    );
+    expect(peer.protocol.successful).toBe(false);
+  });
+
+  it("rejects worker cwd and resumed native identity mismatches", () => {
+    for (const bad of [
+      { actualCwd: "/tmp", native },
+      { actualCwd: "/workspace", native: { ...native, sessionId: "other-session" } },
+    ]) {
+      const peer = runtimePeers("initialize");
+      peer.parent({ ...runtimeBootstrap, prompt: null, native });
+      peer.parent({ type: "transfer-end", transferId: "context" });
+      expect(() => peer.worker({ type: "ready", ...bad })).toThrow();
+      expect(peer.protocol.successful).toBe(false);
+    }
+  });
+
+  it("transfers a multibyte prompt without truncation and decodes UTF8 only after completion", () => {
+    const peer = runtimePeers();
+    const bytes = Buffer.from("😀".repeat(25_000));
+    peer.parent({
+      ...runtimeBootstrap,
+      prompt: { transferId: "prompt", totalBytes: bytes.length },
+    });
+    peer.parent({ type: "transfer-end", transferId: "context" });
+    for (let offset = 0, index = 0; offset < bytes.length; offset += 8192, index++) {
+      peer.parent({
+        type: "transfer-chunk",
+        transferId: "prompt",
+        index,
+        offset,
+        data: bytes.subarray(offset, offset + 8192).toString("base64"),
+      });
+    }
+    peer.parent({ type: "transfer-end", transferId: "prompt" });
+    expect(peer.protocol.takeTransfer("prompt")).toEqual({
+      purpose: "prompt",
+      text: "😀".repeat(25_000),
+    });
+    expect(() => peer.protocol.takeTransfer("prompt")).toThrow("TRANSFER_UNAVAILABLE");
+    peer.worker({ type: "ready", actualCwd: "/workspace", native });
+  });
+
+  it("rejects combined accepted text over 128KiB before accepting any chunk", () => {
+    const peer = runtimePeers();
+    expect(() =>
+      peer.parent({
+        ...runtimeBootstrap,
+        context: { transferId: "context", totalBytes: 100_000 },
+        prompt: { transferId: "prompt", totalBytes: 32_000 },
+      }),
+    ).toThrow("TEXT_BYTE_LIMIT");
+    expect(peer.protocol.successful).toBe(false);
+  });
+
+  it.each([
+    { index: 1, offset: 0, data: Buffer.from("ab").toString("base64") },
+    { index: 0, offset: 1, data: Buffer.from("ab").toString("base64") },
+    { index: 0, offset: 0, data: Buffer.from("abc").toString("base64") },
+  ])("rejects unordered or oversize transfers %j", (fields) => {
+    const peer = runtimePeers();
+    peer.parent({ ...runtimeBootstrap, prompt: { transferId: "prompt", totalBytes: 2 } });
+    expect(() => peer.parent({ type: "transfer-chunk", transferId: "prompt", ...fields })).toThrow(
+      "TRANSFER_ORDER_OR_LIMIT",
+    );
+  });
+
+  it("rejects malformed transferred UTF8 at the completed byte barrier", () => {
+    const peer = runtimePeers();
+    peer.parent({ ...runtimeBootstrap, prompt: { transferId: "prompt", totalBytes: 2 } });
+    peer.parent({
+      type: "transfer-chunk",
+      transferId: "prompt",
+      index: 0,
+      offset: 0,
+      data: Buffer.from([0xc3, 0x28]).toString("base64"),
+    });
+    expect(() => peer.parent({ type: "transfer-end", transferId: "prompt" })).toThrow(
+      "INVALID_TRANSFER_UTF8",
+    );
+  });
+
+  it("preserves an accepted UTF8 byte order mark in prompt text", () => {
+    const peer = runtimePeers();
+    const text = "\uFEFFapproved scope";
+    const bytes = Buffer.from(text);
+    peer.parent({
+      ...runtimeBootstrap,
+      prompt: { transferId: "prompt", totalBytes: bytes.length },
+    });
+    peer.parent({
+      type: "transfer-chunk",
+      transferId: "prompt",
+      index: 0,
+      offset: 0,
+      data: bytes.toString("base64"),
+    });
+    peer.parent({ type: "transfer-end", transferId: "prompt" });
+    expect(peer.protocol.takeTransfer("prompt")).toEqual({ purpose: "prompt", text });
+  });
+
+  it("interrupt is irreversible even if late agent settlement succeeds", () => {
+    const peer = runtimePeers();
+    peer.bootstrap();
+    peer.worker({ type: "agent_start", lifecycleId: 1 });
+    peer.parent({ type: "interrupt", controlId: 1 });
+    peer.worker({ type: "control-receipt", controlId: 1, kind: "interrupt" });
+    expect(() => peer.worker({ type: "agent_end", lifecycleId: 1 })).toThrow("OPERATION_CANCELED");
+    expect(peer.protocol.canFinishSuccessfully).toBe(false);
+  });
+
+  it("allows only one control until its exact receipt, and rejects receipt replay", () => {
+    const peer = runtimePeers();
+    peer.bootstrap();
+    peer.worker({ type: "agent_start", lifecycleId: 1 });
+    peer.parent({ type: "control", controlId: 1, kind: "steer", text: "keep scope" });
+    peer.worker({ type: "control-receipt", controlId: 1, kind: "steer" });
+    peer.parent({ type: "control", controlId: 2, kind: "follow-up", text: "validate" });
+    expect(() => peer.worker({ type: "control-receipt", controlId: 1, kind: "steer" })).toThrow(
+      "UNEXPECTED_CONTROL_RECEIPT",
+    );
+  });
+
+  it.each(["initialize", "compact"] as const)("interrupts %s during worker startup", (kind) => {
+    const peer = runtimePeers(kind);
+    peer.parent({ ...runtimeBootstrap, prompt: null });
+    peer.parent({ type: "interrupt", controlId: 1 });
+    peer.worker({ type: "control-receipt", controlId: 1, kind: "interrupt" });
+    expect(peer.protocol.successful).toBe(false);
+    expect(() => peer.worker({ type: "ready", actualCwd: "/workspace", native })).toThrow(
+      "OPERATION_CANCELED",
+    );
+  });
+
+  it("cannot start another native request after parent request failure", () => {
+    const peer = runtimePeers();
+    peer.bootstrap();
+    peer.worker({ type: "agent_start", lifecycleId: 1 });
+    peer.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" });
+    peer.parent({ type: "error", requestId: 1, code: "SDK_FAILURE" });
+    expect(() =>
+      peer.worker({ type: "request", lifecycleId: 1, requestId: 2, body: "{}" }),
+    ).toThrow("OPERATION_FAILED");
+  });
+});
+
+describe("bounded synchronous frame intake", () => {
+  it("fails coalesced queue overflow while the consumer has not drained", async () => {
+    const delivered: string[] = [];
+    const queue = Protocol.makePiWorkerDispatchQueue((raw) => {
+      delivered.push(raw);
+    });
+    const framer = makePiWorkerLineFramer(queue.push);
+    const wire = encodePiWorkerFrame(workerFrame({ type: "done" }));
+    expect(() => framer.push(Buffer.concat(Array.from({ length: 33 }, () => wire)))).toThrow(
+      "DISPATCH_QUEUE_LIMIT",
+    );
+    await expect(queue.drain()).rejects.toThrow("DISPATCH_CLOSED");
+    expect(delivered).toEqual([]);
+  });
+
+  it("drains frames in wire order without accepting a second drain", async () => {
+    let release!: () => void;
+    const receipt = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const delivered: string[] = [];
+    const queue = Protocol.makePiWorkerDispatchQueue(async (raw) => {
+      delivered.push(raw);
+      if (raw === "first") await receipt;
+    });
+    queue.push("first");
+    queue.push("second");
+    const drained = queue.drain();
+    expect(delivered).toEqual(["first"]);
+    await expect(queue.drain()).rejects.toThrow("DISPATCH_ALREADY_DRAINING");
+    release();
+    await drained;
+    expect(delivered).toEqual(["first", "second"]);
+    queue.finish();
+    expect(() => queue.push("third")).toThrow("DISPATCH_CLOSED");
+  });
+});
+
+describe("frozen tool manifest and bounded payloads", () => {
+  function toolPeer(execution: "local" | "bridge" = "local") {
+    const peer = runtimePeers();
+    peer.bootstrap({ allowedTools: [{ name: "read", execution, description: "read text" }] });
+    peer.worker({ type: "agent_start", lifecycleId: 1 });
+    return peer;
+  }
+  function input(
+    peer: ReturnType<typeof runtimePeers>,
+    text = '{"arguments":{"path":"README.md"}}',
+    callId = 1,
+  ) {
+    peer.worker({
+      type: "tool-call",
+      lifecycleId: 1,
+      callId,
+      nativeCallId: `native-call-${callId}`,
+      toolName: "read",
+      execution: peer.protocol.bootstrap!.allowedTools[0]!.execution,
+      input: { transferId: `input-${callId}`, totalBytes: Buffer.byteLength(text) },
+    });
+    for (let offset = 0, index = 0; offset < Buffer.byteLength(text); offset += 8192, index++)
+      peer.worker({
+        type: "transfer-chunk",
+        transferId: `input-${callId}`,
+        offset,
+        index,
+        data: Buffer.from(text)
+          .subarray(offset, offset + 8192)
+          .toString("base64"),
+      });
+    peer.worker({ type: "transfer-end", transferId: `input-${callId}` });
+  }
+  it.each(["local", "bridge"] as const)("delivers only authorized %s tool results", (execution) => {
+    const peer = toolPeer(execution);
+    input(peer);
+    expect(peer.protocol.takeTransfer("input-1")).toEqual({
+      purpose: "tool-input",
+      value: { arguments: { path: "README.md" } },
+    });
+    peer.parent({ type: "tool-authorized", callId: 1, allowed: true });
+    peer.worker({
+      type: "sdk-event",
+      lifecycleId: 1,
+      event: { type: "tool_start", callId: 1, toolName: "read" },
+    });
+    const output = '{"kind":"text","text":"# T3"}';
+    const send = execution === "local" ? peer.worker.bind(peer) : peer.parent.bind(peer);
+    send({
+      type: "tool-result",
+      callId: 1,
+      output: { transferId: "output", totalBytes: Buffer.byteLength(output) },
+    });
+    send({
+      type: "transfer-chunk",
+      transferId: "output",
+      index: 0,
+      offset: 0,
+      data: Buffer.from(output).toString("base64"),
+    });
+    send({ type: "transfer-end", transferId: "output" });
+    expect(peer.protocol.takeTransfer("output")).toEqual({
+      purpose: "tool-result",
+      value: { kind: "text", text: "# T3" },
+    });
+    peer.worker({
+      type: "sdk-event",
+      lifecycleId: 1,
+      event: { type: "tool_end", callId: 1, toolName: "read", isError: false },
+    });
+    input(peer, '{"arguments":{}}', 2);
+    expect(peer.protocol.successful).toBe(false);
+  });
+  it("rejects an unadvertised tool instead of granting authority from worker text", () => {
+    const peer = toolPeer();
+    expect(() =>
+      peer.worker({
+        type: "tool-call",
+        lifecycleId: 1,
+        callId: 1,
+        nativeCallId: "native-1",
+        toolName: "shell",
+        execution: "local",
+        input: { transferId: "input", totalBytes: 0 },
+      }),
+    ).toThrow("TOOL_NOT_ALLOWED");
+  });
+  it("prevents execution before the completed input and parent authorization", () => {
+    const peer = toolPeer();
+    input(peer);
+    expect(() =>
+      peer.worker({
+        type: "sdk-event",
+        lifecycleId: 1,
+        event: { type: "tool_start", callId: 1, toolName: "read" },
+      }),
+    ).toThrow("TOOL_START_BARRIER");
+  });
+  it("fails a second active tool invocation", () => {
+    const peer = toolPeer();
+    input(peer);
+    expect(() => input(peer, '{"arguments":{}}', 2)).toThrow("TOOL_CALL_BARRIER");
+  });
+  it.each([false, true])(
+    "requires the prior tool to close before model dispatch (closed=%s)",
+    (closed) => {
+      const peer = toolPeer();
+      input(peer);
+      expect(peer.protocol.canStartRequest).toBe(false);
+      if (!closed) {
+        expect(() =>
+          peer.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" }),
+        ).toThrow("REQUEST_BARRIER");
+        expect(peer.protocol.successful).toBe(false);
+        return;
+      }
+      peer.parent({ type: "tool-authorized", callId: 1, allowed: true });
+      peer.worker({
+        type: "sdk-event",
+        lifecycleId: 1,
+        event: { type: "tool_start", callId: 1, toolName: "read" },
+      });
+      const output = Buffer.from('{"kind":"text","text":"ok"}');
+      peer.worker({
+        type: "tool-result",
+        callId: 1,
+        output: { transferId: "output", totalBytes: output.length },
+      });
+      peer.worker({
+        type: "transfer-chunk",
+        transferId: "output",
+        index: 0,
+        offset: 0,
+        data: output.toString("base64"),
+      });
+      peer.worker({ type: "transfer-end", transferId: "output" });
+      peer.worker({
+        type: "sdk-event",
+        lifecycleId: 1,
+        event: { type: "tool_end", callId: 1, toolName: "read", isError: false },
+      });
+      expect(peer.protocol.canStartRequest).toBe(true);
+      peer.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" });
+      peer.parent({ type: "headers", requestId: 1, status: 200 });
+      peer.parent({ type: "end", requestId: 1 });
+      peer.worker({
+        type: "sdk-event",
+        lifecycleId: 1,
+        event: { type: "assistant_result", stopReason: "stop" },
+      });
+      peer.worker({ type: "native", lifecycleId: 1, native: { ...native, leafId: "leaf-2" } });
+      peer.worker({ type: "agent_end", lifecycleId: 1 });
+      peer.worker({ type: "agent_settled", lifecycleId: 1 });
+      peer.worker({ type: "operation_settled", lifecycleId: 1, outcome: "success" });
+      peer.worker({ type: "done" });
+      expect(peer.protocol.successful).toBe(true);
+    },
+  );
+  it.each([
+    '{"arguments":{},"url":"https://worker-chosen"}',
+    '{"arguments":{"__proto__":{"polluted":true}}}',
+    '{"arguments":{"constructor":{"prototype":{"polluted":true}}}}',
+    '{"arguments":{"nested":' + "[".repeat(65) + "0" + "]".repeat(65) + "}}",
+  ])("rejects malformed, excess-key or unsafe nested tool JSON %s", (text) => {
+    const peer = toolPeer();
+    expect(() => input(peer, text)).toThrow("INVALID_TOOL_JSON");
+    expect(peer.protocol.successful).toBe(false);
+  });
+  it("checks the combined active input and output budget before result allocation", () => {
+    const peer = toolPeer();
+    input(peer, json({ arguments: { text: "x".repeat(40_000) } }));
+    peer.parent({ type: "tool-authorized", callId: 1, allowed: true });
+    peer.worker({
+      type: "sdk-event",
+      lifecycleId: 1,
+      event: { type: "tool_start", callId: 1, toolName: "read" },
+    });
+    expect(() =>
+      peer.worker({
+        type: "tool-result",
+        callId: 1,
+        output: { transferId: "output", totalBytes: 30_000 },
+      }),
+    ).toThrow("TOOL_PAYLOAD_BYTE_LIMIT");
+  });
+  it("pins the accepted allowlist even when the parent caller edits its input object", () => {
+    const peer = runtimePeers();
+    const frame: PiParentFrame = {
+      ...parentFrame({
+        ...runtimeBootstrap,
+        allowedTools: runtimeBootstrap.allowedTools.map((item) => ({ ...item })),
+        prompt: runtimeBootstrap.prompt,
+      }),
+      ...peer.operation,
+    };
+    peer.protocol.acceptParent(frame);
+    if (frame.message.type === "bootstrap")
+      Object.assign(frame.message.allowedTools[0]!, { name: "shell" });
+    peer.protocol.acceptParent({
+      ...parentFrame({ type: "transfer-end", transferId: "context" }, 1),
+      ...peer.operation,
+    });
+    peer.protocol.acceptParent({
+      ...parentFrame({ type: "transfer-end", transferId: "prompt" }, 2),
+      ...peer.operation,
+    });
+    peer.protocol.acceptWorker({
+      ...workerFrame({ type: "ready", actualCwd: "/workspace", native }),
+      ...peer.operation,
+    });
+    peer.protocol.acceptWorker({
+      ...workerFrame({ type: "agent_start", lifecycleId: 1 }, 1),
+      ...peer.operation,
+    });
+    expect(() =>
+      peer.protocol.acceptWorker({
+        ...workerFrame(
+          {
+            type: "tool-call",
+            callId: 1,
+            nativeCallId: "native-1",
+            lifecycleId: 1,
+            toolName: "shell",
+            execution: "local",
+            input: { transferId: "input", totalBytes: 0 },
+          },
+          2,
+        ),
+        ...peer.operation,
+      }),
+    ).toThrow("TOOL_NOT_ALLOWED");
+  });
+  it("charges bridged result bytes cumulatively even after each result is consumed", () => {
+    const peer = toolPeer("bridge");
+    const text = json({ kind: "text", text: "x".repeat(16_000) });
+    const bytes = Buffer.from(text);
+    let completed = 0;
+    expect(() => {
+      for (let callId = 1; callId <= 120; callId++) {
+        input(peer, '{"arguments":{}}', callId);
+        peer.protocol.takeTransfer(`input-${callId}`);
+        peer.parent({ type: "tool-authorized", callId, allowed: true });
+        peer.worker({
+          type: "sdk-event",
+          lifecycleId: 1,
+          event: { type: "tool_start", callId, toolName: "read" },
+        });
+        peer.parent({
+          type: "tool-result",
+          callId,
+          output: { transferId: `output-${callId}`, totalBytes: bytes.length },
+        });
+        for (let offset = 0, index = 0; offset < bytes.length; offset += 8192, index++)
+          peer.parent({
+            type: "transfer-chunk",
+            transferId: `output-${callId}`,
+            offset,
+            index,
+            data: bytes.subarray(offset, offset + 8192).toString("base64"),
+          });
+        peer.parent({ type: "transfer-end", transferId: `output-${callId}` });
+        peer.protocol.takeTransfer(`output-${callId}`);
+        peer.worker({
+          type: "sdk-event",
+          lifecycleId: 1,
+          event: { type: "tool_end", callId, toolName: "read", isError: false },
+        });
+        completed++;
+      }
+    }).toThrow("EVENT_BYTE_LIMIT");
+    expect(completed).toBeGreaterThan(50);
+    expect(completed).toBeLessThan(120);
+    expect(peer.protocol.successful).toBe(false);
+  });
+  it("counts the strict outer envelope in the JSON nesting cap", () => {
+    const peer = toolPeer();
+    const text = '{"arguments":{"nested":' + "[".repeat(64) + "0" + "]".repeat(64) + "}}";
+    expect(() => input(peer, text)).toThrow("INVALID_TOOL_JSON");
+  });
+});
 
 function peers() {
   const protocol = makePiWorkerProtocol(identity);
