@@ -55,6 +55,12 @@ const decodeHydrationInput = (input: unknown) => {
   }
   return decodeInput({ projectId: project.value, hitIds: values });
 };
+// The sourceId and observationKey contracts each allow 4,000 UTF-16 units.
+// JSON can escape each unit into six characters; the two safe integers need
+// at most 16 digits each, plus four quotes, two brackets and three commas.
+const maxMemoryTextLength = 4_000;
+const maxUniqueKeyCharacters =
+  2 * maxMemoryTextLength * 6 + 2 * String(Number.MAX_SAFE_INTEGER).length + 9;
 const Metadata = Schema.Struct({
   recordId: Id,
   projectId: Input.fields.projectId,
@@ -64,10 +70,10 @@ const Metadata = Schema.Struct({
   updatedAt: ProjectMemoryObservation.fields.updatedAt,
   sourceId: Schema.String.check(
     Schema.isMinLength(1),
-    Schema.isMaxLength(4_000),
+    Schema.isMaxLength(maxMemoryTextLength),
     Schema.isTrimmed(),
   ),
-  uniqueKey: Schema.NullOr(Schema.String.check(Schema.isMaxLength(8_000))),
+  uniqueKey: Schema.NullOr(Schema.String.check(Schema.isMaxLength(maxUniqueKeyCharacters))),
   bytes: Version,
 });
 const decodeMetadata = Schema.decodeUnknownOption(Schema.Array(Metadata));

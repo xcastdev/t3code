@@ -104,11 +104,12 @@ const addProject = Effect.fn("fixture.addProject")(function* (projectId: string)
 const addMemory = Effect.fn("fixture.addMemory")(function* (
   s = source(),
   obs: ReadonlyArray<ProjectMemoryObservation> = [observation(s)],
+  extractionId = `${s.recordId}-extraction`,
 ) {
   const extraction = yield* decodeExtractionFixture({
     kind: "memory-extraction",
     projectId: s.projectId,
-    recordId: `${s.recordId}-extraction`,
+    recordId: extractionId,
     revision: 0,
     generation: 0,
     updatedAt: at,
@@ -1103,6 +1104,119 @@ it.effect("loads only indexed owner history; unrelated corrupt events are exclud
             false,
           );
         }
+      }),
+    ),
+  ),
+);
+
+for (const [label, character] of [
+  ["plain", "x"],
+  ["quote", '"'],
+  ["backslash", "\\"],
+] as const) {
+  it.effect(`hydrates legal maximum-width ${label} observation keys after typed persistence`, () =>
+    withDatabase(
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        const s = source();
+        const o = observation(s, "hit", { observationKey: character.repeat(4_000) });
+        yield* addMemory(s, [o]);
+        expect(
+          selectProjectMemoryHits({
+            projectId: "target",
+            hitIds: ["hit"],
+            sources: [s],
+            observations: [o],
+            authorityComplete: true,
+          }),
+        ).toMatchObject({ status: "accepted", selected: [o] });
+        expect(yield* hydrate(sql)).toMatchObject({ status: "accepted", selected: [o] });
+      }),
+    ),
+  );
+}
+
+it.effect("hydrates legal maximum-width control characters and maximum source versions", () =>
+  withDatabase(
+    Effect.gen(function* () {
+      const sql = yield* setup;
+      const s = source("target", "\u0001".repeat(256), {
+        sourceId: "a" + "\u0000".repeat(3_998) + "a",
+        sourceRevision: Number.MAX_SAFE_INTEGER,
+        generation: Number.MAX_SAFE_INTEGER,
+      });
+      const o = observation(s, "hit", {
+        observationKey: "\u0000".repeat(4_000),
+        extractionId: "max-extraction",
+      });
+      yield* addMemory(s, [o], "max-extraction");
+      expect(
+        selectProjectMemoryHits({
+          projectId: "target",
+          hitIds: ["hit"],
+          sources: [s],
+          observations: [o],
+          authorityComplete: true,
+        }),
+      ).toMatchObject({ status: "accepted", selected: [o] });
+      expect(
+        yield* sql`SELECT length(unique_key) AS characters FROM project_team_memory_observation WHERE record_id = 'hit'`,
+      ).toEqual([{ characters: 25_577 }]);
+      expect(
+        yield* sql`SELECT length(CAST(payload_json AS BLOB)) < 1048576 AS bounded FROM project_team_memory_source UNION ALL SELECT length(CAST(payload_json AS BLOB)) < 1048576 AS bounded FROM project_team_memory_observation`,
+      ).toEqual([{ bounded: 1 }, { bounded: 1 }]);
+      expect(yield* hydrate(sql)).toMatchObject({ status: "accepted", selected: [o] });
+    }),
+  ),
+);
+
+it.effect("refuses tampered or oversized unique tuples after accepting escaped keys", () =>
+  withDatabase(
+    Effect.scoped(
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        const s = source();
+        const o = observation(s, "hit", { observationKey: '"'.repeat(4_000) });
+        yield* addMemory(s, [o]);
+        const actualKey = encodeJson([
+          o.sourceId,
+          o.sourceRevision,
+          o.sourceGeneration,
+          o.observationKey,
+        ]);
+        const tamperedKey = encodeJson([
+          o.sourceId,
+          o.sourceRevision,
+          o.sourceGeneration,
+          "wrong-key",
+        ]);
+        const { reader, reads } = yield* traceReader(sql);
+        expect(yield* hydrate(reader)).toMatchObject({ status: "accepted", selected: [o] });
+        yield* reader`UPDATE project_team_memory_observation SET unique_key = ${tamperedKey} WHERE record_id = 'hit'`;
+        expect(yield* hydrate(reader)).toEqual({
+          status: "denied",
+          reason: "corruption",
+          selected: [],
+        });
+        // The conservative maximum does not authorize arbitrary metadata at the bound.
+        for (const size of [48_041, 48_042]) {
+          yield* reader`UPDATE project_team_memory_observation SET unique_key = ${"x".repeat(size)} WHERE record_id = 'hit'`;
+          reads.length = 0;
+          expect(yield* hydrate(reader)).toEqual({
+            status: "denied",
+            reason: "corruption",
+            selected: [],
+          });
+          if (size === 48_042)
+            expect(
+              reads.some(
+                ({ query }) =>
+                  query.includes("project_team_memory_observation") && query.includes("AS payload"),
+              ),
+            ).toBe(false);
+        }
+        yield* reader`UPDATE project_team_memory_observation SET unique_key = ${actualKey} WHERE record_id = 'hit'`;
+        expect(yield* hydrate(reader)).toMatchObject({ status: "accepted", selected: [o] });
       }),
     ),
   ),
