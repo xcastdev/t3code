@@ -38,6 +38,7 @@ import {
 } from "../projectWork/ProjectWorkProjection.ts";
 import { ProjectWorkEventBus } from "../projectWork/ProjectWorkEventBus.ts";
 import { purgeProjectTeamRecords } from "../projectWork/ProjectTeamsPersistence.ts";
+import { retireProjectIssueRepositories } from "../projectWork/ProjectIssueRepositoryLifecycle.ts";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as RepositoryIdentityResolver from "./RepositoryIdentityResolver.ts";
@@ -333,6 +334,8 @@ const makeProjectLifecycle = Effect.gen(function* () {
             workspace_root = excluded.workspace_root, repository_key = excluded.repository_key,
             revision = excluded.revision, changed_at = excluded.changed_at, tombstone_json = NULL
         `;
+        if (input.target === "archived")
+          yield* retireProjectIssueRepositories(sql, String(input.projectId), false);
         const result = mutationResult(next);
         yield* sql`
           INSERT INTO project_lifecycle_operations

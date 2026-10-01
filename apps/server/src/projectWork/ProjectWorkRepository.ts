@@ -17,6 +17,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+import * as SqlError from "effect/unstable/sql/SqlError";
 
 import {
   applyProjectWorkEvents,
@@ -72,6 +73,16 @@ export interface ProjectWorkRepositoryShape {
     liveValidate?: (input: { readonly duplicate: boolean }) => Effect.Effect<void, L>,
     receiptFingerprint?: string,
   ) => Effect.Effect<ProjectWorkCommandResult, ProjectWorkRepositoryError | E | L>;
+  /** Trusted multi-project writes and auxiliary SQL share one outer commit. No publication escapes rollback. */
+  readonly executeAtomic: <E, R, V = never, VR = never>(
+    prepare: Effect.Effect<ReadonlyArray<ProjectWorkCommand>, E, R>,
+    /** Runs after every command receipt, before commit or publication. */
+    finalValidate?: Effect.Effect<void, V, VR>,
+  ) => Effect.Effect<
+    ReadonlyArray<ProjectWorkCommandResult>,
+    E | V | ProjectWorkRepositoryError,
+    R | VR
+  >;
   readonly executeCommand: ProjectWorkRepositoryShape["execute"];
   readonly replay: (
     projectId: string,
@@ -272,7 +283,7 @@ const makeProjectWorkRepository = Effect.gen(function* () {
       }),
     );
 
-  const executeAuthorized: ProjectWorkRepositoryShape["executeAuthorized"] = (
+  const executeUnpublished: ProjectWorkRepositoryShape["executeAuthorized"] = (
     command,
     authorize,
     liveValidate,
@@ -580,31 +591,6 @@ const makeProjectWorkRepository = Effect.gen(function* () {
         }),
       )
       .pipe(
-        Effect.tap((result) =>
-          result.duplicate === true || Option.isNone(eventBus)
-            ? Effect.void
-            : Effect.gen(function* () {
-                // Resolve cursors after commit.  The event payload intentionally
-                // stays independent from storage sequence metadata, while the
-                // stream retains a resume-safe cursor for every subscriber.
-                const committed = yield* Effect.forEach(result.events, (event) =>
-                  sql<Record<string, unknown>>`
-                    SELECT sequence
-                    FROM project_work_events
-                    WHERE event_id = ${event.eventId}
-                    LIMIT 1
-                  `.pipe(
-                    Effect.map((rows) => ({
-                      event,
-                      cursor: Number(rows[0]?.sequence ?? 0),
-                    })),
-                  ),
-                );
-                yield* eventBus.value.publish(committed);
-              }).pipe(Effect.ignore),
-        ),
-      )
-      .pipe(
         Effect.mapError((cause) =>
           cause instanceof ProjectWorkPolicyError
             ? cause
@@ -612,9 +598,75 @@ const makeProjectWorkRepository = Effect.gen(function* () {
         ),
       );
   };
+  const publishCommitted = (result: ProjectWorkCommandResult) =>
+    result.duplicate === true || Option.isNone(eventBus)
+      ? Effect.void
+      : Effect.gen(function* () {
+          // Resolve cursors after commit.  The event payload intentionally
+          // stays independent from storage sequence metadata, while the
+          // stream retains a resume-safe cursor for every subscriber.
+          const committed = yield* Effect.forEach(result.events, (event) =>
+            sql<Record<string, unknown>>`
+                    SELECT sequence
+                    FROM project_work_events
+                    WHERE event_id = ${event.eventId}
+                    LIMIT 1
+                  `.pipe(
+              Effect.map((rows) => ({
+                event,
+                cursor: Number(rows[0]?.sequence ?? 0),
+              })),
+            ),
+          );
+          yield* eventBus.value.publish(committed);
+        }).pipe(Effect.ignore);
+  const executeAuthorized: ProjectWorkRepositoryShape["executeAuthorized"] = (...args) =>
+    executeUnpublished(...args).pipe(Effect.tap(publishCommitted));
+  const executeAtomic: ProjectWorkRepositoryShape["executeAtomic"] = (prepare, finalValidate) =>
+    Effect.gen(function* () {
+      const currentClient = yield* Effect.serviceOption(SqlClient.SqlClient);
+      if (Option.isSome(currentClient) && currentClient.value !== sql)
+        return yield* Effect.fail(
+          new ProjectWorkPolicyError(
+            "invalid-state",
+            "Atomic work must use its repository SQL client",
+          ),
+        );
+      // An enclosing unmanaged SQL transaction cannot provide an after-commit receipt.
+      if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
+        return yield* Effect.fail(
+          new ProjectWorkPolicyError("invalid-state", "Atomic work must own its SQL transaction"),
+        );
+      const committed = yield* sql
+        .withTransaction(
+          Effect.gen(function* () {
+            // Preparation loads fresh authority and writes auxiliary rows under this same transaction.
+            const commands = yield* prepare;
+            if (commands.length > 16)
+              return yield* Effect.fail(
+                new ProjectWorkPolicyError("invalid-state", "Atomic work command limit exceeded"),
+              );
+            const results = yield* Effect.forEach(commands, (command) =>
+              executeUnpublished(command, () => Effect.succeed(command)),
+            );
+            if (finalValidate !== undefined) yield* finalValidate;
+            return results;
+          }),
+        )
+        .pipe(
+          Effect.mapError((error) =>
+            SqlError.isSqlError(error)
+              ? toPersistenceSqlError("ProjectWorkRepository.executeAtomic")(error)
+              : error,
+          ),
+        );
+      yield* Effect.forEach(committed, publishCommitted, { discard: true });
+      return committed;
+    });
   return {
     execute: (command) => executeAuthorized(command, () => Effect.succeed(command)),
     executeAuthorized,
+    executeAtomic,
     executeCommand: (command) => executeAuthorized(command, () => Effect.succeed(command)),
     replay,
     replayAll,

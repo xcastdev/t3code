@@ -19,9 +19,15 @@ import {
   ProjectWorkFoundationCommitCommand,
   ProjectTeamRecord,
   type ProjectTeamRecord as TeamRecord,
+  type ProjectTeamGuidedIntent,
+  type ProjectWorkCommand,
 } from "@t3tools/contracts";
 import { runMigrations, runForkMigrations } from "../persistence/Migrations.ts";
-import { ProjectWorkRepository, ProjectWorkRepositoryLive } from "./ProjectWorkRepository.ts";
+import {
+  ProjectWorkRepository,
+  ProjectWorkRepositoryLive,
+  readCurrentState,
+} from "./ProjectWorkRepository.ts";
 import {
   ProjectWorkProjection,
   ProjectWorkProjectionLive,
@@ -32,6 +38,7 @@ import {
   emptyProjectWorkProjectionState,
   applyProjectWorkProjectionEvents,
 } from "./ProjectWorkProjection.ts";
+import { projectTeamScopeHash } from "./ProjectTeamPolicy.ts";
 import { PROJECT_WORK_CHECKPOINT_VERSION } from "./ProjectTeamsPersistence.ts";
 
 const decodeTeamRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
@@ -81,6 +88,324 @@ const services = Layer.mergeAll(
   ProjectWorkProjectionLive,
   ProjectWorkQueryLive,
 );
+const prepareFoundationProject = Effect.fn("prepareFoundationProject")(function* (
+  project: string,
+  authorized = true,
+) {
+  const repo = yield* ProjectWorkRepository;
+  const sql = yield* SqlClient.SqlClient;
+  const projectId = ProjectId.make(project);
+  const taskId = ProjectWorkTaskId.make(project + "-task");
+  yield* repo.execute({
+    type: "project-work.task.create",
+    projectId,
+    taskId,
+    commandId: CommandId.make(project + "-create"),
+    title: "Delivery",
+    createdAt: at,
+  });
+  const criterionId = ProjectWorkCriterionId.make(project + "-criterion");
+  const criterion = {
+    criterionId,
+    taskId,
+    description: "Recorded requirement",
+    required: false,
+    status: "unsatisfied" as const,
+    satisfiedByEvidenceIds: [],
+    revision: 0,
+    updatedAt: at,
+  };
+  const specification = {
+    objective: "Deliver",
+    scopeIn: "Task",
+    scopeOut: "Unrelated work",
+    criterionIds: [criterionId],
+    revision: 1,
+    protected: false,
+  };
+  const humanAttribution = {
+    actor: { kind: "human" as const, id: "maintainer" },
+    source: { kind: "web" as const, id: "foundation-client" },
+    recordedAt: at,
+  };
+  const guided = (intent: ProjectTeamGuidedIntent) =>
+    repo.execute({
+      type: "project-work.foundation.commit",
+      projectId,
+      commandId: intent.commandId,
+      expectedRevision: intent.expectedRevision,
+      records: [],
+      committedAt: at,
+      attribution: humanAttribution,
+      guided: { intent },
+    });
+  const envelope = Effect.fn("foundationEnvelope")(function* (id: string) {
+    const state = yield* readCurrentState(sql, projectId);
+    return {
+      projectId,
+      taskId,
+      commandId: CommandId.make(project + "-" + id),
+      expectedRevision: state.revision,
+      expectedTaskRevision: state.tasks.find((task) => task.taskId === taskId)!.revision,
+    };
+  });
+  const approve = Effect.fn("approveFoundationGates")(function* () {
+    const state = yield* readCurrentState(sql, projectId);
+    const pending = state.foundationRecords!.filter(
+      (entry): entry is Extract<TeamRecord, { kind: "gate" }> =>
+        entry.kind === "gate" && entry.status === "pending",
+    );
+    return yield* repo.execute({
+      ...commit(
+        project,
+        project + "-approve-" + state.revision,
+        state.revision,
+        pending.map((gate) => ({
+          ...gate,
+          status: "approved" as const,
+          revision: gate.revision + 1,
+        })),
+      ),
+      attribution: humanAttribution,
+    });
+  });
+  if (authorized) {
+    yield* guided({
+      ...(yield* envelope("spec")),
+      type: "project-team.specification.propose",
+      expectedSpecRevision: 0,
+      specification,
+      criterionSnapshots: [criterion],
+    });
+    yield* approve();
+    yield* guided({
+      ...(yield* envelope("plan")),
+      type: "project-team.plan.propose",
+      specRevision: 1,
+      content: "Deliver and verify the recorded requirement",
+      dependencyTaskIds: [],
+    });
+    const approved = yield* approve();
+    const specGate = approved.state.foundationRecords!.find(
+      (entry): entry is Extract<TeamRecord, { kind: "gate" }> =>
+        entry.kind === "gate" && entry.gate === "specification",
+    )!;
+    const plan = approved.state.foundationRecords!.find(
+      (entry): entry is Extract<TeamRecord, { kind: "plan-revision" }> =>
+        entry.kind === "plan-revision",
+    )!;
+    const planGate = approved.state.foundationRecords!.find(
+      (entry): entry is Extract<TeamRecord, { kind: "gate" }> =>
+        entry.kind === "gate" && entry.gate === "plan",
+    )!;
+    yield* guided({
+      ...(yield* envelope("execution")),
+      type: "project-team.execution.start",
+      specRevision: 1,
+      planRevision: plan.planRevision,
+      specGateId: specGate.recordId,
+      expectedSpecGateRevision: specGate.revision,
+      planId: plan.recordId,
+      expectedPlanRecordRevision: plan.revision,
+      planGateId: planGate.recordId,
+      expectedPlanGateRevision: planGate.revision,
+    });
+  } else {
+    yield* repo.execute({
+      type: "project-work.criterion.upsert",
+      projectId,
+      taskId,
+      commandId: CommandId.make(project + "-criterion"),
+      criterion,
+      updatedAt: at,
+    });
+    yield* repo.execute({
+      type: "project-work.task.specify",
+      projectId,
+      taskId,
+      commandId: CommandId.make(project + "-spec"),
+      specification,
+      updatedAt: at,
+    });
+    yield* repo.execute({
+      type: "project-work.task.ready",
+      projectId,
+      taskId,
+      commandId: CommandId.make(project + "-ready"),
+      updatedAt: at,
+    });
+  }
+  const role = record(project, "role-revision", project + "-role", {
+    status: "available",
+    roleId: "implementer",
+    roleRevision: 1,
+    role: "implementer",
+    instructions: "Deliver",
+    skills: [],
+    tools: [],
+    model: "ling",
+    memoryAccess: "project",
+    delegationDepth: 2,
+  });
+  const member = record(project, "member", project + "-member", {
+    status: "active",
+    name: "Worker",
+    coordinator: false,
+    roleRevisionId: role.recordId,
+  });
+  const limits = record(project, "limits", project + "-limits", {
+    status: "configured",
+    environmentModelCalls: 1,
+    projectWritableWorkers: 1,
+    modelCalls: 1,
+    delegationDepth: 2,
+    repairAllowance: 2,
+    model: "ling",
+    tokenLimit: 1000,
+    durationLimitMs: 1000,
+  });
+  const setupState = yield* readCurrentState(sql, projectId);
+  const setup = yield* repo.execute(
+    commit(project, project + "-setup", setupState.revision, [role, member, limits]),
+  );
+  const grant = setup.state.foundationRecords!.find(
+    (entry): entry is Extract<TeamRecord, { kind: "gate" }> =>
+      entry.kind === "gate" && entry.gate === "execution",
+  );
+  const plan = setup.state.foundationRecords!.find(
+    (entry): entry is Extract<TeamRecord, { kind: "plan-revision" }> =>
+      entry.kind === "plan-revision",
+  );
+  const run = record(project, "run-binding", project + "-run", {
+    status: authorized ? "reserved" : "running",
+    taskId,
+    attemptId: project + "-attempt",
+    memberId: member.recordId,
+    roleRevisionId: role.recordId,
+    providerInstanceId: "pi",
+    threadId: project + "-thread",
+    sessionId: project + "-session",
+    environmentId: "environment",
+    model: "ling",
+    configuration: {
+      instructionsHash: "hash",
+      toolIds: [],
+      skillIds: [],
+      runtimeVersion: "0.99.1",
+      maxTokens: 1000,
+      maxDurationMs: 1000,
+      paidFallback: false,
+    },
+    worktree: "/tmp/" + project,
+    branch: project,
+    leaseGeneration: 0,
+    specRevision: 1,
+    planRevision: plan?.planRevision ?? 0,
+    ...(grant === undefined
+      ? {}
+      : {
+          authorizationGateId: grant.recordId,
+          specificationGateId: setup.state.foundationRecords!.find(
+            (entry) => entry.kind === "gate" && entry.gate === "specification",
+          )!.recordId,
+          planGateId: setup.state.foundationRecords!.find(
+            (entry) => entry.kind === "gate" && entry.gate === "plan",
+          )!.recordId,
+          scopeHash: projectTeamScopeHash(setup.state, taskId, plan),
+        }),
+  });
+  const reservation = record(project, "reservation", project + "-reservation", {
+    status: "held",
+    environmentId: "environment",
+    scope: "environment",
+    resourceKey: project + "-different-key",
+    slot: 0,
+    runId: run.recordId,
+    taskId,
+    attemptId: project + "-attempt",
+    maximumTokens: 1000,
+    consumedTokens: 0,
+  });
+  const effect = record(project, "effect", project + "-effect", {
+    status: "pending",
+    effectId: project + "-external-effect",
+    effectKind: "dispatch",
+    taskId,
+    runId: run.recordId,
+    targetId: run.recordId,
+    payload: { recordIds: [run.recordId], expectedRevision: setup.revision + (authorized ? 3 : 0) },
+    claimGeneration: 0,
+    availableAt: at,
+  });
+  const command = {
+    ...commit(project, project + "-dispatch", setup.revision, [run, reservation, effect]),
+    claim: {
+      type: "project-work.task.claim" as const,
+      commandId: CommandId.make(project + "-dispatch"),
+      projectId,
+      taskId,
+      attemptId: ProjectWorkAttemptId.make(project + "-attempt"),
+      leaseToken: "opaque-lease",
+      leasedUntil: "2026-01-02T00:00:00.000Z",
+      claimedAt: at,
+    },
+  };
+  const claimCommand = {
+    type: "project-work.foundation.commit",
+    projectId,
+    commandId: CommandId.make(project + "-dispatch-claim"),
+    expectedRevision: setup.revision,
+    records: [],
+    attribution,
+    committedAt: at,
+    transition: {
+      kind: "claim",
+      taskId,
+      expectedTaskRevision: setup.state.tasks.find((task) => task.taskId === taskId)!.revision,
+      authorizationGateId: grant?.recordId ?? "missing-grant",
+      expectedGateRevision: grant?.revision ?? 0,
+      binding: run,
+      claim: { ...command.claim, commandId: CommandId.make(project + "-dispatch-claim") },
+    },
+  } satisfies Extract<ProjectWorkCommand, { type: "project-work.foundation.commit" }>;
+  const running = { ...run, status: "running" as const, revision: 1 };
+  const dispatchCommand = commit(project, project + "-dispatch", setup.revision + 3, [
+    running,
+    reservation,
+    effect,
+  ]);
+  return {
+    project,
+    command,
+    claimCommand,
+    dispatchCommand,
+    run: authorized ? running : run,
+    reservation,
+    effect,
+    grant,
+  };
+});
+
+const foundationSnapshot = Effect.fn("foundationSnapshot")(function* (project: string) {
+  const sql = yield* SqlClient.SqlClient;
+  return {
+    state: yield* readCurrentState(sql, ProjectId.make(project)),
+    attempts:
+      yield* sql`SELECT * FROM project_work_attempts WHERE project_id = ${project} ORDER BY attempt_id`,
+    runs: yield* sql`SELECT * FROM project_team_run_binding WHERE project_id = ${project} ORDER BY record_id`,
+    reservations:
+      yield* sql`SELECT * FROM project_team_reservation WHERE project_id = ${project} ORDER BY record_id`,
+    effects:
+      yield* sql`SELECT * FROM project_team_effect WHERE project_id = ${project} ORDER BY record_id`,
+    gates:
+      yield* sql`SELECT * FROM project_team_gate WHERE project_id = ${project} ORDER BY record_id`,
+    events:
+      yield* sql`SELECT * FROM project_work_events WHERE project_id = ${project} ORDER BY sequence`,
+    receipts:
+      yield* sql`SELECT * FROM project_work_command_receipts WHERE project_id = ${project} ORDER BY command_id`,
+  };
+});
+
 const layer = it.layer(Layer.fresh(NodeSqliteClient.layerMemory()));
 layer("teams foundation persistence", (it) => {
   it.effect("upgrades old events and invalidates old checkpoints without changing task IDs", () =>
@@ -363,6 +688,29 @@ layer("teams foundation persistence", (it) => {
       expect(checkpoint[0]!.version).toBe(PROJECT_WORK_CHECKPOINT_VERSION);
     }).pipe(Effect.provide(services)),
   );
+  it.effect("rejects raw claim and run records without exact persisted grant authority", () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const repo = yield* ProjectWorkRepository;
+      const fixture = yield* prepareFoundationProject("raw-dispatch", false);
+      const before = yield* foundationSnapshot(fixture.project);
+      expect(before.state.foundationRecords!.some((entry) => entry.kind === "gate")).toBe(false);
+      expect(before.attempts).toEqual([]);
+      expect(before.runs).toEqual([]);
+      expect(before.reservations).toEqual([]);
+      expect(before.effects).toEqual([]);
+      const result = yield* repo.execute(fixture.command).pipe(Effect.result);
+      expect(result).toMatchObject({
+        _tag: "Failure",
+        failure: {
+          _tag: "ProjectWorkPolicyError",
+          code: "authority-required",
+        },
+      });
+      expect(yield* foundationSnapshot(fixture.project)).toEqual(before);
+    }).pipe(Effect.provide(services)),
+  );
+
   it.effect(
     "atomically claims, reserves global capacity and inserts outbox across competing projects",
     () =>
@@ -372,163 +720,55 @@ layer("teams foundation persistence", (it) => {
         const sql = yield* SqlClient.SqlClient;
         const projection = yield* ProjectWorkProjection;
         const query = yield* ProjectWorkQuery;
-        const prepare = Effect.fn("prepareFoundationProject")(function* (project: string) {
-          const projectId = ProjectId.make(project);
-          const taskId = ProjectWorkTaskId.make(project + "-task");
-          yield* repo.execute({
-            type: "project-work.task.create",
-            projectId,
-            taskId,
-            commandId: CommandId.make(project + "-create"),
-            title: "Delivery",
-            createdAt: at,
-          });
-          const criterionId = ProjectWorkCriterionId.make(project + "-criterion");
-          yield* repo.execute({
-            type: "project-work.criterion.upsert",
-            projectId,
-            taskId,
-            commandId: CommandId.make(project + "-criterion"),
-            criterion: {
-              criterionId,
-              taskId,
-              description: "Recorded requirement",
-              required: false,
-              status: "unsatisfied",
-              satisfiedByEvidenceIds: [],
-              revision: 0,
-              updatedAt: at,
-            },
-            updatedAt: at,
-          });
-          yield* repo.execute({
-            type: "project-work.task.specify",
-            projectId,
-            taskId,
-            commandId: CommandId.make(project + "-spec"),
-            specification: {
-              objective: "Deliver",
-              scopeIn: "Task",
-              scopeOut: "Unrelated work",
-              criterionIds: [criterionId],
-              revision: 1,
-              protected: false,
-            },
-            updatedAt: at,
-          });
-          yield* repo.execute({
-            type: "project-work.task.ready",
-            projectId,
-            taskId,
-            commandId: CommandId.make(project + "-ready"),
-            updatedAt: at,
-          });
-          const role = record(project, "role-revision", project + "-role", {
-            status: "available",
-            roleId: "implementer",
-            roleRevision: 1,
-            role: "implementer",
-            instructions: "Deliver",
-            skills: [],
-            tools: [],
-            model: "ling",
-            memoryAccess: "project",
-            delegationDepth: 2,
-          });
-          const member = record(project, "member", project + "-member", {
-            status: "active",
-            name: "Worker",
-            coordinator: false,
-            roleRevisionId: role.recordId,
-          });
-          const limits = record(project, "limits", project + "-limits", {
-            status: "configured",
-            environmentModelCalls: 1,
-            projectWritableWorkers: 1,
-            modelCalls: 1,
-            delegationDepth: 2,
-            repairAllowance: 2,
-            model: "ling",
-            tokenLimit: 1000,
-            durationLimitMs: 1000,
-          });
-          yield* repo.execute(commit(project, project + "-setup", 4, [role, member, limits]));
-          const run = record(project, "run-binding", project + "-run", {
-            status: "running",
-            taskId,
-            attemptId: project + "-attempt",
-            memberId: member.recordId,
-            roleRevisionId: role.recordId,
-            providerInstanceId: "pi",
-            threadId: project + "-thread",
-            sessionId: project + "-session",
-            environmentId: "environment",
-            model: "ling",
-            configuration: {
-              instructionsHash: "hash",
-              toolIds: [],
-              skillIds: [],
-              runtimeVersion: "0.99.1",
-              maxTokens: 1000,
-              maxDurationMs: 1000,
-              paidFallback: false,
-            },
-            worktree: "/tmp/" + project,
-            branch: project,
-            leaseGeneration: 0,
-            specRevision: 1,
-            planRevision: 0,
-          });
-          const reservation = record(project, "reservation", project + "-reservation", {
-            status: "held",
-            environmentId: "environment",
-            scope: "environment",
-            resourceKey: project + "-different-key",
-            slot: 0,
-            runId: run.recordId,
-            taskId,
-            attemptId: project + "-attempt",
-            maximumTokens: 1000,
-            consumedTokens: 0,
-          });
-          const effect = record(project, "effect", project + "-effect", {
-            status: "pending",
-            effectId: project + "-external-effect",
-            effectKind: "dispatch",
-            taskId,
-            runId: run.recordId,
-            targetId: run.recordId,
-            payload: { recordIds: [run.recordId], expectedRevision: 7 },
-            claimGeneration: 0,
-            availableAt: at,
-          });
-          const command = {
-            ...commit(project, project + "-dispatch", 7, [run, reservation, effect]),
-            claim: {
-              type: "project-work.task.claim" as const,
-              commandId: CommandId.make(project + "-dispatch"),
-              projectId,
-              taskId,
-              attemptId: ProjectWorkAttemptId.make(project + "-attempt"),
-              leaseToken: "opaque-lease",
-              leasedUntil: "2026-01-02T00:00:00.000Z",
-              claimedAt: at,
-            },
-          };
-          return { project, command, run, reservation, effect };
-        });
-        const a = yield* prepare("capacity-a");
-        const b = yield* prepare("capacity-b");
+        const a = yield* prepareFoundationProject("capacity-a");
+        const b = yield* prepareFoundationProject("capacity-b");
+        const beforeA = yield* foundationSnapshot(a.project);
+        const beforeB = yield* foundationSnapshot(b.project);
         const outcomes = yield* Effect.all(
           [
-            repo.execute(a.command).pipe(Effect.result),
-            repo.execute(b.command).pipe(Effect.result),
+            repo
+              .executeAtomic(Effect.succeed([a.claimCommand, a.dispatchCommand]))
+              .pipe(Effect.result),
+            repo
+              .executeAtomic(Effect.succeed([b.claimCommand, b.dispatchCommand]))
+              .pipe(Effect.result),
           ],
           { concurrency: "unbounded" },
         );
         expect(outcomes.filter((result) => result._tag === "Success")).toHaveLength(1);
         const winner = outcomes[0]!._tag === "Success" ? a : b;
         const loser = winner === a ? b : a;
+        expect(outcomes[winner === a ? 1 : 0]).toMatchObject({
+          _tag: "Failure",
+          failure: { _tag: "PersistenceSqlError" },
+        });
+        expect(yield* foundationSnapshot(loser.project)).toEqual(loser === a ? beforeA : beforeB);
+        const accepted = yield* foundationSnapshot(winner.project);
+        expect(accepted.attempts).toHaveLength(1);
+        expect(accepted.runs).toHaveLength(1);
+        expect(accepted.state.foundationRecords).toContainEqual(winner.run);
+        expect(accepted.state.foundationRecords).toContainEqual({
+          ...winner.grant!,
+          status: "consumed",
+          revision: winner.grant!.revision + 1,
+          consumedByRunId: winner.run.recordId,
+          consumedByCommandId: winner.claimCommand.commandId,
+        });
+        expect(
+          accepted.events.filter(
+            (event) =>
+              event.command_id === winner.claimCommand.commandId ||
+              event.command_id === winner.dispatchCommand.commandId,
+          ),
+        ).toHaveLength(6);
+        expect(
+          accepted.receipts.filter(
+            (receipt) =>
+              receipt.command_id === winner.claimCommand.commandId ||
+              receipt.command_id === winner.dispatchCommand.commandId,
+          ),
+        ).toHaveLength(2);
+        const revision = accepted.state.revision;
         expect(
           (yield* sql`SELECT * FROM project_team_reservation WHERE status = 'held'`).length,
         ).toBe(1);
@@ -573,14 +813,14 @@ layer("teams foundation persistence", (it) => {
         expect(
           (yield* repo
             .execute(
-              commit(winner.project, "mutate-frozen-model", 11, [
-                { ...winner.run, revision: 1, model: "paid-fallback" },
+              commit(winner.project, "mutate-frozen-model", revision, [
+                { ...winner.run, revision: 2, model: "paid-fallback" },
               ]),
             )
             .pipe(Effect.result))._tag,
         ).toBe("Failure");
         yield* repo.execute(
-          commit(winner.project, "dispatch-receipt", 11, [
+          commit(winner.project, "dispatch-receipt", revision, [
             {
               ...winner.effect,
               revision: 1,
@@ -592,7 +832,7 @@ layer("teams foundation persistence", (it) => {
         expect(
           (yield* repo
             .execute(
-              commit(winner.project, "retry-completed-effect", 12, [
+              commit(winner.project, "retry-completed-effect", revision + 1, [
                 { ...winner.effect, revision: 2 },
               ]),
             )
@@ -609,17 +849,35 @@ layer("teams foundation persistence", (it) => {
         ).toBe(1);
         // Force a late failure after authority inserts; all domain/receipt writes roll back.
         yield* repo.execute(
-          commit(winner.project, winner.project + "-release", 12, [
+          commit(winner.project, winner.project + "-release", revision + 1, [
             { ...winner.reservation, status: "released", revision: 1 },
           ]),
         );
         yield* sql`CREATE TRIGGER foundation_forced_rollback BEFORE INSERT ON project_work_command_receipts WHEN NEW.command_id = 'capacity-forced-rollback' BEGIN SELECT RAISE(ABORT, 'forced rollback'); END`;
-        const forced = {
-          ...loser.command,
-          commandId: CommandId.make("capacity-forced-rollback"),
-          claim: { ...loser.command.claim, commandId: CommandId.make("capacity-forced-rollback") },
+        const beforeForced = yield* foundationSnapshot(loser.project);
+        const forcedClaimId = CommandId.make("capacity-forced-rollback-claim");
+        const forcedClaim = {
+          ...loser.claimCommand,
+          commandId: forcedClaimId,
+          transition: {
+            ...loser.claimCommand.transition!,
+            claim: { ...loser.claimCommand.transition!.claim, commandId: forcedClaimId },
+          },
         };
-        expect((yield* repo.execute(forced).pipe(Effect.result))._tag).toBe("Failure");
+        const forcedDispatch = {
+          ...loser.dispatchCommand,
+          commandId: CommandId.make("capacity-forced-rollback"),
+        };
+        const forced = yield* repo
+          .executeAtomic(Effect.succeed([forcedClaim, forcedDispatch]))
+          .pipe(Effect.result);
+        expect(forced).toMatchObject({
+          _tag: "Failure",
+          failure: {
+            _tag: "PersistenceSqlError",
+          },
+        });
+        expect(yield* foundationSnapshot(loser.project)).toEqual(beforeForced);
         expect(
           (yield* sql`SELECT * FROM project_team_effect WHERE project_id = ${loser.project}`)
             .length,
@@ -633,6 +891,20 @@ layer("teams foundation persistence", (it) => {
             .length,
         ).toBe(0);
         yield* sql`DROP TRIGGER foundation_forced_rollback`;
+        const retried = yield* repo.executeAtomic(Effect.succeed([forcedClaim, forcedDispatch]));
+        expect(retried).toHaveLength(2);
+        const afterRetry = yield* foundationSnapshot(loser.project);
+        expect(afterRetry.attempts).toHaveLength(1);
+        expect(afterRetry.runs).toHaveLength(1);
+        expect(afterRetry.reservations).toHaveLength(1);
+        expect(afterRetry.effects).toHaveLength(1);
+        expect(afterRetry.state.foundationRecords).toContainEqual({
+          ...loser.grant!,
+          status: "consumed",
+          revision: loser.grant!.revision + 1,
+          consumedByRunId: loser.run.recordId,
+          consumedByCommandId: forcedClaimId,
+        });
       }).pipe(Effect.provide(services)),
   );
 
