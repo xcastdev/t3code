@@ -98,6 +98,248 @@ function serve(data: string | ((endpoint: string) => string)) {
 }
 afterEach(() => run.mockReset());
 
+// Captured GitHub REST Link shapes, with the repository ID replaced by this fixture's ID.
+const capturedNext =
+  "https://api.github.com/repositories/1300192/issues?state=all&sort=updated&direction=asc&since=2026-09-01T00%3A00%3A00Z&per_page=2&page=2&after=Y3Vyc29yOnYyOpLPAAABoPldXqjPAAAAAVHshgk%3D";
+const capturedPrev =
+  "https://api.github.com/repositories/1300192/issues?state=all&sort=updated&direction=asc&since=2026-09-01T00%3A00%3A00Z&per_page=2&page=1&before=Y3Vyc29yOnYyOpLPAAABoPldYpDPAAAAAVHshs0%3D";
+
+for (const since of ["1970-01-01T00:00:00Z", input.since]) {
+  it.effect(`reads three distinct issues across captured cursor links for ${since}`, () =>
+    provide(
+      Effect.gen(function* () {
+        const fullSweep = since === "1970-01-01T00:00:00Z";
+        const link = (url: string) =>
+          fullSweep ? url.replace("&since=2026-09-01T00%3A00%3A00Z", "") : url;
+        serve((endpoint) => {
+          const query = new URL(endpoint, "https://api.github.com/").searchParams;
+          if (
+            query.has("after") ||
+            query.has("before") ||
+            (fullSweep ? query.has("since") : query.get("since") !== input.since)
+          )
+            return response([]);
+          return query.get("page") === "1"
+            ? response([issue(1), issue(2)], { Link: `<${link(capturedNext)}>; rel="next"` })
+            : response([issue(3)], { Link: `<${link(capturedPrev)}>; rel="prev"` });
+        });
+        const client = yield* Client.GitHubIssueClient;
+        const first = yield* client.readIssuesPage({ ...input, since });
+        expect(first).toMatchObject({ status: "changed", nextPage: 2, rawEntryCount: 2 });
+        if (first.status !== "changed" || first.nextPage === null)
+          throw new Error("Missing first page.");
+        const second = yield* client.readIssuesPage({ ...input, since, page: first.nextPage });
+        expect(second).toMatchObject({ status: "changed", nextPage: null, rawEntryCount: 1 });
+        if (second.status !== "changed") throw new Error("Missing second page.");
+        expect([...first.entries, ...second.entries].map((entry) => entry.nodeId)).toEqual([
+          "I_1",
+          "I_2",
+          "I_3",
+        ]);
+        const endpoints = run.mock.calls
+          .map(([request]) => request.args.at(-1)!)
+          .filter((endpoint) => endpoint.includes("issues?"));
+        expect(endpoints).toHaveLength(2);
+        expect(
+          endpoints.every(
+            (endpoint) =>
+              endpoint.startsWith("repos/owner/repo/issues?") &&
+              !endpoint.includes("after=") &&
+              !endpoint.includes("before="),
+          ),
+        ).toBe(true);
+      }),
+    ),
+  );
+}
+
+it.effect(
+  "retains every ordinary since filter, including a timestamp next to the epoch sentinel",
+  () =>
+    provide(
+      Effect.gen(function* () {
+        const client = yield* Client.GitHubIssueClient;
+        for (const since of ["1970-01-01T00:00:01Z", input.since]) {
+          serve((endpoint) =>
+            response(
+              new URL(endpoint, "https://api.github.com/").searchParams.get("since") === since
+                ? [issue()]
+                : [],
+            ),
+          );
+          expect(yield* client.readIssuesPage({ ...input, since })).toMatchObject({
+            status: "changed",
+            entries: [{ nodeId: "I_1" }],
+          });
+        }
+      }),
+    ),
+);
+
+for (const { name, url, relation = "next", page = 1 } of [
+  { name: "before on next", url: capturedNext.replace("after=", "before=") },
+  {
+    name: "after on prev",
+    url: capturedPrev.replace("before=", "after="),
+    relation: "prev",
+    page: 2,
+  },
+  { name: "unknown cursor parameter", url: capturedNext.replace("after=", "cursor=") },
+  { name: "duplicate cursor", url: capturedNext + "&after=again" },
+  { name: "both cursor directions", url: capturedNext + "&before=other" },
+  { name: "empty cursor", url: capturedNext.replace(/after=.*$/u, "after=") },
+  {
+    name: "cursor over 1024 characters",
+    url: capturedNext.replace(/after=.*$/u, "after=" + "x".repeat(1025)),
+  },
+  { name: "control cursor", url: capturedNext.replace(/after=.*$/u, "after=%00") },
+  { name: "altered filters", url: capturedNext.replace("state=all", "state=open") },
+  { name: "missing since", url: capturedNext.replace("&since=2026-09-01T00%3A00%3A00Z", "") },
+  { name: "duplicate page", url: capturedNext + "&page=2" },
+  { name: "other origin", url: capturedNext.replace("api.github.com", "external.test") },
+  { name: "other repository", url: capturedNext.replace("1300192", "1300193") },
+  { name: "wrong next page", url: capturedNext.replace("&page=2", "&page=3") },
+]) {
+  it.effect(`rejects captured cursor links with ${name}`, () =>
+    provide(
+      Effect.gen(function* () {
+        serve(response([issue()], { Link: `<${url}>; rel="${relation}"` }));
+        const client = yield* Client.GitHubIssueClient;
+        expect((yield* client.readIssuesPage({ ...input, page }).pipe(Effect.flip)).reason).toBe(
+          "invalid-response",
+        );
+      }),
+    ),
+  );
+}
+
+it.effect("bounds accepted cursor metadata and retains the numeric page ceiling", () =>
+  provide(
+    Effect.gen(function* () {
+      const client = yield* Client.GitHubIssueClient;
+      serve(
+        response([issue()], {
+          Link: `<${capturedNext.replace(/after=.*$/u, "after=" + "x".repeat(1024))}>; rel="next"`,
+        }),
+      );
+      expect(yield* client.readIssuesPage(input)).toMatchObject({ status: "changed", nextPage: 2 });
+      serve(
+        response([issue()], {
+          Link: `<${capturedNext.replace("&page=2", "&page=10001")}>; rel="next"`,
+        }),
+      );
+      expect(
+        (yield* client.readIssuesPage({ ...input, page: 10000 }).pipe(Effect.flip)).reason,
+      ).toBe("page-limit");
+    }),
+  ),
+);
+
+it.effect("reads the initial full sweep without GitHub's unsupported epoch since filter", () =>
+  provide(
+    Effect.gen(function* () {
+      serve((endpoint) =>
+        response(
+          new URL(endpoint, "https://api.github.com/").searchParams.has("since") ? [] : [issue()],
+        ),
+      );
+      const client = yield* Client.GitHubIssueClient;
+      const first = yield* client.readIssuesPage({ ...input, since: "1970-01-01T00:00:00Z" });
+      expect(first).toMatchObject({ status: "changed", entries: [{ nodeId: "I_1" }] });
+      expect(
+        run.mock.calls
+          .find(([request]) => request.args.at(-1)?.includes("issues?"))?.[0]
+          .args.at(-1),
+      ).toBe("repos/owner/repo/issues?state=all&sort=updated&direction=asc&per_page=2&page=1");
+    }),
+  ),
+);
+
+it.effect("pins comment reads to the captured issue source revision before fetching comments", () =>
+  provide(
+    Effect.gen(function* () {
+      serve(response([comment()]));
+      const commentsInput = {
+        cwd: input.cwd,
+        account,
+        repository,
+        issue: { nodeId: "I_1", number: 1 },
+        pageSize: 2,
+      };
+      const client = yield* Client.GitHubIssueClient;
+      expect(
+        (yield* client.readCommentsPage({
+          ...commentsInput,
+          expectedSourceRevision: issue().updated_at,
+        })).status,
+      ).toBe("changed");
+      expect(
+        (yield* client.readCommentsPage({
+          ...commentsInput,
+          expectedSourceRevision: "2026-09-02T00:00:00.000Z",
+        })).status,
+      ).toBe("changed");
+      run.mockClear();
+      expect(
+        (yield* client
+          .readCommentsPage({ ...commentsInput, expectedSourceRevision: input.since })
+          .pipe(Effect.flip)).reason,
+      ).toBe("issue-mismatch");
+      expect(run.mock.calls.some(([request]) => request.args.at(-1)?.includes("comments?"))).toBe(
+        false,
+      );
+    }),
+  ),
+);
+
+for (const status of [200, 304] as const) {
+  it.effect(`rechecks a pinned issue after a ${status} comments response`, () =>
+    provide(
+      Effect.gen(function* () {
+        const client = yield* Client.GitHubIssueClient;
+        for (const edited of [false, true]) {
+          let issueReads = 0;
+          run.mockImplementation((request) => {
+            const endpoint = request.args.at(-1)!;
+            const body =
+              endpoint === "user"
+                ? response({ node_id: account.nodeId })
+                : endpoint === "repos/owner/repo"
+                  ? response(rawRepository)
+                  : endpoint === "repos/owner/repo/issues/1"
+                    ? response({
+                        ...issue(),
+                        updated_at:
+                          ++issueReads === 2 && edited
+                            ? "2026-09-03T00:00:00Z"
+                            : issue().updated_at,
+                      })
+                    : response([comment()], {}, status);
+            return Effect.succeed(
+              output(body, status === 304 && endpoint.includes("comments?") ? 1 : 0),
+            );
+          });
+          const read = client.readCommentsPage({
+            cwd: input.cwd,
+            account,
+            repository,
+            issue: { nodeId: "I_1", number: 1 },
+            expectedSourceRevision: issue().updated_at,
+            ...(status === 304 ? { etag: '"comments-page"' } : {}),
+            pageSize: 2,
+          });
+          if (edited) {
+            expect((yield* read.pipe(Effect.flip)).reason).toBe("issue-mismatch");
+          } else {
+            expect((yield* read).status).toBe(status === 304 ? "not-modified" : "changed");
+          }
+          expect(issueReads).toBe(2);
+        }
+      }),
+    ),
+  );
+}
+
 describe("bounded GitHub issue transport", () => {
   it.effect("keeps continuation on a PR-only page and includes close/reopen source versions", () =>
     provide(
@@ -1057,3 +1299,34 @@ describe("bounded GitHub issue transport", () => {
     ),
   );
 });
+
+for (const length of [1024, 1100, 4096]) {
+  it.effect(`accepts the full workspace cwd bound (${length}) for verified lookup`, () =>
+    provide(
+      Effect.gen(function* () {
+        serve(response([]));
+        const cwd = "/" + "x".repeat(length - 1);
+        const result = yield* (yield* Client.GitHubIssueClient).lookupRepository({
+          cwd,
+          account,
+          repository: "owner/repo",
+        });
+        expect(result.status).toBe("changed");
+        expect(run.mock.calls.some(([request]) => request.cwd === cwd)).toBe(true);
+      }),
+    ),
+  );
+}
+it.effect("rejects workspace cwd beyond4096 before GitHub effects", () =>
+  provide(
+    Effect.gen(function* () {
+      serve(response([]));
+      const before = run.mock.calls.length;
+      const result = yield* (yield* Client.GitHubIssueClient)
+        .lookupRepository({ cwd: "/" + "x".repeat(4096), account, repository: "owner/repo" })
+        .pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      expect(run.mock.calls).toHaveLength(before);
+    }),
+  ),
+);

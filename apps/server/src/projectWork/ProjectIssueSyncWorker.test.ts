@@ -131,8 +131,14 @@ const setup = Effect.fn("issueWorkerTest.setup")(function* () {
       credentialEpoch: state.credentialEpoch,
       token: Redacted.make("synthetic-token"),
     });
-  const start = (resolveCredential = resolve) =>
-    Worker.make({ resolveCredential }).pipe(
+  const start = (
+    resolveCredential = resolve,
+    prepareCredential?: Worker.IssueSyncWorkerOptions["prepareCredential"],
+  ) =>
+    Worker.make({
+      resolveCredential,
+      ...(prepareCredential === undefined ? {} : { prepareCredential }),
+    }).pipe(
       Effect.provideService(ProjectWorkRepository, repo),
       Effect.provideService(Client.GitHubIssueClient, client),
     );
@@ -302,6 +308,282 @@ for (const kind of ["authentication", "rate-limit", "invalid-page", "transport"]
         }),
       ),
     ),
+  );
+
+const preclaimSnapshot = Effect.fn("issueWorkerTest.preclaimSnapshot")(function* (
+  sql: SqlClient.SqlClient,
+) {
+  return {
+    repositories:
+      yield* sql`SELECT * FROM project_issue_repository ORDER BY host,repository_node_id`,
+    bindings:
+      yield* sql`SELECT * FROM project_issue_binding ORDER BY project_id,host,repository_node_id`,
+    pages: yield* sql`SELECT * FROM project_issue_page`,
+    events: yield* sql`SELECT * FROM project_work_events`,
+    effects: yield* sql`SELECT * FROM project_team_effect`,
+    changes: yield* sql`SELECT total_changes() AS changes`,
+  };
+});
+const preparedCredential = (
+  state: Parameters<Worker.IssueSyncWorkerOptions["resolveCredential"]>[0],
+) => ({
+  cwd: "/prepared/repository",
+  host: state.host,
+  accountNodeId: state.accountNodeId,
+  credentialEpoch: state.credentialEpoch,
+  token: Redacted.make("prepared-token"),
+});
+
+for (const outcome of [
+  "missing",
+  "unavailable",
+  "authentication",
+  "host",
+  "account",
+  "epoch",
+] as const)
+  it.effect(`deferred ${outcome} preparation makes no claim, SQL mutation or remote read`, () =>
+    memory(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* setup();
+          yield* f.bind();
+          const before = yield* preclaimSnapshot(f.sql);
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          let resolved = 0;
+          const worker = yield* f.start(
+            () =>
+              Effect.sync(() => {
+                resolved++;
+                return undefined;
+              }),
+            (state) =>
+              Effect.gen(function* () {
+                yield* Deferred.succeed(held, undefined);
+                yield* Deferred.await(release);
+                if (outcome === "missing") return undefined;
+                if (outcome === "unavailable" || outcome === "authentication")
+                  return yield* Effect.fail(
+                    new Worker.IssueSyncCredentialError({ reason: outcome }),
+                  );
+                return {
+                  ...preparedCredential(state),
+                  ...(outcome === "host" ? { host: "other.example" } : {}),
+                  ...(outcome === "account" ? { accountNodeId: "U_other" } : {}),
+                  ...(outcome === "epoch" ? { credentialEpoch: "stale" } : {}),
+                };
+              }),
+          );
+          const pending = yield* Effect.forkScoped(worker.readOnce(key));
+          yield* Deferred.await(held);
+          expect(yield* preclaimSnapshot(f.sql)).toEqual(before);
+          expect(f.calls).toEqual([]);
+          yield* Deferred.succeed(release, undefined);
+          expect(yield* Fiber.join(pending)).toEqual({ status: "no-claim", key });
+          expect(yield* preclaimSnapshot(f.sql)).toEqual(before);
+          expect(resolved).toBe(0);
+          expect(f.calls).toEqual([]);
+        }),
+      ),
+    ),
+  );
+
+for (const change of ["rotation", "binding", "other-reader"] as const)
+  it.effect(`preclaim preparation cannot lease a revision changed by ${change}`, () =>
+    memory(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* setup();
+          yield* f.bind();
+          const original = (yield* readIssueRepositoryState(f.sql, key))!;
+          const before = yield* preclaimSnapshot(f.sql);
+          const held = yield* Deferred.make<void>();
+          const release = yield* Deferred.make<void>();
+          let resolved = 0;
+          const worker = yield* f.start(
+            () =>
+              Effect.sync(() => {
+                resolved++;
+                return undefined;
+              }),
+            (state) =>
+              Deferred.succeed(held, undefined).pipe(
+                Effect.andThen(Deferred.await(release)),
+                Effect.as(preparedCredential(state)),
+              ),
+          );
+          const pending = yield* Effect.forkScoped(worker.readOnce(key));
+          yield* Deferred.await(held);
+          expect(yield* preclaimSnapshot(f.sql)).toEqual(before);
+          if (change === "rotation")
+            yield* rotateIssueRepositoryCredential(f.sql, key, {
+              accountNodeId: original.accountNodeId,
+              expectedRevision: original.revision,
+              credentialEpoch: "rotated",
+            });
+          else if (change === "binding") yield* f.bind("b");
+          else {
+            const competing = (yield* claimIssueRepositoryRead(f.sql, key, {
+              leaseId: "competing-read",
+              durationMs: 60_000,
+              sweepStartedAt: now,
+            }))!;
+            expect(
+              yield* recordIssueRepositoryReadFailure(f.sql, key, competing.lease!, {
+                retryAt: nowMillis,
+                error: "transport",
+              }),
+            ).toBe(true);
+          }
+          const changed = (yield* readIssueRepositoryState(f.sql, key))!;
+          expect(changed.revision).toBeGreaterThan(original.revision);
+          expect(changed.lease).toBeNull();
+          expect(changed.retryAt).toBeLessThanOrEqual(nowMillis);
+          if (change === "other-reader") {
+            expect(changed.authorityGeneration).toBe(original.authorityGeneration);
+            expect(changed.credentialEpoch).toBe(original.credentialEpoch);
+          }
+          const afterChange = yield* preclaimSnapshot(f.sql);
+          yield* Deferred.succeed(release, undefined);
+          expect(yield* Fiber.join(pending)).toEqual({ status: "no-claim", key });
+          expect(yield* preclaimSnapshot(f.sql)).toEqual(afterChange);
+          expect(resolved).toBe(0);
+          expect(f.calls).toEqual([]);
+        }),
+      ),
+    ),
+  );
+
+it.effect(
+  "a deferred row recovers using one prepared credential snapshot and one remote page",
+  () =>
+    memory(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* setup();
+          yield* f.bind("a");
+          yield* f.bind("b");
+          const before = yield* preclaimSnapshot(f.sql);
+          let available = false;
+          let prepared = 0;
+          let resolved = 0;
+          const worker = yield* f.start(
+            () =>
+              Effect.sync(() => {
+                resolved++;
+                return undefined;
+              }),
+            (state) =>
+              Effect.sync(() => {
+                prepared++;
+                return available ? preparedCredential(state) : undefined;
+              }),
+          );
+          expect(yield* worker.readOnce(key)).toEqual({ status: "no-claim", key });
+          expect(yield* preclaimSnapshot(f.sql)).toEqual(before);
+          available = true;
+          expect(yield* worker.readOnce(key)).toMatchObject({
+            status: "committed",
+            page: 1,
+            nextPage: null,
+          });
+          expect(prepared).toBe(2);
+          expect(resolved).toBe(0);
+          expect(f.calls.filter((call) => call.args.at(-1)?.includes("issues?"))).toHaveLength(1);
+          for (const call of f.calls) {
+            expect(call.cwd).toBe("/prepared/repository");
+            expect(call.env?.GH_TOKEN).toBe("prepared-token");
+          }
+          for (const project of ["a", "b"]) {
+            const state = yield* readCurrentState(f.sql, project);
+            expect(
+              state.foundationRecords?.filter((record) => record.kind === "issue"),
+            ).toHaveLength(1);
+            expect(state.tasks).toEqual([]);
+          }
+          expect(yield* f.sql`SELECT * FROM project_issue_page`).toHaveLength(1);
+          expect(yield* f.sql`SELECT * FROM project_team_effect`).toEqual([]);
+          expect(yield* readIssueRepositoryState(f.sql, key)).toMatchObject({
+            lease: null,
+            error: null,
+            status: "ready",
+          });
+        }),
+      ),
+    ),
+);
+
+for (const close of ["stop", "scope"] as const)
+  it.effect(
+    `${close} joins held preclaim preparation without allocating a lease or remote read`,
+    () =>
+      memory(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const f = yield* setup();
+            yield* f.bind();
+            const before = yield* preclaimSnapshot(f.sql);
+            const held = yield* Deferred.make<void>();
+            const exiting = yield* Deferred.make<void>();
+            const releaseExit = yield* Deferred.make<void>();
+            const exited = yield* Deferred.make<void>();
+            const closed = yield* Deferred.make<void>();
+            let active = 0;
+            let resolved = 0;
+            const scope = yield* Scope.make();
+            const worker = yield* f
+              .start(
+                () =>
+                  Effect.sync(() => {
+                    resolved++;
+                    return undefined;
+                  }),
+                () =>
+                  Effect.gen(function* () {
+                    active++;
+                    yield* Deferred.succeed(held, undefined);
+                    return yield* Effect.never;
+                  }).pipe(
+                    Effect.ensuring(
+                      Deferred.succeed(exiting, undefined).pipe(
+                        Effect.andThen(Deferred.await(releaseExit)),
+                        Effect.andThen(
+                          Effect.sync(() => {
+                            active--;
+                          }),
+                        ),
+                        Effect.andThen(Deferred.succeed(exited, undefined)),
+                      ),
+                    ),
+                  ),
+              )
+              .pipe(Scope.provide(scope));
+            const pending = yield* Effect.forkScoped(worker.readOnce(key));
+            yield* Deferred.await(held);
+            expect(yield* preclaimSnapshot(f.sql)).toEqual(before);
+            const closing = yield* Effect.forkScoped(
+              (close === "stop" ? worker.stop : Scope.close(scope, Exit.void)).pipe(
+                Effect.andThen(Deferred.succeed(closed, undefined)),
+              ),
+            );
+            yield* Deferred.await(exiting);
+            const returnedBeforeCleanup = yield* Deferred.isDone(closed);
+            yield* Deferred.succeed(releaseExit, undefined);
+            yield* Fiber.join(closing);
+            expect(returnedBeforeCleanup).toBe(false);
+            expect(yield* Deferred.isDone(exited)).toBe(true);
+            expect(active).toBe(0);
+            expect(yield* Fiber.join(pending)).toEqual({ status: "obsolete", key });
+            expect(yield* worker.drain).toEqual([]);
+            expect(yield* worker.readOnce(key)).toEqual({ status: "obsolete", key });
+            expect(yield* preclaimSnapshot(f.sql)).toEqual(before);
+            expect(resolved).toBe(0);
+            expect(f.calls).toEqual([]);
+            yield* Scope.close(scope, Exit.void);
+          }),
+        ),
+      ),
   );
 
 for (const mismatch of ["missing", "host", "account", "epoch", "resolver-error"] as const)

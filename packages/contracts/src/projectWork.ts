@@ -1465,6 +1465,7 @@ export type ProjectWorkReadRecord = typeof ProjectWorkReadRecord.Type;
 /** Stable read surface used by both the WebSocket RPC and MCP adapters. */
 export const ProjectWorkReadOperation = Schema.Literals([
   "foundation-records",
+  "issue-comments",
   "snapshot",
   "task",
   "task-context",
@@ -1491,6 +1492,13 @@ export type ProjectWorkReadOperation = typeof ProjectWorkReadOperation.Type;
 export const ProjectWorkReadIntent = Schema.Struct({
   projectId: ProjectId,
   operation: ProjectWorkReadOperation,
+  issueRecordId: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
+  expectedIssueRevision: Schema.optionalKey(
+    NonNegativeInt.check(Schema.isLessThanOrEqualTo(Number.MAX_SAFE_INTEGER)),
+  ),
+  issueCommentPage: Schema.optionalKey(
+    NonNegativeInt.check(Schema.isBetween({ minimum: 1, maximum: 10_000 })),
+  ),
   cursor: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(4_000))),
   exportVersion: Schema.optionalKey(Schema.Literals([1, 2])),
   taskId: Schema.optionalKey(ProjectWorkTaskId),

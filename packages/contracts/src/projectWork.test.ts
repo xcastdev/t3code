@@ -117,6 +117,27 @@ describe("project work contracts", () => {
     ).toBe(4);
   });
 
+  it("bounds source-pinned lazy issue comment requests and preserves legacy reads", () => {
+    const decode = Schema.decodeUnknownSync(ProjectWorkReadIntent);
+    const input = {
+      projectId: "project-1",
+      operation: "issue-comments",
+      issueRecordId: "issue-1",
+      expectedIssueRevision: 0,
+      issueCommentPage: 10_000,
+    };
+    expect(decode(input)).toMatchObject(input);
+    expect(decode({ projectId: "project-1", operation: "tasks" }).operation).toBe("tasks");
+    for (const patch of [
+      { issueRecordId: "x".repeat(257) },
+      { expectedIssueRevision: -1 },
+      { expectedIssueRevision: 0.5 },
+      { issueCommentPage: 0 },
+      { issueCommentPage: 10_001 },
+    ])
+      expect(() => decode({ ...input, ...patch })).toThrow();
+  });
+
   it("defaults new task writes to Draft while reads preserve future states", () => {
     const task = decodeTask({
       taskId: "task-1",

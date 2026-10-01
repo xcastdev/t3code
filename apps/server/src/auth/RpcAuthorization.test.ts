@@ -13,6 +13,14 @@ import { describe, expect, it } from "@effect/vitest";
 import { RPC_REQUIRED_SCOPES, requiredScopeForRpcMethod } from "./RpcAuthorization.ts";
 
 describe("RPC authorization scopes", () => {
+  it("reads repository binding history and requires operate scope to bind", () => {
+    expect(requiredScopeForRpcMethod(WS_METHODS.projectWorkRepositoryBindings)).toBe(
+      AuthOrchestrationReadScope,
+    );
+    expect(requiredScopeForRpcMethod(WS_METHODS.projectWorkBindIssueRepository)).toBe(
+      AuthOrchestrationOperateScope,
+    );
+  });
   it("requires read scope to list installs and operate scope to change them", () => {
     expect(requiredScopeForRpcMethod(WS_METHODS.skillsDeploymentList)).toBe(
       AuthOrchestrationReadScope,
