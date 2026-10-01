@@ -1187,7 +1187,10 @@ it.effect(
         Effect.gen(function* () {
           yield* runMigrations({ toForkMigrationInclusive: 19 });
           yield* insertBindingSession("created");
-          expect(yield* runForkMigrations()).toEqual([[20, "ProjectTeamIdentityFences"]]);
+          expect(yield* runForkMigrations()).toEqual([
+            [20, "ProjectTeamIdentityFences"],
+            [21, "ProjectWorkEvidenceMetadata"],
+          ]);
           const upgradedSql = yield* SqlClient.SqlClient;
           expect(
             (yield* upgradedSql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id='created'`)[0]
