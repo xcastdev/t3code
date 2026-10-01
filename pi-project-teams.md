@@ -7,12 +7,11 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-10-01 01:41 UTC. Implementation is running. The harness permits
-**ten subagents plus the coordinator**. P2/P3 have landed on main. Root prepares
-P4's shared workflow contracts in wave3. The repaired Linux process candidate
-`f746e690` has passed its existing reviewer; root verifies its sealed evidence.
-Four subagent seats are active: P4 core, P7 process extension, P7 protocol extension
-and P7 parent model brokerage.
+Last updated: 2026-10-01 02:04 UTC. Implementation is running. The harness permits
+**ten subagents plus the coordinator**. P1/P2/P3 are finished on main. P4 guided
+workflow and three P7 runtime pieces have independent owners. The P7 process
+extension's review found an unsafe startup-cleanup ownership assumption; its
+owner is repairing it while protocol and model brokerage finish their checks.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
@@ -24,16 +23,19 @@ and P7 parent model brokerage.
   P3 current managed identity and protected command authorization. P2/P3 land
   at `1346f50af` after 301 combined tests, three normal compilers, scoped
   checks and fresh wave APPROVE. All 56 reviewed source hashes match main.
-- **P4:** pure policy leaf `76089058` is approved. Guided workflow contracts are under focused validation on wave3; the full
-  state-transition owner will start from the resulting exact commit.
+- **P4:** pure policy leaf `76089058` is approved. Shared guided contracts at
+  `eb71cf2b1` pass 36 focused checks and the normal contracts compiler. The core
+  owner is implementing state transitions; root integrates authenticated wiring
+  and upgrades the real-SQL authorization fixtures. Full combined review remains.
 - **P5:** transport and pure sync/intake leaves are approved. Title repair
   `42663135` passes 79 tests and independent replay/rename/conflict checks.
   Durable sync authority interfaces are prepared; refinement, wiring
   and real GitHub evidence remain.
-- **P7:** protocol `df620a4a` and skills `4168f789` are approved and merged
-  into wave3. Linux process repair `f746e690` passes its existing reviewer: 54
-  independent focused tests, three actual parent-EOF proofs, a forced partial-write
-  case and two discriminating controls. Full runtime integration remains open.
+- **P7:** approved protocol, skills and Linux process leaves are merged into
+  wave3. The extended protocol passes 90 tests and is compiling; parent model
+  brokerage passes 118 affected tests, including an actual pinned-SDK synthetic
+  tool turn. Process extension `4d70b500` has one verified ownership finding and
+  is under repair. These pieces still need review and full runtime integration.
 - **P10:** native adapter repair `2a88e791` is approved after real deletion,
   recovery and explicit native-proof checks. Extraction, authorized hydration,
   context and integration remain dependent work.
@@ -59,25 +61,24 @@ Each row is one subagent seat, with its owner, work and next gate. Finished agen
 release their seat. Worktrees live under
 `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                                    | State                              | Assignment / branch                              | Next gate                                                        |
-| ---- | ---------------------------------------- | ---------------------------------- | ------------------------------------------------ | ---------------------------------------------------------------- |
-| 1    | `p4_guided_core_high`                    | Active implementation              | `pi-teams/p4-guided-core`, base `6bb8db009`      | Root contracts + core checks + one review                        |
-| 2    | `p7_protocol_runtime_high`               | Active implementation              | `pi-teams/p7-protocol-runtime`, base `6bb8db009` | Exact bootstrap/control/compaction interfaces, focused tests     |
-| 3    | `p7_model_broker_high`                   | Active implementation              | `pi-teams/p7-model-broker`, base `6bb8db009`     | Strict actual-SDK requests, parent auth/budget/stream accounting |
-| 4    | — (last: `review_p5_sync_leaf`)          | Available; repair APPROVE          | P5 `42663135` held for integration               | Ready independent work or review                                 |
-| 5    | — (last: `p8_dispatch_preparation_high`) | Available; recovery proposal ready | P8 read-only preparation complete                | Root persisted identity, Git/setup and budget contracts          |
-| 6    | — (last: `review_wave2_foundation`)      | Available; combined wave APPROVE   | P2/P3 `8defdcf12`; 15 sealed review artifacts    | Landed on main `1346f50af`                                       |
-| 7    | — (last: `review_p7_skills_slice`)       | Available; repair APPROVE          | P7 skills `4168f789` merged into wave3           | Ready independent work or review                                 |
-| 8    | — (last: `p5_sync_leaf_high`)            | Available                          | P5 repair committed and approved                 | Ready independent work                                           |
-| 9    | `p7_process_runtime_high`                | Active implementation              | `pi-teams/p7-process-runtime`, base `6bb8db009`  | Read-only/state/Git mounts and preallocated identity proofs      |
-| 10   | — (last: `review_p7_managed_process`)    | Available; repair APPROVE          | `f746e690`, 231 sealed artifacts root-verified   | Reviewed process merged into wave3                               |
+| Slot | Agent                                    | State                              | Assignment / branch                                 | Next gate                                                        |
+| ---- | ---------------------------------------- | ---------------------------------- | --------------------------------------------------- | ---------------------------------------------------------------- |
+| 1    | `p4_guided_core_high`                    | Active implementation              | `pi-teams/p4-guided-core`, base `6bb8db009`         | Root contracts + core checks + one review                        |
+| 2    | `p7_protocol_runtime_high`               | Active implementation              | `pi-teams/p7-protocol-runtime`, base `6bb8db009`    | Exact bootstrap/control/compaction interfaces, focused tests     |
+| 3    | `p7_model_broker_high`                   | Active implementation              | `pi-teams/p7-model-broker`, base `6bb8db009`        | Strict actual-SDK requests, parent auth/budget/stream accounting |
+| 4    | `p7_process_runtime_high`                | Active scoped repair               | `pi-teams/p7-process-runtime`, candidate `4d70b500` | Captured ownership cleanup; same reviewer recheck                |
+| 5    | — (last: `p8_dispatch_preparation_high`) | Available; recovery proposal ready | P8 read-only preparation complete                   | Root persisted identity, Git/setup and budget contracts          |
+| 6    | — (last: `review_wave2_foundation`)      | Available; combined wave APPROVE   | P2/P3 `8defdcf12`; 15 sealed review artifacts       | Landed on main `1346f50af`                                       |
+| 7    | — (last: `review_p7_skills_slice`)       | Available; repair APPROVE          | P7 skills `4168f789` merged into wave3              | Ready independent work or review                                 |
+| 8    | — (last: `p5_sync_leaf_high`)            | Available                          | P5 repair committed and approved                    | Ready independent work                                           |
+| 9    | — (last: `review_p7_process_runtime`)    | Available; REQUEST_CHANGES sealed  | One verified AC-13 finding; 154 artifacts verified  | Same reviewer reserved for repaired piece                        |
+| 10   | — (last: `review_p7_managed_process`)    | Available; repair APPROVE          | `f746e690`, 231 sealed artifacts root-verified      | Reviewed process merged into wave3                               |
 
-Coordinator: implementing P4 authenticated intent compilation and shared private
-claim/repair/report contracts. Candidate `256194114` passes 35 focused tests and
-the normal contracts compiler. P7 process extension returns its successful final
-compiler reservation; P7 protocol extension now holds that single reservation.
-Root wiring awaits P4's pure authority/replay helpers before its combined gate.
-No model or integrated client proof is running.
+Coordinator: integrating P4 authenticated intent compilation and real-SQL
+fixtures. Private claim/report/repair provenance contracts are committed on
+wave3 `eb71cf2b1`. One normal server compiler runs at a time: protocol currently
+holds the reservation; broker then P4 are queued. Root wiring awaits committed
+core helpers for its combined checks. No model or integrated client proof runs.
 
 Primary branch: `t3code/implement-pi-project-teams`. Main product commit:
 `1346f50af6f1361b0942fe1d42e636804e1ba9a0`. Reviewed foundation wave:
@@ -2606,3 +2607,32 @@ delegation, one owner per scope and focused measured checks. P4 owner requests
 private claim/failure/repair transitions and non-code output applicability; root
 retains those shared contract changes. No phase completion or live-client proof
 is claimed by these preparatory integration merges.
+
+### Active P4/P7 integration and verified runtime finding (2026-10-01)
+
+Root contracts `eb71cf2b12ebf99f33bee19fad80615f2b50df46` pass 36 focused
+contract/persistence cases, normal contracts compilation and exact-path lint and
+formatting. Bounded report outputs, Human reminders, private repair claims and
+immutable repair authorization provenance are included. P4 core tests currently
+pass 112 applicable pure/lease cases and two new actual-SQL cases. Five older
+repository cases fail because their shared fixture attempts the now-prohibited
+raw managed claim; two receipt barriers time out. Root upgrades that fixture to
+real guided approvals and the private typed claim, preserving those failures and
+the duplicate/rollback protections. No full P4 gate or phase completion is claimed.
+
+Fresh process-extension reviewer requests changes on exact `4d70b500`. Root
+verifies all 154 review artifacts against manifest
+`836a785ddeedafe07453cd0268d8d426ef968dc680bcc1b655f9fd992eb2a1f2` and confirms
+P7-RUNTIME-R1: failed acquisition can stop an existing same-unit service before
+capturing its InvocationID, using only its matching Description. The actual
+Linux consumer fails one of two cases; the isolated omission control passes
+both. The independent 57-case gate passes; all 41 review units drain, with zero
+OOM/swap. The original owner repairs only its three files; the same reviewer
+will recheck. This candidate remains outside wave3.
+
+Protocol extension passes 90 focused tests, 13 independent byte-consumer groups
+and 11 causal controls; its final normal compiler is queued first. Broker passes
+118 affected tests, including 67 broker cases and a pinned-SDK synthetic native
+two-call tool turn. These checks use no remote model call and do not satisfy
+the required bounded real-runtime proof. Main product commit remains `1346f50af`;
+no push or PR.
