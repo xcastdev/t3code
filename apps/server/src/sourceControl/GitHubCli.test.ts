@@ -9,6 +9,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 import { VcsProcessExitError, VcsProcessSpawnError } from "@t3tools/contracts";
 
 import * as VcsProcess from "../vcs/VcsProcess.ts";
+import * as ProcessRunner from "../processRunner.ts";
 import * as GitHubCli from "./GitHubCli.ts";
 
 const encodeGitHubCliError = Schema.encodeEffect(Schema.fromJsonString(GitHubCli.GitHubCliError));
@@ -36,6 +37,56 @@ afterEach(() => {
 });
 
 describe("GitHubCli.layer", () => {
+  it.effect("retains conditional HTTP output only for opted-in callers", () =>
+    Effect.gen(function* () {
+      const output = {
+        stdout: 'HTTP/2.0 304 Not Modified\nEtag: "page-one"\r\n\r\n',
+        stderr: "gh: HTTP 304\n",
+        code: ChildProcessSpawner.ExitCode(1),
+        timedOut: false,
+        stdoutTruncated: false,
+        stderrTruncated: false,
+        stdoutInvalidUtf8: false,
+        stderrInvalidUtf8: false,
+      };
+      const vcs = yield* VcsProcess.make.pipe(
+        Effect.provideService(
+          ProcessRunner.ProcessRunner,
+          ProcessRunner.ProcessRunner.of({ run: () => Effect.succeed(output) }),
+        ),
+      );
+      const gh = yield* GitHubCli.make.pipe(Effect.provideService(VcsProcess.VcsProcess, vcs));
+      const input = {
+        cwd: "/repo",
+        args: ["api", "repos/owner/repo/issues", "--include", "--hostname", "github.com"],
+      };
+      const ordinary = yield* gh.execute(input).pipe(Effect.result);
+      expect(ordinary._tag).toBe("Failure");
+      const optedIn = yield* gh.execute({ ...input, allowNonZeroExit: true });
+      expect(optedIn.exitCode).toBe(1);
+      expect(optedIn.stdout).toBe(output.stdout);
+      expect(optedIn.stderr).toBe(output.stderr);
+      expect(optedIn.stdoutTruncated).toBe(false);
+      const explicitlyStrict = yield* gh
+        .execute({ ...input, allowNonZeroExit: false })
+        .pipe(Effect.result);
+      expect(explicitlyStrict._tag).toBe("Failure");
+      const pinned = {
+        host: "github.com",
+        token: Redacted.make("fixture-only"),
+        credentialFingerprint: "fixture",
+      };
+      const mismatch = yield* gh
+        .execute({
+          ...input,
+          args: ["api", "user", "--hostname", "other.example.test"],
+          allowNonZeroExit: true,
+        })
+        .pipe(Effect.provideService(GitHubCli.PinnedGitHubCredential, pinned), Effect.result);
+      expect(mismatch._tag).toBe("Failure");
+    }),
+  );
+
   it.effect("pins concurrent cached commands to their own verified credentials", () =>
     Effect.gen(function* () {
       mockRun.mockImplementation((input) =>
