@@ -1,11 +1,12 @@
 import { CommandId, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import { runMigrations } from "../persistence/Migrations.ts";
-import { ProjectWorkRepositoryLive } from "./ProjectWorkRepository.ts";
+import { ProjectWorkRepository, ProjectWorkRepositoryLive } from "./ProjectWorkRepository.ts";
 import { ProjectWorkEventBus } from "./ProjectWorkEventBus.ts";
 import {
   bindIssueRepositoryProject,
@@ -381,6 +382,127 @@ it.effect("authentication failure blocks reads until a fresh same-account creden
         expectedRevision: failed.revision,
       });
       expect((yield* claim(sql, "fresh-auth", 200))?.lease?.credentialEpoch).toBe("opaque-epoch-2");
+    }),
+  ),
+);
+
+it.effect("rejects valid repository payloads stored under another immutable SQL key", () =>
+  run(
+    Effect.gen(function* () {
+      const sql = yield* setup;
+      yield* bind(sql);
+      const foreignKey = { host: "github.com", repositoryNodeId: "R_foreign" };
+      const foreign = yield* bindIssueRepositoryProject(sql, {
+        key: foreignKey,
+        projectId: "b",
+        repositoryName: "foreign/repository",
+        accountNodeId: "U_foreign",
+        credentialEpoch: "foreign-epoch",
+        since: at,
+        expectedBindingRevision: null,
+      });
+      const leased = (yield* claimIssueRepositoryRead(sql, foreignKey, {
+        leaseId: "foreign-lease",
+        durationMs: 1000,
+        sweepStartedAt: at,
+      }))!;
+      const payload = yield* Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown))(leased);
+      yield* sql`UPDATE project_issue_repository SET payload_json=${payload} WHERE host=${key.host} AND repository_node_id=${key.repositoryNodeId}`;
+      expect((yield* readIssueRepositoryState(sql, key).pipe(Effect.result))._tag).toBe("Failure");
+      let prepared = false;
+      const outcome = yield* commitIssueRepositoryRead(sql, key, leased.lease!, () =>
+        Effect.sync(() => {
+          prepared = true;
+          return {
+            commands: [],
+            progress: { since: at, nextPage: 2, sweepStartedAt: at, lastSuccessfulPageAt: at },
+          };
+        }),
+      ).pipe(Effect.provide(ProjectWorkRepositoryLive), Effect.result);
+      expect(outcome._tag).toBe("Failure");
+      expect(prepared).toBe(false);
+      expect(yield* readIssueRepositoryState(sql, foreignKey)).toEqual(leased);
+      expect(yield* sql`SELECT * FROM project_work_command_receipts`).toEqual([]);
+      expect(foreign.state.accountNodeId).toBe("U_foreign");
+    }),
+  ),
+);
+
+it.effect("adding or updating a binding cannot revive an authentication-failed epoch", () =>
+  run(
+    Effect.gen(function* () {
+      const sql = yield* setup;
+      yield* bind(sql);
+      const leased = (yield* claim(sql))!;
+      yield* recordIssueRepositoryReadFailure(sql, key, leased.lease!, {
+        retryAt: 100,
+        error: "authentication",
+      });
+      const failed = yield* readIssueRepositoryState(sql, key);
+      for (const [project, expected] of [
+        ["a", 0],
+        ["b", null],
+      ] as const) {
+        expect((yield* bind(sql, project, expected).pipe(Effect.result))._tag).toBe("Failure");
+        expect(yield* readIssueRepositoryState(sql, key)).toEqual(failed);
+        expect(yield* claim(sql, "blocked")).toBeUndefined();
+      }
+      expect(yield* sql`SELECT * FROM project_issue_binding`).toHaveLength(1);
+      const fresh = yield* bindIssueRepositoryProject(sql, {
+        key,
+        projectId: "b",
+        expectedBindingRevision: null,
+        accountNodeId: "U_account",
+        repositoryName: "owner/repository",
+        credentialEpoch: "opaque-epoch-2",
+        since: at,
+      });
+      expect(fresh.state.status).toBe("ready");
+      expect(fresh.state.error).toBeNull();
+      expect((yield* claim(sql, "fresh"))?.lease?.credentialEpoch).toBe("opaque-epoch-2");
+    }),
+  ),
+);
+
+it.effect("a retained repository cannot commit shared page progress on another SQL client", () =>
+  run(
+    Effect.gen(function* () {
+      const ownerSql = yield* setup;
+      return yield* Effect.gen(function* () {
+        const ownerRepository = yield* ProjectWorkRepository;
+        yield* Effect.gen(function* () {
+          const otherSql = yield* setup;
+          expect(otherSql).not.toBe(ownerSql);
+          yield* bind(otherSql);
+          const leased = (yield* claim(otherSql))!;
+          yield* ownerSql`CREATE TRIGGER reject_foreign_receipt BEFORE INSERT ON project_work_command_receipts BEGIN SELECT RAISE(ABORT,'owner receipt'); END`;
+          let prepared = false;
+          const result = yield* commitIssueRepositoryRead(otherSql, key, leased.lease!, () =>
+            Effect.gen(function* () {
+              prepared = true;
+              yield* otherSql`INSERT INTO project_issue_page(host,repository_node_id,read_key,page_kind,payload_json) VALUES(${key.host},${key.repositoryNodeId},'foreign','issues','{}')`;
+              return {
+                commands: [
+                  {
+                    type: "project-work.task.create" as const,
+                    commandId: CommandId.make("foreign"),
+                    taskId: ProjectWorkTaskId.make("foreign"),
+                    projectId: ProjectId.make("a"),
+                    title: "foreign",
+                    createdAt: at,
+                  },
+                ],
+                progress: { since: at, nextPage: 2, sweepStartedAt: at, lastSuccessfulPageAt: at },
+              };
+            }),
+          ).pipe(Effect.provideService(ProjectWorkRepository, ownerRepository), Effect.result);
+          expect(result._tag).toBe("Failure");
+          expect(prepared).toBe(false);
+          expect(yield* readIssueRepositoryState(otherSql, key)).toEqual(leased);
+          expect(yield* otherSql`SELECT * FROM project_issue_page`).toEqual([]);
+          expect(yield* ownerSql`SELECT * FROM project_work_command_receipts`).toEqual([]);
+        }).pipe(Effect.provide(NodeSqliteClient.layerMemory()));
+      }).pipe(Effect.provide(ProjectWorkRepositoryLive));
     }),
   ),
 );

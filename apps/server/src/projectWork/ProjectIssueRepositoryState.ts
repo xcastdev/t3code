@@ -136,9 +136,11 @@ export const readIssueRepositoryState = Effect.fn("readIssueRepositoryState")(fu
   }>`SELECT payload_json AS payload FROM project_issue_repository
     WHERE host=${key.host} AND repository_node_id=${key.repositoryNodeId}`;
   const row = rows[0];
-  return row === undefined
-    ? undefined
-    : yield* decodeState(row.payload).pipe(Effect.mapError(() => fail("invalid-input")));
+  if (row === undefined) return undefined;
+  const state = yield* decodeState(row.payload).pipe(Effect.mapError(() => fail("invalid-input")));
+  if (state.host !== key.host || state.repositoryNodeId !== key.repositoryNodeId)
+    return yield* fail("invalid-input");
+  return state;
 });
 
 const writeState = Effect.fn("IssueRepository.writeState")(function* (
@@ -208,6 +210,8 @@ export const bindIssueRepositoryProject = Effect.fn("bindIssueRepositoryProject"
       let state = yield* readIssueRepositoryState(sql, input.key);
       if (state !== undefined && state.accountNodeId !== input.accountNodeId)
         return yield* fail("account-mismatch");
+      if (state?.error === "authentication" && state.credentialEpoch === input.credentialEpoch)
+        return yield* fail("invalid-input");
       const prior = yield* sql<{
         revision: number;
         generation: number;
@@ -397,6 +401,8 @@ export const commitIssueRepositoryRead = Effect.fn("commitIssueRepositoryRead")(
   let accepted = false;
   const results = yield* repository.executeAtomic(
     Effect.gen(function* () {
+      if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
+        return yield* fail("invalid-input");
       const current = yield* currentLease(sql, key, lease);
       if (current === undefined) return [];
       const prepared = yield* prepare(current);
