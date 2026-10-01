@@ -10,6 +10,7 @@ import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { runMigrations } from "../persistence/Migrations.ts";
 import { ProjectLifecycle, ProjectLifecycleLive } from "../project/ProjectLifecycle.ts";
 import { ProjectWorkRepository, ProjectWorkRepositoryLive } from "./ProjectWorkRepository.ts";
+import { importLegacyIssueRepositories } from "./ProjectIssueRepositoryMigration.ts";
 import { retireProjectIssueRepositories } from "./ProjectIssueRepositoryLifecycle.ts";
 import {
   bindIssueRepositoryProject,
@@ -307,3 +308,68 @@ it.effect(
       ).toHaveLength(0);
     }).pipe(Effect.provide(layer)),
 );
+
+for (const mode of ["legacy-deleted", "archived"] as const)
+  it.effect(
+    `permanent deletion removes an unbound imported repository from a ${mode} project`,
+    () =>
+      Effect.gen(function* () {
+        const sql = yield* setup;
+        const repo = yield* ProjectWorkRepository;
+        yield* repo.execute({
+          type: "project-work.foundation.commit",
+          projectId: ProjectId.make("a"),
+          commandId: CommandId.make("legacy-create"),
+          expectedRevision: 0,
+          attribution: {
+            actor: { kind: "system", id: "test" },
+            source: { kind: "system", id: "test" },
+            recordedAt: at,
+          },
+          committedAt: at,
+          records: [cursor],
+        });
+        const lifecycle = yield* ProjectLifecycle;
+        if (mode === "legacy-deleted")
+          yield* sql`UPDATE projection_projects SET deleted_at=${at} WHERE project_id='a'`;
+        else
+          yield* lifecycle.archive({
+            projectId: ProjectId.make("a"),
+            commandId: CommandId.make("archive-legacy"),
+          });
+        yield* sql.withTransaction(importLegacyIssueRepositories(sql));
+        expect(yield* sql`SELECT * FROM project_issue_binding`).toHaveLength(0);
+        expect(yield* readIssueRepositoryState(sql, key)).toBeDefined();
+        yield* sql`INSERT INTO project_issue_page(host,repository_node_id,read_key,page_kind,payload_json) VALUES(${key.host},${key.repositoryNodeId},'legacy-page','issues','{}')`;
+        yield* sql`INSERT INTO project_issue_external(host,repository_node_id,issue_node_id,issue_number,source_revision,payload_json) VALUES(${key.host},${key.repositoryNodeId},'I_legacy',1,${at},'{}')`;
+        yield* sql`CREATE TRIGGER fail_unbound_receipt BEFORE INSERT ON project_lifecycle_operations WHEN NEW.operation='permanent-local-delete' BEGIN SELECT RAISE(ABORT,'unbound rollback'); END`;
+        expect((yield* lifecycle.permanentDelete(deletion("a")).pipe(Effect.result))._tag).toBe(
+          "Failure",
+        );
+        expect(yield* readIssueRepositoryState(sql, key)).toBeDefined();
+        expect(yield* sql`SELECT * FROM project_issue_repository_legacy`).toHaveLength(1);
+        expect(yield* sql`SELECT * FROM project_issue_page`).toHaveLength(1);
+        yield* sql`DROP TRIGGER fail_unbound_receipt`;
+        yield* lifecycle.permanentDelete(deletion("a"));
+        for (const table of [
+          "project_issue_repository",
+          "project_issue_binding",
+          "project_issue_page",
+          "project_issue_external",
+          "project_issue_repository_legacy",
+          "project_team_intake_cursor",
+        ])
+          expect(yield* sql`SELECT * FROM ${sql(table)}`).toHaveLength(0);
+        expect(
+          (yield* bindIssueRepositoryProject(sql, {
+            key,
+            projectId: "b",
+            expectedBindingRevision: null,
+            accountNodeId: "U_new",
+            repositoryName: "owner/repository",
+            credentialEpoch: "new-epoch",
+            since: at,
+          })).state.accountNodeId,
+        ).toBe("U_new");
+      }).pipe(Effect.provide(layer)),
+  );
