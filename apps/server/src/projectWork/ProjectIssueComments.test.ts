@@ -235,6 +235,38 @@ const authorities = (sql: SqlClient.SqlClient) =>
     return rows;
   });
 
+for (const length of [1100, 4096, 4097]) {
+  it.effect(
+    `validates a ${length}-character comments cwd through actual SQLite and GitHub layers`,
+    () =>
+      database(
+        Effect.gen(function* () {
+          const cwd = "/" + "x".repeat(length - 1);
+          const f = yield* fixture({
+            resolveCredential: (state) =>
+              credential(state).pipe(Effect.map((value) => ({ ...value, cwd }))),
+          });
+          const before = yield* authorities(f.sql);
+          if (length > 4096) {
+            expect(yield* reason(f.reader.read(input))).toBe("credential-mismatch");
+            expect(f.requests).toEqual([]);
+            expect(yield* pages(f)).toEqual([]);
+          } else {
+            const read = yield* f.reader.read(input);
+            expect(read.entries).toMatchObject([{ nodeId: "IC_1", body: "Comment" }]);
+            expect(f.commentCount()).toBe(1);
+            expect(f.requests.every((request) => request.cwd === cwd)).toBe(true);
+            expect(yield* pages(f)).toHaveLength(1);
+            f.serve(http(null, { Etag: '"v1"' }, 304));
+            expect((yield* f.reader.read(input)).entries).toEqual(read.entries);
+            expect(yield* pages(f)).toHaveLength(1);
+          }
+          expect(yield* authorities(f.sql)).toEqual(before);
+        }),
+      ),
+  );
+}
+
 it.effect(
   "reads bounded comments through actual GitHub layers, commits once per repository and reuses exact committed ETags",
   () =>

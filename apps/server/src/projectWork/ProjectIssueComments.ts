@@ -139,7 +139,12 @@ const ExternalRow = Schema.Struct({
 });
 const CacheRow = Schema.Struct({ ...PayloadRow.fields, sequence: Positive });
 const Credential = Schema.Struct({
-  cwd: Text,
+  cwd: Schema.String.check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(4096),
+    Schema.isTrimmed(),
+    Schema.makeFilter((value) => !/\p{Cc}/u.test(value)),
+  ),
   host: Host,
   accountNodeId: Text,
   credentialEpoch: Text,

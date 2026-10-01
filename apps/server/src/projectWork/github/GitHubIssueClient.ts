@@ -282,9 +282,14 @@ function pageContinuation(
       throw failure("invalid-response", host);
     const linkedPage = Number(rawPage);
     const keys = [...url.searchParams.keys()];
+    // GitHub adds cursor hints to numeric page links; validate them without forwarding them.
+    const cursorKey = match[2] === "next" ? "after" : match[2] === "prev" ? "before" : undefined;
+    const cursor = cursorKey === undefined ? null : url.searchParams.get(cursorKey);
     if (
       new Set(keys).size !== keys.length ||
-      keys.length !== [...expected.searchParams.keys()].length
+      keys.length !== [...expected.searchParams.keys()].length + (cursor === null ? 0 : 1) ||
+      (cursor !== null &&
+        (cursor.length === 0 || cursor.length > 1024 || /[\s\p{Cc}]/u.test(cursor)))
     )
       throw failure("invalid-response", host);
     for (const [key, value] of expected.searchParams)
@@ -566,7 +571,10 @@ export const make = Effect.gen(function* () {
     const { repository } = verified;
     const page = valid.page ?? 1,
       pageSize = valid.pageSize ?? 100;
-    const endpoint = `repos/${repository.nameWithOwner}/issues?state=all&sort=updated&direction=asc&since=${encodeURIComponent(valid.since)}&per_page=${pageSize}&page=${page}`;
+    // The stored epoch sentinel means a full sweep; GitHub returns no issues for that filter.
+    const since =
+      valid.since === "1970-01-01T00:00:00Z" ? "" : `&since=${encodeURIComponent(valid.since)}`;
+    const endpoint = `repos/${repository.nameWithOwner}/issues?state=all&sort=updated&direction=asc${since}&per_page=${pageSize}&page=${page}`;
     const response = yield* request(valid.cwd, valid.account, endpoint, valid.etag);
     if (response.status === 304) return { status: "not-modified", etag: response.etag, repository };
     const rows = yield* decodeBody(
