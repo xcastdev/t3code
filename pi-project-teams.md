@@ -7,7 +7,7 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-10-01 17:28 UTC. Implementation is running. **P1–P4 are complete. P5 authority and intake have landed.** Credential capture `9b93eae6c`, repaired model accounting `38873fa9e` and shared client reader `54f58879c` are independently approved. Combined human workflow/sync wave `5be52b50e` passes 472 cases; its review found one legal multi-issue UI defect. Repair `4b91bc86c` passes 87 affected cases and is with the same piece reviewer before the same wave reviewer rechecks integration. Parent phases remain open.
+Last updated: 2026-10-01 18:22 UTC. Implementation is running. **P1–P4 are complete. P5 authority and intake have landed.** Human workflow/sync wave `72b7db22c` is independently approved: 479 combined cases and 44 fresh reviewer cases pass, including actual SQLite-to-gateway-to-UI multi-issue writes. Shared repository authority/source pinning `6e44f2afc`, comments reader `a45ae46ec`, credentials `9b93eae6c`, repaired model accounting `38873fa9e` and shared client reader `54f58879c` are approved. Root is reconciling wave dependency resolution before local integration. Parent phases remain open.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
@@ -37,22 +37,24 @@ Prioritize **Pi, OpenCode, Claude and Codex**. Shared contracts, migrations, wir
 
 Each row is one subagent seat. Finished agents release their seat. Worktrees and evidence live under `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                                     | State                                   | Assignment / exact base                | Next gate                                                        |
-| ---- | ----------------------------------------- | --------------------------------------- | -------------------------------------- | ---------------------------------------------------------------- |
-| 1    | — (last: `review_wave6_human_sync`)       | Waiting for reviewed repair             | Wave `5be52b50e`, base `130c33a0d`     | Same reviewer rechecks actual gateway-to-UI multi-issue behavior |
-| 2    | —                                         | Available                               | Independent scopes only                | Frozen interfaces and exclusive paths                            |
-| 3    | — (last: `review_p5_sync_worker`)         | Available; approved                     | `16a571e16`                            | Wave integration                                                 |
-| 4    | — (last: `review_p5_credential_snapshot`) | Available; approved                     | `9b93eae6c`                            | Production credential wiring and real GitHub proof               |
-| 5    | `p5_issue_comments_high`                  | Active; waiting for shared source fence | Base `5be52b50e`; two new reader paths | Remote revision boundary adoption, final checks and review       |
-| 6    | — (last: `review_p6_client_foundation`)   | Available; approved                     | `54f58879c`, base `5be52b50e`          | Root cursor codec and real client wiring                         |
-| 7    | `review_p6_guided_human_view`             | Active same-reviewer repair recheck     | `4b91bc86c`, parent `a2cdd13c2`        | 87 affected cases, then actual combined gateway proof            |
-| 8    | — (last: `review_p7_model_accounting`)    | Available; repair approved              | `38873fa9e`, parent `5fa428b19`        | Durable operation resolution and production runtime integration  |
-| 9    | —                                         | Available                               | Independent scopes only                | Frozen interfaces and exclusive paths                            |
-| 10   | —                                         | Available                               | Independent scopes only                | Frozen interfaces and exclusive paths                            |
+| Slot | Agent                                      | State                      | Assignment / exact base                 | Next gate                                                        |
+| ---- | ------------------------------------------ | -------------------------- | --------------------------------------- | ---------------------------------------------------------------- |
+| 1    | — (last: `review_wave6_human_sync`)        | Available; repair approved | `72b7db22c`, base `130c33a0d`           | Dependency-tuple reconciliation and local wave integration       |
+| 2    | — (last: `review_p5_repository_authority`) | Available; approved        | `6e44f2afc`                             | Same reviewer checks explicit detached-rebind repair             |
+| 3    | — (last: `review_p5_sync_worker`)          | Available; approved        | `16a571e16`                             | Production manager/server wiring                                 |
+| 4    | — (last: `review_p5_credential_snapshot`)  | Available; approved        | `9b93eae6c`                             | Production wiring and real GitHub proof                          |
+| 5    | — (last: `review_p5_issue_comments`)       | Available; approved        | `a45ae46ec`, base `f7420634a`           | Authenticated RPC and current credential wiring                  |
+| 6    | — (last: `review_p6_client_foundation`)    | Available; approved        | `54f58879c`, base `5be52b50e`           | Root cursor/capability boundary and live client integration      |
+| 7    | — (last: `review_p6_guided_human_view`)    | Available; repair approved | `4b91bc86c`                             | Work entrypoint integration                                      |
+| 8    | — (last: `review_p7_model_accounting`)     | Available; repair approved | `38873fa9e`                             | Actual durable operation resolution and runtime                  |
+| 9    | `p5_repository_manager_high`               | Active; final compiler     | Base `6e44f2afc`; two new manager paths | 28 native cases pass; final strict gate, commit and fresh review |
+| 10   | —                                          | Available                  | Independent scopes only                 | Frozen interfaces and exclusive paths                            |
 
-Coordinator: root verified all 56 guided repair, 33 accounting repair-review and 40 client review artifacts, in addition to previous seals. Accounting now refuses inherited SQL transactions before granting durable receipts; 15 affected cases and three independent SQL controls pass. The client reader passes 40 cases plus five independent controls. Credential review passes 45 cases plus five native subprocess groups. No parent acceptance criterion is closed by these leaf approvals.
+Coordinator: shared repository authority passes 73 focused cases plus seven independent SQLite/remote-protocol control groups. Comments passes 33 focused cases plus ten independent native controls, including cancellation/expiry during an already committed cache transaction. Derived cache may survive a completed commit; the caller receives no false success and a fresh read revalidates authority. No parent criterion is closed by these approvals.
 
-Root owns isolated `p5-production-wiring`, base `5be52b50e`, including approved credential adoption `76fe5205f`. Its four shared paths cover successful retry-deadline preservation, verified account-login retention, canonical rename/explicit rebind and remote comment source pinning. The combined focused test gate passes 71/71; strict compilation caught a missing optional account-login input declaration, which is being fixed before review. The comments worker identified a second source-revision check required after a remote comments response, including 304; root is adding that check. Unreviewed changes remain private.
+Root owns private P5 production wiring and the P6 cursor/capability boundary. P6 has 97 passing focused cases and a passing normal server compiler; the contract compiler caught one stale decoder name in a new invalid-cursor fixture, now corrected before review. Private worktree dependencies were repaired to resolve their own workspace packages rather than main's older contracts. No global dependency links, TypeScript aliases or diagnostic settings were changed.
+
+Evidence correction: one wave repair compiler command accidentally targeted the original sealed web build cache. Its original manifest remains unchanged, and 52 of 53 original artifacts still match. The original cache cannot be claimed intact. A fresh compiler with a new cache passes against all 833 physical inputs; the same wave reviewer independently verifies and approves that replacement evidence. The failed command and attempted recovery remain recorded. No requirement is waived.
 
 Browser and available device use are approved against disposable state. Private GitHub fixture repository is created but empty; creation alone proves no workflow. Android is available; the existing emulator belongs to another proof and has not been disturbed. iOS is unavailable on this Linux host because macOS/Xcode are required; this platform gate remains open. No browser/device session, dev server or model call has been started in this continuation.
 
