@@ -1,6 +1,8 @@
 import * as NodeCrypto from "node:crypto";
 import type {
   McpServerId,
+  ProviderInstanceId,
+  ProjectTeamCredential,
   ProjectMcpCredentialId,
   ResolvedProjectMcpServer,
   ThreadId,
@@ -30,6 +32,7 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import { HttpServer } from "effect/unstable/http";
 
+import * as ProjectTeamAuthorization from "../projectWork/ProjectTeamAuthorization.ts";
 import type { ConnectProjectMcpServerInput, ProjectMcpConnection } from "./ProjectMcpConnection.ts";
 import {
   connectProjectMcpServer,
@@ -55,6 +58,8 @@ export interface ProjectMcpProxyEndpoint {
 export interface ProjectMcpProxySessionInput {
   readonly providerSessionId: string;
   readonly threadId: ThreadId;
+  readonly providerInstanceId?: ProviderInstanceId;
+  readonly managed?: ProjectTeamCredential;
   readonly servers: ReadonlyArray<ResolvedProjectMcpServer>;
   /** Used by tests and by secret-store integrations that already own a lease. */
   readonly resolveSecret?: (serverId: McpServerId, credentialId: string) => string | undefined;
@@ -123,6 +128,7 @@ interface LegacySessionRecord {
 interface SessionRecord {
   readonly providerSessionId: string;
   readonly threadId: ThreadId;
+  readonly managed?: ProjectTeamCredential;
   readonly servers: ReadonlyMap<string, ResolvedProjectMcpServer>;
   readonly endpoints: ReadonlyMap<string, ProjectMcpProxyEndpoint>;
   readonly connections: Map<string, ConnectionRecord>;
@@ -427,6 +433,9 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
         : "http://127.0.0.1/mcp"),
   );
   const connect = options.connect ?? connectProjectMcpServer;
+  const authorization = yield* Effect.serviceOption(
+    ProjectTeamAuthorization.ProjectTeamAuthorization,
+  );
   const sessions = new Map<string, SessionRecord>();
 
   const closeConnection = async (entry: ConnectionRecord): Promise<void> => {
@@ -473,6 +482,19 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
   const registerSession: ProjectMcpProxyRegistryShape["registerSession"] = Effect.fn(
     "ProjectMcpProxyRegistry.registerSession",
   )(function* (input) {
+    if (
+      authorization._tag === "Some" &&
+      (yield* authorization.value.hasManagedThread(input.threadId).pipe(Effect.orDie))
+    )
+      return yield* Effect.die(new ProjectMcpProxyUnauthorizedError());
+    let managed = input.managed;
+    if (authorization._tag === "Some" && input.providerInstanceId !== undefined)
+      managed =
+        managed ??
+        (yield* authorization.value
+          .discover({ providerInstanceId: input.providerInstanceId, threadId: input.threadId })
+          .pipe(Effect.orDie));
+    if (managed !== undefined) return yield* Effect.die(new ProjectMcpProxyUnauthorizedError());
     yield* revokeProviderSession(input.providerSessionId);
     const endpointMap = new Map<string, ProjectMcpProxyEndpoint>();
     const serverMap = new Map<string, ResolvedProjectMcpServer>();
@@ -501,9 +523,15 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
         }),
       );
     }
+    if (
+      authorization._tag === "Some" &&
+      (yield* authorization.value.hasManagedThread(input.threadId).pipe(Effect.orDie))
+    )
+      return yield* Effect.die(new ProjectMcpProxyUnauthorizedError());
     sessions.set(input.providerSessionId, {
       providerSessionId: input.providerSessionId,
       threadId: input.threadId,
+      ...(managed === undefined ? {} : { managed }),
       servers: serverMap,
       endpoints: endpointMap,
       connections: new Map(),
@@ -516,20 +544,28 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
     return [...endpointMap.values()];
   });
 
-  const resolve: ProjectMcpProxyRegistryShape["resolve"] = (providerSessionId, endpointHandle) =>
-    Effect.sync(() => {
-      const session = sessions.get(providerSessionId);
-      const server = session?.servers.get(endpointHandle);
-      return server &&
-        session &&
-        !session.revoked &&
-        !session.revokedServerIds.has(server.id) &&
-        !session.revokedOAuthStorageIds.has(
-          ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId),
-        )
-        ? { server, threadId: session.threadId }
-        : undefined;
-    });
+  const resolve: ProjectMcpProxyRegistryShape["resolve"] = Effect.fn(
+    "ProjectMcpProxyRegistry.resolve",
+  )(function* (providerSessionId, endpointHandle) {
+    const session = sessions.get(providerSessionId);
+    if (
+      session !== undefined &&
+      authorization._tag === "Some" &&
+      (yield* authorization.value.hasManagedThread(session.threadId).pipe(Effect.orDie))
+    )
+      return undefined;
+    const server = session?.servers.get(endpointHandle);
+    if (session?.managed !== undefined) return undefined;
+    return server &&
+      session &&
+      !session.revoked &&
+      !session.revokedServerIds.has(server.id) &&
+      !session.revokedOAuthStorageIds.has(
+        ProjectMcpOAuth.storageIdForServer(server.id, server.transportDefinitionId),
+      )
+      ? { server, threadId: session.threadId }
+      : undefined;
+  });
 
   const getConnection = (session: SessionRecord, endpointHandle: string) => {
     const existing = session.connections.get(endpointHandle);
@@ -737,6 +773,14 @@ const makeWithOptions = Effect.fn("ProjectMcpProxyRegistry.make")(function* (
     "ProjectMcpProxyRegistry.handle",
   )(function* (providerSessionId, endpointHandle, request) {
     const session = sessions.get(providerSessionId);
+    if (
+      session !== undefined &&
+      authorization._tag === "Some" &&
+      (yield* authorization.value
+        .hasManagedThread(session.threadId)
+        .pipe(Effect.mapError(() => new ProjectMcpProxyUnauthorizedError())))
+    )
+      return yield* Effect.fail(new ProjectMcpProxyUnauthorizedError());
     const server = session?.servers.get(endpointHandle);
     if (!session || session.revoked) {
       return yield* Effect.fail<ProjectMcpProxyError>(new ProjectMcpProxyUnauthorizedError());

@@ -1097,6 +1097,10 @@ export const ProjectSettingsOverrides = Schema.Struct({
 export type ProjectSettingsOverrides = typeof ProjectSettingsOverrides.Type;
 
 export const ServerSettings = Schema.Struct({
+  /** Opt-in only; runtime eligibility also requires supported host capabilities and explicit limits. */
+  projectTeamExecutionEnabled: Schema.Boolean.pipe(
+    Schema.withDecodingDefault(Effect.succeed(false)),
+  ),
   /** Enables the durable project work and knowledge aggregate for this environment. */
   projectWorkEnabled: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   // How assistant text reaches clients during a turn. Deliberately a fresh
@@ -1442,6 +1446,7 @@ const OpenCodeSettingsPatch = Schema.Struct({
 
 export const ServerSettingsPatch = Schema.Struct({
   // Server settings
+  projectTeamExecutionEnabled: Schema.optionalKey(Schema.Boolean),
   projectWorkEnabled: Schema.optionalKey(Schema.Boolean),
   responseStreamingMode: Schema.optionalKey(ResponseStreamingMode),
   enableProviderUpdateChecks: Schema.optionalKey(Schema.Boolean),

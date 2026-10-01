@@ -1,4 +1,8 @@
 import {
+  seed as seedTeam,
+  scoped as teamScoped,
+} from "../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+import {
   EnvironmentId,
   ProjectId,
   ProviderInstanceId,
@@ -654,3 +658,43 @@ describe("ProjectTerminalService", () => {
     },
   );
 });
+
+for (const role of ["investigator", "implementer", "integrator"])
+  effectIt.effect(
+    `denies managed ${role} host terminals before creating or writing a process`,
+    () =>
+      teamScoped(
+        Effect.gen(function* () {
+          const f = yield* seedTeam(role);
+          const harness = makeHarness();
+          const service = yield* ProjectTerminalService.pipe(Effect.provide(harness.layer));
+          const invocation = {
+            environmentId: EnvironmentId.make("environment"),
+            providerInstanceId: f.principal.managed.providerInstanceId,
+            threadId: f.principal.managed.threadId,
+            providerSessionId: "managed-mcp-session",
+            managed: f.principal.managed,
+            capabilities: new Set(["terminal" as const]),
+            issuedAt: 0,
+          };
+          expect(
+            (yield* service
+              .spawn({ command: "forbidden" })
+              .pipe(
+                Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+                Effect.result,
+              ))._tag,
+          ).toBe("Failure");
+          expect(
+            (yield* service
+              .write({ terminalId: "host-terminal", data: "forbidden" })
+              .pipe(
+                Effect.provideService(McpInvocationContext.McpInvocationContext, invocation),
+                Effect.result,
+              ))._tag,
+          ).toBe("Failure");
+          expect(harness.createInputs).toHaveLength(0);
+          expect(harness.accessAttempts).toHaveLength(0);
+        }),
+      ),
+  );

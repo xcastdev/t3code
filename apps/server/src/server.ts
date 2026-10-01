@@ -130,6 +130,7 @@ import * as ProjectWorkQuery from "./projectWork/ProjectWorkQuery.ts";
 import * as ProjectWorkSearch from "./projectWork/ProjectWorkSearch.ts";
 import * as ProjectWorkBriefing from "./projectWork/ProjectWorkBriefing.ts";
 import * as ProjectWorkNarrative from "./projectWork/ProjectWorkNarrative.ts";
+import * as ProjectTeamAuthorization from "./projectWork/ProjectTeamAuthorization.ts";
 import * as ProjectWorkGateway from "./projectWork/ProjectWorkGateway.ts";
 import * as ProjectWorkAttentionReactor from "./projectWork/ProjectWorkAttentionReactor.ts";
 import * as ProjectWorkContentGuard from "./projectWork/ProjectWorkContentGuard.ts";
@@ -374,7 +375,12 @@ const ProjectMcpServiceLayerLive = ProjectMcpService.layer.pipe(
   Layer.provideMerge(ProjectMcpOAuthLayerLive),
 );
 
+const ProjectTeamAuthorizationLive = ProjectTeamAuthorization.layer.pipe(
+  Layer.provideMerge(SqlitePersistenceLayerLive),
+);
+
 const ProjectMcpProxyRegistryLayerLive = ProjectMcpProxyRegistry.layer.pipe(
+  Layer.provideMerge(ProjectTeamAuthorizationLive),
   Layer.provide(ProjectMcpOAuthLayerLive),
 );
 
@@ -383,6 +389,7 @@ const McpCatalogGatewayLayerLive = McpCatalogGateway.layer.pipe(
 );
 
 const McpSessionRegistryLayerLive = McpSessionRegistry.layer.pipe(
+  Layer.provideMerge(ProjectTeamAuthorizationLive),
   Layer.provide(ProjectMcpProxyRegistryLayerLive),
 );
 
@@ -584,15 +591,18 @@ const ServerEnvironmentLayerLive = ServerEnvironment.layer.pipe(
 );
 
 const AuthLayerLive = EnvironmentAuth.layer.pipe(
+  Layer.provideMerge(ProjectTeamAuthorizationLive),
   Layer.provideMerge(PersistenceLayerLive),
   Layer.provide(ServerEnvironmentLayerLive),
   Layer.provide(ServerSecretStore.layer),
 );
 
+const ProjectWorkCoreLive = ProjectWorkRuntime.coreLayer.pipe(
+  Layer.provide(ProjectTeamAuthorizationLive),
+);
+
 const ProjectWorkServicesLive = Layer.mergeAll(
-  ProjectWorkRuntime.coreLayer,
-  ProjectWorkRuntime.leaseLayer,
-  ProjectWorkRuntime.leaseWorkerLayer,
+  ProjectWorkRuntime.withCore(ProjectWorkCoreLive),
   ProjectWorkProjection.ProjectWorkProjectionLive,
   ProjectWorkQuery.ProjectWorkQueryLive,
   ProjectWorkSearch.ProjectWorkSearchLive,
@@ -605,11 +615,13 @@ const ProjectWorkServicesLive = Layer.mergeAll(
 ).pipe(Layer.provideMerge(ProjectWorkContentGuardLive), Layer.provideMerge(PersistenceLayerLive));
 
 const ProjectLifecycleLive = ProjectLifecycle.ProjectLifecycleLive.pipe(
+  Layer.provideMerge(ProjectWorkCoreLive),
   Layer.provideMerge(PersistenceLayerLive),
   Layer.provideMerge(ServerEnvironmentLayerLive),
 );
 
 const ProjectWorkGatewayLive = ProjectWorkGateway.ProjectWorkGatewayLive.pipe(
+  Layer.provideMerge(ProjectTeamAuthorizationLive),
   Layer.provideMerge(ProjectWorkServicesLive),
   Layer.provideMerge(ProjectLifecycleLive),
 );

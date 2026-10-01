@@ -897,3 +897,10 @@ it("validates remote device hosts and rejects ambiguous host ids", () => {
   ).toThrow();
   expect(() => decodeDeviceHostSettings({ deviceHosts: [{ ...host, port: 0 }] })).toThrow();
 });
+
+it("keeps managed teams default disabled independently of Project Work", () => {
+  expect(decodeServerSettings({ projectWorkEnabled: true }).projectTeamExecutionEnabled).toBe(
+    false,
+  );
+  expect(decodeServerSettings({}).projectTeamExecutionEnabled).toBe(false);
+});

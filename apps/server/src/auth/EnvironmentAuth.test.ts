@@ -639,3 +639,673 @@ it.layer(NodeServices.layer)("EnvironmentAuth.layer", (it) => {
       ),
   );
 });
+
+import * as TeamAuthorization from "../projectWork/ProjectTeamAuthorization.ts";
+import { ProjectWorkRepositoryLive } from "../projectWork/ProjectWorkRepository.ts";
+import {
+  seed as seedTeam,
+  decodeRecord as decodeTeamRecord,
+} from "../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+import {
+  authorizeRpcSession,
+  guardRpcEffect,
+  guardRpcStream,
+  guardRpcStreamEffect,
+} from "./RpcAuthorization.ts";
+import { WS_METHODS, ORCHESTRATION_WS_METHODS } from "@t3tools/contracts";
+import * as Stream from "effect/Stream";
+
+const managedAuthLayer = Layer.mergeAll(EnvironmentAuth.layer, ProjectWorkRepositoryLive).pipe(
+  Layer.provideMerge(TeamAuthorization.layer),
+  Layer.provide(ServerSecretStore.layer),
+  Layer.provide(ServerEnvironment.identityLayer),
+  Layer.provideMerge(makeServerConfigLayer()),
+  Layer.provideMerge(SqlitePersistenceMemory),
+  Layer.provideMerge(NodeServices.layer),
+);
+it.effect(
+  "enforces current SQL credentials before managed RPC side effects and every stream payload",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const legacy = yield* auth.issueSession({
+        identity: { kind: "agent", id: "agent:mcp:pi:authorization-thread" },
+      });
+      const legacySession = yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token));
+      expect(legacySession.managed).toBeUndefined();
+      const f = yield* seedTeam("implementer");
+      expect(
+        (yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token)).pipe(Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* auth.issueSession({ subject: "agent:project-team:forged" }).pipe(Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* auth
+          .createPairingLink({ subject: "agent:project-team:forged" })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      const issued = yield* auth.issueSession({ managed: f.principal.managed });
+      const session = yield* auth.authenticateHttpRequest(makeBearerRequest(issued.token));
+      expect(session.managed).toEqual(f.principal.managed);
+      let effects = 0;
+      for (const method of [
+        WS_METHODS.terminalOpen,
+        WS_METHODS.gitCommitIndex,
+        WS_METHODS.gitRunStackedAction,
+        ORCHESTRATION_WS_METHODS.dispatchCommand,
+        WS_METHODS.projectWorkRequestApproval,
+      ]) {
+        const result = yield* guardRpcEffect(
+          authorizeRpcSession(method, session, auth),
+          Effect.sync(() => effects++),
+        ).pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+      }
+      expect(effects).toBe(0);
+      yield* guardRpcEffect(
+        authorizeRpcSession(WS_METHODS.projectWorkRead, session, auth),
+        Effect.sync(() => effects++),
+      );
+      expect(effects).toBe(1);
+      const validation = authorizeRpcSession(WS_METHODS.projectWorkSubscribe, session, auth);
+      const received: string[] = [];
+      const values = Stream.fromIterable(["allowed", "must-not-leak"]).pipe(
+        Stream.mapEffect((value) =>
+          value === "allowed"
+            ? Effect.succeed(value)
+            : f
+                .change(decodeTeamRecord({ ...f.binding, revision: 1, status: "revoked" }))
+                .pipe(Effect.as(value)),
+        ),
+      );
+      const result = yield* guardRpcStream(validation, values).pipe(
+        Stream.runForEach((value) => Effect.sync(() => received.push(value))),
+        Effect.result,
+      );
+      expect(result._tag).toBe("Failure");
+      expect(received).toEqual(["allowed"]);
+      let constructed = false;
+      expect(
+        (yield* guardRpcStreamEffect(
+          validation,
+          Effect.sync(() => {
+            constructed = true;
+            return Stream.make("secret");
+          }),
+        ).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(constructed).toBe(false);
+      expect(
+        (yield* auth.authenticateHttpRequest(makeBearerRequest(issued.token)).pipe(Effect.result))
+          ._tag,
+      ).toBe("Failure");
+      yield* f.sql`DELETE FROM project_team_run_binding WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_events WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${f.principal.managed.projectId}`;
+      expect((yield* auth.validateCurrentSession!(legacySession).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      expect((yield* auth.validateCurrentSession!(session).pipe(Effect.result))._tag).toBe(
+        "Failure",
+      );
+      const restartedAuth = yield* EnvironmentAuth.EnvironmentAuth.pipe(
+        Effect.provide(
+          EnvironmentAuth.layer.pipe(
+            Layer.provide(Layer.fresh(TeamAuthorization.layer)),
+            Layer.provide(ServerSecretStore.layer),
+            Layer.provide(ServerEnvironment.identityLayer),
+            Layer.provide(makeServerConfigLayer()),
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      );
+      expect(
+        (yield* restartedAuth.validateCurrentSession!(legacySession).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+    }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+);
+
+import * as McpSessionRegistry from "../mcp/McpSessionRegistry.ts";
+import { HttpServer } from "effect/unstable/http";
+import {
+  EnvironmentId,
+  ProviderInstanceId,
+  ThreadId,
+  CommandId,
+  ProjectWorkTaskId,
+  ProjectWorkAttemptId,
+  ProjectWorkCriterionId,
+} from "@t3tools/contracts";
+import { at } from "../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+
+for (const issuance of [
+  "successful",
+  "retired-role",
+  "settled-binding",
+  "ambiguous-bindings",
+] as const)
+  it.effect(`permanently withdraws old environment bearers on MCP-only ${issuance} issuance`, () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const config = yield* ServerConfig.ServerConfig;
+      const legacy = yield* auth.issueSession({
+        identity: { kind: "agent", id: "agent:mcp:pi:authorization-thread" },
+      });
+      const ordinary = yield* auth.issueSession({
+        identity: { kind: "agent", id: "agent:ordinary" },
+      });
+      const held = yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token));
+      const f = yield* seedTeam("implementer", "running", { issueCredential: false });
+      const before =
+        yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+      // Trusted binding storage withdraws the old bearer before any credential issuance.
+      expect(before[0]?.revokedAt).not.toBeNull();
+      if (issuance === "retired-role")
+        yield* f.change(decodeTeamRecord({ ...f.role, revision: 1, status: "retired" }));
+      else if (issuance === "settled-binding")
+        yield* f.change(decodeTeamRecord({ ...f.binding, revision: 1, status: "settled" }));
+      else if (issuance === "ambiguous-bindings") {
+        const otherTask = ProjectWorkTaskId.make("other-task");
+        const otherAttempt = ProjectWorkAttemptId.make("other-attempt");
+        const criterion = ProjectWorkCriterionId.make("other-criterion");
+        yield* f.repo.execute({
+          type: "project-work.task.create",
+          projectId: f.principal.managed.projectId,
+          taskId: otherTask,
+          commandId: CommandId.make("other-create"),
+          title: "Other task",
+          createdAt: at,
+        });
+        yield* f.repo.execute({
+          type: "project-work.criterion.upsert",
+          projectId: f.principal.managed.projectId,
+          taskId: otherTask,
+          commandId: CommandId.make("other-criterion"),
+          criterion: {
+            criterionId: criterion,
+            taskId: otherTask,
+            description: "Other scope",
+            required: false,
+            status: "unsatisfied",
+            satisfiedByEvidenceIds: [],
+            revision: 0,
+            updatedAt: at,
+          },
+          updatedAt: at,
+        });
+        yield* f.repo.execute({
+          type: "project-work.task.specify",
+          projectId: f.principal.managed.projectId,
+          taskId: otherTask,
+          commandId: CommandId.make("other-spec"),
+          specification: {
+            objective: "Other scope",
+            scopeIn: "Other",
+            scopeOut: "Assigned task",
+            criterionIds: [criterion],
+            revision: 1,
+            protected: false,
+          },
+          updatedAt: at,
+        });
+        yield* f.repo.execute({
+          type: "project-work.task.ready",
+          projectId: f.principal.managed.projectId,
+          taskId: otherTask,
+          commandId: CommandId.make("other-ready"),
+          updatedAt: at,
+        });
+        yield* f.repo.execute({
+          type: "project-work.task.claim",
+          projectId: f.principal.managed.projectId,
+          taskId: otherTask,
+          commandId: CommandId.make("other-claim"),
+          attemptId: otherAttempt,
+          leaseToken: "other-lease",
+          leasedUntil: "2030-01-01T00:00:00.000Z",
+          claimedAt: at,
+        });
+        yield* f.change(
+          decodeTeamRecord({
+            ...f.binding,
+            recordId: "other-binding",
+            taskId: otherTask,
+            attemptId: otherAttempt,
+          }),
+        );
+      }
+      const registry = yield* McpSessionRegistry.__testing.make({ now: () => 1000 }).pipe(
+        Effect.provideService(
+          HttpServer.HttpServer,
+          HttpServer.HttpServer.of({
+            address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: 43123 },
+            serve: () => Effect.void,
+          }),
+        ),
+        Effect.provideService(
+          ServerEnvironment.ServerEnvironment,
+          ServerEnvironment.ServerEnvironment.of({
+            getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+            getDescriptor: Effect.die("unused"),
+          }),
+        ),
+      );
+      for (const identity of [
+        {
+          providerInstanceId: ProviderInstanceId.make("codex"),
+          threadId: ThreadId.make("authorization-thread"),
+        },
+        {
+          providerInstanceId: ProviderInstanceId.make("pi"),
+          threadId: ThreadId.make("ordinary-thread"),
+        },
+      ]) {
+        const bearer = yield* auth.issueSession({
+          identity: { kind: "agent", id: TeamAuthorization.managedActorId(identity) },
+        });
+        expect(
+          (yield* registry.issue({ ...identity, managed: f.principal.managed }).pipe(Effect.exit))
+            ._tag,
+        ).toBe("Failure");
+        expect(
+          (yield* auth.authenticateHttpRequest(makeBearerRequest(bearer.token))).identity.id,
+        ).toBe(TeamAuthorization.managedActorId(identity));
+      }
+      const managedMcp = yield* registry
+        .issue({
+          threadId: ThreadId.make("authorization-thread"),
+          providerInstanceId: ProviderInstanceId.make("pi"),
+        })
+        .pipe(Effect.exit);
+      expect(managedMcp._tag).toBe(issuance === "successful" ? "Success" : "Failure");
+      const withdrawn =
+        yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+      expect(withdrawn[0]?.revokedAt).not.toBeNull();
+      if (managedMcp._tag === "Success")
+        expect(
+          yield* registry.resolve(
+            managedMcp.value.config.authorizationHeader.replace("Bearer ", ""),
+          ),
+        ).toBeDefined();
+      expect(
+        (yield* authorizeRpcSession(WS_METHODS.terminalOpen, held, auth).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      yield* f.sql`DELETE FROM project_team_run_binding WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_events WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${f.principal.managed.projectId}`;
+      expect(
+        (yield* authorizeRpcSession(WS_METHODS.terminalOpen, held, auth).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      const restarted = yield* EnvironmentAuth.EnvironmentAuth.pipe(
+        Effect.provide(
+          EnvironmentAuth.layer.pipe(
+            Layer.provide(Layer.fresh(TeamAuthorization.layer)),
+            Layer.provide(ServerSecretStore.layer),
+            Layer.provide(ServerEnvironment.identityLayer),
+            Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      );
+      let effects = 0;
+      const result = yield* guardRpcEffect(
+        authorizeRpcSession(WS_METHODS.terminalOpen, held, restarted),
+        Effect.sync(() => effects++),
+      ).pipe(Effect.result);
+      expect(result._tag).toBe("Failure");
+      expect(effects).toBe(0);
+      expect(
+        (yield* restarted
+          .authenticateHttpRequest(makeBearerRequest(legacy.token))
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* restarted.authenticateHttpRequest(makeBearerRequest(ordinary.token))).identity.id,
+      ).toBe("agent:ordinary");
+      const revoked =
+        yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+      expect(revoked[0]?.revokedAt).not.toBeNull();
+      yield* registry.revokeAll;
+    }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+  );
+
+it.effect("preserves a valid managed environment bearer through repeated trusted issuance", () =>
+  Effect.gen(function* () {
+    const f = yield* seedTeam("implementer");
+    const auth = yield* EnvironmentAuth.EnvironmentAuth;
+    const bearer = yield* auth.issueSession({ managed: f.principal.managed });
+    yield* f.change(decodeTeamRecord({ ...f.binding, revision: 1 }));
+    for (let n = 0; n < 3; n++) {
+      yield* f.auth.issueCredential(f.principal.managed);
+      const session = yield* auth.authenticateHttpRequest(makeBearerRequest(bearer.token));
+      yield* authorizeRpcSession(WS_METHODS.projectWorkRead, session, auth);
+    }
+  }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+);
+
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+
+for (const timing of ["before", "queued", "interrupted", "queued-update"] as const)
+  it.effect(`keeps binding observation and withdrawal consistent for ${timing} issuance`, () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const config = yield* ServerConfig.ServerConfig;
+      const sql = yield* SqlClient.SqlClient;
+      const legacy = yield* auth.issueSession({
+        identity: { kind: "agent", id: "agent:mcp:pi:authorization-thread" },
+      });
+      const held = yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token));
+      const preseed =
+        timing === "queued"
+          ? undefined
+          : yield* seedTeam("implementer", "running", { issueCredential: false });
+      const completed = yield* Deferred.make<{
+        readonly inTransaction: boolean;
+        readonly bindingCount: number;
+      }>();
+      const release = yield* Deferred.make<void>();
+      const updateRequested = yield* Deferred.make<void>();
+      const issuedAuthority = yield* Deferred.make<
+        TeamAuthorization.ProjectTeamAuthority | undefined
+      >();
+      let intercepted = false;
+      // Preserve SQL execution/results while holding the first binding observation or withdrawal receipt.
+      const racingSql = new Proxy(sql, {
+        apply(target, _receiver, args) {
+          const statement = target(args[0], ...args.slice(1));
+          if (!Array.isArray(args[0]) || !("raw" in args[0])) return statement;
+          const bindingObservation = statement
+            .compile()[0]
+            .includes("SELECT DISTINCT project_id AS projectId FROM project_team_run_binding");
+          if (
+            !intercepted &&
+            (statement.compile()[0].includes("UPDATE auth_sessions SET revoked_at=") ||
+              (timing !== "interrupted" && bindingObservation))
+          ) {
+            intercepted = true;
+            return statement.pipe(
+              Effect.tap((observedRows) =>
+                Effect.gen(function* () {
+                  const transaction = yield* Effect.serviceOption(sql.transactionService);
+                  const rows = bindingObservation
+                    ? observedRows
+                    : yield* sql`SELECT record_id FROM project_team_run_binding WHERE provider_instance_id='pi' AND thread_id='authorization-thread'`;
+                  yield* Deferred.succeed(completed, {
+                    inTransaction: transaction._tag === "Some",
+                    bindingCount: rows.length,
+                  });
+                  yield* Deferred.await(release);
+                }),
+              ),
+            );
+          }
+          if (
+            timing === "queued-update" &&
+            statement.compile()[0].includes("UPDATE auth_sessions SET revoked_at=")
+          )
+            return Deferred.succeed(updateRequested, undefined).pipe(Effect.andThen(statement));
+          return statement;
+        },
+      });
+      const authorization = yield* TeamAuthorization.ProjectTeamAuthorization.pipe(
+        Effect.provide(
+          Layer.fresh(TeamAuthorization.layer).pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, racingSql)),
+          ),
+        ),
+      );
+      const registry = yield* McpSessionRegistry.__testing.make({ now: () => 1000 }).pipe(
+        Effect.provideService(
+          TeamAuthorization.ProjectTeamAuthorization,
+          TeamAuthorization.ProjectTeamAuthorization.of({
+            ...authorization,
+            // Observe the actual returned authority without changing it.
+            issueCredential: (identity) =>
+              authorization
+                .issueCredential(identity)
+                .pipe(Effect.tap((authority) => Deferred.succeed(issuedAuthority, authority))),
+          }),
+        ),
+        Effect.provideService(
+          HttpServer.HttpServer,
+          HttpServer.HttpServer.of({
+            address: { _tag: "TcpAddress", hostname: "127.0.0.1", port: 43123 },
+            serve: () => Effect.void,
+          }),
+        ),
+        Effect.provideService(
+          ServerEnvironment.ServerEnvironment,
+          ServerEnvironment.ServerEnvironment.of({
+            getEnvironmentId: Effect.succeed(EnvironmentId.make("environment")),
+            getDescriptor: Effect.die("unused"),
+          }),
+        ),
+      );
+      const request = {
+        providerInstanceId: ProviderInstanceId.make("pi"),
+        threadId: ThreadId.make("authorization-thread"),
+      };
+      const pending = yield* registry.issue(request).pipe(Effect.exit, Effect.forkScoped);
+      const receipt = yield* Deferred.await(completed);
+      expect(receipt.bindingCount).toBe(timing === "queued" ? 0 : 1);
+      if (timing === "queued-update") {
+        const ownerHeld = yield* Deferred.make<void>();
+        const ownerRelease = yield* Deferred.make<void>();
+        const owner = yield* sql
+          .withTransaction(
+            Effect.gen(function* () {
+              yield* Deferred.succeed(ownerHeld, undefined);
+              yield* Deferred.await(ownerRelease);
+            }),
+          )
+          .pipe(Effect.forkScoped);
+        yield* Deferred.await(ownerHeld);
+        yield* Deferred.succeed(release, undefined);
+        yield* Deferred.await(updateRequested);
+        yield* Fiber.interrupt(pending);
+        expect((yield* Fiber.await(pending))._tag).toBe("Failure");
+        expect(yield* Deferred.isDone(ownerRelease)).toBe(false);
+        yield* Deferred.succeed(ownerRelease, undefined);
+        yield* Fiber.join(owner);
+      } else if (timing === "interrupted") {
+        yield* Fiber.interrupt(pending);
+        expect((yield* Fiber.await(pending))._tag).toBe("Failure");
+      } else if (timing === "queued") {
+        const attempted = yield* Deferred.make<void>();
+        const writerSql = new Proxy(sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            if (!Array.isArray(args[0]) || !("raw" in args[0])) return statement;
+            Deferred.doneUnsafe(attempted, Effect.void);
+            return statement;
+          },
+        });
+        const writer = yield* seedTeam("implementer", "running", { issueCredential: false }).pipe(
+          Effect.provideService(SqlClient.SqlClient, writerSql),
+          Effect.forkScoped,
+        );
+        yield* Deferred.await(attempted);
+        // The completed empty SELECT owns no transaction; the committed fence refuses stale fallback.
+        expect(receipt.inTransaction).toBe(false);
+        yield* Fiber.join(writer);
+        yield* Deferred.succeed(release, undefined);
+        expect((yield* Fiber.join(pending))._tag).toBe("Failure");
+        expect(yield* Deferred.isDone(issuedAuthority)).toBe(false);
+        const managed = yield* registry.issue(request);
+        expect(
+          (yield* registry.resolve(managed.config.authorizationHeader.replace("Bearer ", "")))
+            ?.managed,
+        ).toBeDefined();
+      } else {
+        yield* Deferred.succeed(release, undefined);
+        yield* Fiber.join(pending);
+        expect((yield* Deferred.await(issuedAuthority))?.credential).toEqual(
+          preseed!.principal.managed,
+        );
+      }
+      // These ordinary statements also prove interruption/release returned the SQL permit.
+      const withdrawn =
+        yield* sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+      yield* sql`DELETE FROM project_team_run_binding WHERE project_id='authorization-project'`;
+      yield* sql`DELETE FROM project_work_events WHERE project_id='authorization-project'`;
+      yield* sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id='authorization-project'`;
+      const restarted = yield* EnvironmentAuth.EnvironmentAuth.pipe(
+        Effect.provide(
+          EnvironmentAuth.layer.pipe(
+            Layer.provide(Layer.fresh(TeamAuthorization.layer)),
+            Layer.provide(ServerSecretStore.layer),
+            Layer.provide(ServerEnvironment.identityLayer),
+            Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      );
+      let effects = 0;
+      const guarded = yield* guardRpcEffect(
+        authorizeRpcSession(WS_METHODS.terminalOpen, held, restarted),
+        Effect.sync(() => effects++),
+      ).pipe(Effect.result);
+      const bearer = yield* restarted
+        .authenticateHttpRequest(makeBearerRequest(legacy.token))
+        .pipe(Effect.result);
+      expect({
+        withdrawn: withdrawn[0]?.revokedAt !== null,
+        guarded: guarded._tag,
+        bearer: bearer._tag,
+        effects,
+      }).toEqual({
+        withdrawn: true,
+        guarded: "Failure",
+        bearer: "Failure",
+        effects: 0,
+      });
+      yield* registry.revokeAll;
+    }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+  );
+
+it.effect(
+  "cancels trusted issuance waiting for SQL ownership without retaining the connection",
+  () =>
+    Effect.gen(function* () {
+      yield* runMigrations();
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const legacy = yield* auth.issueSession({
+        identity: { kind: "agent", id: "agent:mcp:pi:authorization-thread" },
+      });
+      const held = yield* auth.authenticateHttpRequest(makeBearerRequest(legacy.token));
+      const f = yield* seedTeam("implementer", "running", { issueCredential: false });
+      const owned = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const requested = yield* Deferred.make<void>();
+      const owner = yield* f.sql
+        .withTransaction(
+          Effect.gen(function* () {
+            yield* Deferred.succeed(owned, undefined);
+            yield* Deferred.await(release);
+          }),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(owned);
+      let observed = false;
+      const waitingSql = new Proxy(f.sql, {
+        apply(target, _receiver, args) {
+          const statement = target(args[0], ...args.slice(1));
+          if (!Array.isArray(args[0]) || !("raw" in args[0])) return statement;
+          if (
+            !observed &&
+            statement
+              .compile()[0]
+              .includes("SELECT DISTINCT project_id AS projectId FROM project_team_run_binding")
+          ) {
+            observed = true;
+            return Deferred.succeed(requested, undefined).pipe(Effect.andThen(statement));
+          }
+          return statement;
+        },
+      });
+      const authorization = yield* TeamAuthorization.ProjectTeamAuthorization.pipe(
+        Effect.provide(
+          Layer.fresh(TeamAuthorization.layer).pipe(
+            Layer.provide(Layer.succeed(SqlClient.SqlClient, waitingSql)),
+          ),
+        ),
+      );
+      const pending = yield* authorization
+        .issueCredential(f.principal.managed)
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(requested);
+      // Cancellation must settle while the other real SQL owner still holds its permit.
+      yield* Fiber.interrupt(pending);
+      expect((yield* Fiber.await(pending))._tag).toBe("Failure");
+      expect(yield* Deferred.isDone(release)).toBe(false);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(owner);
+      const untouched =
+        yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+      expect(untouched[0]?.revokedAt).not.toBeNull();
+      expect(yield* authorization.issueCredential(f.principal.managed)).toBeDefined();
+      const withdrawn =
+        yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${held.sessionId}`;
+      expect(withdrawn[0]?.revokedAt).not.toBeNull();
+      expect(
+        (yield* authorizeRpcSession(WS_METHODS.terminalOpen, held, auth).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+    }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+);
+
+it.effect(
+  "durable identity fence denies a late legacy environment bearer after purge and fresh auth",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* seedTeam("implementer", "running", { issueCredential: false });
+      const auth = yield* EnvironmentAuth.EnvironmentAuth;
+      const config = yield* ServerConfig.ServerConfig;
+      // An internal raw-subject caller can publish after withdrawal; current authorization must still refuse it.
+      const late = yield* auth.issueSession({ subject: "agent:mcp:pi:authorization-thread" });
+      expect(
+        (yield* f.sql`SELECT revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${late.sessionId}`)[0]
+          ?.revokedAt,
+      ).toBeNull();
+      yield* f.sql`DELETE FROM project_team_run_binding WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_events WHERE project_id=${f.principal.managed.projectId}`;
+      yield* f.sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id=${f.principal.managed.projectId}`;
+      const restarted = yield* EnvironmentAuth.EnvironmentAuth.pipe(
+        Effect.provide(
+          EnvironmentAuth.layer.pipe(
+            Layer.provide(Layer.fresh(TeamAuthorization.layer)),
+            Layer.provide(ServerSecretStore.layer),
+            Layer.provide(ServerEnvironment.identityLayer),
+            Layer.provide(Layer.succeed(ServerConfig.ServerConfig, config)),
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
+      );
+      expect(
+        (yield* restarted
+          .authenticateHttpRequest(makeBearerRequest(late.token))
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      expect(
+        (yield* restarted
+          .issueSession({ identity: { kind: "agent", id: "agent:mcp:pi:authorization-thread" } })
+          .pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      for (const id of [
+        "agent:mcp:codex:authorization-thread",
+        "agent:mcp:pi:other-thread",
+        "agent:ordinary",
+      ]) {
+        const issued = yield* restarted.issueSession({ identity: { kind: "agent", id } });
+        expect(
+          (yield* restarted.authenticateHttpRequest(makeBearerRequest(issued.token))).identity.id,
+        ).toBe(id);
+      }
+    }).pipe(Effect.provide(Layer.fresh(managedAuthLayer))),
+);

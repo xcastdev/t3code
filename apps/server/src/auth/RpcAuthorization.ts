@@ -11,6 +11,10 @@ import {
   WS_METHODS,
   WsRpcGroup,
 } from "@t3tools/contracts";
+import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
+import type * as EnvironmentAuth from "./EnvironmentAuth.ts";
 import type * as RpcGroup from "effect/unstable/rpc/RpcGroup";
 
 type WsRpcMethod = RpcGroup.Rpcs<typeof WsRpcGroup>["_tag"];
@@ -268,3 +272,52 @@ export function requiredScopeForRpcMethod(method: string): AuthEnvironmentScope 
   }
   return requiredScope;
 }
+
+export class ManagedRpcAuthorizationError extends Schema.TaggedError<ManagedRpcAuthorizationError>()(
+  "ManagedRpcAuthorizationError",
+  { method: Schema.String },
+) {}
+/** Rechecks the durable credential, including on an already-open connection. */
+export const authorizeRpcSession = Effect.fn("RpcAuthorization.authorizeRpcSession")(function* (
+  method: string,
+  session: EnvironmentAuth.AuthenticatedSession,
+  auth: Pick<EnvironmentAuth.EnvironmentAuth["Service"], "validateCurrentSession">,
+) {
+  if (session.managed !== undefined && auth.validateCurrentSession === undefined)
+    return yield* new ManagedRpcAuthorizationError({ method });
+  const current =
+    auth.validateCurrentSession === undefined
+      ? session
+      : yield* auth.validateCurrentSession(session);
+  if (
+    current.managed !== undefined &&
+    method !== WS_METHODS.projectWorkRead &&
+    method !== WS_METHODS.projectWorkWrite &&
+    method !== WS_METHODS.projectWorkSubscribe
+  )
+    return yield* new ManagedRpcAuthorizationError({ method });
+  return current;
+});
+
+/** Validate before constructing an operation and again before every delivered item. */
+export const guardRpcEffect = <A, E, R, V, VR>(
+  validation: Effect.Effect<unknown, V, VR>,
+  effect: Effect.Effect<A, E, R>,
+) => validation.pipe(Effect.andThen(effect));
+export const guardRpcStream = <A, E, R, V, VR>(
+  validation: Effect.Effect<unknown, V, VR>,
+  stream: Stream.Stream<A, E, R>,
+) =>
+  Stream.unwrap(
+    validation.pipe(
+      Effect.as(stream.pipe(Stream.mapEffect((item) => validation.pipe(Effect.as(item))))),
+    ),
+  );
+export const guardRpcStreamEffect = <A, E, R, CE, CR, V, VR>(
+  validation: Effect.Effect<unknown, V, VR>,
+  effect: Effect.Effect<Stream.Stream<A, E, R>, CE, CR>,
+) =>
+  validation.pipe(
+    Effect.andThen(effect),
+    Effect.map((stream) => guardRpcStream(validation, stream)),
+  );

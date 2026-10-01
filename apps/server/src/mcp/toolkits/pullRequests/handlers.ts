@@ -167,6 +167,7 @@ const make = Effect.gen(function* () {
     if (Option.isNone(thread)) {
       return yield* new PullRequestThreadNotFoundError({ threadId: scope.threadId });
     }
+    yield* McpInvocationContext.requireMcpCapability("pull-requests", thread.value.projectId);
     return thread.value;
   });
 

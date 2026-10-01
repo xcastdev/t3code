@@ -13,6 +13,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
+import * as ProjectTeamAuthorization from "./ProjectTeamAuthorization.ts";
 import type { ProjectionRepositoryError } from "../persistence/Errors.ts";
 import { ensureProjectWorkTables } from "./ProjectWorkProjection.ts";
 import type { ProjectWorkEvent } from "./ProjectWorkDecider.ts";
@@ -51,6 +52,7 @@ const boundedLimit = (limit: number | undefined): number =>
   );
 
 const eventRecordId = (event: ProjectWorkEvent): string => {
+  if (event.type === "project-work.foundation.recorded") return event.record.recordId;
   const value = event as unknown as Record<string, unknown>;
   const direct = [
     "taskId",
@@ -174,6 +176,9 @@ const decodeEvent = (value: unknown): ProjectWorkEvent => {
 
 const makeProjectWorkStream = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
+  const authorization = yield* Effect.serviceOption(
+    ProjectTeamAuthorization.ProjectTeamAuthorization,
+  );
   const bus = yield* Effect.serviceOption(ProjectWorkEventBus.ProjectWorkEventBus);
 
   const readReplay = (
@@ -225,7 +230,7 @@ const makeProjectWorkStream = Effect.gen(function* () {
       ),
     );
 
-  const stream = (input: ProjectWorkStreamInput) =>
+  const streamRaw = (input: ProjectWorkStreamInput) =>
     Effect.gen(function* () {
       // Subscribe before reading history.  The live tail is filtered after the
       // captured replay head, so a commit racing the read cannot be lost or
@@ -270,6 +275,109 @@ const makeProjectWorkStream = Effect.gen(function* () {
       return Stream.concat(Stream.fromIterable(initial), liveItems);
     });
 
+  const stream = (
+    input: ProjectWorkStreamInput,
+    principal?: ProjectTeamAuthorization.ProjectTeamPrincipal,
+  ) =>
+    Effect.gen(function* () {
+      const authority =
+        principal !== undefined && authorization._tag === "Some"
+          ? yield* authorization.value.resolve(principal)
+          : undefined;
+      if (principal?.managed !== undefined && authorization._tag === "None")
+        return yield* new ProjectWorkStreamError({
+          reason: "read-failed",
+          detail: "Managed authority unavailable",
+        });
+      if (authority !== undefined && input.projectId !== authority.binding.projectId)
+        return yield* new ProjectWorkStreamError({
+          reason: "read-failed",
+          detail: "Managed project mismatch",
+        });
+      const raw = yield* streamRaw(input);
+      return raw.pipe(
+        Stream.mapEffect((item) =>
+          Effect.gen(function* () {
+            const current =
+              principal !== undefined && authorization._tag === "Some"
+                ? yield* authorization.value.resolve(principal)
+                : undefined;
+            if (current === undefined || item.kind !== "delta") return item;
+            const coordinator =
+              current.role.role === "coordinator" &&
+              current.role.tools.includes("project-work.read-project") &&
+              current.binding.configuration.toolIds.includes("project-work.read-project");
+            const recordId = item.delta.recordId;
+            const foundation = current.state.foundationRecords?.find(
+              (r) => r.recordId === recordId,
+            );
+            if (foundation !== undefined) {
+              if (
+                !coordinator ||
+                ![
+                  "mission",
+                  "member",
+                  "task-membership",
+                  "message",
+                  "question",
+                  "run-binding",
+                ].includes(foundation.kind)
+              )
+                return undefined;
+              return item;
+            }
+            if (
+              current.state.tasks.some(
+                (task) =>
+                  task.taskId === recordId &&
+                  (coordinator || task.taskId === current.binding.taskId),
+              )
+            )
+              return item;
+            const children = [
+              ...current.state.attempts,
+              ...current.state.criteria,
+              ...current.state.evidence,
+              ...current.state.blockers,
+              ...(current.state.comments ?? []),
+            ];
+            const record = children.find(
+              (r) =>
+                ("attemptId" in r && r.attemptId === recordId) ||
+                ("criterionId" in r && r.criterionId === recordId) ||
+                ("evidenceId" in r && r.evidenceId === recordId) ||
+                ("blockerId" in r && r.blockerId === recordId) ||
+                ("commentId" in r && r.commentId === recordId),
+            );
+            return record !== undefined &&
+              "taskId" in record &&
+              (coordinator || record.taskId === current.binding.taskId)
+              ? item
+              : undefined;
+          }).pipe(
+            Effect.mapError(
+              (cause) =>
+                new ProjectWorkStreamError({
+                  reason: "read-failed",
+                  detail: "Managed stream authority revoked",
+                  cause,
+                }),
+            ),
+          ),
+        ),
+        Stream.filter((item): item is ProjectWorkStreamItem => item !== undefined),
+      );
+    }).pipe(
+      Effect.mapError((cause) =>
+        Schema.is(ProjectWorkStreamError)(cause)
+          ? cause
+          : new ProjectWorkStreamError({
+              reason: "read-failed",
+              detail: "Managed stream authority unavailable",
+              cause,
+            }),
+      ),
+    );
   return { readReplay, stream };
 });
 
@@ -281,6 +389,7 @@ export interface ProjectWorkStreamShape {
   ) => Effect.Effect<ProjectWorkReplayResult, ProjectWorkStreamError | ProjectionRepositoryError>;
   readonly stream: (
     input: ProjectWorkStreamInput,
+    principal?: ProjectTeamAuthorization.ProjectTeamPrincipal,
   ) => Effect.Effect<
     Stream.Stream<ProjectWorkStreamItem, ProjectWorkStreamError>,
     ProjectWorkStreamError,

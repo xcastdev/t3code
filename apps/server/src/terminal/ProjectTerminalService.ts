@@ -246,6 +246,7 @@ const make = Effect.gen(function* () {
     }
 
     const projectId = thread.value.projectId;
+    yield* McpInvocationContext.requireMcpCapability("terminal", projectId);
     const project = yield* snapshots
       .getProjectShellById(projectId)
       .pipe(Effect.mapError(() => operationError(operation, projectId)));

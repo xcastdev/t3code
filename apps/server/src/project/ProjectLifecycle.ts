@@ -1,4 +1,7 @@
+import * as NodeCrypto from "node:crypto";
 import {
+  CommandId,
+  EventId,
   EnvironmentId,
   ProjectId,
   ProjectLifecycleArchiveInput,
@@ -10,6 +13,8 @@ import {
   ProjectLifecycleRestoreInput,
   ProjectLifecycleTombstone,
   projectWorkPayloadFingerprint,
+  type ProjectWorkWriteResult,
+  type ProjectWorkAttribution,
   type ProjectLifecycleState,
 } from "@t3tools/contracts";
 import * as Context from "effect/Context";
@@ -20,6 +25,19 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
+
+import { readProjectWorkEvents } from "../projectWork/ProjectWorkEventStore.ts";
+import {
+  applyProjectWorkEvents,
+  emptyProjectWorkReducerState,
+  type ProjectWorkEvent,
+} from "../projectWork/ProjectWorkDecider.ts";
+import {
+  emptyProjectWorkProjectionState,
+  persistProjectWorkState,
+} from "../projectWork/ProjectWorkProjection.ts";
+import { ProjectWorkEventBus } from "../projectWork/ProjectWorkEventBus.ts";
+import { purgeProjectTeamRecords } from "../projectWork/ProjectTeamsPersistence.ts";
 
 import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import * as RepositoryIdentityResolver from "./RepositoryIdentityResolver.ts";
@@ -123,6 +141,7 @@ export const relocationDecision = (input: {
 };
 
 const makeProjectLifecycle = Effect.gen(function* () {
+  const eventBus = yield* Effect.serviceOption(ProjectWorkEventBus);
   const sql = yield* SqlClient.SqlClient;
   const fileSystem = yield* FileSystem.FileSystem;
   const identity = yield* Effect.serviceOption(ServerEnvironment.ServerEnvironmentIdentity);
@@ -447,8 +466,11 @@ const makeProjectLifecycle = Effect.gen(function* () {
       } satisfies ProjectLifecycleRelocationCheckResult;
     }).pipe(Effect.mapError(toPersistenceSqlError("ProjectLifecycle.checkRelocation")));
 
-  const permanentDelete: ProjectLifecycleShape["permanentDelete"] = (input) =>
-    sql
+  const permanentDelete: ProjectLifecycleShape["permanentDelete"] = Effect.fn(
+    "ProjectLifecycle.permanentDelete",
+  )(function* (input: ProjectLifecyclePermanentDeleteInput) {
+    const transferredEvents: Array<ProjectWorkEvent> = [];
+    return yield* sql
       .withTransaction(
         Effect.gen(function* () {
           yield* ensureProjectLifecycleTables(sql);
@@ -516,6 +538,97 @@ const makeProjectLifecycle = Effect.gen(function* () {
           ON CONFLICT(project_id) DO UPDATE SET state = 'tombstoned', revision = excluded.revision,
             changed_at = excluded.changed_at, tombstone_json = excluded.tombstone_json
         `;
+          const transferred = yield* purgeProjectTeamRecords(sql, String(input.projectId));
+          for (const cursor of transferred) {
+            const events = yield* readProjectWorkEvents(sql, cursor.projectId);
+            const current = applyProjectWorkEvents(
+              emptyProjectWorkReducerState(cursor.projectId),
+              events,
+            );
+            const transferId = NodeCrypto.createHash("sha256")
+              .update(json([input.projectId, input.commandId, cursor.projectId, cursor.recordId]))
+              .digest("hex");
+            const transferCommandId = CommandId.make("project-delete-transfer:" + transferId);
+            const conflicts = yield* sql`SELECT command_id FROM project_work_command_receipts
+              WHERE project_id = ${cursor.projectId} AND command_id = ${transferCommandId}
+              UNION ALL SELECT command_id FROM project_work_events
+              WHERE project_id = ${cursor.projectId} AND command_id = ${transferCommandId} LIMIT 1`;
+            if (conflicts.length > 0)
+              return yield* new ProjectLifecycleError({
+                reason: "operation-conflict",
+                projectId: input.projectId,
+                detail: "Cursor transfer command identity is already committed",
+              });
+            const attribution: ProjectWorkAttribution = {
+              actor: { kind: "system", id: "project-lifecycle" },
+              source: { kind: "system", id: transferId },
+              recordedAt: changedAt,
+            };
+            // Internal lifecycle intents cannot match an ordinary command's fingerprint.
+            const payloadFingerprint =
+              "project-delete-transfer:" +
+              NodeCrypto.createHash("sha256")
+                .update(
+                  json({
+                    type: "project-delete.cursor-transfer",
+                    commandId: transferCommandId,
+                    deletedProjectId: input.projectId,
+                    deleteCommandId: input.commandId,
+                    projectId: cursor.projectId,
+                    record: cursor,
+                    revision: current.revision + 1,
+                    attribution,
+                  }),
+                )
+                .digest("hex");
+            const event: ProjectWorkEvent = {
+              type: "project-work.foundation.recorded",
+              eventId: EventId.make(`project-delete:${transferId}`),
+              projectId: cursor.projectId,
+              revision: current.revision + 1,
+              occurredAt: changedAt,
+              record: cursor,
+            };
+            yield* sql`INSERT INTO project_work_events (event_id, project_id, event_type, occurred_at, command_id, payload_json)
+              VALUES (${event.eventId}, ${event.projectId}, ${event.type}, ${event.occurredAt}, ${transferCommandId}, ${json(event)})`;
+            const writeResult = {
+              projectId: cursor.projectId,
+              revision: event.revision,
+              receipt: {
+                commandId: transferCommandId,
+                status: "accepted",
+                projectId: cursor.projectId,
+                revision: event.revision,
+                eventCount: 1,
+              },
+              delta: {
+                projectId: cursor.projectId,
+                revision: event.revision,
+                eventIds: [event.eventId],
+                changedFields: ["foundationRecords"],
+              },
+            } satisfies ProjectWorkWriteResult;
+            yield* sql`INSERT INTO project_work_command_receipts
+              (project_id, command_id, payload_fingerprint, actor_kind, actor_id, source_kind, source_id, event_ids_json, created_at, result_json)
+              VALUES (${cursor.projectId}, ${transferCommandId}, ${payloadFingerprint}, ${attribution.actor.kind}, ${attribution.actor.id}, ${attribution.source.kind}, ${attribution.source.id}, ${json([event.eventId])}, ${changedAt}, ${json(writeResult)})`;
+            const sequenceRows = yield* sql<{
+              sequence: number;
+            }>`SELECT sequence FROM project_work_events WHERE event_id = ${event.eventId}`;
+            const next = applyProjectWorkEvents(current, [event]);
+            yield* persistProjectWorkState(
+              sql,
+              { ...emptyProjectWorkProjectionState(cursor.projectId), ...next },
+              cursor.projectId,
+              {
+                lastAppliedSequence: Number(sequenceRows[0]!.sequence),
+                previousState: { ...emptyProjectWorkProjectionState(cursor.projectId), ...current },
+                updatedAt: changedAt,
+              },
+            );
+            // Lifecycle writes a survivor event outside the command checkpoint path.
+            yield* sql`DELETE FROM project_work_reducer_checkpoints WHERE project_id = ${cursor.projectId}`;
+            transferredEvents.push(event);
+          }
           // Remove only local durable work/projection rows.  The lifecycle row is
           // intentionally retained so stale clients cannot recreate this ID.
           for (const table of [
@@ -555,12 +668,27 @@ const makeProjectLifecycle = Effect.gen(function* () {
         }),
       )
       .pipe(
+        Effect.tap(() =>
+          Option.isNone(eventBus) || transferredEvents.length === 0
+            ? Effect.void
+            : Effect.gen(function* () {
+                const committed = yield* Effect.forEach(transferredEvents, (event) =>
+                  sql<{
+                    sequence: number;
+                  }>`SELECT sequence FROM project_work_events WHERE event_id = ${event.eventId}`.pipe(
+                    Effect.map((rows) => ({ event, cursor: Number(rows[0]?.sequence ?? 0) })),
+                  ),
+                );
+                yield* eventBus.value.publish(committed);
+              }).pipe(Effect.ignore),
+        ),
         Effect.mapError((cause) =>
           Schema.is(ProjectLifecycleError)(cause)
             ? cause
             : toPersistenceSqlError("ProjectLifecycle.permanentDelete")(cause),
         ),
       );
+  });
 
   return {
     get,

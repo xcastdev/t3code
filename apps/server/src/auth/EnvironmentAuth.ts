@@ -5,6 +5,7 @@ import {
   AuthStandardClientScopes,
   type AuthAccessTokenResult,
   type AuthIdentity,
+  ProjectTeamCredential,
   type AuthBrowserSessionResult,
   type AuthClientMetadata,
   type AuthClientSession,
@@ -26,6 +27,8 @@ import {
 } from "@t3tools/contracts";
 import { encodeOAuthScope } from "@t3tools/shared/oauthScope";
 import * as Context from "effect/Context";
+import * as Clock from "effect/Clock";
+import * as ProjectTeamAuthorization from "../projectWork/ProjectTeamAuthorization.ts";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -79,14 +82,30 @@ export interface AuthenticatedSession {
   readonly scopes: ReadonlyArray<AuthEnvironmentScope>;
   /** Stable principal derived from the session subject, not the credential. */
   readonly identity: AuthIdentity;
+  readonly managed?: ProjectTeamCredential | undefined;
   readonly proofKeyThumbprint?: string;
   readonly expiresAt?: DateTime.DateTime;
 }
+
+const MANAGED_SUBJECT_PREFIX = "agent:project-team:";
+const decodeManagedCredential = Schema.decodeUnknownSync(
+  Schema.fromJsonString(ProjectTeamCredential),
+);
+const encodeManagedCredential = Schema.encodeSync(Schema.fromJsonString(ProjectTeamCredential));
+export const managedCredentialForSubject = (subject: string): ProjectTeamCredential | undefined =>
+  subject.startsWith(MANAGED_SUBJECT_PREFIX)
+    ? decodeManagedCredential(
+        Buffer.from(subject.slice(MANAGED_SUBJECT_PREFIX.length), "base64url").toString("utf8"),
+      )
+    : undefined;
 
 export function authIdentityForSession(input: {
   readonly subject: string;
   readonly client?: Pick<AuthClientMetadata, "deviceType" | "label">;
 }): AuthIdentity {
+  const managed = managedCredentialForSubject(input.subject);
+  if (managed !== undefined)
+    return { kind: "agent", id: ProjectTeamAuthorization.managedActorId(managed) };
   const explicitKind = input.subject.startsWith("user:")
     ? "user"
     : input.subject.startsWith("agent:")
@@ -536,6 +555,7 @@ export class EnvironmentAuth extends Context.Service<
       readonly scopes?: ReadonlyArray<AuthEnvironmentScope>;
       readonly label?: string;
       readonly identity?: AuthIdentity;
+      readonly managed?: ProjectTeamCredential;
     }) => Effect.Effect<IssuedBearerSession, ServerAuthInternalError>;
     /** Issue a short-lived, durable, single-use approval for an agent intent. */
     readonly issueProjectWorkApproval: (input: {
@@ -583,6 +603,9 @@ export class EnvironmentAuth extends Context.Service<
     ) => Effect.Effect<AuthenticatedSession, ServerAuthCredentialError | ServerAuthInternalError>;
     readonly authenticateWebSocketUpgrade: (
       request: HttpServerRequest.HttpServerRequest,
+    ) => Effect.Effect<AuthenticatedSession, ServerAuthCredentialError | ServerAuthInternalError>;
+    readonly validateCurrentSession?: (
+      session: AuthenticatedSession,
     ) => Effect.Effect<AuthenticatedSession, ServerAuthCredentialError | ServerAuthInternalError>;
     readonly issueWebSocketTicket: (
       session: Pick<AuthenticatedSession, "sessionId">,
@@ -693,16 +716,89 @@ export const make = Effect.gen(function* () {
   const secretStore = yield* ServerSecretStore.ServerSecretStore;
   const crypto = yield* Crypto.Crypto;
   const sql = yield* SqlClient.SqlClient;
+  const teamAuthorization = yield* Effect.serviceOption(
+    ProjectTeamAuthorization.ProjectTeamAuthorization,
+  );
   const descriptor = yield* policy.getDescriptor();
   const config = yield* ServerConfig.ServerConfig;
   const devAuth = resolveReusableDevAuth(config);
 
+  const validateCurrentSession: NonNullable<EnvironmentAuth["Service"]["validateCurrentSession"]> =
+    Effect.fn("EnvironmentAuth.validateCurrentSession")(function* (session) {
+      if (session.identity.kind === "agent" && session.managed === undefined) {
+        const current = yield* sql<{
+          subject: string;
+          expiresAt: string;
+          revokedAt: string | null;
+        }>`SELECT subject, expires_at AS expiresAt, revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${session.sessionId}`.pipe(
+          Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
+        );
+        const now = yield* Clock.currentTimeMillis;
+        if (
+          current.length !== 1 ||
+          current[0]!.subject !== session.subject ||
+          current[0]!.revokedAt !== null ||
+          Date.parse(current[0]!.expiresAt) <= now
+        )
+          return yield* new ServerAuthInvalidCredentialError({
+            diagnostic: "Agent session expired or revoked",
+          });
+      }
+      if (session.managed === undefined && !session.subject.startsWith(MANAGED_SUBJECT_PREFIX)) {
+        if (session.identity.kind === "agent" && teamAuthorization._tag === "Some") {
+          const authority = yield* teamAuthorization.value
+            .resolve({ actor: { kind: "agent", id: session.identity.id } })
+            .pipe(
+              Effect.mapError(
+                () =>
+                  new ServerAuthInvalidCredentialError({
+                    diagnostic: "Managed credential requires reissue",
+                  }),
+              ),
+            );
+          if (authority !== undefined)
+            return yield* new ServerAuthInvalidCredentialError({
+              diagnostic: "Legacy credential cannot become managed",
+            });
+        }
+        return session;
+      }
+      const rows = yield* sql<{
+        subject: string;
+        expiresAt: string;
+        revokedAt: string | null;
+      }>`SELECT subject, expires_at AS expiresAt, revoked_at AS revokedAt FROM auth_sessions WHERE session_id=${session.sessionId}`.pipe(
+        Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
+      );
+      const now = yield* Clock.currentTimeMillis;
+      if (
+        rows.length !== 1 ||
+        rows[0]!.revokedAt !== null ||
+        Date.parse(rows[0]!.expiresAt) <= now ||
+        rows[0]!.subject !== session.subject ||
+        teamAuthorization._tag === "None"
+      )
+        return yield* new ServerAuthInvalidCredentialError({
+          diagnostic: "Managed session expired or revoked",
+        });
+      const managed = managedCredentialForSubject(rows[0]!.subject);
+      if (managed === undefined)
+        return yield* new ServerAuthInvalidCredentialError({
+          diagnostic: "Managed identity missing",
+        });
+      yield* teamAuthorization.value
+        .resolve({ actor: { kind: "agent", id: session.identity.id }, managed })
+        .pipe(
+          Effect.mapError(
+            () => new ServerAuthInvalidCredentialError({ diagnostic: "Managed authority revoked" }),
+          ),
+        );
+      return { ...session, managed };
+    });
+
   const authenticateToken = (
     token: string,
-  ): Effect.Effect<
-    AuthenticatedSession,
-    ServerAuthInvalidCredentialError | ServerAuthInternalError
-  > =>
+  ): Effect.Effect<AuthenticatedSession, ServerAuthCredentialError | ServerAuthInternalError> =>
     sessions.verify(token).pipe(
       Effect.tapError((cause) =>
         SessionStore.isSessionCredentialInvalidError(cause)
@@ -719,10 +815,14 @@ export const make = Effect.gen(function* () {
         method: session.method,
         scopes: session.scopes,
         identity: authIdentityForSession(session),
+        ...(managedCredentialForSubject(session.subject) === undefined
+          ? {}
+          : { managed: managedCredentialForSubject(session.subject) }),
         ...(session.proofKeyThumbprint ? { proofKeyThumbprint: session.proofKeyThumbprint } : {}),
         ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
       })),
       mapSessionVerificationErrors,
+      Effect.flatMap((session) => validateCurrentSession(session)),
     );
 
   const authenticateRequest = (
@@ -976,6 +1076,10 @@ export const make = Effect.gen(function* () {
     "EnvironmentAuth.createPairingLink",
   )(
     function* (input) {
+      if (input?.subject?.startsWith(MANAGED_SUBJECT_PREFIX))
+        return yield* new ServerAuthPairingLinkCreationError({
+          cause: "Reserved managed subject is server-owned",
+        });
       const createdAt = yield* DateTime.now;
       const issued = yield* bootstrapCredentials.issueOneTimeToken({
         scopes: input?.scopes ?? AuthStandardClientScopes,
@@ -1021,7 +1125,37 @@ export const make = Effect.gen(function* () {
     );
 
   const issueSession: EnvironmentAuth["Service"]["issueSession"] = (input) =>
-    (() => {
+    Effect.gen(function* () {
+      if (
+        input?.subject?.startsWith(MANAGED_SUBJECT_PREFIX) ||
+        input?.identity?.id.startsWith(MANAGED_SUBJECT_PREFIX)
+      )
+        return yield* new ServerAuthSessionTokenIssueError({
+          cause: "Reserved managed subject is server-owned",
+        });
+      let managed = input?.managed;
+      if (
+        managed === undefined &&
+        input?.identity?.kind === "agent" &&
+        teamAuthorization._tag === "Some"
+      ) {
+        const authority = yield* teamAuthorization.value
+          .resolve({ actor: { ...input.identity, kind: "agent" } })
+          .pipe(Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })));
+        managed = authority?.credential;
+      }
+      if (managed !== undefined) {
+        if (teamAuthorization._tag === "None")
+          return yield* new ServerAuthSessionTokenIssueError({
+            cause: "Managed authority unavailable",
+          });
+        yield* teamAuthorization.value
+          .resolve({
+            actor: { kind: "agent", id: ProjectTeamAuthorization.managedActorId(managed) },
+            managed,
+          })
+          .pipe(Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })));
+      }
       const sessionIdentity = input?.identity;
       const identitySubject =
         sessionIdentity === undefined
@@ -1029,8 +1163,18 @@ export const make = Effect.gen(function* () {
           : sessionIdentity.id.startsWith(`${sessionIdentity.kind}:`)
             ? sessionIdentity.id
             : `${sessionIdentity.kind}:${sessionIdentity.id}`;
-      const subject = identitySubject ?? input?.subject ?? DEFAULT_SESSION_SUBJECT;
-      return sessions
+      if (managed !== undefined) {
+        const revokedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+        yield* sql`UPDATE auth_sessions SET revoked_at=${revokedAt} WHERE subject=${ProjectTeamAuthorization.managedActorId(managed)} AND revoked_at IS NULL`.pipe(
+          Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
+        );
+      }
+      const subject =
+        managed === undefined
+          ? (identitySubject ?? input?.subject ?? DEFAULT_SESSION_SUBJECT)
+          : MANAGED_SUBJECT_PREFIX +
+            Buffer.from(encodeManagedCredential(managed)).toString("base64url");
+      return yield* sessions
         .issue({
           subject,
           method: "bearer-access-token",
@@ -1051,11 +1195,13 @@ export const make = Effect.gen(function* () {
                 scopes: issued.scopes,
                 subject,
                 identity:
-                  input?.identity ??
-                  authIdentityForSession({
-                    subject,
-                    client: issued.client,
-                  }),
+                  managed === undefined
+                    ? (input?.identity ??
+                      authIdentityForSession({
+                        subject,
+                        client: issued.client,
+                      }))
+                    : { kind: "agent", id: ProjectTeamAuthorization.managedActorId(managed) },
                 client: issued.client,
                 expiresAt: DateTime.toUtc(issued.expiresAt),
               }) satisfies IssuedBearerSession,
@@ -1063,7 +1209,7 @@ export const make = Effect.gen(function* () {
           Effect.mapError((cause) => new ServerAuthSessionTokenIssueError({ cause })),
           Effect.withSpan("EnvironmentAuth.issueSession"),
         );
-    })();
+    });
 
   const ensureApprovalTable = (operation: "issue" | "consume") =>
     sql`
@@ -1438,9 +1584,13 @@ export const make = Effect.gen(function* () {
               method: session.method,
               scopes: session.scopes,
               identity: authIdentityForSession(session),
+              ...(managedCredentialForSubject(session.subject) === undefined
+                ? {}
+                : { managed: managedCredentialForSubject(session.subject) }),
               ...(session.expiresAt ? { expiresAt: session.expiresAt } : {}),
             })),
             mapSessionVerificationErrors,
+            Effect.flatMap((session) => validateCurrentSession(session)),
           );
         }
       }
@@ -1449,6 +1599,7 @@ export const make = Effect.gen(function* () {
     });
 
   return EnvironmentAuth.of({
+    validateCurrentSession,
     getDescriptor: () =>
       Effect.succeed(descriptor).pipe(Effect.withSpan("EnvironmentAuth.getDescriptor")),
     getSessionState,

@@ -48,3 +48,16 @@ export const leaseWorkerLayer = Layer.effectDiscard(
     yield* Effect.forkScoped(runProjectWorkLeaseWorker(reactor));
   }),
 ).pipe(Layer.provide(leaseLayer));
+
+/** Use the same supplied core for command, lease and stream consumers. */
+export const withCore = <ROut, E, RIn>(providedCore: Layer.Layer<ROut, E, RIn>) => {
+  const leases = ProjectWorkLeaseReactor.ProjectWorkLeaseReactorLive.pipe(
+    Layer.provideMerge(providedCore),
+  );
+  return Layer.effectDiscard(
+    Effect.gen(function* () {
+      const reactor = yield* ProjectWorkLeaseReactor.ProjectWorkLeaseReactor;
+      yield* Effect.forkScoped(runProjectWorkLeaseWorker(reactor));
+    }),
+  ).pipe(Layer.provideMerge(leases));
+};
