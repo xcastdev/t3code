@@ -26,6 +26,7 @@ import {
 } from "../pi/PiManagedRuntime.ts";
 import type { PiModelAccountingReceipt } from "../pi/PiModelBroker.ts";
 import type { PiSessionTerminal } from "../pi/PiSessionRuntime.ts";
+import type { ProviderAdapterError } from "../Errors.ts";
 import { makePiAdapter } from "./PiAdapter.ts";
 
 const instanceId = ProviderInstanceId.make("pi-one");
@@ -733,6 +734,121 @@ it.effect("repair R3 uncertain scoped stop reports a fenced error without blind 
     expect(Exit.isFailure(yield* Effect.exit(adapter.startSession(startInput)))).toBe(true);
   }),
 );
+
+for (const race of [
+  "ordinary reuse",
+  "stopSession",
+  "stopAll",
+  "pending stop",
+  "failed stop",
+  "replacement context",
+  "running turn",
+  "settled turn",
+  "settled turn with unchanged snapshot",
+  "failed turn",
+] as const)
+  it.effect(`repair read R1 ${race} revalidates ownership and session state`, () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const runtime: PiManagedRuntimeInstance = {
+        ...fake.runtime,
+        readSession: Effect.fn("PiAdapter.test.heldRead")(function* (thread) {
+          const snapshot = yield* fake.runtime.readSession(thread);
+          yield* Deferred.succeed(entered, undefined);
+          yield* Deferred.await(release);
+          return snapshot;
+        }),
+      };
+      const adapter = yield* makePiAdapter({ instanceId, runtime });
+      const original = yield* adapter.startSession(startInput);
+      const reading = yield* Effect.forkScoped(Effect.exit(adapter.startSession(startInput)), {
+        startImmediately: true,
+      });
+      yield* Deferred.await(entered);
+      let stopping: Fiber.Fiber<void, ProviderAdapterError> | undefined;
+      if (race === "stopSession" || race === "replacement context") {
+        yield* adapter.stopSession(threadId);
+        if (race === "replacement context") {
+          fake.state.session = {
+            ...initialSession(),
+            resumeCursor: { sessionId: "replacement-native", leafId: "replacement-leaf" },
+          };
+          yield* adapter.startSession(startInput);
+        }
+      } else if (race === "stopAll") {
+        yield* adapter.stopAll();
+      } else if (race === "pending stop") {
+        const gate = yield* Deferred.make<void>();
+        fake.state.stopGates = [gate];
+        stopping = yield* Effect.forkScoped(adapter.stopSession(threadId), {
+          startImmediately: true,
+        });
+        yield* Queue.take(fake.stopped);
+      } else if (race === "failed stop") {
+        fake.state.stopError = new PiManagedRuntimeError({
+          code: "uncertain",
+          detail: "private-read-stop-failure",
+        });
+        expect(Exit.isFailure(yield* Effect.exit(adapter.stopSession(threadId)))).toBe(true);
+      } else if (
+        race === "running turn" ||
+        race === "settled turn" ||
+        race === "settled turn with unchanged snapshot" ||
+        race === "failed turn"
+      ) {
+        yield* adapter.sendTurn({ threadId, input: "authorized concurrent prompt" });
+        const operation = fake.operations[1]!;
+        yield* Deferred.await(operation.started);
+        if (race !== "running turn") {
+          const completing = yield* Effect.forkScoped(
+            Effect.exit(adapter.interruptTurn(threadId)),
+            { startImmediately: true },
+          );
+          yield* Queue.take(fake.controls);
+          const committed =
+            race === "settled turn with unchanged snapshot"
+              ? original
+              : {
+                  ...initialSession(),
+                  resumeCursor: { sessionId: "native-one", leafId: "newer-leaf" },
+                  updatedAt: "2026-10-01T01:00:00.000Z",
+                };
+          yield* fake.settle(operation, race === "failed turn" ? "failed" : "success", committed);
+          expect(Exit.isSuccess(yield* Fiber.join(completing))).toBe(race !== "failed turn");
+        }
+      }
+      const current = yield* adapter.listSessions();
+      yield* Deferred.succeed(release, undefined);
+      const read = yield* Fiber.join(reading);
+      const afterRead = yield* adapter.listSessions();
+      if (stopping) {
+        yield* Deferred.succeed(fake.state.stopGates[0]!, undefined);
+        yield* Fiber.join(stopping);
+      }
+      expect(afterRead).toEqual(current);
+      expect(Exit.isSuccess(read)).toBe(race === "ordinary reuse");
+      if (race === "ordinary reuse") {
+        expect(Exit.isSuccess(read) && read.value).toEqual(original);
+        expect(fake.requests).toHaveLength(1);
+      } else if (race === "stopSession" || race === "stopAll") {
+        expect(yield* adapter.hasSession(threadId)).toBe(false);
+      } else if (race === "running turn") {
+        expect(afterRead[0]?.status).toBe("running");
+      } else if (race === "settled turn") {
+        expect(afterRead[0]).toMatchObject({
+          updatedAt: "2026-10-01T01:00:00.000Z",
+          resumeCursor: { leafId: "newer-leaf" },
+        });
+      } else if (race === "failed stop" || race === "failed turn") {
+        expect(afterRead[0]?.status).toBe("error");
+      } else if (race === "replacement context") {
+        expect(afterRead[0]?.resumeCursor).toEqual(fake.state.session.resumeCursor);
+        expect(fake.requests).toHaveLength(2);
+      }
+    }),
+  );
 
 const reportedReceipt = (
   requestId: number,

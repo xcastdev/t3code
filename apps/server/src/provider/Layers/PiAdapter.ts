@@ -661,11 +661,24 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
               "startSession",
               "Pi initialization or turn is already in progress.",
             );
+          const previousSession = context.session;
+          const previousOperationId = context.lastOperationId;
           const session = yield* runtime.readSession(hints.threadId).pipe(
             Effect.mapError((error) => requestError("readSession", error)),
             Effect.flatMap((session) => validateSession(session, hints.threadId)),
           );
           yield* checkHints(session, hints);
+          const current = yield* owned(hints.threadId);
+          if (
+            current !== context ||
+            context.active ||
+            context.session !== previousSession ||
+            context.lastOperationId !== previousOperationId
+          )
+            return yield* invalid(
+              "startSession",
+              "Pi session changed while its committed state was being read. Retry with current session hints.",
+            );
           context.session = session;
           return session;
         }
