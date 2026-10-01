@@ -1,6 +1,7 @@
-import { useAtomValue } from "@effect/atom-react";
+import { RegistryContext, useAtomValue } from "@effect/atom-react";
 import {
   CommandId,
+  ProjectWorkTask,
   ProjectWorkAttemptId,
   ProjectWorkBlockerId,
   ProjectWorkEvidenceId,
@@ -12,16 +13,17 @@ import {
   type ProjectId,
   type ProjectWorkAction,
   type ProjectWorkCommand,
+  type ProjectWorkWriteResult,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
 import { AsyncResult } from "effect/unstable/reactivity";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useContext, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { asProjectWorkTaskContext } from "@t3tools/client-runtime/project-work";
 import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import { randomUUID } from "../../lib/utils";
 import { projectWorkEnvironment } from "../../state/projectWork";
-import { useAtomCommand } from "../../state/use-atom-command";
 import { useAtomQueryRunner } from "../../state/use-atom-query-runner";
 import { Button } from "../ui/button";
 import { WorkDataNotice } from "./WorkDataNotice";
@@ -41,6 +43,8 @@ import {
   makeProjectWorkTaskFailCommand,
   makeProjectWorkTaskManagementCommand,
 } from "./workMutations";
+
+const knownTask = Schema.is(ProjectWorkTask);
 
 const LABELS: Partial<Record<ProjectWorkAction, string>> = {
   claim: "Claim",
@@ -77,13 +81,16 @@ export function TaskLifecycleControls({
   taskId,
   canWrite,
   streamAvailable,
+  onWrite,
 }: {
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
   readonly taskId: ProjectWorkTaskId;
   readonly canWrite: boolean;
   readonly streamAvailable: boolean;
+  readonly onWrite: (command: ProjectWorkCommand) => Promise<ProjectWorkWriteResult>;
 }) {
+  const registry = useContext(RegistryContext);
   const result = useAtomValue(
     projectWorkEnvironment.taskContext({
       environmentId,
@@ -99,7 +106,7 @@ export function TaskLifecycleControls({
     ...(streamAvailable ? { poll: false as const } : {}),
   };
   const context = asProjectWorkTaskContext(Option.getOrNull(AsyncResult.value(result)));
-  const write = useAtomCommand(projectWorkEnvironment.write, { reportFailure: false });
+  const busy = useRef(false);
   const refreshContext = useAtomQueryRunner(projectWorkEnvironment.taskContext, {
     refresh: true,
     reportFailure: false,
@@ -108,6 +115,25 @@ export function TaskLifecycleControls({
   const [pending, setPending] = useState(false);
   const [retry, setRetry] = useState<ProjectWorkCommand | null>(null);
   const [failure, setFailure] = useState<ProjectWorkCommandFailure | null>(null);
+
+  const current =
+    result._tag === "Success" &&
+    !result.waiting &&
+    context?.projectId === projectId &&
+    context?.task.projectId === projectId &&
+    context.task.taskId === taskId &&
+    knownTask(context.task);
+  const live = useRef(true);
+  const allowed = useRef(canWrite && current);
+  useLayoutEffect(() => {
+    allowed.current = canWrite && current;
+  }, [canWrite, current]);
+  useLayoutEffect(() => {
+    live.current = true;
+    return () => {
+      live.current = false;
+    };
+  }, []);
 
   const actor = useMemo(
     () => ({
@@ -120,17 +146,39 @@ export function TaskLifecycleControls({
 
   const submit = useCallback(
     async (command: ProjectWorkCommand) => {
-      if (!canWrite || pending) return;
+      if (!live.current || !allowed.current || busy.current) return;
+      busy.current = true;
       setPending(true);
       setRetry(command);
       setFailure(null);
-      const next = await write({ environmentId, input: command });
-      setPending(false);
-      if (next._tag === "Failure")
-        setFailure(projectWorkCommandFailure(squashAtomCommandFailure(next)));
-      else setRetry(null);
+      try {
+        const latest = registry.get(projectWorkEnvironment.taskContext(contextTarget));
+        const fresh = asProjectWorkTaskContext(Option.getOrNull(AsyncResult.value(latest)));
+        if (
+          latest._tag !== "Success" ||
+          latest.waiting ||
+          !fresh ||
+          fresh.projectId !== projectId ||
+          fresh.task.projectId !== projectId ||
+          fresh.task.taskId !== taskId ||
+          !knownTask(fresh.task) ||
+          !("expectedRevision" in command) ||
+          fresh.revision !== command.expectedRevision
+        )
+          throw {
+            code: "stale-revision",
+            message: "Refresh the current task before making changes.",
+          };
+        await onWrite(command);
+        if (live.current) setRetry(null);
+      } catch (error) {
+        if (live.current) setFailure(projectWorkCommandFailure(error));
+      } finally {
+        busy.current = false;
+        if (live.current) setPending(false);
+      }
     },
-    [canWrite, environmentId, pending, write],
+    [contextTarget, onWrite, projectId, registry, taskId],
   );
 
   const build = useCallback(
@@ -427,7 +475,7 @@ export function TaskLifecycleControls({
             key={action}
             size="sm"
             variant="outline"
-            disabled={!canWrite || pending}
+            disabled={!canWrite || !current || pending}
             onClick={() => {
               const command = build(action);
               if (command) void submit(command);

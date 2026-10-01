@@ -228,6 +228,7 @@ export const make = Effect.gen(function* () {
       projectMcpOverrides: true,
       projectWorkStream: true,
       projectTeamFoundationReads: true,
+      projectTeamGuidedWrites: true,
       projectTeamExecution: false,
       sessionMcpCatalog: true,
       inlineMessageContext: true,

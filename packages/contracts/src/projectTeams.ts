@@ -413,7 +413,9 @@ export type ProjectTeamRecordRead = typeof ProjectTeamRecordRead.Type;
 export const ProjectTeamRecordPage = Schema.Struct({
   projectId: ProjectId,
   revision: NonNegativeInt,
-  nextCursor: Schema.optionalKey(Text),
+  nextCursor: Schema.optionalKey(
+    Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4_000)),
+  ),
   items: Schema.Array(ProjectTeamRecordRead).check(Schema.isMaxLength(128)),
 });
 export const PROJECT_TEAM_DEFAULT_LIMITS = {
