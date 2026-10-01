@@ -85,6 +85,7 @@ describe("pure issue page planning", () => {
         acceptPage({
           request: revised,
           response: { ...notModified, repository: revised.repository },
+          sentEtag: '"page-1"',
           currentFence: fence,
           priorCommittedSnapshot: snapshot(),
           observedAt,
@@ -134,6 +135,60 @@ describe("pure issue page planning", () => {
         observedAt,
       }),
     ).toMatchObject({ status: "rejected" });
+  });
+  for (const [cachedEtag, responseEtag] of [
+    ['W/"page-1"', '"page-1"'],
+    ['"page-1"', 'W/"page-1"'],
+    ['W/"page-1"', 'W/"page-1"'],
+    ['"page-1"', '"page-1"'],
+    ['W/""', '""'],
+  ] as const) {
+    it(`reuses the exact committed ETag ${cachedEtag} on equivalent 304 ${responseEtag}`, () => {
+      const priorCommittedSnapshot = { ...snapshot(), etag: cachedEtag };
+      expect(planPage({ request, currentFence: fence, priorCommittedSnapshot })).toMatchObject({
+        status: "ready",
+        etag: cachedEtag,
+      });
+      expect(
+        acceptPage({
+          request,
+          response: { ...notModified, etag: responseEtag },
+          sentEtag: cachedEtag,
+          currentFence: fence,
+          priorCommittedSnapshot,
+          observedAt,
+        }),
+      ).toMatchObject({
+        status: "accepted",
+        snapshot: { entries: [issue], nextPage: 2, etag: cachedEtag },
+      });
+    });
+  }
+  for (const responseEtag of ['W/"other"', '"PAGE-1"', 'w/"page-1"', "", "page-1", 'W/ "page-1"']) {
+    it(`rejects nonmatching or malformed 304 ETag ${JSON.stringify(responseEtag)}`, () => {
+      expect(
+        acceptPage({
+          request,
+          response: { ...notModified, etag: responseEtag },
+          sentEtag: 'W/"page-1"',
+          currentFence: fence,
+          priorCommittedSnapshot: { ...snapshot(), etag: 'W/"page-1"' },
+          observedAt,
+        }),
+      ).toMatchObject({ status: "rejected" });
+    });
+  }
+  it("rejects a weakly equivalent sent ETag that differs from the committed wire value", () => {
+    expect(
+      acceptPage({
+        request,
+        response: notModified,
+        sentEtag: '"page-1"',
+        currentFence: fence,
+        priorCommittedSnapshot: { ...snapshot(), etag: 'W/"page-1"' },
+        observedAt,
+      }),
+    ).toEqual({ status: "rejected", reason: "snapshot-mismatch" });
   });
   it("rejects a 304 without evidence that the exact conditional etag was sent", () => {
     const priorCommittedSnapshot = snapshot();
