@@ -417,6 +417,37 @@ export const assertProjectTeamRunAuthority = (
       deny("Repair debit exceeded its automatic allowance");
   }
 };
+
+/** A frozen Human exception permits only its own debited repair episode. */
+export const assertProjectTeamSemanticWork = (
+  state: ProjectWorkState,
+  binding: Extract<ProjectTeamRecord, { kind: "run-binding" }>,
+  role: Extract<ProjectTeamRecord, { kind: "role-revision" }>,
+) => {
+  assertProjectTeamRunAuthority(state, binding, role, false);
+  const records = state.foundationRecords ?? [];
+  const grant = records.find(
+    (record) => record.kind === "gate" && record.recordId === binding.authorizationGateId,
+  );
+  const proof =
+    grant?.kind === "gate" && grant.gate === "repair" ? grant.repairAuthorization : undefined;
+  const authorizedExceptionEpisode =
+    proof?.exceptionGateId === undefined ? undefined : proof.episodeId;
+  assertProjectTeamOrdinarySuccessor(
+    {
+      ...state,
+      foundationRecords: records.filter(
+        (record) =>
+          !(
+            record.kind === "repair-episode" &&
+            record.recordId === authorizedExceptionEpisode &&
+            record.pendingSemanticRepair === false
+          ),
+      ),
+    },
+    binding.taskId,
+  );
+};
 export type ProjectTeamGateTarget = Pick<
   Gate,
   | "projectId"
