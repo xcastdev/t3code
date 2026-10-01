@@ -1035,6 +1035,8 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
               }),
           ),
           Effect.catch((error) => stop.pipe(Effect.andThen(Effect.fail(error)))),
+          // Close the launcher while its scoped transport fibers can still deliver EOF.
+          Effect.onInterrupt(() => stop.pipe(Effect.orDie, Effect.asVoid)),
         ),
       );
       const policy = yield* restore(readUnit());

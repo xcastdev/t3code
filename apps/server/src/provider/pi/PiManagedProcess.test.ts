@@ -1004,108 +1004,142 @@ describe.runIf(process.env.PI_MANAGED_PROCESS_LINUX_GATE === "1")(
             }),
           ),
       );
-    check("uncaptured helper ownership drains through actual launcher EOF without START", () =>
-      Effect.gen(function* () {
-        const launch = yield* runtimeLaunch([
-          "/bin/bash",
-          "-c",
-          "printf forbidden > /workspace/withheld-owner-proof",
-        ]);
-        const allocation = yield* preallocatePiManagedProcess(launch);
-        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-        const receipt = yield* Deferred.make<{
-          unit: string;
-          nonce: string;
-          invocation: string;
-          cgroup: string;
-        }>();
-        let pending = Buffer.alloc(0);
-        let captured = false;
-        let launcherPid: number | null = null;
-        let launcherExit = Effect.succeed(-1);
-        let owners = 0;
-        let errorPhase: PiManagedProcessError["phase"] | null = null;
-        const observed = ChildProcessSpawner.make((command) => {
-          if (command._tag !== "StandardCommand" || command.command !== "/usr/bin/systemd-run")
-            return spawner.spawn(command);
-          return spawner.spawn(command).pipe(
-            Effect.map((handle) => {
-              launcherPid = Number(handle.pid);
-              launcherExit = handle.exitCode.pipe(Effect.map(Number), Effect.orDie);
-              return ChildProcessSpawner.makeHandle({
-                ...handle,
-                stdout: handle.stdout.pipe(
-                  Stream.tap((chunk) =>
-                    Effect.gen(function* () {
-                      if (captured) return;
-                      if (pending.byteLength + chunk.byteLength > 65536)
-                        return yield* Effect.die("Withheld owner fixture exceeded frame bound");
-                      pending = Buffer.concat([pending, chunk]);
-                      const newline = pending.indexOf(10);
-                      if (newline < 0) return;
-                      const owner = yield* decodeWithheldOwner(
-                        pending.subarray(0, newline).toString("utf8"),
-                      ).pipe(Effect.orDie);
-                      expect(owner.unit).toBe(allocation.unit);
-                      expect(owner.nonce).toBe(allocation.nonce);
-                      expect(owner.cgroup.endsWith(`/${allocation.unit}`)).toBe(true);
-                      captured = true;
-                      pending = Buffer.alloc(0);
-                      yield* Deferred.succeed(receipt, owner);
-                    }),
-                  ),
-                  Stream.filter(() => false),
+    for (const cancel of [false, true])
+      check(
+        `uncaptured helper ownership drains through actual launcher EOF on ${cancel ? "cancellation" : "startup failure"} without START`,
+        () =>
+          Effect.gen(function* () {
+            const launch = yield* runtimeLaunch([
+              "/bin/bash",
+              "-c",
+              "printf forbidden > /workspace/withheld-owner-proof",
+            ]);
+            const allocation = yield* preallocatePiManagedProcess(launch);
+            const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+            const receipt = yield* Deferred.make<{
+              unit: string;
+              nonce: string;
+              invocation: string;
+              cgroup: string;
+            }>();
+            let pending = Buffer.alloc(0);
+            let captured = false;
+            let launcherPid: number | null = null;
+            let launcherExit = Effect.succeed(-1);
+            let owners = 0;
+            let stops = 0;
+            let errorPhase: PiManagedProcessError["phase"] | null = null;
+            const observed = ChildProcessSpawner.make((command) => {
+              if (
+                command._tag === "StandardCommand" &&
+                command.command === "/usr/bin/systemctl" &&
+                command.args.includes("stop") &&
+                command.args.includes(allocation.unit)
+              )
+                stops++;
+              if (command._tag !== "StandardCommand" || command.command !== "/usr/bin/systemd-run")
+                return spawner.spawn(command);
+              return spawner.spawn(command).pipe(
+                Effect.map((handle) => {
+                  launcherPid = Number(handle.pid);
+                  launcherExit = handle.exitCode.pipe(Effect.map(Number), Effect.orDie);
+                  return ChildProcessSpawner.makeHandle({
+                    ...handle,
+                    stdout: handle.stdout.pipe(
+                      Stream.tap((chunk) =>
+                        Effect.gen(function* () {
+                          if (captured) return;
+                          if (pending.byteLength + chunk.byteLength > 65536)
+                            return yield* Effect.die("Withheld owner fixture exceeded frame bound");
+                          pending = Buffer.concat([pending, chunk]);
+                          const newline = pending.indexOf(10);
+                          if (newline < 0) return;
+                          const owner = yield* decodeWithheldOwner(
+                            pending.subarray(0, newline).toString("utf8"),
+                          ).pipe(Effect.orDie);
+                          expect(owner.unit).toBe(allocation.unit);
+                          expect(owner.nonce).toBe(allocation.nonce);
+                          expect(owner.cgroup.endsWith(`/${allocation.unit}`)).toBe(true);
+                          captured = true;
+                          pending = Buffer.alloc(0);
+                          yield* Deferred.succeed(receipt, owner);
+                        }),
+                      ),
+                      Stream.filter(() => false),
+                    ),
+                  });
+                }),
+              );
+            });
+            const acquisition = Effect.scoped(
+              acquirePiManagedProcess(launch, {
+                allocation,
+                claimActivation: () => Effect.void,
+                beforeStart: () =>
+                  Effect.sync(() => {
+                    owners++;
+                  }),
+              }).pipe(
+                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed),
+                Effect.tapError((error) =>
+                  Effect.sync(() => {
+                    errorPhase = error.phase;
+                  }),
                 ),
-              });
-            }),
-          );
-        });
-        const result = yield* Effect.scoped(
-          acquirePiManagedProcess(launch, {
-            allocation,
-            claimActivation: () => Effect.void,
-            beforeStart: () =>
-              Effect.sync(() => {
-                owners++;
-              }),
-          }).pipe(
-            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed),
-            Effect.tapError((error) =>
-              Effect.sync(() => {
-                errorPhase = error.phase;
-              }),
-            ),
-          ),
-        ).pipe(Effect.exit);
-        const helper = yield* Deferred.await(receipt).pipe(Effect.timeout("1 second"));
-        const code = yield* launcherExit;
-        expect(result._tag).toBe("Failure");
-        expect(errorPhase).toBe("quarantine");
-        expect(owners).toBe(0);
-        expect(code).toBe(0);
-        expect(launcherPid).toBeGreaterThan(0);
-        yield* absent(helper.cgroup);
-        yield* absent(NodePath.join(input.workspaceRoot, "withheld-owner-proof"));
-        const directory = process.env.PI_MANAGED_PROCESS_EVIDENCE_DIR;
-        if (directory)
-          yield* Effect.promise(async () => {
-            await NodeFSP.mkdir(directory, { recursive: true });
-            await NodeFSP.writeFile(
-              NodePath.join(directory, "withheld-owner-eof.json"),
-              encodeEvidence({
-                ...helper,
-                launcherPid,
-                launcherExit: code,
-                owners,
-                errorPhase,
-                kernel: "removed",
-                acquiredOwner: false,
-                result: result._tag,
-              }),
+              ),
             );
-          });
-      }),
-    );
+            const fiber = yield* acquisition.pipe(Effect.forkChild);
+            if (cancel) {
+              yield* Deferred.await(receipt).pipe(Effect.timeout("3 seconds"));
+              yield* Fiber.interrupt(fiber);
+            }
+            const result = yield* Fiber.await(fiber);
+            const helper = yield* Deferred.await(receipt).pipe(Effect.timeout("1 second"));
+            const groupExists = yield* Effect.promise(() =>
+              NodeFSP.stat(helper.cgroup).then(
+                () => true,
+                () => false,
+              ),
+            );
+            const launcherResult = yield* launcherExit.pipe(Effect.exit);
+            const code = launcherResult._tag === "Success" ? launcherResult.value : null;
+            const scopeCause = result._tag === "Failure" ? Cause.pretty(result.cause) : "";
+            const directory = process.env.PI_MANAGED_PROCESS_EVIDENCE_DIR;
+            if (directory)
+              yield* Effect.promise(async () => {
+                await NodeFSP.mkdir(directory, { recursive: true });
+                await NodeFSP.writeFile(
+                  NodePath.join(
+                    directory,
+                    cancel ? "withheld-owner-cancel.json" : "withheld-owner-eof.json",
+                  ),
+                  encodeEvidence({
+                    ...helper,
+                    launcherPid,
+                    launcherExit: code,
+                    owners,
+                    errorPhase,
+                    groupExists,
+                    stops,
+                    scopeCause,
+                    launcherCause:
+                      launcherResult._tag === "Failure" ? Cause.pretty(launcherResult.cause) : "",
+                    acquiredOwner: false,
+                    result: result._tag,
+                  }),
+                );
+              });
+            expect(result._tag).toBe("Failure");
+            expect(scopeCause).toContain("unit ownership remains unproved");
+            if (!cancel) expect(errorPhase).toBe("quarantine");
+            expect(groupExists).toBe(false);
+            expect(owners).toBe(0);
+            expect(stops).toBe(0);
+            expect(code).toBe(0);
+            expect(launcherPid).toBeGreaterThan(0);
+            yield* absent(NodePath.join(input.workspaceRoot, "withheld-owner-proof"));
+          }),
+      );
     for (const seconds of [59, 60, 61, 120, 3600])
       check(`accepts the exact numeric runtime policy for ${seconds} seconds`, () =>
         Effect.scoped(
