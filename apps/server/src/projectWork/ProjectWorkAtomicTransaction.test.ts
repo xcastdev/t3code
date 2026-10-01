@@ -153,3 +153,33 @@ it.effect("refuses an existing SQL transaction before running preparation", () =
     () => Effect.die("must not publish"),
   ),
 );
+
+it.effect("rejects a retained repository under another SQL client before auxiliary writes", () =>
+  withDatabase(
+    Effect.gen(function* () {
+      const { sql: owner, repository } = yield* setup;
+      yield* owner`CREATE TRIGGER atomic_reject_owner_receipt BEFORE INSERT ON project_work_command_receipts BEGIN SELECT RAISE(ABORT,'owner receipt'); END`;
+      yield* Effect.gen(function* () {
+        const other = yield* SqlClient.SqlClient;
+        expect(other).not.toBe(owner);
+        yield* other`CREATE TABLE atomic_foreign_page (id TEXT PRIMARY KEY)`;
+        let prepared = false;
+        const result = yield* repository
+          .executeAtomic(
+            Effect.gen(function* () {
+              prepared = true;
+              yield* other`INSERT INTO atomic_foreign_page VALUES ('must-not-escape')`;
+              return [command("foreign")];
+            }),
+          )
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        expect(prepared).toBe(false);
+        expect(yield* other`SELECT * FROM atomic_foreign_page`).toEqual([]);
+      }).pipe(Effect.provide(NodeSqliteClient.layerMemory()));
+      expect(yield* owner`SELECT * FROM project_work_command_receipts`).toEqual([]);
+      expect(yield* owner`SELECT * FROM project_work_events`).toEqual([]);
+    }),
+    () => Effect.die("must not publish"),
+  ),
+);

@@ -618,6 +618,14 @@ const makeProjectWorkRepository = Effect.gen(function* () {
     executeUnpublished(...args).pipe(Effect.tap(publishCommitted));
   const executeAtomic: ProjectWorkRepositoryShape["executeAtomic"] = (prepare) =>
     Effect.gen(function* () {
+      const currentClient = yield* Effect.serviceOption(SqlClient.SqlClient);
+      if (Option.isSome(currentClient) && currentClient.value !== sql)
+        return yield* Effect.fail(
+          new ProjectWorkPolicyError(
+            "invalid-state",
+            "Atomic work must use its repository SQL client",
+          ),
+        );
       // An enclosing unmanaged SQL transaction cannot provide an after-commit receipt.
       if (Option.isSome(yield* Effect.serviceOption(sql.transactionService)))
         return yield* Effect.fail(
