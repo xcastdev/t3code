@@ -1,6 +1,9 @@
 import { CommandId, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Reactivity from "effect/unstable/reactivity/Reactivity";
+import * as Statement from "effect/unstable/sql/Statement";
+import type { Connection } from "effect/unstable/sql/SqlConnection";
 import * as Schema from "effect/Schema";
 import * as TestClock from "effect/testing/TestClock";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
@@ -506,3 +509,104 @@ it.effect("a retained repository cannot commit shared page progress on another S
     }),
   ),
 );
+
+for (const invalidation of ["expiry", "binding", "archive"] as const) {
+  it.effect(
+    `rolls back the entire page when ${invalidation} occurs after its actual command receipt`,
+    () =>
+      run(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const native = yield* setup;
+            yield* bind(native);
+            const leased = (yield* claim(native))!;
+            const reserved = yield* native.reserve;
+            let observedReceipts = 0;
+            const connection: Connection = {
+              ...reserved,
+              execute(query, parameters, transform) {
+                return reserved.execute(query, parameters, transform).pipe(
+                  Effect.tap(() =>
+                    query.includes("INSERT INTO project_work_command_receipts")
+                      ? Effect.gen(function* () {
+                          observedReceipts++;
+                          if (invalidation === "expiry")
+                            yield* TestClock.setTime(leased.lease!.expiresAt);
+                          else if (invalidation === "binding")
+                            yield* reserved.execute(
+                              "UPDATE project_issue_binding SET status='detached' WHERE project_id='a'",
+                              [],
+                              undefined,
+                            );
+                          else
+                            yield* reserved.execute(
+                              "INSERT INTO project_lifecycle(project_id,state,workspace_root,revision,changed_at) VALUES('a','archived','/unused',1,?)",
+                              [at],
+                              undefined,
+                            );
+                        })
+                      : Effect.void,
+                  ),
+                );
+              },
+            };
+            const sql = yield* SqlClient.make({
+              acquirer: Effect.succeed(connection),
+              transactionAcquirer: Effect.succeed(connection),
+              compiler: Statement.makeCompilerSqlite(),
+              spanAttributes: [],
+            }).pipe(Effect.provide(Reactivity.layer));
+            const before = yield* sql`SELECT * FROM sqlite_sequence ORDER BY name`;
+            let publications = 0;
+            const result = yield* commitIssueRepositoryRead(sql, key, leased.lease!, () =>
+              Effect.gen(function* () {
+                yield* sql`INSERT INTO project_issue_page(host,repository_node_id,read_key,page_kind,payload_json) VALUES(${key.host},${key.repositoryNodeId},'late','issues','{}')`;
+                return {
+                  commands: [
+                    {
+                      type: "project-work.task.create" as const,
+                      projectId: ProjectId.make("a"),
+                      taskId: ProjectWorkTaskId.make("late"),
+                      commandId: CommandId.make("late"),
+                      title: "Late",
+                      createdAt: at,
+                    },
+                  ],
+                  progress: {
+                    since: at,
+                    nextPage: 2,
+                    sweepStartedAt: at,
+                    lastSuccessfulPageAt: at,
+                  },
+                };
+              }),
+            ).pipe(
+              Effect.provide(ProjectWorkRepositoryLive),
+              Effect.provideService(SqlClient.SqlClient, sql),
+              Effect.provideService(ProjectWorkEventBus, {
+                publish: () =>
+                  Effect.sync(() => {
+                    publications++;
+                  }),
+                subscribe: Effect.die("unused"),
+              }),
+              Effect.result,
+            );
+            expect(observedReceipts).toBe(1);
+            expect(result._tag).toBe("Failure");
+            expect(publications).toBe(0);
+            expect(yield* readIssueRepositoryState(sql, key)).toEqual(leased);
+            expect(yield* sql`SELECT * FROM project_issue_page`).toEqual([]);
+            expect(yield* sql`SELECT * FROM project_work_command_receipts`).toEqual([]);
+            expect(yield* sql`SELECT * FROM project_work_events`).toEqual([]);
+            expect(yield* sql`SELECT * FROM sqlite_sequence ORDER BY name`).toEqual(before);
+            expect(
+              (yield* sql`SELECT status FROM project_issue_binding WHERE project_id='a'`)[0]
+                ?.status,
+            ).toBe("active");
+            expect(yield* sql`SELECT * FROM project_lifecycle WHERE project_id='a'`).toEqual([]);
+          }),
+        ),
+      ),
+  );
+}

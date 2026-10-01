@@ -399,6 +399,9 @@ export const commitIssueRepositoryRead = Effect.fn("commitIssueRepositoryRead")(
   const repository = yield* ProjectWorkRepository;
   if ((yield* SqlClient.SqlClient) !== sql) return yield* fail("invalid-input");
   let accepted = false;
+  let progress:
+    | Pick<IssueRepositoryState, "since" | "nextPage" | "sweepStartedAt" | "lastSuccessfulPageAt">
+    | undefined;
   const results = yield* repository.executeAtomic(
     Effect.gen(function* () {
       if (Option.isNone(yield* Effect.serviceOption(sql.transactionService)))
@@ -415,16 +418,28 @@ export const commitIssueRepositoryRead = Effect.fn("commitIssueRepositoryRead")(
         )
       )
         return yield* fail("binding-limit");
+      progress = Object.freeze({
+        since: prepared.progress.since,
+        nextPage: prepared.progress.nextPage,
+        sweepStartedAt: prepared.progress.sweepStartedAt,
+        lastSuccessfulPageAt: prepared.progress.lastSuccessfulPageAt,
+      });
+      return prepared.commands;
+    }),
+    Effect.gen(function* () {
+      if (progress === undefined) return;
+      // Receipts can take time or change authority. Retain the lease until this final check.
+      const current = yield* currentLease(sql, key, lease);
+      if (current === undefined) return yield* fail("stale-state");
       yield* writeState(sql, {
         ...current,
-        ...prepared.progress,
+        ...progress,
         lease: null,
         error: null,
         retryAt: 0,
         revision: yield* increment(current.revision),
       });
       accepted = true;
-      return prepared.commands;
     }),
   );
   return { accepted, results };

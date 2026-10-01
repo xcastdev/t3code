@@ -183,3 +183,45 @@ it.effect("rejects a retained repository under another SQL client before auxilia
     () => Effect.die("must not publish"),
   ),
 );
+
+it.effect(
+  "validates after all atomic receipts and rolls back before publishing either project",
+  () => {
+    const published: Array<ProjectWorkCommittedEvent> = [];
+    return withDatabase(
+      Effect.gen(function* () {
+        const { sql, repository } = yield* setup;
+        const before = yield* sql`SELECT * FROM sqlite_sequence ORDER BY name`;
+        const prepare = Effect.gen(function* () {
+          yield* sql`INSERT INTO atomic_external_page VALUES ('validated')`;
+          return [command("validation-one"), command("validation-two")];
+        });
+        let validations = 0;
+        const validate = Effect.gen(function* () {
+          validations++;
+          expect(yield* sql`SELECT command_id FROM project_work_command_receipts`).toHaveLength(2);
+          expect(published).toEqual([]);
+        });
+        const rejected = yield* repository
+          .executeAtomic(prepare, validate.pipe(Effect.andThen(Effect.fail("late-validation"))))
+          .pipe(Effect.result);
+        expect(rejected._tag).toBe("Failure");
+        expect(validations).toBe(1);
+        expect(yield* sql`SELECT * FROM project_work_command_receipts`).toEqual([]);
+        expect(yield* sql`SELECT * FROM project_work_events`).toEqual([]);
+        expect(yield* sql`SELECT * FROM atomic_external_page`).toEqual([]);
+        expect(yield* sql`SELECT * FROM sqlite_sequence ORDER BY name`).toEqual(before);
+        expect(published).toEqual([]);
+        const accepted = yield* repository.executeAtomic(prepare, validate);
+        expect(accepted).toHaveLength(2);
+        expect(validations).toBe(2);
+        expect(published).toHaveLength(2);
+        expect(yield* sql`SELECT * FROM atomic_external_page`).toEqual([{ id: "validated" }]);
+      }),
+      (events) =>
+        Effect.sync(() => {
+          published.push(...events);
+        }),
+    );
+  },
+);

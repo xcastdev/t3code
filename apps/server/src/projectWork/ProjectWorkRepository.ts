@@ -74,9 +74,15 @@ export interface ProjectWorkRepositoryShape {
     receiptFingerprint?: string,
   ) => Effect.Effect<ProjectWorkCommandResult, ProjectWorkRepositoryError | E | L>;
   /** Trusted multi-project writes and auxiliary SQL share one outer commit. No publication escapes rollback. */
-  readonly executeAtomic: <E, R>(
+  readonly executeAtomic: <E, R, V = never, VR = never>(
     prepare: Effect.Effect<ReadonlyArray<ProjectWorkCommand>, E, R>,
-  ) => Effect.Effect<ReadonlyArray<ProjectWorkCommandResult>, E | ProjectWorkRepositoryError, R>;
+    /** Runs after every command receipt, before commit or publication. */
+    finalValidate?: Effect.Effect<void, V, VR>,
+  ) => Effect.Effect<
+    ReadonlyArray<ProjectWorkCommandResult>,
+    E | V | ProjectWorkRepositoryError,
+    R | VR
+  >;
   readonly executeCommand: ProjectWorkRepositoryShape["execute"];
   readonly replay: (
     projectId: string,
@@ -616,7 +622,7 @@ const makeProjectWorkRepository = Effect.gen(function* () {
         }).pipe(Effect.ignore);
   const executeAuthorized: ProjectWorkRepositoryShape["executeAuthorized"] = (...args) =>
     executeUnpublished(...args).pipe(Effect.tap(publishCommitted));
-  const executeAtomic: ProjectWorkRepositoryShape["executeAtomic"] = (prepare) =>
+  const executeAtomic: ProjectWorkRepositoryShape["executeAtomic"] = (prepare, finalValidate) =>
     Effect.gen(function* () {
       const currentClient = yield* Effect.serviceOption(SqlClient.SqlClient);
       if (Option.isSome(currentClient) && currentClient.value !== sql)
@@ -640,9 +646,11 @@ const makeProjectWorkRepository = Effect.gen(function* () {
               return yield* Effect.fail(
                 new ProjectWorkPolicyError("invalid-state", "Atomic work command limit exceeded"),
               );
-            return yield* Effect.forEach(commands, (command) =>
+            const results = yield* Effect.forEach(commands, (command) =>
               executeUnpublished(command, () => Effect.succeed(command)),
             );
+            if (finalValidate !== undefined) yield* finalValidate;
+            return results;
           }),
         )
         .pipe(
