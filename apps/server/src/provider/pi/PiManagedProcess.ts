@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Crypto from "effect/Crypto";
 import type * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -797,23 +798,37 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
       let state: "owned" | "starting" | "running" | "stopped" = "owned";
       let childExitCode: number | null = null;
       let childPid: number | null = null;
+      let closeInput = Effect.void;
+      let awaitReaders = Effect.void;
       const stop = yield* Effect.cached(
         Effect.gen(function* () {
           state = "stopped";
+          const capturedOwner = owner;
+          if (!capturedOwner) {
+            // The launcher is ours; an existing unit with the same nonce is not.
+            // Closing this launcher's input permits a late helper to take its EOF path.
+            yield* Queue.end(incoming);
+            yield* closeInput.pipe(Effect.timeout("3 seconds"));
+            yield* child.exitCode.pipe(Effect.timeout("3 seconds"));
+            yield* awaitReaders.pipe(Effect.timeout("3 seconds"));
+            yield* Queue.end(stdout);
+            yield* Queue.end(stderr);
+            return yield* fail(
+              "quarantine",
+              "Launcher input and process drained without a captured service invocation; unit ownership remains unproved.",
+            );
+          }
           const before = yield* readUnit();
           if (
             (before.Description !== description && !absentUnit(before)) ||
-            (owner && before.InvocationID && before.InvocationID !== owner.invocation) ||
-            (owner &&
-              before.ControlGroup &&
-              `/sys/fs/cgroup${before.ControlGroup}` !== owner.cgroup)
+            (before.InvocationID && before.InvocationID !== capturedOwner.invocation) ||
+            (before.ControlGroup && `/sys/fs/cgroup${before.ControlGroup}` !== capturedOwner.cgroup)
           )
             return yield* fail(
               "quarantine",
               "Owned service identity changed; termination is unproved.",
             );
-          const group =
-            owner?.cgroup ?? (before.ControlGroup ? `/sys/fs/cgroup${before.ControlGroup}` : "");
+          const group = capturedOwner.cgroup;
           if (group && (!group.startsWith("/sys/fs/cgroup/") || !group.endsWith(`/${unit}`)))
             return yield* fail(
               "quarantine",
@@ -846,12 +861,12 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
           yield* Deferred.fail(exited, stoppedError);
           return {
             unit,
-            invocation: owner?.invocation ?? before.InvocationID,
+            invocation: capturedOwner.invocation,
             cgroup: group,
-            ownerPid: owner?.pid ?? null,
+            ownerPid: capturedOwner.pid,
             memoryBytes: launch.memoryBytes,
             swapBytes: 0,
-            oomGroup: owner?.oomGroup ?? 0,
+            oomGroup: capturedOwner.oomGroup,
             launcherPid: Number(child.pid),
             childPid,
             childExitCode,
@@ -880,7 +895,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         yield* Queue.fail(stdout, error);
         yield* Queue.fail(stderr, error);
       });
-      yield* Stream.fromQueue(incoming).pipe(
+      const inputWriter = yield* Stream.fromQueue(incoming).pipe(
         Stream.run(child.stdin),
         Effect.catch(() =>
           transportFailure(
@@ -893,7 +908,8 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         Effect.interruptible,
         Effect.forkScoped,
       );
-      yield* child.stderr.pipe(
+      closeInput = Fiber.join(inputWriter);
+      const stderrReader = yield* child.stderr.pipe(
         Stream.runForEach(() =>
           fail("startup", "The owned Linux launcher reported a startup failure."),
         ),
@@ -969,7 +985,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
             return yield* fail("startup", event.message);
         }
       });
-      yield* child.stdout.pipe(
+      const stdoutReader = yield* child.stdout.pipe(
         Stream.runForEach((chunk) =>
           Effect.gen(function* () {
             let offset = 0;
@@ -1005,6 +1021,9 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         Effect.interruptible,
         Effect.forkScoped,
       );
+      awaitReaders = Effect.all([Fiber.join(stdoutReader), Fiber.join(stderrReader)], {
+        concurrency: "unbounded",
+      }).pipe(Effect.asVoid);
       const verified = yield* restore(
         Deferred.await(ownerReady).pipe(
           Effect.timeout("5 seconds"),
@@ -1015,6 +1034,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
                 message: "Owned Linux startup did not provide its verified receipt.",
               }),
           ),
+          Effect.catch((error) => stop.pipe(Effect.andThen(Effect.fail(error)))),
         ),
       );
       const policy = yield* restore(readUnit());

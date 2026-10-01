@@ -5,6 +5,7 @@ import * as NodePath from "node:path";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
@@ -62,6 +63,17 @@ const rejects = Effect.fn("managedTest.rejects")(function* (
 const absent = (path: string) =>
   Effect.promise(() => expect(NodeFSP.stat(path)).rejects.toMatchObject({ code: "ENOENT" }));
 const encodeEvidence = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeWithheldOwner = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      type: Schema.Literal("owner"),
+      unit: Schema.String,
+      nonce: Schema.String,
+      invocation: Schema.String,
+      cgroup: Schema.String,
+    }),
+  ),
+);
 
 describe("managed launch filesystem boundary", () => {
   check("accepts a pinned regular runtime file and records the canonical workspace inode", () =>
@@ -816,6 +828,283 @@ describe.runIf(process.env.PI_MANAGED_PROCESS_LINUX_GATE === "1")(
             yield* retain({ ...child.owner, kernel: "foreign-service-exited-from-owned-input" });
           }),
         ),
+    );
+    for (const sameDescription of [false, true])
+      check(
+        `failed acquire preserves uncaptured existing unit with ${sameDescription ? "same" : "different"} description`,
+        () =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const directory = process.env.PI_MANAGED_PROCESS_EVIDENCE_DIR;
+              if (directory)
+                yield* Effect.promise(() => NodeFSP.mkdir(directory, { recursive: true }));
+              const launch = yield* runtimeLaunch([
+                "/bin/bash",
+                "-c",
+                "printf forbidden > /workspace/collision-proof",
+              ]);
+              const allocation = yield* preallocatePiManagedProcess(launch);
+              const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+              const env = {
+                PATH: "/usr/bin:/bin",
+                XDG_RUNTIME_DIR: `/run/user/${process.getuid!()}`,
+                DBUS_SESSION_BUS_ADDRESS: `unix:path=/run/user/${process.getuid!()}/bus`,
+              };
+              const show = Effect.fn("managedTest.collisionShow")(function* () {
+                return yield* Effect.scoped(
+                  Effect.gen(function* () {
+                    const handle = yield* spawner.spawn(
+                      ChildProcess.make(
+                        "/usr/bin/systemctl",
+                        [
+                          "--user",
+                          "show",
+                          allocation.unit,
+                          "--property=LoadState,Description,InvocationID,ActiveState,ControlGroup",
+                        ],
+                        { env, extendEnv: false, shell: false },
+                      ),
+                    );
+                    const [chunks, code] = yield* Effect.all(
+                      [handle.stdout.pipe(Stream.decodeText(), Stream.runCollect), handle.exitCode],
+                      { concurrency: "unbounded" },
+                    );
+                    expect(Number(code)).toBe(0);
+                    return Object.fromEntries(
+                      Array.from(chunks)
+                        .join("")
+                        .trim()
+                        .split("\n")
+                        .map((line) => {
+                          const equals = line.indexOf("=");
+                          return [line.slice(0, equals), line.slice(equals + 1)];
+                        }),
+                    );
+                  }),
+                );
+              });
+              const foreign = yield* spawner.spawn(
+                ChildProcess.make(
+                  "/usr/bin/systemd-run",
+                  [
+                    "--user",
+                    "--wait",
+                    "--pipe",
+                    "--quiet",
+                    `--unit=${allocation.unit}`,
+                    `--description=${sameDescription ? `T3 Pi managed ${allocation.nonce}` : "Captured collision control"}`,
+                    "-p",
+                    "MemoryMax=536870912",
+                    "-p",
+                    "MemorySwapMax=0",
+                    "-p",
+                    "OOMPolicy=kill",
+                    "-p",
+                    "KillMode=control-group",
+                    "-p",
+                    "RuntimeMaxSec=15s",
+                    "-p",
+                    "TimeoutStopSec=2s",
+                    "/usr/bin/bash",
+                    "-c",
+                    "printf foreign-ready; IFS= read -r value; printf foreign-survived",
+                  ],
+                  { env, extendEnv: false, shell: false },
+                ),
+              );
+              const ready = yield* Deferred.make<void>();
+              const reader = yield* foreign.stdout.pipe(
+                Stream.tap(() => Deferred.succeed(ready, undefined)),
+                Stream.decodeText(),
+                Stream.runCollect,
+                Effect.forkChild,
+              );
+              yield* Deferred.await(ready).pipe(Effect.timeout("3 seconds"));
+              const before = yield* show();
+              let owners = 0;
+              let acquireErrorPhase: PiManagedProcessError["phase"] | null = null;
+              let launcherPid: number | null = null;
+              let launcherExit = Effect.succeed(-1);
+              const observed = ChildProcessSpawner.make((command) =>
+                spawner.spawn(command).pipe(
+                  Effect.tap((handle) =>
+                    Effect.sync(() => {
+                      if (
+                        command._tag === "StandardCommand" &&
+                        command.command === "/usr/bin/systemd-run"
+                      ) {
+                        launcherPid = Number(handle.pid);
+                        launcherExit = handle.exitCode.pipe(Effect.map(Number), Effect.orDie);
+                      }
+                    }),
+                  ),
+                ),
+              );
+              const result = yield* Effect.scoped(
+                acquirePiManagedProcess(launch, {
+                  allocation,
+                  claimActivation: () => Effect.void,
+                  beforeStart: () =>
+                    Effect.sync(() => {
+                      owners++;
+                    }),
+                }).pipe(
+                  Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed),
+                  Effect.tapError((error) =>
+                    Effect.sync(() => {
+                      acquireErrorPhase = error.phase;
+                    }),
+                  ),
+                ),
+              ).pipe(Effect.exit);
+              const after = yield* show();
+              const capturedLauncherExit = yield* launcherExit;
+              if (after.ActiveState === "active")
+                yield* Stream.make(Buffer.from("release\n")).pipe(Stream.run(foreign.stdin));
+              const foreignExit = Number(yield* foreign.exitCode);
+              const output = Array.from(yield* Fiber.join(reader)).join("");
+              const final = yield* show();
+              if (directory)
+                yield* Effect.promise(() =>
+                  NodeFSP.writeFile(
+                    NodePath.join(
+                      directory,
+                      `collision-${sameDescription ? "same" : "different"}.json`,
+                    ),
+                    encodeEvidence({
+                      unit: allocation.unit,
+                      foreignLauncherPid: Number(foreign.pid),
+                      launcherPid,
+                      capturedLauncherExit,
+                      before,
+                      after,
+                      final,
+                      owners,
+                      acquireErrorPhase,
+                      result: result._tag,
+                      cause: result._tag === "Failure" ? Cause.pretty(result.cause) : "",
+                      foreignExit,
+                      output,
+                    }),
+                  ),
+                );
+              expect(owners).toBe(0);
+              expect(result._tag).toBe("Failure");
+              if (sameDescription) expect(acquireErrorPhase).toBe("quarantine");
+              expect(capturedLauncherExit).not.toBe(0);
+              expect(launcherPid).toBeGreaterThan(0);
+              expect(after.ActiveState).toBe("active");
+              expect(after.InvocationID).toBe(before.InvocationID);
+              expect(after.ControlGroup).toBe(before.ControlGroup);
+              expect(foreignExit).toBe(0);
+              expect(output).toBe("foreign-readyforeign-survived");
+              expect(final.LoadState).toBe("not-found");
+              yield* absent(`/sys/fs/cgroup${before.ControlGroup}`);
+              yield* absent(NodePath.join(input.workspaceRoot, "collision-proof"));
+            }),
+          ),
+      );
+    check("uncaptured helper ownership drains through actual launcher EOF without START", () =>
+      Effect.gen(function* () {
+        const launch = yield* runtimeLaunch([
+          "/bin/bash",
+          "-c",
+          "printf forbidden > /workspace/withheld-owner-proof",
+        ]);
+        const allocation = yield* preallocatePiManagedProcess(launch);
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const receipt = yield* Deferred.make<{
+          unit: string;
+          nonce: string;
+          invocation: string;
+          cgroup: string;
+        }>();
+        let pending = Buffer.alloc(0);
+        let captured = false;
+        let launcherPid: number | null = null;
+        let launcherExit = Effect.succeed(-1);
+        let owners = 0;
+        let errorPhase: PiManagedProcessError["phase"] | null = null;
+        const observed = ChildProcessSpawner.make((command) => {
+          if (command._tag !== "StandardCommand" || command.command !== "/usr/bin/systemd-run")
+            return spawner.spawn(command);
+          return spawner.spawn(command).pipe(
+            Effect.map((handle) => {
+              launcherPid = Number(handle.pid);
+              launcherExit = handle.exitCode.pipe(Effect.map(Number), Effect.orDie);
+              return ChildProcessSpawner.makeHandle({
+                ...handle,
+                stdout: handle.stdout.pipe(
+                  Stream.tap((chunk) =>
+                    Effect.gen(function* () {
+                      if (captured) return;
+                      if (pending.byteLength + chunk.byteLength > 65536)
+                        return yield* Effect.die("Withheld owner fixture exceeded frame bound");
+                      pending = Buffer.concat([pending, chunk]);
+                      const newline = pending.indexOf(10);
+                      if (newline < 0) return;
+                      const owner = yield* decodeWithheldOwner(
+                        pending.subarray(0, newline).toString("utf8"),
+                      ).pipe(Effect.orDie);
+                      expect(owner.unit).toBe(allocation.unit);
+                      expect(owner.nonce).toBe(allocation.nonce);
+                      expect(owner.cgroup.endsWith(`/${allocation.unit}`)).toBe(true);
+                      captured = true;
+                      pending = Buffer.alloc(0);
+                      yield* Deferred.succeed(receipt, owner);
+                    }),
+                  ),
+                  Stream.filter(() => false),
+                ),
+              });
+            }),
+          );
+        });
+        const result = yield* Effect.scoped(
+          acquirePiManagedProcess(launch, {
+            allocation,
+            claimActivation: () => Effect.void,
+            beforeStart: () =>
+              Effect.sync(() => {
+                owners++;
+              }),
+          }).pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed),
+            Effect.tapError((error) =>
+              Effect.sync(() => {
+                errorPhase = error.phase;
+              }),
+            ),
+          ),
+        ).pipe(Effect.exit);
+        const helper = yield* Deferred.await(receipt).pipe(Effect.timeout("1 second"));
+        const code = yield* launcherExit;
+        expect(result._tag).toBe("Failure");
+        expect(errorPhase).toBe("quarantine");
+        expect(owners).toBe(0);
+        expect(code).toBe(0);
+        expect(launcherPid).toBeGreaterThan(0);
+        yield* absent(helper.cgroup);
+        yield* absent(NodePath.join(input.workspaceRoot, "withheld-owner-proof"));
+        const directory = process.env.PI_MANAGED_PROCESS_EVIDENCE_DIR;
+        if (directory)
+          yield* Effect.promise(async () => {
+            await NodeFSP.mkdir(directory, { recursive: true });
+            await NodeFSP.writeFile(
+              NodePath.join(directory, "withheld-owner-eof.json"),
+              encodeEvidence({
+                ...helper,
+                launcherPid,
+                launcherExit: code,
+                owners,
+                errorPhase,
+                kernel: "removed",
+                acquiredOwner: false,
+                result: result._tag,
+              }),
+            );
+          });
+      }),
     );
     for (const seconds of [59, 60, 61, 120, 3600])
       check(`accepts the exact numeric runtime policy for ${seconds} seconds`, () =>
