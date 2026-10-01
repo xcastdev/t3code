@@ -500,7 +500,7 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity, operation?: PiW
   let bootstrap: PiWorkerBootstrap | undefined;
   let ready = false;
   let nativeReference: PiNativeReference | undefined;
-  let readyLeaf: string | null | undefined;
+  let lifecycleLeaf: string | null | undefined;
   let nativePersisted = false;
   let compacted = false;
   let operationSettled = false;
@@ -561,7 +561,7 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity, operation?: PiW
     if (
       expectedOperation?.operationKind !== "initialize" &&
       value.persisted &&
-      (value.leafId === null || value.leafId === readyLeaf)
+      (value.leafId === null || value.leafId === lifecycleLeaf)
     )
       fail("NATIVE_PERSISTENCE_BARRIER");
     nativeReference = value;
@@ -691,6 +691,7 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity, operation?: PiW
     if (id <= lifecycleId) fail("LIFECYCLE_ID_REUSE");
     lifecycle = "running";
     lifecycleId = id;
+    lifecycleLeaf = nativeReference?.leafId;
     lifecycleHasRequest = false;
     lastOutcome = undefined;
     assistantSucceeded = false;
@@ -913,7 +914,7 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity, operation?: PiW
           fail("RUNTIME_OPERATION_REQUIRED");
         switch (message.type) {
           case "request":
-            if (pending || canceled) fail("REQUEST_BARRIER");
+            if (pending || canceled || tool) fail("REQUEST_BARRIER");
             if (expectedOperation) {
               requireReady();
               if (expectedOperation.operationKind === "initialize") fail("OPERATION_KIND");
@@ -985,7 +986,7 @@ export function makePiWorkerProtocol(identity: PiWorkerIdentity, operation?: PiW
               if (message.native.leafId !== bootstrap.native.leafId) fail("NATIVE_LEAF_MISMATCH");
             }
             nativeReference = message.native;
-            readyLeaf = message.native.leafId;
+            lifecycleLeaf = message.native.leafId;
             ready = true;
             break;
           case "initialized":

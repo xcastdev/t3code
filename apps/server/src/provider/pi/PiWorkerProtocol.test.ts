@@ -161,6 +161,48 @@ describe("parent-bound native operations", () => {
   });
 
   it.each(["prompt", "compact"] as const)(
+    "requires fresh persisted native progress in every %s lifecycle",
+    (kind) => {
+      for (const secondLeaf of ["leaf-2", "leaf-3"]) {
+        const peer = runtimePeers(kind);
+        peer.bootstrap();
+        const cycle = (id: number, leafId: string) => {
+          peer.worker({
+            type: kind === "prompt" ? "agent_start" : "compaction_start",
+            lifecycleId: id,
+          });
+          peer.worker({ type: "request", lifecycleId: id, requestId: id, body: "{}" });
+          peer.parent({ type: "headers", requestId: id, status: 200 });
+          peer.parent({ type: "end", requestId: id });
+          if (kind === "prompt") {
+            peer.worker({
+              type: "sdk-event",
+              lifecycleId: id,
+              event: { type: "assistant_result", stopReason: "stop" },
+            });
+            peer.worker({ type: "native", lifecycleId: id, native: { ...native, leafId } });
+            peer.worker({ type: "agent_end", lifecycleId: id });
+            peer.worker({ type: "agent_settled", lifecycleId: id });
+          } else {
+            peer.worker({ type: "compaction_end", lifecycleId: id });
+            peer.worker({ type: "compacted", lifecycleId: id, native: { ...native, leafId } });
+          }
+        };
+        cycle(1, "leaf-2");
+        if (secondLeaf === "leaf-2") {
+          expect(() => cycle(2, secondLeaf)).toThrow("NATIVE_PERSISTENCE_BARRIER");
+          expect(peer.protocol.successful).toBe(false);
+        } else {
+          cycle(2, secondLeaf);
+          peer.worker({ type: "operation_settled", lifecycleId: 2, outcome: "success" });
+          peer.worker({ type: "done" });
+          expect(peer.protocol.successful).toBe(true);
+        }
+      }
+    },
+  );
+
+  it.each(["prompt", "compact"] as const)(
     "rejects an unchanged persisted native leaf in %s",
     (kind) => {
       const peer = runtimePeers(kind);
@@ -491,6 +533,61 @@ describe("frozen tool manifest and bounded payloads", () => {
     input(peer);
     expect(() => input(peer, '{"arguments":{}}', 2)).toThrow("TOOL_CALL_BARRIER");
   });
+  it.each([false, true])(
+    "requires the prior tool to close before model dispatch (closed=%s)",
+    (closed) => {
+      const peer = toolPeer();
+      input(peer);
+      expect(peer.protocol.canStartRequest).toBe(false);
+      if (!closed) {
+        expect(() =>
+          peer.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" }),
+        ).toThrow("REQUEST_BARRIER");
+        expect(peer.protocol.successful).toBe(false);
+        return;
+      }
+      peer.parent({ type: "tool-authorized", callId: 1, allowed: true });
+      peer.worker({
+        type: "sdk-event",
+        lifecycleId: 1,
+        event: { type: "tool_start", callId: 1, toolName: "read" },
+      });
+      const output = Buffer.from('{"kind":"text","text":"ok"}');
+      peer.worker({
+        type: "tool-result",
+        callId: 1,
+        output: { transferId: "output", totalBytes: output.length },
+      });
+      peer.worker({
+        type: "transfer-chunk",
+        transferId: "output",
+        index: 0,
+        offset: 0,
+        data: output.toString("base64"),
+      });
+      peer.worker({ type: "transfer-end", transferId: "output" });
+      peer.worker({
+        type: "sdk-event",
+        lifecycleId: 1,
+        event: { type: "tool_end", callId: 1, toolName: "read", isError: false },
+      });
+      expect(peer.protocol.canStartRequest).toBe(true);
+      peer.worker({ type: "request", lifecycleId: 1, requestId: 1, body: "{}" });
+      peer.parent({ type: "headers", requestId: 1, status: 200 });
+      peer.parent({ type: "end", requestId: 1 });
+      peer.worker({
+        type: "sdk-event",
+        lifecycleId: 1,
+        event: { type: "assistant_result", stopReason: "stop" },
+      });
+      peer.worker({ type: "native", lifecycleId: 1, native: { ...native, leafId: "leaf-2" } });
+      peer.worker({ type: "agent_end", lifecycleId: 1 });
+      peer.worker({ type: "agent_settled", lifecycleId: 1 });
+      peer.worker({ type: "operation_settled", lifecycleId: 1, outcome: "success" });
+      peer.worker({ type: "done" });
+      expect(peer.protocol.successful).toBe(true);
+    },
+  );
   it.each([
     '{"arguments":{},"url":"https://worker-chosen"}',
     '{"arguments":{"__proto__":{"polluted":true}}}',
