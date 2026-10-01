@@ -6,6 +6,9 @@ import {
   CommandId,
   ProjectId,
   ProjectWorkTaskId,
+  ProjectWorkCriterionId,
+  type ProjectTeamRecord,
+  type ProjectTeamWriteIntent,
   type ProjectTeamGuidedIntent,
 } from "@t3tools/contracts";
 import { runMigrations } from "../persistence/Migrations.ts";
@@ -132,6 +135,122 @@ it.effect(
         const receipts = yield* sql`SELECT command_id FROM project_work_command_receipts
         WHERE project_id=${projectId} AND command_id!=${"guided-create"}`;
         expect(receipts).toHaveLength(0);
+      }),
+    ),
+);
+
+it.effect(
+  "approves a revised specification despite historical plans and rejects stale approval receipts",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const { sql, gateway } = yield* setup;
+        const envelope = Effect.gen(function* () {
+          const state = yield* readCurrentState(sql, projectId);
+          return {
+            projectId,
+            taskId,
+            expectedRevision: state.revision,
+            expectedTaskRevision: state.tasks.find((task) => task.taskId === taskId)!.revision,
+          };
+        });
+        const propose = Effect.fn("guidedGatewayTest.propose")(function* (revision: number) {
+          const criterionId = ProjectWorkCriterionId.make("guided-requirement");
+          const intent: ProjectTeamGuidedIntent = {
+            ...(yield* envelope),
+            type: "project-team.specification.propose",
+            commandId: CommandId.make(`guided-spec-${revision}`),
+            expectedSpecRevision: revision - 1,
+            specification: {
+              objective: `Bounded objective ${revision}`,
+              scopeIn: "Approved task",
+              scopeOut: "Other work",
+              criterionIds: [criterionId],
+              revision,
+              protected: false,
+            },
+            criterionSnapshots: [
+              {
+                criterionId,
+                taskId,
+                description: `Verify requirement ${revision}`,
+                required: true,
+                status: "unsatisfied",
+                satisfiedByEvidenceIds: [],
+                revision: revision - 1,
+                updatedAt: at,
+              },
+            ],
+          };
+          yield* gateway.write(intent, human, source, { actor: human });
+        });
+        const approve = Effect.fn("guidedGatewayTest.approve")(function* (
+          gateKind: "specification" | "plan",
+          commandId: CommandId,
+        ) {
+          const state = yield* readCurrentState(sql, projectId);
+          const gate = state.foundationRecords!.find(
+            (record): record is Extract<ProjectTeamRecord, { kind: "gate" }> =>
+              record.kind === "gate" &&
+              record.taskId === taskId &&
+              record.gate === gateKind &&
+              record.status === "pending",
+          )!;
+          const intent: ProjectTeamWriteIntent = {
+            ...(yield* envelope),
+            type: "project-team.gate.respond",
+            commandId,
+            specRevision: gate.specRevision,
+            planRevision: gate.planRevision,
+            gateId: gate.recordId,
+            expectedGateRevision: gate.revision,
+            response: "approved",
+          };
+          const receipt = yield* gateway.write(intent, human, source, { actor: human });
+          expect(yield* gateway.write(intent, human, source, { actor: human })).toEqual(receipt);
+          return { intent, receipt };
+        });
+        yield* propose(1);
+        const original = yield* approve("specification", CommandId.make("approve-guided-spec-1"));
+        yield* gateway.write(
+          {
+            ...(yield* envelope),
+            type: "project-team.plan.propose",
+            commandId: CommandId.make("guided-plan-1"),
+            specRevision: 1,
+            content: "Implement and verify the bounded task",
+            dependencyTaskIds: [],
+          },
+          human,
+          source,
+          { actor: human },
+        );
+        const oldPlan = yield* approve("plan", CommandId.make("approve-guided-plan-1"));
+        yield* propose(2);
+        const beforeDenial = yield* readCurrentState(sql, projectId);
+        for (const stale of [original, oldPlan])
+          expect(
+            (yield* gateway
+              .write(stale.intent, human, source, { actor: human })
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+        expect((yield* readCurrentState(sql, projectId)).revision).toBe(beforeDenial.revision);
+        const revised = yield* approve("specification", CommandId.make("approve-guided-spec-2"));
+        expect(revised.intent).toMatchObject({ specRevision: 2, planRevision: 0 });
+        const after = yield* readCurrentState(sql, projectId);
+        expect(after.tasks.find((task) => task.taskId === taskId)?.specRevision).toBe(2);
+        expect(after.attempts).toHaveLength(0);
+        expect(
+          after.foundationRecords!.some(
+            (record) =>
+              record.kind === "gate" &&
+              record.recordId === revised.intent.gateId &&
+              record.status === "approved",
+          ),
+        ).toBe(true);
+        const receipts = yield* sql`SELECT command_id FROM project_work_command_receipts
+          WHERE project_id=${projectId} AND command_id=${revised.intent.commandId}`;
+        expect(receipts).toHaveLength(1);
       }),
     ),
 );
