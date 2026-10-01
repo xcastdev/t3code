@@ -7,48 +7,43 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-10-01 05:59 UTC. Implementation is running. **P1–P3 are finished on main. P4 passes its part review and the combined 656-test gate; fresh wave review is next.** Ten subagent seats plus the coordinator are available. Approved private Pi pieces and preparatory leaves do not complete their parent phases.
+Last updated: 2026-10-01 06:27 UTC. Implementation is running. **P1–P4 are finished on main. P5 durable integration and P7 runtime integration are next.** Ten subagent seats plus the coordinator are available. Reviewed preparatory slices do not complete their parent phases.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
-| Implementation steps        | 3    | 7      | 4    | 14    |
+| Implementation steps        | 4    | 6      | 4    | 14    |
 | Product acceptance criteria | 0    | 0      | 19   | 19    |
 | Final independent audits    | 0    | 0      | 2    | 2     |
 
-- **Finished on main:** P1 bounded dependency proofs; P2 durable foundation; P3 current managed identity and protected command authorization. P2/P3 landed at `1346f50af` after 301 combined tests, three normal compilers, scoped checks and fresh wave APPROVE. All 56 reviewed source hashes match main.
-- **Why P3 took time:** independent checks exposed stale permissions, rollback and recovery races. Those fixes and their real-SQL proofs are complete. P3 is no longer blocking active work.
-- **P4:** reviewed candidate `8c4450b4a` is integrated into clean bounded wave `25f7bd6ae`. Combined checks pass 656/656 across 25 files, zero skips, normal strict/Effect-plugin compiler across 42 roots, and exact-path lint/format/Knip. All 149 captured units, 394 PIDs and 145 cgroups drain. Its sole fresh wave reviewer verifies all 50 source hashes and 489 artifacts and runs independent combined probes. P4 is not yet counted complete.
-- **P5:** transport and pure sync/intake leaves are approved. Title repair `42663135` passes 79 tests and independent replay/rename/conflict checks. Durable authority interfaces are prepared; refinement, wiring and real GitHub evidence remain dependent work.
-- **P7:** approved protocol, contained process, governed broker, SDK worker, parent runtime, skills and runtime dependencies are in bounded wave `25f7bd6ae`. Actual SDK-parent slice `d5a9f44d2` and full-frame observer `91b11091b` are independently APPROVED and held for the next wave. Root verifies all 98 and 281 review artifacts. Event repair `082405770` is APPROVED after independent 38-case replay and causal controls; root verifies all 65 recheck artifacts. Host repair `59b549fa6` passes 138 cases and normal compilation; root verifies all 41 artifacts and starts the same-reviewer recheck. Root freezes private interface `46e4ebbcb`, with four strict-config cases and normal compilation passing, and assigns separate driver and adapter owners. Its own fresh review and a small runtime-mode assertion extension remain gated. Durable SQL callbacks/accounting, production entry, registration and platform/package gates remain open.
-- **P6/P8:** human workflow and dispatch/recovery interfaces are prepared. Implementation depends on the required P4/P5 and P7 gates; preparation does not complete these phases.
-- **P10:** native adapter repair `2a88e791` is approved after real deletion, recovery and explicit native-proof checks. Extraction, authorized hydration, context and integration remain dependent work.
-- **P11:** pure evidence policy `090589f4` is approved and held for integration.
-- **Not started:** P9, P12, P13 and P14. Later independent slices can run concurrently, but real runtime, memory, packaging and client validation remain substantial gates. No guarantee that every later phase will be faster.
+- **Finished on main:** P1 dependency proofs; P2 durable foundation; P3 current managed identity/authorization; P4 guided lifecycle, approvals, investigation, bounded repairs and evidence metadata. Latest product merge: `30ca5e52883619da4d338666dcbe64bca39d09f0`.
+- **P4 evidence:** combined 656/656 tests across 25 files, zero skips; normal strict/Effect compiler across 42 roots; exact-path lint/format/Knip. Sole fresh wave reviewer APPROVES `25f7bd6ae` after 16 independent causal groups. Root verifies all 155 review artifacts and all 50 reviewed product files on main. Producer/review audits confirm 172 units, 460 captured PIDs and 168 cgroups drained. Plan-only main advances were preserved.
+- **P5:** transport and sync/intake leaves approved; title repair `42663135` passes 79 cases. P4 dependency is now satisfied. Root must implement durable shared-repository authority, atomic page/cache/intake commits, explicit refinement and service wiring before the full phase can pass.
+- **P7:** protocol/process/broker/SDK/parent/skills/dependencies are on main. SDK-parent `d5a9f44d2`, full-frame observer `91b11091b` and event repair `082405770` are approved and held. Private port `46e4ebbcb` and assertion extension `713ad91f5` are approved; root verifies all 32 extension-review artifacts. Adapter `430cee8d8` passes 18 cases; driver repair `4d642070d` passes 22, correcting obsolete `pi` identity to canonical `piAgent`. Root verifies their 135 and 78 artifacts; each has its sole fresh review active. Native-session reader implementation is active. Host repair `59b549fa6` resolves three findings but its same reviewer finds a supported-stream cleanup hang; root reproduces it and the original owner is preparing a narrow repair. Durable SQL callbacks/accounting, trusted model configuration, production entry/registration and real platform/package gates remain open.
+- **P6/P8:** human-workflow and dispatch/recovery interfaces prepared; dependent implementation awaits required P5/P7 gates.
+- **P10:** native Mem0 adapter `2a88e791` approved; extraction, authorized hydration, context and integration remain dependent work.
+- **P11:** evidence policy `090589f4` approved; full delivery integration remains dependent work.
+- **Not started:** P9, P12, P13 and P14. All 19 product criteria and both final audits remain open.
 
-All 19 product criteria and both final audits remain open. Approved preparatory leaves do not complete their parent phases. Shared contracts, migrations, wiring and dependencies retain one owner. Development repair limits are waived.
-
-No local models, Ollama/llama inference, OpenAI runtime/proof services, push or PR creation. The exhausted eight-call P1 proof budget is closed. Integrated browser/device permission and disposable GitHub fixture-write permission remain required when those concrete proofs are ready.
+Prioritize Pi, OpenCode, Claude and Codex. Shared contracts, migrations, wiring and dependencies retain one owner. Repair limits are waived. No local models, Ollama/llama inference, OpenAI runtime/proof calls, push or PR creation. P1's eight-call proof budget remains closed. Required browser/device permission and disposable GitHub fixture-write permission are outstanding.
 
 ### Live agent slots
 
-Each row is one subagent seat. Finished agents release their seat. Worktrees live under `/home/user/.cache/pi-project-teams-11b7e351/`.
+Each row is one subagent seat. Finished agents release their seat. Worktrees and evidence live under `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                                        | State                            | Assignment / branch                     | Next gate                                                           |
-| ---- | -------------------------------------------- | -------------------------------- | --------------------------------------- | ------------------------------------------------------------------- |
-| 1    | `review_wave3_bounded`                       | Active fresh wave review         | Exact `25f7bd6ae`                       | Combined P4/private-Pi causal source, failure and compliance review |
-| 2    | — (last: `p4_guided_core_high`)              | Available; host repair committed | `59b549fa6`, base `49037a489`           | Same host reviewer recheck active                                   |
-| 3    | — (last: `p7_event_translation_high`)        | Available; event repair APPROVE  | `082405770`, base `a9298c20e`           | Root durable ordinal and ingestion wiring next wave                 |
-| 4    | — (last: `review_p7_runtime_events`)         | Available; event repair APPROVE  | Exact `082405770`                       | Ready independent work                                              |
-| 5    | `p7_driver_high`                             | Active independent Pi slice      | `pi-teams/p7-driver`, base `46e4ebbcb`  | Scoped driver/config/snapshot/skills checks and commit              |
-| 6    | `p7_adapter_high`                            | Active independent Pi slice      | `pi-teams/p7-adapter`, base `46e4ebbcb` | Scoped adapter receipts, cancellation and session checks            |
-| 7    | `review_p7_private_port`                     | Active independent port review   | Exact `46e4ebbcb`                       | Strict actual codec, ownership and private authority interface      |
-| 8    | — (last: `p5_sync_leaf_high`)                | Available; leaf APPROVE          | Sync/intake `42663135`                  | Await main P4 and root durable interfaces                           |
-| 9    | `review_p7_worker_host`                      | Active repair review             | Exact `59b549fa6`                       | Three original findings plus stream shutdown edge cases             |
-| 10   | — (last: `review_p7_sdk_parent_integration`) | Available; SDK-parent APPROVE    | Exact `d5a9f44d2`                       | Root registers two fixtures before next-wave integration            |
+| Slot | Agent                                    | State                                      | Assignment / exact base                               | Next gate                                                             |
+| ---- | ---------------------------------------- | ------------------------------------------ | ----------------------------------------------------- | --------------------------------------------------------------------- |
+| 1    | — (last: `review_wave3_bounded`)         | Available; wave APPROVE                    | Exact `25f7bd6ae`, merged main `30ca5e528`            | Ready independent work                                                |
+| 2    | `p4_guided_core_high`                    | Active host repair proposal                | Frozen `59b549fa6`                                    | Root approves minimal cleanup contract; same reviewer rechecks repair |
+| 3    | `p7_native_reader_high`                  | Active filesystem implementation           | `pi-teams/p7-native-session-reader`, base `713ad91f5` | Actual bounded native-file checks, commit, one fresh review           |
+| 4    | — (last: `p7_driver_adapter_interfaces`) | Available; configuration proposal complete | Read-only base `713ad91f5`                            | Root trusted current model metadata/configuration                     |
+| 5    | — (last: `p7_driver_high`)               | Available; driver committed                | Repair `4d642070d`, base `8b4b28c75`                  | Sole fresh driver review active                                       |
+| 6    | — (last: `p7_adapter_high`)              | Available; adapter committed               | `430cee8d8`, original base `46e4ebbcb`                | Sole fresh adapter review active                                      |
+| 7    | `review_p7_driver`                       | Active fresh driver review                 | Exact `4d642070d`                                     | Independent identity, snapshot, capabilities and skill checks         |
+| 8    | `review_p7_adapter`                      | Active fresh adapter review                | Exact `430cee8d8`                                     | Independent receipts, duplicates, cancellation and shutdown           |
+| 9    | — (last: `review_p7_worker_host`)        | Available; verified HOST-R4                | Exact `59b549fa6`                                     | Same reviewer waits for repaired exact commit                         |
+| 10   | — (last: `review_p7_private_port`)       | Available; both port reviews APPROVE       | Exact `46e4ebbcb` / `713ad91f5`                       | Ready independent work                                                |
 
-Coordinator: clean bounded wave `25f7bd6ae67d627ef8b16faff7e4c8ce9ee1d373` passes the combined P4/private-Pi gate and captured process audit. Its 489-artifact manifest is sealed (`362ad938…`) and its sole fresh wave reviewer is active. New observer, SDK-parent, event repair and host leaves stay outside this frozen candidate. Root owns all shared contracts, migrations, wiring, dependencies and integrated client verification. Root freezes the private Pi port and coordinates its small assertion extension; separate driver and adapter implementation is active. The adapter compiler request is queued after that extension. No model or integrated client proof runs.
-
-Primary branch: `t3code/implement-pi-project-teams`. Main product commit: `1346f50af6f1361b0942fe1d42e636804e1ba9a0`. Bounded wave base is that exact product commit; main has advanced only through plan updates, which will be preserved during local merge. Historical evidence and checkpoint notes remain below and in the worktree cache.
+Coordinator: owns P5 shared durable interfaces and P7 SQL/configuration/entry/wiring. Complete bounded wave is locally integrated. Held later slices require their next combined gate and review. Only the coordinator performs integrated client verification after permission.
 
 ## Goal
 
@@ -559,7 +554,7 @@ prior verdict does not certify the new parallel assignments.
       project, role, recipient, and lease fields; credential renewal; stale generation;
       duplicate approval consumption; and cross-device races.
 
-- [ ] **P4 — Implement guided lifecycle and real investigation before approval.**
+- [x] **P4 — Implement guided lifecycle and real investigation before approval.**
       Dependencies: P2–P3. Covers AC-2–AC-4, AC-8, AC-12–AC-15; validation V4.
       Extend `ProjectWorkDecider.ts`, `ProjectWorkPolicy.ts`, `ProjectWorkRepository.ts`,
       `ProjectWorkLeaseReactor.ts`, and **new** `ProjectTeamPolicy.ts`.
@@ -2764,3 +2759,9 @@ Root candidate `46e4ebbcb8d5592c0a6a91c10d2588e7425a2513`, base bounded wave `25
 Independent Sol-high workers own only `Drivers/PiDriver.ts/.test.ts` and `Layers/PiAdapter.ts/.test.ts` in separate worktrees at exact `46e4ebbcb`. Frozen adapter factory consumes `{instanceId, runtime}`. Driver factory injects that adapter factory, allowing isolated compilation without importing the other worker's unfinished file. Root later registers the composed factory. Adapter alone owns stopAll finalization; driver does not duplicate it. Runtime-mode input will be added by root as an exact-match assertion against the frozen SQL intent before effects, through the same-port-reviewer extension. Explicit approval/sandbox overrides are unsupported. Start/resume initialization remains correlated to durable root intent; a failed read never permits a reset. These mapping tests use explicit private-port fakes and cannot satisfy the actual runtime/SQL/package gate.
 
 Event same reviewer APPROVES `082405770`; root verifies all 65 recheck artifacts, SHA-256 `e55e263427dba29cefac861166610210dddcea184f9d96d52779e669246caa34`. Root inspects host repair `59b549fa6`, verifies all 41 artifacts (`f56b7e82…`) and starts its same-reviewer recheck. Bounded wave `25f7bd6ae` stays frozen; its fresh reviewer verifies all 489 artifacts and 50 current/Git-object source hashes and independently checks combined behavior.
+
+### P4 main integration and parallel Pi checks (2026-10-01)
+
+Fresh bounded-wave reviewer APPROVES exact `25f7bd6ae67d627ef8b16faff7e4c8ce9ee1d373`. Root verifies all 155 sealed review artifacts, manifest SHA-256 `004e1c2ddfa7199c5a27a17e05240c1858306a376adf81f7241e94e4a0e14028`. Independent actual SQLite authority/replay, paused result authorization, omission control, Linux ownership/callback drains, repair provenance and ordinary Claude/Codex/OpenCode materialization total 16 distinct causal groups. Matching combined 656-case, strict compiler, style and Knip seals remain applicable. All producer/review captured units, PIDs and cgroups drain. Root reconciles plan-only main advances and merges locally at `30ca5e52883619da4d338666dcbe64bca39d09f0`; all 50 reviewed product files match and the prior plan is preserved exactly. P4 is complete; all product acceptance criteria remain open.
+
+Root verifies all 117 original driver, 78 canonical-identity repair, 135 adapter and 32 private-port assertion review artifacts. Driver `4d642070dbb8e245c67987e9e33550f4a34d18c6` has 22 passing cases and strict compilation; adapter `430cee8d8b2d80ea418f6e4f64ed1648ecfb3fa6` has 18. Each receives its sole fresh xhigh reviewer. Host R4 is independently reproduced: valid `emitClose:false` resources finish destruction while cleanup waits forever for an event they intentionally omit. The original owner proposes a supported-stream repair; frozen source/evidence remain unchanged. Native-session reader owns only two new files at approved port `713ad91f5`; its Linux descriptor-bound reads cannot replace root current authorization or committed-leaf authority. Native configuration inspection finds saved CommandCode auth metadata but no current catalogue and a Cursor default; no model/API call or credential value is collected. Trusted route resolution remains explicit P7 work.
