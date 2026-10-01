@@ -2,6 +2,7 @@ import {
   CommandId,
   ProjectTeamCredential,
   ProjectTeamRecord,
+  ProjectTeamGuidedIntent,
   ProjectWorkKnowledgeId,
   type ProjectWorkActor,
   type ProjectWorkAttribution,
@@ -20,6 +21,13 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { ProjectWorkReducerState } from "./ProjectWorkDecider.ts";
 import { readCurrentState } from "./ProjectWorkRepository.ts";
+import { decodeProjectWorkEvent } from "./ProjectWorkEventStore.ts";
+import { assertProjectTeamGuidedReplayCurrent } from "./ProjectTeamGuidedLifecycle.ts";
+import {
+  assertProjectTeamRunAuthority,
+  projectTeamSpecificationHash,
+  projectTeamPlanHash,
+} from "./ProjectTeamPolicy.ts";
 
 export class ProjectTeamAuthorizationError extends Schema.TaggedError<ProjectTeamAuthorizationError>()(
   "ProjectTeamAuthorizationError",
@@ -40,6 +48,9 @@ export interface ProjectTeamAuthority {
 const isAuthorizationError = Schema.is(ProjectTeamAuthorizationError);
 const decodeUnknownJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.Unknown));
 const decodeRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
+const decodeGuidedIntent = Schema.decodeUnknownSync(ProjectTeamGuidedIntent, {
+  onExcessProperty: "error",
+});
 export const managedActorId = (
   credential: Pick<ProjectTeamCredential, "providerInstanceId" | "threadId">,
 ) => `agent:mcp:${credential.providerInstanceId}:${credential.threadId}`;
@@ -79,6 +90,12 @@ export class ProjectTeamAuthorization extends Context.Service<
     readonly intent: (
       principal: ProjectTeamPrincipal,
       input: ProjectTeamWriteIntent,
+      attribution: ProjectWorkAttribution,
+      duplicate: boolean,
+    ) => Effect.Effect<ProjectWorkCommand, ProjectTeamAuthorizationError>;
+    readonly guided: (
+      principal: ProjectTeamPrincipal,
+      input: ProjectTeamGuidedIntent,
       attribution: ProjectWorkAttribution,
       duplicate: boolean,
     ) => Effect.Effect<ProjectWorkCommand, ProjectTeamAuthorizationError>;
@@ -244,6 +261,10 @@ export const layer = Layer.effect(
         const projects =
           yield* sql`SELECT project_id FROM projection_projects WHERE project_id = ${credential.projectId} AND deleted_at IS NULL`;
         if (projects.length !== 1) return yield* deny("Managed project unavailable");
+        yield* Effect.try({
+          try: () => assertProjectTeamRunAuthority(state, binding, role, issuing),
+          catch: () => deny("Managed assignment or approval changed"),
+        });
         const lifecycleTable =
           yield* sql`SELECT name FROM sqlite_master WHERE type='table' AND name='project_lifecycle'`;
         if (lifecycleTable.length) {
@@ -405,18 +426,32 @@ export const layer = Layer.effect(
       if (input.type !== "project-team.delegation.request" && principal.actor.kind !== "human")
         return yield* deny("Only a human can respond to gates, answer or promote memory");
       const records = state.foundationRecords ?? [];
+      const question =
+        input.type === "project-team.question.answer"
+          ? records.find((r) => r.kind === "question" && r.recordId === input.questionId)
+          : undefined;
+      const gateId =
+        input.type === "project-team.gate.respond"
+          ? input.gateId
+          : question?.kind === "question"
+            ? question.targetGateId
+            : undefined;
+      const targetGate = records.find((r) => r.kind === "gate" && r.recordId === gateId);
+      const specificationTarget =
+        targetGate?.kind === "gate" && targetGate.gate === "specification";
       const plans = records.filter(
         (r) => r.kind === "plan-revision" && r.taskId === input.taskId && r.status === "proposed",
       );
       if (
-        plans.some((r) => r.kind === "plan-revision" && r.planRevision > input.planRevision) ||
-        (input.planRevision > 0 &&
-          !plans.some(
-            (r) =>
-              r.kind === "plan-revision" &&
-              r.planRevision === input.planRevision &&
-              r.specRevision === input.specRevision,
-          ))
+        !specificationTarget &&
+        (plans.some((r) => r.kind === "plan-revision" && r.planRevision > input.planRevision) ||
+          (input.planRevision > 0 &&
+            !plans.some(
+              (r) =>
+                r.kind === "plan-revision" &&
+                r.planRevision === input.planRevision &&
+                r.specRevision === input.specRevision,
+            )))
       )
         return yield* deny("Plan revision changed");
       const now = attribution.recordedAt;
@@ -425,17 +460,7 @@ export const layer = Layer.effect(
         input.type === "project-team.gate.respond" ||
         input.type === "project-team.question.answer"
       ) {
-        const question =
-          input.type === "project-team.question.answer"
-            ? records.find((r) => r.kind === "question" && r.recordId === input.questionId)
-            : undefined;
-        const gateId =
-          input.type === "project-team.gate.respond"
-            ? input.gateId
-            : question?.kind === "question"
-              ? question.targetGateId
-              : undefined;
-        const gate = records.find((r) => r.kind === "gate" && r.recordId === gateId);
+        const gate = targetGate;
         if (
           gate?.kind !== "gate" ||
           gate.taskId !== input.taskId ||
@@ -446,6 +471,24 @@ export const layer = Layer.effect(
               (duplicate && input.type === "project-team.gate.respond" ? 1 : 0)
         )
           return yield* deny("Gate target changed");
+        if (
+          gate.gate === "specification" &&
+          (gate.planRevision !== 0 ||
+            gate.contentHash !== projectTeamSpecificationHash(state, input.taskId))
+        )
+          return yield* deny("Specification approval target changed");
+        if (
+          gate.gate === "plan" &&
+          !plans.some(
+            (plan) =>
+              plan.kind === "plan-revision" &&
+              plan.planRevision === gate.planRevision &&
+              plan.specRevision === gate.specRevision &&
+              plan.contentHash === gate.contentHash &&
+              projectTeamPlanHash(plan) === gate.contentHash,
+          )
+        )
+          return yield* deny("Plan approval target changed");
         if (input.type === "project-team.gate.respond") {
           if (!duplicate && gate.status !== "pending" && gate.status !== "proposed")
             return yield* deny("Gate response is no longer eligible");
@@ -667,6 +710,84 @@ export const layer = Layer.effect(
         committedAt: now,
       } satisfies ProjectWorkCommand;
     });
+    const guided = Effect.fn("ProjectTeamAuthorization.guided")(function* (
+      principal: ProjectTeamPrincipal,
+      input: ProjectTeamGuidedIntent,
+      attribution: ProjectWorkAttribution,
+      duplicate: boolean,
+    ) {
+      const intent = yield* Effect.try({
+        try: () => decodeGuidedIntent(input),
+        catch: () => deny("Invalid guided intent"),
+      });
+      if (
+        principal.actor.kind !== attribution.actor.kind ||
+        principal.actor.id !== attribution.actor.id
+      )
+        return yield* deny("Guided attribution does not match authenticated principal");
+      const authority = yield* resolve(principal);
+      if (principal.actor.kind !== "human") {
+        if (authority === undefined)
+          return yield* deny("Guided agent requires current managed authority");
+        if (
+          authority.binding.projectId !== intent.projectId ||
+          authority.binding.taskId !== intent.taskId
+        )
+          return yield* deny("Guided intent must target the assigned task");
+        const capability =
+          intent.type === "project-team.assignment.report"
+            ? "project-work.report"
+            : intent.type === "project-team.plan.propose" &&
+                (authority.role.role === "planner" || authority.role.role === "coordinator")
+              ? "project-work.plan"
+              : undefined;
+        if (
+          capability === undefined ||
+          !authority.role.tools.includes(capability) ||
+          !authority.binding.configuration.toolIds.includes(capability)
+        )
+          return yield* deny("Frozen role does not grant this guided action");
+      }
+      const state = authority?.state ?? (yield* stateFor(intent.projectId));
+      if (duplicate) {
+        const rows = yield* sql<{ payload: string }>`
+          SELECT payload_json AS payload FROM project_work_events
+          WHERE project_id=${intent.projectId} AND command_id=${intent.commandId}
+          ORDER BY sequence ASC
+        `;
+        yield* Effect.try({
+          try: () =>
+            assertProjectTeamGuidedReplayCurrent(
+              state,
+              intent,
+              rows.map((row) => decodeProjectWorkEvent(decodeUnknownJson(row.payload))),
+            ),
+          catch: () => deny("Guided receipt target changed"),
+        });
+      } else {
+        const task = state.tasks.find((entry) => entry.taskId === intent.taskId);
+        if (
+          state.revision !== intent.expectedRevision ||
+          task?.revision !== intent.expectedTaskRevision
+        )
+          return yield* deny("Guided project or task revision changed");
+      }
+      return {
+        type: "project-work.foundation.commit",
+        commandId: intent.commandId,
+        projectId: intent.projectId,
+        expectedRevision: intent.expectedRevision,
+        attribution,
+        records: [],
+        guided: {
+          intent,
+          ...(authority === undefined
+            ? {}
+            : { bindingId: authority.binding.recordId, generation: authority.binding.generation }),
+        },
+        committedAt: attribution.recordedAt,
+      } satisfies ProjectWorkCommand;
+    });
     const guard = <A, E>(effect: Effect.Effect<A, E>) =>
       effect.pipe(
         Effect.mapError((error) =>
@@ -693,6 +814,7 @@ export const layer = Layer.effect(
       read: (p, i) => guard(read(p, i)),
       write: (p, c) => guard(write(p, c)),
       intent: (p, i, a, d) => guard(intent(p, i, a, d)),
+      guided: (p, i, a, d) => guard(guided(p, i, a, d)),
     });
   }),
 );

@@ -21,6 +21,8 @@ import * as Environment from "../environment/ServerEnvironment.ts";
 import { ProjectWorkQuery } from "./ProjectWorkQuery.ts";
 import {
   seed,
+  createManagedAssignment,
+  restoreHistoricalBinding,
   scoped,
   decodeRecord,
   projectId,
@@ -91,7 +93,16 @@ for (const status of [
               .resolve({ ...f.principal, managed: { ...f.principal.managed, generation: 1 } })
               .pipe(Effect.result))._tag,
           ).toBe("Failure");
-        else yield* f.change(decodeRecord({ ...f.binding, revision: 1, status }));
+        else if (status === "settled") {
+          const historical = decodeRecord({
+            ...f.binding,
+            revision: f.binding.revision + 1,
+            status,
+          });
+          expect((yield* f.change(historical).pipe(Effect.result))._tag).toBe("Failure");
+          yield* restoreHistoricalBinding(historical);
+        } else
+          yield* f.change(decodeRecord({ ...f.binding, revision: f.binding.revision + 1, status }));
         if (status !== "generation")
           expect((yield* f.auth.resolve(f.principal).pipe(Effect.result))._tag).toBe("Failure");
       }),
@@ -143,7 +154,9 @@ it.effect(
         const token = issued.config.authorizationHeader.replace("Bearer ", "");
         expect(issued.config.providerSessionId).not.toBe("native-pi-session");
         expect(yield* registry.resolve(token)).toBeUndefined();
-        yield* f.change(decodeRecord({ ...f.binding, revision: 1, status: "running" }));
+        yield* f.change(
+          decodeRecord({ ...f.binding, revision: f.binding.revision + 1, status: "running" }),
+        );
         const scope = yield* registry.resolve(token);
         expect(scope?.managed).toEqual(f.principal.managed);
         expect(yield* registry.resolve(untouchedToken)).toBeUndefined();
@@ -154,7 +167,9 @@ it.effect(
           ))._tag,
         ).toBe("Failure");
         expect(yield* auth.resolve(f.principal)).toBeDefined();
-        yield* f.change(decodeRecord({ ...f.binding, revision: 2, status: "revoked" }));
+        yield* f.change(
+          decodeRecord({ ...f.binding, revision: f.binding.revision + 2, status: "revoked" }),
+        );
         yield* registry.touch(threadId);
         expect(yield* registry.resolve(token)).toBeUndefined();
         yield* f.sql`DELETE FROM project_team_run_binding WHERE project_id=${projectId}`;
@@ -209,15 +224,15 @@ it.effect("uses complete indexed binding authority beyond the 128-record public 
       for (let i = 0; i < 130; i++)
         yield* f.change(
           decodeRecord({
-            ...f.binding,
-            recordId: "aaa-binding-" + i.toString().padStart(3, "0"),
-            status: "settled",
+            ...f.role,
+            recordId: "aaa-role-" + i.toString().padStart(3, "0"),
+            roleId: "unrelated-role-" + i,
           }),
         );
       const query = yield* ProjectWorkQuery;
       const page = yield* query.listFoundationRecords({
         projectId,
-        kinds: ["run-binding"],
+        kinds: ["role-revision", "run-binding"],
         limit: 128,
       });
       expect(page.items).toHaveLength(128);
@@ -243,7 +258,9 @@ it.effect(
         expect(
           (yield* f.auth.issueCredential({ providerInstanceId, threadId }))?.credential,
         ).toEqual(f.principal.managed);
-        yield* f.change(decodeRecord({ ...f.binding, revision: 1, status: "running" }));
+        yield* f.change(
+          decodeRecord({ ...f.binding, revision: f.binding.revision + 1, status: "running" }),
+        );
         expect((yield* f.auth.resolve(f.principal).pipe(Effect.result))._tag).toBe("Failure");
       }),
     ),
@@ -253,74 +270,17 @@ it.effect("denies ambiguous reserved issuance and never refreshes a supplied sta
     Effect.gen(function* () {
       const f = yield* seed("implementer", "reserved");
       const otherTask = ProjectWorkTaskId.make("other-task");
-      const otherAttempt = ProjectWorkAttemptId.make("other-attempt");
-      const criterion = ProjectWorkCriterionId.make("other-criterion");
-      const at = "2026-01-01T00:00:00.000Z";
-      yield* f.repo.execute({
-        type: "project-work.task.create",
-        projectId,
+      yield* createManagedAssignment({
         taskId: otherTask,
-        commandId: CommandId.make("other-create"),
-        title: "Other task",
-        createdAt: at,
+        recordId: "other-binding",
+        attemptId: "other-attempt",
+        commandId: "other-claim",
+        providerInstanceId,
+        threadId,
+        role: f.role,
+        status: "reserved",
+        configuration: f.binding.configuration,
       });
-      yield* f.repo.execute({
-        type: "project-work.criterion.upsert",
-        projectId,
-        taskId: otherTask,
-        commandId: CommandId.make("other-criterion"),
-        criterion: {
-          criterionId: criterion,
-          taskId: otherTask,
-          description: "Other scope",
-          required: false,
-          status: "unsatisfied",
-          satisfiedByEvidenceIds: [],
-          revision: 0,
-          updatedAt: at,
-        },
-        updatedAt: at,
-      });
-      yield* f.repo.execute({
-        type: "project-work.task.specify",
-        projectId,
-        taskId: otherTask,
-        commandId: CommandId.make("other-spec"),
-        specification: {
-          objective: "Other scope",
-          scopeIn: "Other",
-          scopeOut: "Assigned task",
-          criterionIds: [criterion],
-          revision: 1,
-          protected: false,
-        },
-        updatedAt: at,
-      });
-      yield* f.repo.execute({
-        type: "project-work.task.ready",
-        projectId,
-        taskId: otherTask,
-        commandId: CommandId.make("other-ready"),
-        updatedAt: at,
-      });
-      yield* f.repo.execute({
-        type: "project-work.task.claim",
-        projectId,
-        taskId: otherTask,
-        commandId: CommandId.make("other-claim"),
-        attemptId: otherAttempt,
-        leaseToken: "other-lease",
-        leasedUntil: "2030-01-01T00:00:00.000Z",
-        claimedAt: at,
-      });
-      yield* f.change(
-        decodeRecord({
-          ...f.binding,
-          recordId: "other-binding",
-          taskId: otherTask,
-          attemptId: otherAttempt,
-        }),
-      );
       expect(
         (yield* f.auth.issueCredential({ providerInstanceId, threadId }).pipe(Effect.result))._tag,
       ).toBe("Failure");
