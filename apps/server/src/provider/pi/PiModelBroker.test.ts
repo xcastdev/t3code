@@ -776,61 +776,66 @@ describe("trusted configuration", () => {
   });
 });
 
+function runNativeFixture(args: ReadonlyArray<string> = []) {
+  return Effect.gen(function* () {
+    const sdkRoot =
+      process.env.PI_RUNTIME_CONTRACT_SDK_ROOT ??
+      NodeURL.fileURLToPath(new URL("..", import.meta.resolve("@earendil-works/pi-coding-agent")));
+    expect(sdkRoot, "Required pinned SDK root is missing").toBeTruthy();
+    const execute = Effect.gen(function* () {
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const handle = yield* spawner.spawn(
+        ChildProcess.make(
+          process.execPath,
+          [
+            "--max-old-space-size=128",
+            NodeURL.fileURLToPath(
+              new URL("./fixtures/p7-model-broker-native-sdk.mjs", import.meta.url),
+            ),
+            ...args,
+          ],
+          {
+            env: { PI_RUNTIME_CONTRACT_SDK_ROOT: sdkRoot, PATH: "" },
+            extendEnv: false,
+            stdin: "ignore",
+            killSignal: "SIGKILL",
+          },
+        ),
+      );
+      let bytes = 0;
+      const collect = (stream: typeof handle.stdout) => {
+        const initial: Array<Uint8Array> = [];
+        return stream.pipe(
+          Stream.runFold(
+            () => initial,
+            (chunks, chunk) => {
+              bytes += chunk.length;
+              if (bytes > 65_536) throw new Error("Native fixture output exceeds its byte limit");
+              chunks.push(chunk);
+              return chunks;
+            },
+          ),
+        );
+      };
+      const [out, err, code] = yield* Effect.all(
+        [collect(handle.stdout), collect(handle.stderr), handle.exitCode],
+        { concurrency: "unbounded" },
+      );
+      return {
+        stdout: Buffer.concat(out).toString(),
+        stderr: Buffer.concat(err).toString(),
+        code,
+      };
+    }).pipe(Effect.timeout("15 seconds"), Effect.scoped, Effect.provide(NodeServices.layer));
+    return yield* execute;
+  });
+}
+
 effectIt.effect(
   "runs actual pinned SDK tool-bearing two-request turn through the broker with synthetic transport",
   () =>
     Effect.gen(function* () {
-      const sdkRoot =
-        process.env.PI_RUNTIME_CONTRACT_SDK_ROOT ??
-        NodeURL.fileURLToPath(
-          new URL("..", import.meta.resolve("@earendil-works/pi-coding-agent")),
-        );
-      expect(sdkRoot, "Required pinned SDK root is missing").toBeTruthy();
-      const execute = Effect.gen(function* () {
-        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
-        const handle = yield* spawner.spawn(
-          ChildProcess.make(
-            process.execPath,
-            [
-              "--max-old-space-size=128",
-              NodeURL.fileURLToPath(
-                new URL("./fixtures/p7-model-broker-native-sdk.mjs", import.meta.url),
-              ),
-            ],
-            {
-              env: { PI_RUNTIME_CONTRACT_SDK_ROOT: sdkRoot, PATH: "" },
-              extendEnv: false,
-              stdin: "ignore",
-              killSignal: "SIGKILL",
-            },
-          ),
-        );
-        let bytes = 0;
-        const collect = (stream: typeof handle.stdout) => {
-          const initial: Array<Uint8Array> = [];
-          return stream.pipe(
-            Stream.runFold(
-              () => initial,
-              (chunks, chunk) => {
-                bytes += chunk.length;
-                if (bytes > 65_536) throw new Error("Native fixture output exceeds its byte limit");
-                chunks.push(chunk);
-                return chunks;
-              },
-            ),
-          );
-        };
-        const [out, err, code] = yield* Effect.all(
-          [collect(handle.stdout), collect(handle.stderr), handle.exitCode],
-          { concurrency: "unbounded" },
-        );
-        return {
-          stdout: Buffer.concat(out).toString(),
-          stderr: Buffer.concat(err).toString(),
-          code,
-        };
-      }).pipe(Effect.timeout("15 seconds"), Effect.scoped, Effect.provide(NodeServices.layer));
-      const outcome = yield* execute;
+      const outcome = yield* runNativeFixture();
       expect(outcome.stderr).toBe("");
       expect(outcome.code).toBe(0);
       const report = Schema.Struct({
@@ -860,3 +865,197 @@ effectIt.effect(
     }),
   20_000,
 );
+
+effectIt.effect(
+  "replays exact retained CommandCode Ling bytes identically in direct SDK and broker",
+  () =>
+    Effect.gen(function* () {
+      const outcome = yield* runNativeFixture(["--captured-ling-replay"]);
+      expect(outcome.code, outcome.stdout + outcome.stderr).toBe(0);
+      expect(outcome.stderr).toBe("");
+      const report = Schema.Struct({
+        rawSHA256: Schema.String,
+        rawBytes: Schema.Int,
+        remoteCalls: Schema.Int,
+        direct: Schema.Struct({ stopReason: Schema.String }),
+        broker: Schema.Struct({ stopReason: Schema.String, transportCalls: Schema.Int }),
+      });
+      const result = yield* Schema.decodeEffect(Schema.fromJsonString(report))(outcome.stdout);
+      expect(result).toMatchObject({
+        rawSHA256: "9ef3ec0c33b7653b8db9cc00474045f76c67e4f0e7dc8939c30e3a6c24b71247",
+        rawBytes: 51_532,
+        remoteCalls: 0,
+        direct: { stopReason: "stop" },
+        broker: { stopReason: "stop", transportCalls: 1 },
+      });
+    }),
+  20_000,
+);
+
+it.each(["stop", "tool_calls"] as const)(
+  "preserves sole after-content zero-usage %s before actual accounting",
+  async (finish) => {
+    const output =
+      finish === "stop"
+        ? native("result")
+        : {
+            model: reportedModel,
+            choices: [
+              {
+                index: 0,
+                delta: {
+                  tool_calls: [
+                    {
+                      index: 0,
+                      id: "call-1",
+                      type: "function",
+                      function: { name: tool.function.name, arguments: "{}" },
+                    },
+                  ],
+                },
+                finish_reason: null,
+              },
+            ],
+          };
+    const zero = {
+      model,
+      choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: finish }],
+      usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    };
+    const text = data(output) + data(zero) + data(final()) + "data: [DONE]\n\n";
+    const f = fixture({ transport: async () => response(text, 1) });
+    const receipt = await f.invoke(requestBody({ tools: [tool] }));
+    expect(receipt.usage).toEqual(usage);
+    expect(f.output()).toContain('"finish_reason":"' + finish + '"');
+    expect(f.settlements[0]).toMatchObject({
+      outcome: "reported",
+      chargedInputTokens: 50,
+      chargedOutputTokens: 10,
+    });
+  },
+);
+
+it.each([
+  { sla_metrics: { ttft_ms: 1, ts_us: 2, unknown: 0 } },
+  { sla_metrics: { ttft_ms: -1, ts_us: 2 } },
+  { sla_metrics: { ttft_ms: 1, ts_us: Number.MAX_SAFE_INTEGER + 1 } },
+  { unknown: "ignored" },
+  { choices: [{ index: 0, delta: { reasoning_content: 1 }, finish_reason: null }] },
+  {
+    choices: [
+      {
+        index: 0,
+        delta: { reasoning_content: "bounded", unknown: "ignored" },
+        finish_reason: null,
+      },
+    ],
+  },
+])("rejects unobserved or invalid native route fields: %j", async (extra) => {
+  const f = fixture({
+    transport: async () => response(data({ ...native("result"), ...extra }) + success()),
+  });
+  await expect(f.invoke()).rejects.toThrow("SSE_FRAME_INVALID");
+  expect(f.chunks).toHaveLength(0);
+  expect(f.settlements[0]).toMatchObject({
+    outcome: "unknown",
+    chargedInputTokens: 20_000,
+    chargedOutputTokens: 512,
+  });
+});
+
+it.each([
+  { prompt_tokens_details: { unknown: 0 } },
+  { completion_tokens_details: { unknown: 0 } },
+  { prompt_tokens_details: { audio_tokens: 51 } },
+  { prompt_tokens_details: { cache_creation_input_tokens: 51 } },
+  { prompt_tokens_details: { cache_read_input_tokens: 51 } },
+  { prompt_tokens_details: { text_tokens: 51 } },
+  { prompt_tokens_details: { image_tokens: 51 } },
+  { prompt_tokens_details: { video_tokens: 51 } },
+  { completion_tokens_details: { reasoning_tokens: 11 } },
+])("rejects invalid known details and unknown detail fields: %j", async (extra) => {
+  const text =
+    data(native("result")) +
+    data(native("", "stop")) +
+    data(final({ ...usage, ...extra })) +
+    "data: [DONE]\n\n";
+  const f = fixture({ transport: async () => response(text, 7) });
+  await expect(f.invoke()).rejects.toBeInstanceOf(PiModelBrokerError);
+  expect(f.settlements[0]).toMatchObject({
+    outcome: "unknown",
+    chargedInputTokens: 20_000,
+    chargedOutputTokens: 512,
+  });
+});
+
+it("protects credentials across reasoning delta frames and reasoning-to-content boundaries", async () => {
+  const reasoning = (text: string) => ({
+    model: reportedModel,
+    choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }],
+  });
+  for (const second of [reasoning(secret.slice(9)), native(secret.slice(9))]) {
+    const text =
+      data(reasoning(secret.slice(0, 9))) +
+      data(second) +
+      data(native("", "stop")) +
+      data(final()) +
+      "data: [DONE]\n\n";
+    const f = fixture({ transport: async () => response(text, 1) });
+    await expect(f.invoke()).rejects.toThrow("CREDENTIAL_ECHO_REJECTED");
+    expect(f.chunks).toHaveLength(0);
+  }
+});
+
+const zeroFinish = (finish: "stop" | "tool_calls" = "stop") => ({
+  model,
+  choices: [{ index: 0, delta: { role: "assistant" }, finish_reason: finish }],
+  usage: {
+    prompt_tokens: 0,
+    completion_tokens: 0,
+    total_tokens: 0,
+    prompt_tokens_details: null,
+    completion_tokens_details: null,
+  },
+});
+it.each([
+  ["placeholder alone", data(zeroFinish()) + data(final())],
+  [
+    "placeholder before content with no actual finish",
+    data(zeroFinish()) + data(native("result")) + data(final()),
+  ],
+  ["terminal without accounting", data(native("result")) + data(zeroFinish())],
+  ["tool placeholder before content", data(zeroFinish("tool_calls")) + success()],
+  [
+    "zero usage with nonzero details",
+    data(native("result")) +
+      data({
+        ...zeroFinish(),
+        usage: { ...zeroFinish().usage, prompt_tokens_details: { audio_tokens: 1 } },
+      }) +
+      data(final()),
+  ],
+])("zero-usage finish requires valid content and final accounting: %s", async (_name, text) => {
+  const f = fixture({ transport: async () => response(text + "data: [DONE]\n\n", 3) });
+  await expect(f.invoke()).rejects.toBeInstanceOf(PiModelBrokerError);
+  expect(f.settlements[0]).toMatchObject({
+    outcome: "unknown",
+    chargedInputTokens: 20_000,
+    chargedOutputTokens: 512,
+  });
+});
+
+it("accepts an existing finish followed by the route's zero-usage marker and actual accounting", async () => {
+  const text =
+    data(native("result")) +
+    data(native("", "stop")) +
+    data(zeroFinish()) +
+    data(final()) +
+    "data: [DONE]\n\n";
+  const f = fixture({ transport: async () => response(text, 3) });
+  expect((await f.invoke()).usage).toEqual(usage);
+  expect(f.settlements[0]).toMatchObject({
+    outcome: "reported",
+    chargedInputTokens: 50,
+    chargedOutputTokens: 10,
+  });
+});

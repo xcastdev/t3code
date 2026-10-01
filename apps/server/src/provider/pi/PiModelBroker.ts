@@ -61,18 +61,28 @@ const Usage = Schema.Struct({
   completion_tokens: Integer,
   total_tokens: Integer,
   prompt_tokens_details: Schema.optional(
-    Schema.Struct({
-      cached_tokens: Schema.optional(Integer),
-      cache_write_tokens: Schema.optional(Integer),
-    }),
+    Schema.NullOr(
+      Schema.Struct({
+        audio_tokens: Schema.optional(Integer),
+        cached_tokens: Schema.optional(Integer),
+        cache_write_tokens: Schema.optional(Integer),
+        cache_creation_input_tokens: Schema.optional(Integer),
+        cache_read_input_tokens: Schema.optional(Integer),
+        text_tokens: Schema.optional(Integer),
+        image_tokens: Schema.optional(Integer),
+        video_tokens: Schema.optional(Integer),
+      }),
+    ),
   ),
   completion_tokens_details: Schema.optional(
-    Schema.Struct({
-      reasoning_tokens: Schema.optional(Integer),
-      accepted_prediction_tokens: Schema.optional(Integer),
-      rejected_prediction_tokens: Schema.optional(Integer),
-      audio_tokens: Schema.optional(Integer),
-    }),
+    Schema.NullOr(
+      Schema.Struct({
+        reasoning_tokens: Schema.optional(Integer),
+        accepted_prediction_tokens: Schema.optional(Integer),
+        rejected_prediction_tokens: Schema.optional(Integer),
+        audio_tokens: Schema.optional(Integer),
+      }),
+    ),
   ),
   prompt_cache_hit_tokens: Schema.optional(Integer),
   prompt_cache_miss_tokens: Schema.optional(Integer),
@@ -81,6 +91,7 @@ const Usage = Schema.Struct({
 const Delta = Schema.Struct({
   role: Schema.optional(Schema.Literal("assistant")),
   content: Schema.optional(Schema.NullOr(Text)),
+  reasoning_content: Schema.optional(Schema.NullOr(Text)),
   tool_calls: Schema.optional(
     Schema.Array(
       Schema.Struct({
@@ -98,6 +109,7 @@ const Native = Schema.Struct({
   created: Schema.optional(Integer),
   model: Text,
   system_fingerprint: Schema.optional(Schema.NullOr(Text)),
+  sla_metrics: Schema.optional(Schema.Struct({ ttft_ms: Integer, ts_us: Integer })),
   choices: Schema.Array(
     Schema.Struct({
       index: Schema.Literal(0),
@@ -538,6 +550,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         const values: string[] = [];
         for (const choice of native.choices) {
           if (choice.delta.content) values.push(choice.delta.content);
+          if (choice.delta.reasoning_content) values.push(choice.delta.reasoning_content);
           for (const call of choice.delta.tool_calls ?? []) {
             if (call.index >= 32) fail("SSE_TOOL_INVALID");
             if (call.function.name !== undefined || call.id !== undefined) {
@@ -565,6 +578,20 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
           fail("CREDENTIAL_ECHO_REJECTED");
         const hasContent = semantic.length > 0 || outputCalls.size > 0;
         const nativeUsage = native.usage;
+        if (nativeUsage != null) {
+          if (
+            [
+              ...Object.values(nativeUsage.prompt_tokens_details ?? {}),
+              nativeUsage.prompt_cache_hit_tokens,
+              nativeUsage.prompt_cache_miss_tokens,
+              nativeUsage.cached_tokens,
+            ].some((n) => n !== undefined && n > nativeUsage.prompt_tokens) ||
+            Object.values(nativeUsage.completion_tokens_details ?? {}).some(
+              (n) => n !== undefined && n > nativeUsage.completion_tokens,
+            )
+          )
+            fail("SSE_USAGE_INVALID");
+        }
         const preliminary =
           nativeUsage != null &&
           native.choices.length === 1 &&
@@ -574,36 +601,27 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
         if (preliminary) {
           const choice = native.choices[0]!;
           if (
-            hasContent ||
-            Object.keys(choice.delta).some((key) => key !== "role" && key !== "content") ||
-            choice.delta.content ||
-            choice.finish_reason !== "stop"
+            semantic.length > 0 ||
+            Object.keys(choice.delta).some(
+              (key) => key !== "role" && key !== "content" && key !== "reasoning_content",
+            ) ||
+            (choice.finish_reason !== "stop" && choice.finish_reason !== "tool_calls")
           )
             fail("SSE_PRELIMINARY_INVALID");
-          // Free route may emit an empty zero-usage stop before content. It is not native completion.
-          return;
+          // Before content this is a free-route placeholder; after content it is the sole native finish.
+          // Neither proves accounting: the choices-empty actual usage frame must still arrive.
+          if (!contentSeen) {
+            if (choice.finish_reason !== "stop") fail("SSE_PRELIMINARY_INVALID");
+            return;
+          }
+          finishSeen = true;
         }
-        if (nativeUsage != null) {
+        if (nativeUsage != null && !preliminary) {
           if (
             native.choices.length !== 0 ||
             !contentSeen ||
             !finishSeen ||
             nativeUsage.total_tokens !== nativeUsage.prompt_tokens + nativeUsage.completion_tokens
-          )
-            fail("SSE_USAGE_INVALID");
-          const promptDetails = nativeUsage.prompt_tokens_details;
-          const completionDetails = nativeUsage.completion_tokens_details;
-          if (
-            [
-              promptDetails?.cached_tokens,
-              promptDetails?.cache_write_tokens,
-              nativeUsage.prompt_cache_hit_tokens,
-              nativeUsage.prompt_cache_miss_tokens,
-              nativeUsage.cached_tokens,
-            ].some((n) => n !== undefined && n > nativeUsage.prompt_tokens) ||
-            Object.values(completionDetails ?? {}).some(
-              (n) => n !== undefined && n > nativeUsage.completion_tokens,
-            )
           )
             fail("SSE_USAGE_INVALID");
           usage = nativeUsage;
@@ -613,7 +631,7 @@ export function makePiModelBroker(input: PiModelBrokerConfig) {
             usage.completion_tokens > parsed.max_tokens
           )
             fail("SSE_USAGE_OVER_RESERVATION");
-        } else {
+        } else if (!preliminary) {
           if (native.choices.length !== 1 || finishSeen) fail("SSE_CHOICE_INVALID");
           contentSeen ||= hasContent;
           const finish = native.choices[0]!.finish_reason;
