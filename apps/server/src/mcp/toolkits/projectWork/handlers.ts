@@ -19,15 +19,29 @@ const make = Effect.gen(function* () {
   const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
   const read = (input: ProjectWorkReadIntent) =>
     Effect.gen(function* () {
-      yield* McpInvocationContext.requireMcpCapability("project");
-      return yield* gateway.read(input).pipe(Effect.mapError(toolError));
+      const invocation = yield* McpInvocationContext.requireMcpCapability(
+        "project",
+        input.projectId,
+      );
+      return yield* gateway
+        .read(input, {
+          actor: McpInvocationContext.projectWorkActorForInvocation(invocation),
+          ...(invocation.managed === undefined ? {} : { managed: invocation.managed }),
+        })
+        .pipe(Effect.mapError(toolError));
     });
   const write = (command: ProjectWorkWriteIntent) =>
     Effect.gen(function* () {
-      const invocation = yield* McpInvocationContext.requireMcpCapability("project");
+      const invocation = yield* McpInvocationContext.requireMcpCapability(
+        "project",
+        command.projectId,
+      );
       const actor = McpInvocationContext.projectWorkActorForInvocation(invocation);
       return yield* gateway
-        .write(command, actor, McpInvocationContext.projectWorkSourceForInvocation(invocation))
+        .write(command, actor, McpInvocationContext.projectWorkSourceForInvocation(invocation), {
+          actor,
+          ...(invocation.managed === undefined ? {} : { managed: invocation.managed }),
+        })
         .pipe(Effect.mapError(toolError));
     });
 

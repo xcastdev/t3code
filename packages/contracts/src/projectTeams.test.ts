@@ -1,11 +1,15 @@
 import { describe, expect, it } from "vite-plus/test";
 import * as Schema from "effect/Schema";
 import {
+  ProjectTeamCredential,
+  ProjectTeamWriteIntent,
   ProjectTeamRecord,
   ProjectTeamRecordRead,
   PROJECT_TEAM_DEFAULT_LIMITS,
 } from "./projectTeams.ts";
 
+const decodeCredential = Schema.decodeUnknownSync(ProjectTeamCredential);
+const decodeIntent = Schema.decodeUnknownSync(ProjectTeamWriteIntent);
 const decodeTeamRecord = Schema.decodeUnknownSync(ProjectTeamRecord);
 const decodeTeamRecordRead = Schema.decodeUnknownSync(ProjectTeamRecordRead);
 const member = {
@@ -46,4 +50,32 @@ it("preserves safe metadata for unknown future record kinds", () => {
     }),
   ).toMatchObject({ kind: "future-record", status: "future-state", recordId: "member" });
   expect(() => decodeTeamRecord({ ...member, kind: "future-record" })).toThrow();
+});
+
+it("accepts an exact managed marker and only typed public gate responses", () => {
+  const credential = {
+    projectId: "project",
+    bindingId: "binding",
+    generation: 7,
+    providerInstanceId: "pi",
+    threadId: "thread",
+  };
+  expect(decodeCredential(credential)).toEqual(credential);
+  expect(() => decodeCredential({ ...credential, generation: -1 })).toThrow();
+  const intent = {
+    type: "project-team.gate.respond",
+    commandId: "response",
+    projectId: "project",
+    taskId: "task",
+    expectedRevision: 1,
+    expectedTaskRevision: 1,
+    specRevision: 1,
+    planRevision: 0,
+    gateId: "gate",
+    expectedGateRevision: 0,
+    response: "approved",
+  };
+  expect(decodeIntent(intent)).toEqual(intent);
+  expect(() => decodeIntent({ ...intent, response: "consumed" })).toThrow();
+  expect(() => decodeIntent({ ...intent, expectedGateRevision: -1 })).toThrow();
 });

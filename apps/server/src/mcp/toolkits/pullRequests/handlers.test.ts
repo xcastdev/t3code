@@ -1,4 +1,8 @@
 import {
+  seed as seedTeam,
+  scoped as teamScoped,
+} from "../../../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+import {
   EnvironmentId,
   ProjectId,
   ProviderInstanceId,
@@ -169,6 +173,7 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
     name: Name,
     params: Parameters<typeof toolkit.handle<Name>>[1],
     capabilities: ReadonlyArray<McpInvocationContext.McpCapability> = ["pull-requests"],
+    scope = invocation(capabilities),
   ) =>
     toolkit.handle(name, params).pipe(
       Stream.unwrap,
@@ -177,7 +182,7 @@ const makeHarness = Effect.fn("makePullRequestsToolkitHarness")(function* (
       Effect.map(
         (chunk) => chunk.at(-1)!.result as Tool.Success<(typeof PullRequestsToolkit.tools)[Name]>,
       ),
-      Effect.provideService(McpInvocationContext.McpInvocationContext, invocation(capabilities)),
+      Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
       Effect.provide(dependencies),
     );
   return { commands, call };
@@ -462,3 +467,32 @@ it("keeps failure diagnostics as the cause rather than exposing them in the tool
   expect(failure.message).toBe("Could not link the pull request.");
   expect(failure.cause).toBe(cause);
 });
+
+for (const role of ["investigator", "implementer", "integrator"])
+  it.effect(`denies actual PR toolkit for managed ${role} before host publication routes`, () =>
+    teamScoped(
+      Effect.gen(function* () {
+        const f = yield* seedTeam(role);
+        const harness = yield* makeHarness();
+        const invocationScope = {
+          environmentId: EnvironmentId.make("environment"),
+          providerInstanceId: f.principal.managed.providerInstanceId,
+          threadId: f.principal.managed.threadId,
+          providerSessionId: "issued-session",
+          managed: f.principal.managed,
+          capabilities: new Set(["pull-requests" as const]),
+          issuedAt: 0,
+        };
+        const result = yield* harness
+          .call(
+            "link_pull_request",
+            { repository: "owner/repo", number: 1 },
+            ["pull-requests"],
+            invocationScope,
+          )
+          .pipe(Effect.result);
+        expect(result._tag).toBe("Failure");
+        expect(yield* Ref.get(harness.commands)).toHaveLength(0);
+      }),
+    ),
+  );

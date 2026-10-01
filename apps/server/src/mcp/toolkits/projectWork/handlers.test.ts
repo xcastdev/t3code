@@ -122,3 +122,94 @@ it.effect("routes project-work writes through the shared gateway", () =>
     });
   }),
 );
+
+import {
+  gatewayRuntime,
+  seed as seedTeam,
+  decodeRecord,
+  at,
+} from "../../../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+it.effect(
+  "uses actual gateway task authority for managed toolkit reads, nested writes and revoked duplicate receipts",
+  () =>
+    Effect.gen(function* () {
+      const f = yield* seedTeam("implementer");
+      const service = yield* ProjectWorkGateway.ProjectWorkGateway;
+      const toolkit = yield* ProjectWorkToolkit.pipe(
+        Effect.provide(
+          ProjectWorkToolkitHandlersLive.pipe(
+            Layer.provide(Layer.succeed(ProjectWorkGateway.ProjectWorkGateway, service)),
+          ),
+        ),
+      );
+      const scope = {
+        environmentId: EnvironmentId.make("environment"),
+        providerInstanceId: f.principal.managed.providerInstanceId,
+        threadId: f.principal.managed.threadId,
+        providerSessionId: "issued",
+        managed: f.principal.managed,
+        capabilities: new Set(["project" as const]),
+        issuedAt: 0,
+      };
+      const invoke = <Name extends keyof typeof ProjectWorkToolkit.tools>(
+        name: Name,
+        input: Parameters<typeof toolkit.handle<Name>>[1],
+      ) =>
+        toolkit
+          .handle(name, input)
+          .pipe(
+            Stream.unwrap,
+            Stream.runCollect,
+            Effect.provideService(McpInvocationContext.McpInvocationContext, scope),
+            Effect.provideService(ProjectWorkGateway.ProjectWorkGateway, service),
+          );
+      const projectId = f.principal.managed.projectId;
+      const taskId = (yield* f.auth.resolve(f.principal))!.binding.taskId;
+      const context = yield* invoke("project_work_read", {
+        projectId,
+        taskId,
+        operation: "task-context",
+      });
+      expect(context.at(-1)?.result).toMatchObject({ task: { taskId } });
+      expect(
+        (yield* invoke("project_work_read", {
+          projectId,
+          taskId: ProjectWorkTaskId.make("other-task"),
+          operation: "task-context",
+        }).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      const input = {
+        type: "project-work.comment.add" as const,
+        commandId: CommandId.make("managed-comment"),
+        projectId,
+        comment: {
+          commentId: "comment" as never,
+          projectId,
+          taskId,
+          body: "Assigned task finding",
+          revision: 0,
+          createdAt: at,
+        },
+        addedAt: at,
+      };
+      expect((yield* invoke("project_work_write", input)).at(-1)?.result).toMatchObject({
+        receipt: { status: "accepted" },
+      });
+      expect((yield* invoke("project_work_write", input)).at(-1)?.result).toMatchObject({
+        receipt: { status: "accepted" },
+      });
+      expect(
+        (yield* invoke("project_work_write", {
+          ...input,
+          commandId: CommandId.make("wrong-target"),
+          comment: {
+            ...input.comment,
+            commentId: "foreign" as never,
+            taskId: ProjectWorkTaskId.make("other-task"),
+          },
+        }).pipe(Effect.result))._tag,
+      ).toBe("Failure");
+      yield* f.change(decodeRecord({ ...f.binding, revision: 1, status: "revoked" }));
+      expect((yield* invoke("project_work_write", input).pipe(Effect.result))._tag).toBe("Failure");
+    }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
+);

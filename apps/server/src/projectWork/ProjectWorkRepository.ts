@@ -63,12 +63,14 @@ export interface ProjectWorkRepositoryShape {
    * the decider, inside the same SQL transaction. This is what lets a retry
    * return the original receipt without consuming a one-shot approval again.
    */
-  readonly executeAuthorized: <E>(
+  readonly executeAuthorized: <E, L = never>(
     command: ProjectWorkCommand,
     authorize: (input: {
       readonly commandFingerprint: string;
     }) => Effect.Effect<ProjectWorkCommand, E>,
-  ) => Effect.Effect<ProjectWorkCommandResult, ProjectWorkRepositoryError | E>;
+    liveValidate?: (input: { readonly duplicate: boolean }) => Effect.Effect<void, L>,
+    receiptFingerprint?: string,
+  ) => Effect.Effect<ProjectWorkCommandResult, ProjectWorkRepositoryError | E | L>;
   readonly executeCommand: ProjectWorkRepositoryShape["execute"];
   readonly replay: (
     projectId: string,
@@ -87,7 +89,8 @@ export class ProjectWorkRepository extends Context.Service<
   ProjectWorkRepositoryShape
 >()("t3/projectWork/ProjectWorkRepository") {}
 
-const readCurrentState = (sql: SqlClient.SqlClient, projectId: string) =>
+/** Complete internal authority loader; never a bounded public projection read. */
+export const readCurrentState = (sql: SqlClient.SqlClient, projectId: string) =>
   Effect.gen(function* () {
     const rows = yield* sql<Record<string, unknown>>`
       SELECT last_sequence AS lastSequence, state_json AS stateJson
@@ -271,6 +274,8 @@ const makeProjectWorkRepository = Effect.gen(function* () {
   const executeAuthorized: ProjectWorkRepositoryShape["executeAuthorized"] = (
     command,
     authorize,
+    liveValidate,
+    receiptFingerprint,
   ) => {
     const projectId = String(command.projectId);
     return sql
@@ -323,9 +328,9 @@ const makeProjectWorkRepository = Effect.gen(function* () {
                   },
                 }
               : commandForDecision;
-          const commandFingerprint = projectWorkPayloadFingerprint(
-            withoutAttributionTimestamps(commandForFingerprint),
-          );
+          const commandFingerprint =
+            receiptFingerprint ??
+            projectWorkPayloadFingerprint(withoutAttributionTimestamps(commandForFingerprint));
           const attribution = commandForDecision.attribution;
           const priorReceiptRows = yield* sql<Record<string, unknown>>`
             SELECT payload_fingerprint AS payloadFingerprint,
@@ -359,6 +364,8 @@ const makeProjectWorkRepository = Effect.gen(function* () {
             WHERE project_id = ${projectId} AND command_id = ${command.commandId}
             ORDER BY sequence ASC
           `;
+          if (liveValidate !== undefined)
+            yield* liveValidate({ duplicate: priorCommandRows.length > 0 });
           if (priorCommandRows.length > 0) {
             const priorEvents = priorCommandRows.map((row) =>
               decodeProjectWorkEvent(JSON.parse(String(row.payloadJson))),
@@ -425,6 +432,20 @@ const makeProjectWorkRepository = Effect.gen(function* () {
             } satisfies ProjectWorkCommandResult;
           }
           const authorizedCommand = yield* authorize({ commandFingerprint });
+          if (authorizedCommand !== command)
+            yield* contentGuard._tag === "Some"
+              ? contentGuard.value
+                  .assertCommandSafe(authorizedCommand)
+                  .pipe(
+                    Effect.mapError(
+                      (cause) => new ProjectWorkPolicyError("invalid-state", String(cause)),
+                    ),
+                  )
+              : Effect.try({
+                  try: () =>
+                    ProjectWorkContentGuard.assertProjectWorkCommandContentSafe(authorizedCommand),
+                  catch: (cause) => new ProjectWorkPolicyError("invalid-state", String(cause)),
+                });
           const events = yield* Effect.try({
             try: () => decideProjectWorkCommand(current, authorizedCommand),
             catch: (cause) => {
@@ -462,6 +483,21 @@ const makeProjectWorkRepository = Effect.gen(function* () {
               event.type === "project-work.foundation.recorded" ? [event.record] : [],
             ),
           );
+          // Binding ownership and withdrawal commit together; rebuilds never revoke credentials.
+          for (const event of events) {
+            if (
+              event.type !== "project-work.foundation.recorded" ||
+              event.record.kind !== "run-binding"
+            )
+              continue;
+            const binding = event.record;
+            yield* sql`INSERT OR IGNORE INTO project_team_identity_fences
+              (provider_instance_id,thread_id) VALUES (${binding.providerInstanceId},${binding.threadId})`;
+            const revokedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+            yield* sql`UPDATE auth_sessions SET revoked_at=${revokedAt}
+              WHERE subject=${`agent:mcp:${binding.providerInstanceId}:${binding.threadId}`}
+                AND revoked_at IS NULL`;
+          }
           const next = applyProjectWorkEvents(current, events);
           const normalized = project(next);
           const latestSequenceRows = yield* sql<Record<string, unknown>>`

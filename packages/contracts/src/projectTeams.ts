@@ -1,6 +1,7 @@
 import { ProviderInstanceId } from "./providerInstance.ts";
 import * as Schema from "effect/Schema";
 import {
+  CommandId,
   EnvironmentId,
   IsoDateTime,
   NonNegativeInt,
@@ -360,3 +361,56 @@ export const PROJECT_TEAM_DEFAULT_LIMITS = {
   delegationDepth: 2,
   repairAllowance: 2,
 } as const;
+
+/** Server-issued credential metadata; never accepted from client command fields. */
+export const ProjectTeamCredential = Schema.Struct({
+  projectId: ProjectId,
+  bindingId: Text.check(Schema.isMaxLength(256)),
+  generation: NonNegativeInt,
+  providerInstanceId: ProviderInstanceId,
+  threadId: ThreadId,
+});
+export type ProjectTeamCredential = typeof ProjectTeamCredential.Type;
+const IntentFields = {
+  commandId: CommandId,
+  projectId: ProjectId,
+  taskId: ProjectWorkTaskId,
+  expectedRevision: NonNegativeInt,
+  expectedTaskRevision: NonNegativeInt,
+  specRevision: NonNegativeInt,
+  planRevision: NonNegativeInt,
+};
+export const ProjectTeamWriteIntent = Schema.Union([
+  Schema.Struct({
+    ...IntentFields,
+    type: Schema.Literal("project-team.gate.respond"),
+    gateId: Text,
+    expectedGateRevision: NonNegativeInt,
+    response: Schema.Literals(["approved", "rejected"]),
+  }),
+  Schema.Struct({
+    ...IntentFields,
+    type: Schema.Literal("project-team.question.answer"),
+    questionId: Text,
+    expectedQuestionRevision: NonNegativeInt,
+    expectedGateRevision: NonNegativeInt,
+    answer: Text,
+  }),
+  Schema.Struct({
+    ...IntentFields,
+    type: Schema.Literal("project-team.delegation.request"),
+    requestId: Text,
+    recipientId: Text,
+    objective: Body,
+  }),
+  Schema.Struct({
+    ...IntentFields,
+    type: Schema.Literal("project-team.memory.promote"),
+    observationId: Text,
+    expectedObservationRevision: NonNegativeInt,
+    expectedSourceRevision: NonNegativeInt,
+    knowledgeId: Text,
+    title: Text,
+  }),
+]);
+export type ProjectTeamWriteIntent = typeof ProjectTeamWriteIntent.Type;

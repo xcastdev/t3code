@@ -240,3 +240,42 @@ it.effect(
     ),
   { timeout: 30_000 },
 );
+
+import * as Authorization from "./ProjectTeamAuthorization.ts";
+import { ProjectWorkStream as WorkStream } from "./ProjectWorkStream.ts";
+import { withCore } from "./ProjectWorkRuntime.ts";
+import { seed as seedTeam, decodeRecord } from "./ProjectTeamAuthorization.testFixtures.ts";
+const authorizedRuntimeTestLayer = withCore(
+  coreLayer.pipe(Layer.provideMerge(Authorization.layer)),
+).pipe(Layer.provideMerge(NodeSqliteClient.layerMemory()));
+it.effect("provides one authorized core to repository, bus, stream and the real lease worker", () =>
+  Effect.gen(function* () {
+    const f = yield* seedTeam("coordinator");
+    const bus = yield* ProjectWorkEventBus;
+    const repository = yield* ProjectWorkRepository;
+    const reactor = yield* ProjectWorkLeaseReactor;
+    const service = yield* WorkStream;
+    expect(reactor).toBeDefined();
+    expect(repository).toBe(f.repo);
+    const marker = yield* Deferred.make<void>();
+    const received = yield* Deferred.make<void>();
+    const stream = yield* service.stream(
+      { projectId: f.principal.managed.projectId, requestCompletionMarker: true },
+      f.principal,
+    );
+    yield* stream.pipe(
+      Stream.runForEach((item) =>
+        item.kind === "synchronized"
+          ? Deferred.succeed(marker, undefined)
+          : item.kind === "delta" && item.delta.recordId === "member" && item.delta.revision > 8
+            ? Deferred.succeed(received, undefined)
+            : Effect.void,
+      ),
+      Effect.forkScoped,
+    );
+    yield* Deferred.await(marker);
+    yield* f.change(decodeRecord({ ...f.member, revision: 1, name: "Live shared publication" }));
+    yield* Deferred.await(received);
+    expect(bus).toBeDefined();
+  }).pipe(Effect.provide(Layer.fresh(authorizedRuntimeTestLayer))),
+);
