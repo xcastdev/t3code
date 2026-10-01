@@ -7,13 +7,7 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-10-01 02:25 UTC. Implementation is running. The harness permits
-**ten subagents plus the coordinator**. P1/P2/P3 are finished on main. P4 guided
-workflow and three P7 runtime pieces have independent owners. The P7 process
-extension's review found an unsafe startup-cleanup ownership assumption; its
-repair is committed and under the same reviewer’s recheck. Protocol review found
-two receipt-ordering defects; its original owner is repairing them. The model
-broker is under review and a fifth independent SDK producer slice has started.
+Last updated: 2026-10-01 02:47 UTC. Implementation is running. **P3 is finished and merged**, alongside P1 and P2. Ten subagent seats plus the coordinator are available. Independent P4 and P7 work runs in parallel; prerequisite-dependent phases remain gated.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
@@ -21,80 +15,40 @@ broker is under review and a fifth independent SDK producer slice has started.
 | Product acceptance criteria | 0    | 0      | 19   | 19    |
 | Final independent audits    | 0    | 0      | 2    | 2     |
 
-- **Finished on main:** P1 bounded dependency proofs; P2 durable foundation;
-  P3 current managed identity and protected command authorization. P2/P3 land
-  at `1346f50af` after 301 combined tests, three normal compilers, scoped
-  checks and fresh wave APPROVE. All 56 reviewed source hashes match main.
-- **P4:** pure policy leaf `76089058` is approved. Shared guided contracts at
-  `eb71cf2b1` pass 36 focused checks and the normal contracts compiler. The core
-  owner is implementing state transitions; root integrates authenticated wiring
-  and upgrades the real-SQL authorization fixtures. Full combined review remains.
-- **P5:** transport and pure sync/intake leaves are approved. Title repair
-  `42663135` passes 79 tests and independent replay/rename/conflict checks.
-  Durable sync authority interfaces are prepared; refinement, wiring
-  and real GitHub evidence remain.
-- **P7:** approved protocol, skills and Linux process leaves are merged into
-  wave3. The extended protocol passes 90 tests and normal compilation; parent model
-  brokerage passes 118 affected tests and normal compilation, including an actual
-  pinned-SDK synthetic tool turn. Both exact commits are now under fresh review. Process extension `4d70b500` has one verified ownership finding and
-  is under repair. These pieces still need review and full runtime integration.
-- **P10:** native adapter repair `2a88e791` is approved after real deletion,
-  recovery and explicit native-proof checks. Extraction, authorized hydration,
-  context and integration remain dependent work.
+- **Finished on main:** P1 bounded dependency proofs; P2 durable foundation; P3 current managed identity and protected command authorization. P2/P3 landed at `1346f50af` after 301 combined tests, three normal compilers, scoped checks and fresh wave APPROVE. All 56 reviewed source hashes match main.
+- **Why P3 took time:** independent checks exposed stale permissions, rollback and recovery races. Those fixes and their real-SQL proofs are complete. P3 is no longer blocking active work.
+- **P4:** core `b9c6b2a43` is committed with 120 core and three selected real-SQL cases passing. Coordinator integrates authenticated gateway routing and legal guided fixtures in an isolated combined candidate. Its full authorization suite, stream suite and new guided gateway tests now pass **28/28**. Four atomic rollback cases also pass. Existing gateway/repository fixtures still need adaptation, further approval/replay coverage, combined compilation and one independent review.
+- **P5:** transport and pure sync/intake leaves are approved. Title repair `42663135` passes 79 tests and independent replay/rename/conflict checks. Durable authority interfaces are prepared; refinement, wiring and real GitHub evidence remain dependent work.
+- **P7:** extended protocol repair `4e590177` is independently APPROVED and merged into wave3; 94 tests and independent byte/receipt controls pass. Process repair `3215d26e` passes 61 Linux cases (39 actual Linux proofs) and is back with its original reviewer. Broker repair `44166a927` passes 143 affected tests and exact retained real-stream replay through the pinned SDK; its original reviewer is rechecking. Coordinator verified all 190 process and 81 broker repair artifacts. SDK child implementation has passed actual synthetic initialization, resumed tool turn, manual compaction and resumed post-compaction prompt; controls and negative cases remain. Full runtime, durable accounting and platform/package gates remain open.
+- **P6/P8:** human workflow and dispatch/recovery interfaces are prepared. Implementation depends on the required P4/P5 and P7 gates; preparation does not complete these phases.
+- **P10:** native adapter repair `2a88e791` is approved after real deletion, recovery and explicit native-proof checks. Extraction, authorized hydration, context and integration remain dependent work.
 - **P11:** pure evidence policy `090589f4` is approved and held for integration.
-- **P6/P8:** P6 human workflow interfaces are prepared; P8 dispatch/recovery
-  interfaces are prepared. Their dependent implementation starts after the
-  required P4/P5 and P7 interfaces and gates.
-- **Not started:** P9, P12, P13 and P14. Seven steps have active or preparatory
-  work; only landed, fully gated steps count as finished.
+- **Not started:** P9, P12, P13 and P14. Later independent slices can run concurrently, but real runtime, memory, packaging and client validation remain substantial gates. No guarantee that every later phase will be faster.
 
-All 19 product criteria and both final audits remain open. Approved preparatory
-leaves do not complete their parent phases. Shared contracts, migrations, wiring
-and dependencies retain one owner. Development repair limits are waived.
+All 19 product criteria and both final audits remain open. Approved preparatory leaves do not complete their parent phases. Shared contracts, migrations, wiring and dependencies retain one owner. Development repair limits are waived.
 
-No local models, Ollama/llama inference, OpenAI runtime/proof services, push or PR
-creation. The exhausted eight-call P1 proof budget is closed. Integrated
-browser/device permission and disposable GitHub fixture-write permission remain
-required when those concrete proofs are ready.
+No local models, Ollama/llama inference, OpenAI runtime/proof services, push or PR creation. The exhausted eight-call P1 proof budget is closed. Integrated browser/device permission and disposable GitHub fixture-write permission remain required when those concrete proofs are ready.
 
 ### Live agent slots
 
-Each row is one subagent seat, with its owner, work and next gate. Finished agents
-release their seat. Worktrees live under
-`/home/user/.cache/pi-project-teams-11b7e351/`.
+Each row is one subagent seat. Finished agents release their seat. Worktrees live under `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                                 | State                               | Assignment / branch                                | Next gate                                                |
-| ---- | ------------------------------------- | ----------------------------------- | -------------------------------------------------- | -------------------------------------------------------- |
-| 1    | — (last: `p4_guided_core_high`)       | Available; scoped core committed    | `b9c6b2a43`, 120 core + 3 selected SQL cases pass  | Root combined P4 candidate integration then one review   |
-| 2    | `p7_protocol_runtime_high`            | Active scoped repair                | `644f8f51d`, two verified protocol findings        | Same reviewer recheck after receipt-barrier repairs      |
-| 3    | `review_p7_model_broker`              | Active independent review           | `fe2ba479e`, 155 producer artifacts root-verified  | Source, behavior and specification verdict               |
-| 4    | `review_p7_process_runtime`           | Active repair recheck               | `3093c81dd`, 228 repair artifacts root-verified    | Same reviewer verifies ownership cleanup                 |
-| 5    | `p7_sdk_worker_high`                  | Assigned independent implementation | `pi-teams/p7-sdk-worker`, base `644f8f51d`         | Actual pinned-SDK producer checks, commit and one review |
-| 6    | — (last: `review_wave2_foundation`)   | Available; combined wave APPROVE    | P2/P3 `8defdcf12`; 15 sealed review artifacts      | Landed on main `1346f50af`                               |
-| 7    | — (last: `review_p7_skills_slice`)    | Available; repair APPROVE           | P7 skills `4168f789` merged into wave3             | Ready independent work or review                         |
-| 8    | — (last: `p5_sync_leaf_high`)         | Available                           | P5 repair committed and approved                   | Ready independent work                                   |
-| 9    | — (last: `review_p7_process_runtime`) | Available; REQUEST_CHANGES sealed   | One verified AC-13 finding; 154 artifacts verified | Same reviewer reserved for repaired piece                |
-| 10   | — (last: `review_p7_managed_process`) | Available; repair APPROVE           | `f746e690`, 231 sealed artifacts root-verified     | Reviewed process merged into wave3                       |
+| Slot | Agent                                  | State                       | Assignment / branch                       | Next gate                                                          |
+| ---- | -------------------------------------- | --------------------------- | ----------------------------------------- | ------------------------------------------------------------------ |
+| 1    | — (last: `p4_guided_core_high`)        | Available; core committed   | `b9c6b2a43`, isolated combined candidate  | Independent test adaptation after root fixture interfaces freeze   |
+| 2    | — (last: `review_p7_protocol_runtime`) | Available; protocol APPROVE | `4e590177` merged into wave3              | Ready independent work                                             |
+| 3    | `review_p7_model_broker`               | Active repair recheck       | `44166a927`, 81 repair artifacts verified | Same reviewer source/behavior verdict                              |
+| 4    | `review_p7_process_runtime`            | Active repair recheck       | `3215d26e`, 190 repair artifacts verified | Same reviewer startup cancellation/ownership verdict               |
+| 5    | `p7_sdk_worker_high`                   | Active implementation       | `pi-teams/p7-sdk-worker`                  | Actual SDK controls, bounded failure checks, commit and one review |
+| 6    | — (last: `review_wave2_foundation`)    | Available; wave APPROVE     | P2/P3 `8defdcf12`                         | Landed on main `1346f50af`                                         |
+| 7    | — (last: `review_p7_skills_slice`)     | Available; repair APPROVE   | P7 skills `4168f789` merged into wave3    | Ready independent work                                             |
+| 8    | — (last: `p5_sync_leaf_high`)          | Available; leaf APPROVE     | P5 sync/intake `42663135`                 | Await prerequisite interfaces                                      |
+| 9    | — (last: `p7_process_runtime_high`)    | Available; repair committed | Process `3215d26e`                        | Same reviewer currently in slot 4                                  |
+| 10   | — (last: `p7_model_broker_high`)       | Available; repair committed | Broker `44166a927`                        | Same reviewer currently in slot 3                                  |
 
-Coordinator: integrating P4 authenticated intent compilation and real-SQL
-fixtures. Private claim/report/repair provenance contracts are committed on
-wave3 `eb71cf2b1`. One normal server compiler runs at a time: protocol and broker passed and
-released their reservations; P4 holds the focused compiler reservation. Root wiring awaits committed
-core helpers for its combined checks. No model or integrated client proof runs.
+Coordinator: combines P4 core, authenticated intent compilation and real-SQL fixtures. Normal server compilers run one at a time; P4 currently holds the reservation after broker released it. SDK requests its turn once frozen. Focused independent tests run concurrently under measured memory caps; no model or integrated client proof runs.
 
-Primary branch: `t3code/implement-pi-project-teams`. Main product commit:
-`1346f50af6f1361b0942fe1d42e636804e1ba9a0`. Reviewed foundation wave:
-`8defdcf1241caf9c3276528e07da076573aa2673`; documentation reconciliation:
-`04001e7578cf26a19842f400fa3be44f67b71cc8`. All 56 reviewed source hashes
-match main after landing. New wave3 starts from that exact main commit; current
-wave3 `29f79b59` contains the approved P4 policy, P7 protocol and P7 skills leaves.
-Root P4 contract candidate `17871202a` passes 33 focused tests, normal contracts
-compiler, scoped lint and formatting. Additional internal transitions/output
-fields requested by the P4 owner are under validation. Wave3 `6bb8db009` also
-contains reviewed process `f746e690`; the phase remains incomplete.
-Preparatory branches retain their explicit earlier bases; P5 sync uses reconciled
-P2/transport base `9bdd1872`. Historical pause evidence remains below and in
-`pause-20260930/RESUME.md` under the worktree cache.
+Primary branch: `t3code/implement-pi-project-teams`. Main product commit: `1346f50af6f1361b0942fe1d42e636804e1ba9a0`. Reviewed foundation wave: `8defdcf1241caf9c3276528e07da076573aa2673`; documentation reconciliation: `04001e7578cf26a19842f400fa3be44f67b71cc8`. All 56 reviewed source hashes match main. Wave3 now `90681d354` contains approved P4 policy, P7 protocol/skills/process leaves and shared guided contracts `eb71cf2b1` (36 focused checks and normal contracts compiler pass). The combined P4 candidate is isolated from wave integration until review; its base is `eb71cf2b1` and internal core cherry-pick `b8b08c532`. Root runtime dependency changes remain uncommitted in wave3 pending focused validation. Preparatory branches retain their explicit earlier bases; P5 sync uses reconciled P2/transport base `9bdd1872`. Historical pause evidence remains below and in `pause-20260930/RESUME.md` under the worktree cache.
 
 ## Goal
 
