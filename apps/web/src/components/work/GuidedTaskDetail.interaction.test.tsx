@@ -301,6 +301,65 @@ describe("GuidedTaskDetail human interactions", () => {
     expect(button("Start investigation").disabled).toBe(true);
   });
 
+  it.each([
+    ["investigation", "Start investigation", "project-team.investigation.start"],
+    ["specification", "Propose specification", "project-team.specification.propose"],
+    ["plan", "Propose plan", "project-team.plan.propose"],
+    ["approval", "Approve specification revision 2", "project-team.gate.respond"],
+    ["rejection", "Reject plan revision 3", "project-team.gate.respond"],
+    ["execution", "Start execution", "project-team.execution.start"],
+    ["control", "Apply pause", "project-team.task.control"],
+  ] as const)(
+    "keeps %s available when two distinct issues link to the same task",
+    async (flow, label, type) => {
+      foundation = [
+        ...records(current, flow === "execution" ? "approved" : "pending"),
+        ...[1, 2].map((number) =>
+          decodeRecord({
+            kind: "issue",
+            recordId: `issue-${number}`,
+            projectId,
+            revision: number,
+            generation: 0,
+            updatedAt: at,
+            status: "open",
+            identity: {
+              host: "github.com",
+              repositoryNodeId: "repo",
+              issueNodeId: `node-${number}`,
+              number,
+            },
+            repositoryName: "t3tools/t3code",
+            title: `Reconnect report ${number}`,
+            body: "One shared deliverable",
+            sourceRevision: `source-${number}`,
+            observedAt: at,
+            taskId: current.task.taskId,
+          }),
+        ),
+      ];
+      await render();
+      if (flow === "control") {
+        await action("pause");
+        await fill("Control reason", "Review both reports");
+      }
+      await click(label);
+      expect(write).toHaveBeenCalledOnce();
+      const intent = emitted[0];
+      expect(intent).toMatchObject({
+        type,
+        projectId,
+        taskId: current.task.taskId,
+        expectedRevision: current.revision,
+        expectedTaskRevision: current.task.revision,
+      });
+      if (flow === "investigation") {
+        expect(intent).not.toHaveProperty("issueRecordId");
+        expect(intent).not.toHaveProperty("expectedIssueRevision");
+      }
+    },
+  );
+
   it("proposes a revised specification with retained criterion identities and fresh unsatisfied snapshots", async () => {
     await render();
     await fill("Specification objective", "Reconnect without losing history");

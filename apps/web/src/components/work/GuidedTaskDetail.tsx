@@ -120,6 +120,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
   );
   const plan = one(plans);
   const gates = taskRecords.filter((record): record is Gate => record.kind === "gate");
+  // Investigation is task-level; attach an issue reference only when its source is unambiguous.
   const issue = one(taskRecords.filter((record) => record.kind === "issue"));
   const criteria = context?.criteria ?? [];
   const known =
@@ -147,8 +148,7 @@ function GuidedTaskSession(props: GuidedTaskDetailProps) {
     specificationComplete &&
     membership?.status === "active" &&
     membership.executionKind !== "legacy" &&
-    plans.length <= 1 &&
-    taskRecords.filter((record) => record.kind === "issue").length <= 1;
+    plans.length <= 1;
   const access = props.connected && props.enabled && props.supported;
   const unsettled = drafts.entries.some(
     (draft) => draft.pending?.status === "sending" || draft.pending?.status === "uncertain",
