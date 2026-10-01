@@ -19,7 +19,8 @@ const testState = vi.hoisted(() => ({
   },
 }));
 
-vi.mock("@effect/atom-react", () => ({
+vi.mock("@effect/atom-react", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@effect/atom-react")>()),
   useAtomValue: (atom: unknown) =>
     atom === testState.briefingAtom ? testState.briefingRead : testState.read,
 }));
@@ -249,7 +250,7 @@ describe("WorkTasks interactions", () => {
             objective: "Document the release checklist",
             scopeIn: "The release process",
             scopeOut: "Automating the release",
-            criterionIds: [],
+            criterionIds: ["criterion-1"],
             revision: 1,
             protected: false,
           },

@@ -21,7 +21,8 @@ const testState = vi.hoisted(() => ({
   },
 }));
 
-vi.mock("@effect/atom-react", () => ({
+vi.mock("@effect/atom-react", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@effect/atom-react")>()),
   useAtomValue: (atom: unknown) => {
     if (atom === testState.configAtom) return testState.config;
     if (typeof atom === "object" && atom !== null && "projectId" in atom) {
