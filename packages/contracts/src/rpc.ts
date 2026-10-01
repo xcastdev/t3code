@@ -391,6 +391,12 @@ import {
   ProjectWorkWriteResult,
 } from "./projectWork.ts";
 import {
+  ProjectIssueRepositoryBindInput,
+  ProjectIssueRepositoryBindReceipt,
+  ProjectIssueRepositoryBindingsInput,
+  ProjectIssueRepositoryBindingsRead,
+} from "./projectIssueIntake.ts";
+import {
   ProjectLifecycleArchiveInput,
   ProjectLifecycleGetInput,
   ProjectLifecycleMutationResult,
@@ -440,6 +446,8 @@ export const WS_METHODS = {
   projectsSearchEntries: "projects.searchEntries",
   projectsWriteFile: "projects.writeFile",
   projectWorkRead: "projectWork.read",
+  projectWorkBindIssueRepository: "projectWork.bindIssueRepository",
+  projectWorkRepositoryBindings: "projectWork.repositoryBindings",
   projectWorkWrite: "projectWork.write",
   projectWorkRequestApproval: "projectWork.requestApproval",
   projectWorkSubscribe: "projectWork.subscribe",
@@ -1407,6 +1415,16 @@ const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   error: Schema.Union([ProjectWriteFileError, EnvironmentAuthorizationError]),
 });
 
+const WsProjectWorkBindIssueRepositoryRpc = Rpc.make(WS_METHODS.projectWorkBindIssueRepository, {
+  payload: ProjectIssueRepositoryBindInput,
+  success: ProjectIssueRepositoryBindReceipt,
+  error: Schema.Unknown,
+});
+const WsProjectWorkRepositoryBindingsRpc = Rpc.make(WS_METHODS.projectWorkRepositoryBindings, {
+  payload: ProjectIssueRepositoryBindingsInput,
+  success: ProjectIssueRepositoryBindingsRead,
+  error: Schema.Unknown,
+});
 const WsProjectWorkReadRpc = Rpc.make(WS_METHODS.projectWorkRead, {
   payload: ProjectWorkReadIntent,
   success: Schema.Unknown,
@@ -2309,6 +2327,8 @@ export const WsBaseRpcGroup = RpcGroup.make(
   WsProjectsSearchEntriesRpc,
   WsProjectsWriteFileRpc,
   WsProjectWorkReadRpc,
+  WsProjectWorkBindIssueRepositoryRpc,
+  WsProjectWorkRepositoryBindingsRpc,
   WsProjectWorkWriteRpc,
   WsProjectWorkRequestApprovalRpc,
   WsProjectWorkSubscribeRpc,

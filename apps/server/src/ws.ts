@@ -228,6 +228,7 @@ import * as ProjectMcpProxyRegistry from "./mcp/ProjectMcpProxyRegistry.ts";
 import * as ProjectMcpOAuth from "./mcp/ProjectMcpOAuth.ts";
 import * as ProjectMcpSecretStore from "./mcp/ProjectMcpSecretStore.ts";
 import * as ProjectWorkGateway from "./projectWork/ProjectWorkGateway.ts";
+import * as ProjectIssueBindingGateway from "./projectWork/ProjectIssueBindingGateway.ts";
 import * as ProjectWorkStream from "./projectWork/ProjectWorkStream.ts";
 import * as ProjectLifecycle from "./project/ProjectLifecycle.ts";
 import { hasCatalogTransportIdentityChange } from "./mcp/McpCatalogDefinitionIdentity.ts";
@@ -1245,6 +1246,9 @@ const makeWsRpcLayer = (
       // construct the SQL-backed project-work services. Production routes
       // provide it through makeRoutesLayer.
       const projectWorkGateway = yield* Effect.serviceOption(ProjectWorkGateway.ProjectWorkGateway);
+      const issueBindingGateway = yield* Effect.serviceOption(
+        ProjectIssueBindingGateway.ProjectIssueBindingGateway,
+      );
       const projectWorkStream = yield* Effect.serviceOption(ProjectWorkStream.ProjectWorkStream);
       const projectLifecycle = yield* Effect.serviceOption(ProjectLifecycle.ProjectLifecycle);
       const sourceControlDiscovery = yield* SourceControlDiscovery.SourceControlDiscovery;
@@ -6138,6 +6142,34 @@ const makeWsRpcLayer = (
               ),
             ),
             { "rpc.aggregate": "workspace" },
+          ),
+        [WS_METHODS.projectWorkBindIssueRepository]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectWorkBindIssueRepository,
+            Option.isSome(issueBindingGateway)
+              ? authorizeRpcSession(
+                  WS_METHODS.projectWorkBindIssueRepository,
+                  currentSession,
+                  serverAuth,
+                ).pipe(Effect.flatMap((session) => issueBindingGateway.value.bind(input, session)))
+              : Effect.fail(
+                  new ProjectIssueBindingGateway.IssueBindingGatewayError({ reason: "storage" }),
+                ),
+            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectWorkRepositoryBindings]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectWorkRepositoryBindings,
+            Option.isSome(issueBindingGateway)
+              ? authorizeRpcSession(
+                  WS_METHODS.projectWorkRepositoryBindings,
+                  currentSession,
+                  serverAuth,
+                ).pipe(Effect.flatMap((session) => issueBindingGateway.value.list(input, session)))
+              : Effect.fail(
+                  new ProjectIssueBindingGateway.IssueBindingGatewayError({ reason: "storage" }),
+                ),
+            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
           ),
         [WS_METHODS.projectWorkRead]: (input: ProjectWorkReadIntent) =>
           observeRpcEffect(

@@ -149,6 +149,8 @@ export const RPC_REQUIRED_SCOPES = {
   [WS_METHODS.projectsSearchEntries]: AuthOrchestrationReadScope,
   [WS_METHODS.projectsWriteFile]: AuthOrchestrationOperateScope,
   [WS_METHODS.projectWorkRead]: AuthOrchestrationReadScope,
+  [WS_METHODS.projectWorkBindIssueRepository]: AuthOrchestrationOperateScope,
+  [WS_METHODS.projectWorkRepositoryBindings]: AuthOrchestrationReadScope,
   [WS_METHODS.projectWorkSubscribe]: AuthOrchestrationReadScope,
   [WS_METHODS.projectWorkWrite]: AuthOrchestrationOperateScope,
   [WS_METHODS.projectWorkRequestApproval]: AuthOrchestrationOperateScope,
