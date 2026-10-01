@@ -176,7 +176,9 @@ effectIt.effect(
       yield* f.change(decodeRecord({ ...f.member, revision: 1, name: "Updated member" }));
       yield* Deferred.await(memberDelivered);
       expect(received).not.toContain("hidden-memory");
-      yield* f.change(decodeRecord({ ...f.binding, revision: 1, status: "revoked" }));
+      yield* f.change(
+        decodeRecord({ ...f.binding, revision: f.binding.revision + 1, status: "revoked" }),
+      );
       const result = yield* Fiber.join(fiber);
       expect(result._tag).toBe("Failure");
     }).pipe(Effect.provide(Layer.fresh(managedStreamLayer))),

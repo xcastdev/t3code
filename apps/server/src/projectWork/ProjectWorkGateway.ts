@@ -3,6 +3,7 @@ import {
   type ProjectWorkActor,
   type ProjectWorkWriteIntent,
   ProjectTeamWriteIntent,
+  ProjectTeamGuidedIntent,
   type ProjectWorkAttribution,
   type ProjectWorkCommand,
   type ProjectWorkCriterion,
@@ -127,6 +128,7 @@ export class ProjectWorkGateway extends Context.Service<
 
 const isTeamAuthorizationError = Schema.is(ProjectTeamAuthorization.ProjectTeamAuthorizationError);
 const isTeamIntent = Schema.is(ProjectTeamWriteIntent);
+const isGuidedIntent = Schema.is(ProjectTeamGuidedIntent);
 
 const sensitiveAgentIntent = (command: ProjectWorkCommand): boolean =>
   command.type === "project-work.task.cancel" ||
@@ -905,7 +907,8 @@ const makeProjectWorkGateway = Effect.gen(function* () {
         ),
       );
   const write: ProjectWorkGatewayShape["write"] = (input, actor, source, principal) => {
-    if (!isTeamIntent(input)) return writeCommand(input, actor, source, principal);
+    if (!isTeamIntent(input) && !isGuidedIntent(input))
+      return writeCommand(input, actor, source, principal);
     return Effect.gen(function* () {
       if (teamAuthorization._tag === "None")
         return yield* new ProjectTeamAuthorization.ProjectTeamAuthorizationError({
@@ -956,10 +959,15 @@ const makeProjectWorkGateway = Effect.gen(function* () {
                   }),
               ),
             );
-            return yield* teamAuthorization.value.intent(caller, input, attribution, false);
+            return yield* isGuidedIntent(input)
+              ? teamAuthorization.value.guided(caller, input, attribution, false)
+              : teamAuthorization.value.intent(caller, input, attribution, false);
           }),
         ({ duplicate }) =>
-          teamAuthorization.value.intent(caller, input, attribution, duplicate).pipe(Effect.asVoid),
+          (isGuidedIntent(input)
+            ? teamAuthorization.value.guided(caller, input, attribution, duplicate)
+            : teamAuthorization.value.intent(caller, input, attribution, duplicate)
+          ).pipe(Effect.asVoid),
         fingerprint,
       );
       return sanitizePublicValue(result.writeResult) as ProjectWorkWriteReceipt;

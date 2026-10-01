@@ -4,6 +4,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import { readProjectWorkEvidenceMetadata } from "./ProjectWorkEvidenceMetadata.ts";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import type { SqlError } from "effect/unstable/sql/SqlError";
@@ -457,7 +458,7 @@ const makeProjectWorkQuery = Effect.gen(function* () {
   const listEvidence: ProjectWorkQueryShape["listEvidence"] = (input) => {
     const page = bounds(input.limit, input.offset, input.trusted);
     return query(sql<Record<string, unknown>>`
-      SELECT evidence_id AS evidenceId, project_id AS projectId, task_id AS taskId,
+      SELECT *, evidence_id AS evidenceId, project_id AS projectId, task_id AS taskId,
         criterion_id AS criterionId, kind, summary, detail, uri, recorded_at AS recordedAt,
         revision, attribution_json AS attributionJson
       FROM project_work_evidence WHERE project_id = ${input.projectId}
@@ -470,6 +471,7 @@ const makeProjectWorkQuery = Effect.gen(function* () {
           (row) =>
             ({
               evidenceId: String(row.evidenceId) as ProjectWorkEvidenceId,
+              ...readProjectWorkEvidenceMetadata(row),
               ...(row.taskId ? { taskId: String(row.taskId) as ProjectWorkTaskId } : {}),
               ...(row.criterionId
                 ? {

@@ -37,7 +37,9 @@ import * as TeamAuthorization from "./ProjectTeamAuthorization.ts";
 import {
   seed as seedTeam,
   decodeRecord as decodeTeamFixture,
+  createManagedAssignment,
 } from "./ProjectTeamAuthorization.testFixtures.ts";
+import { projectTeamSpecificationHash } from "./ProjectTeamPolicy.ts";
 import * as ProjectWorkBriefing from "./ProjectWorkBriefing.ts";
 import * as ProjectWorkGateway from "./ProjectWorkGateway.ts";
 import * as ProjectWorkNarrative from "./ProjectWorkNarrative.ts";
@@ -1533,7 +1535,10 @@ it.effect(
         gate: "specification",
         specRevision: 1,
         planRevision: 0,
-        contentHash: "scope",
+        contentHash: projectTeamSpecificationHash(
+          (yield* f.auth.resolve(f.principal))!.state,
+          taskId,
+        ),
         attribution: {
           actor: { kind: "human", id: "owner" },
           source: { kind: "web", id: "owner" },
@@ -1679,7 +1684,7 @@ it.effect(
           expectedRevision: state.revision,
           expectedTaskRevision: state.tasks[0]!.revision,
           specRevision: 1,
-          planRevision: 0,
+          planRevision: 1,
           requestId: "request",
           recipientId: "recipient",
           objective: "Investigate assigned scope",
@@ -1741,7 +1746,9 @@ it.effect(
         (yield* gateway.write(input, f.principal.actor, source, f.principal).pipe(Effect.result))
           ._tag,
       ).toBe("Failure");
-      yield* f.change(decodeTeamFixture({ ...f.binding, revision: 1, status: "revoked" }));
+      yield* f.change(
+        decodeTeamFixture({ ...f.binding, revision: f.binding.revision + 1, status: "revoked" }),
+      );
       expect(
         (yield* gateway.write(input, f.principal.actor, source, f.principal).pipe(Effect.result))
           ._tag,
@@ -1817,7 +1824,7 @@ it.effect(
         expectedRevision: state.revision,
         expectedTaskRevision: state.tasks[0]!.revision,
         specRevision: 1,
-        planRevision: 0,
+        planRevision: 1,
         observationId: "observation",
         expectedObservationRevision: 0,
         expectedSourceRevision: 0,
@@ -1881,7 +1888,7 @@ for (const missing of ["roleTools", "toolIds"] as const)
         expectedRevision: state.revision,
         expectedTaskRevision: state.tasks[0]!.revision,
         specRevision: 1,
-        planRevision: 0,
+        planRevision: 1,
         requestId: "request",
         recipientId: "recipient",
         objective: "Investigate",
@@ -1925,7 +1932,7 @@ it.effect(
           projectId,
           taskId,
           attemptId,
-          leaseToken: "lease",
+          leaseToken: "binding-lease",
           leasedUntil: "2035-01-01T00:00:00.000Z",
           renewedAt: at,
         },
@@ -1935,7 +1942,7 @@ it.effect(
           projectId,
           taskId,
           attemptId,
-          leaseToken: "lease",
+          leaseToken: "binding-lease",
           satisfiedCriterionIds: [],
           completedAt: at,
         },
@@ -1953,7 +1960,7 @@ it.effect(
         projectId,
         taskId,
         attemptId,
-        leaseToken: "lease",
+        leaseToken: "binding-lease",
         checkpointId: "checkpoint",
         capturedAt: at,
       };
@@ -1977,71 +1984,13 @@ it.effect(
 );
 
 for (const invalidation of ["expired", "reassigned"] as const)
-  it.effect(`denies delegation through a still-running but ${invalidation} ancestor`, () =>
+  it.effect(`denies delegation through an undrained ${invalidation} ancestor`, () =>
     Effect.gen(function* () {
       const f = yield* seedTeam("coordinator");
       const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
       const projectId = f.principal.managed.projectId;
       const taskId = ProjectWorkTaskId.make("child-task");
       const attemptId = ProjectWorkAttemptId.make("child-attempt");
-      const criterionId = ProjectWorkCriterionId.make("child-criterion");
-      yield* f.repo.execute({
-        type: "project-work.task.create",
-        commandId: CommandId.make("child-create"),
-        projectId,
-        taskId,
-        title: "Child scope",
-        createdAt: at,
-      });
-      yield* f.repo.execute({
-        type: "project-work.criterion.upsert",
-        commandId: CommandId.make("child-criterion"),
-        projectId,
-        taskId,
-        criterion: {
-          criterionId,
-          taskId,
-          description: "Child scope",
-          required: false,
-          status: "unsatisfied",
-          satisfiedByEvidenceIds: [],
-          revision: 0,
-          updatedAt: at,
-        },
-        updatedAt: at,
-      });
-      yield* f.repo.execute({
-        type: "project-work.task.specify",
-        commandId: CommandId.make("child-spec"),
-        projectId,
-        taskId,
-        specification: {
-          objective: "Child scope",
-          scopeIn: "Child",
-          scopeOut: "Parent",
-          criterionIds: [criterionId],
-          revision: 1,
-          protected: false,
-        },
-        updatedAt: at,
-      });
-      yield* f.repo.execute({
-        type: "project-work.task.ready",
-        commandId: CommandId.make("child-ready"),
-        projectId,
-        taskId,
-        updatedAt: at,
-      });
-      yield* f.repo.execute({
-        type: "project-work.task.claim",
-        commandId: CommandId.make("child-claim"),
-        projectId,
-        taskId,
-        attemptId,
-        leaseToken: "child-lease",
-        leasedUntil: "2035-01-01T00:00:00.000Z",
-        claimedAt: at,
-      });
       yield* f.change(
         decodeTeamFixture({
           ...f.member,
@@ -2058,18 +2007,29 @@ for (const invalidation of ["expired", "reassigned"] as const)
           coordinator: false,
         }),
       );
-      const child = decodeTeamFixture({
-        ...f.binding,
-        recordId: "child-binding",
+      const child = yield* createManagedAssignment({
         taskId,
         attemptId,
+        recordId: "child-binding",
+        commandId: "child-claim",
         memberId: "child-member",
-        parentRunId: "binding",
+        parentRunId: f.binding.recordId,
+        providerInstanceId: f.binding.providerInstanceId,
+        threadId: ThreadId.make("child-thread"),
+        role: f.role,
+        configuration: f.binding.configuration,
         sessionId: "native-child",
+        status: "running",
+        leasedUntil: "2035-01-01T00:00:00.000Z",
       });
-      yield* f.change(child);
-      const managed = { ...f.principal.managed, bindingId: "child-binding" };
-      const principal = { actor: f.principal.actor, managed };
+      const managed = (yield* f.auth.issueCredential({
+        providerInstanceId: child.providerInstanceId,
+        threadId: child.threadId,
+      }))!.credential;
+      const principal = {
+        actor: { kind: "agent" as const, id: TeamAuthorization.managedActorId(managed) },
+        managed,
+      };
       let state = (yield* f.auth.resolve(principal))!.state;
       const input = {
         type: "project-team.delegation.request" as const,
@@ -2079,7 +2039,7 @@ for (const invalidation of ["expired", "reassigned"] as const)
         expectedRevision: state.revision,
         expectedTaskRevision: state.tasks.find((t) => t.taskId === taskId)!.revision,
         specRevision: 1,
-        planRevision: 0,
+        planRevision: 1,
         requestId: "request",
         recipientId: "recipient",
         objective: "Bounded descendant request",
@@ -2090,19 +2050,38 @@ for (const invalidation of ["expired", "reassigned"] as const)
       ).toBe("accepted");
       if (invalidation === "expired")
         yield* TestClock.setTime(Date.parse("2031-01-01T00:00:00.000Z"));
-      else
-        yield* f.repo.execute({
-          type: "project-work.attempt.takeover",
-          projectId,
-          taskId: (yield* f.auth.resolve(f.principal))!.binding.taskId,
-          commandId: CommandId.make("parent-reassign"),
-          previousAttemptId: ProjectWorkAttemptId.make("attempt"),
-          attemptId: ProjectWorkAttemptId.make("replacement-parent"),
-          leaseToken: "replacement",
-          leasedUntil: "2035-01-01T00:00:00.000Z",
-          claimedAt: at,
-          authorized: true,
-        });
+      else {
+        const parentState = (yield* f.auth.resolve(f.principal))!.state;
+        const parentTask = parentState.tasks.find((t) => t.taskId === f.binding.taskId)!;
+        yield* gateway.write(
+          {
+            type: "project-team.task.control",
+            projectId,
+            taskId: parentTask.taskId,
+            commandId: CommandId.make("parent-reassign"),
+            expectedRevision: parentState.revision,
+            expectedTaskRevision: parentTask.revision,
+            control: {
+              action: "reassign",
+              recipientMemberId: "recipient",
+              expectedMemberRevision: 0,
+              reason: "Assign parent scope to another member",
+            },
+          },
+          { kind: "human", id: "owner" },
+          { kind: "web", id: "owner" },
+        );
+        const reassigned = (yield* f.auth.resolve(principal))!.state;
+        expect(
+          reassigned.foundationRecords?.find((r) => r.recordId === f.binding.recordId),
+        ).toMatchObject({ status: "stopping" });
+        expect(reassigned.attempts).toEqual(parentState.attempts);
+        expect(
+          reassigned.foundationRecords?.find(
+            (r) => r.kind === "task-membership" && r.taskId === parentTask.taskId,
+          ),
+        ).toMatchObject({ controlState: "paused", requestedSuccessorMemberId: "recipient" });
+      }
       state = (yield* f.auth.resolve(principal))!.state;
       const rejected = {
         ...input,
@@ -2136,75 +2115,17 @@ const seedDelegationChain = Effect.fn("authorizationTest.seedDelegationChain")(f
   let credential: ProjectTeamCredential = f.principal.managed;
   for (const n of [1, 2]) {
     const taskId = ProjectWorkTaskId.make(`descendant-task-${n}`);
-    const criterionId = ProjectWorkCriterionId.make(`descendant-criterion-${n}`);
     const attemptId = ProjectWorkAttemptId.make(`descendant-attempt-${n}`);
-    yield* f.repo.execute({
-      type: "project-work.task.create",
-      projectId,
-      taskId,
-      commandId: CommandId.make(`descendant-create-${n}`),
-      title: "Descendant",
-      createdAt: at,
-    });
-    yield* f.repo.execute({
-      type: "project-work.criterion.upsert",
-      projectId,
-      taskId,
-      commandId: CommandId.make(`descendant-criterion-${n}`),
-      criterion: {
-        criterionId,
-        taskId,
-        description: "Child scope",
-        required: false,
-        status: "unsatisfied",
-        satisfiedByEvidenceIds: [],
-        revision: 0,
-        updatedAt: at,
-      },
-      updatedAt: at,
-    });
-    yield* f.repo.execute({
-      type: "project-work.task.specify",
-      projectId,
-      taskId,
-      commandId: CommandId.make(`descendant-spec-${n}`),
-      specification: {
-        objective: "Child scope",
-        scopeIn: "Child",
-        scopeOut: "Parent",
-        criterionIds: [criterionId],
-        revision: 1,
-        protected: false,
-      },
-      updatedAt: at,
-    });
-    yield* f.repo.execute({
-      type: "project-work.task.ready",
-      projectId,
-      taskId,
-      commandId: CommandId.make(`descendant-ready-${n}`),
-      updatedAt: at,
-    });
-    yield* f.repo.execute({
-      type: "project-work.task.claim",
-      projectId,
-      taskId,
-      commandId: CommandId.make(`descendant-claim-${n}`),
-      attemptId,
-      leaseToken: `descendant-lease-${n}`,
-      leasedUntil: "2035-01-01T00:00:00.000Z",
-      claimedAt: at,
-    });
     const roleId = `descendant-role-${n}`;
-    yield* f.change(
-      decodeTeamFixture({
-        ...f.role,
-        recordId: roleId,
-        roleId,
-        delegationDepth: n === 1 ? middleLimit : leafLimit,
-        tools: ["project-work.delegate"],
-      }),
-    );
+    const role = decodeTeamFixture({
+      ...f.role,
+      recordId: roleId,
+      roleId,
+      delegationDepth: n === 1 ? middleLimit : leafLimit,
+      tools: ["project-work.delegate"],
+    });
+    if (role.kind !== "role-revision") return yield* Effect.die("Invalid descendant role");
+    yield* f.change(role);
     const memberId = `descendant-member-${n}`;
     yield* f.change(
       decodeTeamFixture({
@@ -2215,16 +2136,18 @@ const seedDelegationChain = Effect.fn("authorizationTest.seedDelegationChain")(f
       }),
     );
     const threadId = ThreadId.make(`descendant-thread-${n}`);
-    const binding = decodeTeamFixture({
-      ...f.binding,
+    const binding = yield* createManagedAssignment({
       recordId: `descendant-binding-${n}`,
+      commandId: `descendant-claim-${n}`,
       taskId,
       attemptId,
       memberId,
-      roleRevisionId: roleId,
+      role,
       parentRunId,
+      providerInstanceId: f.binding.providerInstanceId,
       threadId,
       sessionId: `native-descendant-${n}`,
+      status: "running",
       configuration: {
         instructionsHash: "hash",
         toolIds: ["project-work.delegate"],
@@ -2235,7 +2158,6 @@ const seedDelegationChain = Effect.fn("authorizationTest.seedDelegationChain")(f
         paidFallback: false,
       },
     });
-    yield* f.change(binding);
     parentRunId = binding.recordId;
     credential = (yield* f.auth.issueCredential({
       providerInstanceId: credential.providerInstanceId,
@@ -2259,7 +2181,7 @@ const seedDelegationChain = Effect.fn("authorizationTest.seedDelegationChain")(f
     expectedRevision: state.revision,
     expectedTaskRevision: state.tasks.find((t) => t.taskId === taskId)!.revision,
     specRevision: 1,
-    planRevision: 0,
+    planRevision: 1,
     requestId: "depth-request",
     recipientId: "depth-recipient",
     objective: "Bounded descendant delegation",

@@ -65,6 +65,18 @@ export const ProjectTeamTaskMembership = Schema.Struct({
   executionKind: ProjectTeamExecutionKind,
   deliverableKind: ProjectTeamDeliverableKind,
   parentTaskId: Schema.optionalKey(ProjectWorkTaskId),
+  assignment: Schema.optionalKey(
+    Schema.Struct({
+      authorizationGateId: Text.check(Schema.isMaxLength(256)),
+      outputDescriptions: Schema.Array(Text).check(Schema.isMinLength(1), Schema.isMaxLength(16)),
+      parentRunId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
+      repairEpisodeId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
+    }),
+  ),
+  controlState: Schema.optionalKey(
+    Schema.Literals(["active", "deferred", "paused", "canceling", "canceled"]),
+  ),
+  requestedSuccessorMemberId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
 });
 export const ProjectTeamRoleRevision = Schema.Struct({
   ...Fields,
@@ -118,7 +130,15 @@ export const ProjectTeamGate = Schema.Struct({
     "consumed",
   ]),
   taskId: ProjectWorkTaskId,
-  gate: Schema.Literals(["investigation", "specification", "plan", "execution", "merge"]),
+  gate: Schema.Literals([
+    "investigation",
+    "assignment",
+    "specification",
+    "plan",
+    "execution",
+    "merge",
+    "repair",
+  ]),
   specRevision: NonNegativeInt,
   planRevision: NonNegativeInt,
   contentHash: Text,
@@ -129,6 +149,36 @@ export const ProjectTeamGate = Schema.Struct({
   targetBranch: Schema.optionalKey(Text),
   mergeMethod: Schema.optionalKey(Schema.Literals(["merge", "squash", "rebase"])),
   evidenceIds: Ids,
+  consumedByRunId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
+  consumedByCommandId: Schema.optionalKey(CommandId),
+  assignmentAuthorization: Schema.optionalKey(
+    Schema.Struct({
+      assignmentKind: Schema.Literals(["planning", "review"]),
+      parentTaskId: ProjectWorkTaskId,
+      parentSpecRevision: NonNegativeInt,
+      parentSpecificationGateId: Text.check(Schema.isMaxLength(256)),
+      parentSpecificationHash: Text,
+      parentScopeHash: Text,
+      parentPlan: Schema.optionalKey(
+        Schema.Struct({
+          recordId: Text.check(Schema.isMaxLength(256)),
+          planRevision: NonNegativeInt,
+          contentHash: Text,
+          gateId: Text.check(Schema.isMaxLength(256)),
+        }),
+      ),
+    }),
+  ),
+  repairAuthorization: Schema.optionalKey(
+    Schema.Struct({
+      episodeId: Text.check(Schema.isMaxLength(256)),
+      failureFingerprint: Text,
+      relevantRevision: Text,
+      semanticRepairNumber: NonNegativeInt,
+      inheritedGateId: Text.check(Schema.isMaxLength(256)),
+      exceptionGateId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
+    }),
+  ),
 });
 export const ProjectTeamRunBinding = Schema.Struct({
   ...Fields,
@@ -158,6 +208,11 @@ export const ProjectTeamRunBinding = Schema.Struct({
   leaseGeneration: NonNegativeInt,
   specRevision: NonNegativeInt,
   planRevision: NonNegativeInt,
+  authorizationGateId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
+  specificationGateId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
+  planGateId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
+  scopeHash: Schema.optionalKey(Text),
+  repairEpisodeId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
 });
 export const ProjectTeamMessage = Schema.Struct({
   ...Fields,
@@ -216,6 +271,7 @@ export const ProjectTeamEvidenceApplicability = Schema.Struct({
   artifactId: Text,
   environmentSummary: Text,
   integration: Schema.Boolean,
+  scopeHash: Schema.optionalKey(Text),
 });
 export const ProjectTeamRepairEpisode = Schema.Struct({
   ...Fields,
@@ -229,6 +285,10 @@ export const ProjectTeamRepairEpisode = Schema.Struct({
   transportRetries: NonNegativeInt,
   timeoutCount: NonNegativeInt,
   attemptIds: Schema.Array(ProjectWorkAttemptId).check(Schema.isMaxLength(64)),
+  rootTaskId: Schema.optionalKey(ProjectWorkTaskId),
+  lastSemanticRevision: Schema.optionalKey(Text),
+  pendingSemanticRepair: Schema.optionalKey(Schema.Boolean),
+  exceptionGrantId: Schema.optionalKey(Text.check(Schema.isMaxLength(256))),
 });
 export const ProjectTeamLimits = Schema.Struct({
   ...Fields,
@@ -269,6 +329,7 @@ export const ProjectTeamEffect = Schema.Struct({
     "mailbox-wake",
     "memory-index",
     "memory-delete",
+    "stop",
   ]),
   taskId: Schema.optionalKey(ProjectWorkTaskId),
   runId: Schema.optionalKey(Text),
@@ -412,5 +473,5 @@ export const ProjectTeamWriteIntent = Schema.Union([
     knowledgeId: Text,
     title: Text,
   }),
-]);
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type ProjectTeamWriteIntent = typeof ProjectTeamWriteIntent.Type;

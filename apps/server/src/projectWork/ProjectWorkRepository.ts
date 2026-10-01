@@ -32,6 +32,7 @@ import {
   type ProjectWorkProjectionState,
 } from "./ProjectWorkProjection.ts";
 import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
+import { assertProjectTeamGuidedReplayCurrent } from "./ProjectTeamGuidedLifecycle.ts";
 import * as ProjectWorkEventBus from "./ProjectWorkEventBus.ts";
 import { enqueueProjectWorkAttentionPublication } from "./ProjectWorkAttentionReactor.ts";
 import * as ProjectWorkContentGuard from "./ProjectWorkContentGuard.ts";
@@ -370,6 +371,22 @@ const makeProjectWorkRepository = Effect.gen(function* () {
             const priorEvents = priorCommandRows.map((row) =>
               decodeProjectWorkEvent(JSON.parse(String(row.payloadJson))),
             );
+            if (
+              commandForDecision.type === "project-work.foundation.commit" &&
+              commandForDecision.guided !== undefined
+            )
+              yield* Effect.try({
+                try: () =>
+                  assertProjectTeamGuidedReplayCurrent(
+                    current,
+                    commandForDecision.guided!.intent,
+                    priorEvents,
+                  ),
+                catch: (cause) =>
+                  cause instanceof ProjectWorkPolicyError
+                    ? cause
+                    : new ProjectWorkPolicyError("invalid-state", String(cause)),
+              });
             const normalized = project(current);
             const priorResult =
               priorReceipt?.resultJson === null || priorReceipt?.resultJson === undefined

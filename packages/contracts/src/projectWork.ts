@@ -2,6 +2,8 @@ import {
   ProjectTeamRecord,
   ProjectTeamRecordRead,
   ProjectTeamWriteIntent,
+  ProjectTeamRunBinding,
+  ProjectTeamDeliverableKind,
 } from "./projectTeams.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -203,6 +205,12 @@ export const ProjectWorkEvidence = Schema.Struct({
   summary: ProjectWorkShortText,
   detail: Schema.optionalKey(ProjectWorkSummary),
   uri: Schema.optionalKey(TrimmedString),
+  scopeHash: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
+  outputArtifactIds: Schema.optionalKey(
+    Schema.Array(TrimmedNonEmptyString.check(Schema.isMaxLength(256))).check(
+      Schema.isMaxLength(64),
+    ),
+  ),
   recordedAt: IsoDateTime,
   revision: ProjectWorkRevision,
   attribution: ProjectWorkAttributionField,
@@ -676,6 +684,7 @@ export const ProjectWorkTaskCreateCommand = Schema.Struct({
   taskId: ProjectWorkTaskId,
   title: TrimmedNonEmptyString,
   summary: Schema.optionalKey(ProjectWorkSummary),
+  deliverableKind: Schema.optionalKey(ProjectTeamDeliverableKind),
   createdAt: IsoDateTime,
 });
 
@@ -1093,15 +1102,271 @@ export const ProjectWorkAttentionSeenCommand = Schema.Struct({
   seenAt: IsoDateTime,
 });
 
+const GuidedText = TrimmedNonEmptyString.check(Schema.isMaxLength(4_000));
+const GuidedBody = TrimmedNonEmptyString.check(Schema.isMaxLength(32_000));
+const GuidedId = TrimmedNonEmptyString.check(Schema.isMaxLength(256));
+const utf8Length = (value: string) => {
+  let bytes = 0;
+  for (const character of value) {
+    const code = character.codePointAt(0)!;
+    bytes += code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+  return bytes;
+};
+const GuidedFields = {
+  commandId: CommandId,
+  projectId: ProjectId,
+  taskId: ProjectWorkTaskId,
+  expectedRevision: NonNegativeInt,
+  expectedTaskRevision: NonNegativeInt,
+};
+
+/** Guided intent inputs describe a requested change, never caller-created authority. */
+export const ProjectTeamGuidedIntent = Schema.Union([
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.assignment.start"),
+    assignmentKind: Schema.Literals(["planning", "review"]),
+    objective: GuidedBody,
+    outputDescriptions: Schema.Array(GuidedText).check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(16),
+    ),
+    specRevision: NonNegativeInt,
+    specificationGateId: GuidedId,
+    expectedSpecificationGateRevision: NonNegativeInt,
+    parentPlan: Schema.optionalKey(
+      Schema.Struct({
+        recordId: GuidedId,
+        expectedRecordRevision: NonNegativeInt,
+        planRevision: NonNegativeInt,
+        gateId: GuidedId,
+        expectedGateRevision: NonNegativeInt,
+      }),
+    ),
+  }).check(
+    Schema.makeFilter(
+      (input) => input.assignmentKind !== "review" || input.parentPlan !== undefined,
+      { message: "A review assignment requires its exact approved parent plan" },
+    ),
+    Schema.makeFilter(
+      (input) => input.assignmentKind !== "planning" || input.outputDescriptions.length === 1,
+      { message: "A planning assignment has one proposed-plan output" },
+    ),
+  ),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.investigation.start"),
+    objective: GuidedBody,
+    outputDescriptions: Schema.Array(GuidedText).check(
+      Schema.isMinLength(1),
+      Schema.isMaxLength(16),
+    ),
+    issueRecordId: Schema.optionalKey(GuidedId),
+    expectedIssueRevision: Schema.optionalKey(NonNegativeInt),
+  }).check(
+    Schema.makeFilter(
+      (input) =>
+        (input.issueRecordId === undefined) === (input.expectedIssueRevision === undefined),
+      { message: "An issue target requires its expected revision" },
+    ),
+  ),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.specification.propose"),
+    expectedSpecRevision: NonNegativeInt,
+    specification: ProjectWorkSpecification,
+    criterionSnapshots: Schema.Array(ProjectWorkCriterion).check(Schema.isMaxLength(64)),
+  }),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.plan.propose"),
+    specRevision: NonNegativeInt,
+    content: GuidedBody,
+    dependencyTaskIds: Schema.Array(ProjectWorkTaskId).check(Schema.isMaxLength(64)),
+    previousPlanId: Schema.optionalKey(GuidedId),
+    expectedPreviousPlanRevision: Schema.optionalKey(NonNegativeInt),
+  }).check(
+    Schema.makeFilter(
+      (input) =>
+        (input.previousPlanId === undefined) === (input.expectedPreviousPlanRevision === undefined),
+      { message: "A previous plan target requires its expected record revision" },
+    ),
+  ),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.execution.start"),
+    specRevision: NonNegativeInt,
+    planRevision: NonNegativeInt,
+    specGateId: GuidedId,
+    expectedSpecGateRevision: NonNegativeInt,
+    planId: GuidedId,
+    expectedPlanRecordRevision: NonNegativeInt,
+    planGateId: GuidedId,
+    expectedPlanGateRevision: NonNegativeInt,
+  }),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.task.control"),
+    control: Schema.Union([
+      Schema.Struct({
+        action: Schema.Literals([
+          "defer",
+          "reopen",
+          "pause",
+          "resume",
+          "cancel",
+          "resolve-failure",
+        ]),
+        reason: GuidedText,
+      }),
+      Schema.Struct({
+        action: Schema.Literal("reassign"),
+        reason: GuidedText,
+        recipientMemberId: GuidedId,
+        expectedMemberRevision: NonNegativeInt,
+      }),
+    ]),
+  }),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.assignment.report"),
+    specRevision: NonNegativeInt,
+    planRevision: NonNegativeInt,
+    assignmentId: GuidedId,
+    expectedAssignmentRevision: NonNegativeInt,
+    summary: GuidedBody,
+    evidenceIds: Schema.Array(GuidedId).check(Schema.isMaxLength(64)),
+    outputArtifactIds: Schema.Array(GuidedId).check(Schema.isMaxLength(64)),
+    outputs: Schema.optionalKey(
+      Schema.Array(
+        Schema.Struct({
+          criterionId: ProjectWorkCriterionId,
+          detail: GuidedBody,
+          summary: Schema.optionalKey(GuidedText),
+          kind: Schema.Literals(["observation", "artifact"]),
+        }),
+      ).check(Schema.isMaxLength(64)),
+    ),
+    outcome: Schema.Literals(["findings", "review-ready", "complete"]),
+  }).check(
+    Schema.makeFilter(
+      (input) =>
+        utf8Length(input.summary) +
+          (input.outputs ?? []).reduce(
+            (total, output) => total + utf8Length(output.detail) + utf8Length(output.summary ?? ""),
+            0,
+          ) <=
+        131_072,
+      { message: "Retained report content exceeds its 128 KiB byte limit" },
+    ),
+  ),
+  Schema.Struct({
+    ...GuidedFields,
+    type: Schema.Literal("project-team.repair.resolve"),
+    episodeId: GuidedId,
+    expectedEpisodeRevision: NonNegativeInt,
+    failureFingerprint: GuidedText,
+    relevantRevision: GuidedText,
+    decision: Schema.Literals(["diagnose", "approve-one-repair", "revise-scope", "abandon"]),
+    reason: GuidedText,
+  }),
+]).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ProjectTeamGuidedIntent = typeof ProjectTeamGuidedIntent.Type;
+
+/** Private gateway compilation; raw foundation commands remain denied by transports. */
+export const ProjectWorkGuidedTransition = Schema.Struct({
+  intent: ProjectTeamGuidedIntent,
+  bindingId: Schema.optionalKey(GuidedId),
+  generation: Schema.optionalKey(NonNegativeInt),
+}).check(
+  Schema.makeFilter(
+    (input) => (input.bindingId === undefined) === (input.generation === undefined),
+    { message: "A compiled managed identity requires its generation" },
+  ),
+);
+export type ProjectWorkGuidedTransition = typeof ProjectWorkGuidedTransition.Type;
+
+/** Private scheduler/runtime transitions. Public transports deny foundation commands. */
+export const ProjectWorkTeamTransition = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("claim"),
+    taskId: ProjectWorkTaskId,
+    expectedTaskRevision: NonNegativeInt,
+    authorizationGateId: GuidedId,
+    expectedGateRevision: NonNegativeInt,
+    claim: ProjectWorkTaskClaimCommand,
+    binding: ProjectTeamRunBinding,
+    repair: Schema.optionalKey(
+      Schema.Struct({
+        episodeId: GuidedId,
+        expectedEpisodeRevision: NonNegativeInt,
+        exceptionGateId: Schema.optionalKey(GuidedId),
+        expectedExceptionGateRevision: Schema.optionalKey(NonNegativeInt),
+      }).check(
+        Schema.makeFilter(
+          (input) =>
+            (input.exceptionGateId === undefined) ===
+            (input.expectedExceptionGateRevision === undefined),
+          { message: "An exception gate requires its expected revision" },
+        ),
+      ),
+    ),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("failure"),
+    bindingId: GuidedId,
+    generation: NonNegativeInt,
+    expectedBindingRevision: NonNegativeInt,
+    failureFingerprint: GuidedText,
+    relevantRevision: GuidedText,
+    failureKind: Schema.Literals(["semantic", "transport", "timeout"]),
+    summary: GuidedBody,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("repair.consume"),
+    episodeId: GuidedId,
+    expectedEpisodeRevision: NonNegativeInt,
+    bindingId: GuidedId,
+    generation: NonNegativeInt,
+    relevantRevision: GuidedText,
+    exceptionGateId: Schema.optionalKey(GuidedId),
+    expectedExceptionGateRevision: Schema.optionalKey(NonNegativeInt),
+  }).check(
+    Schema.makeFilter(
+      (input) =>
+        (input.exceptionGateId === undefined) ===
+        (input.expectedExceptionGateRevision === undefined),
+      { message: "An exception gate requires its expected revision" },
+    ),
+  ),
+]);
+export type ProjectWorkTeamTransition = typeof ProjectWorkTeamTransition.Type;
+
 export const ProjectWorkFoundationCommitCommand = Schema.Struct({
   ...ProjectWorkCommandFields,
   type: Schema.Literal("project-work.foundation.commit"),
   expectedRevision: NonNegativeInt,
   attribution: ProjectWorkAttribution,
-  records: Schema.Array(ProjectTeamRecord).check(Schema.isMinLength(1), Schema.isMaxLength(64)),
+  records: Schema.Array(ProjectTeamRecord).check(Schema.isMaxLength(64)),
   claim: Schema.optionalKey(ProjectWorkTaskClaimCommand),
+  guided: Schema.optionalKey(ProjectWorkGuidedTransition),
+  transition: Schema.optionalKey(ProjectWorkTeamTransition),
   committedAt: IsoDateTime,
-});
+}).check(
+  Schema.makeFilter(
+    (command) => {
+      if (command.guided !== undefined || command.transition !== undefined)
+        return (
+          command.records.length === 0 &&
+          command.claim === undefined &&
+          (command.guided === undefined || command.transition === undefined)
+        );
+      return command.records.length > 0;
+    },
+    { message: "A foundation transaction requires one unmixed transition or nonempty records" },
+  ),
+);
 
 export const ProjectWorkCommand = Schema.Union([
   ProjectWorkFoundationCommitCommand,
@@ -1144,7 +1409,11 @@ export const ProjectWorkCommand = Schema.Union([
 export type ProjectWorkCommand = typeof ProjectWorkCommand.Type;
 
 /** Names used by RPC and MCP adapters when referring to the command union. */
-export const ProjectWorkWriteIntent = Schema.Union([ProjectWorkCommand, ProjectTeamWriteIntent]);
+export const ProjectWorkWriteIntent = Schema.Union([
+  ProjectWorkCommand,
+  ProjectTeamWriteIntent,
+  ProjectTeamGuidedIntent,
+]);
 export type ProjectWorkWriteIntent = typeof ProjectWorkWriteIntent.Type;
 
 export const ProjectWorkReadRecord = Schema.Union([

@@ -1,14 +1,22 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
+import * as NodePath from "node:path";
+import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
 
 import {
   type ProviderDriverKind,
-  type ProviderInstanceId,
+  ProviderInstanceId,
+  ManagedSkillKey,
+  SkillCatalogRevision,
+  ThreadId,
+  TrimmedNonEmptyString,
   type SkillNativeDiscoveryResult,
   type SkillNativeObservation,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Schema from "effect/Schema";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
@@ -19,9 +27,11 @@ import {
   ProviderSkillAdapterError,
   type ProviderSkillAdapter,
   type ProviderSkillPlan,
+  type ProviderSkillPrepareRequest,
 } from "./ProviderSkillAdapter.ts";
 import {
   SkillMaterializationService,
+  withSkillMaterializationCleanup,
   type SkillMaterializationServiceShape,
 } from "./SkillMaterializationService.ts";
 import { SKILL_BODY_FILE } from "./SkillPackage.ts";
@@ -197,6 +207,371 @@ export function makeCodexSkillAdapter(input: {
           providerInstanceId: input.providerInstanceId,
         })
         .pipe(Effect.mapError((cause) => adapterError("cleanup_failed", cause.detail, cause))),
+  };
+}
+
+export interface PiManagedSkillsPayload {
+  readonly kind: "pi-managed-skills";
+  readonly root: string;
+  readonly skills: ReadonlyArray<{ readonly key: ManagedSkillKey; readonly path: string }>;
+}
+
+export type PiManagedSkillAuthorization = (
+  request: ProviderSkillPrepareRequest,
+) => Effect.Effect<ReadonlySet<ManagedSkillKey>, ProviderSkillAdapterError>;
+
+const PiRuntimeIdentity = Schema.Struct({
+  providerInstanceId: ProviderInstanceId,
+  sessionId: Schema.String.check(Schema.isPattern(/^[A-Za-z0-9][A-Za-z0-9_-]*$/)),
+  threadId: ThreadId,
+  cwd: TrimmedNonEmptyString,
+});
+const PiSkillPrepareRequest = Schema.Struct({
+  runtime: PiRuntimeIdentity,
+  desiredRevision: SkillCatalogRevision,
+  skills: Schema.Array(Schema.Struct({ key: ManagedSkillKey, packagePath: TrimmedNonEmptyString })),
+});
+const decodePiRequest = Schema.decodeUnknownEffect(PiSkillPrepareRequest);
+const decodePiRuntime = Schema.decodeUnknownEffect(PiRuntimeIdentity);
+const PiOwnershipMarker = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  sessionId: Schema.String,
+  providerInstanceId: ProviderInstanceId,
+  desiredRevision: SkillCatalogRevision,
+});
+const decodePiOwnershipMarker = Schema.decodeUnknownEffect(
+  Schema.fromJsonString(PiOwnershipMarker),
+);
+const decodePiAllowedKeys = Schema.decodeUnknownEffect(Schema.ReadonlySet(ManagedSkillKey));
+
+// Custom output has no service collector. Detach it before removal so an async ownership
+// receipt cannot authorize deleting a replacement at the public path. The short final
+// metadata/marker check and restore have no async gap; recursive removal stays async.
+// The fresh 0700 cleanup directory is private to this preparation, not an adversarial
+// cross-process filesystem boundary. A foreign detached entry is restored or retained.
+const cleanupPiCustomRoot = async (owned: {
+  readonly root: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly marker: string;
+}) => {
+  const markerName = ".t3-owned.json";
+  const markerBytes = Buffer.from(owned.marker);
+  if (markerBytes.length > 64 * 1024) throw new Error("Ownership marker exceeds cleanup bound.");
+  const matches = async (root: string) => {
+    const info = await NodeFSP.lstat(root, { bigint: true });
+    const markerPath = NodePath.join(root, markerName);
+    const markerInfo = await NodeFSP.lstat(markerPath);
+    return (
+      info.isDirectory() &&
+      !info.isSymbolicLink() &&
+      info.dev === owned.dev &&
+      info.ino === owned.ino &&
+      markerInfo.isFile() &&
+      !markerInfo.isSymbolicLink() &&
+      (await NodeFSP.readFile(markerPath, "utf8")) === owned.marker
+    );
+  };
+  const matchesNow = (root: string) => {
+    let descriptor: number | undefined;
+    try {
+      const info = NodeFS.lstatSync(root, { bigint: true });
+      if (
+        !info.isDirectory() ||
+        info.isSymbolicLink() ||
+        info.dev !== owned.dev ||
+        info.ino !== owned.ino
+      )
+        return false;
+      descriptor = NodeFS.openSync(
+        NodePath.join(root, markerName),
+        NodeFS.constants.O_RDONLY | NodeFS.constants.O_NOFOLLOW,
+      );
+      const markerInfo = NodeFS.fstatSync(descriptor);
+      if (!markerInfo.isFile() || markerInfo.size !== markerBytes.length) return false;
+      const bytes = Buffer.alloc(markerBytes.length + 1);
+      const count = NodeFS.readSync(descriptor, bytes, 0, bytes.length, 0);
+      return count === markerBytes.length && bytes.subarray(0, count).equals(markerBytes);
+    } catch {
+      return false;
+    } finally {
+      if (descriptor !== undefined) NodeFS.closeSync(descriptor);
+    }
+  };
+  if (!(await matches(owned.root))) return;
+  const container = await NodeFSP.mkdtemp(
+    NodePath.join(NodePath.dirname(owned.root), ".t3-pi-cleanup-"),
+  );
+  const detached = NodePath.join(container, "root");
+  let failure: unknown;
+  try {
+    await NodeFSP.chmod(container, 0o700);
+    // Inspect the detached path even if a completed rename receipt reports failure.
+    let renameFailure: unknown;
+    try {
+      await NodeFSP.rename(owned.root, detached);
+    } catch (cause) {
+      renameFailure = cause;
+    }
+    let verified = false;
+    try {
+      verified = await matches(detached);
+    } catch {}
+    if (verified && matchesNow(detached)) {
+      await NodeFSP.rm(detached, { recursive: true });
+    } else {
+      let present = false;
+      try {
+        NodeFS.lstatSync(detached);
+        present = true;
+      } catch (cause) {
+        if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
+      }
+      if (present) {
+        let occupied = true;
+        try {
+          NodeFS.lstatSync(owned.root);
+        } catch (cause) {
+          if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") {
+            occupied = false;
+          } else {
+            throw cause;
+          }
+        }
+        if (occupied) {
+          throw new Error(
+            `Foreign cleanup output retained at ${detached}; original path occupied at ${owned.root}.`,
+          );
+        }
+        NodeFS.renameSync(detached, owned.root);
+      }
+      if (!present && renameFailure !== undefined) throw renameFailure;
+    }
+  } catch (cause) {
+    failure = cause;
+  } finally {
+    // Never recursively remove a container that might retain a foreign entry.
+    try {
+      await NodeFSP.rmdir(container);
+    } catch (cause) {
+      if (!(cause instanceof Error && "code" in cause && cause.code === "ENOTEMPTY"))
+        failure ??= cause;
+    }
+  }
+  if (failure !== undefined) throw failure;
+};
+
+/** The runtime must authorize the current managed binding and frozen role/configuration. */
+export function makePiSkillAdapter(input: {
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly discoverCandidates: CandidateDiscovery;
+  readonly materialization: SkillMaterializationServiceShape;
+  readonly authorizeManagedRequest: PiManagedSkillAuthorization;
+}): ProviderSkillAdapter {
+  const authorize = Effect.fn("PiSkillAdapter.authorize")(function* (
+    request: ProviderSkillPrepareRequest,
+  ) {
+    if (typeof input.authorizeManagedRequest !== "function") {
+      return yield* adapterError(
+        "managed_authorization_required",
+        "Pi skill delivery requires managed run authorization.",
+      );
+    }
+    const allowed = yield* input.authorizeManagedRequest(request);
+    const keys = yield* decodePiAllowedKeys(allowed).pipe(
+      Effect.mapError((cause) =>
+        adapterError(
+          "managed_authorization_invalid",
+          "Managed skill authorization returned invalid keys.",
+          cause,
+        ),
+      ),
+    );
+    if (request.skills.some((skill) => !keys.has(skill.key))) {
+      return yield* adapterError(
+        "managed_skill_not_allowed",
+        "A requested skill is outside the managed run's frozen selection.",
+      );
+    }
+  });
+
+  return {
+    discoverNative: (cwd) => discover(input.providerInstanceId, cwd, input.discoverCandidates),
+    evaluateCompatibility: () => ({
+      ...supportedCompatibility(input.providerInstanceId),
+      support: "supported_with_limitations",
+      reasons: [
+        {
+          code: "managed-team-runs-only",
+          message:
+            "Pi skill delivery requires a current managed team run and an explicit resource loader. Skill changes require a new session; native discovery is advisory.",
+        },
+      ],
+    }),
+    prepareSession: Effect.fn("PiSkillAdapter.prepareSession")(function* (request) {
+      const prepared = yield* decodePiRequest(request).pipe(
+        Effect.mapError((cause) =>
+          adapterError(
+            "invalid_managed_request",
+            "Pi skill runtime identity or selection is invalid.",
+            cause,
+          ),
+        ),
+      );
+      if (prepared.runtime.providerInstanceId !== input.providerInstanceId) {
+        return yield* adapterError(
+          "provider_instance_mismatch",
+          "The runtime belongs to another provider instance.",
+        );
+      }
+      if (new Set(prepared.skills.map((skill) => skill.key)).size !== prepared.skills.length) {
+        return yield* adapterError(
+          "duplicate_skill_keys",
+          "Pi skill delivery contains duplicate managed keys.",
+        );
+      }
+      // Keep the authorization and copied package selection stable across async boundaries.
+      Object.freeze(prepared.runtime);
+      for (const skill of prepared.skills) Object.freeze(skill);
+      Object.freeze(prepared.skills);
+      Object.freeze(prepared);
+      yield* authorize(prepared);
+      const materializationInput = {
+        sessionId: prepared.runtime.sessionId,
+        providerInstanceId: input.providerInstanceId,
+        desiredRevision: prepared.desiredRevision,
+        packages: prepared.skills.map((skill) => ({
+          key: skill.key,
+          sourcePath: skill.packagePath,
+        })),
+      };
+      let fallbackCleanup: Effect.Effect<void> = Effect.void;
+      return yield* withSkillMaterializationCleanup(
+        Effect.gen(function* () {
+          const materialized = yield* input.materialization
+            .materialize(materializationInput)
+            .pipe(
+              Effect.mapError((cause) =>
+                adapterError("materialization_failed", cause.detail, cause),
+              ),
+            );
+          if (
+            !NodePath.isAbsolute(materialized.root) ||
+            NodePath.resolve(materialized.root) !== materialized.root
+          ) {
+            return yield* adapterError(
+              "invalid_materialization",
+              "Pi skill delivery returned paths outside the exact managed selection.",
+            );
+          }
+
+          // Trusted custom materializers must return their acquired generation with its marker.
+          // Pin that returned inode; identity-based dispose may resolve a different completed root.
+          yield* Effect.uninterruptible(
+            Effect.gen(function* () {
+              const pinned = yield* Effect.tryPromise({
+                try: async () => {
+                  const info = await NodeFSP.lstat(materialized.root, { bigint: true });
+                  const markerPath = NodePath.join(materialized.root, ".t3-owned.json");
+                  const markerInfo = await NodeFSP.lstat(markerPath);
+                  if (
+                    !info.isDirectory() ||
+                    info.isSymbolicLink() ||
+                    !markerInfo.isFile() ||
+                    markerInfo.isSymbolicLink()
+                  )
+                    return undefined;
+                  const marker = await NodeFSP.readFile(markerPath, "utf8");
+                  const current = await NodeFSP.lstat(materialized.root, { bigint: true });
+                  if (info.dev !== current.dev || info.ino !== current.ino) return undefined;
+                  return { root: materialized.root, dev: info.dev, ino: info.ino, marker };
+                },
+                catch: (cause) =>
+                  adapterError(
+                    "cleanup_failed",
+                    "Could not retain materialization ownership.",
+                    cause,
+                  ),
+              }).pipe(Effect.option);
+              if (pinned._tag === "Some" && pinned.value !== undefined) {
+                const owned = pinned.value;
+                const marker = yield* decodePiOwnershipMarker(owned.marker).pipe(Effect.option);
+                if (
+                  marker._tag === "Some" &&
+                  marker.value.sessionId === materializationInput.sessionId &&
+                  marker.value.providerInstanceId === materializationInput.providerInstanceId &&
+                  marker.value.desiredRevision === materializationInput.desiredRevision
+                ) {
+                  fallbackCleanup = Effect.tryPromise({
+                    try: () => cleanupPiCustomRoot(owned),
+                    catch: (cause) =>
+                      adapterError(
+                        "cleanup_failed",
+                        "Could not verify materialization ownership.",
+                        cause,
+                      ),
+                  }).pipe(
+                    Effect.tapError((cause) => Effect.logWarning(cause)),
+                    Effect.ignore,
+                  );
+                }
+              }
+            }),
+          );
+          // Pin custom owned output before rejecting its map so failed preparation cleans it.
+          if (
+            materialized.skillPaths.size !== prepared.skills.length ||
+            prepared.skills.some(
+              (skill) =>
+                materialized.skillPaths.get(skill.key) !==
+                NodePath.join(materialized.root, skill.key),
+            )
+          ) {
+            return yield* adapterError(
+              "invalid_materialization",
+              "Pi skill delivery returned paths outside the exact managed selection.",
+            );
+          }
+          // Copying can outlast a lease or role revocation; do not return a stale plan.
+          yield* authorize(prepared);
+          const payload: PiManagedSkillsPayload = {
+            kind: "pi-managed-skills",
+            root: materialized.root,
+            skills: prepared.skills.map((skill) => ({
+              key: skill.key,
+              path: NodePath.join(materialized.root, skill.key, SKILL_BODY_FILE),
+            })),
+          };
+          return {
+            providerInstanceId: input.providerInstanceId,
+            desiredRevision: prepared.desiredRevision,
+            applicationMode: "new_session_required",
+            skillKeys: prepared.skills.map((skill) => skill.key),
+            payload,
+          } satisfies ProviderSkillPlan;
+        }),
+        Effect.suspend(() => fallbackCleanup),
+      );
+    }),
+    disposeSession: Effect.fn("PiSkillAdapter.disposeSession")(function* (runtime) {
+      const validated = yield* decodePiRuntime(runtime).pipe(
+        Effect.mapError((cause) =>
+          adapterError("invalid_managed_request", "Pi skill runtime identity is invalid.", cause),
+        ),
+      );
+      if (validated.providerInstanceId !== input.providerInstanceId) {
+        return yield* adapterError(
+          "provider_instance_mismatch",
+          "The runtime belongs to another provider instance.",
+        );
+      }
+      yield* input.materialization
+        .disposeSession({
+          sessionId: validated.sessionId,
+          providerInstanceId: input.providerInstanceId,
+        })
+        .pipe(Effect.mapError((cause) => adapterError("cleanup_failed", cause.detail, cause)));
+    }),
   };
 }
 

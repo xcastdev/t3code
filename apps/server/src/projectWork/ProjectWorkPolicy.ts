@@ -1,4 +1,5 @@
 import type {
+  ProjectTeamRecord,
   ProjectWorkAction,
   ProjectWorkActionAvailability,
   ProjectWorkAttention,
@@ -56,6 +57,7 @@ export class ProjectWorkPolicyError extends Error {
 }
 
 export interface ProjectWorkState {
+  readonly foundationRecords?: ReadonlyArray<ProjectTeamRecord>;
   readonly projectId: string;
   revision: number;
   tasks: Array<ProjectWorkTask>;
@@ -237,6 +239,15 @@ function claimabilityFor(
   return { claimable: true };
 }
 
+/** These prerequisites are necessary for a private guided claim, but grant no authority. */
+export const deriveProjectWorkClaimPrerequisites = (
+  state: ProjectWorkState,
+  taskId: ProjectWorkTaskId,
+) => {
+  const task = taskFor(state, taskId);
+  return claimabilityFor(state, task, readinessFor(state, task));
+};
+
 function availability(available: boolean, reason?: string): ProjectWorkActionAvailability {
   return available || reason === undefined ? { available } : { available, reason };
 }
@@ -291,7 +302,7 @@ export function deriveProjectWorkTaskPolicy(
 ): ProjectWorkTaskPolicy {
   const task = taskFor(state, taskId);
   const readiness = readinessFor(state, task);
-  const claimability = claimabilityFor(state, task, readiness);
+  let claimability = claimabilityFor(state, task, readiness);
   const actions = Object.fromEntries(
     ACTIONS.map((action) => [action, availability(false, "not-available")]),
   ) as Record<ProjectWorkAction, ProjectWorkActionAvailability>;
@@ -383,6 +394,18 @@ export function deriveProjectWorkTaskPolicy(
     ),
     "no-relationship",
   );
+  if (
+    (state.foundationRecords ?? []).some(
+      (r) =>
+        (r.kind === "task-membership" && r.taskId === taskId && r.executionKind !== "legacy") ||
+        (r.kind === "run-binding" && r.taskId === taskId),
+    )
+  ) {
+    claimability = { claimable: false, reason: "approval-required" };
+    for (const action of ACTIONS)
+      if (!["watch", "unwatch", "add-evidence"].includes(action))
+        actions[action] = availability(false, "guided-transition-required");
+  }
   return {
     taskId,
     readiness,

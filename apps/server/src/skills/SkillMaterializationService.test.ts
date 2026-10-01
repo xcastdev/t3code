@@ -6,6 +6,9 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as Exit from "effect/Exit";
 
 import * as ServerConfig from "../config.ts";
 import * as ManagedSkillRepository from "./ManagedSkillRepository.ts";
@@ -14,6 +17,7 @@ import { hashSkillPackage } from "./SkillPackage.ts";
 import { makeClaudeSkillAdapter, makeCodexSkillAdapter } from "./ProviderSkillAdapters.ts";
 
 const encodeFixtureMarker = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const encodeFixtureJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
 
 const content: ManagedSkillContent = {
   key: "deploy" as ManagedSkillKey,
@@ -449,5 +453,255 @@ describe("SkillMaterializationService", () => {
         assert.isTrue(yield* fs.exists(path.join(foreign, "keep.txt")));
       }),
     );
+  });
+});
+
+const cancellationFixture = Effect.fn("SkillMaterializationService.test.cancellationFixture")(
+  function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const configured = yield* ServerConfig.ServerConfig;
+    const runtimeDir = yield* fs.makeTempDirectoryScoped({ prefix: "skill-cancellation-runtime-" });
+    const config = { ...configured, skillRuntimeDir: runtimeDir };
+    const source = yield* fs.makeTempDirectoryScoped({ prefix: "skill-cancellation-source-" });
+    yield* fs.writeFileString(
+      path.join(source, "SKILL.md"),
+      "---\nname: review\ndescription: Cancellation fixture\n---\nRetain canonical content.",
+    );
+    const hash = yield* hashSkillPackage(source);
+    const manifest = yield* encodeFixtureJson({
+      schemaVersion: 1,
+      kind: "managed-skill",
+      id: "cancel-review",
+      key: "review",
+      scope: "global",
+      revision: { revision: 1, hash },
+      origin: "created",
+      ownership: "t3",
+    });
+    yield* fs.writeFileString(path.join(source, "t3-skill.json"), manifest);
+    const input = {
+      sessionId: path.basename(source),
+      providerInstanceId: "pi-cancel" as ProviderInstanceId,
+      desiredRevision: 2,
+      packages: [{ key: "review" as ManagedSkillKey, sourcePath: source }],
+    };
+    const root = path.join(config.skillRuntimeDir, input.sessionId, "2", "pi-cancel");
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const hold = (candidate: string) =>
+      Deferred.succeed(entered, undefined).pipe(
+        Effect.andThen(Deferred.await(release)),
+        Effect.as(candidate),
+      );
+    return { fs, path, config, source, hash, input, root, entered, release, hold };
+  },
+);
+
+describe("SkillMaterializationService cancellation ownership", () => {
+  it.layer(TestLayer)("drains interrupted acquisitions", (it) => {
+    for (const phase of ["acquire", "copy", "rename"] as const) {
+      for (const interrupt of [true, false]) {
+        it.effect(
+          `${interrupt ? "cleans" : "retains"} its owned directory after ${phase} ${interrupt ? "interruption" : "completion"}`,
+          () =>
+            Effect.gen(function* () {
+              const fixture = yield* cancellationFixture();
+              let held = false;
+              const hooked = FileSystem.FileSystem.of({
+                ...fixture.fs,
+                realPath: (candidate) =>
+                  fixture.fs.realPath(candidate).pipe(
+                    Effect.flatMap((result) => {
+                      if (
+                        phase !== "acquire" ||
+                        held ||
+                        !fixture.path.basename(candidate).startsWith(".pending-")
+                      )
+                        return Effect.succeed(result);
+                      held = true;
+                      return fixture.hold(result);
+                    }),
+                  ),
+                copy: (from, to, options) =>
+                  fixture.fs
+                    .copy(from, to, options)
+                    .pipe(
+                      Effect.andThen(
+                        phase === "copy" ? fixture.hold(to).pipe(Effect.asVoid) : Effect.void,
+                      ),
+                    ),
+                rename: (from, to) =>
+                  fixture.fs
+                    .rename(from, to)
+                    .pipe(
+                      Effect.andThen(
+                        phase === "rename" ? fixture.hold(to).pipe(Effect.asVoid) : Effect.void,
+                      ),
+                    ),
+              });
+              const service = yield* SkillMaterializationService.make.pipe(
+                Effect.provideService(FileSystem.FileSystem, hooked),
+                Effect.provideService(ServerConfig.ServerConfig, fixture.config),
+              );
+              const fiber = yield* service.materialize(fixture.input).pipe(Effect.forkChild);
+              yield* Deferred.await(fixture.entered);
+              if (interrupt) yield* Fiber.interrupt(fiber);
+              else yield* Deferred.succeed(fixture.release, undefined);
+              const exit = yield* Fiber.await(fiber);
+              assert.equal(Exit.isFailure(exit), interrupt);
+              assert.deepEqual(
+                (yield* fixture.fs.readDirectory(fixture.config.skillRuntimeDir)).filter((entry) =>
+                  entry.startsWith(".pending-"),
+                ),
+                [],
+              );
+              assert.equal(yield* fixture.fs.exists(fixture.root), !interrupt);
+              assert.equal(yield* hashSkillPackage(fixture.source), fixture.hash);
+              if (!interrupt) yield* service.dispose(fixture.input);
+            }),
+        );
+      }
+    }
+
+    for (const phase of ["acquire", "copy", "rename"] as const) {
+      it.effect(`preserves a foreign inode replacement after ${phase} interruption`, () =>
+        Effect.gen(function* () {
+          const fixture = yield* cancellationFixture();
+          let ownedPath = "";
+          const hooked = FileSystem.FileSystem.of({
+            ...fixture.fs,
+            realPath: (candidate) =>
+              fixture.fs.realPath(candidate).pipe(
+                Effect.flatMap((result) => {
+                  if (
+                    phase !== "acquire" ||
+                    ownedPath !== "" ||
+                    !fixture.path.basename(candidate).startsWith(".pending-")
+                  )
+                    return Effect.succeed(result);
+                  ownedPath = candidate;
+                  return fixture.hold(result);
+                }),
+              ),
+            copy: (from, to, options) =>
+              fixture.fs.copy(from, to, options).pipe(
+                Effect.andThen(
+                  Effect.suspend(() => {
+                    if (phase !== "copy") return Effect.void;
+                    ownedPath = fixture.path.dirname(to);
+                    return fixture.hold(to).pipe(Effect.asVoid);
+                  }),
+                ),
+              ),
+            rename: (from, to) =>
+              fixture.fs.rename(from, to).pipe(
+                Effect.andThen(
+                  Effect.suspend(() => {
+                    if (phase !== "rename") return Effect.void;
+                    ownedPath = to;
+                    return fixture.hold(to).pipe(Effect.asVoid);
+                  }),
+                ),
+              ),
+          });
+          const service = yield* SkillMaterializationService.make.pipe(
+            Effect.provideService(FileSystem.FileSystem, hooked),
+            Effect.provideService(ServerConfig.ServerConfig, fixture.config),
+          );
+          const fiber = yield* service.materialize(fixture.input).pipe(Effect.forkChild);
+          yield* Deferred.await(fixture.entered);
+          const retained = yield* fixture.fs.makeTempDirectoryScoped({
+            prefix: "skill-retained-inode-",
+          });
+          yield* fixture.fs.rename(ownedPath, fixture.path.join(retained, "original"));
+          yield* fixture.fs.copy(fixture.path.join(retained, "original"), ownedPath);
+          yield* fixture.fs.writeFileString(
+            fixture.path.join(ownedPath, "foreign.txt"),
+            "Retain the replacement inode.",
+          );
+          yield* Fiber.interrupt(fiber);
+          assert.isTrue(Exit.isFailure(yield* Fiber.await(fiber)));
+          assert.equal(
+            yield* fixture.fs.readFileString(fixture.path.join(ownedPath, "foreign.txt")),
+            "Retain the replacement inode.",
+          );
+          assert.equal(yield* hashSkillPackage(fixture.source), fixture.hash);
+          yield* fixture.fs.remove(ownedPath, { recursive: true });
+        }),
+      );
+    }
+
+    it.effect(
+      "preserves a published directory whose ownership marker changed before cancellation",
+      () =>
+        Effect.gen(function* () {
+          const fixture = yield* cancellationFixture();
+          const hooked = FileSystem.FileSystem.of({
+            ...fixture.fs,
+            rename: (from, to) =>
+              fixture.fs.rename(from, to).pipe(Effect.andThen(fixture.hold(to)), Effect.asVoid),
+          });
+          const service = yield* SkillMaterializationService.make.pipe(
+            Effect.provideService(FileSystem.FileSystem, hooked),
+            Effect.provideService(ServerConfig.ServerConfig, fixture.config),
+          );
+          const fiber = yield* service.materialize(fixture.input).pipe(Effect.forkChild);
+          yield* Deferred.await(fixture.entered);
+          yield* fixture.fs.writeFileString(
+            fixture.path.join(fixture.root, ".t3-owned.json"),
+            "{}",
+          );
+          yield* Fiber.interrupt(fiber);
+          assert.isTrue(Exit.isFailure(yield* Fiber.await(fiber)));
+          assert.equal(
+            yield* fixture.fs.readFileString(fixture.path.join(fixture.root, ".t3-owned.json")),
+            "{}",
+          );
+          assert.isTrue(
+            yield* fixture.fs.exists(fixture.path.join(fixture.root, "review", "SKILL.md")),
+          );
+        }),
+    );
+
+    for (const phase of ["copy", "rename"] as const) {
+      it.effect(
+        `cleans its owned directory when ${phase} fails after the filesystem operation`,
+        () =>
+          Effect.gen(function* () {
+            const fixture = yield* cancellationFixture();
+            const failReceipt = fixture.fs
+              .readFileString(fixture.path.join(fixture.source, "missing-receipt"))
+              .pipe(Effect.asVoid);
+            const hooked = FileSystem.FileSystem.of({
+              ...fixture.fs,
+              copy: (from, to, options) =>
+                fixture.fs
+                  .copy(from, to, options)
+                  .pipe(Effect.andThen(phase === "copy" ? failReceipt : Effect.void)),
+              rename: (from, to) =>
+                fixture.fs
+                  .rename(from, to)
+                  .pipe(Effect.andThen(phase === "rename" ? failReceipt : Effect.void)),
+            });
+            const service = yield* SkillMaterializationService.make.pipe(
+              Effect.provideService(FileSystem.FileSystem, hooked),
+              Effect.provideService(ServerConfig.ServerConfig, fixture.config),
+            );
+            assert.equal(
+              (yield* service.materialize(fixture.input).pipe(Effect.result))._tag,
+              "Failure",
+            );
+            assert.deepEqual(
+              (yield* fixture.fs.readDirectory(fixture.config.skillRuntimeDir)).filter((entry) =>
+                entry.startsWith(".pending-"),
+              ),
+              [],
+            );
+            assert.isFalse(yield* fixture.fs.exists(fixture.root));
+            assert.equal(yield* hashSkillPackage(fixture.source), fixture.hash);
+          }),
+      );
+    }
   });
 });

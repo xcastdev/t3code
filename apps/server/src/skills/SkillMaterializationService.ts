@@ -75,6 +75,32 @@ export class SkillMaterializationService extends Context.Service<
   SkillMaterializationServiceShape
 >()("t3/skills/SkillMaterializationService") {}
 
+const cleanupOwner = Context.Reference<((cleanup: Effect.Effect<void>) => void) | undefined>(
+  "t3/skills/MaterializationCleanupOwner",
+  { defaultValue: () => undefined },
+);
+
+/** Keeps inode-pinned cleanup alive when a caller holds the materializer's success receipt. */
+export const withSkillMaterializationCleanup = <A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  fallback: Effect.Effect<void> = Effect.void,
+): Effect.Effect<A, E, R> =>
+  Effect.suspend(() => {
+    const cleanups: Array<Effect.Effect<void>> = [];
+    return effect.pipe(
+      Effect.provideService(cleanupOwner, (cleanup) => {
+        cleanups.push(cleanup);
+      }),
+      Effect.onExit((exit) =>
+        Exit.isFailure(exit)
+          ? cleanups.length === 0
+            ? fallback
+            : Effect.forEach(cleanups, (cleanup) => cleanup, { discard: true })
+          : Effect.void,
+      ),
+    );
+  });
+
 const failure = (code: SkillMaterializationError["code"], detail: string, cause?: unknown) =>
   new SkillMaterializationError({ code, detail, ...(cause === undefined ? {} : { cause }) });
 
@@ -342,8 +368,30 @@ export const make = Effect.gen(function* () {
       const stage = path.join(runtimeRoot.path, `.pending-${NodeCrypto.randomUUID()}`);
       const marker = expectedMarker(input);
       let stageDirectory: RuntimeDirectory | undefined;
+      let publicationAttempted = false;
+      const cleanup = Effect.gen(function* () {
+        yield* cleanupStage(runtimeRoot, stageDirectory);
+        if (!publicationAttempted || stageDirectory === undefined) return;
+        // Rename can move the inode before its Effect receipt arrives. Check the
+        // destination against the created stage, never against a freshly adopted inode.
+        yield* assertDirectoryIdentity(runtimeRoot.path, runtimeRoot, "Configured runtime root");
+        yield* assertDirectoryIdentity(
+          runtimeRoot.path,
+          { path: root, identity: stageDirectory.identity },
+          "Published provider runtime root",
+        );
+        yield* assertOwned(runtimeRoot.path, root, marker);
+        yield* assertDirectoryIdentity(
+          runtimeRoot.path,
+          { path: root, identity: stageDirectory.identity },
+          "Published provider runtime root",
+        );
+        yield* fs.remove(root, { recursive: true });
+      }).pipe(Effect.ignore);
+      const owner = yield* cleanupOwner;
+      owner?.(cleanup);
 
-      const outcome = yield* Effect.gen(function* () {
+      return yield* Effect.gen(function* () {
         yield* assertDirectoryIdentity(runtimeRoot.path, runtimeRoot, "Configured runtime root");
         yield* assertDirectoryIdentity(runtimeRoot.path, sessionRoot!, "Runtime session directory");
         yield* assertDirectoryIdentity(
@@ -359,36 +407,31 @@ export const make = Effect.gen(function* () {
           );
         }
         yield* assertDirectoryIdentity(runtimeRoot.path, runtimeRoot, "Configured runtime root");
-        const stageCreation = yield* fs
-          .makeDirectory(stage, { recursive: false })
-          .pipe(Effect.exit);
-        if (Exit.isFailure(stageCreation)) {
-          const racedStage = yield* lstat(stage);
-          if (racedStage !== undefined) {
-            return yield* failure(
-              "ownership_mismatch",
-              `Pending runtime destination '${stage}' already exists.`,
-            );
-          }
-          return yield* failure(
-            "materialization_failed",
-            `Could not create pending runtime destination '${stage}'.`,
-            stageCreation.cause,
-          );
-        }
-        const createdStageInfo = yield* lstat(stage);
-        if (createdStageInfo === undefined) {
-          return yield* failure(
-            "materialization_failed",
-            `Pending runtime destination '${stage}' disappeared after creation.`,
-          );
-        }
+        // Directory creation must return its inode before cancellation can run
+        // cleanup. Only these native acquisition syscalls are masked; validation,
+        // package copying and publication receipts remain interruptible.
+        yield* Effect.uninterruptible(
+          Effect.tryPromise({
+            try: async () => {
+              await NodeFSP.mkdir(stage, { recursive: false });
+              const info = await NodeFSP.lstat(stage, { bigint: true });
+              stageDirectory = { path: stage, identity: identityOf(info) };
+            },
+            catch: (cause) =>
+              failure(
+                "materialization_failed",
+                `Could not acquire pending runtime destination '${stage}'.`,
+                cause,
+              ),
+          }),
+        );
+        const createdStageInfo = stageDirectory!;
         const inspectedStage = yield* inspectDirectory(
           runtimeRoot.path,
           stage,
           "Pending runtime destination",
         );
-        if (!sameIdentity(identityOf(createdStageInfo), inspectedStage.identity)) {
+        if (!sameIdentity(createdStageInfo.identity, inspectedStage.identity)) {
           return yield* failure(
             "ownership_mismatch",
             `Pending runtime destination '${stage}' changed during creation.`,
@@ -472,13 +515,13 @@ export const make = Effect.gen(function* () {
           "Runtime revision directory",
         );
         yield* assertStage();
+        publicationAttempted = true;
         yield* fs.rename(stage, root);
         yield* assertDirectoryIdentity(
           runtimeRoot.path,
           { path: root, identity: pinnedStage.identity },
           "Published provider runtime root",
         );
-        stageDirectory = undefined;
         return { root, skillPaths } satisfies SkillMaterializationResult;
       }).pipe(
         Effect.mapError((cause) =>
@@ -486,13 +529,8 @@ export const make = Effect.gen(function* () {
             ? cause
             : failure("materialization_failed", "Could not materialize managed skills.", cause),
         ),
-        Effect.exit,
+        Effect.onExit((exit) => (Exit.isFailure(exit) ? cleanup : Effect.void)),
       );
-      if (Exit.isFailure(outcome)) {
-        yield* cleanupStage(runtimeRoot, stageDirectory);
-        return yield* Effect.failCause(outcome.cause);
-      }
-      return outcome.value;
     });
 
   const dispose: SkillMaterializationServiceShape["dispose"] = (input) =>
