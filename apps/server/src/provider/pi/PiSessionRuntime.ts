@@ -278,6 +278,11 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
     allocation: freezeJson(structuredClone(input.persistence.allocation)),
   };
   let used = false;
+  const runFinished = Promise.withResolvers<void>();
+  let finalizing = false;
+  let unresolvedInRun:
+    | ((controlId: number, kind: "steer" | "follow-up" | "interrupt") => Promise<void>)
+    | undefined;
   let cancelActive: (() => void) | undefined;
   let activeControl: ((message: PiParentFrame["message"]) => Promise<void>) | undefined;
   const run = Effect.fn("PiSessionRuntime.run")(function* () {
@@ -299,6 +304,7 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
         let ownerCaptured = false;
         let activationAttempted = false;
         let terminal: PiSessionTerminal | undefined;
+        let unresolvedPersistenceFailed = false;
         const accountingReceipts: PiModelAccountingReceipt[] = [];
         const tracked = <A>(promise: Promise<A>) => {
           pending.add(promise);
@@ -310,6 +316,28 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
         };
         const callback = <A>(body: () => Promise<A>, signal = controller.signal) =>
           waitSignal(tracked(Promise.resolve().then(body)), signal);
+        unresolvedInRun = (controlId, kind) => {
+          const signal = AbortSignal.any([
+            controller.signal,
+            AbortSignal.timeout(cleanupDeadlineMs),
+          ]);
+          return callback(
+            () =>
+              callbacks.persistControl(
+                { identity, operation, controlId, kind, status: "unresolved" },
+                signal,
+              ),
+            signal,
+          ).then(
+            () => {
+              throw failure("OPERATION_NOT_ACTIVE");
+            },
+            (error) => {
+              unresolvedPersistenceFailed = true;
+              throw error;
+            },
+          );
+        };
         const authorize = (
           phase: PiSessionAuthorization["phase"],
           tool?: PiSessionToolCapability,
@@ -724,10 +752,11 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
                 status: "unresolved" as const,
               };
               const persisted = yield* promiseEffect(() =>
-                waitSignal(callbacks.persistControl(unresolved, cleanupSignal), cleanupSignal),
+                callback(() => callbacks.persistControl(unresolved, cleanupSignal), cleanupSignal),
               ).pipe(Effect.exit);
               if (persisted._tag === "Failure") cleanupFailure = true;
             }
+            if (unresolvedPersistenceFailed) cleanupFailure = true;
             if (cleanupFailure) {
               terminal = {
                 identity,
@@ -769,6 +798,10 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
           Effect.onInterrupt(() => Effect.sync(abort)),
           Effect.exit,
         );
+        // Close admission before the final join. Later calls wait for this run's terminal
+        // persistence before beginning their standalone unresolved callback.
+        finalizing = true;
+        unresolvedInRun = undefined;
         deadline.removeEventListener("abort", abort);
         controller.abort();
         const outerJoin = yield* promiseEffect(() =>
@@ -777,7 +810,7 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
             AbortSignal.timeout(cleanupDeadlineMs),
           ),
         ).pipe(Effect.exit);
-        if (outerJoin._tag === "Failure")
+        if (outerJoin._tag === "Failure" || unresolvedPersistenceFailed)
           terminal = {
             identity,
             operation,
@@ -807,11 +840,29 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
           ),
         );
         if (result._tag === "Failure") return yield* Effect.failCause(result.cause);
+        if (terminal.outcome === "quarantine") return yield* failure("CALLBACK_DRAIN_UNKNOWN");
         return result.value;
       }),
+    ).pipe(
+      Effect.ensuring(
+        Effect.sync(() => {
+          unresolvedInRun = undefined;
+          finalizing = false;
+          runFinished.resolve();
+        }),
+      ),
     );
   });
-  const unresolvedControl = (controlId: number, kind: "steer" | "follow-up" | "interrupt") => {
+  const unresolvedControl = async (
+    controlId: number,
+    kind: "steer" | "follow-up" | "interrupt",
+  ) => {
+    if (unresolvedInRun) return unresolvedInRun(controlId, kind);
+    if (finalizing)
+      await waitSignal(
+        runFinished.promise,
+        AbortSignal.timeout(deadlineMs + 4 * cleanupDeadlineMs),
+      );
     const signal = AbortSignal.timeout(cleanupDeadlineMs);
     return waitSignal(
       callbacks.persistControl(

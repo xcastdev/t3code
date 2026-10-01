@@ -485,6 +485,170 @@ describe.runIf(process.env.PI_SESSION_RUNTIME_LINUX_GATE === "1")(
           expect(f.events.filter((event) => event === "transport")).toHaveLength(1);
         }),
       );
+    for (const mode of ["ignored", "honored", "resolved"] as const)
+      check(
+        mode === "honored"
+          ? "unresolved concurrent control honoring cancellation prevents success"
+          : mode === "ignored"
+            ? "unresolved concurrent control must join or quarantine before terminal"
+            : "resolved concurrent control callback joins before success",
+        (f) =>
+          Effect.gen(function* () {
+            const held = mode !== "resolved";
+            const transportEntered = yield* Deferred.make<void>();
+            const transportRelease = Promise.withResolvers<void>();
+            const authorizeEntered = yield* Deferred.make<void>();
+            const authorizeRelease = Promise.withResolvers<void>();
+            const unresolvedEntered = yield* Deferred.make<void>();
+            const unresolvedPersisted = yield* Deferred.make<void>();
+            const unresolvedRelease = Promise.withResolvers<void>();
+            let unresolvedPending = false;
+            let pendingAtTerminal = false;
+            const runtime = yield* makePiSessionRuntime({
+              ...f.options,
+              cleanupDeadlineMs: 100,
+              broker: {
+                ...f.options.broker,
+                transport: async (endpoint, init) => {
+                  Deferred.doneUnsafe(transportEntered, Effect.void);
+                  await waitForSignal(transportRelease.promise, init.signal);
+                  return f.options.broker.transport(endpoint, init);
+                },
+              },
+              authorizeCurrent: async (request, signal) => {
+                if (request.phase === "beforeControl") {
+                  Deferred.doneUnsafe(authorizeEntered, Effect.void);
+                  await waitForSignal(authorizeRelease.promise, signal);
+                }
+              },
+              persistControl: async (receipt, signal) => {
+                if (receipt.status === "unresolved") {
+                  unresolvedPending = true;
+                  Deferred.doneUnsafe(unresolvedEntered, Effect.void);
+                  try {
+                    if (mode === "honored") await waitForSignal(unresolvedRelease.promise, signal);
+                    else await unresolvedRelease.promise;
+                  } finally {
+                    unresolvedPending = false;
+                    if (mode === "honored") Deferred.doneUnsafe(unresolvedPersisted, Effect.void);
+                  }
+                }
+                await f.options.persistControl(receipt, AbortSignal.timeout(1000));
+                if (receipt.status === "unresolved")
+                  Deferred.doneUnsafe(unresolvedPersisted, Effect.void);
+              },
+              persistTerminal: async (terminal, signal) => {
+                pendingAtTerminal = unresolvedPending;
+                await f.options.persistTerminal(terminal, signal);
+              },
+            });
+            const run = yield* runtime.run().pipe(Effect.forkChild);
+            yield* Deferred.await(transportEntered);
+            const first = yield* runtime
+              .control({ type: "control", controlId: 1, kind: "steer", text: "first" })
+              .pipe(Effect.forkChild);
+            yield* Deferred.await(authorizeEntered);
+            const second = yield* runtime
+              .control({ type: "control", controlId: 2, kind: "steer", text: "second" })
+              .pipe(Effect.forkChild);
+            yield* Deferred.await(unresolvedEntered);
+            if (!held) {
+              unresolvedRelease.resolve();
+              yield* Fiber.await(second);
+            }
+            authorizeRelease.resolve();
+            yield* Fiber.join(first);
+            transportRelease.resolve();
+            const result = yield* Fiber.await(run);
+            const observed = {
+              runExit: result._tag,
+              terminal: f.terminals[0],
+              pendingAtTerminal,
+              controls: f.controls,
+            };
+            const evidencePath = process.env.PI_SESSION_RUNTIME_EVIDENCE_DIR;
+            if (evidencePath)
+              yield* Effect.promise(() =>
+                NodeFSP.writeFile(
+                  NodePath.join(
+                    evidencePath,
+                    mode === "ignored"
+                      ? "concurrent-control-observation.json"
+                      : mode === "honored"
+                        ? "concurrent-control-honored-observation.json"
+                        : "concurrent-control-resolved-observation.json",
+                  ),
+                  json(observed),
+                ),
+              );
+            unresolvedRelease.resolve();
+            yield* Fiber.await(second);
+            yield* Deferred.await(unresolvedPersisted);
+            expect(pendingAtTerminal).toBe(mode === "ignored");
+            expect(result._tag).toBe(held ? "Failure" : "Success");
+            expect(f.terminals[0]?.outcome).toBe(held ? "quarantine" : "success");
+            expect(f.terminals[0]?.drain?.kernel).toBe("removed");
+            expect([...f.controls].sort((a, b) => a.controlId - b.controlId)).toMatchObject(
+              mode === "honored"
+                ? [{ controlId: 1, status: "received" }]
+                : [
+                    { controlId: 1, status: "received" },
+                    { controlId: 2, status: "unresolved" },
+                  ],
+            );
+          }),
+      );
+    check("control during terminal persistence waits for the run to close", (f) =>
+      Effect.gen(function* () {
+        const terminalEntered = yield* Deferred.make<void>();
+        const controlStarted = yield* Deferred.make<void>();
+        const releaseTerminal = Promise.withResolvers<void>();
+        let controlCallbackBegun = false;
+        const runtime = yield* makePiSessionRuntime({
+          ...f.options,
+          persistControl: async (receipt, signal) => {
+            controlCallbackBegun = true;
+            await f.options.persistControl(receipt, signal);
+          },
+          persistTerminal: async (terminal, signal) => {
+            Deferred.doneUnsafe(terminalEntered, Effect.void);
+            await waitForSignal(releaseTerminal.promise, signal);
+            await f.options.persistTerminal(terminal, signal);
+          },
+        });
+        const run = yield* runtime.run().pipe(Effect.forkChild);
+        yield* Deferred.await(terminalEntered);
+        const late = yield* Effect.gen(function* () {
+          yield* Deferred.succeed(controlStarted, undefined);
+          yield* runtime.control({
+            type: "control",
+            controlId: 41,
+            kind: "steer",
+            text: "late terminal",
+          });
+        }).pipe(Effect.forkChild);
+        yield* Deferred.await(controlStarted);
+        expect(controlCallbackBegun).toBe(false);
+        releaseTerminal.resolve();
+        yield* Fiber.join(run);
+        yield* Fiber.await(late);
+        expect(f.controls).toMatchObject([{ controlId: 41, status: "unresolved" }]);
+        expect(f.terminals[0]?.outcome).toBe("success");
+        expect(f.events.filter((event) => event === "transport")).toHaveLength(1);
+      }),
+    );
+    check("pre-run control retains its original unresolved ID before one run", (f) =>
+      Effect.gen(function* () {
+        const runtime = yield* makePiSessionRuntime(f.options);
+        yield* runtime
+          .control({ type: "control", controlId: 42, kind: "follow-up", text: "before run" })
+          .pipe(Effect.exit);
+        expect(f.controls).toMatchObject([{ controlId: 42, status: "unresolved" }]);
+        yield* runtime.run();
+        expect(f.terminals[0]?.outcome).toBe("success");
+        expect(f.events.filter((event) => event === "transport")).toHaveLength(1);
+      }),
+    );
     check("interrupt waits its exact receipt, cancels HTTP and prevents success", (f) =>
       Effect.gen(function* () {
         const entered = yield* Deferred.make<void>();
