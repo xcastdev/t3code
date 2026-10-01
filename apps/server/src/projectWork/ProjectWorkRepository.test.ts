@@ -1190,6 +1190,7 @@ it.effect(
           expect(yield* runForkMigrations()).toEqual([
             [20, "ProjectTeamIdentityFences"],
             [21, "ProjectWorkEvidenceMetadata"],
+            [22, "ProjectIssueRepositories"],
           ]);
           const upgradedSql = yield* SqlClient.SqlClient;
           expect(
