@@ -11,6 +11,8 @@ import {
   ProjectTeamGuidedIntent,
   ProjectWorkFoundationCommitCommand,
   ProjectWorkWriteIntent,
+  ProjectWorkTeamTransition,
+  ProjectWorkEvidence,
 } from "./projectWork.ts";
 
 const decodeCredential = Schema.decodeUnknownSync(ProjectTeamCredential);
@@ -20,6 +22,8 @@ const decodeTeamRecordRead = Schema.decodeUnknownSync(ProjectTeamRecordRead);
 const decodeGuided = Schema.decodeUnknownSync(ProjectTeamGuidedIntent);
 const decodeFoundation = Schema.decodeUnknownSync(ProjectWorkFoundationCommitCommand);
 const decodePublicWrite = Schema.decodeUnknownSync(ProjectWorkWriteIntent);
+const decodeTeamTransition = Schema.decodeUnknownSync(ProjectWorkTeamTransition);
+const decodeEvidence = Schema.decodeUnknownSync(ProjectWorkEvidence);
 const member = {
   kind: "member",
   recordId: "member",
@@ -163,5 +167,66 @@ describe("guided contract preparation", () => {
         outcome: "complete",
       }),
     ).toThrow();
+  });
+
+  it("rejects mixing private runtime transitions with guided or raw records", () => {
+    const transition = {
+      kind: "failure",
+      bindingId: "binding",
+      generation: 1,
+      expectedBindingRevision: 0,
+      failureFingerprint: "failure",
+      relevantRevision: "revision",
+      failureKind: "semantic",
+      summary: "Recorded failure",
+    };
+    const command = {
+      type: "project-work.foundation.commit",
+      commandId: "failure",
+      projectId: "project",
+      expectedRevision: 0,
+      attribution: {
+        actor: { kind: "system" },
+        source: { kind: "system" },
+        recordedAt: "2026-01-01T00:00:00.000Z",
+      },
+      records: [],
+      transition,
+      committedAt: "2026-01-01T00:00:00.000Z",
+    };
+    expect(decodeFoundation(command).transition?.kind).toBe("failure");
+    expect(() => decodeFoundation({ ...command, guided: { intent: investigation } })).toThrow();
+    expect(() => decodeFoundation({ ...command, records: [member] })).toThrow();
+    const repair = {
+      kind: "repair.consume",
+      episodeId: "episode",
+      expectedEpisodeRevision: 0,
+      bindingId: "binding",
+      generation: 1,
+      relevantRevision: "revision",
+      exceptionGateId: "exception",
+    };
+    expect(() => decodeTeamTransition(repair)).toThrow();
+    // The legacy public union includes raw foundation commands; the gateway denies them.
+    expect(decodePublicWrite(command).type).toBe("project-work.foundation.commit");
+  });
+
+  it("retains scoped non-code outputs without requiring fabricated Git fields", () => {
+    const evidence = {
+      evidenceId: "artifact",
+      taskId: "task",
+      kind: "artifact",
+      summary: "Research findings",
+      detail: "The bounded findings are retained here",
+      scopeHash: "current-scope",
+      outputArtifactIds: ["source-artifact"],
+      recordedAt: "2026-01-01T00:00:00.000Z",
+      revision: 0,
+    };
+    expect(decodeEvidence(evidence)).toEqual(evidence);
+    expect(() =>
+      decodeEvidence({ ...evidence, outputArtifactIds: Array(65).fill("artifact") }),
+    ).toThrow();
+    expect(() => decodeEvidence({ ...evidence, scopeHash: " " })).toThrow();
   });
 });

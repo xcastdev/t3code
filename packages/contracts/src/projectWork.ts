@@ -2,6 +2,7 @@ import {
   ProjectTeamRecord,
   ProjectTeamRecordRead,
   ProjectTeamWriteIntent,
+  ProjectTeamRunBinding,
 } from "./projectTeams.ts";
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -203,6 +204,12 @@ export const ProjectWorkEvidence = Schema.Struct({
   summary: ProjectWorkShortText,
   detail: Schema.optionalKey(ProjectWorkSummary),
   uri: Schema.optionalKey(TrimmedString),
+  scopeHash: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(256))),
+  outputArtifactIds: Schema.optionalKey(
+    Schema.Array(TrimmedNonEmptyString.check(Schema.isMaxLength(256))).check(
+      Schema.isMaxLength(64),
+    ),
+  ),
   recordedAt: IsoDateTime,
   revision: ProjectWorkRevision,
   attribution: ProjectWorkAttributionField,
@@ -1218,6 +1225,47 @@ export const ProjectWorkGuidedTransition = Schema.Struct({
 );
 export type ProjectWorkGuidedTransition = typeof ProjectWorkGuidedTransition.Type;
 
+/** Private scheduler/runtime transitions. Public transports deny foundation commands. */
+export const ProjectWorkTeamTransition = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("claim"),
+    taskId: ProjectWorkTaskId,
+    expectedTaskRevision: NonNegativeInt,
+    authorizationGateId: GuidedId,
+    expectedGateRevision: NonNegativeInt,
+    claim: ProjectWorkTaskClaimCommand,
+    binding: ProjectTeamRunBinding,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("failure"),
+    bindingId: GuidedId,
+    generation: NonNegativeInt,
+    expectedBindingRevision: NonNegativeInt,
+    failureFingerprint: GuidedText,
+    relevantRevision: GuidedText,
+    failureKind: Schema.Literals(["semantic", "transport", "timeout"]),
+    summary: GuidedBody,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("repair.consume"),
+    episodeId: GuidedId,
+    expectedEpisodeRevision: NonNegativeInt,
+    bindingId: GuidedId,
+    generation: NonNegativeInt,
+    relevantRevision: GuidedText,
+    exceptionGateId: Schema.optionalKey(GuidedId),
+    expectedExceptionGateRevision: Schema.optionalKey(NonNegativeInt),
+  }).check(
+    Schema.makeFilter(
+      (input) =>
+        (input.exceptionGateId === undefined) ===
+        (input.expectedExceptionGateRevision === undefined),
+      { message: "An exception gate requires its expected revision" },
+    ),
+  ),
+]);
+export type ProjectWorkTeamTransition = typeof ProjectWorkTeamTransition.Type;
+
 export const ProjectWorkFoundationCommitCommand = Schema.Struct({
   ...ProjectWorkCommandFields,
   type: Schema.Literal("project-work.foundation.commit"),
@@ -1226,11 +1274,21 @@ export const ProjectWorkFoundationCommitCommand = Schema.Struct({
   records: Schema.Array(ProjectTeamRecord).check(Schema.isMaxLength(64)),
   claim: Schema.optionalKey(ProjectWorkTaskClaimCommand),
   guided: Schema.optionalKey(ProjectWorkGuidedTransition),
+  transition: Schema.optionalKey(ProjectWorkTeamTransition),
   committedAt: IsoDateTime,
 }).check(
-  Schema.makeFilter((command) => command.records.length > 0 || command.guided !== undefined, {
-    message: "A foundation transaction requires records or a guided transition",
-  }),
+  Schema.makeFilter(
+    (command) => {
+      if (command.guided !== undefined || command.transition !== undefined)
+        return (
+          command.records.length === 0 &&
+          command.claim === undefined &&
+          (command.guided === undefined || command.transition === undefined)
+        );
+      return command.records.length > 0;
+    },
+    { message: "A foundation transaction requires one unmixed transition or nonempty records" },
+  ),
 );
 
 export const ProjectWorkCommand = Schema.Union([
