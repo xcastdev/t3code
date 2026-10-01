@@ -415,11 +415,57 @@ it.effect("same-node rename and close/reopen keep the custom record and task/mis
   ),
 );
 
+for (const [cachedEtag, responseEtag] of [
+  ['W/"page"', '"page"'],
+  ['"page"', 'W/"page"'],
+  ['W/"page"', 'W/"page"'],
+  ['"page"', '"page"'],
+  ['W/""', '""'],
+] as const) {
+  it.effect(
+    `native intake preserves committed ETag ${cachedEtag} through 200 then 304 ${responseEtag}`,
+    () =>
+      memory(
+        Effect.gen(function* () {
+          const f = yield* setup();
+          // Keep the next sweep's five-minute overlap identical to the first read key.
+          yield* bindIssueRepositoryProject(f.sql, {
+            key,
+            projectId: "a",
+            expectedBindingRevision: null,
+            repositoryName: repository.nameWithOwner,
+            accountNodeId: "U_account",
+            credentialEpoch: "epoch",
+            since: "2026-10-01T00:55:00Z",
+          });
+          const initial = yield* f.commit(yield* f.claim(), { ...response(), etag: cachedEtag });
+          expect(initial.accepted).toBe(true);
+          expect(initial.page?.etag).toBe(cachedEtag);
+          const imported = yield* issues(f.sql);
+          const publications = [...f.published];
+          const conditional = yield* f.commit(
+            yield* f.claim(),
+            { status: "not-modified", repository, etag: responseEtag },
+            cachedEtag,
+          );
+          expect(conditional.accepted).toBe(true);
+          expect(conditional.page?.etag).toBe(cachedEtag);
+          expect(conditional.page?.entries).toEqual(initial.page?.entries);
+          expect(yield* issues(f.sql)).toEqual(imported);
+          expect(f.published).toEqual(publications);
+          expect(yield* f.sql`SELECT * FROM project_work_tasks`).toEqual([]);
+          expect(yield* f.sql`SELECT * FROM project_work_attempts`).toEqual([]);
+        }),
+      ),
+  );
+}
+
 for (const kind of [
   "valid",
   "missing-snapshot",
   "missing-sent-etag",
   "wrong-sent-etag",
+  "equivalent-wrong-sent-etag",
   "wrong-response-etag",
   "forged-commit-id",
 ] as const)
@@ -445,7 +491,7 @@ for (const kind of [
         const incoming = {
           status: "not-modified",
           repository,
-          etag: kind === "wrong-response-etag" ? '"other"' : '"page"',
+          etag: kind === "wrong-response-etag" ? 'W/"other"' : 'W/"page"',
           ...(kind === "forged-commit-id" ? { commitId: "1" } : {}),
         };
         const outcome = yield* f
@@ -456,7 +502,9 @@ for (const kind of [
               ? undefined
               : kind === "wrong-sent-etag"
                 ? '"wrong"'
-                : '"page"',
+                : kind === "equivalent-wrong-sent-etag"
+                  ? 'W/"page"'
+                  : '"page"',
           )
           .pipe(Effect.result);
         expect(outcome._tag).toBe(kind === "valid" ? "Success" : "Failure");
