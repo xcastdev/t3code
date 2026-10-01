@@ -7,7 +7,7 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-10-01 12:42 UTC. Implementation is running. **P1–P4 are complete. P5 authority has landed; intake integration is approved for landing.** Partial slices do not complete a parent phase.
+Last updated: 2026-10-01 15:05 UTC. Implementation is running. **P1–P4 are complete. P5 authority and intake have landed.** Refinement, closure attention and the intake UI are awaiting remaining checks/review; their parent phases remain open.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
@@ -15,19 +15,19 @@ Last updated: 2026-10-01 12:42 UTC. Implementation is running. **P1–P4 are com
 | Product acceptance criteria | 0    | 0      | 19   | 19    |
 | Final independent audits    | 0    | 0      | 2    | 2     |
 
-| Phase   | Current position                                                                                          | Work remaining                                                                                       |
-| ------- | --------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| P1–P4   | Complete on main                                                                                          | Later real runtime/client/platform gates still apply                                                 |
-| P5      | Authority merged at `dd8194627`; intake wave `9c3219f83` passes 225/225 tests and is approved for landing | Credentials, comments, refinement, rebind, attention, scheduler and server wiring; real GitHub proof |
-| P6      | Draft submission helper reviewed and held                                                                 | Complete human workflow and integrated client verification                                           |
-| P7      | Pi SDK, host, entry, adapter and driver slices reviewed and held                                          | Production runtime/accounting, registration, packaging and supported platform proofs                 |
-| P8      | Dispatch/recovery interfaces prepared                                                                     | Scheduler, isolated launch, cancellation and restart recovery                                        |
-| P9      | Mailbox policy reviewed and held                                                                          | Durable messages, delivery, acknowledgment and wake integration after P8                             |
-| P10     | Hydration repair `0c2b93740` approved; root verifies all 51 final review artifacts                        | Extraction, index/deletion workers, current delivery authorization, fallback and context integration |
-| P11     | Evidence policy reviewed and held                                                                         | PR/head-conditioned delivery, uncertainty and merge authorization integration                        |
-| P12–P14 | Not started                                                                                               | Full supervision clients, integrated workflow and final gates                                        |
+| Phase   | Current position                                                                                   | Work remaining                                                                                       |
+| ------- | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
+| P1–P4   | Complete on main                                                                                   | Later real runtime/client/platform gates still apply                                                 |
+| P5      | Authority and intake merged at `95d78102b`; refinement and closure attention are in implementation | Credentials, comments, refinement, rebind, attention, scheduler and server wiring; real GitHub proof |
+| P6      | Draft submission helper reviewed and held                                                          | Complete human workflow and integrated client verification                                           |
+| P7      | Pi SDK, host, entry, adapter and driver slices reviewed and held                                   | Production runtime/accounting, registration, packaging and supported platform proofs                 |
+| P8      | Dispatch/recovery interfaces prepared                                                              | Scheduler, isolated launch, cancellation and restart recovery                                        |
+| P9      | Mailbox policy reviewed and held                                                                   | Durable messages, delivery, acknowledgment and wake integration after P8                             |
+| P10     | Hydration repair `0c2b93740` approved; root verifies all 51 final review artifacts                 | Extraction, index/deletion workers, current delivery authorization, fallback and context integration |
+| P11     | Evidence policy reviewed and held                                                                  | PR/head-conditioned delivery, uncertainty and merge authorization integration                        |
+| P12–P14 | Not started                                                                                        | Full supervision clients, integrated workflow and final gates                                        |
 
-Latest main product commit: `dd819462756e986a1a87136323235161a13be7f2`. The authority wave passes 89/89 tests, normal strict/Effect compilation, format and scoped Knip; its fresh reviewer approves and root verifies all 79 review artifacts. **Authority-scope lint still fails: five errors and 13 warnings.** All five errors and 12 warnings match the main baseline; the additional fixture warning was previously recorded. No lint waiver or passing result is claimed.
+Latest main product commit: `95d78102bde1db63c50d6ca84ab582e38c97096d`. The authority wave passes 89/89 tests, normal strict/Effect compilation, format and scoped Knip; its fresh reviewer approves and root verifies all 79 review artifacts. **Authority-scope lint still fails: five errors and 13 warnings.** All five errors and 12 warnings match the main baseline; the additional fixture warning was previously recorded. No lint waiver or passing result is claimed.
 
 The intake leaf is approved at `9b0e42e94` (59/59 leaf and 191/191 combined cases; 160 producer/109 review artifacts verified). Its integration wave passes 225/225 tests, strict/Effect, lint with zero errors/warnings, format and scoped Knip. Its fresh wave reviewer approves after 18 independent SQLite groups; root verifies all 45 review artifacts. The memory repair passes 71 candidate cases, 29 prior probes and six new SQLite groups; its same reviewer closes both findings. All captured units/PIDs for those completed checks are drained.
 
@@ -37,20 +37,22 @@ Prioritize **Pi, OpenCode, Claude and Codex**. Shared contracts, migrations, wir
 
 Each row is one subagent seat. Finished agents release their seat. Worktrees and evidence live under `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                                        | State                                    | Assignment / exact base                      | Next gate                                                        |
-| ---- | -------------------------------------------- | ---------------------------------------- | -------------------------------------------- | ---------------------------------------------------------------- |
-| 1    | `review_wave5_p5_intake`                     | Available; combined review approved      | Candidate `9c3219f83`, base main `dd8194627` | Root verified all 45 review artifacts; local landing next        |
-| 2    | — (last: `review_wave4_p5_authority`)        | Available; approved wave landed          | Reviewed `73f8cbd43` → main `dd8194627`      | Shared P5/P7 work remains                                        |
-| 3    | — (last: `review_p10_hit_hydration`)         | Available; same-reviewer repair approved | Candidate `0c2b93740`, base `f3f483b80`      | Root verified all 51 artifacts; held until dependent integration |
-| 4    | — (last: `p10_hit_hydration_high`)           | Available; repair committed              | Two hydration files only                     | Root verified all 87 producer artifacts                          |
-| 5    | — (last: `review_p7_worker_entry`)           | Available; retention repair approved     | Candidate `3a4c3dd64`, base `8dc698c25`      | Production Pi runtime integration                                |
-| 6    | — (last: `review_p5_wave_migration_fixture`) | Available; fixture approved              | Candidate `227327864`                        | Fixture already integrated                                       |
-| 7    | — (last: `review_p5_foundation_fixture`)     | Available; foundation fixture approved   | Candidate `3068cd2be`                        | Fixture already integrated                                       |
-| 8    | — (last: `review_p7_adapter`)                | Available; adapter approved              | Candidate `3b8b71202`                        | Durable usage and registration                                   |
-| 9    | — (last: `review_p7_worker_stdio`)           | Available; stdio repair approved         | Candidate `90e976978`                        | Production integration                                           |
-| 10   | — (last: `review_p5_intake_migration`)       | Available; migration approved            | Candidate `98edb822c`                        | Migration already integrated                                     |
+| Slot | Agent                                      | State                                    | Assignment / exact base                                       | Next gate                                                                     |
+| ---- | ------------------------------------------ | ---------------------------------------- | ------------------------------------------------------------- | ----------------------------------------------------------------------------- |
+| 1    | `review_p5_lifecycle_lint_fixture`         | Active independent review                | Candidate `41bfbeee9`, base `95d78102b`                       | Root verifies all 69 artifacts; fresh lifecycle behavior/style checks         |
+| 2    | `review_p5_closed_issue_attention`         | Active independent review                | Candidate `5dda06349`, private parent `82c5b81cb`             | Root reads complete four-file diff and verifies all 292 artifacts             |
+| 3    | — (last: `review_p10_hit_hydration`)       | Available; same-reviewer repair approved | Candidate `0c2b93740`, base `f3f483b80`                       | Root verified all 51 artifacts; held until dependent integration              |
+| 4    | `p5_refinement_decider_high`               | Active combined implementation           | Base `c02af8dc9`; exact private policy `5dda06349` authorized | Actual closure reducer tests, final scoped checks and sole review             |
+| 5    | — (last: `p5_closed_issue_attention_high`) | Available; candidate in review           | Candidate `5dda06349`                                         | 29 cases/strict compiler/style pass; review in slot 2                         |
+| 6    | `review_p6_issue_intake_view`              | Active independent review                | Candidate `c2ee4ae8e`, base `c02af8dc9`                       | Root verifies 144 original and 60 repair artifacts; 35 interaction cases pass |
+| 7    | — (last: `p5_lifecycle_lint_fixture_high`) | Available; candidate in review           | Candidate `41bfbeee9`                                         | 11 cases/strict compiler pass; five lint errors fixed; review in slot 1       |
+| 8    | — (last: `review_p7_adapter`)              | Available; adapter approved              | Candidate `3b8b71202`                                         | Durable usage and registration                                                |
+| 9    | — (last: `review_p7_worker_stdio`)         | Available; stdio repair approved         | Candidate `90e976978`                                         | Production integration                                                        |
+| 10   | — (last: `review_p5_intake_migration`)     | Available; migration approved            | Candidate `98edb822c`                                         | Migration already integrated                                                  |
 
-Coordinator: owns shared P5 refinement/contracts/wiring and P7 production wiring. Preparing the next exclusive implementation scopes after intake wave approval. One compiler seat runs serially; bounded independent tests may run in parallel. Only the coordinator performs integrated client verification after permission.
+Coordinator: owns shared P5 refinement/contracts/wiring and P7 production wiring. Four independent implementation scopes cover refinement, closure attention, intake UI and the five verified lifecycle-test lint errors. The refinement worker is combining closure behavior; the UI repair is committed and awaiting review. Root's authenticated gateway passes all eight native SQLite cases after private decider adoption. Contract preparation passes 30 focused tests and strict/actual Effect compilation (18 existing test lint warnings, zero errors). One compiler seat runs serially; bounded independent tests may run in parallel. Only the coordinator performs integrated client verification after permission.
+
+Current slowdown: P5 needs the refinement/closure behavior combined before review and landing. Final checks caught a real concurrent mark-seen preservation issue; the corrected attention source passes 29 cases and strict compilation, and is in independent review. The lifecycle fixture repair passes all 11 cases and removes all five verified lint errors locally, but is not reviewed or landed yet. The main authority-scope lint result above therefore remains a failure. Other open work includes production Pi integration, scheduling/recovery, durable messaging, memory delivery/deletion, GitHub delivery, supervision clients and final real-runtime/platform proof. No reliable completion-time estimate is available while these integration gates remain open.
 
 ## Goal
 
@@ -289,6 +291,20 @@ exclusive writable scope. Split work only when interfaces and dependencies are
 settled and the split avoids conflicting edits or unnecessary integration work.
 Leave slots idle when dependencies or shared ownership prevent useful parallelism.
 
+Efficiency instructions (authorized 2026-10-01): finish the critical path through
+P5 and production Pi integration before adding more preparatory helpers. Prefer
+larger coherent independent assignments over many tiny branches and handoffs.
+Freeze shared interfaces early so runtime, recovery, client and memory work can
+overlap safely. Check fixture types early, combine final scoped checks and reuse
+evidence when the exact source and dependencies are unchanged. Rerun affected
+checks after changes; do not expand sufficient tests with optional cases or
+repeat unchanged proof. Keep evidence concise and tied to behavior and the exact
+commit. The coordinator prioritizes connecting approved pieces and clearing
+shared wiring dependencies. Use up to ten subagents for work that can proceed;
+required piece/wave reviews, runtime proof and both final audits remain mandatory.
+Obtain browser/device and disposable GitHub permissions before their gates become
+the remaining critical path. These are standing instructions for every assignment.
+
 Prioritize implementation and meaningful compatibility coverage for Pi, OpenCode, Claude and Codex. Preserve ordinary shared behavior for other providers, but do not spend substantial effort on their provider-specific support unless this plan causes a concrete shared regression. The custom team remains Pi-only initially.
 
 There is no fixed worker count or cumulative limit on implementation subagents.
@@ -368,7 +384,7 @@ Do not launch dev servers, change unrelated code, or delegate further.
 
 #### Integration and review
 
-The lead integrates small completed slices, inspects their diffs, runs relevant
+The lead integrates completed coherent slices, inspects their diffs, runs relevant
 cross-component checks, and then dispatches dependent work from the new base.
 Workers run focused tests. The lead owns integrated verification; no repo-wide
 checks or worker-owned dev servers. Browser/device interaction requires the
@@ -2885,3 +2901,17 @@ The isolated `wave4-p5-authority` branch starts from plan-only main `53cd1c19c` 
 ### Intake wave approval (2026-10-01 12:42 UTC)
 
 Fresh sole reviewer APPROVES exact `9c3219f83c0b4f415ed09aedfebd7044f86c3029` against main `dd819462756e986a1a87136323235161a13be7f2`: fresh 225/225 combined cases and 18 independent actual SQLite integration groups, zero skips; matching strict/Effect and style evidence verified. Root verifies all 45 review artifacts and final seal. Manifest SHA256 `994f69ae2a4f12449019da6cd57b98b6b1d852369133a67efb3f2977e9b3c7f9`; seal SHA256 `e61f928981465ae06b369caf19a486b5af7c583525828084b1b26ed2211fefca`. Four review units/12 PIDs drained, zero swap/OOM. These checks use synthetic transport with actual consumers and SQLite; they do not establish real GitHub behavior or client/runtime proof. Full P5 remains open. Root reconciles this plan-only main advance before landing.
+
+### Intake landed; human refinement starts (2026-10-01)
+
+Approved intake wave lands locally at `95d78102bde1db63c50d6ca84ab582e38c97096d`. Root reconciles the plan-only main advance `f96e9bc8f`, verifies all 12 product files exactly match `9c3219f83`, preserves the plan byte-for-byte and confirms a clean worktree. Receipts are in `root-wave5-main-landing`. Nothing pushed. Full P5 remains open.
+
+Root contract preparation `c02af8dc9b7362004fc24c82a2f866df4dc25119` starts from this exact main commit on isolated `pi-teams/p5-human-refinement`. It defines human issue refinement into a new draft deliverable task, an existing task or a draft mission, requiring project/issue revisions and existing-task revision. It introduces the additive closure-attention reason. Thirty focused contract cases pass, normal exact-root strict/actual Effect compilation passes, and lint has zero errors with 18 existing test warnings. This is an unintegrated interface preparation, not completed P5 behavior. Two Sol-high workers start from that exact base in separate worktrees: `p5-refinement-decider` owns only decider and its tests; `p5-closed-issue-attention` owns only policy/reactor and their tests. Root retains contracts, gateway, authority, migrations and wiring. Each part still requires its one fresh xhigh review and combined validation before local integration.
+
+### Parallel refinement and intake view (2026-10-01 12:52 UTC)
+
+Sol-high worker `p6_issue_intake_view_high` starts from exact `c02af8dc9b7362004fc24c82a2f866df4dc25119` in isolated `p6-issue-intake-view`, owning only the two new intake component/interaction-test paths. The frozen component interface takes project/environment identity, bounded issue/task data, project revision, capability/connection flags and explicit refinement/investigation/page actions. Root owns fetch/transport and entrypoint wiring. This preparation does not complete P6 or its unfinished P5 prerequisite; integrated browser/device permission remains outstanding.
+
+Refinement decider passes 43 focused pure cases, including 26 new refusal/classification cases. Actual attention tests expose that foundation issue events do not refresh task attention, and close/open/close can reuse notice identity without a task change. The existing decider owner handles those reducer seams; the separate attention owner handles closure policy and reactor seen/recovery semantics. Worker scopes do not overlap. The root gateway candidate adds native SQLite tests for human-only actions, immutable retries, stale competing edits, final-receipt rollback, existing-task preservation, mission creation and archive/deletion replay fences. Its initial eight-case run has two passes and six expected failures because the base decider rejects refinement; the normal two-root strict/actual Effect compiler passes. Its combined gate remains pending decider adoption. Initial failures and any existing reactor fixture races remain explicit until verified controls resolve their cause.
+
+Refinement worker affected gate now passes 170/170 across three exact files, zero skips, and its normal two-root strict/actual Effect compiler passes (663,994,368-byte peak, zero swap/OOM). First compiler failures were fixture typing issues; the corrected gate preserves them as superseded evidence. Source lint has four unchanged baseline warnings, zero errors. Its initial candidate is being sealed; closure-policy integration remains open. The attention worker reproduces both existing dispatch-fixture failures on exact pre-change base and verifies startup processing wins the fixture row. Deterministic synchronization is being verified before final checks; no sleep or weakened assertion is authorized. Root contract baseline lint independently reproduces all 18 existing test warnings and zero errors.
