@@ -374,9 +374,11 @@ const currentLease = Effect.fn("IssueRepository.currentLease")(function* (
   )
     return undefined;
   const bindings = yield* currentBindings(sql, state);
-  return bindings === undefined || !sameBindings(bindings, state.lease.bindings)
-    ? undefined
-    : state;
+  if (bindings === undefined || !sameBindings(bindings, state.lease.bindings)) return undefined;
+  const finalNow = yield* Clock.currentTimeMillis;
+  return Number.isSafeInteger(finalNow) && finalNow >= 0 && finalNow < state.lease.expiresAt
+    ? state
+    : undefined;
 });
 
 /** Prepare only SQL commands/page/cache writes in this callback; external reads occur before it. */
@@ -439,6 +441,9 @@ export const commitIssueRepositoryRead = Effect.fn("commitIssueRepositoryRead")(
         retryAt: 0,
         revision: yield* increment(current.revision),
       });
+      const finalNow = yield* Clock.currentTimeMillis;
+      if (!Number.isSafeInteger(finalNow) || finalNow < 0 || finalNow >= lease.expiresAt)
+        return yield* fail("stale-state");
       accepted = true;
     }),
   );

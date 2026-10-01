@@ -1,6 +1,8 @@
 import { CommandId, ProjectId, ProjectWorkTaskId } from "@t3tools/contracts";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Reactivity from "effect/unstable/reactivity/Reactivity";
 import * as Statement from "effect/unstable/sql/Statement";
 import type { Connection } from "effect/unstable/sql/SqlConnection";
@@ -609,4 +611,127 @@ for (const invalidation of ["expiry", "binding", "archive"] as const) {
         ),
       ),
   );
+}
+
+for (const receipt of ["binding", "project", "progress"] as const) {
+  for (const expire of [false, true]) {
+    it.effect(`checks expiry after the final ${receipt} receipt (expire=${expire})`, () =>
+      run(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const native = yield* setup;
+            yield* bind(native);
+            yield* bind(native, "b");
+            const leased = (yield* claim(native))!;
+            const reserved = yield* native.reserve;
+            const ready = yield* Deferred.make<void>();
+            const release = yield* Deferred.make<void>();
+            let receipts = 0;
+            let held = false;
+            let publications = 0;
+            const connection: Connection = {
+              ...reserved,
+              execute(query, parameters, transform) {
+                return reserved.execute(query, parameters, transform).pipe(
+                  Effect.tap(() =>
+                    Effect.gen(function* () {
+                      if (query.includes("INSERT INTO project_work_command_receipts")) receipts++;
+                      if (
+                        !held &&
+                        receipts === 2 &&
+                        ((receipt === "binding" &&
+                          query.includes("SELECT project_id AS projectId")) ||
+                          (receipt === "project" &&
+                            query.includes("LEFT JOIN project_lifecycle") &&
+                            parameters[0] === "b") ||
+                          (receipt === "progress" &&
+                            query.includes("INSERT INTO project_issue_repository")))
+                      ) {
+                        held = true;
+                        yield* Deferred.succeed(ready, undefined);
+                        yield* Deferred.await(release);
+                      }
+                    }),
+                  ),
+                );
+              },
+            };
+            const sql = yield* SqlClient.make({
+              acquirer: Effect.succeed(connection),
+              transactionAcquirer: Effect.succeed(connection),
+              compiler: Statement.makeCompilerSqlite(),
+              spanAttributes: [],
+            }).pipe(Effect.provide(Reactivity.layer));
+            const before = yield* sql`SELECT * FROM sqlite_sequence ORDER BY name`;
+            const operation = commitIssueRepositoryRead(sql, key, leased.lease!, () =>
+              Effect.gen(function* () {
+                yield* sql`INSERT INTO project_issue_page(host,repository_node_id,read_key,page_kind,payload_json) VALUES(${key.host},${key.repositoryNodeId},'clock-window','issues','{}')`;
+                return {
+                  commands: ["a", "b"].map((projectId) => ({
+                    type: "project-work.task.create" as const,
+                    projectId: ProjectId.make(projectId),
+                    taskId: ProjectWorkTaskId.make("clock-" + projectId),
+                    commandId: CommandId.make("clock-" + projectId),
+                    title: "Clock window",
+                    createdAt: at,
+                  })),
+                  progress: {
+                    since: at,
+                    nextPage: 2,
+                    sweepStartedAt: at,
+                    lastSuccessfulPageAt: at,
+                  },
+                };
+              }),
+            ).pipe(
+              Effect.provide(ProjectWorkRepositoryLive),
+              Effect.provideService(SqlClient.SqlClient, sql),
+              Effect.provideService(ProjectWorkEventBus, {
+                publish: () =>
+                  Effect.sync(() => {
+                    publications++;
+                  }),
+                subscribe: Effect.die("unused"),
+              }),
+              Effect.result,
+              Effect.forkChild,
+            );
+            const fiber = yield* operation;
+            yield* Deferred.await(ready);
+            expect(receipts).toBe(2);
+            expect(publications).toBe(0);
+            if (expire) yield* TestClock.setTime(leased.lease!.expiresAt);
+            yield* Deferred.succeed(release, undefined);
+            const result = yield* Fiber.join(fiber);
+            const current = yield* readIssueRepositoryState(sql, key);
+            if (expire) {
+              expect(result._tag).toBe("Failure");
+              if (result._tag === "Failure") {
+                expect(result.failure._tag).toBe("IssueRepositoryStateError");
+                if (result.failure._tag === "IssueRepositoryStateError")
+                  expect(result.failure.reason).toBe("stale-state");
+              }
+              expect(publications).toBe(0);
+              expect(current).toEqual(leased);
+              for (const table of [
+                "project_issue_page",
+                "project_work_events",
+                "project_work_command_receipts",
+                "project_work_tasks",
+                "project_work_reducer_checkpoints",
+              ])
+                expect(yield* sql`SELECT * FROM ${sql(table)}`).toEqual([]);
+              expect(yield* sql`SELECT * FROM sqlite_sequence ORDER BY name`).toEqual(before);
+            } else {
+              expect(result._tag).toBe("Success");
+              if (result._tag === "Success") expect(result.success.accepted).toBe(true);
+              expect(publications).toBe(2);
+              expect(current?.nextPage).toBe(2);
+              expect(current?.lease).toBeNull();
+            }
+          }),
+        ),
+      ),
+    );
+  }
 }
