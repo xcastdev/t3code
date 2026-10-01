@@ -48,7 +48,7 @@ export const importLegacyIssueRepositories = Effect.fn("importLegacyIssueReposit
       payload: string;
     }>`SELECT record_id AS recordId,project_id AS projectId,status,revision,generation,
       unique_key AS uniqueKey,payload_json AS payload FROM project_team_intake_cursor
-      WHERE (${after === undefined ? 1 : 0}=1 OR record_id > ${after ?? ""})
+      ${after === undefined ? sql`` : sql`WHERE record_id > ${after}`}
       ORDER BY record_id LIMIT 128`;
     for (const row of rows) {
       if (typeof row.recordId !== "string" || row.recordId.length === 0) return yield* invalid();
