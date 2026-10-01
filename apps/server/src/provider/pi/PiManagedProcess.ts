@@ -3,6 +3,7 @@ import * as Effect from "effect/Effect";
 import * as Crypto from "effect/Crypto";
 import type * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
@@ -17,6 +18,9 @@ import * as Schema from "effect/Schema";
 
 const LaunchSchema = Schema.Struct({
   workspaceRoot: Schema.String,
+  workspaceAccess: Schema.optional(Schema.Literals(["readonly", "readwrite"])),
+  nativeStateRoot: Schema.optional(Schema.String),
+  protectedWorkspaceEntries: Schema.optional(Schema.Array(Schema.String)),
   protectedRoots: Schema.Array(Schema.String),
   runtimeFiles: Schema.Array(Schema.Struct({ source: Schema.String, target: Schema.String })),
   argv: Schema.Array(Schema.String),
@@ -95,6 +99,69 @@ export const validatePiManagedLaunch = Effect.fn("validatePiManagedLaunch")(
     const rootStat = yield* fs.stat(root);
     if (rootStat.type !== "Directory" || Option.isNone(rootStat.ino))
       return yield* fail("validation", "Assigned cwd requires a directory inode.");
+    const nativeState =
+      value.nativeStateRoot === undefined
+        ? undefined
+        : yield* Effect.gen(function* () {
+            const statePath = value.nativeStateRoot!;
+            if (
+              !path.isAbsolute(statePath) ||
+              path.resolve(statePath) !== statePath ||
+              (yield* fs.realPath(statePath)) !== statePath ||
+              overlaps(statePath, root) ||
+              protectedRoots.some((entry) => overlaps(statePath, entry))
+            )
+              return yield* fail(
+                "validation",
+                "Native state must be canonical and separately owned.",
+              );
+            const stat = yield* fs.stat(statePath);
+            if (stat.type !== "Directory" || Option.isNone(stat.ino))
+              return yield* fail("validation", "Native state requires a directory inode.");
+            return { path: statePath, dev: stat.dev, ino: stat.ino.value };
+          });
+    const protectedWorkspaceEntries: Array<{
+      source: string;
+      target: string;
+      dev: number;
+      ino: number;
+      directory: boolean;
+    }> = [];
+    if ((value.protectedWorkspaceEntries?.length ?? 0) > 16)
+      return yield* fail("validation", "Protected workspace entries exceed their bound.");
+    for (const entry of value.protectedWorkspaceEntries ?? []) {
+      if (
+        !/^[^/\\\0\r\n]+(?:\/[^/\\\0\r\n]+)*$/.test(entry) ||
+        entry.split("/").some((component) => component === "." || component === "..")
+      )
+        return yield* fail(
+          "validation",
+          "Protected workspace entry must use exact relative components.",
+        );
+      const source = path.join(root, entry);
+      const target = `/workspace/${entry}`;
+      // Every component must resolve exactly; an intermediate symlink is also rejected.
+      for (let index = 1; index <= entry.split("/").length; index++) {
+        const prefix = path.join(root, ...entry.split("/").slice(0, index));
+        if ((yield* fs.realPath(prefix)) !== prefix)
+          return yield* fail("validation", "Protected workspace entry cannot traverse a symlink.");
+      }
+      if (protectedWorkspaceEntries.some((existing) => overlaps(target, existing.target)))
+        return yield* fail("validation", "Protected workspace entries overlap.");
+      const stat = yield* fs.stat(source);
+      if (!["File", "Directory"].includes(stat.type) || Option.isNone(stat.ino))
+        return yield* fail(
+          "validation",
+          "Protected workspace entry requires a file or directory inode.",
+        );
+      protectedWorkspaceEntries.push({
+        source,
+        target,
+        dev: stat.dev,
+        ino: stat.ino.value,
+        directory: stat.type === "Directory",
+      });
+    }
     const runtimeFiles: Array<{ source: string; target: string; dev: number; ino: number }> = [];
     for (const file of value.runtimeFiles) {
       if (
@@ -105,7 +172,11 @@ export const validatePiManagedLaunch = Effect.fn("validatePiManagedLaunch")(
       if (runtimeFiles.some((entry) => overlaps(file.target, entry.target)))
         return yield* fail("validation", "Runtime mount targets overlap.");
       const source = yield* fs.realPath(file.source);
-      if (protectedRoots.some((entry) => overlaps(source, entry)) || overlaps(source, root))
+      if (
+        protectedRoots.some((entry) => overlaps(source, entry)) ||
+        overlaps(source, root) ||
+        (nativeState && overlaps(source, nativeState.path))
+      )
         return yield* fail("validation", "Runtime closure overlaps protected or writable data.");
       const stat = yield* fs.stat(source);
       if (stat.type !== "File" || Option.isNone(stat.ino))
@@ -127,6 +198,9 @@ export const validatePiManagedLaunch = Effect.fn("validatePiManagedLaunch")(
       );
     return {
       ...value,
+      workspaceAccess: value.workspaceAccess ?? "readwrite",
+      nativeState,
+      protectedWorkspaceEntries,
       workspace: { path: root, dev: rootStat.dev, ino: rootStat.ino.value },
       protectedRoots,
       runtimeFiles,
@@ -148,12 +222,94 @@ const FileIdentitySchema = Schema.Struct({
   dev: Schema.Int,
   ino: Schema.Int,
 });
-const BootstrapSchema = Schema.Struct({
+const PinnedLaunchSchema = Schema.Struct({
   ...LaunchSchema.fields,
   workspace: Schema.Struct({ path: Schema.String, dev: Schema.Int, ino: Schema.Int }),
+  nativeState: Schema.optional(
+    Schema.Struct({ path: Schema.String, dev: Schema.Int, ino: Schema.Int }),
+  ),
+  protectedWorkspaceEntries: Schema.Array(
+    Schema.Struct({ ...FileIdentitySchema.fields, directory: Schema.Boolean }),
+  ),
   runtimeFiles: Schema.Array(FileIdentitySchema),
+});
+const BootstrapSchema = Schema.Struct({
+  ...PinnedLaunchSchema.fields,
   unit: Schema.String,
   nonce: Schema.String,
+});
+const AllocationSchema = Schema.Struct({
+  version: Schema.Literal(1),
+  unit: Schema.String,
+  nonce: Schema.String,
+  policy: Schema.Struct({ memoryBytes: Schema.Int, runtimeSeconds: Schema.Int }),
+  launch: PinnedLaunchSchema,
+});
+export type PiManagedProcessAllocation = typeof AllocationSchema.Type;
+export interface PiManagedProcessPersistence {
+  readonly allocation: PiManagedProcessAllocation;
+  // Root must atomically consume the persisted descriptor once; this leaf has no durable database.
+  readonly claimActivation: (
+    allocation: PiManagedProcessAllocation,
+  ) => Effect.Effect<void, PiManagedProcessError>;
+  readonly beforeStart: (
+    owner: PiManagedProcessOwner,
+  ) => Effect.Effect<void, PiManagedProcessError>;
+}
+const decodeAllocation = Schema.decodeEffect(AllocationSchema);
+const encodePinnedLaunchValue = Schema.encodeEffect(Schema.fromJsonString(PinnedLaunchSchema));
+const encodePinnedLaunch = (input: typeof PinnedLaunchSchema.Type) =>
+  encodePinnedLaunchValue(input).pipe(
+    Effect.mapError(
+      () =>
+        new PiManagedProcessError({
+          phase: "validation",
+          message: "Pinned launch could not be encoded.",
+        }),
+    ),
+  );
+export const preallocatePiManagedProcess = Effect.fn("preallocatePiManagedProcess")(function* (
+  input: PiManagedLaunch,
+) {
+  const launch = yield* validatePiManagedLaunch(input);
+  const crypto = yield* Crypto.Crypto;
+  const nonce = yield* crypto.randomUUIDv4.pipe(
+    Effect.mapError(
+      () =>
+        new PiManagedProcessError({
+          phase: "startup",
+          message: "Managed launch identity allocation failed.",
+        }),
+    ),
+  );
+  return {
+    version: 1 as const,
+    unit: `t3-pi-managed-${nonce}.service`,
+    nonce,
+    policy: { memoryBytes: launch.memoryBytes, runtimeSeconds: launch.runtimeSeconds },
+    launch,
+  };
+});
+const validateAllocation = Effect.fn("PiManagedProcess.validateAllocation")(function* (
+  input: PiManagedProcessAllocation,
+) {
+  const value = yield* decodeAllocation(input, { onExcessProperty: "error" }).pipe(
+    Effect.mapError(
+      () =>
+        new PiManagedProcessError({
+          phase: "validation",
+          message: "Invalid preallocated process descriptor.",
+        }),
+    ),
+  );
+  if (
+    !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(value.nonce) ||
+    value.unit !== `t3-pi-managed-${value.nonce}.service` ||
+    value.policy.memoryBytes !== value.launch.memoryBytes ||
+    value.policy.runtimeSeconds !== value.launch.runtimeSeconds
+  )
+    return yield* fail("validation", "Preallocated process identity or policy is inconsistent.");
+  return value;
 });
 const ControlSchema = Schema.Union([
   Schema.Struct({ type: Schema.Literals(["start", "end"]) }),
@@ -207,11 +363,13 @@ export interface PiManagedProcess {
 }
 
 const ShowSchema = Schema.Struct({
+  LoadState: Schema.String,
   Description: Schema.String,
   InvocationID: Schema.String,
   ControlGroup: Schema.String,
   ActiveState: Schema.String,
   KillMode: Schema.String,
+  Restart: Schema.String,
   RuntimeMaxUSec: Schema.String,
   TimeoutStopUSec: Schema.String,
   UnsetEnvironment: Schema.String,
@@ -270,23 +428,9 @@ const durationUsec = (text: string) => {
   return value;
 };
 
-// The caller's Scope owns the unique service from spawn through confirmed kernel drain.
-// Acquiring does not start untrusted code. start acknowledges verified ownership once.
-export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(function* (
-  input: PiManagedLaunch,
-): Effect.fn.Return<
-  PiManagedProcess,
-  PiManagedProcessError,
-  | FileSystem.FileSystem
-  | Path.Path
-  | Crypto.Crypto
-  | ChildProcessSpawner.ChildProcessSpawner
-  | Scope.Scope
-> {
-  const launch = yield* validatePiManagedLaunch(input);
-  const fs = yield* FileSystem.FileSystem;
-  const path = yield* Path.Path;
-  const crypto = yield* Crypto.Crypto;
+const makeManagedControl = Effect.fn("PiManagedProcess.makeControl")(function* () {
+  if ((yield* HostProcessPlatform) !== "linux")
+    return yield* fail("unavailable", "Managed Pi execution requires Linux.");
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const uid = yield* HostProcessUserId;
   if (uid === undefined)
@@ -329,6 +473,218 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
       ),
     );
   });
+  return { control, managerEnv };
+});
+const readManagedUnit = Effect.fn("PiManagedProcess.readUnit")(function* (unit: string) {
+  const { control } = yield* makeManagedControl();
+  const result = yield* control("/usr/bin/systemctl", [
+    "--user",
+    "show",
+    unit,
+    "--property=LoadState,Description,InvocationID,ControlGroup,ActiveState,KillMode,Restart,RuntimeMaxUSec,TimeoutStopUSec,UnsetEnvironment,Environment",
+  ]);
+  if (result.code !== 0)
+    return yield* fail("quarantine", "Managed service receipt is unavailable.");
+  return yield* decodeShow(
+    Object.fromEntries(
+      result.stdout
+        .trim()
+        .split("\n")
+        .map((line) => {
+          const equals = line.indexOf("=");
+          return [line.slice(0, equals), line.slice(equals + 1)];
+        }),
+    ),
+  ).pipe(
+    Effect.mapError(
+      () =>
+        new PiManagedProcessError({
+          phase: "quarantine",
+          message: "Managed service receipt is malformed.",
+        }),
+    ),
+  );
+});
+const matchesPolicy = (policy: typeof ShowSchema.Type, allocation: PiManagedProcessAllocation) =>
+  policy.Description === `T3 Pi managed ${allocation.nonce}` &&
+  policy.KillMode === "control-group" &&
+  policy.Restart === "no" &&
+  durationUsec(policy.RuntimeMaxUSec) === allocation.policy.runtimeSeconds * 1000000 &&
+  durationUsec(policy.TimeoutStopUSec) === 2000000 &&
+  policy.UnsetEnvironment.split(" ").filter(Boolean).sort().join(" ") === unsetPolicy &&
+  policy.Environment.split(" ").includes("LC_ALL=C") &&
+  policy.Environment.split(" ").includes("LANG=C");
+const absentUnit = (policy: typeof ShowSchema.Type) =>
+  policy.LoadState === "not-found" &&
+  policy.ActiveState === "inactive" &&
+  !policy.InvocationID &&
+  !policy.ControlGroup;
+export interface PiManagedProcessRecovery {
+  readonly allocation: PiManagedProcessAllocation;
+  // Only root's durable SQL state may supply this value.
+  readonly activation: "unlaunched" | "claimed" | "owned";
+  readonly owner?: PiManagedProcessOwner;
+}
+const RecoverySchema = Schema.Struct({
+  allocation: AllocationSchema,
+  activation: Schema.Literals(["unlaunched", "claimed", "owned"]),
+  owner: Schema.optional(OwnerSchema),
+});
+const RecoveryOptionsSchema = Schema.Struct({ stop: Schema.Boolean });
+const decodeRecovery = Schema.decodeEffect(RecoverySchema);
+const decodeRecoveryOptions = Schema.decodeEffect(RecoveryOptionsSchema);
+const decodeOwner = Schema.decodeEffect(OwnerSchema);
+export interface PiManagedProcessReconciliation {
+  readonly state: "absent" | "owned" | "drained";
+  readonly unit: string;
+  readonly invocation: string | null;
+  readonly cgroup: string | null;
+  readonly kernel: string;
+}
+export const reconcilePiManagedProcess = Effect.fn("reconcilePiManagedProcess")(
+  function* (request: PiManagedProcessRecovery, options: { readonly stop: boolean }) {
+    const input = yield* decodeRecovery(request, {
+      onExcessProperty: "error",
+    });
+    const action = yield* decodeRecoveryOptions(options, {
+      onExcessProperty: "error",
+    });
+    const allocation = yield* validateAllocation(input.allocation);
+    const fs = yield* FileSystem.FileSystem;
+    const { control } = yield* makeManagedControl();
+    const owner =
+      input.owner === undefined
+        ? undefined
+        : yield* decodeOwner(input.owner, { onExcessProperty: "error" }).pipe(
+            Effect.mapError(
+              () =>
+                new PiManagedProcessError({
+                  phase: "quarantine",
+                  message: "Persisted owner receipt is malformed.",
+                }),
+            ),
+          );
+    if (
+      owner &&
+      (owner.unit !== allocation.unit ||
+        owner.nonce !== allocation.nonce ||
+        !/^[a-f0-9]{32}$/.test(owner.invocation) ||
+        owner.pid < 1 ||
+        !owner.cgroup.startsWith("/sys/fs/cgroup/") ||
+        !owner.cgroup.endsWith(`/${allocation.unit}`) ||
+        owner.cgroup.split("/").some((part) => part === "." || part === "..") ||
+        owner.memoryBytes !== allocation.policy.memoryBytes ||
+        owner.swapBytes !== 0 ||
+        owner.oomGroup !== 1)
+    )
+      return yield* fail("quarantine", "Persisted ownership does not match its allocation.");
+    const before = yield* readManagedUnit(allocation.unit);
+    if (absentUnit(before)) {
+      if (input.activation === "unlaunched" && !owner)
+        return {
+          state: "absent" as const,
+          unit: allocation.unit,
+          invocation: null,
+          cgroup: null,
+          kernel: "not-created",
+        };
+      if (input.activation !== "owned" || !owner)
+        return yield* fail(
+          "quarantine",
+          "Claimed activation has no captured owner; absence cannot prove its history.",
+        );
+      if (yield* fs.exists(`${owner.cgroup}/cgroup.events`))
+        return yield* fail("quarantine", "Absent service retains an unverified cgroup.");
+      return {
+        state: "drained" as const,
+        unit: allocation.unit,
+        invocation: owner.invocation,
+        cgroup: owner.cgroup,
+        kernel: "removed",
+      };
+    }
+    if (
+      input.activation !== "owned" ||
+      !owner ||
+      !matchesPolicy(before, allocation) ||
+      before.InvocationID !== owner.invocation ||
+      `/sys/fs/cgroup${before.ControlGroup}` !== owner.cgroup
+    )
+      return yield* fail(
+        "quarantine",
+        "Current service identity differs from captured ownership; no termination was attempted.",
+      );
+    const resources = yield* Effect.all([
+      fs.readFileString(`${owner.cgroup}/memory.max`),
+      fs.readFileString(`${owner.cgroup}/memory.swap.max`),
+      fs.readFileString(`${owner.cgroup}/memory.oom.group`),
+    ]);
+    if (
+      resources[0].trim() !== String(allocation.policy.memoryBytes) ||
+      resources[1].trim() !== "0" ||
+      resources[2].trim() !== "1"
+    )
+      return yield* fail("quarantine", "Current cgroup policy differs from captured ownership.");
+    if (!action.stop)
+      return {
+        state: "owned" as const,
+        unit: allocation.unit,
+        invocation: owner.invocation,
+        cgroup: owner.cgroup,
+        kernel: "owned",
+      };
+    yield* control("/usr/bin/systemctl", ["--user", "stop", allocation.unit]);
+    const after = yield* readManagedUnit(allocation.unit);
+    if (
+      !absentUnit(after) &&
+      (!matchesPolicy(after, allocation) ||
+        (after.InvocationID && after.InvocationID !== owner.invocation) ||
+        !["inactive", "failed"].includes(after.ActiveState) ||
+        after.ControlGroup)
+    )
+      return yield* fail("quarantine", "Owned service drain could not be confirmed.");
+    const kernel = (yield* fs.exists(`${owner.cgroup}/cgroup.events`))
+      ? yield* fs.readFileString(`${owner.cgroup}/cgroup.events`)
+      : "removed";
+    if (kernel !== "removed" && !kernel.split("\n").includes("populated 0"))
+      return yield* fail("quarantine", "Owned descendants remain after stop.");
+    return {
+      state: "drained" as const,
+      unit: allocation.unit,
+      invocation: owner.invocation,
+      cgroup: owner.cgroup,
+      kernel,
+    };
+  },
+  Effect.mapError((cause) =>
+    isPiManagedProcessError(cause)
+      ? cause
+      : new PiManagedProcessError({
+          phase: "quarantine",
+          message: "Ownership reconciliation is unproved; quarantine the run/workspace.",
+        }),
+  ),
+);
+
+// The caller's Scope owns the unique service from spawn through confirmed kernel drain.
+// Acquiring does not start untrusted code. start acknowledges verified ownership once.
+export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(function* (
+  input: PiManagedLaunch,
+  persistence?: PiManagedProcessPersistence,
+): Effect.fn.Return<
+  PiManagedProcess,
+  PiManagedProcessError,
+  | FileSystem.FileSystem
+  | Path.Path
+  | Crypto.Crypto
+  | ChildProcessSpawner.ChildProcessSpawner
+  | Scope.Scope
+> {
+  const launch = yield* validatePiManagedLaunch(input);
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const { control, managerEnv } = yield* makeManagedControl();
   const version = yield* control("/usr/bin/bwrap", ["--version"]);
   if (version.code !== 0 || version.stdout.trim() !== "bubblewrap 0.12.0")
     return yield* fail("unavailable", "Managed execution requires the proven bubblewrap 0.12.0.");
@@ -354,16 +710,12 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
   );
   if (helperStat.type !== "File")
     return yield* fail("unavailable", "The owned Linux helper must be a trusted regular file.");
-  const nonce = yield* crypto.randomUUIDv4.pipe(
-    Effect.mapError(
-      () =>
-        new PiManagedProcessError({
-          phase: "startup",
-          message: "Managed launch identity allocation failed.",
-        }),
-    ),
-  );
-  const unit = `t3-pi-managed-${nonce}.service`;
+  const allocation = persistence
+    ? yield* validateAllocation(persistence.allocation)
+    : yield* preallocatePiManagedProcess(input);
+  if ((yield* encodePinnedLaunch(allocation.launch)) !== (yield* encodePinnedLaunch(launch)))
+    return yield* fail("validation", "Preallocated filesystem identity or launch policy changed.");
+  const { nonce, unit } = allocation;
   const description = `T3 Pi managed ${nonce}`;
   const specText = yield* encodeBootstrap({
     ...launch,
@@ -382,34 +734,11 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
   const spec = Buffer.from(specText).toString("base64");
   if (spec.length > 65536)
     return yield* fail("validation", "Managed launch specification exceeds the bootstrap bound.");
-  const readUnit = Effect.fn("PiManagedProcess.readUnit")(function* () {
-    const result = yield* control("/usr/bin/systemctl", [
-      "--user",
-      "show",
-      unit,
-      "--property=Description,InvocationID,ControlGroup,ActiveState,KillMode,RuntimeMaxUSec,TimeoutStopUSec,UnsetEnvironment,Environment",
-    ]);
-    if (result.code !== 0) return yield* fail("startup", "Managed service receipt is unavailable.");
-    return yield* decodeShow(
-      Object.fromEntries(
-        result.stdout
-          .trim()
-          .split("\n")
-          .map((line) => {
-            const equals = line.indexOf("=");
-            return [line.slice(0, equals), line.slice(equals + 1)];
-          }),
-      ),
-    ).pipe(
-      Effect.mapError(
-        () =>
-          new PiManagedProcessError({
-            phase: "startup",
-            message: "Managed service receipt is malformed.",
-          }),
-      ),
+  const readUnit = () =>
+    readManagedUnit(unit).pipe(
+      Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
     );
-  });
+  if (persistence) yield* persistence.claimActivation(allocation);
   return yield* Effect.uninterruptibleMask((restore) =>
     Effect.gen(function* () {
       const child = yield* spawner
@@ -431,6 +760,8 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
               "OOMPolicy=kill",
               "-p",
               "KillMode=control-group",
+              "-p",
+              "Restart=no",
               "-p",
               `RuntimeMaxSec=${launch.runtimeSeconds}s`,
               "-p",
@@ -467,20 +798,37 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
       let state: "owned" | "starting" | "running" | "stopped" = "owned";
       let childExitCode: number | null = null;
       let childPid: number | null = null;
+      let closeInput = Effect.void;
+      let awaitReaders = Effect.void;
       const stop = yield* Effect.cached(
         Effect.gen(function* () {
           state = "stopped";
+          const capturedOwner = owner;
+          if (!capturedOwner) {
+            // The launcher is ours; an existing unit with the same nonce is not.
+            // Closing this launcher's input permits a late helper to take its EOF path.
+            yield* Queue.end(incoming);
+            yield* closeInput.pipe(Effect.timeout("3 seconds"));
+            yield* child.exitCode.pipe(Effect.timeout("3 seconds"));
+            yield* awaitReaders.pipe(Effect.timeout("3 seconds"));
+            yield* Queue.end(stdout);
+            yield* Queue.end(stderr);
+            return yield* fail(
+              "quarantine",
+              "Launcher input and process drained without a captured service invocation; unit ownership remains unproved.",
+            );
+          }
           const before = yield* readUnit();
           if (
-            (before.Description !== description && before.ActiveState !== "inactive") ||
-            (owner && before.InvocationID && before.InvocationID !== owner.invocation)
+            (before.Description !== description && !absentUnit(before)) ||
+            (before.InvocationID && before.InvocationID !== capturedOwner.invocation) ||
+            (before.ControlGroup && `/sys/fs/cgroup${before.ControlGroup}` !== capturedOwner.cgroup)
           )
             return yield* fail(
               "quarantine",
               "Owned service identity changed; termination is unproved.",
             );
-          const group =
-            owner?.cgroup ?? (before.ControlGroup ? `/sys/fs/cgroup${before.ControlGroup}` : "");
+          const group = capturedOwner.cgroup;
           if (group && (!group.startsWith("/sys/fs/cgroup/") || !group.endsWith(`/${unit}`)))
             return yield* fail(
               "quarantine",
@@ -513,12 +861,12 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
           yield* Deferred.fail(exited, stoppedError);
           return {
             unit,
-            invocation: owner?.invocation ?? before.InvocationID,
+            invocation: capturedOwner.invocation,
             cgroup: group,
-            ownerPid: owner?.pid ?? null,
+            ownerPid: capturedOwner.pid,
             memoryBytes: launch.memoryBytes,
             swapBytes: 0,
-            oomGroup: owner?.oomGroup ?? 0,
+            oomGroup: capturedOwner.oomGroup,
             launcherPid: Number(child.pid),
             childPid,
             childExitCode,
@@ -547,7 +895,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         yield* Queue.fail(stdout, error);
         yield* Queue.fail(stderr, error);
       });
-      yield* Stream.fromQueue(incoming).pipe(
+      const inputWriter = yield* Stream.fromQueue(incoming).pipe(
         Stream.run(child.stdin),
         Effect.catch(() =>
           transportFailure(
@@ -560,7 +908,8 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         Effect.interruptible,
         Effect.forkScoped,
       );
-      yield* child.stderr.pipe(
+      closeInput = Fiber.join(inputWriter);
+      const stderrReader = yield* child.stderr.pipe(
         Stream.runForEach(() =>
           fail("startup", "The owned Linux launcher reported a startup failure."),
         ),
@@ -636,7 +985,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
             return yield* fail("startup", event.message);
         }
       });
-      yield* child.stdout.pipe(
+      const stdoutReader = yield* child.stdout.pipe(
         Stream.runForEach((chunk) =>
           Effect.gen(function* () {
             let offset = 0;
@@ -672,6 +1021,9 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         Effect.interruptible,
         Effect.forkScoped,
       );
+      awaitReaders = Effect.all([Fiber.join(stdoutReader), Fiber.join(stderrReader)], {
+        concurrency: "unbounded",
+      }).pipe(Effect.asVoid);
       const verified = yield* restore(
         Deferred.await(ownerReady).pipe(
           Effect.timeout("5 seconds"),
@@ -682,6 +1034,9 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
                 message: "Owned Linux startup did not provide its verified receipt.",
               }),
           ),
+          Effect.catch((error) => stop.pipe(Effect.andThen(Effect.fail(error)))),
+          // Close the launcher while its scoped transport fibers can still deliver EOF.
+          Effect.onInterrupt(() => stop.pipe(Effect.orDie, Effect.asVoid)),
         ),
       );
       const policy = yield* restore(readUnit());
@@ -690,6 +1045,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         policy.InvocationID !== verified.invocation ||
         `/sys/fs/cgroup${policy.ControlGroup}` !== verified.cgroup ||
         policy.KillMode !== "control-group" ||
+        policy.Restart !== "no" ||
         durationUsec(policy.RuntimeMaxUSec) !== launch.runtimeSeconds * 1000000 ||
         durationUsec(policy.TimeoutStopUSec) !== 2000000 ||
         policy.UnsetEnvironment.split(" ").filter(Boolean).sort().join(" ") !== unsetPolicy ||
@@ -700,6 +1056,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
           "startup",
           "The owned service policy does not match the proven Linux boundary.",
         );
+      if (persistence) yield* restore(persistence.beforeStart(verified));
       const sendControl = (value: typeof ControlSchema.Type) =>
         encodeControl(value).pipe(
           Effect.mapError(

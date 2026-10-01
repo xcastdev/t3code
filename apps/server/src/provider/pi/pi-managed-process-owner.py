@@ -24,7 +24,17 @@ def emit(value):
 
 def pinned(path, dev, ino, directory=False):
     flags = os.O_CLOEXEC | os.O_NOFOLLOW | (os.O_DIRECTORY if directory else os.O_RDONLY)
-    fd = os.open(path, flags)
+    # Reject replaced ancestor symlinks as well as a swapped final component.
+    components = path.split("/")
+    parent_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for component in components[1:-1]:
+            next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+            os.close(parent_fd)
+            parent_fd = next_fd
+        fd = os.open(components[-1], flags, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
     stat = os.fstat(fd)
     if stat.st_dev != dev or stat.st_ino != ino:
         os.close(fd)
@@ -43,7 +53,33 @@ def launch(spec):
             fd = pinned(entry["source"], entry["dev"], entry["ino"])
             fds.append(fd)
             command += ["--ro-bind-fd", str(fd), entry["target"]]
-        command += ["--bind-fd", str(workspace_fd), "/workspace", "--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--setenv", "HOME", "/workspace", "--setenv", "TMPDIR", "/tmp", "--setenv", "PATH", "/runtime:/bin", "--setenv", "LANG", "C.UTF-8", "--remount-ro", "/", "--chdir", "/workspace", "--"] + spec["argv"]
+        command += ["--ro-bind-fd" if spec.get("workspaceAccess") == "readonly" else "--bind-fd", str(workspace_fd), "/workspace"]
+        if spec.get("nativeState") is not None:
+            state = spec["nativeState"]
+            fd = pinned(state["path"], state["dev"], state["ino"], True)
+            fds.append(fd)
+            command += ["--bind-fd", str(fd), "/state"]
+        # Overlay after the workspace bind: the mount point cannot be replaced or removed.
+        for entry in spec.get("protectedWorkspaceEntries", []):
+            relative = entry["target"][len("/workspace/"):]
+            # Resolve through the held workspace FD and prohibit symlinks in each component.
+            parent_fd = os.dup(workspace_fd)
+            try:
+                components = relative.split("/")
+                for component in components[:-1]:
+                    next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent_fd)
+                    os.close(parent_fd)
+                    parent_fd = next_fd
+                fd = os.open(components[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | (os.O_DIRECTORY if entry["directory"] else 0), dir_fd=parent_fd)
+                stat = os.fstat(fd)
+                if stat.st_dev != entry["dev"] or stat.st_ino != entry["ino"]:
+                    os.close(fd)
+                    raise RuntimeError("protected workspace identity changed")
+                fds.append(fd)
+                command += ["--ro-bind-fd", str(fd), entry["target"]]
+            finally:
+                os.close(parent_fd)
+        command += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--setenv", "HOME", "/workspace", "--setenv", "TMPDIR", "/tmp", "--setenv", "PATH", "/runtime:/bin", "--setenv", "LANG", "C.UTF-8", "--remount-ro", "/", "--chdir", "/workspace", "--"] + spec["argv"]
         child = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd="/", env={}, close_fds=True, pass_fds=tuple(fds))
         try:
             pidfd = os.pidfd_open(child.pid)
