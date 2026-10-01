@@ -7,41 +7,40 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-10-01 00:53 UTC. Implementation is running. The harness permits
-**ten subagents plus the coordinator**. One agent is running: the P7 process
-owner sealing its repair. The foundation wave review is approved. P6/P8
-read-only preparations are complete; nine seats are available.
+Last updated: 2026-10-01 01:26 UTC. Implementation is running. The harness permits
+**ten subagents plus the coordinator**. P2/P3 have landed on main. Root prepares
+P4's shared workflow contracts in wave3. The repaired Linux process candidate
+`f746e690` has passed its existing reviewer; root verifies its sealed evidence.
+Three subagent seats are active: P4 core, P7 process extension and P7 protocol extension.
 
 | Tally                       | Done | Active | Left | Total |
 | --------------------------- | ---- | ------ | ---- | ----- |
-| Implementation steps        | 1    | 9      | 4    | 14    |
+| Implementation steps        | 3    | 7      | 4    | 14    |
 | Product acceptance criteria | 0    | 0      | 19   | 19    |
 | Final independent audits    | 0    | 0      | 2    | 2     |
 
-- **Finished on main:** P1's bounded runtime, isolation, packaging and memory-choice proofs.
-- **Next main integration:** P2 is approved in wave2. P3's durable identity fence
-  passes 293 focused/affected cases and final entry compilation. Exact candidate `81a0ccf16` is independently approved: 154 candidate checks
-  and 10 causal/regression cases pass. Combined wave validation passes 301 tests
-  and three normal compilers; the fresh wave reviewer approves `8defdcf12`.
-  Root is reconciling documentation and merging the approved foundation.
-- **P4:** pure policy leaf `76089058` is approved. Guided workflow interfaces are
-  prepared; dependent implementation waits for the foundation gate.
+- **Finished on main:** P1 bounded dependency proofs; P2 durable foundation;
+  P3 current managed identity and protected command authorization. P2/P3 land
+  at `1346f50af` after 301 combined tests, three normal compilers, scoped
+  checks and fresh wave APPROVE. All 56 reviewed source hashes match main.
+- **P4:** pure policy leaf `76089058` is approved. Guided workflow contracts are under focused validation on wave3; the full
+  state-transition owner will start from the resulting exact commit.
 - **P5:** transport and pure sync/intake leaves are approved. Title repair
   `42663135` passes 79 tests and independent replay/rename/conflict checks.
   Durable sync authority interfaces are prepared; refinement, wiring
   and real GitHub evidence remain.
-- **P7:** protocol `df620a4a` is approved. Skills repair `4168f789` is approved after its existing review. Linux process `7db547c70` passes real lifecycle/EOF checks, but
-  its reviewer finds duration parsing, ambient Python startup and full-duplex
-  pipe deadlock defects in a sealed review. Root reproduces all three; the owner
-  repairs them and initial focused regressions pass. Runtime interfaces are prepared.
+- **P7:** protocol `df620a4a` and skills `4168f789` are approved and merged
+  into wave3. Linux process repair `f746e690` passes its existing reviewer: 54
+  independent focused tests, three actual parent-EOF proofs, a forced partial-write
+  case and two discriminating controls. Full runtime integration remains open.
 - **P10:** native adapter repair `2a88e791` is approved after real deletion,
   recovery and explicit native-proof checks. Extraction, authorized hydration,
   context and integration remain dependent work.
 - **P11:** pure evidence policy `090589f4` is approved and held for integration.
 - **P6/P8:** P6 human workflow interfaces are prepared; P8 dispatch/recovery
-  interfaces are prepared while foundation review runs. No dependent code
-  is authorized yet.
-- **Not started:** P9, P12, P13 and P14. Nine steps have active or preparatory
+  interfaces are prepared. Their dependent implementation starts after the
+  required P4/P5 and P7 interfaces and gates.
+- **Not started:** P9, P12, P13 and P14. Seven steps have active or preparatory
   work; only landed, fully gated steps count as finished.
 
 All 19 product criteria and both final audits remain open. Approved preparatory
@@ -59,32 +58,37 @@ Each row is one subagent seat, with its owner, work and next gate. Finished agen
 release their seat. Worktrees live under
 `/home/user/.cache/pi-project-teams-11b7e351/`.
 
-| Slot | Agent                                          | State                              | Assignment / branch                            | Next gate                                               |
-| ---- | ---------------------------------------------- | ---------------------------------- | ---------------------------------------------- | ------------------------------------------------------- |
-| 1    | — (last: `p6_human_workflow_preparation_high`) | Available; UI proposal ready       | P6 read-only preparation complete              | Root guided reads/actions after P4/P5                   |
-| 2    | — (last: `p7_worker_protocol_high`)            | Available; runtime proposal ready  | P7 read-only proposal complete                 | Root interfaces after foundation gate                   |
-| 3    | — (last: `review_p10_backend_adapter`)         | Available; repair APPROVE          | P10 `2a88e791` held for integration            | Ready independent work or review                        |
-| 4    | — (last: `review_p5_sync_leaf`)                | Available; repair APPROVE          | P5 `42663135` held for integration             | Ready independent work or review                        |
-| 5    | — (last: `p8_dispatch_preparation_high`)       | Available; recovery proposal ready | P8 read-only preparation complete              | Root persisted identity, Git/setup and budget contracts |
-| 6    | — (last: `review_wave2_foundation`)            | Available; combined wave APPROVE   | P2/P3 `8defdcf12`; 15 sealed review artifacts  | Root documentation reconciliation and local main merge  |
-| 7    | — (last: `review_p7_skills_slice`)             | Available; repair APPROVE          | P7 skills `4168f789` held for integration      | Ready independent work or review                        |
-| 8    | — (last: `p5_sync_leaf_high`)                  | Available                          | P5 repair committed and approved               | Ready independent work                                  |
-| 9    | `p7_managed_process_high`                      | Sealing verified repair            | P7 process; 36 focused cases and compiler pass | Root diff/evidence inspection, then same reviewer       |
-| 10   | — (last: `review_p7_managed_process`)          | Available; REQUEST_CHANGES         | P7 process; 166 sealed review artifacts        | Same reviewer after three scoped repairs                |
+| Slot | Agent                                    | State                              | Assignment / branch                              | Next gate                                                    |
+| ---- | ---------------------------------------- | ---------------------------------- | ------------------------------------------------ | ------------------------------------------------------------ |
+| 1    | `p4_guided_core_high`                    | Active implementation              | `pi-teams/p4-guided-core`, base `6bb8db009`      | Root contracts + core checks + one review                    |
+| 2    | `p7_protocol_runtime_high`               | Active implementation              | `pi-teams/p7-protocol-runtime`, base `6bb8db009` | Exact bootstrap/control/compaction interfaces, focused tests |
+| 3    | — (last: `review_p10_backend_adapter`)   | Available; repair APPROVE          | P10 `2a88e791` held for integration              | Ready independent work or review                             |
+| 4    | — (last: `review_p5_sync_leaf`)          | Available; repair APPROVE          | P5 `42663135` held for integration               | Ready independent work or review                             |
+| 5    | — (last: `p8_dispatch_preparation_high`) | Available; recovery proposal ready | P8 read-only preparation complete                | Root persisted identity, Git/setup and budget contracts      |
+| 6    | — (last: `review_wave2_foundation`)      | Available; combined wave APPROVE   | P2/P3 `8defdcf12`; 15 sealed review artifacts    | Landed on main `1346f50af`                                   |
+| 7    | — (last: `review_p7_skills_slice`)       | Available; repair APPROVE          | P7 skills `4168f789` merged into wave3           | Ready independent work or review                             |
+| 8    | — (last: `p5_sync_leaf_high`)            | Available                          | P5 repair committed and approved                 | Ready independent work                                       |
+| 9    | `p7_process_runtime_high`                | Active implementation              | `pi-teams/p7-process-runtime`, base `6bb8db009`  | Read-only/state/Git mounts and preallocated identity proofs  |
+| 10   | — (last: `review_p7_managed_process`)    | Available; repair APPROVE          | `f746e690`, 231 sealed artifacts root-verified   | Reviewed process merged into wave3                           |
 
-Coordinator: keeping this record current, inspecting sealed candidates and
-preparing dependency-ordered integration. The normal compiler reservation is
-free after the P7 owner’s final successful compilation; completed scopes have drained. Only one normal compiler runs at a time.
-No model or integrated client proof is running.
+Coordinator: validating three shared P4 contract files on wave3, checking the
+P7 process review seal and preparing exclusive implementation scopes. Root holds
+the normal compiler reservation for the contracts package; only one normal compiler
+runs at a time. No model or integrated client proof is running.
 
-Primary branch: `t3code/implement-pi-project-teams`. Previous saved dashboard checkpoint:
-`59e8ae6c5`; historical restart checkpoint: `238126a8`. Wave2 `8defdcf12`
-contains reviewed P2/P3 source and reconciles that saved dashboard; its combined
-checks and fresh review are recorded below.
-Reconcile subsequent main advances before merging. Main still contains only P1
-product source. Preparatory branches retain their explicit earlier bases;
-P5 sync uses reconciled P2/transport base `9bdd1872`. Historical pause evidence
-remains below and in `pause-20260930/RESUME.md` under the worktree cache.
+Primary branch: `t3code/implement-pi-project-teams`. Main product commit:
+`1346f50af6f1361b0942fe1d42e636804e1ba9a0`. Reviewed foundation wave:
+`8defdcf1241caf9c3276528e07da076573aa2673`; documentation reconciliation:
+`04001e7578cf26a19842f400fa3be44f67b71cc8`. All 56 reviewed source hashes
+match main after landing. New wave3 starts from that exact main commit; current
+wave3 `29f79b59` contains the approved P4 policy, P7 protocol and P7 skills leaves.
+Root P4 contract candidate `17871202a` passes 33 focused tests, normal contracts
+compiler, scoped lint and formatting. Additional internal transitions/output
+fields requested by the P4 owner are under validation. Wave3 `6bb8db009` also
+contains reviewed process `f746e690`; the phase remains incomplete.
+Preparatory branches retain their explicit earlier bases; P5 sync uses reconciled
+P2/transport base `9bdd1872`. Historical pause evidence remains below and in
+`pause-20260930/RESUME.md` under the worktree cache.
 
 ## Goal
 
@@ -556,7 +560,7 @@ prior verdict does not certify the new parallel assignments.
       `provider/pi/PiRuntimeContract.test.ts` and
       `projectWork/memory/MemoryBackendContract.test.ts` (under server `src/`).
 
-- [ ] **P2 — Extend contracts and persistence additively.**
+- [x] **P2 — Extend contracts and persistence additively.**
       Dependencies: P1 results for runtime/memory boundaries. Covers AC-2–AC-5,
       AC-7–AC-16; validation V2.
       Extend `packages/contracts/src/projectWork.ts`, `rpc.ts`, `settings.ts`, and their
@@ -576,7 +580,7 @@ prior verdict does not certify the new parallel assignments.
       external effect ID. Projection/reducer checkpoint version changes invalidate old
       derived caches and replay safely; unknown read variants remain displayable.
 
-- [ ] **P3 — Bind team authority to authenticated sessions.**
+- [x] **P3 — Bind team authority to authenticated sessions.**
       Dependencies: P2. Covers AC-4, AC-5, AC-7–AC-10, AC-12–AC-13; validation V3.
       Extend `ProjectWorkGateway.ts`, `auth/EnvironmentAuth.ts`,
       `auth/RpcAuthorization.ts`, `mcp/McpSessionRegistry.ts`,
@@ -2570,3 +2574,32 @@ P7 process owner reports 36 focused cases (19 portable, 17 actual Linux), three 
 ### Combined foundation review approves (2026-10-01)
 
 Fresh wave reviewer independently approves exact `8defdcf1241caf9c3276528e07da076573aa2673`, with no verified P2/P3 finding. Three new actual-SQL probes exercise post-fence binding conflict rollback, claimed outbox preservation through rebuild and typed gate receipt rollback/retry. Root verifies all 15 sealed review artifacts against manifest `b706091b73056223bad620d43e27dcccc36a6437fe43b835256b63112d8ef165`, all 56 reviewed source hashes and documentation-only main advancement. Review/proof scopes drain; 301 producer cases plus three independent probes pass. Baseline lint and all later runtime/client/product gates remain explicit. Root will reconcile latest saved documentation without source changes, then merge locally; no push/PR.
+
+### P2/P3 land locally on main (2026-10-01)
+
+Root reconciles saved main `580dd3b6c` into wave2 `04001e7578cf26a19842f400fa3be44f67b71cc8` with documentation-only changes; all 56 reviewed source hashes remain exact. No source/config/test/dependency/acceptance change requires repeated checks. Root locally merges wave2 into the main worktree at `1346f50af6f1361b0942fe1d42e636804e1ba9a0`; all 56 hashes match after landing and the tree is clean. P2 and P3 are now checked complete for their phase boundaries. Managed execution remains disabled; all 19 product acceptance criteria and later runtime/client/GitHub/platform gates remain open. No push or PR.
+
+P7 process repair `f746e690371995e20c97fd31b4992fa912b987dc` is committed on exact `7db547c70`, three assigned paths, 263 sealed artifacts (`9d811744d6b6697b6833c54dc6c564957ce726e1e2ca68f884bfd10163811cda`). Root inspection and the same process reviewer are next. Full P4/P7 implementation branches will start from this resulting main product commit once root-owned interfaces/scopes are fixed.
+
+### Wave3 begins after P2/P3 landing (2026-10-01)
+
+Base main `1346f50af6f1361b0942fe1d42e636804e1ba9a0`. Root merges only approved
+P4 policy, P7 protocol, P7 skills and repaired Linux process leaves into isolated
+`pi-teams/wave3`, resulting in `6bb8db00947b59d8c9e5ef05f10c90074a35b20e`.
+Root verifies all 231 final process-review artifacts, manifest
+`90d54646ba65d034df367d8da929d10198118e07939928c68cc65e874e206753`, final seal
+`0710c171a8b0ba1a1400d1d4ac47068015244f6aefa0194bb22cb9984fe3963e`.
+The same reviewer approves exact `f746e690`; 54 independent tests, three actual
+parent-EOF proofs, forced partial writes, two causal controls and 49 captured
+review drains are recorded. Root previously verifies all 263 producer artifacts
+and 47 inner drains. Full SDK/runtime, durable recovery and platforms remain open.
+
+Root shared interface candidate `17871202a` passes 33 focused contract/persistence
+tests, the normal contracts compiler, exact-path lint, format and whitespace.
+The interfaces remain outside the public write union until authenticated wiring
+and core transitions land. P4 core and independent P7 protocol/process extensions
+start in exclusive worktrees from exact `6bb8db009`, with Sol high owners, no
+delegation, one owner per scope and focused measured checks. P4 owner requests
+private claim/failure/repair transitions and non-code output applicability; root
+retains those shared contract changes. No phase completion or live-client proof
+is claimed by these preparatory integration merges.
