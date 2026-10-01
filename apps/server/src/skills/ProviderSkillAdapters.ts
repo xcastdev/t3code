@@ -1,6 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
 import * as NodePath from "node:path";
+import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 
 import {
@@ -243,6 +244,123 @@ const decodePiOwnershipMarker = Schema.decodeUnknownEffect(
 );
 const decodePiAllowedKeys = Schema.decodeUnknownEffect(Schema.ReadonlySet(ManagedSkillKey));
 
+// Custom output has no service collector. Detach it before removal so an async ownership
+// receipt cannot authorize deleting a replacement at the public path. The short final
+// metadata/marker check and restore have no async gap; recursive removal stays async.
+// The fresh 0700 cleanup directory is private to this preparation, not an adversarial
+// cross-process filesystem boundary. A foreign detached entry is restored or retained.
+const cleanupPiCustomRoot = async (owned: {
+  readonly root: string;
+  readonly dev: bigint;
+  readonly ino: bigint;
+  readonly marker: string;
+}) => {
+  const markerName = ".t3-owned.json";
+  const markerBytes = Buffer.from(owned.marker);
+  if (markerBytes.length > 64 * 1024) throw new Error("Ownership marker exceeds cleanup bound.");
+  const matches = async (root: string) => {
+    const info = await NodeFSP.lstat(root, { bigint: true });
+    const markerPath = NodePath.join(root, markerName);
+    const markerInfo = await NodeFSP.lstat(markerPath);
+    return (
+      info.isDirectory() &&
+      !info.isSymbolicLink() &&
+      info.dev === owned.dev &&
+      info.ino === owned.ino &&
+      markerInfo.isFile() &&
+      !markerInfo.isSymbolicLink() &&
+      (await NodeFSP.readFile(markerPath, "utf8")) === owned.marker
+    );
+  };
+  const matchesNow = (root: string) => {
+    let descriptor: number | undefined;
+    try {
+      const info = NodeFS.lstatSync(root, { bigint: true });
+      if (
+        !info.isDirectory() ||
+        info.isSymbolicLink() ||
+        info.dev !== owned.dev ||
+        info.ino !== owned.ino
+      )
+        return false;
+      descriptor = NodeFS.openSync(
+        NodePath.join(root, markerName),
+        NodeFS.constants.O_RDONLY | NodeFS.constants.O_NOFOLLOW,
+      );
+      const markerInfo = NodeFS.fstatSync(descriptor);
+      if (!markerInfo.isFile() || markerInfo.size !== markerBytes.length) return false;
+      const bytes = Buffer.alloc(markerBytes.length + 1);
+      const count = NodeFS.readSync(descriptor, bytes, 0, bytes.length, 0);
+      return count === markerBytes.length && bytes.subarray(0, count).equals(markerBytes);
+    } catch {
+      return false;
+    } finally {
+      if (descriptor !== undefined) NodeFS.closeSync(descriptor);
+    }
+  };
+  if (!(await matches(owned.root))) return;
+  const container = await NodeFSP.mkdtemp(
+    NodePath.join(NodePath.dirname(owned.root), ".t3-pi-cleanup-"),
+  );
+  const detached = NodePath.join(container, "root");
+  let failure: unknown;
+  try {
+    await NodeFSP.chmod(container, 0o700);
+    // Inspect the detached path even if a completed rename receipt reports failure.
+    let renameFailure: unknown;
+    try {
+      await NodeFSP.rename(owned.root, detached);
+    } catch (cause) {
+      renameFailure = cause;
+    }
+    let verified = false;
+    try {
+      verified = await matches(detached);
+    } catch {}
+    if (verified && matchesNow(detached)) {
+      await NodeFSP.rm(detached, { recursive: true });
+    } else {
+      let present = false;
+      try {
+        NodeFS.lstatSync(detached);
+        present = true;
+      } catch (cause) {
+        if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
+      }
+      if (present) {
+        let occupied = true;
+        try {
+          NodeFS.lstatSync(owned.root);
+        } catch (cause) {
+          if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") {
+            occupied = false;
+          } else {
+            throw cause;
+          }
+        }
+        if (occupied) {
+          throw new Error(
+            `Foreign cleanup output retained at ${detached}; original path occupied at ${owned.root}.`,
+          );
+        }
+        NodeFS.renameSync(detached, owned.root);
+      }
+      if (!present && renameFailure !== undefined) throw renameFailure;
+    }
+  } catch (cause) {
+    failure = cause;
+  } finally {
+    // Never recursively remove a container that might retain a foreign entry.
+    try {
+      await NodeFSP.rmdir(container);
+    } catch (cause) {
+      if (!(cause instanceof Error && "code" in cause && cause.code === "ENOTEMPTY"))
+        failure ??= cause;
+    }
+  }
+  if (failure !== undefined) throw failure;
+};
+
 /** The runtime must authorize the current managed binding and frozen role/configuration. */
 export function makePiSkillAdapter(input: {
   readonly providerInstanceId: ProviderInstanceId;
@@ -385,26 +503,17 @@ export function makePiSkillAdapter(input: {
                   marker.value.desiredRevision === materializationInput.desiredRevision
                 ) {
                   fallbackCleanup = Effect.tryPromise({
-                    try: async () => {
-                      const current = await NodeFSP.lstat(owned.root, { bigint: true });
-                      const markerPath = NodePath.join(owned.root, ".t3-owned.json");
-                      const markerInfo = await NodeFSP.lstat(markerPath);
-                      const matches =
-                        current.dev === owned.dev &&
-                        current.ino === owned.ino &&
-                        !current.isSymbolicLink() &&
-                        markerInfo.isFile() &&
-                        !markerInfo.isSymbolicLink() &&
-                        (await NodeFSP.readFile(markerPath, "utf8")) === owned.marker;
-                      if (matches) await NodeFSP.rm(owned.root, { recursive: true });
-                    },
+                    try: () => cleanupPiCustomRoot(owned),
                     catch: (cause) =>
                       adapterError(
                         "cleanup_failed",
                         "Could not verify materialization ownership.",
                         cause,
                       ),
-                  }).pipe(Effect.ignore);
+                  }).pipe(
+                    Effect.tapError((cause) => Effect.logWarning(cause)),
+                    Effect.ignore,
+                  );
                 }
               }
             }),

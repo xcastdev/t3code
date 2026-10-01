@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeFS from "node:fs";
+import * as NodeModule from "node:module";
 import { assert, describe, it } from "@effect/vitest";
 import {
   ManagedSkillKey,
@@ -13,6 +16,7 @@ import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Exit from "effect/Exit";
 import * as Schema from "effect/Schema";
+import * as Logger from "effect/Logger";
 
 import * as ServerConfig from "../config.ts";
 import * as Materialization from "./SkillMaterializationService.ts";
@@ -35,6 +39,7 @@ import {
 import { CODEX_MATERIALIZED_EXTENSION_PATH } from "../provider/Drivers/CodexSkillMaterializer.ts";
 
 const encodeFixtureJson = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const NodePromises = NodeFS.promises;
 const instanceId = ProviderInstanceId.make("codex");
 
 describe("ProviderSkillAdapters", () => {
@@ -320,10 +325,266 @@ const piFixture = Effect.fn("ProviderSkillAdapters.test.piFixture")(function* ()
 
 describe("Pi managed skill delivery", () => {
   it.layer(PiTestLayer)("enforces managed authorization", (it) => {
+    for (const scenario of [
+      { phase: "public", receipt: "root-stat", change: "replacement" },
+      { phase: "public", receipt: "marker-stat", change: "replacement" },
+      { phase: "public", receipt: "marker-read", change: "replacement" },
+      { phase: "detached", receipt: "root-stat", change: "replacement" },
+      { phase: "detached", receipt: "marker-stat", change: "replacement" },
+      { phase: "detached", receipt: "marker-read", change: "replacement" },
+      { phase: "detached", receipt: "rename", change: "replacement" },
+      { phase: "detached", receipt: "marker-read", change: "marker-bytes" },
+      { phase: "detached", receipt: "marker-read", change: "root-symlink" },
+      { phase: "detached", receipt: "marker-read", change: "occupied-restore" },
+      { phase: "detached", receipt: "rename", change: "public-owner" },
+      { phase: "detached", receipt: "rename", change: "rename-error" },
+    ] as const) {
+      it.effect(
+        `fallback cleanup ${scenario.change} after async ${scenario.phase} ${scenario.receipt} receipt`,
+        () =>
+          Effect.gen(function* () {
+            const fixture = yield* piFixture();
+            const parent = yield* fixture.fs.makeTempDirectoryScoped({
+              prefix: "pi-receipt-root-",
+            });
+            const root = fixture.path.join(parent, "acquired");
+            const markerPath = fixture.path.join(root, ".t3-owned.json");
+            const prior = yield* fixture.materialization.materialize({
+              sessionId: fixture.request.runtime.sessionId,
+              providerInstanceId: piInstanceId,
+              desiredRevision: fixture.request.desiredRevision,
+              packages: [{ key: piKey, sourcePath: fixture.source }],
+            });
+            const authorizing = yield* Deferred.make<void>();
+            const authRelease = yield* Deferred.make<void>();
+            const entered = Promise.withResolvers<void>();
+            const release = Promise.withResolvers<void>();
+            let copied = false;
+            let cleanup = false;
+            let held = false;
+            let detached: string | undefined;
+            const warnings: Array<string> = [];
+            const readFile = NodePromises.readFile;
+            const lstat = NodePromises.lstat;
+            const rename = NodePromises.rename;
+            const hold = async () => {
+              held = true;
+              entered.resolve();
+              await release.promise;
+            };
+            yield* Effect.acquireRelease(
+              Effect.sync(() => {
+                NodePromises.readFile = new Proxy(readFile, {
+                  async apply(target, receiver, args) {
+                    const result: unknown = await Reflect.apply(target, receiver, args);
+                    const watched = scenario.phase === "public" ? root : detached;
+                    if (
+                      cleanup &&
+                      !held &&
+                      scenario.receipt === "marker-read" &&
+                      watched !== undefined &&
+                      args[0] === fixture.path.join(watched, ".t3-owned.json")
+                    ) {
+                      await hold();
+                    }
+                    return result;
+                  },
+                });
+                NodePromises.lstat = new Proxy(lstat, {
+                  async apply(target, receiver, args) {
+                    const result: unknown = await Reflect.apply(target, receiver, args);
+                    const watched = scenario.phase === "public" ? root : detached;
+                    if (
+                      cleanup &&
+                      !held &&
+                      watched !== undefined &&
+                      args[0] ===
+                        (scenario.receipt === "root-stat"
+                          ? watched
+                          : fixture.path.join(watched, ".t3-owned.json")) &&
+                      (scenario.receipt === "root-stat" || scenario.receipt === "marker-stat")
+                    ) {
+                      await hold();
+                    }
+                    return result;
+                  },
+                });
+                NodePromises.rename = new Proxy(rename, {
+                  async apply(target, receiver, args) {
+                    const result: unknown = await Reflect.apply(target, receiver, args);
+                    if (cleanup && args[0] === root && typeof args[1] === "string") {
+                      detached = args[1];
+                      if (!held && scenario.receipt === "rename") {
+                        await hold();
+                        if (scenario.change === "rename-error")
+                          throw new Error("Completed rename receipt failed.");
+                      }
+                    }
+                    return result;
+                  },
+                });
+                NodeModule.syncBuiltinESMExports();
+              }),
+              () =>
+                Effect.sync(() => {
+                  NodePromises.readFile = readFile;
+                  NodePromises.lstat = lstat;
+                  NodePromises.rename = rename;
+                  NodeModule.syncBuiltinESMExports();
+                }),
+            );
+            const materialization: SkillMaterializationServiceShape = {
+              ...fixture.materialization,
+              materialize: (input) =>
+                Effect.gen(function* () {
+                  yield* fixture.fs.makeDirectory(root);
+                  yield* fixture.fs.copy(fixture.source, fixture.path.join(root, piKey));
+                  yield* fixture.fs.writeFileString(
+                    markerPath,
+                    yield* encodeFixtureJson({
+                      schemaVersion: 1,
+                      sessionId: input.sessionId,
+                      providerInstanceId: input.providerInstanceId,
+                      desiredRevision: input.desiredRevision,
+                    }),
+                  );
+                  copied = true;
+                  return { root, skillPaths: new Map([[piKey, fixture.path.join(root, piKey)]]) };
+                }).pipe(
+                  Effect.mapError(
+                    (cause) =>
+                      new Materialization.SkillMaterializationError({
+                        code: "materialization_failed",
+                        detail: "Receipt fixture failed.",
+                        cause,
+                      }),
+                  ),
+                ),
+            };
+            const adapter = makePiSkillAdapter({
+              providerInstanceId: piInstanceId,
+              materialization,
+              discoverCandidates: () => Effect.succeed([]),
+              authorizeManagedRequest: () =>
+                copied
+                  ? Deferred.succeed(authorizing, undefined).pipe(
+                      Effect.andThen(Deferred.await(authRelease)),
+                      Effect.as(new Set([piKey])),
+                    )
+                  : Effect.succeed(new Set([piKey])),
+            });
+            const fiber = yield* adapter
+              .prepareSession(fixture.request)
+              .pipe(
+                Effect.provide(
+                  Logger.layer([
+                    Logger.make((options) => warnings.push(Logger.formatSimple.log(options))),
+                  ]),
+                ),
+                Effect.forkChild,
+              );
+            yield* Deferred.await(authorizing);
+            cleanup = true;
+            const interrupt = yield* Fiber.interrupt(fiber).pipe(Effect.forkChild);
+            yield* Effect.promise(() => entered.promise);
+            const retained = fixture.path.join(parent, "retained-original");
+            const changed = scenario.phase === "public" ? root : detached;
+            if (changed === undefined)
+              throw new Error("Detach receipt did not capture its target.");
+            if (detached !== undefined) {
+              const container = fixture.path.dirname(detached);
+              const info = yield* Effect.promise(() => NodePromises.lstat(container));
+              assert.equal(info.mode & 0o777, 0o700);
+            }
+            if (scenario.change === "marker-bytes") {
+              yield* fixture.fs.writeFileString(
+                fixture.path.join(changed, ".t3-owned.json"),
+                "Foreign marker bytes.",
+              );
+            } else if (scenario.change === "root-symlink") {
+              yield* fixture.fs.rename(changed, retained);
+              yield* fixture.fs.symlink(fixture.source, changed);
+            } else if (scenario.change === "public-owner") {
+              yield* fixture.fs.makeDirectory(root);
+              yield* fixture.fs.writeFileString(
+                fixture.path.join(root, "foreign.txt"),
+                "Retain public owner.",
+              );
+            } else if (scenario.change !== "rename-error") {
+              yield* fixture.fs.rename(changed, retained);
+              yield* fixture.fs.copy(retained, changed);
+              yield* fixture.fs.writeFileString(
+                fixture.path.join(changed, "foreign.txt"),
+                "Retain receipt replacement.",
+              );
+              if (scenario.change === "occupied-restore") {
+                yield* fixture.fs.makeDirectory(root);
+                yield* fixture.fs.writeFileString(
+                  fixture.path.join(root, "foreign.txt"),
+                  "Retain public owner.",
+                );
+              }
+            }
+            release.resolve();
+            yield* Fiber.await(interrupt);
+            assert.isTrue(Exit.isFailure(yield* Fiber.await(fiber)));
+            if (scenario.change === "rename-error") {
+              assert.isFalse(yield* fixture.fs.exists(root));
+            } else {
+              assert.isTrue(yield* fixture.fs.exists(root));
+              if (scenario.change === "root-symlink") {
+                assert.equal(yield* fixture.fs.readLink(root), fixture.source);
+              } else if (scenario.change === "marker-bytes") {
+                assert.equal(yield* fixture.fs.readFileString(markerPath), "Foreign marker bytes.");
+              } else {
+                assert.equal(
+                  yield* fixture.fs.readFileString(fixture.path.join(root, "foreign.txt")),
+                  scenario.change === "occupied-restore" || scenario.change === "public-owner"
+                    ? "Retain public owner."
+                    : "Retain receipt replacement.",
+                );
+              }
+            }
+            if (scenario.change === "occupied-restore") {
+              if (detached === undefined)
+                throw new Error("Cleanup did not retain its detached target.");
+              assert.equal(
+                yield* fixture.fs.readFileString(fixture.path.join(detached, "foreign.txt")),
+                "Retain receipt replacement.",
+              );
+              assert.isTrue(
+                warnings.some((message) => message.includes("Foreign cleanup output retained at")),
+              );
+            } else {
+              assert.deepEqual(
+                (yield* fixture.fs.readDirectory(parent)).sort(),
+                scenario.change === "rename-error"
+                  ? []
+                  : scenario.change === "replacement" || scenario.change === "root-symlink"
+                    ? ["acquired", "retained-original"]
+                    : ["acquired"],
+              );
+              assert.deepEqual(warnings, []);
+            }
+            assert.isTrue(yield* fixture.fs.exists(prior.root));
+            if (
+              scenario.change === "replacement" ||
+              scenario.change === "occupied-restore" ||
+              scenario.change === "root-symlink"
+            )
+              assert.isTrue(yield* fixture.fs.exists(retained));
+            assert.include(
+              yield* fixture.fs.readFileString(fixture.path.join(fixture.source, "SKILL.md")),
+              "Review the assigned change.",
+            );
+          }),
+      );
+    }
+
     for (const invalidMap of [true, false]) {
-      for (const foreignMarker of [false, true]) {
+      for (const markerKind of ["owned", "foreign", "oversized"] as const) {
         it.effect(
-          `custom returned root ${invalidMap ? "invalid map" : "revocation"} ${foreignMarker ? "preserves foreign ownership" : "cleans only its own inode"}`,
+          `custom returned root ${invalidMap ? "invalid map" : "revocation"} ${markerKind === "foreign" ? "preserves foreign ownership" : markerKind === "oversized" ? "retains oversized marker with diagnostic" : "cleans only its own inode"}`,
           () =>
             Effect.gen(function* () {
               const fixture = yield* piFixture();
@@ -343,6 +604,7 @@ describe("Pi managed skill delivery", () => {
               const root = fixture.path.join(container, "acquired");
               let disposals = 0;
               let copied = false;
+              const warnings: Array<string> = [];
               const materialization: SkillMaterializationServiceShape = {
                 ...fixture.materialization,
                 materialize: (input) =>
@@ -352,12 +614,13 @@ describe("Pi managed skill delivery", () => {
                     const marker = yield* encodeFixtureJson({
                       schemaVersion: 1,
                       sessionId: input.sessionId,
-                      providerInstanceId: foreignMarker ? "foreign-pi" : input.providerInstanceId,
+                      providerInstanceId:
+                        markerKind === "foreign" ? "foreign-pi" : input.providerInstanceId,
                       desiredRevision: input.desiredRevision,
                     });
                     yield* fixture.fs.writeFileString(
                       fixture.path.join(root, ".t3-owned.json"),
-                      marker,
+                      markerKind === "oversized" ? marker + "\n".repeat(64 * 1024) : marker,
                     );
                     copied = true;
                     return {
@@ -399,7 +662,16 @@ describe("Pi managed skill delivery", () => {
                 authorizeManagedRequest: () =>
                   Effect.succeed(copied ? new Set<ManagedSkillKey>() : new Set([piKey])),
               });
-              const result = yield* adapter.prepareSession(fixture.request).pipe(Effect.result);
+              const result = yield* adapter
+                .prepareSession(fixture.request)
+                .pipe(
+                  Effect.provide(
+                    Logger.layer([
+                      Logger.make((options) => warnings.push(Logger.formatSimple.log(options))),
+                    ]),
+                  ),
+                  Effect.result,
+                );
               assert.equal(result._tag, "Failure");
               if (result._tag === "Failure")
                 assert.equal(
@@ -411,7 +683,14 @@ describe("Pi managed skill delivery", () => {
                 yield* fixture.fs.readFileString(fixture.path.join(previous.root, "prior.txt")),
                 "Retain previously completed generation.",
               );
-              assert.equal(yield* fixture.fs.exists(root), foreignMarker);
+              assert.equal(yield* fixture.fs.exists(root), markerKind !== "owned");
+              if (markerKind === "oversized")
+                assert.isTrue(
+                  warnings.some((message) =>
+                    message.includes("Ownership marker exceeds cleanup bound."),
+                  ),
+                );
+              else assert.deepEqual(warnings, []);
               assert.equal(disposals, 0);
               assert.include(
                 yield* fixture.fs.readFileString(fixture.path.join(fixture.source, "SKILL.md")),
