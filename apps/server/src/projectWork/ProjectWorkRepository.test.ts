@@ -892,7 +892,11 @@ import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as TeamAuthorization from "./ProjectTeamAuthorization.ts";
-import { seed as seedTeam, decodeRecord } from "./ProjectTeamAuthorization.testFixtures.ts";
+import {
+  seed as seedTeam,
+  decodeRecord,
+  createManagedAssignment,
+} from "./ProjectTeamAuthorization.testFixtures.ts";
 import * as EventBus from "./ProjectWorkEventBus.ts";
 
 const bindingServices = Layer.mergeAll(
@@ -1008,7 +1012,7 @@ it.effect(
             yield* repository.replay(p),
           );
           return state;
-        }).pipe(Effect.provide(services), Effect.provide(database())),
+        }).pipe(Effect.provide(services.pipe(Layer.provideMerge(database())))),
       );
       yield* Effect.scoped(
         Effect.gen(function* () {
@@ -1033,7 +1037,7 @@ it.effect(
           ).toBe(2);
           expect(rebuilt.evidence[0]!.detail).toContain("Retained finding");
           expect(rebuilt.evidence[0]!.scopeHash).toMatch(/^[a-f0-9]{64}$/);
-        }).pipe(Effect.provide(services), Effect.provide(database())),
+        }).pipe(Effect.provide(services.pipe(Layer.provideMerge(database())))),
       );
     }).pipe(Effect.provide(NodeServices.layer)),
 );
@@ -1167,7 +1171,7 @@ for (const failure of [
   );
 
 it.effect(
-  "preserves binding withdrawal through retirement, replacement and file-backed restart",
+  "preserves binding withdrawal through Human pause, a new assignment and file-backed restart",
   () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
@@ -1201,16 +1205,70 @@ it.effect(
               .pipe(Effect.result))._tag,
           ).toBe("Failure");
           yield* insertBindingSession("retired");
-          yield* f.change(decodeRecord({ ...f.binding, revision: 1, status: "settled" }));
-          yield* insertBindingSession("replacement", "agent:mcp:codex:replacement-thread");
-          yield* f.change(
-            decodeRecord({
-              ...f.binding,
-              recordId: "replacement-binding",
-              providerInstanceId: "codex",
-              threadId: "replacement-thread",
-            }),
+          const state = applyProjectWorkEvents(
+            emptyProjectWorkReducerState(f.binding.projectId),
+            yield* f.repo.replay(f.binding.projectId),
           );
+          const task = state.tasks.find((entry) => entry.taskId === f.binding.taskId)!;
+          yield* f.repo.execute({
+            type: "project-work.foundation.commit",
+            projectId: f.binding.projectId,
+            commandId: CommandId.make("pause-original-assignment"),
+            expectedRevision: state.revision,
+            attribution: {
+              actor: { kind: "human", id: "maintainer" },
+              source: { kind: "web", id: "withdrawal-client" },
+              recordedAt: at,
+            },
+            records: [],
+            committedAt: at,
+            guided: {
+              intent: {
+                type: "project-team.task.control",
+                projectId: f.binding.projectId,
+                taskId: task.taskId,
+                commandId: CommandId.make("pause-original-assignment"),
+                expectedRevision: state.revision,
+                expectedTaskRevision: task.revision,
+                control: { action: "pause", reason: "Human stops the original assignment" },
+              },
+            },
+          });
+          expect(
+            (yield* f.sql`SELECT status FROM project_team_run_binding WHERE record_id=${f.binding.recordId}`)[0]
+              ?.status,
+          ).toBe("stopping");
+          expect(
+            (yield* f.auth
+              .issueCredential({
+                providerInstanceId: f.binding.providerInstanceId,
+                threadId: f.binding.threadId,
+              })
+              .pipe(Effect.result))._tag,
+          ).toBe("Failure");
+          yield* insertBindingSession("replacement", "agent:mcp:codex:replacement-thread");
+          const replacement = yield* createManagedAssignment({
+            taskId: ProjectWorkTaskId.make("replacement-task"),
+            recordId: "replacement-binding",
+            attemptId: "replacement-attempt",
+            commandId: "replacement-dispatch",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            threadId: ThreadId.make("replacement-thread"),
+            sessionId: "replacement-native-session",
+            role: f.role,
+            configuration: f.binding.configuration,
+            status: "running",
+          });
+          expect(replacement.taskId).not.toBe(f.binding.taskId);
+          expect(replacement.attemptId).not.toBe(f.binding.attemptId);
+          const currentIdentity = {
+            providerInstanceId: replacement.providerInstanceId,
+            threadId: replacement.threadId,
+          };
+          expect((yield* f.auth.issueCredential(currentIdentity))?.credential).toMatchObject({
+            bindingId: replacement.recordId,
+            generation: replacement.generation,
+          });
           yield* insertBindingSession("rebuild-only", "agent:mcp:codex:replacement-thread");
           yield* f.sql`DELETE FROM project_team_identity_fences WHERE provider_instance_id='codex'`;
           const projection = yield* ProjectWorkProjection;
@@ -1224,11 +1282,8 @@ it.effect(
           ]);
           yield* f.change(
             decodeRecord({
-              ...f.binding,
-              recordId: "replacement-binding",
-              providerInstanceId: "codex",
-              threadId: "replacement-thread",
-              revision: 1,
+              ...replacement,
+              revision: replacement.revision + 1,
             }),
           );
           yield* f.sql`DELETE FROM project_team_run_binding`;
