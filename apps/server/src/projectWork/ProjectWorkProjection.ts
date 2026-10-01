@@ -1,4 +1,5 @@
 import { isProjectWorkTombstoned } from "./ProjectTeamsPersistence.ts";
+import { readProjectWorkEvidenceMetadata } from "./ProjectWorkEvidenceMetadata.ts";
 import {
   ensureProjectTeamsTables,
   persistProjectTeamProjections,
@@ -211,12 +212,13 @@ export const readProjectWorkState = (sql: SqlClient.SqlClient, projectId: string
     );
     const evidence = yield* sql<
       Record<string, unknown>
-    >`SELECT evidence_id AS evidenceId, task_id AS taskId, criterion_id AS criterionId, kind, summary, detail, uri, recorded_at AS recordedAt, revision, attribution_json AS attributionJson FROM project_work_evidence WHERE project_id = ${projectId}`;
+    >`SELECT *, evidence_id AS evidenceId, task_id AS taskId, criterion_id AS criterionId, kind, summary, detail, uri, recorded_at AS recordedAt, revision, attribution_json AS attributionJson FROM project_work_evidence WHERE project_id = ${projectId}`;
     state.evidence.push(
       ...evidence.map(
         (row) =>
           ({
             evidenceId: ProjectWorkEvidenceId.make(String(row.evidenceId)),
+            ...readProjectWorkEvidenceMetadata(row),
             ...(row.taskId == null ? {} : { taskId: ProjectWorkTaskId.make(String(row.taskId)) }),
             ...(row.criterionId == null
               ? {}
@@ -721,8 +723,12 @@ export const persistProjectWorkState = (
     for (const criterion of state.criteria) {
       yield* sql`INSERT INTO project_work_criteria (criterion_id, project_id, task_id, description, required, status, satisfied_by_evidence_ids_json, waiver_json, revision, updated_at) VALUES (${criterion.criterionId}, ${projectId}, ${criterion.taskId}, ${criterion.description}, ${criterion.required ? 1 : 0}, ${criterion.status}, ${json(criterion.satisfiedByEvidenceIds)}, ${criterion.waiver === undefined ? null : json(criterion.waiver)}, ${criterion.revision}, ${criterion.updatedAt})`;
     }
-    for (const evidence of state.evidence)
-      yield* sql`INSERT INTO project_work_evidence (evidence_id, project_id, task_id, criterion_id, kind, summary, detail, uri, recorded_at, revision, attribution_json) VALUES (${evidence.evidenceId}, ${projectId}, ${evidence.taskId ?? null}, ${evidence.criterionId ?? null}, ${evidence.kind}, ${evidence.summary}, ${evidence.detail ?? null}, ${evidence.uri ?? null}, ${evidence.recordedAt}, ${evidence.revision}, ${evidence.attribution === undefined ? null : json(evidence.attribution)})`;
+    for (const evidence of state.evidence) {
+      if (evidence.scopeHash !== undefined || evidence.outputArtifactIds !== undefined)
+        yield* sql`INSERT INTO project_work_evidence (evidence_id, project_id, task_id, criterion_id, kind, summary, detail, uri, recorded_at, revision, attribution_json, scope_hash, output_artifact_ids_json) VALUES (${evidence.evidenceId}, ${projectId}, ${evidence.taskId ?? null}, ${evidence.criterionId ?? null}, ${evidence.kind}, ${evidence.summary}, ${evidence.detail ?? null}, ${evidence.uri ?? null}, ${evidence.recordedAt}, ${evidence.revision}, ${evidence.attribution === undefined ? null : json(evidence.attribution)}, ${evidence.scopeHash ?? null}, ${evidence.outputArtifactIds === undefined ? null : json(evidence.outputArtifactIds)})`;
+      else
+        yield* sql`INSERT INTO project_work_evidence (evidence_id, project_id, task_id, criterion_id, kind, summary, detail, uri, recorded_at, revision, attribution_json) VALUES (${evidence.evidenceId}, ${projectId}, ${evidence.taskId ?? null}, ${evidence.criterionId ?? null}, ${evidence.kind}, ${evidence.summary}, ${evidence.detail ?? null}, ${evidence.uri ?? null}, ${evidence.recordedAt}, ${evidence.revision}, ${evidence.attribution === undefined ? null : json(evidence.attribution)})`;
+    }
     for (const relationship of state.relationships)
       yield* sql`INSERT INTO project_work_relationships (relationship_id, project_id, from_task_id, to_task_id, kind, revision, created_at, attribution_json) VALUES (${relationship.relationshipId}, ${projectId}, ${relationship.fromTaskId}, ${relationship.toTaskId}, ${relationship.kind}, ${relationship.revision}, ${relationship.createdAt}, ${relationship.attribution === undefined ? null : json(relationship.attribution)})`;
     for (const blocker of state.blockers)
