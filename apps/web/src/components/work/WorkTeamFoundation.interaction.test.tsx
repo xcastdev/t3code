@@ -115,6 +115,11 @@ describe("Work task entrypoint through mounted environment atoms", () => {
   let writes: ProjectWorkWriteIntent[];
   let reads: ProjectWorkReadIntent[];
   let failWrite: boolean;
+  let holdWrite: boolean;
+  let writeStarted: Promise<void>;
+  let startWrite: () => void;
+  let writeRelease: Promise<void>;
+  let releaseWrite: () => void;
   let foundationFailure: boolean;
   let foundations: Map<string, unknown>;
   let taskPages: Map<number, unknown>;
@@ -133,6 +138,13 @@ describe("Work task entrypoint through mounted environment atoms", () => {
     writes = [];
     reads = [];
     failWrite = false;
+    holdWrite = false;
+    writeStarted = new Promise<void>((resolve) => {
+      startWrite = resolve;
+    });
+    writeRelease = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
     foundationFailure = false;
     foundations = new Map();
     taskPages = new Map();
@@ -182,7 +194,7 @@ describe("Work task entrypoint through mounted environment atoms", () => {
                   taskId: task.taskId,
                   readiness: { ready: false, reasons: [] },
                   claimability: { claimable: false },
-                  actions: {},
+                  actions: { reopen: { available: true } },
                   attention: [],
                 },
               };
@@ -197,9 +209,13 @@ describe("Work task entrypoint through mounted environment atoms", () => {
           });
         }),
       [WS_METHODS.projectWorkWrite]: (input: ProjectWorkWriteIntent) =>
-        Effect.suspend(() => {
+        Effect.gen(function* () {
           writes.push(input);
-          return failWrite
+          if (holdWrite) {
+            startWrite();
+            yield* Effect.promise(() => writeRelease);
+          }
+          return yield* failWrite
             ? Effect.fail(new TestConnectionError())
             : Effect.succeed({
                 projectId,
@@ -915,5 +931,328 @@ describe("Work task entrypoint through mounted environment atoms", () => {
         });
       },
     );
+  }
+  const legacyRecords = () => [issue, { ...membership, executionKind: "legacy" }];
+  async function fillLegacySpecification() {
+    await act(async () => {
+      for (const field of host.querySelectorAll<HTMLTextAreaElement>("textarea")) {
+        Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(
+          field,
+          "Current human scope",
+        );
+        field.dispatchEvent(new Event("input", { bubbles: true }));
+      }
+      const criterion = host.querySelector<HTMLInputElement>(
+        'input[placeholder="How will we know it is done?"]',
+      )!;
+      changeValue(criterion, "A meaningful criterion");
+    });
+  }
+  for (const action of ["legacy-specification", "legacy-lifecycle", "managed-refinement"]) {
+    interaction(
+      "independent: native foundation refresh before React commit for " + action,
+      async () => {
+        records = action === "managed-refinement" ? [issue, membership] : legacyRecords();
+        await render();
+        await act(async () =>
+          settle(atoms.taskContext({ environmentId, projectId, taskId: task.taskId })),
+        );
+        if (action === "legacy-specification") await fillLegacySpecification();
+        if (action === "managed-refinement") await click("Refine issue");
+        const control = button(
+          action === "legacy-specification"
+            ? "Save specification"
+            : action === "legacy-lifecycle"
+              ? "Reopen"
+              : "Save refinement",
+        )!;
+        expect(control.disabled).toBe(false);
+        const foundation = atoms.foundationPage({ environmentId, projectId });
+        let notify!: () => void;
+        const observed = new Promise<void>((resolve) => {
+          notify = resolve;
+        });
+        let once = false;
+        const observations: unknown[] = [];
+        const dispose = registry.subscribe(foundation, (value) => {
+          const raw = Option.getOrNull(AsyncResult.value(value));
+          if (
+            value._tag !== "Success" ||
+            value.waiting ||
+            once ||
+            typeof raw !== "object" ||
+            raw === null ||
+            !("items" in raw) ||
+            !Array.isArray(raw.items) ||
+            !raw.items.some((item) => item.kind === "future-record")
+          )
+            return;
+          once = true;
+          observations.push({ disabled: control.disabled, waiting: value.waiting });
+          control.click();
+          notify();
+        });
+        await act(async () => {
+          records.push({
+            kind: "future-record",
+            recordId: "future",
+            projectId,
+            revision: 1,
+            generation: 0,
+            updatedAt: at,
+            status: "future",
+          });
+          registry.refresh(foundation);
+          await observed;
+        });
+        dispose();
+        expect(observations).toEqual([{ disabled: false, waiting: false }]);
+        const expected = 0;
+        expect(writes).toHaveLength(expected);
+        if (expected > 0) expect(writes[0]?.expectedRevision).toBe(10);
+      },
+    );
+  }
+  interaction("independent: committed unknown foundation blocks legacy specification", async () => {
+    records = legacyRecords();
+    await render();
+    await fillLegacySpecification();
+    const control = button("Save specification")!;
+    records.push({
+      kind: "future-record",
+      recordId: "future",
+      projectId,
+      revision: 1,
+      generation: 0,
+      updatedAt: at,
+      status: "future",
+    });
+    await act(async () => {
+      registry.refresh(atoms.foundationPage({ environmentId, projectId }));
+      await settle(atoms.foundationPage({ environmentId, projectId }));
+    });
+    expect(control.disabled).toBe(true);
+    await act(async () => control.click());
+    expect(writes).toEqual([]);
+  });
+  for (const kind of ["legacy-specification", "managed-refinement"]) {
+    interaction("independent: repeated native clicks in one event for " + kind, async () => {
+      records = kind === "legacy-specification" ? legacyRecords() : [issue, membership];
+      await render();
+      if (kind === "legacy-specification") await fillLegacySpecification();
+      else await click("Refine issue");
+      const control = button(
+        kind === "legacy-specification" ? "Save specification" : "Save refinement",
+      )!;
+      expect(control.disabled).toBe(false);
+      await act(async () => {
+        control.click();
+        control.click();
+      });
+      const expected = kind === "legacy-specification" ? 2 : 1;
+      expect(writes).toHaveLength(expected);
+      if (kind === "legacy-specification") {
+        const firstStages = writes.filter(
+          (intent) => intent.type === "project-work.criterion.upsert",
+        );
+        expect(firstStages).toHaveLength(1);
+        expect(writes.filter((intent) => intent.type === "project-work.task.specify")).toHaveLength(
+          1,
+        );
+        expect(firstStages.every((intent) => intent.expectedRevision === 10)).toBe(true);
+      }
+    });
+  }
+
+  interaction(
+    "independent compatibility: ordinary legacy work survives absent guided-write capability",
+    async () => {
+      records = [issue, { ...membership, executionKind: "legacy" }];
+      await render(true, false);
+      expect(host.textContent).toContain("Define this task");
+      expect(button("New task")?.disabled).toBe(false);
+      expect(
+        host.querySelector<HTMLTextAreaElement>(
+          'textarea[placeholder="What outcome should exist?"]',
+        )?.disabled,
+      ).toBe(false);
+      expect(writes).toEqual([]);
+      await act(async () => {
+        root.render(
+          <RegistryContext.Provider value={registry}>
+            <WorkTasks
+              environmentId={environmentId}
+              projectId={projectId}
+              connected
+              enabled
+              teamReadSupported={false}
+              guidedWritesSupported={false}
+            />
+          </RegistryContext.Provider>,
+        );
+        await settle(atoms.page({ environmentId, projectId, collection: "tasks", offset: 0 }));
+      });
+      expect(button("New task")?.disabled).toBe(false);
+      expect(
+        host.querySelector<HTMLTextAreaElement>(
+          'textarea[placeholder="What outcome should exist?"]',
+        )?.disabled,
+      ).toBe(false);
+      await click("New task");
+      const input = host.querySelector<HTMLInputElement>(
+        'input[placeholder="e.g. Document the release checklist"]',
+      )!;
+      await act(async () => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(
+          input,
+          "Ordinary legacy capture",
+        );
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      await click("Create draft");
+      expect(writes).toHaveLength(1);
+      expect(writes[0]?.type).toBe("project-work.task.create");
+    },
+  );
+  for (const guided of [false, undefined]) {
+    interaction(
+      "legacy specification remains writable with foundation reads and guided capability " +
+        String(guided),
+      async () => {
+        records = legacyRecords();
+        bridge.config = Atom.make({
+          settings: { projectWorkEnabled: true },
+          environment: {
+            capabilities: {
+              projectTeamFoundationReads: true,
+              ...(guided === undefined ? {} : { projectTeamGuidedWrites: guided }),
+            },
+          },
+        });
+        await act(async () =>
+          root.render(
+            <RegistryContext.Provider value={registry}>
+              <WorkPage environmentId={environmentId} projectId={projectId} />
+            </RegistryContext.Provider>,
+          ),
+        );
+        await click("Tasks");
+        await act(async () => {
+          await settle(atoms.foundationPage({ environmentId, projectId }));
+          await settle(atoms.page({ environmentId, projectId, collection: "tasks", offset: 0 }));
+        });
+        expect(button("New task")?.disabled).toBe(false);
+        expect(button("Refine issue")?.disabled).toBe(true);
+        await fillLegacySpecification();
+        await click("Save specification");
+        expect(
+          writes.map((command) => [
+            command.type,
+            "expectedRevision" in command ? command.expectedRevision : null,
+          ]),
+        ).toEqual([
+          ["project-work.criterion.upsert", 10],
+          ["project-work.task.specify", 11],
+        ]);
+      },
+    );
+  }
+
+  interaction(
+    "rechecks live eligibility after the criterion receipt and resumes its exact specification",
+    async () => {
+      records = legacyRecords();
+      await render();
+      await fillLegacySpecification();
+      const objective = host.querySelector<HTMLTextAreaElement>(
+        'textarea[placeholder="What outcome should exist?"]',
+      )!;
+      holdWrite = true;
+      await act(async () => {
+        button("Save specification")!.click();
+        await writeStarted;
+      });
+      expect(writes).toHaveLength(1);
+      records.push({
+        kind: "future-record",
+        recordId: "future",
+        projectId,
+        revision: 1,
+        generation: 0,
+        updatedAt: at,
+        status: "future",
+      });
+      await act(async () => {
+        registry.refresh(atoms.foundationPage({ environmentId, projectId }));
+        await settle(atoms.foundationPage({ environmentId, projectId }));
+        holdWrite = false;
+        releaseWrite();
+      });
+      expect(writes).toHaveLength(1);
+      expect(host.querySelector('textarea[placeholder="What outcome should exist?"]')).toBe(
+        objective,
+      );
+      expect(objective.value).toBe("Current human scope");
+      records = legacyRecords();
+      revision = 11;
+      taskRevision = 11;
+      await act(async () => {
+        registry.refresh(atoms.foundationPage({ environmentId, projectId }));
+        registry.refresh(atoms.page({ environmentId, projectId, collection: "tasks", offset: 0 }));
+        await settle(atoms.foundationPage({ environmentId, projectId }));
+        await settle(atoms.page({ environmentId, projectId, collection: "tasks", offset: 0 }));
+      });
+      await click("Save specification");
+      expect(writes).toHaveLength(2);
+      expect(writes[1]).toMatchObject({
+        type: "project-work.task.specify",
+        expectedRevision: 11,
+        specification: { objective: "Current human scope" },
+      });
+      expect(
+        writes.filter((command) => command.type === "project-work.criterion.upsert"),
+      ).toHaveLength(1);
+    },
+  );
+
+  for (const action of ["capture", "ready", "lifecycle"]) {
+    interaction("synchronously fences repeated legacy " + action + " clicks", async () => {
+      records = legacyRecords();
+      if (action === "ready")
+        taskPages.set(0, {
+          projectId,
+          revision: 10,
+          items: [{ ...task, state: "specified" }],
+          hasMore: false,
+        });
+      await render();
+      let label = "Reopen";
+      if (action === "capture") {
+        await click("New task");
+        const input = host.querySelector<HTMLInputElement>(
+          'input[placeholder="e.g. Document the release checklist"]',
+        )!;
+        await act(async () => changeValue(input, "Once only"));
+        label = "Create draft";
+      } else if (action === "ready") {
+        await act(async () =>
+          [...host.querySelectorAll<HTMLButtonElement>("button")]
+            .find((button) => button.textContent?.includes(task.title))!
+            .click(),
+        );
+        label = "Mark ready";
+      } else {
+        await act(async () =>
+          settle(atoms.taskContext({ environmentId, projectId, taskId: task.taskId })),
+        );
+      }
+      const control = button(label)!;
+      expect(control).not.toBeUndefined();
+      await act(async () => {
+        control.click();
+        control.click();
+      });
+      expect(writes).toHaveLength(1);
+    });
   }
 });

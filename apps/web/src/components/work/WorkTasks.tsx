@@ -11,6 +11,7 @@ import {
   type ProjectId,
   type ProjectWorkCommand,
   type ProjectWorkTaskRead,
+  type ProjectWorkWriteResult,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 import * as Option from "effect/Option";
@@ -67,6 +68,11 @@ type TaskSpecifyCommand = Extract<
   { readonly type: "project-work.task.specify" }
 >;
 
+type LegacyWrite = (
+  command: ProjectWorkCommand,
+  continuation?: { readonly fromRevision: number; readonly toRevision: number },
+) => Promise<ProjectWorkWriteResult>;
+
 type SpecificationRetry =
   | { readonly stage: "criterion"; readonly criterion: CriterionUpsertCommand }
   | {
@@ -98,7 +104,7 @@ export function WorkTasks(props: WorkTasksProps) {
       projectId={props.projectId}
       connected={props.connected}
       enabled={props.enabled}
-      supported={props.guidedWritesSupported === true}
+      supported={props.teamReadSupported === true}
     >
       {(foundation) => (
         <WorkTaskQueue
@@ -150,24 +156,22 @@ function WorkTaskQueue({
       mounted.current = false;
     };
   }, []);
-  const loadedPages = foundation
-    ? offsets.map((offset) => {
-        const result = registry.get(
-          projectWorkEnvironment.page({
-            environmentId,
-            projectId,
-            collection: "tasks",
-            offset,
-            ...(streamAvailable ? { poll: false } : {}),
-          }),
-        );
-        const page = asProjectWorkPage<ProjectWorkTaskRead>(
-          Option.getOrNull(AsyncResult.value(result)),
-          offset,
-        );
-        return { result, page };
-      })
-    : [];
+  const loadedPages = offsets.map((offset) => {
+    const result = registry.get(
+      projectWorkEnvironment.page({
+        environmentId,
+        projectId,
+        collection: "tasks",
+        offset,
+        ...(streamAvailable ? { poll: false } : {}),
+      }),
+    );
+    const page = asProjectWorkPage<ProjectWorkTaskRead>(
+      Option.getOrNull(AsyncResult.value(result)),
+      offset,
+    );
+    return { result, page };
+  });
   const tasks = loadedPages.flatMap(({ page }) => page.records);
   const taskPagesCurrent =
     foundation !== undefined &&
@@ -233,13 +237,12 @@ function WorkTaskQueue({
       Extract<ProjectWorkWriteIntent, { readonly type: "project-team.investigation.start" }>
     >(),
   );
-  const verifyQueue = () => {
+  const verifyQueue = (continuationRevision?: number) => {
     if (!mounted.current || !access.current.connected || !access.current.enabled)
       throw { code: "unavailable", message: "Reconnect before making changes." };
-    if (!foundation && !access.current.guidedWritesSupported) return null;
-    if (!foundation || !access.current.guidedWritesSupported)
+    if (!foundation && access.current.guidedWritesSupported)
       throw { code: "unavailable", message: "Reconnect to a server that supports guided changes." };
-    const fresh = foundation.verify();
+    const fresh = foundation?.verify() ?? null;
     const pages = offsets.map((offset) =>
       registry.get(
         projectWorkEnvironment.page({
@@ -264,7 +267,8 @@ function WorkTaskQueue({
         return (
           result._tag === "Success" &&
           !result.waiting &&
-          page.revision === fresh.revision &&
+          (fresh === null || page.revision !== null) &&
+          page.revision === (fresh?.revision ?? loadedPages[0]?.page.revision) &&
           page.records.every((task) => task.projectId === projectId && knownTask(task))
         );
       }) ||
@@ -274,13 +278,28 @@ function WorkTaskQueue({
         code: "stale-revision",
         message: "Project work changed. Refresh and review the current revisions.",
       };
-    if (writeLock.current || acceptedRevision.current === fresh.revision)
+    const revision =
+      fresh?.revision ?? asProjectWorkPage(Option.getOrNull(AsyncResult.value(pages[0]!))).revision;
+    if (
+      writeLock.current ||
+      (acceptedRevision.current !== null &&
+        revision !== null &&
+        acceptedRevision.current >= revision &&
+        !(continuationRevision === acceptedRevision.current && revision === continuationRevision))
+    )
       throw { code: "stale-revision", message: "Wait for the saved project work to refresh." };
     return fresh;
   };
   const send = async (intent: ProjectWorkWriteIntent) => {
+    if (!access.current.guidedWritesSupported)
+      throw { code: "unavailable", message: "This server does not support guided changes." };
     const fresh = verifyQueue();
-    if (!fresh || intent.projectId !== projectId || intent.expectedRevision !== fresh.revision)
+    if (
+      !fresh ||
+      fresh.revision === null ||
+      intent.projectId !== projectId ||
+      intent.expectedRevision !== fresh.revision
+    )
       throw {
         code: "stale-revision",
         message: "Project work changed. Refresh and review the current revisions.",
@@ -289,7 +308,72 @@ function WorkTaskQueue({
     try {
       const result = await write({ environmentId, input: intent });
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
-      acceptedRevision.current = fresh.revision;
+      acceptedRevision.current = Math.max(acceptedRevision.current ?? -1, fresh.revision);
+    } finally {
+      writeLock.current = false;
+    }
+  };
+  const writeLegacy: LegacyWrite = async (command, continuation) => {
+    const fresh = verifyQueue(continuation?.fromRevision);
+    const latestPages = offsets.map((offset) =>
+      asProjectWorkPage<ProjectWorkTaskRead>(
+        Option.getOrNull(
+          AsyncResult.value(
+            registry.get(
+              projectWorkEnvironment.page({
+                environmentId,
+                projectId,
+                collection: "tasks",
+                offset,
+                ...(streamAvailable ? { poll: false } : {}),
+              }),
+            ),
+          ),
+        ),
+      ),
+    );
+    const revision = fresh?.revision ?? latestPages[0]?.revision;
+    const taskId = "taskId" in command ? command.taskId : undefined;
+    const task = latestPages.flatMap((page) => page.records).find((item) => item.taskId === taskId);
+    const memberships =
+      fresh?.records.filter(
+        (record) =>
+          record.kind === "task-membership" && "taskId" in record && record.taskId === taskId,
+      ) ?? [];
+    const member = memberships[0];
+    if (
+      command.projectId !== projectId ||
+      !task ||
+      !knownTask(task) ||
+      (fresh &&
+        !(
+          memberships.length === 0 ||
+          (memberships.length === 1 &&
+            member &&
+            knownFoundationRecord(member) &&
+            member.kind === "task-membership" &&
+            member.executionKind === "legacy" &&
+            member.status === "active")
+        )) ||
+      !("expectedRevision" in command) ||
+      !(
+        command.expectedRevision === revision ||
+        (continuation &&
+          revision === continuation.fromRevision &&
+          command.expectedRevision === continuation.toRevision &&
+          continuation.toRevision > continuation.fromRevision)
+      )
+    )
+      throw {
+        code: "stale-revision",
+        message: "Refresh the current legacy task before making changes.",
+      };
+    writeLock.current = true;
+    try {
+      const result = await write({ environmentId, input: command });
+      if (result._tag === "Failure") throw squashAtomCommandFailure(result);
+      acceptedRevision.current = Math.max(acceptedRevision.current ?? -1, command.expectedRevision);
+      return result.value;
     } finally {
       writeLock.current = false;
     }
@@ -302,7 +386,9 @@ function WorkTaskQueue({
     try {
       const result = await write({ environmentId, input: command });
       if (result._tag === "Failure") throw squashAtomCommandFailure(result);
-      acceptedRevision.current = fresh?.revision ?? null;
+      const revision = fresh?.revision ?? loadedPages[0]?.page.revision;
+      if (revision !== null && revision !== undefined)
+        acceptedRevision.current = Math.max(acceptedRevision.current ?? -1, revision);
     } finally {
       writeLock.current = false;
     }
@@ -379,7 +465,9 @@ function WorkTaskQueue({
     if (mounted.current) refresh();
   };
 
-  const queueCanWrite = foundation ? guidedCanWrite : canWrite && !guidedWritesSupported;
+  const queueCanWrite = foundation
+    ? canWrite && foundation.current && taskPagesCurrent
+    : canWrite && !guidedWritesSupported;
 
   const reportPage = useCallback((offset: number, hasNext: boolean) => {
     setHasMoreByOffset((current) =>
@@ -456,6 +544,7 @@ function WorkTaskQueue({
             streamAvailable={streamAvailable}
             onPageState={reportPage}
             onPageData={notifyPage}
+            onLegacyWrite={writeLegacy}
             guidedAccess={{ connected, enabled, supported: guidedWritesSupported }}
             {...(foundation ? { foundation, guidedCanWrite, onGuidedWrite: send } : {})}
           />
@@ -479,6 +568,7 @@ function TaskPage({
   streamAvailable,
   onPageState,
   onPageData,
+  onLegacyWrite,
   guidedAccess,
   foundation,
   guidedCanWrite = false,
@@ -492,6 +582,7 @@ function TaskPage({
   readonly streamAvailable: boolean;
   readonly onPageState: (offset: number, hasNext: boolean) => void;
   readonly onPageData: () => void;
+  readonly onLegacyWrite: LegacyWrite;
   readonly guidedAccess: {
     readonly connected: boolean;
     readonly enabled: boolean;
@@ -550,6 +641,7 @@ function TaskPage({
             canWrite={canWrite}
             streamAvailable={streamAvailable}
             aggregateRevision={page.revision}
+            onLegacyWrite={onLegacyWrite}
             guidedAccess={guidedAccess}
             {...(foundation ? { foundation, guidedCanWrite, onGuidedWrite } : {})}
           />
@@ -584,6 +676,7 @@ function NewTaskForm({
   const [submitting, setSubmitting] = useState(false);
   const [retryCommand, setRetryCommand] = useState<TaskCreateCommand | null>(null);
   const mounted = useRef(true);
+  const busy = useRef(false);
 
   useLayoutEffect(() => {
     mounted.current = true;
@@ -594,7 +687,9 @@ function NewTaskForm({
 
   const submit = useCallback(async () => {
     const nextTitle = title.trim();
-    if (!mounted.current || !canWrite || submitting || nextTitle.length === 0) return;
+    if (!mounted.current || busy.current || !canWrite || submitting || nextTitle.length === 0)
+      return;
+    busy.current = true;
     setSubmitting(true);
     setError(null);
     const command =
@@ -610,11 +705,13 @@ function NewTaskForm({
     try {
       await onCreate(command);
     } catch (error) {
+      busy.current = false;
       if (!mounted.current) return;
       setSubmitting(false);
       setError(projectWorkCommandFailure(error).message);
       return;
     }
+    busy.current = false;
     if (!mounted.current) return;
     // Settle local form state before closing the successful form.
     setSubmitting(false);
@@ -668,6 +765,7 @@ function TaskRow({
   streamAvailable,
   aggregateRevision,
   guidedAccess,
+  onLegacyWrite,
   foundation,
   guidedCanWrite = false,
   onGuidedWrite,
@@ -678,6 +776,7 @@ function TaskRow({
   readonly canWrite: boolean;
   readonly streamAvailable: boolean;
   readonly aggregateRevision: number | null;
+  readonly onLegacyWrite: LegacyWrite;
   readonly guidedAccess: {
     readonly connected: boolean;
     readonly enabled: boolean;
@@ -705,7 +804,6 @@ function TaskRow({
             knownFoundationRecord(memberships[0]) &&
             memberships[0].kind === "task-membership" &&
             memberships[0].executionKind === "legacy"))));
-  const write = useAtomCommand(projectWorkEnvironment.write, { reportFailure: false });
   const [failure, setFailure] = useState<ProjectWorkCommandFailure | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [retryCommand, setRetryCommand] = useState<TaskReadyCommand | null>(null);
@@ -716,6 +814,7 @@ function TaskRow({
     reportDefect: false,
   });
   const mounted = useRef(true);
+  const busy = useRef(false);
 
   useEffect(() => {
     mounted.current = true;
@@ -725,7 +824,9 @@ function TaskRow({
   }, []);
 
   const makeReady = useCallback(async () => {
-    if (!canWrite || submitting || aggregateRevision === null) return;
+    if (!mounted.current || busy.current || !canWrite || submitting || aggregateRevision === null)
+      return;
+    busy.current = true;
     setSubmitting(true);
     setFailure(null);
     const command =
@@ -738,25 +839,26 @@ function TaskRow({
         updatedAt: new Date().toISOString(),
       });
     setRetryCommand(command);
-    const result = await write({ environmentId, input: command });
-    if (!mounted.current) return;
-    setSubmitting(false);
-    if (result._tag === "Failure")
-      setFailure(projectWorkCommandFailure(squashAtomCommandFailure(result)));
-    else {
+    try {
+      await onLegacyWrite(command);
+      if (!mounted.current) return;
       setRetryCommand(null);
       setRebasedRevision(null);
+    } catch (error) {
+      if (mounted.current) setFailure(projectWorkCommandFailure(error));
+    } finally {
+      busy.current = false;
+      if (mounted.current) setSubmitting(false);
     }
   }, [
     aggregateRevision,
     canWrite,
-    environmentId,
     projectId,
     rebasedRevision,
     retryCommand,
     submitting,
     task,
-    write,
+    onLegacyWrite,
   ]);
   const retryReady = useCallback(() => void makeReady(), [makeReady]);
 
@@ -803,6 +905,7 @@ function TaskRow({
               projectId={projectId}
               canWrite={canWrite}
               aggregateRevision={aggregateRevision}
+              onWrite={onLegacyWrite}
             />
           ) : (
             <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
@@ -853,6 +956,7 @@ function TaskRow({
               taskId={task.taskId}
               canWrite={canWrite}
               streamAvailable={streamAvailable}
+              onWrite={onLegacyWrite}
             />
           ) : null}
         </div>
@@ -953,12 +1057,14 @@ function SpecificationForm({
   projectId,
   canWrite,
   aggregateRevision,
+  onWrite,
 }: {
   readonly task: ProjectWorkTaskRead;
   readonly environmentId: EnvironmentId;
   readonly projectId: ProjectId;
   readonly canWrite: boolean;
   readonly aggregateRevision: number | null;
+  readonly onWrite: LegacyWrite;
 }) {
   const [objective, setObjective] = useState("");
   const [scopeIn, setScopeIn] = useState("");
@@ -968,7 +1074,7 @@ function SpecificationForm({
   const [failure, setFailure] = useState<ProjectWorkCommandFailure | null>(null);
   const [retryStage, setRetryStage] = useState<SpecificationRetry | null>(null);
   const mounted = useRef(true);
-  const write = useAtomCommand(projectWorkEnvironment.write, { reportFailure: false });
+  const busy = useRef(false);
   const refreshContext = useAtomQueryRunner(projectWorkEnvironment.taskContext, {
     refresh: true,
     reportFailure: false,
@@ -983,8 +1089,9 @@ function SpecificationForm({
   }, []);
 
   const submit = useCallback(async () => {
-    if (!canWrite || submitting || aggregateRevision === null) return;
+    if (!mounted.current || busy.current || !canWrite || aggregateRevision === null) return;
     if ([objective, scopeIn, scopeOut, criterion].some((value) => value.trim() === "")) return;
+    busy.current = true;
     setSubmitting(true);
     setFailure(null);
     const now = new Date().toISOString();
@@ -1000,94 +1107,76 @@ function SpecificationForm({
         description: criterion.trim(),
         updatedAt: now,
       });
-
-    if (
-      currentRetry?.stage !== "specification" &&
-      currentRetry?.stage !== "rebased-specification"
-    ) {
-      setRetryStage({ stage: "criterion", criterion: criterionCommand });
-      const criterionResult = await write({ environmentId, input: criterionCommand });
-      if (!mounted.current) return;
-      if (criterionResult._tag === "Failure") {
-        setFailure(projectWorkCommandFailure(squashAtomCommandFailure(criterionResult)));
-        setSubmitting(false);
-        return;
+    try {
+      let specificationCommand: TaskSpecifyCommand;
+      if (
+        currentRetry?.stage !== "specification" &&
+        currentRetry?.stage !== "rebased-specification"
+      ) {
+        setRetryStage({ stage: "criterion", criterion: criterionCommand });
+        const criterionResult = await onWrite(criterionCommand);
+        if (!mounted.current) return;
+        specificationCommand = makeProjectWorkTaskSpecifyCommand({
+          projectId,
+          taskId: task.taskId,
+          criterionId: criterionCommand.criterion.criterionId,
+          criterionRevision: criterionResult.revision,
+          specificationRevision: task.specRevision + 1,
+          commandId: CommandId.make(randomUUID()),
+          objective: objective.trim(),
+          scopeIn: scopeIn.trim(),
+          scopeOut: scopeOut.trim(),
+          updatedAt: now,
+        });
+      } else {
+        specificationCommand =
+          currentRetry.stage === "rebased-specification"
+            ? makeProjectWorkTaskSpecifyCommand({
+                projectId,
+                taskId: task.taskId,
+                criterionId: currentRetry.criterion.criterion.criterionId,
+                criterionRevision: currentRetry.expectedRevision,
+                specificationRevision: currentRetry.specificationRevision,
+                commandId: CommandId.make(randomUUID()),
+                objective: objective.trim(),
+                scopeIn: scopeIn.trim(),
+                scopeOut: scopeOut.trim(),
+                updatedAt: now,
+              })
+            : currentRetry.specification;
       }
-      const specificationCommand = makeProjectWorkTaskSpecifyCommand({
-        projectId,
-        taskId: task.taskId,
-        criterionId: criterionCommand.criterion.criterionId,
-        criterionRevision: criterionResult.value.revision,
-        specificationRevision: task.specRevision + 1,
-        commandId: CommandId.make(randomUUID()),
-        objective: objective.trim(),
-        scopeIn: scopeIn.trim(),
-        scopeOut: scopeOut.trim(),
-        updatedAt: now,
-      });
+      // Retain the accepted criterion and exact specification command if eligibility changes between stages.
       setRetryStage({
         stage: "specification",
         criterion: criterionCommand,
         specification: specificationCommand,
       });
-
-      const specificationResult = await write({
-        environmentId,
-        input: specificationCommand,
-      });
-      if (!mounted.current) return;
-      if (specificationResult._tag === "Failure") {
-        setFailure(projectWorkCommandFailure(squashAtomCommandFailure(specificationResult)));
-      } else {
-        setRetryStage(null);
-      }
-      setSubmitting(false);
-      return;
+      const fromRevision = criterionCommand.expectedRevision;
+      const toRevision = specificationCommand.expectedRevision;
+      if (fromRevision === undefined || toRevision === undefined)
+        throw {
+          code: "stale-revision",
+          message: "Refresh the current specification before saving.",
+        };
+      await onWrite(specificationCommand, { fromRevision, toRevision });
+      if (mounted.current) setRetryStage(null);
+    } catch (error) {
+      if (mounted.current) setFailure(projectWorkCommandFailure(error));
+    } finally {
+      busy.current = false;
+      if (mounted.current) setSubmitting(false);
     }
-
-    const specificationCommand =
-      currentRetry.stage === "rebased-specification"
-        ? makeProjectWorkTaskSpecifyCommand({
-            projectId,
-            taskId: task.taskId,
-            criterionId: currentRetry.criterion.criterion.criterionId,
-            criterionRevision: currentRetry.expectedRevision,
-            specificationRevision: currentRetry.specificationRevision,
-            commandId: CommandId.make(randomUUID()),
-            objective: objective.trim(),
-            scopeIn: scopeIn.trim(),
-            scopeOut: scopeOut.trim(),
-            updatedAt: now,
-          })
-        : currentRetry.specification;
-    if (currentRetry.stage === "rebased-specification") {
-      setRetryStage({
-        stage: "specification",
-        criterion: currentRetry.criterion,
-        specification: specificationCommand,
-      });
-    }
-    const specificationResult = await write({ environmentId, input: specificationCommand });
-    if (!mounted.current) return;
-    if (specificationResult._tag === "Failure") {
-      setFailure(projectWorkCommandFailure(squashAtomCommandFailure(specificationResult)));
-    } else {
-      setRetryStage(null);
-    }
-    setSubmitting(false);
   }, [
     aggregateRevision,
     canWrite,
     criterion,
-    environmentId,
     objective,
+    onWrite,
     projectId,
     retryStage,
     scopeIn,
     scopeOut,
-    submitting,
     task,
-    write,
   ]);
   const retrySubmit = useCallback(() => void submit(), [submit]);
 

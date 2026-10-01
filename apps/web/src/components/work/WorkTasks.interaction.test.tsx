@@ -1,6 +1,6 @@
 /* @vitest-environment happy-dom */
 
-import { AsyncResult } from "effect/unstable/reactivity";
+import { Atom, AsyncResult } from "effect/unstable/reactivity";
 import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -69,6 +69,7 @@ describe("WorkTasks interactions", () => {
     testState.refreshBriefing.mockReset();
     testState.environment.briefing = undefined;
     testState.environment.page.mockClear();
+    testState.environment.page.mockImplementation(() => Atom.make(() => testState.read));
     testState.read = AsyncResult.success({
       projectId: "project-1",
       revision: 4,
