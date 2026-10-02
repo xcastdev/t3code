@@ -13,7 +13,13 @@ import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
-import { HostProcessPlatform, HostProcessIsExecutable } from "@t3tools/shared/hostProcess";
+import {
+  HostProcessPlatform,
+  HostProcessIsExecutable,
+  HostProcessExecutablePath,
+  HostProcessArchitecture,
+} from "@t3tools/shared/hostProcess";
+import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import { afterEach, beforeEach, describe, expect } from "vite-plus/test";
 import { decodePiWorkerLaunch } from "./PiWorkerEntrypoint.ts";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
@@ -21,6 +27,28 @@ import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
 // Fixtures replace inodes and directory names using actual native filesystem handles.
 const NodeFS = process.getBuiltinModule("fs");
 const NodeFSP = NodeFS.promises;
+const closureEvidenceDirectory = process.env.PI_RUNTIME_ASSETS_CLOSURE_EVIDENCE_DIRECTORY;
+const encodeCapturedObservation = Schema.encodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      label: Schema.String,
+      argv: Schema.Array(Schema.String),
+      pid: Schema.Int,
+      exitCode: Schema.Int,
+      stdout: Schema.String,
+      stderr: Schema.String,
+      childAbsent: Schema.Boolean,
+      files: Schema.Array(
+        Schema.Struct({
+          source: Schema.String,
+          target: Schema.String,
+          bytes: Schema.Int,
+          mode: Schema.Int,
+        }),
+      ),
+    }),
+  ),
+);
 const drainEvidenceDirectory = process.env.PI_RUNTIME_ASSETS_DRAIN_EVIDENCE_DIRECTORY;
 const encodeDrainObservation = Schema.encodeEffect(
   Schema.fromJsonString(
@@ -81,6 +109,137 @@ const check = <A, E>(
   body: () => Effect.Effect<A, E, NodeServices.NodeServices>,
   timeout?: number,
 ) => it.live(name, () => body().pipe(Effect.provide(NodeServices.layer)), timeout);
+// These fixed installed package bytes form a private, physical release-layout fixture.
+// Nothing is imported while preparing it, and no source comes from sealed proof assets.
+const executableFixture = Effect.fn("assetsTest.executableFixture")(function* () {
+  const executable = fixturePath(scratch, "product/t3");
+  const root = fixturePath(scratch, "product/node_modules");
+  yield* Effect.promise(() => NodeFSP.mkdir(root, { recursive: true }));
+  yield* Effect.promise(() =>
+    NodeFSP.copyFile(process.execPath, executable, NodeFS.constants.COPYFILE_FICLONE),
+  );
+  const fff = yield* Effect.promise(() =>
+    NodeFSP.realpath(fixturePath(import.meta.dirname, "../../../node_modules/@ff-labs/fff-node")),
+  );
+  const ffi = yield* Effect.promise(() => NodeFSP.realpath(fixturePath(fff, "../../ffi-rs")));
+  const binding = yield* Effect.promise(() =>
+    NodeFSP.realpath(fixturePath(ffi, "../@yuuang/ffi-rs-linux-x64-gnu")),
+  );
+  const entries: Array<{ source: string; relative: string }> = [];
+  for (const [name, source, files] of [
+    [
+      "@ff-labs/fff-node",
+      fff,
+      [
+        "package.json",
+        ...["binary", "fff-api", "ffi", "finder", "index", "platform"].map(
+          (name) => `dist/src/${name}.js`,
+        ),
+      ],
+    ],
+    ["ffi-rs", ffi, ["package.json", "index.js"]],
+    ["@yuuang/ffi-rs-linux-x64-gnu", binding, ["package.json", "ffi-rs.linux-x64-gnu.node"]],
+  ] as const) {
+    for (const file of files) {
+      const relative = `${name}/${file}`;
+      const destination = fixturePath(root, relative);
+      yield* Effect.promise(() =>
+        NodeFSP.mkdir(destination.slice(0, destination.lastIndexOf("/")), { recursive: true }),
+      );
+      yield* Effect.promise(() => NodeFSP.copyFile(fixturePath(source, file), destination));
+      entries.push({ source: destination, relative });
+    }
+  }
+  return { executable, root, entries };
+});
+
+const executeCaptured = Effect.fn("assetsTest.executeCaptured")(function* (
+  assets: Effect.Success<ReturnType<typeof preparePiRuntimeAssets>>,
+  argv: ReadonlyArray<string>,
+) {
+  yield* assets.revalidate;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const args = [
+    "--unshare-all",
+    "--die-with-parent",
+    "--new-session",
+    "--cap-drop",
+    "ALL",
+    "--clearenv",
+  ];
+  for (const file of assets.runtimeFiles) args.push("--ro-bind", file.source, file.target);
+  args.push(
+    "--proc",
+    "/proc",
+    "--dev",
+    "/dev",
+    "--tmpfs",
+    "/tmp",
+    "--setenv",
+    "HOME",
+    "/tmp",
+    "--setenv",
+    "PATH",
+    "/bin:/runtime",
+    "--remount-ro",
+    "/",
+    "--",
+    ...argv,
+  );
+  const receipt = yield* Effect.scoped(
+    Effect.gen(function* () {
+      const child = yield* spawner.spawn(
+        ChildProcess.make("/usr/bin/bwrap", args, {
+          env: {},
+          extendEnv: false,
+          stdin: "ignore",
+          forceKillAfter: "100 millis",
+        }),
+      );
+      const output = yield* Effect.all(
+        {
+          stdout: collectUint8StreamText({ stream: child.stdout, maxBytes: 65536 }),
+          stderr: collectUint8StreamText({ stream: child.stderr, maxBytes: 65536 }),
+          code: child.exitCode,
+        },
+        { concurrency: "unbounded" },
+      );
+      return { ...output, pid: Number(child.pid) };
+    }).pipe(Effect.timeout("5 seconds")),
+  );
+  expect(receipt.code).toBe(0);
+  expect(receipt.stderr.text).toBe("");
+  expect(receipt.stdout.truncated).toBe(false);
+  yield* Effect.promise(() =>
+    expect(NodeFSP.access(`/proc/${receipt.pid}`)).rejects.toMatchObject({ code: "ENOENT" }),
+  );
+  if (closureEvidenceDirectory) {
+    const label =
+      (assets.runtimeFiles.some((file) => file.target === "/runtime/t3") ? "executable" : "npm") +
+      (argv[0] === "/bin/bash" ? "-bash" : "-ffi");
+    const files = yield* Effect.forEach(assets.runtimeFiles, (file) =>
+      Effect.promise(async () => {
+        const stat = await NodeFSP.stat(file.source);
+        return { ...file, bytes: stat.size, mode: stat.mode & 0o777 };
+      }),
+    );
+    const json = yield* encodeCapturedObservation({
+      label,
+      argv,
+      pid: receipt.pid,
+      exitCode: Number(receipt.code),
+      stdout: receipt.stdout.text,
+      stderr: receipt.stderr.text,
+      childAbsent: true,
+      files,
+    });
+    yield* Effect.promise(() =>
+      NodeFSP.writeFile(fixturePath(closureEvidenceDirectory, label + ".json"), json),
+    );
+  }
+  return receipt.stdout.text;
+});
+
 const beforeDiscovery = Effect.fn("assetsTest.beforeDiscovery")(function* (value = input) {
   let discoveries = 0;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -241,6 +400,195 @@ const native: typeof check = (name, body, timeout) =>
     ? check(name, body, timeout)
     : it.skip(name, () => {});
 describe("required actual Linux executable closure", () => {
+  native("captures Bash and runs builtin commands using only the copied cage closure", () =>
+    Effect.gen(function* () {
+      const result = yield* preparePiRuntimeAssets(input);
+      const bash = result.runtimeFiles.find((file) => file.target === "/bin/bash");
+      expect(bash).toBeDefined();
+      expect(
+        yield* executeCaptured(result, [
+          "/bin/bash",
+          "-c",
+          "printf 'bash:%s\\n' \"$BASH_VERSION\"; [[ ! -e /usr/bin/node ]] && printf 'isolated\\n'",
+        ]),
+      ).toMatch(/^bash:5\.[^\n]+\nisolated\n$/);
+    }),
+  );
+  native(
+    "captures the pinned executable sidecar and loads its actual native binding in the cage",
+    () =>
+      Effect.gen(function* () {
+        const fixture = yield* executableFixture();
+        const result = yield* preparePiRuntimeAssets(input).pipe(
+          Effect.provideService(HostProcessIsExecutable, true),
+          Effect.provideService(HostProcessExecutablePath, fixture.executable),
+        );
+        for (const entry of fixture.entries) {
+          const file = result.runtimeFiles.find(
+            (file) => file.target === "/runtime/node_modules/" + entry.relative,
+          );
+          expect(file).toBeDefined();
+          expect(yield* Effect.promise(() => NodeFSP.readFile(file!.source))).toEqual(
+            yield* Effect.promise(() => NodeFSP.readFile(entry.source)),
+          );
+        }
+        expect(result.runtimeFiles.length).toBeLessThanOrEqual(128);
+        expect(
+          yield* executeCaptured(result, ["/bin/bash", "-c", "printf 'executable-bash\\n'"]),
+        ).toBe("executable-bash\n");
+        // Copied actual Node exercises the SEA-selected closure, not hidden SEA dispatch.
+        const code =
+          'import { FileFinder } from "/runtime/node_modules/@ff-labs/fff-node/dist/src/index.js";import ffi from "/runtime/node_modules/ffi-rs/index.js";if(typeof FileFinder!=="function"||typeof ffi.open!=="function"||!ffi.DataType)throw Error("native exports missing");process.stdout.write("fff-ffi-loaded\\n")';
+        expect(
+          yield* executeCaptured(result, [
+            "/runtime/t3",
+            "--max-old-space-size=512",
+            "--input-type=module",
+            "-e",
+            code,
+          ]),
+        ).toBe("fff-ffi-loaded\n");
+        const binding = result.runtimeFiles.find((file) =>
+          file.target.endsWith("ffi-rs.linux-x64-gnu.node"),
+        )!;
+        yield* Effect.promise(() => NodeFSP.chmod(binding.source, 0o600));
+        yield* Effect.promise(() => NodeFSP.writeFile(binding.source, "changed"));
+        expect((yield* result.revalidate.pipe(Effect.flip)).phase).toBe("validation");
+      }),
+  );
+  for (const fault of [
+    "missing",
+    "version",
+    "main",
+    "symlink-file",
+    "symlink-package",
+    "foreign-ancestor",
+    "ffi-version",
+    "binding-libc",
+    "symlink-binding",
+  ] as const)
+    native(`rejects ${fault} executable sidecars before discovery or staged writes`, () =>
+      Effect.gen(function* () {
+        const fixture = yield* executableFixture();
+        const packageDirectory = fixturePath(fixture.root, "@ff-labs/fff-node");
+        const entry = fixturePath(packageDirectory, "dist/src/index.js");
+        if (fault === "ffi-version")
+          yield* Effect.promise(() =>
+            NodeFSP.writeFile(
+              fixturePath(fixture.root, "ffi-rs/package.json"),
+              '{"name":"ffi-rs","version":"1.3.1","main":"index.js"}',
+            ),
+          );
+        if (fault === "binding-libc")
+          yield* Effect.promise(() =>
+            NodeFSP.writeFile(
+              fixturePath(fixture.root, "@yuuang/ffi-rs-linux-x64-gnu/package.json"),
+              '{"name":"@yuuang/ffi-rs-linux-x64-gnu","version":"1.3.2","main":"ffi-rs.linux-x64-gnu.node","os":["linux"],"cpu":["x64"],"libc":["musl"]}',
+            ),
+          );
+        if (fault === "symlink-binding") {
+          const binding = fixturePath(
+            fixture.root,
+            "@yuuang/ffi-rs-linux-x64-gnu/ffi-rs.linux-x64-gnu.node",
+          );
+          yield* Effect.promise(() => NodeFSP.unlink(binding));
+          yield* Effect.promise(() => NodeFSP.symlink(process.execPath, binding));
+        }
+        if (fault === "missing") yield* Effect.promise(() => NodeFSP.unlink(entry));
+        if (fault === "version" || fault === "main")
+          yield* Effect.promise(() =>
+            NodeFSP.writeFile(
+              fixturePath(packageDirectory, "package.json"),
+              fault === "version"
+                ? '{"name":"@ff-labs/fff-node","version":"0.9.3","type":"module","main":"dist/src/index.js"}'
+                : '{"name":"@ff-labs/fff-node","version":"0.9.4","type":"module","main":"../../foreign.js"}',
+            ),
+          );
+        if (fault === "symlink-file") {
+          const foreign = fixturePath(scratch, "protected/foreign.js");
+          yield* Effect.promise(() => NodeFSP.writeFile(foreign, "foreign"));
+          yield* Effect.promise(() => NodeFSP.unlink(entry));
+          yield* Effect.promise(() => NodeFSP.symlink(foreign, entry));
+        }
+        if (fault === "symlink-package") {
+          const foreign = fixturePath(scratch, "protected/fff-node");
+          yield* Effect.promise(() => NodeFSP.rename(packageDirectory, foreign));
+          yield* Effect.promise(() => NodeFSP.symlink(foreign, packageDirectory));
+        }
+        if (fault === "foreign-ancestor")
+          yield* Effect.promise(() =>
+            NodeFSP.rename(fixture.root, fixturePath(scratch, "node_modules")),
+          );
+        yield* beforeDiscovery().pipe(
+          Effect.provideService(HostProcessIsExecutable, true),
+          Effect.provideService(HostProcessExecutablePath, fixture.executable),
+        );
+        expect(yield* Effect.promise(() => NodeFSP.readdir(input.stagingDirectory))).toEqual([]);
+      }),
+    );
+  native("rejects aggregate closure bytes before discovery despite bounded individual files", () =>
+    Effect.gen(function* () {
+      const node = yield* Effect.promise(() => NodeFSP.stat(process.execPath));
+      yield* Effect.promise(async () => {
+        const file = await NodeFSP.open(
+          fixturePath(input.distributionDirectory, "aggregate.mjs"),
+          "wx",
+        );
+        try {
+          await file.truncate(256 * 1024 * 1024 - node.size);
+        } finally {
+          await file.close();
+        }
+      });
+      yield* beforeDiscovery();
+      expect(yield* Effect.promise(() => NodeFSP.readdir(input.stagingDirectory))).toEqual([]);
+    }),
+  );
+  native("rejects executable sidecar replacement during discovery before staging", () =>
+    Effect.gen(function* () {
+      const fixture = yield* executableFixture();
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      let replaced = false;
+      const error = yield* preparePiRuntimeAssets(input).pipe(
+        Effect.provideService(HostProcessIsExecutable, true),
+        Effect.provideService(HostProcessExecutablePath, fixture.executable),
+        Effect.provideService(
+          ChildProcessSpawner.ChildProcessSpawner,
+          ChildProcessSpawner.ChildProcessSpawner.of({
+            ...spawner,
+            spawn: (command) =>
+              Effect.gen(function* () {
+                if (!replaced) {
+                  replaced = true;
+                  const source = fixture.entries[0]!.source;
+                  yield* Effect.promise(async () => {
+                    const bytes = await NodeFSP.readFile(source);
+                    await NodeFSP.rename(source, source + "-original");
+                    await NodeFSP.writeFile(source, bytes);
+                  });
+                }
+                return yield* spawner.spawn(command);
+              }),
+          }),
+        ),
+        Effect.flip,
+      );
+      expect(replaced).toBe(true);
+      expect(error.phase).toBe("validation");
+      expect(yield* Effect.promise(() => NodeFSP.readdir(input.stagingDirectory))).toEqual([]);
+    }),
+  );
+  native("reports unproven executable architecture unavailable", () =>
+    Effect.gen(function* () {
+      const error = yield* preparePiRuntimeAssets(input).pipe(
+        Effect.provideService(HostProcessIsExecutable, true),
+        Effect.provideService(HostProcessArchitecture, "arm64"),
+        Effect.flip,
+      );
+      expect(error.phase).toBe("unavailable");
+    }),
+  );
+
   for (const mode of ["cancellation", "deadline"] as const)
     native(
       `drains SIGTERM-ignoring discovery on ${mode}`,
@@ -616,11 +964,13 @@ describe("required actual Linux executable closure", () => {
   );
   native("derives the SEA argv from host executable data", () =>
     Effect.gen(function* () {
+      const fixture = yield* executableFixture();
       yield* Effect.promise(() =>
         NodeFSP.unlink(fixturePath(input.distributionDirectory, "pi-worker.mjs")),
       );
       const result = yield* preparePiRuntimeAssets(input).pipe(
         Effect.provideService(HostProcessIsExecutable, true),
+        Effect.provideService(HostProcessExecutablePath, fixture.executable),
       );
       expect(
         result
