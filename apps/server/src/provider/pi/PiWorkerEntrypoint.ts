@@ -107,6 +107,8 @@ export async function runPiWorkerEntrypoint(rawLaunchJson: string | undefined): 
   try {
     // The SDK eagerly reads VERSION during import. No parent/server import sets this.
     process.env.PI_PACKAGE_DIR = launch.trustedSdkPackageDirectory;
+    const { makePiLocalTools } = await import("./PiLocalTools.ts");
+    const { localTools } = await makePiLocalTools("/workspace");
     const { runPiWorkerHost } = await import("./PiWorkerHost.ts");
     await runPiWorkerHost({
       identity: launch.identity,
@@ -115,7 +117,7 @@ export async function runPiWorkerEntrypoint(rawLaunchJson: string | undefined): 
       ...(launch.compactionKeepRecentTokens === undefined
         ? {}
         : { compactionKeepRecentTokens: launch.compactionKeepRecentTokens }),
-      localTools: Object.freeze({}),
+      localTools,
       input: transport.input,
       output: transport.output,
     });
