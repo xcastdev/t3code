@@ -46,6 +46,8 @@ const decodeOwner = Schema.decodeSync(
     }),
   ),
 );
+const ResourceIdentity = Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/));
+const decodeResourceIdentity = Schema.decodeUnknownEffect(ResourceIdentity);
 const decodeIntent = Schema.decodeEffect(
   Schema.fromJsonString(
     Schema.Struct({
@@ -58,6 +60,7 @@ const decodeIntent = Schema.decodeEffect(
         configuration: Schema.Unknown,
       }),
       role: Schema.Unknown,
+      resourceHash: Schema.optional(ResourceIdentity),
     }),
   ),
 );
@@ -261,9 +264,14 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         readonly allocation: PiManagedProcessAllocation;
         readonly workerId: string;
         readonly operationId: string;
+        readonly resourceHash?: string;
       },
     ) {
       const { allocation, workerId, operationId } = allocated;
+      const resourceHash =
+        allocated.resourceHash === undefined
+          ? undefined
+          : yield* decodeResourceIdentity(allocated.resourceHash);
       yield* ownTransaction();
       const result = yield* sql.withTransaction(
         Effect.gen(function* () {
@@ -313,6 +321,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             binding: authority.binding,
             role: authority.role,
             allocation,
+            ...(resourceHash === undefined ? {} : { resourceHash }),
           });
           yield* sql`INSERT INTO project_team_pi_operation (operation_id,environment_id,project_id,binding_id,generation,provider_instance_id,thread_id,worker_id,operation_ordinal,operation_kind,request_hash,root_binding_id,root_task_id,maximum_tokens,deadline_at_ms,status,intent_json) VALUES (${operationId},${options.environmentId},${authority.binding.projectId},${authority.binding.recordId},${authority.binding.generation},${identity.providerInstanceId},${identity.threadId},${workerId},${ordinal},${request.kind},${requestHash},${root.root.recordId},${root.root.taskId},${maximumTokens},${deadlineAtMs},'prepared',${intent})`;
           yield* sql`INSERT INTO project_team_pi_process(unit,operation_id,allocation_json,status) VALUES(${allocation.unit},${operationId},${encode(allocation)},'allocated')`;
@@ -656,10 +665,18 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           if (!row?.native_json)
             return yield* deny("No durable Pi native reference", "unavailable");
           const native = decodeNative(row.native_json);
+          const intent = yield* decodeIntent(row.intent_json).pipe(
+            Effect.mapError(() => deny("Durable Pi resource identity unavailable", "uncertain")),
+          );
           if (native.sessionId !== authority.binding.sessionId)
             return yield* deny("Pi native binding mismatch");
           yield* current(identity);
-          return { authority, native, operationId: row.operation_id };
+          return {
+            authority,
+            native,
+            operationId: row.operation_id,
+            resourceHash: intent.resourceHash ?? null,
+          };
         }),
       );
       yield* current(identity);

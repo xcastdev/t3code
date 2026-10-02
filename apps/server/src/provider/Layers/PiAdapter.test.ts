@@ -2,11 +2,13 @@ import { expect, it } from "@effect/vitest";
 import {
   ApprovalRequestId,
   EventId,
+  ManagedSkillKey,
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderRuntimeEvent,
   type ProviderSession,
   ThreadId,
+  SkillCatalogRevision,
   TurnId,
 } from "@t3tools/contracts";
 import * as Deferred from "effect/Deferred";
@@ -48,6 +50,107 @@ const initialSession = (instance = instanceId): ProviderSession => ({
   updatedAt: timestamp,
 });
 const startInput = { threadId, runtimeMode: "full-access" as const };
+
+it.effect("carries an isolated explicit skill plan into initialization and subsequent turns", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+    const key = ManagedSkillKey.make("review");
+    const plan = {
+      providerInstanceId: instanceId,
+      desiredRevision: SkillCatalogRevision.make(7),
+      applicationMode: "new_session_required" as const,
+      skillKeys: [key],
+      payload: {
+        kind: "pi-managed-skills",
+        root: "/owned/skills",
+        skills: [{ key, path: "/owned/skills/review/SKILL.md" }],
+      },
+    };
+    yield* adapter.startSession({ ...startInput, skillPlan: plan });
+    expect(fake.requests[0]?.skillPlan).toEqual(plan);
+    const expected = structuredClone(plan);
+    plan.payload.skills[0]!.path = "/untrusted/replaced";
+    plan.skillKeys.length = 0;
+    expect(fake.requests[0]?.skillPlan).toEqual(expected);
+    yield* adapter.sendTurn({ threadId, input: "use selected skills" });
+    expect(fake.requests[1]?.skillPlan).toEqual(expected);
+    expect(fake.requests[1]?.skillPlan).not.toBe(fake.requests[0]?.skillPlan);
+    yield* fake.settle(fake.operations[1]!, "success");
+    yield* Deferred.await(fake.operations[1]!.result);
+  }),
+);
+
+it.effect("rejects a foreign skill plan before acquiring a managed operation", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+    expect(
+      Exit.isFailure(
+        yield* Effect.exit(
+          adapter.startSession({
+            ...startInput,
+            skillPlan: {
+              providerInstanceId: ProviderInstanceId.make("foreign"),
+              desiredRevision: SkillCatalogRevision.make(0),
+              applicationMode: "new_session_required",
+              skillKeys: [],
+              payload: null,
+            },
+          }),
+        ),
+      ),
+    ).toBe(true);
+    expect(fake.requests).toHaveLength(0);
+  }),
+);
+
+it.effect("refuses skill replacement in a ready logical session without another acquisition", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+    const plan = {
+      providerInstanceId: instanceId,
+      desiredRevision: SkillCatalogRevision.make(0),
+      applicationMode: "new_session_required" as const,
+      skillKeys: [],
+      payload: null,
+    };
+    yield* adapter.startSession({ ...startInput, skillPlan: plan });
+    yield* adapter.startSession({ ...startInput, skillPlan: structuredClone(plan) });
+    expect(
+      Exit.isFailure(
+        yield* Effect.exit(
+          adapter.startSession({
+            ...startInput,
+            skillPlan: { ...plan, desiredRevision: SkillCatalogRevision.make(1) },
+          }),
+        ),
+      ),
+    ).toBe(true);
+    expect(fake.requests).toHaveLength(1);
+  }),
+);
+
+it.effect("refuses uncopyable explicit skill payloads before a logical session is installed", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+    const plan = {
+      providerInstanceId: instanceId,
+      desiredRevision: SkillCatalogRevision.make(0),
+      applicationMode: "new_session_required" as const,
+      skillKeys: [],
+      payload: () => undefined,
+    };
+    expect(
+      Exit.isFailure(yield* Effect.exit(adapter.startSession({ ...startInput, skillPlan: plan }))),
+    ).toBe(true);
+    expect(fake.requests).toHaveLength(0);
+    yield* adapter.startSession(startInput);
+    expect(fake.requests).toHaveLength(1);
+  }),
+);
 const denied = new PiManagedRuntimeError({
   code: "denied",
   detail: "Current authorization denied.",

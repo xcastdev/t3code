@@ -35,6 +35,7 @@ import type {
   ProviderAdapterSessionStartInput,
 } from "../Services/ProviderAdapter.ts";
 import type { PiSessionTerminal } from "../pi/PiSessionRuntime.ts";
+import type { ProviderSkillPlan } from "../../skills/ProviderSkillAdapter.ts";
 
 const provider = ProviderDriverKind.make("piAgent");
 const invalid = (operation: string, issue: string) =>
@@ -216,6 +217,7 @@ type ActiveOperation = {
 };
 type SessionContext = {
   readonly threadId: ThreadId;
+  readonly skillPlan?: ProviderSkillPlan;
   session?: ProviderSession;
   active?: ActiveOperation | undefined;
   failure?: ProviderAdapterError;
@@ -686,8 +688,22 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             "Pi does not support caller approval, sandbox, model options or project MCP overrides.",
           );
         const existing = sessions.get(hints.threadId);
+        if (
+          hints.skillPlan !== undefined &&
+          (hints.skillPlan.providerInstanceId !== instanceId ||
+            hints.skillPlan.applicationMode !== "new_session_required")
+        )
+          return yield* invalid(
+            "startSession",
+            "Pi requires an explicit skill plan for this instance and a new session.",
+          );
         if (existing) {
           const context = yield* owned(hints.threadId);
+          if (
+            hints.skillPlan !== undefined &&
+            !NodeUtil.isDeepStrictEqual(hints.skillPlan, context.skillPlan)
+          )
+            return yield* invalid("startSession", "Changed Pi skills require a new session.");
           if (context.active)
             return yield* invalid(
               "startSession",
@@ -732,11 +748,28 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             return Effect.succeed(session);
           });
         }
-        const context: SessionContext = { threadId: hints.threadId, closing: false };
+        const skillPlan =
+          hints.skillPlan === undefined
+            ? undefined
+            : yield* Effect.try({
+                try: () => structuredClone(hints.skillPlan),
+                catch: () =>
+                  new ProviderAdapterValidationError({
+                    provider,
+                    operation: "startSession",
+                    issue: "Pi skill plan cannot be copied.",
+                  }),
+              });
+        const context: SessionContext = {
+          threadId: hints.threadId,
+          closing: false,
+          ...(skillPlan === undefined ? {} : { skillPlan }),
+        };
         sessions.set(hints.threadId, context);
         const request = {
           threadId: hints.threadId,
           kind: "initialize" as const,
+          ...(skillPlan === undefined ? {} : { skillPlan: structuredClone(skillPlan) }),
           runtimeMode: hints.runtimeMode,
           ...(hints.cwd !== undefined ? { cwd: hints.cwd } : {}),
           ...(hints.modelSelection !== undefined
@@ -778,6 +811,9 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
           threadId: turn.threadId,
           kind: "prompt",
           prompt: turn.input,
+          ...(context.skillPlan === undefined
+            ? {}
+            : { skillPlan: structuredClone(context.skillPlan) }),
           ...(turn.modelSelection !== undefined
             ? { modelSelection: structuredClone(turn.modelSelection) }
             : {}),

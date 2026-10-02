@@ -13,7 +13,10 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
 import type { NativeSkillCandidate } from "../../skills/NativeSkillObservationService.ts";
-import type { ProviderSkillPrepareRequest } from "../../skills/ProviderSkillAdapter.ts";
+import type {
+  ProviderSkillPlan,
+  ProviderSkillPrepareRequest,
+} from "../../skills/ProviderSkillAdapter.ts";
 import type { ProviderThreadSnapshot } from "../Services/ProviderAdapter.ts";
 import type { ServerProviderDraft } from "../providerSnapshot.ts";
 import type { PiSessionTerminal } from "./PiSessionRuntime.ts";
@@ -44,6 +47,8 @@ type Assertions = {
   readonly cwd?: string;
   readonly modelSelection?: ModelSelection;
   readonly resumeCursor?: unknown;
+  /** Explicit parent-owned materialization; this value alone grants no skill access. */
+  readonly skillPlan?: ProviderSkillPlan;
 };
 
 /** The parent rejects routing/mode mismatches before effects; hints never grant authority. */

@@ -97,6 +97,67 @@ const rejected = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   );
 
 it.effect(
+  "retains selected resource identity in durable intent and reconstructs it after restart",
+  () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const resourceHash = "a".repeat(64);
+        const op = yield* f.operations.prepare(
+          f.identity,
+          { threadId, kind: "initialize" },
+          "skills",
+          {
+            allocation: f.allocation,
+            workerId: "worker",
+            operationId: "skills",
+            resourceHash,
+          },
+        );
+        const rows = yield* f.sql<{
+          intent_json: string;
+        }>`SELECT intent_json FROM project_team_pi_operation`;
+        expect(parseJson(rows[0]!.intent_json)).toHaveProperty("resourceHash", resourceHash);
+        const native = {
+          sessionId: "native",
+          sessionReference: "sessions/native.jsonl",
+          leafId: null,
+          persisted: false,
+        };
+        yield* f.operations.persistNative(op, native);
+        // Synthetic settled SQL fixture proves reconstruction only, not operating-system drain.
+        yield* f.sql`UPDATE project_team_pi_operation SET status='settled'`;
+        const restarted = yield* makeProjectTeamPiOperations({ environmentId: "environment" });
+        expect((yield* restarted.nativeFor(f.identity)).resourceHash).toBe(resourceHash);
+        yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json, '$.resourceHash', 'malformed')`;
+        yield* rejected(restarted.nativeFor(f.identity));
+      }),
+    ),
+);
+
+it.effect(
+  "rejects malformed resource identities before committing operation or process ownership",
+  () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        for (const resourceHash of ["", "a".repeat(63), "z".repeat(64)]) {
+          yield* rejected(
+            f.operations.prepare(f.identity, { threadId, kind: "initialize" }, "skills", {
+              allocation: f.allocation,
+              workerId: "worker",
+              operationId: "skills",
+              resourceHash,
+            }),
+          );
+        }
+        expect((yield* f.sql`SELECT * FROM project_team_pi_operation`).length).toBe(0);
+        expect((yield* f.sql`SELECT * FROM project_team_pi_process`).length).toBe(0);
+      }),
+    ),
+);
+
+it.effect(
   "commits exact launch intent and unique ordinal before activation and denies replay",
   () =>
     fileTest(
