@@ -476,3 +476,18 @@ describe("project work contracts", () => {
     expect(() => decodeSupersede({ ...command, attribution: undefined })).toThrow();
   });
 });
+
+const decodeOpaqueWorkRead = Schema.decodeUnknownSync(ProjectWorkReadIntent);
+const encodeOpaqueWorkRead = Schema.encodeSync(ProjectWorkReadIntent);
+
+it("round-trips opaque foundation request cursors without changing their bytes", () => {
+  for (const cursor of [" page-one ", "\tpage-two\n", " ", "x".repeat(4000)]) {
+    const input = { projectId: "project", operation: "foundation-records", cursor };
+    expect(encodeOpaqueWorkRead(decodeOpaqueWorkRead(input))).toEqual(input);
+  }
+  for (const cursor of ["", "x".repeat(4001)]) {
+    expect(() =>
+      decodeOpaqueWorkRead({ projectId: "project", operation: "foundation-records", cursor }),
+    ).toThrow();
+  }
+});

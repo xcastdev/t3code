@@ -108,6 +108,8 @@ export const ExecutionEnvironmentCapabilities = Schema.Struct({
   /** Server exposes the bounded project-work delta stream. */
   projectWorkStream: Schema.optionalKey(Schema.Boolean),
   projectTeamFoundationReads: Schema.optionalKey(Schema.Boolean),
+  /** Revision-fenced human refinement and approval commands, before managed dispatch is available. */
+  projectTeamGuidedWrites: Schema.optionalKey(Schema.Boolean),
   projectTeamExecution: Schema.optionalKey(Schema.Boolean),
   /** Server exposes active logical-session MCP catalog RPCs. */
   sessionMcpCatalog: Schema.optionalKey(Schema.Boolean),

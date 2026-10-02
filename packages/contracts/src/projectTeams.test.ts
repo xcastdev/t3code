@@ -5,6 +5,7 @@ import {
   ProjectTeamWriteIntent,
   ProjectTeamRecord,
   ProjectTeamRecordRead,
+  ProjectTeamRecordPage,
   PROJECT_TEAM_DEFAULT_LIMITS,
 } from "./projectTeams.ts";
 import {
@@ -374,4 +375,19 @@ it("retains explicit semantic repair state and accepts legacy missing metadata",
       pendingSemanticRepair,
     );
   expect(() => decodeTeamRecord({ ...legacy, pendingSemanticRepair: "false" })).toThrow();
+});
+
+const decodeOpaqueTeamPage = Schema.decodeUnknownSync(ProjectTeamRecordPage);
+const encodeOpaqueTeamPage = Schema.encodeSync(ProjectTeamRecordPage);
+
+it("round-trips opaque foundation continuation cursors without changing their bytes", () => {
+  for (const nextCursor of [" page-one ", "\tpage-two\n", " ", "x".repeat(4000)]) {
+    const page = { projectId: "project", revision: 1, nextCursor, items: [] };
+    expect(encodeOpaqueTeamPage(decodeOpaqueTeamPage(page))).toEqual(page);
+  }
+  for (const nextCursor of ["", "x".repeat(4001)]) {
+    expect(() =>
+      decodeOpaqueTeamPage({ projectId: "project", revision: 1, nextCursor, items: [] }),
+    ).toThrow();
+  }
 });
