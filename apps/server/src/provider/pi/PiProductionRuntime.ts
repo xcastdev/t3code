@@ -378,6 +378,9 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
         if (accepting || preparing !== 0 || !runtimeFiles) return false;
         // Validate every bounded closure before filtering its source paths. Keyset pages keep
         // unrelated history out of the matched-stage limit without retaining it in memory.
+        const ownedIdentities = new Set(
+          stage.entries.map((entry) => `${entry.identity.dev}:${entry.identity.ino}`),
+        );
         let cursor: number | undefined;
         let matched = 0;
         while (true) {
@@ -409,8 +412,11 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
               return false;
           }
           const relevant = rows.filter((_, index) =>
-            allocations[index]!.allocation.launch.runtimeFiles.some((file) =>
-              file.source.startsWith(stage.directory + "/"),
+            allocations[index]!.allocation.launch.runtimeFiles.some(
+              (file) =>
+                // A normalized alias can still name an owned inode outside the stage prefix.
+                ownedIdentities.has(`${file.dev}:${file.ino}`) ||
+                file.source.startsWith(stage.directory + "/"),
             ),
           );
           matched += relevant.length;

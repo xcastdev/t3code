@@ -423,6 +423,44 @@ product("drained unactivated allocations release their exact stage", () =>
     }),
   ),
 );
+product("normalized source aliases cannot hide allocated staged file identities", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* enabledFixture;
+      const sql = yield* SqlClient.SqlClient;
+      let stage = "";
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* f.service.forInstance(instance);
+          stage = stageFrom(f);
+          const alias = f.root + "/source-alias";
+          yield* f.fs.symlink(stage, alias);
+          yield* processRow(f.captured[0]!.runtimeFiles, "allocated");
+          const files = yield* Effect.forEach(f.captured[0]!.runtimeFiles, (file) =>
+            Effect.promise(async () => {
+              const identity = await nativeFS.lstat(file.source);
+              const source = alias + "/" + file.source.slice(stage.length + 1);
+              expect(process.getBuiltinModule("path").resolve(source)).toBe(source);
+              expect(await nativeFS.realpath(source)).toBe(file.source);
+              return { ...file, source, dev: identity.dev, ino: identity.ino };
+            }),
+          );
+          yield* sql`UPDATE project_team_pi_process SET allocation_json = ${encode({
+            unit: "factory-unit",
+            nonce: "factory-nonce",
+            policy: { memoryBytes: 33554432 },
+            launch: { runtimeFiles: files },
+          })} WHERE unit='factory-unit'`;
+        }),
+      );
+      expect(yield* sql`SELECT status FROM project_team_pi_process`).toEqual([
+        { status: "allocated" },
+      ]);
+      expect(f.fetch).not.toHaveBeenCalled();
+      expect(yield* f.fs.exists(stage)).toBe(true);
+    }),
+  ),
+);
 product("a drained allocation with a different source inode cannot authorize deletion", () =>
   scoped(
     Effect.gen(function* () {
