@@ -275,11 +275,59 @@ describe("private Pi production factory", () => {
         const service = yield* construct(f);
         yield* failure(service.forInstance(instance));
         expect(yield* f.fs.readDirectory(other)).toEqual([]);
+        expect(yield* f.fs.exists(f.options.nativeStateRoot)).toBe(false);
         expect(f.captured).toHaveLength(0);
       }),
     ),
   );
 });
+
+for (const alias of [
+  "protected-native",
+  "protected-cache",
+  "agent",
+  "selected-agent",
+  "distribution",
+])
+  it.effect(`declared ${alias} alias is rejected before any state mutation`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const target = f.root + "/alias-target";
+        const link = f.root + "/alias";
+        yield* f.fs.makeDirectory(target);
+        yield* f.fs.symlink(target, link);
+        const options = {
+          ...f.options,
+          ...(alias.startsWith("protected") ? { protectedRoots: [link] } : {}),
+          ...(alias === "agent" ? { agentDirectory: link } : {}),
+          ...(alias === "distribution" ? { distributionDirectory: link } : {}),
+          ...(alias === "protected-native" || alias === "agent"
+            ? { nativeStateRoot: target + "/native" }
+            : {}),
+          ...(alias === "protected-cache" || alias === "selected-agent"
+            ? { stagingRoot: target + "/cache" }
+            : {}),
+        };
+        const service = yield* makePiProductionRuntime(options).pipe(
+          Effect.provideService(PiModelCatalogue, f.catalogue),
+          Effect.provideService(FetchHttpClient.Fetch, f.fetch),
+        );
+        const result = yield* Effect.result(
+          service.forInstance({
+            ...instance,
+            configuration: alias === "selected-agent" ? { agentDirectory: link } : {},
+          }),
+        );
+        expect(yield* f.fs.exists(options.nativeStateRoot)).toBe(false);
+        expect(yield* f.fs.exists(options.stagingRoot)).toBe(false);
+        expect(yield* f.fs.readDirectory(target)).toEqual([]);
+        expect(result._tag).toBe("Failure");
+        expect(f.captured).toHaveLength(0);
+        expect(f.fetch).not.toHaveBeenCalled();
+      }),
+    ),
+  );
 
 // This opt-in group consumes real built npm assets and the actual factory/Runtime/SQL.
 // It stages and inspects only; it does not activate the SDK or contact a model provider.
@@ -512,6 +560,110 @@ product("a malformed allocation retains assets even without a trustworthy source
         }),
       );
       expect(yield* f.fs.exists(stage)).toBe(true);
+    }),
+  ),
+);
+for (const fault of [
+  "missing-array",
+  "empty-allocated",
+  "empty-drained",
+  "missing-source",
+  "invalid-source",
+  "invalid-identity",
+  "noncanonical-source",
+  "empty-unit",
+  "empty-nonce",
+  "different-unit",
+  "duplicate-source",
+  "duplicate-target",
+])
+  product(`uncertain ${fault} closure retains the actual stage before source filtering`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* enabledFixture;
+        let stage = "";
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            yield* f.service.forInstance(instance);
+            stage = stageFrom(f);
+            yield* processRow(
+              f.captured[0]!.runtimeFiles,
+              fault === "empty-drained" ? "drained" : "allocated",
+            );
+            const sql = yield* SqlClient.SqlClient;
+            if (fault === "missing-source") {
+              // A malformed closure after a complete page must still veto deletion.
+              yield* sql`WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<17)
+                INSERT INTO project_team_pi_process(unit,operation_id,allocation_json,status)
+                SELECT 'unrelated-' || n, operation_id,
+                  json_set(allocation_json, '$.unit', 'unrelated-' || n,
+                    '$.launch.runtimeFiles', json('[{"source":"/unrelated/0000","target":"/unrelated/target","dev":1,"ino":1}]')),
+                  'allocated' FROM project_team_pi_process, ids WHERE unit='factory-unit'`;
+              yield* sql`UPDATE project_team_pi_process SET rowid=100 WHERE unit='factory-unit'`;
+            }
+            let files =
+              fault === "empty-allocated" || fault === "empty-drained" || fault === "missing-array"
+                ? []
+                : [
+                    {
+                      ...(fault === "missing-source"
+                        ? {}
+                        : { source: fault === "invalid-source" ? "relative" : "/unrelated/0000" }),
+                      target: "/unrelated/target",
+                      dev: 1,
+                      ino: fault === "invalid-identity" ? 0 : 1,
+                    },
+                  ];
+            if (fault === "noncanonical-source") {
+              const file = f.captured[0]!.runtimeFiles[0]!;
+              const identity = yield* Effect.promise(() => nativeFS.lstat(file.source));
+              yield* f.fs.makeDirectory(f.root + "/unrelated");
+              const source = f.root + "/unrelated/../" + file.source.slice(f.root.length + 1);
+              expect(yield* Effect.promise(() => nativeFS.realpath(source))).toBe(file.source);
+              files = [{ ...file, source, dev: identity.dev, ino: identity.ino }];
+            }
+            if (fault === "duplicate-source")
+              files.push({ ...files[0]!, target: "/unrelated/other-target" });
+            if (fault === "duplicate-target")
+              files.push({ ...files[0]!, source: "/unrelated/other-source" });
+            yield* sql`UPDATE project_team_pi_process SET allocation_json = ${encode({
+              unit:
+                fault === "empty-unit" ? "" : fault === "different-unit" ? "other" : "factory-unit",
+              nonce: fault === "empty-nonce" ? "" : "factory-nonce",
+              policy: { memoryBytes: 33554432 },
+              launch: fault === "missing-array" ? {} : { runtimeFiles: files },
+            })} WHERE unit='factory-unit'`;
+          }),
+        );
+        expect(yield* f.fs.exists(stage)).toBe(true);
+        expect(f.fetch).not.toHaveBeenCalled();
+      }),
+    ),
+  );
+product("a valid unrelated allocated closure does not prevent exact stage cleanup", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* enabledFixture;
+      const source = f.root + "/unrelated";
+      yield* f.fs.writeFileString(source, "unrelated ownership");
+      let stage = "";
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* f.service.forInstance(instance);
+          stage = stageFrom(f);
+          yield* processRow([{ source, target: "/unrelated/target" }], "allocated");
+          const sql = yield* SqlClient.SqlClient;
+          // Valid unrelated history must not consume the 1,024 matched-stage row budget.
+          yield* sql`WITH RECURSIVE ids(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM ids WHERE n<1025)
+            INSERT INTO project_team_pi_process(unit,operation_id,allocation_json,status)
+            SELECT 'unrelated-' || n, operation_id,
+              json_set(allocation_json, '$.unit', 'unrelated-' || n), 'allocated'
+            FROM project_team_pi_process, ids WHERE unit='factory-unit'`;
+        }),
+      );
+      expect(yield* f.fs.exists(stage)).toBe(false);
+      expect(yield* f.fs.readFileString(source)).toBe("unrelated ownership");
+      expect(f.fetch).not.toHaveBeenCalled();
     }),
   ),
 );

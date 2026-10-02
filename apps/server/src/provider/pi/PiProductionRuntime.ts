@@ -48,22 +48,32 @@ const FileIdentity = Schema.Struct({
   dev: Schema.Int,
   ino: positive,
 });
+const Allocation = Schema.fromJsonString(
+  Schema.Struct({
+    unit: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(1024)),
+    nonce: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(1024)),
+    policy: Schema.Struct({ memoryBytes: positive }),
+    launch: Schema.Struct({
+      runtimeFiles: Schema.Array(FileIdentity).check(
+        Schema.isMinLength(1),
+        Schema.isMaxLength(128),
+      ),
+    }),
+  }),
+);
+const decodeAllocationPage = Schema.decodeUnknownEffect(
+  Schema.Array(
+    Schema.Struct({
+      rowId: Schema.Int,
+      unit: Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(1024)),
+      allocation: Allocation,
+    }),
+  ).check(Schema.isMaxLength(16)),
+);
 const ProcessRow = Schema.Struct({
   unit: Schema.String,
   status: Schema.Literal("drained"),
-  allocation: Schema.fromJsonString(
-    Schema.Struct({
-      unit: Schema.String,
-      nonce: Schema.String,
-      policy: Schema.Struct({ memoryBytes: positive }),
-      launch: Schema.Struct({
-        runtimeFiles: Schema.Array(FileIdentity).check(
-          Schema.isMinLength(1),
-          Schema.isMaxLength(128),
-        ),
-      }),
-    }),
-  ),
+  allocation: Allocation,
   ownerBytes: Schema.NullOr(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 262144 }))),
   drainBytes: Schema.NullOr(Schema.Int.check(Schema.isBetween({ minimum: 0, maximum: 262144 }))),
   owner: Schema.NullOr(
@@ -150,6 +160,21 @@ async function privateDirectory(directory: string, uid: number) {
     if (stat.uid !== uid || (stat.mode & 0o022) !== 0 || stat.ino < 1) throw unavailable();
     return stat;
   });
+}
+// Missing private targets are allowed, but every existing ancestor must be a physical directory.
+// Inspect with no writes so an alias in any declared root cannot precede state creation.
+async function canonicalTarget(directory: string) {
+  let existing = directory;
+  while (true) {
+    try {
+      await nativeFS.lstat(existing);
+      break;
+    } catch (cause) {
+      if (!(cause instanceof Error) || !("code" in cause) || cause.code !== "ENOENT") throw cause;
+      existing = existing.slice(0, existing.lastIndexOf("/")) || "/";
+    }
+  }
+  await withDirectory(existing, false, async () => undefined);
 }
 type Stage = {
   readonly directory: string;
@@ -318,16 +343,26 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
       }
       const uid = yield* HostProcessUserId;
       if (uid === undefined) return yield* unavailable();
+      const agentDirectory = instance.configuration.agentDirectory ?? options.agentDirectory;
       for (const root of [
         options.stagingRoot,
         options.nativeStateRoot,
         options.distributionDirectory,
+        options.agentDirectory,
+        agentDirectory,
+        ...options.protectedRoots,
       ]) {
         if (root === "/" || path.resolve(root) !== root) return yield* unavailable();
+        yield* native(() => canonicalTarget(root));
       }
       if (
         overlap(options.nativeStateRoot, options.stagingRoot) ||
-        [options.agentDirectory, options.distributionDirectory, ...options.protectedRoots].some(
+        [
+          options.agentDirectory,
+          agentDirectory,
+          options.distributionDirectory,
+          ...options.protectedRoots,
+        ].some(
           (root) => overlap(root, options.stagingRoot) || overlap(root, options.nativeStateRoot),
         )
       )
@@ -341,65 +376,87 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
       const safeToRelease = Effect.gen(function* () {
         yield* outsideTransaction;
         if (accepting || preparing !== 0 || !runtimeFiles) return false;
-        // Malformed allocations are globally uncertain. Relevant rows use the actual staged
-        // source path, then their entire pinned closure and drain receipts are verified below.
-        const rows = yield* sql`
-          SELECT unit, status,
+        // Validate every bounded closure before filtering its source paths. Keyset pages keep
+        // unrelated history out of the matched-stage limit without retaining it in memory.
+        let cursor: number | undefined;
+        let matched = 0;
+        while (true) {
+          const rows = yield* sql`
+          SELECT rowid AS "rowId",
+            CASE WHEN length(CAST(unit AS BLOB)) <= 4096 THEN unit ELSE NULL END AS unit, status,
             CASE WHEN length(CAST(allocation_json AS BLOB)) <= 262144 THEN allocation_json ELSE NULL END AS allocation,
             length(CAST(owner_json AS BLOB)) AS "ownerBytes",
             length(CAST(drain_json AS BLOB)) AS "drainBytes",
             CASE WHEN length(CAST(owner_json AS BLOB)) <= 262144 THEN owner_json ELSE NULL END AS owner,
             CASE WHEN length(CAST(drain_json AS BLOB)) <= 262144 THEN drain_json ELSE NULL END AS drain
           FROM project_team_pi_process
-          WHERE NOT json_valid(allocation_json)
-            OR COALESCE(json_type(CASE WHEN json_valid(allocation_json) THEN allocation_json ELSE '{}' END, '$.launch.runtimeFiles'), 'null') != 'array'
-            OR EXISTS (
-            SELECT 1 FROM json_each(CASE WHEN json_valid(allocation_json) THEN allocation_json ELSE '{}' END, '$.launch.runtimeFiles') AS file
-            WHERE substr(json_extract(file.value, '$.source'), 1, ${stage.directory.length + 1}) = ${stage.directory + "/"}
-          ) LIMIT 1025
+          WHERE ${cursor === undefined ? sql`1` : sql`rowid > ${cursor}`}
+          ORDER BY rowid LIMIT 16
         `;
-        const processes = yield* decodeRows(rows);
-        for (const process of processes) {
-          const allocation = process.allocation;
-          if (
-            allocation.unit !== process.unit ||
-            allocation.launch.runtimeFiles.length !== stage.entries.length ||
-            new Set(allocation.launch.runtimeFiles.map((file) => file.source)).size !==
-              stage.entries.length
-          )
-            return false;
-          for (const file of allocation.launch.runtimeFiles) {
-            const entry = stage.entries.find(
-              (entry) => stage.directory + "/" + entry.name === file.source,
-            );
+          const allocations = yield* decodeAllocationPage(rows);
+          for (const row of allocations) {
+            const files = row.allocation.launch.runtimeFiles;
             if (
-              !entry ||
-              entry.target !== file.target ||
-              entry.identity.dev !== file.dev ||
-              entry.identity.ino !== file.ino
+              row.allocation.unit !== row.unit ||
+              new Set(files.map((file) => file.source)).size !== files.length ||
+              new Set(files.map((file) => file.target)).size !== files.length ||
+              files.some(
+                (file) =>
+                  path.resolve(file.source) !== file.source ||
+                  path.resolve(file.target) !== file.target,
+              )
             )
               return false;
           }
-          if (!process.owner && !process.drain) continue;
-          const owner = process.owner;
-          const drain = process.drain;
-          if (
-            !owner ||
-            !drain ||
-            owner.unit !== process.unit ||
-            owner.nonce !== allocation.nonce ||
-            drain.unit !== process.unit ||
-            drain.invocation !== owner.invocation ||
-            drain.cgroup !== owner.cgroup ||
-            drain.ownerPid !== owner.pid ||
-            owner.memoryBytes !== allocation.policy.memoryBytes ||
-            drain.memoryBytes !== owner.memoryBytes ||
-            (drain.kernel !== "removed" && !drain.kernel.split("\n").includes("populated 0"))
-          )
-            return false;
+          const relevant = rows.filter((_, index) =>
+            allocations[index]!.allocation.launch.runtimeFiles.some((file) =>
+              file.source.startsWith(stage.directory + "/"),
+            ),
+          );
+          matched += relevant.length;
+          if (matched > 1024) return false;
+          const processes = yield* decodeRows(relevant);
+          for (const process of processes) {
+            const allocation = process.allocation;
+            if (allocation.launch.runtimeFiles.length !== stage.entries.length) return false;
+            for (const file of allocation.launch.runtimeFiles) {
+              const entry = stage.entries.find(
+                (entry) => stage.directory + "/" + entry.name === file.source,
+              );
+              if (
+                !entry ||
+                entry.target !== file.target ||
+                entry.identity.dev !== file.dev ||
+                entry.identity.ino !== file.ino
+              )
+                return false;
+            }
+            if (!process.owner && !process.drain) continue;
+            const owner = process.owner;
+            const drain = process.drain;
+            if (
+              !owner ||
+              !drain ||
+              owner.unit !== process.unit ||
+              owner.nonce !== allocation.nonce ||
+              drain.unit !== process.unit ||
+              drain.invocation !== owner.invocation ||
+              drain.cgroup !== owner.cgroup ||
+              drain.ownerPid !== owner.pid ||
+              owner.memoryBytes !== allocation.policy.memoryBytes ||
+              drain.memoryBytes !== owner.memoryBytes ||
+              (drain.kernel !== "removed" && !drain.kernel.split("\n").includes("populated 0"))
+            )
+              return false;
+          }
+          if (rows.length < 16) return true;
+          cursor = allocations.at(-1)!.rowId;
         }
-        return true;
-      }).pipe(Effect.catch(() => Effect.succeed(false)));
+      }).pipe(
+        Effect.timeoutOption(options.cleanupDeadlineMs),
+        Effect.map(Option.getOrElse(() => false)),
+        Effect.catch(() => Effect.succeed(false)),
+      );
       // Registered before Runtime's finalizer: its stop attempt runs first. A caught stop
       // failure never substitutes for durable verified drainage of this exact stage.
       yield* Effect.addFinalizer(() =>
