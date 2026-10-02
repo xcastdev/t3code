@@ -5,6 +5,9 @@ import * as DateTime from "effect/DateTime";
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Deferred from "effect/Deferred";
+import * as Option from "effect/Option";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as TestClock from "effect/testing/TestClock";
@@ -28,7 +31,10 @@ import { ProjectWorkSearchLive } from "../../projectWork/ProjectWorkSearch.ts";
 import { ProjectWorkNarrativeLive } from "../../projectWork/ProjectWorkNarrative.ts";
 import { ProjectWorkBriefingLive } from "../../projectWork/ProjectWorkBriefing.ts";
 import { ProjectWorkGatewayLive } from "../../projectWork/ProjectWorkGateway.ts";
-import { ProjectWorkProjectionLive } from "../../projectWork/ProjectWorkProjection.ts";
+import {
+  ProjectWorkProjection,
+  ProjectWorkProjectionLive,
+} from "../../projectWork/ProjectWorkProjection.ts";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import {
   makePiManagedRuntimeLive,
@@ -61,6 +67,22 @@ const json = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const parseOwner = Schema.decodeSync(
   Schema.fromJsonString(
     Schema.Struct({ unit: Schema.String, invocation: Schema.String, pid: Schema.Int }),
+  ),
+);
+const parseFullDrain = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      unit: Schema.String,
+      invocation: Schema.String,
+      kernel: Schema.String,
+      cgroup: Schema.String,
+      ownerPid: Schema.Int,
+      launcherPid: Schema.Int,
+      childPid: Schema.Int,
+      memoryBytes: Schema.Int,
+      swapBytes: Schema.Int,
+      oomGroup: Schema.Int,
+    }),
   ),
 );
 const parseDrain = Schema.decodeSync(
@@ -203,7 +225,7 @@ const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
         Layer.provideMerge(ServerSettings.layerTest({ projectWorkEnabled: true })),
         Layer.provideMerge(makeSqlitePersistenceLive(directory + "/native-runtime.sqlite")),
       );
-      return yield* effect.pipe(Effect.provide(live));
+      return yield* Effect.scoped(effect).pipe(Effect.provide(live));
     }),
   ).pipe(Effect.provide(NodeServices.layer));
 const rejected = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
@@ -668,5 +690,286 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_LINUX_GATE === "1")(
         ),
       30000,
     );
+  },
+);
+
+describe.runIf(process.env.PI_MANAGED_RUNTIME_LINUX_GATE === "1")(
+  "actual native publication fence",
+  () => {
+    for (const mode of [
+      "control",
+      "stop-one",
+      "stop-all",
+      "changed-native",
+      "publication-stop-one",
+      "publication-stop-all",
+      "publication-after-commit-stop-one",
+      "publication-after-commit-stop-all",
+      "publication-changed-native",
+      "publication-native-before-commit",
+    ] as const) {
+      it.effect(
+        `actual SDK final handoff ${mode}`,
+        () =>
+          scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture;
+              if (
+                !process.env.PI_MANAGED_RUNTIME_TEST_CLOSURE ||
+                !process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE
+              )
+                return yield* Effect.die("Required actual SDK closure/evidence missing");
+              const closure = yield* decodeClosure(
+                yield* f.fs.readFileString(process.env.PI_MANAGED_RUNTIME_TEST_CLOSURE!),
+              );
+              const actualAt = DateTime.formatIso(DateTime.nowUnsafe());
+              yield* TestClock.setTime(Date.parse(actualAt));
+              yield* restoreHistoricalBinding({
+                ...f.binding,
+                revision: f.binding.revision + 1,
+                updatedAt: actualAt,
+              });
+              const real = yield* Authorization.ProjectTeamAuthorization;
+              const projection = yield* ProjectWorkProjection;
+              const restore = (record: Parameters<typeof restoreHistoricalBinding>[0]) =>
+                restoreHistoricalBinding(record).pipe(
+                  Effect.provideService(ProjectWorkProjection, projection),
+                  Effect.provideService(SqlClient.SqlClient, f.sql),
+                  Effect.orDie,
+                );
+              const entered = yield* Deferred.make<void>();
+              const release = yield* Deferred.make<void>();
+              const canceled = Promise.withResolvers<void>();
+              let operationId: string | undefined;
+              let settledReads = 0;
+              let held = false;
+              let changed = false;
+              let cancellationObserved = false;
+              let stopJoined = false;
+              const sequence: string[] = [];
+              const wrapped = Authorization.ProjectTeamAuthorization.of({
+                ...real,
+                issueCredential: (...args) =>
+                  Effect.gen(function* () {
+                    const authority = yield* real.issueCredential(...args);
+                    if (operationId && mode.startsWith("publication-") && !held) {
+                      const rows = yield* f.sql<{
+                        status: string;
+                      }>`SELECT status FROM project_team_pi_operation WHERE operation_id=${operationId}`.pipe(
+                        Effect.orDie,
+                      );
+                      const inside = Option.isSome(
+                        yield* Effect.serviceOption(f.sql.transactionService),
+                      );
+                      if (
+                        rows[0]?.status === "settled" &&
+                        (mode === "publication-changed-native" || mode.includes("after-commit")
+                          ? !inside
+                          : inside)
+                      ) {
+                        if (!authority)
+                          return yield* Effect.die("No current native publication authority");
+                        held = true;
+                        sequence.push(
+                          inside ? "final-transaction-authority-held" : "postcommit-authority-held",
+                        );
+                        if (mode === "publication-native-before-commit") {
+                          yield* restore({
+                            ...authority.binding,
+                            revision: authority.binding.revision + 1,
+                            sessionId: "foreign-native-inside-publication",
+                          });
+                          changed = true;
+                        } else {
+                          yield* Deferred.succeed(entered, undefined);
+                          yield* Deferred.await(release);
+                        }
+                      }
+                    }
+                    return authority;
+                  }),
+                resolve: (...args) =>
+                  Effect.gen(function* () {
+                    const result = yield* real.resolve(...args);
+                    if (
+                      !mode.startsWith("publication-") &&
+                      operationId &&
+                      Option.isNone(yield* Effect.serviceOption(f.sql.transactionService))
+                    ) {
+                      const rows = yield* f.sql<{
+                        status: string;
+                      }>`SELECT status FROM project_team_pi_operation WHERE operation_id=${operationId}`.pipe(
+                        Effect.orDie,
+                      );
+                      if (rows[0]?.status === "settled") {
+                        settledReads++;
+                        if (settledReads === 2) {
+                          held = true;
+                          sequence.push("actual-final-authority-held");
+                          yield* Deferred.succeed(entered, undefined);
+                          yield* Deferred.await(release);
+                        }
+                      }
+                    }
+                    return result;
+                  }),
+              });
+              const originalFetch = globalThis.fetch;
+              globalThis.fetch = async () => {
+                throw Error("Unexpected ambient model fetch");
+              };
+              const options: PiManagedRuntimeLiveOptions = {
+                ...f.options,
+                memoryBytes: 536870912,
+                cleanupDeadlineMs: 5000,
+                runtimeFiles: closure.files.map(({ source, target }) => ({ source, target })),
+                workerArgv: (identity, operation) => [
+                  "/runtime/node",
+                  "--max-old-space-size=512",
+                  "/runtime/dist/worker.mjs",
+                  identity.workerId,
+                  String(identity.generation),
+                  operation.operationId,
+                  operation.operationKind,
+                  "plain",
+                ],
+                readCatalogue: Effect.succeed({
+                  source: "https://api.commandcode.ai/provider/v1/models",
+                  fetchedAt: actualAt,
+                  selectedEntry: {
+                    id: model,
+                    owned_by: "command-code",
+                    context_length: 20000,
+                    supported_endpoints: ["/chat/completions"],
+                  },
+                }),
+              };
+              const runtime = yield* makePiManagedRuntimeLive(options).pipe(
+                Effect.provideService(Authorization.ProjectTeamAuthorization, wrapped),
+              );
+              const instance = yield* runtime.forInstance({
+                instanceId: providerInstanceId,
+                enabled: true,
+                configuration: {},
+              });
+              const prepared = yield* instance.prepareOperation(
+                { threadId, kind: "initialize" },
+                () => Effect.void,
+              );
+              operationId = prepared.operation.operationId;
+              yield* Effect.addFinalizer(() =>
+                Effect.gen(function* () {
+                  yield* Deferred.succeed(release, undefined);
+                  yield* instance.stopAll;
+                  const operations = yield* f.sql`SELECT * FROM project_team_pi_operation`;
+                  const processes = yield* f.sql`SELECT * FROM project_team_pi_process`;
+                  yield* f.fs.writeFileString(
+                    process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE +
+                      "/native-tail-" +
+                      mode +
+                      "-final.json",
+                    json({ mode, held, sequence, operations, processes }),
+                  );
+                }).pipe(Effect.orDie),
+              );
+              const original = AbortController.prototype.abort;
+              AbortController.prototype.abort = function (...args) {
+                original.apply(this, args);
+                if (held) {
+                  cancellationObserved = true;
+                  sequence.push("internal-cancellation-abort");
+                  canceled.resolve();
+                }
+              };
+              try {
+                const running = yield* Effect.forkChild(prepared.run.pipe(Effect.result));
+                if (mode !== "publication-native-before-commit")
+                  yield* Effect.raceFirst(
+                    Deferred.await(entered),
+                    Fiber.join(running).pipe(
+                      Effect.flatMap((outcome) =>
+                        Effect.die(
+                          "SDK run completed before the required native authority receipt: " +
+                            json(outcome),
+                        ),
+                      ),
+                    ),
+                  );
+                let stopping: Fiber.Fiber<void, Effect.Error<typeof instance.stopAll>> | undefined;
+                if (mode.endsWith("stop-one") || mode.endsWith("stop-all")) {
+                  sequence.push(mode + "-invoked");
+                  stopping = yield* Effect.forkChild(
+                    mode.endsWith("stop-one") ? instance.requestStop(threadId) : instance.stopAll,
+                  );
+                  yield* Effect.promise(() => canceled.promise);
+                }
+                if (mode === "changed-native" || mode === "publication-changed-native") {
+                  const current = yield* real.resolve({
+                    actor: { kind: "agent", id: Authorization.managedActorId(f.principal.managed) },
+                    managed: f.principal.managed,
+                  });
+                  if (!current) return yield* Effect.die("No current fixture authority");
+                  yield* restoreHistoricalBinding({
+                    ...current.binding,
+                    revision: current.binding.revision + 1,
+                    sessionId: "changed-native-after-terminal",
+                  });
+                  changed = true;
+                }
+                sequence.push("authority-receipt-released");
+                yield* Deferred.succeed(release, undefined);
+                const outcome = yield* Fiber.join(running);
+                sequence.push("run-returned-" + outcome._tag);
+                if (stopping) {
+                  yield* Fiber.join(stopping);
+                  stopJoined = true;
+                  sequence.push("stop-joined");
+                }
+                const rows = yield* f.sql<{
+                  owner_json: string;
+                  drain_json: string;
+                }>`SELECT * FROM project_team_pi_process`;
+                yield* f.fs.writeFileString(
+                  process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE + "/native-tail-" + mode + ".json",
+                  json({
+                    mode,
+                    settledReads,
+                    held,
+                    changed,
+                    cancellationObserved,
+                    stopJoined,
+                    sequence,
+                    outcome,
+                    rows,
+                  }),
+                );
+                for (const row of rows) {
+                  const owner = parseOwner(row.owner_json);
+                  const drain = parseFullDrain(row.drain_json);
+                  expect(owner.invocation).toBe(drain.invocation);
+                  expect(owner.unit).toBe(drain.unit);
+                  expect(owner.pid).toBe(drain.ownerPid);
+                  expect(drain.memoryBytes).toBe(536870912);
+                  expect(drain.swapBytes).toBe(0);
+                  expect(drain.oomGroup).toBe(1);
+                  for (const pid of [owner.pid, drain.launcherPid, drain.childPid])
+                    expect(yield* f.fs.exists("/proc/" + pid)).toBe(false);
+                  expect(yield* f.fs.exists(drain.cgroup)).toBe(false);
+                  expect(drain.kernel === "removed" || drain.kernel.includes("populated 0")).toBe(
+                    true,
+                  );
+                }
+                expect(f.transports).toBe(0);
+                expect(held).toBe(true);
+                expect(outcome._tag).toBe(mode === "control" ? "Success" : "Failure");
+              } finally {
+                AbortController.prototype.abort = original;
+                globalThis.fetch = originalFetch;
+              }
+            }),
+          ),
+        30000,
+      );
+    }
   },
 );

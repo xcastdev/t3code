@@ -662,10 +662,22 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       },
                       catch: () => deny("Pi operation requires reconciliation", "uncertain"),
                     }).pipe(Effect.onInterrupt(() => Effect.sync(() => cancellation.abort())));
-                    const current = yield* operations.current(identity(request.threadId));
-                    if (terminal.outcome !== "success")
+                    yield* operations.current(identity(request.threadId));
+                    if (terminal.outcome !== "success" || !terminal.native)
                       return yield* deny("Pi operation requires reconciliation", "uncertain");
-                    return { terminal, session: sessionFor(current, terminal.native ?? undefined) };
+                    const current = yield* operations.publication(durable, terminal);
+                    // No asynchronous work separates these owner checks from publication.
+                    if (
+                      cancellation.signal.aborted ||
+                      active.get(request.threadId)?.prepared.operation.operationId !==
+                        operation.operationId
+                    )
+                      return yield* deny("Pi operation publication canceled", "conflict");
+                    const result = { terminal, session: sessionFor(current, terminal.native) };
+                    active.delete(request.threadId);
+                    done.resolve();
+                    ownsRun = false;
+                    return result;
                   }),
                 ).pipe(
                   Effect.ensuring(

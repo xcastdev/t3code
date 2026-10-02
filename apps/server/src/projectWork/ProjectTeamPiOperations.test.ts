@@ -3,13 +3,15 @@ import { expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as TestClock from "effect/testing/TestClock";
 import { makeSqlitePersistenceLive } from "../persistence/Layers/Sqlite.ts";
 import { ProjectWorkRepositoryLive } from "./ProjectWorkRepository.ts";
-import { ProjectWorkProjectionLive } from "./ProjectWorkProjection.ts";
+import { ProjectWorkProjection, ProjectWorkProjectionLive } from "./ProjectWorkProjection.ts";
 import { ProjectWorkQueryLive } from "./ProjectWorkQuery.ts";
 import * as Authorization from "./ProjectTeamAuthorization.ts";
 import {
@@ -24,6 +26,7 @@ import { makeProjectTeamPiOperations } from "./ProjectTeamPiOperations.ts";
 import { make as makeAccounting } from "./ProjectTeamModelAccounting.ts";
 
 const decodeSetup = Schema.decodeUnknownEffect(ProjectTeamEffect);
+const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const parseJson = Schema.decodeSync(Schema.fromJsonString(Schema.Unknown));
 const model = "inclusionai/ling-3.1-flash:free";
 const time = Date.parse(at) + 100;
@@ -342,3 +345,108 @@ it.effect("keeps unfinished setup uncertain before allocation", () =>
     }),
   ),
 );
+
+for (const mode of ["control", "before-prepare", "before-final-commit", "after-commit"] as const) {
+  it.effect(`native binding commit fence ${mode}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const real = yield* Authorization.ProjectTeamAuthorization;
+        const projection = yield* ProjectWorkProjection;
+        const restore = (record: Parameters<typeof restoreHistoricalBinding>[0]) =>
+          restoreHistoricalBinding(record).pipe(
+            Effect.provideService(ProjectWorkProjection, projection),
+            Effect.provideService(SqlClient.SqlClient, f.sql),
+            Effect.orDie,
+          );
+        let armed = false,
+          reads = 0,
+          changed = false,
+          inTransaction = false;
+        const wrapped = Authorization.ProjectTeamAuthorization.of({
+          ...real,
+          issueCredential: (...args) =>
+            Effect.gen(function* () {
+              const authority = yield* real.issueCredential(...args);
+              if (armed) {
+                reads++;
+                const inside = Option.isSome(yield* Effect.serviceOption(f.sql.transactionService));
+                if (
+                  !changed &&
+                  authority &&
+                  ((mode === "before-prepare" && reads === 1 && inside) ||
+                    (mode === "before-final-commit" && reads === 2 && inside) ||
+                    (mode === "after-commit" && reads === 3 && !inside))
+                ) {
+                  inTransaction = inside;
+                  yield* restore({
+                    ...authority.binding,
+                    revision: authority.binding.revision + 1,
+                    sessionId: "foreign-native-replacement",
+                  });
+                  changed = true;
+                  return yield* real.issueCredential(...args);
+                }
+              }
+              return authority;
+            }),
+        });
+        const ops = yield* makeProjectTeamPiOperations({ environmentId: "environment" }).pipe(
+          Effect.provideService(Authorization.ProjectTeamAuthorization, wrapped),
+        );
+        const op = yield* ops.prepare(
+          f.identity,
+          { threadId: f.identity.threadId, kind: "initialize" },
+          "request",
+          { allocation: f.allocation, workerId: "worker", operationId: "native-fence" },
+        );
+        const native = {
+          sessionId: "original-native",
+          sessionReference: "sessions/original-native.jsonl",
+          leafId: null,
+          persisted: false,
+        };
+        armed = true;
+        const outcome = yield* ops.persistNative(op, native).pipe(Effect.result);
+        armed = false;
+        const current = yield* real.issueCredential(f.identity);
+        const rows = yield* f.sql<{
+          native_json: string | null;
+          status: string;
+        }>`SELECT native_json,status FROM project_team_pi_operation WHERE operation_id='native-fence'`;
+        const journal = yield* f.repo.replay(f.binding.projectId);
+        const fs = yield* FileSystem.FileSystem;
+        if (process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE)
+          yield* fs.writeFileString(
+            process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE + "/native-commit-" + mode + ".json",
+            encodeJson({
+              mode,
+              outcome,
+              reads,
+              changed,
+              inTransaction,
+              binding: current?.binding,
+              rows,
+              events: journal.filter(
+                (e) =>
+                  e.type === "project-work.foundation.recorded" && e.record.kind === "run-binding",
+              ),
+            }),
+          );
+        expect(changed).toBe(mode !== "control");
+        expect(inTransaction).toBe(mode === "before-prepare" || mode === "before-final-commit");
+        if (mode === "before-prepare" || mode === "before-final-commit") {
+          expect(rows[0]?.native_json).toBeNull();
+          expect(current?.binding.status).toBe("reserved");
+          expect(current?.binding.sessionId).toBeUndefined();
+        } else {
+          expect(parseJson(rows[0]!.native_json!)).toEqual(native);
+          expect(current?.binding.sessionId).toBe(
+            mode === "control" ? native.sessionId : "foreign-native-replacement",
+          );
+        }
+        expect(outcome._tag).toBe(mode === "control" ? "Success" : "Failure");
+      }),
+    ),
+  );
+}

@@ -30,7 +30,7 @@ import {
   type ProjectTeamAuthority,
   type ProjectTeamPrincipal,
 } from "./ProjectTeamAuthorization.ts";
-import { ProjectWorkRepository } from "./ProjectWorkRepository.ts";
+import { readCurrentState, ProjectWorkRepository } from "./ProjectWorkRepository.ts";
 
 const encode = canonicalProjectWorkPayload;
 const isRuntimeError = Schema.is(PiManagedRuntimeError);
@@ -89,6 +89,7 @@ type Row = {
   deadline_at_ms: number;
   status: "prepared" | "starting" | "running" | "settled" | "quarantine";
   native_json: string | null;
+  terminal_json: string | null;
   intent_json: string;
 };
 export interface PiDurableOperation {
@@ -212,6 +213,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
     });
     const authorize = Effect.fn("ProjectTeamPiOperations.authorize")(function* (
       captured: PiDurableOperation,
+      settled = false,
     ) {
       const authority = yield* current(
         {
@@ -235,7 +237,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       const root = yield* roots(authority);
       const row = yield* getRow(captured.operation.operationId);
       if (
-        row.status === "settled" ||
+        (settled ? row.status !== "settled" : row.status === "settled") ||
         row.status === "quarantine" ||
         row.worker_id !== captured.workerId ||
         row.binding_id !== binding.recordId ||
@@ -410,6 +412,54 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
           ),
         ),
     });
+    const nativeAuthority = Effect.fn("ProjectTeamPiOperations.nativeAuthority")(function* (
+      captured: PiDurableOperation,
+      native: PiNativeReference,
+      settled = false,
+    ) {
+      const authority = yield* authorize(captured, settled);
+      const row = yield* getRow(captured.operation.operationId);
+      if (
+        authority.binding.status !== "running" ||
+        authority.binding.sessionId !== native.sessionId ||
+        row.native_json !== encode(native)
+      )
+        return yield* deny("Native Pi session identity changed");
+      const state = yield* readCurrentState(sql, authority.binding.projectId);
+      if (state.revision !== authority.state.revision)
+        return yield* deny("Native Pi authority receipt changed");
+      yield* clockCheck(row.deadline_at_ms);
+      return authority;
+    });
+    // Terminal persistence releases the durable writer fence. Publication must still belong
+    // to this exact completed operation and its current native session.
+    const publication = Effect.fn("ProjectTeamPiOperations.publication")(function* (
+      captured: PiDurableOperation,
+      terminal: PiSessionTerminal,
+    ) {
+      yield* ownTransaction();
+      if (terminal.outcome !== "success" || !terminal.native)
+        return yield* deny("Successful native Pi terminal required");
+      const native = terminal.native;
+      const validate = Effect.gen(function* () {
+        const authority = yield* nativeAuthority(captured, native, true);
+        const row = yield* getRow(captured.operation.operationId);
+        if (row.terminal_json !== encode(terminal))
+          return yield* deny("Pi terminal publication receipt changed");
+        const latest = yield* sql<{
+          ordinal: number;
+        }>`SELECT MAX(operation_ordinal) AS ordinal FROM project_team_pi_operation WHERE environment_id=${options.environmentId} AND provider_instance_id=${authority.binding.providerInstanceId} AND thread_id=${authority.binding.threadId}`;
+        if (latest[0]?.ordinal !== captured.ordinal)
+          return yield* deny("Pi operation publication owner changed");
+        const state = yield* readCurrentState(sql, authority.binding.projectId);
+        if (state.revision !== authority.state.revision)
+          return yield* deny("Pi publication authority receipt changed");
+        yield* clockCheck(captured.deadlineAtMs);
+        return authority;
+      });
+      yield* sql.withTransaction(validate);
+      return yield* validate;
+    });
     const persistNative = Effect.fn("ProjectTeamPiOperations.persistNative")(function* (
       captured: PiDurableOperation,
       input: PiNativeReference,
@@ -448,9 +498,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             },
           ];
         }),
-        authorize(captured).pipe(Effect.asVoid),
+        nativeAuthority(captured, native).pipe(Effect.asVoid),
       );
-      yield* authorize(captured);
+      yield* nativeAuthority(captured, native);
     });
     const persistControl = Effect.fn("ProjectTeamPiOperations.persistControl")(function* (
       captured: PiDurableOperation,
@@ -681,6 +731,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
       prepare: (...args: Parameters<typeof prepare>) => guard(prepare(...args)),
       authorize: (operation: PiDurableOperation) => guard(authorize(operation)),
       persistence,
+      publication: (...args: Parameters<typeof publication>) => guard(publication(...args)),
       persistNative: (...args: Parameters<typeof persistNative>) => guard(persistNative(...args)),
       persistControl: (...args: Parameters<typeof persistControl>) =>
         guard(persistControl(...args)),
