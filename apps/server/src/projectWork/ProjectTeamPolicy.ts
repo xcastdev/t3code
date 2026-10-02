@@ -302,7 +302,10 @@ export const assertProjectTeamRunAuthority = (
           ![
             "read",
             "search",
+            "pi.read",
             "project-work",
+            "project-work.read-project",
+            "project-work.read-task",
             "project-work.report",
             ...(inherited.assignmentKind === "planning" ? ["project-work.plan"] : []),
           ].includes(tool),
@@ -319,7 +322,16 @@ export const assertProjectTeamRunAuthority = (
       plan !== undefined ||
       grant.contentHash !== binding.scopeHash ||
       binding.configuration.toolIds.some(
-        (tool) => !["read", "search", "project-work", "project-work.report"].includes(tool),
+        (tool) =>
+          ![
+            "read",
+            "search",
+            "pi.read",
+            "project-work",
+            "project-work.read-project",
+            "project-work.read-task",
+            "project-work.report",
+          ].includes(tool),
       )
     )
       deny("Investigation cannot grant writable implementation authority");
