@@ -110,6 +110,7 @@ const workspaceFixture = Effect.fn("PiSdkSessionRuntime.workspaceFixture")(funct
     native: PiNativeReference | null = null,
     mode = "plain",
     overrides: Partial<PiSessionRuntimeOptions> = {},
+    observeExit = false,
   ) {
     const identity = { workerId: "sdk-parent", generation: 1 };
     const op = { operationId: `${operationKind}-${fixtureId}-${++operationCount}`, operationKind };
@@ -150,6 +151,7 @@ const workspaceFixture = Effect.fn("PiSdkSessionRuntime.workspaceFixture")(funct
     const idle = Promise.withResolvers<void>();
     const ackHeld = Promise.withResolvers<void>();
     const failed = Promise.withResolvers<void>();
+    const launcherExited = Promise.withResolvers<number>();
     let pulls = 0;
     const runtime = yield* makePiSessionRuntime({
       identity,
@@ -355,6 +357,7 @@ const workspaceFixture = Effect.fn("PiSdkSessionRuntime.workspaceFixture")(funct
     });
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const trace: string[] = [];
+    const launcherPids: number[] = [];
     let traceBytes = 0;
     const workerFramer = makePiWorkerLineFramer((raw) => {
       const frame = decodePiWorkerFrame(raw);
@@ -372,23 +375,34 @@ const workspaceFixture = Effect.fn("PiSdkSessionRuntime.workspaceFixture")(funct
     });
     const observed = ChildProcessSpawner.make((command) =>
       spawner.spawn(command).pipe(
-        Effect.map((handle) =>
-          command._tag !== "StandardCommand" || command.command !== "/usr/bin/systemd-run"
-            ? handle
-            : ChildProcessSpawner.makeHandle({
-                ...handle,
-                stdout: handle.stdout.pipe(
-                  Stream.tap((chunk) =>
+        Effect.map((handle) => {
+          if (command._tag !== "StandardCommand" || command.command !== "/usr/bin/systemd-run")
+            return handle;
+          launcherPids.push(Number(handle.pid));
+          return ChildProcessSpawner.makeHandle({
+            ...handle,
+            exitCode: observeExit
+              ? handle.exitCode.pipe(
+                  Effect.tap((code) =>
                     Effect.sync(() => {
-                      traceBytes += chunk.byteLength;
-                      if (traceBytes > 2 * 1024 * 1024) throw Error("Fixture trace limit");
-                      trace.push(Buffer.from(chunk).toString("utf8"));
-                      ownerFramer.push(chunk);
+                      events.push("launcher-exited");
+                      launcherExited.resolve(Number(code));
                     }),
                   ),
-                ),
-              }),
-        ),
+                )
+              : handle.exitCode,
+            stdout: handle.stdout.pipe(
+              Stream.tap((chunk) =>
+                Effect.sync(() => {
+                  traceBytes += chunk.byteLength;
+                  if (traceBytes > 2 * 1024 * 1024) throw Error("Fixture trace limit");
+                  trace.push(Buffer.from(chunk).toString("utf8"));
+                  ownerFramer.push(chunk);
+                }),
+              ),
+            ),
+          });
+        }),
       ),
     );
     const run = runtime.run().pipe(
@@ -412,6 +426,7 @@ const workspaceFixture = Effect.fn("PiSdkSessionRuntime.workspaceFixture")(funct
                 tools,
                 events,
                 trace,
+                launcherPids,
                 pulls,
                 result: result._tag,
               }),
@@ -447,6 +462,7 @@ const workspaceFixture = Effect.fn("PiSdkSessionRuntime.workspaceFixture")(funct
       idle,
       ackHeld,
       failed,
+      launcherExited,
       pulls: () => pulls,
     };
   });
@@ -523,6 +539,44 @@ describe("portable pinned SDK session persistence", () => {
 describe.runIf(process.env.PI_SDK_SESSION_RUNTIME_LINUX_GATE === "1")(
   "actual Linux SDK composed with parent ownership",
   () => {
+    effectIt.live("EOF repair joins actual SDK exit before initialized publication", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const f = yield* workspaceFixture();
+          const release = Promise.withResolvers<void>();
+          const op = yield* f.operation(
+            "initialize",
+            null,
+            "plain",
+            {
+              onWorkerFrame: async (frame, signal) => {
+                if (frame.message.type !== "initialized") return;
+                await new Promise<void>((resolve, reject) => {
+                  const abort = () => reject(signal.reason);
+                  if (signal.aborted) return abort();
+                  signal.addEventListener("abort", abort, { once: true });
+                  void release.promise.then(() => {
+                    signal.removeEventListener("abort", abort);
+                    resolve();
+                  });
+                });
+              },
+            },
+            true,
+          );
+          const running = yield* Effect.forkChild(op.run);
+          expect(yield* Effect.promise(() => op.launcherExited.promise)).toBe(0);
+          release.resolve();
+          yield* f.successful({ ...op, run: Fiber.join(running) });
+          expect(op.requests).toHaveLength(0);
+          expect(op.settlements).toHaveLength(0);
+          expect(op.events.indexOf("launcher-exited")).toBeLessThan(
+            op.events.indexOf("native-persisted"),
+          );
+        }),
+      ).pipe(Effect.provide(NodeServices.layer)),
+    );
+
     effectIt.live(
       "initializes, executes two sequential bridge calls, compacts and reopens the exact native session",
       () =>
