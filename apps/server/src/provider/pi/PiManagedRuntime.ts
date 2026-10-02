@@ -7,6 +7,7 @@ import type {
   ThreadId,
   TurnId,
 } from "@t3tools/contracts";
+import { PiSettings } from "@t3tools/contracts";
 import * as Context from "effect/Context";
 import type * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
@@ -20,15 +21,7 @@ import type { PiSessionTerminal } from "./PiSessionRuntime.ts";
 import type { PiWorkerOperation } from "./PiWorkerProtocol.ts";
 
 /** Select a parent-owned Pi configuration directory; credentials never enter this value. */
-export const PiDriverConfiguration = Schema.Struct({
-  agentDirectory: Schema.optional(
-    Schema.String.check(
-      Schema.isMinLength(1),
-      Schema.isMaxLength(4096),
-      Schema.makeFilter((value) => value.trim() === value && !value.includes("\0")),
-    ),
-  ),
-}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export const PiDriverConfiguration = PiSettings;
 export type PiDriverConfiguration = typeof PiDriverConfiguration.Type;
 
 export class PiManagedRuntimeError extends Schema.TaggedError<PiManagedRuntimeError>()(

@@ -7,6 +7,7 @@ import {
   ClientSettingsPatch,
   ClaudeSettings,
   DEFAULT_SERVER_SETTINGS,
+  PiSettings,
   resolveProviderInstanceEnabled,
   ServerSettings,
   ServerSettingsPatch,
@@ -19,6 +20,32 @@ const decodeServerSettings = Schema.decodeUnknownSync(ServerSettings);
 const decodeServerSettingsPatch = Schema.decodeUnknownSync(ServerSettingsPatch);
 const encodeServerSettings = Schema.encodeSync(ServerSettings);
 const decodeClaudeSettings = Schema.decodeUnknownSync(ClaudeSettings);
+const decodePiSettings = Schema.decodeUnknownSync(PiSettings);
+const encodePiSettings = Schema.encodeSync(PiSettings);
+
+describe("Pi instance configuration", () => {
+  it("uses the native default without inventing a directory or credential", () => {
+    expect(decodePiSettings({})).toEqual({});
+    expect(decodePiSettings({ agentDirectory: "/trusted/pi" })).toEqual({
+      agentDirectory: "/trusted/pi",
+    });
+  });
+
+  it("rejects credentials, runtime authority and instance enablement in configuration", () => {
+    for (const field of ["apiKey", "model", "role", "approved", "tools", "endpoint", "enabled"])
+      expect(() => decodePiSettings({ agentDirectory: "/trusted/pi", [field]: true })).toThrow();
+  });
+
+  it("rejects ambiguous, malformed and unbounded directory values", () => {
+    for (const agentDirectory of ["", " ", " /pi", "/pi ", "/pi\0other", "x".repeat(4097), null, 1])
+      expect(() => decodePiSettings({ agentDirectory })).toThrow();
+  });
+
+  it("retains the native directory selection through a configuration round trip", () => {
+    const configuration = { agentDirectory: "~/.pi/agent" };
+    expect(encodePiSettings(decodePiSettings(configuration))).toEqual(configuration);
+  });
+});
 
 describe("ServerSettings default permissions", () => {
   it("keeps full access for settings saved before a default was configured", () => {
