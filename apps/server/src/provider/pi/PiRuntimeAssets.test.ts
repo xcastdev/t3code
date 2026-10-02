@@ -3,6 +3,14 @@ import * as Crypto from "effect/Crypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
+import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import { HostProcessPlatform, HostProcessIsExecutable } from "@t3tools/shared/hostProcess";
@@ -11,7 +19,29 @@ import { decodePiWorkerLaunch } from "./PiWorkerEntrypoint.ts";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
 
 // Fixtures replace inodes and directory names using actual native filesystem handles.
-const NodeFSP = process.getBuiltinModule("fs").promises;
+const NodeFS = process.getBuiltinModule("fs");
+const NodeFSP = NodeFS.promises;
+const drainEvidenceDirectory = process.env.PI_RUNTIME_ASSETS_DRAIN_EVIDENCE_DIRECTORY;
+const encodeDrainObservation = Schema.encodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      mode: Schema.String,
+      childPid: Schema.Int,
+      readySeen: Schema.Boolean,
+      sigtermReceived: Schema.Boolean,
+      stdoutReaderJoined: Schema.Boolean,
+      stderrReaderJoined: Schema.Boolean,
+      manualKillRequired: Schema.Boolean,
+      failureOnly: Schema.Boolean,
+      childAbsent: Schema.Boolean,
+      stageEmpty: Schema.Boolean,
+      forceKillAfter: Schema.NullOr(Schema.String),
+      producerCompletionBeforeTerminalExit: Schema.Boolean,
+      terminalExitObserved: Schema.Boolean,
+      elapsedMillis: Schema.Finite,
+    }),
+  ),
+);
 const fixturePath = (...parts: ReadonlyArray<string>) => parts.join("/");
 let scratch = "";
 let input: Parameters<typeof preparePiRuntimeAssets>[0];
@@ -46,8 +76,11 @@ afterEach(async () => {
   await NodeFSP.chmod(input.stagingDirectory, 0o700).catch(() => undefined);
   await NodeFSP.rm(scratch, { recursive: true, force: true });
 });
-const check = <A, E>(name: string, body: () => Effect.Effect<A, E, NodeServices.NodeServices>) =>
-  it.live(name, () => body().pipe(Effect.provide(NodeServices.layer)));
+const check = <A, E>(
+  name: string,
+  body: () => Effect.Effect<A, E, NodeServices.NodeServices>,
+  timeout?: number,
+) => it.live(name, () => body().pipe(Effect.provide(NodeServices.layer)), timeout);
 const beforeDiscovery = Effect.fn("assetsTest.beforeDiscovery")(function* (value = input) {
   let discoveries = 0;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
@@ -203,9 +236,156 @@ describe("Pi runtime assets refuse unsafe inputs before discovery", () => {
 });
 
 // This required gate is separately selected. Missing Linux/proc/ldd/ELF prerequisites fail.
-const native: typeof check = (name, body) =>
-  process.env.PI_RUNTIME_ASSETS_LINUX_GATE === "1" ? check(name, body) : it.skip(name, () => {});
+const native: typeof check = (name, body, timeout) =>
+  process.env.PI_RUNTIME_ASSETS_LINUX_GATE === "1"
+    ? check(name, body, timeout)
+    : it.skip(name, () => {});
 describe("required actual Linux executable closure", () => {
+  for (const mode of ["cancellation", "deadline"] as const)
+    native(
+      `drains SIGTERM-ignoring discovery on ${mode}`,
+      () =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const started = yield* Clock.currentTimeMillis;
+            const ready = yield* Deferred.make<void>();
+            const stdoutJoined = yield* Deferred.make<void>();
+            const stderrJoined = yield* Deferred.make<void>();
+            const signalFile = fixturePath(scratch, "sigterm-receipt");
+            yield* Effect.promise(() => NodeFSP.writeFile(signalFile, ""));
+            // This separate native receipt remains observable after product stream cancellation.
+            let watcher: ReturnType<typeof NodeFS.watch> | undefined;
+            const signalReceived = new Promise<void>((resolve, reject) => {
+              watcher = NodeFS.watch(signalFile, { persistent: false }, () => {
+                NodeFSP.readFile(signalFile, "utf8").then((value) => {
+                  if (value === "SIGTERM") resolve();
+                }, reject);
+              });
+              watcher.on("error", reject);
+            });
+            yield* Effect.addFinalizer(() => Effect.sync(() => watcher?.close()));
+            const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+            let captured: ChildProcessSpawner.ChildProcessHandle | undefined;
+            let forceKillAfter: string | null = null;
+            const childCode =
+              'const fs=require("node:fs");process.on("SIGTERM",()=>fs.writeFileSync(process.argv[1],"SIGTERM"));process.stdout.write("ready\\n");setInterval(()=>{},1000)';
+            const fiber = yield* preparePiRuntimeAssets(input).pipe(
+              Effect.provideService(
+                ChildProcessSpawner.ChildProcessSpawner,
+                ChildProcessSpawner.ChildProcessSpawner.of({
+                  ...spawner,
+                  spawn: (command) =>
+                    Effect.gen(function* () {
+                      if (command._tag !== "StandardCommand")
+                        return yield* Effect.die("unexpected discovery pipeline");
+                      expect(command.command).toBe("/usr/bin/ldd");
+                      expect(command.options.extendEnv).toBe(false);
+                      expect(command.options.shell).toBeUndefined();
+                      forceKillAfter =
+                        typeof command.options.forceKillAfter === "string"
+                          ? command.options.forceKillAfter
+                          : null;
+                      const child = yield* spawner.spawn(
+                        ChildProcess.make(
+                          process.execPath,
+                          ["--max-old-space-size=512", "-e", childCode, signalFile],
+                          command.options,
+                        ),
+                      );
+                      captured = child;
+                      let readiness = "";
+                      return {
+                        ...child,
+                        stdout: child.stdout.pipe(
+                          Stream.tap((chunk) =>
+                            Effect.gen(function* () {
+                              readiness += Buffer.from(chunk).toString("utf8");
+                              if (readiness === "ready\n")
+                                yield* Deferred.succeed(ready, undefined);
+                            }),
+                          ),
+                          Stream.ensuring(Deferred.succeed(stdoutJoined, undefined)),
+                        ),
+                        stderr: child.stderr.pipe(
+                          Stream.ensuring(Deferred.succeed(stderrJoined, undefined)),
+                        ),
+                      };
+                    }),
+                }),
+              ),
+              Effect.forkChild,
+            );
+            yield* Deferred.await(ready).pipe(Effect.timeout("3 seconds"));
+            const child = captured;
+            if (!child) return yield* Effect.die("missing captured discovery child");
+            const stopping =
+              mode === "cancellation"
+                ? yield* Fiber.interrupt(fiber).pipe(Effect.forkChild)
+                : undefined;
+            yield* Effect.promise(() => signalReceived).pipe(
+              Effect.timeout(mode === "cancellation" ? "3 seconds" : "8 seconds"),
+            );
+            const completed = stopping
+              ? yield* Fiber.await(stopping).pipe(
+                  Effect.timeoutOption("1 second"),
+                  Effect.map(Option.isSome),
+                )
+              : yield* Fiber.await(fiber).pipe(
+                  Effect.timeoutOption("1 second"),
+                  Effect.map(Option.isSome),
+                );
+            const manualKillRequired = !completed;
+            // Only a failing old-source control needs this captured-handle cleanup.
+            if (manualKillRequired) yield* child.kill({ killSignal: "SIGKILL" });
+            if (stopping) yield* Fiber.join(stopping);
+            const completion = yield* Fiber.await(fiber);
+            const producerCompletionBeforeTerminalExit = yield* child.isRunning;
+            const terminalExit = yield* child.exitCode.pipe(Effect.exit);
+            yield* Deferred.await(stdoutJoined);
+            yield* Deferred.await(stderrJoined);
+            yield* Effect.promise(() =>
+              expect(NodeFSP.access(`/proc/${child.pid}`)).rejects.toMatchObject({
+                code: "ENOENT",
+              }),
+            );
+            const entries = yield* Effect.promise(() => NodeFSP.readdir(input.stagingDirectory));
+            const observation = {
+              mode,
+              childPid: Number(child.pid),
+              readySeen: true,
+              sigtermReceived: true,
+              stdoutReaderJoined: true,
+              stderrReaderJoined: true,
+              manualKillRequired,
+              failureOnly: Exit.isFailure(completion),
+              childAbsent: true,
+              stageEmpty: entries.length === 0,
+              forceKillAfter,
+              producerCompletionBeforeTerminalExit,
+              terminalExitObserved: Exit.isFailure(terminalExit),
+              elapsedMillis: (yield* Clock.currentTimeMillis) - started,
+            };
+            if (drainEvidenceDirectory) {
+              const json = yield* encodeDrainObservation(observation);
+              yield* Effect.promise(() =>
+                NodeFSP.writeFile(fixturePath(drainEvidenceDirectory, `${mode}.json`), json),
+              );
+            }
+            expect(manualKillRequired).toBe(false);
+            expect(Exit.isFailure(completion)).toBe(true);
+            expect(entries).toEqual([]);
+            if (Exit.isFailure(completion)) {
+              if (mode === "cancellation") expect(Cause.hasInterrupts(completion.cause)).toBe(true);
+              else
+                expect(Cause.findErrorOption(completion.cause)).toMatchObject({
+                  _tag: "Some",
+                  value: { phase: "unavailable" },
+                });
+            }
+          }),
+        ),
+      10000,
+    );
   native("rejects a source inode replacement after its bounded read", () =>
     Effect.gen(function* () {
       const crypto = yield* Crypto.Crypto;

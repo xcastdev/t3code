@@ -344,6 +344,8 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
             env: { LC_ALL: "C", LANG: "C", PATH: "/usr/bin:/bin" },
             extendEnv: false,
             stdin: "ignore",
+            // A dependency inspector can ignore SIGTERM; scope cleanup must still stop it.
+            forceKillAfter: "100 millis",
           }),
         );
         return yield* Effect.all(
