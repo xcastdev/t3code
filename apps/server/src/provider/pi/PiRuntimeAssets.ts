@@ -1,5 +1,6 @@
 import {
   HostProcessExecutablePath,
+  HostProcessArchitecture,
   HostProcessIsExecutable,
   HostProcessPlatform,
   HostProcessUserId,
@@ -40,6 +41,55 @@ const Metadata = Schema.fromJsonString(
     version: Schema.Literal("0.99.1"),
   }),
 );
+const GnuHost = Schema.Struct({
+  header: Schema.Struct({
+    glibcVersionRuntime: Schema.String.check(Schema.isPattern(/^\d+\.\d+$/)),
+  }),
+});
+// This is the eager-load closure of the pinned release, not arbitrary package discovery.
+const sidecarPackages = (
+  [
+    {
+      name: "@ff-labs/fff-node",
+      version: "0.9.4",
+      main: "dist/src/index.js",
+      files: [
+        "dist/src/binary.js",
+        "dist/src/fff-api.js",
+        "dist/src/ffi.js",
+        "dist/src/finder.js",
+        "dist/src/index.js",
+        "dist/src/platform.js",
+      ],
+    },
+    { name: "ffi-rs", version: "1.3.2", main: "index.js", files: ["index.js"] },
+    {
+      name: "@yuuang/ffi-rs-linux-x64-gnu",
+      version: "1.3.2",
+      main: "ffi-rs.linux-x64-gnu.node",
+      files: ["ffi-rs.linux-x64-gnu.node"],
+    },
+  ] as const
+).map((sidecar) => ({
+  ...sidecar,
+  decodeMetadata: Schema.decodeEffect(
+    Schema.fromJsonString(
+      Schema.Struct({
+        name: Schema.Literal(sidecar.name),
+        version: Schema.Literal(sidecar.version),
+        main: Schema.Literal(sidecar.main),
+      }),
+    ),
+  ),
+}));
+const FffModule = Schema.fromJsonString(Schema.Struct({ type: Schema.Literal("module") }));
+const GnuBinding = Schema.fromJsonString(
+  Schema.Struct({
+    os: Schema.Array(Schema.Literal("linux")).check(Schema.isMinLength(1), Schema.isMaxLength(1)),
+    cpu: Schema.Array(Schema.Literal("x64")).check(Schema.isMinLength(1), Schema.isMaxLength(1)),
+    libc: Schema.Array(Schema.Literal("glibc")).check(Schema.isMinLength(1), Schema.isMaxLength(1)),
+  }),
+);
 const Descriptor = Schema.fromJsonString(
   Schema.Struct({
     identity: PiWorkerIdentity,
@@ -48,6 +98,9 @@ const Descriptor = Schema.fromJsonString(
     trustedSdkPackageDirectory: Schema.Literal("/runtime/dist/pi-sdk"),
   }),
 );
+const isGnuHost = Schema.is(GnuHost);
+const decodeFffModule = Schema.decodeEffect(FffModule);
+const decodeGnuBinding = Schema.decodeEffect(GnuBinding);
 const decodeInput = Schema.decodeEffect(Input);
 const decodeMetadata = Schema.decodeEffect(Metadata);
 const encodeDescriptor = Schema.encodeSync(Descriptor, { onExcessProperty: "error" });
@@ -69,7 +122,7 @@ const unavailable = () =>
   new PiRuntimeAssetsError({
     phase: "unavailable",
     message:
-      "Pi runtime assets require Linux, compatible actual Node and a working ELF dependency inspection.",
+      "Pi runtime assets require Linux x64 GNU, compatible actual Node, Bash and a working ELF dependency inspection.",
   });
 const native = <A>(run: () => Promise<A>) =>
   Effect.tryPromise({
@@ -271,9 +324,15 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
   }) {
     if (
       (yield* HostProcessPlatform) !== "linux" ||
+      (yield* HostProcessArchitecture) !== "x64" ||
       !isPiWorkerNodeVersionSupported(process.versions.node)
     )
       return yield* unavailable();
+    const gnuHost = yield* Effect.try({
+      try: () => isGnuHost(process.report?.getReport()),
+      catch: unavailable,
+    });
+    if (!gnuHost) return yield* unavailable();
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
     const crypto = yield* Crypto.Crypto;
@@ -337,50 +396,94 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
     );
     if ((executableStat.mode & 0o111n) === 0n) return yield* unavailable();
     yield* native(() => validateElf(executableSource, executableStat, path));
-    const output = yield* Effect.scoped(
-      Effect.gen(function* () {
-        const child = yield* spawner.spawn(
-          ChildProcess.make("/usr/bin/ldd", [executableSource], {
-            env: { LC_ALL: "C", LANG: "C", PATH: "/usr/bin:/bin" },
-            extendEnv: false,
-            stdin: "ignore",
-            // A dependency inspector can ignore SIGTERM; scope cleanup must still stop it.
-            forceKillAfter: "100 millis",
-          }),
-        );
-        return yield* Effect.all(
-          {
-            stdout: collectUint8StreamText({ stream: child.stdout, maxBytes: 65536 }),
-            stderr: collectUint8StreamText({ stream: child.stderr, maxBytes: 65536 }),
-            code: child.exitCode,
-          },
-          { concurrency: "unbounded" },
-        );
-      }).pipe(Effect.timeout("5 seconds"), Effect.mapError(unavailable)),
-    );
-    if (
-      output.code !== 0 ||
-      output.stdout.truncated ||
-      output.stdout.invalidUtf8 ||
-      output.stderr.truncated ||
-      output.stderr.invalidUtf8 ||
-      output.stderr.text.trim() !== ""
-    )
-      return yield* unavailable();
-    const targets = new Set<string>();
-    for (const raw of output.stdout.text.split("\n")) {
-      const line = raw.trim();
-      if (!line || /^linux-vdso\.so\.\d+ \(0x[0-9a-f]+\)$/.test(line)) continue;
-      const match = /^(?:(\S+) => )?(\/[^\s()]+) \(0x[0-9a-f]+\)$/.exec(line);
-      if (!match || !match[2]) return yield* unavailable();
-      if (targets.has(match[2])) return yield* invalid();
-      targets.add(match[2]);
-      if (match[1]?.startsWith("/") && match[1] !== match[2]) {
-        if (targets.has(match[1])) return yield* invalid();
-        targets.add(match[1]);
+    const elfSources = [executableSource];
+    if (executable) {
+      // SEA release archives stage a physical node_modules tree beside the actual
+      // executable. Never search parents, activate imports or use ambient packages.
+      const sidecarRoot = path.join(path.dirname(executableSource), "node_modules");
+      yield* native(() => withDirectory(sidecarRoot, async () => undefined));
+      for (const sidecar of sidecarPackages) {
+        const directory = path.join(sidecarRoot, sidecar.name);
+        const targetDirectory = "/runtime/node_modules/" + sidecar.name;
+        const source = path.join(directory, "package.json");
+        const stat = yield* add(source, targetDirectory + "/package.json");
+        const bytes = yield* native(() => readFile(source, stat, path, 65536));
+        yield* sidecar.decodeMetadata(bytes.toString("utf8")).pipe(Effect.mapError(invalid));
+        if (sidecar.name === "@ff-labs/fff-node")
+          yield* decodeFffModule(bytes.toString("utf8")).pipe(Effect.mapError(invalid));
+        if (sidecar.name === "@yuuang/ffi-rs-linux-x64-gnu")
+          yield* decodeGnuBinding(bytes.toString("utf8")).pipe(Effect.mapError(invalid));
+        for (const relative of sidecar.files) {
+          const source = path.join(directory, relative);
+          const stat = yield* add(source, targetDirectory + "/" + relative);
+          if (relative.endsWith(".node")) {
+            yield* native(() => validateElf(source, stat, path));
+            elfSources.push(source);
+          }
+        }
       }
     }
-    if (targets.size === 0) return yield* unavailable();
+    // Pinned SDK getShellConfig prefers this cage target on Unix; no ambient shell selection.
+    const bashSource = yield* fs.realPath("/bin/bash").pipe(Effect.mapError(unavailable));
+    const bashStat = yield* add(bashSource, "/bin/bash");
+    if ((bashStat.mode & 0o111n) === 0n) return yield* unavailable();
+    yield* native(() => validateElf(bashSource, bashStat, path));
+    elfSources.push(bashSource);
+    const targets = new Set<string>();
+    // All fixed ELF inspections share one deadline; each child owns its pipe and exit drains.
+    yield* Effect.scoped(
+      Effect.gen(function* () {
+        for (const source of elfSources) {
+          const child = yield* spawner.spawn(
+            ChildProcess.make("/usr/bin/ldd", [source], {
+              env: { LC_ALL: "C", LANG: "C", PATH: "/usr/bin:/bin" },
+              extendEnv: false,
+              stdin: "ignore",
+              // A dependency inspector can ignore SIGTERM; scope cleanup must still stop it.
+              forceKillAfter: "100 millis",
+            }),
+          );
+          const output = yield* Effect.all(
+            {
+              stdout: collectUint8StreamText({ stream: child.stdout, maxBytes: 65536 }),
+              stderr: collectUint8StreamText({ stream: child.stderr, maxBytes: 65536 }),
+              code: child.exitCode,
+            },
+            { concurrency: "unbounded" },
+          );
+          // ldd emits this exact diagnostic for valid non-executable shared objects.
+          const warning = `ldd: warning: you do not have execution permission for \`${source}'`;
+          if (
+            output.code !== 0 ||
+            output.stdout.truncated ||
+            output.stdout.invalidUtf8 ||
+            output.stderr.truncated ||
+            output.stderr.invalidUtf8 ||
+            (output.stderr.text.trim() !== "" && output.stderr.text.trim() !== warning)
+          )
+            return yield* unavailable();
+          const discovered = new Set<string>();
+          for (const raw of output.stdout.text.split("\n")) {
+            const line = raw.trim();
+            if (!line || line === warning || /^linux-vdso\.so\.\d+ \(0x[0-9a-f]+\)$/.test(line))
+              continue;
+            const match = /^(?:(\S+) => )?(\/[^\s()]+) \(0x[0-9a-f]+\)$/.exec(line);
+            if (!match || !match[2]) return yield* unavailable();
+            if (discovered.has(match[2])) return yield* invalid();
+            discovered.add(match[2]);
+            if (match[1]?.startsWith("/") && match[1] !== match[2]) {
+              if (discovered.has(match[1])) return yield* invalid();
+              discovered.add(match[1]);
+            }
+          }
+          if (discovered.size === 0) return yield* unavailable();
+          for (const target of discovered) targets.add(target);
+        }
+      }).pipe(
+        Effect.timeout("5 seconds"),
+        Effect.mapError((cause) => (isAssetsError(cause) ? cause : unavailable())),
+      ),
+    );
     for (const target of [...targets].sort()) {
       if (!/^\/(?:lib|lib64|usr\/lib|usr\/lib64)\//.test(target) || path.resolve(target) !== target)
         return yield* invalid();
