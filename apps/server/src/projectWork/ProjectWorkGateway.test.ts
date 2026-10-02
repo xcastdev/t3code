@@ -219,6 +219,10 @@ layer("ProjectWorkGateway", (it) => {
             taskId,
             executionKind: "managed",
             deliverableKind: "code",
+            assignment: {
+              authorizationGateId: "public-investigation-gate",
+              outputDescriptions: ["Findings"],
+            },
           },
           {
             kind: "role-revision",
@@ -260,6 +264,21 @@ layer("ProjectWorkGateway", (it) => {
             contentHash: "hash",
             attribution,
             evidenceIds: [],
+            assignmentAuthorization: {
+              assignmentKind: "planning",
+              parentTaskId: taskId,
+              parentSpecRevision: 0,
+              parentSpecificationGateId: "public-specification-gate",
+              parentSpecificationHash: "public-specification-hash",
+              parentScopeHash: "public-scope-hash",
+            },
+            repairAuthorization: {
+              episodeId: "public-repair-episode",
+              failureFingerprint: "public-failure",
+              relevantRevision: "public-head",
+              semanticRepairNumber: 1,
+              inheritedGateId: "public-inherited-gate",
+            },
           },
           {
             kind: "run-binding",
@@ -284,6 +303,7 @@ layer("ProjectWorkGateway", (it) => {
             worktree: "/workspace",
             branch: "branch",
             leaseGeneration: 0,
+            authorizationGateId: "public-run-gate",
             specRevision: 0,
             planRevision: 0,
           },
@@ -448,9 +468,26 @@ layer("ProjectWorkGateway", (it) => {
           expected.push(record);
           const payload = encodeUnknownJson({
             ...record,
+            ...(record.kind === "gate" && record.assignmentAuthorization
+              ? {
+                  assignmentAuthorization: {
+                    ...record.assignmentAuthorization,
+                    authorization: "private-nested-authorization",
+                  },
+                }
+              : {}),
+            ...(record.kind === "gate" && record.repairAuthorization
+              ? {
+                  repairAuthorization: {
+                    ...record.repairAuthorization,
+                    credentials: { apiKey: "private-nested-key" },
+                  },
+                }
+              : {}),
             credentials: { password: "private-value" },
             apiKey: "private-key",
             authToken: "private-token",
+            authorization: "private-authorization",
             extra: { tokenLimit: "credential-shaped-string", secret: "private-secret" },
           });
           yield* sql`INSERT INTO ${sql("project_team_" + record.kind.replaceAll("-", "_"))} (record_id, project_id, status, revision, generation, updated_at, payload_json) VALUES (${record.recordId}, ${projectId}, ${record.status}, 0, 0, ${at}, ${payload})`;
@@ -469,6 +506,9 @@ layer("ProjectWorkGateway", (it) => {
           "private-value",
           "private-key",
           "private-token",
+          "private-authorization",
+          "private-nested-authorization",
+          "private-nested-key",
           "private-secret",
           "credential-shaped-string",
         ])

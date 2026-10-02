@@ -168,6 +168,12 @@ export function WorkPage({
                 connected={connected}
                 enabled={enabled}
                 streamAvailable={!poll}
+                teamReadSupported={
+                  serverConfig?.environment?.capabilities?.projectTeamFoundationReads === true
+                }
+                guidedWritesSupported={
+                  serverConfig?.environment?.capabilities?.projectTeamGuidedWrites === true
+                }
               />
             ) : (
               <WorkKnowledge
