@@ -1,13 +1,14 @@
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
 import { PiManagedRuntimeError } from "./PiManagedRuntime.ts";
-import { SkillCatalogRevision } from "@t3tools/contracts";
+import { CommandId, SkillCatalogRevision } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import * as DateTime from "effect/DateTime";
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -81,6 +82,24 @@ const parseTransportBody = Schema.decodeSync(
   Schema.fromJsonString(
     Schema.Struct({
       messages: Schema.Array(Schema.Struct({ role: Schema.String, content: Schema.Unknown })),
+      tools: Schema.optional(
+        Schema.Array(
+          Schema.Struct({
+            function: Schema.Struct({ name: Schema.String }),
+          }),
+        ),
+      ),
+    }),
+  ),
+);
+const decodeLocalTerminal = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      outcome: Schema.String,
+      operation: Schema.Struct({ operationId: Schema.String }),
+      accountingReceipts: Schema.Array(
+        Schema.Struct({ reservationId: Schema.String, accountingReceiptId: Schema.String }),
+      ),
     }),
   ),
 );
@@ -1674,6 +1693,718 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_LINUX_GATE === "1")(
               }
               expect(outcome._tag).toBe(
                 mode === "unchanged" || mode === "detached-advance" ? "Success" : "Failure",
+              );
+            }),
+          ),
+        30000,
+      );
+    }
+  },
+);
+
+it.effect(
+  "selects native workspace access from only the frozen tools and rejects unavailable grants",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const role = {
+          ...f.role,
+          revision: f.role.revision + 1,
+          tools: [
+            "pi.read",
+            "pi.write",
+            "pi.edit",
+            "pi.bash",
+            "terminal",
+            "pull-requests",
+            "external-mcp",
+          ],
+        };
+        yield* restoreHistoricalBinding(role);
+        let revision = f.binding.revision + 1;
+        for (const toolIds of [[], ["pi.read"], ["pi.write"], ["pi.edit"], ["pi.bash"]]) {
+          yield* restoreHistoricalBinding({
+            ...f.binding,
+            revision: revision++,
+            configuration: { ...f.binding.configuration, toolIds },
+          });
+          const prepared = yield* f.instance.prepareOperation(
+            { threadId, kind: "initialize" },
+            () => Effect.void,
+          );
+          const allocations = yield* f.sql<{
+            allocation_json: string;
+          }>`SELECT allocation_json FROM project_team_pi_process ORDER BY rowid DESC LIMIT 1`;
+          const allocation = yield* decodeWorkspaceAccess(allocations[0]!.allocation_json);
+          expect(allocation.launch.workspaceAccess).toBe(
+            toolIds.some((tool) => tool !== "pi.read") ? "readwrite" : "readonly",
+          );
+          yield* f.instance.requestStop(threadId);
+          yield* rejected(prepared.run);
+        }
+        const before = (yield* f.sql`SELECT * FROM project_team_pi_process`).length;
+        for (const toolIds of [
+          ["terminal"],
+          ["pull-requests"],
+          ["external-mcp"],
+          ["pi.search"],
+          ["pi.delegate"],
+        ]) {
+          yield* restoreHistoricalBinding({
+            ...f.binding,
+            revision: revision++,
+            configuration: { ...f.binding.configuration, toolIds },
+          });
+          yield* rejected(
+            f.instance.prepareOperation({ threadId, kind: "initialize" }, () => Effect.void),
+          );
+        }
+        yield* restoreHistoricalBinding({
+          ...role,
+          revision: role.revision + 1,
+          tools: ["pi.read"],
+        });
+        yield* restoreHistoricalBinding({
+          ...f.binding,
+          revision: revision++,
+          configuration: { ...f.binding.configuration, toolIds: ["pi.write"] },
+        });
+        yield* rejected(
+          f.instance.prepareOperation({ threadId, kind: "initialize" }, () => Effect.void),
+        );
+        expect((yield* f.sql`SELECT * FROM project_team_pi_process`).length).toBe(before);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+);
+
+const decodeWorkspaceAccess = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      launch: Schema.Struct({ workspaceAccess: Schema.String }),
+    }),
+  ),
+);
+const decodeOwnerCgroup = Schema.decodeEffect(
+  Schema.fromJsonString(Schema.Struct({ cgroup: Schema.String })),
+);
+const decodeLocalClosure = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      sdk: Schema.Literal("0.99.1"),
+      files: Schema.Array(
+        Schema.Struct({ source: Schema.String, target: Schema.String, sha256: Schema.String }),
+      ),
+    }),
+  ),
+);
+const parseProcessOutput = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      type: Schema.String,
+      data: Schema.optional(Schema.String),
+    }),
+  ),
+);
+const parseNativeSpawn = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      type: Schema.String,
+      pid: Schema.optional(Schema.Int),
+      remoteCalls: Schema.optional(Schema.Int),
+    }),
+  ),
+);
+
+describe.runIf(process.env.PI_MANAGED_RUNTIME_LINUX_GATE === "1")(
+  "managed native local tools",
+  () => {
+    for (const mode of [
+      "read",
+      "write",
+      "edit",
+      "bash",
+      "mixed-bridge",
+      "readonly-mutation",
+      "unselected-mutation",
+      "protected-roots",
+      "bounded-failure",
+      "stale-write-bootstrap",
+      "changed-before-invoke",
+      "tools-before-invoke",
+      "changed-before-return",
+      "revoked-before-invoke",
+      "expired-before-invoke",
+      "stop-before-invoke",
+      "cancel-descendants",
+    ] as const) {
+      it.effect(
+        mode,
+        () =>
+          scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture;
+              const manifest = process.env.PI_MANAGED_RUNTIME_LOCAL_TOOL_CLOSURE;
+              const evidence = process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE;
+              if (!manifest || !evidence)
+                return yield* Effect.die(
+                  "Actual managed local tool closure and unique evidence directory are required",
+                );
+              const closure = yield* decodeLocalClosure(yield* f.fs.readFileString(manifest));
+              for (const file of closure.files) {
+                expect(
+                  NodeCrypto.createHash("sha256")
+                    .update(yield* f.fs.readFile(file.source))
+                    .digest("hex"),
+                ).toBe(file.sha256);
+              }
+              expect(
+                closure.files.some((file) => file.target === "/runtime/PiWorkerEntrypoint.mjs"),
+              ).toBe(true);
+              expect(closure.files.some((file) => file.target === "/bin/bash")).toBe(true);
+              const actualAt = DateTime.formatIso(DateTime.nowUnsafe());
+              yield* TestClock.setTime(Date.parse(actualAt));
+              const expiryAt = Date.parse(actualAt) + 1000;
+              const readOnly =
+                mode === "read" || mode === "readonly-mutation" || mode === "unselected-mutation";
+              const selectedName =
+                mode === "mixed-bridge"
+                  ? "project_work_read"
+                  : mode === "edit"
+                    ? "edit"
+                    : mode === "write" ||
+                        mode === "stale-write-bootstrap" ||
+                        mode.includes("before-")
+                      ? "write"
+                      : mode === "read"
+                        ? "read"
+                        : "bash";
+              const toolIds =
+                mode === "mixed-bridge"
+                  ? ["pi.read", "project-work.read-project"]
+                  : readOnly
+                    ? ["pi.read"]
+                    : ["pi." + selectedName];
+              const role = {
+                ...f.role,
+                revision: f.role.revision + 1,
+                role: mode === "mixed-bridge" ? "coordinator" : f.role.role,
+                tools:
+                  mode === "mixed-bridge"
+                    ? ["pi.read", "project-work.read-project"]
+                    : mode === "readonly-mutation"
+                      ? ["pi.read"]
+                      : [
+                          "pi.read",
+                          "pi.write",
+                          "pi.edit",
+                          "pi.bash",
+                          "project-work.read-project",
+                          "terminal",
+                          "pull-requests",
+                          "external-mcp",
+                        ],
+              };
+              const binding = {
+                ...f.binding,
+                revision: f.binding.revision + 1,
+                updatedAt: actualAt,
+                configuration: { ...f.binding.configuration, toolIds, maxTokens: 100000 },
+              };
+              yield* restoreHistoricalBinding(role);
+              yield* restoreHistoricalBinding(binding);
+              yield* f.fs.writeFileString(f.worktree + "/source.txt", "before\n");
+              yield* f.fs.writeFileString(
+                f.options.agentDirectory + "/auth.json",
+                json({ "command-code": { type: "api_key", key: "synthetic-local-key" } }),
+              );
+              const held = yield* Deferred.make<void>();
+              const release = yield* Deferred.make<void>();
+              const descendantReady = Promise.withResolvers<void>();
+              const watcher =
+                mode === "cancel-descendants"
+                  ? process.getBuiltinModule("fs").watch(f.worktree, (_event, filename) => {
+                      if (filename === "descendant.ready") descendantReady.resolve();
+                    })
+                  : undefined;
+              yield* Effect.addFinalizer(() => Effect.sync(() => watcher?.close()));
+              const real = yield* Authorization.ProjectTeamAuthorization;
+              const services = yield* Effect.context<SqlClient.SqlClient | ProjectWorkProjection>();
+              let capabilities = 0;
+              let joined = false;
+              const holdAt = mode === "changed-before-return" ? 3 : 2;
+              const authorization = Authorization.ProjectTeamAuthorization.of({
+                ...real,
+                capability: (...args) =>
+                  Effect.gen(function* () {
+                    yield* real.capability(...args);
+                    if (args[1] !== "pi.write") return;
+                    capabilities++;
+                    if (mode.includes("before-") && capabilities === holdAt) {
+                      yield* Deferred.succeed(held, undefined);
+                      yield* Deferred.await(release);
+                      joined = true;
+                    }
+                  }),
+              });
+              const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+              const workerOutputs: string[] = [];
+              const nativeReceipts: string[] = [];
+              const capturedDescendants = new Set<number>();
+              let outputTail = "";
+              let nativeTail = "";
+              const observeOutput = Effect.fn("managedLocalTools.observeOutput")(function* (
+                chunk: Uint8Array,
+              ) {
+                outputTail += new TextDecoder().decode(chunk);
+                if (outputTail.length > 1_048_576)
+                  return yield* Effect.die("Native observer exceeded bound");
+                const lines = outputTail.split("\n");
+                outputTail = lines.pop()!;
+                for (const line of lines) {
+                  workerOutputs.push(line);
+                  const output = parseProcessOutput(line);
+                  if (output.type !== "stderr" || !output.data) continue;
+                  nativeTail += Buffer.from(output.data, "base64").toString("utf8");
+                  const receipts = nativeTail.split("\n");
+                  nativeTail = receipts.pop()!;
+                  for (const receipt of receipts) {
+                    nativeReceipts.push(receipt);
+                    const native = parseNativeSpawn(receipt);
+                    if (native.type === "native-spawn" || native.type === "descendant-ready") {
+                      // The fixture receipt PID is inside the namespace. Capture host identities
+                      // from this operation's actual owner cgroup instead of treating it as a host PID.
+                      const owners = yield* f.sql<{
+                        owner_json: string;
+                      }>`SELECT owner_json FROM project_team_pi_process WHERE owner_json IS NOT NULL ORDER BY rowid DESC LIMIT 1`.pipe(
+                        Effect.provide(services),
+                      );
+                      const owner = parseOwner(owners[0]!.owner_json);
+                      const cgroup = (yield* decodeOwnerCgroup(owners[0]!.owner_json)).cgroup;
+                      for (const raw of (yield* f.fs.readFileString(cgroup + "/cgroup.procs"))
+                        .trim()
+                        .split("\n")) {
+                        const pid = Number(raw);
+                        if (pid > 0 && pid !== owner.pid) capturedDescendants.add(pid);
+                      }
+                    }
+                  }
+                }
+              });
+              const observedSpawner = ChildProcessSpawner.ChildProcessSpawner.of({
+                ...spawner,
+                spawn: (...args) =>
+                  spawner.spawn(...args).pipe(
+                    Effect.map((child) => ({
+                      ...child,
+                      stdout:
+                        args[0]._tag === "StandardCommand" &&
+                        args[0].command === "/usr/bin/systemd-run"
+                          ? child.stdout.pipe(
+                              Stream.tap((chunk) => observeOutput(chunk).pipe(Effect.orDie)),
+                            )
+                          : child.stdout,
+                    })),
+                  ),
+              });
+              let calls = 0;
+              const toolName =
+                mode === "readonly-mutation" || mode === "unselected-mutation"
+                  ? "write"
+                  : selectedName;
+              const protectedPaths = [
+                f.main + "/sentinel",
+                f.main + "/.git/config",
+                f.options.agentDirectory + "/auth.json",
+                f.options.nativeStateRoot + "/sentinel",
+                f.options.protectedRoots[0] + "/sentinel",
+                "/workspace/.git",
+              ];
+              const args =
+                toolName === "read"
+                  ? { path: "source.txt" }
+                  : toolName === "write"
+                    ? { path: "result.txt", content: "written\n" }
+                    : toolName === "edit"
+                      ? { path: "source.txt", edits: [{ oldText: "before", newText: "after" }] }
+                      : toolName === "project_work_read"
+                        ? {
+                            projectId: binding.projectId,
+                            operation: "tasks",
+                            state: "draft",
+                            limit: 1,
+                          }
+                        : {
+                            command:
+                              mode === "bounded-failure"
+                                ? "printf retained > retained.txt; printf '\\\\%.0s' {1..40000}"
+                                : mode === "protected-roots"
+                                  ? protectedPaths
+                                      .map(
+                                        (path) => `if printf altered > '${path}'; then exit 1; fi`,
+                                      )
+                                      .join("; ") + "; printf protected > result.txt"
+                                  : mode === "cancel-descendants"
+                                    ? '/runtime/node -e \'const fs = require("node:fs"); fs.watch("/workspace", () => {}); fs.writeFileSync("descendant.ready.tmp", String(process.pid)); fs.renameSync("descendant.ready.tmp", "descendant.ready")\' & wait'
+                                    : "printf '%s' \"$PWD\" > result.txt",
+                          };
+              const runtime = yield* makePiManagedRuntimeLive({
+                ...f.options,
+                memoryBytes: 536870912,
+                maxInputTokens: 18000,
+                cleanupDeadlineMs: 5000,
+                runtimeFiles: closure.files.map(({ source, target }) => ({ source, target })),
+                // This reviewed entry fixture uses the actual production entry and native helper.
+                // The legacy SDK fixture and its /runtime/package.json alias stay separate.
+                workerArgv: (identity, operation) => [
+                  "/runtime/node",
+                  "--max-old-space-size=512",
+                  "/runtime/p7-worker-entry-local-tools.mjs",
+                  "plain",
+                  json({
+                    identity,
+                    operation,
+                    sessionDirectory: "/state/sessions",
+                    trustedSdkPackageDirectory: "/runtime/pi-sdk",
+                  }),
+                ],
+                readCatalogue: Effect.succeed({
+                  source: "https://api.commandcode.ai/provider/v1/models",
+                  fetchedAt: actualAt,
+                  selectedEntry: {
+                    id: model,
+                    owned_by: "command-code",
+                    context_length: 20000,
+                    supported_endpoints: ["/chat/completions"],
+                  },
+                }),
+                transport: async (_url, init) => {
+                  calls++;
+                  const body = parseTransportBody(init.body);
+                  expect(body.tools?.map((tool) => tool.function.name).sort()).toEqual(
+                    (mode === "mixed-bridge"
+                      ? ["project_work_read", "read"]
+                      : [readOnly ? "read" : selectedName]
+                    ).sort(),
+                  );
+                  if (calls === 2) {
+                    const result = body.messages.find((message) => message.role === "tool");
+                    expect(result).toBeDefined();
+                    if (mode === "read") expect(result!.content).toContain("before");
+                    if (mode === "mixed-bridge") expect(result!.content).toBe("[]");
+                  }
+                  expect(calls).toBeLessThanOrEqual(2);
+                  const delta =
+                    calls === 1
+                      ? {
+                          role: "assistant",
+                          tool_calls: [
+                            {
+                              index: 0,
+                              id: "native_selected",
+                              type: "function",
+                              function: { name: toolName, arguments: json(args) },
+                            },
+                          ],
+                        }
+                      : { role: "assistant", content: "Local tool completed" };
+                  return new Response(
+                    [
+                      { model, choices: [{ index: 0, delta, finish_reason: null }] },
+                      {
+                        model,
+                        choices: [
+                          {
+                            index: 0,
+                            delta: {},
+                            finish_reason: calls === 1 ? "tool_calls" : "stop",
+                          },
+                        ],
+                      },
+                      {
+                        model,
+                        choices: [],
+                        usage: { prompt_tokens: 20, completion_tokens: 5, total_tokens: 25 },
+                      },
+                    ]
+                      .map((entry) => `data: ${json(entry)}\n\n`)
+                      .join("") + "data: [DONE]\n\n",
+                    { headers: { "content-type": "text/event-stream" } },
+                  );
+                },
+              }).pipe(
+                Effect.provideService(Authorization.ProjectTeamAuthorization, authorization),
+                Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observedSpawner),
+              );
+              const instance = yield* runtime.forInstance({
+                instanceId: providerInstanceId,
+                enabled: true,
+                configuration: {},
+              });
+              yield* Effect.addFinalizer(() =>
+                Deferred.succeed(release, undefined).pipe(
+                  Effect.andThen(instance.stopAll),
+                  Effect.orDie,
+                ),
+              );
+              const originalFetch = globalThis.fetch;
+              globalThis.fetch = async () => {
+                throw Error("Ambient fetch forbidden in actual native local tool proof");
+              };
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  globalThis.fetch = originalFetch;
+                }),
+              );
+              const initialize = yield* instance.prepareOperation(
+                { threadId, kind: "initialize" },
+                () => Effect.void,
+              );
+              expect((yield* initialize.run).terminal.outcome).toBe("success");
+              expect(calls).toBe(0);
+              expect(yield* f.fs.exists(f.worktree + "/result.txt")).toBe(false);
+              const prompt = yield* instance.prepareOperation(
+                { threadId, kind: "prompt", prompt: "Execute exactly the selected synthetic tool" },
+                () => Effect.void,
+              );
+              if (mode === "stale-write-bootstrap")
+                yield* restoreHistoricalBinding({
+                  ...role,
+                  revision: role.revision + 1,
+                  tools: ["pi.read"],
+                });
+              const running = yield* Effect.forkChild(prompt.run.pipe(Effect.result));
+              if (mode.includes("before-") || mode === "cancel-descendants") {
+                yield* Effect.raceFirst(
+                  mode === "cancel-descendants"
+                    ? Effect.promise(() => descendantReady.promise)
+                    : Deferred.await(held),
+                  Fiber.join(running).pipe(
+                    Effect.flatMap((result) =>
+                      Effect.die("Run completed before causal receipt " + json(result)),
+                    ),
+                  ),
+                );
+                if (mode === "cancel-descendants") {
+                  const rows = yield* f.sql<{
+                    owner_json: string;
+                  }>`SELECT owner_json FROM project_team_pi_process WHERE owner_json IS NOT NULL ORDER BY rowid DESC LIMIT 1`;
+                  const cgroup = (yield* decodeOwnerCgroup(rows[0]!.owner_json)).cgroup;
+                  const namespacePid = (yield* f.fs.readFileString(
+                    f.worktree + "/descendant.ready",
+                  )).trim();
+                  let capturedReady = false;
+                  for (const raw of (yield* f.fs.readFileString(cgroup + "/cgroup.procs"))
+                    .trim()
+                    .split("\n")) {
+                    const pid = Number(raw);
+                    if (pid <= 0) continue;
+                    capturedDescendants.add(pid);
+                    const status = yield* f.fs.readFileString("/proc/" + pid + "/status");
+                    const namespaceIds = /^NSpid:\s+([0-9\t ]+)$/m
+                      .exec(status)?.[1]
+                      ?.trim()
+                      .split(/\s+/);
+                    if (namespaceIds?.at(-1) === namespacePid) capturedReady = true;
+                  }
+                  expect(capturedReady).toBe(true);
+                }
+                if (mode === "changed-before-invoke" || mode === "changed-before-return")
+                  yield* restoreHistoricalBinding({
+                    ...role,
+                    revision: role.revision + 1,
+                    tools: ["pi.read"],
+                  });
+                if (mode === "tools-before-invoke") {
+                  const operations = yield* makeProjectTeamPiOperations({
+                    environmentId: "environment",
+                  });
+                  const current = yield* operations.current({ providerInstanceId, threadId });
+                  yield* restoreHistoricalBinding({
+                    ...current.binding,
+                    revision: current.binding.revision + 1,
+                    configuration: { ...current.binding.configuration, toolIds: ["pi.read"] },
+                  });
+                }
+                if (mode === "revoked-before-invoke") {
+                  const operations = yield* makeProjectTeamPiOperations({
+                    environmentId: "environment",
+                  });
+                  const current = yield* operations.current({ providerInstanceId, threadId });
+                  yield* restoreHistoricalBinding({
+                    ...current.binding,
+                    revision: current.binding.revision + 1,
+                    status: "revoked",
+                  });
+                }
+                if (mode === "expired-before-invoke") {
+                  const current = yield* real.resolve(f.principal);
+                  if (!current)
+                    return yield* Effect.die("Current native fixture authority is required");
+                  const attempt = current.state.attempts.find(
+                    (entry) => entry.attemptId === current.binding.attemptId,
+                  )!;
+                  yield* f.repo.execute({
+                    type: "project-work.attempt.renew",
+                    projectId: current.binding.projectId,
+                    taskId: current.binding.taskId,
+                    attemptId: attempt.attemptId,
+                    commandId: CommandId.make("expire-held-local-authority"),
+                    leaseToken: attempt.leaseToken!,
+                    leasedUntil: DateTime.formatIso(DateTime.makeUnsafe(expiryAt)),
+                    renewedAt: actualAt,
+                  });
+                  yield* TestClock.setTime(expiryAt);
+                }
+                if (mode === "stop-before-invoke" || mode === "cancel-descendants") {
+                  const aborted = Promise.withResolvers<void>();
+                  const originalAbort = AbortController.prototype.abort;
+                  AbortController.prototype.abort = function (...args) {
+                    originalAbort.apply(this, args);
+                    aborted.resolve();
+                  };
+                  try {
+                    const stopping = yield* Effect.forkChild(instance.requestStop(threadId));
+                    yield* Effect.promise(() => aborted.promise);
+                    yield* Deferred.succeed(release, undefined);
+                    yield* Fiber.join(stopping);
+                  } finally {
+                    AbortController.prototype.abort = originalAbort;
+                  }
+                } else yield* Deferred.succeed(release, undefined);
+              }
+              const outcome = yield* Fiber.join(running);
+              yield* instance.stopAll;
+              yield* f.fs.writeFileString(
+                evidence + "/local-tools-" + mode + "-preassert.json",
+                json({
+                  mode,
+                  calls,
+                  capabilities,
+                  outcome,
+                  modelRows: yield* f.sql`SELECT * FROM project_team_model_request`,
+                  nativeReceipts,
+                  workerOutputs,
+                  operations: yield* f.sql`SELECT * FROM project_team_pi_operation`,
+                  processes: yield* f.sql`SELECT * FROM project_team_pi_process`,
+                }),
+              );
+              const succeeds = [
+                "read",
+                "write",
+                "edit",
+                "bash",
+                "mixed-bridge",
+                "protected-roots",
+              ].includes(mode);
+              expect(outcome._tag).toBe(succeeds ? "Success" : "Failure");
+              expect(calls).toBe(succeeds ? 2 : mode === "stale-write-bootstrap" ? 0 : 1);
+              if (mode.includes("before-")) expect(joined).toBe(true);
+              if (mode === "write" || mode === "changed-before-return")
+                expect(yield* f.fs.readFileString(f.worktree + "/result.txt")).toBe("written\n");
+              else if (mode === "bash")
+                expect(yield* f.fs.readFileString(f.worktree + "/result.txt")).toBe("/workspace");
+              else if (mode === "protected-roots")
+                expect(yield* f.fs.readFileString(f.worktree + "/result.txt")).toBe("protected");
+              else expect(yield* f.fs.exists(f.worktree + "/result.txt")).toBe(false);
+              if (mode === "protected-roots") {
+                expect(yield* f.fs.exists(f.main + "/sentinel")).toBe(false);
+                expect(
+                  yield* f.fs.readFileString(f.options.agentDirectory + "/auth.json"),
+                ).toContain("synthetic-local-key");
+              }
+              if (mode === "edit")
+                expect(yield* f.fs.readFileString(f.worktree + "/source.txt")).toBe("after\n");
+              if (mode === "bounded-failure") {
+                expect(yield* f.fs.readFileString(f.worktree + "/retained.txt")).toBe("retained");
+                yield* rejected(prompt.run);
+                expect(calls).toBe(1);
+              }
+              const modelRows = yield* f.sql<{
+                operation_id: string;
+                status: string;
+                reservation_id: string;
+                accounting_receipt_id: string;
+                charged_input_tokens: number;
+                charged_output_tokens: number;
+              }>`SELECT * FROM project_team_model_request`;
+              expect(modelRows).toHaveLength(calls);
+              if (mode !== "stale-write-bootstrap") {
+                const operationRows = yield* f.sql<{
+                  terminal_json: string;
+                }>`SELECT terminal_json FROM project_team_pi_operation WHERE operation_kind='prompt'`;
+                const terminal = yield* decodeLocalTerminal(operationRows[0]!.terminal_json);
+                expect(terminal.outcome).toBe(
+                  succeeds
+                    ? "success"
+                    : mode === "stop-before-invoke" || mode === "cancel-descendants"
+                      ? "canceled"
+                      : "failed",
+                );
+                expect(terminal.accountingReceipts).toHaveLength(
+                  mode === "readonly-mutation" || mode === "unselected-mutation" ? 0 : calls,
+                );
+                for (const row of modelRows) {
+                  expect(row.operation_id).toBe(terminal.operation.operationId);
+                  const unknown = mode === "readonly-mutation" || mode === "unselected-mutation";
+                  expect(row.status).toBe(unknown ? "unknown" : "reported");
+                  expect(row.charged_input_tokens).toBe(unknown ? 18000 : 20);
+                  expect(row.charged_output_tokens).toBe(unknown ? 512 : 5);
+                  if (mode !== "readonly-mutation" && mode !== "unselected-mutation")
+                    expect(terminal.accountingReceipts).toContainEqual({
+                      reservationId: row.reservation_id,
+                      accountingReceiptId: row.accounting_receipt_id,
+                    });
+                }
+              }
+              const owners = yield* f.sql<{
+                owner_json: string | null;
+                drain_json: string | null;
+              }>`SELECT owner_json,drain_json FROM project_team_pi_process`;
+              expect(owners).toHaveLength(2);
+              for (const row of owners) {
+                if (row.owner_json === null) {
+                  expect(mode).toBe("stale-write-bootstrap");
+                  continue;
+                }
+                const owner = parseOwner(row.owner_json);
+                const drain = yield* decodeBoundaryDrain(row.drain_json!);
+                expect(drain.unit).toBe(owner.unit);
+                expect(drain.invocation).toBe(owner.invocation);
+                expect(drain.ownerPid).toBe(owner.pid);
+                expect(yield* f.fs.exists(drain.cgroup)).toBe(false);
+                for (const pid of [
+                  owner.pid,
+                  drain.launcherPid,
+                  drain.childPid,
+                  ...capturedDescendants,
+                ])
+                  if (pid !== null) expect(yield* f.fs.exists("/proc/" + pid)).toBe(false);
+              }
+              const results = nativeReceipts
+                .map((receipt) => parseNativeSpawn(receipt))
+                .filter((receipt) => receipt.type === "result");
+              expect(results.length).toBeGreaterThanOrEqual(1);
+              expect(results.every((receipt) => receipt.remoteCalls === 0)).toBe(true);
+              if (mode === "cancel-descendants")
+                expect(capturedDescendants.size).toBeGreaterThan(0);
+              yield* f.fs.writeFileString(
+                evidence + "/local-tools-" + mode + ".json",
+                json({
+                  mode,
+                  toolIds,
+                  calls,
+                  capabilities,
+                  joined,
+                  outcome,
+                  owners,
+                  capturedHostDescendants: [...capturedDescendants],
+                  nativeNamespaceReceipts: nativeReceipts,
+                  operations: yield* f.sql`SELECT * FROM project_team_pi_operation`,
+                  modelRows: yield* f.sql`SELECT * FROM project_team_model_request`,
+                  workerOutputs,
+                }),
               );
             }),
           ),
