@@ -511,7 +511,30 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
               detail: "Successful Pi operation did not return a ready committed session.",
             }),
           );
-        context.session = session;
+        // Validation can auto-yield; final ownership and publication must share one evaluation.
+        yield* Effect.suspend(() => {
+          if (shuttingDown || context.closing)
+            return Effect.fail(
+              new ProviderAdapterSessionClosedError({ provider, threadId: context.threadId }),
+            );
+          if (context.failure) return Effect.fail(context.failure);
+          if (
+            sessions.get(context.threadId) !== context ||
+            context.active !== active ||
+            context.lastOperationId !== output.terminal.operation.operationId
+          )
+            return Effect.fail(
+              requestError(
+                request.kind,
+                new PiManagedRuntimeError({
+                  code: "conflict",
+                  detail: "Pi operation no longer owns its session.",
+                }),
+              ),
+            );
+          context.session = session;
+          return Effect.void;
+        });
         if (active.operation.kind === "initialize")
           yield* emit({
             ...(yield* eventBase(context, active, "ready")),
@@ -541,7 +564,16 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (input: {
             }),
           );
         active.canceled = true;
-        if (context.session && !context.failure) context.session = session;
+        if (
+          !shuttingDown &&
+          !context.closing &&
+          sessions.get(context.threadId) === context &&
+          context.active === active &&
+          context.lastOperationId === output.terminal.operation.operationId &&
+          context.session &&
+          !context.failure
+        )
+          context.session = session;
         if (active.operation.kind === "prompt")
           yield* emit({
             ...(yield* eventBase(context, active, "terminal")),

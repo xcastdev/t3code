@@ -15,6 +15,7 @@ import {
   type IssueRepositoryState,
 } from "./ProjectIssueRepositoryState.ts";
 import { GitHubIssueClient, type GitHubIssueComment } from "./github/GitHubIssueClient.ts";
+import { weaklyMatchesEtag } from "./github/GitHubIssueSync.ts";
 
 const maxPageBytes = 2 * 1024 * 1024;
 const maxSourceBytes = 256 * 1024;
@@ -463,7 +464,7 @@ export const make = Effect.fn("ProjectIssueComments.make")(function* (options: {
         if (
           cached === undefined ||
           cached.etag === null ||
-          (response.etag !== null && response.etag !== cached.etag)
+          (response.etag !== null && !weaklyMatchesEtag(response.etag, cached.etag))
         )
           return yield* fail("invalid-response");
         snapshot = { ...cached, observedAt };

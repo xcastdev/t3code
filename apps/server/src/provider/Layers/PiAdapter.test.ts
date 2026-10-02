@@ -934,6 +934,182 @@ it.live("repair read R1 scheduler boundary cannot publish a snapshot after stop 
   }),
 );
 
+it.effect("repair initialization R1 canceled terminal cannot replace a closing snapshot", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    fake.state.stopSettles = false;
+    fake.state.stopGates = [yield* Deferred.make<void>()];
+    const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+    yield* adapter.startSession(startInput);
+    const turn = yield* adapter.sendTurn({ threadId, input: "prompt" });
+    const settling = yield* Effect.forkScoped(
+      Effect.exit(adapter.interruptTurn(threadId, turn.turnId)),
+      { startImmediately: true },
+    );
+    yield* Queue.take(fake.controls);
+    const closingSnapshot = yield* adapter.listSessions();
+    const stopping = yield* Effect.forkScoped(adapter.stopSession(threadId), {
+      startImmediately: true,
+    });
+    yield* Queue.take(fake.stopped);
+    yield* fake.settle(fake.operations[1]!, "canceled", {
+      ...initialSession(),
+      resumeCursor: "later-canceled-leaf",
+    });
+    expect(Exit.isSuccess(yield* Fiber.join(settling))).toBe(true);
+    const afterTerminal = yield* adapter.listSessions();
+    yield* Deferred.succeed(fake.state.stopGates[0]!, undefined);
+    yield* Fiber.join(stopping);
+    expect(afterTerminal).toEqual(closingSnapshot);
+    expect(yield* adapter.hasSession(threadId)).toBe(false);
+  }),
+);
+
+for (const stop of ["stopSession", "stopAll"] as const)
+  it.live(`repair initialization R1 native scheduler publication is fenced by ${stop}`, () =>
+    Effect.gen(function* () {
+      let beforeFence = 0;
+      let observedFence = 0;
+      for (let tail = 1950; tail < 2080; tail++) {
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const release = yield* Deferred.make<void>();
+            const entered = yield* Deferred.make<void>();
+            const returning = yield* Deferred.make<void>();
+            const stopRelease = yield* Deferred.make<void>();
+            let context: { closing: boolean; session?: unknown } | undefined;
+            const isSessionContext = (
+              value: unknown,
+            ): value is { closing: boolean; session?: unknown } =>
+              typeof value === "object" &&
+              value !== null &&
+              "threadId" in value &&
+              value.threadId === threadId &&
+              "closing" in value &&
+              typeof value.closing === "boolean";
+            let observing = true;
+            let closedBeforePublication = false;
+            let publishedAfterFence = false;
+            const nativeTracer = yield* Effect.tracer;
+            // Observe the ordinary context returned by owned(), without modifying it or the scheduler.
+            const tracer: Tracer.Tracer = {
+              span(options) {
+                return nativeTracer.span(options);
+              },
+              context(primitive, fiber) {
+                if (
+                  observing &&
+                  "_tag" in primitive &&
+                  primitive._tag === "Success" &&
+                  "value" in primitive
+                ) {
+                  const value = primitive.value;
+                  if (isSessionContext(value)) context = value;
+                }
+                if (observing && context) {
+                  if (context.closing && context.session === undefined)
+                    closedBeforePublication = true;
+                  if (closedBeforePublication && context.session !== undefined)
+                    publishedAfterFence = true;
+                }
+                return primitive["~effect/Effect/evaluate"](fiber);
+              },
+            };
+            const session = initialSession();
+            const operation = {
+              operationId: "initialization-boundary",
+              operationKind: "initialize" as const,
+            };
+            const output: Output = {
+              session,
+              terminal: {
+                identity: { workerId: "fixture-owner", generation: 1 },
+                operation,
+                outcome: "success",
+                ownerCaptured: true,
+                native: null,
+                accountingReceipts: [],
+                drain: {
+                  unit: "fixture",
+                  invocation: "fixture",
+                  cgroup: "fixture",
+                  ownerPid: null,
+                  launcherPid: 1,
+                  childPid: null,
+                  childExitCode: 0,
+                  kernel: "fixture",
+                  memoryBytes: 1,
+                  swapBytes: 0,
+                  oomGroup: 0,
+                },
+              },
+            };
+            const runtime: PiManagedRuntimeInstance = {
+              inspect: Effect.die("unused"),
+              prepareOperation: () =>
+                Effect.succeed({
+                  kind: "initialize",
+                  operation,
+                  run: Effect.gen(function* () {
+                    yield* Deferred.succeed(entered, undefined);
+                    yield* Deferred.await(release);
+                    // Sweep the native 2048-operation budget across validation and helper returns.
+                    for (let index = 0; index < tail; index++) yield* Effect.sync(() => undefined);
+                    yield* Deferred.succeed(returning, undefined);
+                    yield* Effect.withFiber(() => Effect.sync(() => undefined));
+                    return output;
+                  }),
+                  interrupt: Effect.succeed({ controlId: 1, status: "unresolved" }),
+                  steer: () => Effect.succeed({ controlId: 2, status: "unresolved" }),
+                }),
+              readSession: () => Effect.succeed(session),
+              readThread: () => Effect.die("unused"),
+              requestStop: () => Deferred.await(stopRelease),
+              stopAll: Deferred.await(stopRelease),
+              authorizeSkills: () => Effect.succeed([]),
+              discoverNativeSkills: () => Effect.succeed([]),
+            };
+            yield* Effect.gen(function* () {
+              const adapter = yield* makePiAdapter({ instanceId, runtime });
+              const stopping = yield* Effect.forkScoped(
+                Deferred.await(returning).pipe(
+                  Effect.andThen(Effect.yieldNow),
+                  Effect.andThen(
+                    stop === "stopSession" ? adapter.stopSession(threadId) : adapter.stopAll(),
+                  ),
+                ),
+                { startImmediately: true },
+              );
+              const starting = yield* Effect.forkScoped(
+                Effect.exit(adapter.startSession(startInput)),
+                { startImmediately: true },
+              );
+              yield* Deferred.await(entered);
+              expect(
+                Exit.isFailure(
+                  yield* Effect.exit(adapter.sendTurn({ threadId, input: "initializing" })),
+                ),
+              ).toBe(true);
+              expect(context).toBeDefined();
+              yield* Deferred.succeed(release, undefined);
+              const result = yield* Fiber.join(starting);
+              observing = false;
+              if (closedBeforePublication) observedFence++;
+              if (Exit.isSuccess(result) && !closedBeforePublication) beforeFence++;
+              yield* Deferred.succeed(stopRelease, undefined);
+              yield* Fiber.join(stopping);
+              expect(publishedAfterFence, `tail ${tail}`).toBe(false);
+              expect(Exit.isSuccess(result) && closedBeforePublication, `tail ${tail}`).toBe(false);
+              expect(yield* adapter.hasSession(threadId)).toBe(false);
+            }).pipe(Effect.provideService(Tracer.Tracer, tracer));
+          }),
+        );
+      }
+      expect(observedFence).toBeGreaterThan(0);
+      expect(beforeFence).toBeGreaterThan(0);
+    }),
+  );
+
 const reportedReceipt = (
   requestId: number,
   inputTokens: number,

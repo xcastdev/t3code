@@ -14,6 +14,15 @@ const Natural = Schema.Int.check(
 const Positive = Natural.check(Schema.isGreaterThanOrEqualTo(1));
 const Page = Positive.check(Schema.isLessThanOrEqualTo(10_000));
 const Etag = Schema.String.check(Schema.isPattern(/^(?:W\/)?"[\x21\x23-\x7e]{0,512}"$/u));
+const isEtag = Schema.is(Etag);
+
+/** If-None-Match uses weak comparison; retain the original tag for storage and sent-header evidence. */
+export const weaklyMatchesEtag = (left: string, right: string) =>
+  isEtag(left) &&
+  isEtag(right) &&
+  (left.startsWith("W/") ? left.slice(2) : left) ===
+    (right.startsWith("W/") ? right.slice(2) : right);
+
 const Timestamp = Schema.String.check(
   Schema.isPattern(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/u),
   Schema.makeFilter((value) => {
@@ -205,7 +214,7 @@ export const acceptPage = (
       !sameRead(request, priorCommittedSnapshot) ||
       priorCommittedSnapshot.etag === null ||
       sentEtag !== priorCommittedSnapshot.etag ||
-      (response.etag !== null && response.etag !== priorCommittedSnapshot.etag) ||
+      (response.etag !== null && !weaklyMatchesEtag(response.etag, priorCommittedSnapshot.etag)) ||
       response.repository.nameWithOwner !== request.repository.nameWithOwner
     )
       return reject("snapshot-mismatch");

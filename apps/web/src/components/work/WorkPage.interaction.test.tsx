@@ -1,6 +1,6 @@
 /* @vitest-environment happy-dom */
 
-import { AsyncResult } from "effect/unstable/reactivity";
+import { Atom, AsyncResult } from "effect/unstable/reactivity";
 import { act, StrictMode, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -21,7 +21,8 @@ const testState = vi.hoisted(() => ({
   },
 }));
 
-vi.mock("@effect/atom-react", () => ({
+vi.mock("@effect/atom-react", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@effect/atom-react")>()),
   useAtomValue: (atom: unknown) => {
     if (atom === testState.configAtom) return testState.config;
     if (typeof atom === "object" && atom !== null && "projectId" in atom) {
@@ -119,6 +120,17 @@ describe("WorkPage project-scoped sections", () => {
     testState.streams.clear();
     delete testState.config.environment;
     testState.environment.page.mockClear();
+    testState.environment.page.mockImplementation((input: unknown) => {
+      const target = input as { projectId: string; collection: string; offset: number };
+      return Object.assign(
+        Atom.make(
+          () =>
+            testState.pages.get(`${target.projectId}:${target.collection}:${target.offset}`) ??
+            AsyncResult.success([]),
+        ),
+        target,
+      );
+    });
     testState.environment.stream.mockClear();
     host = document.createElement("div");
     document.body.append(host);

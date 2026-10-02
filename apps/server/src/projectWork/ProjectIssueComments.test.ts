@@ -321,6 +321,67 @@ it.effect(
     ),
 );
 
+for (const [cachedEtag, responseEtag] of [
+  ['W/"v1"', '"v1"'],
+  ['"v1"', 'W/"v1"'],
+  ['W/"v1"', 'W/"v1"'],
+  ['"v1"', '"v1"'],
+  ['W/""', '""'],
+] as const) {
+  it.effect(`reuses native committed comments with ETag ${cachedEtag} on 304 ${responseEtag}`, () =>
+    database(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const before = yield* authorities(f.sql);
+        f.serve(http([rawComment()], { Etag: cachedEtag }));
+        const first = yield* f.reader.read(input);
+        const committed = yield* pages(f);
+        f.serve(http(null, { Etag: responseEtag }, 304));
+        expect((yield* f.reader.read(input)).entries).toEqual(first.entries);
+        const reused = yield* pages(f);
+        expect(reused).toHaveLength(1);
+        expect(reused[0]?.payload_json).toBe(committed[0]?.payload_json);
+        const commentRequests = f.requests.filter((request) =>
+          request.args.at(-1)?.includes("comments?"),
+        );
+        expect(commentRequests[1]?.args).toContain(`If-None-Match: ${cachedEtag}`);
+        expect(yield* authorities(f.sql)).toEqual(before);
+      }),
+    ),
+  );
+}
+
+for (const [responseEtag, expectedReason] of [
+  ['W/"different"', "invalid-response"],
+  ['"V1"', "invalid-response"],
+  ['w/"v1"', "github"],
+  ["", "github"],
+  ["v1", "github"],
+  ['W/ "v1"', "github"],
+] as const) {
+  it.effect(`rejects invalid native comments 304 ETag ${JSON.stringify(responseEtag)}`, () =>
+    database(
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        f.serve(http([rawComment()], { Etag: 'W/"v1"' }));
+        yield* f.reader.read(input);
+        const committed = yield* pages(f);
+        const before = yield* authorities(f.sql);
+        f.serve(http(null, { Etag: responseEtag }, 304));
+        expect(yield* f.reader.read(input).pipe(Effect.result)).toMatchObject({
+          _tag: "Failure",
+          failure: {
+            reason: expectedReason,
+            ...(expectedReason === "github" ? { githubReason: "invalid-response" } : {}),
+          },
+        });
+        expect(yield* pages(f)).toEqual(committed);
+        expect(yield* authorities(f.sql)).toEqual(before);
+      }),
+    ),
+  );
+}
+
 it.effect(
   "304 without an exact committed snapshot fails and empty 200 is a valid committed page",
   () =>

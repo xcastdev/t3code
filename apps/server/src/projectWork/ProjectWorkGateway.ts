@@ -282,6 +282,12 @@ const PUBLIC_TOKEN_BUDGET_KEYS = new Set([
   "maximumTokens",
   "consumedTokens",
 ]);
+// Public gate references and grant metadata preserve typed foundation records.
+const PUBLIC_FOUNDATION_REFERENCE_KEYS = new Set([
+  "authorizationGateId",
+  "assignmentAuthorization",
+  "repairAuthorization",
+]);
 const sanitizePublicValue = (value: unknown, depth = 0, foundation = false): unknown => {
   if (depth > PUBLIC_MAX_DEPTH) return "[omitted: maximum output depth]";
   if (typeof value === "string") {
@@ -301,7 +307,9 @@ const sanitizePublicValue = (value: unknown, depth = 0, foundation = false): unk
       .filter(
         ([key, entry]) =>
           !PUBLIC_SENSITIVE_KEY.test(key) ||
-          (foundation && PUBLIC_TOKEN_BUDGET_KEYS.has(key) && typeof entry === "number"),
+          (foundation &&
+            ((PUBLIC_TOKEN_BUDGET_KEYS.has(key) && typeof entry === "number") ||
+              PUBLIC_FOUNDATION_REFERENCE_KEYS.has(key))),
       )
       .map(([key, entry]) => [key, sanitizePublicValue(entry, depth + 1, foundation)]),
   );

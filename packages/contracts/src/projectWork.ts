@@ -1499,7 +1499,7 @@ export const ProjectWorkReadIntent = Schema.Struct({
   issueCommentPage: Schema.optionalKey(
     NonNegativeInt.check(Schema.isBetween({ minimum: 1, maximum: 10_000 })),
   ),
-  cursor: Schema.optionalKey(TrimmedNonEmptyString.check(Schema.isMaxLength(4_000))),
+  cursor: Schema.optionalKey(Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4_000))),
   exportVersion: Schema.optionalKey(Schema.Literals([1, 2])),
   taskId: Schema.optionalKey(ProjectWorkTaskId),
   attemptId: Schema.optionalKey(ProjectWorkAttemptId),

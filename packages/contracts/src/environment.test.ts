@@ -72,3 +72,20 @@ describe("ExecutionEnvironmentDescriptor", () => {
     ).toBe(true);
   });
 });
+
+it("keeps guided human workflow capability separate from managed execution under version skew", () => {
+  expect(decodeDescriptor(descriptor).capabilities.projectTeamGuidedWrites).toBeUndefined();
+  const current = decodeDescriptor({
+    ...descriptor,
+    capabilities: {
+      ...descriptor.capabilities,
+      projectTeamGuidedWrites: true,
+      projectTeamExecution: false,
+    },
+  });
+  expect(current.capabilities.projectTeamGuidedWrites).toBe(true);
+  expect(current.capabilities.projectTeamExecution).toBe(false);
+  expect(() =>
+    decodeDescriptor({ ...descriptor, capabilities: { projectTeamGuidedWrites: "true" } }),
+  ).toThrow();
+});

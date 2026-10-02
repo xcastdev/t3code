@@ -69,6 +69,7 @@ function fixture(
   const terminals: PiSessionTerminal[] = [];
   const settlements: PiModelRequestSettlement[] = [];
   const controls: Array<{ controlId: number; status: string }> = [];
+  const launcherExited = Promise.withResolvers<number>();
   const schema = json(parameters);
   const withTool = mode === "tool" || mode === "local-tool";
   const options: PiSessionRuntimeOptions = {
@@ -201,7 +202,7 @@ function fixture(
         );
     },
   };
-  return { options, events, terminals, settlements, controls };
+  return { options, events, terminals, settlements, controls, launcherExited };
 }
 
 // Portable checks validate configuration without launching a systemd service.
@@ -265,6 +266,7 @@ describe.runIf(process.env.PI_SESSION_RUNTIME_LINUX_GATE === "1")(
         NodeServices.NodeServices | Scope.Scope
       >,
       mode = "prompt",
+      exitingCode?: number,
     ) =>
       effectIt.live(name, () =>
         Effect.scoped(
@@ -282,9 +284,19 @@ describe.runIf(process.env.PI_SESSION_RUNTIME_LINUX_GATE === "1")(
                 ),
               ),
             );
-            const fixturePath = NodeURL.fileURLToPath(
+            let fixturePath = NodeURL.fileURLToPath(
               new URL("./fixtures/p7-session-runtime-child.mjs", import.meta.url),
             );
+            if (exitingCode !== undefined) {
+              const source = yield* Effect.promise(() => NodeFSP.readFile(fixturePath, "utf8"));
+              const closing = source.replace(
+                'send({ type: "initialized", native: native(null, true) });',
+                `send({ type: "initialized", native: native(null, true) });
+                 process.stdout.write("", () => process.exit(${exitingCode}));`,
+              );
+              fixturePath = NodePath.join(scratch, "exiting-child.mjs");
+              yield* Effect.promise(() => NodeFSP.writeFile(fixturePath, closing));
+            }
             const sourceNode = yield* Effect.promise(() =>
               NodeFSP.realpath(
                 process.env.PI_SESSION_RUNTIME_NODE ??
@@ -316,6 +328,7 @@ describe.runIf(process.env.PI_SESSION_RUNTIME_LINUX_GATE === "1")(
               runtimeSeconds: 30,
             };
             const allocation = yield* preallocatePiManagedProcess(launch);
+            const f = fixture(launch, allocation, mode);
             const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
             const observed = ChildProcessSpawner.make((command) =>
               spawner.spawn(command).pipe(
@@ -336,14 +349,74 @@ describe.runIf(process.env.PI_SESSION_RUNTIME_LINUX_GATE === "1")(
                     );
                   }),
                 ),
+                Effect.map((handle) =>
+                  command._tag !== "StandardCommand" || command.command !== "/usr/bin/systemd-run"
+                    ? handle
+                    : ChildProcessSpawner.makeHandle({
+                        ...handle,
+                        exitCode: handle.exitCode.pipe(
+                          Effect.tap((code) =>
+                            Effect.sync(() => f.launcherExited.resolve(Number(code))),
+                          ),
+                        ),
+                      }),
+                ),
               ),
             );
-            yield* body(fixture(launch, allocation, mode), scratch).pipe(
+            yield* body(f, scratch).pipe(
               Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed),
             );
           }),
         ).pipe(Effect.provide(NodeServices.layer)),
       );
+    for (const condition of ["success", "nonzero", "native-failed", "canceled"] as const)
+      check(
+        `EOF repair verifies actual exiting initialized child ${condition}`,
+        (f) =>
+          Effect.gen(function* () {
+            const release = Promise.withResolvers<void>();
+            const runtime = yield* makePiSessionRuntime({
+              ...f.options,
+              onWorkerFrame: async (frame, signal) => {
+                if (frame.message.type === "initialized")
+                  await waitForSignal(release.promise, signal);
+              },
+              persistNative: async (frame, signal) => {
+                if (condition === "native-failed") throw Error("native callback rejected");
+                await f.options.persistNative(frame, signal);
+              },
+            });
+            const running = yield* Effect.forkChild(runtime.run().pipe(Effect.exit));
+            expect(yield* Effect.promise(() => f.launcherExited.promise)).toBe(0);
+            if (condition === "canceled") {
+              yield* Fiber.interrupt(running);
+              const interrupted = yield* Fiber.await(running);
+              expect(interrupted._tag === "Failure" || interrupted.value._tag === "Failure").toBe(
+                true,
+              );
+            } else {
+              release.resolve();
+              const result = yield* Fiber.join(running);
+              expect(result._tag).toBe(condition === "success" ? "Success" : "Failure");
+            }
+            expect(f.terminals).toHaveLength(1);
+            expect(f.terminals[0]?.drain).toMatchObject({
+              childExitCode: condition === "nonzero" ? 7 : 0,
+              kernel: "removed",
+            });
+            if (condition === "success") {
+              expect(f.terminals[0]?.outcome).toBe("success");
+              expect(f.terminals[0]?.native?.persisted).toBe(true);
+            } else {
+              expect(f.terminals[0]?.outcome).not.toBe("success");
+              if (condition === "native-failed" || condition === "canceled")
+                expect(f.terminals[0]?.native).toBeNull();
+            }
+          }),
+        "initialize",
+        condition === "nonzero" ? 7 : 0,
+      );
+
     for (const mode of ["prompt", "initialize", "tool", "local-tool"] as const)
       check(
         `observes ordered full ${mode} worker stream from sequence zero`,
