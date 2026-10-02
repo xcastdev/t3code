@@ -94,6 +94,31 @@ const fixture = Effect.fn("PiSkillResources.fixture")(function* () {
   };
 });
 
+type NativeHandle = Awaited<ReturnType<typeof native.open>>;
+function observeDescriptors(
+  onOpen: (
+    handle: NativeHandle,
+    entry: string,
+    flags: number | string | undefined,
+  ) => Promise<void>,
+) {
+  const open = native.open.bind(native);
+  const active = new Set<number>();
+  const spy = vi.spyOn(native, "open").mockImplementation(async (...args) => {
+    const handle = await open(...args);
+    const fd = handle.fd;
+    active.add(fd);
+    const close = handle.close.bind(handle);
+    handle.close = async () => {
+      await close();
+      active.delete(fd);
+    };
+    await onOpen(handle, String(args[0]), args[1]);
+    return handle;
+  });
+  return { spy, active };
+}
+
 function denied(result: Result.Result<unknown, { detail: string }>, detail: RegExp) {
   assert.isTrue(Result.isFailure(result));
   if (Result.isFailure(result)) assert.match(result.failure.detail, detail);
@@ -235,6 +260,138 @@ describe("PiSkillResources", () => {
         assert.isTrue(replaced);
         assert.equal(yield* fs.readFileString(outside), "protected outside bytes");
         assert.deepEqual(yield* fs.readDirectory(f.stage), []);
+      }),
+    );
+    it.effect("receipt boundary refuses replacement of the admitted empty stage before copy", () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const admitted = yield* Effect.promise(() => native.stat(f.stage));
+        let changed = false;
+        const observed = observeDescriptors(async (_handle, entry, flags) => {
+          if (
+            !changed &&
+            typeof flags === "number" &&
+            (flags & process.getBuiltinModule("fs").constants.O_WRONLY) === 0 &&
+            entry.endsWith("/notes.txt")
+          ) {
+            await native.rename(f.stage, f.stage + "-original");
+            await native.mkdir(f.stage, { mode: 0o755 });
+            changed = true;
+          }
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(() => observed.spy.mockRestore()));
+        const result = yield* preparePiSkillResources(f.options).pipe(Effect.result);
+        assert.isTrue(changed);
+        assert.equal(observed.active.size, 0, "all acquired descriptors drained");
+        denied(result, /identity|receipt|changed/);
+        const replacement = yield* Effect.promise(() => native.stat(f.stage));
+        assert.notEqual(replacement.ino, admitted.ino);
+        assert.equal(replacement.mode & 0o777, 0o755);
+        assert.deepEqual(yield* Effect.promise(() => native.readdir(f.stage)), []);
+        assert.deepEqual(yield* Effect.promise(() => native.readdir(f.stage + "-original")), []);
+      }),
+    );
+    it.effect("receipt boundary refuses writable copied file after its seal chmod", () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        let changed = false;
+        const observed = observeDescriptors(async (handle, entry, flags) => {
+          if (
+            typeof flags === "number" &&
+            (flags & process.getBuiltinModule("fs").constants.O_WRONLY) !== 0 &&
+            entry.endsWith("/notes.txt")
+          ) {
+            const chmod = handle.chmod.bind(handle);
+            handle.chmod = async (mode) => {
+              await chmod(mode);
+              if (mode === 0o400) {
+                await chmod(0o600);
+                changed = true;
+              }
+            };
+          }
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(() => observed.spy.mockRestore()));
+        const result = yield* preparePiSkillResources(f.options).pipe(Effect.result);
+        assert.isTrue(changed);
+        assert.equal(observed.active.size, 0, "all acquired descriptors drained");
+        denied(result, /identity|receipt|changed|mode/);
+        assert.equal(
+          (yield* Effect.promise(() => native.stat(f.stage + "/selected/assets/notes.txt"))).mode &
+            0o777,
+          0o600,
+        );
+        assert.equal(
+          yield* Effect.promise(() => native.readFile(f.source + "/assets/notes.txt", "utf8")),
+          "authorized asset",
+        );
+      }),
+    );
+    it.effect(
+      "receipt boundary refuses an identical copied file replaced after creation closes",
+      () =>
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          let createdInode: number | undefined;
+          let replacementInode: number | undefined;
+          const observed = observeDescriptors(async (handle, entry, flags) => {
+            if (
+              typeof flags === "number" &&
+              (flags & process.getBuiltinModule("fs").constants.O_WRONLY) !== 0 &&
+              entry.endsWith("/notes.txt")
+            ) {
+              const close = handle.close.bind(handle);
+              handle.close = async () => {
+                createdInode = (await handle.stat()).ino;
+                await close();
+                await native.rename(entry, f.root + "/copied-created");
+                await native.writeFile(entry, "authorized asset", { mode: 0o400 });
+                replacementInode = (await native.stat(entry)).ino;
+              };
+            }
+          });
+          yield* Effect.addFinalizer(() => Effect.sync(() => observed.spy.mockRestore()));
+          const result = yield* preparePiSkillResources(f.options).pipe(Effect.result);
+          assert.isDefined(createdInode);
+          assert.isDefined(replacementInode);
+          assert.notEqual(createdInode, replacementInode);
+          assert.equal(observed.active.size, 0, "all acquired descriptors drained");
+          denied(result, /identity|receipt|changed/);
+          assert.equal(
+            yield* Effect.promise(() => native.readFile(f.source + "/assets/notes.txt", "utf8")),
+            "authorized asset",
+          );
+        }),
+    );
+    it.effect("receipt boundary refuses writable copied directory after its seal chmod", () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        let changed = false;
+        const observed = observeDescriptors(async (handle, _entry, flags) => {
+          if (
+            typeof flags === "number" &&
+            (flags & process.getBuiltinModule("fs").constants.O_DIRECTORY) !== 0 &&
+            (await native.realpath("/proc/self/fd/" + handle.fd)) === f.stage + "/selected/assets"
+          ) {
+            const chmod = handle.chmod.bind(handle);
+            handle.chmod = async (mode) => {
+              await chmod(mode);
+              if (mode === 0o500) {
+                await chmod(0o700);
+                changed = true;
+              }
+            };
+          }
+        });
+        yield* Effect.addFinalizer(() => Effect.sync(() => observed.spy.mockRestore()));
+        const result = yield* preparePiSkillResources(f.options).pipe(Effect.result);
+        assert.isTrue(changed);
+        assert.equal(observed.active.size, 0, "all acquired descriptors drained");
+        denied(result, /identity|receipt|changed|mode/);
+        assert.equal(
+          (yield* Effect.promise(() => native.stat(f.stage + "/selected/assets"))).mode & 0o777,
+          0o700,
+        );
       }),
     );
     it.effect("refuses redirected source ancestors and writable aliases", () =>

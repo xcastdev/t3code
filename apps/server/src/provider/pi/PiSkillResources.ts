@@ -137,6 +137,24 @@ async function withDirectory<A>(
     await closeDirectories(handles.map((entry) => entry.handle));
   }
 }
+async function admitStage(directory: string) {
+  let pinned: Handle | undefined;
+  try {
+    return await withDirectory(directory, async (handle) => {
+      const info = await handle.stat({ bigint: true });
+      if ((await entries(handle, 0)).length !== 0)
+        throw rejected("Selected skill staging directory is not empty.");
+      // A separate descriptor pins this admission until the Effect release joins its close.
+      pinned = await nativeFS.open(fdPath(handle) + "/.", directoryFlags);
+      if (!sameStat(info, await pinned.stat({ bigint: true })))
+        throw rejected("Selected skill admitted stage identity changed.");
+      return { handle: pinned, stat: info };
+    });
+  } catch (cause) {
+    if (pinned !== undefined) await closeDirectories([pinned]);
+    throw cause;
+  }
+}
 async function entries(handle: Handle, remaining: number) {
   const directory = await nativeFS.opendir(fdPath(handle));
   try {
@@ -284,20 +302,68 @@ async function exactDirectory(directory: string, expected: Stat, names: Readonly
       throw rejected("Selected skill staging closure changed.");
   });
 }
-async function copyTree(root: string, key: string, tree: Tree, path: Path.Path) {
-  await withDirectory(root, async (stage) => {
-    await nativeFS.mkdir(fdPath(stage) + "/" + key, { mode: 0o700 });
-    for (const directory of tree.directories) {
-      if (directory.relative === "") continue;
-      const destination = path.join(root, key, directory.relative);
-      await withDirectory(path.dirname(destination), (parent) =>
-        nativeFS.mkdir(fdPath(parent) + "/" + path.basename(destination), { mode: 0o700 }),
-      );
-    }
-    for (const file of tree.files) {
-      const destination = path.join(root, key, file.relative);
-      await withDirectory(path.dirname(destination), async (parent) => {
-        const entry = fdPath(parent) + "/" + path.basename(destination);
+const sameOwnerIdentity = (expected: Stat, actual: Stat) =>
+  sameIdentity(expected, actual) && expected.uid === actual.uid && expected.gid === actual.gid;
+function ownedDirectory(expected: Stat, actual: Stat, mode: bigint) {
+  if (
+    !actual.isDirectory() ||
+    !sameOwnerIdentity(expected, actual) ||
+    (actual.mode & 0o7777n) !== mode
+  )
+    throw rejected("Selected skill owned directory identity or sealed mode changed.");
+}
+async function copyTree(
+  root: string,
+  expectedStage: Stat,
+  key: string,
+  tree: Tree,
+  path: Path.Path,
+): Promise<Tree> {
+  return withDirectory(root, async (stage) => {
+    const directories = new Map<string, { handle: Handle; created: Stat }>();
+    const files: Array<Tree["files"][number]> = [];
+    const sealedDirectories: Array<Tree["directories"][number]> = [];
+    const verifyStage = async () => {
+      const actual = await stage.stat({ bigint: true });
+      ownedDirectory(expectedStage, actual, 0o700n);
+      if (
+        !sameOwnerIdentity(actual, await stat(root)) ||
+        (await nativeFS.realpath(fdPath(stage))) !== root
+      )
+        throw rejected("Selected skill admitted stage pathname identity changed.");
+    };
+    try {
+      await verifyStage();
+      // Keep every created parent open: mutations never reopen a substituted stage or child.
+      for (const directory of [...tree.directories].sort(
+        (a, b) => a.relative.length - b.relative.length,
+      )) {
+        await verifyStage();
+        const parent =
+          directory.relative === ""
+            ? stage
+            : directories.get(
+                path.dirname(directory.relative) === "." ? "" : path.dirname(directory.relative),
+              )!.handle;
+        const entry =
+          fdPath(parent) +
+          "/" +
+          (directory.relative === "" ? key : path.basename(directory.relative));
+        await nativeFS.mkdir(entry, { mode: 0o700 });
+        const created = await stat(entry);
+        const handle = await nativeFS.open(entry, directoryFlags);
+        directories.set(directory.relative, { handle, created });
+        const actual = await handle.stat({ bigint: true });
+        ownedDirectory(created, actual, 0o700n);
+        if (actual.uid !== expectedStage.uid || !sameStat(created, actual))
+          throw rejected("Selected skill created directory receipt changed.");
+      }
+      for (const file of tree.files) {
+        await verifyStage();
+        const parent = directories.get(
+          path.dirname(file.relative) === "." ? "" : path.dirname(file.relative),
+        )!.handle;
+        const entry = fdPath(parent) + "/" + path.basename(file.relative);
         const copied = await nativeFS.open(
           entry,
           nodeFS.constants.O_WRONLY |
@@ -307,26 +373,55 @@ async function copyTree(root: string, key: string, tree: Tree, path: Path.Path) 
           0o600,
         );
         try {
+          const created = await copied.stat({ bigint: true });
+          if (
+            !created.isFile() ||
+            created.uid !== expectedStage.uid ||
+            created.nlink !== 1n ||
+            (created.mode & 0o7777n) !== 0o600n
+          )
+            throw rejected("Selected skill created file receipt changed.");
           await copied.writeFile(file.bytes);
           await copied.chmod(0o400);
           const info = await copied.stat({ bigint: true });
-          if (!info.isFile() || info.nlink !== 1n || !sameStat(info, await stat(entry)))
-            throw rejected("Selected skill copied file identity changed.");
+          if (
+            !info.isFile() ||
+            !sameOwnerIdentity(created, info) ||
+            info.nlink !== 1n ||
+            (info.mode & 0o7777n) !== 0o400n ||
+            info.size !== BigInt(file.bytes.length) ||
+            !sameStat(info, await stat(entry))
+          )
+            throw rejected("Selected skill copied file identity or sealed mode changed.");
+          files.push({ relative: file.relative, stat: info, bytes: file.bytes });
         } finally {
           await copied.close();
         }
-      });
+      }
+      // Seal children before their parents and retain each original creation identity.
+      for (const [relative, directory] of [...directories].sort(
+        (a, b) => b[0].length - a[0].length,
+      )) {
+        await verifyStage();
+        ownedDirectory(directory.created, await directory.handle.stat({ bigint: true }), 0o700n);
+        await directory.handle.chmod(0o500);
+        const info = await directory.handle.stat({ bigint: true });
+        ownedDirectory(directory.created, info, 0o500n);
+        if (
+          !sameStat(info, await stat(path.join(root, key, relative))) ||
+          (await nativeFS.realpath(fdPath(directory.handle))) !== path.join(root, key, relative)
+        )
+          throw rejected("Selected skill sealed directory pathname receipt changed.");
+        sealedDirectories.push({ relative, stat: info });
+      }
+      return {
+        files: files.sort((a, b) => a.relative.localeCompare(b.relative)),
+        directories: sealedDirectories.sort((a, b) => a.relative.localeCompare(b.relative)),
+      };
+    } finally {
+      await closeDirectories([...directories.values()].map((directory) => directory.handle));
     }
   });
-  // Seal children before their parents. No executable bit is granted to script assets.
-  for (const directory of [...tree.directories].sort(
-    (a, b) => b.relative.length - a.relative.length,
-  ))
-    await withDirectory(
-      path.join(root, key, directory.relative),
-      (handle) => handle.chmod(0o500),
-      true,
-    );
 }
 async function runtimeFile(source: string, path: Path.Path) {
   return withDirectory(path.dirname(source), async (directory) => {
@@ -443,179 +538,208 @@ export const preparePiSkillResources = Effect.fn("preparePiSkillResources")(func
       "Selected skill physical directories alias protected, writable or source roots.",
     );
   const cacheReceipt = yield* native(() => directoryReceipt(value.stagingRoot));
-  const initialStage = yield* native(() =>
-    withDirectory(value.stagingDirectory, async (handle) => {
-      const info = await handle.stat({ bigint: true });
-      if ((await entries(handle, 0)).length !== 0)
-        throw rejected("Selected skill staging directory is not empty.");
-      return info;
-    }),
-  );
-  if (cacheReceipt.dev !== initialStage.dev)
-    return yield* rejected("Selected skill stage must remain on the fixed cache filesystem.");
-  for (const receipt of [cacheReceipt, initialStage])
-    if (receipt.uid !== BigInt(userId) || (receipt.mode & 0o777n) !== 0o700n)
-      return yield* rejected(
-        "Selected skill staging requires an owner-only new empty directory and fixed cache.",
-      );
-  const existingStats = yield* native(() =>
-    Promise.all(
-      value.existingRuntimeFiles.map((entry) =>
-        withDirectory(path.dirname(entry.source), (directory) =>
-          stat(fdPath(directory) + "/" + path.basename(entry.source)),
-        ),
-      ),
-    ),
-  );
-  let totalBytes = existingStats.reduce((sum, entry) => sum + entry.size, 0n);
-  if (totalBytes > BigInt(maxRuntimeBytes))
-    return yield* rejected("Selected skills and existing runtime exceed the combined byte bound.");
-  const existing: Array<Awaited<ReturnType<typeof runtimeFile>>> = [];
-  for (const [i, entry] of value.existingRuntimeFiles.entries()) {
-    const receipt = yield* native(() => runtimeFile(entry.source, path));
-    if (!sameStat(existingStats[i]!, receipt.stat))
-      return yield* rejected("Selected skill existing runtime receipt changed during capture.");
-    existing.push(receipt);
-  }
-  const targets = value.existingRuntimeFiles.map((entry) => entry.target);
-  if (targets.some((target, i) => targets.some((other, j) => i !== j && overlap(target, other))))
-    return yield* rejected("Selected skill runtime targets overlap or are duplicated.");
-  const captured: Array<{ key: ManagedSkillKey; source: string; original: Tree; staged: Tree }> =
-    [];
-  const runtimeFiles: Array<PiManagedLaunch["runtimeFiles"][number]> = [];
-  const skills: Array<NonNullable<PiWorkerBootstrap["resources"]>["skills"][number]> = [];
-  const identities: Array<readonly [ManagedSkillKey, SkillContentHash]> = [];
-  for (const selected of [...value.selection].sort((a, b) => a.key.localeCompare(b.key))) {
-    const original = yield* native(() => readTree(selected.packagePath));
-    if (original.files.length + targets.length > maxRuntimeFiles)
-      return yield* rejected(
-        "Selected skills and existing runtime exceed the combined file bound.",
-      );
-    totalBytes += original.files.reduce((sum, entry) => sum + entry.stat.size, 0n);
-    if (totalBytes > BigInt(maxRuntimeBytes))
-      return yield* rejected(
-        "Selected skills and existing runtime exceed the combined byte bound.",
-      );
-    for (const file of original.files) {
-      const target = `/runtime/skills/${selected.key}/${file.relative}`;
-      if (targets.some((existing) => overlap(existing, target)))
-        return yield* rejected("Selected skill runtime target overlaps the existing closure.");
-      targets.push(target);
-    }
-    yield* native(() => copyTree(value.stagingDirectory, selected.key, original, path));
-    const stage = path.join(value.stagingDirectory, selected.key);
-    const staged = yield* native(() => readTree(stage));
-    if (original.files.some((file, i) => !file.bytes.equals(staged.files[i]!.bytes)))
-      return yield* rejected("Selected skill copy differs from its authorized source.");
-    const inspected = yield* inspectSkillPackage({
-      packagePath: stage,
-      expectedKey: selected.key,
-    }).pipe(Effect.mapError(() => rejected("Selected skill staged package inspection failed.")));
-    if (
-      inspected.validity !== "valid" ||
-      inspected.content === undefined ||
-      inspected.manifest === undefined
-    )
-      return yield* rejected(
-        "Selected skill metadata or portable SKILL.md is invalid: " +
-          inspected.diagnostics.map((entry) => entry.code).join(", "),
-      );
-    const contentHash = yield* hashSkillPackage(stage).pipe(
-      Effect.mapError(() => rejected("Selected skill package hash inspection failed.")),
-    );
-    if (
-      contentHash !== selected.expectedHash ||
-      inspected.hash !== selected.expectedHash ||
-      inspected.manifest.revision.hash !== selected.expectedHash
-    )
-      return yield* rejected(
-        "Selected skill content hash does not match the authorized selection.",
-      );
-    const body = staged.files.find((file) => file.relative === SKILL_BODY_FILE);
-    if (body === undefined) return yield* rejected("Selected skill SKILL.md is missing.");
-    const document = yield* Effect.try({
-      try: () =>
-        parsePortableSkillDocument(new TextDecoder("utf-8", { fatal: true }).decode(body.bytes)),
-      catch: () => rejected("Selected skill portable frontmatter is invalid."),
-    });
-    if (document.frontmatter.name !== selected.key)
-      return yield* rejected("Selected skill portable key does not match its document.");
-    yield* native(async () => {
-      sameTree(original, await readTree(selected.packagePath));
-      sameTree(staged, await readTree(stage));
-    });
-    for (const file of staged.files)
-      runtimeFiles.push(
-        Object.freeze({
-          source: path.join(stage, file.relative),
-          target: `/runtime/skills/${selected.key}/${file.relative}`,
-        }),
-      );
-    skills.push(
-      Object.freeze({
-        key: selected.key,
-        path: `/runtime/skills/${selected.key}/SKILL.md`,
-        description: document.frontmatter.description,
-      }),
-    );
-    captured.push({ key: selected.key, source: selected.packagePath, original, staged });
-    identities.push([selected.key, contentHash]);
-  }
-  // The cache remains owner-writable for later operation directories; this stage is sealed.
-  yield* native(() => withDirectory(value.stagingDirectory, (handle) => handle.chmod(0o500), true));
-  const sealedStage = yield* native(() => directoryReceipt(value.stagingDirectory));
-  const revalidate = native(async () => {
-    for (const ancestors of admittedAncestors) {
-      const current = await directoryAncestors(ancestors[ancestors.length - 1]!.path);
-      if (
-        ancestors.length !== current.length ||
-        ancestors.some(
-          (ancestor, i) =>
-            ancestor.path !== current[i]!.path ||
-            !sameIdentity(ancestor.stat, current[i]!.stat) ||
-            ancestor.stat.mode !== current[i]!.stat.mode,
+  return yield* Effect.acquireUseRelease(
+    native(() => admitStage(value.stagingDirectory)),
+    (admitted) =>
+      Effect.gen(function* () {
+        const initialStage = admitted.stat;
+        if (cacheReceipt.dev !== initialStage.dev)
+          return yield* rejected("Selected skill stage must remain on the fixed cache filesystem.");
+        for (const receipt of [cacheReceipt, initialStage])
+          if (receipt.uid !== BigInt(userId) || (receipt.mode & 0o7777n) !== 0o700n)
+            return yield* rejected(
+              "Selected skill staging requires an owner-only new empty directory and fixed cache.",
+            );
+        const existingStats = yield* native(() =>
+          Promise.all(
+            value.existingRuntimeFiles.map((entry) =>
+              withDirectory(path.dirname(entry.source), (directory) =>
+                stat(fdPath(directory) + "/" + path.basename(entry.source)),
+              ),
+            ),
+          ),
+        );
+        let totalBytes = existingStats.reduce((sum, entry) => sum + entry.size, 0n);
+        if (totalBytes > BigInt(maxRuntimeBytes))
+          return yield* rejected(
+            "Selected skills and existing runtime exceed the combined byte bound.",
+          );
+        const existing: Array<Awaited<ReturnType<typeof runtimeFile>>> = [];
+        for (const [i, entry] of value.existingRuntimeFiles.entries()) {
+          const receipt = yield* native(() => runtimeFile(entry.source, path));
+          if (!sameStat(existingStats[i]!, receipt.stat))
+            return yield* rejected(
+              "Selected skill existing runtime receipt changed during capture.",
+            );
+          existing.push(receipt);
+        }
+        const targets = value.existingRuntimeFiles.map((entry) => entry.target);
+        if (
+          targets.some((target, i) => targets.some((other, j) => i !== j && overlap(target, other)))
         )
-      )
-        throw rejected("Selected skill admitted ancestor identity or mode changed.");
-    }
-    const cache = await directoryReceipt(value.stagingRoot);
-    if (
-      !sameIdentity(cacheReceipt, cache) ||
-      cacheReceipt.uid !== cache.uid ||
-      cacheReceipt.mode !== cache.mode
-    )
-      throw rejected("Selected skill fixed cache identity or permissions changed.");
-    await exactDirectory(value.stagingDirectory, sealedStage, [...keys]);
-    const currentRoots = await Promise.all(
-      [...value.protectedRoots, ...value.writableRoots].map((root) => nativeFS.realpath(root)),
-    );
-    if (currentRoots.some((root, i) => root !== roots[i]))
-      throw rejected("Selected skill protected or writable root alias changed.");
-    for (const [i, root] of roots.entries()) {
-      const receipt = await directoryReceipt(root);
-      if (!sameIdentity(rootReceipts[i]!, receipt) || rootReceipts[i]!.mode !== receipt.mode)
-        throw rejected("Selected skill protected or writable root receipt changed.");
-    }
-    for (const entry of existing) {
-      const actual = await runtimeFile(entry.source, path);
-      if (!sameStat(entry.stat, actual.stat) || !entry.bytes.equals(actual.bytes))
-        throw rejected("Selected skill existing runtime closure receipt changed.");
-    }
-    for (const entry of captured) {
-      sameTree(entry.original, await readTree(entry.source));
-      sameTree(entry.staged, await readTree(path.join(value.stagingDirectory, entry.key)));
-    }
-  });
-  yield* revalidate;
-  const identityHash = process
-    .getBuiltinModule("crypto")
-    .createHash("sha256")
-    .update(encodeIdentities(identities))
-    .digest("hex");
-  return {
-    runtimeFiles: Object.freeze(runtimeFiles),
-    resources: Object.freeze({ skills: Object.freeze(skills) }),
-    identityHash,
-    revalidate,
-  };
+          return yield* rejected("Selected skill runtime targets overlap or are duplicated.");
+        const captured: Array<{
+          key: ManagedSkillKey;
+          source: string;
+          original: Tree;
+          staged: Tree;
+        }> = [];
+        const runtimeFiles: Array<PiManagedLaunch["runtimeFiles"][number]> = [];
+        const skills: Array<NonNullable<PiWorkerBootstrap["resources"]>["skills"][number]> = [];
+        const identities: Array<readonly [ManagedSkillKey, SkillContentHash]> = [];
+        for (const selected of [...value.selection].sort((a, b) => a.key.localeCompare(b.key))) {
+          const original = yield* native(() => readTree(selected.packagePath));
+          if (original.files.length + targets.length > maxRuntimeFiles)
+            return yield* rejected(
+              "Selected skills and existing runtime exceed the combined file bound.",
+            );
+          totalBytes += original.files.reduce((sum, entry) => sum + entry.stat.size, 0n);
+          if (totalBytes > BigInt(maxRuntimeBytes))
+            return yield* rejected(
+              "Selected skills and existing runtime exceed the combined byte bound.",
+            );
+          for (const file of original.files) {
+            const target = `/runtime/skills/${selected.key}/${file.relative}`;
+            if (targets.some((existing) => overlap(existing, target)))
+              return yield* rejected(
+                "Selected skill runtime target overlaps the existing closure.",
+              );
+            targets.push(target);
+          }
+          const staged = yield* native(() =>
+            copyTree(value.stagingDirectory, initialStage, selected.key, original, path),
+          );
+          const stage = path.join(value.stagingDirectory, selected.key);
+          yield* native(async () => sameTree(staged, await readTree(stage)));
+          const inspected = yield* inspectSkillPackage({
+            packagePath: stage,
+            expectedKey: selected.key,
+          }).pipe(
+            Effect.mapError(() => rejected("Selected skill staged package inspection failed.")),
+          );
+          if (
+            inspected.validity !== "valid" ||
+            inspected.content === undefined ||
+            inspected.manifest === undefined
+          )
+            return yield* rejected(
+              "Selected skill metadata or portable SKILL.md is invalid: " +
+                inspected.diagnostics.map((entry) => entry.code).join(", "),
+            );
+          const contentHash = yield* hashSkillPackage(stage).pipe(
+            Effect.mapError(() => rejected("Selected skill package hash inspection failed.")),
+          );
+          if (
+            contentHash !== selected.expectedHash ||
+            inspected.hash !== selected.expectedHash ||
+            inspected.manifest.revision.hash !== selected.expectedHash
+          )
+            return yield* rejected(
+              "Selected skill content hash does not match the authorized selection.",
+            );
+          const body = staged.files.find((file) => file.relative === SKILL_BODY_FILE);
+          if (body === undefined) return yield* rejected("Selected skill SKILL.md is missing.");
+          const document = yield* Effect.try({
+            try: () =>
+              parsePortableSkillDocument(
+                new TextDecoder("utf-8", { fatal: true }).decode(body.bytes),
+              ),
+            catch: () => rejected("Selected skill portable frontmatter is invalid."),
+          });
+          if (document.frontmatter.name !== selected.key)
+            return yield* rejected("Selected skill portable key does not match its document.");
+          yield* native(async () => {
+            sameTree(original, await readTree(selected.packagePath));
+            sameTree(staged, await readTree(stage));
+          });
+          for (const file of staged.files)
+            runtimeFiles.push(
+              Object.freeze({
+                source: path.join(stage, file.relative),
+                target: `/runtime/skills/${selected.key}/${file.relative}`,
+              }),
+            );
+          skills.push(
+            Object.freeze({
+              key: selected.key,
+              path: `/runtime/skills/${selected.key}/SKILL.md`,
+              description: document.frontmatter.description,
+            }),
+          );
+          captured.push({ key: selected.key, source: selected.packagePath, original, staged });
+          identities.push([selected.key, contentHash]);
+        }
+        // The cache remains owner-writable for later operation directories; this stage is sealed.
+        const sealedStage = yield* native(() =>
+          withDirectory(
+            value.stagingDirectory,
+            async (handle) => {
+              ownedDirectory(initialStage, await handle.stat({ bigint: true }), 0o700n);
+              await handle.chmod(0o500);
+              const sealed = await handle.stat({ bigint: true });
+              ownedDirectory(initialStage, sealed, 0o500n);
+              return sealed;
+            },
+            true,
+          ),
+        );
+        const revalidate = native(async () => {
+          for (const ancestors of admittedAncestors) {
+            const current = await directoryAncestors(ancestors[ancestors.length - 1]!.path);
+            if (
+              ancestors.length !== current.length ||
+              ancestors.some(
+                (ancestor, i) =>
+                  ancestor.path !== current[i]!.path ||
+                  !sameIdentity(ancestor.stat, current[i]!.stat) ||
+                  ancestor.stat.mode !== current[i]!.stat.mode,
+              )
+            )
+              throw rejected("Selected skill admitted ancestor identity or mode changed.");
+          }
+          const cache = await directoryReceipt(value.stagingRoot);
+          if (
+            !sameIdentity(cacheReceipt, cache) ||
+            cacheReceipt.uid !== cache.uid ||
+            cacheReceipt.mode !== cache.mode
+          )
+            throw rejected("Selected skill fixed cache identity or permissions changed.");
+          await exactDirectory(value.stagingDirectory, sealedStage, [...keys]);
+          const currentRoots = await Promise.all(
+            [...value.protectedRoots, ...value.writableRoots].map((root) =>
+              nativeFS.realpath(root),
+            ),
+          );
+          if (currentRoots.some((root, i) => root !== roots[i]))
+            throw rejected("Selected skill protected or writable root alias changed.");
+          for (const [i, root] of roots.entries()) {
+            const receipt = await directoryReceipt(root);
+            if (!sameIdentity(rootReceipts[i]!, receipt) || rootReceipts[i]!.mode !== receipt.mode)
+              throw rejected("Selected skill protected or writable root receipt changed.");
+          }
+          for (const entry of existing) {
+            const actual = await runtimeFile(entry.source, path);
+            if (!sameStat(entry.stat, actual.stat) || !entry.bytes.equals(actual.bytes))
+              throw rejected("Selected skill existing runtime closure receipt changed.");
+          }
+          for (const entry of captured) {
+            sameTree(entry.original, await readTree(entry.source));
+            sameTree(entry.staged, await readTree(path.join(value.stagingDirectory, entry.key)));
+          }
+        });
+        yield* revalidate;
+        const identityHash = process
+          .getBuiltinModule("crypto")
+          .createHash("sha256")
+          .update(encodeIdentities(identities))
+          .digest("hex");
+        return {
+          runtimeFiles: Object.freeze(runtimeFiles),
+          resources: Object.freeze({ skills: Object.freeze(skills) }),
+          identityHash,
+          revalidate,
+        };
+      }),
+    (admitted) => native(() => closeDirectories([admitted.handle])),
+  );
 });
