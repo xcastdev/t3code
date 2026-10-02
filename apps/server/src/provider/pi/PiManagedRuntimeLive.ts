@@ -14,6 +14,7 @@ import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
+import * as Option from "effect/Option";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
@@ -79,6 +80,7 @@ export interface PiManagedRuntimeLiveOptions {
   readonly nativeStateRoot: string;
   readonly protectedRoots: ReadonlyArray<string>;
   readonly runtimeFiles: PiManagedLaunch["runtimeFiles"];
+  readonly revalidateRuntime?: Effect.Effect<void, PiManagedRuntimeError>;
   /** The owned state is mounted at /state; the worker must use /state/sessions. */
   readonly workerArgv: (
     identity: PiWorkerIdentity,
@@ -172,10 +174,23 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   });
   const verifyWorkspace = Effect.fn("PiManagedRuntimeLive.verifyWorkspace")(function* (
     authority: ProjectTeamAuthority,
+    agentDirectory: string,
+    expected?: { readonly protectedRoots: ReadonlyArray<string>; readonly fingerprint: string },
   ) {
     const cwd = authority.binding.worktree;
+    const directoryIdentity = Effect.fn("PiManagedRuntimeLive.directoryIdentity")(function* (
+      directory: string,
+    ) {
+      if ((yield* fs.realPath(directory)) !== directory)
+        return yield* deny("Pi Git directory is not canonical");
+      const stat = yield* fs.stat(directory);
+      if (stat.type !== "Directory" || Option.isNone(stat.ino))
+        return yield* deny("Pi Git directory identity is unavailable");
+      return { directory, dev: stat.dev, ino: stat.ino.value };
+    });
+    const assigned = yield* directoryIdentity(cwd);
+    const agent = yield* directoryIdentity(agentDirectory);
     if (
-      (yield* fs.realPath(cwd)) !== cwd ||
       (yield* git(cwd, ["rev-parse", "--show-toplevel"])).trim() !== cwd ||
       (yield* git(cwd, ["symbolic-ref", "--short", "HEAD"])).trim() !== authority.binding.branch
     )
@@ -184,11 +199,15 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
       .split("\0\0")
       .filter(Boolean)
       .map((record) => record.split("\0"));
+    const primaryRecord = records[0];
+    const primaryEntries = primaryRecord?.filter((entry) => entry.startsWith("worktree "));
     if (
       authority.binding.branch === "main" ||
       authority.binding.branch === "master" ||
-      records[0]?.includes(`branch refs/heads/${authority.binding.branch}`) ||
-      records[0]?.includes(`worktree ${cwd}`) ||
+      primaryRecord?.includes(`branch refs/heads/${authority.binding.branch}`) ||
+      primaryRecord?.includes(`worktree ${cwd}`) ||
+      !primaryEntries ||
+      primaryEntries.length !== 1 ||
       !records.some(
         (record) =>
           record.includes(`worktree ${cwd}`) &&
@@ -196,12 +215,50 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
       )
     )
       return yield* deny("Pi requires a registered isolated worktree");
+    const primaryDirectory = primaryEntries[0]!.slice("worktree ".length);
+    const primary = yield* directoryIdentity(primaryDirectory);
+    const commonDirectory = (yield* git(cwd, [
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-common-dir",
+    ])).trim();
+    const common = yield* directoryIdentity(commonDirectory);
     if (
-      (yield* git(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]))
-        .trim()
-        .startsWith(cwd + "/")
+      commonDirectory === cwd ||
+      commonDirectory.startsWith(cwd + "/") ||
+      primaryDirectory.startsWith(cwd + "/") ||
+      (yield* git(primaryDirectory, ["rev-parse", "--show-toplevel"])).trim() !==
+        primaryDirectory ||
+      (yield* git(primaryDirectory, [
+        "rev-parse",
+        "--path-format=absolute",
+        "--git-common-dir",
+      ])).trim() !== commonDirectory
     )
-      return yield* deny("Pi worktree cannot own the main Git directory");
+      return yield* deny("Pi primary checkout or common Git directory changed");
+    // HEAD may advance in the primary checkout; its registered path, branch and
+    // actual directory identities must remain the same for this owned launch.
+    const fingerprint = encode({
+      assigned,
+      agent,
+      primary,
+      common,
+      primaryRecord: primaryRecord!.filter((entry) => !entry.startsWith("HEAD ")),
+    });
+    if (
+      (expected && expected.fingerprint !== fingerprint) ||
+      encode(assigned) !== encode(yield* directoryIdentity(cwd)) ||
+      encode(agent) !== encode(yield* directoryIdentity(agentDirectory)) ||
+      encode(primary) !== encode(yield* directoryIdentity(primaryDirectory)) ||
+      encode(common) !== encode(yield* directoryIdentity(commonDirectory))
+    )
+      return yield* deny("Pi registered workspace ownership changed");
+    return {
+      protectedRoots: [
+        ...new Set([...options.protectedRoots, agentDirectory, primaryDirectory, commonDirectory]),
+      ],
+      fingerprint,
+    };
   });
   const configuration = Effect.fn("PiManagedRuntimeLive.configuration")(function* (
     agentDirectory: string,
@@ -342,7 +399,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 )
               )
                 return yield* deny("Pi profile includes an unsupported tool", "unavailable");
-              yield* verifyWorkspace(authority);
+              const workspace = yield* verifyWorkspace(authority, agentDirectory);
               const nativeConfig = yield* configuration(agentDirectory, authority);
               const previous =
                 request.kind === "initialize" && binding.status === "reserved"
@@ -377,6 +434,15 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                     binding.generation,
                   ]),
                 );
+              if (
+                workspace.protectedRoots.some(
+                  (root) =>
+                    root === nativeStateDirectory ||
+                    nativeStateDirectory.startsWith(root + "/") ||
+                    root.startsWith(nativeStateDirectory + "/"),
+                )
+              )
+                return yield* deny("Pi native state overlaps a protected Git checkout");
               yield* fs.makeDirectory(nativeStateDirectory, { recursive: true, mode: 0o700 });
               if ((yield* fs.realPath(nativeStateDirectory)) !== nativeStateDirectory)
                 return yield* deny("Pi native state directory is not canonical");
@@ -385,12 +451,32 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 workspaceAccess: "readonly",
                 nativeStateRoot: nativeStateDirectory,
                 protectedWorkspaceEntries: [".git"],
-                protectedRoots: options.protectedRoots,
+                protectedRoots: workspace.protectedRoots,
                 runtimeFiles: options.runtimeFiles,
                 argv: options.workerArgv(workerIdentity, operation, nativeStateDirectory),
                 memoryBytes: options.memoryBytes,
                 runtimeSeconds: Math.ceil(nativeConfig.deadlineMs / 1000),
               };
+              yield* options.revalidateRuntime ?? Effect.void;
+              const allocationAuthority = yield* operations.current(
+                identity(request.threadId),
+                request.kind === "initialize",
+              );
+              if (contextFor(allocationAuthority) !== context)
+                return yield* deny("Pi assignment changed before managed allocation", "conflict");
+              yield* verifyWorkspace(allocationAuthority, agentDirectory, workspace);
+              if (
+                contextFor(
+                  yield* operations.current(
+                    identity(request.threadId),
+                    request.kind === "initialize",
+                  ),
+                ) !== context
+              )
+                return yield* deny(
+                  "Pi assignment changed during managed allocation checks",
+                  "conflict",
+                );
               const allocation = yield* preallocatePiManagedProcess(launch).pipe(
                 Effect.provide(services),
               );
@@ -457,12 +543,22 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   texts.find((item) => item.transferId === transferId)!.text,
                 ),
               });
-              const check = (signal: AbortSignal, workspace = false) =>
+              const check = (signal: AbortSignal, verify = false, revalidate = false) =>
                 guard(
                   Effect.gen(function* () {
                     if (signal.aborted) return yield* deny("Pi operation canceled");
                     const current = yield* operations.authorize(durable);
-                    if (workspace) yield* verifyWorkspace(current);
+                    if (verify) yield* verifyWorkspace(current, agentDirectory, workspace);
+                    if (revalidate) {
+                      if (signal.aborted) return yield* deny("Pi operation canceled");
+                      yield* options.revalidateRuntime ?? Effect.void;
+                      if (signal.aborted) return yield* deny("Pi operation canceled");
+                      yield* verifyWorkspace(
+                        yield* operations.authorize(durable),
+                        agentDirectory,
+                        workspace,
+                      );
+                    }
                     yield* operations.authorize(durable);
                     if (signal.aborted) return yield* deny("Pi operation canceled");
                   }),
@@ -514,6 +610,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                         "beforeToolInvoke",
                         "beforeToolReturn",
                       ].includes(input.phase),
+                      input.phase === "beforeAcquire" || input.phase === "beforeStart",
                     ).pipe(
                       Effect.andThen(
                         input.tool

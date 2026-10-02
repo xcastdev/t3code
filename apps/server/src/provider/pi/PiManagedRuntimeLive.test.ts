@@ -1,3 +1,6 @@
+import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
+import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
+import { PiManagedRuntimeError } from "./PiManagedRuntime.ts";
 import { SkillCatalogRevision } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
@@ -53,6 +56,24 @@ const decodeClosure = Schema.decodeEffect(
           sha256: Schema.String,
         }),
       ),
+    }),
+  ),
+);
+const decodeAllocationRoots = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({ launch: Schema.Struct({ protectedRoots: Schema.Array(Schema.String) }) }),
+  ),
+);
+const decodeBoundaryDrain = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      unit: Schema.String,
+      invocation: Schema.String,
+      kernel: Schema.String,
+      cgroup: Schema.String,
+      ownerPid: Schema.Int,
+      launcherPid: Schema.Int,
+      childPid: Schema.NullOr(Schema.Int),
     }),
   ),
 );
@@ -155,7 +176,7 @@ const fixture = Effect.gen(function* () {
     environmentId: "environment",
     agentDirectory,
     nativeStateRoot: state,
-    protectedRoots: [protectedRoot, main],
+    protectedRoots: [protectedRoot],
     runtimeFiles: [{ source: yield* fs.realPath("/usr/bin/true"), target: "/bin/true" }],
     workerArgv: () => {
       launches++;
@@ -972,4 +993,422 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_LINUX_GATE === "1")(
       );
     }
   },
+);
+
+it.effect("derives primary and common Git protection without caller hints", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const prepared = yield* f.instance.prepareOperation(
+        { threadId, kind: "initialize" },
+        () => Effect.void,
+      );
+      const rows = yield* f.sql<{
+        allocation_json: string;
+      }>`SELECT allocation_json FROM project_team_pi_process`;
+      const allocation = yield* decodeAllocationRoots(rows[0]!.allocation_json);
+      expect(allocation.launch.protectedRoots).toContain(f.main);
+      expect(allocation.launch.protectedRoots).toContain(f.main + "/.git");
+      yield* f.instance.requestStop(threadId);
+      yield* rejected(prepared.run);
+    }),
+  ),
+);
+
+it.effect("denies native state inside the dynamically protected primary checkout", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const runtime = yield* makePiManagedRuntimeLive({
+        ...f.options,
+        nativeStateRoot: f.main + "/state",
+      });
+      const instance = yield* runtime.forInstance({
+        instanceId: providerInstanceId,
+        enabled: true,
+        configuration: {},
+      });
+      yield* rejected(
+        instance.prepareOperation({ threadId, kind: "initialize" }, () => Effect.void),
+      );
+      expect((yield* f.sql`SELECT * FROM project_team_pi_operation`).length).toBe(0);
+    }),
+  ),
+);
+
+describe.runIf(process.env.PI_MANAGED_RUNTIME_LINUX_GATE === "1")(
+  "actual staged assets runtime boundaries",
+  () => {
+    for (const phase of [
+      "control",
+      "preallocation",
+      "acquire",
+      "start",
+      "primary-swap",
+      "primary-symlink",
+      "common-symlink",
+      "assigned-swap",
+      "primary-branch",
+      "primary-head",
+      "revoke",
+      "cancel",
+      "common-swap",
+      "agent-swap",
+    ] as const) {
+      it.effect(
+        `staged actual SDK mutation ${phase}`,
+        () =>
+          scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture;
+              const manifest = process.env.PI_MANAGED_RUNTIME_TEST_CLOSURE;
+              const evidence = process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE;
+              if (!manifest || !evidence)
+                return yield* Effect.die("Required actual SDK closure/evidence missing");
+              const closure = yield* decodeClosure(yield* f.fs.readFileString(manifest));
+              const worker = closure.files.find(
+                (file) => file.target === "/runtime/dist/worker.mjs",
+              );
+              const metadata = closure.files.find(
+                (file) => file.target === "/runtime/package.json",
+              );
+              if (!worker || !metadata)
+                return yield* Effect.die("Actual pinned SDK bridge/metadata missing");
+              for (const file of [worker, metadata]) {
+                const bytes = yield* f.fs.readFile(file.source);
+                expect(bytes.length).toBe(file.bytes);
+                expect(NodeCrypto.createHash("sha256").update(bytes).digest("hex")).toBe(
+                  file.sha256,
+                );
+              }
+              const scratch = yield* f.fs.makeTempDirectoryScoped();
+              const distributionDirectory = scratch + "/dist";
+              const stagingDirectory = scratch + "/stage";
+              yield* f.fs.makeDirectory(distributionDirectory + "/pi-sdk", { recursive: true });
+              yield* f.fs.makeDirectory(stagingDirectory);
+              yield* f.fs.copyFile(worker.source, distributionDirectory + "/pi-worker.mjs");
+              yield* f.fs.copyFile(metadata.source, distributionDirectory + "/pi-sdk/package.json");
+              const assets = yield* preparePiRuntimeAssets({
+                distributionDirectory,
+                stagingDirectory,
+                protectedRoots: [f.main],
+              }).pipe(Effect.provideService(HostProcessPlatform, "linux"));
+              yield* Effect.addFinalizer(() =>
+                f.fs.chmod(stagingDirectory, 0o700).pipe(Effect.orDie),
+              );
+              const stagedWorker = assets.runtimeFiles.find(
+                (file) => file.target === "/runtime/dist/pi-worker.mjs",
+              )!.source;
+              const actualAt = DateTime.formatIso(DateTime.nowUnsafe());
+              yield* TestClock.setTime(Date.parse(actualAt));
+              yield* restoreHistoricalBinding({
+                ...f.binding,
+                revision: f.binding.revision + 1,
+                updatedAt: actualAt,
+              });
+              const testServices = yield* Effect.context<
+                SqlClient.SqlClient | ProjectWorkProjection
+              >();
+              const assetEntered = yield* Deferred.make<void>();
+              const assetRelease = yield* Deferred.make<void>();
+              const abortReceipt = Promise.withResolvers<void>();
+              let callbackJoined = false;
+              let validations = 0;
+              let transports = 0;
+              const revalidateRuntime = Effect.gen(function* () {
+                validations++;
+                yield* Effect.gen(function* () {
+                  if (
+                    validations ===
+                    {
+                      preallocation: 1,
+                      acquire: 2,
+                      start: 3,
+                      control: 0,
+                      "primary-swap": 0,
+                      "primary-symlink": 0,
+                      "common-symlink": 0,
+                      "assigned-swap": 0,
+                      "primary-branch": 0,
+                      "primary-head": 0,
+                      revoke: 0,
+                      cancel: 0,
+                      "common-swap": 0,
+                      "agent-swap": 0,
+                    }[phase]
+                  ) {
+                    yield* f.fs.chmod(stagedWorker, 0o600);
+                    yield* f.fs.writeFileString(
+                      stagedWorker,
+                      "throw Error('mutated closure must never start');\n",
+                    );
+                  }
+                  if (validations === 2) {
+                    if (phase === "cancel") {
+                      yield* Deferred.succeed(assetEntered, undefined);
+                      yield* Deferred.await(assetRelease);
+                      callbackJoined = true;
+                    }
+                    if (phase === "common-swap") {
+                      yield* f.fs.rename(f.main + "/.git", f.main + "/.git-held");
+                      yield* f.fs.copy(f.main + "/.git-held", f.main + "/.git");
+                    }
+                    if (
+                      phase === "primary-swap" ||
+                      phase === "assigned-swap" ||
+                      phase === "agent-swap"
+                    ) {
+                      const directory =
+                        phase === "primary-swap"
+                          ? f.main
+                          : phase === "agent-swap"
+                            ? f.options.agentDirectory
+                            : f.worktree;
+                      yield* f.fs.rename(directory, directory + "-held");
+                      yield* f.fs.copy(directory + "-held", directory);
+                    }
+                    if (phase === "primary-symlink" || phase === "common-symlink") {
+                      const directory = phase === "primary-symlink" ? f.main : f.main + "/.git";
+                      yield* f.fs.rename(directory, directory + "-held");
+                      yield* f.fs.symlink(directory + "-held", directory);
+                    }
+                    if (phase === "revoke")
+                      yield* restoreHistoricalBinding({
+                        ...f.binding,
+                        revision: f.binding.revision + 2,
+                        updatedAt: actualAt,
+                        status: "revoked",
+                      }).pipe(Effect.provide(testServices));
+                    if (phase === "primary-branch")
+                      yield* f.git(["-C", f.main, "branch", "-m", "changed-primary"]);
+                    if (phase === "primary-head")
+                      yield* f.git([
+                        "-C",
+                        f.main,
+                        "-c",
+                        "user.name=Fixture",
+                        "-c",
+                        "user.email=fixture@example.test",
+                        "commit",
+                        "--allow-empty",
+                        "-qm",
+                        "primary HEAD may advance",
+                      ]);
+                  }
+                }).pipe(Effect.orDie);
+                yield* assets.revalidate.pipe(
+                  Effect.mapError(
+                    () =>
+                      new PiManagedRuntimeError({
+                        code: "denied",
+                        detail: "Actual staged runtime mutated",
+                      }),
+                  ),
+                );
+              });
+              const originalFetch = globalThis.fetch;
+              globalThis.fetch = async () => {
+                throw Error("Unexpected ambient model fetch");
+              };
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  globalThis.fetch = originalFetch;
+                }),
+              );
+              const runtime = yield* makePiManagedRuntimeLive({
+                ...f.options,
+                memoryBytes: 536870912,
+                cleanupDeadlineMs: 5000,
+                // The held SDK bridge discovers its package at /runtime; this alias is fixture-only.
+                runtimeFiles: [
+                  ...assets.runtimeFiles,
+                  {
+                    source: assets.runtimeFiles.find(
+                      (file) => file.target === "/runtime/dist/pi-sdk/package.json",
+                    )!.source,
+                    target: "/runtime/package.json",
+                  },
+                ],
+                revalidateRuntime,
+                workerArgv: (identity, operation) => [
+                  "/runtime/node",
+                  "--max-old-space-size=512",
+                  "/runtime/dist/pi-worker.mjs",
+                  identity.workerId,
+                  String(identity.generation),
+                  operation.operationId,
+                  operation.operationKind,
+                  "plain",
+                ],
+                readCatalogue: Effect.succeed({
+                  source: "https://api.commandcode.ai/provider/v1/models" as const,
+                  fetchedAt: actualAt,
+                  selectedEntry: {
+                    id: model,
+                    owned_by: "command-code" as const,
+                    context_length: 20000,
+                    supported_endpoints: ["/chat/completions"],
+                  },
+                }),
+                transport: async () => {
+                  transports++;
+                  throw Error("Model forbidden in staged closure proof");
+                },
+              });
+              const instance = yield* runtime.forInstance({
+                instanceId: providerInstanceId,
+                enabled: true,
+                configuration: {},
+              });
+              yield* Effect.addFinalizer(() => instance.stopAll.pipe(Effect.orDie));
+              const preparation = yield* instance
+                .prepareOperation({ threadId, kind: "initialize" }, () => Effect.void)
+                .pipe(Effect.result);
+              if (phase === "preallocation") {
+                expect(preparation._tag).toBe("Failure");
+                expect((yield* f.sql`SELECT * FROM project_team_pi_process`).length).toBe(0);
+              } else {
+                if (preparation._tag !== "Success")
+                  return yield* Effect.die("Unexpected preparation failure " + json(preparation));
+                const originalAbort = AbortController.prototype.abort;
+                if (phase === "cancel")
+                  AbortController.prototype.abort = function (...args) {
+                    originalAbort.apply(this, args);
+                    abortReceipt.resolve();
+                  };
+                let outcome;
+                try {
+                  const running = yield* Effect.forkChild(
+                    preparation.success.run.pipe(Effect.result),
+                  );
+                  if (phase === "cancel") {
+                    yield* Effect.raceFirst(
+                      Deferred.await(assetEntered),
+                      Fiber.join(running).pipe(
+                        Effect.flatMap((early) =>
+                          Effect.die(
+                            "Run completed before asset revalidation receipt: " + json(early),
+                          ),
+                        ),
+                      ),
+                    );
+                    const stopping = yield* Effect.forkChild(instance.requestStop(threadId));
+                    yield* Effect.promise(() => abortReceipt.promise);
+                    yield* Deferred.succeed(assetRelease, undefined);
+                    outcome = yield* Fiber.join(running);
+                    yield* Fiber.join(stopping);
+                    expect(callbackJoined).toBe(true);
+                  } else outcome = yield* Fiber.join(running);
+                } finally {
+                  AbortController.prototype.abort = originalAbort;
+                }
+                yield* f.fs.writeFileString(
+                  evidence + "/assets-runtime-" + phase + "-outcome.json",
+                  json({
+                    outcome,
+                    validations,
+                    processes: yield* f.sql`SELECT * FROM project_team_pi_process`,
+                    operations: yield* f.sql`SELECT * FROM project_team_pi_operation`,
+                  }),
+                );
+                expect(outcome._tag).toBe(
+                  phase === "control" || phase === "primary-head" ? "Success" : "Failure",
+                );
+              }
+              yield* instance.stopAll;
+              const rows = yield* f.sql<{
+                status: string;
+                owner_json: string | null;
+                drain_json: string | null;
+              }>`SELECT * FROM project_team_pi_process`;
+              const operations = yield* f.sql<{
+                native_json: string | null;
+              }>`SELECT * FROM project_team_pi_operation`;
+              expect(validations).toBe(
+                phase === "preallocation"
+                  ? 1
+                  : phase === "start" || phase === "control" || phase === "primary-head"
+                    ? 3
+                    : 2,
+              );
+              expect(transports).toBe(0);
+              if (phase !== "control" && phase !== "primary-head")
+                expect(operations.every((row) => row.native_json === null)).toBe(true);
+              for (const row of rows) {
+                if (row.owner_json) {
+                  const owner = parseOwner(row.owner_json);
+                  const drain = yield* decodeBoundaryDrain(row.drain_json!);
+                  expect(owner.invocation).toBe(drain.invocation);
+                  expect(owner.pid).toBe(drain.ownerPid);
+                  for (const pid of [owner.pid, drain.launcherPid, drain.childPid].filter(
+                    (pid) => pid !== null,
+                  ))
+                    expect(yield* f.fs.exists("/proc/" + pid)).toBe(false);
+                  expect(yield* f.fs.exists(drain.cgroup)).toBe(false);
+                  expect(drain.kernel === "removed" || drain.kernel.includes("populated 0")).toBe(
+                    true,
+                  );
+                }
+              }
+              expect(rows.filter((row) => row.owner_json).length).toBe(
+                phase === "start" || phase === "control" || phase === "primary-head" ? 1 : 0,
+              );
+              yield* f.fs.writeFileString(
+                evidence + "/assets-runtime-" + phase + ".json",
+                json({
+                  phase,
+                  callbackJoined,
+                  validations,
+                  transports,
+                  rows,
+                  operations,
+                  stagedRuntimeFiles: assets.runtimeFiles,
+                }),
+              );
+            }),
+          ),
+        30000,
+      );
+    }
+  },
+);
+
+it.effect(
+  "protects the actual custom credential directory and denies one inside assigned cwd",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const custom = f.main + "-credentials";
+        const inside = f.worktree + "/credentials";
+        yield* f.fs.makeDirectory(custom);
+        yield* f.fs.makeDirectory(inside);
+        const outsideInstance = yield* f.runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: { agentDirectory: custom },
+        });
+        const prepared = yield* outsideInstance.prepareOperation(
+          { threadId, kind: "initialize" },
+          () => Effect.void,
+        );
+        const rows = yield* f.sql<{
+          allocation_json: string;
+        }>`SELECT allocation_json FROM project_team_pi_process`;
+        expect(
+          (yield* decodeAllocationRoots(rows[0]!.allocation_json)).launch.protectedRoots,
+        ).toContain(custom);
+        yield* outsideInstance.requestStop(threadId);
+        yield* rejected(prepared.run);
+        const insideInstance = yield* f.runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: { agentDirectory: inside },
+        });
+        yield* rejected(
+          insideInstance.prepareOperation({ threadId, kind: "initialize" }, () => Effect.void),
+        );
+        expect((yield* f.sql`SELECT * FROM project_team_pi_operation`).length).toBe(1);
+      }),
+    ),
 );
