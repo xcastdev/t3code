@@ -682,6 +682,53 @@ describe.runIf(process.env.PI_SESSION_RUNTIME_LINUX_GATE === "1")(
           }),
         mode,
       );
+    for (const denied of ["beforeToolInvoke", "beforeToolReturn"] as const)
+      check(
+        `local current denial at ${denied} prevents acceptance and further model work`,
+        (f, scratch) =>
+          Effect.gen(function* () {
+            const runtime = yield* makePiSessionRuntime({
+              ...f.options,
+              authorizeCurrent: async (request) => {
+                f.events.push(request.phase);
+                if (request.phase === denied) throw new Error("stale local approval");
+              },
+            });
+            const result = yield* runtime.run().pipe(Effect.exit);
+            expect(result._tag).toBe("Failure");
+            expect(f.terminals[0]?.outcome).toBe("failed");
+            expect(f.terminals[0]?.drain?.kernel).toBe("removed");
+            expect(f.events).not.toContain("transport");
+            expect(f.events).not.toContain("tool_end");
+            const path = NodePath.join(scratch, "workspace", "local-tool");
+            if (denied === "beforeToolInvoke")
+              yield* Effect.promise(() =>
+                expect(NodeFSP.stat(path)).rejects.toMatchObject({ code: "ENOENT" }),
+              );
+            else
+              expect(yield* Effect.promise(() => NodeFSP.readFile(path, "utf8"))).toBe("executed");
+          }),
+        "local-tool",
+      );
+    check(
+      "local authorization phases precede invocation and result observation",
+      (f) =>
+        Effect.gen(function* () {
+          const runtime = yield* makePiSessionRuntime(f.options);
+          const result = yield* runtime.run();
+          expect(result.outcome).toBe("success");
+          expect(f.events.indexOf("beforeToolInvoke")).toBeGreaterThan(
+            f.events.indexOf("beforeTool"),
+          );
+          expect(f.events.indexOf("beforeToolInvoke")).toBeLessThan(f.events.indexOf("tool_start"));
+          expect(f.events.indexOf("beforeToolReturn")).toBeGreaterThan(
+            f.events.indexOf("tool_start"),
+          );
+          expect(f.events.indexOf("beforeToolReturn")).toBeLessThan(f.events.indexOf("tool_end"));
+          expect(f.events.indexOf("beforeToolReturn")).toBeLessThan(f.events.indexOf("transport"));
+        }),
+      "local-tool",
+    );
     for (const denied of [
       "beforeAcquire",
       "beforeStart",
