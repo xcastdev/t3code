@@ -7,6 +7,7 @@ import * as NodePath from "node:path";
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
+import { piLocalToolDefinitions } from "./PiLocalTools.ts";
 import { decodePiWorkerLaunch, isPiWorkerNodeVersionSupported } from "./PiWorkerEntrypoint.ts";
 import {
   decodePiWorkerFrame,
@@ -14,8 +15,12 @@ import {
   makePiWorkerLineFramer,
   type PiWorkerBootstrap,
   type PiNativeReference,
+  type PiParentFrame,
+  type PiWorkerOperation,
 } from "./PiWorkerProtocol.ts";
 
+const decodeNativeArguments = Schema.decodeSync(Schema.JsonObject);
+const decodeReceiptJson = Schema.decodeUnknownSync(Schema.fromJsonString(Schema.JsonObject));
 const identity = { workerId: "entry-child", generation: 1 };
 const operation = { operationId: "entry-initialize", operationKind: "initialize" } as const;
 const context = "Approved assignment. Preserve decision, question and limit; no inference.";
@@ -29,6 +34,9 @@ const decodeReceipt = Schema.decodeUnknownSync(
     node: Schema.optional(Schema.String),
     hostImports: Schema.Int,
     sdkImports: Schema.Int,
+    executable: Schema.optional(Schema.String),
+    exitCode: Schema.optional(Schema.NullOr(Schema.Int)),
+    exitSignal: Schema.optional(Schema.NullOr(Schema.String)),
     sdkEnvironmentCorrect: Schema.optional(Schema.Boolean),
     remoteCalls: Schema.optional(Schema.Int),
     environmentUnchanged: Schema.optional(Schema.Boolean),
@@ -63,21 +71,90 @@ async function roots() {
   };
 }
 
-async function childFixture(mode: string, rawLaunchJson: string, agentDirectory: string) {
-  const child = NodeChildProcess.spawn(
-    process.execPath,
-    [
-      "--max-old-space-size=128",
-      new URL("./fixtures/p7-worker-entry-child.mjs", import.meta.url).pathname,
-      mode,
-      rawLaunchJson,
-    ],
-    {
-      cwd: process.cwd(),
-      stdio: ["pipe", "pipe", "pipe", "ipc"],
-      env: { PATH: "", PI_CODING_AGENT_DIR: agentDirectory, PI_PACKAGE_DIR: "/invalid-ambient" },
-    },
-  );
+const decodeClosure = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      files: Schema.Array(Schema.Struct({ source: Schema.String, target: Schema.String })),
+    }),
+  ),
+);
+const decodeContainerInfo = Schema.decodeUnknownSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      "child-pid": Schema.Int,
+    }),
+  ),
+);
+const promptOperation = { operationId: "entry-native-tools", operationKind: "prompt" } as const;
+type Namespace = {
+  readonly workspace: string;
+  readonly state: string;
+  readonly files: ReturnType<typeof decodeClosure>["files"];
+};
+async function childFixture(
+  mode: string,
+  rawLaunchJson: string,
+  agentDirectory: string,
+  namespace?: Namespace,
+) {
+  const childOperation: PiWorkerOperation = namespace ? promptOperation : operation;
+  const executable = namespace ? "/usr/bin/bwrap" : process.execPath;
+  const args = namespace
+    ? [
+        "--unshare-all",
+        "--die-with-parent",
+        "--new-session",
+        "--cap-drop",
+        "ALL",
+        "--clearenv",
+        "--info-fd",
+        "3",
+        ...namespace.files.flatMap((file) => ["--ro-bind", file.source, file.target]),
+        "--bind",
+        namespace.workspace,
+        "/workspace",
+        "--bind",
+        namespace.state,
+        "/state",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--setenv",
+        "HOME",
+        "/state/agent",
+        "--setenv",
+        "PATH",
+        "/bin",
+        "--setenv",
+        "PI_CODING_AGENT_DIR",
+        "/state/agent",
+        "--setenv",
+        "PI_PACKAGE_DIR",
+        "/invalid-ambient",
+        "--remount-ro",
+        "/",
+        "--chdir",
+        "/workspace",
+        "/runtime/node",
+        "--max-old-space-size=128",
+        "/runtime/p7-worker-entry-local-tools.mjs",
+        mode,
+        rawLaunchJson,
+      ]
+    : [
+        "--max-old-space-size=128",
+        new URL("./fixtures/p7-worker-entry-child.mjs", import.meta.url).pathname,
+        mode,
+        rawLaunchJson,
+      ];
+  const child = NodeChildProcess.spawn(executable, args, {
+    cwd: process.cwd(),
+    stdio: namespace ? ["pipe", "pipe", "pipe", "pipe"] : ["pipe", "pipe", "pipe", "ipc"],
+    env: { PATH: "", PI_CODING_AGENT_DIR: agentDirectory, PI_PACKAGE_DIR: "/invalid-ambient" },
+  });
   const exited = Promise.withResolvers<{ code: number | null; signal: NodeJS.Signals | null }>();
   const closed = Promise.withResolvers<void>();
   child.once("exit", (code, signal) => exited.resolve({ code, signal }));
@@ -85,13 +162,14 @@ async function childFixture(mode: string, rawLaunchJson: string, agentDirectory:
   const messages: ReturnType<typeof decodeReceipt>[] = [];
   const observed: ReturnType<typeof decodeReceipt>[] = [];
   let next = Promise.withResolvers<void>();
-  child.on("message", (raw) => {
+  const receive = (raw: unknown) => {
     const message = decodeReceipt(raw);
     messages.push(message);
     observed.push(message);
     next.resolve();
     next = Promise.withResolvers<void>();
-  });
+  };
+  child.on("message", receive);
   const spawned = new Promise<void>((resolve, reject) => {
     child.once("spawn", resolve);
     child.once("error", reject);
@@ -106,17 +184,87 @@ async function childFixture(mode: string, rawLaunchJson: string, agentDirectory:
   stdin.on("error", () => {});
   const frames: ReturnType<typeof decodePiWorkerFrame>[] = [];
   let stdoutBytes = 0;
+  const container = Promise.withResolvers<number>();
+  container.promise.catch(() => {});
+  if (namespace) {
+    const info = child.stdio[3];
+    if (!info) throw Error("CONTAINER_INFO_UNAVAILABLE");
+    let infoBytes = "";
+    info.on("data", (bytes: Buffer) => {
+      infoBytes += bytes.toString();
+    });
+    info.once("end", () => {
+      try {
+        container.resolve(decodeContainerInfo(infoBytes)["child-pid"]);
+      } catch (error) {
+        container.reject(error);
+      }
+    });
+  }
+  let nativeNodeHostPid: number | undefined;
+  let nextFrame = Promise.withResolvers<void>();
+  let receiptBytes = "";
   let stderrBytes = Buffer.alloc(0);
-  const framer = makePiWorkerLineFramer((raw) => frames.push(decodePiWorkerFrame(raw)));
+  const framer = makePiWorkerLineFramer((raw) => {
+    frames.push(decodePiWorkerFrame(raw));
+    nextFrame.resolve();
+    nextFrame = Promise.withResolvers<void>();
+  });
   stdout.on("data", (bytes: Buffer) => {
     stdoutBytes += bytes.length;
     framer.push(bytes);
   });
   stderr.on("data", (bytes: Buffer) => {
-    stderrBytes = Buffer.concat([stderrBytes, bytes]).subarray(0, 65_536);
+    if (namespace) {
+      receiptBytes += bytes.toString();
+      if (Buffer.byteLength(receiptBytes) > 65_536) throw Error("FIXTURE_RECEIPT_LIMIT");
+      while (receiptBytes.includes("\n")) {
+        const end = receiptBytes.indexOf("\n");
+        receive(decodeReceiptJson(receiptBytes.slice(0, end)));
+        receiptBytes = receiptBytes.slice(end + 1);
+      }
+    } else stderrBytes = Buffer.concat([stderrBytes, bytes]).subarray(0, 65_536);
   });
   return {
     pid: child.pid,
+    containerPid: () => container.promise,
+    async captureNativeNode(namespacePid: number) {
+      const ownerPid = await container.promise;
+      const children = (
+        await NodeFSP.readFile(`/proc/${ownerPid}/task/${ownerPid}/children`, "utf8")
+      )
+        .trim()
+        .split(/\s+/)
+        .filter(Boolean)
+        .map(Number);
+      expect(children).toHaveLength(1);
+      const pid = children[0];
+      if (pid === undefined) throw Error("NATIVE_NODE_PID_UNAVAILABLE");
+      const status = await NodeFSP.readFile(`/proc/${pid}/status`, "utf8");
+      expect(
+        status
+          .match(/^NSpid:\s+(.+)$/m)?.[1]
+          ?.trim()
+          .split(/\s+/)
+          .at(-1),
+      ).toBe(String(namespacePid));
+      nativeNodeHostPid = pid;
+      return pid;
+    },
+    async waitFrame(predicate: (frame: ReturnType<typeof decodePiWorkerFrame>) => boolean) {
+      while (true) {
+        const frame = frames.find(predicate);
+        if (frame) return frame;
+        const failure = frames.find((frame) => frame.message.type === "worker-failure");
+        if (failure) throw Error(`UNEXPECTED_WORKER_FAILURE: ${JSON.stringify(failure.message)}`);
+        await Promise.race([
+          nextFrame.promise,
+          closed.promise.then(() => {
+            throw Error("CHILD_CLOSED_BEFORE_FRAME");
+          }),
+        ]);
+      }
+    },
     stdin,
     frames,
     async wait(type: string) {
@@ -135,7 +283,7 @@ async function childFixture(mode: string, rawLaunchJson: string, agentDirectory:
       const bytes = encodePiParentFrame({
         version: 1,
         ...identity,
-        ...operation,
+        ...childOperation,
         sequence,
         message,
       });
@@ -149,7 +297,11 @@ async function childFixture(mode: string, rawLaunchJson: string, agentDirectory:
       expect(exit).toEqual({ code, signal: null });
       expect([stdin.closed, stdout.closed, stderr.closed]).toEqual([true, true, true]);
       expect(stderrBytes.toString()).toBe("");
+      expect(receiptBytes).toBe("");
       framer.finish();
+      // bwrap close does not reap its orphaned init on failed operations. The explicit
+      // native gate requires an outer subreaper that joins and asserts every captured
+      // init/Node host PID absent before reporting the capped check successful.
       return exit;
     },
     stdoutBytes: () => stdoutBytes,
@@ -166,6 +318,8 @@ async function childFixture(mode: string, rawLaunchJson: string, agentDirectory:
               pid: child.pid,
               exit: await exited.promise,
               observed,
+              containerPid: namespace ? await container.promise.catch(() => null) : null,
+              nativeNodeHostPid,
               frames,
               stdoutBytes,
               stderr: stderrBytes.toString(),
@@ -217,6 +371,154 @@ function assertNoCalls(receipt: ReturnType<typeof decodeReceipt>) {
   expect(receipt.repeatedCode).toBe("PI_WORKER_ALREADY_ACTIVATED");
 }
 
+async function nativeRoots() {
+  const closure = process.env.PI_WORKER_ENTRY_LOCAL_TOOLS_CLOSURE;
+  if (!closure) throw Error("NATIVE_ENTRY_CLOSURE_REQUIRED");
+  if (!process.env.PI_WORKER_ENTRY_REAPING_OWNER_PID)
+    throw Error("NATIVE_ENTRY_REAPING_OWNER_REQUIRED");
+  const r = await roots();
+  const workspace = NodePath.join(r.root, "workspace");
+  const state = NodePath.join(r.root, "state");
+  await NodeFSP.mkdir(workspace);
+  await NodeFSP.mkdir(NodePath.join(state, "sessions"), { recursive: true });
+  await NodeFSP.mkdir(NodePath.join(state, "agent"));
+  return {
+    ...r,
+    workspace,
+    namespace: {
+      workspace,
+      state,
+      files: decodeClosure(await NodeFSP.readFile(closure, "utf8")).files,
+    },
+    launch: {
+      ...r.launch,
+      operation: promptOperation,
+      sessionDirectory: "/state/sessions",
+      trustedSdkPackageDirectory: "/runtime/pi-sdk",
+    },
+  };
+}
+async function nativeProtocol(
+  f: Awaited<ReturnType<typeof childFixture>>,
+  names: readonly string[],
+) {
+  let sequence = 0;
+  const send = (message: PiParentFrame["message"]) => f.send(sequence++, message);
+  const transfer = async (transferId: string, text: string) => {
+    const bytes = Buffer.from(text);
+    let index = 0;
+    for (let offset = 0; offset < bytes.length; offset += 8192) {
+      await send({
+        type: "transfer-chunk",
+        transferId,
+        index: index++,
+        offset,
+        data: bytes.subarray(offset, offset + 8192).toString("base64"),
+      });
+    }
+    await send({ type: "transfer-end", transferId });
+  };
+  const selected = piLocalToolDefinitions.filter((tool) => names.includes(tool.name));
+  const prompt = "Deterministic native tool fixture; no inference.";
+  await send({
+    ...bootstrap(),
+    expectedCwd: "/workspace",
+    prompt: { transferId: "prompt", totalBytes: Buffer.byteLength(prompt) },
+    allowedTools: selected.map((tool) => ({
+      name: tool.name,
+      execution: "local",
+      description: tool.description,
+      inputSchema: {
+        transferId: `schema-${tool.name}`,
+        totalBytes: Buffer.byteLength(JSON.stringify(tool.parameters)),
+      },
+    })),
+  });
+  await transfer("context", context);
+  await transfer("prompt", prompt);
+  for (const tool of selected)
+    await transfer(`schema-${tool.name}`, JSON.stringify(tool.parameters));
+  const reply = async (
+    requestId: number,
+    call?: { readonly name: string; readonly args: Schema.JsonObject },
+  ) => {
+    await send({ type: "headers", requestId, status: 200 });
+    const delta = call
+      ? {
+          role: "assistant",
+          tool_calls: [
+            {
+              index: 0,
+              id: `native-call-${requestId}`,
+              type: "function",
+              function: { name: call.name, arguments: JSON.stringify(call.args) },
+            },
+          ],
+        }
+      : { role: "assistant", content: "Fixture complete." };
+    const chunks = [
+      {
+        id: "fixture",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "no-inference",
+        choices: [{ index: 0, delta, finish_reason: null }],
+      },
+      {
+        id: "fixture",
+        object: "chat.completion.chunk",
+        created: 1,
+        model: "no-inference",
+        choices: [{ index: 0, delta: {}, finish_reason: call ? "tool_calls" : "stop" }],
+        usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+      },
+    ];
+    const data = Buffer.from(
+      chunks.map((chunk) => `data: ${JSON.stringify(chunk)}\n\n`).join("") + "data: [DONE]\n\n",
+    );
+    for (let offset = 0; offset < data.length; offset += 8192) {
+      const expected = sequence;
+      await send({
+        type: "chunk",
+        requestId,
+        data: data.subarray(offset, offset + 8192).toString("base64"),
+      });
+      await f.waitFrame(
+        (frame) =>
+          frame.message.type === "ack" &&
+          frame.message.requestId === requestId &&
+          frame.message.chunkSequence === expected,
+      );
+    }
+    await send({ type: "end", requestId });
+  };
+  const request = async (requestId: number) => {
+    await f.waitFrame(
+      (frame) => frame.message.type === "request" && frame.message.requestId === requestId,
+    );
+  };
+  const toolCall = async (callId: number) => {
+    const frame = await f.waitFrame(
+      (frame) => frame.message.type === "tool-call" && frame.message.callId === callId,
+    );
+    if (frame.message.type !== "tool-call") throw Error("MISSING_TOOL_CALL");
+    await f.waitFrame(
+      (frame) =>
+        frame.message.type === "transfer-end" &&
+        frame.message.transferId === `tool-input-${callId}`,
+    );
+    return frame.message;
+  };
+  return { send, reply, request, toolCall };
+}
+async function assertNativeInert(f: Awaited<ReturnType<typeof childFixture>>) {
+  const receipt = await f.wait("imported");
+  assertInert(receipt);
+  if (receipt.pid === undefined) throw Error("NATIVE_NAMESPACE_PID_REQUIRED");
+  await f.captureNativeNode(receipt.pid);
+}
+const nativeEntryEnabled = process.env.PI_WORKER_ENTRY_LOCAL_TOOLS_GATE === "1";
+
 describe("private Pi worker entry", () => {
   it("strictly bounds launch JSON and freezes accepted identities", () => {
     const launch = {
@@ -238,6 +540,9 @@ describe("private Pi worker entry", () => {
       JSON.stringify({ ...launch, identity: { ...identity, secret: "sentinel" } }),
       JSON.stringify({ ...launch, operation: { ...operation, prompt: "sentinel" } }),
       JSON.stringify({ ...launch, endpoint: "secret-sentinel" }),
+      JSON.stringify({ ...launch, cwd: "/untrusted" }),
+      JSON.stringify({ ...launch, tools: ["bash"] }),
+      JSON.stringify({ ...launch, runtime: { localTools: ["write"] } }),
       JSON.stringify({ ...launch, compactionKeepRecentTokens: 0 }),
       JSON.stringify({ ...launch, compactionKeepRecentTokens: 127 }),
       JSON.stringify({ ...launch, compactionKeepRecentTokens: 4097 }),
@@ -519,7 +824,7 @@ describe("private Pi worker entry", () => {
     }
   });
 
-  it("refuses an implicit local tool before session creation", async () => {
+  it("refuses an unavailable local tool before session creation", async () => {
     const r = await roots();
     const f = await childFixture("local-tool", JSON.stringify(r.launch), r.root);
     try {
@@ -527,7 +832,7 @@ describe("private Pi worker entry", () => {
       await f.send(0, {
         ...bootstrap(),
         allowedTools: [
-          { name: "bash", execution: "local", description: "implicit local tool refused" },
+          { name: "unselected-native", execution: "local", description: "unavailable local tool" },
         ],
       });
       await transfer(f);
@@ -540,6 +845,193 @@ describe("private Pi worker entry", () => {
       f.stdin.end();
       await f.join(1);
       expect(await NodeFSP.readdir(r.sessionDirectory)).toEqual([]);
+    } finally {
+      await f.dispose();
+      await r.dispose();
+    }
+  });
+});
+
+describe.skipIf(!nativeEntryEnabled)("actual bundled Pi entry in an owned namespace", () => {
+  it("executes selected native write/read/edit/bash through parent authorization and real SDK lifecycle", async () => {
+    const r = await nativeRoots();
+    const f = await childFixture("selected-native", JSON.stringify(r.launch), r.root, r.namespace);
+    try {
+      await assertNativeInert(f);
+      const p = await nativeProtocol(f, ["read", "write", "edit", "bash"]);
+      const calls = [
+        { name: "write", args: { path: "selected.txt", content: "before" } },
+        { name: "read", args: { path: "selected.txt" } },
+        {
+          name: "edit",
+          args: { path: "selected.txt", edits: [{ oldText: "before", newText: "after" }] },
+        },
+        { name: "bash", args: { command: "printf 'entry-native-bash-marker:%s' \"$PWD\"" } },
+      ];
+      for (const [index, call] of calls.entries()) {
+        await p.request(index + 1);
+        await p.reply(index + 1, {
+          name: call.name,
+          args: decodeNativeArguments(call.args),
+        });
+        const invoked = await p.toolCall(index + 1);
+        expect(invoked.toolName).toBe(call.name);
+        await p.send({ type: "tool-authorized", callId: invoked.callId, allowed: true });
+        await f.waitFrame(
+          (frame) =>
+            frame.message.type === "transfer-end" &&
+            frame.message.transferId === `tool-output-${invoked.callId}`,
+        );
+      }
+      await p.request(5);
+      await p.reply(5);
+      const result = await f.wait("result");
+      expect(result.ok).toBe(true);
+      expect(result.remoteCalls).toBe(0);
+      expect(result.sdkEnvironmentCorrect).toBe(true);
+      f.stdin.end();
+      await f.join(0);
+      expect(await NodeFSP.readFile(NodePath.join(r.workspace, "selected.txt"), "utf8")).toBe(
+        "after",
+      );
+      const outputs = f.frames
+        .filter(
+          (frame) =>
+            frame.message.type === "transfer-chunk" &&
+            frame.message.transferId.startsWith("tool-output-"),
+        )
+        .map((frame) =>
+          frame.message.type === "transfer-chunk"
+            ? Buffer.from(frame.message.data, "base64").toString()
+            : "",
+        )
+        .join("");
+      expect(outputs).toContain("before");
+      expect(outputs).toContain("entry-native-bash-marker:/workspace");
+      expect(f.frames.at(-1)?.message).toEqual({ type: "done" });
+      const spawned = await f.wait("native-spawn");
+      const exited = await f.wait("native-exit");
+      expect(spawned.executable).toBe("/bin/bash");
+      expect(exited).toMatchObject({ pid: spawned.pid, exitCode: 0, exitSignal: null });
+    } finally {
+      await f.dispose();
+      await r.dispose();
+    }
+  });
+
+  it("does not activate an unselected native write from a deterministic completion", async () => {
+    const r = await nativeRoots();
+    const f = await childFixture("unselected", JSON.stringify(r.launch), r.root, r.namespace);
+    try {
+      await assertNativeInert(f);
+      const p = await nativeProtocol(f, ["read"]);
+      await p.request(1);
+      await p.reply(1, {
+        name: "write",
+        args: { path: "unselected.txt", content: "must not write" },
+      });
+      const next = await f.waitFrame(
+        (frame) =>
+          frame.message.type === "worker-failure" ||
+          (frame.message.type === "request" && frame.message.requestId === 2),
+      );
+      if (next.message.type === "request") await p.reply(2);
+      const result = await f.wait("result");
+      expect(result.remoteCalls).toBe(0);
+      f.stdin.end();
+      await f.join(result.ok ? 0 : 1);
+      expect(await NodeFSP.readdir(r.workspace)).toEqual([]);
+      expect(f.frames.some((frame) => frame.message.type === "tool-call")).toBe(false);
+      expect(
+        f.frames.some(
+          (frame) =>
+            frame.message.type === "sdk-event" && frame.message.event.type === "tool_start",
+        ),
+      ).toBe(false);
+    } finally {
+      await f.dispose();
+      await r.dispose();
+    }
+  });
+
+  it.each(["denied", "canceled"])(
+    "does not invoke native write when authorization is %s",
+    async (mode) => {
+      const r = await nativeRoots();
+      const f = await childFixture(mode, JSON.stringify(r.launch), r.root, r.namespace);
+      try {
+        await assertNativeInert(f);
+        const p = await nativeProtocol(f, ["write"]);
+        await p.request(1);
+        await p.reply(1, {
+          name: "write",
+          args: { path: "forbidden.txt", content: "must not write" },
+        });
+        const call = await p.toolCall(1);
+        if (mode === "denied")
+          await p.send({ type: "tool-authorized", callId: call.callId, allowed: false });
+        else {
+          await p.send({ type: "interrupt", controlId: 1 });
+          const receipt = await f.waitFrame((frame) => frame.message.type === "control-receipt");
+          expect(receipt.message).toEqual({
+            type: "control-receipt",
+            kind: "interrupt",
+            controlId: 1,
+          });
+        }
+        expect((await f.wait("result")).remoteCalls).toBe(0);
+        f.stdin.end();
+        await f.join(1);
+        expect(await NodeFSP.readdir(r.workspace)).toEqual([]);
+        expect(
+          f.frames.some(
+            (frame) =>
+              frame.message.type === "sdk-event" && frame.message.event.type === "tool_start",
+          ),
+        ).toBe(false);
+        expect(f.frames.at(-1)?.message).toEqual({
+          type: "worker-failure",
+          code: mode === "denied" ? "TOOL_DENIED" : "CANCELED",
+        });
+      } finally {
+        await f.dispose();
+        await r.dispose();
+      }
+    },
+  );
+
+  it("retains a native edit mutation when its result exceeds bounds and makes no implicit retry", async () => {
+    const r = await nativeRoots();
+    await NodeFSP.writeFile(
+      NodePath.join(r.workspace, "wide-line.txt"),
+      "unique-token " + "a".repeat(40000) + "\n",
+    );
+    const f = await childFixture("uncertain-edit", JSON.stringify(r.launch), r.root, r.namespace);
+    try {
+      await assertNativeInert(f);
+      const p = await nativeProtocol(f, ["edit"]);
+      await p.request(1);
+      await p.reply(1, {
+        name: "edit",
+        args: {
+          path: "wide-line.txt",
+          edits: [{ oldText: "unique-token", newText: "replacement-token" }],
+        },
+      });
+      const call = await p.toolCall(1);
+      await p.send({ type: "tool-authorized", callId: call.callId, allowed: true });
+      expect((await f.wait("result")).remoteCalls).toBe(0);
+      f.stdin.end();
+      await f.join(1);
+      expect(
+        (await NodeFSP.readFile(NodePath.join(r.workspace, "wide-line.txt"), "utf8")).startsWith(
+          "replacement-token ",
+        ),
+      ).toBe(true);
+      expect(f.frames.at(-1)?.message).toEqual({ type: "worker-failure", code: "TOOL_FAILURE" });
+      expect(f.frames.filter((frame) => frame.message.type === "request")).toHaveLength(1);
+      expect(f.frames.filter((frame) => frame.message.type === "tool-call")).toHaveLength(1);
+      expect(f.frames.some((frame) => frame.message.type === "tool-result")).toBe(false);
     } finally {
       await f.dispose();
       await r.dispose();
