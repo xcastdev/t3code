@@ -1412,3 +1412,273 @@ it.effect(
       }),
     ),
 );
+
+describe.runIf(process.env.PI_MANAGED_RUNTIME_LINUX_GATE === "1")(
+  "late final workspace authority fence",
+  () => {
+    for (const mode of [
+      "unchanged",
+      "branch",
+      "config",
+      "missing-registration",
+      "symlink-registration",
+      "oversized-head",
+      "cancel",
+      "during-validator",
+      "detached-advance",
+    ] as const) {
+      it.effect(
+        `held final workspace authority ${mode}`,
+        () =>
+          scoped(
+            Effect.gen(function* () {
+              const f = yield* fixture;
+              const manifest = process.env.PI_MANAGED_RUNTIME_TEST_CLOSURE;
+              const evidence = process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE;
+              if (!manifest || !evidence)
+                return yield* Effect.die("Required actual SDK closure/evidence missing");
+              const closure = yield* decodeClosure(yield* f.fs.readFileString(manifest));
+              const actualAt = DateTime.formatIso(DateTime.nowUnsafe());
+              yield* TestClock.setTime(Date.parse(actualAt));
+              yield* restoreHistoricalBinding({
+                ...f.binding,
+                revision: f.binding.revision + 1,
+                updatedAt: actualAt,
+              });
+              if (mode === "detached-advance")
+                yield* f.git(["-C", f.main, "checkout", "--detach", "-q"]);
+              const real = yield* Authorization.ProjectTeamAuthorization;
+              const held = yield* Deferred.make<void>();
+              const validatorHeld = yield* Deferred.make<void>();
+              const released = yield* Deferred.make<void>();
+              let validations = 0;
+              let postValidatorCommonStats = 0;
+              let workspaceCompleted = false;
+              let authorityHeld = false;
+              const sequence: string[] = [];
+              const filesystem = FileSystem.FileSystem.of({
+                ...f.fs,
+                stat: (...args) =>
+                  Effect.gen(function* () {
+                    const value = yield* f.fs.stat(...args);
+                    if (validations === 3 && args[0] === f.main + "/.git") {
+                      postValidatorCommonStats++;
+                      if (postValidatorCommonStats === 2) {
+                        workspaceCompleted = true;
+                        sequence.push("final-common-identity-read-completed");
+                      }
+                    }
+                    return value;
+                  }),
+              });
+              const authorization = Authorization.ProjectTeamAuthorization.of({
+                ...real,
+                issueCredential: (...args) =>
+                  Effect.gen(function* () {
+                    const result = yield* real.issueCredential(...args);
+                    if (workspaceCompleted && !authorityHeld && mode !== "during-validator") {
+                      authorityHeld = true;
+                      sequence.push("last-start-authority-read-held");
+                      yield* Deferred.succeed(held, undefined);
+                      yield* Deferred.await(released);
+                      sequence.push("last-start-authority-read-returned");
+                    }
+                    return result;
+                  }),
+              });
+              const runtime = yield* makePiManagedRuntimeLive({
+                ...f.options,
+                memoryBytes: 536870912,
+                cleanupDeadlineMs: 5000,
+                revalidateRuntime: Effect.gen(function* () {
+                  validations++;
+                  sequence.push("validator-" + validations);
+                  if (mode === "during-validator" && validations === 3) {
+                    yield* Deferred.succeed(validatorHeld, undefined);
+                    yield* Deferred.await(released);
+                    sequence.push("held-validator-returned");
+                  }
+                }),
+                runtimeFiles: closure.files.map(({ source, target }) => ({ source, target })),
+                workerArgv: (identity, operation) => [
+                  "/runtime/node",
+                  "--max-old-space-size=512",
+                  "/runtime/dist/worker.mjs",
+                  identity.workerId,
+                  String(identity.generation),
+                  operation.operationId,
+                  operation.operationKind,
+                  "plain",
+                ],
+                readCatalogue: Effect.succeed({
+                  source: "https://api.commandcode.ai/provider/v1/models",
+                  fetchedAt: actualAt,
+                  selectedEntry: {
+                    id: model,
+                    owned_by: "command-code",
+                    context_length: 20000,
+                    supported_endpoints: ["/chat/completions"],
+                  },
+                }),
+              }).pipe(
+                Effect.provideService(FileSystem.FileSystem, filesystem),
+                Effect.provideService(Authorization.ProjectTeamAuthorization, authorization),
+              );
+              const instance = yield* runtime.forInstance({
+                instanceId: providerInstanceId,
+                enabled: true,
+                configuration: {},
+              });
+              yield* Effect.addFinalizer(() =>
+                Deferred.succeed(released, undefined).pipe(
+                  Effect.andThen(instance.stopAll),
+                  Effect.orDie,
+                ),
+              );
+              const originalFetch = globalThis.fetch;
+              globalThis.fetch = async () => {
+                throw Error("Ambient fetch forbidden in independent native control");
+              };
+              yield* Effect.addFinalizer(() =>
+                Effect.sync(() => {
+                  globalThis.fetch = originalFetch;
+                }),
+              );
+              const prepared = yield* instance.prepareOperation(
+                { threadId, kind: "initialize" },
+                () => Effect.void,
+              );
+              const running = yield* Effect.forkChild(prepared.run.pipe(Effect.result));
+              yield* Effect.raceFirst(
+                Deferred.await(mode === "during-validator" ? validatorHeld : held),
+                Fiber.join(running).pipe(
+                  Effect.flatMap((result) =>
+                    Effect.die(
+                      "Operation returned before required authority hold: " + json(result),
+                    ),
+                  ),
+                ),
+              );
+              const before = yield* f.sql`SELECT * FROM project_team_pi_process`;
+              const gitDirectory = (yield* f.fs.readFileString(f.worktree + "/.git"))
+                .trim()
+                .slice("gitdir: ".length);
+              if (mode === "missing-registration") yield* f.fs.remove(gitDirectory + "/commondir");
+              if (mode === "symlink-registration") {
+                yield* f.fs.rename(gitDirectory + "/commondir", gitDirectory + "/commondir-held");
+                yield* f.fs.symlink(gitDirectory + "/commondir-held", gitDirectory + "/commondir");
+              }
+              if (mode === "oversized-head")
+                yield* f.fs.writeFileString(gitDirectory + "/HEAD", "x".repeat(16385));
+              if (mode === "config")
+                yield* f.git(["-C", f.worktree, "config", "core.worktree", f.main]);
+              if (mode === "detached-advance")
+                yield* f.git([
+                  "-C",
+                  f.main,
+                  "-c",
+                  "user.name=Fixture",
+                  "-c",
+                  "user.email=fixture@example.test",
+                  "commit",
+                  "--allow-empty",
+                  "-qm",
+                  "detached primary may advance",
+                ]);
+              if (mode === "branch" || mode === "during-validator")
+                yield* f.git([
+                  "-C",
+                  f.worktree,
+                  "branch",
+                  "-m",
+                  "changed-after-last-workspace-check",
+                ]);
+              sequence.push(
+                mode === "branch"
+                  ? "assigned-branch-changed-externally"
+                  : "unchanged-held-authority-control",
+              );
+              const originalAbort = AbortController.prototype.abort;
+              const abortReceipt = Promise.withResolvers<void>();
+              let stopJoined = false;
+              let outcome;
+              if (mode === "cancel")
+                AbortController.prototype.abort = function (...args) {
+                  originalAbort.apply(this, args);
+                  sequence.push("actual-stop-aborted");
+                  abortReceipt.resolve();
+                };
+              try {
+                let stopping: Fiber.Fiber<void, PiManagedRuntimeError> | undefined;
+                if (mode === "cancel") {
+                  stopping = yield* Effect.forkChild(instance.requestStop(threadId));
+                  yield* Effect.promise(() => abortReceipt.promise);
+                }
+                yield* Deferred.succeed(released, undefined);
+                outcome = yield* Fiber.join(running);
+                if (stopping) {
+                  yield* Fiber.join(stopping);
+                  stopJoined = true;
+                }
+              } finally {
+                AbortController.prototype.abort = originalAbort;
+              }
+              sequence.push("run-returned-" + outcome._tag);
+              yield* instance.stopAll;
+              const processes = yield* f.sql<{
+                owner_json: string | null;
+                drain_json: string | null;
+                status: string;
+              }>`SELECT * FROM project_team_pi_process`;
+              const operations = yield* f.sql<{
+                native_json: string | null;
+              }>`SELECT * FROM project_team_pi_operation`;
+              yield* f.fs.writeFileString(
+                evidence + "/late-final-authority-" + mode + ".json",
+                json({
+                  mode,
+                  stopJoined,
+                  validations,
+                  postValidatorCommonStats,
+                  workspaceCompleted,
+                  authorityHeld,
+                  sequence,
+                  before,
+                  outcome,
+                  processes,
+                  operations,
+                  transports: f.transports,
+                }),
+              );
+              for (const row of processes) {
+                if (row.owner_json) {
+                  const owner = parseOwner(row.owner_json);
+                  const drain = yield* decodeBoundaryDrain(row.drain_json!);
+                  expect(owner.invocation).toBe(drain.invocation);
+                  expect(owner.pid).toBe(drain.ownerPid);
+                  for (const pid of [owner.pid, drain.launcherPid, drain.childPid].filter(
+                    (pid) => pid !== null,
+                  ))
+                    expect(yield* f.fs.exists("/proc/" + pid)).toBe(false);
+                  expect(yield* f.fs.exists(drain.cgroup)).toBe(false);
+                }
+              }
+              expect(authorityHeld).toBe(mode !== "during-validator");
+              if (mode === "cancel") expect(stopJoined).toBe(true);
+              expect(validations).toBe(3);
+              expect(f.transports).toBe(0);
+              if (mode !== "unchanged" && mode !== "detached-advance") {
+                expect(operations.every((row) => row.native_json === null)).toBe(true);
+                for (const row of processes)
+                  expect((yield* decodeBoundaryDrain(String(row.drain_json))).childPid).toBeNull();
+              }
+              expect(outcome._tag).toBe(
+                mode === "unchanged" || mode === "detached-advance" ? "Success" : "Failure",
+              );
+            }),
+          ),
+        30000,
+      );
+    }
+  },
+);

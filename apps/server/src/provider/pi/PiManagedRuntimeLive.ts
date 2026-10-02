@@ -74,6 +74,223 @@ const guard = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       isRuntimeError(error) ? error : deny("Pi managed runtime unavailable", "unavailable"),
     ),
   );
+// A final synchronous receipt closes the asynchronous SQL/workspace-check gap.
+// Fixed metadata only: no Git child, directory scan, includes, or credential read.
+const NodeFS = process.getBuiltinModule("fs");
+const directoryFlags =
+  NodeFS.constants.O_RDONLY |
+  NodeFS.constants.O_DIRECTORY |
+  NodeFS.constants.O_NOFOLLOW |
+  NodeFS.constants.O_NONBLOCK;
+const fileFlags =
+  NodeFS.constants.O_RDONLY | NodeFS.constants.O_NOFOLLOW | NodeFS.constants.O_NONBLOCK;
+interface WorkspaceMetadata {
+  readonly directories: ReadonlyArray<string>;
+  readonly assigned: string;
+  readonly primary: string;
+  readonly common: string;
+  readonly gitDirectory: string;
+  readonly assignedHead: string;
+  readonly primaryHead: string | null;
+}
+interface WorkspaceFence {
+  readonly metadata: WorkspaceMetadata;
+  readonly directories: ReadonlyArray<{
+    readonly path: string;
+    readonly dev: string;
+    readonly ino: string;
+  }>;
+  readonly files: ReadonlyArray<{
+    readonly path: string;
+    readonly dev: string;
+    readonly ino: string;
+    readonly digest: string;
+  } | null>;
+}
+const workspaceReceipt = (
+  paths: Path.Path,
+  metadata: WorkspaceMetadata,
+  expected?: WorkspaceFence,
+): WorkspaceFence => {
+  const handles = new Map<string, number>();
+  const identity = (stat: { readonly dev: number | bigint; readonly ino: number | bigint }) => ({
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+  });
+  const invalid = () => {
+    throw deny("Pi final workspace metadata fence changed or is unavailable");
+  };
+  const canonical = (path: string) => {
+    if (
+      !paths.isAbsolute(path) ||
+      paths.normalize(path) !== path ||
+      path.length > 4096 ||
+      path.split("/").length > 64
+    )
+      invalid();
+  };
+  const directory = (path: string): number => {
+    canonical(path);
+    const cached = handles.get(path);
+    if (cached !== undefined) return cached;
+    const parent = path === "/" ? undefined : directory(paths.dirname(path));
+    const entry = parent === undefined ? "/" : `/proc/self/fd/${parent}/${paths.basename(path)}`;
+    const before = NodeFS.lstatSync(entry, { bigint: true });
+    if (!before.isDirectory()) return invalid();
+    const fd = NodeFS.openSync(entry, directoryFlags);
+    handles.set(path, fd);
+    const stat = NodeFS.fstatSync(fd, { bigint: true });
+    if (
+      encode(identity(before)) !== encode(identity(stat)) ||
+      NodeFS.realpathSync(`/proc/self/fd/${fd}`) !== path ||
+      NodeFS.realpathSync(path) !== path
+    )
+      invalid();
+    return fd;
+  };
+  const read = (path: string, optional = false) => {
+    canonical(path);
+    const parent = directory(paths.dirname(path));
+    const entry = `/proc/self/fd/${parent}/${paths.basename(path)}`;
+    const before = NodeFS.lstatSync(entry, { throwIfNoEntry: false });
+    if (!before) {
+      if (optional) return null;
+      return invalid();
+    }
+    if (!before.isFile() || before.size > 16384 || before.nlink !== 1) return invalid();
+    const fd = NodeFS.openSync(entry, fileFlags);
+    try {
+      const stat = NodeFS.fstatSync(fd, { bigint: true });
+      if (
+        !stat.isFile() ||
+        stat.dev !== BigInt(before.dev) ||
+        stat.ino !== BigInt(before.ino) ||
+        stat.size > 16384n
+      )
+        return invalid();
+      const buffer = Buffer.alloc(16385);
+      const count = NodeFS.readSync(fd, buffer, 0, buffer.length, 0);
+      const after = NodeFS.fstatSync(fd, { bigint: true });
+      const current = NodeFS.lstatSync(entry, { bigint: true });
+      if (
+        BigInt(count) !== stat.size ||
+        count > 16384 ||
+        stat.dev !== after.dev ||
+        stat.ino !== after.ino ||
+        stat.size !== after.size ||
+        stat.mtimeNs !== after.mtimeNs ||
+        stat.ctimeNs !== after.ctimeNs ||
+        current.dev !== stat.dev ||
+        current.ino !== stat.ino ||
+        current.size !== stat.size ||
+        current.mtimeNs !== stat.mtimeNs ||
+        current.ctimeNs !== stat.ctimeNs
+      )
+        return invalid();
+      const bytes = buffer.subarray(0, count);
+      return {
+        path,
+        dev: String(stat.dev),
+        ino: String(stat.ino),
+        digest: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+        text: new TextDecoder("utf-8", { fatal: true }).decode(bytes),
+      };
+    } finally {
+      NodeFS.closeSync(fd);
+    }
+  };
+  try {
+    if (metadata.directories.length > 8) invalid();
+    const directories = metadata.directories.map((path) => ({
+      path,
+      ...identity(NodeFS.fstatSync(directory(path), { bigint: true })),
+    }));
+    const assignedLink = read(metadata.assigned + "/.git");
+    const gitdir = read(metadata.gitDirectory + "/gitdir");
+    const commondir = read(metadata.gitDirectory + "/commondir");
+    if (
+      !assignedLink ||
+      !gitdir ||
+      !commondir ||
+      !assignedLink.text.startsWith("gitdir: ") ||
+      paths.resolve(metadata.assigned, assignedLink.text.slice(8).trim()) !==
+        metadata.gitDirectory ||
+      paths.resolve(metadata.gitDirectory, gitdir.text.trim()) !== metadata.assigned + "/.git" ||
+      paths.resolve(metadata.gitDirectory, commondir.text.trim()) !== metadata.common
+    )
+      invalid();
+    const primaryEntry = `/proc/self/fd/${directory(metadata.primary)}/.git`;
+    const primaryStat = NodeFS.lstatSync(primaryEntry);
+    const primaryLink = primaryStat.isDirectory() ? null : read(metadata.primary + "/.git");
+    if (
+      primaryLink &&
+      (!primaryLink.text.startsWith("gitdir: ") ||
+        paths.resolve(metadata.primary, primaryLink.text.slice(8).trim()) !== metadata.common)
+    )
+      invalid();
+    if (primaryStat.isDirectory() && NodeFS.realpathSync(primaryEntry) !== metadata.common)
+      invalid();
+    const files = [
+      assignedLink,
+      gitdir,
+      commondir,
+      primaryLink,
+      read(metadata.common + "/config", true),
+      read(metadata.common + "/config.worktree", true),
+      read(metadata.gitDirectory + "/config.worktree", true),
+    ].map((file) =>
+      file ? { path: file.path, dev: file.dev, ino: file.ino, digest: file.digest } : null,
+    );
+    const assignedHead = read(metadata.gitDirectory + "/HEAD");
+    const primaryHead = read(metadata.common + "/HEAD");
+    if (
+      !assignedHead ||
+      assignedHead.text.trim() !== metadata.assignedHead ||
+      !primaryHead ||
+      (metadata.primaryHead === null
+        ? !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(primaryHead.text.trim())
+        : primaryHead.text.trim() !== metadata.primaryHead)
+    )
+      invalid();
+    if (
+      expected &&
+      (encode(directories) !== encode(expected.directories) ||
+        encode(files) !== encode(expected.files))
+    )
+      invalid();
+    for (const [path, fd] of handles) {
+      if (
+        NodeFS.realpathSync(`/proc/self/fd/${fd}`) !== path ||
+        NodeFS.realpathSync(path) !== path ||
+        encode(identity(NodeFS.fstatSync(fd, { bigint: true }))) !==
+          encode(identity(NodeFS.lstatSync(path, { bigint: true })))
+      )
+        invalid();
+    }
+    return { metadata, directories, files };
+  } finally {
+    const closed = [...handles.values()].toReversed().map((fd) => {
+      try {
+        NodeFS.closeSync(fd);
+        return true;
+      } catch {
+        return false;
+      }
+    });
+    if (closed.some((value) => !value)) invalid();
+  }
+};
+const finalWorkspaceFence = (paths: Path.Path, fence: WorkspaceFence, signal?: AbortSignal) =>
+  Effect.try({
+    try: () => {
+      if (signal?.aborted) throw deny("Pi operation canceled");
+      workspaceReceipt(paths, fence.metadata, fence);
+      if (signal?.aborted) throw deny("Pi operation canceled");
+    },
+    catch: (error) =>
+      isRuntimeError(error) ? error : deny("Pi final workspace metadata fence is unavailable"),
+  });
+
 export interface PiManagedRuntimeLiveOptions {
   readonly environmentId: string;
   readonly agentDirectory: string;
@@ -130,6 +347,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   });
   const crypto = yield* Crypto.Crypto;
   const fs = yield* FileSystem.FileSystem;
+  const paths = yield* Path.Path;
   const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
   const services = yield* Effect.context<
     Crypto.Crypto | FileSystem.FileSystem | Path.Path | ChildProcessSpawner.ChildProcessSpawner
@@ -175,7 +393,11 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   const verifyWorkspace = Effect.fn("PiManagedRuntimeLive.verifyWorkspace")(function* (
     authority: ProjectTeamAuthority,
     agentDirectory: string,
-    expected?: { readonly protectedRoots: ReadonlyArray<string>; readonly fingerprint: string },
+    expected?: {
+      readonly protectedRoots: ReadonlyArray<string>;
+      readonly fingerprint: string;
+      readonly fence: WorkspaceFence;
+    },
   ) {
     const cwd = authority.binding.worktree;
     const directoryIdentity = Effect.fn("PiManagedRuntimeLive.directoryIdentity")(function* (
@@ -236,10 +458,24 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
       ])).trim() !== commonDirectory
     )
       return yield* deny("Pi primary checkout or common Git directory changed");
+    const gitDirectory = (yield* git(cwd, ["rev-parse", "--absolute-git-dir"])).trim();
+    const ownedGit = yield* directoryIdentity(gitDirectory);
+    if (
+      (yield* git(primaryDirectory, ["rev-parse", "--absolute-git-dir"])).trim() !== commonDirectory
+    )
+      return yield* deny("Pi primary Git metadata layout is unsupported");
+    const configurationEntries = (yield* git(cwd, ["config", "--null", "--list"])).split("\0");
+    if (
+      configurationEntries.some((entry) =>
+        /^(?:include|includeif)\./i.test(entry.split("\n", 1)[0]!),
+      )
+    )
+      return yield* deny("Pi Git configuration includes are unsupported");
     // HEAD may advance in the primary checkout; its registered path, branch and
     // actual directory identities must remain the same for this owned launch.
     const fingerprint = encode({
       assigned,
+      ownedGit,
       agent,
       primary,
       common,
@@ -253,7 +489,29 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
       encode(common) !== encode(yield* directoryIdentity(commonDirectory))
     )
       return yield* deny("Pi registered workspace ownership changed");
+    const primaryBranch = primaryRecord!
+      .find((entry) => entry.startsWith("branch "))
+      ?.slice("branch ".length);
+    if (!primaryBranch && !primaryRecord!.includes("detached"))
+      return yield* deny("Pi primary Git HEAD layout is unsupported");
+    const fence =
+      expected?.fence ??
+      (yield* Effect.try({
+        try: () =>
+          workspaceReceipt(paths, {
+            directories: [cwd, agentDirectory, primaryDirectory, commonDirectory, gitDirectory],
+            assigned: cwd,
+            primary: primaryDirectory,
+            common: commonDirectory,
+            gitDirectory,
+            assignedHead: `ref: refs/heads/${authority.binding.branch}`,
+            primaryHead: primaryBranch ? `ref: ${primaryBranch}` : null,
+          }),
+        catch: () => deny("Pi fixed workspace metadata is unavailable"),
+      }));
+    yield* finalWorkspaceFence(paths, fence);
     return {
+      fence,
       protectedRoots: [
         ...new Set([...options.protectedRoots, agentDirectory, primaryDirectory, commonDirectory]),
       ],
@@ -477,6 +735,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   "Pi assignment changed during managed allocation checks",
                   "conflict",
                 );
+              yield* finalWorkspaceFence(paths, workspace.fence);
               const allocation = yield* preallocatePiManagedProcess(launch).pipe(
                 Effect.provide(services),
               );
@@ -619,6 +878,16 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                               input.tool.capability,
                               binding.projectId,
                             )
+                          : Effect.void,
+                      ),
+                      Effect.andThen(
+                        [
+                          "beforeAcquire",
+                          "beforeStart",
+                          "beforeToolInvoke",
+                          "beforeToolReturn",
+                        ].includes(input.phase)
+                          ? finalWorkspaceFence(paths, workspace.fence, signal)
                           : Effect.void,
                       ),
                     ),
