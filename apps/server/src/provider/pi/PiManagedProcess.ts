@@ -797,6 +797,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
       let owner: PiManagedProcessOwner | undefined;
       let state: "owned" | "starting" | "running" | "stopped" = "owned";
       let stopping = false;
+      let transportError: PiManagedProcessError | undefined;
       let childExitCode: number | null = null;
       let childPid: number | null = null;
       let closeInput = Effect.void;
@@ -899,6 +900,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
       const transportFailure = Effect.fn("PiManagedProcess.transportFailure")(function* (
         error: PiManagedProcessError,
       ) {
+        transportError ??= error;
         yield* Deferred.fail(ownerReady, error);
         yield* Deferred.fail(started, error);
         yield* Deferred.fail(exited, error);
@@ -977,6 +979,8 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
           case "stderr": {
             if (state !== "running")
               return yield* fail("transport", "Worker output preceded the start receipt.");
+            if (childExitCode !== null)
+              return yield* fail("transport", "Worker output followed the exit receipt.");
             const bytes = Buffer.from(event.data, "base64");
             if (bytes.length > 8192 || bytes.toString("base64") !== event.data)
               return yield* fail("transport", "Worker output exceeded the byte framing bound.");
@@ -987,9 +991,6 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
             if (state !== "running" || childExitCode !== null)
               return yield* fail("transport", "Unexpected process exit receipt.");
             childExitCode = event.code;
-            yield* Deferred.succeed(exited, event.code);
-            yield* Queue.end(stdout);
-            yield* Queue.end(stderr);
             break;
           case "failed":
             return yield* fail("startup", event.message);
@@ -1014,8 +1015,13 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         ),
         Effect.andThen(
           Effect.gen(function* () {
+            if (pending.byteLength !== 0)
+              return yield* fail("transport", "Invalid owned process frame at end of stream.");
             if (!stopping && childExitCode === null)
               return yield* fail("transport", "Owned process closed without an exit receipt.");
+            if (childExitCode !== null) yield* Deferred.succeed(exited, childExitCode);
+            yield* Queue.end(stdout);
+            yield* Queue.end(stderr);
           }),
         ),
         Effect.catch((cause) =>
@@ -1034,6 +1040,13 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
       awaitReaders = Effect.all([Fiber.await(stdoutReader), Fiber.await(stderrReader)], {
         concurrency: "unbounded",
       }).pipe(Effect.asVoid);
+      // A receipt is provisional until both readers have finished validating their bytes.
+      // Deferreds and queues may already be complete when a later transport error arrives.
+      const terminalCheck = awaitReaders.pipe(
+        Effect.andThen(
+          Effect.suspend(() => (transportError ? Effect.fail(transportError) : Effect.void)),
+        ),
+      );
       const verified = yield* restore(
         Deferred.await(ownerReady).pipe(
           Effect.timeout("5 seconds"),
@@ -1120,9 +1133,19 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
             ? sendControl({ type: "end" })
             : fail("transport", "Managed input cannot close before start or after exit."),
         ),
-        stdout: Stream.fromQueue(stdout),
-        stderr: Stream.fromQueue(stderr),
-        awaitExit: Deferred.await(exited).pipe(Effect.andThen(stop)),
+        stdout: Stream.fromQueue(stdout).pipe(
+          Stream.concat(Stream.fromEffect(terminalCheck).pipe(Stream.drain)),
+        ),
+        stderr: Stream.fromQueue(stderr).pipe(
+          Stream.concat(Stream.fromEffect(terminalCheck).pipe(Stream.drain)),
+        ),
+        awaitExit: Effect.gen(function* () {
+          const receipt = yield* Deferred.await(exited).pipe(Effect.exit);
+          const drain = yield* stop;
+          yield* terminalCheck;
+          if (receipt._tag === "Failure") return yield* Effect.failCause(receipt.cause);
+          return drain;
+        }),
       };
     }),
   );
