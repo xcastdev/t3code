@@ -26,6 +26,7 @@ import {
   type PiSessionTerminal,
 } from "./PiSessionRuntime.ts";
 import type { PiModelRequestSettlement } from "./PiModelBroker.ts";
+import type { PiWorkerFrame } from "./PiWorkerProtocol.ts";
 
 const json = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
 const model = "inclusionai/ling-3.1-flash:free";
@@ -228,6 +229,16 @@ describe("private session configuration", () => {
       expect(f.events).toEqual([]);
     }),
   );
+  effectIt.effect("rejects a present non-function worker observer before launch", () =>
+    Effect.gen(function* () {
+      const f = portable();
+      const options = { ...f.options };
+      Object.defineProperty(options, "onWorkerFrame", { value: true });
+      const error = yield* makePiSessionRuntime(options).pipe(Effect.flip);
+      expect(error).toMatchObject({ code: "CALLBACK_CONFIGURATION" });
+      expect(f.events).toEqual([]);
+    }),
+  );
   for (const field of ["workerId", "generation", "operationId", "model"] as const)
     effectIt.effect(`rejects incongruent broker ${field} before launch`, () =>
       Effect.gen(function* () {
@@ -332,6 +343,224 @@ describe.runIf(process.env.PI_SESSION_RUNTIME_LINUX_GATE === "1")(
             );
           }),
         ).pipe(Effect.provide(NodeServices.layer)),
+      );
+    for (const mode of ["prompt", "initialize", "tool", "local-tool"] as const)
+      check(
+        `observes ordered full ${mode} worker stream from sequence zero`,
+        (f) =>
+          Effect.gen(function* () {
+            const observed: PiWorkerFrame[] = [];
+            const transportEntered = yield* Deferred.make<void>();
+            const releaseTransport = Promise.withResolvers<void>();
+            const runtime = yield* makePiSessionRuntime({
+              ...f.options,
+              onWorkerFrame: async (frame: PiWorkerFrame) => {
+                observed.push(frame);
+                f.events.push(`observed:${frame.sequence}`);
+              },
+              persistNative: async (frame, signal) => {
+                expect(observed.at(-1)).toBe(frame);
+                await f.options.persistNative(frame, signal);
+              },
+              onSdkEvent: async (frame, signal) => {
+                expect(observed.at(-1)).toBe(frame);
+                await f.options.onSdkEvent(frame, signal);
+              },
+              persistControl: async (receipt, signal) => {
+                expect(observed.at(-1)?.message).toMatchObject({
+                  type: "control-receipt",
+                  controlId: receipt.controlId,
+                });
+                await f.options.persistControl(receipt, signal);
+              },
+              broker: {
+                ...f.options.broker,
+                transport: async (endpoint, init) => {
+                  expect(observed.at(-1)?.message.type).toBe("request");
+                  if (mode === "prompt") {
+                    Deferred.doneUnsafe(transportEntered, Effect.void);
+                    await waitForSignal(releaseTransport.promise, init.signal);
+                  }
+                  return f.options.broker.transport(endpoint, init);
+                },
+              },
+            });
+            const run = yield* runtime.run().pipe(Effect.forkChild);
+            if (mode === "prompt") {
+              yield* Deferred.await(transportEntered);
+              yield* runtime.control({
+                type: "control",
+                controlId: 55,
+                kind: "steer",
+                text: "observed",
+              });
+              releaseTransport.resolve();
+            }
+            const terminal = yield* Fiber.join(run);
+            const types = observed.map((frame) =>
+              frame.message.type === "sdk-event"
+                ? `sdk-event:${frame.message.event.type}`
+                : frame.message.type,
+            );
+            const tail = [
+              "request",
+              ...(mode === "prompt" ? ["control-receipt"] : []),
+              ...Array.from({ length: 7 }, () => "ack"),
+              "sdk-event:assistant_result",
+              "agent_end",
+              "agent_settled",
+              "native",
+              "operation_settled",
+              "done",
+            ];
+            const prefix =
+              mode === "tool" || mode === "local-tool"
+                ? [
+                    "ready",
+                    "agent_start",
+                    "tool-call",
+                    "transfer-chunk",
+                    "transfer-end",
+                    "sdk-event:tool_start",
+                    ...(mode === "local-tool"
+                      ? ["tool-result", "transfer-chunk", "transfer-end"]
+                      : []),
+                    "sdk-event:tool_end",
+                  ]
+                : ["ready", "agent_start"];
+            expect(types).toEqual(
+              mode === "initialize" ? ["ready", "initialized"] : [...prefix, ...tail],
+            );
+            expect(observed.map((frame) => frame.sequence)).toEqual(
+              observed.map((_, index) => index),
+            );
+            for (const frame of observed) {
+              expect(frame).toMatchObject({ ...f.options.identity, ...f.options.operation });
+              expect(Object.isFrozen(frame)).toBe(true);
+              expect(Object.isFrozen(frame.message)).toBe(true);
+            }
+            expect(terminal.outcome).toBe("success");
+            expect(terminal.drain?.kernel).toBe("removed");
+          }),
+        mode,
+      );
+    for (const mode of [
+      "forged-generation",
+      "forged-operation",
+      "forged-sequence",
+      "forged-native",
+    ] as const)
+      check(
+        `worker observer excludes invalid ${mode} frame`,
+        (f) =>
+          Effect.gen(function* () {
+            const observed: PiWorkerFrame[] = [];
+            const runtime = yield* makePiSessionRuntime({
+              ...f.options,
+              onWorkerFrame: async (frame) => {
+                observed.push(frame);
+              },
+            });
+            const result = yield* runtime.run().pipe(Effect.exit);
+            expect(result._tag).toBe("Failure");
+            expect(f.terminals[0]?.outcome).not.toBe("success");
+            expect(f.terminals[0]?.drain?.kernel).toBe("removed");
+            expect(observed.map((frame) => frame.sequence)).toEqual(
+              observed.map((_, index) => index),
+            );
+            for (const frame of observed)
+              expect(frame).toMatchObject({ ...f.options.identity, ...f.options.operation });
+            expect(observed.at(-1)?.message.type).toBe(
+              mode === "forged-operation"
+                ? "native"
+                : mode === "forged-sequence"
+                  ? "operation_settled"
+                  : "agent_settled",
+            );
+            expect(observed.some((frame) => frame.message.type === "done")).toBe(false);
+          }),
+        mode,
+      );
+    for (const target of ["request", "ack"] as const)
+      for (const mode of ["honored", "ignored", "released"] as const)
+        check(
+          `held ${target} worker observer ${mode} signal gates dispatch and joins cleanup`,
+          (f) =>
+            Effect.gen(function* () {
+              const entered = yield* Deferred.make<void>();
+              const finished = yield* Deferred.make<void>();
+              const release = Promise.withResolvers<void>();
+              let observerPending = false;
+              let pendingAtTerminal = false;
+              const runtime = yield* makePiSessionRuntime({
+                ...f.options,
+                cleanupDeadlineMs: 100,
+                onWorkerFrame: async (frame, signal) => {
+                  if (frame.message.type !== target) return;
+                  observerPending = true;
+                  Deferred.doneUnsafe(entered, Effect.void);
+                  try {
+                    if (mode === "ignored") await release.promise;
+                    else await waitForSignal(release.promise, signal);
+                  } finally {
+                    observerPending = false;
+                    Deferred.doneUnsafe(finished, Effect.void);
+                  }
+                },
+                persistTerminal: async (terminal, signal) => {
+                  pendingAtTerminal = observerPending;
+                  await f.options.persistTerminal(terminal, signal);
+                },
+              });
+              const run = yield* runtime.run().pipe(Effect.forkChild);
+              yield* Deferred.await(entered);
+              expect(f.events.filter((event) => event === "transport")).toHaveLength(
+                target === "request" ? 0 : 1,
+              );
+              if (mode === "released") release.resolve();
+              else yield* Fiber.interrupt(run);
+              const result = yield* Fiber.await(run);
+              release.resolve();
+              yield* Deferred.await(finished);
+              expect(result._tag).toBe(mode === "released" ? "Success" : "Failure");
+              expect(f.terminals[0]?.outcome).toBe(
+                mode === "released" ? "success" : mode === "ignored" ? "quarantine" : "canceled",
+              );
+              expect(pendingAtTerminal).toBe(mode === "ignored");
+              expect(f.events.filter((event) => event === "transport")).toHaveLength(
+                mode === "released" || target === "ack" ? 1 : 0,
+              );
+              if (target === "ack" && mode !== "released")
+                expect(f.settlements.at(-1)?.outcome).toBe("failed");
+              expect(f.terminals[0]?.drain?.kernel).toBe("removed");
+              if (mode !== "released") expect(f.terminals[0]?.native).toBeNull();
+            }),
+        );
+    for (const target of ["ready", "request", "ack", "native", "done"] as const)
+      check(`worker observer rejection at ${target} prevents its dispatch`, (f) =>
+        Effect.gen(function* () {
+          const observed: PiWorkerFrame[] = [];
+          const runtime = yield* makePiSessionRuntime({
+            ...f.options,
+            onWorkerFrame: async (frame) => {
+              observed.push(frame);
+              if (frame.message.type === target) throw new Error("observer write rejected");
+            },
+          });
+          const result = yield* runtime.run().pipe(Effect.exit);
+          expect(result._tag).toBe("Failure");
+          expect(observed.at(-1)?.message.type).toBe(target);
+          expect(f.terminals[0]?.outcome).toBe("failed");
+          if (target === "done") expect(f.terminals[0]?.native?.persisted).toBe(true);
+          else {
+            expect(f.terminals[0]?.native).toBeNull();
+            expect(f.events).not.toContain("native");
+          }
+          expect(f.terminals[0]?.drain?.kernel).toBe("removed");
+          expect(f.events.filter((event) => event === "transport")).toHaveLength(
+            target === "native" || target === "ack" || target === "done" ? 1 : 0,
+          );
+        }),
       );
     for (const mode of ["prompt", "initialize", "tool", "local-tool", "descendant"])
       check(
