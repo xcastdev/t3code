@@ -79,6 +79,19 @@ const runConnectCli = (args: ReadonlyArray<string>) => runCli(args, connectCli);
 const runCliWithRuntime = (args: ReadonlyArray<string>) =>
   runCli(args).pipe(Effect.provide(CliRuntimeLayer));
 
+it.effect(
+  "routes the private Pi worker before server startup and redacts invalid launch data",
+  () =>
+    Effect.gen(function* () {
+      const error = yield* runCliWithRuntime([
+        "__pi-worker",
+        '{"unexpected":"private-launch-input"}',
+      ]).pipe(Effect.flip);
+      assert.equal(error.message, "PI_WORKER_OPERATION_FAILED");
+      assert.notInclude(error.message + String(error.cause), "private-launch-input");
+    }),
+);
+
 const captureStdout = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.gen(function* () {
     const result = yield* effect;

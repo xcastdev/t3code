@@ -230,6 +230,11 @@ import * as ProjectMcpSecretStore from "./mcp/ProjectMcpSecretStore.ts";
 import * as ProjectWorkGateway from "./projectWork/ProjectWorkGateway.ts";
 import * as ProjectIssueBindingGateway from "./projectWork/ProjectIssueBindingGateway.ts";
 import * as ProjectWorkStream from "./projectWork/ProjectWorkStream.ts";
+import * as ProjectIssueHumanBinding from "./projectWork/ProjectIssueHumanBinding.ts";
+import * as ProjectIssueComments from "./projectWork/ProjectIssueComments.ts";
+import * as ProjectTeamAuthorization from "./projectWork/ProjectTeamAuthorization.ts";
+import * as ProjectWorkContentGuard from "./projectWork/ProjectWorkContentGuard.ts";
+import { PersistenceSqlError, PersistenceDecodeError } from "./persistence/Errors.ts";
 import * as ProjectLifecycle from "./project/ProjectLifecycle.ts";
 import { hasCatalogTransportIdentityChange } from "./mcp/McpCatalogDefinitionIdentity.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
@@ -239,6 +244,7 @@ import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import {
   requiredScopeForRpcMethod,
   authorizeRpcSession,
+  ManagedRpcAuthorizationError,
   guardRpcEffect,
   guardRpcStream,
   guardRpcStreamEffect,
@@ -291,7 +297,25 @@ const HistoryArchiveWsRpcGroup = RpcGroup.make(
   WsOrchestrationListHistoryArchivesRpc,
   WsOrchestrationGetHistoryArchiveRpc,
 );
+const PROJECT_WORK_RPC_METHODS = [
+  WS_METHODS.projectWorkRead,
+  WS_METHODS.projectWorkBindIssueRepository,
+  WS_METHODS.projectWorkRepositoryBindings,
+  WS_METHODS.projectWorkWrite,
+  WS_METHODS.projectWorkRequestApproval,
+  WS_METHODS.projectWorkSubscribe,
+] as const;
+type ProjectWorkRpc = Extract<
+  RpcGroup.Rpcs<typeof WsBaseRpcGroup>,
+  { readonly _tag: (typeof PROJECT_WORK_RPC_METHODS)[number] }
+>;
+const ProjectWorkWsRpcGroup = RpcGroup.make(
+  ...Array.from(WsBaseRpcGroup.requests.values()).filter((rpc): rpc is ProjectWorkRpc =>
+    PROJECT_WORK_RPC_METHODS.some((method) => method === rpc._tag),
+  ),
+);
 const WsCoreRpcGroup = WsBaseRpcGroup.omit(
+  ...PROJECT_WORK_RPC_METHODS,
   ORCHESTRATION_WS_METHODS.listHistoryArchives,
   ORCHESTRATION_WS_METHODS.getHistoryArchive,
   WS_METHODS.managedTextResourcesCatalogList,
@@ -1039,6 +1063,272 @@ const makeWsManagedTextResourceRpcLayer = (currentSession: EnvironmentAuth.Authe
     }),
   );
 
+// Unknown wire errors still require JSON records. Select public fields without
+// sending internal causes, stacks, or rejected payloads over the transport.
+const encodeProjectWorkRpcError = Schema.encodeUnknownEffect(
+  Schema.toCodecJson(
+    Schema.Union([
+      Schema.Struct(EnvironmentAuthorizationError.fields),
+      Schema.Struct(ManagedRpcAuthorizationError.fields),
+      ...EnvironmentAuth.ServerAuthCredentialError.members.map((error) =>
+        Schema.Struct({ _tag: error.fields._tag }),
+      ),
+      Schema.Struct({
+        _tag: EnvironmentAuth.ServerAuthProjectWorkApprovalError.fields._tag,
+        operation: EnvironmentAuth.ServerAuthProjectWorkApprovalError.fields.operation,
+        reason: EnvironmentAuth.ServerAuthProjectWorkApprovalError.fields.reason,
+      }),
+      ...EnvironmentAuth.ServerAuthInternalError.members.map((error) =>
+        Schema.Struct({ _tag: error.fields._tag }),
+      ),
+      Schema.Struct(ProjectIssueBindingGateway.IssueBindingGatewayError.fields),
+      Schema.Struct(ProjectIssueHumanBinding.IssueHumanBindingError.fields),
+      Schema.Struct(ProjectWorkGateway.ProjectWorkAuthorizationError.fields),
+      Schema.Struct(ProjectTeamAuthorization.ProjectTeamAuthorizationError.fields),
+      Schema.Struct(ProjectWorkContentGuard.ProjectWorkContentRejectedError.fields),
+      Schema.Struct({
+        _tag: ProjectWorkStream.ProjectWorkStreamError.fields._tag,
+        reason: ProjectWorkStream.ProjectWorkStreamError.fields.reason,
+        detail: ProjectWorkStream.ProjectWorkStreamError.fields.detail,
+      }),
+      Schema.Struct(ProjectIssueComments.IssueCommentsError.fields),
+      Schema.Struct({
+        _tag: PersistenceSqlError.fields._tag,
+        operation: PersistenceSqlError.fields.operation,
+        detail: PersistenceSqlError.fields.detail,
+        correlation: PersistenceSqlError.fields.correlation,
+      }),
+      Schema.Struct({
+        _tag: PersistenceDecodeError.fields._tag,
+        operation: PersistenceDecodeError.fields.operation,
+        issue: PersistenceDecodeError.fields.issue,
+        correlation: PersistenceDecodeError.fields.correlation,
+      }),
+      Schema.Struct({
+        _tag: Schema.Literal("ProjectWorkPolicyError"),
+        code: Schema.Literals([
+          "unknown-task",
+          "unknown-criterion",
+          "unknown-evidence",
+          "unknown-relationship",
+          "unknown-blocker",
+          "stale-revision",
+          "invalid-state",
+          "invalid-specification",
+          "invalid-relationship",
+          "active-attempt",
+          "unresolved-dependency",
+          "unsatisfied-criterion",
+          "protected-specification",
+          "approval-required",
+          "authority-required",
+          "duplicate-record",
+          "deferred-command",
+        ]),
+        message: Schema.String,
+      }),
+    ]),
+  ),
+);
+const failProjectWorkRpcError = (error: unknown) =>
+  encodeProjectWorkRpcError(error).pipe(
+    Effect.mapError(() => new Error("Unable to encode project-work RPC error.")),
+    Effect.orDie,
+    Effect.flatMap(Effect.fail),
+  );
+
+const makeWsProjectWorkRpcLayer = (
+  currentSession: EnvironmentAuth.AuthenticatedSession,
+  clientOrigin: OrchestrationClientOrigin,
+) =>
+  ProjectWorkWsRpcGroup.toLayer(
+    Effect.gen(function* () {
+      const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
+      const serverSettings = yield* ServerSettings.ServerSettingsService;
+      // Kept optional so lightweight router/test compositions do not have to
+      // construct the SQL-backed project-work services. Production routes
+      // provide it through makeRoutesLayer.
+      const projectWorkGateway = yield* Effect.serviceOption(ProjectWorkGateway.ProjectWorkGateway);
+      const issueBindingGateway = yield* Effect.serviceOption(
+        ProjectIssueBindingGateway.ProjectIssueBindingGateway,
+      );
+      const projectWorkStream = yield* Effect.serviceOption(ProjectWorkStream.ProjectWorkStream);
+      const authorizationError = (requiredScope: AuthEnvironmentScope) =>
+        new EnvironmentAuthorizationError({
+          message: `The authenticated token is missing required scope: ${requiredScope}.`,
+          requiredScope,
+        });
+      const validateRpcSession = (method: string) =>
+        authorizeRpcSession(method, currentSession, serverAuth).pipe(
+          Effect.mapError(() => authorizationError(requiredScopeForRpcMethod(method))),
+        );
+      const authorizeEffect = <A, E, R>(
+        requiredScope: AuthEnvironmentScope,
+        effect: Effect.Effect<A, E, R>,
+      ): Effect.Effect<A, E | EnvironmentAuthorizationError, R> =>
+        currentSession.scopes.includes(requiredScope)
+          ? effect
+          : Effect.fail(authorizationError(requiredScope));
+      const observeRpcEffect = <A, E, R>(
+        method: string,
+        effect: Effect.Effect<A, E, R>,
+        traceAttributes?: Readonly<Record<string, unknown>>,
+      ) =>
+        instrumentRpcEffect(
+          method,
+          authorizeEffect(
+            requiredScopeForRpcMethod(method),
+            guardRpcEffect(validateRpcSession(method), effect),
+          ),
+          traceAttributes,
+        ).pipe(Effect.catch(failProjectWorkRpcError));
+      const observeRpcStreamEffect = <A, StreamError, StreamContext, EffectError, EffectContext>(
+        method: string,
+        effect: Effect.Effect<
+          Stream.Stream<A, StreamError, StreamContext>,
+          EffectError,
+          EffectContext
+        >,
+        traceAttributes?: Readonly<Record<string, unknown>>,
+      ) =>
+        instrumentRpcStreamEffect(
+          method,
+          authorizeEffect(
+            requiredScopeForRpcMethod(method),
+            guardRpcStreamEffect(validateRpcSession(method), effect),
+          ),
+          traceAttributes,
+        ).pipe(Stream.catch((error) => Stream.fromEffect(failProjectWorkRpcError(error))));
+      return ProjectWorkWsRpcGroup.of({
+        [WS_METHODS.projectWorkBindIssueRepository]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectWorkBindIssueRepository,
+            Option.isSome(issueBindingGateway)
+              ? authorizeRpcSession(
+                  WS_METHODS.projectWorkBindIssueRepository,
+                  currentSession,
+                  serverAuth,
+                ).pipe(Effect.flatMap((session) => issueBindingGateway.value.bind(input, session)))
+              : Effect.fail(
+                  new ProjectIssueBindingGateway.IssueBindingGatewayError({ reason: "storage" }),
+                ),
+            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectWorkRepositoryBindings]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.projectWorkRepositoryBindings,
+            Option.isSome(issueBindingGateway)
+              ? authorizeRpcSession(
+                  WS_METHODS.projectWorkRepositoryBindings,
+                  currentSession,
+                  serverAuth,
+                ).pipe(Effect.flatMap((session) => issueBindingGateway.value.list(input, session)))
+              : Effect.fail(
+                  new ProjectIssueBindingGateway.IssueBindingGatewayError({ reason: "storage" }),
+                ),
+            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectWorkRead]: (input: ProjectWorkReadIntent) =>
+          observeRpcEffect(
+            WS_METHODS.projectWorkRead,
+            Option.isSome(projectWorkGateway)
+              ? authorizeRpcSession(WS_METHODS.projectWorkRead, currentSession, serverAuth).pipe(
+                  Effect.flatMap((session) =>
+                    projectWorkGateway.value.read(input, {
+                      actor: {
+                        kind: session.identity.kind === "agent" ? "agent" : "human",
+                        id: session.identity.id,
+                      },
+                      ...(session.managed === undefined ? {} : { managed: session.managed }),
+                    }),
+                  ),
+                )
+              : Effect.die(new ProjectWorkGateway.ProjectWorkGatewayUnavailableError({})),
+            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectWorkWrite]: (input: ProjectWorkWriteIntent) =>
+          observeRpcEffect(
+            WS_METHODS.projectWorkWrite,
+            Option.isSome(projectWorkGateway)
+              ? projectWorkGateway.value.write(
+                  input,
+                  {
+                    kind: currentSession.identity.kind === "agent" ? "agent" : "human",
+                    id: currentSession.identity.id,
+                    ...(currentSession.identity.displayName
+                      ? { displayName: currentSession.identity.displayName }
+                      : {}),
+                  },
+                  {
+                    kind:
+                      clientOrigin.surface === "mobile"
+                        ? "mobile"
+                        : clientOrigin.surface === "desktop"
+                          ? "desktop"
+                          : "web",
+                    id: currentSession.identity.id,
+                  },
+                  {
+                    actor: {
+                      kind: currentSession.identity.kind === "agent" ? "agent" : "human",
+                      id: currentSession.identity.id,
+                    },
+                    ...(currentSession.managed === undefined
+                      ? {}
+                      : { managed: currentSession.managed }),
+                  },
+                )
+              : Effect.die(new ProjectWorkGateway.ProjectWorkGatewayUnavailableError({})),
+            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectWorkRequestApproval]: (input: ProjectWorkApprovalRequest) =>
+          observeRpcEffect(
+            WS_METHODS.projectWorkRequestApproval,
+            Effect.gen(function* () {
+              const settings = yield* serverSettings.getSettings;
+              if (!settings.projectWorkEnabled) {
+                return yield* new ProjectWorkGateway.ProjectWorkAuthorizationError({
+                  reason: "project-work-disabled",
+                });
+              }
+              return yield* serverAuth.issueProjectWorkApproval({
+                ...input,
+                approvedBy: currentSession.identity,
+                sourceKind:
+                  clientOrigin.surface === "mobile"
+                    ? "mobile"
+                    : clientOrigin.surface === "desktop"
+                      ? "desktop"
+                      : "web",
+              });
+            }),
+            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
+          ),
+        [WS_METHODS.projectWorkSubscribe]: (input) =>
+          observeRpcStreamEffect(
+            WS_METHODS.projectWorkSubscribe,
+            Option.isSome(projectWorkStream)
+              ? projectWorkStream.value.stream(input, {
+                  actor: {
+                    kind: currentSession.identity.kind === "agent" ? "agent" : "human",
+                    id: currentSession.identity.id,
+                  },
+                  ...(currentSession.managed === undefined
+                    ? {}
+                    : { managed: currentSession.managed }),
+                })
+              : Effect.die(
+                  new ProjectWorkStream.ProjectWorkStreamError({
+                    reason: "read-failed",
+                    detail: "The project-work stream is unavailable.",
+                  }),
+                ),
+            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
+          ),
+      });
+    }),
+  );
+
 const makeWsRpcLayer = (
   currentSession: EnvironmentAuth.AuthenticatedSession,
   clientOrigin: OrchestrationClientOrigin,
@@ -1242,14 +1532,6 @@ const makeWsRpcLayer = (
         ),
       );
       const serverAuth = yield* EnvironmentAuth.EnvironmentAuth;
-      // Kept optional so lightweight router/test compositions do not have to
-      // construct the SQL-backed project-work services. Production routes
-      // provide it through makeRoutesLayer.
-      const projectWorkGateway = yield* Effect.serviceOption(ProjectWorkGateway.ProjectWorkGateway);
-      const issueBindingGateway = yield* Effect.serviceOption(
-        ProjectIssueBindingGateway.ProjectIssueBindingGateway,
-      );
-      const projectWorkStream = yield* Effect.serviceOption(ProjectWorkStream.ProjectWorkStream);
       const projectLifecycle = yield* Effect.serviceOption(ProjectLifecycle.ProjectLifecycle);
       const sourceControlDiscovery = yield* SourceControlDiscovery.SourceControlDiscovery;
       const automaticGitFetchInterval = serverSettings.getSettings.pipe(
@@ -6143,131 +6425,6 @@ const makeWsRpcLayer = (
             ),
             { "rpc.aggregate": "workspace" },
           ),
-        [WS_METHODS.projectWorkBindIssueRepository]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.projectWorkBindIssueRepository,
-            Option.isSome(issueBindingGateway)
-              ? authorizeRpcSession(
-                  WS_METHODS.projectWorkBindIssueRepository,
-                  currentSession,
-                  serverAuth,
-                ).pipe(Effect.flatMap((session) => issueBindingGateway.value.bind(input, session)))
-              : Effect.fail(
-                  new ProjectIssueBindingGateway.IssueBindingGatewayError({ reason: "storage" }),
-                ),
-            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
-          ),
-        [WS_METHODS.projectWorkRepositoryBindings]: (input) =>
-          observeRpcEffect(
-            WS_METHODS.projectWorkRepositoryBindings,
-            Option.isSome(issueBindingGateway)
-              ? authorizeRpcSession(
-                  WS_METHODS.projectWorkRepositoryBindings,
-                  currentSession,
-                  serverAuth,
-                ).pipe(Effect.flatMap((session) => issueBindingGateway.value.list(input, session)))
-              : Effect.fail(
-                  new ProjectIssueBindingGateway.IssueBindingGatewayError({ reason: "storage" }),
-                ),
-            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
-          ),
-        [WS_METHODS.projectWorkRead]: (input: ProjectWorkReadIntent) =>
-          observeRpcEffect(
-            WS_METHODS.projectWorkRead,
-            Option.isSome(projectWorkGateway)
-              ? authorizeRpcSession(WS_METHODS.projectWorkRead, currentSession, serverAuth).pipe(
-                  Effect.flatMap((session) =>
-                    projectWorkGateway.value.read(input, {
-                      actor: {
-                        kind: session.identity.kind === "agent" ? "agent" : "human",
-                        id: session.identity.id,
-                      },
-                      ...(session.managed === undefined ? {} : { managed: session.managed }),
-                    }),
-                  ),
-                )
-              : Effect.die(new ProjectWorkGateway.ProjectWorkGatewayUnavailableError({})),
-            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
-          ),
-        [WS_METHODS.projectWorkWrite]: (input: ProjectWorkWriteIntent) =>
-          observeRpcEffect(
-            WS_METHODS.projectWorkWrite,
-            Option.isSome(projectWorkGateway)
-              ? projectWorkGateway.value.write(
-                  input,
-                  {
-                    kind: currentSession.identity.kind === "agent" ? "agent" : "human",
-                    id: currentSession.identity.id,
-                    ...(currentSession.identity.displayName
-                      ? { displayName: currentSession.identity.displayName }
-                      : {}),
-                  },
-                  {
-                    kind:
-                      clientOrigin.surface === "mobile"
-                        ? "mobile"
-                        : clientOrigin.surface === "desktop"
-                          ? "desktop"
-                          : "web",
-                    id: currentSession.identity.id,
-                  },
-                  {
-                    actor: {
-                      kind: currentSession.identity.kind === "agent" ? "agent" : "human",
-                      id: currentSession.identity.id,
-                    },
-                    ...(currentSession.managed === undefined
-                      ? {}
-                      : { managed: currentSession.managed }),
-                  },
-                )
-              : Effect.die(new ProjectWorkGateway.ProjectWorkGatewayUnavailableError({})),
-            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
-          ),
-        [WS_METHODS.projectWorkRequestApproval]: (input: ProjectWorkApprovalRequest) =>
-          observeRpcEffect(
-            WS_METHODS.projectWorkRequestApproval,
-            Effect.gen(function* () {
-              const settings = yield* serverSettings.getSettings;
-              if (!settings.projectWorkEnabled) {
-                return yield* new ProjectWorkGateway.ProjectWorkAuthorizationError({
-                  reason: "project-work-disabled",
-                });
-              }
-              return yield* serverAuth.issueProjectWorkApproval({
-                ...input,
-                approvedBy: currentSession.identity,
-                sourceKind:
-                  clientOrigin.surface === "mobile"
-                    ? "mobile"
-                    : clientOrigin.surface === "desktop"
-                      ? "desktop"
-                      : "web",
-              });
-            }),
-            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
-          ),
-        [WS_METHODS.projectWorkSubscribe]: (input) =>
-          observeRpcStreamEffect(
-            WS_METHODS.projectWorkSubscribe,
-            Option.isSome(projectWorkStream)
-              ? projectWorkStream.value.stream(input, {
-                  actor: {
-                    kind: currentSession.identity.kind === "agent" ? "agent" : "human",
-                    id: currentSession.identity.id,
-                  },
-                  ...(currentSession.managed === undefined
-                    ? {}
-                    : { managed: currentSession.managed }),
-                })
-              : Effect.die(
-                  new ProjectWorkStream.ProjectWorkStreamError({
-                    reason: "read-failed",
-                    detail: "The project-work stream is unavailable.",
-                  }),
-                ),
-            { "rpc.aggregate": "project-work", "project.id": String(input.projectId) },
-          ),
         [WS_METHODS.projectLifecycleArchive]: (input) =>
           observeRpcEffect(
             WS_METHODS.projectLifecycleArchive,
@@ -7162,10 +7319,13 @@ export const websocketRpcRouteLayer = Layer.unwrap(
                 requestOrigin,
               ),
               Layer.merge(
-                makeWsProjectTerminalRpcLayer(session),
+                makeWsProjectWorkRpcLayer(session, clientOrigin),
                 Layer.merge(
-                  makeWsManagedTextResourceRpcLayer(session),
-                  makeWsHistoryArchiveRpcLayer(),
+                  makeWsProjectTerminalRpcLayer(session),
+                  Layer.merge(
+                    makeWsManagedTextResourceRpcLayer(session),
+                    makeWsHistoryArchiveRpcLayer(),
+                  ),
                 ),
               ),
             ).pipe(
