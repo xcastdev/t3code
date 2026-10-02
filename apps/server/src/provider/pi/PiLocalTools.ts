@@ -45,35 +45,50 @@ function boundedJson(value: unknown, maximum: number) {
   return json;
 }
 
-function parameters(native: unknown, bounded: Schema.Top) {
-  const sdk = parseObject(boundedJson(native, PI_WORKER_MAX_TOOL_BYTES));
-  const document = Schema.toJsonSchemaDocument(Schema.toType(bounded));
-  const local = parseObject(
-    boundedJson(
-      { ...document.schema, ...(document.definitions ? { $defs: document.definitions } : {}) },
-      PI_WORKER_MAX_TOOL_BYTES,
-    ),
-  );
-  const properties = Schema.decodeUnknownSync(Schema.Record(Schema.String, Schema.JsonObject));
-  const nativeProperties = properties(sdk.properties);
-  const boundedProperties = properties(local.properties);
+function parameters(schema: Schema.Top) {
+  const document = Schema.toJsonSchemaDocument(Schema.toType(schema));
   return parseObject(
     boundedJson(
       {
-        ...sdk,
-        ...local,
+        ...document.schema,
+        ...(document.definitions ? { $defs: document.definitions } : {}),
         additionalProperties: false,
-        properties: Object.fromEntries(
-          Object.entries(boundedProperties).map(([key, value]) => [
-            key,
-            { ...nativeProperties[key], ...value },
-          ]),
-        ),
       },
       PI_WORKER_MAX_TOOL_BYTES,
     ),
   );
 }
+
+/** Parent advertisement is inert. Selecting capabilities and authorizing calls remain Root-owned. */
+export const piLocalToolDefinitions = Object.freeze([
+  Object.freeze({
+    capabilityId: "pi.read",
+    name: "read",
+    description:
+      "Read text files with native offset/limit paging and truncation. Image attachments are unavailable in this managed profile.",
+    parameters: parameters(ReadInput),
+  }),
+  Object.freeze({
+    capabilityId: "pi.write",
+    name: "write",
+    description: "Create or overwrite a text file, creating missing parent directories.",
+    parameters: parameters(WriteInput),
+  }),
+  Object.freeze({
+    capabilityId: "pi.edit",
+    name: "edit",
+    description:
+      "Edit one file with unique, non-overlapping exact replacements matched against its original contents.",
+    parameters: parameters(EditInput),
+  }),
+  Object.freeze({
+    capabilityId: "pi.bash",
+    name: "bash",
+    description:
+      "Execute a bash command in the explicit workspace and return stdout/stderr. Nonzero exits fail the tool call. Optional timeout is in seconds.",
+    parameters: parameters(BashInput),
+  }),
+]);
 
 function output(result: AgentToolResult<unknown>) {
   // The frozen worker cannot preserve an SDK error flag or image attachment. Reject
@@ -142,33 +157,7 @@ export async function makePiLocalTools(cwd: string) {
   const edit = sdk.createEditTool(cwd);
   const bash = sdk.createBashTool(cwd, { exposeSessionEnvironment: false });
   return Object.freeze({
-    tools: Object.freeze([
-      Object.freeze({
-        capabilityId: "pi.read",
-        name: "read",
-        description:
-          "Read text files with native offset/limit paging and truncation. Image attachments are unavailable in this managed profile.",
-        parameters: parameters(read.parameters, ReadInput),
-      }),
-      Object.freeze({
-        capabilityId: "pi.write",
-        name: "write",
-        description: write.description,
-        parameters: parameters(write.parameters, WriteInput),
-      }),
-      Object.freeze({
-        capabilityId: "pi.edit",
-        name: "edit",
-        description: edit.description,
-        parameters: parameters(edit.parameters, EditInput),
-      }),
-      Object.freeze({
-        capabilityId: "pi.bash",
-        name: "bash",
-        description: bash.description,
-        parameters: parameters(bash.parameters, BashInput),
-      }),
-    ]),
+    tools: piLocalToolDefinitions,
     localTools: Object.freeze({
       read: adapt(ReadInput, (args, signal) => read.execute("t3-local-read", args, signal)),
       write: adapt(WriteInput, (args, signal) => write.execute("t3-local-write", args, signal)),

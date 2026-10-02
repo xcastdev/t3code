@@ -5,7 +5,7 @@ import { it } from "@effect/vitest";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Schema from "effect/Schema";
 import { describe, expect, vi } from "vite-plus/test";
-import { makePiLocalTools } from "./PiLocalTools.ts";
+import { makePiLocalTools, piLocalToolDefinitions } from "./PiLocalTools.ts";
 import type { PiSdkWorkerOptions } from "./PiWorker.ts";
 
 const sdkDirectory = new URL("../", import.meta.resolve("@earendil-works/pi-coding-agent"))
@@ -29,6 +29,7 @@ const fixture = Effect.gen(function* () {
 });
 const encodeJson = Schema.encodeSync(Schema.fromJsonString(Schema.Json));
 const decodeInput = Schema.decodeSync(Schema.JsonObject);
+const decodeValidatedInput = Schema.decodeUnknownSync(Schema.JsonObject);
 const signal = () => new AbortController().signal;
 const ToolResult = Schema.Struct({
   kind: Schema.Literal("json"),
@@ -51,6 +52,7 @@ describe("Pi child-local native SDK tools", () => {
       const fetch = vi.spyOn(globalThis, "fetch");
       const prepared = yield* Effect.promise(() => makePiLocalTools(cwd));
       const local: PiSdkWorkerOptions["localTools"] = prepared.localTools;
+      expect(prepared.tools).toBe(piLocalToolDefinitions);
       expect(Object.keys(local)).toEqual(["read", "write", "edit", "bash"]);
       expect(prepared.tools.map(({ name, capabilityId }) => ({ name, capabilityId }))).toEqual([
         { name: "read", capabilityId: "pi.read" },
@@ -68,6 +70,58 @@ describe("Pi child-local native SDK tools", () => {
         expect(Buffer.byteLength(encodeJson(tool.parameters))).toBeLessThan(65_536);
       }
     }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  );
+
+  it.effect(
+    "consumes the advertised parent schemas through the actual SDK argument validator",
+    () =>
+      Effect.gen(function* () {
+        const { fs, cwd, tools } = yield* fixture;
+        const { Type, validateToolArguments } = yield* Effect.promise(
+          () => import("@earendil-works/pi-ai"),
+        );
+        const calls = [
+          { name: "write" as const, args: { path: "parent-schema.txt", content: "before" } },
+          { name: "read" as const, args: { path: "parent-schema.txt" } },
+          {
+            name: "edit" as const,
+            args: { path: "parent-schema.txt", edits: [{ oldText: "before", newText: "after" }] },
+          },
+          { name: "bash" as const, args: { command: "printf 'parent-schema-marker'" } },
+        ];
+        const outputs: string[] = [];
+        for (const call of calls) {
+          const definition = piLocalToolDefinitions.find((tool) => tool.name === call.name);
+          if (!definition) throw Error("MISSING_PARENT_DEFINITION");
+          // This is the frozen worker's trusted JSON-schema adapter, exercised by the
+          // pinned SDK validator before invoking the actual native execution helper.
+          const sdkTool = {
+            ...definition,
+            parameters: Type.Unsafe<Schema.JsonObject>(definition.parameters),
+          };
+          const validated: unknown = validateToolArguments(sdkTool, {
+            type: "toolCall",
+            id: call.name,
+            name: call.name,
+            arguments: call.args,
+          });
+          const input = decodeValidatedInput(validated);
+          outputs.push(
+            content(yield* Effect.promise(() => tools.localTools[call.name](input, signal()))),
+          );
+          expect(() =>
+            validateToolArguments(sdkTool, {
+              type: "toolCall",
+              id: call.name,
+              name: call.name,
+              arguments: { ...call.args, unexpected: true },
+            }),
+          ).toThrow("Validation failed");
+        }
+        expect(outputs[1]).toBe("before");
+        expect(outputs[3]).toBe("parent-schema-marker");
+        expect(yield* fs.readFileString(`${cwd}/parent-schema.txt`)).toBe("after");
+      }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
   );
 
   it.effect("requires trusted metadata setup and an explicit canonical absolute cwd", () =>
