@@ -689,7 +689,7 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
           let processFailure: unknown;
           const work = Effect.gen(function* () {
             yield* promiseEffect(() => authorize("beforeStart"));
-            yield* child.start;
+            const childPid = yield* child.start;
             exitTask = tracked(
               perform(child.awaitExit).then(
                 (receipt) => {
@@ -717,7 +717,35 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
             closing = true;
             wake.resolve();
             yield* promiseEffect(() => waitSignal(writer, controller.signal));
-            yield* child.endInput;
+            yield* child.endInput.pipe(
+              Effect.catch((error) =>
+                Effect.gen(function* () {
+                  if (
+                    error.phase !== "transport" ||
+                    error.message !== "Managed input cannot close before start or after exit."
+                  )
+                    return yield* Effect.fail(error);
+                  // A native worker may close first. Accept that race only after its owned drain.
+                  const receipt = yield* promiseEffect(() =>
+                    waitSignal(exitTask!, controller.signal),
+                  );
+                  if (
+                    receipt.childExitCode !== 0 ||
+                    receipt.childPid !== childPid ||
+                    receipt.unit !== child.owner.unit ||
+                    receipt.invocation !== child.owner.invocation ||
+                    receipt.cgroup !== child.owner.cgroup ||
+                    receipt.ownerPid !== child.owner.pid ||
+                    receipt.memoryBytes !== child.owner.memoryBytes ||
+                    receipt.swapBytes !== child.owner.swapBytes ||
+                    receipt.oomGroup !== child.owner.oomGroup ||
+                    (receipt.kernel !== "removed" &&
+                      !receipt.kernel.split("\n").includes("populated 0"))
+                  )
+                    return yield* Effect.fail(error);
+                }),
+              ),
+            );
             drain = yield* promiseEffect(() => waitSignal(exitTask!, controller.signal));
             yield* promiseEffect(() =>
               waitSignal(
@@ -725,7 +753,7 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
                 controller.signal,
               ),
             );
-            if (fatal || !readerEnded || drain.childExitCode !== 0)
+            if (fatal || controller.signal.aborted || !readerEnded || drain.childExitCode !== 0)
               return yield* failure("DRAIN_BARRIER");
           });
           const cleanup = Effect.gen(function* () {
