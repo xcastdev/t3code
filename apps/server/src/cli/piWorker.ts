@@ -10,15 +10,21 @@ class PiWorkerCliError extends CliError.UserError {
   }
 }
 
+// Private argv must never reach the general parser's error/help reporter.
+export const runPiWorkerInvocation = (args: ReadonlyArray<string>) =>
+  Effect.tryPromise({
+    try: () => {
+      const launch = args[0];
+      if (args.length !== 1 || launch === undefined) throw Error("PI_WORKER_INVALID_LAUNCH");
+      return runPiWorkerEntrypoint(launch);
+    },
+    catch: () => new PiWorkerCliError({ cause: "PI_WORKER_OPERATION_FAILED" }),
+  });
+
 /** Executables host the same private worker as the npm sibling entry. */
 export const piWorkerCommand = Command.make("__pi-worker", {
   launch: Argument.string("launch"),
 }).pipe(
   Command.unlisted,
-  Command.withHandler(({ launch }) =>
-    Effect.tryPromise({
-      try: () => runPiWorkerEntrypoint(launch),
-      catch: () => new PiWorkerCliError({ cause: "PI_WORKER_OPERATION_FAILED" }),
-    }),
-  ),
+  Command.withHandler(({ launch }) => runPiWorkerInvocation([launch])),
 );

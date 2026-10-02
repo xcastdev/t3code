@@ -27,7 +27,7 @@ import * as CliError from "effect/unstable/cli/CliError";
 import * as TestConsole from "effect/testing/TestConsole";
 import { Command } from "effect/unstable/cli";
 
-import { cli, makeCli } from "./bin.ts";
+import { cli, makeCli, runCliInvocation } from "./bin.ts";
 import * as ServiceLauncherClient from "./cloud/serviceLauncherClient.ts";
 import {
   SERVICE_LAUNCHER_CONTEXT_ENV,
@@ -77,7 +77,7 @@ const runCli = (args: ReadonlyArray<string>, command = cli) =>
   Command.runWith(command, { version: "0.0.0" })(args);
 const runConnectCli = (args: ReadonlyArray<string>) => runCli(args, connectCli);
 const runCliWithRuntime = (args: ReadonlyArray<string>) =>
-  runCli(args).pipe(Effect.provide(CliRuntimeLayer));
+  runCliInvocation(args).pipe(Effect.provide(CliRuntimeLayer));
 
 it.effect(
   "routes the private Pi worker before server startup and redacts invalid launch data",
@@ -91,6 +91,23 @@ it.effect(
       assert.notInclude(error.message + String(error.cause), "private-launch-input");
     }),
 );
+
+for (const [name, args] of [
+  ["missing launch", []],
+  ["excess private launch", ['{"private":"pi-private-parse-marker"}', "pi-private-parse-marker"]],
+  ["option-like launch", ["--pi-private-parse-marker"]],
+  ["malformed launch", ["pi-private-parse-marker"]],
+  ["oversized launch", ["pi-private-parse-marker".repeat(10_000)]],
+] as const) {
+  it.effect(`redacts private worker ${name} before general CLI parsing`, () =>
+    Effect.gen(function* () {
+      const error = yield* runCliWithRuntime(["__pi-worker", ...args]).pipe(Effect.flip);
+      assert.equal(error.message, "PI_WORKER_OPERATION_FAILED");
+      assert.notInclude(error.message + String(error.cause), "pi-private-parse-marker");
+      assert.isEmpty(yield* TestConsole.logLines);
+    }).pipe(Effect.provide(TestConsole.layer)),
+  );
+}
 
 const captureStdout = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.gen(function* () {

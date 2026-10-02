@@ -20,7 +20,7 @@ import { serviceCommand } from "./cli/service.ts";
 import { uninstallCommand } from "./cli/uninstall.ts";
 import { updateCommand } from "./cli/update.ts";
 import { claudeHistoryCommand } from "./cli/claudeHistory.ts";
-import { piWorkerCommand } from "./cli/piWorker.ts";
+import { piWorkerCommand, runPiWorkerInvocation } from "./cli/piWorker.ts";
 import { serviceLauncherCommand } from "./cli/serviceLauncher.ts";
 import { servicePreflightCommand } from "./cli/servicePreflight.ts";
 import { sshHelperCommand } from "./cli/sshHelper.ts";
@@ -80,6 +80,11 @@ export const makeCli = ({ cloudEnabled = hasCloudPublicConfig } = {}) =>
 
 export const cli = makeCli();
 
+export const runCliInvocation = (args: ReadonlyArray<string>) =>
+  args[0] === "__pi-worker"
+    ? runPiWorkerInvocation(args.slice(1))
+    : Command.runWith(cli, { version: packageJson.version })(args);
+
 if (
   isEntrypoint({
     moduleUrl: import.meta.url,
@@ -87,9 +92,18 @@ if (
     runtimeMain: import.meta.main,
   })
 ) {
-  Command.run(cli, { version: packageJson.version }).pipe(
-    Effect.scoped,
-    Effect.provide(CliRuntimeLayer),
-    NodeRuntime.runMain,
-  );
+  const args = process.argv.slice(2);
+  if (args[0] === "__pi-worker") {
+    // Worker stdout carries protocol frames, including when launch validation fails.
+    void Effect.runPromise(runPiWorkerInvocation(args.slice(1))).catch(() => {
+      process.stderr.write("PI_WORKER_OPERATION_FAILED\n");
+      process.exitCode = 1;
+    });
+  } else {
+    runCliInvocation(args).pipe(
+      Effect.scoped,
+      Effect.provide(CliRuntimeLayer),
+      NodeRuntime.runMain,
+    );
+  }
 }
