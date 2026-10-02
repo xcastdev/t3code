@@ -1415,38 +1415,39 @@ const WsProjectsWriteFileRpc = Rpc.make(WS_METHODS.projectsWriteFile, {
   error: Schema.Union([ProjectWriteFileError, EnvironmentAuthorizationError]),
 });
 
+// Forward-compatible application failures still obey the JSON wire boundary.
 const WsProjectWorkBindIssueRepositoryRpc = Rpc.make(WS_METHODS.projectWorkBindIssueRepository, {
   payload: ProjectIssueRepositoryBindInput,
   success: ProjectIssueRepositoryBindReceipt,
-  error: Schema.Unknown,
+  error: Schema.Json,
 });
 const WsProjectWorkRepositoryBindingsRpc = Rpc.make(WS_METHODS.projectWorkRepositoryBindings, {
   payload: ProjectIssueRepositoryBindingsInput,
   success: ProjectIssueRepositoryBindingsRead,
-  error: Schema.Unknown,
+  error: Schema.Json,
 });
 const WsProjectWorkReadRpc = Rpc.make(WS_METHODS.projectWorkRead, {
   payload: ProjectWorkReadIntent,
   success: Schema.Unknown,
-  error: Schema.Unknown,
+  error: Schema.Json,
 });
 
 const WsProjectWorkWriteRpc = Rpc.make(WS_METHODS.projectWorkWrite, {
   payload: ProjectWorkWriteIntent,
   success: ProjectWorkWriteResult,
-  error: Schema.Unknown,
+  error: Schema.Json,
 });
 
 const WsProjectWorkRequestApprovalRpc = Rpc.make(WS_METHODS.projectWorkRequestApproval, {
   payload: ProjectWorkApprovalRequest,
   success: ProjectWorkApprovalGrant,
-  error: Schema.Unknown,
+  error: Schema.Json,
 });
 
 const WsProjectWorkSubscribeRpc = Rpc.make(WS_METHODS.projectWorkSubscribe, {
   payload: ProjectWorkStreamInput,
   success: ProjectWorkStreamItem,
-  error: Schema.Unknown,
+  error: Schema.Json,
   stream: true,
 });
 

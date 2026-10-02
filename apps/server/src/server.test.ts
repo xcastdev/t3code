@@ -78,6 +78,7 @@ import * as PubSub from "effect/PubSub";
 import * as Ref from "effect/Ref";
 import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
+import type * as Result from "effect/Result";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as Tracer from "effect/Tracer";
@@ -138,7 +139,19 @@ import {
 import * as ProjectionSnapshotQuery from "./orchestration/Services/ProjectionSnapshotQuery.ts";
 import { ThreadDeletionReactor } from "./orchestration/Services/ThreadDeletionReactor.ts";
 import * as PullRequestSyncReactor from "./orchestration/PullRequestSyncReactor.ts";
-import { SqlitePersistenceMemory } from "./persistence/Layers/Sqlite.ts";
+import {
+  SqlitePersistenceMemory,
+  layerConfig as NativeSqlitePersistence,
+} from "./persistence/Layers/Sqlite.ts";
+import * as Context from "effect/Context";
+import * as SqlClient from "effect/unstable/sql/SqlClient";
+import {
+  ProjectWorkTaskId,
+  ProjectWorkTaskRead,
+  ProjectWorkStreamItem,
+  AuthOrchestrationReadScope,
+  AuthTerminalOperateScope,
+} from "@t3tools/contracts";
 import { OrchestrationEventStoreLive } from "./persistence/Layers/OrchestrationEventStore.ts";
 import { OrchestrationEventStore } from "./persistence/Services/OrchestrationEventStore.ts";
 import { PersistenceSqlError } from "./persistence/Errors.ts";
@@ -414,9 +427,9 @@ const browserOtlpTracingLayer = Layer.mergeAll(
   Layer.succeed(HttpClient.TracerDisabledWhen, () => true),
 );
 
-const makeAuthTestLayer = () =>
+const makeAuthTestLayer = (nativePersistence = false) =>
   EnvironmentAuth.layer.pipe(
-    Layer.provideMerge(SqlitePersistenceMemory),
+    Layer.provideMerge(nativePersistence ? NativeSqlitePersistence : SqlitePersistenceMemory),
     Layer.provide(ServerSecretStore.layer),
     Layer.provide(
       Layer.mock(ServerEnvironment.ServerEnvironmentIdentity)({
@@ -526,6 +539,7 @@ const makeBrowserOtlpPayload = (spanName: string) =>
   });
 
 const buildAppUnderTest = (options?: {
+  nativeAuthPersistence?: boolean;
   onPairingChangesSubscribed?: Effect.Effect<void>;
   config?: Partial<ServerConfig.ServerConfig["Service"]>;
   layers?: {
@@ -852,6 +866,7 @@ const buildAppUnderTest = (options?: {
           getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
           updateSettings: () => Effect.succeed(DEFAULT_SERVER_SETTINGS),
           streamChanges: Stream.empty,
+          subscribeChanges: Effect.succeed(Stream.empty),
           ...options?.layers?.serverSettings,
         }),
       ),
@@ -1226,7 +1241,7 @@ const buildAppUnderTest = (options?: {
           ),
         };
       }),
-      Layer.provideMerge(makeAuthTestLayer()),
+      Layer.provideMerge(makeAuthTestLayer(options?.nativeAuthPersistence)),
       Layer.provideMerge(ServerSecretStore.layer),
       Layer.provide(workspaceAndProjectServicesLayer),
       Layer.provideMerge(FetchHttpClient.layer),
@@ -1234,8 +1249,8 @@ const buildAppUnderTest = (options?: {
       Layer.provide(layerConfig),
     );
 
-    yield* Layer.build(appLayer);
-    return config;
+    const serviceContext = yield* Layer.build(appLayer);
+    return { ...config, serviceContext };
   });
 
 const parseSessionCookieFromWsUrl = (
@@ -13160,3 +13175,469 @@ it.live(
     }).pipe(Effect.provide(NodeServices.layer)),
   120_000,
 );
+
+const projectWorkRpcFailure = (result: Result.Result<unknown, unknown>) => {
+  if (result._tag !== "Failure") throw Error("Expected the native RPC to fail");
+  return result.failure;
+};
+const projectWorkRpcFailureReason = Schema.decodeUnknownSync(
+  Schema.Struct({ reason: Schema.String }),
+);
+const projectWorkRpcFailureScope = Schema.decodeUnknownSync(
+  Schema.Struct({ requiredScope: Schema.String }),
+);
+const projectWorkRpcProject = ProjectId.make("native-ws-split-project");
+const projectWorkRpcTask = ProjectWorkTaskId.make("native-ws-split-task");
+const projectWorkRpcAt = "2026-10-01T00:00:00.000Z";
+const createProjectWorkRpcTask = (suffix = "") => ({
+  type: "project-work.task.create" as const,
+  commandId: CommandId.make(`native-ws-task-create${suffix}`),
+  projectId: projectWorkRpcProject,
+  taskId: ProjectWorkTaskId.make(`${projectWorkRpcTask}${suffix}`),
+  title: `Native RPC task${suffix}`,
+  createdAt: projectWorkRpcAt,
+});
+const projectWorkRpcApproval = {
+  projectId: projectWorkRpcProject,
+  taskId: projectWorkRpcTask,
+  specRevision: 0,
+  payloadFingerprint: "native-fingerprint",
+  agentId: "native-worker",
+};
+const projectWorkRpcBinding = {
+  projectId: projectWorkRpcProject,
+  expectedRepositoryKey: { host: "github.com", repositoryNodeId: "R_native_fixture" },
+  expectedTargetBindingRevision: null,
+  accountLogin: "fixture-user",
+};
+
+const buildProjectWorkRpcFixture = (enabled = true) =>
+  Effect.gen(function* () {
+    yield* TestClock.setTime(Date.parse(projectWorkRpcAt));
+    const settings = yield* Ref.make({ ...DEFAULT_SERVER_SETTINGS, projectWorkEnabled: enabled });
+    const app = yield* buildAppUnderTest({
+      nativeAuthPersistence: true,
+      layers: { serverSettings: { getSettings: Ref.get(settings) } },
+    });
+    const sql = Context.get(app.serviceContext, SqlClient.SqlClient);
+    yield* sql`INSERT INTO projection_projects(project_id,title,workspace_root,scripts_json,created_at,updated_at) VALUES(${projectWorkRpcProject},'Native split project',${app.baseDir},'[]',${projectWorkRpcAt},${projectWorkRpcAt})`;
+    const url = yield* getWsServerUrl("/ws");
+    return { app, sql, settings, url };
+  });
+
+it.layer(NodeServices.layer)("ProjectWork RPC JSON transport", (it) => {
+  it.effect(
+    "serves actual read, bindings-list, write, approval and subscription RPCs with native SQLite and auth",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* buildProjectWorkRpcFixture();
+        yield* withWsRpcClient(f.url, (client) =>
+          Effect.gen(function* () {
+            assert.deepEqual(
+              yield* client[WS_METHODS.projectWorkRead]({
+                projectId: projectWorkRpcProject,
+                operation: "tasks",
+              }),
+              [],
+            );
+            assert.deepEqual(
+              yield* client[WS_METHODS.projectWorkRepositoryBindings]({
+                projectId: projectWorkRpcProject,
+              }),
+              { items: [] },
+            );
+            const receipt = yield* client[WS_METHODS.projectWorkWrite](createProjectWorkRpcTask());
+            assert.isDefined(receipt);
+            const tasks = yield* client[WS_METHODS.projectWorkRead]({
+              projectId: projectWorkRpcProject,
+              operation: "tasks",
+            })
+
+              .pipe(Effect.flatMap(Schema.decodeUnknownEffect(Schema.Array(ProjectWorkTaskRead))));
+            assert.equal(tasks[0]?.taskId, projectWorkRpcTask);
+            const rows =
+              yield* f.sql`SELECT payload_json FROM project_work_events WHERE project_id=${projectWorkRpcProject}`;
+            assert.equal(rows.length, 1);
+            const grant =
+              yield* client[WS_METHODS.projectWorkRequestApproval](projectWorkRpcApproval);
+            assert.equal(grant.approval.taskId, projectWorkRpcTask);
+            assert.equal(
+              (yield* f.sql`SELECT source_kind FROM project_work_approvals WHERE project_id=${projectWorkRpcProject}`)[0]
+                ?.source_kind,
+              "web",
+            );
+            const items = yield* client[WS_METHODS.projectWorkSubscribe]({
+              projectId: projectWorkRpcProject,
+              requestCompletionMarker: true,
+            })
+
+              .pipe(Stream.take(2), Stream.runCollect);
+            if (items[0]?.kind !== "delta") throw Error("Expected the committed task delta");
+            assert.equal(items[0].delta.recordId, projectWorkRpcTask);
+            assert.equal(items[1]?.kind, "synchronized");
+          }),
+        );
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+  it.effect(
+    "preserves actual native binding feature-off errors across the unchanged RPC codec",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* buildProjectWorkRpcFixture(false);
+        yield* withWsRpcClient(f.url, (client) =>
+          Effect.gen(function* () {
+            const failure = yield* client[WS_METHODS.projectWorkBindIssueRepository](
+              projectWorkRpcBinding,
+            )
+
+              .pipe(Effect.result);
+            assert.equal(failure._tag, "Failure");
+            assert.equal(
+              projectWorkRpcFailureReason(projectWorkRpcFailure(failure)).reason,
+              "feature-disabled",
+            );
+          }),
+        );
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+  it.effect(
+    "returns an authoritative disabled error for writes and approval without persisting effects",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* buildProjectWorkRpcFixture(false);
+        yield* withWsRpcClient(f.url, (client) =>
+          Effect.gen(function* () {
+            const write = yield* client[WS_METHODS.projectWorkWrite](createProjectWorkRpcTask())
+
+              .pipe(Effect.result);
+            assert.equal(write._tag, "Failure");
+            assert.equal(
+              projectWorkRpcFailureReason(projectWorkRpcFailure(write)).reason,
+              "project-work-disabled",
+            );
+            const approval = yield* client[WS_METHODS.projectWorkRequestApproval](
+              projectWorkRpcApproval,
+            )
+
+              .pipe(Effect.result);
+            assert.equal(approval._tag, "Failure");
+            assert.equal(
+              projectWorkRpcFailureReason(projectWorkRpcFailure(approval)).reason,
+              "project-work-disabled",
+            );
+            assert.equal(
+              (yield* f.sql`SELECT * FROM project_work_events WHERE project_id=${projectWorkRpcProject}`)
+                .length,
+              0,
+            );
+          }),
+        );
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+  it.effect("denies read and streaming to a terminal-only paired session", () =>
+    Effect.gen(function* () {
+      const f = yield* buildProjectWorkRpcFixture();
+      const auth = Context.get(f.app.serviceContext, EnvironmentAuth.EnvironmentAuth);
+      const pairing = yield* auth.issuePairingCredential({ scopes: [AuthTerminalOperateScope] });
+      const url = yield* getWsServerUrl("/ws", { credential: pairing.credential });
+      yield* withWsRpcClient(url, (client) =>
+        Effect.gen(function* () {
+          const read = yield* client[WS_METHODS.projectWorkRead]({
+            projectId: projectWorkRpcProject,
+            operation: "tasks",
+          })
+
+            .pipe(Effect.result);
+          assert.equal(read._tag, "Failure");
+          assert.equal(
+            projectWorkRpcFailureScope(projectWorkRpcFailure(read)).requiredScope,
+            AuthOrchestrationReadScope,
+          );
+          const streamed = yield* client[WS_METHODS.projectWorkSubscribe]({
+            projectId: projectWorkRpcProject,
+          })
+
+            .pipe(Stream.runHead, Effect.result);
+          assert.equal(streamed._tag, "Failure");
+          assert.equal(
+            projectWorkRpcFailureScope(projectWorkRpcFailure(streamed)).requiredScope,
+            AuthOrchestrationReadScope,
+          );
+        }),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+  it.effect("denies write, approval and repository binding to a read-only paired session", () =>
+    Effect.gen(function* () {
+      const f = yield* buildProjectWorkRpcFixture();
+      const auth = Context.get(f.app.serviceContext, EnvironmentAuth.EnvironmentAuth);
+      const pairing = yield* auth.issuePairingCredential({ scopes: [AuthOrchestrationReadScope] });
+      const url = yield* getWsServerUrl("/ws", { credential: pairing.credential });
+      yield* withWsRpcClient(url, (client) =>
+        Effect.gen(function* () {
+          assert.deepEqual(
+            yield* client[WS_METHODS.projectWorkRead]({
+              projectId: projectWorkRpcProject,
+              operation: "tasks",
+            }),
+            [],
+          );
+          assert.deepEqual(
+            yield* client[WS_METHODS.projectWorkRepositoryBindings]({
+              projectId: projectWorkRpcProject,
+            }),
+            { items: [] },
+          );
+          for (const effect of [
+            client[WS_METHODS.projectWorkWrite](createProjectWorkRpcTask()).pipe(Effect.asVoid),
+            client[WS_METHODS.projectWorkRequestApproval](projectWorkRpcApproval).pipe(
+              Effect.asVoid,
+            ),
+            client[WS_METHODS.projectWorkBindIssueRepository](projectWorkRpcBinding).pipe(
+              Effect.asVoid,
+            ),
+          ]) {
+            const result = yield* effect.pipe(Effect.result);
+            assert.equal(result._tag, "Failure");
+            assert.equal(
+              projectWorkRpcFailureScope(projectWorkRpcFailure(result)).requiredScope,
+              "orchestration:operate",
+            );
+          }
+          assert.equal(
+            (yield* f.sql`SELECT * FROM project_work_events WHERE project_id=${projectWorkRpcProject}`)
+              .length,
+            0,
+          );
+        }),
+      );
+    }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+});
+
+import * as SessionStore from "./auth/SessionStore.ts";
+const ProjectWorkRpcRawResponse = Schema.Union([
+  Schema.Struct({
+    _tag: Schema.Literal("Chunk"),
+    requestId: Schema.Number,
+    values: Schema.Array(ProjectWorkStreamItem),
+  }),
+  Schema.Struct({ _tag: Schema.Literal("Exit"), requestId: Schema.Number, exit: Schema.Unknown }),
+]);
+type ProjectWorkRpcRawResponse = typeof ProjectWorkRpcRawResponse.Type;
+const decodeProjectWorkRpcRawResponse = Schema.decodeUnknownSync(ProjectWorkRpcRawResponse);
+const decodeProjectWorkRpcInterrupt = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    _tag: Schema.Literal("Failure"),
+    cause: Schema.Array(
+      Schema.Struct({ _tag: Schema.Literal("Interrupt"), fiberId: Schema.Number }),
+    ),
+  }),
+);
+const decodeProjectWorkRpcGuardExit = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    _tag: Schema.Literal("Failure"),
+    cause: Schema.Array(
+      Schema.Struct({ _tag: Schema.Literal("Fail"), error: EnvironmentAuthorizationError }),
+    ),
+  }),
+);
+const decodeProjectWorkRpcReadExit = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    _tag: Schema.Literal("Success"),
+    value: Schema.Array(ProjectWorkTaskRead),
+  }),
+);
+
+const withRawProjectWorkRpcSocket = <A, E, R>(
+  wsUrl: string,
+  use: (transport: {
+    send: (message: unknown) => void;
+    waitFor: (tag: "Chunk" | "Exit", id: number) => Promise<ProjectWorkRpcRawResponse>;
+  }) => Effect.Effect<A, E, R>,
+) =>
+  Effect.gen(function* () {
+    const { cookie, url } = parseSessionCookieFromWsUrl(wsUrl);
+    const waiting = new Map<
+      string,
+      {
+        resolve: (message: ProjectWorkRpcRawResponse) => void;
+        reject: (error: unknown) => void;
+      }
+    >();
+    const parser = RpcSerialization.json.makeUnsafe();
+    const socket = yield* Effect.acquireRelease(
+      Effect.promise(
+        () =>
+          new Promise<NodeSocket.NodeWS.WebSocket>((resolve, reject) => {
+            const socket = new NodeSocket.NodeWS.WebSocket(
+              url,
+              cookie ? { headers: { cookie } } : undefined,
+            );
+            socket.on("error", (error) => {
+              reject(error);
+              for (const pending of waiting.values()) pending.reject(error);
+            });
+            socket.on("message", (data) => {
+              try {
+                for (const encoded of parser.decode(data.toString())) {
+                  const message = decodeProjectWorkRpcRawResponse(encoded);
+                  const key = `${message._tag}:${message.requestId}`;
+                  waiting.get(key)?.resolve(message);
+                  waiting.delete(key);
+                }
+              } catch (error) {
+                for (const pending of waiting.values()) pending.reject(error);
+              }
+            });
+            socket.once("open", () => resolve(socket));
+          }),
+      ),
+      (socket) =>
+        Effect.promise(
+          () =>
+            new Promise<void>((resolve) => {
+              socket.once("close", () => resolve());
+              socket.terminate();
+            }),
+        ),
+    );
+    const waitFor = (tag: "Chunk" | "Exit", id: number) =>
+      new Promise<ProjectWorkRpcRawResponse>((resolve, reject) =>
+        waiting.set(`${tag}:${id}`, { resolve, reject }),
+      );
+    const send = (message: unknown) => {
+      const encoded = parser.encode(message);
+      if (encoded === undefined) throw new Error("RPC request was not encoded.");
+      socket.send(encoded);
+    };
+    return yield* use({ send, waitFor });
+  }).pipe(Effect.scoped);
+
+it.layer(NodeServices.layer)("ProjectWork RPC lifetime", (it) => {
+  it.effect(
+    "returns an interrupt receipt when a native subscription is cancelled and keeps the connection usable",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* buildProjectWorkRpcFixture();
+        yield* withRawProjectWorkRpcSocket(f.url, ({ send, waitFor }) =>
+          Effect.gen(function* () {
+            const marker = waitFor("Chunk", 101);
+            send({
+              _tag: "Request",
+              id: 101,
+              tag: WS_METHODS.projectWorkSubscribe,
+              payload: { projectId: projectWorkRpcProject, requestCompletionMarker: true },
+              headers: [],
+            });
+            const chunk = yield* Effect.promise(() => marker);
+            if (chunk._tag !== "Chunk") throw new Error("Expected a subscription chunk.");
+            assert.equal(chunk.values[0]?.kind, "synchronized");
+            const interrupted = waitFor("Exit", 101);
+            send({ _tag: "Ack", requestId: 101 });
+            send({ _tag: "Interrupt", requestId: 101 });
+            const cancellation = yield* Effect.promise(() => interrupted);
+            if (cancellation._tag !== "Exit") throw new Error("Expected an interrupt exit.");
+            assert.equal((yield* decodeProjectWorkRpcInterrupt(cancellation.exit)).cause.length, 1);
+            const response = waitFor("Exit", 102);
+            send({
+              _tag: "Request",
+              id: 102,
+              tag: WS_METHODS.projectWorkRead,
+              payload: { projectId: projectWorkRpcProject, operation: "tasks" },
+              headers: [],
+            });
+            const read = yield* Effect.promise(() => response);
+            if (read._tag !== "Exit") throw new Error("Expected a read exit.");
+            assert.deepEqual((yield* decodeProjectWorkRpcReadExit(read.exit)).value, []);
+          }),
+        );
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+  it.effect(
+    "rechecks durable revocation on open agent connections and before live stream delivery",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* buildProjectWorkRpcFixture();
+        const auth = Context.get(f.app.serviceContext, EnvironmentAuth.EnvironmentAuth);
+        const sessions = Context.get(f.app.serviceContext, SessionStore.SessionStore);
+        // Issue the fixture's agent identity at the native session-store boundary.
+        // Authentication, revocation, SQL, publication and all RPC guards remain native.
+        const issued = yield* sessions.issue({
+          subject: "agent:rpc-revocation-control",
+          scopes: ["orchestration:read", "orchestration:operate"],
+        });
+        const agentUrl = appendSessionCookieToWsUrl(
+          parseSessionCookieFromWsUrl(f.url).url,
+          `${sessions.cookieName}=${issued.token}`,
+        );
+        yield* withRawProjectWorkRpcSocket(agentUrl, ({ send, waitFor }) =>
+          Effect.gen(function* () {
+            const marker = waitFor("Chunk", 201);
+            send({
+              _tag: "Request",
+              id: 201,
+              tag: WS_METHODS.projectWorkSubscribe,
+              payload: { projectId: projectWorkRpcProject, requestCompletionMarker: true },
+              headers: [],
+            });
+            const chunk = yield* Effect.promise(() => marker);
+            if (chunk._tag !== "Chunk") throw new Error("Expected a subscription chunk.");
+            assert.equal(chunk.values[0]?.kind, "synchronized");
+            send({ _tag: "Ack", requestId: 201 });
+            assert.isTrue(yield* auth.revokeSession(issued.sessionId));
+            const revokedStream = waitFor("Exit", 201);
+            yield* withWsRpcClient(f.url, (client) =>
+              client[WS_METHODS.projectWorkWrite](createProjectWorkRpcTask("-published")),
+            );
+            const stream = yield* Effect.promise(() => revokedStream);
+            if (stream._tag !== "Exit") throw new Error("Expected a revoked subscription exit.");
+            const streamFailure = yield* decodeProjectWorkRpcGuardExit(stream.exit);
+            assert.equal(streamFailure.cause[0]?.error.requiredScope, "orchestration:read");
+            const operations = [
+              {
+                id: 202,
+                tag: WS_METHODS.projectWorkRead,
+                payload: { projectId: projectWorkRpcProject, operation: "tasks" },
+                scope: "orchestration:read",
+              },
+              {
+                id: 203,
+                tag: WS_METHODS.projectWorkWrite,
+                payload: createProjectWorkRpcTask("-denied"),
+                scope: "orchestration:operate",
+              },
+            ];
+            for (const operation of operations) {
+              const response = waitFor("Exit", operation.id);
+              send({
+                _tag: "Request",
+                id: operation.id,
+                tag: operation.tag,
+                payload: operation.payload,
+                headers: [],
+              });
+              const exit = yield* Effect.promise(() => response);
+              if (exit._tag !== "Exit") throw new Error("Expected a revoked operation exit.");
+              assert.equal(
+                (yield* decodeProjectWorkRpcGuardExit(exit.exit)).cause[0]?.error.requiredScope,
+                operation.scope,
+              );
+            }
+            assert.equal(
+              (yield* f.sql<{
+                count: number;
+              }>`SELECT COUNT(*) AS count FROM project_work_events WHERE project_id=${projectWorkRpcProject}`)[0]
+                ?.count,
+              1,
+            );
+            assert.equal(
+              (yield* f.sql`SELECT * FROM project_work_approvals WHERE project_id=${projectWorkRpcProject}`)
+                .length,
+              0,
+            );
+          }),
+        );
+      }).pipe(Effect.provide(NodeHttpServer.layerTest)),
+  );
+});
