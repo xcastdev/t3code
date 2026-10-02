@@ -2,6 +2,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
+import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
+import * as TestClock from "effect/testing/TestClock";
+import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
@@ -21,9 +25,13 @@ import { ProjectWorkProjectionLive } from "../../projectWork/ProjectWorkProjecti
 import {
   providerInstanceId,
   threadId,
+  seed,
+  restoreHistoricalBinding,
+  at,
 } from "../../projectWork/ProjectTeamAuthorization.testFixtures.ts";
 import * as ServerSettings from "../../serverSettings.ts";
-import { PiModelCatalogue } from "./PiModelCatalogue.ts";
+import { PiModelCatalogue, makePiModelCatalogue } from "./PiModelCatalogue.ts";
+import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import * as Runtime from "./PiManagedRuntimeLive.ts";
 import { makePiProductionRuntime, type PiProductionRuntimeOptions } from "./PiProductionRuntime.ts";
 
@@ -63,6 +71,7 @@ const fixture = Effect.gen(function* () {
   yield* fs.makeDirectory(protectedRoot);
   let reads = 0;
   let refreshes = 0;
+  let revalidationCalls = 0;
   const fetch = vi.fn<typeof globalThis.fetch>(async () => new Response("fixture"));
   const catalogue = PiModelCatalogue.of({
     readFresh: Effect.sync(() => {
@@ -104,7 +113,16 @@ const fixture = Effect.gen(function* () {
   const original = Runtime.makePiManagedRuntimeLive;
   vi.spyOn(Runtime, "makePiManagedRuntimeLive").mockImplementation((value) => {
     captured.push(value);
-    return original(value).pipe(
+    const actualRevalidation = value.revalidateRuntime;
+    const recorded = actualRevalidation
+      ? {
+          ...value,
+          revalidateRuntime: Effect.sync(() => {
+            revalidationCalls++;
+          }).pipe(Effect.andThen(actualRevalidation)),
+        }
+      : value;
+    return original(recorded).pipe(
       Effect.tap(() =>
         Effect.promise(async () => {
           const source = value.runtimeFiles[0]?.source;
@@ -128,6 +146,9 @@ const fixture = Effect.gen(function* () {
     catalogue,
     fetch,
     captured,
+    get revalidationCalls() {
+      return revalidationCalls;
+    },
     get reads() {
       return reads;
     },
@@ -559,4 +580,139 @@ product(
         expect(yield* f.fs.exists(f.options.stagingRoot)).toBe(false);
       }),
     ),
+);
+
+product("the approved Runtime consumes factory asset revalidation before durable allocation", () =>
+  scoped(
+    Effect.gen(function* () {
+      yield* TestClock.setTime(DateTime.toEpochMillis(DateTime.makeUnsafe(at)) + 100);
+      const assignment = yield* seed("investigator", "reserved", {
+        nativeSessionId: null,
+        roleTools: [],
+        toolIds: [],
+      });
+      const f = yield* fixture;
+      const primary = f.root + "/primary";
+      const assigned = f.root + "/assigned";
+      const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+      const git = (args: ReadonlyArray<string>) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const child = yield* spawner.spawn(ChildProcess.make("/usr/bin/git", args));
+            const [stdout, stderr, code] = yield* Effect.all(
+              [
+                collectUint8StreamText({ stream: child.stdout, maxBytes: 8192 }),
+                collectUint8StreamText({ stream: child.stderr, maxBytes: 8192 }),
+                child.exitCode,
+              ],
+              { concurrency: "unbounded" },
+            );
+            expect(Number(code)).toBe(0);
+            expect(stdout.truncated || stderr.truncated).toBe(false);
+          }),
+        );
+      yield* git(["init", "-q", primary]);
+      yield* git([
+        "-C",
+        primary,
+        "-c",
+        "user.name=Fixture",
+        "-c",
+        "user.email=fixture@example.test",
+        "commit",
+        "--allow-empty",
+        "-qm",
+        "initial",
+      ]);
+      yield* git(["-C", primary, "worktree", "add", "-qb", "task", assigned]);
+      const model = "inclusionai/ling-3.1-flash:free";
+      const role = { ...assignment.role, instructions: "Inspect the approved assignment", model };
+      yield* restoreHistoricalBinding(role);
+      const crypto = yield* Crypto.Crypto;
+      const instructionsHash = Buffer.from(
+        yield* crypto.digest("SHA-256", new TextEncoder().encode(role.instructions)),
+      ).toString("hex");
+      yield* restoreHistoricalBinding({
+        ...assignment.binding,
+        model,
+        worktree: assigned,
+        configuration: {
+          ...assignment.binding.configuration,
+          instructionsHash,
+          runtimeVersion: "0.99.1",
+          maxDurationMs: 300000,
+          maxTokens: 20000,
+        },
+      });
+      const sql = yield* SqlClient.SqlClient;
+      const source = "https://api.commandcode.ai/provider/v1/models";
+      yield* sql`INSERT INTO project_team_pi_catalogue(source, fetched_at, payload_json)
+    VALUES(${source}, ${at}, ${encode({
+      source,
+      fetchedAt: at,
+      selectedEntry: {
+        id: model,
+        owned_by: "command-code",
+        context_length: 20000,
+        supported_endpoints: ["/chat/completions"],
+      },
+    })})`;
+      const catalogue = yield* makePiModelCatalogue.pipe(
+        Effect.provide(FetchHttpClient.layer),
+        Effect.provideService(FetchHttpClient.Fetch, f.fetch),
+      );
+      const service = yield* makePiProductionRuntime({
+        ...f.options,
+        environmentId: "environment",
+      }).pipe(
+        Effect.provideService(PiModelCatalogue, catalogue),
+        Effect.provideService(FetchHttpClient.Fetch, f.fetch),
+      );
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          const managed = yield* service.forInstance(instance);
+          expect(f.revalidationCalls).toBe(0);
+          const prepared = yield* managed.prepareOperation(
+            { kind: "initialize", threadId },
+            () => Effect.void,
+          );
+          expect(f.revalidationCalls).toBe(1);
+          const before =
+            yield* sql`SELECT unit, allocation_json, status FROM project_team_pi_process`;
+          expect(before).toHaveLength(1);
+          expect(before[0]?.status).toBe("allocated");
+          yield* managed.stopAll;
+          const drained =
+            yield* sql`SELECT unit, allocation_json, status FROM project_team_pi_process`;
+          expect(drained[0]?.status).toBe("drained");
+          const file = f.captured[0]!.runtimeFiles.find(
+            (entry) => entry.target === "/runtime/dist/pi-worker.mjs",
+          )!;
+          const original = yield* Effect.promise(() => nativeFS.stat(file.source));
+          // Change the captured inode's bytes, then restore its read-only mode. Path-only
+          // preallocation would admit this file; the actual Assets identity read rejects it.
+          yield* Effect.promise(async () => {
+            await nativeFS.chmod(file.source, (original.mode & 0o777) | 0o200);
+            await nativeFS.appendFile(file.source, "\n// changed after asset capture\n");
+            await nativeFS.chmod(file.source, original.mode & 0o777);
+          });
+          const failed = yield* failure(
+            managed.prepareOperation({ kind: "initialize", threadId }, () => Effect.void),
+          );
+          if (failed._tag === "Failure")
+            expect(failed.failure).toMatchObject({
+              code: "unavailable",
+              detail: "Pi production runtime unavailable",
+            });
+          expect(f.revalidationCalls).toBe(2);
+          expect(
+            yield* sql`SELECT unit, allocation_json, status FROM project_team_pi_process`,
+          ).toEqual(drained);
+          expect(yield* sql`SELECT operation_id FROM project_team_pi_operation`).toHaveLength(1);
+          expect(f.fetch).not.toHaveBeenCalled();
+          expect(prepared.operation.operationKind).toBe("initialize");
+        }),
+      );
+    }),
+  ),
 );
