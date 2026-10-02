@@ -209,7 +209,9 @@ it.effect(
           },
         }).pipe(Effect.result))._tag,
       ).toBe("Failure");
-      yield* f.change(decodeRecord({ ...f.binding, revision: 1, status: "revoked" }));
+      yield* f.change(
+        decodeRecord({ ...f.binding, revision: f.binding.revision + 1, status: "revoked" }),
+      );
       expect((yield* invoke("project_work_write", input).pipe(Effect.result))._tag).toBe("Failure");
     }).pipe(Effect.provide(Layer.fresh(gatewayRuntime))),
 );
