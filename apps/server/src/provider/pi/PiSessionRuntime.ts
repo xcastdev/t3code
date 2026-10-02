@@ -383,6 +383,9 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
           let brokerTask: Promise<void> | undefined;
           let toolTask: Promise<void> | undefined;
           let toolCall: PiWorkerToolCall | undefined;
+          let localOutput:
+            | { readonly transferId: string; readonly capability: PiSessionToolCapability }
+            | undefined;
           let toolStarted = Promise.withResolvers<void>();
           let ack:
             | {
@@ -488,6 +491,13 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
           const dispatch = async (raw: string) => {
             const frame = freezeJson(decodePiWorkerFrame(raw));
             protocol.acceptWorker(frame);
+            if (
+              frame.message.type === "transfer-end" &&
+              localOutput?.transferId === frame.message.transferId
+            ) {
+              await authorize("beforeToolReturn", localOutput.capability);
+              localOutput = undefined;
+            }
             const observer = callbacks.onWorkerFrame;
             if (observer) await callback(() => observer(frame, controller.signal));
             const message = frame.message;
@@ -547,6 +557,19 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
                 toolCall = message;
                 toolStarted = Promise.withResolvers<void>();
                 break;
+              case "tool-result": {
+                const capability = toolCall && capabilities.get(toolCall.toolName);
+                if (
+                  !toolCall ||
+                  toolCall.callId !== message.callId ||
+                  !capability ||
+                  capability.execution !== "local" ||
+                  localOutput
+                )
+                  throw failure("TOOL_CAPABILITY_INVALID");
+                localOutput = { transferId: message.output.transferId, capability };
+                break;
+              }
               case "transfer-end": {
                 if (!toolCall || message.transferId !== toolCall.input.transferId) break;
                 if (toolTask) throw failure("TOOL_TASK_CONCURRENT");
@@ -559,6 +582,7 @@ export const makePiSessionRuntime = Effect.fn("makePiSessionRuntime")(function* 
                 toolTask = tracked(
                   (async () => {
                     await authorize("beforeTool", capability);
+                    if (call.execution === "local") await authorize("beforeToolInvoke", capability);
                     send({ type: "tool-authorized", callId: call.callId, allowed: true });
                     if (call.execution === "local") return;
                     await waitSignal(toolStarted.promise, controller.signal);
