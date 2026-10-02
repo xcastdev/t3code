@@ -796,13 +796,20 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
       const stderr = yield* Queue.bounded<Uint8Array, PiManagedProcessError | Cause.Done>(32);
       let owner: PiManagedProcessOwner | undefined;
       let state: "owned" | "starting" | "running" | "stopped" = "owned";
+      let stopping = false;
       let childExitCode: number | null = null;
       let childPid: number | null = null;
       let closeInput = Effect.void;
       let awaitReaders = Effect.void;
       const stop = yield* Effect.cached(
         Effect.gen(function* () {
-          state = "stopped";
+          stopping = true;
+          // Canceled consumers cannot release a reader already blocked on a bounded offer.
+          // Keep receipt validation active while discarding its previously queued output.
+          if (childExitCode === null) {
+            yield* Queue.clear(stdout).pipe(Effect.ignore);
+            yield* Queue.clear(stderr).pipe(Effect.ignore);
+          }
           const capturedOwner = owner;
           if (!capturedOwner) {
             // The launcher is ours; an existing unit with the same nonce is not.
@@ -811,6 +818,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
             yield* closeInput.pipe(Effect.timeout("3 seconds"));
             yield* child.exitCode.pipe(Effect.timeout("3 seconds"));
             yield* awaitReaders.pipe(Effect.timeout("3 seconds"));
+            state = "stopped";
             yield* Queue.end(stdout);
             yield* Queue.end(stderr);
             return yield* fail(
@@ -838,6 +846,8 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
             yield* control("/usr/bin/systemctl", ["--user", "stop", unit]);
           yield* Queue.end(incoming);
           yield* child.exitCode.pipe(Effect.timeout("3 seconds"));
+          yield* awaitReaders.pipe(Effect.timeout("3 seconds"));
+          state = "stopped";
           const after = yield* readUnit();
           if (!["inactive", "failed"].includes(after.ActiveState) || after.ControlGroup)
             return yield* fail("quarantine", "Owned service remains active after stop.");
@@ -970,7 +980,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
             const bytes = Buffer.from(event.data, "base64");
             if (bytes.length > 8192 || bytes.toString("base64") !== event.data)
               return yield* fail("transport", "Worker output exceeded the byte framing bound.");
-            yield* Queue.offer(event.type === "stdout" ? stdout : stderr, bytes);
+            if (!stopping) yield* Queue.offer(event.type === "stdout" ? stdout : stderr, bytes);
             break;
           }
           case "exited":
@@ -1004,7 +1014,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         ),
         Effect.andThen(
           Effect.gen(function* () {
-            if (state !== "stopped" && childExitCode === null)
+            if (!stopping && childExitCode === null)
               return yield* fail("transport", "Owned process closed without an exit receipt.");
           }),
         ),
@@ -1021,7 +1031,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         Effect.interruptible,
         Effect.forkScoped,
       );
-      awaitReaders = Effect.all([Fiber.join(stdoutReader), Fiber.join(stderrReader)], {
+      awaitReaders = Effect.all([Fiber.await(stdoutReader), Fiber.await(stderrReader)], {
         concurrency: "unbounded",
       }).pipe(Effect.asVoid);
       const verified = yield* restore(
@@ -1070,7 +1080,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
           Effect.asVoid,
         );
       const start = Effect.gen(function* () {
-        if (state === "stopped")
+        if (stopping || state === "stopped")
           return yield* fail("startup", "Stopped owned processes cannot start.");
         if (state === "owned") {
           state = "starting";
@@ -1093,7 +1103,12 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
         stop,
         send: (bytes: Uint8Array) =>
           Effect.gen(function* () {
-            if (state !== "running" || childExitCode !== null || bytes.byteLength > 8192)
+            if (
+              stopping ||
+              state !== "running" ||
+              childExitCode !== null ||
+              bytes.byteLength > 8192
+            )
               return yield* fail(
                 "transport",
                 "Managed input requires a running owned process and a bounded chunk.",
@@ -1101,7 +1116,7 @@ export const acquirePiManagedProcess = Effect.fn("acquirePiManagedProcess")(func
             yield* sendControl({ type: "input", data: Buffer.from(bytes).toString("base64") });
           }),
         endInput: Effect.suspend(() =>
-          state === "running" && childExitCode === null
+          !stopping && state === "running" && childExitCode === null
             ? sendControl({ type: "end" })
             : fail("transport", "Managed input cannot close before start or after exit."),
         ),
