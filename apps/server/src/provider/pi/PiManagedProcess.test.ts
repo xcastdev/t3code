@@ -1346,6 +1346,353 @@ describe.runIf(process.env.PI_MANAGED_PROCESS_LINUX_GATE === "1")(
         }),
       ),
     );
+    check("shutdown race drains a reader blocked by abandoned bounded output", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const full = yield* Deferred.make<void>();
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+          let outputFrames = 0;
+          const observed = ChildProcessSpawner.make((command) =>
+            spawner.spawn(command).pipe(
+              Effect.map((handle) =>
+                command._tag !== "StandardCommand" || command.command !== "/usr/bin/systemd-run"
+                  ? handle
+                  : ChildProcessSpawner.makeHandle({
+                      ...handle,
+                      stdout: handle.stdout.pipe(
+                        Stream.decodeText(),
+                        Stream.splitLines,
+                        Stream.mapEffect((line) =>
+                          Effect.gen(function* () {
+                            // The first output frame is consumed readiness; the next 32 fill the queue.
+                            if (line.includes('"type":"stdout"') && ++outputFrames === 34)
+                              yield* Deferred.succeed(full, undefined);
+                            return Buffer.from(line + "\n");
+                          }),
+                        ),
+                      ),
+                    }),
+              ),
+            ),
+          );
+          const child = yield* acquire([
+            "/bin/bash",
+            "-c",
+            "printf ready; IFS= read -r value; printf '%1048576s' x; while :; do :; done",
+          ]).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed));
+          yield* child.start;
+          const ready = yield* child.stdout.pipe(Stream.take(1), Stream.runCollect);
+          expect(Buffer.concat(Array.from(ready)).toString()).toBe("ready");
+          yield* child.send(Buffer.from("output\n"));
+          yield* Deferred.await(full).pipe(Effect.timeout("3 seconds"));
+          // Let the forwarded frame reach its bounded offer before requesting shutdown.
+          yield* Effect.yieldNow;
+          const drain = yield* child.stop;
+          expect(drain.kernel).toMatch(/removed|populated 0/);
+          expect(drain.childPid).toBeGreaterThan(0);
+          expect(drain.childExitCode).toBeNull();
+          yield* child.stdout.pipe(Stream.runDrain);
+          yield* absent(child.owner.cgroup);
+        }),
+      ),
+    );
+    for (const [cancel, corruption] of [
+      [false, null],
+      [true, null],
+      [false, "base64"],
+      [false, "frame"],
+      [false, "start"],
+    ] as const)
+      check(
+        `shutdown race ${corruption ? `rejects ${corruption} corruption` : `drains held actual post-START output and exit on ${cancel ? "cancellation" : "stop"}`}`,
+        () =>
+          Effect.gen(function* () {
+            const buffered = yield* Deferred.make<Buffer>();
+            const release = yield* Deferred.make<void>();
+            const ready = yield* Deferred.make<PiManagedProcess>();
+            const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+            let hold = false;
+            let shutdownExpected = false;
+            let pending = Buffer.alloc(0);
+            let drain: PiManagedDrain | undefined;
+            const observed = ChildProcessSpawner.make((command) => {
+              if (
+                shutdownExpected &&
+                command._tag === "StandardCommand" &&
+                command.command === "/usr/bin/systemctl" &&
+                command.args.includes("show")
+              )
+                return Deferred.succeed(release, undefined).pipe(
+                  Effect.andThen(spawner.spawn(command)),
+                );
+              return spawner.spawn(command).pipe(
+                Effect.map((handle) =>
+                  command._tag !== "StandardCommand" || command.command !== "/usr/bin/systemd-run"
+                    ? handle
+                    : ChildProcessSpawner.makeHandle({
+                        ...handle,
+                        stdout: handle.stdout.pipe(
+                          Stream.mapEffect((chunk) =>
+                            Effect.gen(function* () {
+                              if (!hold) return chunk;
+                              if (pending.byteLength + chunk.byteLength > 65536)
+                                return yield* Effect.die(
+                                  "Held shutdown frames exceeded fixture bound",
+                                );
+                              pending = Buffer.concat([pending, chunk]);
+                              if (!pending.includes('"type":"exited"') || pending.at(-1) !== 10)
+                                return Buffer.alloc(0);
+                              const bytes = pending;
+                              pending = Buffer.alloc(0);
+                              yield* Deferred.succeed(buffered, bytes);
+                              yield* Deferred.await(release);
+                              hold = false;
+                              if (corruption === "base64")
+                                return Buffer.from(
+                                  bytes.toString().replace(/"data":"[^"]*"/, '"data":"bad"'),
+                                );
+                              if (corruption === "frame")
+                                return Buffer.concat([
+                                  Buffer.alloc(65537, 120),
+                                  Buffer.from("\n"),
+                                  bytes,
+                                ]);
+                              if (corruption === "start")
+                                return Buffer.concat([
+                                  Buffer.from(encodeEvidence({ type: "started", pid: 1 }) + "\n"),
+                                  bytes,
+                                ]);
+                              return bytes;
+                            }),
+                          ),
+                        ),
+                      }),
+                ),
+              );
+            });
+            const running = yield* Effect.scoped(
+              Effect.gen(function* () {
+                const child = yield* acquire([
+                  "/bin/bash",
+                  "--noprofile",
+                  "--norc",
+                  "-c",
+                  `trap 'printf late-out; printf late-err >&2; exit 0' TERM; printf ready; IFS= read -r value; test "$value" = stop; kill -TERM $$; exit 9`,
+                ]);
+                yield* Effect.addFinalizer(() =>
+                  child.stop.pipe(
+                    Effect.tap((receipt) =>
+                      Effect.sync(() => {
+                        drain = receipt;
+                      }),
+                    ),
+                    Effect.orDie,
+                    Effect.asVoid,
+                  ),
+                );
+                yield* child.start;
+                const output = yield* child.stdout.pipe(Stream.take(1), Stream.runCollect);
+                expect(Buffer.concat(Array.from(output)).toString()).toBe("ready");
+                hold = true;
+                yield* child.send(Buffer.from("stop\n"));
+                yield* Deferred.succeed(ready, child);
+                return yield* Effect.never;
+              }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed)),
+            ).pipe(Effect.forkChild);
+            const child = yield* Deferred.await(ready);
+            const bytes = yield* Deferred.await(buffered).pipe(Effect.timeout("3 seconds"));
+            expect(bytes.toString()).toContain('"type":"stdout"');
+            expect(bytes.toString()).toContain('"type":"stderr"');
+            expect(bytes.toString()).toContain('"type":"exited","code":0');
+            shutdownExpected = true;
+            if (cancel) yield* Fiber.interrupt(running);
+            else {
+              drain = yield* child.stop;
+              yield* Fiber.interrupt(running);
+            }
+            const result = yield* Fiber.await(running);
+            const directory = process.env.PI_MANAGED_PROCESS_EVIDENCE_DIR;
+            if (directory)
+              yield* Effect.promise(() =>
+                NodeFSP.writeFile(
+                  NodePath.join(directory, child.owner.unit + ".shutdown-race.json"),
+                  encodeEvidence({
+                    cancel,
+                    buffered: bytes.toString(),
+                    drain,
+                    result: result._tag,
+                  }),
+                ),
+              );
+            expect(result._tag).toBe("Failure");
+            if (corruption) {
+              const error = yield* child.stdout.pipe(Stream.runDrain, Effect.flip);
+              expect(error.phase).toBe("transport");
+              expect(error.message).toContain(
+                corruption === "base64"
+                  ? "byte framing bound"
+                  : corruption === "frame"
+                    ? "frame exceeds its byte bound"
+                    : "Unexpected process start receipt",
+              );
+              expect(drain?.childExitCode).toBeNull();
+              yield* absent(child.owner.cgroup);
+              return;
+            }
+            const [out, err] = yield* Effect.all(
+              [child.stdout.pipe(Stream.runCollect), child.stderr.pipe(Stream.runCollect)],
+              { concurrency: "unbounded" },
+            );
+            expect(Array.from(out)).toEqual([]);
+            expect(Array.from(err)).toEqual([]);
+            expect(drain?.childExitCode).toBe(0);
+            expect(drain?.childPid).toBeGreaterThan(0);
+            expect(drain?.kernel).toMatch(/removed|populated 0/);
+            yield* absent(child.owner.cgroup);
+            yield* absent(`/proc/${child.owner.pid}`);
+            yield* absent(`/proc/${drain!.childPid}`);
+          }),
+      );
+    for (const corruption of [
+      "exit",
+      "start",
+      "owner",
+      "failed",
+      "json",
+      "utf8",
+      "trailing",
+      "output",
+      "stderr",
+    ] as const)
+      for (const explicitStop of [false, true])
+        check(
+          `terminal barrier rejects late ${corruption} after actual EXIT0 ${explicitStop ? "with stop" : "with awaitExit alone"}`,
+          () =>
+            Effect.scoped(
+              Effect.gen(function* () {
+                const exited = yield* Deferred.make<void>();
+                const release = yield* Deferred.make<void>();
+                const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+                let ownerFrame = Buffer.alloc(0);
+                const extra =
+                  corruption === "utf8"
+                    ? Buffer.from([255, 10])
+                    : Buffer.from(
+                        corruption === "exit"
+                          ? encodeEvidence({ type: "exited", code: 0 }) + "\n"
+                          : corruption === "start"
+                            ? encodeEvidence({ type: "started", pid: 1 }) + "\n"
+                            : corruption === "failed"
+                              ? encodeEvidence({ type: "failed", message: "late helper failure" }) +
+                                "\n"
+                              : corruption === "json"
+                                ? "{\n"
+                                : corruption === "trailing"
+                                  ? "unterminated"
+                                  : encodeEvidence({
+                                      type: corruption === "stderr" ? "stderr" : "stdout",
+                                      data: Buffer.from("late").toString("base64"),
+                                    }) + "\n",
+                      );
+                const observed = ChildProcessSpawner.make((command) =>
+                  spawner.spawn(command).pipe(
+                    Effect.map((handle) =>
+                      command._tag !== "StandardCommand" ||
+                      command.command !== "/usr/bin/systemd-run"
+                        ? handle
+                        : ChildProcessSpawner.makeHandle({
+                            ...handle,
+                            stdout: handle.stdout.pipe(
+                              Stream.decodeText(),
+                              Stream.splitLines,
+                              Stream.mapEffect((line) => {
+                                if (line.includes('"type":"owner"'))
+                                  ownerFrame = Buffer.from(line + "\n");
+                                return (
+                                  line.includes('"type":"exited","code":0')
+                                    ? Deferred.succeed(exited, undefined)
+                                    : Effect.void
+                                ).pipe(Effect.as(Buffer.from(line + "\n")));
+                              }),
+                              Stream.concat(
+                                Stream.fromEffect(
+                                  Deferred.await(release).pipe(
+                                    Effect.map(() => (corruption === "owner" ? ownerFrame : extra)),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          }),
+                    ),
+                  ),
+                );
+                const child = yield* acquire(["/bin/bash", "-c", "printf terminal; exit 0"]).pipe(
+                  Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, observed),
+                );
+                yield* child.start;
+                const out = yield* child.stdout.pipe(
+                  Stream.runCollect,
+                  Effect.exit,
+                  Effect.forkChild,
+                );
+                const err = yield* child.stderr.pipe(
+                  Stream.runCollect,
+                  Effect.exit,
+                  Effect.forkChild,
+                );
+                const terminal = yield* child.awaitExit.pipe(Effect.exit, Effect.forkChild);
+                yield* Deferred.await(exited).pipe(Effect.timeout("3 seconds"));
+                const stopping = explicitStop
+                  ? yield* child.stop.pipe(Effect.forkChild)
+                  : undefined;
+                yield* Deferred.succeed(release, undefined);
+                const terminalResult = yield* Fiber.join(terminal);
+                const stdoutResult = yield* Fiber.join(out);
+                const stderrResult = yield* Fiber.join(err);
+                const drain = stopping ? yield* Fiber.join(stopping) : yield* child.stop;
+                const directory = process.env.PI_MANAGED_PROCESS_EVIDENCE_DIR;
+                if (directory)
+                  yield* Effect.promise(() =>
+                    NodeFSP.writeFile(
+                      NodePath.join(directory, child.owner.unit + ".terminal-barrier.json"),
+                      encodeEvidence({
+                        corruption,
+                        explicitStop,
+                        extra: (corruption === "owner" ? ownerFrame : extra).toString("base64"),
+                        drain,
+                        terminal: terminalResult._tag,
+                        stdout: stdoutResult._tag,
+                        stderr: stderrResult._tag,
+                        cause:
+                          terminalResult._tag === "Failure"
+                            ? Cause.pretty(terminalResult.cause)
+                            : "",
+                      }),
+                    ),
+                  );
+                expect(drain.childExitCode).toBe(0);
+                expect(drain.kernel).toMatch(/removed|populated 0/);
+                yield* absent(child.owner.cgroup);
+                for (const result of [terminalResult, stdoutResult, stderrResult]) {
+                  expect(result._tag).toBe("Failure");
+                  if (result._tag === "Failure")
+                    expect(Cause.pretty(result.cause)).toContain(
+                      corruption === "exit"
+                        ? "Unexpected process exit receipt"
+                        : corruption === "start"
+                          ? "Unexpected process start receipt"
+                          : corruption === "owner"
+                            ? "Owned process receipt does not match the allocated boundary"
+                            : corruption === "failed"
+                              ? "late helper failure"
+                              : corruption === "output" || corruption === "stderr"
+                                ? "Worker output followed the exit receipt"
+                                : "Invalid owned process frame",
+                    );
+                }
+              }),
+            ),
+        );
     check("scope interruption drains prestart ownership before setup execution", () =>
       Effect.scoped(
         Effect.gen(function* () {
