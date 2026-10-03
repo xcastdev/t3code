@@ -4312,3 +4312,102 @@ for (const mode of [
     ),
   );
 }
+
+for (const mode of [
+  "unchanged",
+  "stop-after-prepare",
+  "stopAll-after-prepare",
+  "held-run-stop",
+  "held-run-stopAll",
+  "native-root-replacement",
+  "native-final-boundary",
+  "changed-native-root",
+] as const) {
+  it.effect(`replay review repair fences receipt lifetime and native ownership: ${mode}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* stableReplayFixtureFor();
+        const original = yield* f.sql`SELECT * FROM project_team_pi_operation`;
+        const originalProcesses = yield* f.sql`SELECT * FROM project_team_pi_process`;
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let hold = false;
+        let replaceAtFence = false;
+        const replaceNative = Effect.gen(function* () {
+          const state = f.nativeFile.slice(0, -"/sessions/original.jsonl".length);
+          yield* f.fs.rename(state, state + "-original");
+          yield* f.fs.makeDirectory(state + "/sessions", { recursive: true });
+          yield* f.fs.writeFileString(
+            f.nativeFile,
+            f.bytes.replace('"retained":true', '"retained":false'),
+          );
+        });
+        const observedSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            return mode === "native-final-boundary" &&
+              statement.compile()[0].includes("ORDER BY operation_ordinal DESC LIMIT 1")
+              ? statement.pipe(Effect.tap(() => (replaceAtFence ? replaceNative : Effect.void)))
+              : statement;
+          },
+        });
+        const runtime = yield* makePiManagedRuntimeLive({
+          ...f.options,
+          readCatalogue: f.options.readCatalogue.pipe(
+            Effect.tap(() =>
+              hold
+                ? Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release)))
+                : Effect.void,
+            ),
+          ),
+        }).pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const prepared = yield* instance
+          .prepareOperation(f.request, () => Effect.die("unexpected replay event"))
+          .pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        const run = prepared.run.pipe(Effect.provideService(SqlClient.SqlClient, observedSql));
+        if (mode === "native-root-replacement") {
+          yield* replaceNative;
+        }
+        if (mode === "native-final-boundary") replaceAtFence = true;
+        if (mode === "changed-native-root") {
+          // Recreate the runtime with a different configured root; it must not discover/replay a same-ID copy.
+          const other = f.options.nativeStateRoot + "-other";
+          yield* f.fs.makeDirectory(other, { recursive: true });
+          const otherRuntime = yield* makePiManagedRuntimeLive({
+            ...f.options,
+            nativeStateRoot: other,
+          });
+          const otherInstance = yield* otherRuntime.forInstance({
+            instanceId: providerInstanceId,
+            enabled: true,
+            configuration: {},
+          });
+          yield* rejected(otherInstance.prepareOperation(f.request, () => Effect.void));
+        } else if (mode === "stop-after-prepare" || mode === "stopAll-after-prepare") {
+          yield* mode === "stop-after-prepare" ? instance.requestStop(threadId) : instance.stopAll;
+          yield* rejected(run);
+          yield* rejected(run);
+        } else if (mode === "held-run-stop" || mode === "held-run-stopAll") {
+          hold = true;
+          const running = yield* run.pipe(Effect.result, Effect.forkChild);
+          yield* Deferred.await(entered);
+          yield* mode === "held-run-stop" ? instance.requestStop(threadId) : instance.stopAll;
+          yield* Deferred.succeed(release, undefined);
+          expect((yield* Fiber.join(running))._tag).toBe("Failure");
+          yield* rejected(run);
+        } else if (mode === "native-root-replacement" || mode === "native-final-boundary")
+          yield* rejected(run);
+        else expect((yield* run).terminal).toEqual(f.terminal);
+        expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toEqual(original);
+        expect(yield* f.sql`SELECT * FROM project_team_pi_process`).toEqual(originalProcesses);
+        expect(f.launches).toBe(0);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+  );
+}

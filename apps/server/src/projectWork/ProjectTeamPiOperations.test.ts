@@ -400,9 +400,31 @@ for (const mode of ["unchanged", "stop-first", "expired", "expires-in-callback"]
   );
 }
 
-const terminalFixtureFor = (stable = false) =>
+const terminalFixtureFor = (stable = false, removedStage = false) =>
   Effect.gen(function* () {
-    const f = yield* fixture;
+    let f = yield* fixture;
+    if (removedStage) {
+      const fs = yield* FileSystem.FileSystem;
+      const directory = yield* fs.makeTempDirectoryScoped();
+      const source = directory + "/historical-stage.txt";
+      yield* fs.writeFileString(source, "historical descriptor asset");
+      const original = f.allocation.launch;
+      const allocation = yield* preallocatePiManagedProcess({
+        workspaceRoot: original.workspaceRoot,
+        workspaceAccess: original.workspaceAccess,
+        nativeStateRoot: original.nativeStateRoot,
+        protectedRoots: original.protectedRoots,
+        runtimeFiles: [
+          ...original.runtimeFiles.map((file) => ({ source: file.source, target: file.target })),
+          { source, target: "/runtime/historical-stage.txt" },
+        ],
+        argv: original.argv,
+        memoryBytes: original.memoryBytes,
+        runtimeSeconds: original.runtimeSeconds,
+      });
+      f = { ...f, allocation };
+      yield* fs.remove(source);
+    }
     const request = {
       threadId,
       kind: "initialize" as const,
@@ -1256,3 +1278,77 @@ it.effect("a stable lookup miss cannot admit two competing preparations", () =>
     }),
   ),
 );
+
+for (const mode of [
+  "unchanged",
+  "removed-stage-file",
+  "removed",
+  "trailing-newline",
+  "missing-full-launch",
+  "missing-native-state",
+  "unknown-launch-field",
+  "negative-identity",
+  "invalid-runtime-bound",
+  "contradictory-kernel",
+  "duplicate-kernel",
+  "unknown-kernel",
+  "malformed-kernel",
+  "populated-kernel",
+] as const) {
+  it.effect(`replay review repair rejects malformed retained allocation and drain: ${mode}`, () =>
+    fileTest(
+      Effect.gen(function* () {
+        const f = yield* terminalFixtureFor(true, mode === "removed-stage-file");
+        yield* f.activate;
+        yield* f.operations.persistTerminal(f.op, f.terminal("success", true));
+        if (mode === "missing-full-launch") {
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_remove(intent_json,'$.allocation.launch.argv','$.allocation.launch.protectedRoots','$.allocation.launch.runtimeFiles')`;
+          yield* f.sql`UPDATE project_team_pi_process SET allocation_json=json_remove(allocation_json,'$.launch.argv','$.launch.protectedRoots','$.launch.runtimeFiles')`;
+        }
+        if (mode === "missing-native-state") {
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_remove(intent_json,'$.allocation.launch.nativeState')`;
+          yield* f.sql`UPDATE project_team_pi_process SET allocation_json=json_remove(allocation_json,'$.launch.nativeState')`;
+        }
+        if (mode === "unknown-launch-field") {
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.allocation.launch.unknown',1)`;
+          yield* f.sql`UPDATE project_team_pi_process SET allocation_json=json_set(allocation_json,'$.launch.unknown',1)`;
+        }
+        if (mode === "negative-identity") {
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.allocation.launch.workspace.dev',-1)`;
+          yield* f.sql`UPDATE project_team_pi_process SET allocation_json=json_set(allocation_json,'$.launch.workspace.dev',-1)`;
+        }
+        if (mode === "invalid-runtime-bound") {
+          yield* f.sql`UPDATE project_team_pi_operation SET intent_json=json_set(intent_json,'$.allocation.policy.runtimeSeconds',999999999,'$.allocation.launch.runtimeSeconds',999999999)`;
+          yield* f.sql`UPDATE project_team_pi_process SET allocation_json=json_set(allocation_json,'$.policy.runtimeSeconds',999999999,'$.launch.runtimeSeconds',999999999)`;
+        }
+        const kernel =
+          mode === "removed"
+            ? "removed"
+            : mode === "trailing-newline"
+              ? "populated 0\nfrozen 0\n"
+              : mode === "contradictory-kernel"
+                ? "populated 0\npopulated 1\nfrozen 0"
+                : mode === "duplicate-kernel"
+                  ? "populated 0\npopulated 0\nfrozen 0"
+                  : mode === "unknown-kernel"
+                    ? "populated 0\nunknown 0"
+                    : mode === "malformed-kernel"
+                      ? "populated 0\nfrozen banana"
+                      : mode === "populated-kernel"
+                        ? "populated 1\nfrozen 0"
+                        : undefined;
+        if (kernel !== undefined) {
+          yield* f.sql`UPDATE project_team_pi_operation SET terminal_json=json_set(terminal_json,'$.drain.kernel',${kernel})`;
+          yield* f.sql`UPDATE project_team_pi_process SET drain_json=json_set(drain_json,'$.kernel',${kernel})`;
+        }
+        const replay = f.operations.lookup(f.identity, f.request, f.requestHash, f.resourceHash);
+        if (["unchanged", "removed-stage-file", "removed", "trailing-newline"].includes(mode))
+          expect((yield* replay)?.terminal).toEqual({
+            ...f.terminal("success", true),
+            ...(kernel === undefined ? {} : { drain: { ...f.drain, kernel } }),
+          });
+        else yield* typedDenial(replay, "uncertain");
+      }),
+    ),
+  );
+}

@@ -123,6 +123,34 @@ const directoryFlags =
   NodeFS.constants.O_NONBLOCK;
 const fileFlags =
   NodeFS.constants.O_RDONLY | NodeFS.constants.O_NOFOLLOW | NodeFS.constants.O_NONBLOCK;
+const nativeStateReceipt = (
+  identity: { readonly path: string; readonly dev: number; readonly ino: number },
+  expectedPath: string,
+) => {
+  try {
+    if (identity.path !== expectedPath || NodeFS.realpathSync(expectedPath) !== expectedPath)
+      throw deny("Pi replay native ownership changed", "uncertain");
+    const fd = NodeFS.openSync(expectedPath, directoryFlags);
+    try {
+      const stat = NodeFS.fstatSync(fd, { bigint: true });
+      const linked = NodeFS.lstatSync(expectedPath, { bigint: true });
+      if (
+        !stat.isDirectory() ||
+        !linked.isDirectory() ||
+        String(stat.dev) !== String(identity.dev) ||
+        String(stat.ino) !== String(identity.ino) ||
+        stat.dev !== linked.dev ||
+        stat.ino !== linked.ino ||
+        NodeFS.realpathSync(`/proc/self/fd/${fd}`) !== expectedPath
+      )
+        throw deny("Pi replay native ownership changed", "uncertain");
+    } finally {
+      NodeFS.closeSync(fd);
+    }
+  } catch {
+    throw deny("Pi replay native ownership changed", "uncertain");
+  }
+};
 const sourceStat = (stat: import("node:fs").BigIntStats) =>
   encode({
     dev: String(stat.dev),
@@ -1109,6 +1137,20 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 );
                 if (replay) {
                   const context = contextFor(replay.authority);
+                  const nativeStateDirectory =
+                    options.nativeStateRoot +
+                    "/" +
+                    digest(
+                      encode([
+                        options.environmentId,
+                        instance.instanceId,
+                        request.threadId,
+                        binding.recordId,
+                        binding.generation,
+                      ]),
+                    );
+                  const nativeFence = () =>
+                    nativeStateReceipt(replay.nativeState, nativeStateDirectory);
                   const validateReplay = guard(
                     Effect.gen(function* () {
                       yield* preparationCurrent;
@@ -1163,27 +1205,23 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                           Effect.provideService(Path.Path, paths),
                         );
                       }
+                      yield* Effect.try({
+                        try: nativeFence,
+                        catch: () => deny("Pi replay native ownership changed", "uncertain"),
+                      });
                       yield* Effect.tryPromise({
                         try: () =>
                           readPiNativeSession({
-                            sessionDirectoryRoot:
-                              options.nativeStateRoot +
-                              "/" +
-                              digest(
-                                encode([
-                                  options.environmentId,
-                                  instance.instanceId,
-                                  request.threadId,
-                                  binding.recordId,
-                                  binding.generation,
-                                ]),
-                              ) +
-                              "/sessions",
+                            sessionDirectoryRoot: nativeStateDirectory + "/sessions",
                             expectedCwd: "/workspace",
                             native: current.native,
                           }),
                         catch: () => deny("Pi replay native checkpoint unavailable", "uncertain"),
                       }).pipe(Effect.uninterruptible);
+                      yield* Effect.try({
+                        try: nativeFence,
+                        catch: () => deny("Pi replay native ownership changed", "uncertain"),
+                      });
                       return yield* operations.admitCurrent(
                         identity(request.threadId),
                         (latest) => {
@@ -1195,6 +1233,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                             throw deny("Pi replay authority or deadline changed", "conflict");
                           workspaceReceipt(paths, workspace.fence.metadata, workspace.fence);
                           sourceFence();
+                          nativeFence();
                           return {
                             terminal: current.terminal,
                             session: sessionFor(latest, current.native),
@@ -1215,16 +1254,27 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                   const interrupt = Effect.fail(
                     deny("Completed Pi operation cannot receive controls", "conflict"),
                   );
-                  return request.kind === "prompt"
-                    ? {
-                        kind: "prompt" as const,
-                        turnId: TurnId.make(replay.operation.operationId),
-                        operation: replay.operation,
-                        run,
-                        steer,
-                        interrupt,
-                      }
-                    : { kind: request.kind, operation: replay.operation, run, steer, interrupt };
+                  const prepared: PiManagedPreparedOperation =
+                    request.kind === "prompt"
+                      ? {
+                          kind: "prompt",
+                          turnId: TurnId.make(replay.operation.operationId),
+                          operation: replay.operation,
+                          run,
+                          steer,
+                          interrupt,
+                        }
+                      : { kind: request.kind, operation: replay.operation, run, steer, interrupt };
+                  // Receipt reads remain instance-owned after preparation. Stopping them
+                  // fences publication without rewriting the original settled operation.
+                  const stop = Effect.sync(() => {
+                    preparation.canceled = true;
+                    if (active.get(request.threadId)?.prepared === prepared)
+                      active.delete(request.threadId);
+                  });
+                  active.set(request.threadId, { prepared, stop });
+                  assertPreparing();
+                  return prepared;
                 }
                 const nativeConfig = yield* configuration(agentDirectory, authority);
                 const previous =

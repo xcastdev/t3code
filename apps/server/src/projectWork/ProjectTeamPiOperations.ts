@@ -15,6 +15,8 @@ import * as Schema from "effect/Schema";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   PiManagedProcessError,
+  PiManagedProcessAllocationSchema,
+  MAX_PI_RUNTIME_FILES,
   type PiManagedProcessAllocation,
   type PiManagedProcessOwner,
 } from "../provider/pi/PiManagedProcess.ts";
@@ -161,25 +163,16 @@ const decodeReplayIntent = Schema.decodeEffect(
       request: Schema.Json,
       binding: ProjectTeamRunBinding,
       role: Schema.Json,
-      allocation: Schema.Struct({
-        version: Schema.Literal(1),
-        unit: Schema.String,
-        nonce: Schema.String,
-        policy: Schema.Struct({ memoryBytes: Positive, runtimeSeconds: Positive }),
-        launch: Schema.Struct({
-          workspaceRoot: Schema.String,
-          memoryBytes: Positive,
-          runtimeSeconds: Positive,
-          workspace: Schema.Struct({ path: Schema.String, dev: Safe, ino: Safe }),
-        }),
-      }),
+      allocation: PiManagedProcessAllocationSchema,
       resourceHash: ResourceIdentity,
     }),
   ),
+  { onExcessProperty: "error" },
 );
 const decodeJson = Schema.decodeEffect(Schema.fromJsonString(Schema.Json));
-const decodeRetainedAllocation = Schema.decodeUnknownEffect(
-  Schema.Struct({ allocation: Schema.Json }),
+const decodeReplayAllocation = Schema.decodeEffect(
+  Schema.fromJsonString(PiManagedProcessAllocationSchema),
+  { onExcessProperty: "error" },
 );
 const decodeReplayOwner = Schema.decodeEffect(
   Schema.fromJsonString(
@@ -200,6 +193,101 @@ const decodeReplayOwner = Schema.decodeEffect(
 const decodeReplayDrain = Schema.decodeEffect(Schema.fromJsonString(Drain), {
   onExcessProperty: "error",
 });
+const validKernelDrain = (kernel: string) => {
+  if (kernel === "removed") return true;
+  if (kernel.length > 128) return false;
+  const lines = kernel.endsWith("\n") ? kernel.slice(0, -1).split("\n") : kernel.split("\n");
+  const fields = new Map<string, string>();
+  for (const line of lines) {
+    const match = /^(populated|frozen) ([01])$/.exec(line);
+    if (!match || fields.has(match[1]!)) return false;
+    fields.set(match[1]!, match[2]!);
+  }
+  return fields.get("populated") === "0";
+};
+// Validate historical descriptor values without checking removed staging files.
+const nodePaths = process.getBuiltinModule("path");
+const canonicalPath = (path: string) =>
+  path.length <= 4096 &&
+  /^\/[^\0\r\n]+$/.test(path) &&
+  nodePaths.posix.normalize(path) === path &&
+  path !== "/";
+const overlaps = (left: string, right: string) =>
+  left === right || left.startsWith(right + "/") || right.startsWith(left + "/");
+const physicalIdentity = (value: { readonly dev: number; readonly ino: number }) =>
+  Number.isSafeInteger(value.dev) &&
+  value.dev >= 0 &&
+  Number.isSafeInteger(value.ino) &&
+  value.ino > 0;
+const validRetainedAllocation = (allocation: PiManagedProcessAllocation) => {
+  const launch = allocation.launch;
+  const native = launch.nativeState;
+  if (
+    !native ||
+    !canonicalPath(launch.workspaceRoot) ||
+    !canonicalPath(native.path) ||
+    launch.nativeStateRoot !== native.path ||
+    launch.workspace.path !== launch.workspaceRoot ||
+    !physicalIdentity(launch.workspace) ||
+    !physicalIdentity(native) ||
+    overlaps(native.path, launch.workspaceRoot) ||
+    launch.workspaceAccess === undefined ||
+    !Number.isSafeInteger(launch.memoryBytes) ||
+    launch.memoryBytes < 16777216 ||
+    launch.memoryBytes > 2147483648 ||
+    !Number.isSafeInteger(launch.runtimeSeconds) ||
+    launch.runtimeSeconds < 1 ||
+    launch.runtimeSeconds > 3600 ||
+    allocation.policy.memoryBytes !== launch.memoryBytes ||
+    allocation.policy.runtimeSeconds !== launch.runtimeSeconds ||
+    launch.protectedRoots.length < 1 ||
+    launch.protectedRoots.length > 64 ||
+    launch.runtimeFiles.length < 1 ||
+    launch.runtimeFiles.length > MAX_PI_RUNTIME_FILES ||
+    launch.protectedWorkspaceEntries.length > 16 ||
+    launch.argv.length < 1 ||
+    launch.argv.length > 256 ||
+    launch.argv.some((arg) => arg.includes("\0")) ||
+    Buffer.byteLength(encode(launch.argv)) > 16384 ||
+    !launch.runtimeFiles.some((file) => file.target === launch.argv[0])
+  )
+    return false;
+  if (
+    launch.protectedRoots.some(
+      (root) =>
+        !canonicalPath(root) || overlaps(root, launch.workspaceRoot) || overlaps(root, native.path),
+    )
+  )
+    return false;
+  for (const [index, file] of launch.runtimeFiles.entries()) {
+    if (
+      !canonicalPath(file.source) ||
+      !canonicalPath(file.target) ||
+      !physicalIdentity(file) ||
+      !/^\/(?:runtime|bin|lib|lib64|usr\/lib|usr\/lib64)\//.test(file.target) ||
+      overlaps(file.source, launch.workspaceRoot) ||
+      overlaps(file.source, native.path) ||
+      launch.protectedRoots.some((root) => overlaps(root, file.source)) ||
+      launch.runtimeFiles.slice(0, index).some((other) => overlaps(other.target, file.target))
+    )
+      return false;
+  }
+  for (const [index, entry] of launch.protectedWorkspaceEntries.entries()) {
+    const relative = entry.target.slice("/workspace/".length);
+    if (
+      !entry.target.startsWith("/workspace/") ||
+      !canonicalPath(entry.target) ||
+      !canonicalPath(entry.source) ||
+      entry.source !== launch.workspaceRoot + "/" + relative ||
+      !physicalIdentity(entry) ||
+      launch.protectedWorkspaceEntries
+        .slice(0, index)
+        .some((other) => overlaps(other.target, entry.target))
+    )
+      return false;
+  }
+  return true;
+};
 const immutableBinding = (binding: typeof ProjectTeamRunBinding.Type) => {
   const {
     revision: _,
@@ -583,10 +671,9 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             !process.drain_json
           )
             return yield* deny("Stable Pi process receipt incomplete", "uncertain");
-          const allocationJson = yield* decodeJson(process.allocation_json).pipe(
+          const allocationJson = yield* decodeReplayAllocation(process.allocation_json).pipe(
             Effect.mapError(() => deny("Stable Pi allocation unavailable", "uncertain")),
           );
-          const stored = yield* decodeRetainedAllocation(yield* decodeJson(row.intent_json));
           const owner = yield* decodeReplayOwner(process.owner_json).pipe(
             Effect.mapError(() => deny("Stable Pi owner unavailable", "uncertain")),
           );
@@ -594,8 +681,11 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             Effect.mapError(() => deny("Stable Pi drain unavailable", "uncertain")),
           );
           const allocation = intent.allocation;
+          const nativeState = allocation.launch.nativeState;
           if (
-            encode(allocationJson) !== encode(stored.allocation) ||
+            !nativeState ||
+            !validRetainedAllocation(allocation) ||
+            encode(allocationJson) !== encode(allocation) ||
             process.unit !== allocation.unit ||
             !/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
               allocation.nonce,
@@ -619,7 +709,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             drain.memoryBytes !== owner.memoryBytes ||
             drain.childExitCode !== 0 ||
             !drain.childPid ||
-            (drain.kernel !== "removed" && !drain.kernel.split("\n").includes("populated 0")) ||
+            !validKernelDrain(drain.kernel) ||
             encode(drain) !== encode(terminal.drain)
           )
             return yield* deny("Stable Pi process receipts differ", "uncertain");
@@ -758,6 +848,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
             native,
             authority,
             workspace: allocation.launch.workspace,
+            nativeState,
             deadlineAtMs: row.deadline_at_ms,
           };
         }),
