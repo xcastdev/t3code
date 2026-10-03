@@ -1,6 +1,7 @@
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
@@ -9,13 +10,31 @@ import type {
   ProjectTeamDispatchSnapshot,
 } from "./ProjectTeamDispatch.ts";
 
+import type { ProjectTeamDispatchRecoveryPosition } from "./ProjectTeamDispatchJournal.ts";
+
+const DispatchId = Schema.String.check(
+  Schema.isTrimmed(),
+  Schema.isMinLength(1),
+  Schema.isMaxLength(256),
+);
+const isDispatchId = Schema.is(DispatchId);
+const RecoveryPosition = Schema.Struct({
+  rowId: Schema.String.check(
+    Schema.isPattern(/^(?:0|-?[1-9][0-9]{0,18})$/),
+    Schema.isMaxLength(20),
+  ),
+  dispatchIdHash: Schema.String.check(Schema.isPattern(/^[a-f0-9]{64}$/)),
+});
+const decodePosition = Schema.decodeUnknownEffect(RecoveryPosition, { onExcessProperty: "error" });
+
 export class ProjectTeamRecoveryError extends Schema.TaggedError<ProjectTeamRecoveryError>()(
   "ProjectTeamRecoveryError",
   { reason: Schema.String },
 ) {}
 
 export type ProjectTeamRecoveryDiscovery<Error> = {
-  readonly dispatchId: string;
+  readonly dispatchId: string | null;
+  readonly position?: ProjectTeamDispatchRecoveryPosition;
   readonly snapshot: Exit.Exit<ProjectTeamDispatchSnapshot, Error>;
 };
 
@@ -34,11 +53,13 @@ export interface ProjectTeamRecoveryPorts<
 > {
   readonly readPage: (input: {
     readonly afterDispatchId?: string;
+    readonly afterPosition?: ProjectTeamDispatchRecoveryPosition;
     readonly limit: number;
   }) => Effect.Effect<readonly ProjectTeamRecoveryDiscovery<Error>[], Error, Services>;
   readonly recordDiscoveryFailure: (
-    dispatchId: string,
+    dispatchId: string | null,
     cause: Cause.Cause<Error | ProjectTeamRecoveryError>,
+    position?: ProjectTeamDispatchRecoveryPosition,
   ) => Effect.Effect<void, Error, Services>;
   readonly withClaim: <A, E, R>(
     discovered: ProjectTeamDispatchSnapshot,
@@ -87,7 +108,11 @@ export function makeProjectTeamRecovery<
 ) {
   const pageSize = options.pageSize ?? 128;
   const serial = Semaphore.makeUnsafe(1);
-  let afterDispatchId: string | undefined;
+  type Cursor = {
+    readonly dispatchId: string | null;
+    readonly position?: ProjectTeamDispatchRecoveryPosition;
+  };
+  let cursor: Cursor | undefined;
   type Outcome = ProjectTeamRecoveryOutcome<Error>;
   const reject = (reason: string) => new ProjectTeamRecoveryError({ reason });
 
@@ -161,62 +186,110 @@ export function makeProjectTeamRecovery<
     );
   });
 
+  const discoveryFailure = Effect.fn("ProjectTeamRecovery.discoveryFailure")(function* (
+    item: Cursor,
+    cause: Cause.Cause<Error | ProjectTeamRecoveryError>,
+  ) {
+    const recorded = yield* Effect.suspend(() =>
+      ports.recordDiscoveryFailure(item.dispatchId, cause, item.position),
+    ).pipe(Effect.exit);
+    return yield* Effect.failCause(
+      Exit.isFailure(recorded) ? Cause.combine(cause, recorded.cause) : cause,
+    );
+  }, Effect.uninterruptible);
+
   const sweep = Effect.fn("ProjectTeamRecovery.sweep")(function* () {
     if (!Number.isSafeInteger(pageSize) || pageSize < 1 || pageSize > 128)
       return yield* reject("Recovery page size must be between 1 and 128");
-    const page = yield* ports.readPage({
-      ...(afterDispatchId === undefined ? {} : { afterDispatchId }),
-      limit: pageSize,
-    });
-    let previous = afterDispatchId ?? "";
+    const read = yield* Effect.suspend(() =>
+      ports.readPage({
+        ...(cursor?.position !== undefined
+          ? { afterPosition: cursor.position }
+          : cursor?.dispatchId !== undefined && cursor.dispatchId !== null
+            ? { afterDispatchId: cursor.dispatchId }
+            : {}),
+        limit: pageSize,
+      }),
+    ).pipe(Effect.exit);
+    if (Exit.isFailure(read)) {
+      if (cursor?.position !== undefined && !Cause.hasInterrupts(read.cause)) {
+        // A deleted or changed SQL owner cannot pin discovery forever; the next sweep starts afresh.
+        const failedCursor = cursor;
+        cursor = undefined;
+        return yield* discoveryFailure(failedCursor, read.cause);
+      }
+      return yield* Effect.failCause(read.cause);
+    }
+    const page = read.value;
     if (page.length > pageSize) return yield* reject("Root exceeded the recovery page bound");
+    const positioned = page[0]?.position !== undefined;
+    if (page.length > 0 && cursor !== undefined && positioned !== (cursor.position !== undefined))
+      return yield* reject("Root recovery changed its continuation mode");
+    let previous = cursor?.dispatchId ?? "";
+    const rowIds = new Set<string>(cursor?.position === undefined ? [] : [cursor.position.rowId]);
+    const validated: ProjectTeamRecoveryDiscovery<Error>[] = [];
     for (const item of page) {
-      if (!item.dispatchId || item.dispatchId <= previous)
-        return yield* reject("Root recovery page is not strictly ordered");
-      previous = item.dispatchId;
+      if ((item.position !== undefined) !== positioned)
+        return yield* reject("Root mixed positioned and legacy discovery");
+      if (item.position !== undefined) {
+        const position = yield* decodePosition(item.position).pipe(
+          Effect.mapError(() => reject("Root recovery position is invalid")),
+        );
+        if (rowIds.has(position.rowId)) return yield* reject("Root reused a recovery position");
+        rowIds.add(position.rowId);
+        // Positions are opaque: SQL owns raw key ordering, including normalized malformed keys.
+        validated.push({
+          ...item,
+          dispatchId: Predicate.isString(item.dispatchId) ? item.dispatchId : null,
+          position,
+        });
+      } else {
+        if (!isDispatchId(item.dispatchId) || item.dispatchId <= previous)
+          return yield* reject("Root recovery page is not strictly ordered");
+        previous = item.dispatchId;
+        validated.push(item);
+      }
     }
     const items: {
-      readonly dispatchId: string;
+      readonly dispatchId: string | null;
       readonly result: Exit.Exit<Outcome, Error | ProjectTeamRecoveryError>;
     }[] = [];
-    for (const item of page) {
+    for (const item of validated) {
       const result = yield* Effect.scoped(
         Effect.suspend(() => {
-          if (Exit.isFailure(item.snapshot)) {
-            const cause = item.snapshot.cause;
-            return Effect.suspend(() => ports.recordDiscoveryFailure(item.dispatchId, cause)).pipe(
-              Effect.exit,
-              Effect.flatMap((recorded) =>
-                Effect.failCause(
-                  Exit.isFailure(recorded) ? Cause.combine(cause, recorded.cause) : cause,
-                ),
-              ),
-              Effect.uninterruptible,
+          if (Exit.isFailure(item.snapshot)) return discoveryFailure(item, item.snapshot.cause);
+          if (!isDispatchId(item.dispatchId))
+            return discoveryFailure(
+              item,
+              Cause.fail(reject("Root discovery dispatch identity is invalid")),
             );
-          }
-          if (item.snapshot.value.fence.dispatchId !== item.dispatchId) {
-            const cause = Cause.fail(reject("Root discovery identity does not match its snapshot"));
-            return Effect.suspend(() => ports.recordDiscoveryFailure(item.dispatchId, cause)).pipe(
-              Effect.exit,
-              Effect.flatMap((recorded) =>
-                Effect.failCause(
-                  Exit.isFailure(recorded) ? Cause.combine(cause, recorded.cause) : cause,
-                ),
-              ),
-              Effect.uninterruptible,
+          if (item.snapshot.value.fence.dispatchId !== item.dispatchId)
+            return discoveryFailure(
+              item,
+              Cause.fail(reject("Root discovery identity does not match its snapshot")),
             );
-          }
           return recover(item.snapshot.value);
         }),
       ).pipe(Effect.exit);
       if (Exit.isFailure(result) && Cause.hasInterrupts(result.cause))
         return yield* Effect.failCause(result.cause);
       items.push({ dispatchId: item.dispatchId, result });
-      afterDispatchId = item.dispatchId;
+      cursor = {
+        dispatchId: item.dispatchId,
+        ...(item.position === undefined ? {} : { position: item.position }),
+      };
     }
     const wrapped = page.length < pageSize;
-    if (wrapped) afterDispatchId = undefined;
-    return { items, wrapped, ...(afterDispatchId === undefined ? {} : { afterDispatchId }) };
+    if (wrapped) cursor = undefined;
+    return {
+      items,
+      wrapped,
+      ...(cursor?.position !== undefined
+        ? { afterPosition: cursor.position }
+        : cursor?.dispatchId !== undefined && cursor.dispatchId !== null
+          ? { afterDispatchId: cursor.dispatchId }
+          : {}),
+    };
   }, serial.withPermit);
   return { sweep };
 }
