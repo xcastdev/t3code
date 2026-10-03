@@ -1,12 +1,15 @@
 import * as NodeCrypto from "node:crypto";
 import {
   IsoDateTime,
+  ManagedSkillKey,
+  ProviderInstanceId,
+  SkillCatalogRevision,
+  ThreadId,
   ProjectWorkReadIntent,
   ProjectWorkWriteIntent,
   ProviderDriverKind,
   TurnId,
   type ProviderSession,
-  type ThreadId,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Crypto from "effect/Crypto";
@@ -26,6 +29,8 @@ import {
 import { makeProjectTeamPiOperations } from "../../projectWork/ProjectTeamPiOperations.ts";
 import { make as makeAccounting } from "../../projectWork/ProjectTeamModelAccounting.ts";
 import { ProjectWorkGateway } from "../../projectWork/ProjectWorkGateway.ts";
+import { ManagedSkillRepository } from "../../skills/ManagedSkillRepository.ts";
+import { resolvePiManagedSkillSelection } from "./PiManagedSkillSelection.ts";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import { buildServerProvider } from "../providerSnapshot.ts";
 import {
@@ -66,6 +71,25 @@ const decodeWriteIntentJSON = Schema.decodeEffect(Schema.fromJsonString(ProjectW
 const decodeJsonObject = Schema.decodeUnknownSync(Schema.JsonObject);
 const readParameters = decodeJsonObject(Schema.toJsonSchemaDocument(ProjectWorkReadIntent).schema);
 const writeParameters = decodeJsonObject(Schema.toJsonSchemaDocument(writeEnvelope).schema);
+const skillAbsolute = Schema.String.check(
+  Schema.isMaxLength(4096),
+  Schema.isPattern(/^\/[^\0\r\n]*$/),
+);
+const decodeSkillCandidates = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    runtime: Schema.Struct({
+      providerInstanceId: ProviderInstanceId,
+      threadId: ThreadId,
+      cwd: skillAbsolute,
+      sessionId: Schema.String.check(Schema.isMaxLength(128)),
+    }),
+    desiredRevision: SkillCatalogRevision,
+    skills: Schema.Array(Schema.Struct({ key: ManagedSkillKey, packagePath: skillAbsolute })).check(
+      Schema.isMaxLength(4096),
+    ),
+  }),
+  { onExcessProperty: "error" },
+);
 const digest = (text: string) => NodeCrypto.createHash("sha256").update(text).digest("hex");
 const deny = (detail: string, code: PiManagedRuntimeError["code"] = "denied") =>
   new PiManagedRuntimeError({ code, detail });
@@ -339,6 +363,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   const operations = yield* makeProjectTeamPiOperations({ environmentId: options.environmentId });
   const authorization = yield* ProjectTeamAuthorization;
   const gateway = yield* ProjectWorkGateway;
+  const skillRepository = yield* Effect.serviceOption(ManagedSkillRepository);
   const accounting = yield* makeAccounting({
     environmentId: options.environmentId,
     routeId,
@@ -622,6 +647,83 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
             });
           }),
         );
+        const selectedSkills = Effect.fn("PiManagedRuntimeLive.selectedSkills")(function* (
+          authority: ProjectTeamAuthority,
+          workspace: { readonly fence: WorkspaceFence },
+        ) {
+          if (authority.binding.configuration.skillIds.length === 0) return Object.freeze([]);
+          if (Option.isNone(skillRepository))
+            return yield* deny("Managed skill repository is unavailable", "unavailable");
+          return yield* resolvePiManagedSkillSelection({
+            projectRoot: workspace.fence.metadata.primary,
+            selectedSkillIds: authority.binding.configuration.skillIds,
+            roleSkillIds: authority.role.skills,
+          }).pipe(
+            Effect.provideService(ManagedSkillRepository, skillRepository.value),
+            Effect.mapError((error) => deny(error.detail, error.code)),
+          );
+        });
+        const authorizeSkills: PiManagedRuntimeInstance["authorizeSkills"] = (suppliedRequest) =>
+          guard(
+            Effect.gen(function* () {
+              if (!instance.enabled) return yield* deny("Pi instance disabled");
+              const snapshot = yield* Effect.try({
+                try: () => structuredClone(suppliedRequest),
+                catch: () => deny("Pi skill request cannot be copied"),
+              });
+              const request = yield* decodeSkillCandidates(snapshot).pipe(
+                Effect.mapError(() => deny("Pi skill request is invalid")),
+              );
+              if (
+                request.runtime.providerInstanceId !== instance.instanceId ||
+                request.runtime.sessionId !==
+                  `thread-${digest(request.runtime.threadId).slice(0, 24)}` ||
+                new Set(request.skills.map((skill) => skill.key)).size !== request.skills.length
+              )
+                return yield* deny("Pi skill request identity is invalid");
+              const authority = yield* operations.current(identity(request.runtime.threadId), true);
+              if (
+                authority.binding.configuration.runtimeVersion !== "0.99.1" ||
+                authority.binding.configuration.instructionsHash !==
+                  digest(authority.role.instructions)
+              )
+                return yield* deny("Pi frozen runtime or instructions digest mismatch");
+              if (request.runtime.cwd !== authority.binding.worktree)
+                return yield* deny("Pi skill cwd differs from durable assignment");
+              const context = contextFor(authority);
+              const workspace = yield* verifyWorkspace(authority, agentDirectory);
+              const selection = yield* selectedSkills(authority, workspace);
+              if (
+                selection.some(
+                  (selected) =>
+                    !request.skills.some(
+                      (candidate) =>
+                        candidate.key === selected.key &&
+                        candidate.packagePath === selected.packagePath,
+                    ),
+                )
+              )
+                return yield* deny(
+                  "Selected owned skill is missing from current catalogue candidates",
+                );
+              const current = yield* operations.current(identity(request.runtime.threadId), true);
+              if (contextFor(current) !== context)
+                return yield* deny("Pi skill authority changed during admission", "conflict");
+              yield* verifyWorkspace(current, agentDirectory, workspace);
+              return yield* operations.admitCurrent(
+                identity(request.runtime.threadId),
+                (latest) => {
+                  if (contextFor(latest) !== context)
+                    throw deny(
+                      "Pi skill authority changed during workspace validation",
+                      "conflict",
+                    );
+                  workspaceReceipt(paths, workspace.fence.metadata, workspace.fence);
+                  return Object.freeze(selection.map((selected) => selected.key));
+                },
+              );
+            }),
+          );
         const prepareOperation: PiManagedRuntimeInstance["prepareOperation"] = (request, observe) =>
           guard(
             Effect.gen(function* () {
@@ -1221,8 +1323,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 };
               }),
             ),
-          authorizeSkills: () =>
-            Effect.fail(deny("Pi managed skill delivery unavailable", "unavailable")),
+          authorizeSkills,
           discoverNativeSkills: () =>
             Effect.fail(deny("Pi native extension discovery unavailable", "unavailable")),
         };

@@ -1,12 +1,13 @@
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
 import { PiManagedRuntimeError } from "./PiManagedRuntime.ts";
-import { CommandId, SkillCatalogRevision } from "@t3tools/contracts";
+import { CommandId, ManagedSkillKey, SkillCatalogRevision } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import * as DateTime from "effect/DateTime";
 import * as NodeCrypto from "node:crypto";
 import * as Effect from "effect/Effect";
+import * as Clock from "effect/Clock";
 import * as Fiber from "effect/Fiber";
 import * as Stream from "effect/Stream";
 import * as Deferred from "effect/Deferred";
@@ -23,6 +24,9 @@ import {
   threadId,
   at,
 } from "../../projectWork/ProjectTeamAuthorization.testFixtures.ts";
+import * as ManagedSkills from "../../skills/ManagedSkillRepository.ts";
+import * as ServerConfig from "../../config.ts";
+import { hashSkillPackage } from "../../skills/SkillPackage.ts";
 import { makeProjectTeamPiOperations } from "../../projectWork/ProjectTeamPiOperations.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { EnvironmentAuth } from "../../auth/EnvironmentAuth.ts";
@@ -2413,3 +2417,293 @@ describe.runIf(process.env.PI_MANAGED_RUNTIME_LINUX_GATE === "1")(
     }
   },
 );
+
+const skillAuthorityLayer = ManagedSkills.layer.pipe(
+  Layer.provideMerge(
+    ServerConfig.layerTest(process.cwd(), { prefix: "pi-current-skill-authority-" }),
+  ),
+  Layer.provideMerge(NodeServices.layer),
+);
+const catalogueRequest = (cwd: string) => ({
+  runtime: {
+    providerInstanceId,
+    threadId,
+    cwd,
+    sessionId: `thread-${NodeCrypto.createHash("sha256").update(threadId).digest("hex").slice(0, 24)}`,
+  },
+  desiredRevision: SkillCatalogRevision.make(1),
+  skills: [],
+});
+
+it.effect("authorizes only selected current owned skill keys from the complete catalogue", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const repository = yield* ManagedSkills.ManagedSkillRepository;
+      const global = yield* repository.createGlobal({
+        expectedRevision: 0,
+        content: { key: ManagedSkillKey.make("review"), name: "Review", body: "Global review." },
+      });
+      const unrelated = yield* repository.createGlobal({
+        expectedRevision: 0,
+        content: { key: ManagedSkillKey.make("deploy"), name: "Deploy", body: "Unselected." },
+      });
+      const selected = yield* repository.setProjectOverride({
+        projectRoot: f.main,
+        key: global.manifest.key,
+        content: { name: "Project review", body: "Only the primary project override." },
+      });
+      yield* restoreHistoricalBinding({
+        ...f.role,
+        revision: f.role.revision + 1,
+        skills: [selected.manifest.id],
+      });
+      yield* restoreHistoricalBinding({
+        ...f.binding,
+        revision: f.binding.revision + 1,
+        configuration: { ...f.binding.configuration, skillIds: [selected.manifest.id] },
+      });
+      const request = {
+        ...catalogueRequest(f.worktree),
+        skills: [
+          { key: selected.manifest.key, packagePath: selected.packagePath },
+          { key: unrelated.manifest.key, packagePath: unrelated.packagePath },
+        ],
+      };
+      const before = yield* hashSkillPackage(selected.packagePath);
+      expect(yield* f.instance.authorizeSkills(request)).toEqual([selected.manifest.key]);
+      for (const skills of [
+        [],
+        [{ key: selected.manifest.key, packagePath: global.packagePath }],
+        [...request.skills, request.skills[0]!],
+      ])
+        yield* rejected(f.instance.authorizeSkills({ ...request, skills }));
+      expect(yield* hashSkillPackage(selected.packagePath)).toBe(before);
+      expect(f.launches).toBe(0);
+      expect(f.transports).toBe(0);
+      expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toHaveLength(0);
+    }),
+  ).pipe(Effect.provide(skillAuthorityLayer)),
+);
+
+it.effect(
+  "authorizes empty frozen selection without repository access or role skill activation",
+  () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        yield* restoreHistoricalBinding({
+          ...f.role,
+          revision: f.role.revision + 1,
+          skills: ["uninstalled-role-skill"],
+        });
+        const keys = yield* f.instance.authorizeSkills(catalogueRequest(f.worktree));
+        expect(keys).toEqual([]);
+        expect(Object.isFrozen(keys)).toBe(true);
+        for (const runtime of [
+          { ...catalogueRequest(f.worktree).runtime, cwd: f.main },
+          { ...catalogueRequest(f.worktree).runtime, sessionId: "forged-session" },
+        ])
+          yield* rejected(f.instance.authorizeSkills({ ...catalogueRequest(f.worktree), runtime }));
+        expect(f.launches).toBe(0);
+        expect(f.transports).toBe(0);
+      }),
+    ),
+);
+
+it.effect("rechecks durable skill authority after an owned repository read receipt", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const repository = yield* ManagedSkills.ManagedSkillRepository;
+      const selected = yield* repository.createGlobal({
+        expectedRevision: 0,
+        content: { key: ManagedSkillKey.make("review"), name: "Review", body: "Review." },
+      });
+      yield* restoreHistoricalBinding({
+        ...f.role,
+        revision: f.role.revision + 1,
+        skills: [selected.manifest.id],
+      });
+      const binding = {
+        ...f.binding,
+        revision: f.binding.revision + 1,
+        configuration: { ...f.binding.configuration, skillIds: [selected.manifest.id] },
+      };
+      yield* restoreHistoricalBinding(binding);
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const runtime = yield* makePiManagedRuntimeLive(f.options).pipe(
+        Effect.provideService(ManagedSkills.ManagedSkillRepository, {
+          ...repository,
+          readGlobal: (id) =>
+            repository.readGlobal(id).pipe(
+              Effect.tap(() => Deferred.succeed(entered, undefined)),
+              Effect.tap(() => Deferred.await(release)),
+            ),
+        }),
+      );
+      const instance = yield* runtime.forInstance({
+        instanceId: providerInstanceId,
+        enabled: true,
+        configuration: {},
+      });
+      const pending = yield* instance
+        .authorizeSkills({
+          ...catalogueRequest(f.worktree),
+          skills: [{ key: selected.manifest.key, packagePath: selected.packagePath }],
+        })
+        .pipe(Effect.result, Effect.forkChild);
+      yield* Effect.raceFirst(
+        Deferred.await(entered),
+        Fiber.join(pending).pipe(
+          Effect.flatMap(() => Effect.die("Authorization finished before its owned read receipt.")),
+        ),
+      );
+      yield* restoreHistoricalBinding({
+        ...binding,
+        revision: binding.revision + 1,
+        status: "stopping",
+      });
+      yield* Deferred.succeed(release, undefined);
+      expect((yield* Fiber.join(pending))._tag).toBe("Failure");
+      expect(f.launches).toBe(0);
+      expect(f.transports).toBe(0);
+    }),
+  ).pipe(Effect.provide(skillAuthorityLayer)),
+);
+
+it.effect("denies expiry during the synchronous final skill admission fence", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const clock = yield* Clock.Clock;
+      let expired = false;
+      const operations = yield* makeProjectTeamPiOperations({ environmentId: "environment" }).pipe(
+        Effect.provideService(Clock.Clock, {
+          ...clock,
+          currentTimeMillisUnsafe: () =>
+            expired ? Date.parse("2030-01-01T00:00:00.000Z") : clock.currentTimeMillisUnsafe(),
+        }),
+      );
+      yield* rejected(
+        operations.admitCurrent({ providerInstanceId, threadId }, () => {
+          expired = true;
+          return Object.freeze(["selected"]);
+        }),
+      );
+      expect(expired).toBe(true);
+      expect(f.launches).toBe(0);
+      expect(f.transports).toBe(0);
+      expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toHaveLength(0);
+    }),
+  ),
+);
+
+for (const mode of ["unchanged", "expired", "queued-stop"] as const)
+  it.effect(`linearizes final skill admission at an actual SQL receipt: ${mode}`, () =>
+    scoped(
+      Effect.gen(function* () {
+        const f = yield* fixture;
+        const repository = yield* ManagedSkills.ManagedSkillRepository;
+        const selected = yield* repository.createGlobal({
+          expectedRevision: 0,
+          content: { key: ManagedSkillKey.make("review"), name: "Review", body: "Review." },
+        });
+        yield* restoreHistoricalBinding({
+          ...f.role,
+          revision: f.role.revision + 1,
+          skills: [selected.manifest.id],
+        });
+        const binding = {
+          ...f.binding,
+          revision: f.binding.revision + 1,
+          configuration: { ...f.binding.configuration, skillIds: [selected.manifest.id] },
+        };
+        yield* restoreHistoricalBinding(binding);
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        let receipts = 0;
+        const observedSql = new Proxy(f.sql, {
+          apply(target, _receiver, args) {
+            const statement = target(args[0], ...args.slice(1));
+            if (
+              !statement
+                .compile()[0]
+                .includes("SELECT project_id FROM projection_projects WHERE project_id")
+            )
+              return statement;
+            return statement.pipe(
+              Effect.tap(() =>
+                Effect.gen(function* () {
+                  receipts++;
+                  if (receipts !== 3) return;
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(release);
+                }),
+              ),
+            );
+          },
+        });
+        const authorization = yield* Authorization.ProjectTeamAuthorization.pipe(
+          Effect.provide(Layer.fresh(Authorization.layer)),
+          Effect.provideService(SqlClient.SqlClient, observedSql),
+        );
+        const runtime = yield* makePiManagedRuntimeLive(f.options).pipe(
+          Effect.provideService(Authorization.ProjectTeamAuthorization, authorization),
+        );
+        const instance = yield* runtime.forInstance({
+          instanceId: providerInstanceId,
+          enabled: true,
+          configuration: {},
+        });
+        const pending = yield* instance
+          .authorizeSkills({
+            ...catalogueRequest(f.worktree),
+            skills: [{ key: selected.manifest.key, packagePath: selected.packagePath }],
+          })
+          .pipe(Effect.result, Effect.forkChild);
+        yield* Effect.raceFirst(
+          Deferred.await(entered),
+          Fiber.join(pending).pipe(
+            Effect.flatMap(() => Effect.die("Admission finished without its final SQL receipt")),
+          ),
+        );
+        if (mode === "expired") yield* TestClock.setTime(Date.parse("2030-01-01T00:00:00.000Z"));
+        const stopStarted = yield* Deferred.make<void>();
+        let committed = false;
+        const stop =
+          mode === "queued-stop"
+            ? yield* Effect.gen(function* () {
+                yield* Deferred.succeed(stopStarted, undefined);
+                yield* restoreHistoricalBinding({
+                  ...binding,
+                  revision: binding.revision + 1,
+                  status: "stopping",
+                });
+                committed = true;
+              }).pipe(Effect.forkChild)
+            : undefined;
+        if (stop) {
+          yield* Deferred.await(stopStarted);
+          expect(committed).toBe(false);
+        }
+        yield* Deferred.succeed(release, undefined);
+        const result = yield* Fiber.join(pending);
+        expect(result._tag).toBe(mode === "expired" ? "Failure" : "Success");
+        if (stop) {
+          yield* Fiber.join(stop);
+          expect(committed).toBe(true);
+          yield* rejected(
+            instance.authorizeSkills({
+              ...catalogueRequest(f.worktree),
+              skills: [{ key: selected.manifest.key, packagePath: selected.packagePath }],
+            }),
+          );
+        }
+        expect(f.launches).toBe(0);
+        expect(f.transports).toBe(0);
+        expect(yield* f.sql`SELECT * FROM project_team_pi_operation`).toHaveLength(0);
+      }),
+    ).pipe(Effect.provide(skillAuthorityLayer)),
+  );
