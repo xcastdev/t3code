@@ -251,6 +251,7 @@ const AllocationSchema = Schema.Struct({
   policy: Schema.Struct({ memoryBytes: Schema.Int, runtimeSeconds: Schema.Int }),
   launch: PinnedLaunchSchema,
 });
+export const PiManagedProcessAllocationSchema = AllocationSchema;
 export type PiManagedProcessAllocation = typeof AllocationSchema.Type;
 export interface PiManagedProcessPersistence {
   readonly allocation: PiManagedProcessAllocation;
