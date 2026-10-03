@@ -17,6 +17,7 @@ import {
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -356,9 +357,15 @@ const makeProjectWorkGateway = Effect.gen(function* () {
       let denial: ProjectTeamAuthorization.ProjectTeamAuthorizationError | undefined;
       const captureDenial = <A, Error>(effect: Effect.Effect<A, Error>) =>
         effect.pipe(
-          Effect.tapError((error) =>
+          Effect.tapCause((cause) =>
             Effect.sync(() => {
-              if (isTeamAuthorizationError(error)) denial = error;
+              const reason = cause.reasons[0];
+              if (
+                cause.reasons.length === 1 &&
+                reason?._tag === "Fail" &&
+                isTeamAuthorizationError(reason.error)
+              )
+                denial = reason.error;
             }),
           ),
         );
@@ -370,16 +377,20 @@ const makeProjectWorkGateway = Effect.gen(function* () {
           receiptFingerprint,
         )
         .pipe(
-          // The repository wraps callback failures after its transaction has rolled
-          // back. Restore only this invocation's exact denial; failed rollback is
-          // a defect, and unrelated persistence failures must stay uncertain.
-          Effect.mapError((error) =>
-            denial !== undefined &&
-            isPersistenceSqlError(error) &&
-            error.operation === "ProjectWorkRepository.executeAuthorized" &&
-            error.cause === denial
-              ? denial
-              : error,
+          // Restore only a sole callback denial after successful rollback. Mixed
+          // transaction failures retain their defects/interruption and uncertainty.
+          Effect.catchCause((cause) =>
+            Effect.failCause(
+              Cause.map(cause, (error) =>
+                cause.reasons.length === 1 &&
+                denial !== undefined &&
+                isPersistenceSqlError(error) &&
+                error.operation === "ProjectWorkRepository.executeAuthorized" &&
+                error.cause === denial
+                  ? denial
+                  : error,
+              ),
+            ),
           ),
         );
     });
@@ -885,18 +896,22 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             } as ProjectWorkCommand;
           }),
         ).pipe(
-          Effect.mapError((cause) => {
-            if (
-              Schema.is(ProjectWorkAuthorizationError)(cause) ||
-              Schema.is(EnvironmentAuth.ServerAuthProjectWorkApprovalError)(cause) ||
-              cause instanceof ProjectWorkPolicyError ||
-              isPersistenceError(cause) ||
-              isTeamAuthorizationError(cause)
-            ) {
-              return cause;
-            }
-            return toPersistenceSqlError("ProjectWorkGateway.write")(cause);
-          }),
+          Effect.catchCause((failure) =>
+            Effect.failCause(
+              Cause.map(failure, (cause) => {
+                if (
+                  Schema.is(ProjectWorkAuthorizationError)(cause) ||
+                  Schema.is(EnvironmentAuth.ServerAuthProjectWorkApprovalError)(cause) ||
+                  cause instanceof ProjectWorkPolicyError ||
+                  isPersistenceError(cause) ||
+                  isTeamAuthorizationError(cause)
+                ) {
+                  return cause;
+                }
+                return toPersistenceSqlError("ProjectWorkGateway.write")(cause);
+              }),
+            ),
+          ),
         );
         if (Option.isSome(attention))
           yield* attention.value.onCommitted({
@@ -931,18 +946,22 @@ const makeProjectWorkGateway = Effect.gen(function* () {
                 return withoutApprovalToken(authorizedCommand);
               }),
             ).pipe(
-              Effect.mapError((cause) => {
-                if (
-                  Schema.is(ProjectWorkAuthorizationError)(cause) ||
-                  Schema.is(EnvironmentAuth.ServerAuthProjectWorkApprovalError)(cause) ||
-                  cause instanceof ProjectWorkPolicyError ||
-                  isPersistenceError(cause) ||
-                  isTeamAuthorizationError(cause)
-                ) {
-                  return cause;
-                }
-                return toPersistenceSqlError("ProjectWorkGateway.write")(cause);
-              }),
+              Effect.catchCause((failure) =>
+                Effect.failCause(
+                  Cause.map(failure, (cause) => {
+                    if (
+                      Schema.is(ProjectWorkAuthorizationError)(cause) ||
+                      Schema.is(EnvironmentAuth.ServerAuthProjectWorkApprovalError)(cause) ||
+                      cause instanceof ProjectWorkPolicyError ||
+                      isPersistenceError(cause) ||
+                      isTeamAuthorizationError(cause)
+                    ) {
+                      return cause;
+                    }
+                    return toPersistenceSqlError("ProjectWorkGateway.write")(cause);
+                  }),
+                ),
+              ),
             )
           : yield* executeCommandAuthorized(authorizedCommand, () =>
               fence.pipe(Effect.as(authorizedCommand)),

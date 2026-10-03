@@ -14,6 +14,7 @@ import {
 import * as DateTime from "effect/DateTime";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -591,11 +592,21 @@ const makeProjectWorkRepository = Effect.gen(function* () {
         }),
       )
       .pipe(
-        Effect.mapError((cause) =>
-          cause instanceof ProjectWorkPolicyError
-            ? cause
-            : toPersistenceSqlError("ProjectWorkRepository.executeAuthorized")(cause),
-        ),
+        Effect.catchCause((cause) => {
+          // A rollback defect or interruption leaves the transaction outcome
+          // uncertain. Keep every reason and prevent public typed-error selection
+          // from treating the callback's denial as a completed rejection.
+          const uncertain = Cause.hasDies(cause) || Cause.hasInterrupts(cause);
+          return Effect.failCause(
+            Cause.map(cause, (error) =>
+              !uncertain && error instanceof ProjectWorkPolicyError
+                ? error
+                : toPersistenceSqlError("ProjectWorkRepository.executeAuthorized")(
+                    uncertain ? cause : error,
+                  ),
+            ),
+          );
+        }),
       );
   };
   const publishCommitted = (result: ProjectWorkCommandResult) =>
