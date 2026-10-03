@@ -8,11 +8,31 @@ let sdkEnvironmentCorrect;
 let expectedSdkDirectory;
 const lifecycle = [];
 let closeCalls = 0;
+let resourceCalls = 0;
+let resourceSelection;
 const closeRelease = Promise.withResolvers();
+const resourceRelease = Promise.withResolvers();
 process.on("message", (message) => {
   if (message?.type === "release-close") closeRelease.resolve();
+  if (message?.type === "release-resources") resourceRelease.resolve();
 });
 globalThis.__piEntryFixture = {
+  async initializeLocalResources(resources) {
+    resourceCalls++;
+    resourceSelection = resources;
+    lifecycle.push("resources-start");
+    await notify({
+      type: "resources-start",
+      lifecycle,
+      resourceCalls,
+      resourceSelection,
+      hostImports,
+      sdkImports,
+    });
+    if (mode === "held-resources") await resourceRelease.promise;
+    if (mode === "resources-error") throw Error("UNAVAILABLE");
+    lifecycle.push("resources-joined");
+  },
   async event(type) {
     lifecycle.push(type);
     if (type === "close-start") {
@@ -42,7 +62,7 @@ const hook = NodeModule.registerHooks({
           ${mode === "factory-error" ? 'throw Error("synthetic factory failure");' : ""}
           const tools = await makePiLocalTools(process.cwd());
           await globalThis.__piEntryFixture.event("tools-created");
-          return { ...tools, async close() {
+          return { ...tools, initializeLocalResources: globalThis.__piEntryFixture.initializeLocalResources, async close() {
             await globalThis.__piEntryFixture.event("close-start");
             await globalThis.__piEntryFixture.event("close-joined");
           }};
@@ -133,6 +153,8 @@ try {
       type: "result",
       lifecycle,
       closeCalls,
+      resourceCalls,
+      resourceSelection,
       ok: code === undefined,
       code,
       repeatedCode,
