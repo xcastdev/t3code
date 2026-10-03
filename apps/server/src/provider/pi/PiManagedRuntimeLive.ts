@@ -203,12 +203,7 @@ const captureSkillSources = async (
   // Selection is bounded to 32 packages; each inventory uses the shared package limits.
   if (selection.length > 32) throw sourceChanged();
   const validate = (path: string) => {
-    if (
-      !paths.isAbsolute(path) ||
-      paths.normalize(path) !== path ||
-      path.length > 4096 ||
-      path.split("/").length > 96
-    )
+    if (!paths.isAbsolute(path) || paths.normalize(path) !== path || path.length > 4096)
       throw sourceChanged();
   };
   for (const selected of selection) {
