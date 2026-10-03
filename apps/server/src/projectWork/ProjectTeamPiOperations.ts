@@ -597,7 +597,7 @@ export const makeProjectTeamPiOperations = Effect.fn("makeProjectTeamPiOperation
         }),
         nativeAuthority(captured, native).pipe(Effect.asVoid),
       );
-      yield* nativeAuthority(captured, native);
+      return yield* nativeAuthority(captured, native);
     });
     const persistControl = Effect.fn("ProjectTeamPiOperations.persistControl")(function* (
       captured: PiDurableOperation,

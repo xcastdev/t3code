@@ -711,8 +711,10 @@ it.effect(
           leafId: null,
           persisted: false,
         };
-        yield* f.operations.persistNative(op, native);
+        const committed = yield* f.operations.persistNative(op, native);
         const authority = yield* f.operations.current(f.identity);
+        expect(committed).toEqual(authority);
+        expect(authority.binding.revision).toBe(op.authority.binding.revision + 1);
         expect(authority.binding.status).toBe("running");
         expect(authority.binding.sessionId).toBe("native");
         expect(
