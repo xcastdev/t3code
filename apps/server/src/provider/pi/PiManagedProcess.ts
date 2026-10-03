@@ -16,6 +16,9 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
+// Electron's fixed ELF closure can include more than 128 physical files.
+export const MAX_PI_RUNTIME_FILES = 256;
+
 const LaunchSchema = Schema.Struct({
   workspaceRoot: Schema.String,
   workspaceAccess: Schema.optional(Schema.Literals(["readonly", "readwrite"])),
@@ -73,7 +76,7 @@ export const validatePiManagedLaunch = Effect.fn("validatePiManagedLaunch")(
         "Managed launch requires explicit bounded memory/time bounds.",
       );
     if (
-      value.runtimeFiles.length > 128 ||
+      value.runtimeFiles.length > MAX_PI_RUNTIME_FILES ||
       value.argv.length > 256 ||
       value.protectedRoots.length > 64
     )
