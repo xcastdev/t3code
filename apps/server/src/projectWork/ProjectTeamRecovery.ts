@@ -193,8 +193,14 @@ export function makeProjectTeamRecovery<
     const recorded = yield* Effect.suspend(() =>
       ports.recordDiscoveryFailure(item.dispatchId, cause, item.position),
     ).pipe(Effect.exit);
+    // Join publication before observing cancellation; returning a decode failure alone masks it.
+    const interrupted = yield* Effect.interruptible(Effect.void).pipe(Effect.exit);
     return yield* Effect.failCause(
-      Exit.isFailure(recorded) ? Cause.combine(cause, recorded.cause) : cause,
+      Cause.fromReasons([
+        ...cause.reasons,
+        ...(Exit.isFailure(recorded) ? recorded.cause.reasons : []),
+        ...(Exit.isFailure(interrupted) ? interrupted.cause.reasons : []),
+      ]),
     );
   }, Effect.uninterruptible);
 

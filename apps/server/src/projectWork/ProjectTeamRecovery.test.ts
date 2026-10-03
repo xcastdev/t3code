@@ -2,6 +2,7 @@ import { expect, it } from "@effect/vitest";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ProjectWorkFoundationCommitCommand } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -1298,3 +1299,112 @@ it.effect(
       }),
     ),
 );
+
+for (const positioned of [false, true]) {
+  for (const publication of ["success", "failure", "defect"] as const) {
+    it.effect(
+      `${positioned ? "positioned" : "legacy"} joined attention ${publication} retains full causes and repeated interruption without cursor advance`,
+      () =>
+        scoped(
+          Effect.gen(function* () {
+            const f = yield* fixture;
+            const h = harness(yield* f.journal.reserve(f.request));
+            const entered = yield* Deferred.make<void>();
+            const proceed = yield* Deferred.make<void>();
+            const decodeReason = Cause.makeFailReason(error("decode failure")).annotate(
+              Context.makeUnsafe(new Map([["origin", "decode"]])),
+            );
+            const decodeCause = Cause.fromReasons([decodeReason, decodeReason]);
+            const publicationReason = (
+              publication === "defect"
+                ? Cause.makeDieReason(error("publication defect"))
+                : Cause.makeFailReason(error("publication failure"))
+            ).annotate(Context.makeUnsafe(new Map([["origin", "publication"]])));
+            const publicationCause = Cause.fromReasons([publicationReason, publicationReason]);
+            const reads: Parameters<Ports["readPage"]>[0][] = [];
+            let held = true;
+            let drained = false;
+            let published = 0;
+            h.ports.readPage = (input) => {
+              reads.push(input);
+              const second = positioned
+                ? input.afterPosition !== undefined
+                : input.afterDispatchId !== undefined;
+              return Effect.succeed([
+                {
+                  dispatchId: second ? "b" : "a",
+                  ...(positioned ? { position: positionFor(second ? "2" : "1") } : {}),
+                  snapshot: Exit.failCause(second ? decodeCause : cause("initial malformed")),
+                },
+              ]);
+            };
+            h.ports.recordDiscoveryFailure = (id, observed) =>
+              Effect.gen(function* () {
+                published++;
+                if (id !== "b") return;
+                expect(observed).toEqual(decodeCause);
+                if (held) {
+                  yield* Deferred.succeed(entered, undefined);
+                  yield* Deferred.await(proceed);
+                }
+                drained = true;
+                if (publication !== "success") return yield* Effect.failCause(publicationCause);
+              });
+            const recovery = makeProjectTeamRecovery(h.ports, { pageSize: 1 });
+            yield* recovery.sweep();
+            const fiber = yield* recovery.sweep().pipe(Effect.forkChild);
+            yield* Deferred.await(entered);
+            yield* Effect.sync(() => {
+              fiber.interruptUnsafe(
+                101,
+                Context.makeUnsafe(new Map([["interrupt-origin", "first"]])),
+              );
+              fiber.interruptUnsafe(
+                202,
+                Context.makeUnsafe(new Map([["interrupt-origin", "second"]])),
+              );
+            });
+            expect(drained).toBe(false);
+            expect(h.claims).toEqual([]);
+            held = false;
+            yield* Deferred.succeed(proceed, undefined);
+            const interrupted = yield* Fiber.await(fiber);
+            expect(drained).toBe(true);
+            expect(published).toBe(2);
+            expect(reads).toHaveLength(2);
+            if (!Exit.isFailure(interrupted))
+              return yield* Effect.die("Canceled attention succeeded");
+            expect(Cause.hasInterrupts(interrupted.cause)).toBe(true);
+            const decoded = interrupted.cause.reasons
+              .filter(Cause.isFailReason)
+              .filter((reason) => reason.error.reason === "decode failure");
+            expect(decoded).toHaveLength(2);
+            expect(decoded.every((reason) => reason.annotations.get("origin") === "decode")).toBe(
+              true,
+            );
+            const publications = interrupted.cause.reasons.filter(
+              (reason) => reason.annotations.get("origin") === "publication",
+            );
+            expect(publications).toHaveLength(publication === "success" ? 0 : 2);
+            expect(
+              publications.every(
+                (reason) => reason._tag === (publication === "defect" ? "Die" : "Fail"),
+              ),
+            ).toBe(true);
+            const interrupts = interrupted.cause.reasons.filter(Cause.isInterruptReason);
+            expect(interrupts.map((reason) => reason.fiberId)).toEqual([101, 202]);
+            expect(interrupts.map((reason) => reason.annotations.get("interrupt-origin"))).toEqual([
+              "first",
+              "second",
+            ]);
+            const retry = yield* recovery.sweep();
+            expect(reads[2]).toEqual(reads[1]);
+            expect(Exit.isFailure(retry.items[0]!.result)).toBe(true);
+            expect(published).toBe(3);
+            expect(h.claims).toEqual([]);
+            expect(h.events).toEqual([]);
+          }),
+        ),
+    );
+  }
+}
