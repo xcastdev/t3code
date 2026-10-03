@@ -1247,6 +1247,8 @@ it.effect(
             [20, "ProjectTeamIdentityFences"],
             [21, "ProjectWorkEvidenceMetadata"],
             [22, "ProjectIssueRepositories"],
+            [23, "ProjectTeamModelRequests"],
+            [24, "ProjectTeamPiOperations"],
           ]);
           const upgradedSql = yield* SqlClient.SqlClient;
           expect(
