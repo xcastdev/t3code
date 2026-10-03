@@ -1,5 +1,6 @@
-import type { AgentToolResult } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, BashOperations } from "@earendil-works/pi-coding-agent";
 import * as Schema from "effect/Schema";
+import { makePiBashToolIsolation } from "./PiBashToolIsolation.ts";
 import { PI_WORKER_MAX_TOOL_BYTES, PiWorkerToolOutput } from "./PiWorkerProtocol.ts";
 
 const MAX_PATH = 4096;
@@ -130,8 +131,10 @@ function adapt<S extends Schema.ConstraintDecoder<unknown, never>>(
       const result = await execute(input, signal);
       if (signal.aborted) throw Error("CANCELED");
       return output(result);
-    } catch {
-      throw Error(signal.aborted ? "CANCELED" : "TOOL_FAILURE");
+    } catch (error) {
+      if (signal.aborted) throw Error("CANCELED");
+      if (error instanceof Error && error.message === "UNAVAILABLE") throw Error("UNAVAILABLE");
+      throw Error("TOOL_FAILURE");
     }
   };
 }
@@ -365,24 +368,20 @@ async function workspaceFiles(cwd: string) {
   };
 }
 
-/**
- * Child-only tools for an explicit canonical cwd. Root supplies /workspace after
- * isolation and owns tool selection, mounts, per-call authorization and deadlines.
- * The trusted entry must set PI_PACKAGE_DIR before calling this lazy constructor.
- * Native file reads and output accumulation are not hard allocation bounds; escaped
- * shell descendants require Root's process owner even when SDK abort succeeds.
- */
-export async function makePiLocalTools(cwd: string) {
-  try {
-    decodeCwd(cwd);
-  } catch {
-    throw Error("INVALID_INPUT");
-  }
+async function loadSdk() {
   if (!process.env.PI_PACKAGE_DIR) throw Error("UNAVAILABLE");
   const sdk = await import("@earendil-works/pi-coding-agent");
   if (sdk.VERSION !== "0.99.1") throw Error("UNAVAILABLE");
+  return sdk;
+}
+
+async function makeLocalTools(
+  cwd: string,
+  sdk: Awaited<ReturnType<typeof loadSdk>>,
+  operations: BashOperations,
+) {
   const executeFile = await workspaceFiles(cwd);
-  const bash = sdk.createBashTool(cwd, { exposeSessionEnvironment: false });
+  const bash = sdk.createBashTool(cwd, { operations, exposeSessionEnvironment: false });
   return Object.freeze({
     tools: piLocalToolDefinitions,
     localTools: Object.freeze({
@@ -415,4 +414,89 @@ export async function makePiLocalTools(cwd: string) {
       bash: adapt(BashInput, (args, signal) => bash.execute("t3-local-bash", args, signal)),
     }),
   });
+}
+
+/** File-only fixture constructor. Bash requires the owned production factory. */
+export async function makePiLocalTools(cwd: string) {
+  try {
+    decodeCwd(cwd);
+  } catch {
+    throw Error("INVALID_INPUT");
+  }
+  return makeLocalTools(cwd, await loadSdk(), {
+    exec: () => Promise.reject(Error("UNAVAILABLE")),
+  });
+}
+
+/** Read the fixed outer mount's mode; the owned helper independently admits its authority. */
+async function workspaceAccess() {
+  const fs = process.getBuiltinModule("fs");
+  const handle = await fs.promises.open(
+    "/proc/self/mountinfo",
+    fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK,
+  );
+  try {
+    const bytes = Buffer.alloc(65_537);
+    let length = 0;
+    while (length < bytes.length) {
+      const { bytesRead } = await handle.read(bytes, length, bytes.length - length, null);
+      if (bytesRead === 0) break;
+      length += bytesRead;
+    }
+    if (length > 65_536) throw Error("UNAVAILABLE");
+    const rows = bytes.toString("utf8", 0, length).trimEnd().split("\n");
+    if (rows.length > 512) throw Error("UNAVAILABLE");
+    const mounts = rows.map((row) => {
+      const pieces = row.split(" - ");
+      const fields = pieces[0]?.split(" ") ?? [];
+      if (
+        pieces.length !== 2 ||
+        fields.length < 6 ||
+        fields.length > 32 ||
+        !/^[1-9][0-9]{0,19}$/.test(fields[0] ?? "") ||
+        !/^[1-9][0-9]{0,19}$/.test(fields[1] ?? "") ||
+        !/^[0-9]+:[0-9]+$/.test(fields[2] ?? "") ||
+        !fields[4]?.startsWith("/") ||
+        pieces[1]?.split(" ").length !== 3
+      )
+        throw Error("UNAVAILABLE");
+      return { id: fields[0]!, path: fields[4]!, options: fields[5]!.split(",") };
+    });
+    if (new Set(mounts.map((mount) => mount.id)).size !== mounts.length) throw Error("UNAVAILABLE");
+    const assigned = mounts.filter((mount) => mount.path === "/workspace");
+    if (assigned.length !== 1) throw Error("UNAVAILABLE");
+    const options = assigned[0]!.options;
+    if (
+      new Set(options).size !== options.length ||
+      options.some((option) => !option || /\s/.test(option)) ||
+      options.filter((option) => option === "ro" || option === "rw").length !== 1
+    )
+      throw Error("UNAVAILABLE");
+    return options.includes("ro") ? "readonly" : "readwrite";
+  } finally {
+    await handle.close();
+  }
+}
+
+/**
+ * Fixed child factory inside Root's authorized cage. PI_PACKAGE_DIR is set before import.
+ * The outer role mount supplies its access mode; recursive bind retains readonly flags.
+ * Root fences that mount for the run and joins the native owner after this SDK close.
+ */
+export async function makePiIsolatedLocalTools() {
+  const sdk = await loadSdk();
+  const owner = await makePiBashToolIsolation({
+    localOperations: sdk.createLocalBashOperations({ shellPath: "/bin/bash" }),
+    workspaceAccess: await workspaceAccess(),
+    protectedWorkspacePaths: ["/workspace/.git"],
+  });
+  try {
+    return Object.freeze({
+      ...(await makeLocalTools("/workspace", sdk, owner.operations)),
+      close: owner.close,
+    });
+  } catch (error) {
+    await owner.close();
+    throw error;
+  }
 }

@@ -6,6 +6,24 @@ let remoteCalls = 0;
 let hostImports = 0;
 let sdkImports = 0;
 let sdkEnvironmentCorrect;
+const files = process.getBuiltinModule("fs").promises;
+const originalOpen = files.open;
+let descriptorOpened = 0;
+let descriptorClosed = 0;
+const descriptors = new Set();
+files.open = async (...args) => {
+  const handle = await originalOpen(...args);
+  if (typeof args[0] === "string" && (args[0] === "/workspace" || args[0].startsWith("/proc/"))) {
+    descriptorOpened++;
+    descriptors.add(handle);
+    const close = handle.close.bind(handle);
+    handle.close = async () => {
+      await close();
+      if (descriptors.delete(handle)) descriptorClosed++;
+    };
+  }
+  return handle;
+};
 const notify = (value) =>
   process.stderr.write(JSON.stringify({ hostImports, sdkImports, ...value }) + "\n");
 globalThis.fetch = async () => {
@@ -18,6 +36,10 @@ const builtinChildProcess = NodeChildProcess.default;
 builtinChildProcess.spawn = (...args) => {
   const child = originalSpawn(...args);
   notify({ type: "native-spawn", pid: child.pid, executable: args[0] });
+  child.stdout?.on("data", (bytes) => {
+    if (bytes.toString().includes("entry-descendant-ready"))
+      notify({ type: "native-data", data: bytes.toString() });
+  });
   child.once("exit", (exitCode, exitSignal) => {
     notify({ type: "native-exit", pid: child.pid, exitCode, exitSignal });
   });
@@ -67,10 +89,14 @@ try {
     rawInputDestroyed: process.stdin.destroyed,
     rawOutputDestroyed: process.stdout.destroyed,
     rawOutputEnded: process.stdout.writableEnded,
+    descriptorOpened,
+    descriptorClosed,
+    descriptorsHeld: descriptors.size,
   });
   if (code) process.exitCode = 1;
 } finally {
   hook.deregister();
+  files.open = originalOpen;
   builtinChildProcess.spawn = originalSpawn;
   NodeModule.syncBuiltinESMExports();
 }

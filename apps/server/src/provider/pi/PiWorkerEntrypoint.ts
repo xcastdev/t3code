@@ -104,11 +104,14 @@ export async function runPiWorkerEntrypoint(rawLaunchJson: string | undefined): 
     throw Error("PI_WORKER_STDIO_UNAVAILABLE");
   }
   let failed = false;
+  let tools:
+    | Awaited<ReturnType<typeof import("./PiLocalTools.ts").makePiIsolatedLocalTools>>
+    | undefined;
   try {
     // The SDK eagerly reads VERSION during import. No parent/server import sets this.
     process.env.PI_PACKAGE_DIR = launch.trustedSdkPackageDirectory;
-    const { makePiLocalTools } = await import("./PiLocalTools.ts");
-    const { localTools } = await makePiLocalTools("/workspace");
+    const { makePiIsolatedLocalTools } = await import("./PiLocalTools.ts");
+    tools = await makePiIsolatedLocalTools();
     const { runPiWorkerHost } = await import("./PiWorkerHost.ts");
     await runPiWorkerHost({
       identity: launch.identity,
@@ -117,13 +120,18 @@ export async function runPiWorkerEntrypoint(rawLaunchJson: string | undefined): 
       ...(launch.compactionKeepRecentTokens === undefined
         ? {}
         : { compactionKeepRecentTokens: launch.compactionKeepRecentTokens }),
-      localTools,
+      localTools: tools.localTools,
       input: transport.input,
       output: transport.output,
     });
   } catch {
     failed = true;
   } finally {
+    try {
+      await tools?.close();
+    } catch {
+      failed = true;
+    }
     try {
       await transport.dispose();
     } catch {
