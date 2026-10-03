@@ -7,10 +7,10 @@ Plan review: READY_WITH_EXPLICIT_GATES
 
 ## Progress dashboard
 
-Last updated: 2026-10-03 14:22 UTC. **P1–P4 and the P7 Linux runtime prerequisite are complete on main. P5–P6 and P8–P14 remain open. Latest main product commit: `6de89a30f`.** No product branch has been pushed and no product PR exists.
+Last updated: 2026-10-03 14:38 UTC. **P1–P5 and the P7 Linux runtime prerequisite are complete on main. P6 and P8–P14 remain open. Latest main product commit: `6de89a30f`.** No product branch has been pushed and no product PR exists.
 
 - **Done:** contracts, authenticated authority and guided lifecycle; reviewed intake/human-workflow foundations; Pi registration, isolated runtime, production wiring and Linux packaging.
-- **Working now:** P5/P6 prerequisite evidence mapping; P8 durable admission and limits/Git interfaces; repair of P11's exact-head merge timestamp confirmation. P11 remains a bounded adapter slice until P8–P10 pass.
+- **Working now:** Root P8 durable admission and recovery journal; independent P8 limits and managed Git implementation. P11's timestamp repair `82c6c2e8d` is approved after 192 affected and 12 independent checks, awaiting Root review-packet verification and later integration. P11 remains a bounded adapter slice until P8–P10 pass.
 - **Next:** connect durable scheduling, isolated setup, dispatch and recovery, then messages, memory, delivery and full supervision clients.
 - **Latest evidence:** P7's sole combined reviewer approves exact `7c65aaacc`; current required checks pass 268/268, affected/native initialization checks pass 202 with 55 explicitly gated skips, all 12 real shipping operations and three rebuilt packaged-parent checks pass. Root verified the complete evidence seals. The same reviewer approves source-identical reconciliation `15b6d46a9`, which landed at `6de89a30f` with no additional source change.
 - **Completion gates:** all 19 final acceptance criteria and both final audits remain open. macOS/Windows Pi execution, full installers, npm installation/publication and full client/device/remote proof remain explicitly unverified. No local model or model API call ran in this continuation.
@@ -63,14 +63,14 @@ Last updated: 2026-10-03 14:22 UTC. **P1–P4 and the P7 Linux runtime prerequis
 
 | Tally                       | Done | In progress | Left | Total |
 | --------------------------- | ---- | ----------- | ---- | ----- |
-| Implementation steps        | 5    | 7           | 2    | 14    |
+| Implementation steps        | 6    | 6           | 2    | 14    |
 | Product acceptance criteria | 0    | 0           | 19   | 19    |
 | Final independent audits    | 0    | 0           | 2    | 2     |
 
 | Phase   | Current position                                                    | Work remaining                                                                                       |
 | ------- | ------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------- |
 | P1–P4   | Complete on main                                                    | Later real runtime/client/platform gates still apply                                                 |
-| P5      | Authority, intake, human binding/RPC, sync and cache repair landed  | Complete authenticated live workflow and later recovery/compatibility proof                          |
+| P5      | Intake prerequisite complete; existing real proof mapped to main    | Later full combined client, recovery and delivery gates remain in P8–P14                              |
 | P6      | Draft helper, intake and guided detail views independently approved | Remaining full workflow and desktop/mobile verification                                              |
 | P7      | Linux runtime prerequisite approved and landed at `6de89a30f`       | Remaining platform/installer/full-client evidence belongs to final compatibility gates               |
 | P8      | Dispatch/recovery interfaces prepared                               | Scheduler, isolated launch, cancellation and restart recovery                                        |
@@ -92,19 +92,19 @@ Each row is one subagent seat. Finished agents release their seat. Status questi
 
 | Slot | Agent | State | Assignment / exact base | Next gate |
 | ---- | ----- | ----- | ----------------------- | --------- |
-| 1 | `p5_p6_prerequisite_evidence_high` | Active read-only mapping | Existing V5/V6 and actual client evidence → current source | Root settles prerequisite gaps |
-| 2 | — | Available | P8 limits leaf, base `6de89a30f` | Frozen interface and focused proof |
-| 3 | — | Available | P8 managed Git leaf, base `6de89a30f` | Frozen interface and real Git proof |
+| 1 | — | Available; prerequisite mapping complete | Root verified 72 unchanged P5/P6 paths and existing gates | Full current client pass remains open |
+| 2 | `p8_limits_policy_current_high` | Active implementation/checks | Only new limits source/test, base `723746b97` | 65 cases and scoped compiler pass; final checks/review |
+| 3 | `p8_managed_git_current_high` | Active implementation | Exclusive workflow/VCS paths + managed helper, base `723746b97` | Real worktree/configuration controls and one review |
 | 4 | — | Available | Isolated setup | Root durable ownership interface |
 | 5 | — | Available | Dispatch | Admission, workspace and setup receipts |
-| 6 | `p11_exact_head_merge_transport_high` | Active R1 repair | Exclusive GitHub CLI source/test, candidate `e3957b478` | Focused repair, normal compiler, same reviewer |
+| 6 | — | Available; P11 repair sealed | Approved exact-head transport `82c6c2e8d` | Root verifies report/seal; parent delivery prerequisites |
 | 7 | — | Available | Recovery | Root stage/owner reconciliation interface |
 | 8 | — | Available | Scheduler | Root atomic admission interface |
 | 9 | — | Available | Later independent leaves | Stable prerequisites and exclusive scope |
 | 10 | — | Available | P7 review complete; P11 same reviewer idle | Required piece/wave reviews |
 
 
-Compiler/build seat: the P11 exact-head timestamp repair worker owns the scoped 4 GiB compiler seat; all previous units are drained. All current shipping and Root parent units are drained. Combined production compiler, Repository repair compiler, all 12 real shipping operations and three actual bundled-parent checks pass and are drained. Root verified the complete 36-artifact normal packet, 152 producer/35 reviewer repair artifacts, 13,255 shipping proof files and 8,972 outputs, plus sealed its 80-file actual parent packet. Required/affected tests now pass 268/268; all 26 captured spawns are absent before outer cleanup. The first 267/268 failure and observer overwrite limitation are retained. No local model is hosted. The fresh reviewer and actual Runtime controls confirm the native publication defect. Root receipt `7d965fbaa` passes all 59 Operations tests with zero skips and clean style/format after a discriminating old-source failure. Its 40-artifact seal is `130a2b78ec6111410d1ab91ce9731047ebadfe25e5a8633530989e94021ab282`. The Runtime fix passes 202 affected cases (200 default plus two actual ordinary/selected initialization controls), with 55 explicit native skips; all actual owners and captured PIDs drain. Normal strict/Effect compilation passes with 2,025 physical inputs plus 87 virtual libraries, zero errors/warnings and 69 suggestions. Root inspected the complete repair and froze byte-exact composition `7c65aaacc`. All 12 current shipping checks pass; Root verified 13,254 proof files and 8,972 outputs. Current V7/affected9 passes 268/268, with 26 captured spawns gone before outer cleanup. Rebuilt npm/SEA/physical ASAR parents pass actual immutable publication, stage deletion and captured server/port cleanup. The 39-file test seal is `1c1cd98c577691df85971ed0c715113f754ba5860283b153ef58c7c10d1a4520`; the 50-file parent seal is `c8772e8a648f26081e7157880283217b7b2c0264fa5f55b242d4125d81ff963e`. Prior packets remain immutable. Linux/current source evidence does not claim the missing platforms, full installer or npm installation/publication. The scoped P7 Linux prerequisite is approved and landed; final platform/client gates remain open.
+Compiler/build seat: P8 limits has released its first passing scoped compiler; a final rerun is permitted only for subsequent source changes. Root and Git worker coordinate the single compiler seat. All prior P7/P11 units are drained. All current shipping and Root parent units are drained. Combined production compiler, Repository repair compiler, all 12 real shipping operations and three actual bundled-parent checks pass and are drained. Root verified the complete 36-artifact normal packet, 152 producer/35 reviewer repair artifacts, 13,255 shipping proof files and 8,972 outputs, plus sealed its 80-file actual parent packet. Required/affected tests now pass 268/268; all 26 captured spawns are absent before outer cleanup. The first 267/268 failure and observer overwrite limitation are retained. No local model is hosted. The fresh reviewer and actual Runtime controls confirm the native publication defect. Root receipt `7d965fbaa` passes all 59 Operations tests with zero skips and clean style/format after a discriminating old-source failure. Its 40-artifact seal is `130a2b78ec6111410d1ab91ce9731047ebadfe25e5a8633530989e94021ab282`. The Runtime fix passes 202 affected cases (200 default plus two actual ordinary/selected initialization controls), with 55 explicit native skips; all actual owners and captured PIDs drain. Normal strict/Effect compilation passes with 2,025 physical inputs plus 87 virtual libraries, zero errors/warnings and 69 suggestions. Root inspected the complete repair and froze byte-exact composition `7c65aaacc`. All 12 current shipping checks pass; Root verified 13,254 proof files and 8,972 outputs. Current V7/affected9 passes 268/268, with 26 captured spawns gone before outer cleanup. Rebuilt npm/SEA/physical ASAR parents pass actual immutable publication, stage deletion and captured server/port cleanup. The 39-file test seal is `1c1cd98c577691df85971ed0c715113f754ba5860283b153ef58c7c10d1a4520`; the 50-file parent seal is `c8772e8a648f26081e7157880283217b7b2c0264fa5f55b242d4125d81ff963e`. Prior packets remain immutable. Linux/current source evidence does not claim the missing platforms, full installer or npm installation/publication. The scoped P7 Linux prerequisite is approved and landed; final platform/client gates remain open.
 
 Production review is approved for `72ba53c4`; Root read the full verdict and verified all 186 files, four private links and directory entries before merging into the wave. The actual published npm supplement is distinct from the Node CLI bundle: its five supported targets include four explicitly missing platform artifacts. Linux archive, faithful ASAR and launcher selection pass at that piece commit; current combined artifacts require fresh affected checks. The correcting supplement preserves the original immutable production seal.
 
@@ -674,7 +674,7 @@ prior verdict does not certify the new parallel assignments.
       across task rerouting/session replacement. Parent completion requires the approved
       required deliverables; canceled dependencies do not count as success.
 
-- [ ] **P5 — Add automatic, read-only issue intake and refinement.**
+- [x] **P5 — Add automatic, read-only issue intake and refinement.**
       Dependencies: P2–P4. Covers AC-1–AC-3, AC-16; validation V5.
       Add **new** `projectWork/github/GitHubIssueSync.ts`, `GitHubIssueClient.ts`, and
       `ProjectIssueIntake.ts`. Reuse `sourceControl/GitHubCli.ts`, canonical repository
@@ -3184,3 +3184,11 @@ Main product commit `6de89a30f7c52dfaea4891fc875adbbbe7e23383` locally merges cl
 The original native-publication finding is closed by the returned committed SQL authority and exact reserved-to-running Runtime progression. Current V7/affected nine suites pass 268/268; actual ordinary/selected initialization returns ready Success with one settled SQL initialize each and zero model requests. All 12 current shipping operations and rebuilt Node CLI, full Linux SEA archive and physical ASAR parent startup/drain checks pass. Their exact source, artifacts, cleanup and limitations remain in the immutable packets above. Compiler reuse is independently mapped: 760 unchanged old program inputs, two changed modules covered by current strict/Effect compilation. No duplicate unaffected compilation was required.
 
 P8 starts from this resulting main product commit. Root retains all shared boundaries and will freeze private leaf interfaces before implementation. P5/P6 prerequisite mapping is read-only preparation; remaining full supervision/recovery/platform evidence is not silently marked passed. P11 R1 malformed timestamp confirmation is verified and in repair; its original review inventory remains sealed at `afbf9f74900f6465f858b7ecc75c322e2f4874f0b25cd0187cf407e712e67574`. No product push/PR, local inference or model API call occurred.
+
+### P5 prerequisite confirmed; P8 owners active (2026-10-03)
+
+Root read the complete existing-evidence mapping at `/home/user/.cache/pi-project-teams-11b7e351/p5-p6-prerequisite-current-evidence/report.md` and independently compared all 72 mapped Git paths to current main: 36 P5 and 36 initial client/API paths are unchanged. Required V5 is included in the recorded 608/608 gate; later changed sync/consumers pass 277/277. Actual two-project GitHub intake, pagination, zero-dispatch, retained issue refinement, close/reopen and conditional-comment proofs already passed with their stated boundaries. Current P7's shared uncertainty/error changes have separate approved actual-SQL/public JSON checks. P5's intake prerequisite is complete; later dispatch/recovery and full current integrated-client/platform gates remain open. V6's 176/176 affected-client gate and core paired-browser workflow are preserved, but P6 remains open for the current integrated client pass.
+
+Repeated completed investigation submissions in browser artifact14 are distinct successful human command identities, as the existing same reviewer concluded; native retries of one command and repeated mounted clicks produce one assignment. No content-based deduplication requirement was invented.
+
+P8 workers start at exact resulting main `723746b9769f105afc6f6aba6f0959bdff3b7bc7`, with exclusive scopes recorded above. Root's isolated `p8-durable-admission` worktree owns shared admission, new migrations and typed stage/recovery records. The limits leaf is pure and grants no authority; Root persists/intersects original root budgets and policy caps. Its effective per-attempt deadline may narrow the immutable root deadline, never extend it. The Git leaf begins with controlled worktree creation under canonical common-directory serialization; setup, editing/checkpoint and dispatch consumers remain gated Root work. Worktree roots and dependency links are private; no model is hosted or invoked.
