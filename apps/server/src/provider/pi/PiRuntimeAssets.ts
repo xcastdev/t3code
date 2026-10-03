@@ -13,7 +13,12 @@ import * as Schema from "effect/Schema";
 import * as ChildProcess from "effect/unstable/process/ChildProcess";
 import * as ChildProcessSpawner from "effect/unstable/process/ChildProcessSpawner";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
-import { MAX_PI_RUNTIME_FILES, type PiManagedLaunch } from "./PiManagedProcess.ts";
+import {
+  MAX_PI_RUNTIME_FILES,
+  MAX_PI_RUNTIME_FILE_BYTES,
+  piRuntimeClosureByteLimit,
+  type PiManagedLaunch,
+} from "./PiManagedProcess.ts";
 import { isPiWorkerNodeVersionSupported } from "./PiWorkerEntrypoint.ts";
 import { PiWorkerIdentity, PiWorkerOperation } from "./PiWorkerProtocol.ts";
 
@@ -24,7 +29,7 @@ const NodeFSP = NodeFS.promises;
 const nativeStat = (source: string) => NodeFSP.lstat(source, { bigint: true });
 type BigIntStats = Awaited<ReturnType<typeof nativeStat>>;
 type FileHandle = Awaited<ReturnType<typeof NodeFSP.open>>;
-const maxBytes = 256 * 1024 * 1024;
+const maxBytes = MAX_PI_RUNTIME_FILE_BYTES;
 const directoryFlags =
   NodeFS.constants.O_RDONLY | NodeFS.constants.O_DIRECTORY | NodeFS.constants.O_NOFOLLOW;
 const readFlags =
@@ -378,7 +383,7 @@ export const preparePiRuntimeAssets = Effect.fn("preparePiRuntimeAssets")(
       return yield* invalid();
     const executable = yield* HostProcessIsExecutable;
     const electron = !executable && process.versions.electron !== undefined;
-    const closureMaxBytes = electron ? 512 * 1024 * 1024 : maxBytes;
+    const closureMaxBytes = piRuntimeClosureByteLimit(electron);
     const names = executable
       ? []
       : yield* native(() =>

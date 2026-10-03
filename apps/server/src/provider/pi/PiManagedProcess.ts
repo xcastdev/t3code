@@ -18,6 +18,9 @@ import * as Schema from "effect/Schema";
 
 // Electron's fixed ELF closure can include more than 128 physical files.
 export const MAX_PI_RUNTIME_FILES = 256;
+export const MAX_PI_RUNTIME_FILE_BYTES = 256 * 1024 * 1024;
+export const piRuntimeClosureByteLimit = (electron: boolean) =>
+  electron ? 2 * MAX_PI_RUNTIME_FILE_BYTES : MAX_PI_RUNTIME_FILE_BYTES;
 
 const LaunchSchema = Schema.Struct({
   workspaceRoot: Schema.String,

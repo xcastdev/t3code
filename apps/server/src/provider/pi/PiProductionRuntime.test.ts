@@ -1,3 +1,11 @@
+import {
+  ManagedSkillId,
+  ManagedSkillKey,
+  ManagedSkillManifest,
+  SkillContentHash,
+} from "@t3tools/contracts";
+import { hashSkillPackage, writeSkillPackageContents } from "../../skills/SkillPackage.ts";
+import { preparePiSkillResources } from "./PiSkillResources.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
@@ -38,6 +46,10 @@ import { makePiProductionRuntime, type PiProductionRuntimeOptions } from "./PiPr
 const NodeFS = process.getBuiltinModule("fs");
 const nativeFS = NodeFS.promises;
 const encode = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const decodeSkillKey = Schema.decodeUnknownEffect(ManagedSkillKey);
+const decodeSkillId = Schema.decodeUnknownEffect(ManagedSkillId);
+const decodeSkillHash = Schema.decodeUnknownEffect(SkillContentHash);
+const encodeSkillManifest = Schema.encodeEffect(Schema.fromJsonString(ManagedSkillManifest));
 const distribution = process.env.PI_PRODUCTION_RUNTIME_DISTRIBUTION;
 const scoped = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
   Effect.scoped(
@@ -487,6 +499,98 @@ product("drained unactivated allocations release their exact stage", () =>
           yield* f.service.forInstance(instance);
           stage = stageFrom(f);
           yield* processRow(f.captured[0]!.runtimeFiles, "drained");
+        }),
+      );
+      expect(yield* f.fs.exists(stage)).toBe(false);
+    }),
+  ),
+);
+const productElectron =
+  distribution && process.env.PI_FACTORY_ELECTRON_PROOF === "1" ? it.effect : it.effect.skip;
+productElectron("drained runtime closures exceeding 128 files release their exact stage", () =>
+  scoped(
+    Effect.gen(function* () {
+      expect(process.versions.electron).toBe("44.1.0");
+      const f = yield* fixture;
+      const source = distribution!;
+      const expanded = f.root + "/expanded-distribution";
+      yield* Effect.promise(() => nativeFS.cp(source, expanded, { recursive: true }));
+      const modules = (yield* f.fs.readDirectory(expanded)).filter((name) => name.endsWith(".mjs"));
+      for (let index = modules.length; index < 96; index++)
+        yield* f.fs.writeFileString(expanded + `/fixture-runtime-${index}.mjs`, "export {};\n");
+      const service = yield* construct({
+        ...f,
+        options: { ...f.options, distributionDirectory: expanded },
+      });
+      let stage = "";
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* service.forInstance(instance);
+          expect(f.captured[0]!.runtimeFiles.length).toBeGreaterThan(128);
+          stage = stageFrom(f);
+          const files = f.captured[0]!.runtimeFiles;
+          const totalBytes = (yield* Effect.forEach(files, (file) =>
+            Effect.promise(async () => (await nativeFS.stat(file.source)).size),
+          )).reduce((sum, size) => sum + size, 0);
+          expect(totalBytes).toBeGreaterThan(256 * 1024 * 1024);
+          const source = f.options.protectedRoots[0]! + "/selected";
+          const selectedCache = f.root + "/selected-cache";
+          const selectedStage = selectedCache + "/stage";
+          yield* f.fs.makeDirectory(selectedStage, { recursive: true });
+          yield* Effect.promise(async () => {
+            await nativeFS.chmod(selectedCache, 0o700);
+            await nativeFS.chmod(selectedStage, 0o700);
+          });
+          yield* Effect.addFinalizer(() =>
+            Effect.promise(async () => {
+              for (const directory of [selectedStage, selectedStage + "/selected"]) {
+                try {
+                  await nativeFS.chmod(directory, 0o700);
+                } catch (cause) {
+                  if (!(cause instanceof Error) || !("code" in cause) || cause.code !== "ENOENT")
+                    throw cause;
+                }
+              }
+            }),
+          );
+          const key = yield* decodeSkillKey("selected");
+          const manifest = {
+            schemaVersion: 1 as const,
+            kind: "managed-skill" as const,
+            id: yield* decodeSkillId("electron-selected"),
+            key,
+            scope: "global" as const,
+            revision: {
+              revision: 1,
+              hash: yield* decodeSkillHash("a".repeat(64)),
+            },
+            origin: "created" as const,
+            ownership: "t3" as const,
+          };
+          yield* writeSkillPackageContents({
+            packagePath: source,
+            manifest,
+            content: { key, name: "Electron selected fixture", body: "Bounded selected skill." },
+          });
+          const expectedHash = yield* hashSkillPackage(source);
+          yield* f.fs.writeFileString(
+            source + "/t3-skill.json",
+            yield* encodeSkillManifest({
+              ...manifest,
+              revision: { revision: 1, hash: expectedHash },
+            }),
+          );
+          const selected = yield* preparePiSkillResources({
+            selection: [{ key, packagePath: source, expectedHash }],
+            stagingRoot: selectedCache,
+            stagingDirectory: selectedStage,
+            existingRuntimeFiles: files,
+            protectedRoots: f.options.protectedRoots,
+            writableRoots: [],
+          });
+          expect(selected.runtimeFiles.length).toBe(2);
+          yield* selected.revalidate;
+          yield* processRow(files, "drained");
         }),
       );
       expect(yield* f.fs.exists(stage)).toBe(false);

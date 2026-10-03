@@ -120,6 +120,36 @@ describe("PiManagedSkillResources portable admission", () => {
       }),
     );
 
+    it.effect("accepts a bounded 256-file runtime without selecting skills", () =>
+      Effect.gen(function* () {
+        const f = portableFixture();
+        const files = Array.from({ length: 256 }, (_, index) => ({
+          source: `/runtime-source/${index}`,
+          target: `/runtime/${index}`,
+        }));
+        const prepared = yield* preparePiManagedSkillResources({
+          ...f.input,
+          selection: [],
+          skillPlan: undefined,
+          existingRuntimeFiles: files,
+        });
+        assert.deepEqual(prepared.runtimeFiles, []);
+        yield* prepared.revalidate;
+        denied(
+          yield* preparePiManagedSkillResources({
+            ...f.input,
+            selection: [],
+            skillPlan: undefined,
+            existingRuntimeFiles: [
+              ...files,
+              { source: "/runtime-source/extra", target: "/runtime/extra" },
+            ],
+          }).pipe(Effect.result),
+          /invalid/,
+        );
+      }),
+    );
+
     it.effect("requires an explicit plan for a nonempty selection before admission", () =>
       Effect.gen(function* () {
         const f = portableFixture();

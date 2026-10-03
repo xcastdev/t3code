@@ -10,6 +10,7 @@ import * as FetchHttpClient from "effect/unstable/http/FetchHttpClient";
 import { PiManagedRuntime, PiManagedRuntimeError } from "./PiManagedRuntime.ts";
 import { makePiManagedRuntimeLive } from "./PiManagedRuntimeLive.ts";
 import { PiModelCatalogue } from "./PiModelCatalogue.ts";
+import { MAX_PI_RUNTIME_FILES } from "./PiManagedProcess.ts";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
 import { makePiSkillStageLifetime } from "./PiSkillStageLifetime.ts";
 
@@ -57,7 +58,7 @@ const Allocation = Schema.fromJsonString(
     launch: Schema.Struct({
       runtimeFiles: Schema.Array(FileIdentity).check(
         Schema.isMinLength(1),
-        Schema.isMaxLength(128),
+        Schema.isMaxLength(MAX_PI_RUNTIME_FILES),
       ),
     }),
   }),
