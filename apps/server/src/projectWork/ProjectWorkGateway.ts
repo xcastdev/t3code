@@ -17,6 +17,7 @@ import {
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -46,6 +47,7 @@ import * as ServerEnvironment from "../environment/ServerEnvironment.ts";
 import { resolveProjectSettings } from "@t3tools/shared/projectSettings";
 import {
   isPersistenceError,
+  PersistenceSqlError,
   toPersistenceSqlError,
   type ProjectionRepositoryError,
 } from "../persistence/Errors.ts";
@@ -130,6 +132,7 @@ export class ProjectWorkGateway extends Context.Service<
 >()("t3/projectWork/ProjectWorkGateway") {}
 
 const isTeamAuthorizationError = Schema.is(ProjectTeamAuthorization.ProjectTeamAuthorizationError);
+const isPersistenceSqlError = Schema.is(PersistenceSqlError);
 const isIssueCommentsError = Schema.is(IssueComments.IssueCommentsError);
 const isTeamIntent = Schema.is(ProjectTeamWriteIntent);
 const isGuidedIntent = Schema.is(ProjectTeamGuidedIntent);
@@ -341,6 +344,56 @@ const makeProjectWorkGateway = Effect.gen(function* () {
   const teamAuthorization = yield* Effect.serviceOption(
     ProjectTeamAuthorization.ProjectTeamAuthorization,
   );
+
+  const executeAuthorized = <E, L = never>(
+    command: ProjectWorkCommand,
+    authorize: (input: {
+      readonly commandFingerprint: string;
+    }) => Effect.Effect<ProjectWorkCommand, E>,
+    liveValidate?: (input: { readonly duplicate: boolean }) => Effect.Effect<void, L>,
+    receiptFingerprint?: string,
+  ) =>
+    Effect.suspend(() => {
+      let denial: ProjectTeamAuthorization.ProjectTeamAuthorizationError | undefined;
+      const captureDenial = <A, Error>(effect: Effect.Effect<A, Error>) =>
+        effect.pipe(
+          Effect.tapCause((cause) =>
+            Effect.sync(() => {
+              const reason = cause.reasons[0];
+              if (
+                cause.reasons.length === 1 &&
+                reason?._tag === "Fail" &&
+                isTeamAuthorizationError(reason.error)
+              )
+                denial = reason.error;
+            }),
+          ),
+        );
+      return repository
+        .executeAuthorized(
+          command,
+          (input) => captureDenial(authorize(input)),
+          liveValidate === undefined ? undefined : (input) => captureDenial(liveValidate(input)),
+          receiptFingerprint,
+        )
+        .pipe(
+          // Restore only a sole callback denial after successful rollback. Mixed
+          // transaction failures retain their defects/interruption and uncertainty.
+          Effect.catchCause((cause) =>
+            Effect.failCause(
+              Cause.map(cause, (error) =>
+                cause.reasons.length === 1 &&
+                denial !== undefined &&
+                isPersistenceSqlError(error) &&
+                error.operation === "ProjectWorkRepository.executeAuthorized" &&
+                error.cause === denial
+                  ? denial
+                  : error,
+              ),
+            ),
+          ),
+        );
+    });
 
   const readRaw = (input: ProjectWorkReadIntent) => {
     const base = { projectId: String(input.projectId) };
@@ -647,13 +700,13 @@ const makeProjectWorkGateway = Effect.gen(function* () {
         return yield* new ProjectTeamAuthorization.ProjectTeamAuthorizationError({
           reason: "Managed authority unavailable",
         });
-      const executeAuthorized = <E>(
+      const executeCommandAuthorized = <E>(
         input: ProjectWorkCommand,
         authorize: (input: {
           readonly commandFingerprint: string;
         }) => Effect.Effect<ProjectWorkCommand, E>,
       ) =>
-        repository.executeAuthorized(input, authorize, () =>
+        executeAuthorized(input, authorize, () =>
           Effect.gen(function* () {
             if (command.type === "project-work.issue.refine") yield* fence;
             if (teamAuthorization._tag === "Some")
@@ -800,7 +853,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             reason: "invalid-approval",
           });
         }
-        const approval = yield* executeAuthorized(authorizedCommand, () =>
+        const approval = yield* executeCommandAuthorized(authorizedCommand, () =>
           Effect.gen(function* () {
             yield* fence;
             const consumed = yield* auth.consumeProjectWorkApproval({
@@ -843,17 +896,22 @@ const makeProjectWorkGateway = Effect.gen(function* () {
             } as ProjectWorkCommand;
           }),
         ).pipe(
-          Effect.mapError((cause) => {
-            if (
-              Schema.is(ProjectWorkAuthorizationError)(cause) ||
-              Schema.is(EnvironmentAuth.ServerAuthProjectWorkApprovalError)(cause) ||
-              cause instanceof ProjectWorkPolicyError ||
-              isPersistenceError(cause)
-            ) {
-              return cause;
-            }
-            return toPersistenceSqlError("ProjectWorkGateway.write")(cause);
-          }),
+          Effect.catchCause((failure) =>
+            Effect.failCause(
+              Cause.map(failure, (cause) => {
+                if (
+                  Schema.is(ProjectWorkAuthorizationError)(cause) ||
+                  Schema.is(EnvironmentAuth.ServerAuthProjectWorkApprovalError)(cause) ||
+                  cause instanceof ProjectWorkPolicyError ||
+                  isPersistenceError(cause) ||
+                  isTeamAuthorizationError(cause)
+                ) {
+                  return cause;
+                }
+                return toPersistenceSqlError("ProjectWorkGateway.write")(cause);
+              }),
+            ),
+          ),
         );
         if (Option.isSome(attention))
           yield* attention.value.onCommitted({
@@ -865,7 +923,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
       }
       const result =
         actor.kind === "agent" && sensitiveAgentIntent(command)
-          ? yield* executeAuthorized(authorizedCommand, ({ commandFingerprint }) =>
+          ? yield* executeCommandAuthorized(authorizedCommand, ({ commandFingerprint }) =>
               Effect.gen(function* () {
                 yield* fence;
                 const approvalToken =
@@ -888,19 +946,24 @@ const makeProjectWorkGateway = Effect.gen(function* () {
                 return withoutApprovalToken(authorizedCommand);
               }),
             ).pipe(
-              Effect.mapError((cause) => {
-                if (
-                  Schema.is(ProjectWorkAuthorizationError)(cause) ||
-                  Schema.is(EnvironmentAuth.ServerAuthProjectWorkApprovalError)(cause) ||
-                  cause instanceof ProjectWorkPolicyError ||
-                  isPersistenceError(cause)
-                ) {
-                  return cause;
-                }
-                return toPersistenceSqlError("ProjectWorkGateway.write")(cause);
-              }),
+              Effect.catchCause((failure) =>
+                Effect.failCause(
+                  Cause.map(failure, (cause) => {
+                    if (
+                      Schema.is(ProjectWorkAuthorizationError)(cause) ||
+                      Schema.is(EnvironmentAuth.ServerAuthProjectWorkApprovalError)(cause) ||
+                      cause instanceof ProjectWorkPolicyError ||
+                      isPersistenceError(cause) ||
+                      isTeamAuthorizationError(cause)
+                    ) {
+                      return cause;
+                    }
+                    return toPersistenceSqlError("ProjectWorkGateway.write")(cause);
+                  }),
+                ),
+              ),
             )
-          : yield* executeAuthorized(authorizedCommand, () =>
+          : yield* executeCommandAuthorized(authorizedCommand, () =>
               fence.pipe(Effect.as(authorizedCommand)),
             );
       if (Option.isSome(attention))
@@ -1010,7 +1073,7 @@ const makeProjectWorkGateway = Effect.gen(function* () {
         records: [],
         committedAt: now,
       };
-      const result = yield* repository.executeAuthorized(
+      const result = yield* executeAuthorized(
         envelope,
         () =>
           Effect.gen(function* () {

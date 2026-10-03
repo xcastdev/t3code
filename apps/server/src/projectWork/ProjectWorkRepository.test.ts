@@ -15,6 +15,7 @@ import {
 } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -22,6 +23,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
 import { runForkMigrations, runMigrations } from "../persistence/Migrations.ts";
+import { ProjectWorkPolicyError } from "./ProjectWorkPolicy.ts";
 import { ProjectWorkRepository, ProjectWorkRepositoryLive } from "./ProjectWorkRepository.ts";
 import { ProjectWorkQuery, ProjectWorkQueryLive } from "./ProjectWorkQuery.ts";
 import { ProjectWorkProjection, ProjectWorkProjectionLive } from "./ProjectWorkProjection.ts";
@@ -35,6 +37,60 @@ const at = "2026-01-01T00:00:00.000Z";
 const layer = it.layer(Layer.fresh(Layer.mergeAll(NodeSqliteClient.layerMemory())));
 
 layer("ProjectWorkRepository", (it) => {
+  for (const outcome of ["denial", "defect", "interrupt"] as const)
+    it.effect(`retains transaction cause and policy certainty for ${outcome}`, () =>
+      Effect.gen(function* () {
+        yield* runMigrations();
+        yield* runForkMigrations();
+        const repository = yield* ProjectWorkRepository;
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`CREATE TEMP TABLE policy_callback_mutation (marker TEXT)`;
+        const denial = new ProjectWorkPolicyError("authority-required", "callback denied");
+        const failure =
+          outcome === "denial"
+            ? Cause.fail(denial)
+            : Cause.combine(
+                Cause.fail(denial),
+                outcome === "defect" ? Cause.die("callback defect") : Cause.interrupt(),
+              );
+        const exit = yield* repository
+          .executeAuthorized(
+            {
+              type: "project-work.task.create",
+              projectId,
+              taskId,
+              commandId: CommandId.make(`callback-${outcome}`),
+              title: "Denied callback",
+              createdAt: at,
+            },
+            () =>
+              sql`INSERT INTO policy_callback_mutation VALUES ('pending')`.pipe(
+                Effect.andThen(Effect.failCause(failure)),
+              ),
+          )
+          .pipe(Effect.exit);
+        expect(exit._tag).toBe("Failure");
+        if (exit._tag === "Failure") {
+          expect(Cause.hasDies(exit.cause)).toBe(outcome === "defect");
+          expect(Cause.hasInterrupts(exit.cause)).toBe(outcome === "interrupt");
+          const selected = Cause.findError(exit.cause);
+          expect(selected._tag).toBe("Success");
+          if (selected._tag === "Success") {
+            if (outcome === "denial") expect(selected.success).toBe(denial);
+            else
+              expect(selected.success).toMatchObject({
+                _tag: "PersistenceSqlError",
+                cause: failure,
+              });
+          }
+        }
+        expect(yield* sql`SELECT * FROM policy_callback_mutation`).toHaveLength(0);
+        expect(
+          yield* sql`SELECT * FROM project_work_command_receipts WHERE command_id=${`callback-${outcome}`}`,
+        ).toHaveLength(0);
+        yield* sql`DROP TABLE policy_callback_mutation`;
+      }).pipe(Effect.provide(ProjectWorkRepositoryLive)),
+    );
   it.effect(
     "guided investigation rolls back every generated record and receipt, then commits once",
     () =>

@@ -20,6 +20,9 @@ import { createModelSelection } from "@t3tools/shared/model";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
+import * as Scope from "effect/Scope";
 import * as Deferred from "effect/Deferred";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -50,6 +53,7 @@ import * as ProjectWorkSearch from "./ProjectWorkSearch.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { bindIssueRepositoryProject } from "./ProjectIssueRepositoryState.ts";
 
+const isTeamAuthorizationError = Schema.is(TeamAuthorization.ProjectTeamAuthorizationError);
 const decodeWriteResult = Schema.decodeUnknownEffect(ProjectWorkWriteResult);
 const decodeFoundationCommit = Schema.decodeUnknownEffect(ProjectWorkFoundationCommitCommand);
 const decodeFoundationPage = Schema.decodeUnknownEffect(
@@ -1566,6 +1570,152 @@ layer("ProjectWorkGateway", (it) => {
   );
 });
 
+const seedPendingApproval = Effect.fn("gatewayTest.seedPendingApproval")(function* () {
+  const f = yield* seedTeam();
+  const state = yield* ProjectWorkRepository.readCurrentState(f.sql, f.principal.managed.projectId);
+  const task = state.tasks[0]!;
+  yield* f.change(
+    decodeTeamFixture({
+      kind: "gate",
+      projectId: state.projectId,
+      recordId: "pending-human-gate",
+      revision: 0,
+      generation: 0,
+      updatedAt: at,
+      status: "pending",
+      taskId: task.taskId,
+      gate: "specification",
+      specRevision: task.specRevision,
+      planRevision: 0,
+      contentHash: projectTeamSpecificationHash(state, task.taskId),
+      attribution: {
+        actor: { kind: "human", id: "owner" },
+        source: { kind: "web", id: "owner" },
+        recordedAt: at,
+      },
+      evidenceIds: [],
+    }),
+  );
+  const current = yield* ProjectWorkRepository.readCurrentState(f.sql, state.projectId);
+  const input = {
+    type: "project-team.gate.respond" as const,
+    commandId: CommandId.make("human-gate-response"),
+    projectId: f.principal.managed.projectId,
+    taskId: task.taskId,
+    expectedRevision: current.revision,
+    expectedTaskRevision: task.revision,
+    specRevision: task.specRevision,
+    planRevision: 0,
+    gateId: "pending-human-gate",
+    expectedGateRevision: 0,
+    response: "approved" as const,
+  };
+  return {
+    f,
+    input,
+    actor: { kind: "human" as const, id: "owner" },
+    source: { kind: "web" as const, id: "owner" },
+  };
+});
+
+for (const stale of ["project", "task", "gate"] as const)
+  it.effect(
+    `preserves authoritative ${stale} revision rejection after another client approves`,
+    () =>
+      Effect.gen(function* () {
+        const { f, input, actor, source } = yield* seedPendingApproval();
+        const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+        const winner = { ...input, commandId: CommandId.make("other-client-approval") };
+        const mobile = { kind: "mobile" as const, id: "owner" };
+        const approved = yield* gateway.write(winner, actor, mobile);
+        expect((yield* gateway.write(winner, actor, mobile)).receipt).toEqual(approved.receipt);
+        if (stale === "task") {
+          yield* gateway.write(
+            {
+              type: "project-work.task.watch",
+              commandId: CommandId.make("concurrent-watch"),
+              projectId: input.projectId,
+              taskId: input.taskId,
+              watcher: actor,
+              watchedAt: at,
+            },
+            actor,
+            mobile,
+          );
+        }
+        const before = yield* ProjectWorkRepository.readCurrentState(f.sql, input.projectId);
+        const receipts =
+          yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id = ${input.projectId}`;
+        const result = yield* gateway
+          .write(
+            {
+              ...input,
+              expectedRevision: stale === "project" ? input.expectedRevision : before.revision,
+            },
+            actor,
+            source,
+          )
+          .pipe(Effect.result);
+        expect(result).toMatchObject({
+          _tag: "Failure",
+          failure: {
+            _tag: "ProjectTeamAuthorizationError",
+            reason:
+              stale === "project"
+                ? "Project revision changed"
+                : stale === "task"
+                  ? "Task or specification revision changed"
+                  : "Gate target changed",
+          },
+        });
+        expect(yield* ProjectWorkRepository.readCurrentState(f.sql, input.projectId)).toEqual(
+          before,
+        );
+        expect(
+          yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id = ${input.projectId}`,
+        ).toEqual(receipts);
+        expect(
+          yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id = ${input.projectId} AND command_id = ${input.commandId}`,
+        ).toHaveLength(0);
+      }).pipe(
+        Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer))),
+      ),
+  );
+
+it.effect("keeps SQL failure uncertain and rolls back approval before an exact retry", () =>
+  Effect.gen(function* () {
+    const { f, input, actor, source } = yield* seedPendingApproval();
+    const gateway = yield* ProjectWorkGateway.ProjectWorkGateway;
+    const before = yield* ProjectWorkRepository.readCurrentState(f.sql, input.projectId);
+    const events =
+      yield* f.sql`SELECT * FROM project_work_events WHERE project_id = ${input.projectId}`;
+    yield* f.sql`CREATE TEMP TRIGGER fail_approval_receipt BEFORE INSERT ON project_work_command_receipts
+      WHEN NEW.command_id = 'human-gate-response' BEGIN SELECT RAISE(ABORT, 'fixture SQL failure'); END`;
+    const operation = gateway.write(input, actor, source);
+    expect(yield* operation.pipe(Effect.result)).toMatchObject({
+      _tag: "Failure",
+      failure: { _tag: "PersistenceSqlError" },
+    });
+    expect(yield* ProjectWorkRepository.readCurrentState(f.sql, input.projectId)).toEqual(before);
+    expect(
+      yield* f.sql`SELECT * FROM project_work_events WHERE project_id = ${input.projectId}`,
+    ).toEqual(events);
+    expect(
+      yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id = ${input.projectId} AND command_id = ${input.commandId}`,
+    ).toHaveLength(0);
+    yield* f.sql`DROP TRIGGER fail_approval_receipt`;
+    const approved = yield* operation;
+    expect(approved.receipt.eventCount).toBe(1);
+    expect(yield* operation).toEqual(approved);
+    expect(
+      yield* f.sql`SELECT * FROM project_work_command_receipts WHERE project_id = ${input.projectId} AND command_id = ${input.commandId}`,
+    ).toHaveLength(1);
+    expect((yield* ProjectWorkRepository.readCurrentState(f.sql, input.projectId)).revision).toBe(
+      before.revision + 1,
+    );
+  }).pipe(Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer)))),
+);
+
 it.effect(
   "attributes typed gate responses and answers, rejects forged actor and two-device revision races",
   () =>
@@ -1613,10 +1763,16 @@ it.effect(
         response: "approved" as const,
       };
       expect(
-        (yield* gateway
+        yield* gateway
           .write(input, f.principal.actor, { kind: "mcp", id: "agent" }, f.principal)
-          .pipe(Effect.result))._tag,
-      ).toBe("Failure");
+          .pipe(Effect.result),
+      ).toMatchObject({
+        _tag: "Failure",
+        failure: {
+          _tag: "ProjectTeamAuthorizationError",
+          reason: "Only a human can respond to gates, answer or promote memory",
+        },
+      });
       const actor = { kind: "human" as const, id: "owner" };
       const source = { kind: "web" as const, id: "owner" };
       const race = yield* Effect.all(
@@ -1632,6 +1788,10 @@ it.effect(
         { concurrency: "unbounded" },
       );
       expect(race.filter((result) => result._tag === "Success")).toHaveLength(1);
+      expect(race.find((result) => result._tag === "Failure")).toMatchObject({
+        _tag: "Failure",
+        failure: { _tag: "ProjectTeamAuthorizationError", reason: "Project revision changed" },
+      });
       const winner =
         race[0]!._tag === "Success"
           ? { input, source }
@@ -1640,8 +1800,13 @@ it.effect(
               source: { kind: "mobile" as const, id: "owner" },
             };
       const { gateId, ...reorderedInput } = winner.input;
+      const beforeReplay = (yield* f.auth.resolve(f.principal))!.state;
       const replay = yield* gateway.write({ gateId, ...reorderedInput }, actor, winner.source);
       expect(replay.receipt.eventCount).toBe(1);
+      expect((yield* f.auth.resolve(f.principal))!.state).toEqual(beforeReplay);
+      expect(
+        yield* f.sql`SELECT command_id FROM project_work_command_receipts WHERE project_id = ${projectId} AND command_id IN (${input.commandId}, ${"other-device-answer"})`,
+      ).toHaveLength(1);
       expect(
         (yield* gateway
           .write(winner.input, { kind: "human", id: "wrong-actor" }, winner.source)
@@ -2332,4 +2497,183 @@ it.effect("rejects a recovered delegation ancestry cycle without writing a messa
       ),
     ).toBe(false);
   }).pipe(Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer)))),
+);
+
+for (const defective of [false, true])
+  it.effect(`preserves rollback outcome at the public error boundary defective=${defective}`, () =>
+    Effect.gen(function* () {
+      const { f, input } = yield* seedPendingApproval();
+      yield* f.sql`CREATE TEMP TABLE callback_mutation (marker TEXT)`;
+      const before = yield* ProjectWorkRepository.readCurrentState(f.sql, input.projectId);
+      const connectionScope = yield* Scope.make();
+      const connection = yield* f.sql.reserve.pipe(
+        Effect.provideService(Scope.Scope, connectionScope),
+      );
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let rawCause: Cause.Cause<unknown> | undefined;
+      let repositoryCause: Cause.Cause<unknown> | undefined;
+      let rolledBack = false;
+      const actual = (statement: string) =>
+        connection.executeUnprepared(statement, [], undefined).pipe(Effect.asVoid);
+      const transaction = SqlClient.makeWithTransaction({
+        transactionService: f.sql.transactionService,
+        spanAttributes: [],
+        acquireConnection: Effect.succeed([undefined, connection]),
+        begin: () => actual("BEGIN"),
+        savepoint: (_, id) => actual(`SAVEPOINT effect_sql_${id}`),
+        commit: () => actual("COMMIT"),
+        rollbackSavepoint: (_, id) => actual(`ROLLBACK TO SAVEPOINT effect_sql_${id}`),
+        rollback: () =>
+          Deferred.succeed(entered, undefined).pipe(
+            Effect.andThen(Deferred.await(release)),
+            Effect.andThen(actual(defective ? "ROLLBACK_FIXTURE_INVALID" : "ROLLBACK")),
+            Effect.tap(() =>
+              Effect.sync(() => {
+                rolledBack = true;
+              }),
+            ),
+          ),
+      });
+      const sql = new Proxy(f.sql, {
+        get: (target, key) =>
+          key === "withTransaction"
+            ? <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+                transaction(effect).pipe(
+                  Effect.tapCause((cause) =>
+                    Effect.sync(() => {
+                      rawCause = cause;
+                    }),
+                  ),
+                )
+            : Reflect.get(target, key),
+      });
+      const context = yield* Layer.build(ProjectWorkRepository.ProjectWorkRepositoryLive).pipe(
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
+      const original = Context.get(context, ProjectWorkRepository.ProjectWorkRepository);
+      const repository: ProjectWorkRepository.ProjectWorkRepositoryShape = {
+        ...original,
+        executeAuthorized: (command, authorize, validate, fingerprint) =>
+          original
+            .executeAuthorized(
+              command,
+              authorize,
+              (arg) =>
+                sql`INSERT INTO callback_mutation VALUES ('pending')`.pipe(
+                  Effect.orDie,
+                  Effect.andThen(validate === undefined ? Effect.void : validate(arg)),
+                ),
+              fingerprint,
+            )
+            .pipe(
+              Effect.tapCause((cause) =>
+                Effect.sync(() => {
+                  repositoryCause = cause;
+                }),
+              ),
+            ),
+      };
+      const gatewayContext = yield* Layer.build(ProjectWorkGateway.ProjectWorkGatewayLive).pipe(
+        Effect.provideService(ProjectWorkRepository.ProjectWorkRepository, repository),
+        Effect.provideService(SqlClient.SqlClient, sql),
+      );
+      const gateway = Context.get(gatewayContext, ProjectWorkGateway.ProjectWorkGateway);
+      const fiber = yield* gateway
+        .write(input, f.principal.actor, { kind: "mcp", id: "agent" }, f.principal)
+        .pipe(Effect.exit, Effect.forkChild);
+      yield* Deferred.await(entered);
+      expect(fiber.pollUnsafe()).toBeUndefined();
+      expect(rolledBack).toBe(false);
+      yield* Deferred.succeed(release, undefined);
+      const exit = yield* Fiber.join(fiber);
+      const pendingRows = yield* connection.executeUnprepared(
+        "SELECT * FROM callback_mutation",
+        [],
+        undefined,
+      );
+      if (defective) yield* actual("ROLLBACK");
+      yield* Scope.close(connectionScope, exit);
+      expect(rawCause).toBeDefined();
+      expect(repositoryCause).toBeDefined();
+      expect(exit._tag).toBe("Failure");
+      if (exit._tag === "Failure" && repositoryCause !== undefined && rawCause !== undefined) {
+        expect(Cause.hasDies(rawCause)).toBe(defective);
+        expect(Cause.hasDies(repositoryCause)).toBe(defective);
+        expect(Cause.hasDies(exit.cause)).toBe(defective);
+        expect(Cause.findError(exit.cause)).toMatchObject({
+          _tag: "Success",
+          success: { _tag: defective ? "PersistenceSqlError" : "ProjectTeamAuthorizationError" },
+        });
+        if (defective) {
+          expect(Cause.findError(repositoryCause)).toMatchObject({
+            _tag: "Success",
+            success: { _tag: "PersistenceSqlError", cause: rawCause },
+          });
+          expect(
+            exit.cause.reasons.some(
+              (reason) => reason._tag === "Fail" && isTeamAuthorizationError(reason.error),
+            ),
+          ).toBe(false);
+        }
+      }
+      expect(pendingRows).toHaveLength(defective ? 1 : 0);
+      expect(rolledBack).toBe(!defective);
+      expect(yield* f.sql`SELECT * FROM callback_mutation`).toHaveLength(0);
+      expect(yield* ProjectWorkRepository.readCurrentState(f.sql, input.projectId)).toEqual(before);
+      expect(
+        yield* f.sql`SELECT * FROM project_work_command_receipts WHERE command_id=${input.commandId}`,
+      ).toHaveLength(0);
+    }).pipe(
+      Effect.scoped,
+      Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer))),
+    ),
+  );
+
+it.effect("cancellation rolls back authorization work without a definite public rejection", () =>
+  Effect.gen(function* () {
+    const { f, input, actor, source } = yield* seedPendingApproval();
+    yield* f.sql`CREATE TEMP TABLE cancel_mutation (marker TEXT)`;
+    const entered = yield* Deferred.make<void>();
+    const hold = yield* Deferred.make<void>();
+    const original = yield* ProjectWorkRepository.ProjectWorkRepository;
+    const repository: ProjectWorkRepository.ProjectWorkRepositoryShape = {
+      ...original,
+      executeAuthorized: (command, authorize, validate, fingerprint) =>
+        original.executeAuthorized(
+          command,
+          authorize,
+          (arg) =>
+            f.sql`INSERT INTO cancel_mutation VALUES ('pending')`.pipe(
+              Effect.orDie,
+              Effect.andThen(Deferred.succeed(entered, undefined)),
+              Effect.andThen(Deferred.await(hold)),
+              Effect.andThen(validate === undefined ? Effect.void : validate(arg)),
+            ),
+          fingerprint,
+        ),
+    };
+    const context = yield* Layer.build(ProjectWorkGateway.ProjectWorkGatewayLive).pipe(
+      Effect.provideService(ProjectWorkRepository.ProjectWorkRepository, repository),
+    );
+    const gateway = Context.get(context, ProjectWorkGateway.ProjectWorkGateway);
+    const before = yield* ProjectWorkRepository.readCurrentState(f.sql, input.projectId);
+    const fiber = yield* gateway.write(input, actor, source).pipe(Effect.forkChild);
+    yield* Deferred.await(entered);
+    yield* Fiber.interrupt(fiber);
+    const exit = yield* Fiber.await(fiber);
+    expect(exit._tag).toBe("Failure");
+    if (exit._tag === "Failure") {
+      expect(Cause.hasInterrupts(exit.cause)).toBe(true);
+      expect(Cause.findError(exit.cause)._tag).toBe("Failure");
+    }
+    expect(yield* f.sql`SELECT * FROM cancel_mutation`).toHaveLength(0);
+    expect(yield* ProjectWorkRepository.readCurrentState(f.sql, input.projectId)).toEqual(before);
+    expect(
+      yield* f.sql`SELECT * FROM project_work_command_receipts WHERE command_id=${input.commandId}`,
+    ).toHaveLength(0);
+  }).pipe(
+    Effect.scoped,
+    Effect.provide(Layer.fresh(gatewayLayer).pipe(Layer.provideMerge(NodeServices.layer))),
+  ),
 );
