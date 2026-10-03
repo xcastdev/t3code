@@ -17,7 +17,7 @@ import {
   withOwnedSkillMaterialization,
 } from "../../skills/SkillMaterializationService.ts";
 import { hashSkillPackage, SKILL_BODY_FILE } from "../../skills/SkillPackage.ts";
-import type { PiManagedLaunch } from "./PiManagedProcess.ts";
+import { MAX_PI_RUNTIME_FILES, type PiManagedLaunch } from "./PiManagedProcess.ts";
 import { PiManagedRuntimeError } from "./PiManagedRuntime.ts";
 import type { PiManagedSkillSelection } from "./PiManagedSkillSelection.ts";
 import { type PreparedPiSkillResources, preparePiSkillResources } from "./PiSkillResources.ts";
@@ -73,7 +73,7 @@ const stagingSchema = Schema.Struct({
   stagingDirectory: boundedPath,
   existingRuntimeFiles: Schema.Array(
     Schema.Struct({ source: boundedPath, target: boundedPath }),
-  ).check(Schema.isMaxLength(128)),
+  ).check(Schema.isMaxLength(MAX_PI_RUNTIME_FILES)),
   protectedRoots: Schema.Array(boundedPath).check(Schema.isMaxLength(64)),
   writableRoots: Schema.Array(boundedPath).check(Schema.isMaxLength(64)),
 });

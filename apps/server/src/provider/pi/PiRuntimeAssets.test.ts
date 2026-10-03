@@ -400,6 +400,168 @@ const native: typeof check = (name, body, timeout) =>
   process.env.PI_RUNTIME_ASSETS_LINUX_GATE === "1"
     ? check(name, body, timeout)
     : it.skip(name, () => {});
+
+const electronBinary = process.env.PI_RUNTIME_ASSETS_ELECTRON_BINARY;
+const encodeElectronFixture = Schema.encodeEffect(Schema.fromJsonString(Schema.Unknown));
+const decodeElectronHost = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      argv: Schema.Array(Schema.String),
+      files: Schema.Int,
+      targets: Schema.Array(Schema.String),
+      owned: Schema.Array(Schema.Struct({ pid: Schema.Int, command: Schema.String })),
+      stdout: Schema.String,
+      stderr: Schema.String,
+      drain: Schema.Struct({
+        kernel: Schema.String,
+        childExitCode: Schema.Int,
+        launcherPid: Schema.Int,
+        childPid: Schema.Int,
+      }),
+    }),
+  ),
+);
+const decodeElectronWorker = Schema.decodeEffect(
+  Schema.fromJsonString(
+    Schema.Struct({
+      node: Schema.String,
+      electron: Schema.String,
+      cwd: Schema.String,
+      mode: Schema.String,
+      descriptor: Schema.Unknown,
+    }),
+  ),
+);
+describe.runIf(electronBinary !== undefined)("actual Electron runtime compatibility", () => {
+  check(
+    "starts the frozen worker argv using only the staged Electron closure and drains",
+    () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          yield* Effect.promise(() => NodeFSP.mkdir(fixturePath(scratch, "workspace")));
+          yield* Effect.promise(() =>
+            NodeFSP.writeFile(
+              fixturePath(input.distributionDirectory, "pi-worker.mjs"),
+              "console.log(JSON.stringify({node:process.versions.node,electron:process.versions.electron,cwd:process.cwd(),mode:process.env.ELECTRON_RUN_AS_NODE,descriptor:JSON.parse(process.argv[2])}));\n",
+            ),
+          );
+          // This is a benign startup fixture, not an SDK/model invocation. The actual
+          // Electron host performs production asset preparation and owned launch.
+          const program = `
+        import * as Effect from ${yield* encodeElectronFixture(import.meta.resolve("effect/Effect"))};
+        import * as Stream from ${yield* encodeElectronFixture(import.meta.resolve("effect/Stream"))};
+        import * as NodeServices from ${yield* encodeElectronFixture(import.meta.resolve("@effect/platform-node/NodeServices"))};
+        import * as ChildProcessSpawner from ${yield* encodeElectronFixture(import.meta.resolve("effect/unstable/process/ChildProcessSpawner"))};
+        import { preparePiRuntimeAssets } from ${yield* encodeElectronFixture(new URL("./PiRuntimeAssets.ts", import.meta.url).href)};
+        import { acquirePiManagedProcess } from ${yield* encodeElectronFixture(new URL("./PiManagedProcess.ts", import.meta.url).href)};
+        const output = await Effect.runPromise(Effect.scoped(Effect.gen(function* () {
+          const owned = [];
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const captured = ChildProcessSpawner.make(command => spawner.spawn(command).pipe(Effect.tap(child => Effect.sync(() => owned.push({pid:Number(child.pid),command:command.command})))));
+          return yield* Effect.gen(function* () {
+          const assets = yield* preparePiRuntimeAssets(${yield* encodeElectronFixture(input)});
+          yield* assets.revalidate;
+          const argv = assets.workerArgv({workerId:"electron-worker",generation:1},{operationId:"electron-initialize",operationKind:"initialize"},"/state/sessions");
+          const child = yield* acquirePiManagedProcess({workspaceRoot:${yield* encodeElectronFixture(fixturePath(scratch, "workspace"))},protectedRoots:${yield* encodeElectronFixture(input.protectedRoots)},runtimeFiles:assets.runtimeFiles,argv,memoryBytes:2147483648,runtimeSeconds:30});
+          yield* child.start;
+          const result = yield* Effect.all({stdout:Stream.runCollect(child.stdout),stderr:Stream.runCollect(child.stderr),drain:child.awaitExit},{concurrency:"unbounded"});
+          const fs = process.getBuiltinModule("fs").promises;
+          const crypto = process.getBuiltinModule("crypto");
+          const sourceFiles = yield* Effect.promise(() => Promise.all(assets.runtimeFiles.map(async file => {const bytes=await fs.readFile(file.source);return {...file,bytes:bytes.length,sha256:crypto.createHash("sha256").update(bytes).digest("hex")};})));
+          return {argv,files:assets.runtimeFiles.length,targets:assets.runtimeFiles.map(file=>file.target),sourceFiles,owned,stdout:Buffer.concat(result.stdout).toString(),stderr:Buffer.concat(result.stderr).toString(),drain:result.drain};
+          }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner,captured));
+        })).pipe(Effect.provide(NodeServices.layer)));
+        console.log(JSON.stringify(output));
+      `;
+          const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const child = yield* spawner.spawn(
+            ChildProcess.make(
+              electronBinary!,
+              ["--max-old-space-size=512", "--input-type=module", "--eval", program],
+              {
+                env: { ELECTRON_RUN_AS_NODE: "1" },
+                extendEnv: false,
+                stdin: "ignore",
+                forceKillAfter: "100 millis",
+              },
+            ),
+          );
+          const output = yield* Effect.all(
+            {
+              stdout: collectUint8StreamText({ stream: child.stdout, maxBytes: 65536 }),
+              stderr: collectUint8StreamText({ stream: child.stderr, maxBytes: 65536 }),
+              code: child.exitCode,
+            },
+            { concurrency: "unbounded" },
+          );
+          if (closureEvidenceDirectory) {
+            const json = yield* encodeElectronFixture({ hostPid: Number(child.pid), ...output });
+            yield* Effect.promise(() =>
+              NodeFSP.writeFile(
+                fixturePath(closureEvidenceDirectory, "electron-host-output.json"),
+                json,
+              ),
+            );
+          }
+          expect(output.code, output.stderr.text).toBe(0);
+          expect(output.stderr.text).toBe("");
+          const result = yield* decodeElectronHost(output.stdout.text);
+          expect(result.argv.slice(0, 7)).toEqual([
+            "/bin/bash",
+            "--noprofile",
+            "--norc",
+            "-c",
+            'export ELECTRON_RUN_AS_NODE=1; exec "$@"',
+            "t3-pi-electron",
+            "/runtime/node",
+          ]);
+          expect(result.targets).toContain("/runtime/icudtl.dat");
+          expect(result.targets).toContain("/runtime/libffmpeg.so");
+          expect(result.targets).toContain("/runtime/snapshot_blob.bin");
+          expect(result.targets).toContain("/runtime/v8_context_snapshot.bin");
+          expect(result.files).toBeLessThanOrEqual(256);
+          expect(result.stderr, result.stderr).toBe("");
+          expect(result.drain.childExitCode).toBe(0);
+          expect(
+            result.drain.kernel === "removed" ||
+              result.drain.kernel.split("\n").includes("populated 0"),
+          ).toBe(true);
+          const worker = yield* decodeElectronWorker(result.stdout);
+          expect(worker.electron).toBe("44.1.0");
+          expect(worker.cwd).toBe("/workspace");
+          expect(worker.mode).toBe("1");
+          expect(worker.descriptor).toMatchObject({
+            identity: { workerId: "electron-worker", generation: 1 },
+            operation: { operationId: "electron-initialize", operationKind: "initialize" },
+          });
+          for (const pid of [
+            Number(child.pid),
+            result.drain.launcherPid,
+            result.drain.childPid,
+            ...result.owned.map((owner) => owner.pid),
+          ])
+            yield* Effect.promise(() =>
+              expect(NodeFSP.access(`/proc/${pid}`)).rejects.toMatchObject({ code: "ENOENT" }),
+            );
+          if (closureEvidenceDirectory) {
+            const json = yield* encodeElectronFixture({
+              hostPid: Number(child.pid),
+              hostExitCode: output.code,
+              ...result,
+              worker,
+            });
+            yield* Effect.promise(() =>
+              NodeFSP.writeFile(
+                fixturePath(closureEvidenceDirectory, "electron-startup.json"),
+                json,
+              ),
+            );
+          }
+        }),
+      ),
+    60000,
+  );
+});
 describe("required actual Linux executable closure", () => {
   native("captures the fixed nested bubblewrap executable and its actual ELF dependencies", () =>
     Effect.gen(function* () {

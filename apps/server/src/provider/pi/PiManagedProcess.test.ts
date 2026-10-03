@@ -16,6 +16,7 @@ import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import { afterEach, beforeEach, describe, expect } from "vite-plus/test";
 import {
   acquirePiManagedProcess,
+  MAX_PI_RUNTIME_FILES,
   preallocatePiManagedProcess,
   reconcilePiManagedProcess,
   PiManagedProcessError,
@@ -76,6 +77,25 @@ const decodeWithheldOwner = Schema.decodeEffect(
 );
 
 describe("managed launch filesystem boundary", () => {
+  check("admits the bounded Electron file closure and rejects the next file", () =>
+    Effect.gen(function* () {
+      const runtimeFiles = Array.from({ length: MAX_PI_RUNTIME_FILES }, (_, index) => ({
+        source: input.runtimeFiles[0]!.source,
+        target: index === 0 ? "/runtime/program" : `/runtime/library-${index}`,
+      }));
+      expect((yield* validate({ ...input, runtimeFiles })).runtimeFiles).toHaveLength(256);
+      yield* rejects(
+        {
+          ...input,
+          runtimeFiles: [
+            ...runtimeFiles,
+            { source: runtimeFiles[0]!.source, target: "/runtime/excess" },
+          ],
+        },
+        "closure exceeds its bounds",
+      );
+    }),
+  );
   check("accepts a pinned regular runtime file and records the canonical workspace inode", () =>
     Effect.gen(function* () {
       const result = yield* validate();
