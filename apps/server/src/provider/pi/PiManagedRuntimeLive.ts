@@ -2,6 +2,7 @@ import * as NodeCrypto from "node:crypto";
 import {
   IsoDateTime,
   ManagedSkillKey,
+  ManagedSkillManifest,
   ProviderInstanceId,
   SkillCatalogRevision,
   ThreadId,
@@ -10,6 +11,8 @@ import {
   type ProviderSession,
 } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
+import * as Cause from "effect/Cause";
+import * as Fiber from "effect/Fiber";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -19,6 +22,8 @@ import * as Option from "effect/Option";
 import * as Layer from "effect/Layer";
 import * as Redacted from "effect/Redacted";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
+import * as Exit from "effect/Exit";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 import {
   ProjectTeamAuthorization,
@@ -28,7 +33,14 @@ import { makeProjectTeamPiOperations } from "../../projectWork/ProjectTeamPiOper
 import { make as makeAccounting } from "../../projectWork/ProjectTeamModelAccounting.ts";
 import { ProjectWorkGateway } from "../../projectWork/ProjectWorkGateway.ts";
 import { ManagedSkillRepository } from "../../skills/ManagedSkillRepository.ts";
-import { resolvePiManagedSkillSelection } from "./PiManagedSkillSelection.ts";
+import { ServerConfig } from "../../config.ts";
+import { DEFAULT_SKILL_PACKAGE_LIMITS, SKILL_MANIFEST_FILE } from "../../skills/SkillPackage.ts";
+import { SkillMaterializationService } from "../../skills/SkillMaterializationService.ts";
+import type { ProviderSkillPlan } from "../../skills/ProviderSkillAdapter.ts";
+import {
+  resolvePiManagedSkillSelection,
+  type PiManagedSkillSelection,
+} from "./PiManagedSkillSelection.ts";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import { buildServerProvider } from "../providerSnapshot.ts";
 import {
@@ -53,6 +65,12 @@ import {
 } from "./PiProjectWorkTools.ts";
 import type { PiModelBrokerConfig, PiModelTool } from "./PiModelBroker.ts";
 import type { PiNativeReference, PiWorkerIdentity, PiWorkerOperation } from "./PiWorkerProtocol.ts";
+import type { PiSkillStageLifetime } from "./PiSkillStageLifetime.ts";
+import {
+  piManagedSkillResourceIdentity,
+  preparePiManagedSkillResources,
+  validatePiManagedSkillPlan,
+} from "./PiManagedSkillResources.ts";
 
 const provider = ProviderDriverKind.make("piAgent");
 const routeId = "command-code-ling-free";
@@ -97,6 +115,217 @@ const directoryFlags =
   NodeFS.constants.O_NONBLOCK;
 const fileFlags =
   NodeFS.constants.O_RDONLY | NodeFS.constants.O_NOFOLLOW | NodeFS.constants.O_NONBLOCK;
+const sourceStat = (stat: import("node:fs").BigIntStats) =>
+  encode({
+    dev: String(stat.dev),
+    ino: String(stat.ino),
+    mode: String(stat.mode),
+    uid: String(stat.uid),
+    nlink: String(stat.nlink),
+    size: String(stat.size),
+    mtime: String(stat.mtimeNs),
+    ctime: String(stat.ctimeNs),
+  });
+const sourceChanged = () => deny("Pi selected source or catalogue changed", "conflict");
+const verifySource = (fence: () => void) =>
+  Effect.try({ try: fence, catch: () => sourceChanged() });
+const sourceMissing = Schema.is(Schema.Struct({ code: Schema.Literal("ENOENT") }));
+const decodeSourceManifest = Schema.decodeSync(
+  Schema.fromJsonString(
+    Schema.Struct({
+      ...ManagedSkillManifest.fields,
+      projectState: Schema.optionalKey(Schema.Literal("override")),
+    }),
+  ),
+);
+// Trusted repository mutations serialize per owned root and publish by rename. Capturing
+// those root identities before resolution fences winner/override/tombstone changes without
+// scanning unbounded catalogues in SQL callbacks. Unrelated in-place catalogue edits are
+// outside that mutation model; selected files themselves are always descriptor-validated.
+const skillCatalogueReceipt = (
+  directories: ReadonlyArray<string>,
+  catalogues: ReadonlySet<string>,
+) => {
+  const fingerprint = (path: string, stat: import("node:fs").BigIntStats) =>
+    catalogues.has(path)
+      ? sourceStat(stat)
+      : encode({
+          dev: String(stat.dev),
+          ino: String(stat.ino),
+          uid: String(stat.uid),
+          mode: String(stat.mode),
+        });
+  const before = directories.map((path) => {
+    try {
+      const fd = NodeFS.openSync(path, directoryFlags);
+      try {
+        const stat = NodeFS.fstatSync(fd, { bigint: true });
+        if (
+          !stat.isDirectory() ||
+          NodeFS.realpathSync(path) !== path ||
+          NodeFS.realpathSync(`/proc/self/fd/${fd}`) !== path ||
+          sourceStat(stat) !== sourceStat(NodeFS.lstatSync(path, { bigint: true }))
+        )
+          throw sourceChanged();
+        return fingerprint(path, stat);
+      } finally {
+        NodeFS.closeSync(fd);
+      }
+    } catch (error) {
+      if (sourceMissing(error)) return null;
+      throw error;
+    }
+  });
+  return () => {
+    directories.forEach((path, index) => {
+      try {
+        const stat = NodeFS.lstatSync(path, { bigint: true });
+        if (
+          !stat.isDirectory() ||
+          NodeFS.realpathSync(path) !== path ||
+          fingerprint(path, stat) !== before[index]
+        )
+          throw sourceChanged();
+      } catch (error) {
+        if (before[index] !== null || !sourceMissing(error)) throw sourceChanged();
+      }
+    });
+  };
+};
+const captureSkillSources = async (
+  paths: Path.Path,
+  selection: ReadonlyArray<PiManagedSkillSelection>,
+  catalogue: () => void,
+  roots: { readonly global: string; readonly project: string },
+) => {
+  const receipts: Array<{ path: string; directory: boolean; stat: string }> = [];
+  const limits = DEFAULT_SKILL_PACKAGE_LIMITS;
+  // Selection is bounded to 32 packages; each inventory uses the shared package limits.
+  if (selection.length > 32) throw sourceChanged();
+  const validate = (path: string) => {
+    if (!paths.isAbsolute(path) || paths.normalize(path) !== path || path.length > 4096)
+      throw sourceChanged();
+  };
+  for (const selected of selection) {
+    let entries = 0;
+    let files = 0;
+    let bytes = 0n;
+    const inventory: Array<{ relative: string; path: string; bytes: Buffer }> = [];
+    const walk = async (path: string, relative: string, depth: number): Promise<void> => {
+      validate(path);
+      if (depth > limits.maxDepth || (relative !== "" && ++entries > limits.maxEntries))
+        throw sourceChanged();
+      const initial = await NodeFS.promises.lstat(path, { bigint: true });
+      if (
+        initial.isSymbolicLink() ||
+        (!initial.isDirectory() && !initial.isFile()) ||
+        (!initial.isDirectory() && initial.nlink !== 1n)
+      )
+        throw sourceChanged();
+      const fd = await NodeFS.promises.open(
+        path,
+        initial.isDirectory() ? directoryFlags : fileFlags,
+      );
+      try {
+        const fingerprint = sourceStat(initial);
+        if (
+          sourceStat(await fd.stat({ bigint: true })) !== fingerprint ||
+          (await NodeFS.promises.realpath(`/proc/self/fd/${fd.fd}`)) !== path ||
+          (await NodeFS.promises.realpath(path)) !== path
+        )
+          throw sourceChanged();
+        if (initial.isDirectory()) {
+          const directory = await NodeFS.promises.opendir(`/proc/self/fd/${fd.fd}`);
+          try {
+            for (;;) {
+              const entry = await directory.read();
+              if (!entry) break;
+              await walk(
+                path + "/" + entry.name,
+                relative ? relative + "/" + entry.name : entry.name,
+                depth + 1,
+              );
+            }
+          } finally {
+            await directory.close();
+          }
+        } else {
+          bytes += initial.size;
+          if (
+            ++files > limits.maxFiles ||
+            initial.size < 0n ||
+            bytes > BigInt(limits.maxBytes) ||
+            (relative === SKILL_MANIFEST_FILE && initial.size > BigInt(limits.maxManifestBytes))
+          )
+            throw sourceChanged();
+          const content = Buffer.alloc(Number(initial.size));
+          let offset = 0;
+          while (offset < content.length) {
+            const read = await fd.read(content, offset, content.length - offset, offset);
+            if (read.bytesRead === 0) throw sourceChanged();
+            offset += read.bytesRead;
+          }
+          if ((await fd.read(Buffer.alloc(1), 0, 1, content.length)).bytesRead !== 0)
+            throw sourceChanged();
+          inventory.push({ relative, path, bytes: content });
+        }
+        if (
+          sourceStat(await fd.stat({ bigint: true })) !== fingerprint ||
+          sourceStat(await NodeFS.promises.lstat(path, { bigint: true })) !== fingerprint
+        )
+          throw sourceChanged();
+        receipts.push({ path, directory: initial.isDirectory(), stat: fingerprint });
+      } finally {
+        await fd.close();
+      }
+    };
+    await walk(selected.packagePath, "", 0);
+    const manifestFile = inventory.find((file) => file.relative === SKILL_MANIFEST_FILE);
+    if (!manifestFile) throw sourceChanged();
+    const manifest = decodeSourceManifest(manifestFile.bytes.toString("utf8"));
+    if (
+      manifest.id !== selected.skillId ||
+      manifest.key !== selected.key ||
+      manifest.ownership !== "t3" ||
+      manifest.revision.hash !== selected.expectedHash ||
+      paths.basename(selected.packagePath) !== selected.key ||
+      paths.dirname(selected.packagePath) !==
+        (manifest.scope === "global" ? roots.global : roots.project)
+    )
+      throw sourceChanged();
+    const hash = NodeCrypto.createHash("sha256");
+    for (const file of inventory.sort((a, b) => a.relative.localeCompare(b.relative))) {
+      if (file.relative === SKILL_MANIFEST_FILE) continue;
+      hash
+        .update(file.relative)
+        .update("\0")
+        .update(String(file.bytes.length))
+        .update("\0")
+        .update(file.bytes);
+    }
+    if (hash.digest("hex") !== selected.expectedHash) throw sourceChanged();
+  }
+  const check = () => {
+    catalogue();
+    for (const receipt of receipts) {
+      const fd = NodeFS.openSync(receipt.path, receipt.directory ? directoryFlags : fileFlags);
+      try {
+        const stat = NodeFS.fstatSync(fd, { bigint: true });
+        if (
+          sourceStat(stat) !== receipt.stat ||
+          sourceStat(NodeFS.lstatSync(receipt.path, { bigint: true })) !== receipt.stat ||
+          NodeFS.realpathSync(receipt.path) !== receipt.path ||
+          NodeFS.realpathSync(`/proc/self/fd/${fd}`) !== receipt.path
+        )
+          throw sourceChanged();
+      } finally {
+        NodeFS.closeSync(fd);
+      }
+    }
+  };
+  check();
+  return check;
+};
 interface WorkspaceMetadata {
   readonly directories: ReadonlyArray<string>;
   readonly assigned: string;
@@ -311,6 +540,12 @@ export interface PiManagedRuntimeLiveOptions {
   readonly protectedRoots: ReadonlyArray<string>;
   readonly runtimeFiles: PiManagedLaunch["runtimeFiles"];
   readonly revalidateRuntime?: Effect.Effect<void, PiManagedRuntimeError>;
+  /** Private factory allocation; invoked only for the current nonempty frozen selection. */
+  readonly allocateSkillStage?: Effect.Effect<
+    PiSkillStageLifetime,
+    PiManagedRuntimeError,
+    Scope.Scope
+  >;
   /** The owned state is mounted at /state; the worker must use /state/sessions. */
   readonly workerArgv: (
     identity: PiWorkerIdentity,
@@ -352,6 +587,8 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
   const authorization = yield* ProjectTeamAuthorization;
   const gateway = yield* ProjectWorkGateway;
   const skillRepository = yield* Effect.serviceOption(ManagedSkillRepository);
+  const serverConfig = yield* Effect.serviceOption(ServerConfig);
+  const materialization = yield* Effect.serviceOption(SkillMaterializationService);
   const accounting = yield* makeAccounting({
     environmentId: options.environmentId,
     routeId,
@@ -588,6 +825,8 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
     guard(
       Effect.gen(function* () {
         const agentDirectory = instance.configuration.agentDirectory ?? options.agentDirectory;
+        const stageScopes = new Set<Scope.Closeable>();
+        let closing = false;
         const active = new Map<
           ThreadId,
           {
@@ -595,6 +834,7 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
             readonly stop: Effect.Effect<void, PiManagedRuntimeError>;
           }
         >();
+        const preparing = new Map<ThreadId, Effect.Effect<void>>();
         const sessionFor = (
           authority: ProjectTeamAuthority,
           native?: PiNativeReference,
@@ -651,6 +891,39 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
             Effect.mapError((error) => deny(error.detail, error.code)),
           );
         });
+        const selectedSnapshot = Effect.fn("PiManagedRuntimeLive.selectedSnapshot")(function* (
+          authority: ProjectTeamAuthority,
+          workspace: { readonly fence: WorkspaceFence },
+        ) {
+          if (authority.binding.configuration.skillIds.length === 0)
+            return { selection: Object.freeze([]), fence: () => {} };
+          if (Option.isNone(serverConfig))
+            return yield* deny("Managed skill roots are unavailable", "unavailable");
+          const project = workspace.fence.metadata.primary;
+          const catalogue = yield* Effect.try({
+            try: () =>
+              skillCatalogueReceipt(
+                [
+                  serverConfig.value.stateDir,
+                  serverConfig.value.managedSkillsDir,
+                  project + "/.t3code",
+                  project + "/.t3code/skills",
+                ],
+                new Set([serverConfig.value.managedSkillsDir, project + "/.t3code/skills"]),
+              ),
+            catch: () => sourceChanged(),
+          });
+          const selection = yield* selectedSkills(authority, workspace);
+          const fence = yield* Effect.tryPromise({
+            try: () =>
+              captureSkillSources(paths, selection, catalogue, {
+                global: serverConfig.value.managedSkillsDir,
+                project: project + "/.t3code/skills",
+              }),
+            catch: () => sourceChanged(),
+          }).pipe(Effect.uninterruptible);
+          return { selection, fence };
+        });
         const authorizeSkills: PiManagedRuntimeInstance["authorizeSkills"] = (suppliedRequest) =>
           guard(
             Effect.gen(function* () {
@@ -680,7 +953,10 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                 return yield* deny("Pi skill cwd differs from durable assignment");
               const context = contextFor(authority);
               const workspace = yield* verifyWorkspace(authority, agentDirectory);
-              const selection = yield* selectedSkills(authority, workspace);
+              const { selection, fence: sourceFence } = yield* selectedSnapshot(
+                authority,
+                workspace,
+              );
               if (
                 selection.some(
                   (selected) =>
@@ -707,524 +983,779 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       "conflict",
                     );
                   workspaceReceipt(paths, workspace.fence.metadata, workspace.fence);
+                  sourceFence();
                   return Object.freeze(selection.map((selected) => selected.key));
                 },
               );
             }),
           );
-        const prepareOperation: PiManagedRuntimeInstance["prepareOperation"] = (request, observe) =>
-          guard(
-            Effect.gen(function* () {
-              if (!instance.enabled) return yield* deny("Pi instance disabled");
-              const authority = yield* operations.current(
-                identity(request.threadId),
-                request.kind === "initialize",
-              );
-              const binding = authority.binding;
-              if (
-                (request.cwd !== undefined && request.cwd !== binding.worktree) ||
-                (request.runtimeMode !== undefined &&
-                  request.runtimeMode !== "approval-required") ||
-                (request.modelSelection !== undefined &&
-                  (request.modelSelection.instanceId !== instance.instanceId ||
-                    request.modelSelection.model !== binding.model))
-              )
-                return yield* deny("Pi caller hints differ from durable assignment");
-              if (
-                binding.configuration.runtimeVersion !== "0.99.1" ||
-                binding.configuration.instructionsHash !== digest(authority.role.instructions)
-              )
-                return yield* deny("Pi frozen runtime or instructions digest mismatch");
-              if (binding.configuration.skillIds.length || authority.role.skills.length)
-                return yield* deny("Pi managed skill delivery is unavailable", "unavailable");
-              const supported = new Set<string>([
-                ...piProjectWorkToolCapabilities,
-                ...piLocalToolDefinitions.map((tool) => tool.capabilityId),
-              ]);
-              if (
-                binding.configuration.toolIds.some(
-                  (tool) => !supported.has(tool) || !authority.role.tools.includes(tool),
+        const prepareOperation: PiManagedRuntimeInstance["prepareOperation"] = (
+          suppliedRequest,
+          observe,
+        ) => {
+          let request: typeof suppliedRequest;
+          try {
+            request = structuredClone(suppliedRequest);
+          } catch {
+            return Effect.fail(deny("Pi operation request cannot be copied"));
+          }
+          let attempted = false;
+          return Effect.suspend(() => {
+            if (attempted || closing)
+              return Effect.fail(deny("Pi preparation already attempted or closing", "conflict"));
+            attempted = true;
+            if (active.has(request.threadId) || preparing.has(request.threadId))
+              return Effect.fail(deny("Pi operation is already preparing or active", "conflict"));
+            const preparation = { canceled: false, done: Promise.withResolvers<void>() };
+
+            const assertPreparing = () => {
+              if (preparation.canceled || closing)
+                throw deny("Pi preparation canceled", "conflict");
+            };
+            const preparationCurrent = Effect.try({
+              try: assertPreparing,
+              catch: () => deny("Pi preparation canceled", "conflict"),
+            });
+            let resourceScope: Scope.Closeable | undefined;
+            const closeResources = Effect.suspend(() => {
+              const scope = resourceScope;
+              return scope
+                ? Scope.close(scope, Exit.void).pipe(
+                    Effect.ensuring(Effect.sync(() => stageScopes.delete(scope))),
+                  )
+                : Effect.void;
+            });
+            let skillStage: PiSkillStageLifetime | undefined;
+            let stageSealed = false;
+            let durableAttempted = false;
+            let preparationFiber:
+              | Fiber.Fiber<PiManagedPreparedOperation, PiManagedRuntimeError>
+              | undefined;
+            preparing.set(
+              request.threadId,
+              Effect.suspend(() => {
+                preparation.canceled = true;
+                // A durable handoff must complete before we can settle its never-started owner.
+                // Earlier interruptible reads are canceled; owned descriptor IO joins its closes.
+                const cancel =
+                  !durableAttempted && preparationFiber
+                    ? Fiber.interrupt(preparationFiber)
+                    : Effect.void;
+                return cancel.pipe(Effect.andThen(Effect.promise(() => preparation.done.promise)));
+              }),
+            );
+            const prepare = guard(
+              Effect.gen(function* () {
+                yield* preparationCurrent;
+                if (!instance.enabled) return yield* deny("Pi instance disabled");
+                if (active.has(request.threadId))
+                  return yield* deny("Pi operation is already prepared or active", "conflict");
+                const authority = yield* operations.current(
+                  identity(request.threadId),
+                  request.kind === "initialize",
+                );
+                const binding = authority.binding;
+                if (
+                  (request.cwd !== undefined && request.cwd !== binding.worktree) ||
+                  (request.runtimeMode !== undefined &&
+                    request.runtimeMode !== "approval-required") ||
+                  (request.modelSelection !== undefined &&
+                    (request.modelSelection.instanceId !== instance.instanceId ||
+                      request.modelSelection.model !== binding.model))
                 )
-              )
-                return yield* deny("Pi profile includes an unsupported tool", "unavailable");
-              const localTools = piLocalToolDefinitions.filter(
-                (tool) =>
-                  binding.configuration.toolIds.includes(tool.capabilityId) &&
-                  authority.role.tools.includes(tool.capabilityId),
-              );
-              const workspace = yield* verifyWorkspace(authority, agentDirectory);
-              const nativeConfig = yield* configuration(agentDirectory, authority);
-              const previous =
-                request.kind === "initialize" && binding.status === "reserved"
-                  ? undefined
-                  : yield* operations.nativeFor(identity(request.threadId));
-              if (
-                request.resumeCursor !== undefined &&
-                encode(request.resumeCursor) !== encode(previous?.native ?? null)
-              )
-                return yield* deny("Pi resume hint differs from durable native identity");
-              const context = contextFor(authority);
-              if (Buffer.byteLength(context) > 131072)
-                return yield* deny(
-                  "Pi current assignment context exceeds its bound",
-                  "unavailable",
-                );
-              const operation: PiWorkerOperation = {
-                operationId: yield* crypto.randomUUIDv4,
-                operationKind: request.kind,
-              };
-              const workerId = yield* crypto.randomUUIDv4;
-              const workerIdentity = { workerId, generation: binding.generation };
-              const nativeStateDirectory =
-                options.nativeStateRoot +
-                "/" +
-                digest(
-                  encode([
-                    options.environmentId,
-                    instance.instanceId,
-                    request.threadId,
-                    binding.recordId,
-                    binding.generation,
-                  ]),
-                );
-              if (
-                workspace.protectedRoots.some(
-                  (root) =>
-                    root === nativeStateDirectory ||
-                    nativeStateDirectory.startsWith(root + "/") ||
-                    root.startsWith(nativeStateDirectory + "/"),
+                  return yield* deny("Pi caller hints differ from durable assignment");
+                if (
+                  binding.configuration.runtimeVersion !== "0.99.1" ||
+                  binding.configuration.instructionsHash !== digest(authority.role.instructions)
                 )
-              )
-                return yield* deny("Pi native state overlaps a protected Git checkout");
-              yield* fs.makeDirectory(nativeStateDirectory, { recursive: true, mode: 0o700 });
-              if ((yield* fs.realPath(nativeStateDirectory)) !== nativeStateDirectory)
-                return yield* deny("Pi native state directory is not canonical");
-              const launch: PiManagedLaunch = {
-                workspaceRoot: binding.worktree,
-                workspaceAccess: localTools.some((tool) => tool.name !== "read")
-                  ? "readwrite"
-                  : "readonly",
-                nativeStateRoot: nativeStateDirectory,
-                protectedWorkspaceEntries: [".git"],
-                protectedRoots: workspace.protectedRoots,
-                runtimeFiles: options.runtimeFiles,
-                argv: options.workerArgv(workerIdentity, operation, nativeStateDirectory),
-                memoryBytes: options.memoryBytes,
-                runtimeSeconds: Math.ceil(nativeConfig.deadlineMs / 1000),
-              };
-              yield* options.revalidateRuntime ?? Effect.void;
-              const allocationAuthority = yield* operations.current(
-                identity(request.threadId),
-                request.kind === "initialize",
-              );
-              if (contextFor(allocationAuthority) !== context)
-                return yield* deny("Pi assignment changed before managed allocation", "conflict");
-              yield* verifyWorkspace(allocationAuthority, agentDirectory, workspace);
-              if (
-                contextFor(
-                  yield* operations.current(
-                    identity(request.threadId),
-                    request.kind === "initialize",
-                  ),
-                ) !== context
-              )
-                return yield* deny(
-                  "Pi assignment changed during managed allocation checks",
-                  "conflict",
+                  return yield* deny("Pi frozen runtime or instructions digest mismatch");
+                const supported = new Set<string>([
+                  ...piProjectWorkToolCapabilities,
+                  ...piLocalToolDefinitions.map((tool) => tool.capabilityId),
+                ]);
+                if (
+                  binding.configuration.toolIds.some(
+                    (tool) => !supported.has(tool) || !authority.role.tools.includes(tool),
+                  )
+                )
+                  return yield* deny("Pi profile includes an unsupported tool", "unavailable");
+                const localTools = piLocalToolDefinitions.filter(
+                  (tool) =>
+                    binding.configuration.toolIds.includes(tool.capabilityId) &&
+                    authority.role.tools.includes(tool.capabilityId),
                 );
-              yield* finalWorkspaceFence(paths, workspace.fence);
-              const allocation = yield* preallocatePiManagedProcess(launch).pipe(
-                Effect.provide(services),
-              );
-              const durable = yield* operations.prepare(
-                identity(request.threadId),
-                request,
-                digest(encode(request)),
-                { allocation, workerId, operationId: operation.operationId },
-              );
-              if (contextFor(durable.authority) !== context)
-                return yield* deny("Pi assignment changed before durable handoff", "conflict");
-              const turnId = TurnId.make(operation.operationId);
-              const translator =
-                request.kind === "prompt"
-                  ? makePiRuntimeEventTranslator({
-                      providerInstanceId: instance.instanceId,
-                      threadId: request.threadId,
-                      turnId,
-                      identity: workerIdentity,
-                      operation: { ...operation, operationKind: "prompt" },
-                      operationOrdinal: durable.ordinal,
-                      ...(previous ? { sessionId: previous.native.sessionId } : {}),
-                    })
-                  : undefined;
-              const tools: PiModelTool[] = [];
-              const toolCapabilities: import("./PiSessionRuntime.ts").PiSessionToolCapability[] =
-                [];
-              const bridgeTools = yield* Effect.try({
-                try: () =>
-                  preparePiProjectWorkTools({
-                    roleTools: authority.role.tools,
-                    bindingTools: binding.configuration.toolIds,
-                  }),
-                catch: () => deny("Pi frozen bridge tool configuration is invalid"),
-              });
-              for (const { tool, capability } of bridgeTools) {
-                tools.push(tool);
-                toolCapabilities.push({
-                  name: tool.function.name,
-                  capability,
-                  execution: "bridge",
-                });
-              }
-              for (const tool of localTools) {
-                tools.push({
-                  type: "function",
-                  function: {
-                    name: tool.name,
-                    description: tool.description,
-                    parameters: tool.parameters,
-                  },
-                });
-                toolCapabilities.push({
-                  name: tool.name,
-                  capability: tool.capabilityId,
-                  execution: "local",
-                });
-              }
-              const texts = [
-                { transferId: "context", text: context },
-                ...(request.kind === "prompt"
-                  ? [{ transferId: "prompt", text: request.prompt }]
-                  : []),
-                ...tools.map((tool) => ({
-                  transferId: tool.function.name,
-                  text: encode(tool.function.parameters),
-                })),
-              ];
-              const descriptor = (transferId: string) => ({
-                transferId,
-                totalBytes: Buffer.byteLength(
-                  texts.find((item) => item.transferId === transferId)!.text,
-                ),
-              });
-              const check = (signal: AbortSignal, verify = false, revalidate = false) =>
-                guard(
+                const workspace = yield* verifyWorkspace(authority, agentDirectory);
+                const { selection, fence: sourceFence } = yield* selectedSnapshot(
+                  authority,
+                  workspace,
+                );
+                yield* preparationCurrent;
+                const resourceHash = piManagedSkillResourceIdentity(selection);
+                const nativeConfig = yield* configuration(agentDirectory, authority);
+                const previous =
+                  request.kind === "initialize" && binding.status === "reserved"
+                    ? undefined
+                    : yield* operations.nativeFor(identity(request.threadId));
+                if (
+                  previous &&
+                  (previous.resourceHash ?? piManagedSkillResourceIdentity([])) !== resourceHash
+                )
+                  return yield* deny(
+                    "Changed selected Pi skill content requires a new session",
+                    "conflict",
+                  );
+                if (
+                  request.resumeCursor !== undefined &&
+                  encode(request.resumeCursor) !== encode(previous?.native ?? null)
+                )
+                  return yield* deny("Pi resume hint differs from durable native identity");
+                const context = contextFor(authority);
+                const authorizeResources = guard(
                   Effect.gen(function* () {
-                    if (signal.aborted) return yield* deny("Pi operation canceled");
-                    const current = yield* operations.authorize(durable);
-                    if (verify) yield* verifyWorkspace(current, agentDirectory, workspace);
-                    if (revalidate) {
-                      if (signal.aborted) return yield* deny("Pi operation canceled");
-                      yield* options.revalidateRuntime ?? Effect.void;
-                      if (signal.aborted) return yield* deny("Pi operation canceled");
-                      yield* verifyWorkspace(
-                        yield* operations.authorize(durable),
-                        agentDirectory,
-                        workspace,
-                      );
-                    }
-                    yield* operations.authorize(durable);
-                    if (signal.aborted) return yield* deny("Pi operation canceled");
+                    yield* preparationCurrent;
+                    const current = yield* operations.current(
+                      identity(request.threadId),
+                      request.kind === "initialize",
+                    );
+                    if (contextFor(current) !== context)
+                      return yield* deny("Pi selected resource authority changed", "conflict");
+                    if (
+                      piManagedSkillResourceIdentity(yield* selectedSkills(current, workspace)) !==
+                      resourceHash
+                    )
+                      return yield* deny("Pi selected resource content changed", "conflict");
+                    yield* verifyWorkspace(current, agentDirectory, workspace);
+                    yield* operations.admitCurrent(identity(request.threadId), (latest) => {
+                      if (contextFor(latest) !== context)
+                        throw deny(
+                          "Pi selected resource authority changed during admission",
+                          "conflict",
+                        );
+                      assertPreparing();
+                      workspaceReceipt(paths, workspace.fence.metadata, workspace.fence);
+                      sourceFence();
+                    });
                   }),
                 );
-              const runtime = yield* makePiSessionRuntime({
-                identity: workerIdentity,
-                operation,
-                bootstrap: {
-                  type: "bootstrap",
-                  executionMode: "managed",
-                  expectedCwd: "/workspace",
-                  native: previous?.native ?? null,
-                  context: descriptor("context"),
-                  prompt: request.kind === "prompt" ? descriptor("prompt") : null,
-                  model: {
-                    provider: nativeConfig.provider,
-                    modelId: nativeConfig.model,
-                    api: nativeConfig.api,
-                    contextWindow: nativeConfig.contextWindow,
-                    maxTokens: nativeConfig.maxOutputTokens,
-                    reasoning: false,
-                  },
-                  allowedTools: tools.map((tool) => ({
+                if (selection.length !== 0) {
+                  if (!options.allocateSkillStage || Option.isNone(materialization))
+                    return yield* deny("Selected Pi skill staging is unavailable", "unavailable");
+                  yield* validatePiManagedSkillPlan({
+                    selection,
+                    skillPlan: request.skillPlan,
+                    materialization: materialization.value,
+                    threadId: request.threadId,
+                    providerInstanceId: instance.instanceId,
+                    authorizeCurrent: authorizeResources,
+                  }).pipe(
+                    Effect.provideService(FileSystem.FileSystem, fs),
+                    Effect.provideService(Path.Path, paths),
+                  );
+                  yield* preparationCurrent;
+                  resourceScope = yield* Scope.make();
+                  stageScopes.add(resourceScope);
+                  const ownedScope = resourceScope;
+                  skillStage = yield* options.allocateSkillStage.pipe(
+                    Effect.provideService(Scope.Scope, ownedScope),
+                  );
+                }
+                const resources =
+                  selection.length === 0 && request.skillPlan === undefined
+                    ? {
+                        runtimeFiles: [],
+                        resources: { skills: [] },
+                        identityHash: resourceHash,
+                        revalidate: Effect.void,
+                      }
+                    : Option.isNone(materialization)
+                      ? yield* deny("Owned Pi skill materialization is unavailable", "unavailable")
+                      : yield* preparePiManagedSkillResources({
+                          selection,
+                          skillPlan: request.skillPlan,
+                          materialization: materialization.value,
+                          threadId: request.threadId,
+                          providerInstanceId: instance.instanceId,
+                          stagingRoot: skillStage?.stagingRoot ?? options.nativeStateRoot,
+                          stagingDirectory: skillStage?.stagingDirectory ?? options.nativeStateRoot,
+                          existingRuntimeFiles: options.runtimeFiles,
+                          protectedRoots: workspace.protectedRoots,
+                          writableRoots: [binding.worktree, options.nativeStateRoot],
+                          authorizeCurrent: authorizeResources,
+                        }).pipe(
+                          Effect.provideService(FileSystem.FileSystem, fs),
+                          Effect.provideService(Path.Path, paths),
+                        );
+                if (resources.identityHash !== resourceHash)
+                  return yield* deny("Pi staged selected content identity changed", "conflict");
+                yield* resources.revalidate;
+                if (skillStage) {
+                  yield* skillStage.captureSealedTree(resources.runtimeFiles);
+                  stageSealed = true;
+                }
+                const settleResources = (disposition: "drained" | "uncertain") =>
+                  Effect.suspend(() => {
+                    if (!skillStage || !resourceScope) return Effect.void;
+                    return (
+                      disposition === "drained" ? skillStage.remove() : skillStage.retain()
+                    ).pipe(Effect.ensuring(closeResources));
+                  });
+                const persistTerminal = (
+                  terminal: import("./PiSessionRuntime.ts").PiSessionTerminal,
+                ) =>
+                  operations
+                    .persistTerminal(durable, terminal)
+                    .pipe(Effect.flatMap(settleResources));
+                if (Buffer.byteLength(context) > 131072)
+                  return yield* deny(
+                    "Pi current assignment context exceeds its bound",
+                    "unavailable",
+                  );
+                const operation: PiWorkerOperation = {
+                  operationId: yield* crypto.randomUUIDv4,
+                  operationKind: request.kind,
+                };
+                const workerId = yield* crypto.randomUUIDv4;
+                const workerIdentity = { workerId, generation: binding.generation };
+                const nativeStateDirectory =
+                  options.nativeStateRoot +
+                  "/" +
+                  digest(
+                    encode([
+                      options.environmentId,
+                      instance.instanceId,
+                      request.threadId,
+                      binding.recordId,
+                      binding.generation,
+                    ]),
+                  );
+                if (
+                  workspace.protectedRoots.some(
+                    (root) =>
+                      root === nativeStateDirectory ||
+                      nativeStateDirectory.startsWith(root + "/") ||
+                      root.startsWith(nativeStateDirectory + "/"),
+                  )
+                )
+                  return yield* deny("Pi native state overlaps a protected Git checkout");
+                yield* fs.makeDirectory(nativeStateDirectory, { recursive: true, mode: 0o700 });
+                if ((yield* fs.realPath(nativeStateDirectory)) !== nativeStateDirectory)
+                  return yield* deny("Pi native state directory is not canonical");
+                const launch: PiManagedLaunch = {
+                  workspaceRoot: binding.worktree,
+                  workspaceAccess: localTools.some((tool) => tool.name !== "read")
+                    ? "readwrite"
+                    : "readonly",
+                  nativeStateRoot: nativeStateDirectory,
+                  protectedWorkspaceEntries: [".git"],
+                  protectedRoots: workspace.protectedRoots,
+                  runtimeFiles: [...options.runtimeFiles, ...resources.runtimeFiles],
+                  argv: options.workerArgv(workerIdentity, operation, nativeStateDirectory),
+                  memoryBytes: options.memoryBytes,
+                  runtimeSeconds: Math.ceil(nativeConfig.deadlineMs / 1000),
+                };
+                yield* options.revalidateRuntime ?? Effect.void;
+                const allocationAuthority = yield* operations.current(
+                  identity(request.threadId),
+                  request.kind === "initialize",
+                );
+                if (contextFor(allocationAuthority) !== context)
+                  return yield* deny("Pi assignment changed before managed allocation", "conflict");
+                yield* verifyWorkspace(allocationAuthority, agentDirectory, workspace);
+                if (
+                  contextFor(
+                    yield* operations.current(
+                      identity(request.threadId),
+                      request.kind === "initialize",
+                    ),
+                  ) !== context
+                )
+                  return yield* deny(
+                    "Pi assignment changed during managed allocation checks",
+                    "conflict",
+                  );
+                yield* finalWorkspaceFence(paths, workspace.fence);
+                yield* preparationCurrent;
+                yield* verifySource(sourceFence);
+                const allocation = yield* preallocatePiManagedProcess(launch).pipe(
+                  Effect.provide(services),
+                );
+                yield* preparationCurrent;
+                yield* verifySource(sourceFence);
+                durableAttempted = true;
+                const durable = yield* operations.prepare(
+                  identity(request.threadId),
+                  request,
+                  digest(encode(request)),
+                  { allocation, workerId, operationId: operation.operationId, resourceHash },
+                );
+                if (contextFor(durable.authority) !== context)
+                  return yield* deny("Pi assignment changed before durable handoff", "conflict");
+                const turnId = TurnId.make(operation.operationId);
+                const translator =
+                  request.kind === "prompt"
+                    ? makePiRuntimeEventTranslator({
+                        providerInstanceId: instance.instanceId,
+                        threadId: request.threadId,
+                        turnId,
+                        identity: workerIdentity,
+                        operation: { ...operation, operationKind: "prompt" },
+                        operationOrdinal: durable.ordinal,
+                        ...(previous ? { sessionId: previous.native.sessionId } : {}),
+                      })
+                    : undefined;
+                const tools: PiModelTool[] = [];
+                const toolCapabilities: import("./PiSessionRuntime.ts").PiSessionToolCapability[] =
+                  [];
+                const bridgeTools = yield* Effect.try({
+                  try: () =>
+                    preparePiProjectWorkTools({
+                      roleTools: authority.role.tools,
+                      bindingTools: binding.configuration.toolIds,
+                    }),
+                  catch: () => deny("Pi frozen bridge tool configuration is invalid"),
+                });
+                for (const { tool, capability } of bridgeTools) {
+                  tools.push(tool);
+                  toolCapabilities.push({
                     name: tool.function.name,
-                    execution: toolCapabilities.find((entry) => entry.name === tool.function.name)!
-                      .execution,
-                    description: tool.function.description,
-                    inputSchema: descriptor(tool.function.name),
+                    capability,
+                    execution: "bridge",
+                  });
+                }
+                for (const tool of localTools) {
+                  tools.push({
+                    type: "function",
+                    function: {
+                      name: tool.name,
+                      description: tool.description,
+                      parameters: tool.parameters,
+                    },
+                  });
+                  toolCapabilities.push({
+                    name: tool.name,
+                    capability: tool.capabilityId,
+                    execution: "local",
+                  });
+                }
+                const texts = [
+                  { transferId: "context", text: context },
+                  ...(request.kind === "prompt"
+                    ? [{ transferId: "prompt", text: request.prompt }]
+                    : []),
+                  ...tools.map((tool) => ({
+                    transferId: tool.function.name,
+                    text: encode(tool.function.parameters),
                   })),
-                },
-                transferTexts: texts,
-                launch,
-                persistence: operations.persistence(durable),
-                toolCapabilities,
-                deadlineMs: Math.max(
-                  1,
-                  Math.min(
-                    nativeConfig.deadlineMs,
-                    durable.deadlineAtMs - (yield* Clock.currentTimeMillis),
+                ];
+                const descriptor = (transferId: string) => ({
+                  transferId,
+                  totalBytes: Buffer.byteLength(
+                    texts.find((item) => item.transferId === transferId)!.text,
                   ),
-                ),
-                cleanupDeadlineMs: options.cleanupDeadlineMs,
-                authorizeCurrent: (input, signal) =>
-                  perform(
-                    check(
-                      signal,
-                      [
-                        "beforeAcquire",
-                        "beforeStart",
-                        "beforeTool",
-                        "beforeToolInvoke",
-                        "beforeToolReturn",
-                      ].includes(input.phase),
-                      input.phase === "beforeAcquire" || input.phase === "beforeStart",
-                    ).pipe(
-                      Effect.andThen(
-                        input.tool
-                          ? authorization.capability(
-                              durable.principal,
-                              input.tool.capability,
-                              binding.projectId,
-                            )
-                          : Effect.void,
-                      ),
-                      // Capability checks can await SQL or another authority receipt.
-                      // Recheck the frozen run after that receipt, then fence the workspace.
-                      Effect.andThen(check(signal)),
-                      Effect.andThen(
+                });
+                const check = (signal: AbortSignal, verify = false, revalidate = false) =>
+                  guard(
+                    Effect.gen(function* () {
+                      if (signal.aborted) return yield* deny("Pi operation canceled");
+                      const current = yield* operations.authorize(durable);
+                      if (
+                        piManagedSkillResourceIdentity(
+                          yield* selectedSkills(current, workspace),
+                        ) !== resourceHash
+                      )
+                        return yield* deny(
+                          "Pi current selected content identity changed",
+                          "conflict",
+                        );
+                      if (verify) yield* resources.revalidate;
+                      if (verify) yield* verifyWorkspace(current, agentDirectory, workspace);
+                      if (revalidate) {
+                        if (signal.aborted) return yield* deny("Pi operation canceled");
+                        yield* options.revalidateRuntime ?? Effect.void;
+                        if (signal.aborted) return yield* deny("Pi operation canceled");
+                        yield* verifyWorkspace(
+                          yield* operations.authorize(durable),
+                          agentDirectory,
+                          workspace,
+                        );
+                      }
+                      yield* operations.authorize(durable);
+                      if (signal.aborted) return yield* deny("Pi operation canceled");
+                      yield* verifySource(sourceFence);
+                    }),
+                  );
+                const runtime = yield* makePiSessionRuntime({
+                  identity: workerIdentity,
+                  operation,
+                  bootstrap: {
+                    type: "bootstrap",
+                    executionMode: "managed",
+                    expectedCwd: "/workspace",
+                    native: previous?.native ?? null,
+                    resources: resources.resources,
+                    context: descriptor("context"),
+                    prompt: request.kind === "prompt" ? descriptor("prompt") : null,
+                    model: {
+                      provider: nativeConfig.provider,
+                      modelId: nativeConfig.model,
+                      api: nativeConfig.api,
+                      contextWindow: nativeConfig.contextWindow,
+                      maxTokens: nativeConfig.maxOutputTokens,
+                      reasoning: false,
+                    },
+                    allowedTools: tools.map((tool) => ({
+                      name: tool.function.name,
+                      execution: toolCapabilities.find(
+                        (entry) => entry.name === tool.function.name,
+                      )!.execution,
+                      description: tool.function.description,
+                      inputSchema: descriptor(tool.function.name),
+                    })),
+                  },
+                  transferTexts: texts,
+                  launch,
+                  persistence: operations.persistence(durable),
+                  toolCapabilities,
+                  deadlineMs: Math.max(
+                    1,
+                    Math.min(
+                      nativeConfig.deadlineMs,
+                      durable.deadlineAtMs - (yield* Clock.currentTimeMillis),
+                    ),
+                  ),
+                  cleanupDeadlineMs: options.cleanupDeadlineMs,
+                  authorizeCurrent: (input, signal) =>
+                    perform(
+                      check(
+                        signal,
                         [
                           "beforeAcquire",
                           "beforeStart",
                           "beforeTool",
                           "beforeToolInvoke",
                           "beforeToolReturn",
-                        ].includes(input.phase)
-                          ? finalWorkspaceFence(paths, workspace.fence, signal)
-                          : Effect.void,
-                      ),
-                    ),
-                  ),
-                executeBridgeTool: (call, input, signal) =>
-                  perform(
-                    guard(
-                      Effect.gen(function* () {
-                        yield* check(signal);
-                        const result = yield* executePiProjectWorkBridgeTool({
-                          toolName: call.toolName,
-                          arguments: input.arguments,
-                          principal: durable.principal,
-                          source: { kind: "mcp", id: workerId },
-                        }).pipe(Effect.provideService(ProjectWorkGateway, gateway));
-                        yield* check(signal);
-                        return { kind: "text" as const, text: encode(result) };
-                      }),
-                    ),
-                    { signal },
-                  ),
-                persistNative: (frame, signal) =>
-                  perform(
-                    guard(
-                      Effect.gen(function* () {
-                        yield* check(signal);
-                        if (!("native" in frame.message))
-                          return yield* deny("Pi native receipt absent");
-                        yield* operations.persistNative(durable, frame.message.native);
-                        yield* check(signal);
-                      }),
-                    ),
-                  ),
-                onSdkEvent: () => Promise.resolve(),
-                onWorkerFrame: (frame, signal) =>
-                  perform(
-                    guard(
-                      Effect.gen(function* () {
-                        yield* check(signal);
-                        if (!translator) return;
-                        const translated = translator.accept(
-                          frame,
-                          IsoDateTime.make(DateTime.formatIso(yield* DateTime.now)),
-                        );
-                        for (const event of translated.events) {
-                          yield* check(signal);
-                          yield* observe(event);
-                        }
-                        yield* check(signal);
-                      }),
-                    ),
-                  ),
-                persistControl: (receipt, signal) =>
-                  perform(
-                    guard(
-                      Effect.gen(function* () {
-                        if (receipt.status === "received") yield* check(signal);
-                        yield* operations.persistControl(durable, receipt);
-                        if (receipt.status === "received") yield* check(signal);
-                      }),
-                    ),
-                  ),
-                persistTerminal: (terminal) =>
-                  perform(operations.persistTerminal(durable, terminal)),
-                broker: {
-                  ...workerIdentity,
-                  operationId: operation.operationId,
-                  routeId,
-                  provider: nativeConfig.provider,
-                  model: nativeConfig.model,
-                  endpoint: nativeConfig.endpoint,
-                  acceptedReportedModels: [model, "inclusionai/ling-3.1-flash"],
-                  tools,
-                  maxInputTokens: nativeConfig.maxInputTokens,
-                  maxOutputTokens: nativeConfig.maxOutputTokens,
-                  deadlineMs: Math.max(
-                    1,
-                    Math.min(
-                      30000,
-                      Math.floor((durable.deadlineAtMs - (yield* Clock.currentTimeMillis)) / 2),
-                    ),
-                  ),
-                  authorizeCurrent: (_phase, signal) => perform(check(signal)),
-                  getCredential: (signal) =>
-                    perform(
-                      check(signal).pipe(
-                        Effect.andThen(readPiSavedLiteralCredential(agentDirectory)),
-                        Effect.map(Redacted.value),
-                      ),
-                    ),
-                  reserveRequest: (reservation, signal) =>
-                    perform(
-                      guard(
-                        check(signal).pipe(
-                          Effect.andThen(accounting.reserve(durable.principal, reservation)),
-                          Effect.flatMap((receipt) =>
-                            receipt.status === "existing"
-                              ? Effect.fail(deny("Pi model request already reserved", "conflict"))
-                              : Effect.succeed({ reservationId: receipt.reservationId }),
-                          ),
+                        ].includes(input.phase),
+                        input.phase === "beforeAcquire" || input.phase === "beforeStart",
+                      ).pipe(
+                        Effect.andThen(
+                          input.tool
+                            ? authorization.capability(
+                                durable.principal,
+                                input.tool.capability,
+                                binding.projectId,
+                              )
+                            : Effect.void,
+                        ),
+                        // Capability checks can await SQL or another authority receipt.
+                        // Recheck the frozen run after that receipt, then fence the workspace.
+                        Effect.andThen(check(signal)),
+                        Effect.andThen(
+                          [
+                            "beforeAcquire",
+                            "beforeStart",
+                            "beforeTool",
+                            "beforeToolInvoke",
+                            "beforeToolReturn",
+                          ].includes(input.phase)
+                            ? finalWorkspaceFence(paths, workspace.fence, signal)
+                            : Effect.void,
                         ),
                       ),
                     ),
-                  settleRequest: (settlement) => perform(accounting.settle(settlement)),
-                  transport: options.transport,
-                },
-              });
-              let controlId = 0;
-              const done = Promise.withResolvers<void>();
-              let started = false;
-              const cancellation = new AbortController();
-              let execution: Promise<import("./PiSessionRuntime.ts").PiSessionTerminal> | undefined;
-              const run = Effect.suspend(() => {
-                let ownsRun = false;
-                return guard(
-                  Effect.gen(function* () {
-                    if (started) return yield* deny("Pi operation already attempted", "conflict");
-                    yield* operations.assertIndependent();
-                    if (started) return yield* deny("Pi operation already attempted", "conflict");
-                    started = true;
-                    ownsRun = true;
-                    const terminal = yield* Effect.tryPromise({
-                      try: (signal) => {
-                        execution = perform(Effect.scoped(runtime.run()), {
-                          signal: AbortSignal.any([signal, cancellation.signal]),
-                        });
-                        return execution;
-                      },
-                      catch: () => deny("Pi operation requires reconciliation", "uncertain"),
-                    }).pipe(Effect.onInterrupt(() => Effect.sync(() => cancellation.abort())));
-                    yield* operations.current(identity(request.threadId));
-                    if (terminal.outcome !== "success" || !terminal.native)
-                      return yield* deny("Pi operation requires reconciliation", "uncertain");
-                    const current = yield* operations.publication(durable, terminal);
-                    // No asynchronous work separates these owner checks from publication.
-                    if (
-                      cancellation.signal.aborted ||
-                      active.get(request.threadId)?.prepared.operation.operationId !==
-                        operation.operationId
-                    )
-                      return yield* deny("Pi operation publication canceled", "conflict");
-                    const result = { terminal, session: sessionFor(current, terminal.native) };
-                    active.delete(request.threadId);
-                    done.resolve();
-                    ownsRun = false;
-                    return result;
-                  }),
-                ).pipe(
-                  Effect.ensuring(
-                    Effect.suspend(() =>
-                      ownsRun
-                        ? Effect.gen(function* () {
-                            cancellation.abort();
-                            if (execution)
-                              yield* Effect.promise(() =>
-                                execution!.then(
-                                  () => {},
-                                  () => {},
-                                ),
-                              );
-                            if (
-                              active.get(request.threadId)?.prepared.operation.operationId ===
-                              operation.operationId
-                            )
-                              active.delete(request.threadId);
-                            done.resolve();
-                          })
-                        : Effect.void,
+                  executeBridgeTool: (call, input, signal) =>
+                    perform(
+                      guard(
+                        Effect.gen(function* () {
+                          yield* check(signal);
+                          const result = yield* executePiProjectWorkBridgeTool({
+                            toolName: call.toolName,
+                            arguments: input.arguments,
+                            principal: durable.principal,
+                            source: { kind: "mcp", id: workerId },
+                          }).pipe(Effect.provideService(ProjectWorkGateway, gateway));
+                          yield* check(signal);
+                          return { kind: "text" as const, text: encode(result) };
+                        }),
+                      ),
+                      { signal },
                     ),
+                  persistNative: (frame, signal) =>
+                    perform(
+                      guard(
+                        Effect.gen(function* () {
+                          yield* check(signal);
+                          if (!("native" in frame.message))
+                            return yield* deny("Pi native receipt absent");
+                          yield* operations.persistNative(durable, frame.message.native);
+                          yield* check(signal);
+                        }),
+                      ),
+                    ),
+                  onSdkEvent: () => Promise.resolve(),
+                  onWorkerFrame: (frame, signal) =>
+                    perform(
+                      guard(
+                        Effect.gen(function* () {
+                          yield* check(signal);
+                          if (!translator) return;
+                          const translated = translator.accept(
+                            frame,
+                            IsoDateTime.make(DateTime.formatIso(yield* DateTime.now)),
+                          );
+                          for (const event of translated.events) {
+                            yield* check(signal);
+                            yield* observe(event);
+                          }
+                          yield* check(signal);
+                        }),
+                      ),
+                    ),
+                  persistControl: (receipt, signal) =>
+                    perform(
+                      guard(
+                        Effect.gen(function* () {
+                          if (receipt.status === "received") yield* check(signal);
+                          yield* operations.persistControl(durable, receipt);
+                          if (receipt.status === "received") yield* check(signal);
+                        }),
+                      ),
+                    ),
+                  persistTerminal: (terminal) => perform(persistTerminal(terminal)),
+                  broker: {
+                    ...workerIdentity,
+                    operationId: operation.operationId,
+                    routeId,
+                    provider: nativeConfig.provider,
+                    model: nativeConfig.model,
+                    endpoint: nativeConfig.endpoint,
+                    acceptedReportedModels: [model, "inclusionai/ling-3.1-flash"],
+                    tools,
+                    maxInputTokens: nativeConfig.maxInputTokens,
+                    maxOutputTokens: nativeConfig.maxOutputTokens,
+                    deadlineMs: Math.max(
+                      1,
+                      Math.min(
+                        30000,
+                        Math.floor((durable.deadlineAtMs - (yield* Clock.currentTimeMillis)) / 2),
+                      ),
+                    ),
+                    authorizeCurrent: (_phase, signal) => perform(check(signal)),
+                    getCredential: (signal) =>
+                      perform(
+                        check(signal).pipe(
+                          Effect.andThen(readPiSavedLiteralCredential(agentDirectory)),
+                          Effect.map(Redacted.value),
+                        ),
+                      ),
+                    reserveRequest: (reservation, signal) =>
+                      perform(
+                        guard(
+                          check(signal).pipe(
+                            Effect.andThen(accounting.reserve(durable.principal, reservation)),
+                            Effect.flatMap((receipt) =>
+                              receipt.status === "existing"
+                                ? Effect.fail(deny("Pi model request already reserved", "conflict"))
+                                : Effect.succeed({ reservationId: receipt.reservationId }),
+                            ),
+                          ),
+                        ),
+                      ),
+                    settleRequest: (settlement) => perform(accounting.settle(settlement)),
+                    transport: options.transport,
+                  },
+                });
+                let controlId = 0;
+                const done = Promise.withResolvers<void>();
+                let stopFailure: PiManagedRuntimeError | undefined;
+                let started = false;
+                const cancellation = new AbortController();
+                let execution:
+                  | Promise<import("./PiSessionRuntime.ts").PiSessionTerminal>
+                  | undefined;
+                const run = Effect.suspend(() => {
+                  let ownsRun = false;
+                  return guard(
+                    Effect.gen(function* () {
+                      if (started) return yield* deny("Pi operation already attempted", "conflict");
+                      yield* operations.assertIndependent();
+                      if (started) return yield* deny("Pi operation already attempted", "conflict");
+                      started = true;
+                      ownsRun = true;
+                      const terminal = yield* Effect.tryPromise({
+                        try: (signal) => {
+                          execution = perform(Effect.scoped(runtime.run()), {
+                            signal: AbortSignal.any([signal, cancellation.signal]),
+                          });
+                          return execution;
+                        },
+                        catch: () => deny("Pi operation requires reconciliation", "uncertain"),
+                      }).pipe(Effect.onInterrupt(() => Effect.sync(() => cancellation.abort())));
+                      yield* operations.current(identity(request.threadId));
+                      if (terminal.outcome !== "success" || !terminal.native)
+                        return yield* deny("Pi operation requires reconciliation", "uncertain");
+                      const beforePublication = yield* operations.current(
+                        identity(request.threadId),
+                      );
+                      if (
+                        contextFor(beforePublication) !== context ||
+                        piManagedSkillResourceIdentity(
+                          yield* selectedSkills(beforePublication, workspace),
+                        ) !== resourceHash
+                      )
+                        return yield* deny(
+                          "Pi publication selected content or authority changed",
+                          "conflict",
+                        );
+                      yield* verifyWorkspace(beforePublication, agentDirectory, workspace);
+                      const current = yield* operations.publication(durable, terminal);
+                      yield* verifySource(sourceFence);
+                      yield* finalWorkspaceFence(paths, workspace.fence);
+                      // No asynchronous work separates these owner checks from publication.
+                      if (
+                        cancellation.signal.aborted ||
+                        active.get(request.threadId)?.prepared.operation.operationId !==
+                          operation.operationId
+                      )
+                        return yield* deny("Pi operation publication canceled", "conflict");
+                      const result = { terminal, session: sessionFor(current, terminal.native) };
+                      active.delete(request.threadId);
+                      done.resolve();
+                      ownsRun = false;
+                      return result;
+                    }),
+                  ).pipe(
+                    Effect.ensuring(
+                      Effect.suspend(() =>
+                        ownsRun
+                          ? Effect.gen(function* () {
+                              cancellation.abort();
+                              if (execution)
+                                yield* Effect.promise(() =>
+                                  execution!.then(
+                                    () => {},
+                                    () => {},
+                                  ),
+                                );
+                              if (
+                                active.get(request.threadId)?.prepared.operation.operationId ===
+                                operation.operationId
+                              )
+                                active.delete(request.threadId);
+                              done.resolve();
+                            })
+                          : Effect.void,
+                      ),
+                    ),
+                  );
+                });
+                const steer: PiManagedPreparedOperation["steer"] = (kind, text) =>
+                  guard(
+                    runtime
+                      .control({ type: "control", controlId: ++controlId, kind, text })
+                      .pipe(Effect.as({ controlId, status: "received" as const })),
+                  );
+                const interrupt = guard(
+                  Effect.suspend(() => {
+                    const id = ++controlId;
+                    return runtime
+                      .interrupt(id)
+                      .pipe(Effect.as({ controlId: id, status: "received" as const }));
+                  }),
+                );
+                const prepared: PiManagedPreparedOperation =
+                  request.kind === "prompt"
+                    ? { kind: "prompt", turnId, operation, run, steer, interrupt }
+                    : { kind: request.kind, operation, run, steer, interrupt };
+                const stop = guard(
+                  Effect.uninterruptible(
+                    Effect.gen(function* () {
+                      preparation.canceled = true;
+                      if (!started) {
+                        started = true;
+                        yield* persistTerminal({
+                          identity: workerIdentity,
+                          operation,
+                          outcome: "canceled",
+                          ownerCaptured: false,
+                          native: null,
+                          drain: null,
+                          accountingReceipts: [],
+                        }).pipe(
+                          Effect.tapError((error) =>
+                            Effect.sync(() => {
+                              stopFailure = error;
+                            }),
+                          ),
+                          Effect.ensuring(Effect.sync(() => done.resolve())),
+                        );
+                        if (
+                          active.get(request.threadId)?.prepared.operation.operationId ===
+                          operation.operationId
+                        )
+                          active.delete(request.threadId);
+                        done.resolve();
+                        return;
+                      }
+                      cancellation.abort();
+                      yield* Effect.promise(() => done.promise);
+                      if (stopFailure) return yield* stopFailure;
+                    }),
                   ),
                 );
-              });
-              const steer: PiManagedPreparedOperation["steer"] = (kind, text) =>
-                guard(
-                  runtime
-                    .control({ type: "control", controlId: ++controlId, kind, text })
-                    .pipe(Effect.as({ controlId, status: "received" as const })),
-                );
-              const interrupt = guard(
-                Effect.suspend(() => {
-                  const id = ++controlId;
-                  return runtime
-                    .interrupt(id)
-                    .pipe(Effect.as({ controlId: id, status: "received" as const }));
+                active.set(request.threadId, { prepared, stop });
+                if (preparation.canceled || closing) {
+                  yield* stop;
+                  return yield* deny("Pi preparation canceled", "conflict");
+                }
+                try {
+                  sourceFence();
+                } catch {
+                  yield* stop;
+                  return yield* sourceChanged();
+                }
+                return prepared;
+              }),
+            ).pipe(
+              Effect.onExit((exit) => {
+                if (!Exit.isFailure(exit) || !resourceScope) return Effect.void;
+                // Before entering durable preparation, a sealed view has no native consumer.
+                const cleanup =
+                  stageSealed && !durableAttempted && skillStage
+                    ? skillStage.remove()
+                    : Effect.void;
+                return cleanup.pipe(Effect.ensuring(closeResources));
+              }),
+              Effect.ensuring(
+                Effect.sync(() => {
+                  preparing.delete(request.threadId);
+                  preparation.done.resolve();
                 }),
-              );
-              const prepared: PiManagedPreparedOperation =
-                request.kind === "prompt"
-                  ? { kind: "prompt", turnId, operation, run, steer, interrupt }
-                  : { kind: request.kind, operation, run, steer, interrupt };
-              const stop = guard(
-                Effect.uninterruptible(
-                  Effect.gen(function* () {
-                    if (!started) {
-                      started = true;
-                      yield* operations.persistTerminal(durable, {
-                        identity: workerIdentity,
-                        operation,
-                        outcome: "canceled",
-                        ownerCaptured: false,
-                        native: null,
-                        drain: null,
-                        accountingReceipts: [],
-                      });
-                      if (
-                        active.get(request.threadId)?.prepared.operation.operationId ===
-                        operation.operationId
-                      )
-                        active.delete(request.threadId);
-                      done.resolve();
-                      return;
-                    }
-                    cancellation.abort();
-                    yield* Effect.promise(() => done.promise);
-                  }),
-                ),
-              );
-              active.set(request.threadId, { prepared, stop });
-              return prepared;
-            }),
-          );
+              ),
+            );
+            return Effect.uninterruptibleMask((restore) =>
+              Effect.gen(function* () {
+                preparationFiber = yield* prepare.pipe(
+                  Effect.forkChild({ uninterruptible: false }),
+                );
+                const exit = yield* restore(Fiber.await(preparationFiber));
+                if (
+                  (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)) ||
+                  (Exit.isSuccess(exit) && (preparation.canceled || closing))
+                )
+                  return yield* deny("Pi preparation canceled", "conflict");
+                return yield* exit;
+              }),
+            );
+          });
+        };
         const requestStop = (threadId: ThreadId) =>
           guard(
             Effect.gen(function* () {
+              const pending = preparing.get(threadId);
+              if (pending) yield* pending;
               const running = active.get(threadId);
               if (!running) {
+                if (pending) return;
                 yield* operations.current(identity(threadId));
                 return;
               }
@@ -1232,56 +1763,149 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
             }),
           );
         const stopAll = Effect.suspend(() =>
-          Effect.forEach([...active.keys()], requestStop, { discard: true }),
+          Effect.forEach([...new Set([...preparing.keys(), ...active.keys()])], requestStop, {
+            discard: true,
+          }),
         ).pipe(Effect.asVoid);
         yield* Effect.addFinalizer(() =>
-          Effect.suspend(() =>
-            Effect.forEach([...active.keys()], requestStop, { discard: true }),
-          ).pipe(Effect.catch(() => Effect.void)),
+          Effect.sync(() => {
+            closing = true;
+          }).pipe(
+            Effect.andThen(
+              Effect.suspend(() =>
+                Effect.forEach(
+                  [...new Set([...preparing.keys(), ...active.keys()])],
+                  (threadId) => requestStop(threadId).pipe(Effect.catch(() => Effect.void)),
+                  { discard: true },
+                ),
+              ),
+            ),
+            Effect.ensuring(
+              Effect.forEach(stageScopes, (scope) => Scope.close(scope, Exit.void), {
+                discard: true,
+              }),
+            ),
+          ),
         );
+        const readCommitted = <A>(
+          threadId: ThreadId,
+          skillPlan: ProviderSkillPlan | undefined,
+          read: (
+            committed: Effect.Success<ReturnType<typeof operations.nativeFor>>,
+          ) => Effect.Effect<A, PiManagedRuntimeError>,
+        ) => {
+          // Capture caller hints before any database or filesystem admission.
+          let plan: ProviderSkillPlan | undefined;
+          try {
+            plan = skillPlan === undefined ? undefined : structuredClone(skillPlan);
+          } catch {
+            return Effect.fail(deny("Pi skill plan cannot be copied"));
+          }
+          return guard(
+            Effect.gen(function* () {
+              const committed = yield* operations.nativeFor(identity(threadId));
+              if (
+                committed.authority.binding.configuration.runtimeVersion !== "0.99.1" ||
+                committed.authority.binding.configuration.instructionsHash !==
+                  digest(committed.authority.role.instructions)
+              )
+                return yield* deny(
+                  "Pi native view frozen runtime or instructions changed",
+                  "conflict",
+                );
+              const context = contextFor(committed.authority);
+              const workspace = yield* verifyWorkspace(committed.authority, agentDirectory);
+              const { selection, fence: sourceFence } = yield* selectedSnapshot(
+                committed.authority,
+                workspace,
+              );
+              const resourceHash = piManagedSkillResourceIdentity(selection);
+              if ((committed.resourceHash ?? piManagedSkillResourceIdentity([])) !== resourceHash)
+                return yield* deny("Changed Pi skills require a new native session", "conflict");
+              const authorizeCurrent = guard(
+                Effect.gen(function* () {
+                  const latest = yield* operations.current(identity(threadId));
+                  if (
+                    contextFor(latest) !== context ||
+                    piManagedSkillResourceIdentity(yield* selectedSkills(latest, workspace)) !==
+                      resourceHash
+                  )
+                    return yield* deny(
+                      "Pi native view authority or selected content changed",
+                      "conflict",
+                    );
+                  yield* verifyWorkspace(latest, agentDirectory, workspace);
+                }),
+              );
+              if (plan !== undefined) {
+                if (Option.isNone(materialization))
+                  return yield* deny("Managed skill materialization is unavailable", "unavailable");
+                yield* validatePiManagedSkillPlan({
+                  selection,
+                  skillPlan: plan,
+                  materialization: materialization.value,
+                  threadId,
+                  providerInstanceId: instance.instanceId,
+                  authorizeCurrent,
+                }).pipe(
+                  Effect.provideService(FileSystem.FileSystem, fs),
+                  Effect.provideService(Path.Path, paths),
+                );
+              }
+              const result = yield* read(committed);
+              yield* authorizeCurrent;
+              return yield* operations.admitCurrent(
+                identity(threadId),
+                (latest) => {
+                  if (contextFor(latest) !== context)
+                    throw deny("Pi native view authority changed", "conflict");
+                  workspaceReceipt(paths, workspace.fence.metadata, workspace.fence);
+                  sourceFence();
+                  return result;
+                },
+                {
+                  operationId: committed.operationId,
+                  native: committed.native,
+                  resourceHash: committed.resourceHash,
+                },
+              );
+            }),
+          );
+        };
         return {
           inspect,
           prepareOperation,
           requestStop,
           stopAll,
-          readSession: (threadId: ThreadId) =>
-            guard(
-              operations
-                .current(identity(threadId))
-                .pipe(Effect.map((authority) => sessionFor(authority))),
+          readSession: (threadId: ThreadId, skillPlan?: ProviderSkillPlan) =>
+            readCommitted(threadId, skillPlan, (committed) =>
+              Effect.succeed(sessionFor(committed.authority, committed.native)),
             ),
           readThread: (threadId: ThreadId) =>
-            guard(
-              Effect.gen(function* () {
-                const committed = yield* operations.nativeFor(identity(threadId));
-                const native = yield* Effect.tryPromise({
-                  try: () =>
-                    readPiNativeSession({
-                      sessionDirectoryRoot:
-                        options.nativeStateRoot +
-                        "/" +
-                        digest(
-                          encode([
-                            options.environmentId,
-                            instance.instanceId,
-                            threadId,
-                            committed.authority.binding.recordId,
-                            committed.authority.binding.generation,
-                          ]),
-                        ) +
-                        "/sessions",
-                      expectedCwd: "/workspace",
-                      native: committed.native,
-                    }),
-                  catch: () => deny("Pi native session read unavailable", "unavailable"),
-                }).pipe(Effect.uninterruptible);
-                const current = yield* operations.nativeFor(identity(threadId));
-                if (
-                  current.operationId !== committed.operationId ||
-                  encode(current.native) !== encode(committed.native)
-                )
-                  return yield* deny("Pi native reference changed", "conflict");
-                return {
+            readCommitted(threadId, undefined, (committed) =>
+              Effect.tryPromise({
+                try: () =>
+                  readPiNativeSession({
+                    sessionDirectoryRoot:
+                      options.nativeStateRoot +
+                      "/" +
+                      digest(
+                        encode([
+                          options.environmentId,
+                          instance.instanceId,
+                          threadId,
+                          committed.authority.binding.recordId,
+                          committed.authority.binding.generation,
+                        ]),
+                      ) +
+                      "/sessions",
+                    expectedCwd: "/workspace",
+                    native: committed.native,
+                  }),
+                catch: () => deny("Pi native session read unavailable", "unavailable"),
+              }).pipe(
+                Effect.uninterruptible,
+                Effect.map((native) => ({
                   threadId,
                   turns: [
                     {
@@ -1289,8 +1913,8 @@ export const makePiManagedRuntimeLive = Effect.fn("makePiManagedRuntimeLive")(fu
                       items: native.selectedBranch.map((entry) => entry.payload),
                     },
                   ],
-                };
-              }),
+                })),
+              ),
             ),
           authorizeSkills,
           discoverNativeSkills: () =>
