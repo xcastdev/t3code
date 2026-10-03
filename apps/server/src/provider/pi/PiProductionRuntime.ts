@@ -13,6 +13,7 @@ import { PiModelCatalogue } from "./PiModelCatalogue.ts";
 import { MAX_PI_RUNTIME_FILES } from "./PiManagedProcess.ts";
 import { preparePiRuntimeAssets } from "./PiRuntimeAssets.ts";
 import { makePiSkillStageLifetime } from "./PiSkillStageLifetime.ts";
+import { makeProjectManagedSetupAssetLifetime } from "../../project/ProjectManagedSetupAssetLifetime.ts";
 
 const NodeFS = process.getBuiltinModule("fs");
 const nativeFS = NodeFS.promises;
@@ -43,6 +44,20 @@ const Options = Schema.Struct({
   maxOutputTokens: positive,
 });
 export type PiProductionRuntimeOptions = typeof Options.Type;
+/** Private Root registry handoff. A loan retains the stage through joined setup cleanup. */
+export interface PiProductionRuntimeAssets {
+  readonly runtimeFiles: ReadonlyArray<{ readonly source: string; readonly target: string }>;
+  readonly revalidate: Effect.Effect<void, PiManagedRuntimeError>;
+  readonly borrow: <A, E, R>(
+    operation: Effect.Effect<A, E, R>,
+  ) => Effect.Effect<A, E | PiManagedRuntimeError, R>;
+}
+export interface PiProductionRuntimeHooks {
+  readonly publishAssets?: (
+    instanceId: Parameters<PiManagedRuntime["Service"]["forInstance"]>[0]["instanceId"],
+    assets: PiProductionRuntimeAssets,
+  ) => Effect.Effect<void, PiManagedRuntimeError>;
+}
 const decodeOptions = Schema.decodeEffect(Options, { onExcessProperty: "error" });
 const FileIdentity = Schema.Struct({
   source: absolute,
@@ -290,7 +305,9 @@ async function removeStage(stage: Stage, root: string) {
 /** Root supplies trusted product paths; each enabled instance owns one scoped immutable stage. */
 export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(function* (
   supplied: PiProductionRuntimeOptions,
+  hooks?: PiProductionRuntimeHooks,
 ) {
+  const publishAssets = hooks?.publishAssets;
   const options = yield* decodeOptions(supplied).pipe(Effect.mapError(unavailable));
   const sql = yield* SqlClient.SqlClient;
   const outsideTransaction = Effect.gen(function* () {
@@ -301,6 +318,9 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
   const catalogue = yield* PiModelCatalogue;
   const parentFetch = yield* FetchHttpClient.Fetch;
   const path = yield* Path.Path;
+  const setupAssets = yield* makeProjectManagedSetupAssetLifetime({
+    environmentId: options.environmentId,
+  });
   // Instance finalizers belong to its caller's scope, not the factory construction scope.
   const services = (yield* Effect.context<
     Effect.Services<ReturnType<typeof makePiManagedRuntimeLive>>
@@ -462,9 +482,21 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
             )
               return false;
           }
-          if (rows.length < 16) return true;
+          if (rows.length < 16) break;
           cursor = allocations.at(-1)!.rowId;
         }
+        const files: Array<Parameters<typeof setupAssets.canRelease>[0]["files"][number]> = [];
+        for (const entry of stage.entries) {
+          const { dev, ino } = entry.identity;
+          if (typeof dev !== "number" || typeof ino !== "number") return false;
+          files.push({
+            source: stage.directory + "/" + entry.name,
+            target: entry.target,
+            dev,
+            ino,
+          });
+        }
+        return yield* setupAssets.canRelease({ directory: stage.directory, files });
       }).pipe(
         Effect.timeoutOption(options.cleanupDeadlineMs),
         Effect.map(Option.getOrElse(() => false)),
@@ -512,6 +544,32 @@ export const makePiProductionRuntime = Effect.fn("makePiProductionRuntime")(func
           accepting = false;
         }),
       );
+      if (publishAssets) {
+        const published: PiProductionRuntimeAssets = Object.freeze({
+          runtimeFiles: Object.freeze(
+            assets.runtimeFiles.map((file) => Object.freeze({ ...file })),
+          ),
+          revalidate: revalidateRuntime,
+          borrow: <A, E, R>(operation: Effect.Effect<A, E, R>) =>
+            Effect.suspend<A, E | PiManagedRuntimeError, R>(() => {
+              if (!accepting) return Effect.fail(closed());
+              preparing++;
+              return revalidateRuntime.pipe(
+                Effect.andThen(
+                  Effect.suspend<A, E | PiManagedRuntimeError, R>(() =>
+                    accepting ? operation : Effect.fail(closed()),
+                  ),
+                ),
+                Effect.ensuring(
+                  Effect.sync(() => {
+                    preparing--;
+                  }),
+                ),
+              );
+            }),
+        });
+        yield* publishAssets(instance.instanceId, published);
+      }
       return {
         ...managed,
         prepareOperation: (...args: Parameters<typeof managed.prepareOperation>) => {

@@ -10,6 +10,10 @@ import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import { HostProcessPlatform } from "@t3tools/shared/hostProcess";
 import * as Effect from "effect/Effect";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as Scope from "effect/Scope";
+import * as Exit from "effect/Exit";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as TestClock from "effect/testing/TestClock";
@@ -41,7 +45,13 @@ import * as ServerSettings from "../../serverSettings.ts";
 import { PiModelCatalogue, makePiModelCatalogue } from "./PiModelCatalogue.ts";
 import { collectUint8StreamText } from "../../stream/collectUint8StreamText.ts";
 import * as Runtime from "./PiManagedRuntimeLive.ts";
-import { makePiProductionRuntime, type PiProductionRuntimeOptions } from "./PiProductionRuntime.ts";
+import * as RuntimeAssets from "./PiRuntimeAssets.ts";
+import {
+  makePiProductionRuntime,
+  type PiProductionRuntimeOptions,
+  type PiProductionRuntimeAssets,
+  type PiProductionRuntimeHooks,
+} from "./PiProductionRuntime.ts";
 
 const NodeFS = process.getBuiltinModule("fs");
 const nativeFS = NodeFS.promises;
@@ -172,8 +182,8 @@ const fixture = Effect.gen(function* () {
 afterEach(() => {
   vi.restoreAllMocks();
 });
-const construct = (f: Effect.Success<typeof fixture>) =>
-  makePiProductionRuntime(f.options).pipe(
+const construct = (f: Effect.Success<typeof fixture>, hooks?: PiProductionRuntimeHooks) =>
+  makePiProductionRuntime(f.options, hooks).pipe(
     Effect.provideService(PiModelCatalogue, f.catalogue),
     Effect.provideService(FetchHttpClient.Fetch, f.fetch),
   );
@@ -355,6 +365,193 @@ const stageFrom = (f: Effect.Success<typeof fixture>) => {
   const source = files![0]!.source;
   return source.slice(0, source.lastIndexOf("/"));
 };
+product("an outstanding setup loan retains actual assets after instance scope closes", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const published: PiProductionRuntimeAssets[] = [];
+      const service = yield* construct(f, {
+        publishAssets: (_, assets) =>
+          Effect.sync(() => {
+            published.push(assets);
+          }),
+      });
+      const instanceScope = yield* Scope.make();
+      yield* service.forInstance(instance).pipe(Effect.provideService(Scope.Scope, instanceScope));
+      expect(published).toHaveLength(1);
+      const assets = published[0]!;
+      const stage = stageFrom(f);
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let calls = 0;
+      const loan = yield* assets
+        .borrow(
+          Effect.gen(function* () {
+            calls++;
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+            expect(yield* f.fs.exists(assets.runtimeFiles[0]!.source)).toBe(true);
+          }),
+        )
+        .pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      yield* Scope.close(instanceScope, Exit.void);
+      expect(yield* f.fs.exists(stage)).toBe(true);
+      yield* failure(assets.revalidate);
+      yield* failure(assets.borrow(Effect.sync(() => calls++)));
+      expect(calls).toBe(1);
+      yield* Deferred.succeed(release, undefined);
+      yield* Fiber.join(loan);
+      // Closed scopes retain uncertain stages; a late loan completion cannot delete them.
+      expect(yield* f.fs.exists(stage)).toBe(true);
+      expect(f.fetch).not.toHaveBeenCalled();
+    }),
+  ),
+);
+product("a joined setup loan releases its stage and exposes immutable assets", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const published: PiProductionRuntimeAssets[] = [];
+      const service = yield* construct(f, {
+        publishAssets: (id, assets) => {
+          expect(id).toBe(providerInstanceId);
+          return Effect.sync(() => {
+            published.push(assets);
+          });
+        },
+      });
+      let stage = "";
+      yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* service.forInstance(instance);
+          expect(published).toHaveLength(1);
+          const assets = published[0]!;
+          stage = stageFrom(f);
+          expect(Object.isFrozen(assets)).toBe(true);
+          expect(Object.isFrozen(assets.runtimeFiles)).toBe(true);
+          expect(assets.runtimeFiles.every(Object.isFrozen)).toBe(true);
+          yield* assets.borrow(Effect.void);
+          expect(yield* f.fs.exists(stage)).toBe(true);
+        }),
+      );
+      expect(yield* f.fs.exists(stage)).toBe(false);
+      expect(f.fetch).not.toHaveBeenCalled();
+    }),
+  ),
+);
+product("malformed retained setup history retains actual assets after the last loan joins", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const assignment = yield* seed("investigator", "reserved", { issueCredential: false });
+      const sql = yield* SqlClient.SqlClient;
+      const published: PiProductionRuntimeAssets[] = [];
+      const service = yield* construct(f, {
+        publishAssets: (_, assets) =>
+          Effect.sync(() => {
+            published.push(assets);
+          }),
+      });
+      const instanceScope = yield* Scope.make();
+      yield* service.forInstance(instance).pipe(Effect.provideService(Scope.Scope, instanceScope));
+      const assets = published[0]!;
+      const staged = stageFrom(f);
+      yield* assets.borrow(Effect.void);
+      const deadline = Date.parse(at) + 1000;
+      // Corrupt imported history is legal storage, not an admitted setup or a drain proof.
+      yield* sql`INSERT INTO project_team_model_budget VALUES
+        (${f.options.environmentId},${assignment.binding.projectId},${assignment.binding.taskId},1000,${deadline})`;
+      yield* sql`INSERT INTO project_team_dispatch ${sql.insert({
+        dispatch_id: "retained-setup",
+        environment_id: f.options.environmentId,
+        project_id: assignment.binding.projectId,
+        binding_id: assignment.binding.recordId,
+        generation: assignment.binding.generation,
+        task_id: assignment.binding.taskId,
+        attempt_id: assignment.binding.attemptId,
+        worktree: assignment.binding.worktree,
+        branch: assignment.binding.branch,
+        root_task_id: assignment.binding.taskId,
+        root_maximum_tokens: 1000,
+        root_deadline_at_ms: deadline,
+        attempt_maximum_tokens: 1000,
+        attempt_deadline_at_ms: deadline,
+        delegation_depth: 0,
+        maximum_delegation_depth: 2,
+        repair_allowance: 2,
+        stage: "reserved",
+        revision: 0,
+        claim_generation: 0,
+        intent_json: "{}",
+        created_at: at,
+        updated_at: at,
+      })}`;
+      yield* sql`INSERT INTO project_team_setup_process
+        (setup_id,dispatch_id,selection_json,status,activation,input_json)
+        VALUES ('retained-setup','retained-setup',${encode({
+          kind: "script",
+          launch: { runtimeFiles: [assets.runtimeFiles[0]!] },
+        })},'selected','unlaunched',NULL)`;
+      expect(yield* sql`PRAGMA foreign_key_check`).toEqual([]);
+      expect(yield* sql`SELECT unit FROM project_team_pi_process`).toEqual([]);
+      yield* Scope.close(instanceScope, Exit.void);
+      expect(yield* f.fs.exists(staged)).toBe(true);
+      expect(yield* f.fs.exists(assets.runtimeFiles[0]!.source)).toBe(true);
+      yield* failure(assets.revalidate);
+      expect(f.fetch).not.toHaveBeenCalled();
+    }),
+  ),
+);
+product("scope closure during loan revalidation prevents setup from starting", () =>
+  scoped(
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      const original = RuntimeAssets.preparePiRuntimeAssets;
+      vi.spyOn(RuntimeAssets, "preparePiRuntimeAssets").mockImplementation((input) =>
+        original(input).pipe(
+          Effect.map((assets) => ({
+            ...assets,
+            revalidate: assets.revalidate.pipe(
+              Effect.andThen(Deferred.succeed(entered, undefined)),
+              Effect.andThen(Deferred.await(release)),
+              Effect.as(undefined),
+            ),
+          })),
+        ),
+      );
+      const published: PiProductionRuntimeAssets[] = [];
+      const service = yield* construct(f, {
+        publishAssets: (_, assets) =>
+          Effect.sync(() => {
+            published.push(assets);
+          }),
+      });
+      const instanceScope = yield* Scope.make();
+      yield* service.forInstance(instance).pipe(Effect.provideService(Scope.Scope, instanceScope));
+      expect(published).toHaveLength(1);
+      const assets = published[0]!;
+      const stage = stageFrom(f);
+      let starts = 0;
+      const loan = yield* assets
+        .borrow(
+          Effect.sync(() => {
+            starts++;
+          }),
+        )
+        .pipe(Effect.exit, Effect.forkScoped);
+      yield* Deferred.await(entered);
+      yield* Scope.close(instanceScope, Exit.void);
+      expect(yield* f.fs.exists(stage)).toBe(true);
+      yield* Deferred.succeed(release, undefined);
+      expect(Exit.isFailure(yield* Fiber.join(loan))).toBe(true);
+      expect(starts).toBe(0);
+      expect(f.fetch).not.toHaveBeenCalled();
+    }),
+  ),
+);
 const processRow = Effect.fn("factoryTest.processRow")(function* (
   files: Parameters<typeof Runtime.makePiManagedRuntimeLive>[0]["runtimeFiles"],
   status: string,
