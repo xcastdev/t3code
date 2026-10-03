@@ -35,6 +35,13 @@ import { ThreadRouteScreen } from "./features/threads/ThreadRouteScreen";
 import { ConnectionsRouteScreen } from "./features/connection/ConnectionsRouteScreen";
 import { ConnectionsNewRouteScreen } from "./features/connection/ConnectionsNewRouteScreen";
 import { HomeRouteScreen } from "./features/home/HomeRouteScreen";
+import {
+  ProjectWorkScreen,
+  WorkProjectsScreen,
+  WorkTaskScreen,
+  WorkEntryRow,
+} from "./features/work/WorkScreens";
+import { WORK_PATHS } from "./features/work/workNavigation";
 import { AddProjectDestinationRoute } from "./features/projects/AddProjectDestinationRoute";
 import { AddProjectLocalRoute } from "./features/projects/AddProjectLocalRoute";
 import { AddProjectRepositoryRoute } from "./features/projects/AddProjectRepositoryRoute";
@@ -153,7 +160,7 @@ const SettingsContentStack = createNativeStackNavigator({
   },
   screens: {
     Settings: createNativeStackScreen({
-      screen: SettingsRouteScreen,
+      screen: WorkSettingsRouteScreen,
       linking: "",
       options: {
         title: "Settings",
@@ -501,6 +508,28 @@ function NotFoundScreen() {
   );
 }
 
+function WorkHomeRouteScreen() {
+  return (
+    <View className="flex-1">
+      <View className="flex-1">
+        <HomeRouteScreen />
+      </View>
+      <WorkEntryRow />
+    </View>
+  );
+}
+
+function WorkSettingsRouteScreen() {
+  return (
+    <View className="flex-1">
+      <View className="flex-1">
+        <SettingsRouteScreen />
+      </View>
+      <WorkEntryRow />
+    </View>
+  );
+}
+
 export const RootStack = createNativeStackNavigator({
   initialRouteName: "Home",
   layout: RootStackLayout,
@@ -509,7 +538,7 @@ export const RootStack = createNativeStackNavigator({
   },
   screens: {
     Home: createNativeStackScreen({
-      screen: HomeRouteScreen,
+      screen: WorkHomeRouteScreen,
       linking: "",
       options: {
         ...GLASS_HEADER_OPTIONS,
@@ -517,6 +546,21 @@ export const RootStack = createNativeStackNavigator({
         headerBackVisible: false,
         ...getCompactBrandHeaderOptions(),
       },
+    }),
+    WorkProjects: createNativeStackScreen({
+      screen: WorkProjectsScreen,
+      linking: WORK_PATHS.projects,
+      options: GLASS_HEADER_OPTIONS,
+    }),
+    ProjectWork: createNativeStackScreen({
+      screen: ProjectWorkScreen,
+      linking: WORK_PATHS.project,
+      options: GLASS_HEADER_OPTIONS,
+    }),
+    WorkTask: createNativeStackScreen({
+      screen: WorkTaskScreen,
+      linking: WORK_PATHS.task,
+      options: GLASS_HEADER_OPTIONS,
     }),
     Thread: createNativeStackScreen({
       screen: ThreadRouteScreen,
