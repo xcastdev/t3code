@@ -5,6 +5,7 @@ const [, rawLaunchJson] = process.argv.slice(2);
 let remoteCalls = 0;
 let hostImports = 0;
 let sdkImports = 0;
+let nativeSpawns = 0;
 let sdkEnvironmentCorrect;
 const files = process.getBuiltinModule("fs").promises;
 const originalOpen = files.open;
@@ -12,8 +13,20 @@ let descriptorOpened = 0;
 let descriptorClosed = 0;
 const descriptors = new Set();
 files.open = async (...args) => {
-  const handle = await originalOpen(...args);
-  if (typeof args[0] === "string" && (args[0] === "/workspace" || args[0].startsWith("/proc/"))) {
+  let handle;
+  try {
+    handle = await originalOpen(...args);
+  } catch (error) {
+    notify({ type: "native-open-error", path: String(args[0]), code: error.code });
+    throw error;
+  }
+  if (
+    typeof args[0] === "string" &&
+    (args[0] === "/" ||
+      args[0] === "/workspace" ||
+      args[0].startsWith("/runtime/") ||
+      args[0].startsWith("/proc/"))
+  ) {
     descriptorOpened++;
     descriptors.add(handle);
     const close = handle.close.bind(handle);
@@ -21,6 +34,21 @@ files.open = async (...args) => {
       await close();
       if (descriptors.delete(handle)) descriptorClosed++;
     };
+    const realpath = await files.realpath(`/proc/self/fd/${handle.fd}`);
+    if (realpath.startsWith("/runtime/skills/")) {
+      const stat = await handle.stat();
+      notify({
+        type: "native-opened",
+        path: args[0],
+        fd: handle.fd,
+        uid: stat.uid,
+        mode: stat.mode,
+        dev: stat.dev,
+        ino: stat.ino,
+        nlink: stat.nlink,
+        realpath,
+      });
+    }
   }
   return handle;
 };
@@ -34,6 +62,7 @@ const originalSpawn = NodeChildProcess.spawn;
 const builtinChildProcess = NodeChildProcess.default;
 // Observe the actual native SDK process handle; retain its implementation and arguments.
 builtinChildProcess.spawn = (...args) => {
+  nativeSpawns++;
   const child = originalSpawn(...args);
   notify({ type: "native-spawn", pid: child.pid, executable: args[0] });
   child.stdout?.on("data", (bytes) => {
@@ -84,6 +113,7 @@ try {
     ok: code === undefined,
     code,
     remoteCalls,
+    nativeSpawns,
     sdkEnvironmentCorrect,
     listenersUnchanged: JSON.stringify(listeners()) === JSON.stringify(baseline),
     rawInputDestroyed: process.stdin.destroyed,
@@ -92,6 +122,12 @@ try {
     descriptorOpened,
     descriptorClosed,
     descriptorsHeld: descriptors.size,
+    workspaceMount: (await files.readFile("/proc/self/mountinfo", "utf8"))
+      .split("\n")
+      .find((line) => line.split(" ")[4] === "/workspace"),
+    processPolicy: (await files.readFile("/proc/self/status", "utf8"))
+      .split("\n")
+      .filter((line) => /^(Cap(Inh|Prm|Eff|Bnd|Amb)|NoNewPrivs):/.test(line)),
   });
   if (code) process.exitCode = 1;
 } finally {

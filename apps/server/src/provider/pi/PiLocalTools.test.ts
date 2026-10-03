@@ -5,6 +5,7 @@ import { it } from "@effect/vitest";
 import * as Schema from "effect/Schema";
 import { describe, expect, vi } from "vite-plus/test";
 import * as BashIsolation from "./PiBashToolIsolation.ts";
+import * as SelectedSkillRead from "./PiSelectedSkillRead.ts";
 import {
   makePiIsolatedLocalTools,
   makePiLocalTools,
@@ -518,6 +519,183 @@ const factoryFixture = Effect.gen(function* () {
 });
 
 describe("fixed Pi isolated tool factory", () => {
+  it.effect("activates an empty selection once without acquiring selected descriptors", () =>
+    Effect.gen(function* () {
+      const f = yield* factoryFixture;
+      yield* f.fs.writeFileString(f.metadata, "1 9 0:1 / /workspace ro - tmpfs tmpfs rw\n");
+      const reader = vi.spyOn(SelectedSkillRead, "makePiSelectedSkillRead");
+      const tools = yield* Effect.promise(() => makePiIsolatedLocalTools());
+      yield* Effect.promise(() => tools.initializeLocalResources({ skills: [] }));
+      yield* Effect.promise(() =>
+        expect(tools.initializeLocalResources({ skills: [] })).rejects.toThrow("UNAVAILABLE"),
+      );
+      yield* Effect.promise(() =>
+        expect(
+          tools.localTools.read({ path: "/runtime/skills/example/SKILL.md" }, signal()),
+        ).rejects.toThrow("TOOL_FAILURE"),
+      );
+      expect(reader).toHaveBeenCalledExactlyOnceWith([]);
+      expect(f.handles).toHaveLength(1);
+      const close = tools.close();
+      expect(tools.close()).toBe(close);
+      yield* Effect.promise(() => close);
+      yield* Effect.promise(() =>
+        expect(tools.initializeLocalResources({ skills: [] })).rejects.toThrow("UNAVAILABLE"),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  );
+
+  it.effect("routes canonical selected reads through the owned reader with native output", () =>
+    Effect.gen(function* () {
+      const f = yield* factoryFixture;
+      yield* f.fs.writeFileString(f.metadata, "1 9 0:1 / /workspace ro - tmpfs tmpfs rw\n");
+      const selected = [
+        { key: "example", path: "/runtime/skills/example/SKILL.md", description: "Selected" },
+      ];
+      const read = vi.fn<
+        Awaited<ReturnType<typeof SelectedSkillRead.makePiSelectedSkillRead>>["read"]
+      >(async () => ({
+        content: [
+          { type: "text", text: "two\n\n[2 more lines in file. Use offset=3 to continue.]" },
+        ],
+        details: { paging: true },
+      }));
+      const close = vi.fn(async () => {});
+      const reader = vi
+        .spyOn(SelectedSkillRead, "makePiSelectedSkillRead")
+        .mockResolvedValue({ read, close });
+      const tools = yield* Effect.promise(() => makePiIsolatedLocalTools());
+      yield* Effect.promise(() =>
+        expect(tools.localTools.read({ path: selected[0]!.path }, signal())).rejects.toThrow(
+          "UNAVAILABLE",
+        ),
+      );
+      yield* Effect.promise(() => tools.initializeLocalResources({ skills: selected }));
+      const input = { path: "/runtime/skills/example/assets/@notes", offset: 2, limit: 1 };
+      const abort = signal();
+      expect(content(yield* Effect.promise(() => tools.localTools.read(input, abort)))).toContain(
+        "Use offset=3",
+      );
+      expect(reader).toHaveBeenCalledExactlyOnceWith(selected);
+      expect(read).toHaveBeenCalledExactlyOnceWith(input, abort);
+      for (const path of [
+        "@/runtime/skills/example/SKILL.md",
+        "file:///runtime/skills/example/SKILL.md",
+        "/runtime//skills/example/SKILL.md",
+        "/runtime/skills/example/./SKILL.md",
+      ]) {
+        yield* Effect.promise(() =>
+          expect(tools.localTools.read({ path }, signal())).rejects.toThrow("TOOL_FAILURE"),
+        );
+      }
+      expect(read).toHaveBeenCalledTimes(1);
+      read.mockRejectedValueOnce(Error("private selected-reader path diagnostic"));
+      yield* Effect.promise(() =>
+        expect(
+          tools.localTools.read({ path: "/runtime/skills/unselected/SKILL.md" }, signal()),
+        ).rejects.toThrow(/^TOOL_FAILURE$/),
+      );
+      expect(read).toHaveBeenCalledTimes(2);
+      yield* Effect.promise(tools.close);
+      expect(close).toHaveBeenCalledTimes(1);
+      for (const name of ["read", "write", "edit", "bash"] as const) {
+        const args =
+          name === "read"
+            ? { path: "file" }
+            : name === "write"
+              ? { path: "file", content: "value" }
+              : name === "edit"
+                ? { path: "file", edits: [{ oldText: "a", newText: "b" }] }
+                : { command: "printf closed" };
+        yield* Effect.promise(() =>
+          expect(tools.localTools[name](decodeInput(args), signal())).rejects.toThrow(
+            "UNAVAILABLE",
+          ),
+        );
+      }
+      expect(f.exec).not.toHaveBeenCalled();
+    }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  );
+
+  it.effect.each(["reader", "bash", "both", "neither"] as const)(
+    "joins held activation and attempts both closes when %s close is uncertain",
+    (failure) =>
+      Effect.gen(function* () {
+        const f = yield* factoryFixture;
+        yield* f.fs.writeFileString(f.metadata, "1 9 0:1 / /workspace ro - tmpfs tmpfs rw\n");
+        const release = Promise.withResolvers<void>();
+        const read =
+          vi.fn<Awaited<ReturnType<typeof SelectedSkillRead.makePiSelectedSkillRead>>["read"]>();
+        const readerClose = vi.fn(async () => {
+          if (failure === "reader" || failure === "both")
+            throw Error("private reader close uncertainty");
+        });
+        const reader = vi
+          .spyOn(SelectedSkillRead, "makePiSelectedSkillRead")
+          .mockImplementation(async () => {
+            await release.promise;
+            return { read, close: readerClose };
+          });
+        f.close.mockImplementation(async () => {
+          if (failure === "bash" || failure === "both")
+            throw Error("private bash close uncertainty");
+        });
+        const tools = yield* Effect.promise(() => makePiIsolatedLocalTools());
+        const activation = tools.initializeLocalResources({ skills: [] }).then(
+          () => "unexpected",
+          (error: unknown) => String(error),
+        );
+        yield* Effect.promise(() =>
+          expect(tools.initializeLocalResources({ skills: [] })).rejects.toThrow("UNAVAILABLE"),
+        );
+        expect(reader).toHaveBeenCalledExactlyOnceWith([]);
+        const closing = tools.close();
+        let settled = false;
+        const result = closing.then(
+          () => {
+            settled = true;
+            return "closed";
+          },
+          (error: unknown) => {
+            settled = true;
+            return String(error);
+          },
+        );
+        yield* Effect.promise(() => Promise.resolve());
+        expect(f.close).toHaveBeenCalledTimes(1);
+        expect(readerClose).not.toHaveBeenCalled();
+        expect(settled).toBe(false);
+        expect(tools.close()).toBe(closing);
+        yield* Effect.promise(() =>
+          expect(
+            tools.localTools.read({ path: "/runtime/skills/example/SKILL.md" }, signal()),
+          ).rejects.toThrow("UNAVAILABLE"),
+        );
+        release.resolve();
+        expect(yield* Effect.promise(() => activation)).toContain("UNAVAILABLE");
+        expect(yield* Effect.promise(() => result)).toBe(
+          failure === "neither" ? "closed" : "Error: TOOL_FAILURE",
+        );
+        expect(readerClose).toHaveBeenCalledTimes(1);
+        expect(read).not.toHaveBeenCalled();
+      }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  );
+
+  it.effect("retains activation failure while joining Bash cleanup", () =>
+    Effect.gen(function* () {
+      const f = yield* factoryFixture;
+      yield* f.fs.writeFileString(f.metadata, "1 9 0:1 / /workspace ro - tmpfs tmpfs rw\n");
+      vi.spyOn(SelectedSkillRead, "makePiSelectedSkillRead").mockRejectedValue(
+        Error("UNAVAILABLE"),
+      );
+      const tools = yield* Effect.promise(() => makePiIsolatedLocalTools());
+      yield* Effect.promise(() =>
+        expect(tools.initializeLocalResources({ skills: [] })).rejects.toThrow("UNAVAILABLE"),
+      );
+      yield* Effect.promise(() => expect(tools.close()).rejects.toThrow("TOOL_FAILURE"));
+      expect(f.close).toHaveBeenCalledTimes(1);
+    }).pipe(Effect.scoped, Effect.provide(NodeFileSystem.layer)),
+  );
   it.effect.each(["ro", "rw"] as const)(
     "derives the actual %s mount mode and uses only owned operations",
     (mode) =>
