@@ -3143,6 +3143,158 @@ const selectedRuntimeFixture = Effect.fn("PiManagedRuntimeLive.selectedRuntimeFi
     };
   },
 );
+describe.runIf(process.env.PI_MANAGED_RUNTIME_INITIALIZATION_GATE === "1")(
+  "initial native publication",
+  () => {
+    for (const selected of [false, true]) {
+      it.effect(
+        "publishes durable initial native progression " + (selected ? "selected" : "ordinary"),
+        () =>
+          scoped(
+            Effect.gen(function* () {
+              const selectedFixture = selected ? yield* selectedRuntimeFixture() : undefined;
+              const f = selectedFixture ?? (yield* fixture);
+              const distributionDirectory = process.env.PI_MANAGED_RUNTIME_INITIALIZATION_DIST;
+              const evidence = process.env.PI_MANAGED_RUNTIME_TEST_EVIDENCE;
+              if (!distributionDirectory || !evidence)
+                return yield* Effect.die("Owned current distribution and evidence are required");
+              const stage = yield* f.fs.makeTempDirectoryScoped();
+              yield* f.fs.chmod(stage, 0o700);
+              yield* Effect.addFinalizer(() => f.fs.chmod(stage, 0o700).pipe(Effect.orDie));
+              const assets = yield* preparePiRuntimeAssets({
+                distributionDirectory,
+                stagingDirectory: stage,
+                protectedRoots: [f.main],
+              });
+              const closure = yield* Effect.forEach(assets.runtimeFiles, (file) =>
+                f.fs.readFile(file.source).pipe(
+                  Effect.map((bytes) => ({
+                    ...file,
+                    bytes: bytes.length,
+                    sha256: NodeCrypto.createHash("sha256").update(bytes).digest("hex"),
+                  })),
+                ),
+              );
+              const name = selected ? "selected" : "ordinary";
+              yield* f.fs.writeFileString(evidence + "/" + name + "-closure.json", json(closure));
+              const operations = yield* makeProjectTeamPiOperations({
+                environmentId: "environment",
+              });
+              const initial = yield* operations.current({ providerInstanceId, threadId }, true);
+              const actualAt = DateTime.formatIso(DateTime.nowUnsafe());
+              yield* TestClock.setTime(Date.parse(actualAt));
+              yield* restoreHistoricalBinding({
+                ...initial.binding,
+                revision: initial.binding.revision + 1,
+                updatedAt: actualAt,
+              });
+              const before = yield* operations.current({ providerInstanceId, threadId }, true);
+              let calls = 0;
+              const runtime = yield* makePiManagedRuntimeLive({
+                ...f.options,
+                ...assets,
+                revalidateRuntime: assets.revalidate.pipe(
+                  Effect.mapError(
+                    () =>
+                      new PiManagedRuntimeError({
+                        code: "conflict",
+                        detail: "Owned initialization runtime assets changed",
+                      }),
+                  ),
+                ),
+                ...(selectedFixture
+                  ? { allocateSkillStage: makePiSkillStageLifetime(selectedFixture.cache) }
+                  : {}),
+                workerArgv: (identity, operation) =>
+                  assets.workerArgv(identity, operation, "/state/sessions"),
+                memoryBytes: 536870912,
+                maxInputTokens: 18000,
+                cleanupDeadlineMs: 5000,
+                readCatalogue: Effect.succeed({
+                  source: "https://api.commandcode.ai/provider/v1/models",
+                  fetchedAt: actualAt,
+                  selectedEntry: {
+                    id: model,
+                    owned_by: "command-code",
+                    context_length: 20000,
+                    supported_endpoints: ["/chat/completions"],
+                  },
+                }),
+                transport: async () => {
+                  calls++;
+                  throw Error("Initialization must not call model transport");
+                },
+              });
+              const instance = yield* runtime.forInstance({
+                instanceId: providerInstanceId,
+                enabled: true,
+                configuration: {},
+              });
+              const prepared = yield* instance.prepareOperation(
+                {
+                  threadId,
+                  kind: "initialize",
+                  ...(selectedFixture ? { skillPlan: selectedFixture.plan } : {}),
+                },
+                () => Effect.void,
+              );
+              const result = yield* prepared.run.pipe(Effect.result);
+              yield* instance.requestStop(threadId);
+              const current = yield* operations.current({ providerInstanceId, threadId });
+              const owners = yield* f.sql<{ owner_json: string; drain_json: string }>`
+                SELECT owner_json,drain_json FROM project_team_pi_process`;
+              const rows = yield* f.sql`SELECT * FROM project_team_pi_operation`;
+              const requests = yield* f.sql`SELECT * FROM project_team_model_request`;
+              yield* f.fs.writeFileString(
+                evidence + "/" + name + "-publication.json",
+                json({
+                  result,
+                  before: before.binding,
+                  current: current.binding,
+                  owners,
+                  rows,
+                  requests,
+                  calls,
+                }),
+              );
+              expect(owners).toHaveLength(1);
+              for (const row of owners) {
+                const owner = parseOwner(row.owner_json);
+                const drain = parseFullDrain(row.drain_json);
+                expect(drain.invocation).toBe(owner.invocation);
+                expect(drain.unit).toBe(owner.unit);
+                expect(drain.kernel === "removed" || drain.kernel.includes("populated 0")).toBe(
+                  true,
+                );
+                expect(drain.ownerPid).toBe(owner.pid);
+                for (const pid of [owner.pid, drain.launcherPid, drain.childPid])
+                  expect(yield* f.fs.exists(`/proc/${pid}`)).toBe(false);
+                if (yield* f.fs.exists(drain.cgroup + "/cgroup.events"))
+                  expect(yield* f.fs.readFileString(drain.cgroup + "/cgroup.events")).toContain(
+                    "populated 0",
+                  );
+              }
+              expect(calls).toBe(0);
+              expect(requests).toEqual([]);
+              expect(result._tag).toBe("Success");
+              if (result._tag !== "Success") return;
+              expect(result.success.terminal.outcome).toBe("success");
+              expect(result.success.session.status).toBe("ready");
+              expect(current.binding).toEqual({
+                ...before.binding,
+                revision: before.binding.revision + 1,
+                status: "running",
+                sessionId: result.success.terminal.native!.sessionId,
+                updatedAt: actualAt,
+              });
+              expect(rows).toMatchObject([{ status: "settled" }]);
+            }),
+          ).pipe(Effect.provide(selectedRuntimeLayer)),
+        30000,
+      );
+    }
+  },
+);
 it.effect(
   "stages selected owned content and removes it only after durable never-started drain",
   () =>
