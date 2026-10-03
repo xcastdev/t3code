@@ -24,6 +24,7 @@ import {
   makeProjectManagedSetup,
   ProjectManagedSetupError,
   type ProjectManagedSetupInput,
+  type ProjectManagedSetupReceipt,
   type ProjectManagedSetupPorts,
   type ProjectManagedSetupRetained,
   type ProjectManagedSetupSelection,
@@ -98,6 +99,76 @@ const fresh = (selection: ProjectManagedSetupSelection = script): ProjectManaged
   receipt: null,
   uncertain: false,
 });
+
+const encodeFixture = Schema.encodeSync(Schema.fromJsonString(Schema.Unknown));
+const joined = { text: "complete", bytes: 8, invalidUtf8: false, truncated: false };
+const completed: ProjectManagedSetupReceipt = {
+  outcome: "succeeded",
+  selection: script,
+  allocation,
+  owner,
+  drain,
+  reconciliation: null,
+  stdout: joined,
+  stderr: { ...joined, text: "", bytes: 0 },
+  reason: null,
+};
+const receiptContradictions: readonly { name: string; receipt: ProjectManagedSetupReceipt }[] = [
+  {
+    name: "missing drain and output",
+    receipt: { ...completed, drain: null, stdout: null, stderr: null },
+  },
+  { name: "failed exit", receipt: { ...completed, drain: { ...drain, childExitCode: 7 } } },
+  {
+    name: "missing allocation and owner",
+    receipt: { ...completed, allocation: null, owner: null },
+  },
+  {
+    name: "changed script revision",
+    receipt: { ...completed, selection: { ...script, scriptRevision: "changed" } },
+  },
+  {
+    name: "changed launch bytes",
+    receipt: {
+      ...completed,
+      selection: { ...script, launch: { ...launch, argv: ["/bin/sh", "-c", "printf changed"] } },
+    },
+  },
+  {
+    name: "changed allocation",
+    receipt: { ...completed, allocation: { ...allocation, unit: "other-unit" } },
+  },
+  { name: "changed owner", receipt: { ...completed, owner: { ...owner, pid: 800 } } },
+  {
+    name: "changed drain invocation",
+    receipt: { ...completed, drain: { ...drain, invocation: "b".repeat(32) } },
+  },
+  {
+    name: "populated kernel",
+    receipt: { ...completed, drain: { ...drain, kernel: "populated 1" } },
+  },
+  {
+    name: "contradictory kernel",
+    receipt: { ...completed, drain: { ...drain, kernel: "populated 1\npopulated 0" } },
+  },
+  {
+    name: "unbounded output",
+    receipt: { ...completed, stdout: { ...joined, bytes: 32769, text: "x".repeat(32769) } },
+  },
+  { name: "mismatched output bytes", receipt: { ...completed, stdout: { ...joined, bytes: 4 } } },
+  {
+    name: "script incorrectly skipped",
+    receipt: {
+      ...completed,
+      outcome: "skipped",
+      allocation: null,
+      owner: null,
+      drain: null,
+      stdout: null,
+      stderr: null,
+    },
+  },
+];
 
 const fixture = Effect.fn("managedSetupTest.fixture")(function* () {
   const started = yield* Deferred.make<void>();
@@ -204,10 +275,32 @@ const fixture = Effect.fn("managedSetupTest.fixture")(function* () {
         return Effect.void;
       }),
     markUncertain: (_input, retained) =>
-      Effect.sync(() => {
+      Effect.suspend(() => {
+        const { uncertain: _uncertain, ...actual } = state.retained ?? fresh();
+        const expected = retained.expected;
+        // Root can recognize the exact captured owner after a lost persistOwner response.
+        // A different owner or receipt never matches that recovery exception.
+        const recoveredOwner =
+          expected?.activation === "claimed" &&
+          !expected.owner &&
+          actual.activation === "owned" &&
+          retained.owner !== null &&
+          encodeFixture(actual.owner) === encodeFixture(retained.owner);
+        if (
+          !expected ||
+          !Object.keys(actual).every(
+            (key) =>
+              (recoveredOwner && (key === "activation" || key === "owner")) ||
+              encodeFixture(Reflect.get(actual, key)) === encodeFixture(Reflect.get(expected, key)),
+          )
+        )
+          return Effect.fail(
+            new ProjectManagedSetupError({ reason: "uncertainty snapshot changed" }),
+          );
         state.held.push(retained);
         state.trace.push("uncertain");
         if (state.retained) state.retained = { ...state.retained, uncertain: true };
+        return Effect.void;
       }),
     preallocate: () =>
       Effect.sync(() => {
@@ -415,7 +508,7 @@ describe("managed setup fences and joined cleanup", () => {
       expect((yield* Fiber.await(active))._tag).toBe("Failure");
       expect(f.state.preallocations).toBe(0);
       expect(f.state.starts).toBe(0);
-      expect(f.state.held).toHaveLength(1);
+      expect(f.state.held).toHaveLength(0);
     }),
   );
 
@@ -777,3 +870,211 @@ describe.runIf(process.env.PROJECT_MANAGED_SETUP_NATIVE_GATE === "1")(
     );
   },
 );
+
+describe("retained setup receipt and duplicate repair", () => {
+  it.effect(
+    "replays the exact pinned allocation when native sources resolve to physical paths",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const pinned = {
+          ...allocation,
+          launch: {
+            ...allocation.launch,
+            runtimeFiles: [{ source: "/physical/sh", target: "/bin/sh", dev: 1, ino: 3 }],
+          },
+        };
+        const receipt = { ...completed, allocation: pinned };
+        f.state.retained = { ...fresh(), activation: "owned", allocation: pinned, owner, receipt };
+        expect(yield* f.setup.execute(input)).toEqual(receipt);
+        expect(f.state.starts).toBe(0);
+      }),
+  );
+  for (const method of ["execute", "reconcile"] as const) {
+    it.effect(`${method} replays conservative failed recovery without exit or output`, () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        const recovered: ProjectManagedSetupReceipt = {
+          ...completed,
+          outcome: "failed",
+          drain: null,
+          stdout: null,
+          stderr: null,
+          reason: "exit and output were lost",
+          reconciliation: {
+            state: "drained",
+            unit: owner.unit,
+            invocation: owner.invocation,
+            cgroup: owner.cgroup,
+            kernel: "removed",
+          },
+        };
+        f.state.retained = {
+          ...fresh(),
+          activation: "owned",
+          allocation,
+          owner,
+          receipt: recovered,
+        };
+        expect(yield* f.setup[method](input)).toEqual(recovered);
+        expect(f.state.starts).toBe(0);
+        expect(f.state.reconciliations).toBe(0);
+      }),
+    );
+  }
+  it.effect(
+    "a corrected concurrent receipt rejects the contradictory snapshot uncertainty write",
+    () =>
+      Effect.gen(function* () {
+        const f = yield* fixture();
+        f.state.retained = {
+          ...fresh(),
+          activation: "owned",
+          allocation,
+          owner,
+          receipt: receiptContradictions[0]!.receipt,
+        };
+        const setup = makeProjectManagedSetup({
+          ...f.ports,
+          markUncertain: (request, value) =>
+            Effect.gen(function* () {
+              f.state.retained = { ...f.state.retained!, receipt: completed };
+              return yield* f.ports.markUncertain(request, value);
+            }),
+        });
+        const result = yield* setup.execute(input).pipe(Effect.exit);
+        expect(result._tag).toBe("Failure");
+        if (result._tag === "Failure") expect(result.cause.reasons).toHaveLength(2);
+        expect(f.state.retained?.receipt).toEqual(completed);
+        expect(f.state.retained?.uncertain).toBe(false);
+        expect(f.state.held).toHaveLength(0);
+      }),
+  );
+  it.effect("an ambiguous claim response preserves its claim and conditional marker failure", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      const setup = makeProjectManagedSetup({
+        ...f.ports,
+        claimActivation: (request, selection, allocated) =>
+          Effect.gen(function* () {
+            yield* f.ports.claimActivation(request, selection, allocated);
+            return yield* Effect.fail(
+              new PiManagedProcessError({ phase: "startup", message: "lost claim response" }),
+            );
+          }),
+      });
+      const result = yield* setup.execute(input).pipe(Effect.exit);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") expect(result.cause.reasons).toHaveLength(2);
+      expect(f.state.retained?.activation).toBe("claimed");
+      expect(f.state.retained?.owner).toBeNull();
+      expect(f.state.starts).toBe(0);
+      expect((yield* f.setup.execute(input).pipe(Effect.exit))._tag).toBe("Failure");
+      expect(f.state.preallocations).toBe(1);
+    }),
+  );
+  for (const differentOwner of [false, true]) {
+    it.effect(
+      `lost owner publication ${differentOwner ? "cannot quarantine a different owner" : "retains the exact captured owner"}`,
+      () =>
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          const setup = makeProjectManagedSetup({
+            ...f.ports,
+            persistOwner: (request, allocated, actualOwner) =>
+              Effect.gen(function* () {
+                yield* f.ports.persistOwner(
+                  request,
+                  allocated,
+                  differentOwner
+                    ? { ...actualOwner, invocation: "b".repeat(32), pid: 800 }
+                    : actualOwner,
+                );
+                return yield* Effect.fail(
+                  new PiManagedProcessError({ phase: "startup", message: "lost owner response" }),
+                );
+              }),
+          });
+          const result = yield* setup.execute(input).pipe(Effect.exit);
+          expect(result._tag).toBe("Failure");
+          if (result._tag === "Failure")
+            expect(result.cause.reasons).toHaveLength(differentOwner ? 2 : 1);
+          expect(f.state.retained?.uncertain).toBe(!differentOwner);
+          expect(f.state.retained?.owner?.pid).toBe(differentOwner ? 800 : owner.pid);
+          expect(f.state.starts).toBe(0);
+          expect(f.state.running).toBe(false);
+          expect(f.state.trace).toContain("stop");
+        }),
+    );
+  }
+  for (const method of ["execute", "reconcile"] as const)
+    for (const variant of receiptContradictions) {
+      it.effect(`${method} rejects contradictory retained receipt: ${variant.name}`, () =>
+        Effect.gen(function* () {
+          const f = yield* fixture();
+          f.state.retained = {
+            ...fresh(),
+            allocation,
+            owner,
+            activation: "owned",
+            receipt: variant.receipt,
+          };
+          expect((yield* f.setup[method](input).pipe(Effect.exit))._tag).toBe("Failure");
+          expect(f.state.starts).toBe(0);
+          expect(f.state.reconciliations).toBe(0);
+          expect(f.state.retained?.uncertain).toBe(true);
+        }),
+      );
+    }
+  it.effect("rejects contradictory receipt returned by the selection freeze winner", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      const setup = makeProjectManagedSetup({
+        ...f.ports,
+        freezeSelection: () =>
+          Effect.sync(() => {
+            f.state.retained = { ...fresh(), receipt: completed };
+            return f.state.retained;
+          }),
+      });
+      expect((yield* setup.execute(input).pipe(Effect.exit))._tag).toBe("Failure");
+      expect(f.state.starts).toBe(0);
+      expect(f.state.retained?.uncertain).toBe(true);
+    }),
+  );
+  it.effect("preclaim authority failure cannot quarantine a concurrently started winner", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture();
+      f.state.retained = fresh();
+      f.state.hold = true;
+      const reached = yield* Deferred.make<void>();
+      const deny = yield* Deferred.make<void>();
+      const loserSetup = makeProjectManagedSetup({
+        ...f.ports,
+        validateCurrent: (_input, _selection, phase) =>
+          phase === "selection"
+            ? Deferred.succeed(reached, undefined).pipe(
+                Effect.andThen(Deferred.await(deny)),
+                Effect.andThen(
+                  Effect.fail(
+                    new ProjectManagedSetupError({ reason: "duplicate authority revoked" }),
+                  ),
+                ),
+              )
+            : Effect.void,
+      });
+      const loser = yield* loserSetup.execute(input).pipe(Effect.forkScoped);
+      yield* Deferred.await(reached);
+      const winner = yield* f.setup.execute(input).pipe(Effect.forkScoped);
+      yield* Deferred.await(f.started);
+      yield* Deferred.succeed(deny, undefined);
+      expect((yield* Fiber.await(loser))._tag).toBe("Failure");
+      expect(f.state.running).toBe(true);
+      expect(f.state.retained?.uncertain).toBe(false);
+      expect(f.state.held).toHaveLength(0);
+      expect(f.state.trace).not.toContain("stop");
+      yield* Deferred.succeed(f.release, undefined);
+      expect((yield* Fiber.join(winner)).outcome).toBe("succeeded");
+    }),
+  );
+});

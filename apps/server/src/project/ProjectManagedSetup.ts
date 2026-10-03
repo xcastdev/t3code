@@ -115,6 +115,9 @@ export interface ProjectManagedSetupPorts<R = never> {
   readonly markUncertain: (
     input: ProjectManagedSetupInput,
     retained: {
+      // Root atomically compares this entire snapshot, including selection, before writing.
+      // A captured owner may recover a lost persistOwner response only if its exact identity matches.
+      readonly expected: Omit<ProjectManagedSetupRetained, "uncertain"> | null;
       readonly selection: ProjectManagedSetupSelection | null;
       readonly allocation: PiManagedProcessAllocation | null;
       readonly owner: PiManagedProcessOwner | null;
@@ -140,6 +143,154 @@ const failure = (reason: string) => new ProjectManagedSetupError({ reason });
 const OUTPUT_BYTES = 32768;
 const CLEANUP_MS = 5000;
 
+// These retained descriptors contain plain data. Compare every frozen field, including launch
+// bytes and native filesystem identities, rather than accepting a matching script ID alone.
+const same = (left: unknown, right: unknown): boolean => {
+  if (Object.is(left, right)) return true;
+  if (typeof left !== "object" || left === null || typeof right !== "object" || right === null)
+    return false;
+  if (Array.isArray(left) || Array.isArray(right))
+    return (
+      Array.isArray(left) &&
+      Array.isArray(right) &&
+      left.length === right.length &&
+      left.every((value: unknown, index: number) => same(value, right[index]))
+    );
+  const entries = Object.entries(left).filter(([, value]) => value !== undefined);
+  return (
+    entries.length === Object.entries(right).filter(([, value]) => value !== undefined).length &&
+    entries.every(
+      ([key, value]) => Object.hasOwn(right, key) && same(value, Reflect.get(right, key)),
+    )
+  );
+};
+const pid = (value: number | null) =>
+  value !== null && Number.isSafeInteger(value) && value > 0 && value <= 2147483647;
+const physicallyDrained = (kernel: string) => {
+  if (kernel === "removed") return true;
+  if (kernel.length > 4096) return false;
+  const populated = kernel.split("\n").filter((line) => /^populated(?:\s|$)/.test(line));
+  return populated.length === 1 && populated[0] === "populated 0";
+};
+const boundedOutput = (output: CollectedUint8StreamText | null) => {
+  if (
+    !output ||
+    !Number.isSafeInteger(output.bytes) ||
+    output.bytes < 0 ||
+    output.bytes > OUTPUT_BYTES ||
+    (output.truncated && output.bytes !== OUTPUT_BYTES) ||
+    output.text.length > OUTPUT_BYTES * 3
+  )
+    return false;
+  const encodedBytes = new TextEncoder().encode(output.text).byteLength;
+  return output.invalidUtf8 ? encodedBytes <= output.bytes * 3 : encodedBytes === output.bytes;
+};
+const validReceipt = (retained: ProjectManagedSetupRetained): boolean => {
+  const receipt = retained.receipt;
+  if (
+    !receipt ||
+    !same(receipt.selection, retained.selection) ||
+    !same(receipt.allocation, retained.allocation) ||
+    !same(receipt.owner, retained.owner)
+  )
+    return false;
+  if (receipt.outcome === "skipped")
+    return (
+      retained.selection.kind === "none" &&
+      retained.activation === "unlaunched" &&
+      !receipt.allocation &&
+      !receipt.owner &&
+      !receipt.drain &&
+      !receipt.reconciliation &&
+      !receipt.stdout &&
+      !receipt.stderr &&
+      receipt.reason === null
+    );
+  const { allocation, owner, drain, reconciliation } = receipt;
+  if (retained.selection.kind !== "script" || !allocation) return false;
+  // Native allocation resolves runtime sources and protected roots to physical paths.
+  // Their complete pinned identities were compared to retained allocation above.
+  const selected = retained.selection.launch;
+  if (
+    allocation.launch.workspace.path !== retained.selection.cwd ||
+    allocation.launch.workspaceRoot !== selected.workspaceRoot ||
+    allocation.launch.workspaceAccess !== selected.workspaceAccess ||
+    !same(allocation.launch.argv, selected.argv) ||
+    !same(
+      allocation.launch.runtimeFiles.map((file) => file.target),
+      selected.runtimeFiles.map((file) => file.target),
+    ) ||
+    allocation.policy.memoryBytes !== selected.memoryBytes ||
+    allocation.policy.runtimeSeconds !== selected.runtimeSeconds
+  )
+    return false;
+  if (
+    owner &&
+    (retained.activation !== "owned" ||
+      !pid(owner.pid) ||
+      owner.unit !== allocation.unit ||
+      owner.nonce !== allocation.nonce ||
+      owner.memoryBytes !== allocation.policy.memoryBytes ||
+      owner.swapBytes !== 0 ||
+      owner.oomGroup !== 1 ||
+      !/^[a-f0-9]{32}$/.test(owner.invocation) ||
+      !owner.cgroup.startsWith("/sys/fs/cgroup/") ||
+      !owner.cgroup.endsWith(`/${allocation.unit}`) ||
+      owner.cgroup.split("/").some((part) => part === "." || part === ".."))
+  )
+    return false;
+  if (
+    drain &&
+    (!owner ||
+      drain.unit !== owner.unit ||
+      drain.invocation !== owner.invocation ||
+      drain.cgroup !== owner.cgroup ||
+      drain.ownerPid !== owner.pid ||
+      drain.memoryBytes !== owner.memoryBytes ||
+      drain.swapBytes !== owner.swapBytes ||
+      drain.oomGroup !== owner.oomGroup ||
+      !pid(drain.launcherPid) ||
+      (drain.childPid !== null && !pid(drain.childPid)) ||
+      (drain.childExitCode !== null && !Number.isSafeInteger(drain.childExitCode)) ||
+      !physicallyDrained(drain.kernel))
+  )
+    return false;
+  if (
+    reconciliation &&
+    (drain ||
+      reconciliation.unit !== allocation.unit ||
+      (owner
+        ? reconciliation.state !== "drained" ||
+          reconciliation.invocation !== owner.invocation ||
+          reconciliation.cgroup !== owner.cgroup ||
+          !physicallyDrained(reconciliation.kernel)
+        : retained.activation !== "unlaunched" ||
+          reconciliation.state !== "absent" ||
+          reconciliation.invocation !== null ||
+          reconciliation.cgroup !== null ||
+          reconciliation.kernel !== "not-created"))
+  )
+    return false;
+  if (receipt.outcome === "succeeded")
+    return (
+      !!owner &&
+      !!drain &&
+      pid(drain.childPid) &&
+      drain.childExitCode === 0 &&
+      !reconciliation &&
+      boundedOutput(receipt.stdout) &&
+      boundedOutput(receipt.stderr) &&
+      receipt.reason === null
+    );
+  // Recovery can prove cleanup without recovering the script exit or its joined pipes.
+  return (
+    receipt.reason !== null &&
+    (!!drain || !!reconciliation) &&
+    ((!receipt.stdout && !receipt.stderr) ||
+      (boundedOutput(receipt.stdout) && boundedOutput(receipt.stderr)))
+  );
+};
+
 /** Owns setup lifecycle ordering; durable authority, script resolution and native launch stay in Root. */
 export const makeProjectManagedSetup = <R>(ports: ProjectManagedSetupPorts<R>) => {
   const run = Effect.fn("ProjectManagedSetup.run")(function* (
@@ -153,6 +304,25 @@ export const makeProjectManagedSetup = <R>(ports: ProjectManagedSetupPorts<R>) =
     let drain: PiManagedDrain | null = null;
     let reconciliation: PiManagedProcessReconciliation | null = null;
     let duplicate = false;
+    let markRequired = false;
+    let expected: Omit<ProjectManagedSetupRetained, "uncertain"> | null = null;
+    const remember = (value: ProjectManagedSetupRetained | null) => {
+      if (!value) return null;
+      const { uncertain: _uncertain, ...snapshot } = value;
+      return structuredClone(snapshot);
+    };
+    const replay = Effect.fn("ProjectManagedSetup.replay")(function* (
+      value: ProjectManagedSetupRetained,
+    ) {
+      if (!validReceipt(value)) {
+        markRequired = true;
+        return yield* Effect.fail(
+          failure("retained setup receipt contradicts frozen ownership or cleanup"),
+        );
+      }
+      yield* current(value.selection, "completion");
+      return value.receipt!;
+    });
     const current = Effect.fn("ProjectManagedSetup.current")(function* (
       selection: ProjectManagedSetupSelection | null,
       phase: Parameters<ProjectManagedSetupPorts<R>["validateCurrent"]>[2],
@@ -177,7 +347,12 @@ export const makeProjectManagedSetup = <R>(ports: ProjectManagedSetupPorts<R>) =
     const persist = Effect.fn("ProjectManagedSetup.persist")(function* (
       receipt: ProjectManagedSetupReceipt,
     ) {
+      markRequired = true;
       yield* ports.persistReceipt(input, receipt);
+      if (retained) {
+        retained = { ...retained, receipt };
+        expected = remember(retained);
+      }
       return receipt;
     });
     const receipt = (selection: ProjectManagedSetupSelection): ProjectManagedSetupReceipt => ({
@@ -195,15 +370,16 @@ export const makeProjectManagedSetup = <R>(ports: ProjectManagedSetupPorts<R>) =
     const work = Effect.scoped(
       Effect.gen(function* () {
         retained = yield* ports.read(input);
+        expected = remember(retained);
         if (retained?.receipt && !retained.uncertain) {
-          yield* current(retained.selection, "completion");
-          return retained.receipt;
+          return yield* replay(retained);
         }
         if (recovering)
           return yield* Effect.uninterruptible(
             Effect.gen(function* () {
               if (!retained?.allocation)
                 return yield* Effect.fail(failure("no retained setup allocation to reconcile"));
+              markRequired = true;
               reconciliation = yield* ports.reconcileProcess(
                 {
                   allocation: retained.allocation,
@@ -230,14 +406,12 @@ export const makeProjectManagedSetup = <R>(ports: ProjectManagedSetupPorts<R>) =
           const selected = yield* ports.resolveSelection(input);
           yield* current(selected, "allocation");
           retained = yield* ports.freezeSelection(input, structuredClone(selected));
+          expected = remember(retained);
         }
+        if (retained.receipt && !retained.uncertain) return yield* replay(retained);
         if (retained.uncertain || retained.activation !== "unlaunched") {
           duplicate = true;
           return yield* Effect.fail(failure("reconciliation required"));
-        }
-        if (retained.receipt) {
-          yield* current(retained.selection, "completion");
-          return retained.receipt;
         }
         const selection = structuredClone(retained.selection);
         yield* current(selection, "allocation");
@@ -249,6 +423,7 @@ export const makeProjectManagedSetup = <R>(ports: ProjectManagedSetupPorts<R>) =
           const allocated = yield* ports.preallocate(selection.launch);
           yield* current(selection, "allocation");
           retained = yield* ports.freezeAllocation(input, selection, allocated);
+          expected = remember(retained);
         }
         if (retained.uncertain || retained.activation !== "unlaunched" || retained.receipt) {
           duplicate = true;
@@ -258,12 +433,7 @@ export const makeProjectManagedSetup = <R>(ports: ProjectManagedSetupPorts<R>) =
         if (!allocation) return yield* Effect.fail(failure("setup allocation was not retained"));
         // Root's freeze port must preserve the selection winner. Recheck its returned selection.
         yield* current(retained.selection, "activation");
-        if (
-          retained.selection.kind !== "script" ||
-          retained.selection.scriptId !== selection.scriptId ||
-          retained.selection.scriptRevision !== selection.scriptRevision ||
-          retained.selection.cwd !== selection.cwd
-        )
+        if (!same(retained.selection, selection))
           return yield* Effect.fail(failure("frozen setup selection changed"));
 
         return yield* Effect.uninterruptibleMask((restore) =>
@@ -282,6 +452,7 @@ export const makeProjectManagedSetup = <R>(ports: ProjectManagedSetupPorts<R>) =
                           }),
                       ),
                     );
+                    markRequired = true; // A lost claim response has an ambiguous durable outcome.
                     const claimed = yield* ports.claimActivation(input, selection, actual);
                     if (claimed === "already-claimed") {
                       duplicate = true;
@@ -293,12 +464,14 @@ export const makeProjectManagedSetup = <R>(ports: ProjectManagedSetupPorts<R>) =
                       );
                     }
                     retained = { ...retained!, activation: "claimed" };
+                    expected = remember(retained);
                   }).pipe(Effect.provideContext(context)),
                 beforeStart: (owner) =>
                   Effect.gen(function* () {
                     // Capture actual ownership before any authority read that could reject it.
                     retained = { ...retained!, owner, activation: "owned" };
                     yield* ports.persistOwner(input, allocation, owner);
+                    expected = remember(retained);
                     yield* current(selection, "start").pipe(
                       Effect.mapError(
                         () =>
@@ -410,9 +583,10 @@ export const makeProjectManagedSetup = <R>(ports: ProjectManagedSetupPorts<R>) =
         ).pipe(Effect.exit);
         if (result._tag === "Success") return result.value;
         const cause = result.cause;
-        if (duplicate) return yield* Effect.failCause(cause);
+        if (duplicate || !markRequired) return yield* Effect.failCause(cause);
         const held = yield* ports
           .markUncertain(input, {
+            expected,
             selection: retained?.selection ?? null,
             allocation: retained?.allocation ?? null,
             owner: retained?.owner ?? null,
