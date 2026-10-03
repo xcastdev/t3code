@@ -30,6 +30,7 @@ import {
 import type { PiModelAccountingReceipt } from "../pi/PiModelBroker.ts";
 import type { PiSessionTerminal } from "../pi/PiSessionRuntime.ts";
 import type { ProviderAdapterError } from "../Errors.ts";
+import type { ProviderSkillPlan } from "../../skills/ProviderSkillAdapter.ts";
 import { makePiAdapter } from "./PiAdapter.ts";
 
 const instanceId = ProviderInstanceId.make("pi-one");
@@ -105,32 +106,191 @@ it.effect("rejects a foreign skill plan before acquiring a managed operation", (
   }),
 );
 
-it.effect("refuses skill replacement in a ready logical session without another acquisition", () =>
+// Selected-content admission belongs to the real runtime; these plans exercise adapter transport only.
+const readyPlan = (revision = 7, root = "/owned/skills", hash = "selected-package-v1") => {
+  const key = ManagedSkillKey.make("review");
+  return {
+    providerInstanceId: instanceId,
+    desiredRevision: SkillCatalogRevision.make(revision),
+    applicationMode: "new_session_required" as const,
+    skillKeys: [key],
+    payload: {
+      kind: "pi-managed-skills",
+      root,
+      skills: [{ key, path: `${root}/review/SKILL.md`, packageHash: hash }],
+    },
+  };
+};
+
+it.effect("ready plan accepts a fresh revision and root after runtime validation", () =>
   Effect.gen(function* () {
     const fake = yield* makeFake();
     const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
-    const plan = {
-      providerInstanceId: instanceId,
-      desiredRevision: SkillCatalogRevision.make(0),
-      applicationMode: "new_session_required" as const,
-      skillKeys: [],
-      payload: null,
-    };
-    yield* adapter.startSession({ ...startInput, skillPlan: plan });
-    yield* adapter.startSession({ ...startInput, skillPlan: structuredClone(plan) });
+    const original = readyPlan();
+    const refreshed = readyPlan(8, "/owned/refreshed");
+    yield* adapter.startSession({ ...startInput, skillPlan: original });
+    expect(yield* adapter.startSession({ ...startInput, skillPlan: refreshed })).toEqual(
+      initialSession(),
+    );
+    expect(fake.readPlans).toEqual([refreshed]);
+    yield* adapter.startSession(startInput);
+    expect(fake.readPlans).toEqual([refreshed, refreshed]);
+    yield* adapter.sendTurn({ threadId, input: "use validated plan" });
+    expect(fake.requests[1]?.skillPlan).toEqual(refreshed);
+    expect(fake.requests).toHaveLength(2);
+    yield* fake.settle(fake.operations[1]!, "success");
+  }),
+);
+
+it.effect("ready plan revalidates an omitted caller plan against the stored snapshot", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+    const original = readyPlan();
+    yield* adapter.startSession({ ...startInput, skillPlan: original });
+    fake.state.readError = denied;
+    expect(json(yield* Effect.exit(adapter.startSession(startInput)))).toContain(
+      "ProviderAdapterRequestError",
+    );
+    expect(fake.readPlans).toEqual([original]);
+    expect(fake.requests).toHaveLength(1);
+    expect(yield* adapter.listSessions()).toEqual([initialSession()]);
+  }),
+);
+
+for (const code of ["denied", "conflict"] as const)
+  it.effect(`ready plan preserves its prior snapshot when runtime reports ${code}`, () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+      const original = readyPlan();
+      const changed = readyPlan(8, "/owned/changed", "selected-package-v2");
+      yield* adapter.startSession({ ...startInput, skillPlan: original });
+      fake.state.readError = new PiManagedRuntimeError({
+        code,
+        detail: "selected content changed",
+      });
+      const result = yield* Effect.exit(
+        adapter.startSession({ ...startInput, skillPlan: changed }),
+      );
+      expect(json(result)).toContain("ProviderAdapterRequestError");
+      expect(fake.readPlans).toEqual([changed]);
+      expect(yield* adapter.listSessions()).toEqual([initialSession()]);
+      fake.state.readError = undefined;
+      yield* adapter.startSession(startInput);
+      expect(fake.readPlans[1]).toEqual(original);
+      yield* adapter.sendTurn({ threadId, input: "use prior validated plan" });
+      expect(fake.requests[1]?.skillPlan).toEqual(original);
+      yield* fake.settle(fake.operations[1]!, "success");
+    }),
+  );
+
+it.effect("ready plan publishes only after the refreshed session passes hint checks", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const adapter = yield* makePiAdapter({ instanceId, runtime: fake.runtime });
+    const original = readyPlan();
+    const refreshed = readyPlan(8, "/owned/refreshed");
+    yield* adapter.startSession({ ...startInput, skillPlan: original });
+    fake.state.session = { ...initialSession(), updatedAt: "2026-10-01T01:00:00.000Z" };
     expect(
       Exit.isFailure(
         yield* Effect.exit(
-          adapter.startSession({
-            ...startInput,
-            skillPlan: { ...plan, desiredRevision: SkillCatalogRevision.make(1) },
-          }),
+          adapter.startSession({ ...startInput, skillPlan: refreshed, cwd: "/stale/worktree" }),
         ),
       ),
     ).toBe(true);
-    expect(fake.requests).toHaveLength(1);
+    expect(fake.readPlans).toEqual([refreshed]);
+    expect(yield* adapter.listSessions()).toEqual([initialSession()]);
+    yield* adapter.sendTurn({ threadId, input: "retain prior plan after stale hints" });
+    expect(fake.requests[1]?.skillPlan).toEqual(original);
+    yield* fake.settle(fake.operations[1]!, "success");
   }),
 );
+
+it.effect("ready plan isolates caller mutation while its runtime read is held", () =>
+  Effect.gen(function* () {
+    const fake = yield* makeFake();
+    const entered = yield* Deferred.make<void>();
+    const release = yield* Deferred.make<void>();
+    const runtime: PiManagedRuntimeInstance = {
+      ...fake.runtime,
+      readSession: Effect.fn("PiAdapter.test.heldPlanRead")(function* (thread, plan) {
+        const snapshot = yield* fake.runtime.readSession(thread, plan);
+        yield* Deferred.succeed(entered, undefined);
+        yield* Deferred.await(release);
+        return snapshot;
+      }),
+    };
+    const adapter = yield* makePiAdapter({ instanceId, runtime });
+    const callerPlan = readyPlan();
+    const expected = structuredClone(callerPlan);
+    yield* adapter.startSession({ ...startInput, skillPlan: callerPlan });
+    const reading = yield* Effect.forkScoped(
+      Effect.exit(adapter.startSession({ ...startInput, skillPlan: callerPlan })),
+      { startImmediately: true },
+    );
+    yield* Deferred.await(entered);
+    callerPlan.payload.skills[0]!.path = "/caller/mutated";
+    callerPlan.skillKeys.length = 0;
+    yield* Deferred.succeed(release, undefined);
+    expect(Exit.isSuccess(yield* Fiber.join(reading))).toBe(true);
+    expect(fake.readPlans).toEqual([expected]);
+    yield* adapter.sendTurn({ threadId, input: "use read-time snapshot" });
+    expect(fake.requests[1]?.skillPlan).toEqual(expected);
+    yield* fake.settle(fake.operations[1]!, "success");
+  }),
+);
+
+for (const race of ["newer refresh", "stopSession"] as const)
+  it.effect(`ready plan rejects its obsolete read after ${race}`, () =>
+    Effect.gen(function* () {
+      const fake = yield* makeFake();
+      const entered = yield* Deferred.make<void>();
+      const release = yield* Deferred.make<void>();
+      let reads = 0;
+      const runtime: PiManagedRuntimeInstance = {
+        ...fake.runtime,
+        readSession: Effect.fn("PiAdapter.test.overlappingPlanRead")(function* (thread, plan) {
+          const hold = reads++ === 0;
+          const snapshot = yield* fake.runtime.readSession(thread, plan);
+          if (hold) {
+            yield* Deferred.succeed(entered, undefined);
+            yield* Deferred.await(release);
+          }
+          return snapshot;
+        }),
+      };
+      const adapter = yield* makePiAdapter({ instanceId, runtime });
+      const original = readyPlan();
+      const newer = readyPlan(8, "/owned/newer");
+      yield* adapter.startSession({ ...startInput, skillPlan: original });
+      const reading = yield* Effect.forkScoped(
+        Effect.exit(adapter.startSession({ ...startInput, skillPlan: original })),
+        { startImmediately: true },
+      );
+      yield* Deferred.await(entered);
+      const refreshing =
+        race === "newer refresh"
+          ? yield* Effect.exit(adapter.startSession({ ...startInput, skillPlan: newer }))
+          : undefined;
+      if (race === "stopSession") yield* adapter.stopSession(threadId);
+      yield* Deferred.succeed(release, undefined);
+      const obsolete = yield* Fiber.join(reading);
+      if (refreshing) expect(Exit.isSuccess(refreshing)).toBe(true);
+      expect(Exit.isFailure(obsolete)).toBe(true);
+      if (race === "newer refresh") {
+        // The fake returns the identical session object, so only plan publication changes identity.
+        expect(yield* adapter.listSessions()).toEqual([initialSession()]);
+        yield* adapter.sendTurn({ threadId, input: "retain newer validated plan" });
+        expect(fake.requests[1]?.skillPlan).toEqual(newer);
+        yield* fake.settle(fake.operations[1]!, "success");
+      } else {
+        expect(yield* adapter.listSessions()).toEqual([]);
+        expect(fake.requests).toHaveLength(1);
+      }
+    }),
+  );
 
 it.effect("refuses uncopyable explicit skill payloads before a logical session is installed", () =>
   Effect.gen(function* () {
@@ -167,6 +327,7 @@ type FakeOperation = {
 const makeFake = Effect.fn("PiAdapter.test.makeFake")(function* (instance = instanceId) {
   const operations: FakeOperation[] = [];
   const requests: PiManagedOperationRequest[] = [];
+  const readPlans: Array<ProviderSkillPlan | undefined> = [];
   const preparedQueue = yield* Queue.unbounded<FakeOperation>();
   const stopped = yield* Queue.unbounded<ThreadId>();
   const requestsQueue = yield* Queue.unbounded<PiManagedOperationRequest>();
@@ -261,10 +422,11 @@ const makeFake = Effect.fn("PiAdapter.test.makeFake")(function* (instance = inst
       yield* Queue.offer(preparedQueue, entry);
       return prepared;
     }),
-    readSession: () =>
-      Effect.suspend(() =>
-        state.readError ? Effect.fail(state.readError) : Effect.succeed(state.session),
-      ),
+    readSession: (_thread, plan) =>
+      Effect.suspend(() => {
+        readPlans.push(plan);
+        return state.readError ? Effect.fail(state.readError) : Effect.succeed(state.session);
+      }),
     readThread: () =>
       Effect.suspend(() =>
         state.readError
@@ -296,6 +458,7 @@ const makeFake = Effect.fn("PiAdapter.test.makeFake")(function* (instance = inst
     state,
     operations,
     requests,
+    readPlans,
     preparedQueue,
     stopped,
     requestsQueue,

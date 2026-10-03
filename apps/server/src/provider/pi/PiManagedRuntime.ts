@@ -87,8 +87,10 @@ export interface PiManagedRuntimeInstance {
     request: PiManagedOperationRequest,
     observe: PiManagedEventObserver,
   ) => Effect.Effect<PiManagedPreparedOperation, PiManagedRuntimeError>;
+  /** An explicit plan must match current owned selected content and settled native resources. */
   readonly readSession: (
     threadId: ThreadId,
+    skillPlan?: ProviderSkillPlan,
   ) => Effect.Effect<ProviderSession, PiManagedRuntimeError>;
   /** Bounded, authorized native reads cannot rewrite or migrate session files. */
   readonly readThread: (
