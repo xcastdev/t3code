@@ -11,6 +11,8 @@ import {
   SkillCatalogRevision,
   TurnId,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
@@ -1943,4 +1945,155 @@ for (const kind of ["initialize", "prompt"] as const)
           expect(Exit.isFailure(yield* Effect.exit(adapter.startSession(startInput)))).toBe(true);
           expect(fake.requests).toHaveLength(operationIndex + 1);
         }),
+    );
+
+for (const kind of ["initialize", "prompt"] as const)
+  for (const mode of [
+    "typed-pair",
+    "two-defects",
+    "mixed",
+    "interrupt-pair",
+    "mixed-interrupts",
+  ] as const)
+    it.effect(`repair R1 ${kind} cleanup preserves every ${mode} reason after join`, () =>
+      Effect.gen(function* () {
+        const fake = yield* makeFake();
+        fake.state.autoInitialize = kind !== "initialize";
+        const entered = yield* Deferred.make<void>();
+        const release = yield* Deferred.make<void>();
+        const typed = [
+          Cause.makeFailReason(
+            new PiManagedRuntimeError({ code: "denied", detail: "private-cleanup-first" }),
+          ),
+          Cause.makeFailReason(
+            new PiManagedRuntimeError({ code: "unavailable", detail: "private-cleanup-second" }),
+          ),
+        ];
+        const defects = [
+          Cause.makeDieReason("private-cleanup-defect-one"),
+          Cause.makeDieReason(new Error("private-cleanup-defect-two")),
+        ];
+        const interrupts = [Cause.makeInterruptReason(101), Cause.makeInterruptReason(202)];
+        const selected =
+          mode === "typed-pair"
+            ? typed
+            : mode === "two-defects"
+              ? defects
+              : mode === "mixed"
+                ? [...typed, ...defects]
+                : mode === "interrupt-pair"
+                  ? interrupts
+                  : [
+                      typed[0]!,
+                      interrupts[0]!,
+                      defects[0]!,
+                      typed[1]!,
+                      interrupts[1]!,
+                      defects[1]!,
+                    ];
+        const cleanupReasons = selected.map((reason, index) =>
+          reason.annotate(
+            Context.makeUnsafe(
+              new Map<string, unknown>([
+                ["cleanupStep", index],
+                ["correlation", "owned-identity-cleanup"],
+              ]),
+            ),
+          ),
+        );
+        const originalAnnotations = cleanupReasons.map((reason) => [...reason.annotations]);
+        const runtime: PiManagedRuntimeInstance = {
+          ...fake.runtime,
+          prepareOperation: Effect.fn("PiAdapter.test.multipleCleanupIdentity")(
+            function* (request, observe) {
+              const prepared = yield* fake.runtime.prepareOperation(request, observe);
+              if (request.kind !== kind) return prepared;
+              return {
+                ...prepared,
+                operation: { ...prepared.operation, operationId: "contradictory_cleanup_identity" },
+              };
+            },
+          ),
+          requestStop: () =>
+            Effect.gen(function* () {
+              // A caller seeing Interrupt also joins stopContext; its second controlled receipt is settled.
+              if (fake.state.stopCalls++ > 0) return;
+              yield* Deferred.succeed(entered, undefined);
+              yield* Deferred.await(release);
+              return yield* Effect.failCause(Cause.fromReasons(cleanupReasons));
+            }),
+        };
+        const adapter = yield* makePiAdapter({
+          instanceId,
+          runtime,
+          resolveOperationId: () => Effect.succeed("requested_cleanup_identity"),
+        });
+        if (kind === "prompt") yield* adapter.startSession(startInput);
+        const caller = yield* Effect.forkScoped(
+          Effect.exit(
+            kind === "initialize"
+              ? adapter.startSession(startInput).pipe(Effect.asVoid)
+              : adapter
+                  .sendTurn({ threadId, input: "cleanup cardinality assignment" })
+                  .pipe(Effect.asVoid),
+          ),
+        );
+        yield* Deferred.await(entered);
+        yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined));
+        expect(caller.pollUnsafe()).toBeUndefined();
+        expect(yield* Deferred.isDone(fake.operations.at(-1)!.started)).toBe(false);
+        yield* Deferred.succeed(release, undefined);
+        const completed = yield* Fiber.join(caller);
+        expect(Exit.isFailure(completed)).toBe(true);
+        if (Exit.isFailure(completed)) {
+          const [original, ...retained] = completed.cause.reasons;
+          expect(original).toMatchObject({
+            _tag: "Fail",
+            error: { _tag: "ProviderAdapterRequestError", method: kind },
+          });
+          expect(retained).toHaveLength(cleanupReasons.length);
+          for (const [index, reason] of retained.entries()) {
+            const prior = cleanupReasons[index]!;
+            if (Cause.isInterruptReason(prior))
+              expect(reason).toMatchObject({ _tag: "Interrupt", fiberId: prior.fiberId });
+            else {
+              expect(reason).toMatchObject({
+                _tag: "Fail",
+                error: { _tag: "ProviderAdapterRequestError", method: "stopSession" },
+              });
+              if (
+                reason &&
+                Cause.isFailReason(reason) &&
+                reason.error._tag === "ProviderAdapterRequestError"
+              ) {
+                const expectedCode = Cause.isFailReason(prior) ? prior.error.code : "uncertain";
+                expect(reason.error.detail).toBe(
+                  {
+                    denied:
+                      "Pi authorization was denied. Review the current assignment and permissions.",
+                    conflict:
+                      "Pi operation conflicts with current state. Refresh the session before retrying.",
+                    unavailable:
+                      "Pi operation is unavailable. Review its setup and runtime availability.",
+                    uncertain:
+                      "Pi operation could not be confirmed. Reconcile the owned session before retrying.",
+                  }[expectedCode],
+                );
+              }
+            }
+            expect(reason!.annotations.get("cleanupStep")).toBe(index);
+            expect(reason!.annotations.get("correlation")).toBe("owned-identity-cleanup");
+          }
+        }
+        expect(json(completed)).not.toContain("private-cleanup");
+        expect(cleanupReasons.map((reason) => [...reason.annotations])).toEqual(
+          originalAnnotations,
+        );
+        const interrupted = mode === "interrupt-pair" || mode === "mixed-interrupts";
+        expect(fake.state.stopCalls).toBe(interrupted ? 2 : 1);
+        if (interrupted) expect(yield* adapter.hasSession(threadId)).toBe(false);
+        else
+          expect(Exit.isFailure(yield* Effect.exit(adapter.startSession(startInput)))).toBe(true);
+        expect(fake.requests).toHaveLength(kind === "initialize" ? 1 : 2);
+      }),
     );

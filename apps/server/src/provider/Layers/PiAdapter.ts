@@ -9,6 +9,7 @@ import {
 } from "@t3tools/contracts";
 import * as NodeUtil from "node:util";
 import * as Cause from "effect/Cause";
+import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -534,14 +535,20 @@ const makeCapturedPiAdapter = Effect.fn("makePiAdapter")(function* (input: {
           Effect.onExit(() =>
             Effect.uninterruptible(
               Effect.suspend(() => runtime.requestStop(context.threadId)).pipe(
-                Effect.mapError((error) => requestError("stopSession", error)),
-                Effect.catchDefect(() =>
-                  Effect.fail(
-                    requestError(
-                      "stopSession",
-                      new PiManagedRuntimeError({
-                        code: "uncertain",
-                        detail: "Pi prepared identity cleanup failed.",
+                Effect.catchCause((cause) =>
+                  Effect.failCause(
+                    Cause.fromReasons(
+                      cause.reasons.map((reason) => {
+                        if (Cause.isInterruptReason(reason)) return reason;
+                        const error = Cause.isFailReason(reason)
+                          ? reason.error
+                          : new PiManagedRuntimeError({
+                              code: "uncertain",
+                              detail: "Pi prepared identity cleanup failed.",
+                            });
+                        return Cause.makeFailReason(requestError("stopSession", error)).annotate(
+                          Context.makeUnsafe(reason.annotations),
+                        );
                       }),
                     ),
                   ),
